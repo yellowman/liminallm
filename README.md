@@ -8,8 +8,9 @@ it’s a small kernel wrapped around:
 - per-user / per-skill lora adapters
 - emergent “skills” from clusters + preference events
 - self-describing artifacts (workflows, routing policies, tools)
-- notebooklm-style grounding over cephfs-backed files
-- boring infra: postgres + redis + cephfs
+- notebooklm-style grounding over filesystem-backed files
+- boring infra: postgres + redis + filesystem
+- artifacts and adapter payloads live as JSON/weights on the shared filesystem
 
 the code is just the glue. everything interesting lives as data.
 
@@ -28,7 +29,7 @@ the code is just the glue. everything interesting lives as data.
   - continuous micro-training jobs in jax, only on adapters, never on the base model
 
 - **natural factual memory**
-  - user files in cephfs (`/users/{id}/files`)
+  - user files in the filesystem (`/users/{id}/files`)
   - ingestion → chunking → embeddings in postgres (pgvector)
   - notebooklm-style: bind “contexts” (collections of files/folders) to a chat and ask questions grounded in that corpus
 
@@ -38,7 +39,7 @@ the code is just the glue. everything interesting lives as data.
     - run workflows (graphs)
     - run routing policies
     - call the llm with optional lora adapters
-    - talk to postgres / redis / cephfs
+    - talk to postgres / redis / filesystem
   - everything else (domains, skills, behaviors, tools, routing rules) is expressed as **artifacts**:
     - `adapter.lora`
     - `workflow.chat`
@@ -86,7 +87,7 @@ the code is just the glue. everything interesting lives as data.
     - rate limiting
     - hot conversation summaries
     - router and workflow scratch state
-  - cephfs
+  - filesystem
     - `/shared/models` – frozen base model weights
     - `/users/{id}/files` – user docs
     - `/users/{id}/adapters` – per-user lora weight files
@@ -127,14 +128,18 @@ for v1 these can all live in one python app with clear module boundaries.
 1. **bring your infra**
    - postgres (with pgvector installed)
    - redis
-   - cephfs mount accessible to the app
+   - filesystem path accessible to the app
    - gpu / tpu for jax model if you expect to train adapters
 
 2. **configure env**
    - `DATABASE_URL` – postgres dsn
    - `REDIS_URL` – redis dsn
-   - `CEPHFS_ROOT` – cephfs mount path
-   - `MODEL_PATH` – base model directory under `CEPHFS_ROOT/shared/models/...`
+   - `SHARED_FS_ROOT` – filesystem root path
+   - `MODEL_PATH` – model identifier for cloud mode (default `gpt-4o-mini`) or filesystem path when using an adapter server
+   - `OPENAI_API_KEY` – required for live LLM calls; omit to use the echo fallback
+   - `LLM_MODE` – `cloud` (fine-tune ids as models) or `adapter` (adapter_id passthrough to adapter servers)
+   - `ADAPTER_SERVER_MODEL` – model name when pointing at an OpenAI-compatible adapter server
+   - `USE_MEMORY_STORE` – set to `true` to run without Postgres/Redis while testing the API and LLM calls
 
 3. **migrate db**
    - run the alembic / migration tool to create tables described in the spec.
@@ -159,7 +164,7 @@ for v1 these can all live in one python app with clear module boundaries.
 ## roadmap (rough)
 
 - [ ] minimal chat with postgres-backed conversations
-- [ ] file upload + cephfs + rag over pgvector chunks
+- [ ] file upload + filesystem + rag over pgvector chunks
 - [ ] artifacts for workflows + tools (no adapters yet)
 - [ ] preference events + single persona adapter per user
 - [ ] semantic clustering + skill adapters
@@ -172,3 +177,14 @@ for v1 these can all live in one python app with clear module boundaries.
 ## license
 
 MIT
+
+## dev quickstart (prototype)
+
+- install dependencies: `pip install -e .`
+- run migrations: `DATABASE_URL=postgres://... ./scripts/migrate.sh`
+- start api: `uvicorn liminallm.app:app --reload`
+- hit health check: `curl http://localhost:8000/healthz`
+- call kernel endpoints (session_id header required):
+  - `POST /v1/auth/signup` → returns session
+  - `POST /v1/chat` → creates conversation + LLM reply (live if `OPENAI_API_KEY` is set, echo otherwise)
+  - `GET /v1/artifacts` → lists data-driven workflows/policies
