@@ -1,5 +1,5 @@
 # adaptive chat system spec  
-## (“small kernel, big data” with lora adapters, postgres, redis, cephfs, python, jax)
+## (“small kernel, big data” with lora adapters, postgres, redis, filesystem, python, jax)
 
 ---
 
@@ -14,7 +14,7 @@
   - per-user / per-skill LoRA adapters
   - natural, emergent domains & skills from usage
 - **natural, notebookLM-style grounding** via:
-  - user files on CephFS
+  - user files on a shared filesystem
   - RAG over embedded chunks in Postgres
 - **minimal “kernel” code**:
   - core system only knows about generic primitives:
@@ -25,7 +25,7 @@
 - **storage stack**:
   - PostgreSQL (primary store + pgvector)
   - Redis (sessions / hot cache / rate limits)
-  - CephFS (files, adapters, artifacts)
+  - filesystem (files, adapters, artifacts)
 
 ### 0.2 design principles
 
@@ -70,14 +70,14 @@
   - Workflow Engine
   - LLM Inference Service (JAX, LoRA)
   - Knowledge/RAG Service
-  - File Service (CephFS abstraction)
+  - File Service (filesystem abstraction)
   - Preference & Training Service
   - Clusterer & Skill Discovery
   - ConfigOps Service
 - **data stores**
   - PostgreSQL
   - Redis
-  - CephFS
+  - filesystem
 
 for a minimal v1, all “services” can be modules inside a single Python app with clear boundaries.
 
@@ -180,13 +180,16 @@ CREATE TABLE artifact (
   name            TEXT NOT NULL,
   description     TEXT,
   schema          JSONB NOT NULL,                -- typed metadata
-  cephfs_path     TEXT,                          -- optional link to files
+  fs_path         TEXT,                          -- optional link to files on filesystem
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   visibility      TEXT NOT NULL DEFAULT 'private', -- 'private','shared','global'
   meta            JSONB
 );
 ```
+
+payloads for artifacts (JSON schemas, adapter weights) are additionally written under the shared filesystem root so they can be
+mounted by inference/training jobs without round-trips through the database.
 
 **artifact versions** for history & rollbacks:
 
@@ -196,7 +199,7 @@ CREATE TABLE artifact_version (
   artifact_id     UUID NOT NULL REFERENCES artifact(id) ON DELETE CASCADE,
   version         INT NOT NULL,
   schema          JSONB NOT NULL,
-  cephfs_path     TEXT,
+  fs_path         TEXT,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   created_by      TEXT NOT NULL, -- 'system','user','llm'
   change_note     TEXT
@@ -252,7 +255,7 @@ CREATE TABLE knowledge_context (
 CREATE TABLE context_source (
   id              UUID PRIMARY KEY,
   context_id      UUID NOT NULL REFERENCES knowledge_context(id) ON DELETE CASCADE,
-  cephfs_path     TEXT NOT NULL,  -- directory or file
+  fs_path         TEXT NOT NULL,  -- directory or file
   recursive       BOOLEAN NOT NULL DEFAULT TRUE,
   meta            JSONB
 );
@@ -260,7 +263,7 @@ CREATE TABLE context_source (
 CREATE TABLE knowledge_chunk (
   id              BIGSERIAL PRIMARY KEY,
   context_id      UUID NOT NULL REFERENCES knowledge_context(id) ON DELETE CASCADE,
-  cephfs_path     TEXT NOT NULL,
+  fs_path         TEXT NOT NULL,
   chunk_index     INT NOT NULL,
   content         TEXT NOT NULL,
   embedding       VECTOR NOT NULL,
@@ -272,6 +275,20 @@ CREATE INDEX knowledge_chunk_context_idx ON knowledge_chunk (context_id);
 CREATE INDEX knowledge_chunk_embedding_idx ON knowledge_chunk
 USING ivfflat (embedding) WITH (lists = 100);
 ```
+
+#### ingestion pipeline (knowledge → chunks)
+
+- **parsers**: text, markdown, PDF (pdftotext), HTML (readability). Additional parsers can be registered via `artifact` type `tool.spec`.
+- **chunking**: sliding window token-based splitter (e.g., 300–500 tokens with 50 token overlap) tuned per file type; store `chunk_index` and offsets.
+- **hygiene**: dedupe by file checksum + path; skip binary blobs unless parser registered; enforce max file size per plan tier; optional PII-scrub per context.
+- **embedding model**: fixed small encoder (e.g., `all-MiniLM` equivalent) referenced in config; keep version in `knowledge_context.meta.embedding_model`.
+- **refresh cadence**:
+  - watch filesystem path events; enqueue ingestion job on file change.
+  - periodic sweep (daily) to re-embed if encoder version changes.
+- **retrieval strategy**:
+  - at query time, top-K (default 8) by cosine similarity on `knowledge_chunk.embedding` filtered by `context_id`.
+  - optional re-ranking via lightweight cross-encoder tool if available.
+  - return chunk text + `fs_path` for citation; orchestrator can ask LLM to cite paths.
 
 ### 2.6 preferences & training
 
@@ -330,14 +347,14 @@ CREATE TABLE config_patch (
 
 ---
 
-## 3. cephfs layout
+## 3. filesystem layout
 
 ### 3.1 directory structure
 
-logical layout:
+logical layout (any POSIX-like shared filesystem):
 
 ```text
-/                             # cephfs root
+/                             # filesystem root
   shared/
     models/
       base_lm_v1/
@@ -370,9 +387,9 @@ for each LoRA adapter artifact:
 - `schema` in artifact holds:
   - `kind: "adapter.lora"`
   - `rank`, `layers`, `matrices`, etc.
-  - `current_version`, `cephfs_dir`.
+  - `current_version`, `fs_dir`.
 
-on CephFS in `/users/{user}/adapters/{artifact_id}/vNNNN/`:
+on the shared filesystem in `/users/{user}/adapters/{artifact_id}/vNNNN/`:
 
 - `metadata.json` – redundancy with DB, for direct JAX loader.
 - weight npz files, e.g.:
@@ -414,6 +431,18 @@ all redis keys should be namespaced, e.g.:
 
 ## 5. llm & lora adapter stack (python + jax)
 
+### 5.0 deployment modes (kernel treats both as adapter endpoints)
+
+- **cloud API mode: fine-tuned model = endpoint**
+  - external providers expose each fine-tune as a first-class `model` id.
+  - the kernel maps `artifact` entries of kind `adapter.lora` to these model ids 1:1; activating an adapter means choosing the matching model id.
+  - no dynamic multi-adapter composition; switching behavior = switching model id; router can still choose among models based on policy.
+
+- **self-hosted adapter servers (open source)**
+  - base model served once; hundreds–thousands of LoRA fragments mounted behind an OpenAI-compatible API (e.g., LoRAX/Predibase-style) that accepts `adapter_id`/multi-LoRA parameters.
+  - kernel passes `adapter_id` + optional gate weights; server composes multiple adapters per request when supported.
+  - both modes share the same artifact metadata; only the transport differs, so workflows/policies remain data-driven.
+
 ### 5.1 base model
 
 - JAX/Flax implementation of a decoder-only transformer:
@@ -432,7 +461,7 @@ for each hooked weight matrix `W ∈ ℝ^{d_out × d_in}`:
 - effective weight for given adapter gate weight `g_j`:
 
 \[
-W_{	ext{eff}} = W + \sum_j g_j \cdot lpha_j B_j A_j
+W_{\text{eff}} = W + \sum_j g_j \cdot \alpha_j B_j A_j
 \]
 
 in JAX:
@@ -472,11 +501,20 @@ for performance:
 - per-request:
 
   1. determine active adapters & gate weights (`adapter_ids`, `gate_weights`).
-  2. load corresponding LoRA parameter PyTrees from CephFS (cache hot ones in RAM).
+  2. load corresponding LoRA parameter PyTrees from the shared filesystem (cache hot ones in RAM).
+     - cache policy: LRU by `(adapter_id, version)`; pin persona adapters for logged-in user; max resident bytes guarded by config with periodic eviction.
+     - lazy load: if adapter missing from cache, fetch `metadata.json` + `params.npz`; validate checksum + version; keep small adapters in RAM, map large ones with memmap if supported.
+     - per-request adapter cap (e.g., top 3) to bound composition cost; reject requests exceeding cap.
   3. compose an effective view of weights:
      - for small K (top 2–3 adapters) this is cheap.
+     - composition happens in JIT-compiled function to avoid Python overhead.
   4. run generation with sampling parameters (top-p, temperature, max tokens).
+     - batching policy: group requests by base model + active adapter set hash; cap batch size to avoid latency spikes.
+     - timeouts: cancel generation if wall clock > `max_decode_ms` (configurable per plan tier); return partial tokens with `truncated=true` flag.
+     - cancellation: orchestrator can send `cancel` by `request_id`; worker releases adapter references and frees KV cache slots.
   5. stream tokens back to orchestrator.
+     - protocol: Server-Sent Events (text/event-stream) or WebSocket frames `{ "event": "token", "data": "..." }`.
+     - final frame contains usage stats and adapter gates actually applied.
 
 initial minimal version:
 
@@ -519,12 +557,28 @@ loop for a `training_job`:
 
    - optionally DPO if we have good/bad pairs.
 
+5. dataset format + hygiene:
+
+    - write JSONL to the shared filesystem per job: `{ "prompt", "target", "weight", "context" }`.
+   - dedupe by `(conversation_id, message_seq)` to avoid replaying the same correction.
+   - cap per-example tokens (e.g., 2048) and per-job total tokens (plan-tier bound) to control spend.
+
+6. evaluation + rollout:
+
+   - hold-out slice from recent preference events; metrics = loss + alignment rate to positive feedback.
+   - auto-apply new adapter version only if eval improves or human review approves; otherwise keep previous version pinned.
+
+7. scheduling:
+
+   - per-user throttle (max 1 concurrent job, cooldown between jobs) to avoid GPU starvation.
+   - queue respects priority (admin > paying > free) with fairness to prevent starvation.
+
 5. run optimizer (Optax) for a few steps:
 
    - small learning rate, few epochs.
    - early stopping based on batch loss.
 
-6. write new LoRA params to CephFS in new version directory.
+6. write new LoRA params to the shared filesystem in a new version directory.
 
 7. update:
 
@@ -532,6 +586,14 @@ loop for a `training_job`:
    - `adapter_router_state.last_trained_at`, `success_score`.
 
 8. mark training job `status='succeeded'` with `loss`.
+
+**scheduling & prioritization:**
+
+- queue ordering: prioritize `(user_id, cluster_id)` pairs with highest recent positive feedback density and no recent training.
+- per-user fairness: limit concurrent jobs per user to 1; global cap to avoid GPU exhaustion.
+- retry policy: exponential backoff on transient failures (I/O, OOM); max 3 attempts; mark failed with reason.
+- dataset materialization: store tokenized batches (packed with attention masks) in `/users/{u}/adapters/{id}/vNNNN/batches/` for reproducibility; include manifest JSON summarizing sources.
+- evaluation: optional held-out batch; record perplexity / accuracy proxies in `training_job.meta`.
 
 ---
 
@@ -550,7 +612,7 @@ loop for a `training_job`:
   "layers": [0,1,2,3,4,5],
   "matrices": ["attn_q", "attn_v"],
   "current_version": 3,
-  "cephfs_dir": "/users/.../adapters/{id}",
+  "fs_dir": "/users/.../adapters/{id}",
   "cluster_id": "…",  // semantic cluster this adapter is tied to
   "applicability": {
     "natural_language": "Helps this user debug kernel panics via reproduce→bisect→log-analysis.",
@@ -599,6 +661,62 @@ loop for a `training_job`:
   ]
 }
 ```
+
+**workflow.chat schema / contracts** (JSON Schema sketch):
+
+```json
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": ["kind", "entrypoint", "nodes"],
+  "properties": {
+    "kind": {"const": "workflow.chat"},
+    "entrypoint": {"type": "string"},
+    "timeout_ms": {"type": "integer", "minimum": 1000},
+    "max_retries": {"type": "integer", "minimum": 0, "default": 1},
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "type"],
+        "properties": {
+          "id": {"type": "string"},
+          "type": {"enum": ["tool_call", "switch", "parallel", "end"]},
+          "description": {"type": "string"},
+          "tool": {"type": "string"},
+          "inputs": {"type": "object"},
+          "outputs": {"type": "array", "items": {"type": "string"}},
+          "branches": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["when", "next"],
+              "properties": {
+                "when": {"type": "string"},
+                "next": {"type": "string"}
+              }
+            }
+          },
+          "next": {"type": "string"}
+        }
+      }
+    }
+  }
+}
+```
+
+**workflow engine contracts**:
+
+- `vars` is a `dict[str, Any]` scoped to a workflow execution; tool outputs merge into `vars` by key.
+- tool inputs are resolved by templating from `input` + `vars` (e.g., `${vars.intent}`); missing keys cause a node failure.
+- **error handling:**
+  - node failure triggers retry up to `max_retries`; exponential backoff capped at `timeout_ms`.
+  - if retries exhausted, engine emits an `error` event and returns structured error to orchestrator; optional fallback node `on_error` can be specified in node metadata.
+- **timeouts:**
+  - per-node timeout default 15s unless overridden in node metadata; workflow-level `timeout_ms` caps total wall clock.
+  - on timeout, mark node as failed and follow retry rules.
+- **idempotency:**
+  - workflow runs identified by `(conversation_id, request_id)`; repeated request_id aborts duplicates.
 
 **policy.routing**:
 
@@ -751,6 +869,13 @@ router engine is a small, deterministic piece of code that:
 
 no explicit “if debugging then do X” in code; that lives in the data-driven policy.
 
+**execution semantics:**
+
+- evaluate rules in order; later rules can override earlier weights if `action.overwrite=true` (default false).
+- expression interpreter only supports whitelisted functions (`cosine_similarity`, `contains`, `len`, numeric ops) and literals; no arbitrary Python.
+- provide `trace` object capturing which rules fired, resulting gate weights, safety overrides; stored in logs for LLM auditors.
+- guardrails: clamp resulting gate weights to `[0, 1]`, normalize if sum > 1; enforce max active adapters (default 3) and per-adapter weight floor (default 0.05).
+
 ### 8.2 llm editing routing policies
 
 LLM can propose patches like:
@@ -818,6 +943,13 @@ tools themselves are described as artifacts `tool.spec`:
 
 python code registers functions implementing these tools, checks I/O against schema. LLM can inspect `tool.spec` artifacts to decide how to wire workflows.
 
+execution guardrails:
+
+- tools run in constrained worker pool with CPU/memory limits; network egress allowlisted.
+- no shell execution unless tool is marked `privileged:true` and restricted to admins; sandbox defaults to pure Python/HTTP.
+- per-node `max_retries` and `backoff_ms` defaults (1 retry, 200ms backoff) are overridable in workflow nodes.
+- per-node `timeout_ms` (default 15000) after which the node fails; workflow either retries or aborts per policy.
+
 ---
 
 ## 10. llm as architect: config ops api
@@ -868,13 +1000,13 @@ python code registers functions implementing these tools, checks I/O against sch
    - small derived summary cached in Redis.
 
 2. **factual memory**
-   - files on CephFS under `/users/{user}/files`.
-   - embedded chunks in `knowledge_chunk` tied to `knowledge_context`s.
+  - files on the shared filesystem under `/users/{user}/files`.
+  - embedded chunks in `knowledge_chunk` tied to `knowledge_context`s.
 
 3. **behavioral memory**
-   - preference_events in DB.
-   - LoRA adapters (weights on CephFS).
-   - router state (adapter centroids & stats).
+  - preference_events in DB.
+  - LoRA adapters (weights on the shared filesystem).
+  - router state (adapter centroids & stats).
 
 4. **config memory**
    - artifacts (persona summaries, workflows, policies, tools).
@@ -914,7 +1046,7 @@ python code registers functions implementing these tools, checks I/O against sch
    - group new preference_events per `(user, cluster)` → adapter_artifact.
    - create `training_job`s.
 5. **adapter training** (offline):
-   - TrainingService updates LoRA weights; writes new version to CephFS.
+  - TrainingService updates LoRA weights; writes new version to the shared filesystem.
    - update router state (centroid, metrics).
 6. **config evolution**:
    - separate offline “architect” runs LLM to inspect metrics + artifacts.
@@ -933,6 +1065,15 @@ python code registers functions implementing these tools, checks I/O against sch
   - standard provider flows; on callback:
     - map `provider_uid` to existing user or create new.
     - create `auth_session`.
+- **session management**:
+  - sessions stored in DB + mirrored in Redis for quick lookup.
+  - rotation: refresh `id`/`expires_at` every 24h of activity; invalidate old session id after grace period.
+  - logout: delete session row + Redis key; add JWT to short-lived denylist if JWTs used.
+  - expiry defaults: 7 days web, 1 day mobile; configurable per plan.
+  - password reset: `POST /v1/auth/request_reset { email }` issues signed, single-use token stored in Redis with 30m TTL; `POST /v1/auth/complete_reset { token, new_password }` rotates all sessions and refresh tokens.
+  - email verification: signed link stored in Redis; user blocked or rate-limited until verified or grace period expires.
+  - optional TOTP MFA: `POST /v1/auth/mfa/enable` issues secret + QR; `POST /v1/auth/mfa/verify { code }` required for login/refresh once enabled.
+  - WebSockets require `X-Session: <session id>` header or `Authorization: Bearer`; reject mixed transports without fresh session.
 
 ### 12.2 isolation
 
@@ -940,11 +1081,13 @@ python code registers functions implementing these tools, checks I/O against sch
   - all queries must be filtered by `user_id` where appropriate.
   - Optionally: PostgreSQL Row-Level Security (RLS) to enforce `user_id = current_user_id()`.
 
-- **cephfs**:
+- **filesystem**:
   - every access goes through FileService:
     - resolves `user_id` → root path `/users/{user_id}`.
     - rejects any path escape attempts (`..`).
     - enforces visibility of shared/global artifacts separately.
+  - signed download URLs for browser fetch; upload size limits per tier enforced at gateway; server joins/normalizes paths to avoid traversal.
+  - per-user concurrent workflow caps and rate limits to avoid noisy neighbors; circuit breakers for tools that error repeatedly.
 
 - **artifacts / contexts**:
   - `owner_user_id` + `visibility` field:
@@ -964,47 +1107,85 @@ python code registers functions implementing these tools, checks I/O against sch
 
 ---
 
-## 13. public api (minimal)
+## 13. protocols & apis (kernel surface)
 
-### 13.1 chat
+principles:
 
-`POST /v1/chat`
+- HTTP+JSON for control planes, WebSocket/SSE for streaming chat; stable versioned paths `/v1/...`.
+- every endpoint enforces auth via session cookie or bearer token; `X-User-Id` is ignored/forbidden.
+- request/response schemas stored as `artifact` of type `tool.spec` for LLM discoverability.
+- responses use envelope `{ "status": "ok|error", "data": ..., "error": { "code", "message", "details" } }`.
+- pagination uses `page`/`page_size` or opaque `next_cursor`; errors map to HTTP (400 validation, 401/403 auth, 404 missing, 409 conflict, 429 rate limit, 500 server).
+- idempotency via `Idempotency-Key` header on POST chat/tool calls; server replays prior response if key repeats within TTL.
+
+### 13.1 chat protocol
+
+- `POST /v1/chat` (start chat turn)
+
+request:
 
 ```json
 {
   "conversation_id": "optional",
   "message": {
     "content": "string",
-    "mode": "text"   // or 'voice' in future
+    "mode": "text"
   },
   "context_id": "optional knowledge_context id",
-  "options": {
-    "stream": true,
-    "max_tokens": 512,
-    "workflow_id": "optional artifact id override"
-  }
+  "workflow_id": "optional artifact id override",
+  "stream": true,
+  "client_request_id": "uuid for idempotency"
 }
 ```
 
-- response: streaming SSE or WebSocket of partial tokens + final message metadata.
+response:
 
-### 13.2 files & contexts
+- if `stream=true`: SSE (`event: token`) or WebSocket frames `{event,data}` until `event=done` with `{message_id, usage, adapters, workflow_trace}`.
+- if `stream=false`: blocking JSON `{message_id, content, usage, adapters}`.
 
-- `POST /v1/files/upload` — upload to CephFS under `/users/{u}/files`.
-- `POST /v1/contexts` — create `knowledge_context` and attach paths.
-- `GET /v1/contexts` — list contexts.
-- ingestion service runs separately to chunk + embed.
+### 13.2 auth/session api (minimal definitions)
 
-### 13.3 artifacts
+- `POST /v1/auth/signup { email, password }` → create user.
+- `POST /v1/auth/login { email, password }` → set session cookie / bearer token.
+- `POST /v1/auth/oauth/{provider}/start` + `GET /v1/auth/oauth/{provider}/callback` (standard OAuth).
+- `POST /v1/auth/logout` → revoke session.
+- `POST /v1/auth/refresh` → rotate session/refresh token.
+- responses include `session_expires_at`; headers `Set-Cookie: session_id=...; HttpOnly; Secure` when cookies are used.
+- `POST /v1/auth/mfa/verify` when MFA enabled; returns new session + requires one-time recovery code flow if user is locked out.
 
-- `GET /v1/artifacts?type=workflow` — list accessible artifacts.
-- `GET /v1/artifacts/{id}` — fetch.
-- `POST /v1/artifacts` — create (user or system).
-- `PATCH /v1/artifacts/{id}` — update (validated).
+### 13.3 files & contexts
 
-### 13.4 config ops
+- `POST /v1/files/upload` — multipart; stores under `/users/{u}/files`; returns `fs_path`.
+- `GET /v1/files` — list user files (paginated).
+- `POST /v1/contexts` — create `knowledge_context`, attach file paths.
+- `GET /v1/contexts` — list contexts + stats; supports `?owner=me|global`.
 
-- as in §10.
+### 13.4 artifacts
+
+- `GET /v1/artifacts?type=workflow|policy|adapter|tool` — list accessible artifacts.
+- `GET /v1/artifacts/{id}` — fetch current version + metadata.
+- `POST /v1/artifacts` — create; validates `schema.kind` using per-kind schema.
+- `PATCH /v1/artifacts/{id}` — update via JSON Patch; writes new `artifact_version`.
+- `GET /v1/artifacts/{id}/versions` — list versions.
+
+### 13.5 config ops
+
+- same endpoints as §10; PATCH application triggers validation + dry-run.
+
+### 13.6 migrations (basic shell tool)
+
+- repository includes `scripts/migrate.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+psql "$DATABASE_URL" -f sql/000_base.sql
+psql "$DATABASE_URL" -f sql/001_artifacts.sql
+# add future numbered files in order
+```
+
+- no special tooling; developers add ordered `sql/*.sql` files; CI runs script; idempotency via `CREATE TABLE IF NOT EXISTS` inside SQL.
+- optional seeding happens inside numbered SQL (idempotent upserts) to create default workflow, routing policy, and tool specs as artifacts; keep seeds versioned so reruns are safe.
 
 ---
 
@@ -1014,7 +1195,7 @@ python code registers functions implementing these tools, checks I/O against sch
 
 - implement:
   - users, auth, conversations, messages.
-  - FileService + CephFS.
+  - FileService + filesystem.
   - a single global `workflow.chat` that just calls `llm.generic`.
   - no LoRA, no preferences, no clusters.
 
@@ -1080,15 +1261,22 @@ metrics (per service):
 - adapter usage counts & success_score.
 - preference_event rates.
 - training job counts and average loss.
+- workflow traces: per-node latency, retries, timeout counts.
 
 logs:
 
 - structured logs with correlation IDs for each chat request.
+- include routing trace (rules fired, adapters activated) and workflow trace (nodes executed, errors).
+- redact PII where possible; configurable log sampling for payloads.
+- retention defaults: metrics 7–14 days (Prometheus), logs 30–90 days with payload sampling; alerts on ingestion lag, adapter cache miss spikes, training failure bursts.
 
 traces:
 
 - optional OpenTelemetry traces:
   - gateway → orchestrator → router → workflow → inference → training.
+- dashboards/alerts:
+  - SLOs on chat latency and token error rates.
+  - alerts on adapter cache misses > threshold, training job failure spikes, ingestion lag.
 
 ---
 
@@ -1113,3 +1301,83 @@ traces:
 those live as data (artifacts, clusters, policies) that the LLM can inspect and evolve via ConfigOps.
 
 that’s the whole point: minimal glue, maximal evolution.
+
+---
+
+## 17. front-end expectations (LLM-visible, thin client)
+
+- single-page app speaking the public APIs; no domain knowledge baked in.
+- components:
+- chat view: conversation list, message stream, token streaming via SSE/WS, inline citations to filesystem paths.
+  - artifact browser/editor: render JSON schemas for workflows/policies/adapters, allow proposing patches through ConfigOps endpoints.
+  - context manager: upload files, bind contexts to conversations, show ingestion status.
+  - feedback controls: thumbs/emoji and free-text feedback hooked to `preference_event` creation.
+- state management driven by API responses; LLM-readable tooltips/descriptions fetched from artifact metadata to keep UI descriptive without hard-coded taxonomies.
+- accessibility/performance: optimistic UI for chat, background refresh for workflow/router traces, offline-safe storage only for draft messages (no secret caching).
+
+---
+
+## 18. implementation details (locked, kernel-safe)
+
+the following are treated as constants the kernel must honor; LLM edits happen only to data artifacts, not to these guardrails.
+
+- **API envelopes & transports**
+  - success: `{ "status": "ok", "data": <payload>, "request_id": "uuid" }`; error: `{ "status": "error", "error": { "code": "string", "message": "string", "details": <object|array|null> }, "request_id": "uuid" }`.
+  - pagination: either `{ data: [...], next_cursor: "opaque" }` or `{ page, page_size, total }`; choose per-endpoint but keep stable once published.
+  - idempotency: POST endpoints that create side effects (`/v1/chat`, `/v1/tools/run`, `/v1/artifacts`) accept `Idempotency-Key`; server replays prior response within a 24h TTL and returns `409` if the prior attempt is still running.
+  - auth header is `Authorization: Bearer <token>` in REST; WebSockets require an initial `{ "type": "auth", "session": "<session_id or bearer token>" }` frame before any `chat_start` frames; unauthenticated sockets close with code `4401`.
+  - streaming events: `token`, `message_done`, `error`, `cancel_ack`, `trace` (router/workflow trace snapshot). SSE uses `event:` labels; WebSockets wrap as `{ "event": "token", "data": "..." }`.
+  - minimal REST surface (kernel-stable):
+    - `POST /v1/auth/login { email, password, mfa_code? } → { access_token, refresh_token, user }`.
+    - `POST /v1/auth/refresh { refresh_token } → { access_token, refresh_token }`.
+    - `POST /v1/chat { conversation_id?, message, context_ids?, artifact_ids?, stream: bool } → { conversation_id, message_id, stream_id? }`; stream events carry `{ event, data, request_id }` with `trace` payloads showing router/workflow steps.
+    - `POST /v1/chat/cancel { request_id }`.
+    - `GET /v1/conversations?cursor=...` and `GET /v1/conversations/{id}/messages?cursor=...` return paged lists.
+    - `POST /v1/artifacts { type, name, schema, visibility?, fs_path? }` and `PATCH /v1/artifacts/{id}`; both emit a new `artifact_version` row and validate JSON Schema against `type` registry.
+    - `POST /v1/config/patches { artifact_id, patch, justification }` queues a ConfigOps proposal; `POST /v1/config/apply { patch_id }` (admin-only) applies a validated patch.
+    - `POST /v1/tools/run { tool_id, input }` executes a tool node outside a workflow (for testing) with the same retry/timeout caps.
+  - errors MUST use stable `error.code` values: `unauthorized`, `forbidden`, `not_found`, `rate_limited`, `validation_error`, `conflict`, `server_error`; HTTP codes mirror the error (`401/403/404/429/400/409/500`).
+
+- **auth/session flows (minimal, deterministic)**
+  - password reset: `POST /v1/auth/request_reset { email }` stores a one-time token in Redis (15m TTL) and emails it; `POST /v1/auth/complete_reset { token, new_password }` rotates credentials and revokes sessions.
+  - email verification: `POST /v1/auth/verify_email { token }` marks `user.meta.email_verified=true`; unverified accounts are limited to 24h and low rate limits.
+  - MFA: `POST /v1/auth/mfa/enable` returns TOTP secret + QR; `POST /v1/auth/mfa/verify { code }` gates login/refresh when `user.meta.mfa_enabled=true`; 5 failed codes locks MFA for 5 minutes.
+  - session model: short-lived access token (15–60m configurable) + refresh token (7–30d) stored HttpOnly; refresh rotation on each use; logout revokes both; login from a new device invalidates prior refresh tokens if `meta.single_session=true`.
+
+- **multi-tenant isolation & filesystem guards**
+  - all filesystem paths resolved via `safe_join(base=/users/{user_id}, relative)` unless `artifact.visibility in ('shared','global')` points into `/shared`; path traversal or `..` segments are rejected.
+  - uploads enforce per-plan size caps (e.g., free: 25MB/file, paid: 200MB/file) at gateway; downloads use signed URLs with 10m expiry and content-disposition set to prevent inline execution.
+  - per-user scratch `/users/{id}/tmp` auto-cleans daily; no cross-user hardlinks.
+
+- **safety & resource limits**
+  - rate limits (Redis token bucket): defaults `chat: 60 req/min`, `files.upload: 10 req/min`, `configops: 30 req/hour`, adjustable per plan; 429 response uses standard error envelope.
+  - concurrency caps: max 3 concurrent workflows and 2 concurrent inference decodes per user; requests beyond cap return `409 busy`.
+  - external fetches from tools use a allowlisted proxy with 10s connect + 30s total timeout; circuit breaker opens for a tool after 5 failures in 1 minute.
+
+- **workflow/tool sandboxing**
+  - tool workers run under a fixed UID with cgroup limits (CPU shares, memory hard cap) and no filesystem access except a tmp scratch; `privileged:true` tools require admin-owned artifacts and are never called by default workflows.
+  - JSON Schema validation enforced on tool inputs/outputs; outputs flagged `content_type: "html_untrusted"` must be sanitized by client before render.
+  - retries: default 2 retries with exponential backoff (1s, 4s); per-node override allowed but capped at 3; node timeout default 15s, hard cap 60s.
+
+- **inference/adapter cache discipline**
+  - per-GPU adapter cache budget configured in bytes (e.g., 6GB); eviction LRU with pinning for persona adapter of active user; checksum of `params.npz` verified against `schema.checksum` before activation.
+  - per-request adapter cap = 3; if router selects more, lowest-weight adapters are dropped and the trace records the drop.
+  - cancellation: orchestrator issues `{event:"cancel", request_id}`; worker aborts decode, frees KV cache and adapter refs, and emits `cancel_ack` with partial tokens if any.
+
+- **training pipeline knobs**
+  - dataset: JSONL on the shared filesystem `/users/{u}/adapters/{id}/train_jobs/{job}/dataset.jsonl` with fields `{prompt, target, weight, context, conversation_id, message_id}`; max 2k tokens per sample; dedupe by `(conversation_id, message_id)`.
+  - evaluation: hold-out 10% of most recent events; metrics: loss and preference alignment rate; apply new adapter version only if both improve or if human approves via ConfigOps; otherwise keep previous version.
+  - scheduling: one running job per user; cooldown 1h between jobs; global queue fair-shares across users to avoid single-tenant starvation.
+
+- **knowledge ingestion hygiene**
+  - dedupe by `(fs_path_checksum, path)`; skip files over plan cap or unknown mime type unless a `tool.spec` parser declares support; optional PII scrub set per context (`context.meta.pii_scrub=true`).
+  - re-embed on encoder bump with rolling replacement: write new chunks with `meta.embedding_version`, switch pointer when >=95% ready, then delete old chunks; ingestion lag surfaced in metrics.
+
+- **observability & ops defaults**
+  - metrics retention 14d (Prometheus) with alerts on latency SLO breaches, adapter cache miss rate > 20%, training failure rate spikes, ingestion lag > 1h; logs 30–90d with payload sampling and PII minimization.
+  - backups: nightly Postgres logical backup retained 7d; weekly filesystem snapshot pointers retained 4 weeks; Redis not backed up (ephemeral) but seeded data survives via Postgres + filesystem artifacts.
+  - health checks: `/healthz` per service does dependency checks (DB, Redis, filesystem mount) and reports build/version; readiness gates traffic in orchestrator/gateway.
+
+- **migrations & seeding**
+  - `scripts/migrate.sh` is the only required tool; it applies ordered `sql/*.sql` files and optional `sql/seed/*.sql` that upsert default artifacts (workflow, routing policy, base tool specs); rerunning is safe due to `IF NOT EXISTS` and deterministic upserts.
+  - CI runs migrations on a fresh DB to validate schema; production runs migrations during maintenance windows with `DATABASE_URL` from environment and fails fast on checksum mismatch.
