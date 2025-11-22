@@ -67,8 +67,11 @@ class ChatResponse(BaseModel):
     content: str
     workflow_id: Optional[str]
     adapters: List[str] = []
+    adapter_gates: List[dict] = []
     usage: dict = {}
     context_snippets: List[str] = []
+    routing_trace: List[dict] = []
+    workflow_trace: List[dict] = []
 
 
 class ArtifactRequest(BaseModel):
@@ -145,3 +148,9 @@ class KnowledgeChunkResponse(BaseModel):
     context_id: str
     text: str
     seq: int
+
+
+class FileUploadResponse(BaseModel):
+    fs_path: str
+    context_id: Optional[str] = None
+    chunk_count: Optional[int] = None
