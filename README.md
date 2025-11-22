@@ -242,14 +242,14 @@ for v1 these can all live in one python app with clear module boundaries.
 
 ## roadmap (rough)
 
-- [ ] minimal chat with postgres-backed conversations
-- [ ] file upload + filesystem + rag over pgvector chunks
-- [ ] artifacts for workflows + tools (no adapters yet)
-- [ ] preference events + single persona adapter per user
-- [ ] semantic clustering + skill adapters
-- [ ] router policies as data + simple editor
-- [ ] configops api + llm-generated patches
-- [ ] mobile / voice clients (optional layer)
+- [x] minimal chat with postgres-backed conversations
+- [x] file upload + filesystem + rag over pgvector chunks
+- [x] artifacts for workflows + tools (no adapters yet)
+- [x] preference events + single persona adapter per user
+- [x] semantic clustering + skill adapters
+- [x] router policies as data + simple editor
+- [x] configops api + llm-generated patches
+- [x] mobile / voice clients (optional layer)
 
 ---
 

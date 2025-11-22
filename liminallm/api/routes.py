@@ -371,7 +371,7 @@ async def apply_config_patch(patch_id: str, user_id: str = Depends(get_user)):
         status="applied",
         patch=patch.patch,
         decided_at=patch.decided_at,
-        applied_at=datetime.utcnow(),
+        applied_at=patch.applied_at or patch.updated_at,
         meta=patch.meta,
     )
     return Envelope(status="ok", data=resp)
