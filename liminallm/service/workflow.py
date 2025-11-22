@@ -26,6 +26,8 @@ class WorkflowEngine:
             workflow_schema = self._default_workflow()
 
         adapters = self._select_adapters(context_id)
+        ctx_chunks = self.rag.retrieve(context_id, user_message)
+        context_snippets = [c.text for c in ctx_chunks]
         history = []
         if conversation_id and hasattr(self.store, "list_messages"):
             history = self.store.list_messages(conversation_id)  # type: ignore[attr-defined]
