@@ -55,7 +55,7 @@ class AuthService:
         if self.cache:
             await self.cache.revoke_session(session_id)
 
-    async def resolve_session(self, session_id: Optional[str]) -> Optional[str]:
+    async def resolve_session(self, session_id: Optional[str], *, allow_pending_mfa: bool = False) -> Optional[str]:
         if not session_id:
             return None
         sess = None
@@ -68,7 +68,7 @@ class AuthService:
         if sess and sess.expires_at > datetime.utcnow():
             if self.cache and (not sess.mfa_required or sess.mfa_verified or not self.mfa_enabled):
                 await self.cache.cache_session(sess.id, sess.user_id, sess.expires_at)
-            if sess.mfa_required and not sess.mfa_verified and self.mfa_enabled:
+            if sess.mfa_required and not sess.mfa_verified and self.mfa_enabled and not allow_pending_mfa:
                 return None
             return sess.user_id
         return None

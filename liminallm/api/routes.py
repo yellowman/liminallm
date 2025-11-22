@@ -84,7 +84,7 @@ async def login(body: LoginRequest):
 @router.post("/auth/mfa/request", response_model=Envelope)
 async def request_mfa(body: MFARequest):
     runtime = get_runtime()
-    user_id = await runtime.auth.resolve_session(body.session_id)
+    user_id = await runtime.auth.resolve_session(body.session_id, allow_pending_mfa=True)
     if not user_id:
         raise HTTPException(status_code=401, detail="invalid session")
     challenge = await runtime.auth.issue_mfa_challenge(user_id=user_id)
@@ -94,7 +94,7 @@ async def request_mfa(body: MFARequest):
 @router.post("/auth/mfa/verify", response_model=Envelope)
 async def verify_mfa(body: MFAVerifyRequest):
     runtime = get_runtime()
-    user_id = await runtime.auth.resolve_session(body.session_id)
+    user_id = await runtime.auth.resolve_session(body.session_id, allow_pending_mfa=True)
     if not user_id:
         raise HTTPException(status_code=401, detail="invalid session")
     ok = await runtime.auth.verify_mfa_challenge(user_id=user_id, code=body.code, session_id=body.session_id)
