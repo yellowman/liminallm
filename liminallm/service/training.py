@@ -139,8 +139,16 @@ class TrainingService:
         context_text: Optional[str] = None,
         corrected_text: Optional[str] = None,
         weight: Optional[float] = None,
+        explicit_signal: Optional[str] = None,
+        routing_trace: Optional[List[dict]] = None,
+        adapter_gates: Optional[List[dict]] = None,
     ) -> PreferenceEvent:
         embedding = deterministic_embedding(context_text or "")
+        meta = {}
+        if routing_trace:
+            meta["routing_trace"] = routing_trace
+        if adapter_gates:
+            meta["adapter_gates"] = adapter_gates
         event = self.store.record_preference_event(
             user_id=user_id,
             conversation_id=conversation_id,
@@ -151,6 +159,8 @@ class TrainingService:
             context_text=context_text,
             weight=weight,
             context_embedding=embedding,
+            explicit_signal=explicit_signal,
+            meta=meta or None,
         )
         if feedback in {"positive", "like"}:
             adapter = self.ensure_user_adapter(user_id)
@@ -158,6 +168,45 @@ class TrainingService:
                 user_id=user_id, adapter_id=adapter.id, preference_event_ids=[event.id], dataset_path=None
             )
         return event
+
+    def summarize_preferences(self, user_id: Optional[str]) -> dict:
+        events: List[PreferenceEvent] = []
+        try:
+            events = self.store.list_preference_events(user_id=user_id)  # type: ignore[attr-defined]
+        except Exception:
+            events = []
+        totals = {"positive": 0, "negative": 0, "neutral": 0}
+        routing_feedback: dict[str, int] = {}
+        for event in events:
+            totals[event.feedback] = totals.get(event.feedback, 0) + 1
+            if event.meta and event.meta.get("routing_trace"):
+                routing_feedback["routing_trace_present"] = routing_feedback.get("routing_trace_present", 0) + 1
+        clusters: List[dict] = []
+        if hasattr(self.store, "list_semantic_clusters"):
+            try:
+                for cluster in self.store.list_semantic_clusters(user_id):  # type: ignore[attr-defined]
+                    clusters.append(
+                        {
+                            "id": cluster.id,
+                            "size": cluster.size,
+                            "label": cluster.label,
+                            "similarity_hint": cluster.description,
+                        }
+                    )
+            except Exception:
+                clusters = []
+        adapter_candidates = [a for a in self.store.list_artifacts(type_filter="adapter")]  # type: ignore[arg-type]
+        adapters = [
+            {"id": a.id, "name": a.name, "description": a.description, "cluster_id": a.schema.get("cluster_id")}
+            for a in adapter_candidates
+        ]
+        return {
+            "totals": totals,
+            "events": [asdict(e) for e in events[-10:]],
+            "clusters": clusters,
+            "adapters": adapters,
+            "routing_feedback": routing_feedback,
+        }
 
     def _build_examples(self, events: Iterable[PreferenceEvent]) -> Iterable[dict]:
         for event in events:

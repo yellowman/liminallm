@@ -555,6 +555,34 @@ class MemoryStore:
         self._persist_state()
         return audit
 
+    def get_config_patch(self, patch_id: str) -> Optional[ConfigPatchAudit]:
+        return self.config_patches.get(patch_id)
+
+    def list_config_patches(self, status: Optional[str] = None) -> List[ConfigPatchAudit]:
+        patches = list(self.config_patches.values())
+        if status:
+            patches = [p for p in patches if p.status == status]
+        return sorted(patches, key=lambda p: p.created_at, reverse=True)
+
+    def update_config_patch_status(
+        self, patch_id: str, status: str, *, meta: Optional[Dict] = None, mark_decided: bool = False, mark_applied: bool = False
+    ) -> Optional[ConfigPatchAudit]:
+        patch = self.config_patches.get(patch_id)
+        if not patch:
+            return None
+        patch.status = status
+        patch.updated_at = datetime.utcnow()
+        if mark_decided and not patch.decided_at:
+            patch.decided_at = patch.updated_at
+        if mark_applied:
+            patch.applied_at = patch.updated_at
+        if meta:
+            merged = dict(patch.meta or {})
+            merged.update(meta)
+            patch.meta = merged
+        self._persist_state()
+        return patch
+
     def get_runtime_config(self) -> dict:
         """Return the runtime configuration persisted for the web admin UI."""
 
@@ -844,6 +872,8 @@ class MemoryStore:
             "status": patch.status,
             "created_at": self._serialize_datetime(patch.created_at),
             "updated_at": self._serialize_datetime(patch.updated_at),
+            "decided_at": self._serialize_datetime(patch.decided_at) if patch.decided_at else None,
+            "applied_at": self._serialize_datetime(patch.applied_at) if patch.applied_at else None,
             "meta": patch.meta,
         }
 
@@ -857,6 +887,8 @@ class MemoryStore:
             status=data.get("status", "pending"),
             created_at=self._deserialize_datetime(data["created_at"]),
             updated_at=self._deserialize_datetime(data["updated_at"]),
+            decided_at=self._deserialize_datetime(data["decided_at"]) if data.get("decided_at") else None,
+            applied_at=self._deserialize_datetime(data["applied_at"]) if data.get("applied_at") else None,
             meta=data.get("meta"),
         )
 

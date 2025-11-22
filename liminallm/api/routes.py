@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -17,11 +18,14 @@ from liminallm.api.schemas import (
     ConversationListResponse,
     ConversationSummary,
     ConfigPatchAuditResponse,
+    ConfigPatchDecisionRequest,
+    ConfigPatchListResponse,
     ConfigPatchRequest,
     Envelope,
     LoginRequest,
     MFARequest,
     MFAVerifyRequest,
+    AutoPatchRequest,
     PasswordResetConfirm,
     PasswordResetRequest,
     SignupRequest,
@@ -31,6 +35,10 @@ from liminallm.api.schemas import (
     FileUploadResponse,
     PreferenceEventRequest,
     PreferenceEventResponse,
+    PreferenceInsightsResponse,
+    VoiceSynthesisRequest,
+    VoiceSynthesisResponse,
+    VoiceTranscriptionResponse,
 )
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.config import get_settings
@@ -141,8 +149,18 @@ async def chat(body: ChatRequest, user_id: str = Depends(get_user), idempotency_
     else:
         conversation = runtime.store.create_conversation(user_id=user_id, active_context_id=body.context_id)
         conversation_id = conversation.id
-    runtime.store.append_message(conversation_id, sender="user", role="user", content=body.message.content)
-    orchestration = runtime.workflow.run(body.workflow_id, conversation_id, body.message.content, body.context_id, user_id)
+    user_content = body.message.content
+    voice_meta: dict = {}
+    if body.message.mode == "voice":
+        try:
+            audio_bytes = base64.b64decode(body.message.content)
+        except Exception:
+            audio_bytes = body.message.content.encode()
+        transcript = runtime.voice.transcribe(audio_bytes, user_id=user_id)
+        user_content = transcript.get("transcript", body.message.content)
+        voice_meta = {"mode": "voice", "transcript": transcript}
+    runtime.store.append_message(conversation_id, sender="user", role="user", content=user_content, meta=voice_meta or None)
+    orchestration = runtime.workflow.run(body.workflow_id, conversation_id, user_content, body.context_id, user_id)
     assistant_msg = runtime.store.append_message(
         conversation_id,
         sender="assistant",
@@ -184,6 +202,9 @@ async def record_preference(body: PreferenceEventRequest, user_id: str = Depends
             context_text=body.context_text,
             corrected_text=body.corrected_text,
             weight=body.weight,
+            explicit_signal=body.explicit_signal,
+            routing_trace=body.routing_trace,
+            adapter_gates=body.adapter_gates,
         )
     except ConstraintViolation as err:
         raise HTTPException(status_code=409, detail=err.message)
@@ -191,6 +212,33 @@ async def record_preference(body: PreferenceEventRequest, user_id: str = Depends
     runtime.clusterer.promote_skill_adapters()
     resp = PreferenceEventResponse(id=event.id, cluster_id=event.cluster_id, feedback=event.feedback, created_at=event.created_at)
     return Envelope(status="ok", data=resp)
+
+
+@router.post("/preferences/routing_feedback", response_model=Envelope)
+async def record_routing_feedback(body: PreferenceEventRequest, user_id: str = Depends(get_user)):
+    runtime = get_runtime()
+    event = runtime.training.record_feedback_event(
+        user_id=user_id,
+        conversation_id=body.conversation_id,
+        message_id=body.message_id,
+        feedback=body.feedback,
+        explicit_signal=body.explicit_signal or "routing_feedback",
+        score=body.score,
+        context_text=body.context_text,
+        corrected_text=body.corrected_text,
+        weight=body.weight,
+        routing_trace=body.routing_trace,
+        adapter_gates=body.adapter_gates,
+    )
+    resp = PreferenceEventResponse(id=event.id, cluster_id=event.cluster_id, feedback=event.feedback, created_at=event.created_at)
+    return Envelope(status="ok", data=resp)
+
+
+@router.get("/preferences/insights", response_model=Envelope)
+async def preference_insights(user_id: str = Depends(get_user)):
+    runtime = get_runtime()
+    summary = runtime.training.summarize_preferences(user_id)
+    return Envelope(status="ok", data=PreferenceInsightsResponse(**summary))
 
 
 @router.get("/artifacts", response_model=Envelope)
@@ -263,6 +311,85 @@ async def propose_patch(body: ConfigPatchRequest, user_id: str = Depends(get_use
         justification=audit.justification,
         status=audit.status,
         patch=audit.patch,
+        decided_at=audit.decided_at,
+        applied_at=audit.applied_at,
+        meta=audit.meta,
+    )
+    return Envelope(status="ok", data=resp)
+
+
+@router.get("/config/patches", response_model=Envelope)
+async def list_config_patches(status: Optional[str] = None, user_id: str = Depends(get_user)):
+    runtime = get_runtime()
+    patches = runtime.store.list_config_patches(status)
+    items = [
+        ConfigPatchAuditResponse(
+            id=p.id,
+            artifact_id=p.artifact_id,
+            justification=p.justification,
+            status=p.status,
+            patch=p.patch,
+            decided_at=p.decided_at,
+            applied_at=p.applied_at,
+            meta=p.meta,
+        )
+        for p in patches
+    ]
+    return Envelope(status="ok", data=ConfigPatchListResponse(items=items))
+
+
+@router.post("/config/patches/{patch_id}/decide", response_model=Envelope)
+async def decide_config_patch(patch_id: str, body: ConfigPatchDecisionRequest, user_id: str = Depends(get_user)):
+    runtime = get_runtime()
+    decision = runtime.config_ops.decide_patch(patch_id, body.decision, body.reason)
+    if not decision:
+        raise HTTPException(status_code=404, detail="patch not found")
+    resp = ConfigPatchAuditResponse(
+        id=decision.id,
+        artifact_id=decision.artifact_id,
+        justification=decision.justification,
+        status=decision.status,
+        patch=decision.patch,
+        decided_at=decision.decided_at,
+        applied_at=decision.applied_at,
+        meta=decision.meta,
+    )
+    return Envelope(status="ok", data=resp)
+
+
+@router.post("/config/patches/{patch_id}/apply", response_model=Envelope)
+async def apply_config_patch(patch_id: str, user_id: str = Depends(get_user)):
+    runtime = get_runtime()
+    result = runtime.config_ops.apply_patch(patch_id, approver_user_id=user_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="patch not found")
+    patch = result.get("patch")
+    resp = ConfigPatchAuditResponse(
+        id=patch.id,
+        artifact_id=patch.artifact_id,
+        justification=patch.justification,
+        status="applied",
+        patch=patch.patch,
+        decided_at=patch.decided_at,
+        applied_at=datetime.utcnow(),
+        meta=patch.meta,
+    )
+    return Envelope(status="ok", data=resp)
+
+
+@router.post("/config/auto_patch", response_model=Envelope)
+async def auto_patch(body: AutoPatchRequest, user_id: str = Depends(get_user)):
+    runtime = get_runtime()
+    audit = runtime.config_ops.auto_generate_patch(body.artifact_id, user_id, goal=body.goal)
+    resp = ConfigPatchAuditResponse(
+        id=audit.id,
+        artifact_id=audit.artifact_id,
+        justification=audit.justification,
+        status=audit.status,
+        patch=audit.patch,
+        decided_at=audit.decided_at,
+        applied_at=audit.applied_at,
+        meta=audit.meta,
     )
     return Envelope(status="ok", data=resp)
 
@@ -379,6 +506,21 @@ async def list_chunks(context_id: str, user_id: str = Depends(get_user)):
         for ch in chunks
     ]
     return Envelope(status="ok", data=data)
+
+
+@router.post("/voice/transcribe", response_model=Envelope)
+async def transcribe_voice(file: UploadFile = File(...), user_id: str = Depends(get_user)):
+    runtime = get_runtime()
+    audio_bytes = await file.read()
+    result = runtime.voice.transcribe(audio_bytes, user_id=user_id)
+    return Envelope(status="ok", data=VoiceTranscriptionResponse(**result))
+
+
+@router.post("/voice/synthesize", response_model=Envelope)
+async def synthesize_voice(body: VoiceSynthesisRequest, user_id: str = Depends(get_user)):
+    runtime = get_runtime()
+    audio = runtime.voice.synthesize(body.text, user_id=user_id, voice=body.voice)
+    return Envelope(status="ok", data=VoiceSynthesisResponse(**audio))
 
 
 @router.websocket("/v1/chat/stream")
