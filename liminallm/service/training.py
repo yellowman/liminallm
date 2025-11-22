@@ -229,12 +229,25 @@ class TrainingService:
 
         def forward(p: dict, inputs: jnp.ndarray) -> jnp.ndarray:
             acc = jnp.zeros((inputs.shape[0], inputs.shape[1]))
+
+            def _align_width(arr: jnp.ndarray, width: int) -> jnp.ndarray:
+                if arr.shape[1] > width:
+                    return arr[:, :width]
+                if arr.shape[1] < width:
+                    pad = ((0, 0), (0, width - arr.shape[1]))
+                    return jnp.pad(arr, pad)
+                return arr
+
             for name, mat in p.items():
                 if name.endswith(".A"):
-                    base = mat @ inputs.T
+                    hidden_dim = mat.shape[1]
+                    inputs_aligned = _align_width(inputs, hidden_dim)
+                    base = inputs_aligned @ mat.T
                     b_key = name.replace(".A", ".B")
                     if b_key in p:
-                        acc = acc + (p[b_key] @ base).T
+                        update = base @ p[b_key].T
+                        update = _align_width(update, acc.shape[1])
+                        acc = acc + update
             return acc
 
         def loss_fn(p: dict, batch: dict) -> jnp.ndarray:
