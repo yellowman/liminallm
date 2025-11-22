@@ -40,6 +40,8 @@ class MemoryStore:
         if not self._load_state():
             self.default_artifacts()
             self._persist_state()
+        elif self._backfill_default_classifier_inputs():
+            self._persist_state()
 
     def _state_path(self) -> Path:
         state_dir = self.fs_root / "state"
@@ -120,6 +122,40 @@ class MemoryStore:
             )
         ]
         self._persist_state()
+
+    def _backfill_default_classifier_inputs(self) -> bool:
+        """Ensure default workflow classifier passes the user message to the tool."""
+
+        def _ensure_inputs(schema: dict) -> bool:
+            if not isinstance(schema, dict):
+                return False
+            nodes = schema.get("nodes", [])
+            changed = False
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                if node.get("id") != "classify" or node.get("tool") != "llm.intent_classifier_v1":
+                    continue
+                inputs = node.get("inputs") or {}
+                if "message" not in inputs:
+                    new_inputs = dict(inputs)
+                    new_inputs["message"] = "${input.message}"
+                    node["inputs"] = new_inputs
+                    changed = True
+            return changed
+
+        changed = False
+        for artifact in self.artifacts.values():
+            if artifact.name != "default_chat_workflow":
+                continue
+            if _ensure_inputs(artifact.schema):
+                artifact.updated_at = datetime.utcnow()
+                changed = True
+            for version in self.artifact_versions.get(artifact.id, []):
+                if _ensure_inputs(version.schema):
+                    version.created_at = datetime.utcnow()
+                    changed = True
+        return changed
 
     # user / auth
     def create_user(self, email: str, handle: Optional[str] = None) -> User:

@@ -140,13 +140,16 @@ class RouterEngine:
         max_active = policy.get("max_active_adapters", 3)
         weight_floor = policy.get("weight_floor", 0.05)
         # clamp to 0..1
-        clamped = {k: min(1.0, max(0.0, v)) for k, v in weights.items() if v >= weight_floor}
+        clamped = {k: min(1.0, max(0.0, v)) for k, v in weights.items()}
         if not clamped:
             return []
         total = sum(clamped.values())
         if total > 1.0:
             clamped = {k: v / total for k, v in clamped.items()}
-        ranked = sorted(clamped.items(), key=lambda kv: kv[1], reverse=True)
+        filtered = {k: v for k, v in clamped.items() if v >= weight_floor}
+        if not filtered:
+            return []
+        ranked = sorted(filtered.items(), key=lambda kv: kv[1], reverse=True)
         return [{"id": adapter_id, "weight": weight} for adapter_id, weight in ranked[:max_active]]
 
     def _adapter_embedding(self, adapter: dict) -> List[float]:
