@@ -27,7 +27,11 @@ class Runtime:
             except Exception:
                 self.cache = None
         self.router = RouterEngine()
-        backend_mode = self.settings.model_backend or self.settings.llm_mode
+        db_backend_mode = None
+        if hasattr(self.store, "get_runtime_config"):
+            runtime_config = self.store.get_runtime_config() or {}
+            db_backend_mode = runtime_config.get("model_backend")
+        backend_mode = db_backend_mode or self.settings.model_backend or self.settings.llm_mode
         self.llm = LLMService(
             base_model=self.settings.model_path,
             backend_mode=backend_mode,

@@ -384,6 +384,11 @@ class PostgresStore:
             )
         return ConfigPatchAudit(id=audit_id, artifact_id=artifact_id, proposer_user_id=proposer_user_id, patch=patch, justification=justification, created_at=now, updated_at=now)
 
+    def get_runtime_config(self) -> dict:
+        """Return deployment config sourced from SQL (placeholder until admin UI writes it)."""
+
+        return {}
+
     # knowledge
     def upsert_context(self, owner_user_id: Optional[str], name: str, description: str, fs_path: Optional[str] = None) -> KnowledgeContext:
         ctx_id = str(uuid.uuid4())

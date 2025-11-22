@@ -34,6 +34,7 @@ class MemoryStore:
         self.artifacts: Dict[str, Artifact] = {}
         self.artifact_versions: Dict[str, List[ArtifactVersion]] = {}
         self.config_patches: Dict[str, ConfigPatchAudit] = {}
+        self.runtime_config: Dict[str, str] = {}
         self.contexts: Dict[str, KnowledgeContext] = {}
         self.chunks: Dict[str, List[KnowledgeChunk]] = {}
         self.preference_events: Dict[str, PreferenceEvent] = {}
@@ -418,6 +419,11 @@ class MemoryStore:
         self._persist_state()
         return audit
 
+    def get_runtime_config(self) -> dict:
+        """Return the runtime configuration persisted for the web admin UI."""
+
+        return dict(self.runtime_config)
+
     def get_latest_workflow(self, workflow_id: str) -> Optional[dict]:
         versions = self.artifact_versions.get(workflow_id)
         if not versions:
@@ -486,6 +492,7 @@ class MemoryStore:
                 self._serialize_artifact_version(v) for versions in self.artifact_versions.values() for v in versions
             ],
             "config_patches": [self._serialize_config_patch(cp) for cp in self.config_patches.values()],
+            "runtime_config": self.runtime_config,
             "contexts": [self._serialize_context(ctx) for ctx in self.contexts.values()],
             "chunks": [self._serialize_chunk(ch) for chs in self.chunks.values() for ch in chs],
             "preference_events": [self._serialize_preference_event(e) for e in self.preference_events.values()],
@@ -520,6 +527,7 @@ class MemoryStore:
             versions.append(version)
         for versions in self.artifact_versions.values():
             versions.sort(key=lambda v: v.version)
+        self.runtime_config = data.get("runtime_config", {})
         self.config_patches = {cp["id"]: self._deserialize_config_patch(cp) for cp in data.get("config_patches", [])}
         self.contexts = {ctx["id"]: self._deserialize_context(ctx) for ctx in data.get("contexts", [])}
         self.chunks = {}

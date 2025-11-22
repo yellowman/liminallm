@@ -148,6 +148,7 @@ for v1 these can all live in one python app with clear module boundaries.
    - redis
    - filesystem path accessible to the app
    - gpu / tpu for jax model if you expect to train adapters
+   - backend selection is single-sourced from the SQL deployment config (editable from the web console when wired); env vars only override if you set them explicitly
    - set `MODEL_BACKEND=local_lora` to target the local JAX+LoRA path instead of external API fine-tune IDs
 
 2. **configure env**
@@ -156,7 +157,7 @@ for v1 these can all live in one python app with clear module boundaries.
    - `SHARED_FS_ROOT` – filesystem root path
    - `MODEL_PATH` – model identifier for cloud mode (default `gpt-4o-mini`) or filesystem path when using an adapter server
    - `OPENAI_API_KEY` – required for live LLM calls; omit to use the echo fallback
-   - `LLM_MODE` – `cloud` (fine-tune ids as models) or `adapter` (adapter_id passthrough to adapter servers)
+   - `LLM_MODE` – `cloud` (fine-tune ids as models) or `adapter` (adapter_id passthrough to adapter servers); kept for backward compatibility when no SQL config or `MODEL_BACKEND` override is provided
    - `ADAPTER_SERVER_MODEL` – model name when pointing at an OpenAI-compatible adapter server
    - `USE_MEMORY_STORE` – set to `true` to run without Postgres/Redis while testing the API and LLM calls
 
