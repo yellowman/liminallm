@@ -289,6 +289,7 @@ USING ivfflat (embedding) WITH (lists = 100);
   - at query time, top-K (default 8) by cosine similarity on `knowledge_chunk.embedding` filtered by `context_id`.
   - optional re-ranking via lightweight cross-encoder tool if available.
   - return chunk text + `fs_path` for citation; orchestrator can ask LLM to cite paths.
+  - baseline kernel ships with a deterministic hashing-based embedding fallback (no external model dependency) so chunks always have non-empty vectors for cosine search in both Postgres and in-memory stores.
 
 ### 2.6 preferences & training
 
@@ -403,6 +404,14 @@ params_layer_00_attn_v_B.npy
 ```
 
 or a single `params.npz` keyed by `"layer_00.attn_q.A"`, etc.
+
+### 3.3 memory-store snapshots (dev / single-node mode)
+
+when the kernel runs in the in-memory fallback (no Postgres), it must persist state onto the shared filesystem so restarts do not wipe user data:
+
+- write a JSON snapshot under `{shared_fs_root}/state/memory_store.json` after each mutation covering users, auth sessions, credentials, conversations/messages, artifacts + versions, config patches, knowledge contexts, and chunks.
+- on startup, reload this snapshot before seeding default artifacts; only seed when no persisted state is present.
+- artifact payloads (e.g., workflow JSON) still live under `{shared_fs_root}/artifacts/{artifact_id}/vNNNN.json` so snapshot + files can fully reconstruct state.
 
 ---
 
@@ -876,6 +885,8 @@ no explicit “if debugging then do X” in code; that lives in the data-driven 
 - provide `trace` object capturing which rules fired, resulting gate weights, safety overrides; stored in logs for LLM auditors.
 - guardrails: clamp resulting gate weights to `[0, 1]`, normalize if sum > 1; enforce max active adapters (default 3) and per-adapter weight floor (default 0.05).
 
+**prototype implementation notes:** sandboxed evaluation is implemented with adapter activation/deactivation, weight scaling, cosine-similarity-based "closest" selection, per-rule traces, and normalized adapter gate outputs returned on chat responses.
+
 ### 8.2 llm editing routing policies
 
 LLM can propose patches like:
@@ -1155,7 +1166,7 @@ response:
 
 ### 13.3 files & contexts
 
-- `POST /v1/files/upload` — multipart; stores under `/users/{u}/files`; returns `fs_path`.
+- `POST /v1/files/upload` — multipart; stores under `/users/{u}/files`; returns `fs_path`; optional `context_id` form field triggers chunking + embedding ingestion into that knowledge context.
 - `GET /v1/files` — list user files (paginated).
 - `POST /v1/contexts` — create `knowledge_context`, attach file paths.
 - `GET /v1/contexts` — list contexts + stats; supports `?owner=me|global`.
@@ -1337,6 +1348,7 @@ the following are treated as constants the kernel must honor; LLM edits happen o
     - `POST /v1/config/patches { artifact_id, patch, justification }` queues a ConfigOps proposal; `POST /v1/config/apply { patch_id }` (admin-only) applies a validated patch.
     - `POST /v1/tools/run { tool_id, input }` executes a tool node outside a workflow (for testing) with the same retry/timeout caps.
   - errors MUST use stable `error.code` values: `unauthorized`, `forbidden`, `not_found`, `rate_limited`, `validation_error`, `conflict`, `server_error`; HTTP codes mirror the error (`401/403/404/429/400/409/500`).
+  - constraint violations (FK/unique) return `conflict` with a short `details` map identifying the offending field/id; kernel surfaces storage errors instead of leaking database-specific messages.
 
 - **auth/session flows (minimal, deterministic)**
   - password reset: `POST /v1/auth/request_reset { email }` stores a one-time token in Redis (15m TTL) and emails it; `POST /v1/auth/complete_reset { token, new_password }` rotates credentials and revokes sessions.

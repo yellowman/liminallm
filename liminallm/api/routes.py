@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 
 from liminallm.api.schemas import (
     ArtifactListResponse,
@@ -27,7 +28,9 @@ from liminallm.api.schemas import (
     KnowledgeChunkResponse,
     KnowledgeContextRequest,
     KnowledgeContextResponse,
+    FileUploadResponse,
 )
+from liminallm.storage.errors import ConstraintViolation
 from liminallm.config import get_settings
 from liminallm.service.runtime import get_runtime
 
@@ -49,7 +52,10 @@ async def signup(body: SignupRequest):
     if not settings.allow_signup:
         raise HTTPException(status_code=403, detail="signup disabled")
     runtime = get_runtime()
-    user, session = await runtime.auth.signup(email=body.email, password=body.password, handle=body.handle)
+    try:
+        user, session = await runtime.auth.signup(email=body.email, password=body.password, handle=body.handle)
+    except ConstraintViolation as err:
+        raise HTTPException(status_code=409, detail=err.message)
     return Envelope(status="ok", data=AuthResponse(user_id=user.id, session_id=session.id, session_expires_at=session.expires_at))
 
 
@@ -129,7 +135,13 @@ async def chat(body: ChatRequest, user_id: str = Depends(get_user), idempotency_
         sender="assistant",
         role="assistant",
         content=orchestration["content"],
-        meta={"adapters": orchestration.get("adapters", []), "usage": orchestration.get("usage", {})},
+        meta={
+            "adapters": orchestration.get("adapters", []),
+            "adapter_gates": orchestration.get("adapter_gates", []),
+            "routing_trace": orchestration.get("routing_trace", []),
+            "workflow_trace": orchestration.get("workflow_trace", []),
+            "usage": orchestration.get("usage", {}),
+        },
     )
     resp = ChatResponse(
         message_id=assistant_msg.id,
@@ -137,8 +149,11 @@ async def chat(body: ChatRequest, user_id: str = Depends(get_user), idempotency_
         content=assistant_msg.content,
         workflow_id=body.workflow_id,
         adapters=orchestration.get("adapters", []),
+        adapter_gates=orchestration.get("adapter_gates", []),
         usage=orchestration.get("usage", {}),
         context_snippets=orchestration.get("context_snippets", []),
+        routing_trace=orchestration.get("routing_trace", []),
+        workflow_trace=orchestration.get("workflow_trace", []),
     )
     return Envelope(status="ok", data=resp.model_dump())
 
@@ -165,7 +180,10 @@ async def list_artifacts(type: Optional[str] = None, user_id: str = Depends(get_
 @router.post("/artifacts", response_model=Envelope)
 async def create_artifact(body: ArtifactRequest, user_id: str = Depends(get_user)):
     runtime = get_runtime()
-    artifact = runtime.store.create_artifact(type_=body.type, name=body.name, description=body.description or "", schema=body.schema)
+    try:
+        artifact = runtime.store.create_artifact(type_=body.type, name=body.name, description=body.description or "", schema=body.schema)
+    except ConstraintViolation as err:
+        raise HTTPException(status_code=409, detail=err.message)
     resp = ArtifactResponse(
         id=artifact.id,
         type=artifact.type,
@@ -214,6 +232,28 @@ async def propose_patch(body: ConfigPatchRequest, user_id: str = Depends(get_use
     return Envelope(status="ok", data=resp)
 
 
+@router.post("/files/upload", response_model=Envelope)
+async def upload_file(
+    file: UploadFile = File(...),
+    context_id: Optional[str] = Form(None),
+    user_id: str = Depends(get_user),
+):
+    runtime = get_runtime()
+    dest_dir = Path(runtime.settings.shared_fs_root) / "users" / user_id / "files"
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    contents = await file.read()
+    dest_path = dest_dir / file.filename
+    dest_path.write_bytes(contents)
+    chunk_count = None
+    if context_id:
+        try:
+            chunk_count = runtime.rag.ingest_file(context_id, str(dest_path))
+        except ConstraintViolation as err:
+            raise HTTPException(status_code=404, detail=err.message)
+    resp = FileUploadResponse(fs_path=str(dest_path), context_id=context_id, chunk_count=chunk_count)
+    return Envelope(status="ok", data=resp)
+
+
 @router.get("/conversations/{conversation_id}/messages", response_model=Envelope)
 async def list_messages(conversation_id: str, user_id: str = Depends(get_user)):
     runtime = get_runtime()
@@ -254,7 +294,10 @@ async def list_conversations(user_id: str = Depends(get_user)):
 @router.post("/contexts", response_model=Envelope)
 async def create_context(body: KnowledgeContextRequest, user_id: str = Depends(get_user)):
     runtime = get_runtime()
-    ctx = runtime.store.upsert_context(owner_user_id=user_id, name=body.name, description=body.description)
+    try:
+        ctx = runtime.store.upsert_context(owner_user_id=user_id, name=body.name, description=body.description)
+    except ConstraintViolation as err:
+        raise HTTPException(status_code=409, detail=err.message)
     if body.text:
         runtime.rag.ingest_text(ctx.id, body.text)
     return Envelope(
@@ -291,7 +334,7 @@ async def list_contexts(user_id: str = Depends(get_user)):
 @router.get("/contexts/{context_id}/chunks", response_model=Envelope)
 async def list_chunks(context_id: str, user_id: str = Depends(get_user)):
     runtime = get_runtime()
-    chunks = runtime.store.search_chunks(context_id)
+    chunks = runtime.store.search_chunks(context_id, None)
     data = [
         KnowledgeChunkResponse(id=ch.id, context_id=ch.context_id, text=ch.text, seq=ch.seq)
         for ch in chunks
@@ -325,7 +368,13 @@ async def websocket_chat(ws: WebSocket):
             sender="assistant",
             role="assistant",
             content=orchestration["content"],
-            meta={"adapters": orchestration.get("adapters", []), "usage": orchestration.get("usage", {})},
+            meta={
+                "adapters": orchestration.get("adapters", []),
+                "adapter_gates": orchestration.get("adapter_gates", []),
+                "routing_trace": orchestration.get("routing_trace", []),
+                "workflow_trace": orchestration.get("workflow_trace", []),
+                "usage": orchestration.get("usage", {}),
+            },
         )
         await ws.send_json(
             Envelope(
@@ -336,8 +385,11 @@ async def websocket_chat(ws: WebSocket):
                     content=assistant_msg.content,
                     workflow_id=init.get("workflow_id"),
                     adapters=orchestration.get("adapters", []),
+                    adapter_gates=orchestration.get("adapter_gates", []),
                     usage=orchestration.get("usage", {}),
                     context_snippets=orchestration.get("context_snippets", []),
+                    routing_trace=orchestration.get("routing_trace", []),
+                    workflow_trace=orchestration.get("workflow_trace", []),
                 ).model_dump(),
             ).model_dump()
         )
