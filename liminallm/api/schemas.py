@@ -145,3 +145,9 @@ class KnowledgeChunkResponse(BaseModel):
     context_id: str
     text: str
     seq: int
+
+
+class FileUploadResponse(BaseModel):
+    fs_path: str
+    context_id: Optional[str] = None
+    chunk_count: Optional[int] = None

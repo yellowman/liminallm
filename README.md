@@ -119,6 +119,23 @@ for v1 these can all live in one python app with clear module boundaries.
   - all “product behavior” in data (artifacts / policies / workflows)
   - evolution driven by usage + llm suggestions, not constant code surgery
 
+### implementation completeness (prototype)
+
+- **implemented**
+  - file upload endpoint writing to the shared filesystem and ingesting chunks into RAG contexts with hashed embeddings
+- **partially implemented**
+  - workflow execution (linear path execution; not full graph scheduling)
+  - router policies (basic evaluation engine wired, limited policy usage)
+  - MFA (challenge/verify stubs without production delivery)
+- **not implemented yet**
+  - LoRA adapter training
+  - semantic clustering
+  - skill adapters
+  - preference events
+  - LLM-as-architect auto-patch generation
+  - voice interface
+  - admin UI for patch approval
+
 ---
 
 ## getting started (high level)

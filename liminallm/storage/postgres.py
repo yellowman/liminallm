@@ -7,8 +7,10 @@ from pathlib import Path
 from typing import Iterable, List, Optional
 
 import psycopg
+from psycopg import errors
 from psycopg.rows import dict_row
 
+from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
     Artifact,
     ConfigPatchAudit,
@@ -35,11 +37,14 @@ class PostgresStore:
     # users
     def create_user(self, email: str, handle: Optional[str] = None) -> User:
         user_id = str(uuid.uuid4())
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO app_user (id, email, handle) VALUES (%s, %s, %s)",
-                (user_id, email, handle),
-            )
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO app_user (id, email, handle) VALUES (%s, %s, %s)",
+                    (user_id, email, handle),
+                )
+        except errors.UniqueViolation:
+            raise ConstraintViolation("email already exists", {"field": "email"})
         return User(id=user_id, email=email, handle=handle)
 
     def save_password(self, user_id: str, password_hash: str, password_algo: str) -> None:
@@ -83,11 +88,14 @@ class PostgresStore:
     # sessions
     def create_session(self, user_id: str, ttl_minutes: int = 60 * 24, user_agent: str | None = None, ip_addr: str | None = None) -> Session:
         sess = Session.new(user_id=user_id, ttl_minutes=ttl_minutes, user_agent=user_agent, ip_addr=ip_addr)
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO auth_session (id, user_id, created_at, expires_at, user_agent, ip_addr) VALUES (%s, %s, %s, %s, %s, %s)",
-                (sess.id, sess.user_id, sess.created_at, sess.expires_at, user_agent, ip_addr),
-            )
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO auth_session (id, user_id, created_at, expires_at, user_agent, ip_addr) VALUES (%s, %s, %s, %s, %s, %s)",
+                    (sess.id, sess.user_id, sess.created_at, sess.expires_at, user_agent, ip_addr),
+                )
+        except errors.ForeignKeyViolation:
+            raise ConstraintViolation("session user missing", {"user_id": user_id})
         return sess
 
     def revoke_session(self, session_id: str) -> None:
@@ -113,24 +121,30 @@ class PostgresStore:
     def create_conversation(self, user_id: str, title: Optional[str] = None, active_context_id: Optional[str] = None) -> Conversation:
         conv_id = str(uuid.uuid4())
         now = datetime.utcnow()
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO conversation (id, user_id, title, created_at, updated_at, active_context_id) VALUES (%s, %s, %s, %s, %s, %s)",
-                (conv_id, user_id, title, now, now, active_context_id),
-            )
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO conversation (id, user_id, title, created_at, updated_at, active_context_id) VALUES (%s, %s, %s, %s, %s, %s)",
+                    (conv_id, user_id, title, now, now, active_context_id),
+                )
+        except errors.ForeignKeyViolation:
+            raise ConstraintViolation("conversation owner or context missing", {"user_id": user_id, "context_id": active_context_id})
         return Conversation(id=conv_id, user_id=user_id, title=title, created_at=now, updated_at=now, active_context_id=active_context_id)
 
     def append_message(self, conversation_id: str, sender: str, role: str, content: str, meta: Optional[dict] = None) -> Message:
-        with self._connect() as conn:
-            seq_row = conn.execute("SELECT COUNT(*) AS c FROM message WHERE conversation_id = %s", (conversation_id,)).fetchone()
-            seq = seq_row["c"] if seq_row else 0
-            msg_id = str(uuid.uuid4())
-            now = datetime.utcnow()
-            conn.execute(
-                "INSERT INTO message (id, conversation_id, sender, role, content, seq, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (msg_id, conversation_id, sender, role, content, seq, now, json.dumps(meta) if meta else None),
-            )
-            conn.execute("UPDATE conversation SET updated_at = %s WHERE id = %s", (now, conversation_id))
+        try:
+            with self._connect() as conn:
+                seq_row = conn.execute("SELECT COUNT(*) AS c FROM message WHERE conversation_id = %s", (conversation_id,)).fetchone()
+                seq = seq_row["c"] if seq_row else 0
+                msg_id = str(uuid.uuid4())
+                now = datetime.utcnow()
+                conn.execute(
+                    "INSERT INTO message (id, conversation_id, sender, role, content, seq, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (msg_id, conversation_id, sender, role, content, seq, now, json.dumps(meta) if meta else None),
+                )
+                conn.execute("UPDATE conversation SET updated_at = %s WHERE id = %s", (now, conversation_id))
+        except errors.ForeignKeyViolation:
+            raise ConstraintViolation("conversation not found", {"conversation_id": conversation_id})
         return Message(id=msg_id, conversation_id=conversation_id, sender=sender, role=role, content=content, seq=seq, created_at=now, meta=meta)
 
     def list_messages(self, conversation_id: str, limit: int = 10) -> List[Message]:
@@ -210,15 +224,18 @@ class PostgresStore:
     def create_artifact(self, type_: str, name: str, schema: dict, description: str = "", owner_user_id: Optional[str] = None) -> Artifact:
         artifact_id = str(uuid.uuid4())
         fs_path = self._persist_payload(artifact_id, 1, schema)
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO artifact (id, owner_user_id, type, name, description, schema, fs_path) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                (artifact_id, owner_user_id, type_, name, description, json.dumps(schema), fs_path),
-            )
-            conn.execute(
-                "INSERT INTO artifact_version (artifact_id, version, schema, fs_path) VALUES (%s, %s, %s, %s)",
-                (artifact_id, 1, json.dumps(schema), fs_path),
-            )
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO artifact (id, owner_user_id, type, name, description, schema, fs_path) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (artifact_id, owner_user_id, type_, name, description, json.dumps(schema), fs_path),
+                )
+                conn.execute(
+                    "INSERT INTO artifact_version (artifact_id, version, schema, fs_path) VALUES (%s, %s, %s, %s)",
+                    (artifact_id, 1, json.dumps(schema), fs_path),
+                )
+        except errors.ForeignKeyViolation:
+            raise ConstraintViolation("artifact owner missing", {"owner_user_id": owner_user_id})
         return Artifact(
             id=artifact_id,
             type=type_,
@@ -277,11 +294,14 @@ class PostgresStore:
     # knowledge
     def upsert_context(self, owner_user_id: Optional[str], name: str, description: str, fs_path: Optional[str] = None) -> KnowledgeContext:
         ctx_id = str(uuid.uuid4())
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO knowledge_context (id, owner_user_id, name, description, fs_path) VALUES (%s, %s, %s, %s, %s)",
-                (ctx_id, owner_user_id, name, description, fs_path),
-            )
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO knowledge_context (id, owner_user_id, name, description, fs_path) VALUES (%s, %s, %s, %s, %s)",
+                    (ctx_id, owner_user_id, name, description, fs_path),
+                )
+        except errors.ForeignKeyViolation:
+            raise ConstraintViolation("context owner missing", {"owner_user_id": owner_user_id})
         return KnowledgeContext(id=ctx_id, owner_user_id=owner_user_id, name=name, description=description, fs_path=fs_path)
 
     def list_contexts(self) -> List[KnowledgeContext]:
@@ -304,22 +324,34 @@ class PostgresStore:
         return contexts
 
     def add_chunks(self, context_id: str, chunks: Iterable[KnowledgeChunk]) -> None:
-        with self._connect() as conn:
-            for chunk in chunks:
-                conn.execute(
-                    "INSERT INTO knowledge_chunk (id, context_id, text, embedding, seq, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                    (chunk.id, context_id, chunk.text, chunk.embedding, chunk.seq, chunk.created_at, json.dumps(chunk.meta) if chunk.meta else None),
-                )
+        try:
+            with self._connect() as conn:
+                for chunk in chunks:
+                    conn.execute(
+                        "INSERT INTO knowledge_chunk (id, context_id, text, embedding, seq, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        (chunk.id, context_id, chunk.text, chunk.embedding, chunk.seq, chunk.created_at, json.dumps(chunk.meta) if chunk.meta else None),
+                    )
+        except errors.ForeignKeyViolation:
+            raise ConstraintViolation("context not found", {"context_id": context_id})
 
-    def search_chunks(self, context_id: Optional[str], limit: int = 4) -> List[KnowledgeChunk]:
+    def search_chunks(
+        self, context_id: Optional[str], query_embedding: Optional[List[float]], limit: int = 4
+    ) -> List[KnowledgeChunk]:
+        def _cosine(a: List[float], b: List[float]) -> float:
+            if not a or not b:
+                return 0.0
+            length = min(len(a), len(b))
+            dot = sum(a[i] * b[i] for i in range(length))
+            norm_a = sum(x * x for x in a) ** 0.5 or 1.0
+            norm_b = sum(x * x for x in b) ** 0.5 or 1.0
+            return dot / (norm_a * norm_b)
+
         with self._connect() as conn:
             if context_id:
-                rows = conn.execute(
-                    "SELECT * FROM knowledge_chunk WHERE context_id = %s ORDER BY seq ASC LIMIT %s",
-                    (context_id, limit),
-                ).fetchall()
+                rows = conn.execute("SELECT * FROM knowledge_chunk WHERE context_id = %s", (context_id,)).fetchall()
             else:
-                rows = conn.execute("SELECT * FROM knowledge_chunk ORDER BY created_at DESC LIMIT %s", (limit,)).fetchall()
+                sample_size = max(limit * 5, 20)
+                rows = conn.execute("SELECT * FROM knowledge_chunk ORDER BY created_at DESC LIMIT %s", (sample_size,)).fetchall()
         results: List[KnowledgeChunk] = []
         for row in rows:
             results.append(
@@ -333,7 +365,13 @@ class PostgresStore:
                     meta=row.get("meta"),
                 )
             )
-        return results
+        if query_embedding:
+            results.sort(key=lambda ch: _cosine(query_embedding, ch.embedding), reverse=True)
+        elif context_id:
+            results.sort(key=lambda ch: ch.seq)
+        else:
+            results.sort(key=lambda ch: ch.created_at, reverse=True)
+        return results[:limit]
 
     def _persist_payload(self, artifact_id: str, version: int, schema: dict) -> str:
         artifact_dir = self.fs_root / "artifacts" / artifact_id
