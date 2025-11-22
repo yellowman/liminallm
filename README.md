@@ -127,12 +127,11 @@ for v1 these can all live in one python app with clear module boundaries.
   - router policies with a sandboxed evaluation engine (limited adapter gating usage)
   - pluggable model backend that can target external API fine-tune IDs or local JAX+LoRA adapter application
   - filesystem-backed LoRA adapter training that turns preference events into new adapter versions
+  - preference capture with clustering + skill adapter promotion and routing integration
+  - MFA with TOTP enrollment (otpauth URL), session gating, and login verification
 - **partially implemented**
-  - MFA (challenge/verify stubs only; missing enrollment secret/QR issuance, delivery channel, and login gating)
-  - preference events (capture + training loop stubs wired, but full UI + routing feedback not complete)
+  - preference UI and rich routing feedback loop
 - **not implemented yet**
-  - semantic clustering
-  - skill adapters
   - LLM-as-architect auto-patch generation
   - voice interface
   - admin UI for patch approval

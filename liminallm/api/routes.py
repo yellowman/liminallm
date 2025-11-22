@@ -29,6 +29,8 @@ from liminallm.api.schemas import (
     KnowledgeContextRequest,
     KnowledgeContextResponse,
     FileUploadResponse,
+    PreferenceEventRequest,
+    PreferenceEventResponse,
 )
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.config import get_settings
@@ -57,16 +59,26 @@ async def signup(body: SignupRequest):
         user, session = await runtime.auth.signup(email=body.email, password=body.password, handle=body.handle)
     except ConstraintViolation as err:
         raise HTTPException(status_code=409, detail=err.message)
-    return Envelope(status="ok", data=AuthResponse(user_id=user.id, session_id=session.id, session_expires_at=session.expires_at))
+    return Envelope(
+        status="ok",
+        data=AuthResponse(
+            user_id=user.id, session_id=session.id, session_expires_at=session.expires_at, mfa_required=session.mfa_required
+        ),
+    )
 
 
 @router.post("/auth/login", response_model=Envelope)
 async def login(body: LoginRequest):
     runtime = get_runtime()
-    user, session = await runtime.auth.login(email=body.email, password=body.password)
+    user, session = await runtime.auth.login(email=body.email, password=body.password, mfa_code=body.mfa_code)
     if not user or not session:
         raise HTTPException(status_code=401, detail="invalid credentials")
-    return Envelope(status="ok", data=AuthResponse(user_id=user.id, session_id=session.id, session_expires_at=session.expires_at))
+    return Envelope(
+        status="ok",
+        data=AuthResponse(
+            user_id=user.id, session_id=session.id, session_expires_at=session.expires_at, mfa_required=session.mfa_required
+        ),
+    )
 
 
 @router.post("/auth/mfa/request", response_model=Envelope)
@@ -76,7 +88,7 @@ async def request_mfa(body: MFARequest):
     if not user_id:
         raise HTTPException(status_code=401, detail="invalid session")
     challenge = await runtime.auth.issue_mfa_challenge(user_id=user_id)
-    return Envelope(status="ok", data={"challenge": challenge})
+    return Envelope(status="ok", data=challenge)
 
 
 @router.post("/auth/mfa/verify", response_model=Envelope)
@@ -85,7 +97,7 @@ async def verify_mfa(body: MFAVerifyRequest):
     user_id = await runtime.auth.resolve_session(body.session_id)
     if not user_id:
         raise HTTPException(status_code=401, detail="invalid session")
-    ok = await runtime.auth.verify_mfa_challenge(user_id=user_id, code=body.code)
+    ok = await runtime.auth.verify_mfa_challenge(user_id=user_id, code=body.code, session_id=body.session_id)
     if not ok:
         raise HTTPException(status_code=401, detail="invalid mfa")
     return Envelope(status="ok", data={"status": "verified"})
@@ -130,7 +142,7 @@ async def chat(body: ChatRequest, user_id: str = Depends(get_user), idempotency_
         conversation = runtime.store.create_conversation(user_id=user_id, active_context_id=body.context_id)
         conversation_id = conversation.id
     runtime.store.append_message(conversation_id, sender="user", role="user", content=body.message.content)
-    orchestration = runtime.workflow.run(body.workflow_id, conversation_id, body.message.content, body.context_id)
+    orchestration = runtime.workflow.run(body.workflow_id, conversation_id, body.message.content, body.context_id, user_id)
     assistant_msg = runtime.store.append_message(
         conversation_id,
         sender="assistant",
@@ -157,6 +169,28 @@ async def chat(body: ChatRequest, user_id: str = Depends(get_user), idempotency_
         workflow_trace=orchestration.get("workflow_trace", []),
     )
     return Envelope(status="ok", data=resp.model_dump())
+
+
+@router.post("/preferences", response_model=Envelope)
+async def record_preference(body: PreferenceEventRequest, user_id: str = Depends(get_user)):
+    runtime = get_runtime()
+    try:
+        event = runtime.training.record_feedback_event(
+            user_id=user_id,
+            conversation_id=body.conversation_id,
+            message_id=body.message_id,
+            feedback=body.feedback,
+            score=body.score,
+            context_text=body.context_text,
+            corrected_text=body.corrected_text,
+            weight=body.weight,
+        )
+    except ConstraintViolation as err:
+        raise HTTPException(status_code=409, detail=err.message)
+    runtime.clusterer.cluster_user_preferences(user_id)
+    runtime.clusterer.promote_skill_adapters()
+    resp = PreferenceEventResponse(id=event.id, cluster_id=event.cluster_id, feedback=event.feedback, created_at=event.created_at)
+    return Envelope(status="ok", data=resp)
 
 
 @router.get("/artifacts", response_model=Envelope)
@@ -367,7 +401,9 @@ async def websocket_chat(ws: WebSocket):
                 return
         convo_id = init.get("conversation_id") or runtime.store.create_conversation(user_id=user_id).id
         runtime.store.append_message(convo_id, sender="user", role="user", content=init.get("message", ""))
-        orchestration = runtime.workflow.run(init.get("workflow_id"), convo_id, init.get("message", ""), init.get("context_id"))
+        orchestration = runtime.workflow.run(
+            init.get("workflow_id"), convo_id, init.get("message", ""), init.get("context_id"), user_id
+        )
         assistant_msg = runtime.store.append_message(
             convo_id,
             sender="assistant",

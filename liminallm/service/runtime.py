@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from liminallm.config import get_settings
 from liminallm.service.auth import AuthService
+from liminallm.service.clustering import SemanticClusterer
 from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
 from liminallm.service.router import RouterEngine
@@ -49,9 +50,10 @@ class Runtime:
             fs_root=self.settings.shared_fs_root,
         )
         self.rag = RAGService(self.store)
-        self.workflow = WorkflowEngine(self.store, self.llm, self.router, self.rag)
-        self.auth = AuthService(self.store, self.cache)
         self.training = TrainingService(self.store, self.settings.shared_fs_root)
+        self.clusterer = SemanticClusterer(self.store, self.llm, self.training)
+        self.workflow = WorkflowEngine(self.store, self.llm, self.router, self.rag)
+        self.auth = AuthService(self.store, self.cache, mfa_enabled=self.settings.enable_mfa)
 
 
 runtime = Runtime()

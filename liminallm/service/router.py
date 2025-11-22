@@ -16,7 +16,13 @@ class RouterEngine:
         }
 
     def route(
-        self, policy: dict, context_embedding: List[float] | None, adapters: List[dict], *, safety_risk: Optional[str] = None
+        self,
+        policy: dict,
+        context_embedding: List[float] | None,
+        adapters: List[dict],
+        *,
+        safety_risk: Optional[str] = None,
+        ctx_cluster: Optional[dict] = None,
     ) -> Dict[str, Any]:
         ctx_emb = context_embedding or []
         candidates = adapters or []
@@ -25,16 +31,20 @@ class RouterEngine:
         rules = policy.get("rules", []) if policy else []
         for rule in rules:
             condition = rule.get("when", "true")
-            fired = self._eval_condition(condition, ctx_emb, candidates, safety_risk)
+            fired = self._eval_condition(condition, ctx_emb, candidates, safety_risk, ctx_cluster)
             effect = None
             if fired:
                 effect = self._apply_action(rule.get("action", {}), candidates, ctx_emb, weights)
             trace.append({"id": rule.get("id"), "when": condition, "fired": fired, "action": rule.get("action"), "effect": effect})
+        if not weights and ctx_emb:
+            similarity_effects = self._apply_similarity_boost(candidates, ctx_emb, weights)
+            if similarity_effects:
+                trace.append({"id": "default_similarity_boost", "when": "auto", "fired": True, "action": {"type": "boost_by_similarity"}, "effect": similarity_effects})
         normalized = self._normalize_weights(weights, policy)
-        return {"adapters": normalized, "trace": trace}
+        return {"adapters": normalized, "trace": trace, "ctx_cluster": ctx_cluster}
 
     def _eval_condition(
-        self, expr: str, context_embedding: List[float], adapters: List[dict], safety_risk: Optional[str] = None
+        self, expr: str, context_embedding: List[float], adapters: List[dict], safety_risk: Optional[str] = None, ctx_cluster: Optional[dict] = None
     ) -> bool:
         expr = expr or ""
         if expr.strip() in {"true", "True", "1"}:
@@ -43,6 +53,7 @@ class RouterEngine:
             "ctx_embedding": context_embedding,
             "adapters": adapters,
             "safety_risk": safety_risk,
+            "ctx_cluster": ctx_cluster,
             **self.safe_functions,
             "true": True,
             "false": False,
@@ -96,6 +107,16 @@ class RouterEngine:
         else:
             weights[target_id] = max(weights[target_id], applied_weight)
         return _record(target_id, applied_weight)
+
+    def _apply_similarity_boost(self, adapters: List[dict], ctx_emb: List[float], weights: Dict[str, float]) -> List[dict]:
+        effects: List[dict] = []
+        for candidate in adapters:
+            cand_id = candidate.get("id") or candidate.get("name")
+            similarity = self._cosine_similarity(ctx_emb, self._adapter_embedding(candidate))
+            if similarity > 0.6 and cand_id:
+                weights[cand_id] = max(weights.get(cand_id, 0.0), similarity)
+                effects.append({"target": cand_id, "weight": similarity, "similarity": similarity})
+        return effects
 
     def _resolve_weight(self, configured_weight: Any, similarity: Optional[float]) -> float:
         if isinstance(configured_weight, (int, float)):

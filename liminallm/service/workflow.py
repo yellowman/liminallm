@@ -6,6 +6,7 @@ from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
 from liminallm.service.router import RouterEngine
 from liminallm.service.sandbox import safe_eval_expr
+from liminallm.service.embeddings import cosine_similarity, deterministic_embedding
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.postgres import PostgresStore
 
@@ -19,14 +20,21 @@ class WorkflowEngine:
         self.router = router
         self.rag = rag
 
-    def run(self, workflow_id: Optional[str], conversation_id: Optional[str], user_message: str, context_id: Optional[str]) -> dict:
+    def run(
+        self,
+        workflow_id: Optional[str],
+        conversation_id: Optional[str],
+        user_message: str,
+        context_id: Optional[str],
+        user_id: Optional[str] = None,
+    ) -> dict:
         workflow_schema = None
         if workflow_id:
             workflow_schema = self.store.get_latest_workflow(workflow_id) if hasattr(self.store, "get_latest_workflow") else None
         if not workflow_schema:
             workflow_schema = self._default_workflow()
 
-        adapters, routing_trace, adapter_gates = self._select_adapters(context_id)
+        adapters, routing_trace, adapter_gates = self._select_adapters(user_message, user_id, context_id)
         history = []
         if conversation_id and hasattr(self.store, "list_messages"):
             history = self.store.list_messages(conversation_id)  # type: ignore[attr-defined]
@@ -117,25 +125,54 @@ class WorkflowEngine:
             ],
         }
 
-    def _select_adapters(self, context_id: Optional[str]) -> Tuple[List[dict], List[dict], List[dict]]:
+    def _select_adapters(
+        self, user_message: str, user_id: Optional[str], context_id: Optional[str]
+    ) -> Tuple[List[dict], List[dict], List[dict]]:
         adapter_artifacts = [a for a in self.store.list_artifacts(type_filter="adapter")]  # type: ignore[arg-type]
         policy = None
         for art in self.store.list_artifacts(type_filter="policy"):  # type: ignore[arg-type]
             if art.name == "default_routing":
                 policy = art.schema
                 break
-        context_embedding = None
+        context_embedding = deterministic_embedding(user_message or "")
         candidates = []
+        cluster_lookup: dict[str, Any] = {}
+        if hasattr(self.store, "list_semantic_clusters"):
+            for cluster in self.store.list_semantic_clusters(user_id):  # type: ignore[attr-defined]
+                cluster_lookup[cluster.id] = cluster
+            for cluster in self.store.list_semantic_clusters(None):  # type: ignore[attr-defined]
+                if cluster.user_id is None:
+                    cluster_lookup[cluster.id] = cluster
         for art in adapter_artifacts:
             candidate = {"id": art.id, "name": art.name}
             if isinstance(art.schema, dict):
                 candidate.update(art.schema)
+            cid = candidate.get("cluster_id")
+            if cid and cid in cluster_lookup:
+                candidate.setdefault("centroid", cluster_lookup[cid].centroid)
             candidates.append(candidate)
-        routing = self.router.route(policy or {}, context_embedding, candidates)
+        best_cluster = None
+        best_sim = 0.0
+        for cluster in cluster_lookup.values():
+            emb_a, emb_b = self._align_vectors(context_embedding, cluster.centroid)
+            sim = cosine_similarity(emb_a, emb_b)
+            if sim > best_sim:
+                best_cluster = cluster
+                best_sim = sim
+        ctx_cluster = None
+        if best_cluster:
+            ctx_cluster = {"id": best_cluster.id, "label": best_cluster.label, "similarity": best_sim}
+        routing = self.router.route(policy or {}, context_embedding, candidates, ctx_cluster=ctx_cluster)
         gates = routing.get("adapters", []) if isinstance(routing, dict) else []
         activated_ids = [gate.get("id", "") for gate in gates if gate.get("id")]
         activated_adapters = [c for c in candidates if c.get("id") in activated_ids]
         return activated_adapters, routing.get("trace", []) if isinstance(routing, dict) else [], gates
+
+    def _align_vectors(self, a: List[float], b: List[float]) -> Tuple[List[float], List[float]]:
+        dim = max(len(a), len(b)) or 1
+        padded_a = list(a) + [0.0] * (dim - len(a))
+        padded_b = list(b) + [0.0] * (dim - len(b))
+        return padded_a, padded_b
 
     def _execute_node(
         self,

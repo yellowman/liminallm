@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
+import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -16,9 +17,11 @@ from liminallm.storage.models import (
     KnowledgeContext,
     Message,
     PreferenceEvent,
+    SemanticCluster,
     Session,
     TrainingJob,
     User,
+    UserMFAConfig,
 )
 
 
@@ -39,6 +42,8 @@ class MemoryStore:
         self.chunks: Dict[str, List[KnowledgeChunk]] = {}
         self.preference_events: Dict[str, PreferenceEvent] = {}
         self.training_jobs: Dict[str, TrainingJob] = {}
+        self.semantic_clusters: Dict[str, SemanticCluster] = {}
+        self.mfa_secrets: Dict[str, UserMFAConfig] = {}
         self.fs_root = Path(fs_root)
         self.fs_root.mkdir(parents=True, exist_ok=True)
 
@@ -184,10 +189,29 @@ class MemoryStore:
     def get_password_record(self, user_id: str) -> Optional[tuple[str, str]]:
         return self.credentials.get(user_id)
 
-    def create_session(self, user_id: str, ttl_minutes: int = 60 * 24, user_agent: str | None = None, ip_addr: str | None = None) -> Session:
+    def set_user_mfa_secret(self, user_id: str, secret: str, enabled: bool = False) -> UserMFAConfig:
+        if user_id not in self.users:
+            raise ConstraintViolation("user not found for mfa", {"user_id": user_id})
+        record = UserMFAConfig(user_id=user_id, secret=secret, enabled=enabled)
+        self.mfa_secrets[user_id] = record
+        self._persist_state()
+        return record
+
+    def get_user_mfa_secret(self, user_id: str) -> Optional[UserMFAConfig]:
+        return self.mfa_secrets.get(user_id)
+
+    def create_session(
+        self, user_id: str, ttl_minutes: int = 60 * 24, user_agent: str | None = None, ip_addr: str | None = None, *, mfa_required: bool = False
+    ) -> Session:
         if user_id not in self.users:
             raise ConstraintViolation("user does not exist", {"user_id": user_id})
-        sess = Session.new(user_id=user_id, ttl_minutes=ttl_minutes, user_agent=user_agent, ip_addr=ip_addr)
+        sess = Session.new(
+            user_id=user_id,
+            ttl_minutes=ttl_minutes,
+            user_agent=user_agent,
+            ip_addr=ip_addr,
+            mfa_required=mfa_required,
+        )
         self.sessions[sess.id] = sess
         self._persist_state()
         return sess
@@ -197,6 +221,14 @@ class MemoryStore:
 
     def revoke_session(self, session_id: str) -> None:
         self.sessions.pop(session_id, None)
+        self._persist_state()
+
+    def mark_session_verified(self, session_id: str) -> None:
+        sess = self.sessions.get(session_id)
+        if not sess:
+            return
+        sess.mfa_verified = True
+        sess.mfa_required = True
         self._persist_state()
 
     # chat
@@ -234,6 +266,25 @@ class MemoryStore:
         return msg
 
     # preference events
+    def _message_text(self, message_id: str) -> str:
+        for msgs in self.messages.values():
+            for msg in msgs:
+                if msg.id == message_id:
+                    return msg.content
+        return ""
+
+    def _text_embedding(self, text: Optional[str]) -> List[float]:
+        if not text:
+            return []
+        tokens = text.lower().split()
+        dim = 64
+        vec = [0.0] * dim
+        for tok in tokens:
+            h = int(hashlib.sha256(tok.encode()).hexdigest(), 16)
+            vec[h % dim] += 1.0
+        norm = sum(v * v for v in vec) ** 0.5 or 1.0
+        return [v / norm for v in vec]
+
     def record_preference_event(
         self,
         user_id: str,
@@ -242,6 +293,7 @@ class MemoryStore:
         feedback: str,
         *,
         score: Optional[float] = None,
+        explicit_signal: Optional[str] = None,
         corrected_text: Optional[str] = None,
         weight: Optional[float] = None,
         context_embedding: Optional[List[float]] = None,
@@ -255,6 +307,7 @@ class MemoryStore:
             raise ConstraintViolation("preference conversation missing", {"conversation_id": conversation_id})
         event_id = str(uuid.uuid4())
         normalized_weight = weight if weight is not None else (score if score is not None else 1.0)
+        embedding = context_embedding or self._text_embedding(context_text or self._message_text(message_id))
         event = PreferenceEvent(
             id=event_id,
             user_id=user_id,
@@ -262,7 +315,8 @@ class MemoryStore:
             message_id=message_id,
             feedback=feedback,
             score=score,
-            context_embedding=context_embedding or [],
+            explicit_signal=explicit_signal,
+            context_embedding=embedding,
             cluster_id=cluster_id,
             context_text=context_text,
             corrected_text=corrected_text,
@@ -273,13 +327,95 @@ class MemoryStore:
         self._persist_state()
         return event
 
-    def list_preference_events(self, user_id: Optional[str] = None, feedback: Optional[str] = None) -> List[PreferenceEvent]:
+    def list_preference_events(
+        self, user_id: Optional[str] = None, feedback: Optional[str] = None, cluster_id: Optional[str] = None
+    ) -> List[PreferenceEvent]:
         events = list(self.preference_events.values())
         if user_id:
             events = [e for e in events if e.user_id == user_id]
         if feedback:
             events = [e for e in events if e.feedback == feedback]
+        if cluster_id:
+            events = [e for e in events if e.cluster_id == cluster_id]
         return sorted(events, key=lambda e: e.created_at)
+
+    def update_preference_event(self, event_id: str, *, cluster_id: Optional[str] = None) -> Optional[PreferenceEvent]:
+        event = self.preference_events.get(event_id)
+        if not event:
+            return None
+        if cluster_id:
+            event.cluster_id = cluster_id
+        self._persist_state()
+        return event
+
+    # semantic clusters
+    def upsert_semantic_cluster(
+        self,
+        *,
+        cluster_id: Optional[str] = None,
+        user_id: Optional[str],
+        centroid: List[float],
+        size: int,
+        label: Optional[str] = None,
+        description: Optional[str] = None,
+        sample_message_ids: Optional[List[str]] = None,
+        meta: Optional[Dict] = None,
+    ) -> SemanticCluster:
+        cid = cluster_id or str(uuid.uuid4())
+        now = datetime.utcnow()
+        existing = self.semantic_clusters.get(cid)
+        created_at = existing.created_at if existing else now
+        cluster = SemanticCluster(
+            id=cid,
+            user_id=user_id,
+            centroid=list(centroid),
+            size=size,
+            label=label if label is not None else (existing.label if existing else None),
+            description=description if description is not None else (existing.description if existing else None),
+            sample_message_ids=sample_message_ids or (existing.sample_message_ids if existing else []),
+            created_at=created_at,
+            updated_at=now,
+            meta=meta or (existing.meta if existing else None),
+        )
+        self.semantic_clusters[cid] = cluster
+        self._persist_state()
+        return cluster
+
+    def update_semantic_cluster(
+        self,
+        cluster_id: str,
+        *,
+        label: Optional[str] = None,
+        description: Optional[str] = None,
+        centroid: Optional[List[float]] = None,
+        size: Optional[int] = None,
+        meta: Optional[Dict] = None,
+    ) -> Optional[SemanticCluster]:
+        cluster = self.semantic_clusters.get(cluster_id)
+        if not cluster:
+            return None
+        if label is not None:
+            cluster.label = label
+        if description is not None:
+            cluster.description = description
+        if centroid is not None:
+            cluster.centroid = list(centroid)
+        if size is not None:
+            cluster.size = size
+        if meta is not None:
+            cluster.meta = meta
+        cluster.updated_at = datetime.utcnow()
+        self._persist_state()
+        return cluster
+
+    def list_semantic_clusters(self, user_id: Optional[str] = None) -> List[SemanticCluster]:
+        clusters = list(self.semantic_clusters.values())
+        if user_id:
+            clusters = [c for c in clusters if c.user_id == user_id]
+        return sorted(clusters, key=lambda c: c.updated_at, reverse=True)
+
+    def get_semantic_cluster(self, cluster_id: str) -> Optional[SemanticCluster]:
+        return self.semantic_clusters.get(cluster_id)
 
     # training jobs
     def create_training_job(
@@ -497,6 +633,8 @@ class MemoryStore:
             "chunks": [self._serialize_chunk(ch) for chs in self.chunks.values() for ch in chs],
             "preference_events": [self._serialize_preference_event(e) for e in self.preference_events.values()],
             "training_jobs": [self._serialize_training_job(j) for j in self.training_jobs.values()],
+            "semantic_clusters": [self._serialize_semantic_cluster(c) for c in self.semantic_clusters.values()],
+            "mfa_secrets": [self._serialize_mfa_config(cfg) for cfg in self.mfa_secrets.values()],
         }
         path = self._state_path()
         path.write_text(json.dumps(state, indent=2))
@@ -538,6 +676,10 @@ class MemoryStore:
             e["id"]: self._deserialize_preference_event(e) for e in data.get("preference_events", [])
         }
         self.training_jobs = {j["id"]: self._deserialize_training_job(j) for j in data.get("training_jobs", [])}
+        self.semantic_clusters = {
+            c["id"]: self._deserialize_semantic_cluster(c) for c in data.get("semantic_clusters", [])
+        }
+        self.mfa_secrets = {cfg["user_id"]: self._deserialize_mfa_config(cfg) for cfg in data.get("mfa_secrets", [])}
         return True
 
     def _serialize_user(self, user: User) -> dict:
@@ -570,6 +712,8 @@ class MemoryStore:
             "expires_at": self._serialize_datetime(session.expires_at),
             "user_agent": session.user_agent,
             "ip_addr": session.ip_addr,
+            "mfa_required": session.mfa_required,
+            "mfa_verified": session.mfa_verified,
             "meta": session.meta,
         }
 
@@ -581,6 +725,8 @@ class MemoryStore:
             expires_at=self._deserialize_datetime(data["expires_at"]),
             user_agent=data.get("user_agent"),
             ip_addr=data.get("ip_addr"),
+            mfa_required=data.get("mfa_required", False),
+            mfa_verified=data.get("mfa_verified", False),
             meta=data.get("meta"),
         )
 
@@ -768,6 +914,7 @@ class MemoryStore:
             "message_id": event.message_id,
             "feedback": event.feedback,
             "score": event.score,
+            "explicit_signal": event.explicit_signal,
             "context_embedding": event.context_embedding,
             "cluster_id": event.cluster_id,
             "context_text": event.context_text,
@@ -785,6 +932,7 @@ class MemoryStore:
             message_id=data["message_id"],
             feedback=data["feedback"],
             score=data.get("score"),
+            explicit_signal=data.get("explicit_signal"),
             context_embedding=data.get("context_embedding", []),
             cluster_id=data.get("cluster_id"),
             context_text=data.get("context_text"),
@@ -814,12 +962,58 @@ class MemoryStore:
             id=data["id"],
             user_id=data["user_id"],
             adapter_id=data["adapter_id"],
-            status=data.get("status", "pending"),
+            status=data.get("status", "queued"),
             created_at=self._deserialize_datetime(data["created_at"]),
             updated_at=self._deserialize_datetime(data.get("updated_at", data["created_at"])),
             loss=data.get("loss"),
             preference_event_ids=list(data.get("preference_event_ids", [])),
             dataset_path=data.get("dataset_path"),
             new_version=data.get("new_version"),
+            meta=data.get("meta"),
+        )
+
+    def _serialize_semantic_cluster(self, cluster: SemanticCluster) -> dict:
+        return {
+            "id": cluster.id,
+            "user_id": cluster.user_id,
+            "centroid": cluster.centroid,
+            "size": cluster.size,
+            "label": cluster.label,
+            "description": cluster.description,
+            "sample_message_ids": cluster.sample_message_ids,
+            "created_at": self._serialize_datetime(cluster.created_at),
+            "updated_at": self._serialize_datetime(cluster.updated_at),
+            "meta": cluster.meta,
+        }
+
+    def _deserialize_semantic_cluster(self, data: dict) -> SemanticCluster:
+        return SemanticCluster(
+            id=data["id"],
+            user_id=data.get("user_id"),
+            centroid=data.get("centroid", []),
+            size=data.get("size", 0),
+            label=data.get("label"),
+            description=data.get("description"),
+            sample_message_ids=list(data.get("sample_message_ids", [])),
+            created_at=self._deserialize_datetime(data.get("created_at", datetime.utcnow().isoformat())),
+            updated_at=self._deserialize_datetime(data.get("updated_at", datetime.utcnow().isoformat())),
+            meta=data.get("meta"),
+        )
+
+    def _serialize_mfa_config(self, cfg: UserMFAConfig) -> dict:
+        return {
+            "user_id": cfg.user_id,
+            "secret": cfg.secret,
+            "enabled": cfg.enabled,
+            "created_at": self._serialize_datetime(cfg.created_at),
+            "meta": cfg.meta,
+        }
+
+    def _deserialize_mfa_config(self, data: dict) -> UserMFAConfig:
+        return UserMFAConfig(
+            user_id=data["user_id"],
+            secret=data["secret"],
+            enabled=bool(data.get("enabled", False)),
+            created_at=self._deserialize_datetime(data.get("created_at", datetime.utcnow().isoformat())),
             meta=data.get("meta"),
         )

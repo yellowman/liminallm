@@ -25,10 +25,20 @@ class Session:
     expires_at: datetime
     user_agent: Optional[str] = None
     ip_addr: Optional[str] = None
+    mfa_required: bool = False
+    mfa_verified: bool = False
     meta: Dict | None = None
 
     @classmethod
-    def new(cls, user_id: str, ttl_minutes: int = 60 * 24, user_agent: str | None = None, ip_addr: str | None = None) -> "Session":
+    def new(
+        cls,
+        user_id: str,
+        ttl_minutes: int = 60 * 24,
+        user_agent: str | None = None,
+        ip_addr: str | None = None,
+        *,
+        mfa_required: bool = False,
+    ) -> "Session":
         now = datetime.utcnow()
         return cls(
             id=str(uuid.uuid4()),
@@ -37,6 +47,8 @@ class Session:
             expires_at=now + timedelta(minutes=ttl_minutes),
             user_agent=user_agent,
             ip_addr=ip_addr,
+            mfa_required=mfa_required,
+            mfa_verified=not mfa_required,
         )
 
 
@@ -136,6 +148,7 @@ class PreferenceEvent:
     message_id: str
     feedback: str
     score: Optional[float] = None
+    explicit_signal: Optional[str] = None
     context_embedding: List[float] = field(default_factory=list)
     cluster_id: Optional[str] = None
     context_text: Optional[str] = None
@@ -150,11 +163,34 @@ class TrainingJob:
     id: str
     user_id: str
     adapter_id: str
-    status: str = "pending"
+    status: str = "queued"
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
     loss: Optional[float] = None
     preference_event_ids: List[str] = field(default_factory=list)
     dataset_path: Optional[str] = None
     new_version: Optional[int] = None
+    meta: Dict | None = None
+
+
+@dataclass
+class SemanticCluster:
+    id: str
+    user_id: Optional[str]
+    centroid: List[float]
+    size: int
+    label: Optional[str] = None
+    description: Optional[str] = None
+    sample_message_ids: List[str] = field(default_factory=list)
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+    meta: Dict | None = None
+
+
+@dataclass
+class UserMFAConfig:
+    user_id: str
+    secret: str
+    enabled: bool = False
+    created_at: datetime = field(default_factory=datetime.utcnow)
     meta: Dict | None = None
