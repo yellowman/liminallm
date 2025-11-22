@@ -457,10 +457,12 @@ all redis keys should be namespaced, e.g.:
   - external providers expose each fine-tune as a first-class `model` id.
   - the kernel maps `artifact` entries of kind `adapter.lora` to these model ids 1:1; activating an adapter means choosing the matching model id.
   - no dynamic multi-adapter composition; switching behavior = switching model id; router can still choose among models based on policy.
+  - examples: OpenAI/Azure fine-tuned deployments (`model=ft:...`), Vertex AI Gemini tuned model resource names, Bedrock custom models.
 
 - **self-hosted adapter servers (open source)**
   - base model served once; hundreds–thousands of LoRA fragments mounted behind an OpenAI-compatible API (e.g., LoRAX/Predibase-style) that accepts `adapter_id`/multi-LoRA parameters.
   - kernel passes `adapter_id` + optional gate weights; server composes multiple adapters per request when supported.
+  - providers with adapter-id style APIs include Together AI Serverless Multi-LoRA (`adapter_id`), SageMaker adapter inference components, or custom LoRAX deployments behind OpenAI-compatible routes.
   - both modes share the same artifact metadata; only the transport differs, so workflows/policies remain data-driven.
 
 ### 5.1 base model
@@ -626,20 +628,26 @@ loop for a `training_job`:
 ```json
 {
   "kind": "adapter.lora",
+  "backend": "local",
+  "provider": "local",
   "scope": "per-user",
   "user_id": "…",
+  "base_model": "jax-base",
   "rank": 8,
   "layers": [0,1,2,3,4,5],
   "matrices": ["attn_q", "attn_v"],
   "current_version": 3,
   "fs_dir": "/users/.../adapters/{id}",
   "cluster_id": "…",  // semantic cluster this adapter is tied to
+  "remote_model_id": null, // populated when backend == "api"
   "applicability": {
     "natural_language": "Helps this user debug kernel panics via reproduce→bisect→log-analysis.",
     "embedding_centroid": null  // also in adapter_router_state; optional redundancy.
   }
 }
 ```
+
+Router policies remain agnostic: they pick adapters by id/metadata and hand them to the inference backend. An adapter with `backend="api"` implies switching the request model ID to `remote_model_id` (e.g., Zhipu BigModel or Alibaba DashScope); `backend="local"` means applying filesystem-backed LoRA weights on the base model. `backend="prompt"` distills adapter behavior into a prompt/system-message overlay for API-only providers, and `backend="hybrid"` indicates a two-step plan where a local adapter-enabled controller plans and an external API model executes.
 
 **workflow.chat**:
 

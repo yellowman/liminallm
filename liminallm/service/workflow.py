@@ -117,7 +117,7 @@ class WorkflowEngine:
             ],
         }
 
-    def _select_adapters(self, context_id: Optional[str]) -> Tuple[List[str], List[dict], List[dict]]:
+    def _select_adapters(self, context_id: Optional[str]) -> Tuple[List[dict], List[dict], List[dict]]:
         adapter_artifacts = [a for a in self.store.list_artifacts(type_filter="adapter")]  # type: ignore[arg-type]
         policy = None
         for art in self.store.list_artifacts(type_filter="policy"):  # type: ignore[arg-type]
@@ -127,14 +127,15 @@ class WorkflowEngine:
         context_embedding = None
         candidates = []
         for art in adapter_artifacts:
-            candidate = {"id": art.id}
+            candidate = {"id": art.id, "name": art.name}
             if isinstance(art.schema, dict):
                 candidate.update(art.schema)
             candidates.append(candidate)
         routing = self.router.route(policy or {}, context_embedding, candidates)
         gates = routing.get("adapters", []) if isinstance(routing, dict) else []
-        activated = [gate.get("id", "") for gate in gates if gate.get("id")]
-        return [a for a in activated if a], routing.get("trace", []) if isinstance(routing, dict) else [], gates
+        activated_ids = [gate.get("id", "") for gate in gates if gate.get("id")]
+        activated_adapters = [c for c in candidates if c.get("id") in activated_ids]
+        return activated_adapters, routing.get("trace", []) if isinstance(routing, dict) else [], gates
 
     def _execute_node(
         self,
@@ -143,7 +144,7 @@ class WorkflowEngine:
         user_message: str,
         context_id: Optional[str],
         conversation_id: Optional[str],
-        adapters: List[str],
+        adapters: List[dict],
         history: List[Any],
         vars_scope: Dict[str, Any],
     ) -> Tuple[Dict[str, Any], List[str]]:
@@ -191,7 +192,7 @@ class WorkflowEngine:
         self,
         tool: str,
         inputs: Dict[str, Any],
-        adapters: List[str],
+        adapters: List[dict],
         history: List[Any],
         context_id: Optional[str],
         conversation_id: Optional[str],
