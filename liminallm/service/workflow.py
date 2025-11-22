@@ -38,9 +38,7 @@ class WorkflowEngine:
 
         vars_scope: Dict[str, Any] = {}
         workflow_trace: List[Dict[str, Any]] = []
-        # Context snippets are gathered only from workflow tool outputs; avoid any
-        # pre-workflow retrieval so graph nodes control RAG usage.
-        collected_context_snippets: List[str] = []
+        context_snippets: List[str] = []
         content = ""
         usage: Dict[str, Any] = {}
 
@@ -68,11 +66,11 @@ class WorkflowEngine:
             if result.get("outputs"):
                 vars_scope.update(result["outputs"])
             if result.get("context_snippets"):
-                collected_context_snippets.extend(result["context_snippets"])
+                context_snippets.extend(result["context_snippets"])
             if result.get("content"):
                 content = result["content"]
             if result.get("usage"):
-                usage = self._merge_usage(usage, result["usage"])
+                usage = result["usage"]
 
             pending.extend(next_nodes)
             if result.get("status") == "end":
@@ -86,7 +84,7 @@ class WorkflowEngine:
             "usage": usage,
             "adapters": adapters,
             "adapter_gates": adapter_gates,
-            "context_snippets": collected_context_snippets,
+            "context_snippets": context_snippets,
             "workflow_trace": workflow_trace,
             "routing_trace": routing_trace,
             "vars": vars_scope,
@@ -114,7 +112,15 @@ class WorkflowEngine:
         return {
             "kind": "workflow.chat",
             "entrypoint": "plain_chat",
-            "nodes": [plain_chat_node, {"id": "end", "type": "end"}],
+            "nodes": [
+                {
+                    "id": "plain_chat",
+                    "type": "tool_call",
+                    "tool": "llm.generic",
+                    "inputs": {"message": "${input.message}"},
+                },
+                {"id": "end", "type": "end"},
+            ],
         }
 
     def _select_adapters(self, context_id: Optional[str]) -> Tuple[List[str], List[dict], List[dict]]:
@@ -164,15 +170,7 @@ class WorkflowEngine:
 
         tool_name = node.get("tool", "")
         inputs = self._resolve_inputs(node.get("inputs", {}), user_message, vars_scope)
-        tool_result = self._invoke_tool(
-            tool_name,
-            inputs,
-            adapters,
-            history,
-            context_id,
-            conversation_id,
-            user_message,
-        )
+        tool_result = self._invoke_tool(tool_name, inputs, adapters, history, context_id, conversation_id)
         outputs = {}
         for key in node.get("outputs", []) or []:
             if isinstance(tool_result, dict) and key in tool_result:
@@ -201,7 +199,6 @@ class WorkflowEngine:
         history: List[Any],
         context_id: Optional[str],
         conversation_id: Optional[str],
-        user_message: str,
     ) -> Dict[str, Any]:
         tool_name = tool or "llm.generic"
         if tool_name in {"llm.generic", "llm.generic_chat_v1"}:
@@ -226,7 +223,7 @@ class WorkflowEngine:
             resp = self.llm.generate(question or "", adapters=adapters, context_snippets=snippets, history=history)
             return {"content": resp["content"], "usage": resp["usage"], "context_snippets": snippets, "answer": resp["content"]}
         if tool_name == "llm.intent_classifier_v1":
-            message = inputs.get("message") or user_message or ""
+            message = inputs.get("message") or ""
             lowered = message.lower()
             intent = "qa_with_docs" if "doc" in lowered or "file" in lowered else "analysis"
             if "code" in lowered:

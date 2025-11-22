@@ -242,29 +242,18 @@ async def upload_file(
     runtime = get_runtime()
     dest_dir = Path(runtime.settings.shared_fs_root) / "users" / user_id / "files"
     contents = await file.read()
-    if context_id:
-        existing_context_ids = {ctx.id for ctx in runtime.store.list_contexts()}
-        if context_id not in existing_context_ids:
-            raise HTTPException(status_code=409, detail="context not found")
-    sanitized_name = Path(file.filename).name
-    if sanitized_name in {"", ".", ".."}:
-        raise HTTPException(status_code=400, detail="invalid filename")
     try:
-        dest_path = safe_join(dest_dir, sanitized_name)
+        dest_path = safe_join(dest_dir, file.filename)
     except PathTraversalError as err:
         raise HTTPException(status_code=400, detail=str(err))
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     dest_path.write_bytes(contents)
     chunk_count = None
-    try:
-        if context_id:
-            try:
-                chunk_count = runtime.rag.ingest_file(context_id, str(dest_path))
-            except ConstraintViolation as err:
-                raise HTTPException(status_code=409, detail=err.message)
-    except Exception:
-        dest_path.unlink(missing_ok=True)
-        raise
+    if context_id:
+        try:
+            chunk_count = runtime.rag.ingest_file(context_id, str(dest_path))
+        except ConstraintViolation as err:
+            raise HTTPException(status_code=409, detail=err.message)
     resp = FileUploadResponse(fs_path=str(dest_path), context_id=context_id, chunk_count=chunk_count)
     return Envelope(status="ok", data=resp)
 
