@@ -69,8 +69,8 @@ class WorkflowEngine:
                 context_snippets.extend(result["context_snippets"])
             if result.get("content"):
                 content = result["content"]
-            if result.get("usage"):
-                usage = self._merge_usage(usage, result["usage"])
+            node_usage = result.get("usage")
+            usage = self._merge_usage(usage, node_usage or {})
 
             pending.extend(next_nodes)
             if result.get("status") == "end":
@@ -164,7 +164,9 @@ class WorkflowEngine:
 
         tool_name = node.get("tool", "")
         inputs = self._resolve_inputs(node.get("inputs", {}), user_message, vars_scope)
-        tool_result = self._invoke_tool(tool_name, inputs, adapters, history, context_id, conversation_id)
+        if "message" not in inputs and user_message:
+            inputs["message"] = user_message
+        tool_result = self._invoke_tool(tool_name, inputs, adapters, history, context_id, conversation_id, user_message)
         outputs = {}
         for key in node.get("outputs", []) or []:
             if isinstance(tool_result, dict) and key in tool_result:
@@ -193,6 +195,7 @@ class WorkflowEngine:
         history: List[Any],
         context_id: Optional[str],
         conversation_id: Optional[str],
+        user_message: str,
     ) -> Dict[str, Any]:
         tool_name = tool or "llm.generic"
         if tool_name in {"llm.generic", "llm.generic_chat_v1"}:
@@ -217,7 +220,7 @@ class WorkflowEngine:
             resp = self.llm.generate(question or "", adapters=adapters, context_snippets=snippets, history=history)
             return {"content": resp["content"], "usage": resp["usage"], "context_snippets": snippets, "answer": resp["content"]}
         if tool_name == "llm.intent_classifier_v1":
-            message = inputs.get("message") or ""
+            message = inputs.get("message") or user_message or ""
             lowered = message.lower()
             intent = "qa_with_docs" if "doc" in lowered or "file" in lowered else "analysis"
             if "code" in lowered:
