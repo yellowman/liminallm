@@ -147,17 +147,72 @@ for v1 these can all live in one python app with clear module boundaries.
    - postgres (with pgvector installed)
    - redis
    - filesystem path accessible to the app
-   - gpu / tpu for jax model if you expect to train adapters
-   - backend selection is single-sourced from the SQL deployment config (editable from the web console when wired); env vars only override if you set them explicitly
-   - set `MODEL_BACKEND=local_lora` to target the local JAX+LoRA path instead of external API fine-tune IDs
+ - gpu / tpu for jax model if you expect to train adapters
+  - backend selection is single-sourced from the SQL deployment config (editable from the web console when wired); env vars only override if you set them explicitly
+  - set `MODEL_BACKEND=local_gpu_lora` to target the local JAX+LoRA path instead of external API fine-tune IDs; omit or leave as the default to use the OpenAI-style plug (the stub backend lives in `liminallm/service/model_backend.py` as `LocalJaxLoRABackend`). OpenAI plug secrets live under adapter-specific env vars (see below).
+
+### adapters: local LoRA vs remote fine-tune IDs vs prompt-distilled
+
+- Router policies pick an adapter; the inference backend decides whether that means applying LoRA weights locally, swapping to a remote fine-tuned model ID, or injecting distilled prompt instructions on top of a black-box API.
+- Each `adapter.lora` artifact carries a `backend` field describing where inference happens:
+
+  ```json
+  {
+    "kind": "adapter.lora.remote",
+    "provider": "zhipu",
+    "backend": "api",
+    "base_model": "glm-4-air",
+    "remote_model_id": "glm-4-air-ft-2025-11-01-u123-debug",
+    "region": "cn-beijing",
+    "cluster_id": "…",
+    "applicability": {
+      "natural_language": "u123: kernel panic debugging skill on GLM-4-Air",
+      "embedding_centroid": []
+    }
+  }
+  ```
+
+  ```json
+  {
+    "kind": "adapter.lora.local",
+    "backend": "local",
+    "provider": "aliyun",
+    "base_model": "qwen2.5-32b-instruct",
+    "cephfs_dir": "/users/u123/adapters/{id}",
+    "rank": 8,
+    "layers": [0, 1, 2, 3],
+    "matrices": ["attn_q", "attn_v"],
+    "cluster_id": "…"
+  }
+  ```
+
+  ```json
+  {
+    "kind": "adapter.lora.prompt",
+    "backend": "prompt",
+    "provider": "api_only",
+    "base_model": "glm-4-air",
+    "prompt_instructions": "for kernel issues: reproduce → bisect → log inspection; keep replies terse",
+    "cluster_id": "…",
+    "applicability": {
+      "natural_language": "prompt-distilled skill for kernel debugging",
+      "embedding_centroid": []
+    }
+  }
+  ```
+
+- Remote adapters send requests to OpenAI-compatible fine-tuned model IDs (e.g., Zhipu BigModel or Alibaba DashScope). Local adapters resolve to filesystem-backed LoRA weights and are composable. Prompt-distilled adapters inject behavior as system messages without changing model IDs so you can still steer API-only providers.
+- “Model-ID adapters” (fine-tuned endpoints) map 1:1 to model strings on providers like OpenAI/Azure (fine-tuned deployments), Vertex AI Gemini, or Bedrock custom models. Switching behavior = switching the `model` string; composition happens at routing time, not inside a single call.
+- “Adapter-ID adapters” (multi-LoRA / adapter servers) surface `adapter_id` parameters on Together AI Serverless Multi-LoRA, LoRAX-style servers, or SageMaker adapter inference components. The backend keeps the base model string and passes `adapter_id` for one-or-more adapters per request when supported.
+- Hybrid patterns (local adapter-enabled “controller” + external API “executor”) flow through the same artifacts: the controller uses a local LoRA backend to plan, then the API backend executes with prompt or remote-model adapters.
 
 2. **configure env**
    - `DATABASE_URL` – postgres dsn
    - `REDIS_URL` – redis dsn
    - `SHARED_FS_ROOT` – filesystem root path
    - `MODEL_PATH` – model identifier for cloud mode (default `gpt-4o-mini`) or filesystem path when using an adapter server
-   - `OPENAI_API_KEY` – required for live LLM calls; omit to use the echo fallback
-   - `LLM_MODE` – `cloud` (fine-tune ids as models) or `adapter` (adapter_id passthrough to adapter servers); kept for backward compatibility when no SQL config or `MODEL_BACKEND` override is provided
+   - `OPENAI_ADAPTER_API_KEY` – OpenAI plug API key (leave unset to use the echo fallback)
+   - `OPENAI_ADAPTER_BASE_URL` – optional base URL override when pointing at an OpenAI-compatible endpoint
    - `ADAPTER_SERVER_MODEL` – model name when pointing at an OpenAI-compatible adapter server
    - `USE_MEMORY_STORE` – set to `true` to run without Postgres/Redis while testing the API and LLM calls
 
@@ -213,5 +268,5 @@ MIT
 - hit health check: `curl http://localhost:8000/healthz`
 - call kernel endpoints (session_id header required):
   - `POST /v1/auth/signup` → returns session
-  - `POST /v1/chat` → creates conversation + LLM reply (live if `OPENAI_API_KEY` is set, echo otherwise)
+  - `POST /v1/chat` → creates conversation + LLM reply (live if `OPENAI_ADAPTER_API_KEY` is set, echo otherwise)
   - `GET /v1/artifacts` → lists data-driven workflows/policies

@@ -26,8 +26,11 @@ class TrainingService:
         adapter_id = None
         adapter_schema = {
             "kind": "adapter.lora",
+            "backend": "local",
+            "provider": "local",
             "scope": "per-user",
             "user_id": user_id,
+            "base_model": "jax-base",
             "rank": rank,
             "layers": list(range(4)),
             "matrices": ["attn_q", "attn_v"],
@@ -40,7 +43,9 @@ class TrainingService:
             description="Per-user persona adapter",
             owner_user_id=user_id,
         )
-        adapter_schema["fs_dir"] = str(self._adapter_dir(user_id, adapter.id))
+        adapter_fs_dir = self._adapter_dir(user_id, adapter.id)
+        adapter_schema["fs_dir"] = str(adapter_fs_dir)
+        adapter_schema.setdefault("cephfs_dir", str(adapter_fs_dir))
         self.store.update_artifact(adapter.id, adapter_schema)
         return self.store.get_artifact(adapter.id) or adapter
 

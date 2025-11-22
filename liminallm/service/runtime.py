@@ -31,12 +31,20 @@ class Runtime:
         if hasattr(self.store, "get_runtime_config"):
             runtime_config = self.store.get_runtime_config() or {}
             db_backend_mode = runtime_config.get("model_backend")
-        backend_mode = db_backend_mode or self.settings.model_backend or self.settings.llm_mode
+        backend_mode = db_backend_mode or self.settings.model_backend
+        adapter_configs = {
+            "openai": {
+                "api_key": self.settings.adapter_openai_api_key,
+                "base_url": self.settings.adapter_openai_base_url,
+                "adapter_server_model": self.settings.adapter_server_model,
+            }
+        }
         self.llm = LLMService(
             base_model=self.settings.model_path,
             backend_mode=backend_mode,
-            api_key=self.settings.openai_api_key,
-            base_url=self.settings.openai_base_url,
+            adapter_configs=adapter_configs,
+            api_key=self.settings.adapter_openai_api_key,
+            base_url=self.settings.adapter_openai_base_url,
             adapter_server_model=self.settings.adapter_server_model,
             fs_root=self.settings.shared_fs_root,
         )
