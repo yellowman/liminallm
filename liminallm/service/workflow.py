@@ -70,7 +70,7 @@ class WorkflowEngine:
             if result.get("content"):
                 content = result["content"]
             if result.get("usage"):
-                usage = result["usage"]
+                usage = self._merge_usage(usage, result["usage"])
 
             pending.extend(next_nodes)
             if result.get("status") == "end":
@@ -106,19 +106,13 @@ class WorkflowEngine:
             "tool": "llm.generic",
             # forward the user message so llm.generic doesn't receive an empty payload
             "inputs": {"message": "${input.message}"},
-            "next": "end",
         }
 
         return {
             "kind": "workflow.chat",
             "entrypoint": "plain_chat",
             "nodes": [
-                {
-                    "id": "plain_chat",
-                    "type": "tool_call",
-                    "tool": "llm.generic",
-                    "inputs": {"message": "${input.message}"},
-                },
+                plain_chat_node | {"next": "end"},
                 {"id": "end", "type": "end"},
             ],
         }
