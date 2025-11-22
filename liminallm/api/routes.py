@@ -32,6 +32,7 @@ from liminallm.api.schemas import (
 )
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.config import get_settings
+from liminallm.service.fs import PathTraversalError, safe_join
 from liminallm.service.runtime import get_runtime
 
 router = APIRouter(prefix="/v1")
@@ -240,9 +241,12 @@ async def upload_file(
 ):
     runtime = get_runtime()
     dest_dir = Path(runtime.settings.shared_fs_root) / "users" / user_id / "files"
-    dest_dir.mkdir(parents=True, exist_ok=True)
     contents = await file.read()
-    dest_path = dest_dir / file.filename
+    try:
+        dest_path = safe_join(dest_dir, file.filename)
+    except PathTraversalError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
     dest_path.write_bytes(contents)
     chunk_count = None
     if context_id:
