@@ -32,6 +32,7 @@ from liminallm.api.schemas import (
 )
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.config import get_settings
+from liminallm.service.fs import PathTraversalError, safe_join
 from liminallm.service.runtime import get_runtime
 
 router = APIRouter(prefix="/v1")
@@ -135,7 +136,13 @@ async def chat(body: ChatRequest, user_id: str = Depends(get_user), idempotency_
         sender="assistant",
         role="assistant",
         content=orchestration["content"],
-        meta={"adapters": orchestration.get("adapters", []), "usage": orchestration.get("usage", {})},
+        meta={
+            "adapters": orchestration.get("adapters", []),
+            "adapter_gates": orchestration.get("adapter_gates", []),
+            "routing_trace": orchestration.get("routing_trace", []),
+            "workflow_trace": orchestration.get("workflow_trace", []),
+            "usage": orchestration.get("usage", {}),
+        },
     )
     resp = ChatResponse(
         message_id=assistant_msg.id,
@@ -143,8 +150,11 @@ async def chat(body: ChatRequest, user_id: str = Depends(get_user), idempotency_
         content=assistant_msg.content,
         workflow_id=body.workflow_id,
         adapters=orchestration.get("adapters", []),
+        adapter_gates=orchestration.get("adapter_gates", []),
         usage=orchestration.get("usage", {}),
         context_snippets=orchestration.get("context_snippets", []),
+        routing_trace=orchestration.get("routing_trace", []),
+        workflow_trace=orchestration.get("workflow_trace", []),
     )
     return Envelope(status="ok", data=resp.model_dump())
 
@@ -231,16 +241,30 @@ async def upload_file(
 ):
     runtime = get_runtime()
     dest_dir = Path(runtime.settings.shared_fs_root) / "users" / user_id / "files"
-    dest_dir.mkdir(parents=True, exist_ok=True)
     contents = await file.read()
-    dest_path = dest_dir / file.filename
+    if context_id:
+        existing_context_ids = {ctx.id for ctx in runtime.store.list_contexts()}
+        if context_id not in existing_context_ids:
+            raise HTTPException(status_code=409, detail="context not found")
+    sanitized_name = Path(file.filename).name
+    if sanitized_name in {"", ".", ".."}:
+        raise HTTPException(status_code=400, detail="invalid filename")
+    try:
+        dest_path = safe_join(dest_dir, sanitized_name)
+    except PathTraversalError as err:
+        raise HTTPException(status_code=400, detail=str(err))
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
     dest_path.write_bytes(contents)
     chunk_count = None
-    if context_id:
-        try:
-            chunk_count = runtime.rag.ingest_file(context_id, str(dest_path))
-        except ConstraintViolation as err:
-            raise HTTPException(status_code=404, detail=err.message)
+    try:
+        if context_id:
+            try:
+                chunk_count = runtime.rag.ingest_file(context_id, str(dest_path))
+            except ConstraintViolation as err:
+                raise HTTPException(status_code=409, detail=err.message)
+    except Exception:
+        dest_path.unlink(missing_ok=True)
+        raise
     resp = FileUploadResponse(fs_path=str(dest_path), context_id=context_id, chunk_count=chunk_count)
     return Envelope(status="ok", data=resp)
 
@@ -359,7 +383,13 @@ async def websocket_chat(ws: WebSocket):
             sender="assistant",
             role="assistant",
             content=orchestration["content"],
-            meta={"adapters": orchestration.get("adapters", []), "usage": orchestration.get("usage", {})},
+            meta={
+                "adapters": orchestration.get("adapters", []),
+                "adapter_gates": orchestration.get("adapter_gates", []),
+                "routing_trace": orchestration.get("routing_trace", []),
+                "workflow_trace": orchestration.get("workflow_trace", []),
+                "usage": orchestration.get("usage", {}),
+            },
         )
         await ws.send_json(
             Envelope(
@@ -370,8 +400,11 @@ async def websocket_chat(ws: WebSocket):
                     content=assistant_msg.content,
                     workflow_id=init.get("workflow_id"),
                     adapters=orchestration.get("adapters", []),
+                    adapter_gates=orchestration.get("adapter_gates", []),
                     usage=orchestration.get("usage", {}),
                     context_snippets=orchestration.get("context_snippets", []),
+                    routing_trace=orchestration.get("routing_trace", []),
+                    workflow_trace=orchestration.get("workflow_trace", []),
                 ).model_dump(),
             ).model_dump()
         )

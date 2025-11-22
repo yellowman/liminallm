@@ -124,8 +124,8 @@ for v1 these can all live in one python app with clear module boundaries.
 - **implemented**
   - file upload endpoint writing to the shared filesystem and ingesting chunks into RAG contexts with hashed embeddings
   - workflow execution with branching/parallel scheduling across `workflow.chat` graphs
+  - router policies with a sandboxed evaluation engine (limited adapter gating usage)
 - **partially implemented**
-  - router policies (basic evaluation engine wired, limited policy usage)
   - MFA (challenge/verify stubs without production delivery)
 - **not implemented yet**
   - LoRA adapter training

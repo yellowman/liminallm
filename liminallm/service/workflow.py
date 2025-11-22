@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
 from liminallm.service.router import RouterEngine
+from liminallm.service.sandbox import safe_eval_expr
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.postgres import PostgresStore
 
@@ -25,9 +26,7 @@ class WorkflowEngine:
         if not workflow_schema:
             workflow_schema = self._default_workflow()
 
-        adapters = self._select_adapters(context_id)
-        ctx_chunks = self.rag.retrieve(context_id, user_message)
-        context_snippets = [c.text for c in ctx_chunks]
+        adapters, routing_trace, adapter_gates = self._select_adapters(context_id)
         history = []
         if conversation_id and hasattr(self.store, "list_messages"):
             history = self.store.list_messages(conversation_id)  # type: ignore[attr-defined]
@@ -39,7 +38,9 @@ class WorkflowEngine:
 
         vars_scope: Dict[str, Any] = {}
         workflow_trace: List[Dict[str, Any]] = []
-        context_snippets: List[str] = []
+        # Context snippets are gathered only from workflow tool outputs; avoid any
+        # pre-workflow retrieval so graph nodes control RAG usage.
+        collected_context_snippets: List[str] = []
         content = ""
         usage: Dict[str, Any] = {}
 
@@ -67,11 +68,11 @@ class WorkflowEngine:
             if result.get("outputs"):
                 vars_scope.update(result["outputs"])
             if result.get("context_snippets"):
-                context_snippets.extend(result["context_snippets"])
+                collected_context_snippets.extend(result["context_snippets"])
             if result.get("content"):
                 content = result["content"]
             if result.get("usage"):
-                usage = result["usage"]
+                usage = self._merge_usage(usage, result["usage"])
 
             pending.extend(next_nodes)
             if result.get("status") == "end":
@@ -84,22 +85,39 @@ class WorkflowEngine:
             "content": content,
             "usage": usage,
             "adapters": adapters,
-            "context_snippets": context_snippets,
+            "adapter_gates": adapter_gates,
+            "context_snippets": collected_context_snippets,
             "workflow_trace": workflow_trace,
+            "routing_trace": routing_trace,
             "vars": vars_scope,
         }
 
+    def _merge_usage(self, accum: Dict[str, Any], new_usage: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(accum)
+        for key, value in new_usage.items():
+            if isinstance(value, (int, float)):
+                merged[key] = merged.get(key, 0) + value
+            else:
+                merged[key] = value
+        return merged
+
     def _default_workflow(self) -> dict:
+        plain_chat_node = {
+            "id": "plain_chat",
+            "type": "tool_call",
+            "tool": "llm.generic",
+            # forward the user message so llm.generic doesn't receive an empty payload
+            "inputs": {"message": "${input.message}"},
+            "next": "end",
+        }
+
         return {
             "kind": "workflow.chat",
             "entrypoint": "plain_chat",
-            "nodes": [
-                {"id": "plain_chat", "type": "tool_call", "tool": "llm.generic"},
-                {"id": "end", "type": "end"},
-            ],
+            "nodes": [plain_chat_node, {"id": "end", "type": "end"}],
         }
 
-    def _select_adapters(self, context_id: Optional[str]) -> List[str]:
+    def _select_adapters(self, context_id: Optional[str]) -> Tuple[List[str], List[dict], List[dict]]:
         adapter_artifacts = [a for a in self.store.list_artifacts(type_filter="adapter")]  # type: ignore[arg-type]
         policy = None
         for art in self.store.list_artifacts(type_filter="policy"):  # type: ignore[arg-type]
@@ -107,13 +125,16 @@ class WorkflowEngine:
                 policy = art.schema
                 break
         context_embedding = None
-        actions = self.router.route(policy or {}, context_embedding, [a.schema for a in adapter_artifacts])
-        activated: List[str] = []
-        for action in actions:
-            if action.get("type") == "activate_adapter":
-                if adapter_artifacts:
-                    activated.append(adapter_artifacts[0].id if action.get("adapter_id") == "closest" else action.get("adapter_id", ""))
-        return [a for a in activated if a]
+        candidates = []
+        for art in adapter_artifacts:
+            candidate = {"id": art.id}
+            if isinstance(art.schema, dict):
+                candidate.update(art.schema)
+            candidates.append(candidate)
+        routing = self.router.route(policy or {}, context_embedding, candidates)
+        gates = routing.get("adapters", []) if isinstance(routing, dict) else []
+        activated = [gate.get("id", "") for gate in gates if gate.get("id")]
+        return [a for a in activated if a], routing.get("trace", []) if isinstance(routing, dict) else [], gates
 
     def _execute_node(
         self,
@@ -143,7 +164,15 @@ class WorkflowEngine:
 
         tool_name = node.get("tool", "")
         inputs = self._resolve_inputs(node.get("inputs", {}), user_message, vars_scope)
-        tool_result = self._invoke_tool(tool_name, inputs, adapters, history, context_id, conversation_id)
+        tool_result = self._invoke_tool(
+            tool_name,
+            inputs,
+            adapters,
+            history,
+            context_id,
+            conversation_id,
+            user_message,
+        )
         outputs = {}
         for key in node.get("outputs", []) or []:
             if isinstance(tool_result, dict) and key in tool_result:
@@ -172,6 +201,7 @@ class WorkflowEngine:
         history: List[Any],
         context_id: Optional[str],
         conversation_id: Optional[str],
+        user_message: str,
     ) -> Dict[str, Any]:
         tool_name = tool or "llm.generic"
         if tool_name in {"llm.generic", "llm.generic_chat_v1"}:
@@ -196,7 +226,7 @@ class WorkflowEngine:
             resp = self.llm.generate(question or "", adapters=adapters, context_snippets=snippets, history=history)
             return {"content": resp["content"], "usage": resp["usage"], "context_snippets": snippets, "answer": resp["content"]}
         if tool_name == "llm.intent_classifier_v1":
-            message = inputs.get("message") or ""
+            message = inputs.get("message") or user_message or ""
             lowered = message.lower()
             intent = "qa_with_docs" if "doc" in lowered or "file" in lowered else "analysis"
             if "code" in lowered:
@@ -232,9 +262,9 @@ class WorkflowEngine:
     def _evaluate_condition(self, expr: Optional[str], user_message: str, vars_scope: Dict[str, Any]) -> bool:
         if not expr:
             return False
-        safe_globals: Dict[str, Any] = {"__builtins__": {}}
-        safe_locals = {"input": {"message": user_message}, "vars": vars_scope, "true": True, "false": False}
         try:
-            return bool(eval(expr, safe_globals, safe_locals))
+            return bool(
+                safe_eval_expr(expr, {"input": {"message": user_message}, "vars": vars_scope, "true": True, "false": False})
+            )
         except Exception:
             return False

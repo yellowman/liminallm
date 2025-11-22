@@ -67,8 +67,11 @@ class ChatResponse(BaseModel):
     content: str
     workflow_id: Optional[str]
     adapters: List[str] = []
+    adapter_gates: List[dict] = []
     usage: dict = {}
     context_snippets: List[str] = []
+    routing_trace: List[dict] = []
+    workflow_trace: List[dict] = []
 
 
 class ArtifactRequest(BaseModel):

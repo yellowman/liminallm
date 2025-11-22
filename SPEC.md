@@ -641,6 +641,7 @@ loop for a `training_job`:
       "id": "node_classify",
       "type": "tool_call",
       "tool": "llm.intent_classifier_v1",
+      "inputs": { "message": "${input.message}" },
       "outputs": ["intent"]
     },
     {
@@ -655,17 +656,20 @@ loop for a `training_job`:
     {
       "id": "node_rag",
       "type": "tool_call",
-      "tool": "rag.answer_with_context_v1"
+      "tool": "rag.answer_with_context_v1",
+      "inputs": { "message": "${input.message}" }
     },
     {
       "id": "node_code_agent",
       "type": "tool_call",
-      "tool": "agent.code_v1"
+      "tool": "agent.code_v1",
+      "inputs": { "message": "${input.message}" }
     },
     {
       "id": "node_plain",
       "type": "tool_call",
-      "tool": "llm.generic_chat_v1"
+      "tool": "llm.generic_chat_v1",
+      "inputs": { "message": "${input.message}" }
     }
   ]
 }
@@ -884,6 +888,8 @@ no explicit “if debugging then do X” in code; that lives in the data-driven 
 - expression interpreter only supports whitelisted functions (`cosine_similarity`, `contains`, `len`, numeric ops) and literals; no arbitrary Python.
 - provide `trace` object capturing which rules fired, resulting gate weights, safety overrides; stored in logs for LLM auditors.
 - guardrails: clamp resulting gate weights to `[0, 1]`, normalize if sum > 1; enforce max active adapters (default 3) and per-adapter weight floor (default 0.05).
+
+**prototype implementation notes:** sandboxed evaluation is implemented with adapter activation/deactivation, weight scaling, cosine-similarity-based "closest" selection, per-rule traces, and normalized adapter gate outputs returned on chat responses.
 
 ### 8.2 llm editing routing policies
 
