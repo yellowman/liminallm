@@ -32,3 +32,7 @@ This file gives the shortest possible orientation; see **SPEC.md** for authorita
 - Default test/validation is `python -m compileall liminallm`.
 
 When in doubt, align changes with SPEC sections above and keep the kernel minimal and data-driven.
+
+## Documentation reminders
+- When a task is fully completed, update `README.md` to reflect the finished status.
+- If a change affects the spec (requested by the user or clarifying an ambiguous area), edit `SPEC.md` accordingly.

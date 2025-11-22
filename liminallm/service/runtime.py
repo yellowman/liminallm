@@ -5,6 +5,7 @@ from liminallm.service.auth import AuthService
 from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
 from liminallm.service.router import RouterEngine
+from liminallm.service.training import TrainingService
 from liminallm.service.workflow import WorkflowEngine
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.postgres import PostgresStore
@@ -26,16 +27,19 @@ class Runtime:
             except Exception:
                 self.cache = None
         self.router = RouterEngine()
+        backend_mode = self.settings.model_backend or self.settings.llm_mode
         self.llm = LLMService(
             base_model=self.settings.model_path,
-            mode=self.settings.llm_mode,
+            backend_mode=backend_mode,
             api_key=self.settings.openai_api_key,
             base_url=self.settings.openai_base_url,
             adapter_server_model=self.settings.adapter_server_model,
+            fs_root=self.settings.shared_fs_root,
         )
         self.rag = RAGService(self.store)
         self.workflow = WorkflowEngine(self.store, self.llm, self.router, self.rag)
         self.auth = AuthService(self.store, self.cache)
+        self.training = TrainingService(self.store, self.settings.shared_fs_root)
 
 
 runtime = Runtime()
