@@ -497,6 +497,31 @@ class PostgresStore:
             )
         return artifacts
 
+    def get_artifact(self, artifact_id: str) -> Optional[Artifact]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM artifact WHERE id = %s", (artifact_id,)).fetchone()
+        if not row:
+            return None
+        schema = row.get("schema") if isinstance(row, dict) else row["schema"]
+        if isinstance(schema, str):
+            try:
+                schema = json.loads(schema)
+            except Exception:
+                schema = {}
+        return Artifact(
+            id=str(row["id"]),
+            type=row["type"],
+            name=row["name"],
+            description=row.get("description") or "",
+            schema=schema or {},
+            owner_user_id=(str(row["owner_user_id"]) if row.get("owner_user_id") else None),
+            visibility=row.get("visibility", "private"),
+            created_at=row.get("created_at", datetime.utcnow()),
+            updated_at=row.get("updated_at", datetime.utcnow()),
+            fs_path=row.get("fs_path"),
+            meta=row.get("meta"),
+        )
+
     def create_artifact(self, type_: str, name: str, schema: dict, description: str = "", owner_user_id: Optional[str] = None) -> Artifact:
         artifact_id = str(uuid.uuid4())
         fs_path = self._persist_payload(artifact_id, 1, schema)
