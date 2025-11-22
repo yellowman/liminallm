@@ -75,7 +75,7 @@ async def request_mfa(body: MFARequest):
     user_id = await runtime.auth.resolve_session(body.session_id)
     if not user_id:
         raise HTTPException(status_code=401, detail="invalid session")
-    challenge = runtime.auth.issue_mfa_challenge(user_id=user_id)
+    challenge = await runtime.auth.issue_mfa_challenge(user_id=user_id)
     return Envelope(status="ok", data={"challenge": challenge})
 
 
@@ -85,7 +85,7 @@ async def verify_mfa(body: MFAVerifyRequest):
     user_id = await runtime.auth.resolve_session(body.session_id)
     if not user_id:
         raise HTTPException(status_code=401, detail="invalid session")
-    ok = runtime.auth.verify_mfa_challenge(user_id=user_id, code=body.code, expected=body.code)
+    ok = await runtime.auth.verify_mfa_challenge(user_id=user_id, code=body.code)
     if not ok:
         raise HTTPException(status_code=401, detail="invalid mfa")
     return Envelope(status="ok", data={"status": "verified"})
