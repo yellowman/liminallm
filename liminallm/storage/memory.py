@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
+from liminallm.logging import get_logger
+from liminallm.service.artifact_validation import ArtifactValidationError, validate_artifact
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
     Artifact,
@@ -29,6 +31,7 @@ class MemoryStore:
     """Minimal in-memory backing store for the initial prototype."""
 
     def __init__(self, fs_root: str = "/tmp/liminallm") -> None:
+        self.logger = get_logger(__name__)
         self.users: Dict[str, User] = {}
         self.sessions: Dict[str, Session] = {}
         self.conversations: Dict[str, Conversation] = {}
@@ -486,6 +489,11 @@ class MemoryStore:
         return self.artifacts.get(artifact_id)
 
     def create_artifact(self, type_: str, name: str, schema: dict, description: str = "", owner_user_id: Optional[str] = None) -> Artifact:
+        try:
+            validate_artifact(type_, schema)
+        except ArtifactValidationError as exc:
+            self.logger.warning("artifact_validation_failed", errors=exc.errors)
+            raise
         if owner_user_id and owner_user_id not in self.users:
             raise ConstraintViolation("artifact owner missing", {"owner_user_id": owner_user_id})
         artifact_id = str(uuid.uuid4())
@@ -513,6 +521,11 @@ class MemoryStore:
         return artifact
 
     def update_artifact(self, artifact_id: str, schema: dict, description: Optional[str] = None) -> Optional[Artifact]:
+        try:
+            validate_artifact("workflow" if schema.get("kind") == "workflow.chat" else "tool" if schema.get("kind") == "tool.spec" else "artifact", schema)  # type: ignore[arg-type]
+        except ArtifactValidationError as exc:
+            self.logger.warning("artifact_validation_failed", errors=exc.errors)
+            raise
         artifact = self.artifacts.get(artifact_id)
         if not artifact:
             return None

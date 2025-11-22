@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Tuple
+import concurrent.futures
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+from liminallm.logging import get_logger
 
 from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
@@ -19,6 +22,8 @@ class WorkflowEngine:
         self.llm = llm
         self.router = router
         self.rag = rag
+        self.logger = get_logger(__name__)
+        self.tool_registry = self._build_tool_registry()
 
     def run(
         self,
@@ -52,7 +57,8 @@ class WorkflowEngine:
 
         pending: List[str] = [entry] if entry else []
         visited = 0
-        max_steps = max(1, len(node_map) * 3)
+        max_steps = max(1, min(100, len(node_map) * 2 + 10))
+        visited_nodes: Dict[str, int] = {}
 
         while pending and visited < max_steps:
             node_id = pending.pop(0)
@@ -60,6 +66,10 @@ class WorkflowEngine:
             if not node:
                 continue
             visited += 1
+            visited_nodes[node_id] = visited_nodes.get(node_id, 0) + 1
+            if visited_nodes[node_id] > len(node_map) + 2:
+                self.logger.warning("workflow_loop_detected", node=node_id)
+                break
 
             result, next_nodes = self._execute_node(
                 node,
@@ -81,7 +91,7 @@ class WorkflowEngine:
             usage = self._merge_usage(usage, node_usage or {})
 
             pending.extend(next_nodes)
-            if result.get("status") == "end":
+            if result.get("status") in {"end", "error"}:
                 break
 
         if not content:
@@ -106,6 +116,14 @@ class WorkflowEngine:
             else:
                 merged[key] = value
         return merged
+
+    def _build_tool_registry(self) -> Dict[str, dict]:
+        registry: Dict[str, dict] = {}
+        if hasattr(self.store, "list_artifacts"):
+            for artifact in self.store.list_artifacts(type_filter="tool"):
+                if isinstance(artifact.schema, dict) and artifact.schema.get("name"):
+                    registry[artifact.schema["name"]] = artifact.schema
+        return registry
 
     def _default_workflow(self) -> dict:
         plain_chat_node = {
@@ -205,7 +223,11 @@ class WorkflowEngine:
         inputs = self._resolve_inputs(node.get("inputs", {}), user_message, vars_scope)
         if "message" not in inputs and user_message:
             inputs["message"] = user_message
-        tool_result = self._invoke_tool(tool_name, inputs, adapters, history, context_id, conversation_id, user_message)
+        try:
+            tool_result = self._invoke_tool(tool_name, inputs, adapters, history, context_id, conversation_id, user_message)
+        except Exception as exc:
+            self.logger.error("tool_invoke_failed", tool=tool_name, error=str(exc))
+            tool_result = {"status": "error", "content": "tool execution failed", "error": str(exc)}
         outputs = {}
         for key in node.get("outputs", []) or []:
             if isinstance(tool_result, dict) and key in tool_result:
@@ -219,7 +241,11 @@ class WorkflowEngine:
             next_nodes_list = [n for n in next_nodes if n]
         else:
             next_nodes_list = []
-        result_payload: Dict[str, Any] = {"status": "ok", "outputs": outputs}
+        if isinstance(tool_result, dict) and tool_result.get("status") == "error":
+            err_next = node.get("on_error")
+            if err_next:
+                next_nodes_list = [err_next]
+        result_payload: Dict[str, Any] = {"status": tool_result.get("status", "ok") if isinstance(tool_result, dict) else "ok", "outputs": outputs}
         if isinstance(tool_result, dict):
             for k in ("content", "usage", "context_snippets"):
                 if k in tool_result:
@@ -237,41 +263,113 @@ class WorkflowEngine:
         user_message: str,
     ) -> Dict[str, Any]:
         tool_name = tool or "llm.generic"
-        if tool_name in {"llm.generic", "llm.generic_chat_v1"}:
-            message = inputs.get("message") or inputs.get("prompt") or inputs.get("text") or ""
-            if not message:
-                message = inputs.get("input") or ""
-            if not message:
-                message = inputs.get("question") or ""
-            if not message:
-                message = inputs.get("raw") or ""
-            if not message:
-                message = ""
-            ctx_chunks = self.rag.retrieve(inputs.get("context_id", context_id), message)
-            context_snippets = [c.text for c in ctx_chunks]
-            resp = self.llm.generate(message or "", adapters=adapters, context_snippets=context_snippets, history=history)
-            return {"content": resp["content"], "usage": resp["usage"], "context_snippets": context_snippets}
-        if tool_name == "rag.answer_with_context_v1":
-            question = inputs.get("question") or inputs.get("message") or ""
-            ctx_id = inputs.get("context_id") or context_id
-            chunks = self.rag.retrieve(ctx_id, question)
-            snippets = [c.text for c in chunks]
-            resp = self.llm.generate(question or "", adapters=adapters, context_snippets=snippets, history=history)
-            return {"content": resp["content"], "usage": resp["usage"], "context_snippets": snippets, "answer": resp["content"]}
-        if tool_name == "llm.intent_classifier_v1":
-            message = inputs.get("message") or user_message or ""
-            lowered = message.lower()
-            intent = "qa_with_docs" if "doc" in lowered or "file" in lowered else "analysis"
-            if "code" in lowered:
-                intent = "code_edit"
-            return {"intent": intent}
-        if tool_name == "agent.code_v1":
-            prompt = inputs.get("message") or inputs.get("prompt") or ""
-            resp = self.llm.generate(prompt or "", adapters=adapters, context_snippets=[], history=history)
-            return {"content": resp["content"], "usage": resp["usage"]}
-        if tool_name == "workflow.end":
-            return {"content": inputs.get("message", ""), "usage": {}}
-        return {"content": inputs.get("message", ""), "usage": {}}
+        tool_spec = self.tool_registry.get(tool_name)
+        timeout = tool_spec.get("timeout_seconds", 5) if tool_spec else 5
+        handler = self._builtin_tool_handlers().get(tool_name)
+        if tool_spec and not handler:
+            handler = self._builtin_tool_handlers().get(tool_spec.get("handler"))
+
+        def _run_handler() -> Dict[str, Any]:
+            if not handler:
+                return {"status": "error", "content": f"unknown tool {tool_name}"}
+            return handler(inputs, adapters, history, context_id, conversation_id, user_message)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_run_handler)
+            try:
+                return future.result(timeout=timeout)
+            except concurrent.futures.TimeoutError:
+                self.logger.warning("tool_timeout", tool=tool_name, timeout=timeout)
+                return {"status": "error", "content": "tool timed out", "error": "timeout"}
+
+    def _builtin_tool_handlers(self) -> Dict[str, Callable[[Dict[str, Any], List[dict], List[Any], Optional[str], Optional[str], str], Dict[str, Any]]]:
+        return {
+            "llm.generic": self._tool_llm_generic,
+            "llm.generic_chat_v1": self._tool_llm_generic,
+            "rag.answer_with_context_v1": self._tool_rag_answer,
+            "llm.intent_classifier_v1": self._tool_intent_classifier,
+            "agent.code_v1": self._tool_agent_code,
+            "workflow.end": self._tool_end,
+        }
+
+    def _tool_llm_generic(
+        self,
+        inputs: Dict[str, Any],
+        adapters: List[dict],
+        history: List[Any],
+        context_id: Optional[str],
+        conversation_id: Optional[str],
+        user_message: str,
+    ) -> Dict[str, Any]:
+        message = inputs.get("message") or inputs.get("prompt") or inputs.get("text") or ""
+        if not message:
+            message = inputs.get("input") or ""
+        if not message:
+            message = inputs.get("question") or ""
+        if not message:
+            message = inputs.get("raw") or ""
+        if not message:
+            message = ""
+        ctx_chunks = self.rag.retrieve(inputs.get("context_id", context_id), message)
+        context_snippets = [c.text for c in ctx_chunks]
+        resp = self.llm.generate(message or "", adapters=adapters, context_snippets=context_snippets, history=history)
+        return {"content": resp["content"], "usage": resp["usage"], "context_snippets": context_snippets}
+
+    def _tool_rag_answer(
+        self,
+        inputs: Dict[str, Any],
+        adapters: List[dict],
+        history: List[Any],
+        context_id: Optional[str],
+        conversation_id: Optional[str],
+        user_message: str,
+    ) -> Dict[str, Any]:
+        question = inputs.get("question") or inputs.get("message") or ""
+        ctx_id = inputs.get("context_id") or context_id
+        chunks = self.rag.retrieve(ctx_id, question)
+        snippets = [c.text for c in chunks]
+        resp = self.llm.generate(question or "", adapters=adapters, context_snippets=snippets, history=history)
+        return {"content": resp["content"], "usage": resp["usage"], "context_snippets": snippets, "answer": resp["content"]}
+
+    def _tool_intent_classifier(
+        self,
+        inputs: Dict[str, Any],
+        adapters: List[dict],
+        history: List[Any],
+        context_id: Optional[str],
+        conversation_id: Optional[str],
+        user_message: str,
+    ) -> Dict[str, Any]:
+        message = inputs.get("message") or user_message or ""
+        lowered = message.lower()
+        intent = "qa_with_docs" if "doc" in lowered or "file" in lowered else "analysis"
+        if "code" in lowered:
+            intent = "code_edit"
+        return {"intent": intent}
+
+    def _tool_agent_code(
+        self,
+        inputs: Dict[str, Any],
+        adapters: List[dict],
+        history: List[Any],
+        context_id: Optional[str],
+        conversation_id: Optional[str],
+        user_message: str,
+    ) -> Dict[str, Any]:
+        prompt = inputs.get("message") or inputs.get("prompt") or ""
+        resp = self.llm.generate(prompt or "", adapters=adapters, context_snippets=[], history=history)
+        return {"content": resp["content"], "usage": resp["usage"]}
+
+    def _tool_end(
+        self,
+        inputs: Dict[str, Any],
+        adapters: List[dict],
+        history: List[Any],
+        context_id: Optional[str],
+        conversation_id: Optional[str],
+        user_message: str,
+    ) -> Dict[str, Any]:
+        return {"content": inputs.get("message", ""), "usage": {}, "status": "end"}
 
     def _resolve_inputs(self, inputs: Dict[str, Any], user_message: str, vars_scope: Dict[str, Any]) -> Dict[str, Any]:
         def _resolve(val: Any) -> Any:
