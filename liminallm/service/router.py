@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
+from .sandbox import safe_eval_expr
+
 
 class RouterEngine:
     """Evaluate routing policy artifacts to choose adapters/tools."""
@@ -42,9 +44,12 @@ class RouterEngine:
             "adapters": adapters,
             "safety_risk": safety_risk,
             **self.safe_functions,
+            "true": True,
+            "false": False,
+            "none": None,
         }
         try:
-            return bool(eval(expr, {"__builtins__": {}}, local_scope))
+            return bool(safe_eval_expr(expr, local_scope))
         except Exception:
             return False
 

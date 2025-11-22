@@ -5,6 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
 from liminallm.service.router import RouterEngine
+from liminallm.service.sandbox import safe_eval_expr
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.postgres import PostgresStore
 
@@ -240,9 +241,9 @@ class WorkflowEngine:
     def _evaluate_condition(self, expr: Optional[str], user_message: str, vars_scope: Dict[str, Any]) -> bool:
         if not expr:
             return False
-        safe_globals: Dict[str, Any] = {"__builtins__": {}}
-        safe_locals = {"input": {"message": user_message}, "vars": vars_scope, "true": True, "false": False}
         try:
-            return bool(eval(expr, safe_globals, safe_locals))
+            return bool(
+                safe_eval_expr(expr, {"input": {"message": user_message}, "vars": vars_scope, "true": True, "false": False})
+            )
         except Exception:
             return False
