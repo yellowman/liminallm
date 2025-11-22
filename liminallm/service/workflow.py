@@ -94,7 +94,12 @@ class WorkflowEngine:
             "kind": "workflow.chat",
             "entrypoint": "plain_chat",
             "nodes": [
-                {"id": "plain_chat", "type": "tool_call", "tool": "llm.generic"},
+                {
+                    "id": "plain_chat",
+                    "type": "tool_call",
+                    "tool": "llm.generic",
+                    "inputs": {"message": "${input.message}"},
+                },
                 {"id": "end", "type": "end"},
             ],
         }
