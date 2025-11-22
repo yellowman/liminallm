@@ -66,7 +66,9 @@ class LLMService:
         mode = backend_mode or "api_adapters"
         if mode in {"local_lora", "local", "jax_lora"}:
             return LocalJaxLoRABackend(self.base_model, fs_root or "/srv/liminallm")
-        adapter_mode = mode if mode in {"api_adapters", "adapter_server"} else "api_adapters"
+        adapter_mode = "adapter_server" if mode == "adapter" else mode
+        if adapter_mode not in {"api_adapters", "adapter_server"}:
+            adapter_mode = "api_adapters"
         return ApiAdapterBackend(
             self.base_model,
             adapter_mode=adapter_mode,
