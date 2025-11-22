@@ -65,13 +65,13 @@ class ChatResponse(BaseModel):
     message_id: str
     conversation_id: str
     content: str
-    workflow_id: Optional[str]
-    adapters: List[str] = []
-    adapter_gates: List[dict] = []
-    usage: dict = {}
-    context_snippets: List[str] = []
-    routing_trace: List[dict] = []
-    workflow_trace: List[dict] = []
+    workflow_id: Optional[str] = None
+    adapters: List[str] = Field(default_factory=list)
+    adapter_gates: List[dict] = Field(default_factory=list)
+    usage: dict = Field(default_factory=dict)
+    context_snippets: List[str] = Field(default_factory=list)
+    routing_trace: List[dict] = Field(default_factory=list)
+    workflow_trace: List[dict] = Field(default_factory=list)
 
 
 class ArtifactRequest(BaseModel):
