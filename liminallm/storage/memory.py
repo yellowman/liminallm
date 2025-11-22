@@ -15,7 +15,9 @@ from liminallm.storage.models import (
     KnowledgeChunk,
     KnowledgeContext,
     Message,
+    PreferenceEvent,
     Session,
+    TrainingJob,
     User,
 )
 
@@ -34,6 +36,8 @@ class MemoryStore:
         self.config_patches: Dict[str, ConfigPatchAudit] = {}
         self.contexts: Dict[str, KnowledgeContext] = {}
         self.chunks: Dict[str, List[KnowledgeChunk]] = {}
+        self.preference_events: Dict[str, PreferenceEvent] = {}
+        self.training_jobs: Dict[str, TrainingJob] = {}
         self.fs_root = Path(fs_root)
         self.fs_root.mkdir(parents=True, exist_ok=True)
 
@@ -228,6 +232,103 @@ class MemoryStore:
         self._persist_state()
         return msg
 
+    # preference events
+    def record_preference_event(
+        self,
+        user_id: str,
+        conversation_id: str,
+        message_id: str,
+        feedback: str,
+        *,
+        score: Optional[float] = None,
+        corrected_text: Optional[str] = None,
+        weight: Optional[float] = None,
+        context_embedding: Optional[List[float]] = None,
+        cluster_id: Optional[str] = None,
+        context_text: Optional[str] = None,
+        meta: Optional[Dict] = None,
+    ) -> PreferenceEvent:
+        if user_id not in self.users:
+            raise ConstraintViolation("preference user missing", {"user_id": user_id})
+        if conversation_id not in self.conversations:
+            raise ConstraintViolation("preference conversation missing", {"conversation_id": conversation_id})
+        event_id = str(uuid.uuid4())
+        normalized_weight = weight if weight is not None else (score if score is not None else 1.0)
+        event = PreferenceEvent(
+            id=event_id,
+            user_id=user_id,
+            conversation_id=conversation_id,
+            message_id=message_id,
+            feedback=feedback,
+            score=score,
+            context_embedding=context_embedding or [],
+            cluster_id=cluster_id,
+            context_text=context_text,
+            corrected_text=corrected_text,
+            weight=normalized_weight,
+            meta=meta,
+        )
+        self.preference_events[event_id] = event
+        self._persist_state()
+        return event
+
+    def list_preference_events(self, user_id: Optional[str] = None, feedback: Optional[str] = None) -> List[PreferenceEvent]:
+        events = list(self.preference_events.values())
+        if user_id:
+            events = [e for e in events if e.user_id == user_id]
+        if feedback:
+            events = [e for e in events if e.feedback == feedback]
+        return sorted(events, key=lambda e: e.created_at)
+
+    # training jobs
+    def create_training_job(
+        self,
+        user_id: str,
+        adapter_id: str,
+        preference_event_ids: Optional[List[str]] = None,
+        dataset_path: Optional[str] = None,
+    ) -> TrainingJob:
+        if user_id not in self.users:
+            raise ConstraintViolation("training user missing", {"user_id": user_id})
+        job_id = str(uuid.uuid4())
+        job = TrainingJob(
+            id=job_id,
+            user_id=user_id,
+            adapter_id=adapter_id,
+            preference_event_ids=preference_event_ids or [],
+            dataset_path=dataset_path,
+        )
+        self.training_jobs[job_id] = job
+        self._persist_state()
+        return job
+
+    def update_training_job(
+        self,
+        job_id: str,
+        *,
+        status: Optional[str] = None,
+        loss: Optional[float] = None,
+        new_version: Optional[int] = None,
+        dataset_path: Optional[str] = None,
+        meta: Optional[Dict] = None,
+    ) -> Optional[TrainingJob]:
+        job = self.training_jobs.get(job_id)
+        if not job:
+            return None
+        if status:
+            job.status = status
+        if loss is not None:
+            job.loss = loss
+        if new_version is not None:
+            job.new_version = new_version
+        if dataset_path is not None:
+            job.dataset_path = dataset_path
+        if meta is not None:
+            job.meta = meta
+        job.updated_at = datetime.utcnow()
+        self._persist_state()
+        return job
+
     def list_messages(self, conversation_id: str, limit: int = 10) -> List[Message]:
         msgs = self.messages.get(conversation_id, [])
         return msgs[-limit:]
@@ -387,6 +488,8 @@ class MemoryStore:
             "config_patches": [self._serialize_config_patch(cp) for cp in self.config_patches.values()],
             "contexts": [self._serialize_context(ctx) for ctx in self.contexts.values()],
             "chunks": [self._serialize_chunk(ch) for chs in self.chunks.values() for ch in chs],
+            "preference_events": [self._serialize_preference_event(e) for e in self.preference_events.values()],
+            "training_jobs": [self._serialize_training_job(j) for j in self.training_jobs.values()],
         }
         path = self._state_path()
         path.write_text(json.dumps(state, indent=2))
@@ -423,6 +526,10 @@ class MemoryStore:
         for chunk_data in data.get("chunks", []):
             chunk = self._deserialize_chunk(chunk_data)
             self.chunks.setdefault(chunk.context_id, []).append(chunk)
+        self.preference_events = {
+            e["id"]: self._deserialize_preference_event(e) for e in data.get("preference_events", [])
+        }
+        self.training_jobs = {j["id"]: self._deserialize_training_job(j) for j in data.get("training_jobs", [])}
         return True
 
     def _serialize_user(self, user: User) -> dict:
@@ -642,5 +749,69 @@ class MemoryStore:
             embedding=data.get("embedding", []),
             seq=data.get("seq", 0),
             created_at=self._deserialize_datetime(data["created_at"]),
+            meta=data.get("meta"),
+        )
+
+    def _serialize_preference_event(self, event: PreferenceEvent) -> dict:
+        return {
+            "id": event.id,
+            "user_id": event.user_id,
+            "conversation_id": event.conversation_id,
+            "message_id": event.message_id,
+            "feedback": event.feedback,
+            "score": event.score,
+            "context_embedding": event.context_embedding,
+            "cluster_id": event.cluster_id,
+            "context_text": event.context_text,
+            "corrected_text": event.corrected_text,
+            "created_at": self._serialize_datetime(event.created_at),
+            "weight": event.weight,
+            "meta": event.meta,
+        }
+
+    def _deserialize_preference_event(self, data: dict) -> PreferenceEvent:
+        return PreferenceEvent(
+            id=data["id"],
+            user_id=data["user_id"],
+            conversation_id=data["conversation_id"],
+            message_id=data["message_id"],
+            feedback=data["feedback"],
+            score=data.get("score"),
+            context_embedding=data.get("context_embedding", []),
+            cluster_id=data.get("cluster_id"),
+            context_text=data.get("context_text"),
+            corrected_text=data.get("corrected_text"),
+            created_at=self._deserialize_datetime(data["created_at"]),
+            weight=float(data.get("weight", 1.0)),
+            meta=data.get("meta"),
+        )
+
+    def _serialize_training_job(self, job: TrainingJob) -> dict:
+        return {
+            "id": job.id,
+            "user_id": job.user_id,
+            "adapter_id": job.adapter_id,
+            "status": job.status,
+            "created_at": self._serialize_datetime(job.created_at),
+            "updated_at": self._serialize_datetime(job.updated_at),
+            "loss": job.loss,
+            "preference_event_ids": job.preference_event_ids,
+            "dataset_path": job.dataset_path,
+            "new_version": job.new_version,
+            "meta": job.meta,
+        }
+
+    def _deserialize_training_job(self, data: dict) -> TrainingJob:
+        return TrainingJob(
+            id=data["id"],
+            user_id=data["user_id"],
+            adapter_id=data["adapter_id"],
+            status=data.get("status", "pending"),
+            created_at=self._deserialize_datetime(data["created_at"]),
+            updated_at=self._deserialize_datetime(data.get("updated_at", data["created_at"])),
+            loss=data.get("loss"),
+            preference_event_ids=list(data.get("preference_event_ids", [])),
+            dataset_path=data.get("dataset_path"),
+            new_version=data.get("new_version"),
             meta=data.get("meta"),
         )

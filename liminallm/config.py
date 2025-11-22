@@ -11,6 +11,7 @@ class Settings(BaseSettings):
     shared_fs_root: str = Field("/srv/liminallm", env="SHARED_FS_ROOT")
     model_path: str = Field("gpt-4o-mini", env="MODEL_PATH")
     llm_mode: str = Field("cloud", env="LLM_MODE")
+    model_backend: str | None = Field("api_adapters", env="MODEL_BACKEND")
     openai_api_key: str | None = Field(None, env="OPENAI_API_KEY")
     openai_base_url: str | None = Field(None, env="OPENAI_BASE_URL")
     adapter_server_model: str | None = Field(None, env="ADAPTER_SERVER_MODEL")
