@@ -641,6 +641,7 @@ loop for a `training_job`:
       "id": "node_classify",
       "type": "tool_call",
       "tool": "llm.intent_classifier_v1",
+      "inputs": { "message": "${input.message}" },
       "outputs": ["intent"]
     },
     {
@@ -655,17 +656,20 @@ loop for a `training_job`:
     {
       "id": "node_rag",
       "type": "tool_call",
-      "tool": "rag.answer_with_context_v1"
+      "tool": "rag.answer_with_context_v1",
+      "inputs": { "message": "${input.message}" }
     },
     {
       "id": "node_code_agent",
       "type": "tool_call",
-      "tool": "agent.code_v1"
+      "tool": "agent.code_v1",
+      "inputs": { "message": "${input.message}" }
     },
     {
       "id": "node_plain",
       "type": "tool_call",
-      "tool": "llm.generic_chat_v1"
+      "tool": "llm.generic_chat_v1",
+      "inputs": { "message": "${input.message}" }
     }
   ]
 }

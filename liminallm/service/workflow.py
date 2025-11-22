@@ -90,7 +90,25 @@ class WorkflowEngine:
             "vars": vars_scope,
         }
 
+    def _merge_usage(self, accum: Dict[str, Any], new_usage: Dict[str, Any]) -> Dict[str, Any]:
+        merged = dict(accum)
+        for key, value in new_usage.items():
+            if isinstance(value, (int, float)):
+                merged[key] = merged.get(key, 0) + value
+            else:
+                merged[key] = value
+        return merged
+
     def _default_workflow(self) -> dict:
+        plain_chat_node = {
+            "id": "plain_chat",
+            "type": "tool_call",
+            "tool": "llm.generic",
+            # forward the user message so llm.generic doesn't receive an empty payload
+            "inputs": {"message": "${input.message}"},
+            "next": "end",
+        }
+
         return {
             "kind": "workflow.chat",
             "entrypoint": "plain_chat",
