@@ -162,7 +162,7 @@ class ApiAdapterBackend:
 
     def _resolve_extra_body(self, adapters: List[dict]) -> Optional[dict]:
         if self._uses_adapter_id(adapters):
-            adapter_ids = [a.get("id") for a in adapters if a.get("id")]
+            adapter_ids = [a.get("id") for a in adapters if a.get("id") and not self._is_prompt_style(a)]
             if adapter_ids:
                 return {"adapter_id": adapter_ids}
         return None

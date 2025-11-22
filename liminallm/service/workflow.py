@@ -165,7 +165,8 @@ class WorkflowEngine:
         routing = self.router.route(policy or {}, context_embedding, candidates, ctx_cluster=ctx_cluster)
         gates = routing.get("adapters", []) if isinstance(routing, dict) else []
         activated_ids = [gate.get("id", "") for gate in gates if gate.get("id")]
-        activated_adapters = [c for c in candidates if c.get("id") in activated_ids]
+        candidate_lookup = {c.get("id"): c for c in candidates if c.get("id")}
+        activated_adapters = [candidate_lookup[a_id] for a_id in activated_ids if a_id in candidate_lookup]
         return activated_adapters, routing.get("trace", []) if isinstance(routing, dict) else [], gates
 
     def _align_vectors(self, a: List[float], b: List[float]) -> Tuple[List[float], List[float]]:
