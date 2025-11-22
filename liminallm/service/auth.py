@@ -18,6 +18,7 @@ class AuthService:
     def __init__(self, store: PostgresStore | MemoryStore, cache: Optional[RedisCache] = None) -> None:
         self.store = store
         self.cache = cache
+        self._mfa_challenges: dict[str, tuple[str, datetime]] = {}
 
     async def signup(self, email: str, password: str, handle: Optional[str] = None) -> tuple[User, Session]:
         user = self.store.create_user(email=email, handle=handle)
@@ -59,13 +60,39 @@ class AuthService:
             return sess.user_id
         return None
 
-    def issue_mfa_challenge(self, user_id: str) -> str:
+    async def issue_mfa_challenge(self, user_id: str) -> str:
         code = hashlib.sha256(f"{user_id}-{os.urandom(6)}".encode()).hexdigest()[:6]
+        expires_at = datetime.utcnow() + timedelta(minutes=5)
+        ttl = int((expires_at - datetime.utcnow()).total_seconds())
+        if self.cache:
+            await self.cache.client.set(f"mfa:{user_id}", code, ex=ttl)
+        else:
+            self._mfa_challenges[user_id] = (code, expires_at)
         # A real implementation would deliver this via SMS/email; here we just return it
         return code
 
-    def verify_mfa_challenge(self, user_id: str, code: str, expected: str) -> bool:
-        return code == expected
+    async def verify_mfa_challenge(self, user_id: str, code: str) -> bool:
+        expected: Optional[str | bytes] = None
+        expires_at: Optional[datetime] = None
+        if self.cache:
+            expected = await self.cache.client.get(f"mfa:{user_id}")
+        else:
+            if user_id in self._mfa_challenges:
+                expected, expires_at = self._mfa_challenges[user_id]
+        if not expected:
+            return False
+        if expires_at and expires_at < datetime.utcnow():
+            self._mfa_challenges.pop(user_id, None)
+            return False
+        if isinstance(expected, bytes):
+            expected = expected.decode()
+        if not hmac.compare_digest(code, expected):
+            return False
+        if self.cache:
+            await self.cache.client.delete(f"mfa:{user_id}")
+        else:
+            self._mfa_challenges.pop(user_id, None)
+        return True
 
     async def initiate_password_reset(self, email: str) -> str:
         token = hashlib.sha256(f"reset-{email}-{os.urandom(6)}".encode()).hexdigest()
