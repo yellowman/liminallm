@@ -253,7 +253,7 @@ async def upload_file(
         try:
             chunk_count = runtime.rag.ingest_file(context_id, str(dest_path))
         except ConstraintViolation as err:
-            raise HTTPException(status_code=404, detail=err.message)
+            raise HTTPException(status_code=409, detail=err.message)
     resp = FileUploadResponse(fs_path=str(dest_path), context_id=context_id, chunk_count=chunk_count)
     return Envelope(status="ok", data=resp)
 
