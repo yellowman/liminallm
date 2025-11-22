@@ -7,6 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Sequence
 
+from liminallm.service.embeddings import deterministic_embedding
 from liminallm.service.fs import safe_join
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import Artifact, PreferenceEvent
@@ -19,11 +20,13 @@ class TrainingService:
         self.store = store
         self.fs_root = Path(fs_root)
 
-    def ensure_user_adapter(self, user_id: str, *, rank: int = 4) -> Artifact:
+    def ensure_user_adapter(self, user_id: str, *, rank: int = 4, adapter_id_override: Optional[str] = None) -> Artifact:
         existing = [a for a in self.store.list_artifacts(type_filter="adapter") if a.owner_user_id == user_id]
+        if adapter_id_override:
+            existing = [a for a in existing if a.id == adapter_id_override] or existing
         if existing:
             return existing[0]
-        adapter_id = None
+        adapter_id = adapter_id_override
         adapter_schema = {
             "kind": "adapter.lora",
             "backend": "local",
@@ -49,11 +52,13 @@ class TrainingService:
         self.store.update_artifact(adapter.id, adapter_schema)
         return self.store.get_artifact(adapter.id) or adapter
 
-    def train_from_preferences(self, user_id: str, adapter_id: Optional[str] = None) -> Optional[dict]:
+    def train_from_preferences(
+        self, user_id: str, adapter_id: Optional[str] = None, cluster_id: Optional[str] = None
+    ) -> Optional[dict]:
         adapter = self.ensure_user_adapter(user_id) if not adapter_id else self.store.get_artifact(adapter_id)
         if not adapter:
             raise ConstraintViolation("adapter missing", {"adapter_id": adapter_id})
-        events = self.store.list_preference_events(user_id=user_id, feedback="positive")
+        events = self.store.list_preference_events(user_id=user_id, feedback="positive", cluster_id=cluster_id)
         if not events:
             return None
         cluster_meta = self._cluster_events(events, user_id)
@@ -122,6 +127,37 @@ class TrainingService:
             "jax_trace": training_trace,
             "clusters": cluster_meta,
         }
+
+    def record_feedback_event(
+        self,
+        *,
+        user_id: str,
+        conversation_id: str,
+        message_id: str,
+        feedback: str,
+        score: Optional[float] = None,
+        context_text: Optional[str] = None,
+        corrected_text: Optional[str] = None,
+        weight: Optional[float] = None,
+    ) -> PreferenceEvent:
+        embedding = deterministic_embedding(context_text or "")
+        event = self.store.record_preference_event(
+            user_id=user_id,
+            conversation_id=conversation_id,
+            message_id=message_id,
+            feedback=feedback,
+            score=score,
+            corrected_text=corrected_text,
+            context_text=context_text,
+            weight=weight,
+            context_embedding=embedding,
+        )
+        if feedback in {"positive", "like"}:
+            adapter = self.ensure_user_adapter(user_id)
+            self.store.create_training_job(
+                user_id=user_id, adapter_id=adapter.id, preference_event_ids=[event.id], dataset_path=None
+            )
+        return event
 
     def _build_examples(self, events: Iterable[PreferenceEvent]) -> Iterable[dict]:
         for event in events:

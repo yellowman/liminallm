@@ -19,9 +19,11 @@ from liminallm.storage.models import (
     KnowledgeContext,
     Message,
     PreferenceEvent,
+    SemanticCluster,
     Session,
     TrainingJob,
     User,
+    UserMFAConfig,
 )
 
 
@@ -34,6 +36,9 @@ class PostgresStore:
         self.fs_root.mkdir(parents=True, exist_ok=True)
         self.preference_events: dict[str, PreferenceEvent] = {}
         self.training_jobs: dict[str, TrainingJob] = {}
+        self.semantic_clusters: dict[str, SemanticCluster] = {}
+        self.mfa_secrets: dict[str, UserMFAConfig] = {}
+        self.sessions: dict[str, Session] = {}
         self._load_training_state()
 
     def _connect(self):
@@ -48,6 +53,7 @@ class PostgresStore:
         feedback: str,
         *,
         score: float | None = None,
+        explicit_signal: str | None = None,
         corrected_text: str | None = None,
         weight: float | None = None,
         context_embedding: list[float] | None = None,
@@ -63,6 +69,7 @@ class PostgresStore:
             message_id=message_id,
             feedback=feedback,
             score=score,
+            explicit_signal=explicit_signal,
             context_embedding=context_embedding or [],
             cluster_id=cluster_id,
             context_text=context_text,
@@ -74,13 +81,126 @@ class PostgresStore:
         self._persist_training_state()
         return event
 
-    def list_preference_events(self, user_id: str | None = None, feedback: str | None = None) -> list[PreferenceEvent]:
+    def list_preference_events(
+        self, user_id: str | None = None, feedback: str | None = None, cluster_id: str | None = None
+    ) -> list[PreferenceEvent]:
         events = list(self.preference_events.values())
         if user_id:
             events = [e for e in events if e.user_id == user_id]
         if feedback:
             events = [e for e in events if e.feedback == feedback]
+        if cluster_id:
+            events = [e for e in events if e.cluster_id == cluster_id]
         return sorted(events, key=lambda e: e.created_at)
+
+    def update_preference_event(self, event_id: str, *, cluster_id: str | None = None) -> PreferenceEvent | None:
+        event = self.preference_events.get(event_id)
+        if not event:
+            return None
+        if cluster_id:
+            event.cluster_id = cluster_id
+        self._persist_training_state()
+        return event
+
+    # semantic clusters
+    def upsert_semantic_cluster(
+        self,
+        *,
+        cluster_id: str | None = None,
+        user_id: str | None,
+        centroid: list[float],
+        size: int,
+        label: str | None = None,
+        description: str | None = None,
+        sample_message_ids: list[str] | None = None,
+        meta: dict | None = None,
+    ) -> SemanticCluster:
+        cid = cluster_id or str(uuid.uuid4())
+        now = datetime.utcnow()
+        existing = self.semantic_clusters.get(cid)
+        created_at = existing.created_at if existing else now
+        cluster = SemanticCluster(
+            id=cid,
+            user_id=user_id,
+            centroid=list(centroid),
+            size=size,
+            label=label if label is not None else (existing.label if existing else None),
+            description=description if description is not None else (existing.description if existing else None),
+            sample_message_ids=sample_message_ids or (existing.sample_message_ids if existing else []),
+            created_at=created_at,
+            updated_at=now,
+            meta=meta or (existing.meta if existing else None),
+        )
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO semantic_cluster (id, user_id, centroid, size, label, description, sample_message_ids, meta, created_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE
+                    SET centroid = EXCLUDED.centroid,
+                        size = EXCLUDED.size,
+                        label = COALESCE(EXCLUDED.label, semantic_cluster.label),
+                        description = COALESCE(EXCLUDED.description, semantic_cluster.description),
+                        sample_message_ids = EXCLUDED.sample_message_ids,
+                        meta = EXCLUDED.meta,
+                        updated_at = now()
+                    """,
+                    (
+                        cid,
+                        user_id,
+                        cluster.centroid,
+                        size,
+                        cluster.label,
+                        cluster.description,
+                        cluster.sample_message_ids,
+                        cluster.meta,
+                        created_at,
+                        now,
+                    ),
+                )
+        except Exception:
+            pass
+        self.semantic_clusters[cid] = cluster
+        self._persist_training_state()
+        return cluster
+
+    def update_semantic_cluster(
+        self,
+        cluster_id: str,
+        *,
+        label: str | None = None,
+        description: str | None = None,
+        centroid: list[float] | None = None,
+        size: int | None = None,
+        meta: dict | None = None,
+    ) -> SemanticCluster | None:
+        cluster = self.semantic_clusters.get(cluster_id)
+        if not cluster:
+            return None
+        if label is not None:
+            cluster.label = label
+        if description is not None:
+            cluster.description = description
+        if centroid is not None:
+            cluster.centroid = list(centroid)
+        if size is not None:
+            cluster.size = size
+        if meta is not None:
+            cluster.meta = meta
+        cluster.updated_at = datetime.utcnow()
+        self.semantic_clusters[cluster_id] = cluster
+        self._persist_training_state()
+        return cluster
+
+    def list_semantic_clusters(self, user_id: str | None = None) -> list[SemanticCluster]:
+        clusters = list(self.semantic_clusters.values())
+        if user_id:
+            clusters = [c for c in clusters if c.user_id == user_id]
+        return sorted(clusters, key=lambda c: c.updated_at, reverse=True)
+
+    def get_semantic_cluster(self, cluster_id: str) -> SemanticCluster | None:
+        return self.semantic_clusters.get(cluster_id)
 
     def create_training_job(
         self,
@@ -163,6 +283,46 @@ class PostgresStore:
             return None
         return str(row["password_hash"]), str(row["password_algo"])
 
+    def set_user_mfa_secret(self, user_id: str, secret: str, enabled: bool = False) -> UserMFAConfig:
+        record = UserMFAConfig(user_id=user_id, secret=secret, enabled=enabled)
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO user_mfa_secret (user_id, secret, enabled, created_at)
+                    VALUES (%s, %s, %s, now())
+                    ON CONFLICT (user_id) DO UPDATE SET secret = EXCLUDED.secret, enabled = EXCLUDED.enabled
+                    """,
+                    (user_id, secret, enabled),
+                )
+        except Exception:
+            pass
+        self.mfa_secrets[user_id] = record
+        self._persist_training_state()
+        return record
+
+    def get_user_mfa_secret(self, user_id: str) -> Optional[UserMFAConfig]:
+        if user_id in self.mfa_secrets:
+            return self.mfa_secrets[user_id]
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM user_mfa_secret WHERE user_id = %s", (user_id,)
+                ).fetchone()
+            if row:
+                cfg = UserMFAConfig(
+                    user_id=row["user_id"],
+                    secret=row["secret"],
+                    enabled=bool(row.get("enabled", False)),
+                    created_at=row.get("created_at", datetime.utcnow()),
+                    meta=row.get("meta"),
+                )
+                self.mfa_secrets[user_id] = cfg
+                return cfg
+        except Exception:
+            return None
+        return None
+
     def get_user_by_email(self, email: str) -> Optional[User]:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM app_user WHERE email = %s", (email,)).fetchone()
@@ -179,13 +339,18 @@ class PostgresStore:
         )
 
     # sessions
-    def create_session(self, user_id: str, ttl_minutes: int = 60 * 24, user_agent: str | None = None, ip_addr: str | None = None) -> Session:
-        sess = Session.new(user_id=user_id, ttl_minutes=ttl_minutes, user_agent=user_agent, ip_addr=ip_addr)
+    def create_session(
+        self, user_id: str, ttl_minutes: int = 60 * 24, user_agent: str | None = None, ip_addr: str | None = None, *, mfa_required: bool = False
+    ) -> Session:
+        sess = Session.new(user_id=user_id, ttl_minutes=ttl_minutes, user_agent=user_agent, ip_addr=ip_addr, mfa_required=mfa_required)
         try:
             with self._connect() as conn:
                 conn.execute(
-                    "INSERT INTO auth_session (id, user_id, created_at, expires_at, user_agent, ip_addr) VALUES (%s, %s, %s, %s, %s, %s)",
-                    (sess.id, sess.user_id, sess.created_at, sess.expires_at, user_agent, ip_addr),
+                    """
+                    INSERT INTO auth_session (id, user_id, created_at, expires_at, user_agent, ip_addr, mfa_required, mfa_verified)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (sess.id, sess.user_id, sess.created_at, sess.expires_at, user_agent, ip_addr, mfa_required, sess.mfa_verified),
                 )
         except errors.ForeignKeyViolation:
             raise ConstraintViolation("session user missing", {"user_id": user_id})
@@ -195,20 +360,38 @@ class PostgresStore:
         with self._connect() as conn:
             conn.execute("DELETE FROM auth_session WHERE id = %s", (session_id,))
 
+    def mark_session_verified(self, session_id: str) -> None:
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE auth_session SET mfa_verified = TRUE, mfa_required = TRUE WHERE id = %s",
+                    (session_id,),
+                )
+        except Exception:
+            pass
+        sess = self.sessions.get(session_id)
+        if sess:
+            sess.mfa_verified = True
+            sess.mfa_required = True
+
     def get_session(self, session_id: str) -> Optional[Session]:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM auth_session WHERE id = %s", (session_id,)).fetchone()
         if not row:
             return None
-        return Session(
+        sess = Session(
             id=str(row["id"]),
             user_id=str(row["user_id"]),
             created_at=row.get("created_at", datetime.utcnow()),
             expires_at=row.get("expires_at", datetime.utcnow()),
             user_agent=row.get("user_agent"),
             ip_addr=row.get("ip_addr"),
+            mfa_required=row.get("mfa_required", False),
+            mfa_verified=row.get("mfa_verified", False),
             meta=row.get("meta"),
         )
+        self.sessions[sess.id] = sess
+        return sess
 
     # conversations
     def create_conversation(self, user_id: str, title: Optional[str] = None, active_context_id: Optional[str] = None) -> Conversation:
@@ -493,6 +676,7 @@ class PostgresStore:
                     "message_id": e.message_id,
                     "feedback": e.feedback,
                     "score": e.score,
+                    "explicit_signal": e.explicit_signal,
                     "context_embedding": e.context_embedding,
                     "cluster_id": e.cluster_id,
                     "context_text": e.context_text,
@@ -519,6 +703,31 @@ class PostgresStore:
                 }
                 for j in self.training_jobs.values()
             ],
+            "semantic_clusters": [
+                {
+                    "id": c.id,
+                    "user_id": c.user_id,
+                    "centroid": c.centroid,
+                    "size": c.size,
+                    "label": c.label,
+                    "description": c.description,
+                    "sample_message_ids": c.sample_message_ids,
+                    "created_at": c.created_at.isoformat(),
+                    "updated_at": c.updated_at.isoformat(),
+                    "meta": c.meta,
+                }
+                for c in self.semantic_clusters.values()
+            ],
+            "mfa_secrets": [
+                {
+                    "user_id": cfg.user_id,
+                    "secret": cfg.secret,
+                    "enabled": cfg.enabled,
+                    "created_at": cfg.created_at.isoformat(),
+                    "meta": cfg.meta,
+                }
+                for cfg in self.mfa_secrets.values()
+            ],
         }
         self._training_state_path().write_text(json.dumps(data, indent=2))
 
@@ -535,6 +744,7 @@ class PostgresStore:
                 message_id=e["message_id"],
                 feedback=e["feedback"],
                 score=e.get("score"),
+                explicit_signal=e.get("explicit_signal"),
                 context_embedding=e.get("context_embedding", []),
                 cluster_id=e.get("cluster_id"),
                 context_text=e.get("context_text"),
@@ -550,7 +760,7 @@ class PostgresStore:
                 id=j["id"],
                 user_id=j["user_id"],
                 adapter_id=j["adapter_id"],
-                status=j.get("status", "pending"),
+                status=j.get("status", "queued"),
                 created_at=datetime.fromisoformat(j["created_at"]),
                 updated_at=datetime.fromisoformat(j.get("updated_at", j["created_at"])),
                 loss=j.get("loss"),
@@ -560,4 +770,29 @@ class PostgresStore:
                 meta=j.get("meta"),
             )
             for j in raw.get("training_jobs", [])
+        }
+        self.semantic_clusters = {
+            c["id"]: SemanticCluster(
+                id=c["id"],
+                user_id=c.get("user_id"),
+                centroid=c.get("centroid", []),
+                size=c.get("size", 0),
+                label=c.get("label"),
+                description=c.get("description"),
+                sample_message_ids=list(c.get("sample_message_ids", [])),
+                created_at=datetime.fromisoformat(c.get("created_at", datetime.utcnow().isoformat())),
+                updated_at=datetime.fromisoformat(c.get("updated_at", datetime.utcnow().isoformat())),
+                meta=c.get("meta"),
+            )
+            for c in raw.get("semantic_clusters", [])
+        }
+        self.mfa_secrets = {
+            cfg["user_id"]: UserMFAConfig(
+                user_id=cfg["user_id"],
+                secret=cfg["secret"],
+                enabled=bool(cfg.get("enabled", False)),
+                created_at=datetime.fromisoformat(cfg.get("created_at", datetime.utcnow().isoformat())),
+                meta=cfg.get("meta"),
+            )
+            for cfg in raw.get("mfa_secrets", [])
         }

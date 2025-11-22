@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     use_memory_store: bool = Field(False, env="USE_MEMORY_STORE")
     chat_rate_limit_per_minute: int = Field(60, env="CHAT_RATE_LIMIT_PER_MINUTE")
     chat_rate_limit_window_seconds: int = Field(60, env="CHAT_RATE_LIMIT_WINDOW_SECONDS")
+    enable_mfa: bool = Field(True, env="ENABLE_MFA")
 
     class Config:
         env_file = ".env"

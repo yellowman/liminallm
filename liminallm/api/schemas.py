@@ -3,6 +3,9 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any, List, Optional
 
+from datetime import datetime
+from typing import Any, List, Optional
+
 from pydantic import BaseModel, Field
 
 
@@ -22,11 +25,13 @@ class AuthResponse(BaseModel):
     user_id: str
     session_id: str
     session_expires_at: datetime
+    mfa_required: bool = False
 
 
 class LoginRequest(BaseModel):
     email: str
     password: str
+    mfa_code: Optional[str] = None
 
 
 class MFARequest(BaseModel):
@@ -154,3 +159,21 @@ class FileUploadResponse(BaseModel):
     fs_path: str
     context_id: Optional[str] = None
     chunk_count: Optional[int] = None
+
+
+class PreferenceEventRequest(BaseModel):
+    conversation_id: str
+    message_id: str
+    feedback: str = Field(..., pattern="^(positive|negative|neutral|like|dislike)$")
+    explicit_signal: Optional[str] = None
+    score: Optional[float] = None
+    context_text: Optional[str] = None
+    corrected_text: Optional[str] = None
+    weight: Optional[float] = None
+
+
+class PreferenceEventResponse(BaseModel):
+    id: str
+    cluster_id: Optional[str] = None
+    feedback: str
+    created_at: datetime
