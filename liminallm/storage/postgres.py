@@ -9,7 +9,10 @@ from typing import Any, Iterable, List, Optional
 import psycopg
 from psycopg import errors
 from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
 
+from liminallm.logging import get_logger
+from liminallm.service.artifact_validation import ArtifactValidationError, validate_artifact
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
     Artifact,
@@ -34,6 +37,8 @@ class PostgresStore:
         self.dsn = dsn
         self.fs_root = Path(fs_root)
         self.fs_root.mkdir(parents=True, exist_ok=True)
+        self.logger = get_logger(__name__)
+        self.pool = ConnectionPool(self.dsn, min_size=2, max_size=10, kwargs={"row_factory": dict_row, "autocommit": True})
         self.preference_events: dict[str, PreferenceEvent] = {}
         self.training_jobs: dict[str, TrainingJob] = {}
         self.semantic_clusters: dict[str, SemanticCluster] = {}
@@ -42,7 +47,7 @@ class PostgresStore:
         self._load_training_state()
 
     def _connect(self):
-        return psycopg.connect(self.dsn, autocommit=True, row_factory=dict_row)
+        return self.pool.connection()
 
     # preference events (filesystem-backed placeholder until full tables exist)
     def record_preference_event(
@@ -159,8 +164,8 @@ class PostgresStore:
                         now,
                     ),
                 )
-        except Exception:
-            pass
+        except Exception as exc:  # pragma: no cover - best effort persistence
+            self.logger.warning("semantic_cluster_upsert_failed", error=str(exc))
         self.semantic_clusters[cid] = cluster
         self._persist_training_state()
         return cluster
@@ -295,8 +300,8 @@ class PostgresStore:
                     """,
                     (user_id, secret, enabled),
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            self.logger.warning("set_user_mfa_secret_failed", error=str(exc))
         self.mfa_secrets[user_id] = record
         self._persist_training_state()
         return record
@@ -319,7 +324,8 @@ class PostgresStore:
                 )
                 self.mfa_secrets[user_id] = cfg
                 return cfg
-        except Exception:
+        except Exception as exc:
+            self.logger.warning("get_user_mfa_secret_failed", error=str(exc))
             return None
         return None
 
@@ -367,8 +373,8 @@ class PostgresStore:
                     "UPDATE auth_session SET mfa_verified = TRUE, mfa_required = TRUE WHERE id = %s",
                     (session_id,),
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            self.logger.warning("mark_session_verified_failed", error=str(exc))
         sess = self.sessions.get(session_id)
         if sess:
             sess.mfa_verified = True
@@ -506,7 +512,8 @@ class PostgresStore:
         if isinstance(schema, str):
             try:
                 schema = json.loads(schema)
-            except Exception:
+            except Exception as exc:
+                self.logger.warning("artifact_schema_parse_failed", error=str(exc))
                 schema = {}
         return Artifact(
             id=str(row["id"]),
@@ -523,6 +530,11 @@ class PostgresStore:
         )
 
     def create_artifact(self, type_: str, name: str, schema: dict, description: str = "", owner_user_id: Optional[str] = None) -> Artifact:
+        try:
+            validate_artifact(type_, schema)
+        except ArtifactValidationError as exc:
+            self.logger.warning("artifact_validation_failed", errors=exc.errors)
+            raise
         artifact_id = str(uuid.uuid4())
         fs_path = self._persist_payload(artifact_id, 1, schema)
         try:
@@ -548,6 +560,11 @@ class PostgresStore:
         )
 
     def update_artifact(self, artifact_id: str, schema: dict, description: Optional[str] = None) -> Optional[Artifact]:
+        try:
+            validate_artifact("workflow" if schema.get("kind") == "workflow.chat" else "tool" if schema.get("kind") == "tool.spec" else "artifact", schema)  # type: ignore[arg-type]
+        except ArtifactValidationError as exc:
+            self.logger.warning("artifact_validation_failed", errors=exc.errors)
+            raise
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM artifact WHERE id = %s", (artifact_id,)).fetchone()
             if not row:
@@ -620,7 +637,8 @@ class PostgresStore:
             if isinstance(existing_meta, str):
                 try:
                     existing_meta = json.loads(existing_meta)
-                except Exception:
+                except Exception as exc:
+                    self.logger.warning("config_patch_meta_parse_failed", error=str(exc))
                     existing_meta = {}
             merged_meta: Dict = dict(existing_meta)
             if meta:
@@ -643,7 +661,8 @@ class PostgresStore:
         if isinstance(meta, str):
             try:
                 meta = json.loads(meta)
-            except Exception:
+            except Exception as exc:
+                self.logger.warning("config_patch_meta_parse_failed", error=str(exc))
                 meta = {}
         decided_at = None
         applied_at = None
