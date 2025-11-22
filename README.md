@@ -129,9 +129,7 @@ for v1 these can all live in one python app with clear module boundaries.
   - filesystem-backed LoRA adapter training that turns preference events into new adapter versions
   - preference capture with clustering + skill adapter promotion and routing integration
   - MFA with TOTP enrollment (otpauth URL), session gating, and login verification
-- **partially implemented**
   - preference UI and rich routing feedback loop
-- **not implemented yet**
   - LLM-as-architect auto-patch generation
   - voice interface
   - admin UI for patch approval

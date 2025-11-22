@@ -114,6 +114,8 @@ class ConfigPatchAudit:
     status: str = "pending"
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
+    decided_at: Optional[datetime] = None
+    applied_at: Optional[datetime] = None
     meta: Dict | None = None
 
 

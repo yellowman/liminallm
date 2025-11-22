@@ -4,7 +4,7 @@ import json
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, List, Optional
+from typing import Any, Iterable, List, Optional
 
 import psycopg
 from psycopg import errors
@@ -566,6 +566,91 @@ class PostgresStore:
                 (audit_id, artifact_id, proposer_user_id, json.dumps(patch), justification, "pending", now, now),
             )
         return ConfigPatchAudit(id=audit_id, artifact_id=artifact_id, proposer_user_id=proposer_user_id, patch=patch, justification=justification, created_at=now, updated_at=now)
+
+    def get_config_patch(self, patch_id: str) -> Optional[ConfigPatchAudit]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM config_patch WHERE id = %s", (patch_id,)).fetchone()
+        return self._config_patch_from_row(row) if row else None
+
+    def list_config_patches(self, status: Optional[str] = None) -> List[ConfigPatchAudit]:
+        query = "SELECT * FROM config_patch"
+        params: tuple = ()
+        if status:
+            query += " WHERE status = %s"
+            params = (status,)
+        query += " ORDER BY created_at DESC"
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._config_patch_from_row(row) for row in rows]
+
+    def update_config_patch_status(
+        self, patch_id: str, status: str, *, meta: Optional[Dict] = None, mark_decided: bool = False, mark_applied: bool = False
+    ) -> Optional[ConfigPatchAudit]:
+        with self._connect() as conn:
+            existing = conn.execute("SELECT * FROM config_patch WHERE id = %s", (patch_id,)).fetchone()
+            if not existing:
+                return None
+            now = datetime.utcnow()
+            existing_meta = existing.get("meta") or {}
+            if isinstance(existing_meta, str):
+                try:
+                    existing_meta = json.loads(existing_meta)
+                except Exception:
+                    existing_meta = {}
+            merged_meta: Dict = dict(existing_meta)
+            if meta:
+                merged_meta.update(meta)
+            if mark_decided and "decided_at" not in merged_meta:
+                merged_meta["decided_at"] = now.isoformat()
+            if mark_applied:
+                merged_meta["applied_at"] = now.isoformat()
+            conn.execute(
+                "UPDATE config_patch SET status = %s, updated_at = %s, meta = %s WHERE id = %s",
+                (status, now, json.dumps(merged_meta), patch_id),
+            )
+            row = conn.execute("SELECT * FROM config_patch WHERE id = %s", (patch_id,)).fetchone()
+        return self._config_patch_from_row(row) if row else None
+
+    def _config_patch_from_row(self, row) -> ConfigPatchAudit:
+        raw_patch = row.get("patch") if isinstance(row, dict) else row["patch"]
+        patch_data = raw_patch if isinstance(raw_patch, dict) else json.loads(raw_patch or "{}")
+        meta = row.get("meta") if isinstance(row, dict) else row.get("meta")
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = {}
+        decided_at = None
+        applied_at = None
+        if isinstance(meta, dict):
+            decided_at = self._parse_ts(meta.get("decided_at"))
+            applied_at = self._parse_ts(meta.get("applied_at"))
+        created = row.get("created_at") if isinstance(row, dict) else row["created_at"]
+        updated = row.get("updated_at") if isinstance(row, dict) else row["updated_at"]
+        return ConfigPatchAudit(
+            id=str(row["id"]),
+            artifact_id=str(row["artifact_id"]),
+            proposer_user_id=(str(row["proposer_user_id"]) if row.get("proposer_user_id") else None) if isinstance(row, dict) else (str(row["proposer_user_id"]) if row["proposer_user_id"] else None),
+            patch=patch_data,
+            justification=row.get("justification") if isinstance(row, dict) else row["justification"],
+            status=row.get("status", "pending") if isinstance(row, dict) else row["status"],
+            created_at=created if isinstance(created, datetime) else datetime.fromisoformat(str(created)),
+            updated_at=updated if isinstance(updated, datetime) else datetime.fromisoformat(str(updated)),
+            decided_at=decided_at,
+            applied_at=applied_at,
+            meta=meta if isinstance(meta, dict) else {},
+        )
+
+    @staticmethod
+    def _parse_ts(value: Optional[Any]) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            return value
+        if isinstance(value, str):
+            try:
+                return datetime.fromisoformat(value)
+            except ValueError:
+                return None
+        return None
 
     def get_runtime_config(self) -> dict:
         """Return deployment config sourced from SQL (placeholder until admin UI writes it)."""

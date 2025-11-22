@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from liminallm.config import get_settings
+from liminallm.service.config_ops import ConfigOpsService
 from liminallm.service.auth import AuthService
 from liminallm.service.clustering import SemanticClusterer
 from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
 from liminallm.service.router import RouterEngine
 from liminallm.service.training import TrainingService
+from liminallm.service.voice import VoiceService
 from liminallm.service.workflow import WorkflowEngine
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.postgres import PostgresStore
@@ -53,6 +55,8 @@ class Runtime:
         self.training = TrainingService(self.store, self.settings.shared_fs_root)
         self.clusterer = SemanticClusterer(self.store, self.llm, self.training)
         self.workflow = WorkflowEngine(self.store, self.llm, self.router, self.rag)
+        self.voice = VoiceService(self.settings.shared_fs_root)
+        self.config_ops = ConfigOpsService(self.store, self.llm, self.router, self.training)
         self.auth = AuthService(self.store, self.cache, mfa_enabled=self.settings.enable_mfa)
 
 

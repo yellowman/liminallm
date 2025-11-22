@@ -107,6 +107,9 @@ class ConfigPatchAuditResponse(BaseModel):
     justification: Optional[str]
     status: str
     patch: dict
+    decided_at: Optional[datetime] = None
+    applied_at: Optional[datetime] = None
+    meta: Optional[dict] = None
 
 
 class ConfigPatchRequest(BaseModel):
@@ -170,6 +173,9 @@ class PreferenceEventRequest(BaseModel):
     context_text: Optional[str] = None
     corrected_text: Optional[str] = None
     weight: Optional[float] = None
+    routing_trace: Optional[List[dict]] = None
+    adapter_gates: Optional[List[dict]] = None
+    notes: Optional[str] = None
 
 
 class PreferenceEventResponse(BaseModel):
@@ -177,3 +183,44 @@ class PreferenceEventResponse(BaseModel):
     cluster_id: Optional[str] = None
     feedback: str
     created_at: datetime
+
+
+class PreferenceInsightsResponse(BaseModel):
+    totals: dict
+    clusters: List[dict] = Field(default_factory=list)
+    adapters: List[dict] = Field(default_factory=list)
+    routing_feedback: dict = Field(default_factory=dict)
+    events: List[dict] = Field(default_factory=list)
+
+
+class ConfigPatchDecisionRequest(BaseModel):
+    decision: str
+    reason: Optional[str] = None
+
+
+class ConfigPatchListResponse(BaseModel):
+    items: List[ConfigPatchAuditResponse]
+
+
+class AutoPatchRequest(BaseModel):
+    artifact_id: str
+    goal: Optional[str] = None
+
+
+class VoiceTranscriptionResponse(BaseModel):
+    transcript: str
+    duration_ms: int
+    user_id: Optional[str] = None
+
+
+class VoiceSynthesisRequest(BaseModel):
+    text: str
+    voice: Optional[str] = None
+
+
+class VoiceSynthesisResponse(BaseModel):
+    audio_path: str
+    format: str
+    sample_rate: int
+    duration_ms: int
+    voice: str
