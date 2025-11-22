@@ -18,7 +18,9 @@ from liminallm.storage.models import (
     KnowledgeChunk,
     KnowledgeContext,
     Message,
+    PreferenceEvent,
     Session,
+    TrainingJob,
     User,
 )
 
@@ -30,9 +32,100 @@ class PostgresStore:
         self.dsn = dsn
         self.fs_root = Path(fs_root)
         self.fs_root.mkdir(parents=True, exist_ok=True)
+        self.preference_events: dict[str, PreferenceEvent] = {}
+        self.training_jobs: dict[str, TrainingJob] = {}
+        self._load_training_state()
 
     def _connect(self):
         return psycopg.connect(self.dsn, autocommit=True, row_factory=dict_row)
+
+    # preference events (filesystem-backed placeholder until full tables exist)
+    def record_preference_event(
+        self,
+        user_id: str,
+        conversation_id: str,
+        message_id: str,
+        feedback: str,
+        *,
+        score: float | None = None,
+        corrected_text: str | None = None,
+        weight: float | None = None,
+        context_embedding: list[float] | None = None,
+        cluster_id: str | None = None,
+        context_text: str | None = None,
+        meta: dict | None = None,
+    ) -> PreferenceEvent:
+        normalized_weight = weight if weight is not None else (score if score is not None else 1.0)
+        event = PreferenceEvent(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            conversation_id=conversation_id,
+            message_id=message_id,
+            feedback=feedback,
+            score=score,
+            context_embedding=context_embedding or [],
+            cluster_id=cluster_id,
+            context_text=context_text,
+            corrected_text=corrected_text,
+            weight=normalized_weight,
+            meta=meta,
+        )
+        self.preference_events[event.id] = event
+        self._persist_training_state()
+        return event
+
+    def list_preference_events(self, user_id: str | None = None, feedback: str | None = None) -> list[PreferenceEvent]:
+        events = list(self.preference_events.values())
+        if user_id:
+            events = [e for e in events if e.user_id == user_id]
+        if feedback:
+            events = [e for e in events if e.feedback == feedback]
+        return sorted(events, key=lambda e: e.created_at)
+
+    def create_training_job(
+        self,
+        user_id: str,
+        adapter_id: str,
+        preference_event_ids: list[str] | None = None,
+        dataset_path: str | None = None,
+    ) -> TrainingJob:
+        job = TrainingJob(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            adapter_id=adapter_id,
+            preference_event_ids=preference_event_ids or [],
+            dataset_path=dataset_path,
+        )
+        self.training_jobs[job.id] = job
+        self._persist_training_state()
+        return job
+
+    def update_training_job(
+        self,
+        job_id: str,
+        *,
+        status: str | None = None,
+        loss: float | None = None,
+        new_version: int | None = None,
+        dataset_path: str | None = None,
+        meta: dict | None = None,
+    ) -> TrainingJob | None:
+        job = self.training_jobs.get(job_id)
+        if not job:
+            return None
+        if status:
+            job.status = status
+        if loss is not None:
+            job.loss = loss
+        if new_version is not None:
+            job.new_version = new_version
+        if dataset_path is not None:
+            job.dataset_path = dataset_path
+        if meta is not None:
+            job.meta = meta
+        job.updated_at = datetime.utcnow()
+        self._persist_training_state()
+        return job
 
     # users
     def create_user(self, email: str, handle: Optional[str] = None) -> User:
@@ -291,6 +384,11 @@ class PostgresStore:
             )
         return ConfigPatchAudit(id=audit_id, artifact_id=artifact_id, proposer_user_id=proposer_user_id, patch=patch, justification=justification, created_at=now, updated_at=now)
 
+    def get_runtime_config(self) -> dict:
+        """Return deployment config sourced from SQL (placeholder until admin UI writes it)."""
+
+        return {}
+
     # knowledge
     def upsert_context(self, owner_user_id: Optional[str], name: str, description: str, fs_path: Optional[str] = None) -> KnowledgeContext:
         ctx_id = str(uuid.uuid4())
@@ -379,3 +477,87 @@ class PostgresStore:
         path = artifact_dir / f"v{version}.json"
         path.write_text(json.dumps(schema, indent=2))
         return str(path)
+
+    def _training_state_path(self) -> Path:
+        state_dir = self.fs_root / "state"
+        state_dir.mkdir(parents=True, exist_ok=True)
+        return state_dir / "training_pg.json"
+
+    def _persist_training_state(self) -> None:
+        data = {
+            "preference_events": [
+                {
+                    "id": e.id,
+                    "user_id": e.user_id,
+                    "conversation_id": e.conversation_id,
+                    "message_id": e.message_id,
+                    "feedback": e.feedback,
+                    "score": e.score,
+                    "context_embedding": e.context_embedding,
+                    "cluster_id": e.cluster_id,
+                    "context_text": e.context_text,
+                    "corrected_text": e.corrected_text,
+                    "created_at": e.created_at.isoformat(),
+                    "weight": e.weight,
+                    "meta": e.meta,
+                }
+                for e in self.preference_events.values()
+            ],
+            "training_jobs": [
+                {
+                    "id": j.id,
+                    "user_id": j.user_id,
+                    "adapter_id": j.adapter_id,
+                    "status": j.status,
+                    "created_at": j.created_at.isoformat(),
+                    "updated_at": j.updated_at.isoformat(),
+                    "loss": j.loss,
+                    "preference_event_ids": j.preference_event_ids,
+                    "dataset_path": j.dataset_path,
+                    "new_version": j.new_version,
+                    "meta": j.meta,
+                }
+                for j in self.training_jobs.values()
+            ],
+        }
+        self._training_state_path().write_text(json.dumps(data, indent=2))
+
+    def _load_training_state(self) -> None:
+        path = self._training_state_path()
+        if not path.exists():
+            return
+        raw = json.loads(path.read_text())
+        self.preference_events = {
+            e["id"]: PreferenceEvent(
+                id=e["id"],
+                user_id=e["user_id"],
+                conversation_id=e["conversation_id"],
+                message_id=e["message_id"],
+                feedback=e["feedback"],
+                score=e.get("score"),
+                context_embedding=e.get("context_embedding", []),
+                cluster_id=e.get("cluster_id"),
+                context_text=e.get("context_text"),
+                corrected_text=e.get("corrected_text"),
+                created_at=datetime.fromisoformat(e["created_at"]),
+                weight=float(e.get("weight", 1.0)),
+                meta=e.get("meta"),
+            )
+            for e in raw.get("preference_events", [])
+        }
+        self.training_jobs = {
+            j["id"]: TrainingJob(
+                id=j["id"],
+                user_id=j["user_id"],
+                adapter_id=j["adapter_id"],
+                status=j.get("status", "pending"),
+                created_at=datetime.fromisoformat(j["created_at"]),
+                updated_at=datetime.fromisoformat(j.get("updated_at", j["created_at"])),
+                loss=j.get("loss"),
+                preference_event_ids=list(j.get("preference_event_ids", [])),
+                dataset_path=j.get("dataset_path"),
+                new_version=j.get("new_version"),
+                meta=j.get("meta"),
+            )
+            for j in raw.get("training_jobs", [])
+        }

@@ -126,3 +126,35 @@ class KnowledgeChunk:
     seq: int
     created_at: datetime = field(default_factory=datetime.utcnow)
     meta: Dict | None = None
+
+
+@dataclass
+class PreferenceEvent:
+    id: str
+    user_id: str
+    conversation_id: str
+    message_id: str
+    feedback: str
+    score: Optional[float] = None
+    context_embedding: List[float] = field(default_factory=list)
+    cluster_id: Optional[str] = None
+    context_text: Optional[str] = None
+    corrected_text: Optional[str] = None
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    weight: float = 1.0
+    meta: Dict | None = None
+
+
+@dataclass
+class TrainingJob:
+    id: str
+    user_id: str
+    adapter_id: str
+    status: str = "pending"
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+    loss: Optional[float] = None
+    preference_event_ids: List[str] = field(default_factory=list)
+    dataset_path: Optional[str] = None
+    new_version: Optional[int] = None
+    meta: Dict | None = None

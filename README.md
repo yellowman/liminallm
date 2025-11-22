@@ -125,13 +125,14 @@ for v1 these can all live in one python app with clear module boundaries.
   - file upload endpoint writing to the shared filesystem and ingesting chunks into RAG contexts with hashed embeddings
   - workflow execution with branching/parallel scheduling across `workflow.chat` graphs
   - router policies with a sandboxed evaluation engine (limited adapter gating usage)
+  - pluggable model backend that can target external API fine-tune IDs or local JAX+LoRA adapter application
+  - filesystem-backed LoRA adapter training that turns preference events into new adapter versions
 - **partially implemented**
-  - MFA (challenge/verify stubs without production delivery)
+  - MFA (challenge/verify stubs only; missing enrollment secret/QR issuance, delivery channel, and login gating)
+  - preference events (capture + training loop stubs wired, but full UI + routing feedback not complete)
 - **not implemented yet**
-  - LoRA adapter training
   - semantic clustering
   - skill adapters
-  - preference events
   - LLM-as-architect auto-patch generation
   - voice interface
   - admin UI for patch approval
@@ -147,6 +148,8 @@ for v1 these can all live in one python app with clear module boundaries.
    - redis
    - filesystem path accessible to the app
    - gpu / tpu for jax model if you expect to train adapters
+   - backend selection is single-sourced from the SQL deployment config (editable from the web console when wired); env vars only override if you set them explicitly
+   - set `MODEL_BACKEND=local_lora` to target the local JAX+LoRA path instead of external API fine-tune IDs
 
 2. **configure env**
    - `DATABASE_URL` – postgres dsn
@@ -154,12 +157,19 @@ for v1 these can all live in one python app with clear module boundaries.
    - `SHARED_FS_ROOT` – filesystem root path
    - `MODEL_PATH` – model identifier for cloud mode (default `gpt-4o-mini`) or filesystem path when using an adapter server
    - `OPENAI_API_KEY` – required for live LLM calls; omit to use the echo fallback
-   - `LLM_MODE` – `cloud` (fine-tune ids as models) or `adapter` (adapter_id passthrough to adapter servers)
+   - `LLM_MODE` – `cloud` (fine-tune ids as models) or `adapter` (adapter_id passthrough to adapter servers); kept for backward compatibility when no SQL config or `MODEL_BACKEND` override is provided
    - `ADAPTER_SERVER_MODEL` – model name when pointing at an OpenAI-compatible adapter server
    - `USE_MEMORY_STORE` – set to `true` to run without Postgres/Redis while testing the API and LLM calls
 
 3. **migrate db**
    - run the alembic / migration tool to create tables described in the spec.
+
+4a. **preference_event → adapter dataset → tokenized batches**
+   - `preference_event` rows (positive feedback) capture `context_embedding`, `score`, and optional `context_text`; they are clustered per-user to build adapter personas.
+   - the training service reconstructs prompts from recent messages, appends any provided context snippet, and uses corrected text as targets while tracking cluster centroids.
+   - dataset rows are written to `${SHARED_FS_ROOT}/users/{user_id}/adapters/{adapter_id}/jobs/{job_id}/dataset.jsonl`.
+   - tokenized batches carry shapes for the downstream JAX/Optax loop (padding + masks, no base-model update), and training metadata records batch shapes + cluster summaries.
+   - adapter metadata and params are stored under `${SHARED_FS_ROOT}/users/{user_id}/adapters/{adapter_id}/v####/`.
 
 4. **start services**
    - run the api server (http + websocket for streaming)

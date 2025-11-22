@@ -303,6 +303,7 @@ CREATE TABLE preference_event (
   explicit_signal    TEXT,         -- 'like','dislike','always','never', etc.
   score              DOUBLE PRECISION, -- normalized [-1,1]
   context_embedding  VECTOR NOT NULL,  -- embedding of situation
+  context_text       TEXT,         -- optional raw snippet of the surrounding exchange
   cluster_id         UUID,         -- link to semantic_cluster
   meta               JSONB
 );
@@ -328,6 +329,16 @@ CREATE TABLE training_job (
   meta               JSONB
 );
 ```
+
+**preference_event → dataset → tokenized batches (single-adapter pipeline)**
+
+- fetch positive `preference_event` rows by `user_id` (optionally filtered by `adapter_artifact_id`).
+- reconstruct prompts from recent `message` rows in the linked `conversation` (limit ~200, keep last 50 turns).
+- target text = `preference_event.corrected_text` when provided, otherwise the original `message.content`, with optional `context_text` appended for grounding.
+- write JSONL dataset rows `{prompt, target, weight, context}` to `${SHARED_FS_ROOT}/users/{user}/adapters/{adapter}/jobs/{job}/dataset.jsonl`.
+- tokenize with the configured tokenizer (fallback: whitespace hash IDs) into padded batches of `input_ids`, `labels`, and `attention_mask` (track `{batch, prompt_len, target_len}` in metadata for allocation).
+- cluster context embeddings per-user (and optionally globally) to surface emergent themes; persist cluster summaries alongside token batch shapes for routing/training diagnostics.
+- feed batches into a JAX/Optax loop that only updates LoRA matrices for the adapter; base model weights are frozen.
 
 ### 2.7 config ops (LLM as architect)
 
