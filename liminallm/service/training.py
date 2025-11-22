@@ -255,7 +255,7 @@ class TrainingService:
             params_tree = optax.apply_updates(params_tree, updates)
             trace.append({"loss": float(value), "shape": batch["shape"]})
 
-            return {"status": "ok", "steps": trace[-10:]}
+        return {"status": "ok", "steps": trace[-10:]}
 
     def _bucket_embedding(self, embedding: Sequence[float], user_id: str) -> Optional[str]:
         if not embedding:
