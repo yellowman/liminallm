@@ -60,8 +60,26 @@ class MemoryStore:
             "kind": "workflow.chat",
             "entrypoint": "classify",
             "nodes": [
-                {"id": "classify", "tool": "llm.generic", "outputs": ["intent"]},
-                {"id": "plain_chat", "tool": "llm.generic"},
+                {
+                    "id": "classify",
+                    "type": "tool_call",
+                    "tool": "llm.intent_classifier_v1",
+                    "outputs": ["intent"],
+                    "next": "route",
+                },
+                {
+                    "id": "route",
+                    "type": "switch",
+                    "branches": [
+                        {"when": "vars.intent == 'qa_with_docs'", "next": "rag"},
+                        {"when": "vars.intent == 'code_edit'", "next": "code"},
+                        {"when": "true", "next": "plain_chat"},
+                    ],
+                },
+                {"id": "rag", "type": "tool_call", "tool": "rag.answer_with_context_v1", "next": "end"},
+                {"id": "code", "type": "tool_call", "tool": "agent.code_v1", "next": "end"},
+                {"id": "plain_chat", "type": "tool_call", "tool": "llm.generic", "next": "end"},
+                {"id": "end", "type": "end"},
             ],
         }
         payload_path = self.persist_artifact_payload(chat_workflow_id, default_schema)
