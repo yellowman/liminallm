@@ -39,17 +39,76 @@ class PostgresStore:
         self.fs_root.mkdir(parents=True, exist_ok=True)
         self.logger = get_logger(__name__)
         self.pool = ConnectionPool(self.dsn, min_size=2, max_size=10, kwargs={"row_factory": dict_row, "autocommit": True})
-        self.preference_events: dict[str, PreferenceEvent] = {}
-        self.training_jobs: dict[str, TrainingJob] = {}
-        self.semantic_clusters: dict[str, SemanticCluster] = {}
         self.mfa_secrets: dict[str, UserMFAConfig] = {}
         self.sessions: dict[str, Session] = {}
         self._load_training_state()
+        self._ensure_default_artifacts()
 
     def _connect(self):
         return self.pool.connection()
 
-    # preference events (filesystem-backed placeholder until full tables exist)
+    def _ensure_default_artifacts(self) -> None:
+        """Seed the default workflow artifact if the database is empty."""
+
+        existing = self.list_artifacts()
+        if any(artifact.name == "default_chat_workflow" for artifact in existing):
+            return
+
+        default_schema = {
+            "kind": "workflow.chat",
+            "entrypoint": "classify",
+            "nodes": [
+                {
+                    "id": "classify",
+                    "type": "tool_call",
+                    "tool": "llm.intent_classifier_v1",
+                    "inputs": {"message": "${input.message}"},
+                    "outputs": ["intent"],
+                    "next": "route",
+                },
+                {
+                    "id": "route",
+                    "type": "switch",
+                    "branches": [
+                        {"when": "vars.intent == 'qa_with_docs'", "next": "rag"},
+                        {"when": "vars.intent == 'code_edit'", "next": "code"},
+                        {"when": "true", "next": "plain_chat"},
+                    ],
+                },
+                {
+                    "id": "rag",
+                    "type": "tool_call",
+                    "tool": "rag.answer_with_context_v1",
+                    "inputs": {"message": "${input.message}"},
+                    "next": "end",
+                },
+                {
+                    "id": "code",
+                    "type": "tool_call",
+                    "tool": "agent.code_v1",
+                    "inputs": {"message": "${input.message}"},
+                    "next": "end",
+                },
+                {
+                    "id": "plain_chat",
+                    "type": "tool_call",
+                    "tool": "llm.generic",
+                    "inputs": {"message": "${input.message}"},
+                    "next": "end",
+                },
+                {"id": "end", "type": "end"},
+            ],
+        }
+        self.create_artifact(
+            "workflow",
+            "default_chat_workflow",
+            default_schema,
+            "LLM-only chat workflow defined as data.",
+            created_by="system_llm",
+            change_note="Seeded default workflow",
+        )
+
+    # preference events
     def record_preference_event(
         self,
         user_id: str,
@@ -66,15 +125,36 @@ class PostgresStore:
         context_text: str | None = None,
         meta: dict | None = None,
     ) -> PreferenceEvent:
-        """Persist feedback to the local filesystem cache until SQL tables exist.
-
-        This should migrate to a proper ``preference_event`` table with
-        vector indexes, conflict handling, and retention policies once the
-        migration scripts are available and the admin UI can drive writes.
-        """
         normalized_weight = weight if weight is not None else (score if score is not None else 1.0)
-        event = PreferenceEvent(
-            id=str(uuid.uuid4()),
+        event_id = str(uuid.uuid4())
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO preference_event (
+                    id, user_id, conversation_id, message_id, feedback, score, explicit_signal,
+                    context_embedding, cluster_id, context_text, corrected_text, weight, meta
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING *
+                """,
+                (
+                    event_id,
+                    user_id,
+                    conversation_id,
+                    message_id,
+                    feedback,
+                    score,
+                    explicit_signal,
+                    context_embedding,
+                    cluster_id,
+                    context_text,
+                    corrected_text,
+                    normalized_weight,
+                    meta,
+                ),
+            ).fetchone()
+        return PreferenceEvent(
+            id=event_id,
             user_id=user_id,
             conversation_id=conversation_id,
             message_id=message_id,
@@ -85,33 +165,98 @@ class PostgresStore:
             cluster_id=cluster_id,
             context_text=context_text,
             corrected_text=corrected_text,
+            created_at=row.get("created_at", datetime.utcnow()) if row else datetime.utcnow(),
             weight=normalized_weight,
             meta=meta,
         )
-        self.preference_events[event.id] = event
-        self._persist_training_state()
-        return event
 
     def list_preference_events(
         self, user_id: str | None = None, feedback: str | None = None, cluster_id: str | None = None
     ) -> list[PreferenceEvent]:
-        events = list(self.preference_events.values())
+        clauses = []
+        params: list[Any] = []
         if user_id:
-            events = [e for e in events if e.user_id == user_id]
+            clauses.append("user_id = %s")
+            params.append(user_id)
         if feedback:
-            events = [e for e in events if e.feedback == feedback]
+            clauses.append("feedback = %s")
+            params.append(feedback)
         if cluster_id:
-            events = [e for e in events if e.cluster_id == cluster_id]
-        return sorted(events, key=lambda e: e.created_at)
+            clauses.append("cluster_id = %s")
+            params.append(cluster_id)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT * FROM preference_event {where} ORDER BY created_at", params
+            ).fetchall()
+        return [
+            PreferenceEvent(
+                id=str(row["id"]),
+                user_id=str(row["user_id"]),
+                conversation_id=str(row["conversation_id"]),
+                message_id=str(row["message_id"]),
+                feedback=row["feedback"],
+                score=row.get("score"),
+                explicit_signal=row.get("explicit_signal"),
+                context_embedding=row.get("context_embedding") or [],
+                cluster_id=row.get("cluster_id"),
+                context_text=row.get("context_text"),
+                corrected_text=row.get("corrected_text"),
+                created_at=row.get("created_at", datetime.utcnow()),
+                weight=float(row.get("weight", 1.0)),
+                meta=row.get("meta"),
+            )
+            for row in rows
+        ]
 
     def update_preference_event(self, event_id: str, *, cluster_id: str | None = None) -> PreferenceEvent | None:
-        event = self.preference_events.get(event_id)
-        if not event:
+        if cluster_id is None:
+            return self.get_preference_event(event_id)
+        with self._connect() as conn:
+            row = conn.execute(
+                "UPDATE preference_event SET cluster_id = %s WHERE id = %s RETURNING *",
+                (cluster_id, event_id),
+            ).fetchone()
+        if not row:
             return None
-        if cluster_id:
-            event.cluster_id = cluster_id
-        self._persist_training_state()
-        return event
+        return PreferenceEvent(
+            id=str(row["id"]),
+            user_id=str(row["user_id"]),
+            conversation_id=str(row["conversation_id"]),
+            message_id=str(row["message_id"]),
+            feedback=row["feedback"],
+            score=row.get("score"),
+            explicit_signal=row.get("explicit_signal"),
+            context_embedding=row.get("context_embedding") or [],
+            cluster_id=row.get("cluster_id"),
+            context_text=row.get("context_text"),
+            corrected_text=row.get("corrected_text"),
+            created_at=row.get("created_at", datetime.utcnow()),
+            weight=float(row.get("weight", 1.0)),
+            meta=row.get("meta"),
+        )
+
+    def get_preference_event(self, event_id: str) -> PreferenceEvent | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM preference_event WHERE id = %s", (event_id,)).fetchone()
+        if not row:
+            return None
+        return PreferenceEvent(
+            id=str(row["id"]),
+            user_id=str(row["user_id"]),
+            conversation_id=str(row["conversation_id"]),
+            message_id=str(row["message_id"]),
+            feedback=row["feedback"],
+            score=row.get("score"),
+            explicit_signal=row.get("explicit_signal"),
+            context_embedding=row.get("context_embedding") or [],
+            cluster_id=row.get("cluster_id"),
+            context_text=row.get("context_text"),
+            corrected_text=row.get("corrected_text"),
+            created_at=row.get("created_at", datetime.utcnow()),
+            weight=float(row.get("weight", 1.0)),
+            meta=row.get("meta"),
+        )
 
     # semantic clusters
     def upsert_semantic_cluster(
@@ -128,7 +273,7 @@ class PostgresStore:
     ) -> SemanticCluster:
         cid = cluster_id or str(uuid.uuid4())
         now = datetime.utcnow()
-        existing = self.semantic_clusters.get(cid)
+        existing = self.get_semantic_cluster(cid)
         created_at = existing.created_at if existing else now
         cluster = SemanticCluster(
             id=cid,
@@ -142,39 +287,46 @@ class PostgresStore:
             updated_at=now,
             meta=meta or (existing.meta if existing else None),
         )
-        try:
-            with self._connect() as conn:
-                conn.execute(
-                    """
-                    INSERT INTO semantic_cluster (id, user_id, centroid, size, label, description, sample_message_ids, meta, created_at, updated_at)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (id) DO UPDATE
-                    SET centroid = EXCLUDED.centroid,
-                        size = EXCLUDED.size,
-                        label = COALESCE(EXCLUDED.label, semantic_cluster.label),
-                        description = COALESCE(EXCLUDED.description, semantic_cluster.description),
-                        sample_message_ids = EXCLUDED.sample_message_ids,
-                        meta = EXCLUDED.meta,
-                        updated_at = now()
-                    """,
-                    (
-                        cid,
-                        user_id,
-                        cluster.centroid,
-                        size,
-                        cluster.label,
-                        cluster.description,
-                        cluster.sample_message_ids,
-                        cluster.meta,
-                        created_at,
-                        now,
-                    ),
-                )
-        except Exception as exc:  # pragma: no cover - best effort persistence
-            self.logger.warning("semantic_cluster_upsert_failed", error=str(exc))
-        self.semantic_clusters[cid] = cluster
-        self._persist_training_state()
-        return cluster
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO semantic_cluster (id, user_id, centroid, size, label, description, sample_message_ids, meta, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO UPDATE
+                SET centroid = EXCLUDED.centroid,
+                    size = EXCLUDED.size,
+                    label = COALESCE(EXCLUDED.label, semantic_cluster.label),
+                    description = COALESCE(EXCLUDED.description, semantic_cluster.description),
+                    sample_message_ids = EXCLUDED.sample_message_ids,
+                    meta = EXCLUDED.meta,
+                    updated_at = now()
+                RETURNING *
+                """,
+                (
+                    cid,
+                    user_id,
+                    cluster.centroid,
+                    size,
+                    cluster.label,
+                    cluster.description,
+                    cluster.sample_message_ids,
+                    cluster.meta,
+                    created_at,
+                    now,
+                ),
+            ).fetchone()
+        return SemanticCluster(
+            id=cid,
+            user_id=user_id,
+            centroid=cluster.centroid,
+            size=size,
+            label=row.get("label") if row else cluster.label,
+            description=row.get("description") if row else cluster.description,
+            sample_message_ids=row.get("sample_message_ids") if row else cluster.sample_message_ids,
+            created_at=row.get("created_at", created_at) if row else created_at,
+            updated_at=row.get("updated_at", now) if row else now,
+            meta=row.get("meta") if row else cluster.meta,
+        )
 
     def update_semantic_cluster(
         self,
@@ -186,32 +338,89 @@ class PostgresStore:
         size: int | None = None,
         meta: dict | None = None,
     ) -> SemanticCluster | None:
-        cluster = self.semantic_clusters.get(cluster_id)
-        if not cluster:
+        existing = self.get_semantic_cluster(cluster_id)
+        if not existing:
             return None
-        if label is not None:
-            cluster.label = label
-        if description is not None:
-            cluster.description = description
-        if centroid is not None:
-            cluster.centroid = list(centroid)
-        if size is not None:
-            cluster.size = size
-        if meta is not None:
-            cluster.meta = meta
-        cluster.updated_at = datetime.utcnow()
-        self.semantic_clusters[cluster_id] = cluster
-        self._persist_training_state()
-        return cluster
+        new_centroid = list(centroid) if centroid is not None else existing.centroid
+        new_size = size if size is not None else existing.size
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                UPDATE semantic_cluster
+                SET label = %s,
+                    description = %s,
+                    centroid = %s,
+                    size = %s,
+                    meta = %s,
+                    updated_at = now()
+                WHERE id = %s
+                RETURNING *
+                """,
+                (
+                    label if label is not None else existing.label,
+                    description if description is not None else existing.description,
+                    new_centroid,
+                    new_size,
+                    meta if meta is not None else existing.meta,
+                    cluster_id,
+                ),
+            ).fetchone()
+        if not row:
+            return None
+        return SemanticCluster(
+            id=str(row["id"]),
+            user_id=row.get("user_id"),
+            centroid=row.get("centroid", new_centroid) or [],
+            size=row.get("size", new_size),
+            label=row.get("label"),
+            description=row.get("description"),
+            sample_message_ids=row.get("sample_message_ids") or [],
+            created_at=row.get("created_at", existing.created_at),
+            updated_at=row.get("updated_at", datetime.utcnow()),
+            meta=row.get("meta"),
+        )
 
     def list_semantic_clusters(self, user_id: str | None = None) -> list[SemanticCluster]:
-        clusters = list(self.semantic_clusters.values())
-        if user_id:
-            clusters = [c for c in clusters if c.user_id == user_id]
-        return sorted(clusters, key=lambda c: c.updated_at, reverse=True)
+        with self._connect() as conn:
+            if user_id:
+                rows = conn.execute(
+                    "SELECT * FROM semantic_cluster WHERE user_id = %s ORDER BY updated_at DESC", (user_id,)
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM semantic_cluster ORDER BY updated_at DESC", ()).fetchall()
+        return [
+            SemanticCluster(
+                id=str(row["id"]),
+                user_id=row.get("user_id"),
+                centroid=row.get("centroid") or [],
+                size=row.get("size", 0),
+                label=row.get("label"),
+                description=row.get("description"),
+                sample_message_ids=row.get("sample_message_ids") or [],
+                created_at=row.get("created_at", datetime.utcnow()),
+                updated_at=row.get("updated_at", datetime.utcnow()),
+                meta=row.get("meta"),
+            )
+            for row in rows
+        ]
 
     def get_semantic_cluster(self, cluster_id: str) -> SemanticCluster | None:
-        return self.semantic_clusters.get(cluster_id)
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM semantic_cluster WHERE id = %s", (cluster_id,)).fetchone()
+        if not row:
+            return None
+        return SemanticCluster(
+            id=str(row["id"]),
+            user_id=row.get("user_id"),
+            centroid=row.get("centroid") or [],
+            size=row.get("size", 0),
+            label=row.get("label"),
+            description=row.get("description"),
+            sample_message_ids=row.get("sample_message_ids") or [],
+            created_at=row.get("created_at", datetime.utcnow()),
+            updated_at=row.get("updated_at", datetime.utcnow()),
+            meta=row.get("meta"),
+        )
 
     def create_training_job(
         self,
@@ -220,16 +429,46 @@ class PostgresStore:
         preference_event_ids: list[str] | None = None,
         dataset_path: str | None = None,
     ) -> TrainingJob:
-        job = TrainingJob(
-            id=str(uuid.uuid4()),
+        job_id = str(uuid.uuid4())
+        now = datetime.utcnow()
+        pref_ids = preference_event_ids or []
+        num_events = len(pref_ids) if pref_ids else None
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO training_job (
+                    id, adapter_artifact_id, user_id, created_at, updated_at, status, num_events, loss,
+                    dataset_path, new_version, preference_event_ids, meta
+                )
+                VALUES (%s, %s, %s, %s, %s, 'queued', %s, NULL, %s, NULL, %s, %s)
+                RETURNING *
+                """,
+                (
+                    job_id,
+                    adapter_id,
+                    user_id,
+                    now,
+                    now,
+                    num_events,
+                    dataset_path,
+                    pref_ids if pref_ids else None,
+                    meta,
+                ),
+            ).fetchone()
+        return TrainingJob(
+            id=job_id,
             user_id=user_id,
             adapter_id=adapter_id,
-            preference_event_ids=preference_event_ids or [],
-            dataset_path=dataset_path,
+            status=row.get("status", "queued") if row else "queued",
+            num_events=row.get("num_events", num_events) if row else num_events,
+            created_at=row.get("created_at", now) if row else now,
+            updated_at=row.get("updated_at", now) if row else now,
+            loss=row.get("loss"),
+            preference_event_ids=row.get("preference_event_ids") or pref_ids,
+            dataset_path=row.get("dataset_path", dataset_path),
+            new_version=row.get("new_version"),
+            meta=row.get("meta") if row else meta,
         )
-        self.training_jobs[job.id] = job
-        self._persist_training_state()
-        return job
 
     def update_training_job(
         self,
@@ -241,22 +480,69 @@ class PostgresStore:
         dataset_path: str | None = None,
         meta: dict | None = None,
     ) -> TrainingJob | None:
-        job = self.training_jobs.get(job_id)
-        if not job:
+        existing = self.get_training_job(job_id)
+        if not existing:
             return None
-        if status:
-            job.status = status
-        if loss is not None:
-            job.loss = loss
-        if new_version is not None:
-            job.new_version = new_version
-        if dataset_path is not None:
-            job.dataset_path = dataset_path
-        if meta is not None:
-            job.meta = meta
-        job.updated_at = datetime.utcnow()
-        self._persist_training_state()
-        return job
+        new_updated_at = datetime.utcnow()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                UPDATE training_job
+                SET status = %s,
+                    loss = %s,
+                    new_version = %s,
+                    dataset_path = %s,
+                    meta = %s,
+                    updated_at = %s
+                WHERE id = %s
+                RETURNING *
+                """,
+                (
+                    status if status is not None else existing.status,
+                    loss if loss is not None else existing.loss,
+                    new_version if new_version is not None else existing.new_version,
+                    dataset_path if dataset_path is not None else existing.dataset_path,
+                    meta if meta is not None else existing.meta,
+                    new_updated_at,
+                    job_id,
+                ),
+            ).fetchone()
+        if not row:
+            return None
+        return TrainingJob(
+            id=str(row["id"]),
+            user_id=str(row["user_id"]),
+            adapter_id=str(row["adapter_artifact_id"]),
+            status=row.get("status", existing.status),
+            num_events=row.get("num_events", existing.num_events),
+            created_at=row.get("created_at", existing.created_at),
+            updated_at=row.get("updated_at", new_updated_at),
+            loss=row.get("loss"),
+            preference_event_ids=row.get("preference_event_ids") or [],
+            dataset_path=row.get("dataset_path"),
+            new_version=row.get("new_version"),
+            meta=row.get("meta"),
+        )
+
+    def get_training_job(self, job_id: str) -> TrainingJob | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM training_job WHERE id = %s", (job_id,)).fetchone()
+        if not row:
+            return None
+        return TrainingJob(
+            id=str(row["id"]),
+            user_id=str(row["user_id"]),
+            adapter_id=str(row["adapter_artifact_id"]),
+            status=row.get("status", "queued"),
+            num_events=row.get("num_events"),
+            created_at=row.get("created_at", datetime.utcnow()),
+            updated_at=row.get("updated_at", datetime.utcnow()),
+            loss=row.get("loss"),
+            preference_event_ids=row.get("preference_event_ids") or [],
+            dataset_path=row.get("dataset_path"),
+            new_version=row.get("new_version"),
+            meta=row.get("meta"),
+        )
 
     # users
     def create_user(self, email: str, handle: Optional[str] = None) -> User:
@@ -484,9 +770,20 @@ class PostgresStore:
         return conversations
 
     # artifacts
-    def list_artifacts(self, type_filter: Optional[str] = None) -> List[Artifact]:
+    def list_artifacts(
+        self, type_filter: Optional[str] = None, kind_filter: Optional[str] = None
+    ) -> List[Artifact]:
         with self._connect() as conn:
-            if type_filter:
+            if type_filter and kind_filter:
+                rows = conn.execute(
+                    "SELECT * FROM artifact WHERE type = %s AND schema->>'kind' = %s",
+                    (type_filter, kind_filter),
+                ).fetchall()
+            elif kind_filter:
+                rows = conn.execute(
+                    "SELECT * FROM artifact WHERE schema->>'kind' = %s", (kind_filter,)
+                ).fetchall()
+            elif type_filter:
                 rows = conn.execute("SELECT * FROM artifact WHERE type = %s", (type_filter,)).fetchall()
             else:
                 rows = conn.execute("SELECT * FROM artifact", ()).fetchall()
@@ -535,7 +832,17 @@ class PostgresStore:
             meta=row.get("meta"),
         )
 
-    def create_artifact(self, type_: str, name: str, schema: dict, description: str = "", owner_user_id: Optional[str] = None) -> Artifact:
+    def create_artifact(
+        self,
+        type_: str,
+        name: str,
+        schema: dict,
+        description: str = "",
+        owner_user_id: Optional[str] = None,
+        *,
+        created_by: Optional[str] = None,
+        change_note: Optional[str] = None,
+    ) -> Artifact:
         try:
             validate_artifact(type_, schema)
         except ArtifactValidationError as exc:
@@ -550,8 +857,8 @@ class PostgresStore:
                     (artifact_id, owner_user_id, type_, name, description, json.dumps(schema), fs_path),
                 )
                 conn.execute(
-                    "INSERT INTO artifact_version (artifact_id, version, schema, fs_path) VALUES (%s, %s, %s, %s)",
-                    (artifact_id, 1, json.dumps(schema), fs_path),
+                    "INSERT INTO artifact_version (artifact_id, version, schema, fs_path, created_by, change_note) VALUES (%s, %s, %s, %s, %s, %s)",
+                    (artifact_id, 1, json.dumps(schema), fs_path, created_by or owner_user_id or "system_llm", change_note),
                 )
         except errors.ForeignKeyViolation:
             raise ConstraintViolation("artifact owner missing", {"owner_user_id": owner_user_id})
@@ -565,7 +872,15 @@ class PostgresStore:
             fs_path=fs_path,
         )
 
-    def update_artifact(self, artifact_id: str, schema: dict, description: Optional[str] = None) -> Optional[Artifact]:
+    def update_artifact(
+        self,
+        artifact_id: str,
+        schema: dict,
+        description: Optional[str] = None,
+        *,
+        created_by: Optional[str] = None,
+        change_note: Optional[str] = None,
+    ) -> Optional[Artifact]:
         try:
             validate_artifact("workflow" if schema.get("kind") == "workflow.chat" else "tool" if schema.get("kind") == "tool.spec" else "artifact", schema)  # type: ignore[arg-type]
         except ArtifactValidationError as exc:
@@ -583,8 +898,15 @@ class PostgresStore:
                 (json.dumps(schema), description, fs_path, artifact_id),
             )
             conn.execute(
-                "INSERT INTO artifact_version (artifact_id, version, schema, fs_path) VALUES (%s, %s, %s, %s)",
-                (artifact_id, next_version, json.dumps(schema), fs_path),
+                "INSERT INTO artifact_version (artifact_id, version, schema, fs_path, created_by, change_note) VALUES (%s, %s, %s, %s, %s, %s)",
+                (
+                    artifact_id,
+                    next_version,
+                    json.dumps(schema),
+                    fs_path,
+                    created_by or (str(row["owner_user_id"]) if row.get("owner_user_id") else None) or "system_llm",
+                    change_note,
+                ),
             )
         return Artifact(
             id=str(row["id"]),
@@ -596,6 +918,36 @@ class PostgresStore:
             fs_path=fs_path,
             visibility=row.get("visibility", "private"),
         )
+
+    def list_artifact_versions(self, artifact_id: str) -> List[ArtifactVersion]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM artifact_version WHERE artifact_id = %s ORDER BY version DESC",
+                (artifact_id,),
+            ).fetchall()
+        versions: List[ArtifactVersion] = []
+        for row in rows:
+            schema = row.get("schema") if isinstance(row, dict) else row["schema"]
+            if isinstance(schema, str):
+                try:
+                    schema = json.loads(schema)
+                except Exception as exc:
+                    self.logger.warning("artifact_version_schema_parse_failed", error=str(exc))
+                    schema = {}
+            versions.append(
+                ArtifactVersion(
+                    id=row["id"],
+                    artifact_id=str(row["artifact_id"]),
+                    version=row["version"],
+                    schema=schema or {},
+                    created_by=row.get("created_by", "system_llm"),
+                    change_note=row.get("change_note"),
+                    created_at=row.get("created_at", datetime.utcnow()),
+                    fs_path=row.get("fs_path"),
+                    meta=row.get("meta"),
+                )
+            )
+        return versions
 
     def get_latest_workflow(self, workflow_id: str) -> Optional[dict]:
         with self._connect() as conn:
@@ -808,56 +1160,6 @@ class PostgresStore:
 
     def _persist_training_state(self) -> None:
         data = {
-            "preference_events": [
-                {
-                    "id": e.id,
-                    "user_id": e.user_id,
-                    "conversation_id": e.conversation_id,
-                    "message_id": e.message_id,
-                    "feedback": e.feedback,
-                    "score": e.score,
-                    "explicit_signal": e.explicit_signal,
-                    "context_embedding": e.context_embedding,
-                    "cluster_id": e.cluster_id,
-                    "context_text": e.context_text,
-                    "corrected_text": e.corrected_text,
-                    "created_at": e.created_at.isoformat(),
-                    "weight": e.weight,
-                    "meta": e.meta,
-                }
-                for e in self.preference_events.values()
-            ],
-            "training_jobs": [
-                {
-                    "id": j.id,
-                    "user_id": j.user_id,
-                    "adapter_id": j.adapter_id,
-                    "status": j.status,
-                    "created_at": j.created_at.isoformat(),
-                    "updated_at": j.updated_at.isoformat(),
-                    "loss": j.loss,
-                    "preference_event_ids": j.preference_event_ids,
-                    "dataset_path": j.dataset_path,
-                    "new_version": j.new_version,
-                    "meta": j.meta,
-                }
-                for j in self.training_jobs.values()
-            ],
-            "semantic_clusters": [
-                {
-                    "id": c.id,
-                    "user_id": c.user_id,
-                    "centroid": c.centroid,
-                    "size": c.size,
-                    "label": c.label,
-                    "description": c.description,
-                    "sample_message_ids": c.sample_message_ids,
-                    "created_at": c.created_at.isoformat(),
-                    "updated_at": c.updated_at.isoformat(),
-                    "meta": c.meta,
-                }
-                for c in self.semantic_clusters.values()
-            ],
             "mfa_secrets": [
                 {
                     "user_id": cfg.user_id,
@@ -876,56 +1178,6 @@ class PostgresStore:
         if not path.exists():
             return
         raw = json.loads(path.read_text())
-        self.preference_events = {
-            e["id"]: PreferenceEvent(
-                id=e["id"],
-                user_id=e["user_id"],
-                conversation_id=e["conversation_id"],
-                message_id=e["message_id"],
-                feedback=e["feedback"],
-                score=e.get("score"),
-                explicit_signal=e.get("explicit_signal"),
-                context_embedding=e.get("context_embedding", []),
-                cluster_id=e.get("cluster_id"),
-                context_text=e.get("context_text"),
-                corrected_text=e.get("corrected_text"),
-                created_at=datetime.fromisoformat(e["created_at"]),
-                weight=float(e.get("weight", 1.0)),
-                meta=e.get("meta"),
-            )
-            for e in raw.get("preference_events", [])
-        }
-        self.training_jobs = {
-            j["id"]: TrainingJob(
-                id=j["id"],
-                user_id=j["user_id"],
-                adapter_id=j["adapter_id"],
-                status=j.get("status", "queued"),
-                created_at=datetime.fromisoformat(j["created_at"]),
-                updated_at=datetime.fromisoformat(j.get("updated_at", j["created_at"])),
-                loss=j.get("loss"),
-                preference_event_ids=list(j.get("preference_event_ids", [])),
-                dataset_path=j.get("dataset_path"),
-                new_version=j.get("new_version"),
-                meta=j.get("meta"),
-            )
-            for j in raw.get("training_jobs", [])
-        }
-        self.semantic_clusters = {
-            c["id"]: SemanticCluster(
-                id=c["id"],
-                user_id=c.get("user_id"),
-                centroid=c.get("centroid", []),
-                size=c.get("size", 0),
-                label=c.get("label"),
-                description=c.get("description"),
-                sample_message_ids=list(c.get("sample_message_ids", [])),
-                created_at=datetime.fromisoformat(c.get("created_at", datetime.utcnow().isoformat())),
-                updated_at=datetime.fromisoformat(c.get("updated_at", datetime.utcnow().isoformat())),
-                meta=c.get("meta"),
-            )
-            for c in raw.get("semantic_clusters", [])
-        }
         self.mfa_secrets = {
             cfg["user_id"]: UserMFAConfig(
                 user_id=cfg["user_id"],

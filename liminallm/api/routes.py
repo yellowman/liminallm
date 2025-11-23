@@ -11,6 +11,8 @@ from liminallm.api.schemas import (
     ArtifactListResponse,
     ArtifactRequest,
     ArtifactResponse,
+    ArtifactVersionListResponse,
+    ArtifactVersionResponse,
     AuthResponse,
     ChatRequest,
     ChatResponse,
@@ -243,12 +245,19 @@ async def preference_insights(user_id: str = Depends(get_user)):
 
 
 @router.get("/artifacts", response_model=Envelope)
-async def list_artifacts(type: Optional[str] = None, user_id: str = Depends(get_user)):
+async def list_artifacts(
+    type: Optional[str] = None, kind: Optional[str] = None, user_id: str = Depends(get_user)
+):
     runtime = get_runtime()
+    kind_filter = kind or (type if type and "." in type else None)
+    type_filter = type if type and "." not in type else None
+    if not type_filter and kind_filter:
+        type_filter = kind_filter.split(".", 1)[0]
     items = [
         ArtifactResponse(
             id=a.id,
             type=a.type,
+            kind=a.schema.get("kind") if isinstance(a.schema, dict) else None,
             name=a.name,
             description=a.description,
             schema=a.schema,
@@ -256,21 +265,87 @@ async def list_artifacts(type: Optional[str] = None, user_id: str = Depends(get_
             created_at=a.created_at,
             updated_at=a.updated_at,
         )
-        for a in runtime.store.list_artifacts(type_filter=type)
+        for a in runtime.store.list_artifacts(type_filter=type_filter, kind_filter=kind_filter)
     ]
     return Envelope(status="ok", data=ArtifactListResponse(items=items))
+
+
+@router.get("/artifacts/{artifact_id}", response_model=Envelope)
+async def get_artifact(artifact_id: str, user_id: str = Depends(get_user)):
+    runtime = get_runtime()
+    artifact = runtime.store.get_artifact(artifact_id)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="artifact not found")
+    resp = ArtifactResponse(
+        id=artifact.id,
+        type=artifact.type,
+        kind=artifact.schema.get("kind") if isinstance(artifact.schema, dict) else None,
+        name=artifact.name,
+        description=artifact.description,
+        schema=artifact.schema,
+        owner_user_id=artifact.owner_user_id,
+        created_at=artifact.created_at,
+        updated_at=artifact.updated_at,
+    )
+    return Envelope(status="ok", data=resp)
+
+
+@router.get("/artifacts/{artifact_id}/versions", response_model=Envelope)
+async def list_artifact_versions(artifact_id: str, user_id: str = Depends(get_user)):
+    runtime = get_runtime()
+    versions = runtime.store.list_artifact_versions(artifact_id)
+    if not versions:
+        artifact = runtime.store.get_artifact(artifact_id)
+        if not artifact:
+            raise HTTPException(status_code=404, detail="artifact not found")
+    items = [
+        ArtifactVersionResponse(
+            id=v.id,
+            artifact_id=v.artifact_id,
+            version=v.version,
+            schema=v.schema,
+            created_by=v.created_by,
+            change_note=v.change_note,
+            created_at=v.created_at,
+            fs_path=v.fs_path,
+            meta=v.meta,
+        )
+        for v in versions
+    ]
+    return Envelope(status="ok", data=ArtifactVersionListResponse(items=items))
 
 
 @router.post("/artifacts", response_model=Envelope)
 async def create_artifact(body: ArtifactRequest, user_id: str = Depends(get_user)):
     runtime = get_runtime()
+    if not isinstance(body.schema, dict):
+        raise HTTPException(status_code=400, detail="artifact schema must be an object")
+    schema_kind = body.kind or body.schema.get("kind")
+    type_prefix = body.type
+    if schema_kind and not type_prefix:
+        type_prefix = schema_kind.split(".", 1)[0]
+    if schema_kind and type_prefix and not schema_kind.startswith(f"{type_prefix}."):
+        raise HTTPException(status_code=400, detail="kind must start with the type prefix")
+    if not type_prefix:
+        raise HTTPException(status_code=400, detail="type or kind is required")
+    artifact_schema = dict(body.schema)
+    if schema_kind:
+        artifact_schema["kind"] = schema_kind
     try:
-        artifact = runtime.store.create_artifact(type_=body.type, name=body.name, description=body.description or "", schema=body.schema)
+        artifact = runtime.store.create_artifact(
+            type_=type_prefix,
+            name=body.name,
+            description=body.description or "",
+            schema=artifact_schema,
+            owner_user_id=user_id,
+            created_by=user_id,
+        )
     except ConstraintViolation as err:
         raise HTTPException(status_code=409, detail=err.message)
     resp = ArtifactResponse(
         id=artifact.id,
         type=artifact.type,
+        kind=artifact.schema.get("kind") if isinstance(artifact.schema, dict) else None,
         name=artifact.name,
         description=artifact.description,
         schema=artifact.schema,
@@ -284,12 +359,29 @@ async def create_artifact(body: ArtifactRequest, user_id: str = Depends(get_user
 @router.patch("/artifacts/{artifact_id}", response_model=Envelope)
 async def patch_artifact(artifact_id: str, body: ArtifactRequest, user_id: str = Depends(get_user)):
     runtime = get_runtime()
-    artifact = runtime.store.update_artifact(artifact_id, schema=body.schema, description=body.description)
+    current = runtime.store.get_artifact(artifact_id)
+    if not current:
+        raise HTTPException(status_code=404, detail="artifact not found")
+    if not isinstance(body.schema, dict):
+        raise HTTPException(status_code=400, detail="artifact schema must be an object")
+    schema_kind = body.kind or body.schema.get("kind")
+    artifact_schema = dict(body.schema)
+    if schema_kind:
+        if not schema_kind.startswith(f"{current.type}."):
+            raise HTTPException(status_code=400, detail="kind must start with the type prefix")
+        artifact_schema["kind"] = schema_kind
+    artifact = runtime.store.update_artifact(
+        artifact_id,
+        schema=artifact_schema,
+        description=body.description,
+        created_by=user_id,
+    )
     if not artifact:
         raise HTTPException(status_code=404, detail="artifact not found")
     resp = ArtifactResponse(
         id=artifact.id,
         type=artifact.type,
+        kind=artifact.schema.get("kind") if isinstance(artifact.schema, dict) else None,
         name=artifact.name,
         description=artifact.description,
         schema=artifact.schema,

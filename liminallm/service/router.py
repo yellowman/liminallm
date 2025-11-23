@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
 
+from .embeddings import cosine_similarity
 from .sandbox import safe_eval_expr
 
 
@@ -10,7 +11,7 @@ class RouterEngine:
 
     def __init__(self) -> None:
         self.safe_functions = {
-            "cosine_similarity": self._cosine_similarity,
+            "cosine_similarity": cosine_similarity,
             "contains": lambda haystack, needle: needle in haystack if haystack is not None else False,
             "len": len,
         }
@@ -112,7 +113,7 @@ class RouterEngine:
         effects: List[dict] = []
         for candidate in adapters:
             cand_id = candidate.get("id") or candidate.get("name")
-            similarity = self._cosine_similarity(ctx_emb, self._adapter_embedding(candidate))
+            similarity = cosine_similarity(ctx_emb, self._adapter_embedding(candidate))
             if similarity > 0.6 and cand_id:
                 weights[cand_id] = max(weights.get(cand_id, 0.0), similarity)
                 effects.append({"target": cand_id, "weight": similarity, "similarity": similarity})
@@ -135,14 +136,14 @@ class RouterEngine:
             best_sim = -1.0
             for candidate in adapters:
                 cand_id = candidate.get("id") or candidate.get("name")
-                sim = self._cosine_similarity(ctx_emb, self._adapter_embedding(candidate))
+                sim = cosine_similarity(ctx_emb, self._adapter_embedding(candidate))
                 if sim > best_sim:
                     best_id, best_sim = cand_id, sim
             return best_id, best_sim if best_sim >= 0 else None
         for candidate in adapters:
             cand_id = candidate.get("id") or candidate.get("name")
             if cand_id == adapter_id:
-                sim = self._cosine_similarity(ctx_emb, self._adapter_embedding(candidate))
+                sim = cosine_similarity(ctx_emb, self._adapter_embedding(candidate))
                 return cand_id, sim
         return None, None
 
@@ -154,7 +155,7 @@ class RouterEngine:
         for candidate in adapters:
             if candidate.get(field) == value:
                 cand_id = candidate.get("id") or candidate.get("name")
-                return cand_id, self._cosine_similarity(ctx_emb, self._adapter_embedding(candidate))
+                return cand_id, cosine_similarity(ctx_emb, self._adapter_embedding(candidate))
         return None, None
 
     def _normalize_weights(self, weights: Dict[str, float], policy: dict) -> List[Dict[str, Any]]:
@@ -177,9 +178,3 @@ class RouterEngine:
         emb = adapter.get("embedding") or adapter.get("centroid") or []
         return emb if isinstance(emb, list) else []
 
-    def _cosine_similarity(self, a: List[float], b: List[float]) -> float:
-        if not a or not b or len(a) != len(b):
-            return 0.0
-        num = sum(x * y for x, y in zip(a, b))
-        denom = (sum(x * x for x in a) ** 0.5) * (sum(y * y for y in b) ** 0.5)
-        return num / denom if denom else 0.0

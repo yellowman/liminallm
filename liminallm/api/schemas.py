@@ -80,7 +80,8 @@ class ChatResponse(BaseModel):
 
 
 class ArtifactRequest(BaseModel):
-    type: str
+    type: Optional[str] = None
+    kind: Optional[str] = None
     name: str
     description: Optional[str] = ""
     schema: dict
@@ -89,6 +90,7 @@ class ArtifactRequest(BaseModel):
 class ArtifactResponse(BaseModel):
     id: str
     type: str
+    kind: Optional[str]
     name: str
     description: str
     schema: dict
@@ -99,6 +101,22 @@ class ArtifactResponse(BaseModel):
 
 class ArtifactListResponse(BaseModel):
     items: List[ArtifactResponse]
+
+
+class ArtifactVersionResponse(BaseModel):
+    id: int
+    artifact_id: str
+    version: int
+    schema: dict
+    created_by: str
+    change_note: Optional[str] = None
+    created_at: datetime
+    fs_path: Optional[str] = None
+    meta: Optional[dict] = None
+
+
+class ArtifactVersionListResponse(BaseModel):
+    items: List[ArtifactVersionResponse]
 
 
 class ConfigPatchAuditResponse(BaseModel):

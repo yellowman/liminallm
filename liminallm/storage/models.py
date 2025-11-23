@@ -99,6 +99,8 @@ class ArtifactVersion:
     artifact_id: str
     version: int
     schema: dict
+    created_by: str = "system_llm"
+    change_note: Optional[str] = None
     created_at: datetime = field(default_factory=datetime.utcnow)
     fs_path: Optional[str] = None
     meta: Dict | None = None
@@ -166,6 +168,7 @@ class TrainingJob:
     user_id: str
     adapter_id: str
     status: str = "queued"
+    num_events: Optional[int] = None
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
     loss: Optional[float] = None
