@@ -428,6 +428,7 @@ class PostgresStore:
         adapter_id: str,
         preference_event_ids: list[str] | None = None,
         dataset_path: str | None = None,
+        meta: dict | None = None,
     ) -> TrainingJob:
         job_id = str(uuid.uuid4())
         now = datetime.utcnow()
