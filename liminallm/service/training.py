@@ -106,7 +106,12 @@ class TrainingService:
         updated_schema["fs_dir"] = str(self._adapter_dir(user_id, adapter.id))
         self.store.update_artifact(adapter.id, updated_schema)
         loss = 1.0 / (1 + len(dataset_entries))
-        training_trace = self._run_jax_optax_training(weights, token_batches)
+        training_trace = self._run_jax_optax_training(
+            weights,
+            token_batches,
+            params_path=params_path,
+            checkpoint_dir=version_dir / "checkpoints",
+        )
         self.store.update_training_job(
             job.id,
             status="succeeded",
@@ -296,18 +301,24 @@ class TrainingService:
                 weights[key_b] = [[random.uniform(-0.01, 0.01) for _ in range(rank)] for _ in range(hidden_dim)]
         return weights
 
-    def _run_jax_optax_training(self, params: dict, batches: Sequence[dict]) -> dict:
+    def _run_jax_optax_training(
+        self,
+        params: dict,
+        batches: Sequence[dict],
+        *,
+        params_path: Path,
+        checkpoint_dir: Optional[Path] = None,
+        accumulation_steps: int = 4,
+    ) -> dict:
         """
-        Sketch a single-adapter JAX/Optax loop (no base-model updates).
+        Train a single LoRA adapter with a supervised loss and checkpoints.
 
-        The implementation is intentionally lightweight and only runs if
-        `jax` and `optax` are available. It treats LoRA matrices as a flat
-        parameter dict and minimizes a simple L2 loss between a toy forward
-        pass and target labels. Real deployments should swap in the
-        architecture-specific forward function described in SPEC §5 and
-        extend the loop with gradient accumulation, mixed-precision handling,
-        and checkpointing of the adapter deltas for reload in the local
-        backend.
+        The loop mirrors the lightweight JAX forward pass used by the
+        ``LocalJaxLoRABackend``: embeddings are projected through paired
+        ``.A`` / ``.B`` matrices to produce logits and a masked
+        cross-entropy loss. Gradients are accumulated across
+        ``accumulation_steps`` microbatches before each optimizer update and
+        checkpoints are written so the backend can reload trained weights.
         """
 
         try:
@@ -317,51 +328,92 @@ class TrainingService:
         except Exception:
             return {"status": "skipped", "reason": "jax/optax not installed"}
 
+        vocab_size = 4096
+        hidden_dim = 0
+        for name, value in params.items():
+            if name.endswith(".A"):
+                hidden_dim = max(hidden_dim, len(value[0]) if value else 0)
+        hidden_dim = hidden_dim or 16
+
+        emb_table = jnp.sin(
+            jnp.arange(vocab_size * hidden_dim, dtype=jnp.float32).reshape(vocab_size, hidden_dim)
+            / float(hidden_dim)
+        )
+
         def _flatten_params(param_dict: dict) -> dict:
-            return {k: jnp.array(v) for k, v in param_dict.items()}
+            return {k: jnp.array(v, dtype=jnp.float32) for k, v in param_dict.items()}
 
-        def forward(p: dict, inputs: jnp.ndarray) -> jnp.ndarray:
-            acc = jnp.zeros((inputs.shape[0], inputs.shape[1]))
+        def _to_python(tree: dict) -> dict:
+            return {k: v.tolist() for k, v in tree.items()}
 
-            def _align_width(arr: jnp.ndarray, width: int) -> jnp.ndarray:
-                if arr.shape[1] > width:
-                    return arr[:, :width]
-                if arr.shape[1] < width:
-                    pad = ((0, 0), (0, width - arr.shape[1]))
-                    return jnp.pad(arr, pad)
-                return arr
+        def _checkpoint(step: int, tree: dict) -> None:
+            if not checkpoint_dir:
+                return
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            path = checkpoint_dir / f"step_{step:04d}.json"
+            path.write_text(json.dumps(_to_python(tree)))
 
+        def _apply_lora(p: dict, embeds: jnp.ndarray) -> jnp.ndarray:
+            acc = jnp.zeros_like(embeds)
             for name, mat in p.items():
-                if name.endswith(".A"):
-                    hidden_dim = mat.shape[1]
-                    inputs_aligned = _align_width(inputs, hidden_dim)
-                    base = inputs_aligned @ mat.T
-                    b_key = name.replace(".A", ".B")
-                    if b_key in p:
-                        update = base @ p[b_key].T
-                        update = _align_width(update, acc.shape[1])
-                        acc = acc + update
-            return acc
+                if not name.endswith(".A"):
+                    continue
+                b_key = name.replace(".A", ".B")
+                if b_key not in p:
+                    continue
+                base = embeds @ mat.T
+                update = base @ p[b_key].T
+                if update.shape[-1] != embeds.shape[-1]:
+                    width = embeds.shape[-1]
+                    pad = width - update.shape[-1]
+                    if pad > 0:
+                        update = jnp.pad(update, ((0, 0), (0, 0), (0, pad)))
+                    else:
+                        update = update[:, :, :width]
+                acc = acc + update
+            return embeds + acc
 
-        def loss_fn(p: dict, batch: dict) -> jnp.ndarray:
-            inputs = jnp.array(batch["input_ids"], dtype=jnp.float32)
-            labels = jnp.array(batch["labels"], dtype=jnp.float32)
-            preds = forward(p, inputs)
-            return jnp.mean((preds - labels) ** 2)
+        def forward(p: dict, batch: dict) -> jnp.ndarray:
+            input_ids = jnp.array(batch["input_ids"], dtype=jnp.int32)
+            labels = jnp.array(batch["labels"], dtype=jnp.int32)
+            mask = jnp.array(batch.get("attention_mask") or [[1]], dtype=jnp.float32)
+            clipped_ids = jnp.clip(input_ids, 0, vocab_size - 1)
+            embeds = emb_table[clipped_ids]
+            lora_embeds = _apply_lora(p, embeds)
+            logits = jnp.einsum("bsh,vh->bsv", lora_embeds, emb_table)
+            labels = jnp.clip(labels, 0, vocab_size - 1)
+            log_probs = jax.nn.log_softmax(logits, axis=-1)
+            nll = -jnp.take_along_axis(log_probs, labels[..., None], axis=-1).squeeze(-1)
+            masked = nll * mask
+            denom = jnp.maximum(jnp.sum(mask), 1.0)
+            return jnp.sum(masked) / denom
 
-        opt = optax.adam(1e-3)
+        opt = optax.adam(2e-3)
         params_tree = _flatten_params(params)
         opt_state = opt.init(params_tree)
-        grad_fn = jax.value_and_grad(loss_fn)
+        grad_fn = jax.value_and_grad(forward)
         trace: list[dict] = []
+        accum_grads = None
+        accum_count = 0
 
-        for batch in batches:
+        for step, batch in enumerate(batches, start=1):
             value, grads = grad_fn(params_tree, batch)
-            updates, opt_state = opt.update(grads, opt_state)
-            params_tree = optax.apply_updates(params_tree, updates)
-            trace.append({"loss": float(value), "shape": batch["shape"]})
+            accum_grads = grads if accum_grads is None else jax.tree_util.tree_map(lambda a, b: a + b, accum_grads, grads)
+            accum_count += 1
+            if accum_count < accumulation_steps and step < len(batches):
+                trace.append({"loss": float(value), "shape": batch["shape"], "accumulating": True})
+                continue
 
-        return {"status": "ok", "steps": trace[-10:]}
+            mean_grads = jax.tree_util.tree_map(lambda g: g / float(accum_count), accum_grads)
+            updates, opt_state = opt.update(mean_grads, opt_state, params_tree)
+            params_tree = optax.apply_updates(params_tree, updates)
+            trace.append({"loss": float(value), "shape": batch["shape"], "accumulated": accum_count})
+            _checkpoint(step, params_tree)
+            accum_grads = None
+            accum_count = 0
+
+        params_path.write_text(json.dumps(_to_python(params_tree), indent=2))
+        return {"status": "ok", "steps": trace[-10:], "final_params_path": str(params_path)}
 
     def _bucket_embedding(self, embedding: Sequence[float], user_id: str) -> Optional[str]:
         if not embedding:

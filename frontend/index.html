@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>LiminalLM Chat</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script defer src="/static/chat.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="spark"></span>
+          <span>LiminalLM Chat</span>
+        </div>
+        <div class="bar-actions">
+          <a href="/admin" id="admin-link" aria-label="Admin console">Admin</a>
+          <button id="logout" class="ghost">Sign out</button>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section class="panel" id="auth-panel">
+          <h2>Sign in</h2>
+          <p class="subtext">Use your account to start or resume conversations.</p>
+          <form id="auth-form">
+            <div class="field">
+              <label for="email">Email</label>
+              <input type="email" id="email" name="email" placeholder="you@example.com" required />
+            </div>
+            <div class="field">
+              <label for="password">Password</label>
+              <input type="password" id="password" name="password" placeholder="••••••••" required />
+            </div>
+            <div class="field">
+              <label for="tenant">Tenant (optional)</label>
+              <input type="text" id="tenant" name="tenant" placeholder="tenant-123" />
+            </div>
+            <button class="primary" type="submit">Continue</button>
+          </form>
+          <div id="status" aria-live="polite"></div>
+          <div id="error-banner" role="alert"></div>
+        </section>
+
+        <section class="panel chat-panel" aria-label="Chat workspace">
+          <div class="conversation-header">
+            <div class="badge">
+              <span class="dot"></span>
+              <span id="conversation-label">New conversation</span>
+            </div>
+            <div class="flex-row">
+              <button class="ghost" id="new-thread">New thread</button>
+              <button class="minor" id="refresh-conversations">Refresh history</button>
+            </div>
+          </div>
+          <div class="subtext">
+            Provide an optional context ID to ground retrieval-augmented answers and a workflow ID to steer execution.
+          </div>
+          <div class="flex-row" style="gap: 14px; margin-bottom: 8px; flex-wrap: wrap">
+            <div class="field" style="flex: 1 1 220px; margin-bottom: 0">
+              <label for="context-id">Context ID</label>
+              <input type="text" id="context-id" placeholder="ctx_..." />
+            </div>
+            <div class="field" style="flex: 1 1 220px; margin-bottom: 0">
+              <label for="workflow-id">Workflow ID</label>
+              <input type="text" id="workflow-id" placeholder="workflow.chat..." />
+            </div>
+          </div>
+
+          <div id="messages" aria-live="polite"></div>
+
+          <form id="chat-form">
+            <div class="field textarea-wrap">
+              <label for="message-input">Message</label>
+              <textarea id="message-input" placeholder="Ask anything..." rows="3"></textarea>
+            </div>
+            <div id="chat-actions">
+              <div class="small" id="session-indicator">Not signed in</div>
+              <button type="submit" class="primary" id="send-btn">Send</button>
+            </div>
+          </form>
+          <div id="admin-warning" role="status"></div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

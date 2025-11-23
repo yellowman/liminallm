@@ -19,6 +19,7 @@ class SignupRequest(BaseModel):
     email: str
     password: str
     handle: Optional[str] = None
+    tenant_id: Optional[str] = None
 
 
 class AuthResponse(BaseModel):
@@ -26,12 +27,23 @@ class AuthResponse(BaseModel):
     session_id: str
     session_expires_at: datetime
     mfa_required: bool = False
+    access_token: Optional[str] = None
+    refresh_token: Optional[str] = None
+    token_type: Optional[str] = None
+    role: str = "user"
+    tenant_id: str = "public"
 
 
 class LoginRequest(BaseModel):
     email: str
     password: str
     mfa_code: Optional[str] = None
+    tenant_id: Optional[str] = None
+
+
+class TokenRefreshRequest(BaseModel):
+    refresh_token: str
+    tenant_id: Optional[str] = None
 
 
 class MFARequest(BaseModel):
@@ -158,6 +170,7 @@ class KnowledgeContextRequest(BaseModel):
     name: str
     description: str
     text: Optional[str] = None
+    chunk_size: Optional[int] = Field(default=None, ge=64, le=4000)
 
 
 class KnowledgeContextResponse(BaseModel):
@@ -242,3 +255,39 @@ class VoiceSynthesisResponse(BaseModel):
     sample_rate: int
     duration_ms: int
     voice: str
+
+
+class UserResponse(BaseModel):
+    id: str
+    email: str
+    handle: Optional[str] = None
+    role: str
+    tenant_id: str
+    created_at: datetime
+    is_active: bool = True
+    plan_tier: str = "free"
+    meta: Optional[dict] = None
+
+
+class UserListResponse(BaseModel):
+    items: List[UserResponse]
+
+
+class AdminCreateUserRequest(BaseModel):
+    email: str
+    password: Optional[str] = None
+    handle: Optional[str] = None
+    role: Optional[str] = None
+    tenant_id: Optional[str] = None
+    plan_tier: Optional[str] = None
+    is_active: Optional[bool] = None
+    meta: Optional[dict] = None
+
+
+class UpdateUserRoleRequest(BaseModel):
+    role: str
+
+
+class AdminInspectionResponse(BaseModel):
+    summary: dict
+    details: dict

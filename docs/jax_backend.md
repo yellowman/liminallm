@@ -1,36 +1,42 @@
-# JAX LoRA backend notes
+# JAX LoRA backend
 
-The current JAX pathway is intentionally skeletal so the kernel can run without GPU bindings or external dependencies. The pieces to strengthen are:
+`LocalJaxLoRABackend` now runs a functional local adapter path instead of the earlier placeholder. This page summarizes how the implementation works and the operational expectations for using it.
 
-## Gaps in the placeholder backend
-- **No inference:** `LocalJaxLoRABackend` only echoes routing metadata and does not load a model or tokenize inputs.
-- **Adapter loading stub:** Adapter paths resolve to the filesystem, but LoRA weights are never read or merged into a model.
-- **Safety/shape checks:** There is no enforcement of maximum batch sizes, sequence lengths, or device placement.
-- **Tokenizer mismatch risk:** Calls rely on pre-tokenized inputs; a tokenizer tied to the base model is required for deterministic outputs.
+## Backend capabilities
 
-## Turning it into a real backend
-1. **Model and tokenizer loading**
-   - Choose a Flax/Transformers checkpoint compatible with your adapters and load it once per process (pin to GPU/TPU).
-   - Initialize the matching tokenizer and expose it to the request path for prompt/adapter shape validation.
-2. **Adapter materialization**
-   - Read LoRA deltas from `fs_root` (``users/<user_id>/adapters/<adapter_id>``) and lift them into JAX device arrays.
-   - Decide whether to *merge* deltas into the base weights at load time (faster inference, more memory) or apply them on the fly (slower, less memory).
-3. **Forward pass and decoding**
-   - Implement an architecture-specific forward function (SPEC §5) that consumes tokenized prompts and adapter deltas.
-   - Stream decoded tokens through the API layer for parity with remote backends and include per-token usage accounting.
-4. **Batching and safety**
-   - Normalize all requests to fixed shapes (padding/truncation) before dispatch; reject oversized batches.
-   - Enforce device placement and a consistent PRNG key strategy to keep runs deterministic across adapter reloads.
-5. **Checkpointing and hot-reload**
-   - Persist adapter deltas after training (see `_run_jax_optax_training`) in a format that can be memory-mapped or lazily loaded.
-   - Add a small cache with LRU eviction keyed by adapter_id so frequently used adapters stay warm without leaking memory.
-6. **Observability and limits**
-   - Emit timing, peak memory, and token throughput metrics per request.
-   - Wire circuit breakers for latency and OOMs so the server degrades gracefully under load.
+- **Tokenizer-aware prompt handling:** Messages are normalized into a `role: content` string and tokenized with the base model's tokenizer when available (via `transformers.AutoTokenizer`). If the tokenizer dependency is missing, a deterministic hash-based fallback keeps the pathway usable for testing.
+- **Fixed shapes with safety limits:** Requests are padded/truncated to `max_seq_len` (default 512) and restricted to a single-item batch (`max_batch_size` guard). Oversized prompts or invalid batch limits are rejected early.
+- **Adapter materialization with caching:** LoRA weights are loaded from `fs_root/adapters/<adapter_id>/` (or an explicit `fs_dir`/`cephfs_dir`) by reading `params.json`. The backend caches weights keyed by adapter ID and file `mtime` so hot adapters avoid repeated disk reads.
+- **Device placement and JAX execution:** Token/attention arrays are placed on the first available JAX device, and adapter matrices are lifted to JAX arrays. A lightweight forward pass applies paired `.A`/`.B` matrices with width alignment before sampling.
+- **Deterministic sampling and decoding:** Generated tokens are sampled deterministically from the LoRA score aggregate and decoded with the tokenizer when present; otherwise a `tok-<id>` fallback is used. Usage metrics include prompt/completion token counts, latency, model ID, and adapter ID.
 
-## Training loop hardening
-- Replace the toy loss in `_run_jax_optax_training` with the model's supervised loss (or DPO/RLHF objectives) and integrate gradient accumulation.
-- Add mixed-precision support (FP16/bfloat16) and gradient clipping to avoid instabilities.
-- Save optimizer and adapter states periodically so jobs can resume after failures.
+## Adapter resolution
 
-With these pieces in place, the "local_gpu_lora" adapter plug can serve parity with remote adapter servers while keeping the kernel minimal and filesystem-driven.
+- Default path: `fs_root/adapters/<adapter_id>/latest/params.json` if present; otherwise the newest `v*/params.json` directory is selected.
+- Explicit paths: callers may supply `fs_dir` or `cephfs_dir` in the adapter metadata to override the default layout.
+- Cache: weight arrays are cached per adapter ID alongside the `params.json` modification time to avoid stale loads after updates.
+
+## Request flow
+
+1. Normalize chat messages and tokenize to `(input_ids, attention_mask)` with truncation to `max_seq_len`.
+2. Pad to non-empty tensors and move them to the active JAX device with dtype `int32`.
+3. Load and cache adapter weights; if none are found, generation falls back to zeroed scores.
+4. Run the LoRA forward pass (`_lora_forward`) to accumulate adapter contributions, mask with attention, and sample a fixed-length completion.
+5. Decode tokens and return the text plus usage metadata (prompt/completion token counts, latency, model, adapter ID).
+
+## Operational notes
+
+- **Dependencies:** JAX and (optionally) `transformers` must be available for full fidelity; the backend degrades gracefully without the tokenizer by using hashed tokens and naive decoding.
+- **Limits:** `max_seq_len` defaults to 512 and batch size to 4, but the generation path enforces a single example; adjust carefully to avoid device memory issues.
+- **Determinism:** A process-level PRNG key is set once in `_ensure_jax` to keep sampling stable across adapter reloads.
+- **Observability:** Per-call latency is reported in milliseconds. Additional metrics (throughput, memory) can be layered on top of this scaffolding if needed.
+
+## Training loop
+
+The `TrainingService` now performs a usable JAX+Optax fine-tuning cycle for LoRA adapters:
+
+- **Supervised loss:** Preference-derived prompts/targets are tokenized and fed through the same lightweight LoRA projection used at inference time. A masked cross-entropy loss over a fixed vocab drives updates.
+- **Gradient accumulation:** Microbatches accumulate gradients across configurable steps before each optimizer update, allowing larger effective batch sizes without exceeding device memory.
+- **Checkpoints and persistence:** Each optimizer step writes a checkpoint under the adapter version's `checkpoints/` directory and rewrites `params.json` with the trained weights so `local_gpu_lora` reloads the latest adapter artifacts immediately.
+
+With these pieces, `local_gpu_lora` mirrors the repository's data-driven kernel expectations while remaining lightweight and test-friendly.

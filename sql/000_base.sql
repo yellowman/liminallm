@@ -5,6 +5,8 @@ CREATE TABLE IF NOT EXISTS app_user (
   id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   email           CITEXT UNIQUE NOT NULL,
   handle          TEXT,
+  role            TEXT NOT NULL DEFAULT 'user',
+  tenant_id       TEXT NOT NULL DEFAULT 'public',
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   plan_tier       TEXT NOT NULL DEFAULT 'free',
   is_active       BOOLEAN NOT NULL DEFAULT TRUE,
@@ -40,10 +42,13 @@ CREATE TABLE IF NOT EXISTS user_settings (
 CREATE TABLE IF NOT EXISTS auth_session (
   id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   user_id         UUID NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+  tenant_id       TEXT NOT NULL DEFAULT 'public',
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   expires_at      TIMESTAMPTZ NOT NULL,
   user_agent      TEXT,
   ip_addr         INET,
+  mfa_required    BOOLEAN NOT NULL DEFAULT FALSE,
+  mfa_verified    BOOLEAN NOT NULL DEFAULT FALSE,
   meta            JSONB
 );
 

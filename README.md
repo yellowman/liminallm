@@ -130,13 +130,14 @@ for v1 these can all live in one python app with clear module boundaries.
 ### implementation completeness (prototype)
 
 - **implemented**
-  - file upload endpoint writing to the shared filesystem and ingesting chunks into RAG contexts with hashed embeddings
+  - file upload endpoint writing to the shared filesystem and ingesting chunks into RAG contexts with configurable chunk sizes, hybrid BM25 + semantic search, and deduped reranking over hashed embeddings
   - workflow execution with branching/parallel scheduling across `workflow.chat` graphs
   - router policies with a sandboxed evaluation engine (limited adapter gating usage)
   - pluggable model backend that can target external API fine-tune IDs or local JAX+LoRA adapter application
   - filesystem-backed LoRA adapter training that turns preference events into new adapter versions
   - preference capture with clustering + skill adapter promotion and routing integration
   - MFA with TOTP enrollment (otpauth URL), session gating, and login verification
+  - HMAC-signed JWT access tokens with refresh rotation, tenant-aware sessions, and admin-only config endpoints
   - preference UI and rich routing feedback loop
   - LLM-as-architect auto-patch generation
   - voice interface
@@ -153,8 +154,14 @@ for v1 these can all live in one python app with clear module boundaries.
    - redis
    - filesystem path accessible to the app
  - gpu / tpu for jax model if you expect to train adapters
-  - backend selection is single-sourced from the SQL deployment config (editable from the web console when wired); env vars only override if you set them explicitly
-  - set `MODEL_BACKEND=local_gpu_lora` to target the local JAX+LoRA path instead of external API fine-tune IDs; omit or leave as the default to use the OpenAI-style plug (the stub backend lives in `liminallm/service/model_backend.py` as `LocalJaxLoRABackend`). OpenAI plug secrets live under adapter-specific env vars (see below).
+ - backend selection is single-sourced from the SQL deployment config (editable from the web console when wired); env vars only override if you set them explicitly
+  - set `MODEL_BACKEND=local_gpu_lora` to target the local JAX+LoRA path instead of external API fine-tune IDs; omit or leave as the default to use the OpenAI-style plug. The JAX backend (`LocalJaxLoRABackend` in `liminallm/service/model_backend.py`) loads adapters from the filesystem, tokenizes prompts, runs a JAX forward pass, and enforces conservative shapes; it requires a JAX runtime and optionally a Transformers tokenizer for decode parity. OpenAI plug secrets live under adapter-specific env vars (see below).
+
+### frontend (chat + admin)
+
+- A minimal, ChatGPT-style UI now lives in `/frontend` and is served by the FastAPI app at `/` with static assets mounted at `/static/*`.
+- Authenticate with `/v1/auth/login`; the UI stores the issued bearer token/tenant ID locally and uses it for `/v1/chat`, `/v1/conversations`, and other API calls.
+- The admin console is separate at `/admin` and is guarded by the `admin` role (FastAPI enforces the role before serving the HTML). It surfaces config patch proposal/approval flows backed by `/v1/config/*` endpoints, tenant-scoped user administration (list/add/delete, role changes), adapter visibility, and a read-only inspector for database objects.
 
 ### adapters: local LoRA vs remote fine-tune IDs vs prompt-distilled
 
@@ -220,6 +227,7 @@ for v1 these can all live in one python app with clear module boundaries.
    - `OPENAI_ADAPTER_BASE_URL` – optional base URL override when pointing at an OpenAI-compatible endpoint
    - `ADAPTER_SERVER_MODEL` – model name when pointing at an OpenAI-compatible adapter server
    - `USE_MEMORY_STORE` – set to `true` to run without Postgres/Redis while testing the API and LLM calls
+   - `RAG_CHUNK_SIZE` – default character window for knowledge ingestion; overrides can be provided per request
 
 3. **migrate db**
    - run the alembic / migration tool to create tables described in the spec.
@@ -271,7 +279,10 @@ MIT
 - run migrations: `DATABASE_URL=postgres://... ./scripts/migrate.sh`
 - start api: `uvicorn liminallm.app:app --reload`
 - hit health check: `curl http://localhost:8000/healthz`
-- call kernel endpoints (session_id header required):
-  - `POST /v1/auth/signup` → returns session
+- call kernel endpoints (Bearer access token preferred; legacy `session_id` header supported for compatibility):
+  - `POST /v1/auth/signup` → returns session + signed access/refresh tokens scoped to the tenant
+  - `POST /v1/auth/login` → returns tokens, with MFA gating when enabled
+  - `POST /v1/auth/refresh` → rotates refresh tokens and issues a new access token
   - `POST /v1/chat` → creates conversation + LLM reply (live if `OPENAI_ADAPTER_API_KEY` is set, echo otherwise)
   - `GET /v1/artifacts` → lists data-driven workflows/policies
+  - admin config endpoints (`/v1/config/*`) require an admin-role token and are intended for the admin UI only

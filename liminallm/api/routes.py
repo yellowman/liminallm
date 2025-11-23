@@ -31,6 +31,7 @@ from liminallm.api.schemas import (
     PasswordResetConfirm,
     PasswordResetRequest,
     SignupRequest,
+    TokenRefreshRequest,
     KnowledgeChunkResponse,
     KnowledgeContextRequest,
     KnowledgeContextResponse,
@@ -41,7 +42,13 @@ from liminallm.api.schemas import (
     VoiceSynthesisRequest,
     VoiceSynthesisResponse,
     VoiceTranscriptionResponse,
+    UserListResponse,
+    UserResponse,
+    AdminCreateUserRequest,
+    UpdateUserRoleRequest,
+    AdminInspectionResponse,
 )
+from liminallm.service.auth import AuthContext
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.config import get_settings
 from liminallm.service.fs import PathTraversalError, safe_join
@@ -50,14 +57,51 @@ from liminallm.service.runtime import get_runtime
 router = APIRouter(prefix="/v1")
 
 
-# Dependency placeholder for auth: replace with signed tokens + role scopes
-# once the API surface is hardened beyond demo mode.
-async def get_user(session_id: Optional[str] = Header(None, convert_underscores=False)) -> str:
+async def get_user(
+    authorization: Optional[str] = Header(None),
+    session_id: Optional[str] = Header(None, convert_underscores=False),
+    x_tenant_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Tenant-ID"),
+) -> AuthContext:
     runtime = get_runtime()
-    user_id = await runtime.auth.resolve_session(session_id)
-    if not user_id:
+    ctx = await runtime.auth.authenticate(
+        authorization,
+        session_id,
+        tenant_hint=x_tenant_id,
+    )
+    if not ctx:
         raise HTTPException(status_code=401, detail="invalid session")
-    return user_id
+    return ctx
+
+
+async def get_admin_user(
+    authorization: Optional[str] = Header(None),
+    session_id: Optional[str] = Header(None, convert_underscores=False),
+    x_tenant_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Tenant-ID"),
+) -> AuthContext:
+    runtime = get_runtime()
+    ctx = await runtime.auth.authenticate(
+        authorization,
+        session_id,
+        tenant_hint=x_tenant_id,
+        required_role="admin",
+    )
+    if not ctx:
+        raise HTTPException(status_code=403, detail="admin access required")
+    return ctx
+
+
+def _user_to_response(user) -> UserResponse:
+    return UserResponse(
+        id=user.id,
+        email=user.email,
+        handle=user.handle,
+        role=user.role,
+        tenant_id=user.tenant_id,
+        created_at=user.created_at,
+        is_active=getattr(user, "is_active", True),
+        plan_tier=getattr(user, "plan_tier", "free"),
+        meta=getattr(user, "meta", None),
+    )
 
 
 @router.post("/auth/signup", response_model=Envelope)
@@ -67,13 +111,23 @@ async def signup(body: SignupRequest):
         raise HTTPException(status_code=403, detail="signup disabled")
     runtime = get_runtime()
     try:
-        user, session = await runtime.auth.signup(email=body.email, password=body.password, handle=body.handle)
+        user, session, tokens = await runtime.auth.signup(
+            email=body.email, password=body.password, handle=body.handle, tenant_id=body.tenant_id
+        )
     except ConstraintViolation as err:
         raise HTTPException(status_code=409, detail=err.message)
     return Envelope(
         status="ok",
         data=AuthResponse(
-            user_id=user.id, session_id=session.id, session_expires_at=session.expires_at, mfa_required=session.mfa_required
+            user_id=user.id,
+            session_id=session.id,
+            session_expires_at=session.expires_at,
+            mfa_required=session.mfa_required,
+            access_token=tokens.get("access_token"),
+            refresh_token=tokens.get("refresh_token"),
+            token_type=tokens.get("token_type"),
+            role=user.role,
+            tenant_id=user.tenant_id,
         ),
     )
 
@@ -81,37 +135,170 @@ async def signup(body: SignupRequest):
 @router.post("/auth/login", response_model=Envelope)
 async def login(body: LoginRequest):
     runtime = get_runtime()
-    user, session = await runtime.auth.login(email=body.email, password=body.password, mfa_code=body.mfa_code)
+    user, session, tokens = await runtime.auth.login(
+        email=body.email, password=body.password, mfa_code=body.mfa_code, tenant_id=body.tenant_id
+    )
     if not user or not session:
         raise HTTPException(status_code=401, detail="invalid credentials")
     return Envelope(
         status="ok",
         data=AuthResponse(
-            user_id=user.id, session_id=session.id, session_expires_at=session.expires_at, mfa_required=session.mfa_required
+            user_id=user.id,
+            session_id=session.id,
+            session_expires_at=session.expires_at,
+            mfa_required=session.mfa_required,
+            access_token=tokens.get("access_token"),
+            refresh_token=tokens.get("refresh_token"),
+            token_type=tokens.get("token_type"),
+            role=user.role,
+            tenant_id=user.tenant_id,
         ),
     )
+
+
+@router.post("/auth/refresh", response_model=Envelope)
+async def refresh_tokens(
+    body: TokenRefreshRequest,
+    authorization: Optional[str] = Header(None),
+    x_tenant_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Tenant-ID"),
+):
+    runtime = get_runtime()
+    tenant_hint = body.tenant_id or x_tenant_id
+    user, session, tokens = await runtime.auth.refresh_tokens(body.refresh_token, tenant_hint=tenant_hint)
+    if not user or not session:
+        raise HTTPException(status_code=401, detail="invalid refresh")
+    return Envelope(
+        status="ok",
+        data=AuthResponse(
+            user_id=user.id,
+            session_id=session.id,
+            session_expires_at=session.expires_at,
+            mfa_required=session.mfa_required,
+            access_token=tokens.get("access_token"),
+            refresh_token=tokens.get("refresh_token"),
+            token_type=tokens.get("token_type"),
+            role=user.role,
+            tenant_id=user.tenant_id,
+        ),
+    )
+
+
+@router.get("/admin/users", response_model=Envelope)
+async def admin_list_users(
+    tenant_id: Optional[str] = None, limit: int = 100, principal: AuthContext = Depends(get_admin_user)
+):
+    runtime = get_runtime()
+    users = runtime.auth.list_users(tenant_id=tenant_id or principal.tenant_id, limit=min(limit, 500))
+    return Envelope(status="ok", data=UserListResponse(items=[_user_to_response(u) for u in users]))
+
+
+@router.post("/admin/users", response_model=Envelope)
+async def admin_create_user(body: AdminCreateUserRequest, principal: AuthContext = Depends(get_admin_user)):
+    runtime = get_runtime()
+    user, password = await runtime.auth.admin_create_user(
+        email=body.email,
+        password=body.password,
+        handle=body.handle,
+        tenant_id=body.tenant_id or principal.tenant_id,
+        role=body.role,
+        plan_tier=body.plan_tier,
+        is_active=body.is_active,
+        meta=body.meta,
+    )
+    return Envelope(status="ok", data={"user": _user_to_response(user), "password": password})
+
+
+@router.post("/admin/users/{user_id}/role", response_model=Envelope)
+async def admin_set_role(user_id: str, body: UpdateUserRoleRequest, principal: AuthContext = Depends(get_admin_user)):
+    runtime = get_runtime()
+    user = runtime.auth.set_user_role(user_id, body.role)
+    if not user:
+        raise HTTPException(status_code=404, detail="user not found")
+    return Envelope(status="ok", data=_user_to_response(user))
+
+
+@router.delete("/admin/users/{user_id}", response_model=Envelope)
+async def admin_delete_user(user_id: str, principal: AuthContext = Depends(get_admin_user)):
+    runtime = get_runtime()
+    removed = runtime.auth.delete_user(user_id)
+    if not removed:
+        raise HTTPException(status_code=404, detail="user not found")
+    return Envelope(status="ok", data={"deleted": True, "user_id": user_id})
+
+
+@router.get("/admin/adapters", response_model=Envelope)
+async def admin_list_adapters(principal: AuthContext = Depends(get_admin_user)):
+    runtime = get_runtime()
+    adapters = runtime.store.list_artifacts(type_filter="adapter")
+    return Envelope(
+        status="ok",
+        data=ArtifactListResponse(
+            items=[
+                ArtifactResponse(
+                    id=a.id,
+                    type=a.type,
+                    kind=a.schema.get("kind") if isinstance(a.schema, dict) else None,
+                    name=a.name,
+                    description=a.description,
+                    schema=a.schema,
+                    owner_user_id=a.owner_user_id,
+                    created_at=a.created_at,
+                    updated_at=a.updated_at,
+                )
+                for a in adapters
+            ]
+        ),
+    )
+
+
+@router.get("/admin/objects", response_model=Envelope)
+async def admin_inspect_objects(
+    kind: Optional[str] = None, limit: int = 50, principal: AuthContext = Depends(get_admin_user)
+):
+    runtime = get_runtime()
+    if not hasattr(runtime.store, "inspect_state"):
+        raise HTTPException(status_code=400, detail="inspect not supported")
+    details = runtime.store.inspect_state(kind=kind, tenant_id=principal.tenant_id, limit=min(limit, 500))
+    summary = {k: len(v) for k, v in details.items()}
+    return Envelope(status="ok", data=AdminInspectionResponse(summary=summary, details=details))
 
 
 @router.post("/auth/mfa/request", response_model=Envelope)
 async def request_mfa(body: MFARequest):
     runtime = get_runtime()
-    user_id = await runtime.auth.resolve_session(body.session_id, allow_pending_mfa=True)
-    if not user_id:
+    auth_ctx = await runtime.auth.resolve_session(body.session_id, allow_pending_mfa=True)
+    if not auth_ctx:
         raise HTTPException(status_code=401, detail="invalid session")
-    challenge = await runtime.auth.issue_mfa_challenge(user_id=user_id)
+    challenge = await runtime.auth.issue_mfa_challenge(user_id=auth_ctx.user_id)
     return Envelope(status="ok", data=challenge)
 
 
 @router.post("/auth/mfa/verify", response_model=Envelope)
 async def verify_mfa(body: MFAVerifyRequest):
     runtime = get_runtime()
-    user_id = await runtime.auth.resolve_session(body.session_id, allow_pending_mfa=True)
-    if not user_id:
+    auth_ctx = await runtime.auth.resolve_session(body.session_id, allow_pending_mfa=True)
+    if not auth_ctx:
         raise HTTPException(status_code=401, detail="invalid session")
-    ok = await runtime.auth.verify_mfa_challenge(user_id=user_id, code=body.code, session_id=body.session_id)
+    ok = await runtime.auth.verify_mfa_challenge(user_id=auth_ctx.user_id, code=body.code, session_id=body.session_id)
     if not ok:
         raise HTTPException(status_code=401, detail="invalid mfa")
-    return Envelope(status="ok", data={"status": "verified"})
+    user, session, tokens = runtime.auth.issue_tokens_for_session(body.session_id)
+    resp: dict = {"status": "verified"}
+    if user and session:
+        resp.update(
+            AuthResponse(
+                user_id=user.id,
+                session_id=session.id,
+                session_expires_at=session.expires_at,
+                mfa_required=False,
+                access_token=tokens.get("access_token"),
+                refresh_token=tokens.get("refresh_token"),
+                token_type=tokens.get("token_type"),
+                role=user.role,
+                tenant_id=user.tenant_id,
+            ).model_dump()
+        )
+    return Envelope(status="ok", data=resp)
 
 
 @router.post("/auth/reset/request", response_model=Envelope)
@@ -131,16 +318,28 @@ async def confirm_reset(body: PasswordResetConfirm):
 
 
 @router.post("/auth/logout", response_model=Envelope)
-async def logout(session_id: Optional[str] = Header(None, convert_underscores=False)):
-    if session_id:
-        runtime = get_runtime()
-        await runtime.auth.revoke(session_id)
+async def logout(
+    session_id: Optional[str] = Header(None, convert_underscores=False),
+    authorization: Optional[str] = Header(None),
+):
+    runtime = get_runtime()
+    if authorization or session_id:
+        ctx = await runtime.auth.authenticate(authorization, session_id, allow_pending_mfa=True)
+        target_session = session_id or (ctx.session_id if ctx else None)
+        if not target_session:
+            raise HTTPException(status_code=401, detail="invalid session")
+        await runtime.auth.revoke(target_session)
     return Envelope(status="ok", data={"message": "session revoked"})
 
 
 @router.post("/chat", response_model=Envelope)
-async def chat(body: ChatRequest, user_id: str = Depends(get_user), idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key")):
+async def chat(
+    body: ChatRequest,
+    principal: AuthContext = Depends(get_user),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+):
     runtime = get_runtime()
+    user_id = principal.user_id
     if runtime.cache:
         allowed = await runtime.cache.check_rate_limit(
             f"chat:{user_id}", runtime.settings.chat_rate_limit_per_minute, runtime.settings.chat_rate_limit_window_seconds
@@ -193,11 +392,11 @@ async def chat(body: ChatRequest, user_id: str = Depends(get_user), idempotency_
 
 
 @router.post("/preferences", response_model=Envelope)
-async def record_preference(body: PreferenceEventRequest, user_id: str = Depends(get_user)):
+async def record_preference(body: PreferenceEventRequest, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     try:
         event = runtime.training.record_feedback_event(
-            user_id=user_id,
+            user_id=principal.user_id,
             conversation_id=body.conversation_id,
             message_id=body.message_id,
             feedback=body.feedback,
@@ -211,17 +410,17 @@ async def record_preference(body: PreferenceEventRequest, user_id: str = Depends
         )
     except ConstraintViolation as err:
         raise HTTPException(status_code=409, detail=err.message)
-    runtime.clusterer.cluster_user_preferences(user_id)
+    runtime.clusterer.cluster_user_preferences(principal.user_id)
     runtime.clusterer.promote_skill_adapters()
     resp = PreferenceEventResponse(id=event.id, cluster_id=event.cluster_id, feedback=event.feedback, created_at=event.created_at)
     return Envelope(status="ok", data=resp)
 
 
 @router.post("/preferences/routing_feedback", response_model=Envelope)
-async def record_routing_feedback(body: PreferenceEventRequest, user_id: str = Depends(get_user)):
+async def record_routing_feedback(body: PreferenceEventRequest, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     event = runtime.training.record_feedback_event(
-        user_id=user_id,
+        user_id=principal.user_id,
         conversation_id=body.conversation_id,
         message_id=body.message_id,
         feedback=body.feedback,
@@ -238,15 +437,15 @@ async def record_routing_feedback(body: PreferenceEventRequest, user_id: str = D
 
 
 @router.get("/preferences/insights", response_model=Envelope)
-async def preference_insights(user_id: str = Depends(get_user)):
+async def preference_insights(principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
-    summary = runtime.training.summarize_preferences(user_id)
+    summary = runtime.training.summarize_preferences(principal.user_id)
     return Envelope(status="ok", data=PreferenceInsightsResponse(**summary))
 
 
 @router.get("/artifacts", response_model=Envelope)
 async def list_artifacts(
-    type: Optional[str] = None, kind: Optional[str] = None, user_id: str = Depends(get_user)
+    type: Optional[str] = None, kind: Optional[str] = None, principal: AuthContext = Depends(get_user)
 ):
     runtime = get_runtime()
     kind_filter = kind or (type if type and "." in type else None)
@@ -271,7 +470,7 @@ async def list_artifacts(
 
 
 @router.get("/artifacts/{artifact_id}", response_model=Envelope)
-async def get_artifact(artifact_id: str, user_id: str = Depends(get_user)):
+async def get_artifact(artifact_id: str, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     artifact = runtime.store.get_artifact(artifact_id)
     if not artifact:
@@ -291,7 +490,7 @@ async def get_artifact(artifact_id: str, user_id: str = Depends(get_user)):
 
 
 @router.get("/artifacts/{artifact_id}/versions", response_model=Envelope)
-async def list_artifact_versions(artifact_id: str, user_id: str = Depends(get_user)):
+async def list_artifact_versions(artifact_id: str, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     versions = runtime.store.list_artifact_versions(artifact_id)
     if not versions:
@@ -316,7 +515,7 @@ async def list_artifact_versions(artifact_id: str, user_id: str = Depends(get_us
 
 
 @router.post("/artifacts", response_model=Envelope)
-async def create_artifact(body: ArtifactRequest, user_id: str = Depends(get_user)):
+async def create_artifact(body: ArtifactRequest, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     if not isinstance(body.schema, dict):
         raise HTTPException(status_code=400, detail="artifact schema must be an object")
@@ -337,8 +536,8 @@ async def create_artifact(body: ArtifactRequest, user_id: str = Depends(get_user
             name=body.name,
             description=body.description or "",
             schema=artifact_schema,
-            owner_user_id=user_id,
-            created_by=user_id,
+            owner_user_id=principal.user_id,
+            created_by=principal.user_id,
         )
     except ConstraintViolation as err:
         raise HTTPException(status_code=409, detail=err.message)
@@ -357,7 +556,7 @@ async def create_artifact(body: ArtifactRequest, user_id: str = Depends(get_user
 
 
 @router.patch("/artifacts/{artifact_id}", response_model=Envelope)
-async def patch_artifact(artifact_id: str, body: ArtifactRequest, user_id: str = Depends(get_user)):
+async def patch_artifact(artifact_id: str, body: ArtifactRequest, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     current = runtime.store.get_artifact(artifact_id)
     if not current:
@@ -393,10 +592,10 @@ async def patch_artifact(artifact_id: str, body: ArtifactRequest, user_id: str =
 
 
 @router.post("/config/propose_patch", response_model=Envelope)
-async def propose_patch(body: ConfigPatchRequest, user_id: str = Depends(get_user)):
+async def propose_patch(body: ConfigPatchRequest, principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
     audit = runtime.store.record_config_patch(
-        artifact_id=body.artifact_id, proposer_user_id=user_id, patch=body.patch, justification=body.justification
+        artifact_id=body.artifact_id, proposer_user_id=principal.user_id, patch=body.patch, justification=body.justification
     )
     resp = ConfigPatchAuditResponse(
         id=audit.id,
@@ -412,7 +611,7 @@ async def propose_patch(body: ConfigPatchRequest, user_id: str = Depends(get_use
 
 
 @router.get("/config/patches", response_model=Envelope)
-async def list_config_patches(status: Optional[str] = None, user_id: str = Depends(get_user)):
+async def list_config_patches(status: Optional[str] = None, principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
     patches = runtime.store.list_config_patches(status)
     items = [
@@ -432,7 +631,7 @@ async def list_config_patches(status: Optional[str] = None, user_id: str = Depen
 
 
 @router.post("/config/patches/{patch_id}/decide", response_model=Envelope)
-async def decide_config_patch(patch_id: str, body: ConfigPatchDecisionRequest, user_id: str = Depends(get_user)):
+async def decide_config_patch(patch_id: str, body: ConfigPatchDecisionRequest, principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
     decision = runtime.config_ops.decide_patch(patch_id, body.decision, body.reason)
     if not decision:
@@ -451,9 +650,9 @@ async def decide_config_patch(patch_id: str, body: ConfigPatchDecisionRequest, u
 
 
 @router.post("/config/patches/{patch_id}/apply", response_model=Envelope)
-async def apply_config_patch(patch_id: str, user_id: str = Depends(get_user)):
+async def apply_config_patch(patch_id: str, principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
-    result = runtime.config_ops.apply_patch(patch_id, approver_user_id=user_id)
+    result = runtime.config_ops.apply_patch(patch_id, approver_user_id=principal.user_id)
     if not result:
         raise HTTPException(status_code=404, detail="patch not found")
     patch = result.get("patch")
@@ -471,9 +670,9 @@ async def apply_config_patch(patch_id: str, user_id: str = Depends(get_user)):
 
 
 @router.post("/config/auto_patch", response_model=Envelope)
-async def auto_patch(body: AutoPatchRequest, user_id: str = Depends(get_user)):
+async def auto_patch(body: AutoPatchRequest, principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
-    audit = runtime.config_ops.auto_generate_patch(body.artifact_id, user_id, goal=body.goal)
+    audit = runtime.config_ops.auto_generate_patch(body.artifact_id, principal.user_id, goal=body.goal)
     resp = ConfigPatchAuditResponse(
         id=audit.id,
         artifact_id=audit.artifact_id,
@@ -491,10 +690,11 @@ async def auto_patch(body: AutoPatchRequest, user_id: str = Depends(get_user)):
 async def upload_file(
     file: UploadFile = File(...),
     context_id: Optional[str] = Form(None),
-    user_id: str = Depends(get_user),
+    chunk_size: Optional[int] = Form(None),
+    principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
-    dest_dir = Path(runtime.settings.shared_fs_root) / "users" / user_id / "files"
+    dest_dir = Path(runtime.settings.shared_fs_root) / "users" / principal.user_id / "files"
     contents = await file.read()
     try:
         dest_path = safe_join(dest_dir, file.filename)
@@ -505,7 +705,7 @@ async def upload_file(
     chunk_count = None
     if context_id:
         try:
-            chunk_count = runtime.rag.ingest_file(context_id, str(dest_path))
+            chunk_count = runtime.rag.ingest_file(context_id, str(dest_path), chunk_size=chunk_size)
         except ConstraintViolation as err:
             dest_path.unlink(missing_ok=True)
             raise HTTPException(status_code=409, detail=err.message)
@@ -514,7 +714,7 @@ async def upload_file(
 
 
 @router.get("/conversations/{conversation_id}/messages", response_model=Envelope)
-async def list_messages(conversation_id: str, user_id: str = Depends(get_user)):
+async def list_messages(conversation_id: str, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     msgs = runtime.store.list_messages(conversation_id)
     payload = [
@@ -533,9 +733,9 @@ async def list_messages(conversation_id: str, user_id: str = Depends(get_user)):
 
 
 @router.get("/conversations", response_model=Envelope)
-async def list_conversations(user_id: str = Depends(get_user)):
+async def list_conversations(principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
-    convs = runtime.store.list_conversations(user_id)
+    convs = runtime.store.list_conversations(principal.user_id)
     items = [
         ConversationSummary(
             id=c.id,
@@ -551,14 +751,14 @@ async def list_conversations(user_id: str = Depends(get_user)):
 
 
 @router.post("/contexts", response_model=Envelope)
-async def create_context(body: KnowledgeContextRequest, user_id: str = Depends(get_user)):
+async def create_context(body: KnowledgeContextRequest, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     try:
-        ctx = runtime.store.upsert_context(owner_user_id=user_id, name=body.name, description=body.description)
+        ctx = runtime.store.upsert_context(owner_user_id=principal.user_id, name=body.name, description=body.description)
     except ConstraintViolation as err:
         raise HTTPException(status_code=409, detail=err.message)
     if body.text:
-        runtime.rag.ingest_text(ctx.id, body.text)
+        runtime.rag.ingest_text(ctx.id, body.text, chunk_size=body.chunk_size)
     return Envelope(
         status="ok",
         data=KnowledgeContextResponse(
@@ -573,9 +773,9 @@ async def create_context(body: KnowledgeContextRequest, user_id: str = Depends(g
 
 
 @router.get("/contexts", response_model=Envelope)
-async def list_contexts(user_id: str = Depends(get_user)):
+async def list_contexts(principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
-    contexts = runtime.store.list_contexts()
+    contexts = runtime.store.list_contexts(owner_user_id=principal.user_id)
     items = [
         KnowledgeContextResponse(
             id=c.id,
@@ -591,9 +791,9 @@ async def list_contexts(user_id: str = Depends(get_user)):
 
 
 @router.get("/contexts/{context_id}/chunks", response_model=Envelope)
-async def list_chunks(context_id: str, user_id: str = Depends(get_user)):
+async def list_chunks(context_id: str, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
-    chunks = runtime.store.search_chunks(context_id, None)
+    chunks = runtime.store.list_chunks(context_id)
     data = [
         KnowledgeChunkResponse(id=ch.id, context_id=ch.context_id, text=ch.text, seq=ch.seq)
         for ch in chunks
@@ -602,17 +802,17 @@ async def list_chunks(context_id: str, user_id: str = Depends(get_user)):
 
 
 @router.post("/voice/transcribe", response_model=Envelope)
-async def transcribe_voice(file: UploadFile = File(...), user_id: str = Depends(get_user)):
+async def transcribe_voice(file: UploadFile = File(...), principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     audio_bytes = await file.read()
-    result = runtime.voice.transcribe(audio_bytes, user_id=user_id)
+    result = runtime.voice.transcribe(audio_bytes, user_id=principal.user_id)
     return Envelope(status="ok", data=VoiceTranscriptionResponse(**result))
 
 
 @router.post("/voice/synthesize", response_model=Envelope)
-async def synthesize_voice(body: VoiceSynthesisRequest, user_id: str = Depends(get_user)):
+async def synthesize_voice(body: VoiceSynthesisRequest, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
-    audio = runtime.voice.synthesize(body.text, user_id=user_id, voice=body.voice)
+    audio = runtime.voice.synthesize(body.text, user_id=principal.user_id, voice=body.voice)
     return Envelope(status="ok", data=VoiceSynthesisResponse(**audio))
 
 
@@ -623,10 +823,15 @@ async def websocket_chat(ws: WebSocket):
     try:
         init = await ws.receive_json()
         session_id = init.get("session_id")
-        user_id = await runtime.auth.resolve_session(session_id)
-        if not user_id:
+        access_token = init.get("access_token")
+        auth_ctx = await runtime.auth.authenticate(
+            f"Bearer {access_token}" if access_token else None,
+            session_id,
+        )
+        if not auth_ctx:
             await ws.close(code=4401)
             return
+        user_id = auth_ctx.user_id
         if runtime.cache:
             allowed = await runtime.cache.check_rate_limit(
                 f"chat:{user_id}", runtime.settings.chat_rate_limit_per_minute, runtime.settings.chat_rate_limit_window_seconds

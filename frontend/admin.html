@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Admin Console · LiminalLM</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+    <script defer src="/static/admin.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="spark"></span>
+          <span>Admin Console</span>
+        </div>
+        <div class="bar-actions">
+          <a href="/" aria-label="Back to chat">Chat</a>
+          <button id="logout" class="ghost">Sign out</button>
+        </div>
+      </header>
+
+      <main class="layout">
+        <section class="panel" id="admin-auth-panel">
+          <h2>Admin sign-in</h2>
+          <p class="subtext">Only users with the <strong>admin</strong> role will be allowed to continue.</p>
+          <form id="admin-auth-form">
+            <div class="field">
+              <label for="admin-email">Email</label>
+              <input type="email" id="admin-email" placeholder="admin@example.com" required />
+            </div>
+            <div class="field">
+              <label for="admin-password">Password</label>
+              <input type="password" id="admin-password" placeholder="••••••••" required />
+            </div>
+            <div class="field">
+              <label for="admin-tenant">Tenant (optional)</label>
+              <input type="text" id="admin-tenant" placeholder="tenant-123" />
+            </div>
+            <button class="primary" type="submit">Enter console</button>
+          </form>
+          <div id="admin-error" role="alert"></div>
+        </section>
+
+        <section class="panel" id="admin-console" aria-label="Admin console" style="display: none">
+          <div class="conversation-header">
+            <div class="badge"><span class="dot"></span><span>System controls</span></div>
+            <div class="small" id="admin-session-indicator"></div>
+          </div>
+          <div class="subtext">Review patch proposals and operate only on behalf of your tenant.</div>
+
+          <div class="field">
+            <label for="patch-artifact">Artifact ID</label>
+            <input type="text" id="patch-artifact" placeholder="artifact id for new patch" />
+          </div>
+          <div class="field">
+            <label for="patch-justification">Justification</label>
+            <textarea id="patch-justification" placeholder="Why this patch?" rows="2"></textarea>
+          </div>
+          <div class="field">
+            <label for="patch-body">Patch JSON</label>
+            <textarea id="patch-body" placeholder='{"op": "replace", "path": "..."}'></textarea>
+          </div>
+          <div class="flex-row" style="margin-bottom: 14px; flex-wrap: wrap">
+            <button class="primary" id="propose-patch">Propose patch</button>
+            <button class="minor" id="refresh-patches">Refresh patches</button>
+          </div>
+
+          <div class="field" style="margin-top: 12px">
+            <label for="decision-id">Decide / apply patch</label>
+            <input type="text" id="decision-id" placeholder="patch id" />
+          </div>
+          <div class="flex-row" style="flex-wrap: wrap; margin-bottom: 12px">
+            <button class="ghost" id="approve-patch">Approve</button>
+            <button class="ghost" id="reject-patch">Reject</button>
+            <button class="minor" id="apply-patch">Apply patch</button>
+          </div>
+
+          <div id="admin-feedback" role="status" class="subtext"></div>
+          <div id="patch-table-wrapper"></div>
+
+          <div class="divider"></div>
+
+          <div class="section-header">
+            <h3>User management</h3>
+            <button class="minor" id="refresh-users">Reload users</button>
+          </div>
+          <div class="field">
+            <label for="user-limit">Limit</label>
+            <input type="number" id="user-limit" value="50" min="1" max="500" />
+          </div>
+          <div id="user-table-wrapper" class="table-wrapper"></div>
+
+          <div class="stack">
+            <div class="field">
+              <label for="new-user-email">Create user email</label>
+              <input type="email" id="new-user-email" placeholder="newuser@example.com" />
+            </div>
+            <div class="field">
+              <label for="new-user-password">Password (leave blank to auto-generate)</label>
+              <input type="text" id="new-user-password" placeholder="auto" />
+            </div>
+            <div class="field">
+              <label for="new-user-handle">Handle</label>
+              <input type="text" id="new-user-handle" placeholder="handle" />
+            </div>
+            <div class="field">
+              <label for="new-user-tenant">Tenant</label>
+              <input type="text" id="new-user-tenant" placeholder="tenant override (optional)" />
+            </div>
+            <div class="field">
+              <label for="new-user-role">Role</label>
+              <input type="text" id="new-user-role" placeholder="user | admin" />
+            </div>
+            <div class="field">
+              <label for="new-user-plan">Plan tier</label>
+              <input type="text" id="new-user-plan" placeholder="free" />
+            </div>
+            <div class="field checkbox">
+              <label><input type="checkbox" id="new-user-active" checked /> Active</label>
+            </div>
+            <button class="primary" id="create-user">Create user</button>
+            <div class="subtext" id="created-user-password"></div>
+          </div>
+
+          <div class="section-header">
+            <h4>Update or delete user</h4>
+          </div>
+          <div class="field">
+            <label for="target-user-id">User ID</label>
+            <input type="text" id="target-user-id" placeholder="user id" />
+          </div>
+          <div class="field">
+            <label for="target-user-role">New role</label>
+            <input type="text" id="target-user-role" placeholder="admin" />
+          </div>
+          <div class="flex-row" style="flex-wrap: wrap; margin-bottom: 12px">
+            <button class="ghost" id="set-user-role">Set role</button>
+            <button class="ghost" id="delete-user">Delete user</button>
+          </div>
+
+          <div class="divider"></div>
+
+          <div class="section-header">
+            <h3>Adapters</h3>
+            <button class="minor" id="refresh-adapters">Refresh adapters</button>
+          </div>
+          <div id="adapter-table-wrapper" class="table-wrapper"></div>
+
+          <div class="divider"></div>
+
+          <div class="section-header">
+            <h3>Deep database view</h3>
+            <button class="minor" id="run-inspect">Inspect</button>
+          </div>
+          <div class="field">
+            <label for="inspect-kind">Kind</label>
+            <select id="inspect-kind">
+              <option value="">All</option>
+              <option value="users">Users</option>
+              <option value="sessions">Sessions</option>
+              <option value="conversations">Conversations</option>
+              <option value="messages">Messages</option>
+              <option value="artifacts">Artifacts</option>
+              <option value="contexts">Contexts</option>
+              <option value="chunks">Chunks</option>
+              <option value="training_jobs">Training jobs</option>
+              <option value="config_patches">Config patches</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="inspect-limit">Limit</label>
+            <input type="number" id="inspect-limit" value="50" min="1" max="500" />
+          </div>
+          <pre id="inspect-output" class="code-block" aria-live="polite"></pre>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>
