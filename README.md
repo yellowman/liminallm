@@ -18,6 +18,14 @@ the code is just the glue. everything interesting lives as data.
 
 ## what it does (conceptually)
 
+### feedback loop (at a glance)
+
+```
+User Feedback → Embeddings → Clustering → Skill Discovery
+     ↑                                            ↓
+Router Updates ← Adapter Training ← Promotion Decision
+```
+
 - **chatgpt-like web ui**
   - multi-user, password + pluggable auth
   - conversations, history, summaries
