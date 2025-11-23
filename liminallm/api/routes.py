@@ -48,7 +48,8 @@ from liminallm.service.runtime import get_runtime
 router = APIRouter(prefix="/v1")
 
 
-# Dependency placeholder for auth
+# Dependency placeholder for auth: replace with signed tokens + role scopes
+# once the API surface is hardened beyond demo mode.
 async def get_user(session_id: Optional[str] = Header(None, convert_underscores=False)) -> str:
     runtime = get_runtime()
     user_id = await runtime.auth.resolve_session(session_id)

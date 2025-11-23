@@ -304,7 +304,10 @@ class TrainingService:
         `jax` and `optax` are available. It treats LoRA matrices as a flat
         parameter dict and minimizes a simple L2 loss between a toy forward
         pass and target labels. Real deployments should swap in the
-        architecture-specific forward function described in SPEC §5.
+        architecture-specific forward function described in SPEC §5 and
+        extend the loop with gradient accumulation, mixed-precision handling,
+        and checkpointing of the adapter deltas for reload in the local
+        backend.
         """
 
         try:

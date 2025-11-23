@@ -6,7 +6,13 @@ from typing import Optional
 
 
 class VoiceService:
-    """Minimal voice interface stub for transcription and synthesis."""
+    """Minimal voice interface stub for transcription and synthesis.
+
+    This placeholder skips actual ASR/TTS. It should be replaced by a
+    hardened client that streams audio to a provider (or local model),
+    enforces per-user quotas, and stores generated artifacts in durable
+    object storage instead of the local filesystem.
+    """
 
     def __init__(self, fs_root: str) -> None:
         self.fs_root = Path(fs_root)
