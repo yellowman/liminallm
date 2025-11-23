@@ -431,11 +431,13 @@ class MemoryStore:
         if user_id not in self.users:
             raise ConstraintViolation("training user missing", {"user_id": user_id})
         job_id = str(uuid.uuid4())
+        pref_ids = preference_event_ids or []
         job = TrainingJob(
             id=job_id,
             user_id=user_id,
             adapter_id=adapter_id,
-            preference_event_ids=preference_event_ids or [],
+            num_events=len(pref_ids) if pref_ids else None,
+            preference_event_ids=pref_ids,
             dataset_path=dataset_path,
         )
         self.training_jobs[job_id] = job
@@ -479,16 +481,34 @@ class MemoryStore:
         return convs[:limit]
 
     # artifacts
-    def list_artifacts(self, type_filter: Optional[str] = None) -> List[Artifact]:
+    def list_artifacts(
+        self, type_filter: Optional[str] = None, kind_filter: Optional[str] = None
+    ) -> List[Artifact]:
         artifacts = list(self.artifacts.values())
         if type_filter:
             artifacts = [a for a in artifacts if a.type == type_filter]
+        if kind_filter:
+            artifacts = [
+                a
+                for a in artifacts
+                if isinstance(a.schema, dict) and a.schema.get("kind") == kind_filter
+            ]
         return artifacts
 
     def get_artifact(self, artifact_id: str) -> Optional[Artifact]:
         return self.artifacts.get(artifact_id)
 
-    def create_artifact(self, type_: str, name: str, schema: dict, description: str = "", owner_user_id: Optional[str] = None) -> Artifact:
+    def create_artifact(
+        self,
+        type_: str,
+        name: str,
+        schema: dict,
+        description: str = "",
+        owner_user_id: Optional[str] = None,
+        *,
+        created_by: Optional[str] = None,
+        change_note: Optional[str] = None,
+    ) -> Artifact:
         try:
             validate_artifact(type_, schema)
         except ArtifactValidationError as exc:
@@ -498,6 +518,7 @@ class MemoryStore:
             raise ConstraintViolation("artifact owner missing", {"owner_user_id": owner_user_id})
         artifact_id = str(uuid.uuid4())
         fs_path = self.persist_artifact_payload(artifact_id, schema)
+        author = created_by or owner_user_id or "system_llm"
         artifact = Artifact(
             id=artifact_id,
             type=type_,
@@ -514,13 +535,23 @@ class MemoryStore:
                 artifact_id=artifact_id,
                 version=1,
                 schema=schema,
+                created_by=author,
+                change_note=change_note,
                 fs_path=fs_path,
             )
         )
         self._persist_state()
         return artifact
 
-    def update_artifact(self, artifact_id: str, schema: dict, description: Optional[str] = None) -> Optional[Artifact]:
+    def update_artifact(
+        self,
+        artifact_id: str,
+        schema: dict,
+        description: Optional[str] = None,
+        *,
+        created_by: Optional[str] = None,
+        change_note: Optional[str] = None,
+    ) -> Optional[Artifact]:
         try:
             validate_artifact("workflow" if schema.get("kind") == "workflow.chat" else "tool" if schema.get("kind") == "tool.spec" else "artifact", schema)  # type: ignore[arg-type]
         except ArtifactValidationError as exc:
@@ -530,6 +561,7 @@ class MemoryStore:
         if not artifact:
             return None
         fs_path = self.persist_artifact_payload(artifact_id, schema)
+        author = created_by or artifact.owner_user_id or "system_llm"
         artifact.schema = schema
         if description is not None:
             artifact.description = description
@@ -542,11 +574,17 @@ class MemoryStore:
                 artifact_id=artifact_id,
                 version=(versions[-1].version + 1 if versions else 1),
                 schema=schema,
+                created_by=author,
+                change_note=change_note,
                 fs_path=fs_path,
             )
         )
         self._persist_state()
         return artifact
+
+    def list_artifact_versions(self, artifact_id: str) -> List[ArtifactVersion]:
+        versions = list(self.artifact_versions.get(artifact_id, []))
+        return sorted(versions, key=lambda v: v.version, reverse=True)
 
     def persist_artifact_payload(self, artifact_id: str, schema: dict) -> str:
         artifact_dir = self.fs_root / "artifacts" / artifact_id
@@ -993,6 +1031,7 @@ class MemoryStore:
             "user_id": job.user_id,
             "adapter_id": job.adapter_id,
             "status": job.status,
+            "num_events": job.num_events,
             "created_at": self._serialize_datetime(job.created_at),
             "updated_at": self._serialize_datetime(job.updated_at),
             "loss": job.loss,
@@ -1008,6 +1047,7 @@ class MemoryStore:
             user_id=data["user_id"],
             adapter_id=data["adapter_id"],
             status=data.get("status", "queued"),
+            num_events=data.get("num_events"),
             created_at=self._deserialize_datetime(data["created_at"]),
             updated_at=self._deserialize_datetime(data.get("updated_at", data["created_at"])),
             loss=data.get("loss"),

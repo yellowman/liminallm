@@ -20,18 +20,24 @@ CREATE TABLE IF NOT EXISTS artifact_version (
   schema          JSONB NOT NULL,
   fs_path         TEXT,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_by      TEXT NOT NULL,
+  change_note     TEXT,
   meta            JSONB,
   UNIQUE (artifact_id, version)
 );
 
+ALTER TABLE artifact_version
+  ADD COLUMN IF NOT EXISTS change_note TEXT;
+
 CREATE TABLE IF NOT EXISTS config_patch (
-  id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  id              BIGSERIAL PRIMARY KEY,
   artifact_id     UUID NOT NULL REFERENCES artifact(id) ON DELETE CASCADE,
-  proposer_user_id UUID REFERENCES app_user(id),
+  proposer        TEXT NOT NULL,
   patch           JSONB NOT NULL,
   justification   TEXT,
   status          TEXT NOT NULL DEFAULT 'pending',
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  decided_at      TIMESTAMPTZ,
+  applied_at      TIMESTAMPTZ,
   meta            JSONB
 );
