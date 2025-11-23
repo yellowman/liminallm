@@ -427,6 +427,7 @@ class MemoryStore:
         adapter_id: str,
         preference_event_ids: Optional[List[str]] = None,
         dataset_path: Optional[str] = None,
+        meta: Optional[Dict] = None,
     ) -> TrainingJob:
         if user_id not in self.users:
             raise ConstraintViolation("training user missing", {"user_id": user_id})
@@ -439,6 +440,7 @@ class MemoryStore:
             num_events=len(pref_ids) if pref_ids else None,
             preference_event_ids=pref_ids,
             dataset_path=dataset_path,
+            meta=meta,
         )
         self.training_jobs[job_id] = job
         self._persist_state()
@@ -897,6 +899,8 @@ class MemoryStore:
             "artifact_id": version.artifact_id,
             "version": version.version,
             "schema": version.schema,
+            "created_by": version.created_by,
+            "change_note": version.change_note,
             "created_at": self._serialize_datetime(version.created_at),
             "fs_path": version.fs_path,
             "meta": version.meta,
@@ -908,6 +912,8 @@ class MemoryStore:
             artifact_id=data["artifact_id"],
             version=data["version"],
             schema=data.get("schema", {}),
+            created_by=data.get("created_by", "system_llm"),
+            change_note=data.get("change_note"),
             created_at=self._deserialize_datetime(data["created_at"]),
             fs_path=data.get("fs_path"),
             meta=data.get("meta"),
