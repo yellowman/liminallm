@@ -3,9 +3,11 @@ from __future__ import annotations
 import json
 import uuid
 import hashlib
+import math
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from liminallm.logging import get_logger
 from liminallm.service.artifact_validation import ArtifactValidationError, validate_artifact
@@ -171,17 +173,73 @@ class MemoryStore:
         return changed
 
     # user / auth
-    def create_user(self, email: str, handle: Optional[str] = None) -> User:
+    def create_user(
+        self,
+        email: str,
+        handle: Optional[str] = None,
+        *,
+        tenant_id: str = "public",
+        role: str = "user",
+        plan_tier: str = "free",
+        is_active: bool = True,
+        meta: Optional[Dict] = None,
+    ) -> User:
         if any(existing.email == email for existing in self.users.values()):
             raise ConstraintViolation("email already exists", {"field": "email"})
         user_id = str(uuid.uuid4())
-        user = User(id=user_id, email=email, handle=handle)
+        user = User(
+            id=user_id,
+            email=email,
+            handle=handle,
+            tenant_id=tenant_id,
+            role=role,
+            plan_tier=plan_tier,
+            is_active=is_active,
+            meta=meta,
+        )
         self.users[user_id] = user
         self._persist_state()
         return user
 
     def get_user_by_email(self, email: str) -> Optional[User]:
         return next((u for u in self.users.values() if u.email == email), None)
+
+    def get_user(self, user_id: str) -> Optional[User]:
+        return self.users.get(user_id)
+
+    def list_users(self, tenant_id: Optional[str] = None, limit: int = 100) -> List[User]:
+        results = [u for u in self.users.values() if not tenant_id or u.tenant_id == tenant_id]
+        return sorted(results, key=lambda u: u.created_at, reverse=True)[:limit]
+
+    def update_user_role(self, user_id: str, role: str) -> Optional[User]:
+        user = self.users.get(user_id)
+        if not user:
+            return None
+        user.role = role
+        self._persist_state()
+        return user
+
+    def delete_user(self, user_id: str) -> bool:
+        if user_id not in self.users:
+            return False
+        self.users.pop(user_id, None)
+        for sess_id, sess in list(self.sessions.items()):
+            if sess.user_id == user_id:
+                self.sessions.pop(sess_id, None)
+        for conv_id, conv in list(self.conversations.items()):
+            if conv.user_id == user_id:
+                self.messages.pop(conv_id, None)
+                self.conversations.pop(conv_id, None)
+        for ctx_id, ctx in list(self.contexts.items()):
+            if ctx.owner_user_id == user_id:
+                self.contexts.pop(ctx_id, None)
+                self.chunks.pop(ctx_id, None)
+        for art_id, art in list(self.artifacts.items()):
+            if art.owner_user_id == user_id:
+                self.artifacts.pop(art_id, None)
+                self.artifact_versions.pop(art_id, None)
+        self._persist_state()
+        return True
 
     def save_password(self, user_id: str, password_hash: str, password_algo: str) -> None:
         if user_id not in self.users:
@@ -204,7 +262,15 @@ class MemoryStore:
         return self.mfa_secrets.get(user_id)
 
     def create_session(
-        self, user_id: str, ttl_minutes: int = 60 * 24, user_agent: str | None = None, ip_addr: str | None = None, *, mfa_required: bool = False
+        self,
+        user_id: str,
+        ttl_minutes: int = 60 * 24,
+        user_agent: str | None = None,
+        ip_addr: str | None = None,
+        *,
+        mfa_required: bool = False,
+        tenant_id: str = "public",
+        meta: Optional[Dict] = None,
     ) -> Session:
         if user_id not in self.users:
             raise ConstraintViolation("user does not exist", {"user_id": user_id})
@@ -214,6 +280,8 @@ class MemoryStore:
             user_agent=user_agent,
             ip_addr=ip_addr,
             mfa_required=mfa_required,
+            tenant_id=tenant_id,
+            meta=meta,
         )
         self.sessions[sess.id] = sess
         self._persist_state()
@@ -221,6 +289,14 @@ class MemoryStore:
 
     def get_session(self, session_id: str) -> Optional[Session]:
         return self.sessions.get(session_id)
+
+    def set_session_meta(self, session_id: str, meta: Dict) -> None:
+        sess = self.sessions.get(session_id)
+        if not sess:
+            return
+        sess.meta = meta
+        self.sessions[session_id] = sess
+        self._persist_state()
 
     def revoke_session(self, session_id: str) -> None:
         self.sessions.pop(session_id, None)
@@ -473,6 +549,65 @@ class MemoryStore:
         self._persist_state()
         return job
 
+    def inspect_state(self, *, tenant_id: Optional[str] = None, kind: Optional[str] = None, limit: int = 50) -> dict:
+        def _serialize(obj: Any) -> dict:
+            if hasattr(obj, "__dict__"):
+                data = dict(obj.__dict__)
+            elif isinstance(obj, dict):
+                data = dict(obj)
+            else:
+                return {"value": str(obj)}
+            for k, v in list(data.items()):
+                if isinstance(v, datetime):
+                    data[k] = v.isoformat()
+            return data
+
+        sections: dict[str, list] = {}
+        if kind in (None, "users"):
+            sections["users"] = [_serialize(u) for u in self.list_users(tenant_id=tenant_id, limit=limit)]
+        if kind in (None, "sessions"):
+            sessions = [s for s in self.sessions.values() if not tenant_id or s.tenant_id == tenant_id]
+            sections["sessions"] = [_serialize(s) for s in sorted(sessions, key=lambda s: s.created_at, reverse=True)[:limit]]
+        if kind in (None, "conversations"):
+            convs = [
+                c
+                for c in self.conversations.values()
+                if not tenant_id or (self.users.get(c.user_id) and self.users[c.user_id].tenant_id == tenant_id)
+            ]
+            sections["conversations"] = [_serialize(c) for c in sorted(convs, key=lambda c: c.updated_at, reverse=True)[:limit]]
+        if kind in (None, "messages"):
+            flattened: list[Message] = []
+            for msgs in self.messages.values():
+                for msg in msgs:
+                    conv = self.conversations.get(msg.conversation_id)
+                    if tenant_id and conv:
+                        user = self.users.get(conv.user_id)
+                        if not user or user.tenant_id != tenant_id:
+                            continue
+                    flattened.append(msg)
+            sections["messages"] = [_serialize(m) for m in sorted(flattened, key=lambda m: m.created_at, reverse=True)[:limit]]
+        if kind in (None, "artifacts"):
+            sections["artifacts"] = [_serialize(a) for a in list(self.artifacts.values())[:limit]]
+        if kind in (None, "contexts"):
+            contexts = [c for c in self.contexts.values() if not tenant_id or (c.owner_user_id and self.users.get(c.owner_user_id) and self.users[c.owner_user_id].tenant_id == tenant_id)]
+            sections["contexts"] = [_serialize(c) for c in contexts[:limit]]
+        if kind in (None, "chunks"):
+            flattened_chunks: list[KnowledgeChunk] = []
+            for context_id, chunk_list in self.chunks.items():
+                ctx = self.contexts.get(context_id)
+                if tenant_id and ctx and ctx.owner_user_id:
+                    user = self.users.get(ctx.owner_user_id)
+                    if not user or user.tenant_id != tenant_id:
+                        continue
+                flattened_chunks.extend(chunk_list)
+            sections["chunks"] = [_serialize(ch) for ch in flattened_chunks[:limit]]
+        if kind in (None, "training_jobs"):
+            jobs = [t for t in self.training_jobs.values() if not tenant_id or (self.users.get(t.user_id) and self.users[t.user_id].tenant_id == tenant_id)]
+            sections["training_jobs"] = [_serialize(t) for t in jobs[:limit]]
+        if kind in (None, "config_patches"):
+            sections["config_patches"] = [_serialize(p) for p in list(self.config_patches.values())[:limit]]
+        return sections
+
     def list_messages(self, conversation_id: str, limit: int = 10) -> List[Message]:
         msgs = self.messages.get(conversation_id, [])
         return msgs[-limit:]
@@ -656,7 +791,9 @@ class MemoryStore:
         self._persist_state()
         return ctx
 
-    def list_contexts(self) -> List[KnowledgeContext]:
+    def list_contexts(self, owner_user_id: Optional[str] = None) -> List[KnowledgeContext]:
+        if owner_user_id:
+            return [ctx for ctx in self.contexts.values() if ctx.owner_user_id == owner_user_id]
         return list(self.contexts.values())
 
     def add_chunks(self, context_id: str, chunks: Iterable[KnowledgeChunk]) -> None:
@@ -666,9 +803,28 @@ class MemoryStore:
         existing.extend(chunks)
         self._persist_state()
 
+    def list_chunks(self, context_id: Optional[str] = None) -> List[KnowledgeChunk]:
+        if context_id:
+            return list(self.chunks.get(context_id, []))
+        chunks: List[KnowledgeChunk] = []
+        for vals in self.chunks.values():
+            chunks.extend(vals)
+        return chunks
+
     def search_chunks(
-        self, context_id: Optional[str], query_embedding: Optional[List[float]], limit: int = 4
+        self,
+        context_id: Optional[str],
+        query: str,
+        query_embedding: Optional[List[float]],
+        limit: int = 4,
     ) -> List[KnowledgeChunk]:
+        candidates = self.list_chunks(context_id)
+        if not candidates:
+            return []
+
+        def _tokenize(text: str) -> List[str]:
+            return re.findall(r"\w+", text.lower())
+
         def _cosine(a: List[float], b: List[float]) -> float:
             if not a or not b:
                 return 0.0
@@ -678,21 +834,49 @@ class MemoryStore:
             norm_b = sum(x * x for x in b) ** 0.5 or 1.0
             return dot / (norm_a * norm_b)
 
-        if context_id:
-            if context_id not in self.chunks:
-                return []
-            candidates = list(self.chunks[context_id])
-        else:
-            candidates: List[KnowledgeChunk] = []
-            for vals in self.chunks.values():
-                candidates.extend(vals)
+        def _bm25_scores(query_tokens: Sequence[str], documents: List[List[str]]) -> List[float]:
+            if not query_tokens or not documents:
+                return [0.0 for _ in documents]
+            N = len(documents)
+            avgdl = sum(len(doc) for doc in documents) / float(N)
+            doc_freq: Dict[str, int] = {}
+            for doc in documents:
+                seen = set(doc)
+                for tok in seen:
+                    doc_freq[tok] = doc_freq.get(tok, 0) + 1
+            k1 = 1.5
+            b = 0.75
+            scores: List[float] = []
+            for doc in documents:
+                tf: Dict[str, int] = {}
+                for tok in doc:
+                    tf[tok] = tf.get(tok, 0) + 1
+                score = 0.0
+                for tok in query_tokens:
+                    df = doc_freq.get(tok, 0)
+                    if df == 0:
+                        continue
+                    idf = math.log(1 + (N - df + 0.5) / (df + 0.5))
+                    freq = tf.get(tok, 0)
+                    denom = freq + k1 * (1 - b + b * (len(doc) / (avgdl or 1.0)))
+                    score += idf * (freq * (k1 + 1)) / denom if denom else 0.0
+                scores.append(score)
+            return scores
 
-        if query_embedding:
-            ranked = sorted(candidates, key=lambda ch: _cosine(query_embedding, ch.embedding), reverse=True)
-            return ranked[:limit]
-        if context_id:
-            return candidates[:limit]
-        return candidates[:limit]
+        query_tokens = _tokenize(query)
+        doc_tokens = [_tokenize(ch.text) for ch in candidates]
+        bm25_scores = _bm25_scores(query_tokens, doc_tokens)
+        semantic_scores = [(_cosine(query_embedding, ch.embedding) if query_embedding else 0.0) for ch in candidates]
+        max_bm25 = max(bm25_scores) or 1.0
+        combined: Dict[str, tuple[KnowledgeChunk, float]] = {}
+        for chunk, lex, sem in zip(candidates, bm25_scores, semantic_scores):
+            hybrid = 0.45 * (lex / max_bm25) + 0.55 * sem
+            key = " ".join(chunk.text.split()).lower() or chunk.id
+            existing = combined.get(key)
+            if not existing or hybrid > existing[1]:
+                combined[key] = (chunk, hybrid)
+        ranked = sorted(combined.values(), key=lambda pair: pair[1], reverse=True)
+        return [pair[0] for pair in ranked[:limit]]
 
     def _persist_state(self) -> None:
         state = {

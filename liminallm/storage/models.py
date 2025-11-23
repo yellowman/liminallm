@@ -11,6 +11,8 @@ class User:
     id: str
     email: str
     handle: Optional[str] = None
+    role: str = "user"
+    tenant_id: str = "public"
     created_at: datetime = field(default_factory=datetime.utcnow)
     is_active: bool = True
     plan_tier: str = "free"
@@ -27,6 +29,7 @@ class Session:
     ip_addr: Optional[str] = None
     mfa_required: bool = False
     mfa_verified: bool = False
+    tenant_id: str = "public"
     meta: Dict | None = None
 
     @classmethod
@@ -38,6 +41,8 @@ class Session:
         ip_addr: str | None = None,
         *,
         mfa_required: bool = False,
+        tenant_id: str = "public",
+        meta: Dict | None = None,
     ) -> "Session":
         now = datetime.utcnow()
         return cls(
@@ -49,6 +54,8 @@ class Session:
             ip_addr=ip_addr,
             mfa_required=mfa_required,
             mfa_verified=not mfa_required,
+            tenant_id=tenant_id,
+            meta=meta,
         )
 
 

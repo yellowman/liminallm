@@ -19,6 +19,13 @@ class Settings(BaseSettings):
     chat_rate_limit_per_minute: int = Field(60, env="CHAT_RATE_LIMIT_PER_MINUTE")
     chat_rate_limit_window_seconds: int = Field(60, env="CHAT_RATE_LIMIT_WINDOW_SECONDS")
     enable_mfa: bool = Field(True, env="ENABLE_MFA")
+    jwt_secret: str = Field("dev-secret", env="JWT_SECRET")
+    jwt_issuer: str = Field("liminallm", env="JWT_ISSUER")
+    jwt_audience: str = Field("liminal-clients", env="JWT_AUDIENCE")
+    access_token_ttl_minutes: int = Field(30, env="ACCESS_TOKEN_TTL_MINUTES")
+    refresh_token_ttl_minutes: int = Field(24 * 60, env="REFRESH_TOKEN_TTL_MINUTES")
+    default_tenant_id: str = Field("public", env="DEFAULT_TENANT_ID")
+    rag_chunk_size: int = Field(400, env="RAG_CHUNK_SIZE")
 
     class Config:
         env_file = ".env"

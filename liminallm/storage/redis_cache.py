@@ -29,3 +29,9 @@ class RedisCache:
         if current == 1:
             await self.client.expire(redis_key, window_seconds)
         return current <= limit
+
+    async def mark_refresh_revoked(self, jti: str, ttl_seconds: int) -> None:
+        await self.client.set(f"refresh:revoked:{jti}", "1", ex=ttl_seconds)
+
+    async def is_refresh_revoked(self, jti: str) -> bool:
+        return bool(await self.client.exists(f"refresh:revoked:{jti}"))

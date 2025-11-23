@@ -51,13 +51,18 @@ class Runtime:
             adapter_server_model=self.settings.adapter_server_model,
             fs_root=self.settings.shared_fs_root,
         )
-        self.rag = RAGService(self.store)
+        self.rag = RAGService(self.store, default_chunk_size=self.settings.rag_chunk_size)
         self.training = TrainingService(self.store, self.settings.shared_fs_root)
         self.clusterer = SemanticClusterer(self.store, self.llm, self.training)
         self.workflow = WorkflowEngine(self.store, self.llm, self.router, self.rag)
         self.voice = VoiceService(self.settings.shared_fs_root)
         self.config_ops = ConfigOpsService(self.store, self.llm, self.router, self.training)
-        self.auth = AuthService(self.store, self.cache, mfa_enabled=self.settings.enable_mfa)
+        self.auth = AuthService(
+            self.store,
+            self.cache,
+            self.settings,
+            mfa_enabled=self.settings.enable_mfa,
+        )
 
 
 runtime = Runtime()

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Iterable, List, Optional
+from typing import Any, Iterable, List, Optional, Sequence
 
 import psycopg
 from psycopg import errors
@@ -434,14 +436,16 @@ class PostgresStore:
         now = datetime.utcnow()
         pref_ids = preference_event_ids or []
         num_events = len(pref_ids) if pref_ids else None
+        columns = (
+            "id, adapter_artifact_id, user_id, created_at, updated_at, status, num_events, loss, "
+            "dataset_path, new_version, preference_event_ids, meta"
+        )
+        placeholders = "%s, %s, %s, %s, %s, 'queued', %s, NULL, %s, NULL, %s, %s"
         with self._connect() as conn:
             row = conn.execute(
-                """
-                INSERT INTO training_job (
-                    id, adapter_artifact_id, user_id, created_at, updated_at, status, num_events, loss,
-                    dataset_path, new_version, preference_event_ids, meta
-                )
-                VALUES (%s, %s, %s, %s, %s, 'queued', %s, NULL, %s, NULL, %s, %s)
+                f"""
+                INSERT INTO training_job ({columns})
+                VALUES ({placeholders})
                 RETURNING *
                 """,
                 (
@@ -546,17 +550,39 @@ class PostgresStore:
         )
 
     # users
-    def create_user(self, email: str, handle: Optional[str] = None) -> User:
+    def create_user(
+        self,
+        email: str,
+        handle: Optional[str] = None,
+        *,
+        tenant_id: str = "public",
+        role: str = "user",
+        plan_tier: str = "free",
+        is_active: bool = True,
+        meta: Optional[dict] = None,
+    ) -> User:
         user_id = str(uuid.uuid4())
         try:
             with self._connect() as conn:
                 conn.execute(
-                    "INSERT INTO app_user (id, email, handle) VALUES (%s, %s, %s)",
-                    (user_id, email, handle),
+                    """
+                    INSERT INTO app_user (id, email, handle, tenant_id, role, plan_tier, is_active, meta)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (user_id, email, handle, tenant_id, role, plan_tier, is_active, json.dumps(meta) if meta else None),
                 )
         except errors.UniqueViolation:
             raise ConstraintViolation("email already exists", {"field": "email"})
-        return User(id=user_id, email=email, handle=handle)
+        return User(
+            id=user_id,
+            email=email,
+            handle=handle,
+            tenant_id=tenant_id,
+            role=role,
+            plan_tier=plan_tier,
+            is_active=is_active,
+            meta=meta,
+        )
 
     def save_password(self, user_id: str, password_hash: str, password_algo: str) -> None:
         with self._connect() as conn:
@@ -634,22 +660,118 @@ class PostgresStore:
             created_at=row.get("created_at", datetime.utcnow()),
             is_active=row.get("is_active", True),
             plan_tier=row.get("plan_tier", "free"),
+            role=row.get("role", "user"),
+            tenant_id=row.get("tenant_id", "public"),
             meta=row.get("meta"),
         )
 
+    def get_user(self, user_id: str) -> Optional[User]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM app_user WHERE id = %s", (user_id,)).fetchone()
+        if not row:
+            return None
+        return User(
+            id=str(row["id"]),
+            email=row["email"],
+            handle=row.get("handle"),
+            created_at=row.get("created_at", datetime.utcnow()),
+            is_active=row.get("is_active", True),
+            plan_tier=row.get("plan_tier", "free"),
+            role=row.get("role", "user"),
+            tenant_id=row.get("tenant_id", "public"),
+            meta=row.get("meta"),
+        )
+
+    def list_users(self, tenant_id: Optional[str] = None, limit: int = 100) -> List[User]:
+        with self._connect() as conn:
+            if tenant_id:
+                rows = conn.execute(
+                    "SELECT * FROM app_user WHERE tenant_id = %s ORDER BY created_at DESC LIMIT %s",
+                    (tenant_id, limit),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM app_user ORDER BY created_at DESC LIMIT %s", (limit,)).fetchall()
+        users: List[User] = []
+        for row in rows:
+            users.append(
+                User(
+                    id=str(row["id"]),
+                    email=row["email"],
+                    handle=row.get("handle"),
+                    created_at=row.get("created_at", datetime.utcnow()),
+                    is_active=row.get("is_active", True),
+                    plan_tier=row.get("plan_tier", "free"),
+                    role=row.get("role", "user"),
+                    tenant_id=row.get("tenant_id", "public"),
+                    meta=row.get("meta"),
+                )
+            )
+        return users
+
+    def update_user_role(self, user_id: str, role: str) -> Optional[User]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "UPDATE app_user SET role = %s, updated_at = now() WHERE id = %s RETURNING *", (role, user_id)
+            ).fetchone()
+        if not row:
+            return None
+        return User(
+            id=str(row["id"]),
+            email=row["email"],
+            handle=row.get("handle"),
+            created_at=row.get("created_at", datetime.utcnow()),
+            is_active=row.get("is_active", True),
+            plan_tier=row.get("plan_tier", "free"),
+            role=row.get("role", "user"),
+            tenant_id=row.get("tenant_id", "public"),
+            meta=row.get("meta"),
+        )
+
+    def delete_user(self, user_id: str) -> bool:
+        with self._connect() as conn:
+            result = conn.execute("DELETE FROM app_user WHERE id = %s", (user_id,))
+            return result.rowcount > 0
+
     # sessions
     def create_session(
-        self, user_id: str, ttl_minutes: int = 60 * 24, user_agent: str | None = None, ip_addr: str | None = None, *, mfa_required: bool = False
+        self,
+        user_id: str,
+        ttl_minutes: int = 60 * 24,
+        user_agent: str | None = None,
+        ip_addr: str | None = None,
+        *,
+        mfa_required: bool = False,
+        tenant_id: str = "public",
+        meta: Optional[dict] = None,
     ) -> Session:
-        sess = Session.new(user_id=user_id, ttl_minutes=ttl_minutes, user_agent=user_agent, ip_addr=ip_addr, mfa_required=mfa_required)
+        sess = Session.new(
+            user_id=user_id,
+            ttl_minutes=ttl_minutes,
+            user_agent=user_agent,
+            ip_addr=ip_addr,
+            mfa_required=mfa_required,
+            tenant_id=tenant_id,
+            meta=meta,
+        )
         try:
             with self._connect() as conn:
                 conn.execute(
                     """
-                    INSERT INTO auth_session (id, user_id, created_at, expires_at, user_agent, ip_addr, mfa_required, mfa_verified)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    INSERT INTO auth_session (id, user_id, tenant_id, created_at, expires_at, user_agent, ip_addr, mfa_required, mfa_verified, meta)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
-                    (sess.id, sess.user_id, sess.created_at, sess.expires_at, user_agent, ip_addr, mfa_required, sess.mfa_verified),
+                    (
+                        sess.id,
+                        sess.user_id,
+                        tenant_id,
+                        sess.created_at,
+                        sess.expires_at,
+                        user_agent,
+                        ip_addr,
+                        mfa_required,
+                        sess.mfa_verified,
+                        json.dumps(meta) if meta else None,
+                    ),
                 )
         except errors.ForeignKeyViolation:
             raise ConstraintViolation("session user missing", {"user_id": user_id})
@@ -678,6 +800,12 @@ class PostgresStore:
             row = conn.execute("SELECT * FROM auth_session WHERE id = %s", (session_id,)).fetchone()
         if not row:
             return None
+        meta = row.get("meta")
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = None
         sess = Session(
             id=str(row["id"]),
             user_id=str(row["user_id"]),
@@ -687,10 +815,19 @@ class PostgresStore:
             ip_addr=row.get("ip_addr"),
             mfa_required=row.get("mfa_required", False),
             mfa_verified=row.get("mfa_verified", False),
-            meta=row.get("meta"),
+            tenant_id=row.get("tenant_id", "public"),
+            meta=meta,
         )
         self.sessions[sess.id] = sess
         return sess
+
+    def set_session_meta(self, session_id: str, meta: dict) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE auth_session SET meta = %s WHERE id = %s", (json.dumps(meta), session_id))
+        sess = self.sessions.get(session_id)
+        if sess:
+            sess.meta = meta
+            self.sessions[session_id] = sess
 
     # conversations
     def create_conversation(self, user_id: str, title: Optional[str] = None, active_context_id: Optional[str] = None) -> Conversation:
@@ -1078,9 +1215,15 @@ class PostgresStore:
             raise ConstraintViolation("context owner missing", {"owner_user_id": owner_user_id})
         return KnowledgeContext(id=ctx_id, owner_user_id=owner_user_id, name=name, description=description, fs_path=fs_path)
 
-    def list_contexts(self) -> List[KnowledgeContext]:
+    def list_contexts(self, owner_user_id: Optional[str] = None) -> List[KnowledgeContext]:
         with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM knowledge_context ORDER BY created_at DESC", ()).fetchall()
+            if owner_user_id:
+                rows = conn.execute(
+                    "SELECT * FROM knowledge_context WHERE owner_user_id = %s ORDER BY created_at DESC",
+                    (owner_user_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM knowledge_context ORDER BY created_at DESC", ()).fetchall()
         contexts: List[KnowledgeContext] = []
         for row in rows:
             contexts.append(
@@ -1108,27 +1251,21 @@ class PostgresStore:
         except errors.ForeignKeyViolation:
             raise ConstraintViolation("context not found", {"context_id": context_id})
 
-    def search_chunks(
-        self, context_id: Optional[str], query_embedding: Optional[List[float]], limit: int = 4
-    ) -> List[KnowledgeChunk]:
-        def _cosine(a: List[float], b: List[float]) -> float:
-            if not a or not b:
-                return 0.0
-            length = min(len(a), len(b))
-            dot = sum(a[i] * b[i] for i in range(length))
-            norm_a = sum(x * x for x in a) ** 0.5 or 1.0
-            norm_b = sum(x * x for x in b) ** 0.5 or 1.0
-            return dot / (norm_a * norm_b)
-
+    def list_chunks(self, context_id: Optional[str] = None) -> List[KnowledgeChunk]:
         with self._connect() as conn:
             if context_id:
-                rows = conn.execute("SELECT * FROM knowledge_chunk WHERE context_id = %s", (context_id,)).fetchall()
+                rows = conn.execute(
+                    "SELECT * FROM knowledge_chunk WHERE context_id = %s ORDER BY seq ASC",
+                    (context_id,),
+                ).fetchall()
             else:
-                sample_size = max(limit * 5, 20)
-                rows = conn.execute("SELECT * FROM knowledge_chunk ORDER BY created_at DESC LIMIT %s", (sample_size,)).fetchall()
-        results: List[KnowledgeChunk] = []
+                rows = conn.execute(
+                    "SELECT * FROM knowledge_chunk ORDER BY created_at DESC",
+                    (),
+                ).fetchall()
+        chunks: List[KnowledgeChunk] = []
         for row in rows:
-            results.append(
+            chunks.append(
                 KnowledgeChunk(
                     id=str(row["id"]),
                     context_id=str(row["context_id"]),
@@ -1139,13 +1276,172 @@ class PostgresStore:
                     meta=row.get("meta"),
                 )
             )
-        if query_embedding:
-            results.sort(key=lambda ch: _cosine(query_embedding, ch.embedding), reverse=True)
-        elif context_id:
-            results.sort(key=lambda ch: ch.seq)
-        else:
-            results.sort(key=lambda ch: ch.created_at, reverse=True)
-        return results[:limit]
+        return chunks
+
+    def search_chunks(
+        self,
+        context_id: Optional[str],
+        query: str,
+        query_embedding: Optional[List[float]],
+        limit: int = 4,
+    ) -> List[KnowledgeChunk]:
+        def _tokenize(text: str) -> List[str]:
+            return re.findall(r"\w+", text.lower())
+
+        def _cosine(a: List[float], b: List[float]) -> float:
+            if not a or not b:
+                return 0.0
+            length = min(len(a), len(b))
+            dot = sum(a[i] * b[i] for i in range(length))
+            norm_a = sum(x * x for x in a) ** 0.5 or 1.0
+            norm_b = sum(x * x for x in b) ** 0.5 or 1.0
+            return dot / (norm_a * norm_b)
+
+        def _bm25_scores(query_tokens: Sequence[str], documents: List[List[str]]) -> List[float]:
+            if not query_tokens or not documents:
+                return [0.0 for _ in documents]
+            N = len(documents)
+            avgdl = sum(len(doc) for doc in documents) / float(N)
+            doc_freq: dict[str, int] = {}
+            for doc in documents:
+                seen = set(doc)
+                for tok in seen:
+                    doc_freq[tok] = doc_freq.get(tok, 0) + 1
+            k1 = 1.5
+            b = 0.75
+            scores: List[float] = []
+            for doc in documents:
+                tf: dict[str, int] = {}
+                for tok in doc:
+                    tf[tok] = tf.get(tok, 0) + 1
+                score = 0.0
+                for tok in query_tokens:
+                    df = doc_freq.get(tok, 0)
+                    if df == 0:
+                        continue
+                    idf = math.log(1 + (N - df + 0.5) / (df + 0.5))
+                    freq = tf.get(tok, 0)
+                    denom = freq + k1 * (1 - b + b * (len(doc) / (avgdl or 1.0)))
+                    score += idf * (freq * (k1 + 1)) / denom if denom else 0.0
+                scores.append(score)
+            return scores
+
+        candidates = self.list_chunks(context_id)
+        if not candidates:
+            return []
+        query_tokens = _tokenize(query)
+        documents = [_tokenize(ch.text) for ch in candidates]
+        bm25_scores = _bm25_scores(query_tokens, documents)
+        semantic_scores = [(_cosine(query_embedding, ch.embedding) if query_embedding else 0.0) for ch in candidates]
+        max_bm25 = max(bm25_scores) or 1.0
+        combined: dict[str, tuple[KnowledgeChunk, float]] = {}
+        for chunk, lex, sem in zip(candidates, bm25_scores, semantic_scores):
+            hybrid = 0.45 * (lex / max_bm25) + 0.55 * sem
+            key = " ".join(chunk.text.split()).lower() or chunk.id
+            existing = combined.get(key)
+            if not existing or hybrid > existing[1]:
+                combined[key] = (chunk, hybrid)
+        ranked = sorted(combined.values(), key=lambda pair: pair[1], reverse=True)
+        return [pair[0] for pair in ranked[:limit]]
+
+    def inspect_state(self, *, tenant_id: Optional[str] = None, kind: Optional[str] = None, limit: int = 50) -> dict:
+        def _serialize(row: dict) -> dict:
+            data = dict(row)
+            for key, value in list(data.items()):
+                if isinstance(value, datetime):
+                    data[key] = value.isoformat()
+            return data
+
+        sections: dict[str, list] = {}
+        with self._connect() as conn:
+            if kind in (None, "users"):
+                if tenant_id:
+                    rows = conn.execute(
+                        "SELECT * FROM app_user WHERE tenant_id = %s ORDER BY created_at DESC LIMIT %s", (tenant_id, limit)
+                    ).fetchall()
+                else:
+                    rows = conn.execute("SELECT * FROM app_user ORDER BY created_at DESC LIMIT %s", (limit,)).fetchall()
+                sections["users"] = [_serialize(row) for row in rows]
+            if kind in (None, "sessions"):
+                rows = conn.execute(
+                    "SELECT * FROM auth_session WHERE (%s IS NULL OR tenant_id = %s) ORDER BY created_at DESC LIMIT %s",
+                    (tenant_id, tenant_id, limit),
+                ).fetchall()
+                sections["sessions"] = [_serialize(row) for row in rows]
+            if kind in (None, "conversations"):
+                rows = conn.execute(
+                    """
+                    SELECT c.*
+                    FROM conversation c
+                    JOIN app_user u ON c.user_id = u.id
+                    WHERE (%s IS NULL OR u.tenant_id = %s)
+                    ORDER BY c.updated_at DESC
+                    LIMIT %s
+                    """,
+                    (tenant_id, tenant_id, limit),
+                ).fetchall()
+                sections["conversations"] = [_serialize(row) for row in rows]
+            if kind in (None, "messages"):
+                rows = conn.execute(
+                    """
+                    SELECT m.*
+                    FROM message m
+                    JOIN conversation c ON m.conversation_id = c.id
+                    JOIN app_user u ON c.user_id = u.id
+                    WHERE (%s IS NULL OR u.tenant_id = %s)
+                    ORDER BY m.created_at DESC
+                    LIMIT %s
+                    """,
+                    (tenant_id, tenant_id, limit),
+                ).fetchall()
+                sections["messages"] = [_serialize(row) for row in rows]
+            if kind in (None, "artifacts"):
+                rows = conn.execute("SELECT * FROM artifact ORDER BY created_at DESC LIMIT %s", (limit,)).fetchall()
+                sections["artifacts"] = [_serialize(row) for row in rows]
+            if kind in (None, "contexts"):
+                rows = conn.execute(
+                    """
+                    SELECT kc.*
+                    FROM knowledge_context kc
+                    LEFT JOIN app_user u ON kc.owner_user_id = u.id
+                    WHERE (%s IS NULL OR u.tenant_id = %s)
+                    ORDER BY kc.created_at DESC
+                    LIMIT %s
+                    """,
+                    (tenant_id, tenant_id, limit),
+                ).fetchall()
+                sections["contexts"] = [_serialize(row) for row in rows]
+            if kind in (None, "chunks"):
+                rows = conn.execute(
+                    """
+                    SELECT kc.*
+                    FROM knowledge_chunk kc
+                    LEFT JOIN knowledge_context ctx ON kc.context_id = ctx.id
+                    LEFT JOIN app_user u ON ctx.owner_user_id = u.id
+                    WHERE (%s IS NULL OR u.tenant_id = %s)
+                    ORDER BY kc.created_at DESC
+                    LIMIT %s
+                    """,
+                    (tenant_id, tenant_id, limit),
+                ).fetchall()
+                sections["chunks"] = [_serialize(row) for row in rows]
+            if kind in (None, "training_jobs"):
+                rows = conn.execute(
+                    """
+                    SELECT tj.*
+                    FROM training_job tj
+                    JOIN app_user u ON tj.user_id = u.id
+                    WHERE (%s IS NULL OR u.tenant_id = %s)
+                    ORDER BY tj.created_at DESC
+                    LIMIT %s
+                    """,
+                    (tenant_id, tenant_id, limit),
+                ).fetchall()
+                sections["training_jobs"] = [_serialize(row) for row in rows]
+            if kind in (None, "config_patches"):
+                rows = conn.execute("SELECT * FROM config_patch_audit ORDER BY created_at DESC LIMIT %s", (limit,)).fetchall()
+                sections["config_patches"] = [_serialize(row) for row in rows]
+        return sections
 
     def _persist_payload(self, artifact_id: str, version: int, schema: dict) -> str:
         artifact_dir = self.fs_root / "artifacts" / artifact_id
