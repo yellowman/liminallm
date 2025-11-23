@@ -317,20 +317,43 @@ class LocalJaxLoRABackend:
             return self._jnp.pad(arr, pad)
         return arr
 
+    def _align_last_dim(self, arr, width: int):
+        current = arr.shape[-1]
+        if current > width:
+            slices = (slice(None),) * (arr.ndim - 1) + (slice(0, width),)
+            return arr[slices]
+        if current < width:
+            pad = [(0, 0)] * (arr.ndim - 1) + [(0, width - current)]
+            return self._jnp.pad(arr, pad)
+        return arr
+
     def _lora_forward(self, params: dict, inputs):
-        acc = self._jnp.zeros((inputs.shape[0], inputs.shape[1]))
+        hidden_dim = max((mat.shape[1] for name, mat in params.items() if name.endswith(".A")), default=16)
+        vocab_size = 4096
+
+        if inputs.ndim == 2:
+            emb_table = self._jnp.sin(
+                self._jnp.arange(vocab_size * hidden_dim, dtype=self._jnp.float32).reshape(vocab_size, hidden_dim)
+                / float(hidden_dim)
+            )
+            clipped = self._jnp.clip(inputs, 0, vocab_size - 1)
+            embeds = emb_table[clipped]
+        else:
+            embeds = inputs
+
+        acc = self._jnp.zeros_like(embeds, dtype=self._jnp.float32)
         for name, mat in params.items():
             if not name.endswith(".A"):
                 continue
-            hidden_dim = mat.shape[1]
-            inputs_aligned = self._align_width(inputs, hidden_dim)
-            base = inputs_aligned @ mat.T
             b_key = name.replace(".A", ".B")
-            if b_key in params:
-                update = base @ params[b_key].T
-                update = self._align_width(update, acc.shape[1])
-                acc = acc + update
-        return acc
+            if b_key not in params:
+                continue
+            inputs_aligned = self._align_last_dim(embeds, mat.shape[1])
+            base = inputs_aligned @ mat.T
+            update = base @ params[b_key].T
+            update = self._align_last_dim(update, acc.shape[-1])
+            acc = acc + update
+        return embeds + acc
 
     def _decode(self, token_ids: List[int]) -> str:
         self._ensure_tokenizer()
