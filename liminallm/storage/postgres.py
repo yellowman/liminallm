@@ -66,6 +66,12 @@ class PostgresStore:
         context_text: str | None = None,
         meta: dict | None = None,
     ) -> PreferenceEvent:
+        """Persist feedback to the local filesystem cache until SQL tables exist.
+
+        This should migrate to a proper ``preference_event`` table with
+        vector indexes, conflict handling, and retention policies once the
+        migration scripts are available and the admin UI can drive writes.
+        """
         normalized_weight = weight if weight is not None else (score if score is not None else 1.0)
         event = PreferenceEvent(
             id=str(uuid.uuid4()),
@@ -697,7 +703,12 @@ class PostgresStore:
         return None
 
     def get_runtime_config(self) -> dict:
-        """Return deployment config sourced from SQL (placeholder until admin UI writes it)."""
+        """Return deployment config sourced from SQL (placeholder until admin UI writes it).
+
+        Replace this stub with typed reads from an ``instance_config`` table
+        once config patches are persisted server-side, and enforce versioning
+        plus source attribution (UI vs. drift detection) per SPEC §10.
+        """
 
         return {}
 

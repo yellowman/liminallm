@@ -194,7 +194,18 @@ class ApiAdapterBackend:
 
 
 class LocalJaxLoRABackend:
-    """Backend placeholder for local JAX generation with LoRA adapter application."""
+    """Backend placeholder for local JAX generation with LoRA adapter application.
+
+    This stub only echoes routing metadata; real implementations should:
+    - Load a frozen base model (e.g., Flax/Transformers) once per process and
+      keep it resident on the accelerator.
+    - Materialize LoRA weights from the filesystem (``fs_root``) and either
+      merge them into the base weights or apply them at run time.
+    - Provide a tokenizer that matches the base model and stream decoded tokens
+      back through the API layer for parity with remote backends.
+    - Enforce deterministic batching and shape checks so adapters cannot cause
+      OOMs; see ``docs/jax_backend.md`` for a concrete build-out checklist.
+    """
 
     def __init__(self, base_model: str, fs_root: str) -> None:
         self.base_model = base_model
