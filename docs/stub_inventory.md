@@ -23,8 +23,8 @@ This project ships several placeholder components intended to keep the kernel li
 - Path forward: add vector indexes and retention/aggregation policies, surface the data in the admin UI, and enforce tenant scoping.
 
 ## Runtime config loader (`liminallm/storage/postgres.py`)
-- Status: returns an empty dict because instance-level config patches are not yet persisted.
-- Path forward: introduce an `instance_config` table, enforce versioned reads, and attribute sources (UI vs. drift detection) to support safe rollout and rollback.
+- Status: reads from the `instance_config` table so database overrides (e.g., admin-set model backend) apply at startup.
+- Path forward: enforce versioned reads and source attribution (UI vs. drift detection) to support safe rollout and rollback.
 
 ## Frontend static exposure (`liminallm/app.py`)
 - Status: the `/static` mount serves the entire `frontend` directory without authentication, so `/static/admin.html` is reachable even though `/admin` depends on `get_admin_user`. This exposes the admin console UI to unauthenticated users.
