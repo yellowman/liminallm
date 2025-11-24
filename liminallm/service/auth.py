@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import os
 import time
 import uuid
@@ -17,6 +18,8 @@ from liminallm.storage.postgres import PostgresStore
 from liminallm.storage.redis_cache import RedisCache
 from liminallm.storage.memory import MemoryStore
 
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class AuthContext:
@@ -358,7 +361,8 @@ class AuthService:
             return None
         try:
             payload = json.loads(self._decode_segment(payload_b64))
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to decode JWT payload: %s", exc)
             return None
         if payload.get("iss") != self.settings.jwt_issuer:
             return None
@@ -440,7 +444,8 @@ class AuthService:
         if self.cache and ttl is not None:
             try:
                 await self.cache.mark_refresh_revoked(jti, ttl)
-            except Exception:
+            except Exception as exc:
+                logger.warning("Failed to cache revoked refresh token %s: %s", jti, exc)
                 return
 
     async def _is_refresh_revoked(self, jti: str) -> bool:
@@ -449,7 +454,8 @@ class AuthService:
         if self.cache:
             try:
                 return await self.cache.is_refresh_revoked(jti)
-            except Exception:
+            except Exception as exc:
+                logger.warning("Failed to check revoked refresh token %s: %s", jti, exc)
                 return False
         return False
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import random
 import time
 from dataclasses import dataclass
@@ -32,6 +33,8 @@ _ADAPTER_ID_PROVIDERS = {
     "sagemaker",
     "aws_sagemaker",
 }
+
+logger = logging.getLogger(__name__)
 
 _OPENAI_SPEC = importlib.util.find_spec("openai")
 if _OPENAI_SPEC:
@@ -250,6 +253,7 @@ class LocalJaxLoRABackend:
         except Exception as exc:  # pragma: no cover - optional dependency
             self._tokenizer = None
             self._tokenizer_error = str(exc)
+            logger.warning("Failed to load tokenizer for %s: %s", self.base_model, exc)
 
     def _vocab_size(self) -> int:
         self._ensure_tokenizer()
@@ -366,8 +370,8 @@ class LocalJaxLoRABackend:
         if self._tokenizer:
             try:  # pragma: no cover - optional dependency
                 return self._tokenizer.decode(token_ids, skip_special_tokens=True)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Tokenizer decode failed for %s: %s", self.base_model, exc)
         return " ".join([f"tok-{tid}" for tid in token_ids])
 
     def _sample_tokens(self, lora_scores, seed_token: int) -> List[int]:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import random
 import shutil
 from dataclasses import asdict
@@ -13,6 +14,8 @@ from liminallm.service.fs import safe_join
 from liminallm.service.tokenizer_utils import DEFAULT_VOCAB_SIZE, vocab_size_from_tokenizer
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import Artifact, PreferenceEvent
+
+logger = logging.getLogger(__name__)
 
 
 class TrainingService:
@@ -43,6 +46,7 @@ class TrainingService:
             self.tokenizer = None
             self._tokenizer_model = base_model
             self._tokenizer_error = str(exc)
+            logger.warning("Failed to load tokenizer for %s: %s", base_model, exc)
 
     def _vocab_size(self) -> int:
         return vocab_size_from_tokenizer(self.tokenizer, fallback=self.default_vocab_size)
@@ -207,7 +211,8 @@ class TrainingService:
         events: List[PreferenceEvent] = []
         try:
             events = self.store.list_preference_events(user_id=user_id)  # type: ignore[attr-defined]
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to list preference events for %s: %s", user_id, exc)
             events = []
         totals = {"positive": 0, "negative": 0, "neutral": 0}
         routing_feedback: dict[str, int] = {}
@@ -227,7 +232,8 @@ class TrainingService:
                             "similarity_hint": cluster.description,
                         }
                     )
-            except Exception:
+            except Exception as exc:
+                logger.warning("Failed to list semantic clusters for %s: %s", user_id, exc)
                 clusters = []
         adapter_candidates = [a for a in self.store.list_artifacts(type_filter="adapter")]  # type: ignore[arg-type]
         adapters = [
@@ -371,7 +377,8 @@ class TrainingService:
             import jax
             import jax.numpy as jnp
             import optax
-        except Exception:
+        except Exception as exc:
+            logger.warning("Skipping training loop; JAX/Optax unavailable: %s", exc)
             return {"status": "skipped", "reason": "jax/optax not installed"}
 
         vocab_size = max(self._vocab_size(), 1)
