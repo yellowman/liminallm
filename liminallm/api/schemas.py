@@ -90,7 +90,6 @@ class ChatResponse(BaseModel):
 
 class ArtifactRequest(BaseModel):
     type: Optional[str] = None
-    kind: Optional[str] = None
     name: str
     description: Optional[str] = ""
     schema: dict
