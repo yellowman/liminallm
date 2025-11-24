@@ -49,9 +49,10 @@ from liminallm.api.schemas import (
     AdminInspectionResponse,
 )
 from liminallm.service.auth import AuthContext
+from liminallm.service.errors import BadRequestError, NotFoundError
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.config import get_settings
-from liminallm.service.fs import PathTraversalError, safe_join
+from liminallm.service.fs import safe_join
 from liminallm.service.runtime import get_runtime
 
 router = APIRouter(prefix="/v1")
@@ -110,12 +111,9 @@ async def signup(body: SignupRequest):
     if not settings.allow_signup:
         raise HTTPException(status_code=403, detail="signup disabled")
     runtime = get_runtime()
-    try:
-        user, session, tokens = await runtime.auth.signup(
-            email=body.email, password=body.password, handle=body.handle, tenant_id=body.tenant_id
-        )
-    except ConstraintViolation as err:
-        raise HTTPException(status_code=409, detail=err.message)
+    user, session, tokens = await runtime.auth.signup(
+        email=body.email, password=body.password, handle=body.handle, tenant_id=body.tenant_id
+    )
     return Envelope(
         status="ok",
         data=AuthResponse(
@@ -213,7 +211,7 @@ async def admin_set_role(user_id: str, body: UpdateUserRoleRequest, principal: A
     runtime = get_runtime()
     user = runtime.auth.set_user_role(user_id, body.role)
     if not user:
-        raise HTTPException(status_code=404, detail="user not found")
+        raise NotFoundError("user not found", detail={"user_id": user_id})
     return Envelope(status="ok", data=_user_to_response(user))
 
 
@@ -222,7 +220,7 @@ async def admin_delete_user(user_id: str, principal: AuthContext = Depends(get_a
     runtime = get_runtime()
     removed = runtime.auth.delete_user(user_id)
     if not removed:
-        raise HTTPException(status_code=404, detail="user not found")
+        raise NotFoundError("user not found", detail={"user_id": user_id})
     return Envelope(status="ok", data={"deleted": True, "user_id": user_id})
 
 
@@ -257,7 +255,7 @@ async def admin_inspect_objects(
 ):
     runtime = get_runtime()
     if not hasattr(runtime.store, "inspect_state"):
-        raise HTTPException(status_code=400, detail="inspect not supported")
+        raise BadRequestError("inspect not supported")
     details = runtime.store.inspect_state(kind=kind, tenant_id=principal.tenant_id, limit=min(limit, 500))
     summary = {k: len(v) for k, v in details.items()}
     return Envelope(status="ok", data=AdminInspectionResponse(summary=summary, details=details))
@@ -394,22 +392,19 @@ async def chat(
 @router.post("/preferences", response_model=Envelope)
 async def record_preference(body: PreferenceEventRequest, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
-    try:
-        event = runtime.training.record_feedback_event(
-            user_id=principal.user_id,
-            conversation_id=body.conversation_id,
-            message_id=body.message_id,
-            feedback=body.feedback,
-            score=body.score,
-            context_text=body.context_text,
-            corrected_text=body.corrected_text,
-            weight=body.weight,
-            explicit_signal=body.explicit_signal,
-            routing_trace=body.routing_trace,
-            adapter_gates=body.adapter_gates,
-        )
-    except ConstraintViolation as err:
-        raise HTTPException(status_code=409, detail=err.message)
+    event = runtime.training.record_feedback_event(
+        user_id=principal.user_id,
+        conversation_id=body.conversation_id,
+        message_id=body.message_id,
+        feedback=body.feedback,
+        score=body.score,
+        context_text=body.context_text,
+        corrected_text=body.corrected_text,
+        weight=body.weight,
+        explicit_signal=body.explicit_signal,
+        routing_trace=body.routing_trace,
+        adapter_gates=body.adapter_gates,
+    )
     runtime.clusterer.cluster_user_preferences(principal.user_id)
     runtime.clusterer.promote_skill_adapters()
     resp = PreferenceEventResponse(id=event.id, cluster_id=event.cluster_id, feedback=event.feedback, created_at=event.created_at)
@@ -474,7 +469,7 @@ async def get_artifact(artifact_id: str, principal: AuthContext = Depends(get_us
     runtime = get_runtime()
     artifact = runtime.store.get_artifact(artifact_id)
     if not artifact:
-        raise HTTPException(status_code=404, detail="artifact not found")
+        raise NotFoundError("artifact not found", detail={"artifact_id": artifact_id})
     resp = ArtifactResponse(
         id=artifact.id,
         type=artifact.type,
@@ -496,7 +491,7 @@ async def list_artifact_versions(artifact_id: str, principal: AuthContext = Depe
     if not versions:
         artifact = runtime.store.get_artifact(artifact_id)
         if not artifact:
-            raise HTTPException(status_code=404, detail="artifact not found")
+            raise NotFoundError("artifact not found", detail={"artifact_id": artifact_id})
     items = [
         ArtifactVersionResponse(
             id=v.id,
@@ -518,29 +513,26 @@ async def list_artifact_versions(artifact_id: str, principal: AuthContext = Depe
 async def create_artifact(body: ArtifactRequest, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     if not isinstance(body.schema, dict):
-        raise HTTPException(status_code=400, detail="artifact schema must be an object")
+        raise BadRequestError("artifact schema must be an object", detail={"provided_type": type(body.schema).__name__})
     schema_kind = body.schema.get("kind")
     type_prefix = body.type
     if schema_kind and not type_prefix:
         type_prefix = schema_kind.split(".", 1)[0]
     if schema_kind and type_prefix and not schema_kind.startswith(f"{type_prefix}."):
-        raise HTTPException(status_code=400, detail="kind must start with the type prefix")
+        raise BadRequestError("kind must start with the type prefix", detail={"kind": schema_kind, "type": type_prefix})
     if not type_prefix:
-        raise HTTPException(status_code=400, detail="type or kind is required")
+        raise BadRequestError("type or kind is required")
     artifact_schema = dict(body.schema)
     if schema_kind:
         artifact_schema["kind"] = schema_kind
-    try:
-        artifact = runtime.store.create_artifact(
-            type_=type_prefix,
-            name=body.name,
-            description=body.description or "",
-            schema=artifact_schema,
-            owner_user_id=principal.user_id,
-            created_by=principal.user_id,
-        )
-    except ConstraintViolation as err:
-        raise HTTPException(status_code=409, detail=err.message)
+    artifact = runtime.store.create_artifact(
+        type_=type_prefix,
+        name=body.name,
+        description=body.description or "",
+        schema=artifact_schema,
+        owner_user_id=principal.user_id,
+        created_by=principal.user_id,
+    )
     resp = ArtifactResponse(
         id=artifact.id,
         type=artifact.type,
@@ -560,14 +552,14 @@ async def patch_artifact(artifact_id: str, body: ArtifactRequest, principal: Aut
     runtime = get_runtime()
     current = runtime.store.get_artifact(artifact_id)
     if not current:
-        raise HTTPException(status_code=404, detail="artifact not found")
+        raise NotFoundError("artifact not found", detail={"artifact_id": artifact_id})
     if not isinstance(body.schema, dict):
-        raise HTTPException(status_code=400, detail="artifact schema must be an object")
+        raise BadRequestError("artifact schema must be an object", detail={"provided_type": type(body.schema).__name__})
     schema_kind = body.schema.get("kind")
     artifact_schema = dict(body.schema)
     if schema_kind:
         if not schema_kind.startswith(f"{current.type}."):
-            raise HTTPException(status_code=400, detail="kind must start with the type prefix")
+            raise BadRequestError("kind must start with the type prefix", detail={"kind": schema_kind, "type": current.type})
         artifact_schema["kind"] = schema_kind
     artifact = runtime.store.update_artifact(
         artifact_id,
@@ -576,7 +568,7 @@ async def patch_artifact(artifact_id: str, body: ArtifactRequest, principal: Aut
         created_by=principal.user_id,
     )
     if not artifact:
-        raise HTTPException(status_code=404, detail="artifact not found")
+        raise NotFoundError("artifact not found", detail={"artifact_id": artifact_id})
     resp = ArtifactResponse(
         id=artifact.id,
         type=artifact.type,
@@ -634,8 +626,6 @@ async def list_config_patches(status: Optional[str] = None, principal: AuthConte
 async def decide_config_patch(patch_id: str, body: ConfigPatchDecisionRequest, principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
     decision = runtime.config_ops.decide_patch(patch_id, body.decision, body.reason)
-    if not decision:
-        raise HTTPException(status_code=404, detail="patch not found")
     resp = ConfigPatchAuditResponse(
         id=decision.id,
         artifact_id=decision.artifact_id,
@@ -653,8 +643,6 @@ async def decide_config_patch(patch_id: str, body: ConfigPatchDecisionRequest, p
 async def apply_config_patch(patch_id: str, principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
     result = runtime.config_ops.apply_patch(patch_id, approver_user_id=principal.user_id)
-    if not result:
-        raise HTTPException(status_code=404, detail="patch not found")
     patch = result.get("patch")
     resp = ConfigPatchAuditResponse(
         id=patch.id,
@@ -696,19 +684,16 @@ async def upload_file(
     runtime = get_runtime()
     dest_dir = Path(runtime.settings.shared_fs_root) / "users" / principal.user_id / "files"
     contents = await file.read()
-    try:
-        dest_path = safe_join(dest_dir, file.filename)
-    except PathTraversalError as err:
-        raise HTTPException(status_code=400, detail=str(err))
+    dest_path = safe_join(dest_dir, file.filename)
     dest_path.parent.mkdir(parents=True, exist_ok=True)
     dest_path.write_bytes(contents)
     chunk_count = None
     if context_id:
         try:
             chunk_count = runtime.rag.ingest_file(context_id, str(dest_path), chunk_size=chunk_size)
-        except ConstraintViolation as err:
+        except ConstraintViolation:
             dest_path.unlink(missing_ok=True)
-            raise HTTPException(status_code=409, detail=err.message)
+            raise
     resp = FileUploadResponse(fs_path=str(dest_path), context_id=context_id, chunk_count=chunk_count)
     return Envelope(status="ok", data=resp)
 
@@ -753,10 +738,7 @@ async def list_conversations(principal: AuthContext = Depends(get_user)):
 @router.post("/contexts", response_model=Envelope)
 async def create_context(body: KnowledgeContextRequest, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
-    try:
-        ctx = runtime.store.upsert_context(owner_user_id=principal.user_id, name=body.name, description=body.description)
-    except ConstraintViolation as err:
-        raise HTTPException(status_code=409, detail=err.message)
+    ctx = runtime.store.upsert_context(owner_user_id=principal.user_id, name=body.name, description=body.description)
     if body.text:
         runtime.rag.ingest_text(ctx.id, body.text, chunk_size=body.chunk_size)
     return Envelope(

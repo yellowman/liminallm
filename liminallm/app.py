@@ -7,8 +7,10 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from liminallm.api.routes import get_admin_user, router
+from liminallm.api.error_handling import register_exception_handlers
 
 app = FastAPI(title="LiminalLM Kernel", version="0.1.0")
+register_exception_handlers(app)
 app.include_router(router)
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "frontend"
