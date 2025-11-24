@@ -251,8 +251,17 @@ class LocalJaxLoRABackend:
 
     def _vocab_size(self) -> int:
         self._ensure_tokenizer()
-        if self._tokenizer is not None and hasattr(self._tokenizer, "vocab_size"):
-            return int(self._tokenizer.vocab_size)
+        if self._tokenizer is not None:
+            if hasattr(self._tokenizer, "vocab_size"):
+                try:
+                    return int(self._tokenizer.vocab_size)
+                except Exception:
+                    pass
+            if hasattr(self._tokenizer, "get_vocab"):
+                try:
+                    return int(len(self._tokenizer.get_vocab()))
+                except Exception:
+                    pass
         return 32000
 
     def _normalize_messages(self, messages: List[dict]) -> str:
