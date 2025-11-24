@@ -519,7 +519,7 @@ async def create_artifact(body: ArtifactRequest, principal: AuthContext = Depend
     runtime = get_runtime()
     if not isinstance(body.schema, dict):
         raise HTTPException(status_code=400, detail="artifact schema must be an object")
-    schema_kind = body.kind or body.schema.get("kind")
+    schema_kind = body.schema.get("kind")
     type_prefix = body.type
     if schema_kind and not type_prefix:
         type_prefix = schema_kind.split(".", 1)[0]
@@ -563,7 +563,7 @@ async def patch_artifact(artifact_id: str, body: ArtifactRequest, principal: Aut
         raise HTTPException(status_code=404, detail="artifact not found")
     if not isinstance(body.schema, dict):
         raise HTTPException(status_code=400, detail="artifact schema must be an object")
-    schema_kind = body.kind or body.schema.get("kind")
+    schema_kind = body.schema.get("kind")
     artifact_schema = dict(body.schema)
     if schema_kind:
         if not schema_kind.startswith(f"{current.type}."):
@@ -573,7 +573,7 @@ async def patch_artifact(artifact_id: str, body: ArtifactRequest, principal: Aut
         artifact_id,
         schema=artifact_schema,
         description=body.description,
-        created_by=user_id,
+        created_by=principal.user_id,
     )
     if not artifact:
         raise HTTPException(status_code=404, detail="artifact not found")
