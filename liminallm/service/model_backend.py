@@ -223,6 +223,7 @@ class LocalJaxLoRABackend:
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.default_vocab_size = DEFAULT_VOCAB_SIZE
+        self._adapter_vocab_size: Optional[int] = None
         self._adapter_cache: Dict[str, Tuple[float, dict]] = {}
         self._tokenizer = None
         self._tokenizer_error: Optional[str] = None
@@ -250,12 +251,17 @@ class LocalJaxLoRABackend:
             from transformers import AutoTokenizer
 
             self._tokenizer = AutoTokenizer.from_pretrained(self.base_model)
+            self.default_vocab_size = vocab_size_from_tokenizer(
+                self._tokenizer, fallback=self.default_vocab_size
+            )
         except Exception as exc:  # pragma: no cover - optional dependency
             self._tokenizer = None
             self._tokenizer_error = str(exc)
             logger.warning("Failed to load tokenizer for %s: %s", self.base_model, exc)
 
     def _vocab_size(self) -> int:
+        if isinstance(self._adapter_vocab_size, int) and self._adapter_vocab_size > 0:
+            return self._adapter_vocab_size
         self._ensure_tokenizer()
         return vocab_size_from_tokenizer(self._tokenizer, fallback=self.default_vocab_size)
 
@@ -263,6 +269,16 @@ class LocalJaxLoRABackend:
         if not messages:
             return ""
         return "\n".join([f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages])
+
+    def _apply_adapter_vocab_size(self, adapter: dict) -> None:
+        self._adapter_vocab_size = None
+        if not isinstance(adapter, dict):
+            return
+        schema = adapter.get("schema") or {}
+        vocab_size = schema.get("vocab_size")
+        if isinstance(vocab_size, int) and vocab_size > 0:
+            self._adapter_vocab_size = vocab_size
+            self.default_vocab_size = vocab_size
 
     def _tokenize(self, text: str) -> Tuple[List[int], List[int]]:
         self._ensure_tokenizer()
@@ -387,6 +403,8 @@ class LocalJaxLoRABackend:
 
     def generate(self, messages: List[dict], adapters: List[dict]) -> dict:
         prompt = self._normalize_messages(messages)
+        adapter = adapters[0] if adapters else {}
+        self._apply_adapter_vocab_size(adapter)
         ids, attention = self._tokenize(prompt)
         ids, attention = self._pad_batch(ids, attention)
         if len(ids) > self.max_seq_len:
@@ -402,7 +420,6 @@ class LocalJaxLoRABackend:
         token_array = self._jax.device_put(token_array, self._device)
         attn_array = self._jax.device_put(attn_array, self._device)
 
-        adapter = adapters[0] if adapters else {}
         weights = self._load_adapter_weights(adapter)
         start = time.perf_counter()
         lora_scores = self._lora_forward(weights, token_array) if weights else self._jnp.zeros_like(token_array)
