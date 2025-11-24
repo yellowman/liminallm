@@ -7,8 +7,8 @@ This project ships several placeholder components intended to keep the kernel li
 - Path forward: add proper base model logits instead of hashed token sampling, and reintroduce batching/safety limits now that the training/inference embedding layouts are reconciled.
 
 ## Jsonschema shim (`jsonschema/__init__.py`)
-- Status: tiny validator covering only required-field checks used by tests.
-- Path forward: depend on the upstream `jsonschema` package (or another full validator) once the runtime image can install optional dependencies; re-enable full schema validation in artifact handling.
+- Status: replaced with the upstream `jsonschema` package so artifact schemas run through full Draft 2020-12 validation.
+- Path forward: keep schemas synchronized with runtime expectations and surface validation errors in the admin UI.
 
 ## Auth dependency (`liminallm/api/routes.py`)
 - Status: Routes now delegate to `AuthService.authenticate`, which validates signed JWT access/refresh tokens, enforces roles (e.g., `/admin`), supports MFA, and falls back to cached sessions. The dependency is functional rather than a stub, but perimeter controls (e.g., device binding and per-route scopes) remain thin compared to SPEC §13 expectations.
