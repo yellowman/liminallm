@@ -5,6 +5,7 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, Optional
 
+from liminallm.service.errors import BadRequestError, NotFoundError
 from liminallm.service.llm import LLMService
 from liminallm.service.router import RouterEngine
 from liminallm.service.training import TrainingService
@@ -34,29 +35,32 @@ class ConfigOpsService:
     def auto_generate_patch(self, artifact_id: str, user_id: Optional[str], goal: Optional[str] = None) -> ConfigPatchAudit:
         artifact = self.store.get_artifact(artifact_id)
         if not artifact:
-            raise ConstraintViolation("artifact not found", {"artifact_id": artifact_id})
+            raise NotFoundError("artifact not found", detail={"artifact_id": artifact_id})
         prompt = self._build_prompt(artifact, goal)
         patch = self._run_llm_for_patch(prompt)
         return self.store.record_config_patch(artifact_id=artifact_id, proposer_user_id=user_id, patch=patch, justification=goal or "auto-proposed")
 
-    def decide_patch(self, patch_id: str, decision: str, reason: Optional[str] = None) -> Optional[ConfigPatchAudit]:
+    def decide_patch(self, patch_id: str, decision: str, reason: Optional[str] = None) -> ConfigPatchAudit:
         normalized = decision.lower()
         if normalized not in {"approved", "rejected"}:
-            raise ConstraintViolation("invalid decision", {"decision": decision})
-        return self.store.update_config_patch_status(
+            raise BadRequestError("invalid decision", detail={"decision": decision})
+        updated = self.store.update_config_patch_status(
             patch_id,
             normalized,
             meta={"reason": reason} if reason else None,
             mark_decided=True,
         )
+        if not updated:
+            raise NotFoundError("patch not found", detail={"patch_id": patch_id})
+        return updated
 
-    def apply_patch(self, patch_id: str, approver_user_id: Optional[str] = None) -> Optional[dict]:
+    def apply_patch(self, patch_id: str, approver_user_id: Optional[str] = None) -> dict:
         patch = self.store.get_config_patch(patch_id)
         if not patch:
-            return None
+            raise NotFoundError("patch not found", detail={"patch_id": patch_id})
         artifact = self.store.get_artifact(patch.artifact_id)
         if not artifact:
-            raise ConstraintViolation("artifact missing", {"artifact_id": patch.artifact_id})
+            raise NotFoundError("artifact missing", detail={"artifact_id": patch.artifact_id})
         new_schema = self._apply_patch_to_schema(artifact.schema, patch.patch)
         updated = self.store.update_artifact(artifact.id, new_schema, artifact.description)
         applied_patch = self.store.update_config_patch_status(
