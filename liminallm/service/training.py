@@ -23,6 +23,26 @@ class TrainingService:
         self.fs_root = Path(fs_root)
         self.default_vocab_size = DEFAULT_VOCAB_SIZE
         self.tokenizer = None
+        self._tokenizer_error: Optional[str] = None
+        self._tokenizer_model: Optional[str] = None
+
+    def _ensure_tokenizer(self, base_model: Optional[str]) -> None:
+        if not base_model:
+            return
+        if self.tokenizer is not None and self._tokenizer_model == base_model:
+            return
+        if self._tokenizer_error is not None and self._tokenizer_model == base_model:
+            return
+        try:  # pragma: no cover - optional dependency
+            from transformers import AutoTokenizer
+
+            self.tokenizer = AutoTokenizer.from_pretrained(base_model)
+            self._tokenizer_model = base_model
+            self._tokenizer_error = None
+        except Exception as exc:  # pragma: no cover - optional dependency
+            self.tokenizer = None
+            self._tokenizer_model = base_model
+            self._tokenizer_error = str(exc)
 
     def _vocab_size(self) -> int:
         return vocab_size_from_tokenizer(self.tokenizer, fallback=self.default_vocab_size)
@@ -70,7 +90,7 @@ class TrainingService:
             return None
         cluster_meta = self._cluster_events(events, user_id)
         dataset_entries = list(self._build_examples(events))
-        token_batches = list(self._tokenize_batches(dataset_entries))
+        token_batches = list(self._tokenize_batches(dataset_entries, base_model=adapter.schema.get("base_model")))
         job = self.store.create_training_job(
             user_id=user_id,
             adapter_id=adapter.id,
@@ -254,6 +274,7 @@ class TrainingService:
         dataset_entries: Sequence[dict],
         batch_size: int = 2,
         max_length: int = 512,
+        base_model: Optional[str] = None,
     ) -> Iterator[dict]:
         """
         Convert preference_event-derived examples into padded token batches.
@@ -264,6 +285,7 @@ class TrainingService:
         backends (e.g., JAX) can preallocate arrays without re-tokenizing.
         """
 
+        self._ensure_tokenizer(base_model)
         vocab_size = max(self._vocab_size(), 1)
 
         def _encode(text: str) -> List[int]:
