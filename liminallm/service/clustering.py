@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import random
 from datetime import datetime
+import json
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 from liminallm.service.embeddings import cosine_similarity, pad_vectors
@@ -82,7 +83,7 @@ class SemanticClusterer:
                 elif evt.context_text:
                     texts.append(evt.context_text)
             summary_prompt = "\n".join(texts) if texts else "No examples"
-            label, description = self._label_with_llm(summary_prompt)
+            label, description = self._label_with_llm(cluster, summary_prompt)
             self.store.update_semantic_cluster(
                 cluster.id,
                 label=label,
@@ -90,21 +91,38 @@ class SemanticClusterer:
                 meta={"labeled_at": datetime.utcnow().isoformat()},
             )
 
-    def _label_with_llm(self, text: str) -> Tuple[str, str]:
+    def _label_with_llm(self, cluster: SemanticCluster, text: str) -> Tuple[str, str]:
         if self.llm:
             prompt = (
-                "You are labeling a cluster of user preference events. "
-                "Provide a short 3-5 word label and a one-sentence description for: " + text
+                "You label semantic clusters of user preference events. "
+                "Return JSON with fields 'label' (3-5 words) and 'description' (one sentence).\n"
+                f"Cluster size: {cluster.size}\nSample messages:\n{text}"
             )
             resp = self.llm.generate(prompt, adapters=[], context_snippets=[], history=None)
             content = resp.get("content", "") if isinstance(resp, dict) else ""
-            if content:
-                parts = content.split("\n", 1)
-                label = parts[0][:64]
-                desc = parts[1].strip() if len(parts) > 1 else content
-                return label, desc
+            parsed = self._parse_label_response(content)
+            if parsed:
+                return parsed
         fallback = text.split(" ")[:5]
         return (" ".join(fallback) or "Unlabeled cluster", text[:140] or "No description")
+
+    def _parse_label_response(self, content: str) -> Tuple[str, str] | None:
+        if not content:
+            return None
+        try:
+            payload = json.loads(content)
+            label = str(payload.get("label", "")).strip()
+            description = str(payload.get("description", "")).strip()
+            if label or description:
+                return label or description[:64] or "Unlabeled cluster", description or label
+        except (TypeError, ValueError):
+            pass
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        if not lines:
+            return None
+        label = lines[0][:64]
+        description = lines[1] if len(lines) > 1 else ""
+        return label, description or label
 
     def promote_skill_adapters(
         self,

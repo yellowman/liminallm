@@ -23,3 +23,12 @@ def test_validate_artifact_rejects_invalid_schema():
         validate_artifact("workflow", schema)
 
     assert "'type' is a required property" in excinfo.value.errors[0]
+
+
+def test_validate_artifact_rejects_type_errors():
+    schema = {"kind": "workflow.chat", "entrypoint": "start", "nodes": "not-a-list"}
+
+    with pytest.raises(ArtifactValidationError) as excinfo:
+        validate_artifact("workflow", schema)
+
+    assert "array" in excinfo.value.errors[0]
