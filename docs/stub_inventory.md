@@ -3,8 +3,8 @@
 This project ships several placeholder components intended to keep the kernel lightweight in constrained environments. Replace them with production-grade implementations before exposing the stack broadly.
 
 ## Local JAX + LoRA backend (`liminallm/service/model_backend.py`)
-- Status: lightweight JAX path that tokenizes requests, loads cached adapter weights, and applies paired `.A`/`.B` matrices, but inference assumes 2D `(batch, seq)` inputs while training uses 3D `(batch, seq, hidden)` embeddings. Loading a trained adapter into `_lora_forward` currently produces shape mismatches between the 2D accumulator and the 3D matrices emitted by `TrainingService._apply_lora`.
-- Path forward: align the inference forward pass with the training embedding layout (or flatten training outputs), add proper base model logits instead of hashed token sampling, and reintroduce batching/safety limits once the shapes are reconciled.
+- Status: lightweight JAX path that tokenizes requests, loads cached adapter weights, and applies paired `.A`/`.B` matrices. The LoRA forward pass now accepts either token IDs or precomputed `(batch, seq, hidden)` embeddings and aligns widths to adapter expectations so training outputs can be reused during inference without shape errors.
+- Path forward: add proper base model logits instead of hashed token sampling, and reintroduce batching/safety limits now that the training/inference embedding layouts are reconciled.
 
 ## Jsonschema shim (`jsonschema/__init__.py`)
 - Status: tiny validator covering only required-field checks used by tests.

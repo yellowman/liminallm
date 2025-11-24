@@ -341,9 +341,12 @@ class LocalJaxLoRABackend:
             )
             clipped = self._jnp.clip(inputs, 0, vocab_size - 1)
             embeds = emb_table[clipped]
+        elif inputs.ndim == 3:
+            embeds = self._jnp.asarray(inputs, dtype=self._jnp.float32)
         else:
-            embeds = inputs
+            raise ValueError("inputs must be token IDs (2D) or embeddings (3D)")
 
+        embeds = self._align_last_dim(embeds, hidden_dim)
         acc = self._jnp.zeros_like(embeds, dtype=self._jnp.float32)
         for name, mat in params.items():
             if not name.endswith(".A"):
