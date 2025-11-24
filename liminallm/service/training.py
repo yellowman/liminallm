@@ -211,7 +211,8 @@ class TrainingService:
         events: List[PreferenceEvent] = []
         try:
             events = self.store.list_preference_events(user_id=user_id)  # type: ignore[attr-defined]
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to list preference events for %s: %s", user_id, exc)
             events = []
         totals = {"positive": 0, "negative": 0, "neutral": 0}
         routing_feedback: dict[str, int] = {}
@@ -231,7 +232,8 @@ class TrainingService:
                             "similarity_hint": cluster.description,
                         }
                     )
-            except Exception:
+            except Exception as exc:
+                logger.warning("Failed to list semantic clusters for %s: %s", user_id, exc)
                 clusters = []
         adapter_candidates = [a for a in self.store.list_artifacts(type_filter="adapter")]  # type: ignore[arg-type]
         adapters = [
@@ -375,7 +377,8 @@ class TrainingService:
             import jax
             import jax.numpy as jnp
             import optax
-        except Exception:
+        except Exception as exc:
+            logger.warning("Skipping training loop; JAX/Optax unavailable: %s", exc)
             return {"status": "skipped", "reason": "jax/optax not installed"}
 
         vocab_size = max(self._vocab_size(), 1)

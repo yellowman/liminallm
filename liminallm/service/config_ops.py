@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -11,6 +12,8 @@ from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.models import Artifact, ConfigPatchAudit
 from liminallm.storage.postgres import PostgresStore
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigOpsService:
@@ -85,8 +88,8 @@ class ConfigOpsService:
             parsed = json.loads(content)
             if isinstance(parsed, dict):
                 return parsed
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Falling back to default patch after LLM error: %s", exc)
         return self._fallback_patch()
 
     def _fallback_patch(self) -> dict:

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, List, Optional, Tuple
 
 from .embeddings import cosine_similarity
 from .sandbox import safe_eval_expr
+
+logger = logging.getLogger(__name__)
 
 
 class RouterEngine:
@@ -62,7 +65,8 @@ class RouterEngine:
         }
         try:
             return bool(safe_eval_expr(expr, local_scope))
-        except Exception:
+        except Exception as exc:
+            logger.warning("Routing condition evaluation failed for '%s': %s", expr, exc)
             return False
 
     def _apply_action(
