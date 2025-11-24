@@ -25,6 +25,7 @@ class TrainingService:
         self.store = store
         self.fs_root = Path(fs_root)
         self.default_vocab_size = DEFAULT_VOCAB_SIZE
+        self._adapter_vocab_size: Optional[int] = None
         self.tokenizer = None
         self._tokenizer_error: Optional[str] = None
         self._tokenizer_model: Optional[str] = None
@@ -40,6 +41,9 @@ class TrainingService:
             from transformers import AutoTokenizer
 
             self.tokenizer = AutoTokenizer.from_pretrained(base_model)
+            self.default_vocab_size = vocab_size_from_tokenizer(
+                self.tokenizer, fallback=self.default_vocab_size
+            )
             self._tokenizer_model = base_model
             self._tokenizer_error = None
         except Exception as exc:  # pragma: no cover - optional dependency
@@ -49,7 +53,18 @@ class TrainingService:
             logger.warning("Failed to load tokenizer for %s: %s", base_model, exc)
 
     def _vocab_size(self) -> int:
+        if isinstance(self._adapter_vocab_size, int) and self._adapter_vocab_size > 0:
+            return self._adapter_vocab_size
         return vocab_size_from_tokenizer(self.tokenizer, fallback=self.default_vocab_size)
+
+    def _apply_adapter_vocab_size(self, adapter: Artifact) -> None:
+        self._adapter_vocab_size = None
+        if not adapter:
+            return
+        vocab_size = (adapter.schema or {}).get("vocab_size")
+        if isinstance(vocab_size, int) and vocab_size > 0:
+            self._adapter_vocab_size = vocab_size
+            self.default_vocab_size = vocab_size
 
     def ensure_user_adapter(self, user_id: str, *, rank: int = 4, adapter_id_override: Optional[str] = None) -> Artifact:
         existing = [a for a in self.store.list_artifacts(type_filter="adapter") if a.owner_user_id == user_id]
@@ -89,12 +104,20 @@ class TrainingService:
         adapter = self.ensure_user_adapter(user_id) if not adapter_id else self.store.get_artifact(adapter_id)
         if not adapter:
             raise ConstraintViolation("adapter missing", {"adapter_id": adapter_id})
+        self._apply_adapter_vocab_size(adapter)
         events = self.store.list_preference_events(user_id=user_id, feedback="positive", cluster_id=cluster_id)
         if not events:
             return None
         cluster_meta = self._cluster_events(events, user_id)
         dataset_entries = list(self._build_examples(events))
         token_batches = list(self._tokenize_batches(dataset_entries, base_model=adapter.schema.get("base_model")))
+        vocab_size = self._vocab_size()
+        if adapter.schema.get("vocab_size") != vocab_size:
+            adapter_schema = dict(adapter.schema)
+            adapter_schema["vocab_size"] = vocab_size
+            self.store.update_artifact(adapter.id, adapter_schema)
+            adapter = self.store.get_artifact(adapter.id) or adapter
+            self._apply_adapter_vocab_size(adapter)
         job = self.store.create_training_job(
             user_id=user_id,
             adapter_id=adapter.id,
