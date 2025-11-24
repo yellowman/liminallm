@@ -9,6 +9,7 @@ from typing import Iterable, Iterator, List, Optional, Sequence
 
 from liminallm.service.embeddings import deterministic_embedding
 from liminallm.service.fs import safe_join
+from liminallm.service.tokenizer_utils import DEFAULT_VOCAB_SIZE, vocab_size_from_tokenizer
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import Artifact, PreferenceEvent
 
@@ -19,21 +20,11 @@ class TrainingService:
     def __init__(self, store, fs_root: str) -> None:
         self.store = store
         self.fs_root = Path(fs_root)
+        self.default_vocab_size = DEFAULT_VOCAB_SIZE
+        self.tokenizer = None
 
     def _vocab_size(self) -> int:
-        tokenizer = getattr(self, "tokenizer", None)
-        if tokenizer is not None:
-            if hasattr(tokenizer, "vocab_size"):
-                try:
-                    return int(tokenizer.vocab_size)
-                except Exception:
-                    pass
-            if hasattr(tokenizer, "get_vocab"):
-                try:
-                    return int(len(tokenizer.get_vocab()))
-                except Exception:
-                    pass
-        return 32000
+        return vocab_size_from_tokenizer(self.tokenizer, fallback=self.default_vocab_size)
 
     def ensure_user_adapter(self, user_id: str, *, rank: int = 4, adapter_id_override: Optional[str] = None) -> Artifact:
         existing = [a for a in self.store.list_artifacts(type_filter="adapter") if a.owner_user_id == user_id]
