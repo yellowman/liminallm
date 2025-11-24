@@ -43,11 +43,40 @@ class PostgresStore:
         self.pool = ConnectionPool(self.dsn, min_size=2, max_size=10, kwargs={"row_factory": dict_row, "autocommit": True})
         self.mfa_secrets: dict[str, UserMFAConfig] = {}
         self.sessions: dict[str, Session] = {}
+        self._ensure_runtime_config_table()
         self._load_training_state()
         self._ensure_default_artifacts()
 
     def _connect(self):
         return self.pool.connection()
+
+    def _ensure_runtime_config_table(self) -> None:
+        """Create the ``instance_config`` table if it is missing."""
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS instance_config (
+                    name TEXT PRIMARY KEY,
+                    config JSONB NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+
+    def _set_runtime_config(self, config: dict) -> None:
+        """Persist the runtime configuration for admin-driven overrides."""
+
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO instance_config (name, config, created_at, updated_at)
+                VALUES (%s, %s, now(), now())
+                ON CONFLICT (name) DO UPDATE SET config = EXCLUDED.config, updated_at = EXCLUDED.updated_at
+                """,
+                ("default", json.dumps(config)),
+            )
 
     def _ensure_default_artifacts(self) -> None:
         """Seed the default workflow artifact if the database is empty."""
@@ -1200,7 +1229,23 @@ class PostgresStore:
         plus source attribution (UI vs. drift detection) per SPEC §10.
         """
 
-        return {}
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT config FROM instance_config WHERE name = %s", ("default",)
+            ).fetchone()
+        raw_config = row.get("config") if row else {}
+        if isinstance(raw_config, str):
+            try:
+                return json.loads(raw_config)
+            except Exception as exc:
+                self.logger.warning("runtime_config_parse_failed", error=str(exc))
+                return {}
+        if isinstance(raw_config, dict):
+            return raw_config
+        try:
+            return dict(raw_config or {})
+        except Exception:
+            return {}
 
     # knowledge
     def upsert_context(self, owner_user_id: Optional[str], name: str, description: str, fs_path: Optional[str] = None) -> KnowledgeContext:
