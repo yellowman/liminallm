@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Protocol, Tuple
 
 from liminallm.service.fs import safe_join
+from liminallm.service.tokenizer_utils import DEFAULT_VOCAB_SIZE, vocab_size_from_tokenizer
 
 # providers that expose fine-tuned models as first-class endpoints (model IDs)
 _MODEL_ID_PROVIDERS = {
@@ -218,6 +219,7 @@ class LocalJaxLoRABackend:
         self.mode = "local_lora"
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
+        self.default_vocab_size = DEFAULT_VOCAB_SIZE
         self._adapter_cache: Dict[str, Tuple[float, dict]] = {}
         self._tokenizer = None
         self._tokenizer_error: Optional[str] = None
@@ -251,18 +253,7 @@ class LocalJaxLoRABackend:
 
     def _vocab_size(self) -> int:
         self._ensure_tokenizer()
-        if self._tokenizer is not None:
-            if hasattr(self._tokenizer, "vocab_size"):
-                try:
-                    return int(self._tokenizer.vocab_size)
-                except Exception:
-                    pass
-            if hasattr(self._tokenizer, "get_vocab"):
-                try:
-                    return int(len(self._tokenizer.get_vocab()))
-                except Exception:
-                    pass
-        return 32000
+        return vocab_size_from_tokenizer(self._tokenizer, fallback=self.default_vocab_size)
 
     def _normalize_messages(self, messages: List[dict]) -> str:
         if not messages:
