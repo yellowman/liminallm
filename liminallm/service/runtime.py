@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 from liminallm.config import get_settings
 from liminallm.service.config_ops import ConfigOpsService
 from liminallm.service.auth import AuthService
@@ -14,6 +16,8 @@ from liminallm.storage.memory import MemoryStore
 from liminallm.storage.postgres import PostgresStore
 from liminallm.storage.redis_cache import RedisCache
 
+logger = logging.getLogger(__name__)
+
 
 class Runtime:
     """Holds singleton service instances for the FastAPI app."""
@@ -27,8 +31,9 @@ class Runtime:
         if self.settings.redis_url:
             try:
                 self.cache = RedisCache(self.settings.redis_url)
-            except Exception:
+            except Exception as exc:
                 self.cache = None
+                logger.warning("Failed to initialize Redis cache at %s: %s", self.settings.redis_url, exc)
         self.router = RouterEngine()
         db_backend_mode = None
         if hasattr(self.store, "get_runtime_config"):
