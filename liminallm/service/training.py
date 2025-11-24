@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import shutil
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -52,7 +53,7 @@ class TrainingService:
             description="Per-user persona adapter",
             owner_user_id=user_id,
         )
-        adapter_fs_dir = self._adapter_dir(user_id, adapter.id)
+        adapter_fs_dir = self._adapter_dir(user_id, adapter.id, adapter_schema)
         adapter_schema["fs_dir"] = str(adapter_fs_dir)
         adapter_schema.setdefault("cephfs_dir", str(adapter_fs_dir))
         self.store.update_artifact(adapter.id, adapter_schema)
@@ -75,7 +76,7 @@ class TrainingService:
             adapter_id=adapter.id,
             preference_event_ids=[e.id for e in events],
         )
-        job_dir = self._job_dir(user_id, adapter.id, job.id)
+        job_dir = self._job_dir(user_id, adapter.id, job.id, adapter.schema)
         job_dir.mkdir(parents=True, exist_ok=True)
         dataset_path = job_dir / "dataset.jsonl"
         with dataset_path.open("w") as f:
@@ -87,7 +88,8 @@ class TrainingService:
             meta={"token_batches": [b["shape"] for b in token_batches], "clusters": cluster_meta},
         )
         next_version = int(adapter.schema.get("current_version", 0)) + 1
-        version_dir = self._adapter_dir(user_id, adapter.id) / f"v{next_version:04d}"
+        adapter_dir = self._adapter_dir(user_id, adapter.id, adapter.schema)
+        version_dir = adapter_dir / f"v{next_version:04d}"
         version_dir.mkdir(parents=True, exist_ok=True)
         params_path = version_dir / "params.json"
         weights = self._init_lora_weights(
@@ -109,8 +111,9 @@ class TrainingService:
         (version_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
         updated_schema = dict(adapter.schema)
         updated_schema["current_version"] = next_version
-        updated_schema["fs_dir"] = str(self._adapter_dir(user_id, adapter.id))
+        updated_schema["fs_dir"] = str(adapter_dir)
         self.store.update_artifact(adapter.id, updated_schema)
+        self._update_latest_symlink(adapter_dir, version_dir)
         loss = 1.0 / (1 + len(dataset_entries))
         training_trace = self._run_jax_optax_training(
             weights,
@@ -292,11 +295,24 @@ class TrainingService:
                 },
             }
 
-    def _adapter_dir(self, user_id: str, adapter_id: str) -> Path:
-        return safe_join(self.fs_root, f"users/{user_id}/adapters/{adapter_id}")
+    def _adapter_dir(self, user_id: str, adapter_id: str, adapter_schema: Optional[dict] = None) -> Path:
+        adapter_schema = adapter_schema or {}
+        explicit = adapter_schema.get("cephfs_dir") or adapter_schema.get("fs_dir")
+        if explicit:
+            return Path(explicit)
+        return safe_join(self.fs_root, f"adapters/{adapter_id}")
 
-    def _job_dir(self, user_id: str, adapter_id: str, job_id: str) -> Path:
-        return safe_join(self._adapter_dir(user_id, adapter_id), f"jobs/{job_id}")
+    def _job_dir(self, user_id: str, adapter_id: str, job_id: str, adapter_schema: Optional[dict] = None) -> Path:
+        return safe_join(self._adapter_dir(user_id, adapter_id, adapter_schema), f"jobs/{job_id}")
+
+    def _update_latest_symlink(self, adapter_dir: Path, version_dir: Path) -> None:
+        latest = adapter_dir / "latest"
+        if latest.exists() or latest.is_symlink():
+            if latest.is_dir() and not latest.is_symlink():
+                shutil.rmtree(latest)
+            else:
+                latest.unlink()
+        latest.symlink_to(version_dir, target_is_directory=True)
 
     def _init_lora_weights(self, rank: int, layers: List[int], matrices: List[str]) -> dict:
         weights: dict[str, list[list[float]]] = {}
