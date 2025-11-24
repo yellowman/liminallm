@@ -329,9 +329,12 @@ class LocalJaxLoRABackend:
 
     def _lora_forward(self, params: dict, inputs):
         hidden_dim = max((mat.shape[1] for name, mat in params.items() if name.endswith(".A")), default=16)
-        vocab_size = 4096
+        vocab_size = max(self._vocab_size(), 1)
 
         if inputs.ndim == 2:
+            if inputs.size:
+                max_token = int(self._jnp.max(inputs))
+                vocab_size = max(vocab_size, max_token + 1)
             emb_table = self._jnp.sin(
                 self._jnp.arange(vocab_size * hidden_dim, dtype=self._jnp.float32).reshape(vocab_size, hidden_dim)
                 / float(hidden_dim)

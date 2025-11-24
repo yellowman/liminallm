@@ -20,6 +20,21 @@ class TrainingService:
         self.store = store
         self.fs_root = Path(fs_root)
 
+    def _vocab_size(self) -> int:
+        tokenizer = getattr(self, "tokenizer", None)
+        if tokenizer is not None:
+            if hasattr(tokenizer, "vocab_size"):
+                try:
+                    return int(tokenizer.vocab_size)
+                except Exception:
+                    pass
+            if hasattr(tokenizer, "get_vocab"):
+                try:
+                    return int(len(tokenizer.get_vocab()))
+                except Exception:
+                    pass
+        return 32000
+
     def ensure_user_adapter(self, user_id: str, *, rank: int = 4, adapter_id_override: Optional[str] = None) -> Artifact:
         existing = [a for a in self.store.list_artifacts(type_filter="adapter") if a.owner_user_id == user_id]
         if adapter_id_override:
@@ -255,11 +270,13 @@ class TrainingService:
         backends (e.g., JAX) can preallocate arrays without re-tokenizing.
         """
 
+        vocab_size = max(self._vocab_size(), 1)
+
         def _encode(text: str) -> List[int]:
             if hasattr(self, "tokenizer") and getattr(self, "tokenizer") is not None:
                 return list(getattr(self, "tokenizer").encode(text, truncation=True, max_length=max_length))
             tokens = text.split()
-            return [hash(tok) % 32000 for tok in tokens[:max_length]]
+            return [hash(tok) % vocab_size for tok in tokens[:max_length]]
 
         for i in range(0, len(dataset_entries), batch_size):
             batch = dataset_entries[i : i + batch_size]
@@ -328,7 +345,15 @@ class TrainingService:
         except Exception:
             return {"status": "skipped", "reason": "jax/optax not installed"}
 
-        vocab_size = 4096
+        vocab_size = max(self._vocab_size(), 1)
+        max_token_id = 0
+        for batch in batches:
+            for key in ("input_ids", "labels"):
+                seqs = batch.get(key) or []
+                for seq in seqs:
+                    if seq:
+                        max_token_id = max(max_token_id, max(seq))
+        vocab_size = max(vocab_size, max_token_id + 1)
         hidden_dim = 0
         for name, value in params.items():
             if name.endswith(".A"):
