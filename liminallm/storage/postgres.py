@@ -1545,7 +1545,7 @@ class PostgresStore:
             for row in rows
         ]
 
-    def search_chunks_legacy(
+    def search_chunks(
         self,
         context_id: Optional[str],
         query: str,

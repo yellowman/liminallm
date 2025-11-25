@@ -35,7 +35,7 @@ class RAGService:
                 raise ValueError("pgvector-backed store required for RAGService")
             self._retriever = self._retrieve_pgvector
         else:
-            if not hasattr(store, "search_chunks_legacy") and not hasattr(store, "search_chunks"):
+            if not hasattr(store, "search_chunks"):
                 raise ValueError("legacy-backed store required for hybrid RAG mode")
             self._retriever = self._retrieve_local_hybrid
 
@@ -108,8 +108,8 @@ class RAGService:
             return []
 
         query_embedding = self.embed(query)
-        legacy_search = getattr(self.store, "search_chunks_legacy", None) or getattr(self.store, "search_chunks", None)
-        if not legacy_search:
+        legacy_search = getattr(self.store, "search_chunks", None)
+        if not callable(legacy_search):
             return []
 
         results: List[KnowledgeChunk] = []
