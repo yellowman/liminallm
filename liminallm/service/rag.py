@@ -27,10 +27,17 @@ class RAGService:
         self.store = store
         self.default_chunk_size = max(default_chunk_size, 64)
         self.rag_mode = (rag_mode or os.getenv("RAG_MODE") or "pgvector").lower()
-        if not hasattr(store, "search_chunks_pgvector"):
-            raise ValueError("pgvector-backed store required for RAGService")
         self.embed = embed
         self.embedding_model_id = embedding_model_id
+
+        if self._uses_pgvector():
+            if not hasattr(store, "search_chunks_pgvector"):
+                raise ValueError("pgvector-backed store required for RAGService")
+            self._retriever = self._retrieve_pgvector
+        else:
+            if not hasattr(store, "search_chunks_legacy") and not hasattr(store, "search_chunks"):
+                raise ValueError("legacy-backed store required for hybrid RAG mode")
+            self._retriever = self._retrieve_local_hybrid
 
     def retrieve(
         self,
@@ -44,12 +51,77 @@ class RAGService:
         if not query or not context_ids:
             return []
 
+        return self._retriever(context_ids, query, limit, user_id=user_id, tenant_id=tenant_id)
+
+    def _uses_pgvector(self) -> bool:
+        return self.rag_mode in {"pgvector", "pg", "vector"}
+
+    def _allowed_context_ids(
+        self, context_ids: Sequence[str], *, user_id: Optional[str], tenant_id: Optional[str]
+    ) -> List[str]:
+        if not hasattr(self.store, "contexts"):
+            return list(context_ids)
+
+        contexts = getattr(self.store, "contexts")
+        users = getattr(self.store, "users", {})
+        allowed: List[str] = []
+        for ctx_id in context_ids:
+            ctx = contexts.get(ctx_id) if isinstance(contexts, dict) else None
+            if not ctx:
+                continue
+            if user_id and ctx.owner_user_id != user_id:
+                continue
+            if tenant_id:
+                owner = users.get(ctx.owner_user_id) if isinstance(users, dict) else None
+                if not owner or owner.tenant_id != tenant_id:
+                    continue
+            allowed.append(ctx_id)
+        return allowed
+
+    def _retrieve_pgvector(
+        self,
+        context_ids: Sequence[str],
+        query: str,
+        limit: int,
+        *,
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+    ) -> List[KnowledgeChunk]:
         query_embedding = self.embed(query)
         filters = {"embedding_model_id": self.embedding_model_id}
 
         return self.store.search_chunks_pgvector(  # type: ignore[attr-defined]
             context_ids, query_embedding, limit, filters=filters, user_id=user_id, tenant_id=tenant_id
         )
+
+    def _retrieve_local_hybrid(
+        self,
+        context_ids: Sequence[str],
+        query: str,
+        limit: int,
+        *,
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+    ) -> List[KnowledgeChunk]:
+        allowed_ids = self._allowed_context_ids(context_ids, user_id=user_id, tenant_id=tenant_id)
+        if not allowed_ids:
+            return []
+
+        query_embedding = self.embed(query)
+        legacy_search = getattr(self.store, "search_chunks_legacy", None) or getattr(self.store, "search_chunks", None)
+        if not legacy_search:
+            return []
+
+        results: List[KnowledgeChunk] = []
+        for ctx_id in allowed_ids:
+            results.extend(legacy_search(ctx_id, query, query_embedding, limit))
+
+        filtered = [
+            chunk for chunk in results if (chunk.meta or {}).get("embedding_model_id") == self.embedding_model_id
+        ]
+        if filtered:
+            return filtered[:limit]
+        return results[:limit]
 
     def ingest_text(
         self, context_id: str, text: str, chunk_size: Optional[int] = None, source_path: Optional[str] = None

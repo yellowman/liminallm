@@ -2,6 +2,7 @@ import uuid
 
 from liminallm.service.rag import RAGService
 from liminallm.storage.memory import MemoryStore
+from liminallm.storage.models import KnowledgeChunk, KnowledgeContext, User
 
 
 def _setup_store() -> tuple[RAGService, str, str, str, str]:
@@ -33,3 +34,58 @@ def test_retrieve_filters_by_user_and_tenant():
 
     blocked = service.retrieve([ctx_b], "tenant b data", user_id=user_a, tenant_id="tenant_a")
     assert blocked == []
+
+
+class LegacyOnlyStore:
+    def __init__(self):
+        self.contexts = {}
+        self.users = {}
+        self.chunks = {}
+
+    def add_user(self, tenant_id: str) -> User:
+        user = User(id=str(uuid.uuid4()), email=f"user-{tenant_id}@example.com", tenant_id=tenant_id)
+        self.users[user.id] = user
+        return user
+
+    def upsert_context(self, owner_user_id: str, name: str, description: str) -> KnowledgeContext:
+        ctx = KnowledgeContext(id=str(uuid.uuid4()), owner_user_id=owner_user_id, name=name, description=description)
+        self.contexts[ctx.id] = ctx
+        return ctx
+
+    def add_chunks(self, context_id: str, chunks: list[KnowledgeChunk]) -> None:
+        self.chunks.setdefault(context_id, []).extend(chunks)
+
+    def search_chunks_legacy(
+        self, context_id: str | None, query: str, query_embedding: list[float] | None, limit: int = 4
+    ) -> list[KnowledgeChunk]:
+        return list(self.chunks.get(context_id or "", []))[:limit]
+
+
+def test_local_hybrid_without_pgvector():
+    store = LegacyOnlyStore()
+    owner = store.add_user("tenant_legacy")
+    ctx = store.upsert_context(owner.id, "legacy", "local hybrid")
+
+    rag = RAGService(store, rag_mode="local_hybrid", embedding_model_id="legacy-embedding")
+    rag.ingest_text(ctx.id, "legacy search path")
+    store.add_chunks(
+        ctx.id,
+        [
+            KnowledgeChunk(
+                id=str(uuid.uuid4()),
+                context_id=ctx.id,
+                text="other model",
+                embedding=[],
+                seq=99,
+                meta={"embedding_model_id": "other"},
+            )
+        ],
+    )
+
+    allowed = rag.retrieve([ctx.id], "legacy", user_id=owner.id, tenant_id="tenant_legacy")
+    assert allowed
+    assert all((chunk.meta or {}).get("embedding_model_id") == "legacy-embedding" for chunk in allowed)
+
+    blocked_user = store.add_user("other")
+    denied = rag.retrieve([ctx.id], "legacy", user_id=blocked_user.id, tenant_id="other")
+    assert denied == []
