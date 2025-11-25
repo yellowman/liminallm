@@ -470,9 +470,11 @@ class WorkflowEngine:
             message = inputs.get("raw") or ""
         if not message:
             message = ""
-        ctx_chunks = self.rag.retrieve(
-            inputs.get("context_id", context_id), message, user_id=user_id, tenant_id=tenant_id
-        )
+        ctx_ids = inputs.get("context_id", context_id)
+        if isinstance(ctx_ids, str):
+            ctx_ids = [ctx_ids]
+
+        ctx_chunks = self.rag.retrieve(ctx_ids, message, user_id=user_id, tenant_id=tenant_id)
         context_snippets = [c.text for c in ctx_chunks]
         resp = self.llm.generate(message or "", adapters=adapters, context_snippets=context_snippets, history=history)
         return {"content": resp["content"], "usage": resp["usage"], "context_snippets": context_snippets}
@@ -489,8 +491,11 @@ class WorkflowEngine:
         tenant_id: Optional[str],
     ) -> Dict[str, Any]:
         question = inputs.get("question") or inputs.get("message") or ""
-        ctx_id = inputs.get("context_id") or context_id
-        chunks = self.rag.retrieve(ctx_id, question, user_id=user_id, tenant_id=tenant_id)
+        ctx_ids = inputs.get("context_id") or context_id
+        if isinstance(ctx_ids, str):
+            ctx_ids = [ctx_ids]
+
+        chunks = self.rag.retrieve(ctx_ids, question, user_id=user_id, tenant_id=tenant_id)
         snippets = [c.text for c in chunks]
         resp = self.llm.generate(question or "", adapters=adapters, context_snippets=snippets, history=history)
         return {"content": resp["content"], "usage": resp["usage"], "context_snippets": snippets, "answer": resp["content"]}
