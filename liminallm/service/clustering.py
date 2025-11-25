@@ -111,11 +111,13 @@ class SemanticClusterer:
             return None
         try:
             payload = json.loads(content)
+            if not isinstance(payload, dict):
+                raise ValueError("Label payload must be a JSON object")
             label = str(payload.get("label", "")).strip()
             description = str(payload.get("description", "")).strip()
             if label or description:
                 return label or description[:64] or "Unlabeled cluster", description or label
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, AttributeError):
             pass
         lines = [line.strip() for line in content.splitlines() if line.strip()]
         if not lines:

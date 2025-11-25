@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-import logging
 from typing import Any
 
-logger = logging.getLogger(__name__)
+from liminallm.logging import get_logger
+
+logger = get_logger(__name__)
 
 DEFAULT_VOCAB_SIZE = 32000
 
@@ -22,10 +23,10 @@ def vocab_size_from_tokenizer(tokenizer: Any, *, fallback: int = DEFAULT_VOCAB_S
         try:
             return int(tokenizer.vocab_size)
         except Exception as exc:  # pragma: no cover - defensive logging
-            logger.debug("tokenizer.vocab_size unavailable: %s", exc)
+            logger.debug("tokenizer_vocab_size_unavailable", error=str(exc))
     if hasattr(tokenizer, "get_vocab"):
         try:
             return int(len(tokenizer.get_vocab()))
         except Exception as exc:  # pragma: no cover - defensive logging
-            logger.debug("tokenizer.get_vocab() unavailable: %s", exc)
+            logger.debug("tokenizer_get_vocab_unavailable", error=str(exc))
     return fallback

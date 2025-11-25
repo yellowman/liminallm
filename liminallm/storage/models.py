@@ -97,6 +97,7 @@ class Artifact:
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
     fs_path: Optional[str] = None
+    base_model: Optional[str] = None
     meta: Dict | None = None
 
 
@@ -110,6 +111,7 @@ class ArtifactVersion:
     change_note: Optional[str] = None
     created_at: datetime = field(default_factory=datetime.utcnow)
     fs_path: Optional[str] = None
+    base_model: Optional[str] = None
     meta: Dict | None = None
 
 

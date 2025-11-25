@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import logging
-
 from liminallm.config import get_settings
 from liminallm.service.config_ops import ConfigOpsService
 from liminallm.service.auth import AuthService
@@ -16,7 +14,9 @@ from liminallm.storage.memory import MemoryStore
 from liminallm.storage.postgres import PostgresStore
 from liminallm.storage.redis_cache import RedisCache
 
-logger = logging.getLogger(__name__)
+from liminallm.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class Runtime:
@@ -33,12 +33,16 @@ class Runtime:
                 self.cache = RedisCache(self.settings.redis_url)
             except Exception as exc:
                 self.cache = None
-                logger.warning("Failed to initialize Redis cache at %s: %s", self.settings.redis_url, exc)
+                logger.warning(
+                    "redis_cache_init_failed", redis_url=self.settings.redis_url, error=str(exc)
+                )
         self.router = RouterEngine()
+        runtime_config = {}
         db_backend_mode = None
         if hasattr(self.store, "get_runtime_config"):
             runtime_config = self.store.get_runtime_config() or {}
             db_backend_mode = runtime_config.get("model_backend")
+        resolved_base_model = runtime_config.get("model_path") or self.settings.model_path
         backend_mode = db_backend_mode or self.settings.model_backend
         adapter_configs = {
             "openai": {
@@ -48,7 +52,7 @@ class Runtime:
             }
         }
         self.llm = LLMService(
-            base_model=self.settings.model_path,
+            base_model=resolved_base_model,
             backend_mode=backend_mode,
             adapter_configs=adapter_configs,
             api_key=self.settings.adapter_openai_api_key,
@@ -57,7 +61,9 @@ class Runtime:
             fs_root=self.settings.shared_fs_root,
         )
         self.rag = RAGService(self.store, default_chunk_size=self.settings.rag_chunk_size)
-        self.training = TrainingService(self.store, self.settings.shared_fs_root)
+        self.training = TrainingService(
+            self.store, self.settings.shared_fs_root, runtime_base_model=resolved_base_model
+        )
         self.clusterer = SemanticClusterer(self.store, self.llm, self.training)
         self.workflow = WorkflowEngine(self.store, self.llm, self.router, self.rag)
         self.voice = VoiceService(self.settings.shared_fs_root)

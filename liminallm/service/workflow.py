@@ -398,5 +398,7 @@ class WorkflowEngine:
                 safe_eval_expr(expr, {"input": {"message": user_message}, "vars": vars_scope, "true": True, "false": False})
             )
         except Exception as exc:
-            self.logger.warning("Workflow condition evaluation failed for '%s': %s", expr, exc)
+            self.logger.warning(
+                "workflow_condition_evaluation_failed", expr=expr, error=str(exc)
+            )
             return False

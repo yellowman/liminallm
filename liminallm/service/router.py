@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import logging
 from typing import Any, Dict, List, Optional, Tuple
+
+from liminallm.logging import get_logger
 
 from .embeddings import cosine_similarity
 from .sandbox import safe_eval_expr
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class RouterEngine:
@@ -66,7 +67,7 @@ class RouterEngine:
         try:
             return bool(safe_eval_expr(expr, local_scope))
         except Exception as exc:
-            logger.warning("Routing condition evaluation failed for '%s': %s", expr, exc)
+            logger.warning("routing_condition_evaluation_failed", expr=expr, error=str(exc))
             return False
 
     def _apply_action(
@@ -76,8 +77,13 @@ class RouterEngine:
         weight = action.get("weight", 1.0)
         overwrite = action.get("overwrite", False)
 
-        def _record(target_id: Optional[str], applied_weight: float) -> Dict[str, Any]:
-            return {"target": target_id, "weight": applied_weight}
+        def _record(target_id: Optional[str], applied_weight: float, similarity: Optional[float] = None, ranked: Optional[List[dict]] = None) -> Dict[str, Any]:
+            record: Dict[str, Any] = {"target": target_id, "weight": applied_weight}
+            if similarity is not None:
+                record["similarity"] = similarity
+            if ranked:
+                record["ranked_candidates"] = ranked
+            return record
 
         if action_type == "deactivate_all_adapters":
             weights.clear()
@@ -86,12 +92,13 @@ class RouterEngine:
         target_id: Optional[str] = None
         target_similarity: Optional[float] = None
 
+        ranked_candidates: List[dict] = []
         if action_type == "activate_adapter_by_id":
             target_id, target_similarity = self._resolve_adapter(action.get("adapter_id"), adapters, ctx_emb)
         elif action_type == "activate_adapter_by_type":
-            target_id, target_similarity = self._resolve_adapter_by_field("adapter_type", action.get("adapter_type"), adapters, ctx_emb)
+            target_id, target_similarity, ranked_candidates = self._resolve_adapter_by_field("adapter_type", action.get("adapter_type"), adapters, ctx_emb)
         elif action_type == "activate_adapter_by_cluster":
-            target_id, target_similarity = self._resolve_adapter_by_field("cluster_id", action.get("cluster_id"), adapters, ctx_emb)
+            target_id, target_similarity, ranked_candidates = self._resolve_adapter_by_field("cluster_id", action.get("cluster_id"), adapters, ctx_emb)
         elif action_type == "deactivate_adapter":
             target_id, _ = self._resolve_adapter(action.get("adapter_id"), adapters, ctx_emb)
             if target_id:
@@ -111,7 +118,7 @@ class RouterEngine:
             weights[target_id] = applied_weight
         else:
             weights[target_id] = max(weights[target_id], applied_weight)
-        return _record(target_id, applied_weight)
+        return _record(target_id, applied_weight, target_similarity, ranked_candidates)
 
     def _apply_similarity_boost(self, adapters: List[dict], ctx_emb: List[float], weights: Dict[str, float]) -> List[dict]:
         effects: List[dict] = []
@@ -153,14 +160,28 @@ class RouterEngine:
 
     def _resolve_adapter_by_field(
         self, field: str, value: Optional[str], adapters: List[dict], ctx_emb: List[float]
-    ) -> Tuple[Optional[str], Optional[float]]:
+    ) -> Tuple[Optional[str], Optional[float], List[dict]]:
         if value == "closest":
-            return self._resolve_adapter(value, adapters, ctx_emb)
+            cand_id, sim = self._resolve_adapter(value, adapters, ctx_emb)
+            return cand_id, sim, []
+        ranked: List[dict] = []
         for candidate in adapters:
             if candidate.get(field) == value:
                 cand_id = candidate.get("id") or candidate.get("name")
-                return cand_id, cosine_similarity(ctx_emb, self._adapter_embedding(candidate))
-        return None, None
+                ranked.append(
+                    {
+                        "id": cand_id,
+                        "similarity": cosine_similarity(ctx_emb, self._adapter_embedding(candidate)),
+                    }
+                )
+        ranked = sorted(
+            [c for c in ranked if c.get("id")],
+            key=lambda entry: (-(entry.get("similarity") or 0.0), str(entry.get("id"))),
+        )
+        if not ranked:
+            return None, None, []
+        top = ranked[0]
+        return str(top.get("id")), float(top.get("similarity") or 0.0), ranked
 
     def _normalize_weights(self, weights: Dict[str, float], policy: dict) -> List[Dict[str, Any]]:
         max_active = policy.get("max_active_adapters", 3)
