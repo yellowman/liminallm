@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from liminallm.logging import get_logger
@@ -11,21 +12,32 @@ from liminallm.service.router import RouterEngine
 from liminallm.service.sandbox import safe_eval_expr
 from liminallm.service.embeddings import cosine_similarity, deterministic_embedding
 from liminallm.storage.memory import MemoryStore
+from liminallm.storage.models import Message
 from liminallm.storage.postgres import PostgresStore
+from liminallm.storage.redis_cache import RedisCache
 
 
 class WorkflowEngine:
     """Executes workflow.chat graphs using a small tool registry."""
 
-    def __init__(self, store: PostgresStore | MemoryStore, llm: LLMService, router: RouterEngine, rag: RAGService) -> None:
+    def __init__(
+        self,
+        store: PostgresStore | MemoryStore,
+        llm: LLMService,
+        router: RouterEngine,
+        rag: RAGService,
+        *,
+        cache: Optional[RedisCache] = None,
+    ) -> None:
         self.store = store
         self.llm = llm
         self.router = router
         self.rag = rag
         self.logger = get_logger(__name__)
         self.tool_registry = self._build_tool_registry()
+        self.cache = cache
 
-    def run(
+    async def run(
         self,
         workflow_id: Optional[str],
         conversation_id: Optional[str],
@@ -39,10 +51,8 @@ class WorkflowEngine:
         if not workflow_schema:
             workflow_schema = self._default_workflow()
 
-        adapters, routing_trace, adapter_gates = self._select_adapters(user_message, user_id, context_id)
-        history = []
-        if conversation_id and hasattr(self.store, "list_messages"):
-            history = self.store.list_messages(conversation_id)  # type: ignore[attr-defined]
+        adapters, routing_trace, adapter_gates = await self._select_adapters(user_message, user_id, context_id)
+        history = await self._load_conversation_history(conversation_id)
 
         node_map = {n.get("id"): n for n in workflow_schema.get("nodes", []) if n.get("id")}
         entry = workflow_schema.get("entrypoint") or next(iter(node_map), None)
@@ -59,6 +69,9 @@ class WorkflowEngine:
         visited = 0
         max_steps = max(1, min(100, len(node_map) * 2 + 10))
         visited_nodes: Dict[str, int] = {}
+
+        state_key = f"{conversation_id or 'anon'}:{workflow_id or 'default'}"
+        await self._persist_workflow_state(state_key, {"status": "running", "started_at": datetime.utcnow().isoformat()})
 
         while pending and visited < max_steps:
             node_id = pending.pop(0)
@@ -97,7 +110,7 @@ class WorkflowEngine:
         if not content:
             content = "No response generated."
 
-        return {
+        result = {
             "content": content,
             "usage": usage,
             "adapters": adapters,
@@ -107,6 +120,16 @@ class WorkflowEngine:
             "routing_trace": routing_trace,
             "vars": vars_scope,
         }
+        await self._persist_workflow_state(
+            state_key,
+            {
+                "status": "completed",
+                "completed_at": datetime.utcnow().isoformat(),
+                "result": {"content": content, "adapters": [a.get("id") for a in adapters or []]},
+            },
+        )
+        await self.cache_conversation_state(conversation_id, history)
+        return result
 
     def _merge_usage(self, accum: Dict[str, Any], new_usage: Dict[str, Any]) -> Dict[str, Any]:
         merged = dict(accum)
@@ -116,6 +139,74 @@ class WorkflowEngine:
             else:
                 merged[key] = value
         return merged
+
+    async def _load_conversation_history(self, conversation_id: Optional[str]) -> List[Message]:
+        if not conversation_id or not hasattr(self.store, "list_messages"):
+            return []
+        cached: Optional[dict] = None
+        if self.cache:
+            cached = await self.cache.get_conversation_summary(conversation_id)
+        if cached and isinstance(cached.get("recent_messages"), list):
+            deserialized = self._deserialize_messages(cached["recent_messages"])
+            if deserialized:
+                return deserialized
+        history = self.store.list_messages(conversation_id)  # type: ignore[attr-defined]
+        await self.cache_conversation_state(conversation_id, history)
+        return history
+
+    async def cache_conversation_state(self, conversation_id: Optional[str], history: List[Message]) -> None:
+        if not conversation_id or not self.cache:
+            return
+        serialized = self._serialize_messages(history[-10:])
+        await self.cache.set_conversation_summary(
+            conversation_id,
+            {
+                "recent_messages": serialized,
+                "updated_at": datetime.utcnow().isoformat(),
+            },
+        )
+
+    async def _persist_workflow_state(self, state_key: str, state: dict) -> None:
+        if not self.cache:
+            return
+        await self.cache.set_workflow_state(state_key, state)
+
+    def _serialize_messages(self, history: List[Message]) -> List[dict]:
+        serialized: List[dict] = []
+        for msg in history:
+            serialized.append(
+                {
+                    "id": msg.id,
+                    "conversation_id": msg.conversation_id,
+                    "sender": msg.sender,
+                    "role": msg.role,
+                    "content": msg.content,
+                    "seq": msg.seq,
+                    "created_at": msg.created_at.isoformat(),
+                    "meta": msg.meta,
+                }
+            )
+        return serialized
+
+    def _deserialize_messages(self, items: List[dict]) -> List[Message]:
+        deserialized: List[Message] = []
+        for item in items:
+            try:
+                deserialized.append(
+                    Message(
+                        id=str(item.get("id")),
+                        conversation_id=str(item.get("conversation_id")),
+                        sender=str(item.get("sender", "")),
+                        role=str(item.get("role", "assistant")),
+                        content=str(item.get("content", "")),
+                        seq=int(item.get("seq", 0)),
+                        created_at=datetime.fromisoformat(str(item.get("created_at"))),
+                        meta=item.get("meta"),
+                    )
+                )
+            except Exception:
+                continue
+        return deserialized
 
     def _build_tool_registry(self) -> Dict[str, dict]:
         registry: Dict[str, dict] = {}
@@ -143,7 +234,7 @@ class WorkflowEngine:
             ],
         }
 
-    def _select_adapters(
+    async def _select_adapters(
         self, user_message: str, user_id: Optional[str], context_id: Optional[str]
     ) -> Tuple[List[dict], List[dict], List[dict]]:
         adapter_artifacts = [a for a in self.store.list_artifacts(type_filter="adapter")]  # type: ignore[arg-type]
@@ -180,7 +271,9 @@ class WorkflowEngine:
         ctx_cluster = None
         if best_cluster:
             ctx_cluster = {"id": best_cluster.id, "label": best_cluster.label, "similarity": best_sim}
-        routing = self.router.route(policy or {}, context_embedding, candidates, ctx_cluster=ctx_cluster)
+        routing = await self.router.route(
+            policy or {}, context_embedding, candidates, ctx_cluster=ctx_cluster, user_id=user_id
+        )
         gates = routing.get("adapters", []) if isinstance(routing, dict) else []
         activated_ids = [gate.get("id", "") for gate in gates if gate.get("id")]
         candidate_lookup = {c.get("id"): c for c in candidates if c.get("id")}
