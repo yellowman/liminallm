@@ -35,8 +35,10 @@ from liminallm.api.schemas import (
     PasswordResetRequest,
     SignupRequest,
     TokenRefreshRequest,
+    KnowledgeChunkListResponse,
     KnowledgeChunkResponse,
     KnowledgeContextRequest,
+    KnowledgeContextListResponse,
     KnowledgeContextResponse,
     FileUploadResponse,
     PreferenceEventRequest,
@@ -1073,7 +1075,7 @@ async def list_contexts(principal: AuthContext = Depends(get_user)):
         )
         for c in contexts
     ]
-    return Envelope(status="ok", data=items)
+    return Envelope(status="ok", data=KnowledgeContextListResponse(items=items))
 
 
 @router.get("/contexts/{context_id}/chunks", response_model=Envelope)
@@ -1084,7 +1086,7 @@ async def list_chunks(context_id: str, principal: AuthContext = Depends(get_user
         KnowledgeChunkResponse(id=ch.id, context_id=ch.context_id, text=ch.text, seq=ch.seq)
         for ch in chunks
     ]
-    return Envelope(status="ok", data=data)
+    return Envelope(status="ok", data=KnowledgeChunkListResponse(items=data))
 
 
 @router.post("/voice/transcribe", response_model=Envelope)

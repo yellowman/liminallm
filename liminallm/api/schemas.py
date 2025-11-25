@@ -192,11 +192,19 @@ class KnowledgeContextResponse(BaseModel):
     meta: Optional[dict] = None
 
 
+class KnowledgeContextListResponse(BaseModel):
+    items: List[KnowledgeContextResponse]
+
+
 class KnowledgeChunkResponse(BaseModel):
     id: str
     context_id: str
     text: str
     seq: int
+
+
+class KnowledgeChunkListResponse(BaseModel):
+    items: List[KnowledgeChunkResponse]
 
 
 class FileUploadResponse(BaseModel):
