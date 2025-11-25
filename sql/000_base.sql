@@ -1,6 +1,8 @@
 -- Core user and chat tables from SPEC phase 0
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
+CREATE EXTENSION IF NOT EXISTS citext;
+
 CREATE TABLE IF NOT EXISTS app_user (
   id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   email           CITEXT UNIQUE NOT NULL,

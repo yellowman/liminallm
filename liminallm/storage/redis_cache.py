@@ -13,6 +13,16 @@ class RedisCache:
     def __init__(self, redis_url: str):
         self.client = redis.from_url(redis_url, decode_responses=True)
 
+    def verify_connection(self) -> None:
+        """Assert Redis connectivity before enabling dependent features."""
+
+        import asyncio
+
+        async def _ping() -> None:
+            await self.client.ping()
+
+        asyncio.run(_ping())
+
     async def cache_session(self, session_id: str, user_id: str, expires_at: datetime) -> None:
         ttl = int((expires_at - datetime.utcnow()).total_seconds())
         await self.client.set(f"auth:session:{session_id}", user_id, ex=ttl)

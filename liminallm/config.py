@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     adapter_server_model: str | None = Field(None, env="ADAPTER_SERVER_MODEL")
     allow_signup: bool = Field(True, env="ALLOW_SIGNUP")
     use_memory_store: bool = Field(False, env="USE_MEMORY_STORE")
+    allow_redis_fallback_dev: bool = Field(False, env="ALLOW_REDIS_FALLBACK_DEV")
     chat_rate_limit_per_minute: int = Field(60, env="CHAT_RATE_LIMIT_PER_MINUTE")
     chat_rate_limit_window_seconds: int = Field(60, env="CHAT_RATE_LIMIT_WINDOW_SECONDS")
     enable_mfa: bool = Field(True, env="ENABLE_MFA")

@@ -32,14 +32,28 @@ class Runtime:
             self.settings.database_url, fs_root=self.settings.shared_fs_root
         )
         self.cache = None
+        redis_error: Exception | None = None
         if self.settings.redis_url:
             try:
-                self.cache = RedisCache(self.settings.redis_url)
+                cache = RedisCache(self.settings.redis_url)
+                cache.verify_connection()
+                self.cache = cache
             except Exception as exc:
+                redis_error = exc
                 self.cache = None
-                logger.warning(
-                    "redis_cache_init_failed", redis_url=self.settings.redis_url, error=str(exc)
-                )
+
+        if not self.cache:
+            if not self.settings.allow_redis_fallback_dev:
+                raise RuntimeError(
+                    "Redis is required for sessions, rate limits, idempotency, and workflow caches; "
+                    "start Redis or set ALLOW_REDIS_FALLBACK_DEV=true for dev-only fallback."
+                ) from redis_error
+            logger.warning(
+                "redis_disabled_dev_fallback",
+                redis_url=self.settings.redis_url,
+                error=str(redis_error) if redis_error else "redis_url_missing",
+                message="Running without Redis; rate limits, idempotency durability, and workflow/router caches are disabled.",
+            )
         self.router = RouterEngine(cache=self.cache)
         runtime_config = {}
         db_backend_mode = None
