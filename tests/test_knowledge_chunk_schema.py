@@ -1,4 +1,5 @@
 from dataclasses import fields
+from typing import get_type_hints
 import uuid
 
 from liminallm.api.schemas import KnowledgeChunkResponse
@@ -20,6 +21,12 @@ def test_knowledge_chunk_dataclass_fields_match_schema():
     }
 
     assert chunk_field_names == expected_fields
+
+
+def test_knowledge_chunk_fs_path_is_required_per_spec():
+    hints = get_type_hints(KnowledgeChunk)
+
+    assert hints.get("fs_path") is str
 
 
 def test_knowledge_chunk_response_matches_model_fields():
