@@ -76,11 +76,12 @@ def test_local_hybrid_without_pgvector():
         ctx.id,
         [
             KnowledgeChunk(
-                id=str(uuid.uuid4()),
+                id=None,
                 context_id=ctx.id,
-                text="other model",
+                fs_path="inline",
+                content="other model",
                 embedding=[],
-                seq=99,
+                chunk_index=99,
                 meta={"embedding_model_id": "other"},
             )
         ],

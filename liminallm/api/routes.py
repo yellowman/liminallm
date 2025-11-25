@@ -1083,7 +1083,13 @@ async def list_chunks(context_id: str, principal: AuthContext = Depends(get_user
     runtime = get_runtime()
     chunks = runtime.store.list_chunks(context_id)
     data = [
-        KnowledgeChunkResponse(id=ch.id, context_id=ch.context_id, text=ch.text, seq=ch.seq)
+        KnowledgeChunkResponse(
+            id=ch.id if ch.id is not None else 0,
+            context_id=ch.context_id,
+            fs_path=ch.fs_path,
+            content=ch.content,
+            chunk_index=ch.chunk_index,
+        )
         for ch in chunks
     ]
     return Envelope(status="ok", data=KnowledgeChunkListResponse(items=data))

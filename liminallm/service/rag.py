@@ -132,21 +132,18 @@ class RAGService:
             return 0
         chosen_chunk = max(chunk_size or self.default_chunk_size, 64)
         chunks: List[KnowledgeChunk] = []
+        default_path = source_path or "inline"
         for idx in range(0, len(blob), chosen_chunk):
             segment = blob[idx : idx + chosen_chunk]
             chunks.append(
                 KnowledgeChunk(
-                    id=str(uuid.uuid4()),
+                    id=None,
                     context_id=context_id,
-                    text=segment,
+                    fs_path=default_path,
+                    content=segment,
                     embedding=self.embed(segment),
-                    seq=math.floor(idx / chosen_chunk),
-                    meta={
-                        "fs_path": source_path,
-                        "embedding_model_id": self.embedding_model_id,
-                    }
-                    if source_path
-                    else {"embedding_model_id": self.embedding_model_id},
+                    chunk_index=math.floor(idx / chosen_chunk),
+                    meta={"embedding_model_id": self.embedding_model_id},
                 )
             )
         if chunks:

@@ -144,11 +144,12 @@ class KnowledgeContext:
 
 @dataclass
 class KnowledgeChunk:
-    id: str
+    id: int | None
     context_id: str
-    text: str
+    fs_path: str
+    content: str
     embedding: List[float]
-    seq: int
+    chunk_index: int
     created_at: datetime = field(default_factory=datetime.utcnow)
     meta: Dict | None = None
 
