@@ -163,10 +163,12 @@ class SemanticClusterer:
             )
             if self.training:
                 self.training.ensure_user_adapter(owner_id, adapter_id_override=adapter.id)
-                self.store.create_training_job(
-                    user_id=owner_id,
-                    adapter_id=adapter.id,
-                    preference_event_ids=[e.id for e in events],
-                )
+                create_training_job = getattr(self.store, "create_training_job", None)
+                if callable(create_training_job):
+                    create_training_job(
+                        user_id=owner_id,
+                        adapter_id=adapter.id,
+                        preference_event_ids=[e.id for e in events],
+                    )
             promoted.append(adapter.id)
         return promoted
