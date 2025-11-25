@@ -56,7 +56,7 @@ class LegacyOnlyStore:
     def add_chunks(self, context_id: str, chunks: list[KnowledgeChunk]) -> None:
         bucket = self.chunks.setdefault(context_id, [])
         for chunk in chunks:
-            if chunk.id is None:
+            if not chunk.id:
                 chunk.id = self._chunk_id_seq
                 self._chunk_id_seq += 1
             bucket.append(chunk)
@@ -79,7 +79,7 @@ def test_local_hybrid_without_pgvector():
         ctx.id,
         [
             KnowledgeChunk(
-                id=None,
+                id=0,
                 context_id=ctx.id,
                 fs_path="inline",
                 content="other model",
@@ -108,7 +108,7 @@ def test_memory_store_pgvector_filters_fs_path(tmp_path):
         ctx.id,
         [
             KnowledgeChunk(
-                id=None,
+                id=0,
                 context_id=ctx.id,
                 fs_path="keep_me",
                 content="keep",
@@ -116,7 +116,7 @@ def test_memory_store_pgvector_filters_fs_path(tmp_path):
                 chunk_index=0,
             ),
             KnowledgeChunk(
-                id=None,
+                id=0,
                 context_id=ctx.id,
                 fs_path="skip_me",
                 content="skip",

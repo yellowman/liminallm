@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS artifact (
   description     TEXT,
   schema          JSONB NOT NULL,
   fs_path         TEXT,
+  base_model      TEXT,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   visibility      TEXT NOT NULL DEFAULT 'private',
@@ -19,6 +20,7 @@ CREATE TABLE IF NOT EXISTS artifact_version (
   version         INT NOT NULL,
   schema          JSONB NOT NULL,
   fs_path         TEXT,
+  base_model      TEXT,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   created_by      TEXT NOT NULL,
   change_note     TEXT,
@@ -28,6 +30,10 @@ CREATE TABLE IF NOT EXISTS artifact_version (
 
 ALTER TABLE artifact_version
   ADD COLUMN IF NOT EXISTS change_note TEXT;
+ALTER TABLE artifact
+  ADD COLUMN IF NOT EXISTS base_model TEXT;
+ALTER TABLE artifact_version
+  ADD COLUMN IF NOT EXISTS base_model TEXT;
 
 CREATE TABLE IF NOT EXISTS config_patch (
   id              BIGSERIAL PRIMARY KEY,

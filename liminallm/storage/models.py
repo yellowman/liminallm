@@ -78,6 +78,7 @@ class Message:
     sender: str
     role: str
     content: str
+    content_struct: Optional[dict] = None
     seq: int
     created_at: datetime
     token_count_in: Optional[int] = None
@@ -132,7 +133,7 @@ class ConfigPatchAudit:
 @dataclass
 class KnowledgeContext:
     id: str
-    owner_user_id: Optional[str]
+    owner_user_id: str
     name: str
     description: str
     created_at: datetime = field(default_factory=datetime.utcnow)
@@ -152,7 +153,7 @@ class ContextSource:
 
 @dataclass
 class KnowledgeChunk:
-    id: int | None
+    id: int = 0
     context_id: str
     fs_path: str
     content: str

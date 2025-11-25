@@ -1001,7 +1001,15 @@ class PostgresStore:
             raise ConstraintViolation("conversation owner or context missing", {"user_id": user_id, "context_id": active_context_id})
         return Conversation(id=conv_id, user_id=user_id, title=title, created_at=now, updated_at=now, active_context_id=active_context_id)
 
-    def append_message(self, conversation_id: str, sender: str, role: str, content: str, meta: Optional[dict] = None) -> Message:
+    def append_message(
+        self,
+        conversation_id: str,
+        sender: str,
+        role: str,
+        content: str,
+        meta: Optional[dict] = None,
+        content_struct: Optional[dict] = None,
+    ) -> Message:
         try:
             with self._connect() as conn:
                 seq_row = conn.execute("SELECT COUNT(*) AS c FROM message WHERE conversation_id = %s", (conversation_id,)).fetchone()
@@ -1009,13 +1017,33 @@ class PostgresStore:
                 msg_id = str(uuid.uuid4())
                 now = datetime.utcnow()
                 conn.execute(
-                    "INSERT INTO message (id, conversation_id, sender, role, content, seq, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                    (msg_id, conversation_id, sender, role, content, seq, now, json.dumps(meta) if meta else None),
+                    "INSERT INTO message (id, conversation_id, sender, role, content, content_struct, seq, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        msg_id,
+                        conversation_id,
+                        sender,
+                        role,
+                        content,
+                        json.dumps(content_struct) if content_struct is not None else None,
+                        seq,
+                        now,
+                        json.dumps(meta) if meta else None,
+                    ),
                 )
                 conn.execute("UPDATE conversation SET updated_at = %s WHERE id = %s", (now, conversation_id))
         except errors.ForeignKeyViolation:
             raise ConstraintViolation("conversation not found", {"conversation_id": conversation_id})
-        return Message(id=msg_id, conversation_id=conversation_id, sender=sender, role=role, content=content, seq=seq, created_at=now, meta=meta)
+        return Message(
+            id=msg_id,
+            conversation_id=conversation_id,
+            sender=sender,
+            role=role,
+            content=content,
+            content_struct=content_struct,
+            seq=seq,
+            created_at=now,
+            meta=meta,
+        )
 
     def list_messages(self, conversation_id: str, limit: int = 10) -> List[Message]:
         with self._connect() as conn:
@@ -1024,6 +1052,18 @@ class PostgresStore:
             ).fetchall()
         messages: List[Message] = []
         for row in reversed(rows):
+            content_struct = row.get("content_struct") if isinstance(row, dict) else row["content_struct"]
+            if isinstance(content_struct, str):
+                try:
+                    content_struct = json.loads(content_struct)
+                except Exception:
+                    content_struct = None
+            meta = row.get("meta") if isinstance(row, dict) else row["meta"]
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = None
             messages.append(
                 Message(
                     id=str(row["id"]),
@@ -1031,9 +1071,10 @@ class PostgresStore:
                     sender=row["sender"],
                     role=row["role"],
                     content=row["content"],
+                    content_struct=content_struct,
                     seq=row["seq"],
                     created_at=row.get("created_at", datetime.utcnow()),
-                    meta=row.get("meta"),
+                    meta=meta,
                 )
             )
         return messages
@@ -1108,6 +1149,7 @@ class PostgresStore:
                     created_at=row.get("created_at", datetime.utcnow()),
                     updated_at=row.get("updated_at", datetime.utcnow()),
                     fs_path=row.get("fs_path"),
+                    base_model=row.get("base_model") or (row.get("schema") or {}).get("base_model"),
                     meta=row.get("meta"),
                 )
             )
@@ -1136,7 +1178,7 @@ class PostgresStore:
             created_at=row.get("created_at", datetime.utcnow()),
             updated_at=row.get("updated_at", datetime.utcnow()),
             fs_path=row.get("fs_path"),
-            base_model=(schema or {}).get("base_model"),
+            base_model=row.get("base_model") or (schema or {}).get("base_model"),
             meta=row.get("meta"),
         )
 
@@ -1161,12 +1203,20 @@ class PostgresStore:
         try:
             with self._connect() as conn:
                 conn.execute(
-                    "INSERT INTO artifact (id, owner_user_id, type, name, description, schema, fs_path) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                    (artifact_id, owner_user_id, type_, name, description, json.dumps(schema), fs_path),
+                    "INSERT INTO artifact (id, owner_user_id, type, name, description, schema, fs_path, base_model) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    (artifact_id, owner_user_id, type_, name, description, json.dumps(schema), fs_path, schema.get("base_model")),
                 )
                 conn.execute(
-                    "INSERT INTO artifact_version (artifact_id, version, schema, fs_path, created_by, change_note) VALUES (%s, %s, %s, %s, %s, %s)",
-                    (artifact_id, 1, json.dumps(schema), fs_path, version_author or owner_user_id or "system_llm", change_note),
+                    "INSERT INTO artifact_version (artifact_id, version, schema, fs_path, base_model, created_by, change_note) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        artifact_id,
+                        1,
+                        json.dumps(schema),
+                        fs_path,
+                        schema.get("base_model"),
+                        version_author or owner_user_id or "system_llm",
+                        change_note,
+                    ),
                 )
         except errors.ForeignKeyViolation:
             raise ConstraintViolation("artifact owner missing", {"owner_user_id": owner_user_id})
@@ -1203,16 +1253,17 @@ class PostgresStore:
             next_version = (versions["v"] or 0) + 1
             fs_path = self._persist_payload(artifact_id, next_version, schema)
             conn.execute(
-                "UPDATE artifact SET schema = %s, description = COALESCE(%s, description), updated_at = now(), fs_path = %s WHERE id = %s",
-                (json.dumps(schema), description, fs_path, artifact_id),
+                "UPDATE artifact SET schema = %s, description = COALESCE(%s, description), updated_at = now(), fs_path = %s, base_model = %s WHERE id = %s",
+                (json.dumps(schema), description, fs_path, schema.get("base_model"), artifact_id),
             )
             conn.execute(
-                "INSERT INTO artifact_version (artifact_id, version, schema, fs_path, created_by, change_note) VALUES (%s, %s, %s, %s, %s, %s)",
+                "INSERT INTO artifact_version (artifact_id, version, schema, fs_path, base_model, created_by, change_note) VALUES (%s, %s, %s, %s, %s, %s, %s)",
                 (
                     artifact_id,
                     next_version,
                     json.dumps(schema),
                     fs_path,
+                    schema.get("base_model"),
                     version_author or (str(row["owner_user_id"]) if row.get("owner_user_id") else None) or "system_llm",
                     change_note,
                 ),
@@ -1226,7 +1277,7 @@ class PostgresStore:
             owner_user_id=(str(row["owner_user_id"]) if row.get("owner_user_id") else None),
             fs_path=fs_path,
             visibility=row.get("visibility", "private"),
-            base_model=schema.get("base_model"),
+            base_model=row.get("base_model") or schema.get("base_model"),
         )
 
     def list_artifact_versions(self, artifact_id: str) -> List[ArtifactVersion]:
@@ -1254,7 +1305,7 @@ class PostgresStore:
                     change_note=row.get("change_note"),
                     created_at=row.get("created_at", datetime.utcnow()),
                     fs_path=row.get("fs_path"),
-                    base_model=(schema or {}).get("base_model"),
+                    base_model=row.get("base_model") or (schema or {}).get("base_model"),
                     meta=row.get("meta"),
                 )
             )
@@ -1421,9 +1472,11 @@ class PostgresStore:
 
     # knowledge
     def upsert_context(
-        self, owner_user_id: Optional[str], name: str, description: str, fs_path: Optional[str] = None, meta: Optional[dict] = None
+        self, owner_user_id: str, name: str, description: str, fs_path: Optional[str] = None, meta: Optional[dict] = None
     ) -> KnowledgeContext:
         ctx_id = str(uuid.uuid4())
+        if not owner_user_id:
+            raise ConstraintViolation("context owner required", {"owner_user_id": owner_user_id})
         try:
             with self._connect() as conn:
                 conn.execute(
@@ -1450,7 +1503,7 @@ class PostgresStore:
             contexts.append(
                 KnowledgeContext(
                     id=str(row["id"]),
-                    owner_user_id=str(row["owner_user_id"]) if row.get("owner_user_id") else None,
+                    owner_user_id=str(row["owner_user_id"]),
                     name=row["name"],
                     description=row["description"],
                     created_at=row.get("created_at", datetime.utcnow()),
