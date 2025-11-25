@@ -41,7 +41,7 @@ class MemoryStore:
         self.credentials: Dict[str, tuple[str, str]] = {}
         self.artifacts: Dict[str, Artifact] = {}
         self.artifact_versions: Dict[str, List[ArtifactVersion]] = {}
-        self.config_patches: Dict[str, ConfigPatchAudit] = {}
+        self.config_patches: Dict[int, ConfigPatchAudit] = {}
         self.runtime_config: Dict[str, str] = {}
         self.contexts: Dict[str, KnowledgeContext] = {}
         self.chunks: Dict[str, List[KnowledgeChunk]] = {}
@@ -742,11 +742,12 @@ class MemoryStore:
         payload_path.write_text(json.dumps(schema, indent=2))
         return str(payload_path)
 
-    def record_config_patch(self, artifact_id: str, proposer_user_id: Optional[str], patch: dict, justification: Optional[str]) -> ConfigPatchAudit:
+    def record_config_patch(self, artifact_id: str, proposer: str, patch: dict, justification: Optional[str]) -> ConfigPatchAudit:
+        audit_id = max(self.config_patches.keys(), default=0) + 1
         audit = ConfigPatchAudit(
-            id=str(uuid.uuid4()),
+            id=audit_id,
             artifact_id=artifact_id,
-            proposer_user_id=proposer_user_id,
+            proposer=proposer,
             patch=patch,
             justification=justification,
         )
@@ -754,7 +755,7 @@ class MemoryStore:
         self._persist_state()
         return audit
 
-    def get_config_patch(self, patch_id: str) -> Optional[ConfigPatchAudit]:
+    def get_config_patch(self, patch_id: int) -> Optional[ConfigPatchAudit]:
         return self.config_patches.get(patch_id)
 
     def list_config_patches(self, status: Optional[str] = None) -> List[ConfigPatchAudit]:
@@ -764,17 +765,17 @@ class MemoryStore:
         return sorted(patches, key=lambda p: p.created_at, reverse=True)
 
     def update_config_patch_status(
-        self, patch_id: str, status: str, *, meta: Optional[Dict] = None, mark_decided: bool = False, mark_applied: bool = False
+        self, patch_id: int, status: str, *, meta: Optional[Dict] = None, mark_decided: bool = False, mark_applied: bool = False
     ) -> Optional[ConfigPatchAudit]:
         patch = self.config_patches.get(patch_id)
         if not patch:
             return None
         patch.status = status
-        patch.updated_at = datetime.utcnow()
+        now = datetime.utcnow()
         if mark_decided and not patch.decided_at:
-            patch.decided_at = patch.updated_at
+            patch.decided_at = now
         if mark_applied:
-            patch.applied_at = patch.updated_at
+            patch.applied_at = now
         if meta:
             merged = dict(patch.meta or {})
             merged.update(meta)
@@ -1017,7 +1018,10 @@ class MemoryStore:
         for versions in self.artifact_versions.values():
             versions.sort(key=lambda v: v.version)
         self.runtime_config = data.get("runtime_config", {})
-        self.config_patches = {cp["id"]: self._deserialize_config_patch(cp) for cp in data.get("config_patches", [])}
+        self.config_patches = {}
+        for cp in data.get("config_patches", []):
+            deserialized = self._deserialize_config_patch(cp)
+            self.config_patches[deserialized.id] = deserialized
         self.contexts = {ctx["id"]: self._deserialize_context(ctx) for ctx in data.get("contexts", [])}
         self.chunks = {}
         for chunk_data in data.get("chunks", []):
@@ -1046,7 +1050,7 @@ class MemoryStore:
 
     def _deserialize_user(self, data: dict) -> User:
         return User(
-            id=data["id"],
+            id=int(data["id"]),
             email=data["email"],
             handle=data.get("handle"),
             created_at=self._deserialize_datetime(data["created_at"]),
@@ -1197,12 +1201,11 @@ class MemoryStore:
         return {
             "id": patch.id,
             "artifact_id": patch.artifact_id,
-            "proposer_user_id": patch.proposer_user_id,
+            "proposer": patch.proposer,
             "patch": patch.patch,
             "justification": patch.justification,
             "status": patch.status,
             "created_at": self._serialize_datetime(patch.created_at),
-            "updated_at": self._serialize_datetime(patch.updated_at),
             "decided_at": self._serialize_datetime(patch.decided_at) if patch.decided_at else None,
             "applied_at": self._serialize_datetime(patch.applied_at) if patch.applied_at else None,
             "meta": patch.meta,
@@ -1212,12 +1215,11 @@ class MemoryStore:
         return ConfigPatchAudit(
             id=data["id"],
             artifact_id=data["artifact_id"],
-            proposer_user_id=data.get("proposer_user_id"),
+            proposer=data.get("proposer", "user"),
             patch=data.get("patch", {}),
             justification=data.get("justification"),
             status=data.get("status", "pending"),
             created_at=self._deserialize_datetime(data["created_at"]),
-            updated_at=self._deserialize_datetime(data["updated_at"]),
             decided_at=self._deserialize_datetime(data["decided_at"]) if data.get("decided_at") else None,
             applied_at=self._deserialize_datetime(data["applied_at"]) if data.get("applied_at") else None,
             meta=data.get("meta"),

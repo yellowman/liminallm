@@ -1264,17 +1264,26 @@ class PostgresStore:
             ).fetchone()
         return row["schema"] if row else None
 
-    def record_config_patch(self, artifact_id: str, proposer_user_id: Optional[str], patch: dict, justification: Optional[str]) -> ConfigPatchAudit:
-        audit_id = str(uuid.uuid4())
-        now = datetime.utcnow()
+    def record_config_patch(self, artifact_id: str, proposer: str, patch: dict, justification: Optional[str]) -> ConfigPatchAudit:
         with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO config_patch (id, artifact_id, proposer_user_id, patch, justification, status, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                (audit_id, artifact_id, proposer_user_id, json.dumps(patch), justification, "pending", now, now),
-            )
-        return ConfigPatchAudit(id=audit_id, artifact_id=artifact_id, proposer_user_id=proposer_user_id, patch=patch, justification=justification, created_at=now, updated_at=now)
+            row = conn.execute(
+                "INSERT INTO config_patch (artifact_id, proposer, patch, justification, status) VALUES (%s, %s, %s, %s, %s) RETURNING id, created_at, decided_at, applied_at, status, meta",
+                (artifact_id, proposer, json.dumps(patch), justification, "pending"),
+            ).fetchone()
+        return ConfigPatchAudit(
+            id=row["id"],
+            artifact_id=artifact_id,
+            proposer=proposer,
+            patch=patch,
+            justification=justification,
+            status=row.get("status", "pending") if isinstance(row, dict) else row["status"],
+            created_at=row.get("created_at", datetime.utcnow()) if isinstance(row, dict) else row["created_at"],
+            decided_at=row.get("decided_at") if isinstance(row, dict) else row.get("decided_at"),
+            applied_at=row.get("applied_at") if isinstance(row, dict) else row.get("applied_at"),
+            meta=row.get("meta") if isinstance(row, dict) else row.get("meta"),
+        )
 
-    def get_config_patch(self, patch_id: str) -> Optional[ConfigPatchAudit]:
+    def get_config_patch(self, patch_id: int) -> Optional[ConfigPatchAudit]:
         with self._connect() as conn:
             row = conn.execute("SELECT * FROM config_patch WHERE id = %s", (patch_id,)).fetchone()
         return self._config_patch_from_row(row) if row else None
@@ -1291,7 +1300,7 @@ class PostgresStore:
         return [self._config_patch_from_row(row) for row in rows]
 
     def update_config_patch_status(
-        self, patch_id: str, status: str, *, meta: Optional[Dict] = None, mark_decided: bool = False, mark_applied: bool = False
+        self, patch_id: int, status: str, *, meta: Optional[Dict] = None, mark_decided: bool = False, mark_applied: bool = False
     ) -> Optional[ConfigPatchAudit]:
         with self._connect() as conn:
             existing = conn.execute("SELECT * FROM config_patch WHERE id = %s", (patch_id,)).fetchone()
@@ -1308,13 +1317,15 @@ class PostgresStore:
             merged_meta: Dict = dict(existing_meta)
             if meta:
                 merged_meta.update(meta)
-            if mark_decided and "decided_at" not in merged_meta:
-                merged_meta["decided_at"] = now.isoformat()
+            decided_at = existing.get("decided_at") if isinstance(existing, dict) else existing["decided_at"]
+            applied_at = existing.get("applied_at") if isinstance(existing, dict) else existing["applied_at"]
+            if mark_decided and not decided_at:
+                decided_at = now
             if mark_applied:
-                merged_meta["applied_at"] = now.isoformat()
+                applied_at = now
             conn.execute(
-                "UPDATE config_patch SET status = %s, updated_at = %s, meta = %s WHERE id = %s",
-                (status, now, json.dumps(merged_meta), patch_id),
+                "UPDATE config_patch SET status = %s, decided_at = %s, applied_at = %s, meta = %s WHERE id = %s",
+                (status, decided_at, applied_at, json.dumps(merged_meta), patch_id),
             )
             row = conn.execute("SELECT * FROM config_patch WHERE id = %s", (patch_id,)).fetchone()
         return self._config_patch_from_row(row) if row else None
@@ -1329,24 +1340,19 @@ class PostgresStore:
             except Exception as exc:
                 self.logger.warning("config_patch_meta_parse_failed", error=str(exc))
                 meta = {}
-        decided_at = None
-        applied_at = None
-        if isinstance(meta, dict):
-            decided_at = self._parse_ts(meta.get("decided_at"))
-            applied_at = self._parse_ts(meta.get("applied_at"))
+        decided_at = row.get("decided_at") if isinstance(row, dict) else row.get("decided_at")
+        applied_at = row.get("applied_at") if isinstance(row, dict) else row.get("applied_at")
         created = row.get("created_at") if isinstance(row, dict) else row["created_at"]
-        updated = row.get("updated_at") if isinstance(row, dict) else row["updated_at"]
         return ConfigPatchAudit(
-            id=str(row["id"]),
+            id=int(row["id"]),
             artifact_id=str(row["artifact_id"]),
-            proposer_user_id=(str(row["proposer_user_id"]) if row.get("proposer_user_id") else None) if isinstance(row, dict) else (str(row["proposer_user_id"]) if row["proposer_user_id"] else None),
+            proposer=row.get("proposer") if isinstance(row, dict) else row["proposer"],
             patch=patch_data,
             justification=row.get("justification") if isinstance(row, dict) else row["justification"],
             status=row.get("status", "pending") if isinstance(row, dict) else row["status"],
             created_at=created if isinstance(created, datetime) else datetime.fromisoformat(str(created)),
-            updated_at=updated if isinstance(updated, datetime) else datetime.fromisoformat(str(updated)),
-            decided_at=decided_at,
-            applied_at=applied_at,
+            decided_at=decided_at if isinstance(decided_at, datetime) or decided_at is None else datetime.fromisoformat(str(decided_at)),
+            applied_at=applied_at if isinstance(applied_at, datetime) or applied_at is None else datetime.fromisoformat(str(applied_at)),
             meta=meta if isinstance(meta, dict) else {},
         )
 

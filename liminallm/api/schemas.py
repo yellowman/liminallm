@@ -141,11 +141,13 @@ class ArtifactVersionListResponse(BaseModel):
 
 
 class ConfigPatchAuditResponse(BaseModel):
-    id: str
+    id: int
     artifact_id: str
+    proposer: str
     justification: Optional[str]
     status: str
     patch: dict
+    created_at: datetime
     decided_at: Optional[datetime] = None
     applied_at: Optional[datetime] = None
     meta: Optional[dict] = None

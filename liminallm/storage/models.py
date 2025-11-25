@@ -117,14 +117,13 @@ class ArtifactVersion:
 
 @dataclass
 class ConfigPatchAudit:
-    id: str
+    id: int
     artifact_id: str
-    proposer_user_id: Optional[str]
+    proposer: str
     patch: dict
     justification: Optional[str]
     status: str = "pending"
     created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
     decided_at: Optional[datetime] = None
     applied_at: Optional[datetime] = None
     meta: Dict | None = None
