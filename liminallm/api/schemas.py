@@ -190,7 +190,7 @@ class KnowledgeContextResponse(BaseModel):
     description: str
     created_at: datetime
     updated_at: datetime
-    owner_user_id: Optional[str]
+    owner_user_id: str
     meta: Optional[dict] = None
 
 

@@ -328,7 +328,15 @@ class MemoryStore:
         self._persist_state()
         return conv
 
-    def append_message(self, conversation_id: str, sender: str, role: str, content: str, meta: Optional[Dict] = None) -> Message:
+    def append_message(
+        self,
+        conversation_id: str,
+        sender: str,
+        role: str,
+        content: str,
+        meta: Optional[Dict] = None,
+        content_struct: Optional[dict] = None,
+    ) -> Message:
         if conversation_id not in self.conversations:
             raise ConstraintViolation("conversation not found", {"conversation_id": conversation_id})
         seq = len(self.messages.get(conversation_id, []))
@@ -338,6 +346,7 @@ class MemoryStore:
             sender=sender,
             role=role,
             content=content,
+            content_struct=content_struct,
             seq=seq,
             created_at=datetime.utcnow(),
             meta=meta,
@@ -814,9 +823,11 @@ class MemoryStore:
         return []
 
     def upsert_context(
-        self, owner_user_id: Optional[str], name: str, description: str, fs_path: Optional[str] = None, meta: Optional[dict] = None
+        self, owner_user_id: str, name: str, description: str, fs_path: Optional[str] = None, meta: Optional[dict] = None
     ) -> KnowledgeContext:
-        if owner_user_id and owner_user_id not in self.users:
+        if not owner_user_id:
+            raise ConstraintViolation("context owner required", {"owner_user_id": owner_user_id})
+        if owner_user_id not in self.users:
             raise ConstraintViolation("context owner missing", {"owner_user_id": owner_user_id})
         ctx_id = str(uuid.uuid4())
         ctx = KnowledgeContext(
@@ -865,11 +876,17 @@ class MemoryStore:
         for chunk in chunks:
             if not chunk.fs_path or not str(chunk.fs_path).strip():
                 raise ConstraintViolation("fs_path required for knowledge_chunk", {"fs_path": chunk.fs_path})
-            if chunk.id is None or (isinstance(chunk.id, str) and not chunk.id.strip()):
+            chunk_id = getattr(chunk, "id", 0) or 0
+            if isinstance(chunk_id, str):
+                try:
+                    chunk_id = int(chunk_id)
+                except ValueError:
+                    chunk_id = 0
+            if chunk_id <= 0:
                 chunk.id = self._chunk_id_seq
                 self._chunk_id_seq += 1
             else:
-                chunk.id = int(chunk.id)
+                chunk.id = int(chunk_id)
                 self._chunk_id_seq = max(self._chunk_id_seq, chunk.id + 1)
             existing.append(chunk)
         self._persist_state()
@@ -1177,6 +1194,7 @@ class MemoryStore:
             "sender": message.sender,
             "role": message.role,
             "content": message.content,
+            "content_struct": message.content_struct,
             "seq": message.seq,
             "created_at": self._serialize_datetime(message.created_at),
             "token_count_in": message.token_count_in,
@@ -1191,6 +1209,7 @@ class MemoryStore:
             sender=data["sender"],
             role=data["role"],
             content=data["content"],
+            content_struct=data.get("content_struct"),
             seq=data["seq"],
             created_at=self._deserialize_datetime(data["created_at"]),
             token_count_in=data.get("token_count_in"),
@@ -1301,7 +1320,7 @@ class MemoryStore:
     def _deserialize_context(self, data: dict) -> KnowledgeContext:
         return KnowledgeContext(
             id=data["id"],
-            owner_user_id=data.get("owner_user_id"),
+            owner_user_id=data["owner_user_id"],
             name=data["name"],
             description=data.get("description", ""),
             created_at=self._deserialize_datetime(data["created_at"]),
@@ -1342,7 +1361,7 @@ class MemoryStore:
 
     def _deserialize_chunk(self, data: dict) -> KnowledgeChunk:
         return KnowledgeChunk(
-            id=int(data["id"]) if data.get("id") is not None else None,
+            id=int(data["id"]) if data.get("id") is not None else 0,
             context_id=data["context_id"],
             fs_path=data.get("fs_path", ""),
             content=data.get("content", ""),

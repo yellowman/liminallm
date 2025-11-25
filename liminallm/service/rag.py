@@ -137,7 +137,7 @@ class RAGService:
             segment = blob[idx : idx + chosen_chunk]
             chunks.append(
                 KnowledgeChunk(
-                    id=None,
+                    id=0,
                     context_id=context_id,
                     fs_path=default_path,
                     content=segment,
