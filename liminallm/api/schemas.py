@@ -45,6 +45,17 @@ class TokenRefreshRequest(BaseModel):
     tenant_id: Optional[str] = None
 
 
+class OAuthStartRequest(BaseModel):
+    redirect_uri: Optional[str] = None
+    tenant_id: Optional[str] = None
+
+
+class OAuthStartResponse(BaseModel):
+    authorization_url: str
+    state: str
+    provider: str
+
+
 class MFARequest(BaseModel):
     session_id: str
 
@@ -178,6 +189,7 @@ class KnowledgeContextResponse(BaseModel):
     created_at: datetime
     updated_at: datetime
     owner_user_id: Optional[str]
+    meta: Optional[dict] = None
 
 
 class KnowledgeChunkResponse(BaseModel):
@@ -289,3 +301,30 @@ class UpdateUserRoleRequest(BaseModel):
 class AdminInspectionResponse(BaseModel):
     summary: dict
     details: dict
+
+
+class ToolInvokeRequest(BaseModel):
+    inputs: dict = Field(default_factory=dict)
+    conversation_id: Optional[str] = None
+    context_id: Optional[str] = None
+    user_message: Optional[str] = None
+
+
+class ToolInvokeResponse(BaseModel):
+    status: str = "ok"
+    outputs: dict = Field(default_factory=dict)
+    content: Optional[str] = None
+    usage: Optional[dict] = None
+    context_snippets: Optional[List[str]] = None
+
+
+class ToolSpecListResponse(BaseModel):
+    items: List[ArtifactResponse]
+    next_page: Optional[int] = None
+    page_size: int = 50
+
+
+class WorkflowListResponse(BaseModel):
+    items: List[ArtifactResponse]
+    next_page: Optional[int] = None
+    page_size: int = 50

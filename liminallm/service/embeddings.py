@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from typing import Iterable, List
+from typing import Callable, Iterable, List
 
 
 def deterministic_embedding(text: str, dim: int = 64) -> List[float]:
@@ -38,3 +38,14 @@ def pad_vectors(vectors: list[list[float]]) -> list[list[float]]:
         return []
     dim = max(len(v) for v in vectors)
     return [list(v) + [0.0] * (dim - len(v)) for v in vectors]
+
+
+class EmbeddingsService:
+    """Wrapper for embedding providers with a stable model identifier."""
+
+    def __init__(self, model_id: str, *, encoder: Callable[[str], List[float]] = deterministic_embedding):
+        self.model_id = model_id
+        self._encoder = encoder
+
+    def embed(self, text: str) -> List[float]:
+        return self._encoder(text)

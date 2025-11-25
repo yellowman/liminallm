@@ -216,6 +216,35 @@ class WorkflowEngine:
                     registry[artifact.schema["name"]] = artifact.schema
         return registry
 
+    def invoke_tool(
+        self,
+        tool_schema: dict,
+        inputs: Dict[str, Any],
+        *,
+        conversation_id: Optional[str] = None,
+        context_id: Optional[str] = None,
+        user_message: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        tool_name = tool_schema.get("name") or tool_schema.get("id")
+        if not tool_name:
+            return {"status": "error", "content": "tool spec missing name"}
+        self.tool_registry[tool_name] = tool_schema
+        history: List[Any] = []
+        if conversation_id and hasattr(self.store, "list_messages"):
+            try:
+                history = self.store.list_messages(conversation_id)  # type: ignore[attr-defined]
+            except Exception:
+                history = []
+        return self._invoke_tool(
+            tool_name,
+            inputs,
+            adapters=[],
+            history=history,
+            context_id=context_id,
+            conversation_id=conversation_id,
+            user_message=user_message or inputs.get("message") or "",
+        )
+
     def _default_workflow(self) -> dict:
         plain_chat_node = {
             "id": "plain_chat",
