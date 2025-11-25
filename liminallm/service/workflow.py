@@ -450,6 +450,12 @@ class WorkflowEngine:
             "workflow.end": self._tool_end,
         }
 
+    def _resolve_context_ids(self, provided: Any, fallback: Optional[str]) -> Optional[List[str]]:
+        ctx_ids = provided or fallback
+        if isinstance(ctx_ids, str):
+            return [ctx_ids]
+        return ctx_ids
+
     def _tool_llm_generic(
         self,
         inputs: Dict[str, Any],
@@ -470,9 +476,7 @@ class WorkflowEngine:
             message = inputs.get("raw") or ""
         if not message:
             message = ""
-        ctx_ids = inputs.get("context_id") or context_id
-        if isinstance(ctx_ids, str):
-            ctx_ids = [ctx_ids]
+        ctx_ids = self._resolve_context_ids(inputs.get("context_id"), context_id)
 
         ctx_chunks = self.rag.retrieve(ctx_ids, message, user_id=user_id, tenant_id=tenant_id)
         context_snippets = [c.text for c in ctx_chunks]
@@ -491,9 +495,7 @@ class WorkflowEngine:
         tenant_id: Optional[str],
     ) -> Dict[str, Any]:
         question = inputs.get("question") or inputs.get("message") or ""
-        ctx_ids = inputs.get("context_id") or context_id
-        if isinstance(ctx_ids, str):
-            ctx_ids = [ctx_ids]
+        ctx_ids = self._resolve_context_ids(inputs.get("context_id"), context_id)
 
         chunks = self.rag.retrieve(ctx_ids, question, user_id=user_id, tenant_id=tenant_id)
         snippets = [c.text for c in chunks]
