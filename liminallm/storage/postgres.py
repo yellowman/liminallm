@@ -1439,6 +1439,8 @@ class PostgresStore:
         try:
             with self._connect() as conn:
                 for chunk in chunks:
+                    if not chunk.fs_path:
+                        raise ConstraintViolation("fs_path required for knowledge_chunk", {"fs_path": chunk.fs_path})
                     conn.execute(
                         "INSERT INTO knowledge_chunk (context_id, fs_path, chunk_index, content, embedding, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s)",
                         (

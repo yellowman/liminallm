@@ -2,7 +2,10 @@ from dataclasses import fields
 from typing import get_type_hints
 import uuid
 
+import pytest
+
 from liminallm.api.schemas import KnowledgeChunkResponse
+from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.models import KnowledgeChunk
 
@@ -61,3 +64,23 @@ def test_memory_store_round_trips_chunk_fields(tmp_path):
     assert stored.content == "schema aligned"
     assert stored.chunk_index == 0
     assert (stored.meta or {}).get("embedding_model_id") == "deterministic"
+
+
+def test_memory_store_rejects_missing_fs_path(tmp_path):
+    store = MemoryStore(fs_root=str(tmp_path))
+    context = store.upsert_context(owner_user_id=None, name="ctx", description="desc")
+
+    with pytest.raises(ConstraintViolation):
+        store.add_chunks(
+            context.id,
+            [
+                KnowledgeChunk(
+                    id=None,
+                    context_id=context.id,
+                    fs_path="",
+                    content="",
+                    embedding=[],
+                    chunk_index=0,
+                )
+            ],
+        )

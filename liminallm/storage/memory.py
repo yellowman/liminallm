@@ -818,6 +818,8 @@ class MemoryStore:
             raise ConstraintViolation("context not found", {"context_id": context_id})
         existing = self.chunks.setdefault(context_id, [])
         for chunk in chunks:
+            if not chunk.fs_path:
+                raise ConstraintViolation("fs_path required for knowledge_chunk", {"fs_path": chunk.fs_path})
             if chunk.id is None:
                 chunk.id = self._chunk_id_seq
                 self._chunk_id_seq += 1
@@ -1275,7 +1277,7 @@ class MemoryStore:
         return KnowledgeChunk(
             id=int(data["id"]) if data.get("id") is not None else None,
             context_id=data["context_id"],
-            fs_path=data.get("fs_path", ""),
+            fs_path=data["fs_path"],
             content=data.get("content", ""),
             embedding=data.get("embedding", []),
             chunk_index=data.get("chunk_index", 0),
