@@ -2,10 +2,6 @@ import uuid
 
 from liminallm.service.rag import RAGService
 from liminallm.storage.memory import MemoryStore
-import uuid
-
-from liminallm.service.rag import RAGService
-from liminallm.storage.memory import MemoryStore
 from liminallm.storage.models import KnowledgeChunk, KnowledgeContext, User
 
 
@@ -45,6 +41,7 @@ class LegacyOnlyStore:
         self.contexts = {}
         self.users = {}
         self.chunks = {}
+        self._chunk_id_seq = 1
 
     def add_user(self, tenant_id: str) -> User:
         user = User(id=str(uuid.uuid4()), email=f"user-{tenant_id}@example.com", tenant_id=tenant_id)
@@ -57,7 +54,12 @@ class LegacyOnlyStore:
         return ctx
 
     def add_chunks(self, context_id: str, chunks: list[KnowledgeChunk]) -> None:
-        self.chunks.setdefault(context_id, []).extend(chunks)
+        bucket = self.chunks.setdefault(context_id, [])
+        for chunk in chunks:
+            if chunk.id is None:
+                chunk.id = self._chunk_id_seq
+                self._chunk_id_seq += 1
+            bucket.append(chunk)
 
     def search_chunks_legacy(
         self, context_id: str | None, query: str, query_embedding: list[float] | None, limit: int = 4
@@ -72,15 +74,17 @@ def test_local_hybrid_without_pgvector():
 
     rag = RAGService(store, rag_mode="local_hybrid", embedding_model_id="legacy-embedding")
     rag.ingest_text(ctx.id, "legacy search path")
+    existing_chunks = store.chunks.get(ctx.id, [])
     store.add_chunks(
         ctx.id,
         [
             KnowledgeChunk(
-                id=str(uuid.uuid4()),
+                id=None,
                 context_id=ctx.id,
-                text="other model",
+                fs_path="inline",
+                content="other model",
                 embedding=[],
-                seq=99,
+                chunk_index=len(existing_chunks),
                 meta={"embedding_model_id": "other"},
             )
         ],

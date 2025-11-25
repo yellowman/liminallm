@@ -197,10 +197,11 @@ class KnowledgeContextListResponse(BaseModel):
 
 
 class KnowledgeChunkResponse(BaseModel):
-    id: str
+    id: int
     context_id: str
-    text: str
-    seq: int
+    fs_path: str
+    content: str
+    chunk_index: int
 
 
 class KnowledgeChunkListResponse(BaseModel):

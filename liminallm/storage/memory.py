@@ -879,14 +879,14 @@ class MemoryStore:
             return scores
 
         query_tokens = _tokenize(query)
-        doc_tokens = [_tokenize(ch.text) for ch in candidates]
+        doc_tokens = [_tokenize(ch.content) for ch in candidates]
         bm25_scores = _bm25_scores(query_tokens, doc_tokens)
         semantic_scores = [(_cosine(query_embedding, ch.embedding) if query_embedding else 0.0) for ch in candidates]
         max_bm25 = max(bm25_scores) or 1.0
         combined: Dict[str, tuple[KnowledgeChunk, float]] = {}
         for chunk, lex, sem in zip(candidates, bm25_scores, semantic_scores):
             hybrid = 0.45 * (lex / max_bm25) + 0.55 * sem
-            key = " ".join(chunk.text.split()).lower() or chunk.id
+            key = " ".join(chunk.content.split()).lower() or str(chunk.id or "")
             existing = combined.get(key)
             if not existing or hybrid > existing[1]:
                 combined[key] = (chunk, hybrid)
@@ -946,7 +946,7 @@ class MemoryStore:
         combined: Dict[str, tuple[KnowledgeChunk, float]] = {}
         for chunk, lex, sem in zip(allowed_chunks, bm25_scores, semantic_scores):
             hybrid = 0.45 * (lex / max_bm25) + 0.55 * sem
-            key = " ".join(chunk.text.split()).lower() or chunk.id
+            key = " ".join(chunk.content.split()).lower() or str(chunk.id or "")
             existing = combined.get(key)
             if not existing or hybrid > existing[1]:
                 combined[key] = (chunk, hybrid)
@@ -1251,9 +1251,10 @@ class MemoryStore:
         return {
             "id": chunk.id,
             "context_id": chunk.context_id,
-            "text": chunk.text,
+            "fs_path": chunk.fs_path,
+            "content": chunk.content,
             "embedding": chunk.embedding,
-            "seq": chunk.seq,
+            "chunk_index": chunk.chunk_index,
             "created_at": self._serialize_datetime(chunk.created_at),
             "meta": chunk.meta,
         }
@@ -1262,9 +1263,10 @@ class MemoryStore:
         return KnowledgeChunk(
             id=data["id"],
             context_id=data["context_id"],
-            text=data.get("text", ""),
+            fs_path=data.get("fs_path", ""),
+            content=data.get("content", ""),
             embedding=data.get("embedding", []),
-            seq=data.get("seq", 0),
+            chunk_index=data.get("chunk_index", 0),
             created_at=self._deserialize_datetime(data["created_at"]),
             meta=data.get("meta"),
         )

@@ -1434,8 +1434,16 @@ class PostgresStore:
             with self._connect() as conn:
                 for chunk in chunks:
                     conn.execute(
-                        "INSERT INTO knowledge_chunk (id, context_id, text, embedding, seq, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                        (chunk.id, context_id, chunk.text, chunk.embedding, chunk.seq, chunk.created_at, json.dumps(chunk.meta) if chunk.meta else None),
+                        "INSERT INTO knowledge_chunk (context_id, fs_path, chunk_index, content, embedding, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            context_id,
+                            chunk.fs_path,
+                            chunk.chunk_index,
+                            chunk.content,
+                            chunk.embedding,
+                            chunk.created_at,
+                            json.dumps(chunk.meta) if chunk.meta else None,
+                        ),
                     )
         except errors.ForeignKeyViolation:
             raise ConstraintViolation("context not found", {"context_id": context_id})
@@ -1444,7 +1452,7 @@ class PostgresStore:
         with self._connect() as conn:
             if context_id:
                 rows = conn.execute(
-                    "SELECT * FROM knowledge_chunk WHERE context_id = %s ORDER BY seq ASC",
+                    "SELECT * FROM knowledge_chunk WHERE context_id = %s ORDER BY chunk_index ASC",
                     (context_id,),
                 ).fetchall()
             else:
@@ -1456,11 +1464,12 @@ class PostgresStore:
         for row in rows:
             chunks.append(
                 KnowledgeChunk(
-                    id=str(row["id"]),
+                    id=int(row["id"]),
                     context_id=str(row["context_id"]),
-                    text=row["text"],
+                    fs_path=row["fs_path"],
+                    content=row["content"],
                     embedding=row.get("embedding") or [],
-                    seq=row.get("seq", 0),
+                    chunk_index=row.get("chunk_index", 0),
                     created_at=row.get("created_at", datetime.utcnow()),
                     meta=row.get("meta"),
                 )
@@ -1495,7 +1504,7 @@ class PostgresStore:
             where_clauses.append("u.tenant_id = %s")
             params.append(tenant_id)
         if filters and filters.get("fs_path"):
-            where_clauses.append("kc.meta->>'fs_path' = %s")
+            where_clauses.append("kc.fs_path = %s")
             params.append(filters["fs_path"])
         if filters and filters.get("embedding_model_id"):
             where_clauses.append("kc.meta->>'embedding_model_id' = %s")
@@ -1504,7 +1513,7 @@ class PostgresStore:
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
-                SELECT kc.id, kc.context_id, kc.text, kc.embedding, kc.seq, kc.created_at, kc.meta
+                SELECT kc.id, kc.context_id, kc.fs_path, kc.content, kc.embedding, kc.chunk_index, kc.created_at, kc.meta
                 FROM knowledge_chunk kc
                 JOIN knowledge_context ctx ON kc.context_id = ctx.id
                 LEFT JOIN app_user u ON ctx.owner_user_id = u.id
@@ -1516,11 +1525,12 @@ class PostgresStore:
             ).fetchall()
         return [
             KnowledgeChunk(
-                id=str(row["id"]),
+                id=int(row["id"]),
                 context_id=str(row["context_id"]),
-                text=row["text"],
+                fs_path=row["fs_path"],
+                content=row["content"],
                 embedding=row.get("embedding") or [],
-                seq=row.get("seq", 0),
+                chunk_index=row.get("chunk_index", 0),
                 created_at=row.get("created_at", datetime.utcnow()),
                 meta=row.get("meta"),
             )
@@ -1581,14 +1591,14 @@ class PostgresStore:
         if not candidates:
             return []
         query_tokens = _tokenize(query)
-        documents = [_tokenize(ch.text) for ch in candidates]
+        documents = [_tokenize(ch.content) for ch in candidates]
         bm25_scores = _bm25_scores(query_tokens, documents)
         semantic_scores = [(_cosine(query_embedding, ch.embedding) if query_embedding else 0.0) for ch in candidates]
         max_bm25 = max(bm25_scores) or 1.0
         combined: dict[str, tuple[KnowledgeChunk, float]] = {}
         for chunk, lex, sem in zip(candidates, bm25_scores, semantic_scores):
             hybrid = 0.45 * (lex / max_bm25) + 0.55 * sem
-            key = " ".join(chunk.text.split()).lower() or chunk.id
+            key = " ".join(chunk.content.split()).lower() or str(chunk.id or "")
             existing = combined.get(key)
             if not existing or hybrid > existing[1]:
                 combined[key] = (chunk, hybrid)
