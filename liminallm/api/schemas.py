@@ -227,11 +227,16 @@ class PreferenceEventResponse(BaseModel):
 
 
 class PreferenceInsightsResponse(BaseModel):
+    status: Optional[str] = None
+    error: Optional[str] = None
     totals: dict
     clusters: List[dict] = Field(default_factory=list)
+    clusters_status: Optional[str] = None
+    clusters_error: Optional[str] = None
     adapters: List[dict] = Field(default_factory=list)
     routing_feedback: dict = Field(default_factory=dict)
     events: List[dict] = Field(default_factory=list)
+    adapter_router_state: dict = Field(default_factory=dict)
 
 
 class ConfigPatchDecisionRequest(BaseModel):
