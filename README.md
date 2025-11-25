@@ -232,6 +232,7 @@ for v1 these can all live in one python app with clear module boundaries.
 
 3. **migrate db**
    - run the alembic / migration tool to create tables described in the spec.
+   - if you ran earlier builds, delete `${SHARED_FS_ROOT}/state/training_pg.json` after upgrading to purge legacy MFA secrets (secrets are now sourced solely from the `user_mfa_secret` table).
 
 4a. **preference_event → adapter dataset → tokenized batches**
    - `preference_event` rows (positive feedback) capture `context_embedding`, `score`, and optional `context_text`; they are clustered per-user to build adapter personas.

@@ -683,7 +683,6 @@ class PostgresStore:
         except Exception as exc:
             self.logger.warning("set_user_mfa_secret_failed", error=str(exc))
         self.mfa_secrets[user_id] = record
-        self._persist_training_state()
         return record
 
     def get_user_mfa_secret(self, user_id: str) -> Optional[UserMFAConfig]:
@@ -1603,33 +1602,12 @@ class PostgresStore:
         state_dir.mkdir(parents=True, exist_ok=True)
         return state_dir / "training_pg.json"
 
-    def _persist_training_state(self) -> None:
-        data = {
-            "mfa_secrets": [
-                {
-                    "user_id": cfg.user_id,
-                    "secret": cfg.secret,
-                    "enabled": cfg.enabled,
-                    "created_at": cfg.created_at.isoformat(),
-                    "meta": cfg.meta,
-                }
-                for cfg in self.mfa_secrets.values()
-            ],
-        }
-        self._training_state_path().write_text(json.dumps(data, indent=2))
-
     def _load_training_state(self) -> None:
         path = self._training_state_path()
         if not path.exists():
             return
-        raw = json.loads(path.read_text())
-        self.mfa_secrets = {
-            cfg["user_id"]: UserMFAConfig(
-                user_id=cfg["user_id"],
-                secret=cfg["secret"],
-                enabled=bool(cfg.get("enabled", False)),
-                created_at=datetime.fromisoformat(cfg.get("created_at", datetime.utcnow().isoformat())),
-                meta=cfg.get("meta"),
-            )
-            for cfg in raw.get("mfa_secrets", [])
-        }
+        try:
+            path.unlink()
+            self.logger.info("removed_legacy_training_state_file", path=str(path))
+        except OSError as exc:
+            self.logger.warning("remove_legacy_training_state_file_failed", path=str(path), error=str(exc))
