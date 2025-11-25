@@ -1058,6 +1058,8 @@ class MemoryStore:
             "id": user.id,
             "email": user.email,
             "handle": user.handle,
+            "role": user.role,
+            "tenant_id": user.tenant_id,
             "created_at": self._serialize_datetime(user.created_at),
             "is_active": user.is_active,
             "plan_tier": user.plan_tier,
@@ -1069,6 +1071,8 @@ class MemoryStore:
             id=str(data["id"]),
             email=data["email"],
             handle=data.get("handle"),
+            role=data.get("role", "user"),
+            tenant_id=data.get("tenant_id", "public"),
             created_at=self._deserialize_datetime(data["created_at"]),
             is_active=data.get("is_active", True),
             plan_tier=data.get("plan_tier", "free"),
@@ -1085,6 +1089,7 @@ class MemoryStore:
             "ip_addr": session.ip_addr,
             "mfa_required": session.mfa_required,
             "mfa_verified": session.mfa_verified,
+            "tenant_id": session.tenant_id,
             "meta": session.meta,
         }
 
@@ -1098,6 +1103,7 @@ class MemoryStore:
             ip_addr=data.get("ip_addr"),
             mfa_required=data.get("mfa_required", False),
             mfa_verified=data.get("mfa_verified", False),
+            tenant_id=data.get("tenant_id", "public"),
             meta=data.get("meta"),
         )
 
