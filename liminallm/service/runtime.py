@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+from typing import Any, Dict, Optional, Tuple
+
 from liminallm.config import get_settings
 from liminallm.service.config_ops import ConfigOpsService
 from liminallm.service.auth import AuthService
@@ -36,7 +39,7 @@ class Runtime:
                 logger.warning(
                     "redis_cache_init_failed", redis_url=self.settings.redis_url, error=str(exc)
                 )
-        self.router = RouterEngine()
+        self.router = RouterEngine(cache=self.cache)
         runtime_config = {}
         db_backend_mode = None
         if hasattr(self.store, "get_runtime_config"):
@@ -69,7 +72,7 @@ class Runtime:
             self.store, self.settings.shared_fs_root, runtime_base_model=resolved_base_model
         )
         self.clusterer = SemanticClusterer(self.store, self.llm, self.training)
-        self.workflow = WorkflowEngine(self.store, self.llm, self.router, self.rag)
+        self.workflow = WorkflowEngine(self.store, self.llm, self.router, self.rag, cache=self.cache)
         self.voice = VoiceService(self.settings.shared_fs_root)
         self.config_ops = ConfigOpsService(self.store, self.llm, self.router, self.training)
         self.auth = AuthService(
@@ -78,6 +81,7 @@ class Runtime:
             self.settings,
             mfa_enabled=self.settings.enable_mfa,
         )
+        self._local_idempotency: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
 
 
 runtime = Runtime()
@@ -85,3 +89,35 @@ runtime = Runtime()
 
 def get_runtime() -> Runtime:
     return runtime
+
+
+IDEMPOTENCY_TTL_SECONDS = 60 * 60 * 24
+
+
+async def _get_cached_idempotency_record(runtime: Runtime, route: str, user_id: str, key: str) -> Optional[dict]:
+    now = datetime.utcnow()
+    if runtime.cache:
+        return await runtime.cache.get_idempotency_record(route, user_id, key)
+    record = runtime._local_idempotency.get((route, user_id, key))
+    if not record:
+        return None
+    if record.get("expires_at") and record["expires_at"] < now:
+        runtime._local_idempotency.pop((route, user_id, key), None)
+        return None
+    return record
+
+
+async def _set_cached_idempotency_record(
+    runtime: Runtime,
+    route: str,
+    user_id: str,
+    key: str,
+    record: dict,
+    *,
+    ttl_seconds: int = IDEMPOTENCY_TTL_SECONDS,
+) -> None:
+    expires_at = datetime.utcnow() + timedelta(seconds=ttl_seconds)
+    if runtime.cache:
+        await runtime.cache.set_idempotency_record(route, user_id, key, record, ttl_seconds=ttl_seconds)
+        return
+    runtime._local_idempotency[(route, user_id, key)] = {**record, "expires_at": expires_at}

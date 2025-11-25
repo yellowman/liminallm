@@ -4,6 +4,7 @@ import base64
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 
@@ -53,9 +54,63 @@ from liminallm.service.errors import BadRequestError, NotFoundError
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.config import get_settings
 from liminallm.service.fs import safe_join
-from liminallm.service.runtime import get_runtime
+from liminallm.service.runtime import (
+    IDEMPOTENCY_TTL_SECONDS,
+    _get_cached_idempotency_record,
+    _set_cached_idempotency_record,
+    get_runtime,
+)
 
 router = APIRouter(prefix="/v1")
+
+
+async def _resolve_idempotency(
+    route: str, user_id: str, idempotency_key: Optional[str]
+) -> tuple[str, Optional[Envelope]]:
+    request_id = str(uuid4())
+    runtime = get_runtime()
+    if not idempotency_key:
+        return request_id, None
+    record = await _get_cached_idempotency_record(runtime, route, user_id, idempotency_key)
+    if record:
+        status = record.get("status")
+        if status == "in_progress":
+            raise HTTPException(status_code=409, detail="request in progress")
+        if status == "completed" and record.get("response"):
+            response_payload = record.get("response", {})
+            if "request_id" not in response_payload:
+                response_payload["request_id"] = record.get("request_id", request_id)
+            return record.get("request_id", request_id), Envelope(**response_payload)
+    await _set_cached_idempotency_record(
+        runtime,
+        route,
+        user_id,
+        idempotency_key,
+        {"status": "in_progress", "request_id": request_id, "started_at": datetime.utcnow().isoformat()},
+        ttl_seconds=IDEMPOTENCY_TTL_SECONDS,
+    )
+    return request_id, None
+
+
+async def _store_idempotency_result(
+    route: str,
+    user_id: str,
+    idempotency_key: Optional[str],
+    envelope: Envelope,
+    status: str = "completed",
+) -> None:
+    if not idempotency_key:
+        return
+    runtime = get_runtime()
+    payload = envelope.model_dump()
+    await _set_cached_idempotency_record(
+        runtime,
+        route,
+        user_id,
+        idempotency_key,
+        {"status": status, "request_id": envelope.request_id, "response": payload},
+        ttl_seconds=IDEMPOTENCY_TTL_SECONDS,
+    )
 
 
 async def get_user(
@@ -338,55 +393,88 @@ async def chat(
 ):
     runtime = get_runtime()
     user_id = principal.user_id
-    if runtime.cache:
-        allowed = await runtime.cache.check_rate_limit(
-            f"chat:{user_id}", runtime.settings.chat_rate_limit_per_minute, runtime.settings.chat_rate_limit_window_seconds
+    request_id, cached = await _resolve_idempotency("chat", user_id, idempotency_key)
+    if cached:
+        return cached
+    try:
+        if runtime.cache:
+            allowed = await runtime.cache.check_rate_limit(
+                f"chat:{user_id}",
+                runtime.settings.chat_rate_limit_per_minute,
+                runtime.settings.chat_rate_limit_window_seconds,
+            )
+            if not allowed:
+                raise HTTPException(status_code=429, detail="rate limit exceeded")
+        if body.conversation_id:
+            conversation_id = body.conversation_id
+        else:
+            conversation = runtime.store.create_conversation(user_id=user_id, active_context_id=body.context_id)
+            conversation_id = conversation.id
+        user_content = body.message.content
+        voice_meta: dict = {}
+        if body.message.mode == "voice":
+            try:
+                audio_bytes = base64.b64decode(body.message.content)
+            except Exception:
+                audio_bytes = body.message.content.encode()
+            transcript = runtime.voice.transcribe(audio_bytes, user_id=user_id)
+            user_content = transcript.get("transcript", body.message.content)
+            voice_meta = {"mode": "voice", "transcript": transcript}
+        runtime.store.append_message(
+            conversation_id, sender="user", role="user", content=user_content, meta=voice_meta or None
         )
-        if not allowed:
-            raise HTTPException(status_code=429, detail="rate limit exceeded")
-    if body.conversation_id:
-        conversation_id = body.conversation_id
-    else:
-        conversation = runtime.store.create_conversation(user_id=user_id, active_context_id=body.context_id)
-        conversation_id = conversation.id
-    user_content = body.message.content
-    voice_meta: dict = {}
-    if body.message.mode == "voice":
-        try:
-            audio_bytes = base64.b64decode(body.message.content)
-        except Exception:
-            audio_bytes = body.message.content.encode()
-        transcript = runtime.voice.transcribe(audio_bytes, user_id=user_id)
-        user_content = transcript.get("transcript", body.message.content)
-        voice_meta = {"mode": "voice", "transcript": transcript}
-    runtime.store.append_message(conversation_id, sender="user", role="user", content=user_content, meta=voice_meta or None)
-    orchestration = runtime.workflow.run(body.workflow_id, conversation_id, user_content, body.context_id, user_id)
-    assistant_msg = runtime.store.append_message(
-        conversation_id,
-        sender="assistant",
-        role="assistant",
-        content=orchestration["content"],
-        meta={
-            "adapters": orchestration.get("adapters", []),
-            "adapter_gates": orchestration.get("adapter_gates", []),
-            "routing_trace": orchestration.get("routing_trace", []),
-            "workflow_trace": orchestration.get("workflow_trace", []),
-            "usage": orchestration.get("usage", {}),
-        },
-    )
-    resp = ChatResponse(
-        message_id=assistant_msg.id,
-        conversation_id=conversation_id,
-        content=assistant_msg.content,
-        workflow_id=body.workflow_id,
-        adapters=orchestration.get("adapters", []),
-        adapter_gates=orchestration.get("adapter_gates", []),
-        usage=orchestration.get("usage", {}),
-        context_snippets=orchestration.get("context_snippets", []),
-        routing_trace=orchestration.get("routing_trace", []),
-        workflow_trace=orchestration.get("workflow_trace", []),
-    )
-    return Envelope(status="ok", data=resp.model_dump())
+        orchestration = await runtime.workflow.run(
+            body.workflow_id, conversation_id, user_content, body.context_id, user_id
+        )
+        assistant_msg = runtime.store.append_message(
+            conversation_id,
+            sender="assistant",
+            role="assistant",
+            content=orchestration["content"],
+            meta={
+                "adapters": orchestration.get("adapters", []),
+                "adapter_gates": orchestration.get("adapter_gates", []),
+                "routing_trace": orchestration.get("routing_trace", []),
+                "workflow_trace": orchestration.get("workflow_trace", []),
+                "usage": orchestration.get("usage", {}),
+            },
+        )
+        resp = ChatResponse(
+            message_id=assistant_msg.id,
+            conversation_id=conversation_id,
+            content=assistant_msg.content,
+            workflow_id=body.workflow_id,
+            adapters=orchestration.get("adapters", []),
+            adapter_gates=orchestration.get("adapter_gates", []),
+            usage=orchestration.get("usage", {}),
+            context_snippets=orchestration.get("context_snippets", []),
+            routing_trace=orchestration.get("routing_trace", []),
+            workflow_trace=orchestration.get("workflow_trace", []),
+        )
+        envelope = Envelope(status="ok", data=resp.model_dump(), request_id=request_id)
+        if runtime.cache:
+            history = runtime.store.list_messages(conversation_id)
+            await runtime.workflow.cache_conversation_state(conversation_id, history)
+        await _store_idempotency_result("chat", user_id, idempotency_key, envelope)
+        return envelope
+    except HTTPException as http_exc:
+        await _store_idempotency_result(
+            "chat",
+            user_id,
+            idempotency_key,
+            Envelope(status="error", error={"message": http_exc.detail}, request_id=request_id),
+            status="error",
+        )
+        raise
+    except Exception as exc:
+        await _store_idempotency_result(
+            "chat",
+            user_id,
+            idempotency_key,
+            Envelope(status="error", error={"message": str(exc)}, request_id=request_id),
+            status="error",
+        )
+        raise
 
 
 @router.post("/preferences", response_model=Envelope)
@@ -510,29 +598,46 @@ async def list_artifact_versions(artifact_id: str, principal: AuthContext = Depe
 
 
 @router.post("/artifacts", response_model=Envelope)
-async def create_artifact(body: ArtifactRequest, principal: AuthContext = Depends(get_user)):
+async def create_artifact(
+    body: ArtifactRequest,
+    principal: AuthContext = Depends(get_user),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+):
     runtime = get_runtime()
-    if not isinstance(body.schema, dict):
-        raise BadRequestError("artifact schema must be an object", detail={"provided_type": type(body.schema).__name__})
-    schema_kind = body.schema.get("kind")
-    type_prefix = body.type
-    if schema_kind and not type_prefix:
-        type_prefix = schema_kind.split(".", 1)[0]
-    if schema_kind and type_prefix and not schema_kind.startswith(f"{type_prefix}."):
-        raise BadRequestError("kind must start with the type prefix", detail={"kind": schema_kind, "type": type_prefix})
-    if not type_prefix:
-        raise BadRequestError("type or kind is required")
-    artifact_schema = dict(body.schema)
-    if schema_kind:
-        artifact_schema["kind"] = schema_kind
-    artifact = runtime.store.create_artifact(
-        type_=type_prefix,
-        name=body.name,
-        description=body.description or "",
-        schema=artifact_schema,
-        owner_user_id=principal.user_id,
-        created_by=principal.user_id,
-    )
+    request_id, cached = await _resolve_idempotency("artifacts:create", principal.user_id, idempotency_key)
+    if cached:
+        return cached
+    try:
+        if not isinstance(body.schema, dict):
+            raise BadRequestError("artifact schema must be an object", detail={"provided_type": type(body.schema).__name__})
+        schema_kind = body.schema.get("kind")
+        type_prefix = body.type
+        if schema_kind and not type_prefix:
+            type_prefix = schema_kind.split(".", 1)[0]
+        if schema_kind and type_prefix and not schema_kind.startswith(f"{type_prefix}."):
+            raise BadRequestError("kind must start with the type prefix", detail={"kind": schema_kind, "type": type_prefix})
+        if not type_prefix:
+            raise BadRequestError("type or kind is required")
+        artifact_schema = dict(body.schema)
+        if schema_kind:
+            artifact_schema["kind"] = schema_kind
+        artifact = runtime.store.create_artifact(
+            type_=type_prefix,
+            name=body.name,
+            description=body.description or "",
+            schema=artifact_schema,
+            owner_user_id=principal.user_id,
+            created_by=principal.user_id,
+        )
+    except Exception as exc:
+        await _store_idempotency_result(
+            "artifacts:create",
+            principal.user_id,
+            idempotency_key,
+            Envelope(status="error", error={"message": str(exc)}, request_id=request_id),
+            status="error",
+        )
+        raise
     resp = ArtifactResponse(
         id=artifact.id,
         type=artifact.type,
@@ -544,7 +649,9 @@ async def create_artifact(body: ArtifactRequest, principal: AuthContext = Depend
         created_at=artifact.created_at,
         updated_at=artifact.updated_at,
     )
-    return Envelope(status="ok", data=resp)
+    envelope = Envelope(status="ok", data=resp, request_id=request_id)
+    await _store_idempotency_result("artifacts:create", principal.user_id, idempotency_key, envelope)
+    return envelope
 
 
 @router.patch("/artifacts/{artifact_id}", response_model=Envelope)
@@ -823,7 +930,7 @@ async def websocket_chat(ws: WebSocket):
                 return
         convo_id = init.get("conversation_id") or runtime.store.create_conversation(user_id=user_id).id
         runtime.store.append_message(convo_id, sender="user", role="user", content=init.get("message", ""))
-        orchestration = runtime.workflow.run(
+        orchestration = await runtime.workflow.run(
             init.get("workflow_id"), convo_id, init.get("message", ""), init.get("context_id"), user_id
         )
         assistant_msg = runtime.store.append_message(

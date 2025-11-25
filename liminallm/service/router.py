@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from liminallm.logging import get_logger
 
 from .embeddings import cosine_similarity
 from .sandbox import safe_eval_expr
+from liminallm.storage.redis_cache import RedisCache
 
 logger = get_logger(__name__)
 
@@ -13,14 +16,15 @@ logger = get_logger(__name__)
 class RouterEngine:
     """Evaluate routing policy artifacts to choose adapters/tools."""
 
-    def __init__(self) -> None:
+    def __init__(self, cache: Optional[RedisCache] = None) -> None:
         self.safe_functions = {
             "cosine_similarity": cosine_similarity,
             "contains": lambda haystack, needle: needle in haystack if haystack is not None else False,
             "len": len,
         }
+        self.cache = cache
 
-    def route(
+    async def route(
         self,
         policy: dict,
         context_embedding: List[float] | None,
@@ -28,9 +32,16 @@ class RouterEngine:
         *,
         safety_risk: Optional[str] = None,
         ctx_cluster: Optional[dict] = None,
+        user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         ctx_emb = context_embedding or []
         candidates = adapters or []
+        cached = None
+        ctx_hash = self._hash_embedding(ctx_emb)
+        if self.cache and user_id and ctx_hash:
+            cached = await self.cache.get_router_cache(user_id, ctx_hash)
+        if cached:
+            return cached
         weights: Dict[str, float] = {}
         trace: List[Dict[str, Any]] = []
         rules = policy.get("rules", []) if policy else []
@@ -46,7 +57,16 @@ class RouterEngine:
             if similarity_effects:
                 trace.append({"id": "default_similarity_boost", "when": "auto", "fired": True, "action": {"type": "boost_by_similarity"}, "effect": similarity_effects})
         normalized = self._normalize_weights(weights, policy)
-        return {"adapters": normalized, "trace": trace, "ctx_cluster": ctx_cluster}
+        routing = {"adapters": normalized, "trace": trace, "ctx_cluster": ctx_cluster}
+        if self.cache and user_id and ctx_hash:
+            await self.cache.set_router_cache(user_id, ctx_hash, routing)
+        return routing
+
+    def _hash_embedding(self, embedding: List[float]) -> str:
+        if not embedding:
+            return ""
+        normalized = json.dumps([round(v, 4) for v in embedding])
+        return hashlib.sha1(normalized.encode()).hexdigest()
 
     def _eval_condition(
         self, expr: str, context_embedding: List[float], adapters: List[dict], safety_risk: Optional[str] = None, ctx_cluster: Optional[dict] = None

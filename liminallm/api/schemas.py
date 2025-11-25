@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Any, List, Optional
+from uuid import uuid4
 
 from pydantic import BaseModel, Field
 
@@ -10,6 +11,7 @@ class Envelope(BaseModel):
     status: str = Field(..., pattern="^(ok|error)$")
     data: Optional[Any] = None
     error: Optional[dict] = None
+    request_id: str = Field(default_factory=lambda: str(uuid4()))
 
 
 class SignupRequest(BaseModel):
