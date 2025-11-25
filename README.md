@@ -227,6 +227,7 @@ for v1 these can all live in one python app with clear module boundaries.
    - `OPENAI_ADAPTER_BASE_URL` – optional base URL override when pointing at an OpenAI-compatible endpoint
    - `ADAPTER_SERVER_MODEL` – model name when pointing at an OpenAI-compatible adapter server
    - `USE_MEMORY_STORE` – set to `true` to run without Postgres/Redis while testing the API and LLM calls
+   - `TEST_MODE` – set to `true` to allow Redis-free test harnesses (rate limits, idempotency durability, and caches are disabled)
    - `RAG_CHUNK_SIZE` – default character window for knowledge ingestion; overrides can be provided per request
    - `RAG_MODE` – `pgvector` (default) uses the database index; `local_hybrid` forces the in-process BM25+cosine fallback for dev/test
 
