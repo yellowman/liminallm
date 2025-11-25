@@ -142,6 +142,15 @@ class KnowledgeContext:
 
 
 @dataclass
+class ContextSource:
+    id: str
+    context_id: str
+    fs_path: str
+    recursive: bool = True
+    meta: Dict | None = None
+
+
+@dataclass
 class KnowledgeChunk:
     id: int | None
     context_id: str

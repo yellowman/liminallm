@@ -815,7 +815,7 @@ async def create_artifact(
             description=body.description or "",
             schema=artifact_schema,
             owner_user_id=principal.user_id,
-            created_by=principal.user_id,
+            version_author=principal.user_id,
         )
         resp = ArtifactResponse(
             id=artifact.id,
@@ -851,7 +851,7 @@ async def patch_artifact(artifact_id: str, body: ArtifactRequest, principal: Aut
         artifact_id,
         schema=artifact_schema,
         description=body.description,
-        created_by=principal.user_id,
+        version_author=principal.user_id,
     )
     if not artifact:
         raise NotFoundError("artifact not found", detail={"artifact_id": artifact_id})

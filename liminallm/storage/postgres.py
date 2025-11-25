@@ -19,6 +19,7 @@ from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
     Artifact,
     ConfigPatchAudit,
+    ContextSource,
     Conversation,
     KnowledgeChunk,
     KnowledgeContext,
@@ -231,7 +232,7 @@ class PostgresStore:
                 "default_chat_workflow",
                 default_schema,
                 "LLM-only chat workflow defined as data.",
-                created_by="system_llm",
+                version_author="system_llm",
                 change_note="Seeded default workflow",
             )
 
@@ -260,7 +261,7 @@ class PostgresStore:
                 spec["name"],
                 spec,
                 spec.get("description", ""),
-                created_by="system_llm",
+                version_author="system_llm",
                 change_note="Seeded default tool spec",
             )
 
@@ -1147,7 +1148,7 @@ class PostgresStore:
         description: str = "",
         owner_user_id: Optional[str] = None,
         *,
-        created_by: Optional[str] = None,
+        version_author: Optional[str] = None,
         change_note: Optional[str] = None,
     ) -> Artifact:
         try:
@@ -1165,7 +1166,7 @@ class PostgresStore:
                 )
                 conn.execute(
                     "INSERT INTO artifact_version (artifact_id, version, schema, fs_path, created_by, change_note) VALUES (%s, %s, %s, %s, %s, %s)",
-                    (artifact_id, 1, json.dumps(schema), fs_path, created_by or owner_user_id or "system_llm", change_note),
+                    (artifact_id, 1, json.dumps(schema), fs_path, version_author or owner_user_id or "system_llm", change_note),
                 )
         except errors.ForeignKeyViolation:
             raise ConstraintViolation("artifact owner missing", {"owner_user_id": owner_user_id})
@@ -1186,7 +1187,7 @@ class PostgresStore:
         schema: dict,
         description: Optional[str] = None,
         *,
-        created_by: Optional[str] = None,
+        version_author: Optional[str] = None,
         change_note: Optional[str] = None,
     ) -> Optional[Artifact]:
         try:
@@ -1212,7 +1213,7 @@ class PostgresStore:
                     next_version,
                     json.dumps(schema),
                     fs_path,
-                    created_by or (str(row["owner_user_id"]) if row.get("owner_user_id") else None) or "system_llm",
+                    version_author or (str(row["owner_user_id"]) if row.get("owner_user_id") else None) or "system_llm",
                     change_note,
                 ),
             )
@@ -1450,6 +1451,42 @@ class PostgresStore:
                 )
             )
         return contexts
+
+    def add_context_source(
+        self, context_id: str, fs_path: str, recursive: bool = True, meta: Optional[dict] = None
+    ) -> ContextSource:
+        if not fs_path or not fs_path.strip():
+            raise ConstraintViolation("fs_path required for context_source", {"fs_path": fs_path})
+        src_id = str(uuid.uuid4())
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO context_source (id, context_id, fs_path, recursive, meta) VALUES (%s, %s, %s, %s, %s)",
+                    (src_id, context_id, fs_path, recursive, json.dumps(meta) if meta else None),
+                )
+        except errors.ForeignKeyViolation:
+            raise ConstraintViolation("context not found", {"context_id": context_id})
+        return ContextSource(id=src_id, context_id=context_id, fs_path=fs_path, recursive=recursive, meta=meta)
+
+    def list_context_sources(self, context_id: Optional[str] = None) -> List[ContextSource]:
+        with self._connect() as conn:
+            if context_id:
+                rows = conn.execute(
+                    "SELECT * FROM context_source WHERE context_id = %s ORDER BY fs_path ASC",
+                    (context_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM context_source ORDER BY context_id, fs_path ASC", ()).fetchall()
+        return [
+            ContextSource(
+                id=str(row["id"]),
+                context_id=str(row["context_id"]),
+                fs_path=row["fs_path"],
+                recursive=bool(row.get("recursive", True)),
+                meta=row.get("meta"),
+            )
+            for row in rows
+        ]
 
     def add_chunks(self, context_id: str, chunks: Iterable[KnowledgeChunk]) -> None:
         try:
