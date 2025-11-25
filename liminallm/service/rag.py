@@ -119,9 +119,7 @@ class RAGService:
         filtered = [
             chunk for chunk in results if (chunk.meta or {}).get("embedding_model_id") == self.embedding_model_id
         ]
-        if filtered:
-            return filtered[:limit]
-        return results[:limit]
+        return filtered[:limit]
 
     def ingest_text(
         self, context_id: str, text: str, chunk_size: Optional[int] = None, source_path: Optional[str] = None
