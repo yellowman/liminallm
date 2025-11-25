@@ -591,7 +591,7 @@ class PostgresStore:
         pref_ids = preference_event_ids or []
         num_events = len(pref_ids) if pref_ids else None
         columns = (
-            "id, adapter_artifact_id, user_id, created_at, updated_at, status, num_events, loss, "
+            "id, adapter_id, user_id, created_at, updated_at, status, num_events, loss, "
             "dataset_path, new_version, preference_event_ids, meta"
         )
         placeholders = "%s, %s, %s, %s, %s, 'queued', %s, NULL, %s, NULL, %s, %s"
@@ -668,10 +668,11 @@ class PostgresStore:
             ).fetchone()
         if not row:
             return None
+        adapter_id_value = row.get("adapter_id") or row.get("adapter_artifact_id")
         return TrainingJob(
             id=str(row["id"]),
             user_id=str(row["user_id"]),
-            adapter_id=str(row["adapter_artifact_id"]),
+            adapter_id=str(adapter_id_value) if adapter_id_value else existing.adapter_id,
             status=row.get("status", existing.status),
             num_events=row.get("num_events", existing.num_events),
             created_at=row.get("created_at", existing.created_at),
@@ -688,10 +689,11 @@ class PostgresStore:
             row = conn.execute("SELECT * FROM training_job WHERE id = %s", (job_id,)).fetchone()
         if not row:
             return None
+        adapter_id_value = row.get("adapter_id") or row.get("adapter_artifact_id")
         return TrainingJob(
             id=str(row["id"]),
             user_id=str(row["user_id"]),
-            adapter_id=str(row["adapter_artifact_id"]),
+            adapter_id=str(adapter_id_value) if adapter_id_value else "",
             status=row.get("status", "queued"),
             num_events=row.get("num_events"),
             created_at=row.get("created_at", datetime.utcnow()),
