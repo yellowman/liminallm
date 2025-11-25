@@ -16,6 +16,7 @@ from liminallm.storage.models import (
     Artifact,
     ArtifactVersion,
     ConfigPatchAudit,
+    ContextSource,
     Conversation,
     KnowledgeChunk,
     KnowledgeContext,
@@ -44,6 +45,7 @@ class MemoryStore:
         self.config_patches: Dict[int, ConfigPatchAudit] = {}
         self.runtime_config: Dict[str, str] = {}
         self.contexts: Dict[str, KnowledgeContext] = {}
+        self.context_sources: Dict[str, List[ContextSource]] = {}
         self.chunks: Dict[str, List[KnowledgeChunk]] = {}
         self._chunk_id_seq: int = 1
         self.preference_events: Dict[str, PreferenceEvent] = {}
@@ -234,6 +236,7 @@ class MemoryStore:
         for ctx_id, ctx in list(self.contexts.items()):
             if ctx.owner_user_id == user_id:
                 self.contexts.pop(ctx_id, None)
+                self.context_sources.pop(ctx_id, None)
                 self.chunks.pop(ctx_id, None)
         for art_id, art in list(self.artifacts.items()):
             if art.owner_user_id == user_id:
@@ -651,7 +654,7 @@ class MemoryStore:
         description: str = "",
         owner_user_id: Optional[str] = None,
         *,
-        created_by: Optional[str] = None,
+        version_author: Optional[str] = None,
         change_note: Optional[str] = None,
     ) -> Artifact:
         try:
@@ -663,7 +666,7 @@ class MemoryStore:
             raise ConstraintViolation("artifact owner missing", {"owner_user_id": owner_user_id})
         artifact_id = str(uuid.uuid4())
         fs_path = self.persist_artifact_payload(artifact_id, schema)
-        author = created_by or owner_user_id or "system_llm"
+        author = version_author or owner_user_id or "system_llm"
         artifact = Artifact(
             id=artifact_id,
             type=type_,
@@ -696,7 +699,7 @@ class MemoryStore:
         schema: dict,
         description: Optional[str] = None,
         *,
-        created_by: Optional[str] = None,
+        version_author: Optional[str] = None,
         change_note: Optional[str] = None,
     ) -> Optional[Artifact]:
         try:
@@ -708,7 +711,7 @@ class MemoryStore:
         if not artifact:
             return None
         fs_path = self.persist_artifact_payload(artifact_id, schema)
-        author = created_by or artifact.owner_user_id or "system_llm"
+        author = version_author or artifact.owner_user_id or "system_llm"
         artifact.schema = schema
         if description is not None:
             artifact.description = description
@@ -821,6 +824,33 @@ class MemoryStore:
         if owner_user_id:
             return [ctx for ctx in self.contexts.values() if ctx.owner_user_id == owner_user_id]
         return list(self.contexts.values())
+
+    def add_context_source(
+        self, context_id: str, fs_path: str, recursive: bool = True, meta: Optional[Dict] = None
+    ) -> ContextSource:
+        if context_id not in self.contexts:
+            raise ConstraintViolation("context not found", {"context_id": context_id})
+        if not fs_path or not fs_path.strip():
+            raise ConstraintViolation("fs_path required for context_source", {"fs_path": fs_path})
+        source = ContextSource(
+            id=str(uuid.uuid4()),
+            context_id=context_id,
+            fs_path=fs_path,
+            recursive=recursive,
+            meta=meta,
+        )
+        sources = self.context_sources.setdefault(context_id, [])
+        sources.append(source)
+        self._persist_state()
+        return source
+
+    def list_context_sources(self, context_id: Optional[str] = None) -> List[ContextSource]:
+        if context_id:
+            return list(self.context_sources.get(context_id, []))
+        all_sources: List[ContextSource] = []
+        for sources in self.context_sources.values():
+            all_sources.extend(sources)
+        return all_sources
 
     def add_chunks(self, context_id: str, chunks: Iterable[KnowledgeChunk]) -> None:
         if context_id not in self.contexts:
@@ -994,6 +1024,7 @@ class MemoryStore:
             "config_patches": [self._serialize_config_patch(cp) for cp in self.config_patches.values()],
             "runtime_config": self.runtime_config,
             "contexts": [self._serialize_context(ctx) for ctx in self.contexts.values()],
+            "context_sources": [self._serialize_context_source(src) for srcs in self.context_sources.values() for src in srcs],
             "chunks": [self._serialize_chunk(ch) for chs in self.chunks.values() for ch in chs],
             "preference_events": [self._serialize_preference_event(e) for e in self.preference_events.values()],
             "training_jobs": [self._serialize_training_job(j) for j in self.training_jobs.values()],
@@ -1035,6 +1066,10 @@ class MemoryStore:
             deserialized = self._deserialize_config_patch(cp)
             self.config_patches[deserialized.id] = deserialized
         self.contexts = {ctx["id"]: self._deserialize_context(ctx) for ctx in data.get("contexts", [])}
+        self.context_sources = {}
+        for src_data in data.get("context_sources", []):
+            source = self._deserialize_context_source(src_data)
+            self.context_sources.setdefault(source.context_id, []).append(source)
         self.chunks = {}
         for chunk_data in data.get("chunks", []):
             chunk = self._deserialize_chunk(chunk_data)
@@ -1266,6 +1301,24 @@ class MemoryStore:
             created_at=self._deserialize_datetime(data["created_at"]),
             updated_at=self._deserialize_datetime(data["updated_at"]),
             fs_path=data.get("fs_path"),
+            meta=data.get("meta"),
+        )
+
+    def _serialize_context_source(self, src: ContextSource) -> dict:
+        return {
+            "id": src.id,
+            "context_id": src.context_id,
+            "fs_path": src.fs_path,
+            "recursive": src.recursive,
+            "meta": src.meta,
+        }
+
+    def _deserialize_context_source(self, data: dict) -> ContextSource:
+        return ContextSource(
+            id=data["id"],
+            context_id=data["context_id"],
+            fs_path=data.get("fs_path", ""),
+            recursive=bool(data.get("recursive", True)),
             meta=data.get("meta"),
         )
 

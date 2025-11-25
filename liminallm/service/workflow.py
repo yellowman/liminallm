@@ -48,7 +48,7 @@ class WorkflowEngine:
     ) -> dict:
         workflow_schema = None
         if workflow_id:
-            workflow_schema = self.store.get_latest_workflow(workflow_id) if hasattr(self.store, "get_latest_workflow") else None
+            workflow_schema = self.store.get_latest_workflow(workflow_id)
         if not workflow_schema:
             workflow_schema = self._default_workflow()
 
