@@ -25,6 +25,7 @@ class TrainingService:
         self.store = store
         self.fs_root = Path(fs_root)
         self.default_vocab_size = DEFAULT_VOCAB_SIZE
+        self._base_vocab_size = DEFAULT_VOCAB_SIZE
         self._adapter_vocab_size: Optional[int] = None
         self.tokenizer = None
         self._tokenizer_error: Optional[str] = None
@@ -41,7 +42,7 @@ class TrainingService:
             from transformers import AutoTokenizer
 
             self.tokenizer = AutoTokenizer.from_pretrained(base_model)
-            self.default_vocab_size = vocab_size_from_tokenizer(
+            self._base_vocab_size = vocab_size_from_tokenizer(
                 self.tokenizer, fallback=self.default_vocab_size
             )
             self._tokenizer_model = base_model
@@ -55,7 +56,7 @@ class TrainingService:
     def _vocab_size(self) -> int:
         if isinstance(self._adapter_vocab_size, int) and self._adapter_vocab_size > 0:
             return self._adapter_vocab_size
-        return vocab_size_from_tokenizer(self.tokenizer, fallback=self.default_vocab_size)
+        return self._base_vocab_size
 
     def _apply_adapter_vocab_size(self, adapter: Artifact) -> None:
         self._adapter_vocab_size = None
@@ -64,7 +65,6 @@ class TrainingService:
         vocab_size = (adapter.schema or {}).get("vocab_size")
         if isinstance(vocab_size, int) and vocab_size > 0:
             self._adapter_vocab_size = vocab_size
-            self.default_vocab_size = vocab_size
 
     def ensure_user_adapter(self, user_id: str, *, rank: int = 4, adapter_id_override: Optional[str] = None) -> Artifact:
         existing = [a for a in self.store.list_artifacts(type_filter="adapter") if a.owner_user_id == user_id]

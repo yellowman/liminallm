@@ -223,6 +223,7 @@ class LocalJaxLoRABackend:
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.default_vocab_size = DEFAULT_VOCAB_SIZE
+        self._base_vocab_size = DEFAULT_VOCAB_SIZE
         self._adapter_vocab_size: Optional[int] = None
         self._adapter_cache: Dict[str, Tuple[float, dict]] = {}
         self._tokenizer = None
@@ -251,7 +252,7 @@ class LocalJaxLoRABackend:
             from transformers import AutoTokenizer
 
             self._tokenizer = AutoTokenizer.from_pretrained(self.base_model)
-            self.default_vocab_size = vocab_size_from_tokenizer(
+            self._base_vocab_size = vocab_size_from_tokenizer(
                 self._tokenizer, fallback=self.default_vocab_size
             )
         except Exception as exc:  # pragma: no cover - optional dependency
@@ -263,7 +264,7 @@ class LocalJaxLoRABackend:
         if isinstance(self._adapter_vocab_size, int) and self._adapter_vocab_size > 0:
             return self._adapter_vocab_size
         self._ensure_tokenizer()
-        return vocab_size_from_tokenizer(self._tokenizer, fallback=self.default_vocab_size)
+        return self._base_vocab_size
 
     def _normalize_messages(self, messages: List[dict]) -> str:
         if not messages:
@@ -278,7 +279,6 @@ class LocalJaxLoRABackend:
         vocab_size = schema.get("vocab_size")
         if isinstance(vocab_size, int) and vocab_size > 0:
             self._adapter_vocab_size = vocab_size
-            self.default_vocab_size = vocab_size
 
     def _tokenize(self, text: str) -> Tuple[List[int], List[int]]:
         self._ensure_tokenizer()
