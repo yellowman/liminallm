@@ -9,17 +9,82 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Optional, Tuple
+from typing import Any, List, Optional, Protocol, Tuple
 
 from liminallm.config import Settings
-from liminallm.storage.models import Session, User
-from liminallm.storage.postgres import PostgresStore
+from liminallm.storage.models import Session, User, UserMFAConfig
 from liminallm.storage.redis_cache import RedisCache
-from liminallm.storage.memory import MemoryStore
 
 from liminallm.logging import get_logger
 
 logger = get_logger(__name__)
+
+
+class AuthStore(Protocol):
+    def create_user(
+        self,
+        email: str,
+        handle: Optional[str] = None,
+        *,
+        tenant_id: str,
+        role: str = "user",
+        plan_tier: str = "free",
+        is_active: bool = True,
+        meta: Optional[dict] = None,
+    ) -> User:
+        ...
+
+    def save_password(self, user_id: str, password_hash: str, password_algo: str) -> None:
+        ...
+
+    def get_password_record(self, user_id: str) -> Optional[tuple[str, str]]:
+        ...
+
+    def set_user_mfa_secret(self, user_id: str, secret: str, enabled: bool = False) -> UserMFAConfig:
+        ...
+
+    def get_user_mfa_secret(self, user_id: str) -> Optional[UserMFAConfig]:
+        ...
+
+    def create_session(
+        self,
+        user_id: str,
+        ttl_minutes: int = 60 * 24,
+        user_agent: str | None = None,
+        ip_addr: str | None = None,
+        *,
+        mfa_required: bool = False,
+        tenant_id: str = "public",
+        meta: Optional[dict] = None,
+    ) -> Session:
+        ...
+
+    def get_session(self, session_id: str) -> Optional[Session]:
+        ...
+
+    def set_session_meta(self, session_id: str, meta: dict) -> None:
+        ...
+
+    def revoke_session(self, session_id: str) -> None:
+        ...
+
+    def mark_session_verified(self, session_id: str) -> None:
+        ...
+
+    def get_user_by_email(self, email: str) -> Optional[User]:
+        ...
+
+    def get_user(self, user_id: str) -> Optional[User]:
+        ...
+
+    def update_user_role(self, user_id: str, role: str) -> Optional[User]:
+        ...
+
+    def delete_user(self, user_id: str) -> bool:
+        ...
+
+    def list_users(self, tenant_id: Optional[str] = None, limit: int = 100) -> List[User]:
+        ...
 
 @dataclass
 class AuthContext:
@@ -34,13 +99,13 @@ class AuthService:
 
     def __init__(
         self,
-        store: PostgresStore | MemoryStore,
+        store: AuthStore,
         cache: Optional[RedisCache],
         settings: Settings,
         *,
         mfa_enabled: bool = True,
     ) -> None:
-        self.store = store
+        self.store: AuthStore = store
         self.cache = cache
         self.settings = settings
         self._mfa_challenges: dict[str, tuple[str, datetime]] = {}
@@ -64,8 +129,7 @@ class AuthService:
             tenant_id=tenant_id or self.settings.default_tenant_id,
         )
         pwd_hash, algo = self._hash_password(password)
-        if hasattr(self.store, "save_password"):
-            self.store.save_password(user.id, pwd_hash, algo)  # type: ignore[attr-defined]
+        self.store.save_password(user.id, pwd_hash, algo)
         session = self.store.create_session(user.id, tenant_id=user.tenant_id)
         tokens = self._issue_tokens(user, session)
         if self.cache:
@@ -95,8 +159,7 @@ class AuthService:
             meta=meta,
         )
         pwd_hash, algo = self._hash_password(pwd)
-        if hasattr(self.store, "save_password"):
-            self.store.save_password(user.id, pwd_hash, algo)  # type: ignore[attr-defined]
+        self.store.save_password(user.id, pwd_hash, algo)
         return user, pwd
 
     async def start_oauth(self, provider: str, redirect_uri: Optional[str] = None, *, tenant_id: Optional[str] = None) -> dict:
@@ -120,11 +183,10 @@ class AuthService:
         self._oauth_states.pop(state, None)
         normalized_tenant = tenant_id or tenant_hint or self.settings.default_tenant_id
         synthetic_email = f"{provider}+{code}@oauth.local"
-        user = self.store.get_user_by_email(synthetic_email) if hasattr(self.store, "get_user_by_email") else None  # type: ignore[attr-defined]
+        user = self.store.get_user_by_email(synthetic_email)
         if not user:
             user = self.store.create_user(email=synthetic_email, handle=provider, tenant_id=normalized_tenant)
-            if hasattr(self.store, "save_password"):
-                self.store.save_password(user.id, "", "oauth")  # type: ignore[attr-defined]
+            self.store.save_password(user.id, "", "oauth")
         session = self.store.create_session(user.id, tenant_id=user.tenant_id)
         tokens = self._issue_tokens(user, session)
         if self.cache:
@@ -132,19 +194,13 @@ class AuthService:
         return user, session, tokens
 
     def list_users(self, tenant_id: Optional[str] = None, limit: int = 100) -> list[User]:
-        if hasattr(self.store, "list_users"):
-            return self.store.list_users(tenant_id=tenant_id, limit=limit)  # type: ignore[attr-defined]
-        return []
+        return self.store.list_users(tenant_id=tenant_id, limit=limit)
 
     def set_user_role(self, user_id: str, role: str) -> Optional[User]:
-        if hasattr(self.store, "update_user_role"):
-            return self.store.update_user_role(user_id, role)  # type: ignore[attr-defined]
-        return None
+        return self.store.update_user_role(user_id, role)
 
     def delete_user(self, user_id: str) -> bool:
-        if hasattr(self.store, "delete_user"):
-            return bool(self.store.delete_user(user_id))  # type: ignore[attr-defined]
-        return False
+        return bool(self.store.delete_user(user_id))
 
     async def login(
         self,
@@ -154,12 +210,12 @@ class AuthService:
         *,
         tenant_id: Optional[str] = None,
     ) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
-        user = self.store.get_user_by_email(email) if hasattr(self.store, "get_user_by_email") else None  # type: ignore[attr-defined]
+        user = self.store.get_user_by_email(email)
         if not user or not self._verify_password(user.id, password):
             return None, None, {}
         if tenant_id and tenant_id != user.tenant_id:
             return None, None, {}
-        mfa_cfg = self.store.get_user_mfa_secret(user.id) if self.mfa_enabled and hasattr(self.store, "get_user_mfa_secret") else None  # type: ignore[attr-defined]
+        mfa_cfg = self.store.get_user_mfa_secret(user.id) if self.mfa_enabled else None
         require_mfa = bool(self.mfa_enabled and mfa_cfg and mfa_cfg.enabled)
         session = self.store.create_session(user.id, mfa_required=require_mfa, tenant_id=user.tenant_id)
         tokens: dict[str, str] = {}
@@ -184,10 +240,10 @@ class AuthService:
         if not jti or await self._is_refresh_revoked(jti):
             return None, None, {}
         session_id = payload.get("sid")
-        session = self.store.get_session(session_id) if session_id else None  # type: ignore[attr-defined]
+        session = self.store.get_session(session_id) if session_id else None
         if not session or session.expires_at <= datetime.utcnow():
             return None, None, {}
-        user = self.store.get_user(session.user_id) if hasattr(self.store, "get_user") else None  # type: ignore[attr-defined]
+        user = self.store.get_user(session.user_id)
         if not user:
             return None, None, {}
         if payload.get("sub") != user.id or payload.get("tenant_id") != user.tenant_id:
@@ -201,7 +257,7 @@ class AuthService:
         return user, session, tokens
 
     async def revoke(self, session_id: str) -> None:
-        sess = self.store.get_session(session_id) if hasattr(self.store, "get_session") else None  # type: ignore[attr-defined]
+        sess = self.store.get_session(session_id)
         if sess:
             refresh_jti = (sess.meta or {}).get("refresh_jti") if isinstance(sess.meta, dict) else None
             if refresh_jti:
@@ -221,15 +277,14 @@ class AuthService:
         if not session_id:
             return None
         sess = None
-        if hasattr(self.store, "get_session"):
-            sess = self.store.get_session(session_id)  # type: ignore[attr-defined]
+        sess = self.store.get_session(session_id)
         if not sess and self.cache:
             cached_user = await self.cache.get_session_user(session_id)
-            if cached_user and hasattr(self.store, "get_session"):
-                sess = self.store.get_session(session_id)  # type: ignore[attr-defined]
+            if cached_user:
+                sess = self.store.get_session(session_id)
         if not sess or sess.expires_at <= datetime.utcnow():
             return None
-        user = self.store.get_user(sess.user_id) if hasattr(self.store, "get_user") else None  # type: ignore[attr-defined]
+        user = self.store.get_user(sess.user_id)
         if not user:
             return None
         if tenant_hint and tenant_hint != user.tenant_id:
@@ -269,12 +324,12 @@ class AuthService:
         )
 
     def issue_tokens_for_session(self, session_id: str) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
-        sess = self.store.get_session(session_id) if hasattr(self.store, "get_session") else None  # type: ignore[attr-defined]
+        sess = self.store.get_session(session_id)
         if not sess or sess.expires_at <= datetime.utcnow():
             return None, None, {}
         if sess.mfa_required and self.mfa_enabled and not sess.mfa_verified:
             return None, None, {}
-        user = self.store.get_user(sess.user_id) if hasattr(self.store, "get_user") else None  # type: ignore[attr-defined]
+        user = self.store.get_user(sess.user_id)
         if not user:
             return None, None, {}
         tokens = self._issue_tokens(user, sess)
@@ -283,7 +338,7 @@ class AuthService:
     async def issue_mfa_challenge(self, user_id: str) -> dict:
         if not self.mfa_enabled:
             return {"status": "disabled"}
-        existing = self.store.get_user_mfa_secret(user_id) if hasattr(self.store, "get_user_mfa_secret") else None  # type: ignore[attr-defined]
+        existing = self.store.get_user_mfa_secret(user_id)
         secret = existing.secret if existing else base64.b32encode(os.urandom(10)).decode("utf-8").rstrip("=")
         self.store.set_user_mfa_secret(user_id, secret, enabled=False)
         uri = f"otpauth://totp/liminallm:{user_id}?secret={secret}&issuer=LiminalLM"
@@ -292,7 +347,7 @@ class AuthService:
     async def verify_mfa_challenge(self, user_id: str, code: str, session_id: Optional[str] = None) -> bool:
         if not self.mfa_enabled:
             return True
-        cfg = self.store.get_user_mfa_secret(user_id) if hasattr(self.store, "get_user_mfa_secret") else None  # type: ignore[attr-defined]
+        cfg = self.store.get_user_mfa_secret(user_id)
         if not cfg:
             return False
         if not self._verify_totp(cfg.secret, code):
@@ -320,12 +375,11 @@ class AuthService:
             return False
         if isinstance(email, bytes):
             email = email.decode()
-        user = self.store.get_user_by_email(email) if hasattr(self.store, "get_user_by_email") else None  # type: ignore[attr-defined]
+        user = self.store.get_user_by_email(email)
         if not user:
             return False
         pwd_hash, algo = self._hash_password(new_password)
-        if hasattr(self.store, "save_password"):
-            self.store.save_password(user.id, pwd_hash, algo)  # type: ignore[attr-defined]
+        self.store.save_password(user.id, pwd_hash, algo)
         return True
 
     def _hash_password(self, password: str) -> Tuple[str, str]:
@@ -335,9 +389,7 @@ class AuthService:
         return f"{salt}${digest}", algo
 
     def _verify_password(self, user_id: str, password: str) -> bool:
-        if not hasattr(self.store, "get_password_record"):
-            return False
-        record = self.store.get_password_record(user_id)  # type: ignore[attr-defined]
+        record = self.store.get_password_record(user_id)
         if not record:
             return False
         stored_hash, algo = record
@@ -363,8 +415,7 @@ class AuthService:
         return str(code_int).zfill(digits)
 
     def _mark_session_verified(self, session_id: str) -> None:
-        if hasattr(self.store, "mark_session_verified"):
-            self.store.mark_session_verified(session_id)  # type: ignore[attr-defined]
+        self.store.mark_session_verified(session_id)
 
     def _encode_segment(self, data: bytes) -> str:
         return base64.urlsafe_b64encode(data).decode("utf-8").rstrip("=")
@@ -452,8 +503,7 @@ class AuthService:
         meta = dict(session.meta or {})
         meta.update({"refresh_jti": refresh_jti, "refresh_exp": refresh_exp})
         session.meta = meta
-        if hasattr(self.store, "set_session_meta"):
-            self.store.set_session_meta(session.id, meta)  # type: ignore[attr-defined]
+        self.store.set_session_meta(session.id, meta)
 
     def _refresh_token_matches(self, session: Session, jti: str) -> bool:
         meta = session.meta or {}
@@ -519,10 +569,10 @@ class AuthService:
         if not payload or payload.get("token_type") != "access":
             return None
         session_id = payload.get("sid")
-        sess = self.store.get_session(session_id) if session_id and hasattr(self.store, "get_session") else None  # type: ignore[attr-defined]
+        sess = self.store.get_session(session_id) if session_id else None
         if not sess or sess.expires_at <= datetime.utcnow():
             return None
-        user = self.store.get_user(payload.get("sub")) if hasattr(self.store, "get_user") else None  # type: ignore[attr-defined]
+        user = self.store.get_user(payload.get("sub"))
         if not user:
             return None
         if payload.get("tenant_id") != user.tenant_id or payload.get("role") != user.role:
