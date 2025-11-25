@@ -83,8 +83,9 @@ class IdempotencyGuard:
         self._stored = False
 
     async def __aenter__(self) -> "IdempotencyGuard":
+        self.request_id = self.request_id or str(uuid4())
         self.request_id, self.cached = await _resolve_idempotency(
-            self.route, self.user_id, self.idempotency_key, require=self.require
+            self.route, self.user_id, self.idempotency_key, require=self.require, request_id=self.request_id
         )
         return self
 
@@ -114,9 +115,9 @@ class IdempotencyGuard:
 
 
 async def _resolve_idempotency(
-    route: str, user_id: str, idempotency_key: Optional[str], *, require: bool = False
+    route: str, user_id: str, idempotency_key: Optional[str], *, require: bool = False, request_id: Optional[str] = None
 ) -> tuple[str, Optional[Envelope]]:
-    request_id = str(uuid4())
+    request_id = request_id or str(uuid4())
     runtime = get_runtime()
     if not idempotency_key:
         if require:

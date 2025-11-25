@@ -820,7 +820,7 @@ class MemoryStore:
         for chunk in chunks:
             if not chunk.fs_path:
                 raise ConstraintViolation("fs_path required for knowledge_chunk", {"fs_path": chunk.fs_path})
-            if chunk.id is None:
+            if chunk.id is None or (isinstance(chunk.id, str) and not chunk.id.strip()):
                 chunk.id = self._chunk_id_seq
                 self._chunk_id_seq += 1
             else:
@@ -1066,7 +1066,7 @@ class MemoryStore:
 
     def _deserialize_user(self, data: dict) -> User:
         return User(
-            id=int(data["id"]),
+            id=str(data["id"]),
             email=data["email"],
             handle=data.get("handle"),
             created_at=self._deserialize_datetime(data["created_at"]),
