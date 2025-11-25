@@ -283,6 +283,7 @@ class PostgresStore:
     ) -> PreferenceEvent:
         normalized_weight = weight if weight is not None else (score if score is not None else 1.0)
         event_id = str(uuid.uuid4())
+        formatted_embedding = self._format_vector(context_embedding) if context_embedding else None
         with self._connect() as conn:
             row = conn.execute(
                 """
@@ -301,7 +302,7 @@ class PostgresStore:
                     feedback,
                     score,
                     explicit_signal,
-                    context_embedding,
+                    formatted_embedding,
                     cluster_id,
                     context_text,
                     corrected_text,
@@ -1258,6 +1259,13 @@ class PostgresStore:
             )
         return versions
 
+    def persist_artifact_payload(self, artifact_id: str, schema: dict) -> str:
+        """Public wrapper kept for parity with MemoryStore."""
+
+        existing = self.list_artifact_versions(artifact_id)
+        next_version = (existing[0].version + 1) if existing else 1
+        return self._persist_payload(artifact_id, next_version, schema)
+
     def get_latest_workflow(self, workflow_id: str) -> Optional[dict]:
         with self._connect() as conn:
             row = conn.execute(
@@ -1265,6 +1273,12 @@ class PostgresStore:
                 (workflow_id,),
             ).fetchone()
         return row["schema"] if row else None
+
+    def list_adapter_router_state(self, user_id: Optional[str] = None) -> list[dict]:
+        """Provide an empty adapter router state until persisted in SQL (SPEC §8)."""
+
+        _ = user_id  # placeholder for future user scoping
+        return []
 
     def record_config_patch(self, artifact_id: str, proposer: str, patch: dict, justification: Optional[str]) -> ConfigPatchAudit:
         with self._connect() as conn:
@@ -1441,7 +1455,7 @@ class PostgresStore:
         try:
             with self._connect() as conn:
                 for chunk in chunks:
-                    if not chunk.fs_path:
+                    if not chunk.fs_path or not str(chunk.fs_path).strip():
                         raise ConstraintViolation("fs_path required for knowledge_chunk", {"fs_path": chunk.fs_path})
                     conn.execute(
                         "INSERT INTO knowledge_chunk (context_id, fs_path, chunk_index, content, embedding, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s)",

@@ -735,6 +735,9 @@ class MemoryStore:
         versions = list(self.artifact_versions.get(artifact_id, []))
         return sorted(versions, key=lambda v: v.version, reverse=True)
 
+    def _persist_payload(self, artifact_id: str, schema: dict) -> str:
+        return self.persist_artifact_payload(artifact_id, schema)
+
     def persist_artifact_payload(self, artifact_id: str, schema: dict) -> str:
         artifact_dir = self.fs_root / "artifacts" / artifact_id
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -795,6 +798,12 @@ class MemoryStore:
             return None
         return versions[-1].schema
 
+    def list_adapter_router_state(self, user_id: Optional[str] = None) -> list[dict]:
+        """In-memory placeholder for adapter router state (not yet persisted)."""
+
+        _ = user_id  # unused; parity with PostgresStore signature
+        return []
+
     def upsert_context(
         self, owner_user_id: Optional[str], name: str, description: str, fs_path: Optional[str] = None, meta: Optional[dict] = None
     ) -> KnowledgeContext:
@@ -818,7 +827,7 @@ class MemoryStore:
             raise ConstraintViolation("context not found", {"context_id": context_id})
         existing = self.chunks.setdefault(context_id, [])
         for chunk in chunks:
-            if not chunk.fs_path:
+            if not chunk.fs_path or not str(chunk.fs_path).strip():
                 raise ConstraintViolation("fs_path required for knowledge_chunk", {"fs_path": chunk.fs_path})
             if chunk.id is None or (isinstance(chunk.id, str) and not chunk.id.strip()):
                 chunk.id = self._chunk_id_seq

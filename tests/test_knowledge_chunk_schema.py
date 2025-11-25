@@ -86,6 +86,21 @@ def test_memory_store_rejects_missing_fs_path(tmp_path):
             ],
         )
 
+    with pytest.raises(ConstraintViolation):
+        store.add_chunks(
+            context.id,
+            [
+                KnowledgeChunk(
+                    id=None,
+                    context_id=context.id,
+                    fs_path="   ",
+                    content="",
+                    embedding=[],
+                    chunk_index=1,
+                )
+            ],
+        )
+
 
 def test_memory_store_loads_legacy_chunk_without_fs_path(tmp_path):
     store = MemoryStore(fs_root=str(tmp_path))
