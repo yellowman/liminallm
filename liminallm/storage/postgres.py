@@ -1706,7 +1706,9 @@ class PostgresStore:
                 ).fetchall()
                 sections["training_jobs"] = [_serialize(row) for row in rows]
             if kind in (None, "config_patches"):
-                rows = conn.execute("SELECT * FROM config_patch_audit ORDER BY created_at DESC LIMIT %s", (limit,)).fetchall()
+                rows = conn.execute(
+                    "SELECT * FROM config_patch ORDER BY created_at DESC LIMIT %s", (limit,)
+                ).fetchall()
                 sections["config_patches"] = [_serialize(row) for row in rows]
         return sections
 
