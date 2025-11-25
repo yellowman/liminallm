@@ -26,9 +26,14 @@ class RAGService:
     ) -> None:
         self.store = store
         self.default_chunk_size = max(default_chunk_size, 64)
-        self.rag_mode = (rag_mode or os.getenv("RAG_MODE") or "pgvector").lower()
-        if not hasattr(store, "search_chunks_pgvector"):
+        self.rag_mode = (rag_mode or os.getenv("RAG_MODE") or "pgvector").lower().replace("-", "_")
+        self.use_pgvector = self.rag_mode not in {"local_hybrid", "legacy", "hybrid_local"}
+        if self.use_pgvector and not hasattr(store, "search_chunks_pgvector"):
             raise ValueError("pgvector-backed store required for RAGService")
+        if not self.use_pgvector and not (
+            hasattr(store, "search_chunks_legacy") or hasattr(store, "search_chunks")
+        ):
+            raise ValueError("legacy chunk search required for local_hybrid RAG mode")
         self.embed = embed
         self.embedding_model_id = embedding_model_id
 
@@ -40,9 +45,23 @@ class RAGService:
         contexts: Sequence[str] | None = [context_id] if context_id else None
         filters = {"embedding_model_id": self.embedding_model_id}
 
-        return self.store.search_chunks_pgvector(  # type: ignore[attr-defined]
-            contexts, query_embedding, limit, filters=filters
-        )
+        if self.use_pgvector and hasattr(self.store, "search_chunks_pgvector"):
+            return self.store.search_chunks_pgvector(  # type: ignore[attr-defined]
+                contexts, query_embedding, limit, filters=filters
+            )
+
+        legacy_search = getattr(self.store, "search_chunks_legacy", None) or getattr(self.store, "search_chunks", None)
+        if not legacy_search:
+            return []
+
+        results = legacy_search(context_id, query, query_embedding, limit)
+        if filters and filters.get("embedding_model_id"):
+            results = [
+                chunk
+                for chunk in results
+                if (chunk.meta or {}).get("embedding_model_id") == filters.get("embedding_model_id")
+            ]
+        return results
 
     def ingest_text(
         self, context_id: str, text: str, chunk_size: Optional[int] = None, source_path: Optional[str] = None
