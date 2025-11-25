@@ -894,13 +894,64 @@ class MemoryStore:
         return [pair[0] for pair in ranked[:limit]]
 
     def search_chunks_pgvector(
-        self, context_ids: Optional[Sequence[str]], query_embedding: List[float], limit: int = 4, filters: Optional[dict] = None
+        self,
+        context_ids: Optional[Sequence[str]],
+        query_embedding: List[float],
+        limit: int = 4,
+        filters: Optional[dict] = None,
+        *,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> List[KnowledgeChunk]:
-        context_id = context_ids[0] if context_ids else None
-        chunks = self.search_chunks(context_id, "", query_embedding, limit)
+        if not context_ids or not query_embedding:
+            return []
+
+        allowed_chunks: List[KnowledgeChunk] = []
+        for ctx_id in context_ids:
+            ctx = self.contexts.get(ctx_id)
+            if not ctx:
+                continue
+            if user_id and ctx.owner_user_id != user_id:
+                continue
+            if tenant_id:
+                if not ctx.owner_user_id:
+                    continue
+                owner = self.users.get(ctx.owner_user_id)
+                if not owner or owner.tenant_id != tenant_id:
+                    continue
+            allowed_chunks.extend(self.list_chunks(ctx_id))
+
+        if not allowed_chunks:
+            return []
+
         if filters and filters.get("embedding_model_id"):
-            chunks = [c for c in chunks if (c.meta or {}).get("embedding_model_id") == filters.get("embedding_model_id")]
-        return chunks
+            allowed_chunks = [
+                c for c in allowed_chunks if (c.meta or {}).get("embedding_model_id") == filters.get("embedding_model_id")
+            ]
+        if not allowed_chunks:
+            return []
+
+        def _cosine(a: List[float], b: List[float]) -> float:
+            if not a or not b:
+                return 0.0
+            length = min(len(a), len(b))
+            dot = sum(a[i] * b[i] for i in range(length))
+            norm_a = sum(x * x for x in a) ** 0.5 or 1.0
+            norm_b = sum(x * x for x in b) ** 0.5 or 1.0
+            return dot / (norm_a * norm_b)
+
+        bm25_scores = [0.0 for _ in allowed_chunks]
+        semantic_scores = [(_cosine(query_embedding, ch.embedding) if query_embedding else 0.0) for ch in allowed_chunks]
+        max_bm25 = max(bm25_scores) or 1.0
+        combined: Dict[str, tuple[KnowledgeChunk, float]] = {}
+        for chunk, lex, sem in zip(allowed_chunks, bm25_scores, semantic_scores):
+            hybrid = 0.45 * (lex / max_bm25) + 0.55 * sem
+            key = " ".join(chunk.text.split()).lower() or chunk.id
+            existing = combined.get(key)
+            if not existing or hybrid > existing[1]:
+                combined[key] = (chunk, hybrid)
+        ranked = sorted(combined.values(), key=lambda pair: pair[1], reverse=True)
+        return [pair[0] for pair in ranked[:limit]]
 
     def search_chunks_legacy(
         self,
