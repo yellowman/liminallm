@@ -629,6 +629,20 @@ async def create_artifact(
             owner_user_id=principal.user_id,
             created_by=principal.user_id,
         )
+        resp = ArtifactResponse(
+            id=artifact.id,
+            type=artifact.type,
+            kind=artifact.schema.get("kind") if isinstance(artifact.schema, dict) else None,
+            name=artifact.name,
+            description=artifact.description,
+            schema=artifact.schema,
+            owner_user_id=artifact.owner_user_id,
+            created_at=artifact.created_at,
+            updated_at=artifact.updated_at,
+        )
+        envelope = Envelope(status="ok", data=resp, request_id=request_id)
+        await _store_idempotency_result("artifacts:create", principal.user_id, idempotency_key, envelope)
+        return envelope
     except Exception as exc:
         await _store_idempotency_result(
             "artifacts:create",
@@ -638,20 +652,6 @@ async def create_artifact(
             status="error",
         )
         raise
-    resp = ArtifactResponse(
-        id=artifact.id,
-        type=artifact.type,
-        kind=artifact.schema.get("kind") if isinstance(artifact.schema, dict) else None,
-        name=artifact.name,
-        description=artifact.description,
-        schema=artifact.schema,
-        owner_user_id=artifact.owner_user_id,
-        created_at=artifact.created_at,
-        updated_at=artifact.updated_at,
-    )
-    envelope = Envelope(status="ok", data=resp, request_id=request_id)
-    await _store_idempotency_result("artifacts:create", principal.user_id, idempotency_key, envelope)
-    return envelope
 
 
 @router.patch("/artifacts/{artifact_id}", response_model=Envelope)
