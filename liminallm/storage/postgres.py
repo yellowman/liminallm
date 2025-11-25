@@ -1382,30 +1382,40 @@ class PostgresStore:
         query_embedding: List[float],
         limit: int = 4,
         filters: Optional[dict[str, Any]] = None,
+        *,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> List[KnowledgeChunk]:
         """Primary pgvector-backed retrieval over knowledge chunks."""
 
-        if not query_embedding:
+        if not query_embedding or not context_ids:
             return []
         where_clauses: list[str] = []
         params: list[Any] = []
-        if context_ids:
-            where_clauses.append("context_id = ANY(%s)")
-            params.append(list(context_ids))
+        where_clauses.append("kc.context_id = ANY(%s)")
+        params.append(list(context_ids))
+        if user_id:
+            where_clauses.append("ctx.owner_user_id = %s")
+            params.append(user_id)
+        if tenant_id:
+            where_clauses.append("u.tenant_id = %s")
+            params.append(tenant_id)
         if filters and filters.get("fs_path"):
-            where_clauses.append("meta->>'fs_path' = %s")
+            where_clauses.append("kc.meta->>'fs_path' = %s")
             params.append(filters["fs_path"])
         if filters and filters.get("embedding_model_id"):
-            where_clauses.append("meta->>'embedding_model_id' = %s")
+            where_clauses.append("kc.meta->>'embedding_model_id' = %s")
             params.append(filters["embedding_model_id"])
         where = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
                 SELECT id, context_id, text, embedding, seq, created_at, meta
-                FROM knowledge_chunk
+                FROM knowledge_chunk kc
+                JOIN knowledge_context ctx ON kc.context_id = ctx.id
+                LEFT JOIN app_user u ON ctx.owner_user_id = u.id
                 {where}
-                ORDER BY embedding <-> %s::vector
+                ORDER BY kc.embedding <-> %s::vector
                 LIMIT %s
                 """,
                 (*params, self._format_vector(query_embedding), limit),

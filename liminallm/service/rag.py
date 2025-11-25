@@ -32,16 +32,23 @@ class RAGService:
         self.embed = embed
         self.embedding_model_id = embedding_model_id
 
-    def retrieve(self, context_id: Optional[str], query: Optional[str], limit: int = 4) -> List[KnowledgeChunk]:
-        if not query:
+    def retrieve(
+        self,
+        context_ids: Optional[Sequence[str]],
+        query: Optional[str],
+        limit: int = 4,
+        *,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+    ) -> List[KnowledgeChunk]:
+        if not query or not context_ids:
             return []
 
         query_embedding = self.embed(query)
-        contexts: Sequence[str] | None = [context_id] if context_id else None
         filters = {"embedding_model_id": self.embedding_model_id}
 
         return self.store.search_chunks_pgvector(  # type: ignore[attr-defined]
-            contexts, query_embedding, limit, filters=filters
+            context_ids, query_embedding, limit, filters=filters, user_id=user_id, tenant_id=tenant_id
         )
 
     def ingest_text(
