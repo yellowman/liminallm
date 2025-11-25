@@ -470,7 +470,7 @@ class WorkflowEngine:
             message = inputs.get("raw") or ""
         if not message:
             message = ""
-        ctx_ids = inputs.get("context_id", context_id)
+        ctx_ids = inputs.get("context_id") or context_id
         if isinstance(ctx_ids, str):
             ctx_ids = [ctx_ids]
 
