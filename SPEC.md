@@ -320,20 +320,24 @@ CREATE TABLE adapter_router_state (
 );
 
 CREATE TABLE training_job (
-  id                 BIGSERIAL PRIMARY KEY,
-  adapter_artifact_id UUID NOT NULL REFERENCES artifact(id) ON DELETE CASCADE,
+  id                 UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  adapter_id         UUID NOT NULL REFERENCES artifact(id) ON DELETE CASCADE,
   user_id            UUID NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
   created_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
   status             TEXT NOT NULL DEFAULT 'queued', -- 'queued','running','succeeded','failed'
   num_events         INT,
   loss               DOUBLE PRECISION,
+  dataset_path       TEXT,
+  new_version        INT,
+  preference_event_ids UUID[],
   meta               JSONB
 );
 ```
 
 **preference_event → dataset → tokenized batches (single-adapter pipeline)**
 
-- fetch positive `preference_event` rows by `user_id` (optionally filtered by `adapter_artifact_id`).
+- fetch positive `preference_event` rows by `user_id` (optionally filtered by `adapter_id`).
 - reconstruct prompts from recent `message` rows in the linked `conversation` (limit ~200, keep last 50 turns).
 - target text = `preference_event.corrected_text` when provided, otherwise the original `message.content`, with optional `context_text` appended for grounding.
 - write JSONL dataset rows `{prompt, target, weight, context}` to `${SHARED_FS_ROOT}/users/{user}/adapters/{adapter}/jobs/{job}/dataset.jsonl`.

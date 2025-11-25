@@ -46,9 +46,21 @@ CREATE TABLE IF NOT EXISTS adapter_router_state (
 );
 
 -- Training jobs generated from preference events
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM information_schema.columns
+    WHERE table_name = 'training_job'
+      AND column_name = 'adapter_artifact_id'
+  ) THEN
+    ALTER TABLE training_job RENAME COLUMN adapter_artifact_id TO adapter_id;
+  END IF;
+END $$;
+
 CREATE TABLE IF NOT EXISTS training_job (
   id                   UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  adapter_artifact_id  UUID NOT NULL REFERENCES artifact(id) ON DELETE CASCADE,
+  adapter_id           UUID NOT NULL REFERENCES artifact(id) ON DELETE CASCADE,
   user_id              UUID NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
   created_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at           TIMESTAMPTZ NOT NULL DEFAULT now(),
