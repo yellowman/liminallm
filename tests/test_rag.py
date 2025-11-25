@@ -97,3 +97,42 @@ def test_local_hybrid_without_pgvector():
     blocked_user = store.add_user("other")
     denied = rag.retrieve([ctx.id], "legacy", user_id=blocked_user.id, tenant_id="other")
     assert denied == []
+
+
+def test_memory_store_pgvector_filters_fs_path(tmp_path):
+    store = MemoryStore(fs_root=tmp_path)
+    user = store.create_user("fs@example.com", tenant_id="tenant_fs")
+    ctx = store.upsert_context(owner_user_id=user.id, name="fs ctx", description="desc")
+
+    store.add_chunks(
+        ctx.id,
+        [
+            KnowledgeChunk(
+                id=None,
+                context_id=ctx.id,
+                fs_path="keep_me",
+                content="keep",
+                embedding=[1.0, 0.0],
+                chunk_index=0,
+            ),
+            KnowledgeChunk(
+                id=None,
+                context_id=ctx.id,
+                fs_path="skip_me",
+                content="skip",
+                embedding=[0.0, 1.0],
+                chunk_index=1,
+            ),
+        ],
+    )
+
+    results = store.search_chunks_pgvector(
+        [ctx.id],
+        [1.0, 0.0],
+        filters={"fs_path": "keep_me"},
+        user_id=user.id,
+        tenant_id="tenant_fs",
+    )
+
+    assert len(results) == 1
+    assert results[0].fs_path == "keep_me"

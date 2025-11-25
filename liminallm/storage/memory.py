@@ -941,6 +941,10 @@ class MemoryStore:
             ]
         if not allowed_chunks:
             return []
+        if filters and filters.get("fs_path"):
+            allowed_chunks = [c for c in allowed_chunks if c.fs_path == filters["fs_path"]]
+        if not allowed_chunks:
+            return []
 
         def _cosine(a: List[float], b: List[float]) -> float:
             if not a or not b:
