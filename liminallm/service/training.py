@@ -34,27 +34,28 @@ class TrainingService:
         self.runtime_base_model = runtime_base_model
 
     def _ensure_tokenizer(self, base_model: Optional[str]) -> None:
-        if not base_model:
+        model_name = base_model or self.runtime_base_model
+        if not model_name:
             return
-        if self.tokenizer is not None and self._tokenizer_model == base_model:
+        if self.tokenizer is not None and self._tokenizer_model == model_name:
             return
-        if self._tokenizer_error is not None and self._tokenizer_model == base_model:
+        if self._tokenizer_error is not None and self._tokenizer_model == model_name:
             return
         try:  # pragma: no cover - optional dependency
             from transformers import AutoTokenizer
 
-            self.tokenizer = AutoTokenizer.from_pretrained(base_model)
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
             self._base_vocab_size = vocab_size_from_tokenizer(
                 self.tokenizer, fallback=self.default_vocab_size
             )
-            self._tokenizer_model = base_model
+            self._tokenizer_model = model_name
             self._tokenizer_error = None
         except Exception as exc:  # pragma: no cover - optional dependency
             self.tokenizer = None
-            self._tokenizer_model = base_model
+            self._tokenizer_model = model_name
             self._tokenizer_error = str(exc)
             self._base_vocab_size = self.default_vocab_size
-            logger.warning("tokenizer_load_failed", base_model=base_model, error=str(exc))
+            logger.warning("tokenizer_load_failed", base_model=model_name, error=str(exc))
 
     def _vocab_size(self) -> int:
         if isinstance(self._adapter_vocab_size, int) and self._adapter_vocab_size > 0:
@@ -411,8 +412,8 @@ class TrainingService:
         vocab_size = max(self._vocab_size(), 1)
 
         def _encode(text: str) -> List[int]:
-            if hasattr(self, "tokenizer") and getattr(self, "tokenizer") is not None:
-                return list(getattr(self, "tokenizer").encode(text, truncation=True, max_length=max_length))
+            if self.tokenizer is not None:
+                return list(self.tokenizer.encode(text, truncation=True, max_length=max_length))
             tokens = text.split()
             return [hash(tok) % vocab_size for tok in tokens[:max_length]]
 
