@@ -996,6 +996,7 @@ class PostgresStore:
             created_at=row.get("created_at", datetime.utcnow()),
             updated_at=row.get("updated_at", datetime.utcnow()),
             fs_path=row.get("fs_path"),
+            base_model=(schema or {}).get("base_model"),
             meta=row.get("meta"),
         )
 
@@ -1037,6 +1038,7 @@ class PostgresStore:
             schema=schema,
             owner_user_id=owner_user_id,
             fs_path=fs_path,
+            base_model=schema.get("base_model"),
         )
 
     def update_artifact(
@@ -1084,6 +1086,7 @@ class PostgresStore:
             owner_user_id=(str(row["owner_user_id"]) if row.get("owner_user_id") else None),
             fs_path=fs_path,
             visibility=row.get("visibility", "private"),
+            base_model=schema.get("base_model"),
         )
 
     def list_artifact_versions(self, artifact_id: str) -> List[ArtifactVersion]:
@@ -1111,6 +1114,7 @@ class PostgresStore:
                     change_note=row.get("change_note"),
                     created_at=row.get("created_at", datetime.utcnow()),
                     fs_path=row.get("fs_path"),
+                    base_model=(schema or {}).get("base_model"),
                     meta=row.get("meta"),
                 )
             )

@@ -664,6 +664,7 @@ class MemoryStore:
             description=description,
             owner_user_id=owner_user_id,
             fs_path=fs_path,
+            base_model=schema.get("base_model"),
         )
         self.artifacts[artifact_id] = artifact
         self.artifact_versions.setdefault(artifact_id, []).append(
@@ -675,6 +676,7 @@ class MemoryStore:
                 created_by=author,
                 change_note=change_note,
                 fs_path=fs_path,
+                base_model=schema.get("base_model"),
             )
         )
         self._persist_state()
@@ -704,6 +706,7 @@ class MemoryStore:
             artifact.description = description
         artifact.updated_at = datetime.utcnow()
         artifact.fs_path = fs_path
+        artifact.base_model = schema.get("base_model")
         versions = self.artifact_versions.setdefault(artifact_id, [])
         versions.append(
             ArtifactVersion(
@@ -714,6 +717,7 @@ class MemoryStore:
                 created_by=author,
                 change_note=change_note,
                 fs_path=fs_path,
+                base_model=schema.get("base_model"),
             )
         )
         self._persist_state()
@@ -1059,6 +1063,7 @@ class MemoryStore:
             "created_at": self._serialize_datetime(artifact.created_at),
             "updated_at": self._serialize_datetime(artifact.updated_at),
             "fs_path": artifact.fs_path,
+            "base_model": artifact.base_model,
             "meta": artifact.meta,
         }
 
@@ -1074,6 +1079,7 @@ class MemoryStore:
             created_at=self._deserialize_datetime(data["created_at"]),
             updated_at=self._deserialize_datetime(data["updated_at"]),
             fs_path=data.get("fs_path"),
+            base_model=data.get("base_model"),
             meta=data.get("meta"),
         )
 
@@ -1087,6 +1093,7 @@ class MemoryStore:
             "change_note": version.change_note,
             "created_at": self._serialize_datetime(version.created_at),
             "fs_path": version.fs_path,
+            "base_model": version.base_model,
             "meta": version.meta,
         }
 
@@ -1100,6 +1107,7 @@ class MemoryStore:
             change_note=data.get("change_note"),
             created_at=self._deserialize_datetime(data["created_at"]),
             fs_path=data.get("fs_path"),
+            base_model=data.get("base_model"),
             meta=data.get("meta"),
         )
 

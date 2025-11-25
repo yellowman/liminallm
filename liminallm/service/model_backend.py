@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import logging
 import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Protocol, Tuple
 
+from liminallm.logging import get_logger
 from liminallm.service.fs import safe_join
 from liminallm.service.tokenizer_utils import DEFAULT_VOCAB_SIZE, vocab_size_from_tokenizer
 
@@ -34,7 +34,7 @@ _ADAPTER_ID_PROVIDERS = {
     "aws_sagemaker",
 }
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 _OPENAI_SPEC = importlib.util.find_spec("openai")
 if _OPENAI_SPEC:
@@ -258,7 +258,7 @@ class LocalJaxLoRABackend:
         except Exception as exc:  # pragma: no cover - optional dependency
             self._tokenizer = None
             self._tokenizer_error = str(exc)
-            logger.warning("Failed to load tokenizer for %s: %s", self.base_model, exc)
+            logger.warning("tokenizer_load_failed", base_model=self.base_model, error=str(exc))
 
     def _vocab_size(self) -> int:
         if isinstance(self._adapter_vocab_size, int) and self._adapter_vocab_size > 0:
@@ -387,7 +387,7 @@ class LocalJaxLoRABackend:
             try:  # pragma: no cover - optional dependency
                 return self._tokenizer.decode(token_ids, skip_special_tokens=True)
             except Exception as exc:
-                logger.warning("Tokenizer decode failed for %s: %s", self.base_model, exc)
+                logger.warning("tokenizer_decode_failed", base_model=self.base_model, error=str(exc))
         return " ".join([f"tok-{tid}" for tid in token_ids])
 
     def _sample_tokens(self, lora_scores, seed_token: int) -> List[int]:

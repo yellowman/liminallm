@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import random
 import shutil
 from dataclasses import asdict
@@ -15,13 +14,15 @@ from liminallm.service.tokenizer_utils import DEFAULT_VOCAB_SIZE, vocab_size_fro
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import Artifact, PreferenceEvent
 
-logger = logging.getLogger(__name__)
+from liminallm.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class TrainingService:
     """Minimal LoRA adapter training loop following SPEC phase 2."""
 
-    def __init__(self, store, fs_root: str) -> None:
+    def __init__(self, store, fs_root: str, *, runtime_base_model: Optional[str] = None) -> None:
         self.store = store
         self.fs_root = Path(fs_root)
         self.default_vocab_size = DEFAULT_VOCAB_SIZE
@@ -30,6 +31,7 @@ class TrainingService:
         self.tokenizer = None
         self._tokenizer_error: Optional[str] = None
         self._tokenizer_model: Optional[str] = None
+        self.runtime_base_model = runtime_base_model
 
     def _ensure_tokenizer(self, base_model: Optional[str]) -> None:
         if not base_model:
@@ -51,7 +53,7 @@ class TrainingService:
             self.tokenizer = None
             self._tokenizer_model = base_model
             self._tokenizer_error = str(exc)
-            logger.warning("Failed to load tokenizer for %s: %s", base_model, exc)
+            logger.warning("tokenizer_load_failed", base_model=base_model, error=str(exc))
 
     def _vocab_size(self) -> int:
         if isinstance(self._adapter_vocab_size, int) and self._adapter_vocab_size > 0:
@@ -66,12 +68,59 @@ class TrainingService:
         if isinstance(vocab_size, int) and vocab_size > 0:
             self._adapter_vocab_size = vocab_size
 
+    def _assert_adapter_base(self, adapter: Artifact) -> Artifact:
+        runtime_base = self.runtime_base_model
+        stored_base = adapter.schema.get("base_model") if adapter and adapter.schema else None
+        if runtime_base and stored_base and stored_base != runtime_base:
+            migration_plan = {
+                "expected_base": runtime_base,
+                "stored_base": stored_base,
+                "plan": "retrain adapter on active base or distill weights",
+            }
+            logger.warning(
+                "adapter_base_model_mismatch",
+                adapter_id=adapter.id,
+                stored_base_model=stored_base,
+                runtime_base_model=runtime_base,
+                migration_plan=migration_plan,
+            )
+            raise ConstraintViolation("adapter base incompatible", migration_plan)
+        if runtime_base and not stored_base:
+            updated_schema = dict(adapter.schema)
+            updated_schema["base_model"] = runtime_base
+            self.store.update_artifact(adapter.id, updated_schema)
+            refreshed = self.store.get_artifact(adapter.id)
+            return refreshed or adapter
+        return adapter
+
     def ensure_user_adapter(self, user_id: str, *, rank: int = 4, adapter_id_override: Optional[str] = None) -> Artifact:
         existing = [a for a in self.store.list_artifacts(type_filter="adapter") if a.owner_user_id == user_id]
         if adapter_id_override:
             existing = [a for a in existing if a.id == adapter_id_override] or existing
         if existing:
-            return existing[0]
+            adapter = existing[0]
+            runtime_base = self.runtime_base_model
+            stored_base = adapter.schema.get("base_model") if adapter.schema else None
+            if runtime_base and stored_base and stored_base != runtime_base:
+                migration_plan = {
+                    "expected_base": runtime_base,
+                    "stored_base": stored_base,
+                    "plan": "retrain adapter on active base or distill weights",
+                }
+                logger.warning(
+                    "adapter_base_model_mismatch",
+                    adapter_id=adapter.id,
+                    stored_base_model=stored_base,
+                    runtime_base_model=runtime_base,
+                    migration_plan=migration_plan,
+                )
+                raise ConstraintViolation("adapter base incompatible", migration_plan)
+            if runtime_base and not stored_base:
+                updated_schema = dict(adapter.schema)
+                updated_schema["base_model"] = runtime_base
+                self.store.update_artifact(adapter.id, updated_schema)
+                adapter = self.store.get_artifact(adapter.id) or adapter
+            return adapter
         adapter_id = adapter_id_override
         adapter_schema = {
             "kind": "adapter.lora",
@@ -79,7 +128,7 @@ class TrainingService:
             "provider": "local",
             "scope": "per-user",
             "user_id": user_id,
-            "base_model": "jax-base",
+            "base_model": self.runtime_base_model or "jax-base",
             "rank": rank,
             "layers": list(range(4)),
             "matrices": ["attn_q", "attn_v"],
@@ -104,6 +153,7 @@ class TrainingService:
         adapter = self.ensure_user_adapter(user_id) if not adapter_id else self.store.get_artifact(adapter_id)
         if not adapter:
             raise ConstraintViolation("adapter missing", {"adapter_id": adapter_id})
+        adapter = self._assert_adapter_base(adapter)
         self._apply_adapter_vocab_size(adapter)
         events = self.store.list_preference_events(user_id=user_id, feedback="positive", cluster_id=cluster_id)
         if not events:
@@ -232,11 +282,14 @@ class TrainingService:
 
     def summarize_preferences(self, user_id: Optional[str]) -> dict:
         events: List[PreferenceEvent] = []
+        status: str = "ok"
+        error_detail: Optional[str] = None
         try:
             events = self.store.list_preference_events(user_id=user_id)  # type: ignore[attr-defined]
         except Exception as exc:
-            logger.warning("Failed to list preference events for %s: %s", user_id, exc)
-            events = []
+            status = "error"
+            error_detail = f"preference retrieval failed: {exc}"
+            logger.warning("list_preference_events_failed", user_id=user_id, error=str(exc))
         totals = {"positive": 0, "negative": 0, "neutral": 0}
         routing_feedback: dict[str, int] = {}
         for event in events:
@@ -244,6 +297,7 @@ class TrainingService:
             if event.meta and event.meta.get("routing_trace"):
                 routing_feedback["routing_trace_present"] = routing_feedback.get("routing_trace_present", 0) + 1
         clusters: List[dict] = []
+        clusters_error: Optional[str] = None
         if hasattr(self.store, "list_semantic_clusters"):
             try:
                 for cluster in self.store.list_semantic_clusters(user_id):  # type: ignore[attr-defined]
@@ -256,20 +310,58 @@ class TrainingService:
                         }
                     )
             except Exception as exc:
-                logger.warning("Failed to list semantic clusters for %s: %s", user_id, exc)
-                clusters = []
+                clusters_error = str(exc)
+                logger.warning("list_semantic_clusters_failed", user_id=user_id, error=str(exc))
         adapter_candidates = [a for a in self.store.list_artifacts(type_filter="adapter")]  # type: ignore[arg-type]
         adapters = [
-            {"id": a.id, "name": a.name, "description": a.description, "cluster_id": a.schema.get("cluster_id")}
+            {
+                "id": a.id,
+                "name": a.name,
+                "description": a.description,
+                "cluster_id": a.schema.get("cluster_id"),
+                "base_model": a.schema.get("base_model"),
+            }
             for a in adapter_candidates
         ]
+        adapter_state = self._collect_adapter_router_state(user_id)
+        if status == "ok" and not events and not clusters and (
+            adapter_state.get("status") in {"no_data", "unavailable"}
+            or not adapter_state.get("entries")
+        ):
+            status = "no_data"
         return {
+            "status": status,
+            "error": error_detail,
             "totals": totals,
             "events": [asdict(e) for e in events[-10:]],
             "clusters": clusters,
+            "clusters_status": "error" if clusters_error else ("ok" if clusters else "no_data"),
+            "clusters_error": clusters_error,
             "adapters": adapters,
             "routing_feedback": routing_feedback,
+            "adapter_router_state": adapter_state,
         }
+
+    def _collect_adapter_router_state(self, user_id: Optional[str]) -> dict:
+        if hasattr(self.store, "list_adapter_router_state"):
+            try:
+                states = self.store.list_adapter_router_state(user_id=user_id)  # type: ignore[attr-defined]
+            except Exception as exc:
+                logger.warning("list_adapter_router_state_failed", user_id=user_id, error=str(exc))
+                return {"status": "error", "error": str(exc)}
+            parsed: List[dict] = []
+            for state in states or []:
+                parsed.append(
+                    {
+                        "adapter_id": getattr(state, "adapter_id", None),
+                        "centroid_vec": getattr(state, "centroid_vec", None),
+                        "base_model": getattr(state, "base_model", None),
+                        "success_score": getattr(state, "success_score", None),
+                        "last_trained_at": getattr(state, "last_trained_at", None),
+                    }
+                )
+            return {"status": "ok" if parsed else "no_data", "entries": parsed}
+        return {"status": "unavailable"}
 
     def _build_examples(self, events: Iterable[PreferenceEvent]) -> Iterable[dict]:
         for event in events:
@@ -401,7 +493,7 @@ class TrainingService:
             import jax.numpy as jnp
             import optax
         except Exception as exc:
-            logger.warning("Skipping training loop; JAX/Optax unavailable: %s", exc)
+            logger.warning("training_loop_skipped", reason="jax_optax_unavailable", error=str(exc))
             return {"status": "skipped", "reason": "jax/optax not installed"}
 
         vocab_size = max(self._vocab_size(), 1)

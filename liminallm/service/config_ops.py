@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import logging
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -14,7 +13,9 @@ from liminallm.storage.memory import MemoryStore
 from liminallm.storage.models import Artifact, ConfigPatchAudit
 from liminallm.storage.postgres import PostgresStore
 
-logger = logging.getLogger(__name__)
+from liminallm.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class ConfigOpsService:
@@ -73,7 +74,12 @@ class ConfigOpsService:
 
     def _build_prompt(self, artifact: Artifact, goal: Optional[str]) -> str:
         insights = self.training.summarize_preferences(artifact.owner_user_id) if artifact.owner_user_id else {}
-        summary_blob = json.dumps(insights, indent=2) if insights else "no preference insights available"
+        if isinstance(insights, dict) and insights.get("status") == "error":
+            summary_blob = f"preference retrieval error: {insights.get('error')}"
+        elif isinstance(insights, dict) and insights.get("status") == "no_data":
+            summary_blob = "no preference data available; request feedback before risky changes"
+        else:
+            summary_blob = json.dumps(insights, indent=2) if insights else "no preference insights available"
         description = artifact.description or artifact.name
         goal_line = goal or "improve routing quality and adapter selection accuracy"
         return (
@@ -93,7 +99,7 @@ class ConfigOpsService:
             if isinstance(parsed, dict):
                 return parsed
         except Exception as exc:
-            logger.warning("Falling back to default patch after LLM error: %s", exc)
+            logger.warning("config_patch_llm_error", error=str(exc))
         return self._fallback_patch()
 
     def _fallback_patch(self) -> dict:
