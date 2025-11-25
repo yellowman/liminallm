@@ -53,6 +53,7 @@ class TrainingService:
             self.tokenizer = None
             self._tokenizer_model = base_model
             self._tokenizer_error = str(exc)
+            self._base_vocab_size = DEFAULT_VOCAB_SIZE
             logger.warning("tokenizer_load_failed", base_model=base_model, error=str(exc))
 
     def _vocab_size(self) -> int:
