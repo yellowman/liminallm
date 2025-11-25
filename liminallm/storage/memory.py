@@ -1281,7 +1281,7 @@ class MemoryStore:
         return KnowledgeChunk(
             id=int(data["id"]) if data.get("id") is not None else None,
             context_id=data["context_id"],
-            fs_path=data["fs_path"],
+            fs_path=data.get("fs_path", ""),
             content=data.get("content", ""),
             embedding=data.get("embedding", []),
             chunk_index=data.get("chunk_index", 0),

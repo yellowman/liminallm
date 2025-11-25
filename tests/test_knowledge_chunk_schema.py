@@ -1,3 +1,4 @@
+import json
 from dataclasses import fields
 from typing import get_type_hints
 import uuid
@@ -84,3 +85,29 @@ def test_memory_store_rejects_missing_fs_path(tmp_path):
                 )
             ],
         )
+
+
+def test_memory_store_loads_legacy_chunk_without_fs_path(tmp_path):
+    store = MemoryStore(fs_root=str(tmp_path))
+    context = store.upsert_context(owner_user_id=None, name="ctx", description="desc")
+
+    chunk = KnowledgeChunk(
+        id=None,
+        context_id=context.id,
+        fs_path="legacy",
+        content="persisted chunk",
+        embedding=[],
+        chunk_index=0,
+    )
+    store.add_chunks(context.id, [chunk])
+
+    state_path = tmp_path / "state" / "memory_store.json"
+    legacy_state = json.loads(state_path.read_text())
+    for chunk_data in legacy_state.get("chunks", []):
+        chunk_data.pop("fs_path", None)
+    state_path.write_text(json.dumps(legacy_state))
+
+    reloaded = MemoryStore(fs_root=str(tmp_path))
+    loaded_chunks = reloaded.list_chunks(context.id)
+
+    assert loaded_chunks[0].fs_path == ""
