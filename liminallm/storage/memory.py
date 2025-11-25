@@ -45,6 +45,7 @@ class MemoryStore:
         self.runtime_config: Dict[str, str] = {}
         self.contexts: Dict[str, KnowledgeContext] = {}
         self.chunks: Dict[str, List[KnowledgeChunk]] = {}
+        self._chunk_id_seq: int = 1
         self.preference_events: Dict[str, PreferenceEvent] = {}
         self.training_jobs: Dict[str, TrainingJob] = {}
         self.semantic_clusters: Dict[str, SemanticCluster] = {}
@@ -816,7 +817,14 @@ class MemoryStore:
         if context_id not in self.contexts:
             raise ConstraintViolation("context not found", {"context_id": context_id})
         existing = self.chunks.setdefault(context_id, [])
-        existing.extend(chunks)
+        for chunk in chunks:
+            if chunk.id is None:
+                chunk.id = self._chunk_id_seq
+                self._chunk_id_seq += 1
+            else:
+                chunk.id = int(chunk.id)
+                self._chunk_id_seq = max(self._chunk_id_seq, chunk.id + 1)
+            existing.append(chunk)
         self._persist_state()
 
     def list_chunks(self, context_id: Optional[str] = None) -> List[KnowledgeChunk]:
@@ -1027,6 +1035,8 @@ class MemoryStore:
         for chunk_data in data.get("chunks", []):
             chunk = self._deserialize_chunk(chunk_data)
             self.chunks.setdefault(chunk.context_id, []).append(chunk)
+        max_chunk_id = max((chunk.id or 0 for chunks in self.chunks.values() for chunk in chunks), default=0)
+        self._chunk_id_seq = max_chunk_id + 1
         self.preference_events = {
             e["id"]: self._deserialize_preference_event(e) for e in data.get("preference_events", [])
         }
@@ -1263,7 +1273,7 @@ class MemoryStore:
 
     def _deserialize_chunk(self, data: dict) -> KnowledgeChunk:
         return KnowledgeChunk(
-            id=data["id"],
+            id=int(data["id"]) if data.get("id") is not None else None,
             context_id=data["context_id"],
             fs_path=data.get("fs_path", ""),
             content=data.get("content", ""),
