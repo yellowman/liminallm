@@ -60,6 +60,34 @@ class Session:
 
 
 @dataclass
+class UserAuthCredential:
+    user_id: str
+    password_hash: Optional[str] = None
+    password_algo: Optional[str] = None
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    last_updated_at: Optional[datetime] = None
+
+
+@dataclass
+class UserAuthProvider:
+    id: int
+    user_id: str
+    provider: str
+    provider_uid: str
+    created_at: datetime = field(default_factory=datetime.utcnow)
+
+
+@dataclass
+class UserSettings:
+    user_id: str
+    locale: Optional[str] = None
+    timezone: Optional[str] = None
+    default_voice: Optional[str] = None
+    default_style: Optional[dict] = None
+    flags: Optional[dict] = None
+
+
+@dataclass
 class Conversation:
     id: str
     user_id: str
@@ -178,6 +206,17 @@ class PreferenceEvent:
     corrected_text: Optional[str] = None
     created_at: datetime = field(default_factory=datetime.utcnow)
     weight: float = 1.0
+    meta: Dict | None = None
+
+
+@dataclass
+class AdapterRouterState:
+    artifact_id: str
+    centroid_vec: Optional[List[float]] = None
+    usage_count: int = 0
+    success_score: float = 0.0
+    last_used_at: Optional[datetime] = None
+    last_trained_at: Optional[datetime] = None
     meta: Dict | None = None
 
 
