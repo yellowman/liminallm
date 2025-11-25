@@ -48,7 +48,7 @@ def test_memory_store_round_trips_chunk_fields(tmp_path):
     context = store.upsert_context(owner_user_id=None, name="ctx", description="desc")
 
     chunk = KnowledgeChunk(
-        id=None,
+        id=0,
         context_id=context.id,
         fs_path="inline",
         content="schema aligned",
@@ -76,7 +76,7 @@ def test_memory_store_rejects_missing_fs_path(tmp_path):
             context.id,
             [
                 KnowledgeChunk(
-                    id=None,
+                    id=0,
                     context_id=context.id,
                     fs_path="",
                     content="",
@@ -91,7 +91,7 @@ def test_memory_store_rejects_missing_fs_path(tmp_path):
             context.id,
             [
                 KnowledgeChunk(
-                    id=None,
+                    id=0,
                     context_id=context.id,
                     fs_path="   ",
                     content="",
@@ -107,7 +107,7 @@ def test_memory_store_loads_legacy_chunk_without_fs_path(tmp_path):
     context = store.upsert_context(owner_user_id=None, name="ctx", description="desc")
 
     chunk = KnowledgeChunk(
-        id=None,
+        id=0,
         context_id=context.id,
         fs_path="legacy",
         content="persisted chunk",
