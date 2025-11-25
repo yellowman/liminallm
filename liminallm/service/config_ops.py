@@ -39,9 +39,10 @@ class ConfigOpsService:
             raise NotFoundError("artifact not found", detail={"artifact_id": artifact_id})
         prompt = self._build_prompt(artifact, goal)
         patch = self._run_llm_for_patch(prompt)
-        return self.store.record_config_patch(artifact_id=artifact_id, proposer_user_id=user_id, patch=patch, justification=goal or "auto-proposed")
+        proposer = "user" if user_id else "system_llm"
+        return self.store.record_config_patch(artifact_id=artifact_id, proposer=proposer, patch=patch, justification=goal or "auto-proposed")
 
-    def decide_patch(self, patch_id: str, decision: str, reason: Optional[str] = None) -> ConfigPatchAudit:
+    def decide_patch(self, patch_id: int, decision: str, reason: Optional[str] = None) -> ConfigPatchAudit:
         normalized = decision.lower()
         if normalized not in {"approved", "rejected"}:
             raise BadRequestError("invalid decision", detail={"decision": decision})
@@ -55,7 +56,7 @@ class ConfigOpsService:
             raise NotFoundError("patch not found", detail={"patch_id": patch_id})
         return updated
 
-    def apply_patch(self, patch_id: str, approver_user_id: Optional[str] = None) -> dict:
+    def apply_patch(self, patch_id: int, approver_user_id: Optional[str] = None) -> dict:
         patch = self.store.get_config_patch(patch_id)
         if not patch:
             raise NotFoundError("patch not found", detail={"patch_id": patch_id})

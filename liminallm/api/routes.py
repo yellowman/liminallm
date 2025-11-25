@@ -871,15 +871,18 @@ async def patch_artifact(artifact_id: str, body: ArtifactRequest, principal: Aut
 @router.post("/config/propose_patch", response_model=Envelope)
 async def propose_patch(body: ConfigPatchRequest, principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
+    proposer = "human_admin" if principal.role == "admin" else "user"
     audit = runtime.store.record_config_patch(
-        artifact_id=body.artifact_id, proposer_user_id=principal.user_id, patch=body.patch, justification=body.justification
+        artifact_id=body.artifact_id, proposer=proposer, patch=body.patch, justification=body.justification
     )
     resp = ConfigPatchAuditResponse(
         id=audit.id,
         artifact_id=audit.artifact_id,
+        proposer=audit.proposer,
         justification=audit.justification,
         status=audit.status,
         patch=audit.patch,
+        created_at=audit.created_at,
         decided_at=audit.decided_at,
         applied_at=audit.applied_at,
         meta=audit.meta,
@@ -895,9 +898,11 @@ async def list_config_patches(status: Optional[str] = None, principal: AuthConte
         ConfigPatchAuditResponse(
             id=p.id,
             artifact_id=p.artifact_id,
+            proposer=p.proposer,
             justification=p.justification,
             status=p.status,
             patch=p.patch,
+            created_at=p.created_at,
             decided_at=p.decided_at,
             applied_at=p.applied_at,
             meta=p.meta,
@@ -908,15 +913,17 @@ async def list_config_patches(status: Optional[str] = None, principal: AuthConte
 
 
 @router.post("/config/patches/{patch_id}/decide", response_model=Envelope)
-async def decide_config_patch(patch_id: str, body: ConfigPatchDecisionRequest, principal: AuthContext = Depends(get_admin_user)):
+async def decide_config_patch(patch_id: int, body: ConfigPatchDecisionRequest, principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
     decision = runtime.config_ops.decide_patch(patch_id, body.decision, body.reason)
     resp = ConfigPatchAuditResponse(
         id=decision.id,
         artifact_id=decision.artifact_id,
+        proposer=decision.proposer,
         justification=decision.justification,
         status=decision.status,
         patch=decision.patch,
+        created_at=decision.created_at,
         decided_at=decision.decided_at,
         applied_at=decision.applied_at,
         meta=decision.meta,
@@ -925,18 +932,20 @@ async def decide_config_patch(patch_id: str, body: ConfigPatchDecisionRequest, p
 
 
 @router.post("/config/patches/{patch_id}/apply", response_model=Envelope)
-async def apply_config_patch(patch_id: str, principal: AuthContext = Depends(get_admin_user)):
+async def apply_config_patch(patch_id: int, principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
     result = runtime.config_ops.apply_patch(patch_id, approver_user_id=principal.user_id)
     patch = result.get("patch")
     resp = ConfigPatchAuditResponse(
         id=patch.id,
         artifact_id=patch.artifact_id,
+        proposer=patch.proposer,
         justification=patch.justification,
         status="applied",
         patch=patch.patch,
+        created_at=patch.created_at,
         decided_at=patch.decided_at,
-        applied_at=patch.applied_at or patch.updated_at,
+        applied_at=patch.applied_at or patch.decided_at or patch.created_at,
         meta=patch.meta,
     )
     return Envelope(status="ok", data=resp)
@@ -949,9 +958,11 @@ async def auto_patch(body: AutoPatchRequest, principal: AuthContext = Depends(ge
     resp = ConfigPatchAuditResponse(
         id=audit.id,
         artifact_id=audit.artifact_id,
+        proposer=audit.proposer,
         justification=audit.justification,
         status=audit.status,
         patch=audit.patch,
+        created_at=audit.created_at,
         decided_at=audit.decided_at,
         applied_at=audit.applied_at,
         meta=audit.meta,
