@@ -422,6 +422,9 @@ class MemoryStore:
             events = [e for e in events if e.cluster_id == cluster_id]
         return sorted(events, key=lambda e: e.created_at)
 
+    def get_preference_event(self, event_id: str) -> Optional[PreferenceEvent]:
+        return self.preference_events.get(event_id)
+
     def update_preference_event(self, event_id: str, *, cluster_id: Optional[str] = None) -> Optional[PreferenceEvent]:
         event = self.preference_events.get(event_id)
         if not event:
@@ -525,6 +528,9 @@ class MemoryStore:
         self.training_jobs[job_id] = job
         self._persist_state()
         return job
+
+    def get_training_job(self, job_id: str) -> Optional[TrainingJob]:
+        return self.training_jobs.get(job_id)
 
     def update_training_job(
         self,
