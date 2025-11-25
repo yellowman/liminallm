@@ -758,10 +758,13 @@ async def create_artifact(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     runtime = get_runtime()
-    request_id, cached = await _resolve_idempotency("artifacts:create", principal.user_id, idempotency_key, require=True)
-    if cached:
-        return cached
+    request_id: Optional[str] = None
     try:
+        request_id, cached = await _resolve_idempotency(
+            "artifacts:create", principal.user_id, idempotency_key, require=True
+        )
+        if cached:
+            return cached
         if not isinstance(body.schema, dict):
             raise BadRequestError("artifact schema must be an object", detail={"provided_type": type(body.schema).__name__})
         schema_kind = body.schema.get("kind")

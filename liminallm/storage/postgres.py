@@ -775,6 +775,7 @@ class PostgresStore:
                 )
         except Exception as exc:
             self.logger.warning("set_user_mfa_secret_failed", error=str(exc))
+            raise
         self.mfa_secrets[user_id] = record
         return record
 
@@ -1503,7 +1504,7 @@ class PostgresStore:
         with self._connect() as conn:
             rows = conn.execute(
                 f"""
-                SELECT id, context_id, text, embedding, seq, created_at, meta
+                SELECT kc.id, kc.context_id, kc.text, kc.embedding, kc.seq, kc.created_at, kc.meta
                 FROM knowledge_chunk kc
                 JOIN knowledge_context ctx ON kc.context_id = ctx.id
                 LEFT JOIN app_user u ON ctx.owner_user_id = u.id
