@@ -11,17 +11,20 @@ class RedisCache:
     """Thin Redis wrapper for sessions and rate limits."""
 
     def __init__(self, redis_url: str):
+        self.redis_url = redis_url
         self.client = redis.from_url(redis_url, decode_responses=True)
 
     def verify_connection(self) -> None:
         """Assert Redis connectivity before enabling dependent features."""
+        from redis import Redis
 
-        import asyncio
-
-        async def _ping() -> None:
-            await self.client.ping()
-
-        asyncio.run(_ping())
+        # Use a short-lived synchronous client to avoid binding the async client to a
+        # temporary event loop during startup checks.
+        sync_client = Redis.from_url(self.redis_url, decode_responses=True)
+        try:
+            sync_client.ping()
+        finally:
+            sync_client.close()
 
     async def cache_session(self, session_id: str, user_id: str, expires_at: datetime) -> None:
         ttl = int((expires_at - datetime.utcnow()).total_seconds())
