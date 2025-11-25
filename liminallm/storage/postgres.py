@@ -44,6 +44,7 @@ class PostgresStore:
         self.mfa_secrets: dict[str, UserMFAConfig] = {}
         self.sessions: dict[str, Session] = {}
         self._ensure_runtime_config_table()
+        self._verify_required_schema()
         self._load_training_state()
         self._ensure_default_artifacts()
 
@@ -64,6 +65,98 @@ class PostgresStore:
                 )
                 """
             )
+
+    def _verify_required_schema(self) -> None:
+        """Ensure core tables and pgvector expectations exist before serving requests."""
+
+        required_tables = [
+            "app_user",
+            "user_auth_credential",
+            "user_auth_provider",
+            "user_settings",
+            "auth_session",
+            "conversation",
+            "message",
+            "artifact",
+            "artifact_version",
+            "config_patch",
+            "knowledge_context",
+            "context_source",
+            "knowledge_chunk",
+            "preference_event",
+            "semantic_cluster",
+            "adapter_router_state",
+            "training_job",
+            "user_mfa_secret",
+            "instance_config",
+        ]
+
+        with self._connect() as conn:
+            missing_tables = []
+            for table in required_tables:
+                row = conn.execute("SELECT to_regclass(%s) AS oid", (f"public.{table}",)).fetchone()
+                if not row or not row.get("oid"):
+                    missing_tables.append(table)
+
+            if missing_tables:
+                raise RuntimeError(
+                    "Missing required Postgres tables: {}. Run scripts/migrate.sh to install the SPEC §2 schema.".format(
+                        ", ".join(sorted(missing_tables))
+                    )
+                )
+
+            vector_ext = conn.execute("SELECT extname FROM pg_extension WHERE extname = 'vector'").fetchone()
+            if not vector_ext:
+                raise RuntimeError(
+                    "pgvector extension is missing. Install it and rerun scripts/migrate.sh to satisfy SPEC §3 RAG requirements."
+                )
+
+            citext_ext = conn.execute("SELECT extname FROM pg_extension WHERE extname = 'citext'").fetchone()
+            if not citext_ext:
+                raise RuntimeError(
+                    "citext extension is missing. Install it and rerun scripts/migrate.sh to satisfy SPEC §2 auth expectations."
+                )
+
+            embedding_col = conn.execute(
+                """
+                SELECT udt_name, data_type
+                FROM information_schema.columns
+                WHERE table_schema = 'public' AND table_name = 'knowledge_chunk' AND column_name = 'embedding'
+                """
+            ).fetchone()
+            if not embedding_col or embedding_col.get("udt_name") != "vector":
+                raise RuntimeError(
+                    "knowledge_chunk.embedding must be a pgvector column; run migrations to align with SPEC §§2–3."
+                )
+
+            embedding_index = conn.execute(
+                """
+                SELECT i.relname AS index_name, am.amname AS access_method
+                FROM pg_index idx
+                JOIN pg_class i ON i.oid = idx.indexrelid
+                JOIN pg_class t ON t.oid = idx.indrelid
+                JOIN pg_am am ON i.relam = am.oid
+                WHERE t.relname = 'knowledge_chunk' AND i.relname = 'knowledge_chunk_embedding_idx'
+                """
+            ).fetchone()
+            if not embedding_index or embedding_index.get("access_method") != "ivfflat":
+                raise RuntimeError(
+                    "knowledge_chunk_embedding_idx (ivfflat) is missing. Run scripts/migrate.sh to install pgvector indices."
+                )
+
+            context_index = conn.execute(
+                """
+                SELECT i.relname AS index_name
+                FROM pg_index idx
+                JOIN pg_class i ON i.oid = idx.indexrelid
+                JOIN pg_class t ON t.oid = idx.indrelid
+                WHERE t.relname = 'knowledge_chunk' AND i.relname = 'knowledge_chunk_context_idx'
+                """
+            ).fetchone()
+            if not context_index:
+                raise RuntimeError(
+                    "knowledge_chunk_context_idx is missing. Run scripts/migrate.sh to align with SPEC §2 context lookups."
+                )
 
     def _set_runtime_config(self, config: dict) -> None:
         """Persist the runtime configuration for admin-driven overrides."""
