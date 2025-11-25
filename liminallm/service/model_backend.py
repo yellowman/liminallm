@@ -257,6 +257,7 @@ class LocalJaxLoRABackend:
             )
         except Exception as exc:  # pragma: no cover - optional dependency
             self._tokenizer = None
+            self._base_vocab_size = self.default_vocab_size
             self._tokenizer_error = str(exc)
             logger.warning("tokenizer_load_failed", base_model=self.base_model, error=str(exc))
 
