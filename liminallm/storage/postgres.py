@@ -1273,7 +1273,16 @@ class PostgresStore:
                 "SELECT schema FROM artifact_version WHERE artifact_id = %s ORDER BY version DESC LIMIT 1",
                 (workflow_id,),
             ).fetchone()
-        return row["schema"] if row else None
+        if not row:
+            return None
+        schema = row.get("schema") if isinstance(row, dict) else row["schema"]
+        if isinstance(schema, str):
+            try:
+                schema = json.loads(schema)
+            except Exception as exc:
+                self.logger.warning("workflow_schema_parse_failed", error=str(exc))
+                schema = {}
+        return schema or None
 
     def list_adapter_router_state(self, user_id: Optional[str] = None) -> list[dict]:
         """Provide an empty adapter router state until persisted in SQL (SPEC §8)."""
