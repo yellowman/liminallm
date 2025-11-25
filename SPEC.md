@@ -286,10 +286,11 @@ USING ivfflat (embedding) WITH (lists = 100);
   - watch filesystem path events; enqueue ingestion job on file change.
   - periodic sweep (daily) to re-embed if encoder version changes.
 - **retrieval strategy**:
-  - at query time, top-K (default 8) by cosine similarity on `knowledge_chunk.embedding` filtered by `context_id`.
+  - primary path: pgvector `ORDER BY embedding <-> $query LIMIT k` filtered by `context_id`.
   - optional re-ranking via lightweight cross-encoder tool if available.
   - return chunk text + `fs_path` for citation; orchestrator can ask LLM to cite paths.
-  - baseline kernel ships with a deterministic hashing-based embedding fallback (no external model dependency) so chunks always have non-empty vectors for cosine search in both Postgres and in-memory stores.
+  - optional dev fallback: in-process hybrid BM25 + cosine search (controlled by `RAG_MODE=local_hybrid`), intended for tests or tiny corpora when pgvector is absent.
+  - baseline kernel ships with a deterministic hashing-based embedding fallback (no external model dependency) shared across RAG/routing/clustering so chunks always have non-empty vectors for cosine search in both Postgres and in-memory stores.
 
 ### 2.6 preferences & training
 

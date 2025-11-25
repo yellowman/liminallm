@@ -882,6 +882,17 @@ class MemoryStore:
         ranked = sorted(combined.values(), key=lambda pair: pair[1], reverse=True)
         return [pair[0] for pair in ranked[:limit]]
 
+    def search_chunks_legacy(
+        self,
+        context_id: Optional[str],
+        query: str,
+        query_embedding: Optional[List[float]],
+        limit: int = 4,
+    ) -> List[KnowledgeChunk]:
+        """Alias to the in-memory hybrid search; not for production scale."""
+
+        return self.search_chunks(context_id, query, query_embedding, limit)
+
     def _persist_state(self) -> None:
         state = {
             "users": [self._serialize_user(u) for u in self.users.values()],
