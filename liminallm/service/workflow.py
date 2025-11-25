@@ -44,6 +44,7 @@ class WorkflowEngine:
         user_message: str,
         context_id: Optional[str],
         user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> dict:
         workflow_schema = None
         if workflow_id:
@@ -92,6 +93,8 @@ class WorkflowEngine:
                 adapters=adapters,
                 history=history,
                 vars_scope=vars_scope,
+                user_id=user_id,
+                tenant_id=tenant_id,
             )
             workflow_trace.append({"node": node_id, **result})
             if result.get("outputs"):
@@ -224,6 +227,8 @@ class WorkflowEngine:
         conversation_id: Optional[str] = None,
         context_id: Optional[str] = None,
         user_message: Optional[str] = None,
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         tool_name = tool_schema.get("name") or tool_schema.get("id")
         if not tool_name:
@@ -243,6 +248,8 @@ class WorkflowEngine:
             context_id=context_id,
             conversation_id=conversation_id,
             user_message=user_message or inputs.get("message") or "",
+            user_id=user_id,
+            tenant_id=tenant_id,
         )
 
     def _default_workflow(self) -> dict:
@@ -325,6 +332,8 @@ class WorkflowEngine:
         adapters: List[dict],
         history: List[Any],
         vars_scope: Dict[str, Any],
+        user_id: Optional[str],
+        tenant_id: Optional[str],
     ) -> Tuple[Dict[str, Any], List[str]]:
         node_type = node.get("type", "tool_call")
         if node_type == "switch":
@@ -346,7 +355,17 @@ class WorkflowEngine:
         if "message" not in inputs and user_message:
             inputs["message"] = user_message
         try:
-            tool_result = self._invoke_tool(tool_name, inputs, adapters, history, context_id, conversation_id, user_message)
+            tool_result = self._invoke_tool(
+                tool_name,
+                inputs,
+                adapters,
+                history,
+                context_id,
+                conversation_id,
+                user_message,
+                user_id=user_id,
+                tenant_id=tenant_id,
+            )
         except Exception as exc:
             self.logger.error("tool_invoke_failed", tool=tool_name, error=str(exc))
             tool_result = {"status": "error", "content": "tool execution failed", "error": str(exc)}
@@ -383,6 +402,9 @@ class WorkflowEngine:
         context_id: Optional[str],
         conversation_id: Optional[str],
         user_message: str,
+        *,
+        user_id: Optional[str],
+        tenant_id: Optional[str],
     ) -> Dict[str, Any]:
         tool_name = tool or "llm.generic"
         tool_spec = self.tool_registry.get(tool_name)
@@ -394,7 +416,16 @@ class WorkflowEngine:
         def _run_handler() -> Dict[str, Any]:
             if not handler:
                 return {"status": "error", "content": f"unknown tool {tool_name}"}
-            return handler(inputs, adapters, history, context_id, conversation_id, user_message)
+            return handler(
+                inputs,
+                adapters,
+                history,
+                context_id,
+                conversation_id,
+                user_message,
+                user_id,
+                tenant_id,
+            )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
             future = executor.submit(_run_handler)
@@ -404,7 +435,12 @@ class WorkflowEngine:
                 self.logger.warning("tool_timeout", tool=tool_name, timeout=timeout)
                 return {"status": "error", "content": "tool timed out", "error": "timeout"}
 
-    def _builtin_tool_handlers(self) -> Dict[str, Callable[[Dict[str, Any], List[dict], List[Any], Optional[str], Optional[str], str], Dict[str, Any]]]:
+    def _builtin_tool_handlers(
+        self,
+    ) -> Dict[
+        str,
+        Callable[[Dict[str, Any], List[dict], List[Any], Optional[str], Optional[str], str, Optional[str], Optional[str]], Dict[str, Any]],
+    ]:
         return {
             "llm.generic": self._tool_llm_generic,
             "llm.generic_chat_v1": self._tool_llm_generic,
@@ -422,6 +458,8 @@ class WorkflowEngine:
         context_id: Optional[str],
         conversation_id: Optional[str],
         user_message: str,
+        user_id: Optional[str],
+        tenant_id: Optional[str],
     ) -> Dict[str, Any]:
         message = inputs.get("message") or inputs.get("prompt") or inputs.get("text") or ""
         if not message:
@@ -432,7 +470,9 @@ class WorkflowEngine:
             message = inputs.get("raw") or ""
         if not message:
             message = ""
-        ctx_chunks = self.rag.retrieve(inputs.get("context_id", context_id), message)
+        ctx_chunks = self.rag.retrieve(
+            inputs.get("context_id", context_id), message, user_id=user_id, tenant_id=tenant_id
+        )
         context_snippets = [c.text for c in ctx_chunks]
         resp = self.llm.generate(message or "", adapters=adapters, context_snippets=context_snippets, history=history)
         return {"content": resp["content"], "usage": resp["usage"], "context_snippets": context_snippets}
@@ -445,10 +485,12 @@ class WorkflowEngine:
         context_id: Optional[str],
         conversation_id: Optional[str],
         user_message: str,
+        user_id: Optional[str],
+        tenant_id: Optional[str],
     ) -> Dict[str, Any]:
         question = inputs.get("question") or inputs.get("message") or ""
         ctx_id = inputs.get("context_id") or context_id
-        chunks = self.rag.retrieve(ctx_id, question)
+        chunks = self.rag.retrieve(ctx_id, question, user_id=user_id, tenant_id=tenant_id)
         snippets = [c.text for c in chunks]
         resp = self.llm.generate(question or "", adapters=adapters, context_snippets=snippets, history=history)
         return {"content": resp["content"], "usage": resp["usage"], "context_snippets": snippets, "answer": resp["content"]}
@@ -461,6 +503,8 @@ class WorkflowEngine:
         context_id: Optional[str],
         conversation_id: Optional[str],
         user_message: str,
+        user_id: Optional[str],
+        tenant_id: Optional[str],
     ) -> Dict[str, Any]:
         message = inputs.get("message") or user_message or ""
         lowered = message.lower()
@@ -477,6 +521,8 @@ class WorkflowEngine:
         context_id: Optional[str],
         conversation_id: Optional[str],
         user_message: str,
+        user_id: Optional[str],
+        tenant_id: Optional[str],
     ) -> Dict[str, Any]:
         prompt = inputs.get("message") or inputs.get("prompt") or ""
         resp = self.llm.generate(prompt or "", adapters=adapters, context_snippets=[], history=history)
@@ -490,6 +536,8 @@ class WorkflowEngine:
         context_id: Optional[str],
         conversation_id: Optional[str],
         user_message: str,
+        user_id: Optional[str],
+        tenant_id: Optional[str],
     ) -> Dict[str, Any]:
         return {"content": inputs.get("message", ""), "usage": {}, "status": "end"}
 

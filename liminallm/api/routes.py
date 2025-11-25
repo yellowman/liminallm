@@ -70,6 +70,47 @@ from liminallm.service.runtime import (
 router = APIRouter(prefix="/v1")
 
 
+class IdempotencyGuard:
+    def __init__(self, route: str, user_id: str, idempotency_key: Optional[str], *, require: bool = False):
+        self.route = route
+        self.user_id = user_id
+        self.idempotency_key = idempotency_key
+        self.require = require
+        self.request_id: Optional[str] = None
+        self.cached: Optional[Envelope] = None
+        self._stored = False
+
+    async def __aenter__(self) -> "IdempotencyGuard":
+        self.request_id, self.cached = await _resolve_idempotency(
+            self.route, self.user_id, self.idempotency_key, require=self.require
+        )
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> bool:
+        if exc and not self._stored and self.request_id:
+            await _store_idempotency_result(
+                self.route,
+                self.user_id,
+                self.idempotency_key,
+                Envelope(status="error", error={"message": str(exc)}, request_id=self.request_id),
+                status="failed",
+            )
+            self._stored = True
+        return False
+
+    async def store_result(self, envelope: Envelope, *, status: str = "completed") -> None:
+        await _store_idempotency_result(self.route, self.user_id, self.idempotency_key, envelope, status=status)
+        self._stored = True
+
+    async def store_error(self, message: str) -> None:
+        if not self.request_id:
+            return
+        await self.store_result(
+            Envelope(status="error", error={"message": message}, request_id=self.request_id),
+            status="failed",
+        )
+
+
 async def _resolve_idempotency(
     route: str, user_id: str, idempotency_key: Optional[str], *, require: bool = False
 ) -> tuple[str, Optional[Envelope]]:
@@ -433,10 +474,9 @@ async def chat(
 ):
     runtime = get_runtime()
     user_id = principal.user_id
-    request_id, cached = await _resolve_idempotency("chat", user_id, idempotency_key, require=True)
-    if cached:
-        return cached
-    try:
+    async with IdempotencyGuard("chat", user_id, idempotency_key, require=True) as idem:
+        if idem.cached:
+            return idem.cached
         if runtime.cache:
             allowed = await runtime.cache.check_rate_limit(
                 f"chat:{user_id}",
@@ -464,7 +504,12 @@ async def chat(
             conversation_id, sender="user", role="user", content=user_content, meta=voice_meta or None
         )
         orchestration = await runtime.workflow.run(
-            body.workflow_id, conversation_id, user_content, body.context_id, user_id
+            body.workflow_id,
+            conversation_id,
+            user_content,
+            body.context_id,
+            user_id,
+            tenant_id=principal.tenant_id,
         )
         assistant_msg = runtime.store.append_message(
             conversation_id,
@@ -491,30 +536,13 @@ async def chat(
             routing_trace=orchestration.get("routing_trace", []),
             workflow_trace=orchestration.get("workflow_trace", []),
         )
-        envelope = Envelope(status="ok", data=resp.model_dump(), request_id=request_id)
+        envelope = Envelope(status="ok", data=resp.model_dump(), request_id=idem.request_id)
         if runtime.cache:
             history = runtime.store.list_messages(conversation_id)
             await runtime.workflow.cache_conversation_state(conversation_id, history)
-        await _store_idempotency_result("chat", user_id, idempotency_key, envelope)
+        await idem.store_result(envelope)
         return envelope
-    except HTTPException as http_exc:
-        await _store_idempotency_result(
-            "chat",
-            user_id,
-            idempotency_key,
-            Envelope(status="error", error={"message": http_exc.detail}, request_id=request_id),
-            status="error",
-        )
-        raise
-    except Exception as exc:
-        await _store_idempotency_result(
-            "chat",
-            user_id,
-            idempotency_key,
-            Envelope(status="error", error={"message": str(exc)}, request_id=request_id),
-            status="error",
-        )
-        raise
+    # Exceptions bubble through the guard which records failed states
 
 
 @router.post("/preferences", response_model=Envelope)
@@ -726,29 +754,33 @@ async def invoke_tool(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     runtime = get_runtime()
-    request_id, cached = await _resolve_idempotency(f"tools:{tool_id}:invoke", principal.user_id, idempotency_key, require=True)
-    if cached:
-        return cached
-    artifact = runtime.store.get_artifact(tool_id)
-    if not artifact or not (isinstance(artifact.schema, dict) and artifact.schema.get("kind") == "tool.spec"):
-        raise NotFoundError("tool spec not found", detail={"artifact_id": tool_id})
-    result = runtime.workflow.invoke_tool(
-        artifact.schema,
-        body.inputs or {},
-        conversation_id=body.conversation_id,
-        context_id=body.context_id,
-        user_message=body.user_message,
-    )
-    response = ToolInvokeResponse(
-        status=result.get("status", "ok") if isinstance(result, dict) else "ok",
-        outputs=result.get("outputs", {}) if isinstance(result, dict) else {},
-        content=result.get("content") if isinstance(result, dict) else None,
-        usage=result.get("usage") if isinstance(result, dict) else None,
-        context_snippets=result.get("context_snippets") if isinstance(result, dict) else None,
-    )
-    envelope = Envelope(status="ok", data=response, request_id=request_id)
-    await _store_idempotency_result(f"tools:{tool_id}:invoke", principal.user_id, idempotency_key, envelope)
-    return envelope
+    async with IdempotencyGuard(
+        f"tools:{tool_id}:invoke", principal.user_id, idempotency_key, require=True
+    ) as idem:
+        if idem.cached:
+            return idem.cached
+        artifact = runtime.store.get_artifact(tool_id)
+        if not artifact or not (isinstance(artifact.schema, dict) and artifact.schema.get("kind") == "tool.spec"):
+            raise NotFoundError("tool spec not found", detail={"artifact_id": tool_id})
+        result = runtime.workflow.invoke_tool(
+            artifact.schema,
+            body.inputs or {},
+            conversation_id=body.conversation_id,
+            context_id=body.context_id,
+            user_message=body.user_message,
+            user_id=principal.user_id,
+            tenant_id=principal.tenant_id,
+        )
+        response = ToolInvokeResponse(
+            status=result.get("status", "ok") if isinstance(result, dict) else "ok",
+            outputs=result.get("outputs", {}) if isinstance(result, dict) else {},
+            content=result.get("content") if isinstance(result, dict) else None,
+            usage=result.get("usage") if isinstance(result, dict) else None,
+            context_snippets=result.get("context_snippets") if isinstance(result, dict) else None,
+        )
+        envelope = Envelope(status="ok", data=response, request_id=idem.request_id)
+        await idem.store_result(envelope)
+        return envelope
 
 
 @router.post("/artifacts", response_model=Envelope)
@@ -758,13 +790,9 @@ async def create_artifact(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     runtime = get_runtime()
-    request_id: Optional[str] = None
-    try:
-        request_id, cached = await _resolve_idempotency(
-            "artifacts:create", principal.user_id, idempotency_key, require=True
-        )
-        if cached:
-            return cached
+    async with IdempotencyGuard("artifacts:create", principal.user_id, idempotency_key, require=True) as idem:
+        if idem.cached:
+            return idem.cached
         if not isinstance(body.schema, dict):
             raise BadRequestError("artifact schema must be an object", detail={"provided_type": type(body.schema).__name__})
         schema_kind = body.schema.get("kind")
@@ -797,18 +825,9 @@ async def create_artifact(
             created_at=artifact.created_at,
             updated_at=artifact.updated_at,
         )
-        envelope = Envelope(status="ok", data=resp, request_id=request_id)
-        await _store_idempotency_result("artifacts:create", principal.user_id, idempotency_key, envelope)
+        envelope = Envelope(status="ok", data=resp, request_id=idem.request_id)
+        await idem.store_result(envelope)
         return envelope
-    except Exception as exc:
-        await _store_idempotency_result(
-            "artifacts:create",
-            principal.user_id,
-            idempotency_key,
-            Envelope(status="error", error={"message": str(exc)}, request_id=request_id),
-            status="error",
-        )
-        raise
 
 
 @router.patch("/artifacts/{artifact_id}", response_model=Envelope)
@@ -947,25 +966,25 @@ async def upload_file(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     runtime = get_runtime()
-    request_id, cached = await _resolve_idempotency("files:upload", principal.user_id, idempotency_key, require=True)
-    if cached:
-        return cached
-    dest_dir = Path(runtime.settings.shared_fs_root) / "users" / principal.user_id / "files"
-    contents = await file.read()
-    dest_path = safe_join(dest_dir, file.filename)
-    dest_path.parent.mkdir(parents=True, exist_ok=True)
-    dest_path.write_bytes(contents)
-    chunk_count = None
-    if context_id:
-        try:
-            chunk_count = runtime.rag.ingest_file(context_id, str(dest_path), chunk_size=chunk_size)
-        except ConstraintViolation:
-            dest_path.unlink(missing_ok=True)
-            raise
-    resp = FileUploadResponse(fs_path=str(dest_path), context_id=context_id, chunk_count=chunk_count)
-    envelope = Envelope(status="ok", data=resp, request_id=request_id)
-    await _store_idempotency_result("files:upload", principal.user_id, idempotency_key, envelope)
-    return envelope
+    async with IdempotencyGuard("files:upload", principal.user_id, idempotency_key, require=True) as idem:
+        if idem.cached:
+            return idem.cached
+        dest_dir = Path(runtime.settings.shared_fs_root) / "users" / principal.user_id / "files"
+        contents = await file.read()
+        dest_path = safe_join(dest_dir, file.filename)
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        dest_path.write_bytes(contents)
+        chunk_count = None
+        if context_id:
+            try:
+                chunk_count = runtime.rag.ingest_file(context_id, str(dest_path), chunk_size=chunk_size)
+            except ConstraintViolation:
+                dest_path.unlink(missing_ok=True)
+                raise
+        resp = FileUploadResponse(fs_path=str(dest_path), context_id=context_id, chunk_count=chunk_count)
+        envelope = Envelope(status="ok", data=resp, request_id=idem.request_id)
+        await idem.store_result(envelope)
+        return envelope
 
 
 @router.get("/conversations/{conversation_id}/messages", response_model=Envelope)
@@ -1012,30 +1031,30 @@ async def create_context(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     runtime = get_runtime()
-    request_id, cached = await _resolve_idempotency("contexts:create", principal.user_id, idempotency_key, require=True)
-    if cached:
-        return cached
-    ctx_meta = {"embedding_model_id": runtime.rag.embedding_model_id}
-    ctx = runtime.store.upsert_context(
-        owner_user_id=principal.user_id, name=body.name, description=body.description, meta=ctx_meta
-    )
-    if body.text:
-        runtime.rag.ingest_text(ctx.id, body.text, chunk_size=body.chunk_size)
-    envelope = Envelope(
-        status="ok",
-        data=KnowledgeContextResponse(
-            id=ctx.id,
-            name=ctx.name,
-            description=ctx.description,
-            created_at=ctx.created_at,
-            updated_at=ctx.updated_at,
-            owner_user_id=ctx.owner_user_id,
-            meta=ctx.meta,
-        ),
-        request_id=request_id,
-    )
-    await _store_idempotency_result("contexts:create", principal.user_id, idempotency_key, envelope)
-    return envelope
+    async with IdempotencyGuard("contexts:create", principal.user_id, idempotency_key, require=True) as idem:
+        if idem.cached:
+            return idem.cached
+        ctx_meta = {"embedding_model_id": runtime.rag.embedding_model_id}
+        ctx = runtime.store.upsert_context(
+            owner_user_id=principal.user_id, name=body.name, description=body.description, meta=ctx_meta
+        )
+        if body.text:
+            runtime.rag.ingest_text(ctx.id, body.text, chunk_size=body.chunk_size)
+        envelope = Envelope(
+            status="ok",
+            data=KnowledgeContextResponse(
+                id=ctx.id,
+                name=ctx.name,
+                description=ctx.description,
+                created_at=ctx.created_at,
+                updated_at=ctx.updated_at,
+                owner_user_id=ctx.owner_user_id,
+                meta=ctx.meta,
+            ),
+            request_id=idem.request_id,
+        )
+        await idem.store_result(envelope)
+        return envelope
 
 
 @router.get("/contexts", response_model=Envelope)
@@ -1109,7 +1128,12 @@ async def websocket_chat(ws: WebSocket):
         convo_id = init.get("conversation_id") or runtime.store.create_conversation(user_id=user_id).id
         runtime.store.append_message(convo_id, sender="user", role="user", content=init.get("message", ""))
         orchestration = await runtime.workflow.run(
-            init.get("workflow_id"), convo_id, init.get("message", ""), init.get("context_id"), user_id
+            init.get("workflow_id"),
+            convo_id,
+            init.get("message", ""),
+            init.get("context_id"),
+            user_id,
+            tenant_id=auth_ctx.tenant_id,
         )
         assistant_msg = runtime.store.append_message(
             convo_id,

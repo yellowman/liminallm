@@ -43,16 +43,30 @@ class Runtime:
                 self.cache = None
 
         if not self.cache:
-            if not self.settings.allow_redis_fallback_dev:
+            if not self.settings.test_mode:
+                if self.settings.allow_redis_fallback_dev:
+                    logger.warning(
+                        "redis_fallback_blocked_without_test_mode",
+                        redis_url=self.settings.redis_url,
+                        error=str(redis_error) if redis_error else "redis_url_missing",
+                        message=(
+                            "Redis is required; set TEST_MODE=true for explicit test harnesses or start Redis. "
+                            "ALLOW_REDIS_FALLBACK_DEV is ignored without TEST_MODE."
+                        ),
+                    )
                 raise RuntimeError(
                     "Redis is required for sessions, rate limits, idempotency, and workflow caches; "
-                    "start Redis or set ALLOW_REDIS_FALLBACK_DEV=true for dev-only fallback."
+                    "start Redis or set TEST_MODE=true for explicit test harnesses."
                 ) from redis_error
+
             logger.warning(
-                "redis_disabled_dev_fallback",
+                "redis_disabled_test_mode",
                 redis_url=self.settings.redis_url,
                 error=str(redis_error) if redis_error else "redis_url_missing",
-                message="Running without Redis; rate limits, idempotency durability, and workflow/router caches are disabled.",
+                message=(
+                    "Running without Redis under TEST_MODE; rate limits, idempotency durability, and workflow/router caches "
+                    "are disabled."
+                ),
             )
         self.router = RouterEngine(cache=self.cache)
         runtime_config = {}
