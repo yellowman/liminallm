@@ -3,6 +3,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from ipaddress import IPv4Address, IPv6Address, ip_address
 from typing import Dict, List, Optional
 
 
@@ -26,7 +27,7 @@ class Session:
     created_at: datetime
     expires_at: datetime
     user_agent: Optional[str] = None
-    ip_addr: Optional[str] = None
+    ip_addr: IPv4Address | IPv6Address | None = None
     mfa_required: bool = False
     mfa_verified: bool = False
     tenant_id: str = "public"
@@ -38,20 +39,21 @@ class Session:
         user_id: str,
         ttl_minutes: int = 60 * 24,
         user_agent: str | None = None,
-        ip_addr: str | None = None,
+        ip_addr: IPv4Address | IPv6Address | str | None = None,
         *,
         mfa_required: bool = False,
         tenant_id: str = "public",
         meta: Dict | None = None,
     ) -> "Session":
         now = datetime.utcnow()
+        parsed_ip = ip_address(ip_addr) if isinstance(ip_addr, str) else ip_addr
         return cls(
             id=str(uuid.uuid4()),
             user_id=user_id,
             created_at=now,
             expires_at=now + timedelta(minutes=ttl_minutes),
             user_agent=user_agent,
-            ip_addr=ip_addr,
+            ip_addr=parsed_ip,
             mfa_required=mfa_required,
             mfa_verified=not mfa_required,
             tenant_id=tenant_id,
@@ -106,9 +108,9 @@ class Message:
     sender: str
     role: str
     content: str
-    content_struct: Optional[dict] = None
     seq: int
     created_at: datetime
+    content_struct: Optional[dict] = None
     token_count_in: Optional[int] = None
     token_count_out: Optional[int] = None
     meta: Dict | None = None
@@ -181,12 +183,12 @@ class ContextSource:
 
 @dataclass
 class KnowledgeChunk:
-    id: int = 0
     context_id: str
     fs_path: str
     content: str
     embedding: List[float]
     chunk_index: int
+    id: int = 0
     created_at: datetime = field(default_factory=datetime.utcnow)
     meta: Dict | None = None
 

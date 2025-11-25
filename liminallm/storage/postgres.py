@@ -6,6 +6,7 @@ import re
 import uuid
 from datetime import datetime
 from pathlib import Path
+from ipaddress import ip_address
 from typing import Any, Iterable, List, Optional, Sequence
 
 import psycopg
@@ -925,7 +926,7 @@ class PostgresStore:
                         sess.created_at,
                         sess.expires_at,
                         user_agent,
-                        ip_addr,
+                        str(sess.ip_addr) if sess.ip_addr is not None else None,
                         mfa_required,
                         sess.mfa_verified,
                         json.dumps(meta) if meta else None,
@@ -964,13 +965,14 @@ class PostgresStore:
                 meta = json.loads(meta)
             except Exception:
                 meta = None
+        raw_ip = row.get("ip_addr")
         sess = Session(
             id=str(row["id"]),
             user_id=str(row["user_id"]),
             created_at=row.get("created_at", datetime.utcnow()),
             expires_at=row.get("expires_at", datetime.utcnow()),
             user_agent=row.get("user_agent"),
-            ip_addr=row.get("ip_addr"),
+            ip_addr=ip_address(raw_ip) if isinstance(raw_ip, str) and raw_ip else raw_ip,
             mfa_required=row.get("mfa_required", False),
             mfa_verified=row.get("mfa_verified", False),
             tenant_id=row.get("tenant_id", "public"),

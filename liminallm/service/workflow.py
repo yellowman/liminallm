@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import concurrent.futures
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from liminallm.logging import get_logger
 
@@ -450,7 +450,7 @@ class WorkflowEngine:
             "workflow.end": self._tool_end,
         }
 
-    def _resolve_context_ids(self, provided: Any, fallback: Optional[str]) -> Optional[List[str]]:
+    def _resolve_context_ids(self, provided: Any, fallback: Optional[str]) -> Optional[Sequence[str]]:
         ctx_ids = provided or fallback
         if isinstance(ctx_ids, str):
             return [ctx_ids]

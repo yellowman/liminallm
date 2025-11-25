@@ -6,6 +6,7 @@ import hashlib
 import math
 import re
 from datetime import datetime, timedelta
+from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
@@ -1142,7 +1143,7 @@ class MemoryStore:
             "created_at": self._serialize_datetime(session.created_at),
             "expires_at": self._serialize_datetime(session.expires_at),
             "user_agent": session.user_agent,
-            "ip_addr": session.ip_addr,
+            "ip_addr": str(session.ip_addr) if session.ip_addr is not None else None,
             "mfa_required": session.mfa_required,
             "mfa_verified": session.mfa_verified,
             "tenant_id": session.tenant_id,
@@ -1150,13 +1151,14 @@ class MemoryStore:
         }
 
     def _deserialize_session(self, data: dict) -> Session:
+        raw_ip = data.get("ip_addr")
         return Session(
             id=data["id"],
             user_id=data["user_id"],
             created_at=self._deserialize_datetime(data["created_at"]),
             expires_at=self._deserialize_datetime(data["expires_at"]),
             user_agent=data.get("user_agent"),
-            ip_addr=data.get("ip_addr"),
+            ip_addr=ip_address(raw_ip) if isinstance(raw_ip, str) and raw_ip else raw_ip,
             mfa_required=data.get("mfa_required", False),
             mfa_verified=data.get("mfa_verified", False),
             tenant_id=data.get("tenant_id", "public"),
