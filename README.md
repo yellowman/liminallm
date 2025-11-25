@@ -130,7 +130,7 @@ for v1 these can all live in one python app with clear module boundaries.
 ### implementation completeness (prototype)
 
 - **implemented**
-  - file upload endpoint writing to the shared filesystem and ingesting chunks into RAG contexts with configurable chunk sizes, hybrid BM25 + semantic search, and deduped reranking over hashed embeddings
+  - file upload endpoint writing to the shared filesystem and ingesting chunks into RAG contexts with configurable chunk sizes; default retrieval runs against pgvector with shared deterministic embeddings (optional in-process hybrid fallback for dev/test)
   - workflow execution with branching/parallel scheduling across `workflow.chat` graphs
   - router policies with a sandboxed evaluation engine (limited adapter gating usage)
   - pluggable model backend that can target external API fine-tune IDs or local JAX+LoRA adapter application
@@ -228,6 +228,7 @@ for v1 these can all live in one python app with clear module boundaries.
    - `ADAPTER_SERVER_MODEL` – model name when pointing at an OpenAI-compatible adapter server
    - `USE_MEMORY_STORE` – set to `true` to run without Postgres/Redis while testing the API and LLM calls
    - `RAG_CHUNK_SIZE` – default character window for knowledge ingestion; overrides can be provided per request
+   - `RAG_MODE` – `pgvector` (default) uses the database index; `local_hybrid` forces the in-process BM25+cosine fallback for dev/test
 
 3. **migrate db**
    - run the alembic / migration tool to create tables described in the spec.

@@ -60,7 +60,11 @@ class Runtime:
             adapter_server_model=self.settings.adapter_server_model,
             fs_root=self.settings.shared_fs_root,
         )
-        self.rag = RAGService(self.store, default_chunk_size=self.settings.rag_chunk_size)
+        self.rag = RAGService(
+            self.store,
+            default_chunk_size=self.settings.rag_chunk_size,
+            rag_mode=self.settings.rag_mode,
+        )
         self.training = TrainingService(
             self.store, self.settings.shared_fs_root, runtime_base_model=resolved_base_model
         )

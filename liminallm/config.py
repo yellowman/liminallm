@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     refresh_token_ttl_minutes: int = Field(24 * 60, env="REFRESH_TOKEN_TTL_MINUTES")
     default_tenant_id: str = Field("public", env="DEFAULT_TENANT_ID")
     rag_chunk_size: int = Field(400, env="RAG_CHUNK_SIZE")
+    rag_mode: str = Field("pgvector", env="RAG_MODE")
 
     class Config:
         env_file = ".env"

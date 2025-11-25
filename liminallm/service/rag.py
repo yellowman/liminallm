@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import hashlib
 import math
-import re
+import os
 import uuid
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional, Sequence
 
+from liminallm.service.embeddings import deterministic_embedding
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.postgres import PostgresStore
 from liminallm.storage.models import KnowledgeChunk
@@ -15,17 +15,40 @@ from liminallm.storage.models import KnowledgeChunk
 class RAGService:
     """Hybrid retriever against knowledge chunks."""
 
-    def __init__(self, store: PostgresStore | MemoryStore, default_chunk_size: int = 400) -> None:
+    def __init__(
+        self,
+        store: PostgresStore | MemoryStore,
+        default_chunk_size: int = 400,
+        *,
+        rag_mode: str | None = None,
+        embed: Callable[[str], List[float]] = deterministic_embedding,
+    ) -> None:
         self.store = store
         self.default_chunk_size = max(default_chunk_size, 64)
+        self.rag_mode = (rag_mode or os.getenv("RAG_MODE") or "pgvector").lower()
+        self.embed = embed
 
     def retrieve(self, context_id: Optional[str], query: Optional[str], limit: int = 4) -> List[KnowledgeChunk]:
-        if hasattr(self.store, "search_chunks"):
-            query_embedding = self.embed_text(query or "") if query else None
-            return self.store.search_chunks(  # type: ignore[attr-defined]
-                context_id, query or "", query_embedding, limit
+        if not query:
+            return []
+
+        query_embedding = self.embed(query)
+        contexts: Sequence[str] | None = [context_id] if context_id else None
+
+        if self.rag_mode != "local_hybrid" and hasattr(self.store, "search_chunks_pgvector"):
+            return self.store.search_chunks_pgvector(  # type: ignore[attr-defined]
+                contexts, query_embedding, limit
             )
-        return []
+
+        if hasattr(self.store, "search_chunks_legacy"):
+            return self.store.search_chunks_legacy(  # type: ignore[attr-defined]
+                context_id, query, query_embedding, limit
+            )
+        if hasattr(self.store, "search_chunks"):
+            return self.store.search_chunks(  # type: ignore[attr-defined]
+                context_id, query, query_embedding, limit
+            )
+        return []  # pragma: no cover
 
     def ingest_text(
         self, context_id: str, text: str, chunk_size: Optional[int] = None, source_path: Optional[str] = None
@@ -45,7 +68,7 @@ class RAGService:
                     id=str(uuid.uuid4()),
                     context_id=context_id,
                     text=segment,
-                    embedding=self.embed_text(segment),
+                    embedding=self.embed(segment),
                     seq=math.floor(idx / chosen_chunk),
                     meta={"fs_path": source_path} if source_path else None,
                 )
@@ -58,17 +81,7 @@ class RAGService:
         data = Path(path).read_text(encoding="utf-8", errors="ignore")
         return self.ingest_text(context_id, data, chunk_size=chunk_size, source_path=path)
 
-    def embed_text(self, text: str, dim: int = 64) -> List[float]:
-        tokens = self._tokenize(text)
-        if not tokens:
-            return [0.0 for _ in range(dim)]
-        vec = [0.0 for _ in range(dim)]
-        for token in tokens:
-            h = int(hashlib.sha256(token.encode()).hexdigest(), 16)
-            vec[h % dim] += 1.0
-        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
-        return [v / norm for v in vec]
+    def embed_text(self, text: str) -> List[float]:
+        """Backward-compatible hook: use the deterministic embedding pipeline."""
 
-    @staticmethod
-    def _tokenize(text: str) -> List[str]:
-        return re.findall(r"\w+", text.lower())
+        return self.embed(text)

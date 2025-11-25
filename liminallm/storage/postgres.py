@@ -1327,13 +1327,62 @@ class PostgresStore:
             )
         return chunks
 
-    def search_chunks(
+    def _format_vector(self, embedding: Sequence[float]) -> str:
+        return "[" + ",".join(f"{float(val):.6f}" for val in embedding) + "]"
+
+    def search_chunks_pgvector(
+        self,
+        context_ids: Optional[Sequence[str]],
+        query_embedding: List[float],
+        limit: int = 4,
+        filters: Optional[dict[str, Any]] = None,
+    ) -> List[KnowledgeChunk]:
+        """Primary pgvector-backed retrieval over knowledge chunks."""
+
+        if not query_embedding:
+            return []
+        where_clauses: list[str] = []
+        params: list[Any] = []
+        if context_ids:
+            where_clauses.append("context_id = ANY(%s)")
+            params.append(list(context_ids))
+        if filters and filters.get("fs_path"):
+            where_clauses.append("meta->>'fs_path' = %s")
+            params.append(filters["fs_path"])
+        where = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT id, context_id, text, embedding, seq, created_at, meta
+                FROM knowledge_chunk
+                {where}
+                ORDER BY embedding <-> %s::vector
+                LIMIT %s
+                """,
+                (*params, self._format_vector(query_embedding), limit),
+            ).fetchall()
+        return [
+            KnowledgeChunk(
+                id=str(row["id"]),
+                context_id=str(row["context_id"]),
+                text=row["text"],
+                embedding=row.get("embedding") or [],
+                seq=row.get("seq", 0),
+                created_at=row.get("created_at", datetime.utcnow()),
+                meta=row.get("meta"),
+            )
+            for row in rows
+        ]
+
+    def search_chunks_legacy(
         self,
         context_id: Optional[str],
         query: str,
         query_embedding: Optional[List[float]],
         limit: int = 4,
     ) -> List[KnowledgeChunk]:
+        """Non-pgvector hybrid search; suitable for tests and tiny corpora only."""
+
         def _tokenize(text: str) -> List[str]:
             return re.findall(r"\w+", text.lower())
 
