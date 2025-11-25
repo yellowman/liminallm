@@ -619,7 +619,12 @@ class MemoryStore:
 
     # artifacts
     def list_artifacts(
-        self, type_filter: Optional[str] = None, kind_filter: Optional[str] = None
+        self,
+        type_filter: Optional[str] = None,
+        kind_filter: Optional[str] = None,
+        *,
+        page: int = 1,
+        page_size: int = 100,
     ) -> List[Artifact]:
         artifacts = list(self.artifacts.values())
         if type_filter:
@@ -630,7 +635,9 @@ class MemoryStore:
                 for a in artifacts
                 if isinstance(a.schema, dict) and a.schema.get("kind") == kind_filter
             ]
-        return artifacts
+        start = max(page - 1, 0) * max(page_size, 1)
+        end = start + max(page_size, 1)
+        return artifacts[start:end]
 
     def get_artifact(self, artifact_id: str) -> Optional[Artifact]:
         return self.artifacts.get(artifact_id)
@@ -786,11 +793,15 @@ class MemoryStore:
             return None
         return versions[-1].schema
 
-    def upsert_context(self, owner_user_id: Optional[str], name: str, description: str, fs_path: Optional[str] = None) -> KnowledgeContext:
+    def upsert_context(
+        self, owner_user_id: Optional[str], name: str, description: str, fs_path: Optional[str] = None, meta: Optional[dict] = None
+    ) -> KnowledgeContext:
         if owner_user_id and owner_user_id not in self.users:
             raise ConstraintViolation("context owner missing", {"owner_user_id": owner_user_id})
         ctx_id = str(uuid.uuid4())
-        ctx = KnowledgeContext(id=ctx_id, owner_user_id=owner_user_id, name=name, description=description, fs_path=fs_path)
+        ctx = KnowledgeContext(
+            id=ctx_id, owner_user_id=owner_user_id, name=name, description=description, fs_path=fs_path, meta=meta
+        )
         self.contexts[ctx.id] = ctx
         self._persist_state()
         return ctx
@@ -881,6 +892,15 @@ class MemoryStore:
                 combined[key] = (chunk, hybrid)
         ranked = sorted(combined.values(), key=lambda pair: pair[1], reverse=True)
         return [pair[0] for pair in ranked[:limit]]
+
+    def search_chunks_pgvector(
+        self, context_ids: Optional[Sequence[str]], query_embedding: List[float], limit: int = 4, filters: Optional[dict] = None
+    ) -> List[KnowledgeChunk]:
+        context_id = context_ids[0] if context_ids else None
+        chunks = self.search_chunks(context_id, "", query_embedding, limit)
+        if filters and filters.get("embedding_model_id"):
+            chunks = [c for c in chunks if (c.meta or {}).get("embedding_model_id") == filters.get("embedding_model_id")]
+        return chunks
 
     def search_chunks_legacy(
         self,

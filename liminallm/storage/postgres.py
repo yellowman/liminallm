@@ -83,61 +83,93 @@ class PostgresStore:
 
         existing = self.list_artifacts()
         if any(artifact.name == "default_chat_workflow" for artifact in existing):
-            return
+            seeded_workflow = True
+        else:
+            seeded_workflow = False
 
-        default_schema = {
-            "kind": "workflow.chat",
-            "entrypoint": "classify",
-            "nodes": [
-                {
-                    "id": "classify",
-                    "type": "tool_call",
-                    "tool": "llm.intent_classifier_v1",
-                    "inputs": {"message": "${input.message}"},
-                    "outputs": ["intent"],
-                    "next": "route",
-                },
-                {
-                    "id": "route",
-                    "type": "switch",
-                    "branches": [
-                        {"when": "vars.intent == 'qa_with_docs'", "next": "rag"},
-                        {"when": "vars.intent == 'code_edit'", "next": "code"},
-                        {"when": "true", "next": "plain_chat"},
-                    ],
-                },
-                {
-                    "id": "rag",
-                    "type": "tool_call",
-                    "tool": "rag.answer_with_context_v1",
-                    "inputs": {"message": "${input.message}"},
-                    "next": "end",
-                },
-                {
-                    "id": "code",
-                    "type": "tool_call",
-                    "tool": "agent.code_v1",
-                    "inputs": {"message": "${input.message}"},
-                    "next": "end",
-                },
-                {
-                    "id": "plain_chat",
-                    "type": "tool_call",
-                    "tool": "llm.generic",
-                    "inputs": {"message": "${input.message}"},
-                    "next": "end",
-                },
-                {"id": "end", "type": "end"},
-            ],
-        }
-        self.create_artifact(
-            "workflow",
-            "default_chat_workflow",
-            default_schema,
-            "LLM-only chat workflow defined as data.",
-            created_by="system_llm",
-            change_note="Seeded default workflow",
-        )
+        if not seeded_workflow:
+            default_schema = {
+                "kind": "workflow.chat",
+                "entrypoint": "classify",
+                "nodes": [
+                    {
+                        "id": "classify",
+                        "type": "tool_call",
+                        "tool": "llm.intent_classifier_v1",
+                        "inputs": {"message": "${input.message}"},
+                        "outputs": ["intent"],
+                        "next": "route",
+                    },
+                    {
+                        "id": "route",
+                        "type": "switch",
+                        "branches": [
+                            {"when": "vars.intent == 'qa_with_docs'", "next": "rag"},
+                            {"when": "vars.intent == 'code_edit'", "next": "code"},
+                            {"when": "true", "next": "plain_chat"},
+                        ],
+                    },
+                    {
+                        "id": "rag",
+                        "type": "tool_call",
+                        "tool": "rag.answer_with_context_v1",
+                        "inputs": {"message": "${input.message}"},
+                        "next": "end",
+                    },
+                    {
+                        "id": "code",
+                        "type": "tool_call",
+                        "tool": "agent.code_v1",
+                        "inputs": {"message": "${input.message}"},
+                        "next": "end",
+                    },
+                    {
+                        "id": "plain_chat",
+                        "type": "tool_call",
+                        "tool": "llm.generic",
+                        "inputs": {"message": "${input.message}"},
+                        "next": "end",
+                    },
+                    {"id": "end", "type": "end"},
+                ],
+            }
+            self.create_artifact(
+                "workflow",
+                "default_chat_workflow",
+                default_schema,
+                "LLM-only chat workflow defined as data.",
+                created_by="system_llm",
+                change_note="Seeded default workflow",
+            )
+
+        seeded_tools = {art.schema.get("name") for art in existing if isinstance(art.schema, dict) and art.schema.get("kind") == "tool.spec"}
+        default_tools = [
+            {
+                "kind": "tool.spec",
+                "name": "llm.generic",
+                "description": "Plain chat response from the base model.",
+                "inputs": {"message": {"type": "string"}},
+                "handler": "llm.generic",
+            },
+            {
+                "kind": "tool.spec",
+                "name": "rag.answer_with_context_v1",
+                "description": "Retrieval augmented answer with pgvector context.",
+                "inputs": {"message": {"type": "string"}, "context_id": {"type": "string", "optional": True}},
+                "handler": "rag.answer_with_context_v1",
+            },
+        ]
+        for spec in default_tools:
+            if spec["name"] in seeded_tools:
+                continue
+            self.create_artifact(
+                "tool",
+                spec["name"],
+                spec,
+                spec.get("description", ""),
+                created_by="system_llm",
+                change_note="Seeded default tool spec",
+            )
 
     # preference events
     def record_preference_event(
@@ -938,22 +970,33 @@ class PostgresStore:
 
     # artifacts
     def list_artifacts(
-        self, type_filter: Optional[str] = None, kind_filter: Optional[str] = None
+        self,
+        type_filter: Optional[str] = None,
+        kind_filter: Optional[str] = None,
+        *,
+        page: int = 1,
+        page_size: int = 100,
     ) -> List[Artifact]:
+        offset = max(page - 1, 0) * max(page_size, 1)
+        limit = max(page_size, 1)
         with self._connect() as conn:
             if type_filter and kind_filter:
                 rows = conn.execute(
-                    "SELECT * FROM artifact WHERE type = %s AND schema->>'kind' = %s",
-                    (type_filter, kind_filter),
+                    "SELECT * FROM artifact WHERE type = %s AND schema->>'kind' = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                    (type_filter, kind_filter, limit, offset),
                 ).fetchall()
             elif kind_filter:
                 rows = conn.execute(
-                    "SELECT * FROM artifact WHERE schema->>'kind' = %s", (kind_filter,)
+                    "SELECT * FROM artifact WHERE schema->>'kind' = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                    (kind_filter, limit, offset),
                 ).fetchall()
             elif type_filter:
-                rows = conn.execute("SELECT * FROM artifact WHERE type = %s", (type_filter,)).fetchall()
+                rows = conn.execute(
+                    "SELECT * FROM artifact WHERE type = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
+                    (type_filter, limit, offset),
+                ).fetchall()
             else:
-                rows = conn.execute("SELECT * FROM artifact", ()).fetchall()
+                rows = conn.execute("SELECT * FROM artifact ORDER BY created_at DESC LIMIT %s OFFSET %s", (limit, offset)).fetchall()
         artifacts: List[Artifact] = []
         for row in rows:
             artifacts.append(
@@ -1252,17 +1295,21 @@ class PostgresStore:
             return {}
 
     # knowledge
-    def upsert_context(self, owner_user_id: Optional[str], name: str, description: str, fs_path: Optional[str] = None) -> KnowledgeContext:
+    def upsert_context(
+        self, owner_user_id: Optional[str], name: str, description: str, fs_path: Optional[str] = None, meta: Optional[dict] = None
+    ) -> KnowledgeContext:
         ctx_id = str(uuid.uuid4())
         try:
             with self._connect() as conn:
                 conn.execute(
-                    "INSERT INTO knowledge_context (id, owner_user_id, name, description, fs_path) VALUES (%s, %s, %s, %s, %s)",
-                    (ctx_id, owner_user_id, name, description, fs_path),
+                    "INSERT INTO knowledge_context (id, owner_user_id, name, description, fs_path, meta) VALUES (%s, %s, %s, %s, %s, %s)",
+                    (ctx_id, owner_user_id, name, description, fs_path, meta),
                 )
         except errors.ForeignKeyViolation:
             raise ConstraintViolation("context owner missing", {"owner_user_id": owner_user_id})
-        return KnowledgeContext(id=ctx_id, owner_user_id=owner_user_id, name=name, description=description, fs_path=fs_path)
+        return KnowledgeContext(
+            id=ctx_id, owner_user_id=owner_user_id, name=name, description=description, fs_path=fs_path, meta=meta
+        )
 
     def list_contexts(self, owner_user_id: Optional[str] = None) -> List[KnowledgeContext]:
         with self._connect() as conn:
@@ -1349,6 +1396,9 @@ class PostgresStore:
         if filters and filters.get("fs_path"):
             where_clauses.append("meta->>'fs_path' = %s")
             params.append(filters["fs_path"])
+        if filters and filters.get("embedding_model_id"):
+            where_clauses.append("meta->>'embedding_model_id' = %s")
+            params.append(filters["embedding_model_id"])
         where = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         with self._connect() as conn:
             rows = conn.execute(

@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     default_tenant_id: str = Field("public", env="DEFAULT_TENANT_ID")
     rag_chunk_size: int = Field(400, env="RAG_CHUNK_SIZE")
     rag_mode: str = Field("pgvector", env="RAG_MODE")
+    embedding_model_id: str = Field("text-embedding", env="EMBEDDING_MODEL_ID")
 
     class Config:
         env_file = ".env"

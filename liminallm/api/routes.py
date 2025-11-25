@@ -29,6 +29,8 @@ from liminallm.api.schemas import (
     MFARequest,
     MFAVerifyRequest,
     AutoPatchRequest,
+    OAuthStartRequest,
+    OAuthStartResponse,
     PasswordResetConfirm,
     PasswordResetRequest,
     SignupRequest,
@@ -48,6 +50,10 @@ from liminallm.api.schemas import (
     AdminCreateUserRequest,
     UpdateUserRoleRequest,
     AdminInspectionResponse,
+    ToolInvokeRequest,
+    ToolInvokeResponse,
+    ToolSpecListResponse,
+    WorkflowListResponse,
 )
 from liminallm.service.auth import AuthContext
 from liminallm.service.errors import BadRequestError, NotFoundError
@@ -65,11 +71,13 @@ router = APIRouter(prefix="/v1")
 
 
 async def _resolve_idempotency(
-    route: str, user_id: str, idempotency_key: Optional[str]
+    route: str, user_id: str, idempotency_key: Optional[str], *, require: bool = False
 ) -> tuple[str, Optional[Envelope]]:
     request_id = str(uuid4())
     runtime = get_runtime()
     if not idempotency_key:
+        if require:
+            raise HTTPException(status_code=400, detail="Idempotency-Key header required")
         return request_id, None
     record = await _get_cached_idempotency_record(runtime, route, user_id, idempotency_key)
     if record:
@@ -193,6 +201,38 @@ async def login(body: LoginRequest):
     )
     if not user or not session:
         raise HTTPException(status_code=401, detail="invalid credentials")
+    return Envelope(
+        status="ok",
+        data=AuthResponse(
+            user_id=user.id,
+            session_id=session.id,
+            session_expires_at=session.expires_at,
+            mfa_required=session.mfa_required,
+            access_token=tokens.get("access_token"),
+            refresh_token=tokens.get("refresh_token"),
+            token_type=tokens.get("token_type"),
+            role=user.role,
+            tenant_id=user.tenant_id,
+        ),
+    )
+
+
+@router.post("/auth/oauth/{provider}/start", response_model=Envelope)
+async def oauth_start(provider: str, body: OAuthStartRequest):
+    runtime = get_runtime()
+    start = await runtime.auth.start_oauth(provider, redirect_uri=body.redirect_uri, tenant_id=body.tenant_id)
+    return Envelope(
+        status="ok",
+        data=OAuthStartResponse(authorization_url=start["authorization_url"], state=start["state"], provider=provider),
+    )
+
+
+@router.get("/auth/oauth/{provider}/callback", response_model=Envelope)
+async def oauth_callback(provider: str, code: str, state: str, tenant_id: Optional[str] = None):
+    runtime = get_runtime()
+    user, session, tokens = await runtime.auth.complete_oauth(provider, code, state, tenant_id=tenant_id)
+    if not user or not session:
+        raise HTTPException(status_code=401, detail="oauth verification failed")
     return Envelope(
         status="ok",
         data=AuthResponse(
@@ -393,7 +433,7 @@ async def chat(
 ):
     runtime = get_runtime()
     user_id = principal.user_id
-    request_id, cached = await _resolve_idempotency("chat", user_id, idempotency_key)
+    request_id, cached = await _resolve_idempotency("chat", user_id, idempotency_key, require=True)
     if cached:
         return cached
     try:
@@ -528,13 +568,18 @@ async def preference_insights(principal: AuthContext = Depends(get_user)):
 
 @router.get("/artifacts", response_model=Envelope)
 async def list_artifacts(
-    type: Optional[str] = None, kind: Optional[str] = None, principal: AuthContext = Depends(get_user)
+    type: Optional[str] = None,
+    kind: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 100,
+    principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
     kind_filter = kind or (type if type and "." in type else None)
     type_filter = type if type and "." not in type else None
     if not type_filter and kind_filter:
         type_filter = kind_filter.split(".", 1)[0]
+    resolved_page_size = min(max(page_size, 1), 500)
     items = [
         ArtifactResponse(
             id=a.id,
@@ -547,7 +592,9 @@ async def list_artifacts(
             created_at=a.created_at,
             updated_at=a.updated_at,
         )
-        for a in runtime.store.list_artifacts(type_filter=type_filter, kind_filter=kind_filter)
+        for a in runtime.store.list_artifacts(
+            type_filter=type_filter, kind_filter=kind_filter, page=page, page_size=resolved_page_size
+        )
     ]
     return Envelope(status="ok", data=ArtifactListResponse(items=items))
 
@@ -570,6 +617,80 @@ async def get_artifact(artifact_id: str, principal: AuthContext = Depends(get_us
         updated_at=artifact.updated_at,
     )
     return Envelope(status="ok", data=resp)
+
+
+@router.get("/tools/specs", response_model=Envelope)
+async def list_tool_specs(
+    page: int = 1, page_size: int = 50, principal: AuthContext = Depends(get_user)
+):
+    runtime = get_runtime()
+    resolved_page_size = min(max(page_size, 1), 200)
+    artifacts = runtime.store.list_artifacts(
+        type_filter="tool", kind_filter="tool.spec", page=page, page_size=resolved_page_size
+    )
+    items = [
+        ArtifactResponse(
+            id=a.id,
+            type=a.type,
+            kind=a.schema.get("kind") if isinstance(a.schema, dict) else None,
+            name=a.name,
+            description=a.description,
+            schema=a.schema,
+            owner_user_id=a.owner_user_id,
+            created_at=a.created_at,
+            updated_at=a.updated_at,
+        )
+        for a in artifacts
+    ]
+    next_page = page + 1 if len(items) == resolved_page_size else None
+    return Envelope(status="ok", data=ToolSpecListResponse(items=items, next_page=next_page, page_size=resolved_page_size))
+
+
+@router.get("/tools/specs/{artifact_id}", response_model=Envelope)
+async def get_tool_spec(artifact_id: str, principal: AuthContext = Depends(get_user)):
+    runtime = get_runtime()
+    artifact = runtime.store.get_artifact(artifact_id)
+    if not artifact or not (isinstance(artifact.schema, dict) and artifact.schema.get("kind") == "tool.spec"):
+        raise NotFoundError("tool spec not found", detail={"artifact_id": artifact_id})
+    resp = ArtifactResponse(
+        id=artifact.id,
+        type=artifact.type,
+        kind=artifact.schema.get("kind") if isinstance(artifact.schema, dict) else None,
+        name=artifact.name,
+        description=artifact.description,
+        schema=artifact.schema,
+        owner_user_id=artifact.owner_user_id,
+        created_at=artifact.created_at,
+        updated_at=artifact.updated_at,
+    )
+    return Envelope(status="ok", data=resp)
+
+
+@router.get("/workflows", response_model=Envelope)
+async def list_workflows(
+    page: int = 1, page_size: int = 50, principal: AuthContext = Depends(get_user)
+):
+    runtime = get_runtime()
+    resolved_page_size = min(max(page_size, 1), 200)
+    artifacts = runtime.store.list_artifacts(
+        type_filter="workflow", kind_filter="workflow.chat", page=page, page_size=resolved_page_size
+    )
+    items = [
+        ArtifactResponse(
+            id=a.id,
+            type=a.type,
+            kind=a.schema.get("kind") if isinstance(a.schema, dict) else None,
+            name=a.name,
+            description=a.description,
+            schema=a.schema,
+            owner_user_id=a.owner_user_id,
+            created_at=a.created_at,
+            updated_at=a.updated_at,
+        )
+        for a in artifacts
+    ]
+    next_page = page + 1 if len(items) == resolved_page_size else None
+    return Envelope(status="ok", data=WorkflowListResponse(items=items, next_page=next_page, page_size=resolved_page_size))
 
 
 @router.get("/artifacts/{artifact_id}/versions", response_model=Envelope)
@@ -597,6 +718,39 @@ async def list_artifact_versions(artifact_id: str, principal: AuthContext = Depe
     return Envelope(status="ok", data=ArtifactVersionListResponse(items=items))
 
 
+@router.post("/tools/{tool_id}/invoke", response_model=Envelope)
+async def invoke_tool(
+    tool_id: str,
+    body: ToolInvokeRequest,
+    principal: AuthContext = Depends(get_user),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+):
+    runtime = get_runtime()
+    request_id, cached = await _resolve_idempotency(f"tools:{tool_id}:invoke", principal.user_id, idempotency_key, require=True)
+    if cached:
+        return cached
+    artifact = runtime.store.get_artifact(tool_id)
+    if not artifact or not (isinstance(artifact.schema, dict) and artifact.schema.get("kind") == "tool.spec"):
+        raise NotFoundError("tool spec not found", detail={"artifact_id": tool_id})
+    result = runtime.workflow.invoke_tool(
+        artifact.schema,
+        body.inputs or {},
+        conversation_id=body.conversation_id,
+        context_id=body.context_id,
+        user_message=body.user_message,
+    )
+    response = ToolInvokeResponse(
+        status=result.get("status", "ok") if isinstance(result, dict) else "ok",
+        outputs=result.get("outputs", {}) if isinstance(result, dict) else {},
+        content=result.get("content") if isinstance(result, dict) else None,
+        usage=result.get("usage") if isinstance(result, dict) else None,
+        context_snippets=result.get("context_snippets") if isinstance(result, dict) else None,
+    )
+    envelope = Envelope(status="ok", data=response, request_id=request_id)
+    await _store_idempotency_result(f"tools:{tool_id}:invoke", principal.user_id, idempotency_key, envelope)
+    return envelope
+
+
 @router.post("/artifacts", response_model=Envelope)
 async def create_artifact(
     body: ArtifactRequest,
@@ -604,7 +758,7 @@ async def create_artifact(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     runtime = get_runtime()
-    request_id, cached = await _resolve_idempotency("artifacts:create", principal.user_id, idempotency_key)
+    request_id, cached = await _resolve_idempotency("artifacts:create", principal.user_id, idempotency_key, require=True)
     if cached:
         return cached
     try:
@@ -787,8 +941,12 @@ async def upload_file(
     context_id: Optional[str] = Form(None),
     chunk_size: Optional[int] = Form(None),
     principal: AuthContext = Depends(get_user),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     runtime = get_runtime()
+    request_id, cached = await _resolve_idempotency("files:upload", principal.user_id, idempotency_key, require=True)
+    if cached:
+        return cached
     dest_dir = Path(runtime.settings.shared_fs_root) / "users" / principal.user_id / "files"
     contents = await file.read()
     dest_path = safe_join(dest_dir, file.filename)
@@ -802,7 +960,9 @@ async def upload_file(
             dest_path.unlink(missing_ok=True)
             raise
     resp = FileUploadResponse(fs_path=str(dest_path), context_id=context_id, chunk_count=chunk_count)
-    return Envelope(status="ok", data=resp)
+    envelope = Envelope(status="ok", data=resp, request_id=request_id)
+    await _store_idempotency_result("files:upload", principal.user_id, idempotency_key, envelope)
+    return envelope
 
 
 @router.get("/conversations/{conversation_id}/messages", response_model=Envelope)
@@ -843,12 +1003,22 @@ async def list_conversations(principal: AuthContext = Depends(get_user)):
 
 
 @router.post("/contexts", response_model=Envelope)
-async def create_context(body: KnowledgeContextRequest, principal: AuthContext = Depends(get_user)):
+async def create_context(
+    body: KnowledgeContextRequest,
+    principal: AuthContext = Depends(get_user),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+):
     runtime = get_runtime()
-    ctx = runtime.store.upsert_context(owner_user_id=principal.user_id, name=body.name, description=body.description)
+    request_id, cached = await _resolve_idempotency("contexts:create", principal.user_id, idempotency_key, require=True)
+    if cached:
+        return cached
+    ctx_meta = {"embedding_model_id": runtime.rag.embedding_model_id}
+    ctx = runtime.store.upsert_context(
+        owner_user_id=principal.user_id, name=body.name, description=body.description, meta=ctx_meta
+    )
     if body.text:
         runtime.rag.ingest_text(ctx.id, body.text, chunk_size=body.chunk_size)
-    return Envelope(
+    envelope = Envelope(
         status="ok",
         data=KnowledgeContextResponse(
             id=ctx.id,
@@ -857,8 +1027,12 @@ async def create_context(body: KnowledgeContextRequest, principal: AuthContext =
             created_at=ctx.created_at,
             updated_at=ctx.updated_at,
             owner_user_id=ctx.owner_user_id,
+            meta=ctx.meta,
         ),
+        request_id=request_id,
     )
+    await _store_idempotency_result("contexts:create", principal.user_id, idempotency_key, envelope)
+    return envelope
 
 
 @router.get("/contexts", response_model=Envelope)
@@ -873,6 +1047,7 @@ async def list_contexts(principal: AuthContext = Depends(get_user)):
             created_at=c.created_at,
             updated_at=c.updated_at,
             owner_user_id=c.owner_user_id,
+            meta=c.meta,
         )
         for c in contexts
     ]

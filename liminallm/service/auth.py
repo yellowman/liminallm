@@ -46,6 +46,7 @@ class AuthService:
         self._mfa_challenges: dict[str, tuple[str, datetime]] = {}
         self.mfa_enabled = mfa_enabled
         self.revoked_refresh_tokens: set[str] = set()
+        self._oauth_states: dict[str, tuple[str, datetime, Optional[str]]] = {}
 
     def _generate_password(self) -> str:
         return base64.urlsafe_b64encode(os.urandom(12)).decode().rstrip("=")
@@ -97,6 +98,38 @@ class AuthService:
         if hasattr(self.store, "save_password"):
             self.store.save_password(user.id, pwd_hash, algo)  # type: ignore[attr-defined]
         return user, pwd
+
+    async def start_oauth(self, provider: str, redirect_uri: Optional[str] = None, *, tenant_id: Optional[str] = None) -> dict:
+        state = uuid.uuid4().hex
+        expires_at = datetime.utcnow() + timedelta(minutes=10)
+        self._oauth_states[state] = (provider, expires_at, tenant_id)
+        base_url = redirect_uri or self.settings.adapter_openai_base_url or "https://auth.example.com/callback"
+        authorization_url = f"{base_url}?provider={provider}&state={state}"
+        return {"authorization_url": authorization_url, "state": state, "provider": provider}
+
+    async def complete_oauth(
+        self, provider: str, code: str, state: str, *, tenant_id: Optional[str] = None
+    ) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
+        stored = self._oauth_states.get(state)
+        now = datetime.utcnow()
+        if not stored or stored[1] < now or stored[0] != provider:
+            return None, None, {}
+        _, _, tenant_hint = stored
+        if tenant_id and tenant_hint and tenant_id != tenant_hint:
+            return None, None, {}
+        self._oauth_states.pop(state, None)
+        normalized_tenant = tenant_id or tenant_hint or self.settings.default_tenant_id
+        synthetic_email = f"{provider}+{code}@oauth.local"
+        user = self.store.get_user_by_email(synthetic_email) if hasattr(self.store, "get_user_by_email") else None  # type: ignore[attr-defined]
+        if not user:
+            user = self.store.create_user(email=synthetic_email, handle=provider, tenant_id=normalized_tenant)
+            if hasattr(self.store, "save_password"):
+                self.store.save_password(user.id, "", "oauth")  # type: ignore[attr-defined]
+        session = self.store.create_session(user.id, tenant_id=user.tenant_id)
+        tokens = self._issue_tokens(user, session)
+        if self.cache:
+            await self.cache.cache_session(session.id, user.id, session.expires_at)
+        return user, session, tokens
 
     def list_users(self, tenant_id: Optional[str] = None, limit: int = 100) -> list[User]:
         if hasattr(self.store, "list_users"):

@@ -16,6 +16,7 @@ from liminallm.service.workflow import WorkflowEngine
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.postgres import PostgresStore
 from liminallm.storage.redis_cache import RedisCache
+from liminallm.service.embeddings import EmbeddingsService
 
 from liminallm.logging import get_logger
 
@@ -54,6 +55,7 @@ class Runtime:
                 "adapter_server_model": self.settings.adapter_server_model,
             }
         }
+        self.embeddings = EmbeddingsService(self.settings.embedding_model_id)
         self.llm = LLMService(
             base_model=resolved_base_model,
             backend_mode=backend_mode,
@@ -67,6 +69,8 @@ class Runtime:
             self.store,
             default_chunk_size=self.settings.rag_chunk_size,
             rag_mode=self.settings.rag_mode,
+            embed=self.embeddings.embed,
+            embedding_model_id=self.settings.embedding_model_id,
         )
         self.training = TrainingService(
             self.store, self.settings.shared_fs_root, runtime_base_model=resolved_base_model

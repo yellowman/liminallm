@@ -22,11 +22,15 @@ class RAGService:
         *,
         rag_mode: str | None = None,
         embed: Callable[[str], List[float]] = deterministic_embedding,
+        embedding_model_id: str = "text-embedding",
     ) -> None:
         self.store = store
         self.default_chunk_size = max(default_chunk_size, 64)
         self.rag_mode = (rag_mode or os.getenv("RAG_MODE") or "pgvector").lower()
+        if not hasattr(store, "search_chunks_pgvector"):
+            raise ValueError("pgvector-backed store required for RAGService")
         self.embed = embed
+        self.embedding_model_id = embedding_model_id
 
     def retrieve(self, context_id: Optional[str], query: Optional[str], limit: int = 4) -> List[KnowledgeChunk]:
         if not query:
@@ -34,21 +38,11 @@ class RAGService:
 
         query_embedding = self.embed(query)
         contexts: Sequence[str] | None = [context_id] if context_id else None
+        filters = {"embedding_model_id": self.embedding_model_id}
 
-        if self.rag_mode != "local_hybrid" and hasattr(self.store, "search_chunks_pgvector"):
-            return self.store.search_chunks_pgvector(  # type: ignore[attr-defined]
-                contexts, query_embedding, limit
-            )
-
-        if hasattr(self.store, "search_chunks_legacy"):
-            return self.store.search_chunks_legacy(  # type: ignore[attr-defined]
-                context_id, query, query_embedding, limit
-            )
-        if hasattr(self.store, "search_chunks"):
-            return self.store.search_chunks(  # type: ignore[attr-defined]
-                context_id, query, query_embedding, limit
-            )
-        return []  # pragma: no cover
+        return self.store.search_chunks_pgvector(  # type: ignore[attr-defined]
+            contexts, query_embedding, limit, filters=filters
+        )
 
     def ingest_text(
         self, context_id: str, text: str, chunk_size: Optional[int] = None, source_path: Optional[str] = None
@@ -70,7 +64,12 @@ class RAGService:
                     text=segment,
                     embedding=self.embed(segment),
                     seq=math.floor(idx / chosen_chunk),
-                    meta={"fs_path": source_path} if source_path else None,
+                    meta={
+                        "fs_path": source_path,
+                        "embedding_model_id": self.embedding_model_id,
+                    }
+                    if source_path
+                    else {"embedding_model_id": self.embedding_model_id},
                 )
             )
         if chunks:
