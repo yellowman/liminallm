@@ -337,6 +337,9 @@ class MemoryStore:
         self._persist_state()
         return conv
 
+    def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
+        return self.conversations.get(conversation_id)
+
     def append_message(
         self,
         conversation_id: str,
@@ -887,6 +890,9 @@ class MemoryStore:
         self.contexts[ctx.id] = ctx
         self._persist_state()
         return ctx
+
+    def get_context(self, context_id: str) -> Optional[KnowledgeContext]:
+        return self.contexts.get(context_id)
 
     def list_contexts(self, owner_user_id: Optional[str] = None) -> List[KnowledgeContext]:
         if owner_user_id:
