@@ -1476,7 +1476,12 @@ class PostgresStore:
 
     # knowledge
     def upsert_context(
-        self, owner_user_id: str, name: str, description: str, fs_path: Optional[str] = None, meta: Optional[dict] = None
+        self,
+        owner_user_id: Optional[str],
+        name: str,
+        description: str,
+        fs_path: Optional[str] = None,
+        meta: Optional[dict] = None,
     ) -> KnowledgeContext:
         ctx_id = str(uuid.uuid4())
         if not owner_user_id:
@@ -1489,6 +1494,8 @@ class PostgresStore:
                 )
         except errors.ForeignKeyViolation:
             raise ConstraintViolation("context owner missing", {"owner_user_id": owner_user_id})
+        except errors.NotNullViolation:
+            raise ConstraintViolation("context owner required", {"owner_user_id": owner_user_id})
         return KnowledgeContext(
             id=ctx_id, owner_user_id=owner_user_id, name=name, description=description, fs_path=fs_path, meta=meta
         )

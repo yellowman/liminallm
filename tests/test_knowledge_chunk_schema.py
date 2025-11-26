@@ -1,14 +1,17 @@
 import json
 from dataclasses import fields
 from typing import get_type_hints
-import uuid
-
 import pytest
 
 from liminallm.api.schemas import KnowledgeChunkResponse
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.models import KnowledgeChunk
+
+
+def _create_context(store: MemoryStore, name: str = "ctx"):
+    owner = store.create_user(f"{name}@example.com", tenant_id="tenant_ctx")
+    return store.upsert_context(owner_user_id=owner.id, name=name, description="desc")
 
 
 def test_knowledge_chunk_dataclass_fields_match_schema():
@@ -45,7 +48,7 @@ def test_knowledge_chunk_response_matches_model_fields():
 
 def test_memory_store_round_trips_chunk_fields(tmp_path):
     store = MemoryStore(fs_root=str(tmp_path))
-    context = store.upsert_context(owner_user_id=None, name="ctx", description="desc")
+    context = _create_context(store)
 
     chunk = KnowledgeChunk(
         id=0,
@@ -69,7 +72,7 @@ def test_memory_store_round_trips_chunk_fields(tmp_path):
 
 def test_memory_store_rejects_missing_fs_path(tmp_path):
     store = MemoryStore(fs_root=str(tmp_path))
-    context = store.upsert_context(owner_user_id=None, name="ctx", description="desc")
+    context = _create_context(store)
 
     with pytest.raises(ConstraintViolation):
         store.add_chunks(
@@ -104,7 +107,7 @@ def test_memory_store_rejects_missing_fs_path(tmp_path):
 
 def test_memory_store_loads_legacy_chunk_without_fs_path(tmp_path):
     store = MemoryStore(fs_root=str(tmp_path))
-    context = store.upsert_context(owner_user_id=None, name="ctx", description="desc")
+    context = _create_context(store)
 
     chunk = KnowledgeChunk(
         id=0,
@@ -126,3 +129,10 @@ def test_memory_store_loads_legacy_chunk_without_fs_path(tmp_path):
     loaded_chunks = reloaded.list_chunks(context.id)
 
     assert loaded_chunks[0].fs_path == ""
+
+
+def test_upsert_context_rejects_missing_owner(tmp_path):
+    store = MemoryStore(fs_root=str(tmp_path))
+
+    with pytest.raises(ConstraintViolation):
+        store.upsert_context(owner_user_id=None, name="ctx", description="desc")
