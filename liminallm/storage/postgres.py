@@ -46,7 +46,6 @@ class PostgresStore:
         self.fs_root.mkdir(parents=True, exist_ok=True)
         self.logger = get_logger(__name__)
         self.pool = ConnectionPool(self.dsn, min_size=2, max_size=10, kwargs={"row_factory": dict_row, "autocommit": True})
-        self.mfa_secrets: dict[str, UserMFAConfig] = {}
         self.sessions: dict[str, Session] = {}
         self._ensure_runtime_config_table()
         self._verify_required_schema()
@@ -863,12 +862,9 @@ class PostgresStore:
         except Exception as exc:
             self.logger.warning("set_user_mfa_secret_failed", error=str(exc))
             raise
-        self.mfa_secrets[user_id] = record
         return record
 
     def get_user_mfa_secret(self, user_id: str) -> Optional[UserMFAConfig]:
-        if user_id in self.mfa_secrets:
-            return self.mfa_secrets[user_id]
         try:
             with self._connect() as conn:
                 row = conn.execute(
@@ -882,7 +878,6 @@ class PostgresStore:
                     created_at=row.get("created_at", datetime.utcnow()),
                     meta=row.get("meta"),
                 )
-                self.mfa_secrets[user_id] = cfg
                 return cfg
         except Exception as exc:
             self.logger.warning("get_user_mfa_secret_failed", error=str(exc))
