@@ -214,6 +214,7 @@ class PreferenceEvent:
 @dataclass
 class AdapterRouterState:
     artifact_id: str
+    base_model: Optional[str] = None
     centroid_vec: Optional[List[float]] = None
     usage_count: int = 0
     success_score: float = 0.0
