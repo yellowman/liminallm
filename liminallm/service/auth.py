@@ -209,12 +209,14 @@ class AuthService:
         _, _, tenant_hint = stored
         if tenant_id and tenant_hint and tenant_id != tenant_hint:
             return None, None, {}
+        identity = await self._exchange_oauth_code(provider, code)
+        if not identity:
+            if not cached_state:
+                self._oauth_states.pop(state, None)
+            return None, None, {}
         self._oauth_states.pop(state, None)
         if self.cache and not cached_state:
             await self.cache.pop_oauth_state(state)
-        identity = await self._exchange_oauth_code(provider, code)
-        if not identity:
-            return None, None, {}
         provider_uid = identity.get("provider_uid")
         if not provider_uid:
             return None, None, {}
