@@ -53,6 +53,27 @@ class PostgresStore:
         self._load_training_state()
         self._ensure_default_artifacts()
 
+    def _cache_session(self, session: Session) -> Session:
+        """Store session in the in-memory cache and return it."""
+
+        self.sessions[session.id] = session
+        return session
+
+    def _evict_session(self, session_id: str) -> None:
+        """Remove a session from the in-memory cache if present."""
+
+        self.sessions.pop(session_id, None)
+
+    def _update_cached_session(self, session_id: str, **updates: Any) -> None:
+        """Apply field updates to a cached session if it exists."""
+
+        sess = self.sessions.get(session_id)
+        if not sess:
+            return
+        for field, value in updates.items():
+            setattr(sess, field, value)
+        self.sessions[session_id] = sess
+
     def _connect(self):
         return self.pool.connection()
 
@@ -994,11 +1015,12 @@ class PostgresStore:
                 )
         except errors.ForeignKeyViolation:
             raise ConstraintViolation("session user missing", {"user_id": user_id})
-        return sess
+        return self._cache_session(sess)
 
     def revoke_session(self, session_id: str) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM auth_session WHERE id = %s", (session_id,))
+        self._evict_session(session_id)
 
     def mark_session_verified(self, session_id: str) -> None:
         try:
@@ -1009,10 +1031,7 @@ class PostgresStore:
                 )
         except Exception as exc:
             self.logger.warning("mark_session_verified_failed", error=str(exc))
-        sess = self.sessions.get(session_id)
-        if sess:
-            sess.mfa_verified = True
-            sess.mfa_required = True
+        self._update_cached_session(session_id, mfa_verified=True, mfa_required=True)
 
     def get_session(self, session_id: str) -> Optional[Session]:
         with self._connect() as conn:
@@ -1044,16 +1063,12 @@ class PostgresStore:
             tenant_id=row.get("tenant_id", "public"),
             meta=meta,
         )
-        self.sessions[sess.id] = sess
-        return sess
+        return self._cache_session(sess)
 
     def set_session_meta(self, session_id: str, meta: dict) -> None:
         with self._connect() as conn:
             conn.execute("UPDATE auth_session SET meta = %s WHERE id = %s", (json.dumps(meta), session_id))
-        sess = self.sessions.get(session_id)
-        if sess:
-            sess.meta = meta
-            self.sessions[session_id] = sess
+        self._update_cached_session(session_id, meta=meta)
 
     # conversations
     def create_conversation(self, user_id: str, title: Optional[str] = None, active_context_id: Optional[str] = None) -> Conversation:
