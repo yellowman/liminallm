@@ -387,7 +387,7 @@ logical layout (any POSIX-like shared filesystem):
       artifacts/             # artifact-backed files (e.g. notebooks)
         ...
       adapters/
-        {adapter_artifact_id}/
+        {adapter_id}/
           v0001/
              params_layer_00_q.npz
              params_layer_00_v.npz
@@ -1082,7 +1082,7 @@ execution guardrails:
 3. **cluster update**:
    - clusterer runs periodically to refine `semantic_cluster` and event mappings.
 4. **training scheduling**:
-   - group new preference_events per `(user, cluster)` → adapter_artifact.
+  - group new preference_events per `(user, cluster)` → adapter_id.
    - create `training_job`s.
 5. **adapter training** (offline):
   - TrainingService updates LoRA weights; writes new version to the shared filesystem.

@@ -671,7 +671,7 @@ class PostgresStore:
             ).fetchone()
         if not row:
             return None
-        adapter_id_value = row.get("adapter_id") or row.get("adapter_artifact_id")
+        adapter_id_value = row.get("adapter_id") or existing.adapter_id
         return TrainingJob(
             id=str(row["id"]),
             user_id=str(row["user_id"]),
@@ -692,11 +692,10 @@ class PostgresStore:
             row = conn.execute("SELECT * FROM training_job WHERE id = %s", (job_id,)).fetchone()
         if not row:
             return None
-        adapter_id_value = row.get("adapter_id") or row.get("adapter_artifact_id")
         return TrainingJob(
             id=str(row["id"]),
             user_id=str(row["user_id"]),
-            adapter_id=str(adapter_id_value) if adapter_id_value else "",
+            adapter_id=str(row["adapter_id"]),
             status=row.get("status", "queued"),
             num_events=row.get("num_events"),
             created_at=row.get("created_at", datetime.utcnow()),
