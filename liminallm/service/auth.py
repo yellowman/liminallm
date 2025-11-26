@@ -116,7 +116,9 @@ class AuthService:
         self.revoked_refresh_tokens: set[str] = set()
         self._oauth_states: dict[str, tuple[str, datetime, Optional[str]]] = {}
         self._oauth_code_registry: dict[tuple[str, str], dict] = {}
+        self._email_verification_tokens: dict[str, tuple[str, datetime]] = {}
         self._pwd_hasher = PasswordHasher(type=Type.ID)
+        self.logger = logger
 
     def _generate_password(self) -> str:
         return base64.urlsafe_b64encode(os.urandom(12)).decode().rstrip("=")
@@ -189,7 +191,9 @@ class AuthService:
             if raw:
                 try:
                     cached_payload = json.loads(raw)
-                finally:
+                except Exception as exc:
+                    self.logger.warning("oauth_code_parse_failed", error=str(exc))
+                else:
                     await self.cache.client.delete(f"auth:oauth:code:{provider}:{code}")
         if not cached_payload:
             cached_payload = self._oauth_code_registry.pop((provider, code), None)
@@ -206,12 +210,14 @@ class AuthService:
         _, _, tenant_hint = stored
         if tenant_id and tenant_hint and tenant_id != tenant_hint:
             return None, None, {}
+        identity = await self._exchange_oauth_code(provider, code)
+        if not identity:
+            if not cached_state:
+                self._oauth_states.pop(state, None)
+            return None, None, {}
         self._oauth_states.pop(state, None)
         if self.cache and not cached_state:
             await self.cache.pop_oauth_state(state)
-        identity = await self._exchange_oauth_code(provider, code)
-        if not identity:
-            return None, None, {}
         provider_uid = identity.get("provider_uid")
         if not provider_uid:
             return None, None, {}
@@ -219,7 +225,8 @@ class AuthService:
         existing = None
         if hasattr(self.store, "get_user_by_provider"):
             existing = self.store.get_user_by_provider(provider, provider_uid)
-        user = existing or self.store.get_user_by_email(identity.get("email")) if identity.get("email") else None
+        email = identity.get("email")
+        user = existing or (self.store.get_user_by_email(email) if email else None)
         if not user:
             user_email = identity.get("email") or f"{provider_uid}@{provider}.oauth"
             handle = identity.get("handle") or provider_uid
@@ -436,14 +443,25 @@ class AuthService:
 
     async def request_email_verification(self, user: User) -> str:
         token = hashlib.sha256(f"verify-{user.email}-{os.urandom(32)}".encode()).hexdigest()
+        expires_at = datetime.utcnow() + timedelta(hours=24)
         if self.cache:
-            await self.cache.client.set(f"verify:{token}", user.id, ex=60 * 60 * 24)
+            await self.cache.client.set(f"verify:{token}", user.id, ex=int((expires_at - datetime.utcnow()).total_seconds()))
+        else:
+            self._email_verification_tokens[token] = (user.id, expires_at)
         return token
 
     async def complete_email_verification(self, token: str) -> bool:
         user_id = None
         if self.cache:
             user_id = await self.cache.client.get(f"verify:{token}")
+        else:
+            stored = self._email_verification_tokens.get(token)
+            if stored:
+                user_id, expires_at = stored
+                if expires_at <= datetime.utcnow():
+                    user_id = None
+                else:
+                    self._email_verification_tokens.pop(token, None)
         if not user_id:
             return False
         user = self.store.get_user(user_id)
@@ -453,6 +471,8 @@ class AuthService:
             self.store.mark_email_verified(user.id)
         if self.cache:
             await self.cache.client.delete(f"verify:{token}")
+        else:
+            self._email_verification_tokens.pop(token, None)
         return True
 
     def _hash_password(self, password: str) -> Tuple[str, str]:
