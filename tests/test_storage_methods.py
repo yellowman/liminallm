@@ -3,6 +3,7 @@ from copy import deepcopy
 
 import pytest
 
+from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.postgres import PostgresStore
 
@@ -39,6 +40,44 @@ def test_get_preference_event_round_trip(memory_store: MemoryStore):
 
 def test_get_preference_event_missing_returns_none(memory_store: MemoryStore):
     assert memory_store.get_preference_event("missing") is None
+
+
+def test_record_preference_event_requires_valid_message(memory_store: MemoryStore):
+    user, conversation, message = _create_user_conversation_message(memory_store)
+    other_conversation = memory_store.create_conversation(user.id, title="other")
+    other_message = memory_store.append_message(
+        other_conversation.id, sender=user.id, role="assistant", content="other"
+    )
+
+    with pytest.raises(ConstraintViolation):
+        memory_store.record_preference_event(
+            user.id,
+            conversation.id,
+            "missing",  # nonexistent message
+            feedback="thumbs_down",
+        )
+
+    with pytest.raises(ConstraintViolation):
+        memory_store.record_preference_event(
+            user.id,
+            conversation.id,
+            other_message.id,  # message from different conversation
+            feedback="thumbs_down",
+        )
+
+
+def test_record_preference_event_populates_embedding(memory_store: MemoryStore):
+    user, conversation, message = _create_user_conversation_message(memory_store)
+
+    event = memory_store.record_preference_event(
+        user.id,
+        conversation.id,
+        message.id,
+        feedback="thumbs_up",
+    )
+
+    assert event.context_embedding
+    assert len(event.context_embedding) == 64
 
 
 def test_get_training_job_round_trip(memory_store: MemoryStore):

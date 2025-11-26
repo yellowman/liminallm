@@ -362,13 +362,6 @@ class MemoryStore:
         return msg
 
     # preference events
-    def _message_text(self, message_id: str) -> str:
-        for msgs in self.messages.values():
-            for msg in msgs:
-                if msg.id == message_id:
-                    return msg.content
-        return ""
-
     def _text_embedding(self, text: Optional[str]) -> List[float]:
         if not text:
             return []
@@ -401,9 +394,18 @@ class MemoryStore:
             raise ConstraintViolation("preference user missing", {"user_id": user_id})
         if conversation_id not in self.conversations:
             raise ConstraintViolation("preference conversation missing", {"conversation_id": conversation_id})
+        message = next(
+            (m for m in self.messages.get(conversation_id, []) if m.id == message_id),
+            None,
+        )
+        if not message:
+            raise ConstraintViolation(
+                "preference message missing",
+                {"message_id": message_id, "conversation_id": conversation_id},
+            )
         event_id = str(uuid.uuid4())
         normalized_weight = weight if weight is not None else (score if score is not None else 1.0)
-        embedding = context_embedding or self._text_embedding(context_text or self._message_text(message_id))
+        embedding = context_embedding or self._text_embedding(context_text or message.content)
         event = PreferenceEvent(
             id=event_id,
             user_id=user_id,
