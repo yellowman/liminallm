@@ -1092,25 +1092,29 @@ class PostgresStore:
         try:
             normalized_content_struct = normalize_content_struct(content_struct, content)
             with self._connect() as conn:
-                seq_row = conn.execute("SELECT COUNT(*) AS c FROM message WHERE conversation_id = %s", (conversation_id,)).fetchone()
-                seq = seq_row["c"] if seq_row else 0
-                msg_id = str(uuid.uuid4())
-                now = datetime.utcnow()
-                conn.execute(
-                    "INSERT INTO message (id, conversation_id, sender, role, content, content_struct, seq, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
-                    (
-                        msg_id,
-                        conversation_id,
-                        sender,
-                        role,
-                        content,
-                        json.dumps(normalized_content_struct) if normalized_content_struct is not None else None,
-                        seq,
-                        now,
-                        json.dumps(meta) if meta else None,
-                    ),
-                )
-                conn.execute("UPDATE conversation SET updated_at = %s WHERE id = %s", (now, conversation_id))
+                with conn.transaction():
+                    seq_row = conn.execute(
+                        "SELECT COUNT(*) AS c FROM message WHERE conversation_id = %s",
+                        (conversation_id,),
+                    ).fetchone()
+                    seq = seq_row["c"] if seq_row else 0
+                    msg_id = str(uuid.uuid4())
+                    now = datetime.utcnow()
+                    conn.execute(
+                        "INSERT INTO message (id, conversation_id, sender, role, content, content_struct, seq, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                        (
+                            msg_id,
+                            conversation_id,
+                            sender,
+                            role,
+                            content,
+                            json.dumps(normalized_content_struct) if normalized_content_struct is not None else None,
+                            seq,
+                            now,
+                            json.dumps(meta) if meta else None,
+                        ),
+                    )
+                    conn.execute("UPDATE conversation SET updated_at = %s WHERE id = %s", (now, conversation_id))
         except errors.ForeignKeyViolation:
             raise ConstraintViolation("conversation not found", {"conversation_id": conversation_id})
         return Message(
