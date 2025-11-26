@@ -362,7 +362,7 @@ async def admin_create_user(body: AdminCreateUserRequest, principal: AuthContext
         is_active=body.is_active,
         meta=body.meta,
     )
-    return Envelope(status="ok", data={"user": _user_to_response(user), "password": password})
+    return Envelope(status="ok", data=_user_to_response(user))
 
 
 @router.post("/admin/users/{user_id}/role", response_model=Envelope)
