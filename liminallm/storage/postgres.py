@@ -45,7 +45,7 @@ class PostgresStore:
         self.fs_root = Path(fs_root)
         self.fs_root.mkdir(parents=True, exist_ok=True)
         self.logger = get_logger(__name__)
-        self.pool = ConnectionPool(self.dsn, min_size=2, max_size=10, kwargs={"row_factory": dict_row, "autocommit": True})
+        self.pool = ConnectionPool(self.dsn, min_size=2, max_size=10, kwargs={"row_factory": dict_row})
         self.sessions: dict[str, Session] = {}
         self._ensure_runtime_config_table()
         self._verify_required_schema()
