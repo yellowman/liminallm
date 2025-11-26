@@ -136,7 +136,10 @@ for v1 these can all live in one python app with clear module boundaries.
   - pluggable model backend that can target external API fine-tune IDs or local JAX+LoRA adapter application
   - filesystem-backed LoRA adapter training that turns preference events into new adapter versions
   - preference capture with clustering + skill adapter promotion and routing integration
+  - hardened auth + multi-tenant isolation: OAuth provider mapping, session revocation on password resets, error envelopes with stable `error.code`, ownership-enforced artifact and conversation access (including workflows/tools), adapter checksum + path validation, and email verification flows
   - MFA with TOTP enrollment (otpauth URL), session gating, and login verification
+  - email verification tokens with `/v1/auth/request_email_verification` and `/v1/auth/verify_email`
+  - tenant-scoped conversation history enforcement in workflows and tool invocations
   - HMAC-signed JWT access tokens with refresh rotation, tenant-aware sessions, and admin-only config endpoints
   - preference UI and rich routing feedback loop
   - LLM-as-architect auto-patch generation

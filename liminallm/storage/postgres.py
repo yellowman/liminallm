@@ -744,7 +744,7 @@ class PostgresStore:
         return TrainingJob(
             id=str(row["id"]),
             user_id=str(row["user_id"]),
-            adapter_id=str(row["adapter_id"]),
+            adapter_id=self._require_training_adapter_id(row.get("adapter_id"), row.get("id")),
             status=row.get("status", "queued"),
             num_events=row.get("num_events"),
             created_at=row.get("created_at", datetime.utcnow()),
@@ -810,6 +810,8 @@ class PostgresStore:
         meta: Optional[dict] = None,
     ) -> User:
         user_id = str(uuid.uuid4())
+        normalized_meta = meta.copy() if meta else {}
+        normalized_meta.setdefault("email_verified", False)
         try:
             with self._connect() as conn:
                 conn.execute(
@@ -817,7 +819,16 @@ class PostgresStore:
                     INSERT INTO app_user (id, email, handle, tenant_id, role, plan_tier, is_active, meta)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     """,
-                    (user_id, email, handle, tenant_id, role, plan_tier, is_active, json.dumps(meta) if meta else None),
+                    (
+                        user_id,
+                        email,
+                        handle,
+                        tenant_id,
+                        role,
+                        plan_tier,
+                        is_active,
+                        json.dumps(normalized_meta) if normalized_meta else None,
+                    ),
                 )
         except errors.UniqueViolation:
             raise ConstraintViolation("email already exists", {"field": "email"})
@@ -829,7 +840,38 @@ class PostgresStore:
             role=role,
             plan_tier=plan_tier,
             is_active=is_active,
-            meta=meta,
+            meta=normalized_meta,
+        )
+
+    def link_user_auth_provider(self, user_id: str, provider: str, provider_uid: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_auth_provider (user_id, provider, provider_uid)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (provider, provider_uid) DO NOTHING
+                """,
+                (user_id, provider, provider_uid),
+            )
+
+    def get_user_by_provider(self, provider: str, provider_uid: str) -> Optional[User]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT u.* FROM user_auth_provider p JOIN app_user u ON u.id = p.user_id WHERE p.provider = %s AND p.provider_uid = %s",
+                (provider, provider_uid),
+            ).fetchone()
+        if not row:
+            return None
+        return User(
+            id=str(row["id"]),
+            email=row["email"],
+            handle=row.get("handle"),
+            created_at=row.get("created_at", datetime.utcnow()),
+            is_active=row.get("is_active", True),
+            plan_tier=row.get("plan_tier", "free"),
+            role=row.get("role", "user"),
+            tenant_id=row.get("tenant_id", "public"),
+            meta=row.get("meta"),
         )
 
     def save_password(self, user_id: str, password_hash: str, password_algo: str) -> None:
@@ -971,6 +1013,32 @@ class PostgresStore:
             meta=row.get("meta"),
         )
 
+    def mark_email_verified(self, user_id: str) -> Optional[User]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                UPDATE app_user
+                SET meta = jsonb_set(COALESCE(meta, '{}'::jsonb), '{email_verified}', 'true', true),
+                    updated_at = now()
+                WHERE id = %s
+                RETURNING *
+                """,
+                (user_id,),
+            ).fetchone()
+        if not row:
+            return None
+        return User(
+            id=str(row["id"]),
+            email=row["email"],
+            handle=row.get("handle"),
+            created_at=row.get("created_at", datetime.utcnow()),
+            is_active=row.get("is_active", True),
+            plan_tier=row.get("plan_tier", "free"),
+            role=row.get("role", "user"),
+            tenant_id=row.get("tenant_id", "public"),
+            meta=row.get("meta"),
+        )
+
     def delete_user(self, user_id: str) -> bool:
         with self._connect() as conn:
             result = conn.execute("DELETE FROM app_user WHERE id = %s", (user_id,))
@@ -1025,6 +1093,13 @@ class PostgresStore:
         with self._connect() as conn:
             conn.execute("DELETE FROM auth_session WHERE id = %s", (session_id,))
         self._evict_session(session_id)
+
+    def revoke_user_sessions(self, user_id: str) -> None:
+        with self._connect() as conn:
+            conn.execute("DELETE FROM auth_session WHERE user_id = %s", (user_id,))
+        stale_ids = [sid for sid, sess in self.sessions.items() if sess.user_id == user_id]
+        for sid in stale_ids:
+            self._evict_session(sid)
 
     def mark_session_verified(self, session_id: str) -> None:
         try:
@@ -1088,9 +1163,14 @@ class PostgresStore:
             raise ConstraintViolation("conversation owner or context missing", {"user_id": user_id, "context_id": active_context_id})
         return Conversation(id=conv_id, user_id=user_id, title=title, created_at=now, updated_at=now, active_context_id=active_context_id)
 
-    def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
+    def get_conversation(self, conversation_id: str, *, user_id: Optional[str] = None) -> Optional[Conversation]:
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM conversation WHERE id = %s", (conversation_id,)).fetchone()
+            params: tuple[Any, ...] = (conversation_id,)
+            query = "SELECT * FROM conversation WHERE id = %s"
+            if user_id:
+                query += " AND user_id = %s"
+                params = (conversation_id, user_id)
+            row = conn.execute(query, params).fetchone()
         if not row:
             return None
         def _row_value(key: str, default: Optional[Any] = None) -> Optional[Any]:
@@ -1168,11 +1248,16 @@ class PostgresStore:
             meta=meta,
         )
 
-    def list_messages(self, conversation_id: str, limit: int = 10) -> List[Message]:
+    def list_messages(self, conversation_id: str, limit: int = 10, *, user_id: Optional[str] = None) -> List[Message]:
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM message WHERE conversation_id = %s ORDER BY seq DESC LIMIT %s", (conversation_id, limit)
-            ).fetchall()
+            params: list[Any] = [conversation_id]
+            query = "SELECT m.* FROM message m"
+            if user_id:
+                query += " JOIN conversation c ON c.id = m.conversation_id AND c.user_id = %s"
+                params.append(user_id)
+            query += " WHERE m.conversation_id = %s ORDER BY m.seq DESC LIMIT %s" if user_id else " WHERE conversation_id = %s ORDER BY seq DESC LIMIT %s"
+            params.append(limit)
+            rows = conn.execute(query, tuple(params)).fetchall()
         messages: List[Message] = []
         for row in reversed(rows):
             content_struct = row.get("content_struct") if isinstance(row, dict) else row["content_struct"]
@@ -1375,9 +1460,10 @@ class PostgresStore:
             versions = conn.execute("SELECT COALESCE(MAX(version), 0) AS v FROM artifact_version WHERE artifact_id = %s", (artifact_id,)).fetchone()
             next_version = (versions["v"] or 0) + 1
             fs_path = self._persist_payload(artifact_id, next_version, schema)
+            base_model = schema.get("base_model") if "base_model" in schema else row.get("base_model")
             conn.execute(
                 "UPDATE artifact SET schema = %s, description = COALESCE(%s, description), updated_at = now(), fs_path = %s, base_model = %s WHERE id = %s",
-                (json.dumps(schema), description, fs_path, schema.get("base_model"), artifact_id),
+                (json.dumps(schema), description, fs_path, base_model, artifact_id),
             )
             conn.execute(
                 "INSERT INTO artifact_version (artifact_id, version, schema, fs_path, base_model, created_by, change_note) VALUES (%s, %s, %s, %s, %s, %s, %s)",
@@ -1386,12 +1472,12 @@ class PostgresStore:
                     next_version,
                     json.dumps(schema),
                     fs_path,
-                    schema.get("base_model"),
+                    base_model,
                     version_author or (str(row["owner_user_id"]) if row.get("owner_user_id") else None) or "system_llm",
                     change_note,
                 ),
             )
-        new_base_model = schema.get("base_model") if "base_model" in schema else row.get("base_model")
+        new_base_model = base_model
         return Artifact(
             id=str(row["id"]),
             type=row["type"],
@@ -1688,14 +1774,13 @@ class PostgresStore:
         )
 
     def list_contexts(self, owner_user_id: Optional[str] = None) -> List[KnowledgeContext]:
+        if not owner_user_id:
+            return []
         with self._connect() as conn:
-            if owner_user_id:
-                rows = conn.execute(
-                    "SELECT * FROM knowledge_context WHERE owner_user_id = %s ORDER BY created_at DESC",
-                    (owner_user_id,),
-                ).fetchall()
-            else:
-                rows = conn.execute("SELECT * FROM knowledge_context ORDER BY created_at DESC", ()).fetchall()
+            rows = conn.execute(
+                "SELECT * FROM knowledge_context WHERE owner_user_id = %s ORDER BY created_at DESC",
+                (owner_user_id,),
+            ).fetchall()
         contexts: List[KnowledgeContext] = []
         for row in rows:
             contexts.append(
@@ -1769,17 +1854,22 @@ class PostgresStore:
         except errors.ForeignKeyViolation:
             raise ConstraintViolation("context not found", {"context_id": context_id})
 
-    def list_chunks(self, context_id: Optional[str] = None) -> List[KnowledgeChunk]:
+    def list_chunks(self, context_id: Optional[str] = None, *, owner_user_id: Optional[str] = None) -> List[KnowledgeChunk]:
         with self._connect() as conn:
             if context_id:
-                rows = conn.execute(
-                    "SELECT * FROM knowledge_chunk WHERE context_id = %s ORDER BY chunk_index ASC",
-                    (context_id,),
-                ).fetchall()
+                params: list[Any] = [context_id]
+                query = "SELECT kc.* FROM knowledge_chunk kc"
+                if owner_user_id:
+                    query += " JOIN knowledge_context ctx ON ctx.id = kc.context_id AND ctx.owner_user_id = %s"
+                    params.append(owner_user_id)
+                query += " WHERE kc.context_id = %s ORDER BY kc.chunk_index ASC" if owner_user_id else " WHERE context_id = %s ORDER BY chunk_index ASC"
+                rows = conn.execute(query, tuple(params)).fetchall()
             else:
+                if not owner_user_id:
+                    return []
                 rows = conn.execute(
-                    "SELECT * FROM knowledge_chunk ORDER BY created_at DESC",
-                    (),
+                    "SELECT kc.* FROM knowledge_chunk kc JOIN knowledge_context ctx ON ctx.id = kc.context_id WHERE ctx.owner_user_id = %s ORDER BY kc.created_at DESC",
+                    (owner_user_id,),
                 ).fetchall()
         chunks: List[KnowledgeChunk] = []
         for row in rows:

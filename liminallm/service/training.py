@@ -404,7 +404,7 @@ class TrainingService:
 
     def _build_examples(self, events: Iterable[PreferenceEvent]) -> Iterable[dict]:
         for event in events:
-            messages = self.store.list_messages(event.conversation_id, limit=200)
+            messages = self.store.list_messages(event.conversation_id, limit=200, user_id=event.user_id)
             prompt_chunks: List[str] = []
             target_text = event.corrected_text
             cluster_id = event.cluster_id or self._bucket_embedding(event.context_embedding, event.user_id)

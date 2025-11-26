@@ -96,6 +96,10 @@ class PasswordResetConfirm(BaseModel):
         return value
 
 
+class EmailVerificationRequest(BaseModel):
+    token: str
+
+
 class ChatMessage(BaseModel):
     content: str
     mode: str = "text"
