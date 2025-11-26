@@ -1086,6 +1086,36 @@ class PostgresStore:
             raise ConstraintViolation("conversation owner or context missing", {"user_id": user_id, "context_id": active_context_id})
         return Conversation(id=conv_id, user_id=user_id, title=title, created_at=now, updated_at=now, active_context_id=active_context_id)
 
+    def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM conversation WHERE id = %s", (conversation_id,)).fetchone()
+        if not row:
+            return None
+        def _row_value(key: str, default: Optional[Any] = None) -> Optional[Any]:
+            if hasattr(row, "get"):
+                return row.get(key, default)
+            try:
+                return row[key]
+            except Exception:
+                return default
+
+        raw_meta = _row_value("meta")
+        if isinstance(raw_meta, str):
+            try:
+                raw_meta = json.loads(raw_meta)
+            except Exception:
+                raw_meta = None
+        return Conversation(
+            id=str(_row_value("id")),
+            user_id=str(_row_value("user_id")),
+            created_at=_row_value("created_at", datetime.utcnow()),
+            updated_at=_row_value("updated_at", datetime.utcnow()),
+            title=_row_value("title"),
+            status=_row_value("status"),
+            active_context_id=_row_value("active_context_id"),
+            meta=raw_meta,
+        )
+
     def append_message(
         self,
         conversation_id: str,
@@ -1622,6 +1652,37 @@ class PostgresStore:
             raise ConstraintViolation("context fields required", error_fields) from exc
         return KnowledgeContext(
             id=ctx_id, owner_user_id=owner_user_id, name=name, description=description, fs_path=fs_path, meta=meta
+        )
+
+    def get_context(self, context_id: str) -> Optional[KnowledgeContext]:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM knowledge_context WHERE id = %s", (context_id,)).fetchone()
+        if not row:
+            return None
+
+        def _row_value(key: str, default: Optional[Any] = None) -> Optional[Any]:
+            if hasattr(row, "get"):
+                return row.get(key, default)
+            try:
+                return row[key]
+            except Exception:
+                return default
+
+        raw_meta = _row_value("meta")
+        if isinstance(raw_meta, str):
+            try:
+                raw_meta = json.loads(raw_meta)
+            except Exception:
+                raw_meta = None
+        return KnowledgeContext(
+            id=str(_row_value("id")),
+            owner_user_id=str(_row_value("owner_user_id")),
+            name=_row_value("name", ""),
+            description=_row_value("description", ""),
+            created_at=_row_value("created_at", datetime.utcnow()),
+            updated_at=_row_value("updated_at", datetime.utcnow()),
+            fs_path=_row_value("fs_path"),
+            meta=raw_meta,
         )
 
     def list_contexts(self, owner_user_id: Optional[str] = None) -> List[KnowledgeContext]:

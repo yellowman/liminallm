@@ -61,6 +61,7 @@ from liminallm.api.schemas import (
 from liminallm.service.auth import AuthContext
 from liminallm.service.errors import BadRequestError, NotFoundError
 from liminallm.storage.errors import ConstraintViolation
+from liminallm.storage.models import Conversation, KnowledgeContext
 from liminallm.config import get_settings
 from liminallm.service.fs import safe_join
 from liminallm.service.runtime import (
@@ -196,6 +197,24 @@ async def get_admin_user(
     )
     if not ctx:
         raise HTTPException(status_code=403, detail="admin access required")
+    return ctx
+
+
+def _get_owned_conversation(runtime, conversation_id: str, principal: AuthContext) -> Conversation:
+    conversation = runtime.store.get_conversation(conversation_id)
+    if not conversation:
+        raise HTTPException(status_code=404, detail="conversation not found")
+    if conversation.user_id != principal.user_id:
+        raise HTTPException(status_code=403, detail="forbidden")
+    return conversation
+
+
+def _get_owned_context(runtime, context_id: str, principal: AuthContext) -> KnowledgeContext:
+    ctx = runtime.store.get_context(context_id)
+    if not ctx:
+        raise HTTPException(status_code=404, detail="context not found")
+    if ctx.owner_user_id != principal.user_id:
+        raise HTTPException(status_code=403, detail="forbidden")
     return ctx
 
 
@@ -489,11 +508,17 @@ async def chat(
             )
             if not allowed:
                 raise HTTPException(status_code=429, detail="rate limit exceeded")
+        conversation: Conversation | None = None
+        if body.context_id:
+            _get_owned_context(runtime, body.context_id, principal)
         if body.conversation_id:
-            conversation_id = body.conversation_id
+            conversation = _get_owned_conversation(runtime, body.conversation_id, principal)
+            conversation_id = conversation.id
         else:
             conversation = runtime.store.create_conversation(user_id=user_id, active_context_id=body.context_id)
             conversation_id = conversation.id
+        if conversation and conversation.active_context_id:
+            _get_owned_context(runtime, conversation.active_context_id, principal)
         user_content = body.message.content
         voice_meta: dict = {}
         if body.message.mode == "voice":
@@ -1017,6 +1042,7 @@ async def upload_file(
 @router.get("/conversations/{conversation_id}/messages", response_model=Envelope)
 async def list_messages(conversation_id: str, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
+    _get_owned_conversation(runtime, conversation_id, principal)
     msgs = runtime.store.list_messages(conversation_id)
     payload = [
         {
@@ -1107,6 +1133,7 @@ async def list_contexts(principal: AuthContext = Depends(get_user)):
 @router.get("/contexts/{context_id}/chunks", response_model=Envelope)
 async def list_chunks(context_id: str, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
+    _get_owned_context(runtime, context_id, principal)
     chunks = runtime.store.list_chunks(context_id)
     data = [
         KnowledgeChunkResponse(
