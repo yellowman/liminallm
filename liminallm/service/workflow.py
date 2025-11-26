@@ -243,7 +243,7 @@ class WorkflowEngine:
         tool_name = tool_schema.get("name") or tool_schema.get("id")
         if not tool_name:
             return {"status": "error", "content": "tool spec missing name"}
-        self.tool_registry[tool_name] = tool_schema
+        self.tool_registry.setdefault(tool_name, dict(tool_schema))
         history: List[Any] = []
         if conversation_id and hasattr(self.store, "list_messages"):
             try:
@@ -354,6 +354,8 @@ class WorkflowEngine:
             return {"status": "ok"}, [n for n in next_nodes if n]
         if node_type == "parallel":
             next_nodes = node.get("next", []) or []
+            if isinstance(next_nodes, str):
+                next_nodes = [next_nodes]
             return {"status": "ok"}, [n for n in next_nodes if n]
         if node_type == "end":
             return {"status": "end"}, []

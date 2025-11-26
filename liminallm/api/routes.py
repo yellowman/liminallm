@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Response, UploadFile, WebSocket, WebSocketDisconnect
 
 from liminallm.content_struct import normalize_content_struct
 from liminallm.api.schemas import (
@@ -61,7 +61,7 @@ from liminallm.api.schemas import (
 from liminallm.service.auth import AuthContext
 from liminallm.service.errors import BadRequestError, NotFoundError
 from liminallm.storage.errors import ConstraintViolation
-from liminallm.storage.models import Conversation, KnowledgeContext
+from liminallm.storage.models import Conversation, KnowledgeContext, Session
 from liminallm.config import get_settings
 from liminallm.service.fs import safe_join
 from liminallm.service.runtime import (
@@ -225,6 +225,15 @@ def _get_owned_context(runtime, context_id: str, principal: AuthContext) -> Know
     return ctx
 
 
+def _get_owned_artifact(runtime, artifact_id: str, principal: AuthContext):
+    artifact = runtime.store.get_artifact(artifact_id)
+    if not artifact:
+        raise HTTPException(status_code=404, detail="artifact not found")
+    if artifact.owner_user_id and artifact.owner_user_id != principal.user_id:
+        raise HTTPException(status_code=403, detail="forbidden")
+    return artifact
+
+
 def _user_to_response(user) -> UserResponse:
     return UserResponse(
         id=user.id,
@@ -239,8 +248,31 @@ def _user_to_response(user) -> UserResponse:
     )
 
 
+def _apply_session_cookies(response: Response, session: Session, tokens: dict, *, refresh_ttl_minutes: int) -> None:
+    response.set_cookie(
+        "session_id",
+        session.id,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        expires=session.expires_at,
+        path="/",
+    )
+    refresh_token = tokens.get("refresh_token")
+    if refresh_token:
+        response.set_cookie(
+            "refresh_token",
+            refresh_token,
+            httponly=True,
+            secure=True,
+            samesite="lax",
+            max_age=refresh_ttl_minutes * 60,
+            path="/",
+        )
+
+
 @router.post("/auth/signup", response_model=Envelope, status_code=201)
-async def signup(body: SignupRequest):
+async def signup(body: SignupRequest, response: Response):
     settings = get_settings()
     if not settings.allow_signup:
         raise HTTPException(status_code=403, detail="signup disabled")
@@ -254,6 +286,7 @@ async def signup(body: SignupRequest):
     user, session, tokens = await runtime.auth.signup(
         email=body.email, password=body.password, handle=body.handle, tenant_id=body.tenant_id
     )
+    _apply_session_cookies(response, session, tokens, refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes)
     return Envelope(
         status="ok",
         data=AuthResponse(
@@ -271,7 +304,7 @@ async def signup(body: SignupRequest):
 
 
 @router.post("/auth/login", response_model=Envelope)
-async def login(body: LoginRequest):
+async def login(body: LoginRequest, response: Response):
     runtime = get_runtime()
     await _enforce_rate_limit(
         runtime,
@@ -284,6 +317,7 @@ async def login(body: LoginRequest):
     )
     if not user or not session:
         raise HTTPException(status_code=401, detail="invalid credentials")
+    _apply_session_cookies(response, session, tokens, refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes)
     return Envelope(
         status="ok",
         data=AuthResponse(
@@ -311,11 +345,13 @@ async def oauth_start(provider: str, body: OAuthStartRequest):
 
 
 @router.get("/auth/oauth/{provider}/callback", response_model=Envelope)
-async def oauth_callback(provider: str, code: str, state: str, tenant_id: Optional[str] = None):
+async def oauth_callback(provider: str, code: str, state: str, tenant_id: Optional[str] = None, response: Response = None):
     runtime = get_runtime()
     user, session, tokens = await runtime.auth.complete_oauth(provider, code, state, tenant_id=tenant_id)
     if not user or not session:
         raise HTTPException(status_code=401, detail="oauth verification failed")
+    if response:
+        _apply_session_cookies(response, session, tokens, refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes)
     return Envelope(
         status="ok",
         data=AuthResponse(
@@ -337,12 +373,15 @@ async def refresh_tokens(
     body: TokenRefreshRequest,
     authorization: Optional[str] = Header(None),
     x_tenant_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Tenant-ID"),
+    response: Response = None,
 ):
     runtime = get_runtime()
     tenant_hint = body.tenant_id or x_tenant_id
     user, session, tokens = await runtime.auth.refresh_tokens(body.refresh_token, tenant_hint=tenant_hint)
     if not user or not session:
         raise HTTPException(status_code=401, detail="invalid refresh")
+    if response:
+        _apply_session_cookies(response, session, tokens, refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes)
     return Envelope(
         status="ok",
         data=AuthResponse(
@@ -450,7 +489,7 @@ async def request_mfa(body: MFARequest):
 
 
 @router.post("/auth/mfa/verify", response_model=Envelope)
-async def verify_mfa(body: MFAVerifyRequest):
+async def verify_mfa(body: MFAVerifyRequest, response: Response):
     runtime = get_runtime()
     auth_ctx = await runtime.auth.resolve_session(body.session_id, allow_pending_mfa=True)
     if not auth_ctx:
@@ -474,6 +513,7 @@ async def verify_mfa(body: MFAVerifyRequest):
                 tenant_id=user.tenant_id,
             ).model_dump()
         )
+        _apply_session_cookies(response, session, tokens, refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes)
     return Envelope(status="ok", data=resp)
 
 
@@ -487,7 +527,8 @@ async def request_reset(body: PasswordResetRequest):
         60,
     )
     token = await runtime.auth.initiate_password_reset(body.email)
-    return Envelope(status="ok", data={"token": token})
+    # Token delivery should be handled out-of-band; avoid exposing it directly.
+    return Envelope(status="ok", data={"status": "sent"})
 
 
 @router.post("/auth/reset/confirm", response_model=Envelope)
@@ -503,6 +544,7 @@ async def confirm_reset(body: PasswordResetConfirm):
 async def logout(
     session_id: Optional[str] = Header(None, convert_underscores=False),
     authorization: Optional[str] = Header(None),
+    response: Response = None,
 ):
     runtime = get_runtime()
     if authorization or session_id:
@@ -511,6 +553,9 @@ async def logout(
         if not target_session:
             raise HTTPException(status_code=401, detail="invalid session")
         await runtime.auth.revoke(target_session)
+    if response:
+        response.delete_cookie("session_id", path="/")
+        response.delete_cookie("refresh_token", path="/")
     return Envelope(status="ok", data={"message": "session revoked"})
 
 
@@ -685,7 +730,11 @@ async def list_artifacts(
             updated_at=a.updated_at,
         )
         for a in runtime.store.list_artifacts(
-            type_filter=type_filter, kind_filter=kind_filter, page=page, page_size=resolved_page_size
+            type_filter=type_filter,
+            kind_filter=kind_filter,
+            owner_user_id=principal.user_id,
+            page=page,
+            page_size=resolved_page_size,
         )
     ]
     return Envelope(status="ok", data=ArtifactListResponse(items=items))
@@ -694,9 +743,7 @@ async def list_artifacts(
 @router.get("/artifacts/{artifact_id}", response_model=Envelope)
 async def get_artifact(artifact_id: str, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
-    artifact = runtime.store.get_artifact(artifact_id)
-    if not artifact:
-        raise NotFoundError("artifact not found", detail={"artifact_id": artifact_id})
+    artifact = _get_owned_artifact(runtime, artifact_id, principal)
     resp = ArtifactResponse(
         id=artifact.id,
         type=artifact.type,
@@ -718,7 +765,11 @@ async def list_tool_specs(
     runtime = get_runtime()
     resolved_page_size = min(max(page_size, 1), 200)
     artifacts = runtime.store.list_artifacts(
-        type_filter="tool", kind_filter="tool.spec", page=page, page_size=resolved_page_size
+        type_filter="tool",
+        kind_filter="tool.spec",
+        owner_user_id=principal.user_id,
+        page=page,
+        page_size=resolved_page_size,
     )
     items = [
         ArtifactResponse(
@@ -741,8 +792,8 @@ async def list_tool_specs(
 @router.get("/tools/specs/{artifact_id}", response_model=Envelope)
 async def get_tool_spec(artifact_id: str, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
-    artifact = runtime.store.get_artifact(artifact_id)
-    if not artifact or not (isinstance(artifact.schema, dict) and artifact.schema.get("kind") == "tool.spec"):
+    artifact = _get_owned_artifact(runtime, artifact_id, principal)
+    if not (isinstance(artifact.schema, dict) and artifact.schema.get("kind") == "tool.spec"):
         raise NotFoundError("tool spec not found", detail={"artifact_id": artifact_id})
     resp = ArtifactResponse(
         id=artifact.id,
@@ -823,8 +874,8 @@ async def invoke_tool(
     ) as idem:
         if idem.cached:
             return idem.cached
-        artifact = runtime.store.get_artifact(tool_id)
-        if not artifact or not (isinstance(artifact.schema, dict) and artifact.schema.get("kind") == "tool.spec"):
+        artifact = _get_owned_artifact(runtime, tool_id, principal)
+        if not (isinstance(artifact.schema, dict) and artifact.schema.get("kind") == "tool.spec"):
             raise NotFoundError("tool spec not found", detail={"artifact_id": tool_id})
         result = runtime.workflow.invoke_tool(
             artifact.schema,
@@ -897,9 +948,7 @@ async def create_artifact(
 @router.patch("/artifacts/{artifact_id}", response_model=Envelope)
 async def patch_artifact(artifact_id: str, body: ArtifactRequest, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
-    current = runtime.store.get_artifact(artifact_id)
-    if not current:
-        raise NotFoundError("artifact not found", detail={"artifact_id": artifact_id})
+    current = _get_owned_artifact(runtime, artifact_id, principal)
     if not isinstance(body.schema, dict):
         raise BadRequestError("artifact schema must be an object", detail={"provided_type": type(body.schema).__name__})
     schema_kind = body.schema.get("kind")
@@ -1054,12 +1103,13 @@ async def upload_file(
         dest_path.write_bytes(contents)
         chunk_count = None
         if context_id:
+            _get_owned_context(runtime, context_id, principal)
             try:
                 chunk_count = runtime.rag.ingest_file(context_id, str(dest_path), chunk_size=chunk_size)
             except ConstraintViolation:
                 dest_path.unlink(missing_ok=True)
                 raise
-        resp = FileUploadResponse(fs_path=str(dest_path), context_id=context_id, chunk_count=chunk_count)
+        resp = FileUploadResponse(fs_path=file.filename, context_id=context_id, chunk_count=chunk_count)
         envelope = Envelope(status="ok", data=resp, request_id=idem.request_id)
         await idem.store_result(envelope)
         return envelope
@@ -1212,7 +1262,13 @@ async def websocket_chat(ws: WebSocket):
             if not allowed:
                 await ws.close(code=4429)
                 return
-        convo_id = init.get("conversation_id") or runtime.store.create_conversation(user_id=user_id).id
+        convo_id = init.get("conversation_id")
+        if convo_id:
+            _get_owned_conversation(runtime, convo_id, auth_ctx)
+        else:
+            convo_id = runtime.store.create_conversation(user_id=user_id).id
+        if init.get("context_id"):
+            _get_owned_context(runtime, init.get("context_id"), auth_ctx)
         runtime.store.append_message(convo_id, sender="user", role="user", content=init.get("message", ""))
         orchestration = await runtime.workflow.run(
             init.get("workflow_id"),

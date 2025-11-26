@@ -79,3 +79,8 @@ CREATE TABLE IF NOT EXISTS message (
   meta            JSONB,
   UNIQUE (conversation_id, seq)
 );
+
+CREATE INDEX IF NOT EXISTS idx_app_user_tenant_id ON app_user(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_auth_session_user_id ON auth_session(user_id);
+CREATE INDEX IF NOT EXISTS idx_conversation_user_id ON conversation(user_id);
+CREATE INDEX IF NOT EXISTS idx_message_conversation_id ON message(conversation_id);

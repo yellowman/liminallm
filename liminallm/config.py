@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from enum import Enum
 from typing import Any
 
@@ -62,7 +63,7 @@ class Settings(BaseModel):
     chat_rate_limit_per_minute: int = env_field(60, "CHAT_RATE_LIMIT_PER_MINUTE")
     chat_rate_limit_window_seconds: int = env_field(60, "CHAT_RATE_LIMIT_WINDOW_SECONDS")
     enable_mfa: bool = env_field(True, "ENABLE_MFA")
-    jwt_secret: str = env_field("dev-secret", "JWT_SECRET")
+    jwt_secret: str = env_field(None, "JWT_SECRET")
     jwt_issuer: str = env_field("liminallm", "JWT_ISSUER")
     jwt_audience: str = env_field("liminal-clients", "JWT_AUDIENCE")
     access_token_ttl_minutes: int = env_field(30, "ACCESS_TOKEN_TTL_MINUTES")
@@ -104,6 +105,13 @@ class Settings(BaseModel):
     def _validate_rag_mode(cls, value: RagMode) -> RagMode:
         return RagMode(value)
 
+    @field_validator("jwt_secret")
+    @classmethod
+    def _ensure_jwt_secret(cls, value: str | None) -> str:
+        if value:
+            return value
+        return secrets.token_urlsafe(64)
+
 
 def get_settings() -> Settings:
     global _settings_cache
@@ -113,3 +121,10 @@ def get_settings() -> Settings:
 
 
 _settings_cache: Settings | None = None
+
+
+def reset_settings_cache() -> None:
+    """Clear cached settings so future calls re-read the environment."""
+
+    global _settings_cache
+    _settings_cache = None

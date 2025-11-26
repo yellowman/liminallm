@@ -3,13 +3,14 @@ from __future__ import annotations
 import json
 import random
 import shutil
+import uuid
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Sequence
 
 from liminallm.service.embeddings import deterministic_embedding
-from liminallm.service.fs import safe_join
+from liminallm.service.fs import PathTraversalError, safe_join
 from liminallm.service.tokenizer_utils import DEFAULT_VOCAB_SIZE, vocab_size_from_tokenizer
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import Artifact, PreferenceEvent
@@ -161,6 +162,8 @@ class TrainingService:
         adapter = self.ensure_user_adapter(user_id) if not adapter_id else self.store.get_artifact(adapter_id)
         if not adapter:
             raise ConstraintViolation("adapter missing", {"adapter_id": adapter_id})
+        if adapter.owner_user_id and adapter.owner_user_id != user_id:
+            raise ConstraintViolation("adapter ownership mismatch", {"adapter_id": adapter.id})
         adapter = self._assert_adapter_base(adapter)
         self._apply_adapter_vocab_size(adapter)
         events = self.store.list_preference_events(user_id=user_id, feedback="positive", cluster_id=cluster_id)
@@ -314,7 +317,6 @@ class TrainingService:
             jobs.sort(key=lambda j: j.updated_at or j.created_at, reverse=True)
         except Exception as exc:
             logger.warning("training_job_sort_failed", error=str(exc))
-            raise
         return jobs
 
     def summarize_preferences(self, user_id: Optional[str]) -> dict:
@@ -479,7 +481,12 @@ class TrainingService:
         adapter_schema = adapter_schema or {}
         explicit = adapter_schema.get("cephfs_dir") or adapter_schema.get("fs_dir")
         if explicit:
-            return Path(explicit)
+            candidate = Path(explicit)
+            base_root = Path(self.fs_root).resolve()
+            resolved = candidate if candidate.is_absolute() else safe_join(base_root, str(candidate))
+            if base_root not in resolved.parents and resolved != base_root:
+                raise PathTraversalError("adapter directory must reside under shared_fs_root")
+            return resolved
         return safe_join(self.fs_root, f"adapters/{adapter_id}")
 
     def _job_dir(self, user_id: str, adapter_id: str, job_id: str, adapter_schema: Optional[dict] = None) -> Path:
@@ -487,12 +494,11 @@ class TrainingService:
 
     def _update_latest_symlink(self, adapter_dir: Path, version_dir: Path) -> None:
         latest = adapter_dir / "latest"
-        if latest.exists() or latest.is_symlink():
-            if latest.is_dir() and not latest.is_symlink():
-                shutil.rmtree(latest)
-            else:
-                latest.unlink()
-        latest.symlink_to(version_dir, target_is_directory=True)
+        temp = adapter_dir / f".latest.{uuid.uuid4()}"
+        if temp.exists() or temp.is_symlink():
+            temp.unlink()
+        temp.symlink_to(version_dir, target_is_directory=True)
+        temp.replace(latest)
 
     def _init_lora_weights(self, rank: int, layers: List[int], matrices: List[str]) -> dict:
         weights: dict[str, list[list[float]]] = {}

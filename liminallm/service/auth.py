@@ -290,6 +290,7 @@ class AuthService:
             cached_user = await self.cache.get_session_user(session_id)
             if not cached_user:
                 return None
+            sess = self.store.get_session(session_id)
         if not sess or sess.expires_at <= datetime.utcnow():
             return None
         user = self.store.get_user(sess.user_id)
@@ -350,7 +351,7 @@ class AuthService:
         secret = existing.secret if existing else base64.b32encode(os.urandom(10)).decode("utf-8").rstrip("=")
         self.store.set_user_mfa_secret(user_id, secret, enabled=False)
         uri = f"otpauth://totp/liminallm:{user_id}?secret={secret}&issuer=LiminalLM"
-        return {"otpauth_uri": uri, "secret": secret}
+        return {"otpauth_uri": uri}
 
     async def verify_mfa_challenge(self, user_id: str, code: str, session_id: Optional[str] = None) -> bool:
         if not self.mfa_enabled:
@@ -366,7 +367,7 @@ class AuthService:
         return True
 
     async def initiate_password_reset(self, email: str) -> str:
-        token = hashlib.sha256(f"reset-{email}-{os.urandom(6)}".encode()).hexdigest()
+        token = hashlib.sha256(f"reset-{email}-{os.urandom(32)}".encode()).hexdigest()
         # Persist a short-lived reset token with TTL in Redis if available
         if self.cache:
             expires_at = datetime.utcnow() + timedelta(minutes=15)
@@ -388,6 +389,8 @@ class AuthService:
             return False
         pwd_hash, algo = self._hash_password(new_password)
         self.store.save_password(user.id, pwd_hash, algo)
+        if self.cache:
+            await self.cache.client.delete(f"reset:{token}")
         return True
 
     def _hash_password(self, password: str) -> Tuple[str, str]:
