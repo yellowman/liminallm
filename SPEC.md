@@ -308,6 +308,7 @@ USING ivfflat (embedding) WITH (lists = 100);
 - **chunking**: sliding window token-based splitter (e.g., 300–500 tokens with 50 token overlap) tuned per file type; store `chunk_index` and offsets.
 - **hygiene**: dedupe by file checksum + path; skip binary blobs unless parser registered; enforce max file size per plan tier; optional PII-scrub per context.
 - **embedding model**: fixed small encoder (e.g., `all-MiniLM` equivalent) referenced in config; keep version in `knowledge_context.meta.embedding_model`.
+- **embedding dimensionality**: embeddings are normalized/padded to a fixed 64-d vector (`EMBEDDING_DIM`) across routing, RAG, and clustering; external providers must truncate/pad to this size before persistence.
 - **refresh cadence**:
   - watch filesystem path events; enqueue ingestion job on file change.
   - periodic sweep (daily) to re-embed if encoder version changes.

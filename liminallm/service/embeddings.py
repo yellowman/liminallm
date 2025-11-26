@@ -4,7 +4,11 @@ import hashlib
 from typing import Callable, Iterable, List
 
 
-def deterministic_embedding(text: str, dim: int = 64) -> List[float]:
+# Fixed embedding size shared across routing/RAG/clustering
+EMBEDDING_DIM = 64
+
+
+def deterministic_embedding(text: str, dim: int = EMBEDDING_DIM) -> List[float]:
     """Generate a small deterministic embedding without external models.
 
     This keeps the kernel self-contained for routing and clustering when a real
@@ -12,7 +16,7 @@ def deterministic_embedding(text: str, dim: int = 64) -> List[float]:
     """
 
     if not text:
-        return [0.0] * dim
+        return ensure_embedding_dim([], dim=dim)
     tokens = text.lower().split()
     vec = [0.0] * dim
     for tok in tokens:
@@ -20,7 +24,7 @@ def deterministic_embedding(text: str, dim: int = 64) -> List[float]:
         idx = h % dim
         vec[idx] += 1.0
     norm = sum(v * v for v in vec) ** 0.5 or 1.0
-    return [v / norm for v in vec]
+    return ensure_embedding_dim([v / norm for v in vec], dim=dim)
 
 
 def cosine_similarity(a: Iterable[float], b: Iterable[float]) -> float:
@@ -33,11 +37,19 @@ def cosine_similarity(a: Iterable[float], b: Iterable[float]) -> float:
     return num / denom if denom else 0.0
 
 
-def pad_vectors(vectors: list[list[float]]) -> list[list[float]]:
+def ensure_embedding_dim(vec: Iterable[float] | None, *, dim: int = EMBEDDING_DIM) -> List[float]:
+    if not vec:
+        return [0.0] * dim
+    trimmed = list(vec)[:dim]
+    if len(trimmed) < dim:
+        trimmed += [0.0] * (dim - len(trimmed))
+    return trimmed
+
+
+def pad_vectors(vectors: list[list[float]], *, dim: int = EMBEDDING_DIM) -> list[list[float]]:
     if not vectors:
         return []
-    dim = max(len(v) for v in vectors)
-    return [list(v) + [0.0] * (dim - len(v)) for v in vectors]
+    return [ensure_embedding_dim(v, dim=dim) for v in vectors]
 
 
 class EmbeddingsService:
