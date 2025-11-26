@@ -99,7 +99,12 @@ class TrainingService:
     def ensure_user_adapter(self, user_id: str, *, rank: int = 4, adapter_id_override: Optional[str] = None) -> Artifact:
         existing = [a for a in self.store.list_artifacts(type_filter="adapter") if a.owner_user_id == user_id]
         if adapter_id_override:
-            existing = [a for a in existing if a.id == adapter_id_override] or existing
+            existing = [a for a in existing if a.id == adapter_id_override]
+            if not existing:
+                raise ConstraintViolation(
+                    "adapter override missing",
+                    {"adapter_id": adapter_id_override, "user_id": user_id},
+                )
         if existing:
             adapter = existing[0]
             runtime_base = self.runtime_base_model
