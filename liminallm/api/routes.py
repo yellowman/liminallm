@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 
+from liminallm.content_struct import normalize_content_struct
 from liminallm.api.schemas import (
     ArtifactListResponse,
     ArtifactRequest,
@@ -503,8 +504,14 @@ async def chat(
             transcript = runtime.voice.transcribe(audio_bytes, user_id=user_id)
             user_content = transcript.get("transcript", body.message.content)
             voice_meta = {"mode": "voice", "transcript": transcript}
+        user_content_struct = normalize_content_struct(body.message.content_struct, user_content)
         runtime.store.append_message(
-            conversation_id, sender="user", role="user", content=user_content, meta=voice_meta or None
+            conversation_id,
+            sender="user",
+            role="user",
+            content=user_content,
+            meta=voice_meta or None,
+            content_struct=user_content_struct,
         )
         orchestration = await runtime.workflow.run(
             body.workflow_id,
@@ -514,11 +521,16 @@ async def chat(
             user_id,
             tenant_id=principal.tenant_id,
         )
+        assistant_content_struct = normalize_content_struct(
+            orchestration.get("content_struct") if isinstance(orchestration, dict) else None,
+            orchestration.get("content") if isinstance(orchestration, dict) else None,
+        )
         assistant_msg = runtime.store.append_message(
             conversation_id,
             sender="assistant",
             role="assistant",
             content=orchestration["content"],
+            content_struct=assistant_content_struct,
             meta={
                 "adapters": orchestration.get("adapters", []),
                 "adapter_gates": orchestration.get("adapter_gates", []),
@@ -531,6 +543,7 @@ async def chat(
             message_id=assistant_msg.id,
             conversation_id=conversation_id,
             content=assistant_msg.content,
+            content_struct=assistant_msg.content_struct,
             workflow_id=body.workflow_id,
             adapters=orchestration.get("adapters", []),
             adapter_gates=orchestration.get("adapter_gates", []),
@@ -1011,6 +1024,7 @@ async def list_messages(conversation_id: str, principal: AuthContext = Depends(g
             "role": m.role,
             "sender": m.sender,
             "content": m.content,
+            "content_struct": m.content_struct,
             "seq": m.seq,
             "created_at": m.created_at,
             "meta": m.meta,
@@ -1155,11 +1169,16 @@ async def websocket_chat(ws: WebSocket):
             user_id,
             tenant_id=auth_ctx.tenant_id,
         )
+        assistant_content_struct = normalize_content_struct(
+            orchestration.get("content_struct") if isinstance(orchestration, dict) else None,
+            orchestration.get("content") if isinstance(orchestration, dict) else None,
+        )
         assistant_msg = runtime.store.append_message(
             convo_id,
             sender="assistant",
             role="assistant",
             content=orchestration["content"],
+            content_struct=assistant_content_struct,
             meta={
                 "adapters": orchestration.get("adapters", []),
                 "adapter_gates": orchestration.get("adapter_gates", []),
@@ -1175,6 +1194,7 @@ async def websocket_chat(ws: WebSocket):
                     message_id=assistant_msg.id,
                     conversation_id=convo_id,
                     content=assistant_msg.content,
+                    content_struct=assistant_msg.content_struct,
                     workflow_id=init.get("workflow_id"),
                     adapters=orchestration.get("adapters", []),
                     adapter_gates=orchestration.get("adapter_gates", []),

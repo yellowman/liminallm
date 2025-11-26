@@ -10,6 +10,7 @@ from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service.artifact_validation import ArtifactValidationError, validate_artifact
 from liminallm.storage.errors import ConstraintViolation
@@ -340,6 +341,7 @@ class MemoryStore:
     ) -> Message:
         if conversation_id not in self.conversations:
             raise ConstraintViolation("conversation not found", {"conversation_id": conversation_id})
+        normalized_content_struct = normalize_content_struct(content_struct, content)
         seq = len(self.messages.get(conversation_id, []))
         msg = Message(
             id=str(uuid.uuid4()),
@@ -347,7 +349,7 @@ class MemoryStore:
             sender=sender,
             role=role,
             content=content,
-            content_struct=content_struct,
+            content_struct=normalized_content_struct,
             seq=seq,
             created_at=datetime.utcnow(),
             meta=meta,

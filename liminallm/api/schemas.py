@@ -77,6 +77,7 @@ class PasswordResetConfirm(BaseModel):
 class ChatMessage(BaseModel):
     content: str
     mode: str = "text"
+    content_struct: Optional[dict] = None
 
 
 class ChatRequest(BaseModel):
@@ -92,6 +93,7 @@ class ChatResponse(BaseModel):
     message_id: str
     conversation_id: str
     content: str
+    content_struct: Optional[dict] = None
     workflow_id: Optional[str] = None
     adapters: List[str] = Field(default_factory=list)
     adapter_gates: List[dict] = Field(default_factory=list)

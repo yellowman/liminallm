@@ -14,6 +14,7 @@ from psycopg import errors
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
+from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service.artifact_validation import ArtifactValidationError, validate_artifact
 from liminallm.storage.errors import ConstraintViolation
@@ -1012,6 +1013,7 @@ class PostgresStore:
         content_struct: Optional[dict] = None,
     ) -> Message:
         try:
+            normalized_content_struct = normalize_content_struct(content_struct, content)
             with self._connect() as conn:
                 seq_row = conn.execute("SELECT COUNT(*) AS c FROM message WHERE conversation_id = %s", (conversation_id,)).fetchone()
                 seq = seq_row["c"] if seq_row else 0
@@ -1025,7 +1027,7 @@ class PostgresStore:
                         sender,
                         role,
                         content,
-                        json.dumps(content_struct) if content_struct is not None else None,
+                        json.dumps(normalized_content_struct) if normalized_content_struct is not None else None,
                         seq,
                         now,
                         json.dumps(meta) if meta else None,
@@ -1040,7 +1042,7 @@ class PostgresStore:
             sender=sender,
             role=role,
             content=content,
-            content_struct=content_struct,
+            content_struct=normalized_content_struct,
             seq=seq,
             created_at=now,
             meta=meta,
@@ -1059,6 +1061,7 @@ class PostgresStore:
                     content_struct = json.loads(content_struct)
                 except Exception:
                     content_struct = None
+            content_struct = normalize_content_struct(content_struct, row.get("content") if isinstance(row, dict) else row["content"])
             meta = row.get("meta") if isinstance(row, dict) else row["meta"]
             if isinstance(meta, str):
                 try:
