@@ -394,13 +394,24 @@ class MemoryStore:
             raise ConstraintViolation("preference user missing", {"user_id": user_id})
         if conversation_id not in self.conversations:
             raise ConstraintViolation("preference conversation missing", {"conversation_id": conversation_id})
-        message = next(
-            (m for m in self.messages.get(conversation_id, []) if m.id == message_id),
-            None,
-        )
+        message = None
+        message_conversation_id = None
+        for cid, messages in self.messages.items():
+            for msg in messages:
+                if msg.id == message_id:
+                    message = msg
+                    message_conversation_id = cid
+                    break
+            if message:
+                break
         if not message:
             raise ConstraintViolation(
                 "preference message missing",
+                {"message_id": message_id, "conversation_id": conversation_id},
+            )
+        if message_conversation_id != conversation_id:
+            raise ConstraintViolation(
+                "preference message conversation mismatch",
                 {"message_id": message_id, "conversation_id": conversation_id},
             )
         event_id = str(uuid.uuid4())
