@@ -129,7 +129,7 @@ async def _resolve_idempotency(
         status = record.get("status")
         if status == "in_progress":
             raise HTTPException(status_code=409, detail="request in progress")
-        if status == "completed" and record.get("response"):
+        if status in {"completed", "failed"} and record.get("response"):
             response_payload = record.get("response", {})
             if "request_id" not in response_payload:
                 response_payload["request_id"] = record.get("request_id", request_id)
