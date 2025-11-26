@@ -11,6 +11,9 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, List, Optional, Protocol, Tuple
 
+from argon2 import PasswordHasher, Type
+from argon2.exceptions import InvalidHash, VerifyMismatchError
+
 from liminallm.config import Settings
 from liminallm.storage.models import Session, User, UserMFAConfig
 from liminallm.storage.redis_cache import RedisCache
@@ -112,6 +115,7 @@ class AuthService:
         self.mfa_enabled = mfa_enabled
         self.revoked_refresh_tokens: set[str] = set()
         self._oauth_states: dict[str, tuple[str, datetime, Optional[str]]] = {}
+        self._pwd_hasher = PasswordHasher(type=Type.ID)
 
     def _generate_password(self) -> str:
         return base64.urlsafe_b64encode(os.urandom(12)).decode().rstrip("=")
@@ -383,21 +387,21 @@ class AuthService:
         return True
 
     def _hash_password(self, password: str) -> Tuple[str, str]:
-        salt = os.urandom(8).hex()
-        algo = "sha256"
-        digest = hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
-        return f"{salt}${digest}", algo
+        algo = "argon2id"
+        digest = self._pwd_hasher.hash(password)
+        return digest, algo
 
     def _verify_password(self, user_id: str, password: str) -> bool:
         record = self.store.get_password_record(user_id)
         if not record:
             return False
         stored_hash, algo = record
-        if algo != "sha256" or "$" not in stored_hash:
+        if algo != "argon2id":
             return False
-        salt, expected = stored_hash.split("$", 1)
-        digest = hashlib.sha256(f"{salt}:{password}".encode()).hexdigest()
-        return hmac.compare_digest(expected, digest)
+        try:
+            return self._pwd_hasher.verify(stored_hash, password)
+        except (InvalidHash, VerifyMismatchError):
+            return False
 
     def _verify_totp(self, secret: str, code: str, *, window: int = 1, interval: int = 30) -> bool:
         for offset in range(-window, window + 1):
