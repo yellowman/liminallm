@@ -826,7 +826,12 @@ class MemoryStore:
         return []
 
     def upsert_context(
-        self, owner_user_id: str, name: str, description: str, fs_path: Optional[str] = None, meta: Optional[dict] = None
+        self,
+        owner_user_id: Optional[str],
+        name: str,
+        description: str,
+        fs_path: Optional[str] = None,
+        meta: Optional[dict] = None,
     ) -> KnowledgeContext:
         if not owner_user_id:
             raise ConstraintViolation("context owner required", {"owner_user_id": owner_user_id})
