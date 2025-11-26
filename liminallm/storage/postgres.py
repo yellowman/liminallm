@@ -390,11 +390,12 @@ class PostgresStore:
         if cluster_id:
             clauses.append("cluster_id = %s")
             params.append(cluster_id)
-        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        query = "SELECT * FROM preference_event"
+        if clauses:
+            query = " ".join([query, "WHERE", " AND ".join(clauses)])
+        query = " ".join([query, "ORDER BY created_at"])
         with self._connect() as conn:
-            rows = conn.execute(
-                f"SELECT * FROM preference_event {where} ORDER BY created_at", params
-            ).fetchall()
+            rows = conn.execute(query, params).fetchall()
         return [
             PreferenceEvent(
                 id=str(row["id"]),
