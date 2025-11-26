@@ -135,8 +135,12 @@ class ApiAdapterBackend:
                 temperature=0.2,
                 extra_body=extra_body,
             )
-            choice = completion.choices[0]
-            content = choice.message.content or ""
+            choices = completion.choices or []
+            if not choices:
+                logger.warning("API completion returned no choices; returning empty content")
+                content = ""
+            else:
+                content = choices[0].message.content or ""
             usage = {
                 "prompt_tokens": getattr(completion.usage, "prompt_tokens", 0),
                 "completion_tokens": getattr(completion.usage, "completion_tokens", 0),
