@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import math
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -75,6 +76,7 @@ class WorkflowEngine:
         visited = 0
         max_steps = max(1, min(100, len(node_map) * 2 + 10))
         visited_nodes: Dict[str, int] = {}
+        max_visits_per_node = max(2, math.ceil(max_steps / max(1, len(node_map))))
 
         state_key = f"{conversation_id or 'anon'}:{workflow_id or 'default'}"
         await self._persist_workflow_state(state_key, {"status": "running", "started_at": datetime.utcnow().isoformat()})
@@ -86,7 +88,7 @@ class WorkflowEngine:
                 continue
             visited += 1
             visited_nodes[node_id] = visited_nodes.get(node_id, 0) + 1
-            if visited_nodes[node_id] > len(node_map) + 2:
+            if visited_nodes[node_id] > max_visits_per_node:
                 self.logger.warning("workflow_loop_detected", node=node_id)
                 break
 
@@ -470,6 +472,50 @@ class WorkflowEngine:
             return [ctx_ids]
         return ctx_ids
 
+    def _validate_context_scope(
+        self, ctx_ids: Optional[Sequence[str]], *, user_id: Optional[str], tenant_id: Optional[str]
+    ) -> Optional[List[str]]:
+        if not ctx_ids:
+            return None
+        if not user_id:
+            self.logger.warning("context_scope_missing_user", requested=list(ctx_ids))
+            return None
+
+        allowed: List[str] = []
+        # MemoryStore path: direct access to context ownership and tenants
+        contexts = getattr(self.store, "contexts", None)
+        users = getattr(self.store, "users", None)
+        if isinstance(contexts, dict):
+            for ctx_id in ctx_ids:
+                ctx = contexts.get(ctx_id)
+                if not ctx or ctx.owner_user_id != user_id:
+                    continue
+                if tenant_id and isinstance(users, dict):
+                    owner = users.get(ctx.owner_user_id)
+                    if not owner or owner.tenant_id != tenant_id:
+                        continue
+                allowed.append(ctx_id)
+            return allowed or None
+
+        # Postgres path: fall back to listed contexts for the user
+        list_contexts = getattr(self.store, "list_contexts", None)
+        get_user = getattr(self.store, "get_user", None)
+        if callable(list_contexts):
+            owned_contexts = {ctx.id: ctx for ctx in list_contexts(owner_user_id=user_id)}
+            for ctx_id in ctx_ids:
+                ctx = owned_contexts.get(ctx_id)
+                if not ctx:
+                    continue
+                if tenant_id and callable(get_user):
+                    owner = get_user(ctx.owner_user_id)
+                    if not owner or owner.tenant_id != tenant_id:
+                        continue
+                allowed.append(ctx_id)
+            return allowed or None
+
+        self.logger.warning("context_scope_validation_unavailable", requested=list(ctx_ids))
+        return None
+
     def _tool_llm_generic(
         self,
         inputs: Dict[str, Any],
@@ -491,8 +537,9 @@ class WorkflowEngine:
         if not message:
             message = ""
         ctx_ids = self._resolve_context_ids(inputs.get("context_id"), context_id)
+        allowed_ctx_ids = self._validate_context_scope(ctx_ids, user_id=user_id, tenant_id=tenant_id)
 
-        ctx_chunks = self.rag.retrieve(ctx_ids, message, user_id=user_id, tenant_id=tenant_id)
+        ctx_chunks = self.rag.retrieve(allowed_ctx_ids, message, user_id=user_id, tenant_id=tenant_id)
         context_snippets = [c.text for c in ctx_chunks]
         resp = self.llm.generate(message or "", adapters=adapters, context_snippets=context_snippets, history=history)
         return {"content": resp["content"], "usage": resp["usage"], "context_snippets": context_snippets}
@@ -510,8 +557,9 @@ class WorkflowEngine:
     ) -> Dict[str, Any]:
         question = inputs.get("question") or inputs.get("message") or ""
         ctx_ids = self._resolve_context_ids(inputs.get("context_id"), context_id)
+        allowed_ctx_ids = self._validate_context_scope(ctx_ids, user_id=user_id, tenant_id=tenant_id)
 
-        chunks = self.rag.retrieve(ctx_ids, question, user_id=user_id, tenant_id=tenant_id)
+        chunks = self.rag.retrieve(allowed_ctx_ids, question, user_id=user_id, tenant_id=tenant_id)
         snippets = [c.text for c in chunks]
         resp = self.llm.generate(question or "", adapters=adapters, context_snippets=snippets, history=history)
         return {"content": resp["content"], "usage": resp["usage"], "context_snippets": snippets, "answer": resp["content"]}

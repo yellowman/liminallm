@@ -79,6 +79,28 @@ class RedisCache:
             f"chat:summary:{conversation_id}", json.dumps(summary), ex=ttl_seconds
         )
 
+    async def set_oauth_state(
+        self, state: str, provider: str, expires_at: datetime, tenant_id: Optional[str]
+    ) -> None:
+        ttl = max(1, int((expires_at - datetime.utcnow()).total_seconds()))
+        payload = {
+            "provider": provider,
+            "expires_at": expires_at.isoformat(),
+            "tenant_id": tenant_id,
+        }
+        await self.client.set(f"auth:oauth:{state}", json.dumps(payload), ex=ttl)
+
+    async def pop_oauth_state(self, state: str) -> Optional[tuple[str, datetime, Optional[str]]]:
+        key = f"auth:oauth:{state}"
+        cached = await self.client.get(key)
+        if cached is None:
+            return None
+        await self.client.delete(key)
+        data = json.loads(cached)
+        expires_raw = data.get("expires_at")
+        expires_at = datetime.fromisoformat(expires_raw) if isinstance(expires_raw, str) else datetime.utcnow()
+        return data.get("provider"), expires_at, data.get("tenant_id")
+
     async def get_idempotency_record(self, route: str, user_id: str, key: str) -> Optional[dict]:
         cached = await self.client.get(f"idemp:{route}:{user_id}:{key}")
         return json.loads(cached) if cached else None
