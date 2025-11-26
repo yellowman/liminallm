@@ -235,6 +235,7 @@ class MemoryStore:
         if user_id not in self.users:
             return False
         self.users.pop(user_id, None)
+        self.mfa_secrets.pop(user_id, None)
         for sess_id, sess in list(self.sessions.items()):
             if sess.user_id == user_id:
                 self.sessions.pop(sess_id, None)
@@ -251,6 +252,15 @@ class MemoryStore:
             if art.owner_user_id == user_id:
                 self.artifacts.pop(art_id, None)
                 self.artifact_versions.pop(art_id, None)
+        for evt_id, evt in list(self.preference_events.items()):
+            if evt.user_id == user_id:
+                self.preference_events.pop(evt_id, None)
+        for job_id, job in list(self.training_jobs.items()):
+            if job.user_id == user_id:
+                self.training_jobs.pop(job_id, None)
+        for cluster_id, cluster in list(self.semantic_clusters.items()):
+            if cluster.user_id == user_id:
+                self.semantic_clusters.pop(cluster_id, None)
         self._persist_state()
         return True
 
@@ -664,7 +674,7 @@ class MemoryStore:
             sections["config_patches"] = [_serialize(p) for p in list(self.config_patches.values())[:limit]]
         return sections
 
-    def list_messages(self, conversation_id: str, limit: int = 10) -> List[Message]:
+    def list_messages(self, conversation_id: str, limit: int = 10, **_: Any) -> List[Message]:
         msgs = self.messages.get(conversation_id, [])
         return msgs[-limit:]
 
@@ -1112,7 +1122,10 @@ class MemoryStore:
             "mfa_secrets": [self._serialize_mfa_config(cfg) for cfg in self.mfa_secrets.values()],
         }
         path = self._state_path()
-        path.write_text(json.dumps(state, indent=2))
+        try:
+            path.write_text(json.dumps(state, indent=2))
+        except Exception as exc:
+            raise RuntimeError(f"failed to persist in-memory state: {exc}")
 
     def _load_state(self) -> bool:
         path = self._state_path()

@@ -52,7 +52,12 @@ class SemanticClusterer:
     def _mini_batch_kmeans(
         self, embeddings: Sequence[Sequence[float]], k: int, batch_size: int = 8, iters: int = 10
     ) -> Tuple[List[List[float]], List[int]]:
+        if not embeddings or k <= 0:
+            return [], []
+        k = min(k, len(embeddings))
         centroids = [list(vec) for vec in random.sample(list(embeddings), k)]
+        if not centroids:
+            return [], []
         assignments = [0 for _ in embeddings]
         for _ in range(iters):
             batch_indices = random.sample(range(len(embeddings)), min(batch_size, len(embeddings)))

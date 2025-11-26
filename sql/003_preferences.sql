@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS preference_event (
   context_embedding  VECTOR,
   context_text       TEXT,
   corrected_text     TEXT,
-  cluster_id         UUID,
+  cluster_id         UUID REFERENCES semantic_cluster(id) ON DELETE SET NULL,
   weight             DOUBLE PRECISION DEFAULT 1.0,
   meta               JSONB
 );

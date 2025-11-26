@@ -96,7 +96,10 @@ def _eval_node(node: ast.AST, names: Mapping[str, Any]) -> Any:
     if isinstance(node, ast.Subscript):
         target = _eval_node(node.value, names)
         index = _eval_node(node.slice, names)
-        return target[index]
+        try:
+            return target[index]
+        except Exception as exc:
+            raise ValueError(f"invalid subscript access: {exc}")
 
     if isinstance(node, ast.Tuple):
         return tuple(_eval_node(elt, names) for elt in node.elts)

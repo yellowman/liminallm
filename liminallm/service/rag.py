@@ -35,9 +35,12 @@ class RAGService:
                 raise ValueError("pgvector-backed store required for RAGService")
             self._retriever = self._retrieve_pgvector
         else:
-            if not hasattr(store, "search_chunks"):
+            if hasattr(store, "search_chunks"):
+                self._retriever = self._retrieve_local_hybrid
+            elif hasattr(store, "search_chunks_legacy"):
+                self._retriever = self._retrieve_local_hybrid
+            else:
                 raise ValueError("legacy-backed store required for hybrid RAG mode")
-            self._retriever = self._retrieve_local_hybrid
 
     def retrieve(
         self,
@@ -108,7 +111,7 @@ class RAGService:
             return []
 
         query_embedding = self.embed(query)
-        legacy_search = getattr(self.store, "search_chunks", None)
+        legacy_search = getattr(self.store, "search_chunks", None) or getattr(self.store, "search_chunks_legacy", None)
         if not callable(legacy_search):
             return []
 

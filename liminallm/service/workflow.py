@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from liminallm.logging import get_logger
 
+from liminallm.service.errors import BadRequestError
 from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
 from liminallm.service.router import RouterEngine
@@ -62,6 +63,8 @@ class WorkflowEngine:
         history = await self._load_conversation_history(conversation_id)
 
         node_map = {n.get("id"): n for n in workflow_schema.get("nodes", []) if n.get("id")}
+        if not node_map:
+            raise BadRequestError("workflow has no nodes to execute")
         entry = workflow_schema.get("entrypoint") or next(iter(node_map), None)
         if not entry or entry not in node_map:
             entry = next(iter(node_map)) if node_map else None
@@ -314,9 +317,7 @@ class WorkflowEngine:
         ctx_cluster = None
         if best_cluster:
             ctx_cluster = {"id": best_cluster.id, "label": best_cluster.label, "similarity": best_sim}
-        routing = await self.router.route(
-            policy or {}, context_embedding, candidates, ctx_cluster=ctx_cluster, user_id=user_id
-        )
+        routing = await self.router.route(policy or {}, context_embedding, candidates, ctx_cluster=ctx_cluster, user_id=user_id)
         gates = routing.get("adapters", []) if isinstance(routing, dict) else []
         activated_ids = [gate.get("id", "") for gate in gates if gate.get("id")]
         candidate_lookup = {c.get("id"): c for c in candidates if c.get("id")}

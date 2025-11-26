@@ -312,8 +312,9 @@ class TrainingService:
             jobs = []
         try:
             jobs.sort(key=lambda j: j.updated_at or j.created_at, reverse=True)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("training_job_sort_failed", error=str(exc))
+            raise
         return jobs
 
     def summarize_preferences(self, user_id: Optional[str]) -> dict:

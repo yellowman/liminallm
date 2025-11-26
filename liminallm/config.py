@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
 from enum import Enum
+from typing import Any
 
-from pydantic import BaseSettings, Field, field_validator
+from dotenv import dotenv_values
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class ModelBackend(str, Enum):
@@ -11,7 +14,7 @@ class ModelBackend(str, Enum):
     OPENAI = "openai"
     AZURE = "azure"
     AZURE_OPENAI = "azure_openai"
-    AZURE_OPENAI_ALT = "azure-openai"
+    AZURE_OPENAI_ALT = AZURE_OPENAI
     VERTEX = "vertex"
     GEMINI = "gemini"
     GOOGLE = "google"
@@ -31,41 +34,63 @@ class RagMode(str, Enum):
     MEMORY = "memory"
 
 
-class Settings(BaseSettings):
+def env_field(default: Any, env: str, **kwargs):
+    extra = kwargs.pop("json_schema_extra", {}) or {}
+    extra = {**extra, "env": env}
+    return Field(default, json_schema_extra=extra, **kwargs)
+
+
+class Settings(BaseModel):
     """Runtime settings aligned with the SPEC kernel contracts."""
 
-    database_url: str = Field("postgresql://localhost:5432/liminallm", env="DATABASE_URL")
-    redis_url: str = Field("redis://localhost:6379/0", env="REDIS_URL")
-    shared_fs_root: str = Field("/srv/liminallm", env="SHARED_FS_ROOT")
-    model_path: str = Field("gpt-4o-mini", env="MODEL_PATH")
-    model_backend: ModelBackend | None = Field(ModelBackend.OPENAI, env="MODEL_BACKEND")
-    adapter_openai_api_key: str | None = Field(None, env="OPENAI_ADAPTER_API_KEY")
-    adapter_openai_base_url: str | None = Field(None, env="OPENAI_ADAPTER_BASE_URL")
-    adapter_server_model: str | None = Field(None, env="ADAPTER_SERVER_MODEL")
-    allow_signup: bool = Field(True, env="ALLOW_SIGNUP")
-    use_memory_store: bool = Field(False, env="USE_MEMORY_STORE")
-    allow_redis_fallback_dev: bool = Field(False, env="ALLOW_REDIS_FALLBACK_DEV")
-    test_mode: bool = Field(
+    database_url: str = env_field("postgresql://localhost:5432/liminallm", "DATABASE_URL")
+    redis_url: str = env_field("redis://localhost:6379/0", "REDIS_URL")
+    shared_fs_root: str = env_field("/srv/liminallm", "SHARED_FS_ROOT")
+    model_path: str = env_field("gpt-4o-mini", "MODEL_PATH")
+    model_backend: ModelBackend | None = env_field(ModelBackend.OPENAI, "MODEL_BACKEND")
+    adapter_openai_api_key: str | None = env_field(None, "OPENAI_ADAPTER_API_KEY")
+    adapter_openai_base_url: str | None = env_field(None, "OPENAI_ADAPTER_BASE_URL")
+    adapter_server_model: str | None = env_field(None, "ADAPTER_SERVER_MODEL")
+    allow_signup: bool = env_field(True, "ALLOW_SIGNUP")
+    use_memory_store: bool = env_field(False, "USE_MEMORY_STORE")
+    allow_redis_fallback_dev: bool = env_field(False, "ALLOW_REDIS_FALLBACK_DEV")
+    test_mode: bool = env_field(
         False,
-        env="TEST_MODE",
+        "TEST_MODE",
         description="Toggle deterministic testing behaviors; required for CI pathways described in SPEC §14.",
     )
-    chat_rate_limit_per_minute: int = Field(60, env="CHAT_RATE_LIMIT_PER_MINUTE")
-    chat_rate_limit_window_seconds: int = Field(60, env="CHAT_RATE_LIMIT_WINDOW_SECONDS")
-    enable_mfa: bool = Field(True, env="ENABLE_MFA")
-    jwt_secret: str = Field("dev-secret", env="JWT_SECRET")
-    jwt_issuer: str = Field("liminallm", env="JWT_ISSUER")
-    jwt_audience: str = Field("liminal-clients", env="JWT_AUDIENCE")
-    access_token_ttl_minutes: int = Field(30, env="ACCESS_TOKEN_TTL_MINUTES")
-    refresh_token_ttl_minutes: int = Field(24 * 60, env="REFRESH_TOKEN_TTL_MINUTES")
-    default_tenant_id: str = Field("public", env="DEFAULT_TENANT_ID")
-    rag_chunk_size: int = Field(400, env="RAG_CHUNK_SIZE")
-    rag_mode: RagMode = Field(RagMode.PGVECTOR, env="RAG_MODE")
-    embedding_model_id: str = Field("text-embedding", env="EMBEDDING_MODEL_ID")
+    chat_rate_limit_per_minute: int = env_field(60, "CHAT_RATE_LIMIT_PER_MINUTE")
+    chat_rate_limit_window_seconds: int = env_field(60, "CHAT_RATE_LIMIT_WINDOW_SECONDS")
+    enable_mfa: bool = env_field(True, "ENABLE_MFA")
+    jwt_secret: str = env_field("dev-secret", "JWT_SECRET")
+    jwt_issuer: str = env_field("liminallm", "JWT_ISSUER")
+    jwt_audience: str = env_field("liminal-clients", "JWT_AUDIENCE")
+    access_token_ttl_minutes: int = env_field(30, "ACCESS_TOKEN_TTL_MINUTES")
+    refresh_token_ttl_minutes: int = env_field(24 * 60, "REFRESH_TOKEN_TTL_MINUTES")
+    default_tenant_id: str = env_field("public", "DEFAULT_TENANT_ID")
+    rag_chunk_size: int = env_field(400, "RAG_CHUNK_SIZE")
+    rag_mode: RagMode = env_field(RagMode.PGVECTOR, "RAG_MODE")
+    embedding_model_id: str = env_field("text-embedding", "EMBEDDING_MODEL_ID")
+    max_upload_bytes: int = env_field(10 * 1024 * 1024, "MAX_UPLOAD_BYTES")
+    login_rate_limit_per_minute: int = env_field(10, "LOGIN_RATE_LIMIT_PER_MINUTE")
+    signup_rate_limit_per_minute: int = env_field(5, "SIGNUP_RATE_LIMIT_PER_MINUTE")
+    reset_rate_limit_per_minute: int = env_field(5, "RESET_RATE_LIMIT_PER_MINUTE")
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = ConfigDict(extra="ignore")
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        env_file_values = dotenv_values(".env")
+        merged: dict[str, str] = {}
+        for name, field in cls.model_fields.items():
+            extra = field.json_schema_extra or {}
+            env_key = extra.get("env") if isinstance(extra, dict) else None
+            env_name = env_key or name.upper()
+            if env_name in os.environ:
+                merged[name] = os.environ[env_name]
+            elif env_name in env_file_values:
+                merged[name] = env_file_values[env_name]
+        return cls(**merged)
 
     @field_validator("model_backend")
     @classmethod
@@ -81,4 +106,10 @@ class Settings(BaseSettings):
 
 
 def get_settings() -> Settings:
-    return Settings()  # relies on pydantic caching
+    global _settings_cache
+    if _settings_cache is None:
+        _settings_cache = Settings.from_env()
+    return _settings_cache
+
+
+_settings_cache: Settings | None = None

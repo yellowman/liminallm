@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
 
@@ -114,12 +115,26 @@ class Runtime:
             mfa_enabled=self.settings.enable_mfa,
         )
         self._local_idempotency: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
+        self._local_idempotency_lock = asyncio.Lock()
+        self._local_rate_limits: Dict[str, Tuple[datetime, int]] = {}
+        self._local_rate_limit_lock = asyncio.Lock()
 
 
 runtime = Runtime()
 
 
 def get_runtime() -> Runtime:
+    return runtime
+
+
+def reset_runtime_for_tests() -> Runtime:
+    """Reinitialize the runtime singleton for isolated test runs."""
+
+    global runtime
+    settings = get_settings()
+    if not settings.test_mode:
+        raise RuntimeError("runtime reset is only allowed in TEST_MODE")
+    runtime = Runtime()
     return runtime
 
 
@@ -130,13 +145,14 @@ async def _get_cached_idempotency_record(runtime: Runtime, route: str, user_id: 
     now = datetime.utcnow()
     if runtime.cache:
         return await runtime.cache.get_idempotency_record(route, user_id, key)
-    record = runtime._local_idempotency.get((route, user_id, key))
-    if not record:
-        return None
-    if record.get("expires_at") and record["expires_at"] < now:
-        runtime._local_idempotency.pop((route, user_id, key), None)
-        return None
-    return record
+    async with runtime._local_idempotency_lock:
+        record = runtime._local_idempotency.get((route, user_id, key))
+        if not record:
+            return None
+        if record.get("expires_at") and record["expires_at"] < now:
+            runtime._local_idempotency.pop((route, user_id, key), None)
+            return None
+        return record
 
 
 async def _set_cached_idempotency_record(
@@ -152,4 +168,24 @@ async def _set_cached_idempotency_record(
     if runtime.cache:
         await runtime.cache.set_idempotency_record(route, user_id, key, record, ttl_seconds=ttl_seconds)
         return
-    runtime._local_idempotency[(route, user_id, key)] = {**record, "expires_at": expires_at}
+    async with runtime._local_idempotency_lock:
+        runtime._local_idempotency[(route, user_id, key)] = {**record, "expires_at": expires_at}
+
+
+async def check_rate_limit(runtime: Runtime, key: str, limit: int, window_seconds: int) -> bool:
+    """Enforce rate limits even when Redis is unavailable."""
+
+    if limit <= 0:
+        return False
+    now = datetime.utcnow()
+    if runtime.cache:
+        return await runtime.cache.check_rate_limit(key, limit, window_seconds)
+    window = timedelta(seconds=window_seconds)
+    async with runtime._local_rate_limit_lock:
+        window_start, count = runtime._local_rate_limits.get(key, (now, 0))
+        if now - window_start >= window:
+            window_start, count = now, 0
+        if count + 1 > limit:
+            return False
+        runtime._local_rate_limits[key] = (window_start, count + 1)
+    return True

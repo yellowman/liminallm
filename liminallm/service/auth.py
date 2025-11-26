@@ -188,6 +188,8 @@ class AuthService:
         if tenant_id and tenant_hint and tenant_id != tenant_hint:
             return None, None, {}
         self._oauth_states.pop(state, None)
+        if self.cache and not cached_state:
+            await self.cache.pop_oauth_state(state)
         normalized_tenant = tenant_id or tenant_hint or self.settings.default_tenant_id
         synthetic_email = f"{provider}+{code}@oauth.local"
         user = self.store.get_user_by_email(synthetic_email)
@@ -283,12 +285,11 @@ class AuthService:
     ) -> Optional[AuthContext]:
         if not session_id:
             return None
-        sess = None
         sess = self.store.get_session(session_id)
         if not sess and self.cache:
             cached_user = await self.cache.get_session_user(session_id)
-            if cached_user:
-                sess = self.store.get_session(session_id)
+            if not cached_user:
+                return None
         if not sess or sess.expires_at <= datetime.utcnow():
             return None
         user = self.store.get_user(sess.user_id)
