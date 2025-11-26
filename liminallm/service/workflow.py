@@ -10,7 +10,12 @@ from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
 from liminallm.service.router import RouterEngine
 from liminallm.service.sandbox import safe_eval_expr
-from liminallm.service.embeddings import cosine_similarity, deterministic_embedding
+from liminallm.service.embeddings import (
+    EMBEDDING_DIM,
+    cosine_similarity,
+    deterministic_embedding,
+    ensure_embedding_dim,
+)
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.models import Message
 from liminallm.storage.postgres import PostgresStore
@@ -317,10 +322,10 @@ class WorkflowEngine:
         return activated_adapters, routing.get("trace", []) if isinstance(routing, dict) else [], gates
 
     def _align_vectors(self, a: List[float], b: List[float]) -> Tuple[List[float], List[float]]:
-        dim = max(len(a), len(b)) or 1
-        padded_a = list(a) + [0.0] * (dim - len(a))
-        padded_b = list(b) + [0.0] * (dim - len(b))
-        return padded_a, padded_b
+        return (
+            ensure_embedding_dim(a, dim=EMBEDDING_DIM),
+            ensure_embedding_dim(b, dim=EMBEDDING_DIM),
+        )
 
     def _execute_node(
         self,

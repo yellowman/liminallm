@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from liminallm.logging import get_logger
 
-from .embeddings import cosine_similarity
+from .embeddings import EMBEDDING_DIM, cosine_similarity, ensure_embedding_dim
 from .sandbox import safe_eval_expr
 from liminallm.storage.redis_cache import RedisCache
 
@@ -34,7 +34,7 @@ class RouterEngine:
         ctx_cluster: Optional[dict] = None,
         user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        ctx_emb = context_embedding or []
+        ctx_emb = ensure_embedding_dim(context_embedding, dim=EMBEDDING_DIM) if context_embedding else []
         candidates = adapters or []
         cached = None
         ctx_hash = self._hash_embedding(ctx_emb)
@@ -221,5 +221,7 @@ class RouterEngine:
 
     def _adapter_embedding(self, adapter: dict) -> List[float]:
         emb = adapter.get("embedding") or adapter.get("centroid") or []
-        return emb if isinstance(emb, list) else []
+        if not isinstance(emb, list):
+            return ensure_embedding_dim([], dim=EMBEDDING_DIM)
+        return ensure_embedding_dim(emb, dim=EMBEDDING_DIM)
 
