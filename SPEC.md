@@ -168,6 +168,32 @@ CREATE UNIQUE INDEX ON message (conversation_id, seq);
 
 special “summary” messages can be `sender='system', role='system', meta.summary=true`.
 
+**`content_struct` schema (structured message payload)**
+
+- Stored alongside `content` to avoid reparsing plain text; kept lightweight so renderers and downstream agents can rely on a consistent shape.
+- Expected shape:
+
+```json
+{
+  "segments": [
+    {"type": "text", "text": "...", "start": 0, "end": 42, "tags": ["markdown"]},
+    {"type": "code", "text": "print('hi')", "language": "python"},
+    {"type": "citation", "text": "...", "source_id": "doc-123", "chunk_id": "chunk-5", "score": 0.87},
+    {"type": "tool_call", "name": "lookup_customer", "arguments": {"id": "42"}, "result": {"status": "ok"}, "duration_ms": 123},
+    {"type": "attachment", "kind": "image", "uri": "s3://...", "mime": "image/png", "description": "rendered chart"},
+    {"type": "redaction", "text": "[redacted]", "reason": "policy", "policy": "p0"}
+  ],
+  "summary": {"highlights": "optional per-turn summary"}
+}
+```
+
+- Segment intents:
+  - **text/code/citation**: renderable spans with optional source and similarity scores for RAG provenance.
+  - **tool_call**: capture name/args/result/status/timing to support replay and audit.
+  - **attachment**: structured references to non-text payloads (images, audio, tables).
+  - **redaction**: mark filtered spans and the policies that applied to them for safety reviews.
+- Callers may attach custom annotations under `meta` inside each segment; storage normalizes to the keys above and drops invalid structures.
+
 ### 2.3 artifacts (generic primitives)
 
 single generic table for everything that is “configuration-like”:
