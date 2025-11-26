@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-import json
+import struct
 from typing import Any, Dict, List, Optional, Tuple
 
 from liminallm.logging import get_logger
@@ -63,10 +63,16 @@ class RouterEngine:
         return routing
 
     def _hash_embedding(self, embedding: List[float]) -> str:
+        """Return a deterministic hash for a numeric embedding.
+
+        Uses the full double precision of each component instead of rounding so
+        that small numeric differences still produce distinct cache keys.
+        """
+
         if not embedding:
             return ""
-        normalized = json.dumps([round(v, 4) for v in embedding])
-        return hashlib.sha1(normalized.encode()).hexdigest()
+        packed = struct.pack(f">{len(embedding)}d", *[float(v) for v in embedding])
+        return hashlib.blake2b(packed, digest_size=32).hexdigest()
 
     def _eval_condition(
         self, expr: str, context_embedding: List[float], adapters: List[dict], safety_risk: Optional[str] = None, ctx_cluster: Optional[dict] = None

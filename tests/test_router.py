@@ -39,3 +39,12 @@ def test_router_similarity_boost_when_no_rules_fire():
 
     assert any(entry["id"] == "default_similarity_boost" for entry in result["trace"])
     assert result["adapters"][0]["id"] == "similar"
+
+
+def test_hash_embedding_preserves_precision():
+    engine = RouterEngine()
+
+    close = [0.12345, 0.98765]
+    closer = [0.12346, 0.98765]
+
+    assert engine._hash_embedding(close) != engine._hash_embedding(closer)
