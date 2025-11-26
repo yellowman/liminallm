@@ -68,6 +68,7 @@ from liminallm.service.runtime import (
     IDEMPOTENCY_TTL_SECONDS,
     _get_cached_idempotency_record,
     _set_cached_idempotency_record,
+    check_rate_limit,
     get_runtime,
 )
 
@@ -114,6 +115,12 @@ class IdempotencyGuard:
             Envelope(status="error", error={"message": message}, request_id=self.request_id),
             status="failed",
         )
+
+
+async def _enforce_rate_limit(runtime, key: str, limit: int, window_seconds: int) -> None:
+    allowed = await check_rate_limit(runtime, key, limit, window_seconds)
+    if not allowed:
+        raise HTTPException(status_code=429, detail="rate limit exceeded")
 
 
 async def _resolve_idempotency(
@@ -232,12 +239,18 @@ def _user_to_response(user) -> UserResponse:
     )
 
 
-@router.post("/auth/signup", response_model=Envelope)
+@router.post("/auth/signup", response_model=Envelope, status_code=201)
 async def signup(body: SignupRequest):
     settings = get_settings()
     if not settings.allow_signup:
         raise HTTPException(status_code=403, detail="signup disabled")
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"signup:{body.email.lower()}",
+        runtime.settings.signup_rate_limit_per_minute,
+        60,
+    )
     user, session, tokens = await runtime.auth.signup(
         email=body.email, password=body.password, handle=body.handle, tenant_id=body.tenant_id
     )
@@ -260,6 +273,12 @@ async def signup(body: SignupRequest):
 @router.post("/auth/login", response_model=Envelope)
 async def login(body: LoginRequest):
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"login:{body.email.lower()}",
+        runtime.settings.login_rate_limit_per_minute,
+        60,
+    )
     user, session, tokens = await runtime.auth.login(
         email=body.email, password=body.password, mfa_code=body.mfa_code, tenant_id=body.tenant_id
     )
@@ -461,6 +480,12 @@ async def verify_mfa(body: MFAVerifyRequest):
 @router.post("/auth/reset/request", response_model=Envelope)
 async def request_reset(body: PasswordResetRequest):
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"reset:{body.email.lower()}",
+        runtime.settings.reset_rate_limit_per_minute,
+        60,
+    )
     token = await runtime.auth.initiate_password_reset(body.email)
     return Envelope(status="ok", data={"token": token})
 
@@ -500,14 +525,12 @@ async def chat(
     async with IdempotencyGuard("chat", user_id, idempotency_key, require=True) as idem:
         if idem.cached:
             return idem.cached
-        if runtime.cache:
-            allowed = await runtime.cache.check_rate_limit(
-                f"chat:{user_id}",
-                runtime.settings.chat_rate_limit_per_minute,
-                runtime.settings.chat_rate_limit_window_seconds,
-            )
-            if not allowed:
-                raise HTTPException(status_code=429, detail="rate limit exceeded")
+        await _enforce_rate_limit(
+            runtime,
+            f"chat:{user_id}",
+            runtime.settings.chat_rate_limit_per_minute,
+            runtime.settings.chat_rate_limit_window_seconds,
+        )
         conversation: Conversation | None = None
         if body.context_id:
             _get_owned_context(runtime, body.context_id, principal)
@@ -824,7 +847,7 @@ async def invoke_tool(
         return envelope
 
 
-@router.post("/artifacts", response_model=Envelope)
+@router.post("/artifacts", response_model=Envelope, status_code=201)
 async def create_artifact(
     body: ArtifactRequest,
     principal: AuthContext = Depends(get_user),
@@ -1022,7 +1045,10 @@ async def upload_file(
         if idem.cached:
             return idem.cached
         dest_dir = Path(runtime.settings.shared_fs_root) / "users" / principal.user_id / "files"
-        contents = await file.read()
+        max_bytes = max(1, runtime.settings.max_upload_bytes)
+        contents = await file.read(max_bytes + 1)
+        if len(contents) > max_bytes:
+            raise HTTPException(status_code=413, detail="file too large")
         dest_path = safe_join(dest_dir, file.filename)
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         dest_path.write_bytes(contents)
@@ -1078,7 +1104,7 @@ async def list_conversations(principal: AuthContext = Depends(get_user)):
     return Envelope(status="ok", data=ConversationListResponse(items=items))
 
 
-@router.post("/contexts", response_model=Envelope)
+@router.post("/contexts", response_model=Envelope, status_code=201)
 async def create_context(
     body: KnowledgeContextRequest,
     principal: AuthContext = Depends(get_user),

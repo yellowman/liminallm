@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 from datetime import datetime
 from typing import Any, Dict, Optional
@@ -120,7 +121,7 @@ class ConfigOpsService:
     def _apply_patch_to_schema(self, schema: dict, patch: dict) -> dict:
         if not patch:
             return schema
-        working = json.loads(json.dumps(schema))
+        working = copy.deepcopy(schema)
         ops = patch.get("ops") if isinstance(patch, dict) else None
         if isinstance(ops, list):
             for op in ops:

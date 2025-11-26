@@ -288,4 +288,9 @@ MIT
   - `POST /v1/auth/refresh` → rotates refresh tokens and issues a new access token
   - `POST /v1/chat` → creates conversation + LLM reply (live if `OPENAI_ADAPTER_API_KEY` is set, echo otherwise)
   - `GET /v1/artifacts` → lists data-driven workflows/policies
-  - admin config endpoints (`/v1/config/*`) require an admin-role token and are intended for the admin UI only
+- admin config endpoints (`/v1/config/*`) require an admin-role token and are intended for the admin UI only
+
+## operational hardening
+
+- local rate limits now fall back to in-process counters when Redis is unavailable (TEST_MODE), covering auth and chat flows
+- uploads are capped by `MAX_UPLOAD_BYTES` to prevent unbounded in-memory reads

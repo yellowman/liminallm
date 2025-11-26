@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 
 from liminallm.service.router import RouterEngine
@@ -18,7 +20,7 @@ def test_router_applies_rules_and_normalizes():
     ]
     ctx_emb = [1.0, 0.0]
 
-    result = engine.route(policy, ctx_emb, adapters)
+    result = asyncio.run(engine.route(policy, ctx_emb, adapters))
 
     assert result["adapters"] == [
         {"id": "a1", "weight": pytest.approx(0.5714, rel=1e-3)},
@@ -35,7 +37,7 @@ def test_router_similarity_boost_when_no_rules_fire():
     ]
     ctx_emb = [0.7, 0.7]
 
-    result = engine.route({}, ctx_emb, adapters)
+    result = asyncio.run(engine.route({}, ctx_emb, adapters))
 
     assert any(entry["id"] == "default_similarity_boost" for entry in result["trace"])
     assert result["adapters"][0]["id"] == "similar"

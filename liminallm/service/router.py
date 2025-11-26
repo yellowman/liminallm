@@ -188,8 +188,11 @@ class RouterEngine:
         self, field: str, value: Optional[str], adapters: List[dict], ctx_emb: List[float]
     ) -> Tuple[Optional[str], Optional[float], List[dict]]:
         if value == "closest":
-            cand_id, sim = self._resolve_adapter(value, adapters, ctx_emb)
-            return cand_id, sim, []
+            cand_id, sim = self._resolve_adapter("closest", adapters, ctx_emb)
+            ranked = []
+            if cand_id:
+                ranked = [{"id": cand_id, "similarity": sim or 0.0}]
+            return cand_id, sim, ranked
         ranked: List[dict] = []
         for candidate in adapters:
             if candidate.get(field) == value:
