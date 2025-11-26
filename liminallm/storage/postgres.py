@@ -765,7 +765,7 @@ class PostgresStore:
         if status:
             params.append(status)
             query += f" AND status = %s"
-        query += " ORDER BY created_at DESC"
+        query += " ORDER BY COALESCE(updated_at, created_at) DESC"
         if limit:
             params.append(limit)
             query += " LIMIT %s"
@@ -775,7 +775,7 @@ class PostgresStore:
             TrainingJob(
                 id=str(row["id"]),
                 user_id=str(row["user_id"]),
-                adapter_id=str(row.get("adapter_id")),
+                adapter_id=self._require_training_adapter_id(row.get("adapter_id"), row.get("id")),
                 status=row.get("status", "queued"),
                 num_events=row.get("num_events"),
                 created_at=row.get("created_at", datetime.utcnow()),
@@ -788,6 +788,12 @@ class PostgresStore:
             )
             for row in rows
         ]
+
+    @staticmethod
+    def _require_training_adapter_id(adapter_id: Any, job_id: Any) -> str:
+        if adapter_id is None:
+            raise ValueError(f"training_job {job_id} is missing adapter_id")
+        return str(adapter_id)
 
     # users
     def create_user(

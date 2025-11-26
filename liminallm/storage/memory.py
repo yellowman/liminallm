@@ -599,7 +599,7 @@ class MemoryStore:
             jobs = [j for j in jobs if j.user_id == user_id]
         if status:
             jobs = [j for j in jobs if j.status == status]
-        jobs.sort(key=lambda j: j.created_at, reverse=True)
+        jobs.sort(key=lambda j: j.updated_at or j.created_at, reverse=True)
         return jobs if limit is None else jobs[:limit]
 
     def inspect_state(self, *, tenant_id: Optional[str] = None, kind: Optional[str] = None, limit: int = 50) -> dict:
