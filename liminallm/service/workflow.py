@@ -60,7 +60,7 @@ class WorkflowEngine:
             workflow_schema = self._default_workflow()
 
         adapters, routing_trace, adapter_gates = await self._select_adapters(user_message, user_id, context_id)
-        history = await self._load_conversation_history(conversation_id)
+        history = await self._load_conversation_history(conversation_id, user_id=user_id, tenant_id=tenant_id)
 
         node_map = {n.get("id"): n for n in workflow_schema.get("nodes", []) if n.get("id")}
         if not node_map:
@@ -153,8 +153,12 @@ class WorkflowEngine:
                 merged[key] = value
         return merged
 
-    async def _load_conversation_history(self, conversation_id: Optional[str]) -> List[Message]:
+    async def _load_conversation_history(
+        self, conversation_id: Optional[str], *, user_id: Optional[str], tenant_id: Optional[str]
+    ) -> List[Message]:
         if not conversation_id or not hasattr(self.store, "list_messages"):
+            return []
+        if not self._validate_conversation_scope(conversation_id, user_id=user_id, tenant_id=tenant_id):
             return []
         cached: Optional[dict] = None
         if self.cache:
@@ -163,7 +167,7 @@ class WorkflowEngine:
             deserialized = self._deserialize_messages(cached["recent_messages"])
             if deserialized:
                 return deserialized
-        history = self.store.list_messages(conversation_id)  # type: ignore[attr-defined]
+        history = self.store.list_messages(conversation_id, user_id=user_id)  # type: ignore[attr-defined]
         await self.cache_conversation_state(conversation_id, history)
         return history
 
@@ -246,10 +250,11 @@ class WorkflowEngine:
         self.tool_registry.setdefault(tool_name, dict(tool_schema))
         history: List[Any] = []
         if conversation_id and hasattr(self.store, "list_messages"):
-            try:
-                history = self.store.list_messages(conversation_id)  # type: ignore[attr-defined]
-            except Exception:
-                history = []
+            if self._validate_conversation_scope(conversation_id, user_id=user_id, tenant_id=tenant_id):
+                try:
+                    history = self.store.list_messages(conversation_id, user_id=user_id)  # type: ignore[attr-defined]
+                except Exception:
+                    history = []
         return self._invoke_tool(
             tool_name,
             inputs,
@@ -518,6 +523,36 @@ class WorkflowEngine:
 
         self.logger.warning("context_scope_validation_unavailable", requested=list(ctx_ids))
         return None
+
+    def _validate_conversation_scope(
+        self, conversation_id: str, *, user_id: Optional[str], tenant_id: Optional[str]
+    ) -> bool:
+        if not user_id:
+            self.logger.warning("conversation_scope_missing_user", conversation_id=conversation_id)
+            return False
+
+        get_conversation = getattr(self.store, "get_conversation", None)
+        if callable(get_conversation):
+            conv = get_conversation(conversation_id, user_id=user_id)
+        else:
+            conv = None
+        if not conv:
+            self.logger.warning("conversation_scope_forbidden", conversation_id=conversation_id, user_id=user_id)
+            return False
+
+        if tenant_id and hasattr(self.store, "get_user"):
+            get_user = getattr(self.store, "get_user")
+            if callable(get_user):
+                owner = get_user(conv.user_id)
+                if not owner or owner.tenant_id != tenant_id:
+                    self.logger.warning(
+                        "conversation_scope_tenant_mismatch",
+                        conversation_id=conversation_id,
+                        user_id=user_id,
+                        tenant_id=tenant_id,
+                    )
+                    return False
+        return True
 
     def _tool_llm_generic(
         self,
