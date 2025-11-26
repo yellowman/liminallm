@@ -427,13 +427,22 @@ class WorkflowEngine:
                 tenant_id,
             )
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(_run_handler)
-            try:
-                return future.result(timeout=timeout)
-            except concurrent.futures.TimeoutError:
-                self.logger.warning("tool_timeout", tool=tool_name, timeout=timeout)
-                return {"status": "error", "content": "tool timed out", "error": "timeout"}
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        future = executor.submit(_run_handler)
+        shutdown = False
+        try:
+            return future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            self.logger.warning("tool_timeout", tool=tool_name, timeout=timeout)
+            cancelled = future.cancel()
+            executor.shutdown(wait=False, cancel_futures=True)
+            shutdown = True
+            if not cancelled:
+                self.logger.warning("tool_timeout_cancellation_failed", tool=tool_name)
+            return {"status": "error", "content": "tool timed out", "error": "timeout"}
+        finally:
+            if not shutdown:
+                executor.shutdown(wait=True, cancel_futures=True)
 
     def _builtin_tool_handlers(
         self,
