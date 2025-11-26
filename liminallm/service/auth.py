@@ -170,6 +170,8 @@ class AuthService:
         state = uuid.uuid4().hex
         expires_at = datetime.utcnow() + timedelta(minutes=10)
         self._oauth_states[state] = (provider, expires_at, tenant_id)
+        if self.cache:
+            await self.cache.set_oauth_state(state, provider, expires_at, tenant_id)
         base_url = redirect_uri or self.settings.adapter_openai_base_url or "https://auth.example.com/callback"
         authorization_url = f"{base_url}?provider={provider}&state={state}"
         return {"authorization_url": authorization_url, "state": state, "provider": provider}
@@ -177,7 +179,8 @@ class AuthService:
     async def complete_oauth(
         self, provider: str, code: str, state: str, *, tenant_id: Optional[str] = None
     ) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
-        stored = self._oauth_states.get(state)
+        cached_state = await self.cache.pop_oauth_state(state) if self.cache else None
+        stored = cached_state or self._oauth_states.get(state)
         now = datetime.utcnow()
         if not stored or stored[1] < now or stored[0] != provider:
             return None, None, {}
@@ -463,7 +466,9 @@ class AuthService:
         if not valid_aud:
             return None
         exp = payload.get("exp")
-        if exp and datetime.utcfromtimestamp(int(exp)) <= datetime.utcnow():
+        if not exp:
+            return None
+        if datetime.utcfromtimestamp(int(exp)) <= datetime.utcnow():
             return None
         return payload
 

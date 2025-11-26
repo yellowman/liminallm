@@ -51,6 +51,7 @@ class MemoryStore:
         self.context_sources: Dict[str, List[ContextSource]] = {}
         self.chunks: Dict[str, List[KnowledgeChunk]] = {}
         self._chunk_id_seq: int = 1
+        self._artifact_version_seq: int = 1
         self.preference_events: Dict[str, PreferenceEvent] = {}
         self.training_jobs: Dict[str, TrainingJob] = {}
         self.semantic_clusters: Dict[str, SemanticCluster] = {}
@@ -135,7 +136,7 @@ class MemoryStore:
         )
         self.artifact_versions[chat_workflow_id] = [
             ArtifactVersion(
-                id=1,
+                id=self._next_artifact_version_id(),
                 artifact_id=chat_workflow_id,
                 version=1,
                 schema=self.artifacts[chat_workflow_id].schema,
@@ -143,6 +144,11 @@ class MemoryStore:
             )
         ]
         self._persist_state()
+
+    def _next_artifact_version_id(self) -> int:
+        next_id = self._artifact_version_seq
+        self._artifact_version_seq += 1
+        return next_id
 
     def _backfill_default_classifier_inputs(self) -> bool:
         """Ensure default workflow classifier passes the user message to the tool."""
@@ -723,7 +729,7 @@ class MemoryStore:
         self.artifacts[artifact_id] = artifact
         self.artifact_versions.setdefault(artifact_id, []).append(
             ArtifactVersion(
-                id=len(self.artifact_versions.get(artifact_id, [])) + 1,
+                id=self._next_artifact_version_id(),
                 artifact_id=artifact_id,
                 version=1,
                 schema=schema,
@@ -764,7 +770,7 @@ class MemoryStore:
         versions = self.artifact_versions.setdefault(artifact_id, [])
         versions.append(
             ArtifactVersion(
-                id=len(versions) + 1,
+                id=self._next_artifact_version_id(),
                 artifact_id=artifact_id,
                 version=(versions[-1].version + 1 if versions else 1),
                 schema=schema,
@@ -1128,6 +1134,11 @@ class MemoryStore:
             versions.append(version)
         for versions in self.artifact_versions.values():
             versions.sort(key=lambda v: v.version)
+        max_artifact_version_id = max(
+            (version.id for versions in self.artifact_versions.values() for version in versions),
+            default=0,
+        )
+        self._artifact_version_seq = max_artifact_version_id + 1
         self.runtime_config = data.get("runtime_config", {})
         self.config_patches = {}
         for cp in data.get("config_patches", []):
