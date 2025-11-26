@@ -1,7 +1,7 @@
 -- Artifact tables aligned to the SPEC kernel primitives
 CREATE TABLE IF NOT EXISTS artifact (
   id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  owner_user_id   UUID REFERENCES app_user(id),
+  owner_user_id   UUID REFERENCES app_user(id) ON DELETE CASCADE,
   type            TEXT NOT NULL,
   name            TEXT NOT NULL,
   description     TEXT,
@@ -34,6 +34,10 @@ ALTER TABLE artifact
   ADD COLUMN IF NOT EXISTS base_model TEXT;
 ALTER TABLE artifact_version
   ADD COLUMN IF NOT EXISTS base_model TEXT;
+
+CREATE INDEX IF NOT EXISTS idx_artifact_owner_user_id ON artifact(owner_user_id);
+CREATE INDEX IF NOT EXISTS idx_artifact_type ON artifact(type);
+CREATE INDEX IF NOT EXISTS idx_artifact_kind ON artifact((schema->>'kind'));
 
 CREATE TABLE IF NOT EXISTS config_patch (
   id              BIGSERIAL PRIMARY KEY,

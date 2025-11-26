@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple
 
-from liminallm.config import get_settings
+from liminallm.config import get_settings, reset_settings_cache
 from liminallm.service.config_ops import ConfigOpsService
 from liminallm.service.auth import AuthService
 from liminallm.service.clustering import SemanticClusterer
@@ -131,6 +131,7 @@ def reset_runtime_for_tests() -> Runtime:
     """Reinitialize the runtime singleton for isolated test runs."""
 
     global runtime
+    reset_settings_cache()
     settings = get_settings()
     if not settings.test_mode:
         raise RuntimeError("runtime reset is only allowed in TEST_MODE")

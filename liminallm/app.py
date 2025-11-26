@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -10,6 +11,23 @@ from liminallm.api.routes import get_admin_user, router
 from liminallm.api.error_handling import register_exception_handlers
 
 app = FastAPI(title="LiminalLM Kernel", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+@app.middleware("http")
+async def add_security_headers(request, call_next):
+    response = await call_next(request)
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+    response.headers.setdefault("Content-Security-Policy", "default-src 'self'")
+    return response
 register_exception_handlers(app)
 app.include_router(router)
 

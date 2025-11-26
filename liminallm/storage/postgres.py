@@ -45,7 +45,9 @@ class PostgresStore:
         self.fs_root = Path(fs_root)
         self.fs_root.mkdir(parents=True, exist_ok=True)
         self.logger = get_logger(__name__)
-        self.pool = ConnectionPool(self.dsn, min_size=2, max_size=10, kwargs={"row_factory": dict_row})
+        self.pool = ConnectionPool(
+            self.dsn, min_size=2, max_size=10, kwargs={"row_factory": dict_row, "autocommit": False}
+        )
         self.sessions: dict[str, Session] = {}
         self._ensure_runtime_config_table()
         self._verify_required_schema()
@@ -1129,6 +1131,7 @@ class PostgresStore:
             normalized_content_struct = normalize_content_struct(content_struct, content)
             with self._connect() as conn:
                 with conn.transaction():
+                    conn.execute("SELECT 1 FROM conversation WHERE id = %s FOR UPDATE", (conversation_id,))
                     seq_row = conn.execute(
                         "SELECT COUNT(*) AS c FROM message WHERE conversation_id = %s",
                         (conversation_id,),
@@ -1235,27 +1238,26 @@ class PostgresStore:
         *,
         page: int = 1,
         page_size: int = 100,
+        owner_user_id: Optional[str] = None,
     ) -> List[Artifact]:
         offset = max(page - 1, 0) * max(page_size, 1)
         limit = max(page_size, 1)
         with self._connect() as conn:
-            if type_filter and kind_filter:
-                rows = conn.execute(
-                    "SELECT * FROM artifact WHERE type = %s AND schema->>'kind' = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
-                    (type_filter, kind_filter, limit, offset),
-                ).fetchall()
-            elif kind_filter:
-                rows = conn.execute(
-                    "SELECT * FROM artifact WHERE schema->>'kind' = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
-                    (kind_filter, limit, offset),
-                ).fetchall()
-            elif type_filter:
-                rows = conn.execute(
-                    "SELECT * FROM artifact WHERE type = %s ORDER BY created_at DESC LIMIT %s OFFSET %s",
-                    (type_filter, limit, offset),
-                ).fetchall()
-            else:
-                rows = conn.execute("SELECT * FROM artifact ORDER BY created_at DESC LIMIT %s OFFSET %s", (limit, offset)).fetchall()
+            clauses = []
+            params: list[Any] = []
+            if type_filter:
+                clauses.append("type = %s")
+                params.append(type_filter)
+            if kind_filter:
+                clauses.append("schema->>'kind' = %s")
+                params.append(kind_filter)
+            if owner_user_id:
+                clauses.append("owner_user_id = %s")
+                params.append(owner_user_id)
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            query = f"SELECT * FROM artifact {where} ORDER BY created_at DESC LIMIT %s OFFSET %s"
+            params.extend([limit, offset])
+            rows = conn.execute(query, tuple(params)).fetchall()
         artifacts: List[Artifact] = []
         for row in rows:
             artifacts.append(
@@ -1322,7 +1324,7 @@ class PostgresStore:
         artifact_id = str(uuid.uuid4())
         fs_path = self._persist_payload(artifact_id, 1, schema)
         try:
-            with self._connect() as conn:
+            with self._connect() as conn, conn.transaction():
                 conn.execute(
                     "INSERT INTO artifact (id, owner_user_id, type, name, description, schema, fs_path, base_model) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
                     (artifact_id, owner_user_id, type_, name, description, json.dumps(schema), fs_path, schema.get("base_model")),
@@ -1366,7 +1368,7 @@ class PostgresStore:
         except ArtifactValidationError as exc:
             self.logger.warning("artifact_validation_failed", errors=exc.errors)
             raise
-        with self._connect() as conn:
+        with self._connect() as conn, conn.transaction():
             row = conn.execute("SELECT * FROM artifact WHERE id = %s", (artifact_id,)).fetchone()
             if not row:
                 return None
@@ -1533,7 +1535,7 @@ class PostgresStore:
     def update_config_patch_status(
         self, patch_id: int, status: str, *, meta: Optional[Dict] = None, mark_decided: bool = False, mark_applied: bool = False
     ) -> Optional[ConfigPatchAudit]:
-        with self._connect() as conn:
+        with self._connect() as conn, conn.transaction():
             existing = conn.execute("SELECT * FROM config_patch WHERE id = %s", (patch_id,)).fetchone()
             if not existing:
                 return None

@@ -23,8 +23,33 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
                         "inputs": {"type": "object"},
                         "outputs": {"type": "array"},
                         "next": {"anyOf": [{"type": "string"}, {"type": "array"}]},
+                        "branches": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "when": {},
+                                    "next": {"anyOf": [{"type": "string"}, {"type": "array"}]},
+                                },
+                                "required": ["when", "next"],
+                            },
+                        },
                     },
                     "required": ["id", "type"],
+                    "allOf": [
+                        {
+                            "if": {"properties": {"type": {"const": "switch"}}},
+                            "then": {"required": ["branches"]},
+                        },
+                        {
+                            "if": {"properties": {"type": {"const": "tool_call"}}},
+                            "then": {"required": ["tool"]},
+                        },
+                        {
+                            "if": {"properties": {"type": {"const": "parallel"}}},
+                            "then": {"required": ["next"]},
+                        },
+                    ],
                 },
             },
         },

@@ -691,8 +691,11 @@ class MemoryStore:
         *,
         page: int = 1,
         page_size: int = 100,
+        owner_user_id: Optional[str] = None,
     ) -> List[Artifact]:
         artifacts = list(self.artifacts.values())
+        if owner_user_id:
+            artifacts = [a for a in artifacts if a.owner_user_id == owner_user_id]
         if type_filter:
             artifacts = [a for a in artifacts if a.type == type_filter]
         if kind_filter:

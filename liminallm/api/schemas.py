@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, List, Optional
 from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, EmailStr, Field, field_validator
 
 
 class Envelope(BaseModel):
@@ -15,10 +15,21 @@ class Envelope(BaseModel):
 
 
 class SignupRequest(BaseModel):
-    email: str
+    email: EmailStr
     password: str
     handle: Optional[str] = None
     tenant_id: Optional[str] = None
+
+    @field_validator("password")
+    @classmethod
+    def _validate_password(cls, value: str) -> str:
+        if len(value) < 8:
+            raise ValueError("password must be at least 8 characters")
+        if not any(c.islower() for c in value) or not any(c.isupper() for c in value):
+            raise ValueError("password must include upper and lower case letters")
+        if not any(c.isdigit() for c in value):
+            raise ValueError("password must include a digit")
+        return value
 
 
 class AuthResponse(BaseModel):
@@ -34,7 +45,7 @@ class AuthResponse(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    email: str
+    email: EmailStr
     password: str
     mfa_code: Optional[str] = None
     tenant_id: Optional[str] = None
@@ -66,12 +77,23 @@ class MFAVerifyRequest(BaseModel):
 
 
 class PasswordResetRequest(BaseModel):
-    email: str
+    email: EmailStr
 
 
 class PasswordResetConfirm(BaseModel):
     token: str
     new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def _validate_new_password(cls, value: str) -> str:
+        if len(value) < 8:
+            raise ValueError("password must be at least 8 characters")
+        if not any(c.islower() for c in value) or not any(c.isupper() for c in value):
+            raise ValueError("password must include upper and lower case letters")
+        if not any(c.isdigit() for c in value):
+            raise ValueError("password must include a digit")
+        return value
 
 
 class ChatMessage(BaseModel):

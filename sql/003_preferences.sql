@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS preference_event (
 -- Semantic clusters for emergent skills/domains
 CREATE TABLE IF NOT EXISTS semantic_cluster (
   id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id         UUID,
+  user_id         UUID REFERENCES app_user(id) ON DELETE CASCADE,
   centroid        VECTOR,
   size            INT NOT NULL,
   label           TEXT,
@@ -72,6 +72,13 @@ CREATE TABLE IF NOT EXISTS training_job (
   preference_event_ids UUID[],
   meta                 JSONB
 );
+
+CREATE INDEX IF NOT EXISTS idx_preference_event_user_id ON preference_event(user_id);
+CREATE INDEX IF NOT EXISTS idx_preference_event_conversation_id ON preference_event(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_preference_event_cluster_id ON preference_event(cluster_id);
+CREATE INDEX IF NOT EXISTS idx_training_job_user_id ON training_job(user_id);
+CREATE INDEX IF NOT EXISTS idx_training_job_status ON training_job(status);
+CREATE INDEX IF NOT EXISTS idx_training_job_adapter_id ON training_job(adapter_id);
 
 -- MFA secrets for TOTP enrollment
 CREATE TABLE IF NOT EXISTS user_mfa_secret (
