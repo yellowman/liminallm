@@ -17,6 +17,8 @@ from liminallm.logging import get_logger
 
 logger = get_logger(__name__)
 
+MAX_LIST_EXTENSION = 1024
+
 
 class ConfigOpsService:
     """ConfigOps helper for LLM-as-architect patch proposals and application."""
@@ -142,6 +144,7 @@ class ConfigOpsService:
                     idx = int(seg)
                 except ValueError:
                     return
+                self._ensure_list_capacity(parent, idx, path)
                 while len(parent) <= idx:
                     parent.append({})
                 parent = parent[idx]
@@ -155,6 +158,7 @@ class ConfigOpsService:
                 else:
                     try:
                         idx = int(key)
+                        self._ensure_list_capacity(parent, idx, path)
                         if idx < len(parent):
                             parent[idx] = value
                         else:
@@ -167,12 +171,21 @@ class ConfigOpsService:
             if isinstance(parent, list):
                 try:
                     idx = int(key)
+                    self._ensure_list_capacity(parent, idx, path)
                     if 0 <= idx < len(parent):
                         parent.pop(idx)
                 except ValueError:
                     return
             else:
                 parent.pop(key, None)
+
+    def _ensure_list_capacity(self, parent: list, idx: int, path: str) -> None:
+        if idx < 0:
+            raise BadRequestError("negative list index", detail={"path": path, "index": idx})
+        if idx >= MAX_LIST_EXTENSION:
+            raise BadRequestError(
+                "list index too large", detail={"path": path, "index": idx, "max_index": MAX_LIST_EXTENSION - 1}
+            )
 
     def _deep_merge(self, base: dict, patch: dict) -> dict:
         merged = dict(base)
