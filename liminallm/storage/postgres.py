@@ -1250,13 +1250,13 @@ class PostgresStore:
 
     def list_messages(self, conversation_id: str, limit: int = 10, *, user_id: Optional[str] = None) -> List[Message]:
         with self._connect() as conn:
-            params: list[Any] = [conversation_id]
+            params: list[Any] = []
             query = "SELECT m.* FROM message m"
             if user_id:
                 query += " JOIN conversation c ON c.id = m.conversation_id AND c.user_id = %s"
                 params.append(user_id)
-            query += " WHERE m.conversation_id = %s ORDER BY m.seq DESC LIMIT %s" if user_id else " WHERE conversation_id = %s ORDER BY seq DESC LIMIT %s"
-            params.append(limit)
+            query += " WHERE m.conversation_id = %s ORDER BY m.seq DESC LIMIT %s"
+            params.extend([conversation_id, limit])
             rows = conn.execute(query, tuple(params)).fetchall()
         messages: List[Message] = []
         for row in reversed(rows):
@@ -1857,12 +1857,13 @@ class PostgresStore:
     def list_chunks(self, context_id: Optional[str] = None, *, owner_user_id: Optional[str] = None) -> List[KnowledgeChunk]:
         with self._connect() as conn:
             if context_id:
-                params: list[Any] = [context_id]
+                params: list[Any] = []
                 query = "SELECT kc.* FROM knowledge_chunk kc"
                 if owner_user_id:
                     query += " JOIN knowledge_context ctx ON ctx.id = kc.context_id AND ctx.owner_user_id = %s"
                     params.append(owner_user_id)
-                query += " WHERE kc.context_id = %s ORDER BY kc.chunk_index ASC" if owner_user_id else " WHERE context_id = %s ORDER BY chunk_index ASC"
+                query += " WHERE kc.context_id = %s ORDER BY kc.chunk_index ASC"
+                params.append(context_id)
                 rows = conn.execute(query, tuple(params)).fetchall()
             else:
                 if not owner_user_id:

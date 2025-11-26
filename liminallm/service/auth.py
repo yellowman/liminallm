@@ -117,6 +117,7 @@ class AuthService:
         self._oauth_states: dict[str, tuple[str, datetime, Optional[str]]] = {}
         self._oauth_code_registry: dict[tuple[str, str], dict] = {}
         self._pwd_hasher = PasswordHasher(type=Type.ID)
+        self.logger = logger
 
     def _generate_password(self) -> str:
         return base64.urlsafe_b64encode(os.urandom(12)).decode().rstrip("=")
@@ -189,7 +190,9 @@ class AuthService:
             if raw:
                 try:
                     cached_payload = json.loads(raw)
-                finally:
+                except Exception as exc:
+                    self.logger.warning("oauth_code_parse_failed", error=str(exc))
+                else:
                     await self.cache.client.delete(f"auth:oauth:code:{provider}:{code}")
         if not cached_payload:
             cached_payload = self._oauth_code_registry.pop((provider, code), None)
@@ -219,7 +222,8 @@ class AuthService:
         existing = None
         if hasattr(self.store, "get_user_by_provider"):
             existing = self.store.get_user_by_provider(provider, provider_uid)
-        user = existing or self.store.get_user_by_email(identity.get("email")) if identity.get("email") else None
+        email = identity.get("email")
+        user = existing or (self.store.get_user_by_email(email) if email else None)
         if not user:
             user_email = identity.get("email") or f"{provider_uid}@{provider}.oauth"
             handle = identity.get("handle") or provider_uid
