@@ -810,6 +810,8 @@ class PostgresStore:
         meta: Optional[dict] = None,
     ) -> User:
         user_id = str(uuid.uuid4())
+        normalized_meta = meta.copy() if meta else {}
+        normalized_meta.setdefault("email_verified", False)
         try:
             with self._connect() as conn:
                 conn.execute(
@@ -817,7 +819,16 @@ class PostgresStore:
                     INSERT INTO app_user (id, email, handle, tenant_id, role, plan_tier, is_active, meta)
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                     """,
-                    (user_id, email, handle, tenant_id, role, plan_tier, is_active, json.dumps(meta) if meta else None),
+                    (
+                        user_id,
+                        email,
+                        handle,
+                        tenant_id,
+                        role,
+                        plan_tier,
+                        is_active,
+                        json.dumps(normalized_meta) if normalized_meta else None,
+                    ),
                 )
         except errors.UniqueViolation:
             raise ConstraintViolation("email already exists", {"field": "email"})
@@ -829,7 +840,38 @@ class PostgresStore:
             role=role,
             plan_tier=plan_tier,
             is_active=is_active,
-            meta=meta,
+            meta=normalized_meta,
+        )
+
+    def link_user_auth_provider(self, user_id: str, provider: str, provider_uid: str) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_auth_provider (user_id, provider, provider_uid)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (provider, provider_uid) DO NOTHING
+                """,
+                (user_id, provider, provider_uid),
+            )
+
+    def get_user_by_provider(self, provider: str, provider_uid: str) -> Optional[User]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT u.* FROM user_auth_provider p JOIN app_user u ON u.id = p.user_id WHERE p.provider = %s AND p.provider_uid = %s",
+                (provider, provider_uid),
+            ).fetchone()
+        if not row:
+            return None
+        return User(
+            id=str(row["id"]),
+            email=row["email"],
+            handle=row.get("handle"),
+            created_at=row.get("created_at", datetime.utcnow()),
+            is_active=row.get("is_active", True),
+            plan_tier=row.get("plan_tier", "free"),
+            role=row.get("role", "user"),
+            tenant_id=row.get("tenant_id", "public"),
+            meta=row.get("meta"),
         )
 
     def save_password(self, user_id: str, password_hash: str, password_algo: str) -> None:
@@ -956,6 +998,32 @@ class PostgresStore:
         with self._connect() as conn:
             row = conn.execute(
                 "UPDATE app_user SET role = %s, updated_at = now() WHERE id = %s RETURNING *", (role, user_id)
+            ).fetchone()
+        if not row:
+            return None
+        return User(
+            id=str(row["id"]),
+            email=row["email"],
+            handle=row.get("handle"),
+            created_at=row.get("created_at", datetime.utcnow()),
+            is_active=row.get("is_active", True),
+            plan_tier=row.get("plan_tier", "free"),
+            role=row.get("role", "user"),
+            tenant_id=row.get("tenant_id", "public"),
+            meta=row.get("meta"),
+        )
+
+    def mark_email_verified(self, user_id: str) -> Optional[User]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                UPDATE app_user
+                SET meta = jsonb_set(COALESCE(meta, '{}'::jsonb), '{email_verified}', 'true', true),
+                    updated_at = now()
+                WHERE id = %s
+                RETURNING *
+                """,
+                (user_id,),
             ).fetchone()
         if not row:
             return None

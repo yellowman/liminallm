@@ -34,6 +34,7 @@ from liminallm.api.schemas import (
     OAuthStartResponse,
     PasswordResetConfirm,
     PasswordResetRequest,
+    EmailVerificationRequest,
     SignupRequest,
     TokenRefreshRequest,
     KnowledgeChunkListResponse,
@@ -75,6 +76,13 @@ from liminallm.service.runtime import (
 router = APIRouter(prefix="/v1")
 
 
+def _http_error(code: str, message: str, status_code: int, details: Optional[dict | str] = None) -> HTTPException:
+    payload: dict[str, object] = {"status": "error", "error": {"code": code, "message": message}}
+    if details is not None:
+        payload["error"]["details"] = details  # type: ignore[index]
+    return HTTPException(status_code=status_code, detail=payload)
+
+
 class IdempotencyGuard:
     def __init__(self, route: str, user_id: str, idempotency_key: Optional[str], *, require: bool = False):
         self.route = route
@@ -112,7 +120,7 @@ class IdempotencyGuard:
         if not self.request_id:
             return
         await self.store_result(
-            Envelope(status="error", error={"message": message}, request_id=self.request_id),
+            Envelope(status="error", error={"code": "server_error", "message": message}, request_id=self.request_id),
             status="failed",
         )
 
@@ -120,7 +128,7 @@ class IdempotencyGuard:
 async def _enforce_rate_limit(runtime, key: str, limit: int, window_seconds: int) -> None:
     allowed = await check_rate_limit(runtime, key, limit, window_seconds)
     if not allowed:
-        raise HTTPException(status_code=429, detail="rate limit exceeded")
+        raise _http_error("rate_limited", "rate limit exceeded", status_code=429)
 
 
 async def _resolve_idempotency(
@@ -130,13 +138,13 @@ async def _resolve_idempotency(
     runtime = get_runtime()
     if not idempotency_key:
         if require:
-            raise HTTPException(status_code=400, detail="Idempotency-Key header required")
+            raise _http_error("validation_error", "Idempotency-Key header required", status_code=400)
         return request_id, None
     record = await _get_cached_idempotency_record(runtime, route, user_id, idempotency_key)
     if record:
         status = record.get("status")
         if status == "in_progress":
-            raise HTTPException(status_code=409, detail="request in progress")
+            raise _http_error("conflict", "request in progress", status_code=409)
         if status in {"completed", "failed"} and record.get("response"):
             response_payload = record.get("response", {})
             if "request_id" not in response_payload:
@@ -186,7 +194,7 @@ async def get_user(
         tenant_hint=x_tenant_id,
     )
     if not ctx:
-        raise HTTPException(status_code=401, detail="invalid session")
+        raise _http_error("unauthorized", "invalid session", status_code=401)
     return ctx
 
 
@@ -203,36 +211,36 @@ async def get_admin_user(
         required_role="admin",
     )
     if not ctx:
-        raise HTTPException(status_code=403, detail="admin access required")
+        raise _http_error("forbidden", "admin access required", status_code=403)
     return ctx
 
 
 def _get_owned_conversation(runtime, conversation_id: str, principal: AuthContext) -> Conversation:
     conversation = runtime.store.get_conversation(conversation_id, user_id=principal.user_id)
     if not conversation:
-        raise HTTPException(status_code=404, detail="conversation not found")
+        raise _http_error("not_found", "conversation not found", status_code=404)
     if conversation.user_id != principal.user_id:
-        raise HTTPException(status_code=403, detail="forbidden")
+        raise _http_error("forbidden", "forbidden", status_code=403)
     return conversation
 
 
 def _get_owned_context(runtime, context_id: str, principal: AuthContext) -> KnowledgeContext:
     ctx = runtime.store.get_context(context_id)
     if not ctx:
-        raise HTTPException(status_code=404, detail="context not found")
+        raise _http_error("not_found", "context not found", status_code=404)
     if ctx.owner_user_id != principal.user_id:
-        raise HTTPException(status_code=403, detail="forbidden")
+        raise _http_error("forbidden", "forbidden", status_code=403)
     return ctx
 
 
 def _get_owned_artifact(runtime, artifact_id: str, principal: AuthContext):
     artifact = runtime.store.get_artifact(artifact_id)
     if not artifact:
-        raise HTTPException(status_code=404, detail="artifact not found")
+        raise _http_error("not_found", "artifact not found", status_code=404)
     if artifact.owner_user_id and artifact.owner_user_id != principal.user_id:
-        raise HTTPException(status_code=403, detail="forbidden")
+        raise _http_error("forbidden", "forbidden", status_code=403)
     if not artifact.owner_user_id and principal.role != "admin":
-        raise HTTPException(status_code=403, detail="forbidden")
+        raise _http_error("forbidden", "forbidden", status_code=403)
     return artifact
 
 
@@ -277,7 +285,7 @@ def _apply_session_cookies(response: Response, session: Session, tokens: dict, *
 async def signup(body: SignupRequest, response: Response):
     settings = get_settings()
     if not settings.allow_signup:
-        raise HTTPException(status_code=403, detail="signup disabled")
+        raise _http_error("forbidden", "signup disabled", status_code=403)
     runtime = get_runtime()
     await _enforce_rate_limit(
         runtime,
@@ -318,7 +326,7 @@ async def login(body: LoginRequest, response: Response):
         email=body.email, password=body.password, mfa_code=body.mfa_code, tenant_id=body.tenant_id
     )
     if not user or not session:
-        raise HTTPException(status_code=401, detail="invalid credentials")
+        raise _http_error("unauthorized", "invalid credentials", status_code=401)
     _apply_session_cookies(response, session, tokens, refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes)
     return Envelope(
         status="ok",
@@ -351,7 +359,7 @@ async def oauth_callback(provider: str, code: str, state: str, tenant_id: Option
     runtime = get_runtime()
     user, session, tokens = await runtime.auth.complete_oauth(provider, code, state, tenant_id=tenant_id)
     if not user or not session:
-        raise HTTPException(status_code=401, detail="oauth verification failed")
+        raise _http_error("unauthorized", "oauth verification failed", status_code=401)
     if response:
         _apply_session_cookies(response, session, tokens, refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes)
     return Envelope(
@@ -381,7 +389,7 @@ async def refresh_tokens(
     tenant_hint = body.tenant_id or x_tenant_id
     user, session, tokens = await runtime.auth.refresh_tokens(body.refresh_token, tenant_hint=tenant_hint)
     if not user or not session:
-        raise HTTPException(status_code=401, detail="invalid refresh")
+        raise _http_error("unauthorized", "invalid refresh", status_code=401)
     if response:
         _apply_session_cookies(response, session, tokens, refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes)
     return Envelope(
@@ -485,7 +493,7 @@ async def request_mfa(body: MFARequest):
     runtime = get_runtime()
     auth_ctx = await runtime.auth.resolve_session(body.session_id, allow_pending_mfa=True)
     if not auth_ctx:
-        raise HTTPException(status_code=401, detail="invalid session")
+        raise _http_error("unauthorized", "invalid session", status_code=401)
     challenge = await runtime.auth.issue_mfa_challenge(user_id=auth_ctx.user_id)
     return Envelope(status="ok", data=challenge)
 
@@ -495,10 +503,10 @@ async def verify_mfa(body: MFAVerifyRequest, response: Response):
     runtime = get_runtime()
     auth_ctx = await runtime.auth.resolve_session(body.session_id, allow_pending_mfa=True)
     if not auth_ctx:
-        raise HTTPException(status_code=401, detail="invalid session")
+        raise _http_error("unauthorized", "invalid session", status_code=401)
     ok = await runtime.auth.verify_mfa_challenge(user_id=auth_ctx.user_id, code=body.code, session_id=body.session_id)
     if not ok:
-        raise HTTPException(status_code=401, detail="invalid mfa")
+        raise _http_error("unauthorized", "invalid mfa", status_code=401)
     user, session, tokens = runtime.auth.issue_tokens_for_session(body.session_id)
     resp: dict = {"status": "verified"}
     if user and session:
@@ -538,8 +546,27 @@ async def confirm_reset(body: PasswordResetConfirm):
     runtime = get_runtime()
     ok = await runtime.auth.complete_password_reset(body.token, body.new_password)
     if not ok:
-        raise HTTPException(status_code=400, detail="invalid token")
+        raise _http_error("validation_error", "invalid token", status_code=400)
     return Envelope(status="ok", data={"status": "reset"})
+
+
+@router.post("/auth/request_email_verification", response_model=Envelope)
+async def request_email_verification(principal: AuthContext = Depends(get_user)):
+    runtime = get_runtime()
+    user = runtime.store.get_user(principal.user_id)
+    if not user:
+        raise _http_error("not_found", "user not found", status_code=404)
+    await runtime.auth.request_email_verification(user)
+    return Envelope(status="ok", data={"status": "sent"})
+
+
+@router.post("/auth/verify_email", response_model=Envelope)
+async def verify_email(body: EmailVerificationRequest):
+    runtime = get_runtime()
+    ok = await runtime.auth.complete_email_verification(body.token)
+    if not ok:
+        raise _http_error("validation_error", "invalid token", status_code=400)
+    return Envelope(status="ok", data={"status": "verified"})
 
 
 @router.post("/auth/logout", response_model=Envelope)
@@ -553,7 +580,7 @@ async def logout(
         ctx = await runtime.auth.authenticate(authorization, session_id, allow_pending_mfa=True)
         target_session = session_id or (ctx.session_id if ctx else None)
         if not target_session:
-            raise HTTPException(status_code=401, detail="invalid session")
+            raise _http_error("unauthorized", "invalid session", status_code=401)
         await runtime.auth.revoke(target_session)
     if response:
         response.delete_cookie("session_id", path="/")
@@ -1099,7 +1126,7 @@ async def upload_file(
         max_bytes = max(1, runtime.settings.max_upload_bytes)
         contents = await file.read(max_bytes + 1)
         if len(contents) > max_bytes:
-            raise HTTPException(status_code=413, detail="file too large")
+            raise _http_error("validation_error", "file too large", status_code=413)
         dest_path = safe_join(dest_dir, file.filename)
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         dest_path.write_bytes(contents)

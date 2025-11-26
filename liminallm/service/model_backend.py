@@ -49,7 +49,7 @@ class ModelBackend(Protocol):
 
     mode: str
 
-    def generate(self, messages: List[dict], adapters: List[dict]) -> dict:
+    def generate(self, messages: List[dict], adapters: List[dict], *, user_id: Optional[str] = None) -> dict:
         ...
 
 
@@ -125,7 +125,7 @@ class ApiAdapterBackend:
         self.mode = adapter_mode
         self.client = _OpenAIClient(api_key=api_key, base_url=base_url) if api_key and _OpenAIClient else None
 
-    def generate(self, messages: List[dict], adapters: List[dict]) -> dict:
+    def generate(self, messages: List[dict], adapters: List[dict], *, user_id: Optional[str] = None) -> dict:
         adapter_list = adapters or []
         target_model = self._resolve_model(adapter_list)
         extra_body = self._resolve_extra_body(adapter_list)
@@ -313,11 +313,11 @@ class LocalJaxLoRABackend:
             attention = [0]
         return ids, attention
 
-    def _load_adapter_weights(self, adapter: dict) -> dict:
+    def _load_adapter_weights(self, adapter: dict, *, user_id: Optional[str] = None) -> dict:
         if not adapter:
             return {}
         adapter_id = adapter.get("id", "unknown")
-        path = Path(self._adapter_path(adapter))
+        path = Path(self._adapter_path(adapter, requested_user_id=user_id))
         if path.name != "latest" and not (path / "params.json").exists():
             candidates = sorted([p for p in path.glob("v*/params.json") if p.parent.is_dir()])
             if candidates:
@@ -414,7 +414,7 @@ class LocalJaxLoRABackend:
             score = score * 0.9 + 0.1 * token
         return generated
 
-    def generate(self, messages: List[dict], adapters: List[dict]) -> dict:
+    def generate(self, messages: List[dict], adapters: List[dict], *, user_id: Optional[str] = None) -> dict:
         prompt = self._normalize_messages(messages)
         adapter = adapters[0] if adapters else {}
         self._apply_adapter_vocab_size(adapter)
@@ -433,7 +433,7 @@ class LocalJaxLoRABackend:
         token_array = self._jax.device_put(token_array, self._device)
         attn_array = self._jax.device_put(attn_array, self._device)
 
-        weights = self._load_adapter_weights(adapter)
+        weights = self._load_adapter_weights(adapter, user_id=user_id)
         start = time.perf_counter()
         lora_scores = self._lora_forward(weights, token_array) if weights else self._jnp.zeros_like(token_array)
         lora_scores = lora_scores * attn_array
@@ -452,11 +452,17 @@ class LocalJaxLoRABackend:
             },
         }
 
-    def _adapter_path(self, adapter: dict) -> str:
+    def _adapter_path(self, adapter: dict, *, requested_user_id: Optional[str]) -> str:
         if not adapter:
             return str(self.fs_root / "adapters")
         explicit = adapter.get("cephfs_dir") or adapter.get("fs_dir")
         if explicit:
+            if not requested_user_id:
+                raise ValueError("adapter path resolution requires requesting user context")
+            owner = adapter.get("owner_user_id") or adapter.get("schema", {}).get("owner_user_id")
+            visibility = adapter.get("visibility") or adapter.get("schema", {}).get("visibility")
+            if owner and owner != requested_user_id and visibility not in {"shared", "global"}:
+                raise ValueError("adapter owner mismatch")
             base = self.fs_root.resolve()
             candidate = (Path(str(explicit)) if isinstance(explicit, (str, Path)) else Path(""))
             resolved = (candidate if candidate.is_absolute() else base / candidate).resolve()

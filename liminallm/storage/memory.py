@@ -29,6 +29,7 @@ from liminallm.storage.models import (
     Session,
     TrainingJob,
     User,
+    UserAuthProvider,
     UserMFAConfig,
 )
 
@@ -43,6 +44,7 @@ class MemoryStore:
         self.conversations: Dict[str, Conversation] = {}
         self.messages: Dict[str, List[Message]] = {}
         self.credentials: Dict[str, tuple[str, str]] = {}
+        self.providers: List[UserAuthProvider] = []
         self.artifacts: Dict[str, Artifact] = {}
         self.artifact_versions: Dict[str, List[ArtifactVersion]] = {}
         self.config_patches: Dict[int, ConfigPatchAudit] = {}
@@ -199,6 +201,8 @@ class MemoryStore:
         if any(existing.email == email for existing in self.users.values()):
             raise ConstraintViolation("email already exists", {"field": "email"})
         user_id = str(uuid.uuid4())
+        normalized_meta = meta.copy() if meta else {}
+        normalized_meta.setdefault("email_verified", False)
         user = User(
             id=user_id,
             email=email,
@@ -207,11 +211,21 @@ class MemoryStore:
             role=role,
             plan_tier=plan_tier,
             is_active=is_active,
-            meta=meta,
+            meta=normalized_meta,
         )
         self.users[user_id] = user
         self._persist_state()
         return user
+
+    def link_user_auth_provider(self, user_id: str, provider: str, provider_uid: str) -> None:
+        mapping = UserAuthProvider(id=len(self.providers) + 1, user_id=user_id, provider=provider, provider_uid=provider_uid)
+        self.providers.append(mapping)
+
+    def get_user_by_provider(self, provider: str, provider_uid: str) -> Optional[User]:
+        for mapping in self.providers:
+            if mapping.provider == provider and mapping.provider_uid == provider_uid:
+                return self.users.get(mapping.user_id)
+        return None
 
     def get_user_by_email(self, email: str) -> Optional[User]:
         return next((u for u in self.users.values() if u.email == email), None)
@@ -228,6 +242,16 @@ class MemoryStore:
         if not user:
             return None
         user.role = role
+        self._persist_state()
+        return user
+
+    def mark_email_verified(self, user_id: str) -> Optional[User]:
+        user = self.users.get(user_id)
+        if not user:
+            return None
+        meta = user.meta or {}
+        meta["email_verified"] = True
+        user.meta = meta
         self._persist_state()
         return user
 
@@ -1131,6 +1155,7 @@ class MemoryStore:
                 {"user_id": user_id, "password_hash": creds[0], "password_algo": creds[1]}
                 for user_id, creds in self.credentials.items()
             ],
+            "providers": [self._serialize_provider(p) for p in self.providers],
             "conversations": [self._serialize_conversation(c) for c in self.conversations.values()],
             "messages": [self._serialize_message(m) for msgs in self.messages.values() for m in msgs],
             "artifacts": [self._serialize_artifact(a) for a in self.artifacts.values()],
@@ -1164,6 +1189,7 @@ class MemoryStore:
             entry["user_id"]: (entry["password_hash"], entry.get("password_algo", ""))
             for entry in data.get("credentials", [])
         }
+        self.providers = [self._deserialize_provider(p) for p in data.get("providers", [])]
         self.conversations = {c["id"]: self._deserialize_conversation(c) for c in data.get("conversations", [])}
         self.messages = {}
         for msg_data in data.get("messages", []):
@@ -1234,6 +1260,24 @@ class MemoryStore:
             is_active=data.get("is_active", True),
             plan_tier=data.get("plan_tier", "free"),
             meta=data.get("meta"),
+        )
+
+    def _serialize_provider(self, provider: UserAuthProvider) -> dict:
+        return {
+            "id": provider.id,
+            "user_id": provider.user_id,
+            "provider": provider.provider,
+            "provider_uid": provider.provider_uid,
+            "created_at": self._serialize_datetime(provider.created_at),
+        }
+
+    def _deserialize_provider(self, data: dict) -> UserAuthProvider:
+        return UserAuthProvider(
+            id=int(data["id"]),
+            user_id=str(data["user_id"]),
+            provider=data["provider"],
+            provider_uid=data["provider_uid"],
+            created_at=self._deserialize_datetime(data.get("created_at", datetime.utcnow().isoformat())),
         )
 
     def _serialize_session(self, session: Session) -> dict:

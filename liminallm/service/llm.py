@@ -37,7 +37,15 @@ class LLMService:
             fs_root=fs_root,
         )
 
-    def generate(self, prompt: str, adapters: List[dict], context_snippets: List[str], history: Optional[List[Message]] = None) -> dict:
+    def generate(
+        self,
+        prompt: str,
+        adapters: List[dict],
+        context_snippets: List[str],
+        history: Optional[List[Message]] = None,
+        *,
+        user_id: Optional[str] = None,
+    ) -> dict:
         normalized_adapters = self._normalize_adapters(adapters)
         messages = [{"role": "system", "content": "You are a concise assistant."}]
         messages.extend(self._build_adapter_prompts(normalized_adapters))
@@ -47,7 +55,7 @@ class LLMService:
             messages = self._inject_context(messages, context_snippets)
         else:
             messages.append({"role": "user", "content": self._format_user(prompt, context_snippets)})
-        return self.backend.generate(messages, normalized_adapters)
+        return self.backend.generate(messages, normalized_adapters, user_id=user_id)
 
     def _format_user(self, prompt: str, context_snippets: List[str]) -> str:
         if context_snippets:

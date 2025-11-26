@@ -115,6 +115,7 @@ class AuthService:
         self.mfa_enabled = mfa_enabled
         self.revoked_refresh_tokens: set[str] = set()
         self._oauth_states: dict[str, tuple[str, datetime, Optional[str]]] = {}
+        self._oauth_code_registry: dict[tuple[str, str], dict] = {}
         self._pwd_hasher = PasswordHasher(type=Type.ID)
 
     def _generate_password(self) -> str:
@@ -176,6 +177,24 @@ class AuthService:
         authorization_url = f"{base_url}?provider={provider}&state={state}"
         return {"authorization_url": authorization_url, "state": state, "provider": provider}
 
+    def register_oauth_code(self, provider: str, code: str, payload: dict) -> None:
+        """Record an exchanged OAuth payload for testing or offline flows."""
+
+        self._oauth_code_registry[(provider, code)] = payload
+
+    async def _exchange_oauth_code(self, provider: str, code: str) -> Optional[dict]:
+        cached_payload: Optional[dict] = None
+        if self.cache:
+            raw = await self.cache.client.get(f"auth:oauth:code:{provider}:{code}")
+            if raw:
+                try:
+                    cached_payload = json.loads(raw)
+                finally:
+                    await self.cache.client.delete(f"auth:oauth:code:{provider}:{code}")
+        if not cached_payload:
+            cached_payload = self._oauth_code_registry.pop((provider, code), None)
+        return cached_payload
+
     async def complete_oauth(
         self, provider: str, code: str, state: str, *, tenant_id: Optional[str] = None
     ) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
@@ -190,12 +209,27 @@ class AuthService:
         self._oauth_states.pop(state, None)
         if self.cache and not cached_state:
             await self.cache.pop_oauth_state(state)
+        identity = await self._exchange_oauth_code(provider, code)
+        if not identity:
+            return None, None, {}
+        provider_uid = identity.get("provider_uid")
+        if not provider_uid:
+            return None, None, {}
         normalized_tenant = tenant_id or tenant_hint or self.settings.default_tenant_id
-        synthetic_email = f"{provider}+{code}@oauth.local"
-        user = self.store.get_user_by_email(synthetic_email)
+        existing = None
+        if hasattr(self.store, "get_user_by_provider"):
+            existing = self.store.get_user_by_provider(provider, provider_uid)
+        user = existing or self.store.get_user_by_email(identity.get("email")) if identity.get("email") else None
         if not user:
-            user = self.store.create_user(email=synthetic_email, handle=provider, tenant_id=normalized_tenant)
+            user_email = identity.get("email") or f"{provider_uid}@{provider}.oauth"
+            handle = identity.get("handle") or provider_uid
+            user = self.store.create_user(email=user_email, handle=handle, tenant_id=normalized_tenant)
             self.store.save_password(user.id, "", "oauth")
+        if hasattr(self.store, "link_user_auth_provider"):
+            try:
+                self.store.link_user_auth_provider(user.id, provider, provider_uid)
+            except Exception as exc:
+                self.logger.warning("link_oauth_provider_failed", error=str(exc))
         session = self.store.create_session(user.id, tenant_id=user.tenant_id)
         tokens = self._issue_tokens(user, session)
         if self.cache:
@@ -398,6 +432,27 @@ class AuthService:
                 self.logger.warning("revoke_sessions_failed", user_id=user.id, error=str(exc))
         if self.cache:
             await self.cache.client.delete(f"reset:{token}")
+        return True
+
+    async def request_email_verification(self, user: User) -> str:
+        token = hashlib.sha256(f"verify-{user.email}-{os.urandom(32)}".encode()).hexdigest()
+        if self.cache:
+            await self.cache.client.set(f"verify:{token}", user.id, ex=60 * 60 * 24)
+        return token
+
+    async def complete_email_verification(self, token: str) -> bool:
+        user_id = None
+        if self.cache:
+            user_id = await self.cache.client.get(f"verify:{token}")
+        if not user_id:
+            return False
+        user = self.store.get_user(user_id)
+        if not user:
+            return False
+        if hasattr(self.store, "mark_email_verified"):
+            self.store.mark_email_verified(user.id)
+        if self.cache:
+            await self.cache.client.delete(f"verify:{token}")
         return True
 
     def _hash_password(self, password: str) -> Tuple[str, str]:
