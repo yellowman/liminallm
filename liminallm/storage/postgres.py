@@ -23,6 +23,7 @@ from liminallm.storage.models import (
     ConfigPatchAudit,
     ContextSource,
     Conversation,
+    AdapterRouterState,
     KnowledgeChunk,
     KnowledgeContext,
     Message,
@@ -966,13 +967,19 @@ class PostgresStore:
             except Exception:
                 meta = None
         raw_ip = row.get("ip_addr")
+        ip_val = None
+        if isinstance(raw_ip, str):
+            if raw_ip.strip():
+                ip_val = ip_address(raw_ip)
+        else:
+            ip_val = raw_ip
         sess = Session(
             id=str(row["id"]),
             user_id=str(row["user_id"]),
             created_at=row.get("created_at", datetime.utcnow()),
             expires_at=row.get("expires_at", datetime.utcnow()),
             user_agent=row.get("user_agent"),
-            ip_addr=ip_address(raw_ip) if isinstance(raw_ip, str) and raw_ip else raw_ip,
+            ip_addr=ip_val,
             mfa_required=row.get("mfa_required", False),
             mfa_verified=row.get("mfa_verified", False),
             tenant_id=row.get("tenant_id", "public"),
@@ -1272,6 +1279,7 @@ class PostgresStore:
                     change_note,
                 ),
             )
+        new_base_model = schema.get("base_model") if "base_model" in schema else row.get("base_model")
         return Artifact(
             id=str(row["id"]),
             type=row["type"],
@@ -1281,7 +1289,7 @@ class PostgresStore:
             owner_user_id=(str(row["owner_user_id"]) if row.get("owner_user_id") else None),
             fs_path=fs_path,
             visibility=row.get("visibility", "private"),
-            base_model=row.get("base_model") or schema.get("base_model"),
+            base_model=new_base_model,
         )
 
     def list_artifact_versions(self, artifact_id: str) -> List[ArtifactVersion]:
@@ -1337,13 +1345,45 @@ class PostgresStore:
             except Exception as exc:
                 self.logger.warning("workflow_schema_parse_failed", error=str(exc))
                 schema = {}
-        return schema or None
+        return schema
 
-    def list_adapter_router_state(self, user_id: Optional[str] = None) -> list[dict]:
-        """Provide an empty adapter router state until persisted in SQL (SPEC §8)."""
+    def list_adapter_router_state(self, user_id: Optional[str] = None) -> list[AdapterRouterState]:
+        """Return adapter router state rows scoped by user ownership when provided."""
 
-        _ = user_id  # placeholder for future user scoping
-        return []
+        query = (
+            "SELECT ars.*, a.base_model FROM adapter_router_state ars "
+            "JOIN artifact a ON ars.artifact_id = a.id"
+        )
+        params: tuple[Any, ...] = ()
+        if user_id:
+            query += " WHERE a.owner_user_id = %s"
+            params = (user_id,)
+        query += " ORDER BY ars.last_used_at DESC NULLS LAST, ars.usage_count DESC, ars.last_trained_at DESC NULLS LAST"
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+
+        states: list[AdapterRouterState] = []
+        for row in rows:
+            meta = row.get("meta") if isinstance(row, dict) else None
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = None
+            centroid_vec = row.get("centroid_vec") if isinstance(row, dict) else None
+            states.append(
+                AdapterRouterState(
+                    artifact_id=str(row["artifact_id"]),
+                    base_model=row.get("base_model") if isinstance(row, dict) else None,
+                    centroid_vec=centroid_vec if centroid_vec is not None else [],
+                    usage_count=row.get("usage_count", 0) if isinstance(row, dict) else 0,
+                    success_score=row.get("success_score", 0.0) if isinstance(row, dict) else 0.0,
+                    last_used_at=row.get("last_used_at") if isinstance(row, dict) else None,
+                    last_trained_at=row.get("last_trained_at") if isinstance(row, dict) else None,
+                    meta=meta,
+                )
+            )
+        return states
 
     def record_config_patch(self, artifact_id: str, proposer: str, patch: dict, justification: Optional[str]) -> ConfigPatchAudit:
         with self._connect() as conn:
@@ -1494,8 +1534,12 @@ class PostgresStore:
                 )
         except errors.ForeignKeyViolation:
             raise ConstraintViolation("context owner missing", {"owner_user_id": owner_user_id})
-        except errors.NotNullViolation:
-            raise ConstraintViolation("context owner required", {"owner_user_id": owner_user_id})
+        except errors.NotNullViolation as exc:
+            missing_field = getattr(getattr(exc, "diag", None), "column_name", None)
+            error_fields = {"owner_user_id": owner_user_id}
+            if missing_field:
+                error_fields[missing_field] = None
+            raise ConstraintViolation("context fields required", error_fields) from exc
         return KnowledgeContext(
             id=ctx_id, owner_user_id=owner_user_id, name=name, description=description, fs_path=fs_path, meta=meta
         )

@@ -17,6 +17,7 @@ from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
     Artifact,
     ArtifactVersion,
+    AdapterRouterState,
     ConfigPatchAudit,
     ContextSource,
     Conversation,
@@ -819,11 +820,23 @@ class MemoryStore:
             return None
         return versions[-1].schema
 
-    def list_adapter_router_state(self, user_id: Optional[str] = None) -> list[dict]:
-        """In-memory placeholder for adapter router state (not yet persisted)."""
+    def list_adapter_router_state(self, user_id: Optional[str] = None) -> list[AdapterRouterState]:
+        """Return synthetic router state for adapters in memory."""
 
-        _ = user_id  # unused; parity with PostgresStore signature
-        return []
+        adapters = [a for a in self.artifacts.values() if a.type == "adapter"]
+        if user_id:
+            adapters = [a for a in adapters if a.owner_user_id == user_id]
+        return [
+            AdapterRouterState(
+                artifact_id=a.id,
+                base_model=a.schema.get("base_model"),
+                centroid_vec=a.schema.get("embedding_centroid") or [],
+                usage_count=0,
+                success_score=0.0,
+                meta=None,
+            )
+            for a in adapters
+        ]
 
     def upsert_context(
         self,
@@ -1159,13 +1172,19 @@ class MemoryStore:
 
     def _deserialize_session(self, data: dict) -> Session:
         raw_ip = data.get("ip_addr")
+        ip_val = None
+        if isinstance(raw_ip, str):
+            if raw_ip.strip():
+                ip_val = ip_address(raw_ip)
+        else:
+            ip_val = raw_ip
         return Session(
             id=data["id"],
             user_id=data["user_id"],
             created_at=self._deserialize_datetime(data["created_at"]),
             expires_at=self._deserialize_datetime(data["expires_at"]),
             user_agent=data.get("user_agent"),
-            ip_addr=ip_address(raw_ip) if isinstance(raw_ip, str) and raw_ip else raw_ip,
+            ip_addr=ip_val,
             mfa_required=data.get("mfa_required", False),
             mfa_verified=data.get("mfa_verified", False),
             tenant_id=data.get("tenant_id", "public"),
