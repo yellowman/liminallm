@@ -572,6 +572,17 @@ class MemoryStore:
         self._persist_state()
         return job
 
+    def list_training_jobs(
+        self, user_id: Optional[str] = None, status: Optional[str] = None, *, limit: Optional[int] = None
+    ) -> List[TrainingJob]:
+        jobs = list(self.training_jobs.values())
+        if user_id:
+            jobs = [j for j in jobs if j.user_id == user_id]
+        if status:
+            jobs = [j for j in jobs if j.status == status]
+        jobs.sort(key=lambda j: j.created_at, reverse=True)
+        return jobs if limit is None else jobs[:limit]
+
     def inspect_state(self, *, tenant_id: Optional[str] = None, kind: Optional[str] = None, limit: int = 50) -> dict:
         def _serialize(obj: Any) -> dict:
             if hasattr(obj, "__dict__"):

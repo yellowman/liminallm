@@ -32,6 +32,7 @@ class TrainingService:
         self._tokenizer_error: Optional[str] = None
         self._tokenizer_model: Optional[str] = None
         self.runtime_base_model = runtime_base_model
+        self.training_job_cooldown_seconds = 300
 
     def _ensure_tokenizer(self, base_model: Optional[str]) -> None:
         model_name = base_model or self.runtime_base_model
@@ -275,12 +276,40 @@ class TrainingService:
             explicit_signal=explicit_signal,
             meta=meta or None,
         )
-        if feedback in {"positive", "like"}:
+        if feedback in {"positive", "like"} and self._should_enqueue_training_job(user_id):
             adapter = self.ensure_user_adapter(user_id)
             self.store.create_training_job(
                 user_id=user_id, adapter_id=adapter.id, preference_event_ids=[event.id], dataset_path=None
             )
         return event
+
+    def _should_enqueue_training_job(self, user_id: str) -> bool:
+        active_statuses = {"queued", "running"}
+        recent_jobs = self._list_user_training_jobs(user_id)
+        for job in recent_jobs:
+            if job.status in active_statuses:
+                return False
+        if not recent_jobs:
+            return True
+        most_recent = recent_jobs[0]
+        cooldown_elapsed = (
+            datetime.utcnow() - (most_recent.updated_at or most_recent.created_at)
+        ).total_seconds()
+        return cooldown_elapsed >= self.training_job_cooldown_seconds
+
+    def _list_user_training_jobs(self, user_id: str) -> List:
+        list_fn = getattr(self.store, "list_training_jobs", None)
+        if callable(list_fn):
+            jobs = list_fn(user_id=user_id)
+        elif hasattr(self.store, "training_jobs"):
+            jobs = [j for j in getattr(self.store, "training_jobs", {}).values() if j.user_id == user_id]
+        else:
+            jobs = []
+        try:
+            jobs.sort(key=lambda j: j.created_at, reverse=True)
+        except Exception:
+            pass
+        return jobs
 
     def summarize_preferences(self, user_id: Optional[str]) -> dict:
         events: List[PreferenceEvent] = []
