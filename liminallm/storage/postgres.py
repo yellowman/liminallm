@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -287,8 +288,19 @@ class PostgresStore:
     ) -> PreferenceEvent:
         normalized_weight = weight if weight is not None else (score if score is not None else 1.0)
         event_id = str(uuid.uuid4())
-        formatted_embedding = self._format_vector(context_embedding) if context_embedding else None
         with self._connect() as conn:
+            msg_row = conn.execute(
+                "SELECT conversation_id, content FROM message WHERE id = %s",
+                (message_id,),
+            ).fetchone()
+            if not msg_row:
+                raise ConstraintViolation("preference message missing", {"message_id": message_id})
+            if msg_row.get("conversation_id") != conversation_id:
+                raise ConstraintViolation(
+                    "preference message conversation mismatch",
+                    {"message_id": message_id, "conversation_id": conversation_id},
+                )
+            embedding = context_embedding or self._text_embedding(context_text or msg_row.get("content"))
             row = conn.execute(
                 """
                 INSERT INTO preference_event (
@@ -306,7 +318,7 @@ class PostgresStore:
                     feedback,
                     score,
                     explicit_signal,
-                    formatted_embedding,
+                    self._format_vector(embedding),
                     cluster_id,
                     context_text,
                     corrected_text,
@@ -322,7 +334,7 @@ class PostgresStore:
             feedback=feedback,
             score=score,
             explicit_signal=explicit_signal,
-            context_embedding=context_embedding or [],
+            context_embedding=embedding,
             cluster_id=cluster_id,
             context_text=context_text,
             corrected_text=corrected_text,
@@ -330,6 +342,18 @@ class PostgresStore:
             weight=normalized_weight,
             meta=meta,
         )
+
+    def _text_embedding(self, text: Optional[str]) -> list[float]:
+        if not text:
+            return []
+        tokens = text.lower().split()
+        dim = 64
+        vec = [0.0] * dim
+        for tok in tokens:
+            h = int(hashlib.sha256(tok.encode()).hexdigest(), 16)
+            vec[h % dim] += 1.0
+        norm = sum(v * v for v in vec) ** 0.5 or 1.0
+        return [v / norm for v in vec]
 
     def list_preference_events(
         self, user_id: str | None = None, feedback: str | None = None, cluster_id: str | None = None
