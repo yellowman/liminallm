@@ -709,6 +709,41 @@ class PostgresStore:
             meta=row.get("meta"),
         )
 
+    def list_training_jobs(
+        self, user_id: str | None = None, status: str | None = None, *, limit: int | None = None
+    ) -> List[TrainingJob]:
+        query = "SELECT * FROM training_job WHERE 1=1"
+        params: list[Any] = []
+        if user_id:
+            params.append(user_id)
+            query += f" AND user_id = %s"
+        if status:
+            params.append(status)
+            query += f" AND status = %s"
+        query += " ORDER BY created_at DESC"
+        if limit:
+            params.append(limit)
+            query += " LIMIT %s"
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [
+            TrainingJob(
+                id=str(row["id"]),
+                user_id=str(row["user_id"]),
+                adapter_id=str(row.get("adapter_id")),
+                status=row.get("status", "queued"),
+                num_events=row.get("num_events"),
+                created_at=row.get("created_at", datetime.utcnow()),
+                updated_at=row.get("updated_at", datetime.utcnow()),
+                loss=row.get("loss"),
+                preference_event_ids=row.get("preference_event_ids") or [],
+                dataset_path=row.get("dataset_path"),
+                new_version=row.get("new_version"),
+                meta=row.get("meta"),
+            )
+            for row in rows
+        ]
+
     # users
     def create_user(
         self,
