@@ -311,7 +311,7 @@ class TrainingService:
         else:
             jobs = []
         try:
-            jobs.sort(key=lambda j: j.created_at, reverse=True)
+            jobs.sort(key=lambda j: j.updated_at or j.created_at, reverse=True)
         except Exception:
             pass
         return jobs
