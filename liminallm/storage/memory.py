@@ -325,6 +325,13 @@ class MemoryStore:
         self.sessions.pop(session_id, None)
         self._persist_state()
 
+    def revoke_user_sessions(self, user_id: str) -> None:
+        stale = [sid for sid, sess in self.sessions.items() if sess.user_id == user_id]
+        for sid in stale:
+            self.sessions.pop(sid, None)
+        if stale:
+            self._persist_state()
+
     def mark_session_verified(self, session_id: str) -> None:
         sess = self.sessions.get(session_id)
         if not sess:
@@ -347,8 +354,13 @@ class MemoryStore:
         self._persist_state()
         return conv
 
-    def get_conversation(self, conversation_id: str) -> Optional[Conversation]:
-        return self.conversations.get(conversation_id)
+    def get_conversation(self, conversation_id: str, *, user_id: Optional[str] = None) -> Optional[Conversation]:
+        conv = self.conversations.get(conversation_id)
+        if not conv:
+            return None
+        if user_id and conv.user_id != user_id:
+            return None
+        return conv
 
     def append_message(
         self,
@@ -674,7 +686,10 @@ class MemoryStore:
             sections["config_patches"] = [_serialize(p) for p in list(self.config_patches.values())[:limit]]
         return sections
 
-    def list_messages(self, conversation_id: str, limit: int = 10, **_: Any) -> List[Message]:
+    def list_messages(self, conversation_id: str, limit: int = 10, *, user_id: Optional[str] = None, **_: Any) -> List[Message]:
+        conv = self.get_conversation(conversation_id, user_id=user_id) if user_id else self.conversations.get(conversation_id)
+        if not conv:
+            return []
         msgs = self.messages.get(conversation_id, [])
         return msgs[-limit:]
 
@@ -961,12 +976,20 @@ class MemoryStore:
             existing.append(chunk)
         self._persist_state()
 
-    def list_chunks(self, context_id: Optional[str] = None) -> List[KnowledgeChunk]:
+    def list_chunks(self, context_id: Optional[str] = None, *, owner_user_id: Optional[str] = None) -> List[KnowledgeChunk]:
         if context_id:
+            ctx = self.contexts.get(context_id)
+            if owner_user_id and (not ctx or ctx.owner_user_id != owner_user_id):
+                return []
             return list(self.chunks.get(context_id, []))
+        if not owner_user_id:
+            return []
         chunks: List[KnowledgeChunk] = []
         for vals in self.chunks.values():
-            chunks.extend(vals)
+            if vals:
+                ctx = self.contexts.get(vals[0].context_id)
+                if ctx and ctx.owner_user_id == owner_user_id:
+                    chunks.extend(vals)
         return chunks
 
     def search_chunks(

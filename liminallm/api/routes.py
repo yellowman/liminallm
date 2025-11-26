@@ -208,7 +208,7 @@ async def get_admin_user(
 
 
 def _get_owned_conversation(runtime, conversation_id: str, principal: AuthContext) -> Conversation:
-    conversation = runtime.store.get_conversation(conversation_id)
+    conversation = runtime.store.get_conversation(conversation_id, user_id=principal.user_id)
     if not conversation:
         raise HTTPException(status_code=404, detail="conversation not found")
     if conversation.user_id != principal.user_id:
@@ -230,6 +230,8 @@ def _get_owned_artifact(runtime, artifact_id: str, principal: AuthContext):
     if not artifact:
         raise HTTPException(status_code=404, detail="artifact not found")
     if artifact.owner_user_id and artifact.owner_user_id != principal.user_id:
+        raise HTTPException(status_code=403, detail="forbidden")
+    if not artifact.owner_user_id and principal.role != "admin":
         raise HTTPException(status_code=403, detail="forbidden")
     return artifact
 
@@ -647,7 +649,7 @@ async def chat(
         )
         envelope = Envelope(status="ok", data=resp.model_dump(), request_id=idem.request_id)
         if runtime.cache:
-            history = runtime.store.list_messages(conversation_id)
+            history = runtime.store.list_messages(conversation_id, user_id=principal.user_id)
             await runtime.workflow.cache_conversation_state(conversation_id, history)
         await idem.store_result(envelope)
         return envelope
@@ -1119,7 +1121,7 @@ async def upload_file(
 async def list_messages(conversation_id: str, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     _get_owned_conversation(runtime, conversation_id, principal)
-    msgs = runtime.store.list_messages(conversation_id)
+    msgs = runtime.store.list_messages(conversation_id, user_id=principal.user_id)
     payload = [
         {
             "id": m.id,
@@ -1210,7 +1212,7 @@ async def list_contexts(principal: AuthContext = Depends(get_user)):
 async def list_chunks(context_id: str, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     _get_owned_context(runtime, context_id, principal)
-    chunks = runtime.store.list_chunks(context_id)
+    chunks = runtime.store.list_chunks(context_id, owner_user_id=principal.user_id)
     data = [
         KnowledgeChunkResponse(
             id=ch.id if ch.id is not None else 0,

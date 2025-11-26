@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import random
@@ -328,7 +329,13 @@ class LocalJaxLoRABackend:
         cached = self._adapter_cache.get(adapter_id)
         if cached and cached[0] == mtime:
             return cached[1]
-        weights_raw = json.loads(params_path.read_text())
+        payload = params_path.read_bytes()
+        checksum = adapter.get("checksum") or adapter.get("schema", {}).get("checksum")
+        if checksum:
+            digest = hashlib.sha256(payload).hexdigest()
+            if digest != checksum:
+                raise ValueError("adapter checksum mismatch")
+        weights_raw = json.loads(payload.decode())
         self._ensure_jax()
         weights = {k: self._jnp.array(v, dtype=self._jnp.float32) for k, v in weights_raw.items()}
         self._adapter_cache[adapter_id] = (mtime, weights)
@@ -450,7 +457,12 @@ class LocalJaxLoRABackend:
             return str(self.fs_root / "adapters")
         explicit = adapter.get("cephfs_dir") or adapter.get("fs_dir")
         if explicit:
-            return str(explicit)
+            base = self.fs_root.resolve()
+            candidate = (Path(str(explicit)) if isinstance(explicit, (str, Path)) else Path(""))
+            resolved = (candidate if candidate.is_absolute() else base / candidate).resolve()
+            if base not in resolved.parents and resolved != base:
+                raise ValueError("adapter path must reside within fs_root")
+            return str(resolved)
         adapter_id = adapter.get("id", "unknown")
         candidate = safe_join(self.fs_root, f"adapters/{adapter_id}")
         latest = candidate / "latest"

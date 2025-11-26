@@ -291,6 +291,8 @@ class AuthService:
             if not cached_user:
                 return None
             sess = self.store.get_session(session_id)
+        if not sess:
+            return None
         if not sess or sess.expires_at <= datetime.utcnow():
             return None
         user = self.store.get_user(sess.user_id)
@@ -389,6 +391,11 @@ class AuthService:
             return False
         pwd_hash, algo = self._hash_password(new_password)
         self.store.save_password(user.id, pwd_hash, algo)
+        if hasattr(self.store, "revoke_user_sessions"):
+            try:
+                self.store.revoke_user_sessions(user.id)  # type: ignore[attr-defined]
+            except Exception as exc:
+                self.logger.warning("revoke_sessions_failed", user_id=user.id, error=str(exc))
         if self.cache:
             await self.cache.client.delete(f"reset:{token}")
         return True
