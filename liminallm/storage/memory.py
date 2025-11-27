@@ -993,13 +993,13 @@ class MemoryStore:
         for chunk in chunks:
             if not chunk.fs_path or not str(chunk.fs_path).strip():
                 raise ConstraintViolation("fs_path required for knowledge_chunk", {"fs_path": chunk.fs_path})
-            chunk_id = getattr(chunk, "id", 0) or 0
+            chunk_id = getattr(chunk, "id", None)
             if isinstance(chunk_id, str):
                 try:
                     chunk_id = int(chunk_id)
                 except ValueError:
-                    chunk_id = 0
-            if chunk_id <= 0:
+                    chunk_id = None
+            if not chunk_id or int(chunk_id) <= 0:
                 chunk.id = self._chunk_id_seq
                 self._chunk_id_seq += 1
             else:
@@ -1521,7 +1521,7 @@ class MemoryStore:
 
     def _deserialize_chunk(self, data: dict) -> KnowledgeChunk:
         return KnowledgeChunk(
-            id=int(data["id"]) if data.get("id") is not None else 0,
+            id=int(data["id"]) if data.get("id") is not None else None,
             context_id=data["context_id"],
             fs_path=data.get("fs_path", ""),
             content=data.get("content", ""),

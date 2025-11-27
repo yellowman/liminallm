@@ -36,6 +36,8 @@ class Session:
     def __post_init__(self) -> None:
         if self.expires_at <= self.created_at:
             raise ValueError("session expiration must be after creation time")
+        if self.expires_at <= datetime.utcnow():
+            raise ValueError("session expiration must be in the future")
 
     @classmethod
     def new(
@@ -192,7 +194,7 @@ class KnowledgeChunk:
     content: str
     embedding: List[float]
     chunk_index: int
-    id: int = 0
+    id: Optional[int] = None
     created_at: datetime = field(default_factory=datetime.utcnow)
     meta: Dict | None = None
 
