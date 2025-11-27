@@ -36,6 +36,15 @@ def test_retrieve_filters_by_user_and_tenant():
     assert blocked == []
 
 
+def test_pgvector_retrieve_requires_auth_scope():
+    service, _, ctx_b, _, _ = _setup_store()
+
+    # Without a user context, pgvector retrieval should not surface chunks from any context.
+    blocked = service.retrieve([ctx_b], "tenant b data", user_id=None, tenant_id=None)
+
+    assert blocked == []
+
+
 class LegacyOnlyStore:
     def __init__(self):
         self.contexts = {}
