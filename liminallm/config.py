@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import secrets
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from dotenv import dotenv_values
@@ -112,7 +113,28 @@ class Settings(BaseModel):
     def _ensure_jwt_secret(cls, value: str | None) -> str:
         if value:
             return value
-        return secrets.token_urlsafe(64)
+        # Persist a generated JWT secret so tokens remain valid across restarts
+        fs_root = Path(os.getenv("SHARED_FS_ROOT", "/srv/liminallm"))
+        secret_path = fs_root / ".jwt_secret"
+        secret_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if secret_path.exists():
+            try:
+                persisted = secret_path.read_text().strip()
+                if persisted:
+                    return persisted
+            except Exception:
+                pass
+
+        generated = secrets.token_urlsafe(64)
+        try:
+            secret_path.write_text(generated)
+            os.chmod(secret_path, 0o600)
+        except Exception:
+            # If persistence fails we still return the generated secret, but tokens
+            # will rotate on restart until storage is writable.
+            pass
+        return generated
 
 
 def get_settings() -> Settings:

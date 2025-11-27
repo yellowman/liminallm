@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import json
+import os
 import uuid
 import hashlib
 import math
@@ -11,6 +13,7 @@ from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from cryptography.fernet import Fernet, InvalidToken
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service.artifact_validation import ArtifactValidationError, validate_artifact
@@ -39,7 +42,7 @@ from liminallm.storage.models import (
 class MemoryStore:
     """Minimal in-memory backing store for the initial prototype."""
 
-    def __init__(self, fs_root: str = "/tmp/liminallm") -> None:
+    def __init__(self, fs_root: str = "/tmp/liminallm", *, mfa_encryption_key: str | None = None) -> None:
         self.logger = get_logger(__name__)
         self.users: Dict[str, User] = {}
         self.sessions: Dict[str, Session] = {}
@@ -63,6 +66,7 @@ class MemoryStore:
         self.mfa_secrets: Dict[str, UserMFAConfig] = {}
         self.fs_root = Path(fs_root)
         self.fs_root.mkdir(parents=True, exist_ok=True)
+        self._mfa_cipher = self._build_mfa_cipher(mfa_encryption_key)
 
         if not self._load_state():
             self.default_artifacts()
@@ -74,6 +78,28 @@ class MemoryStore:
         state_dir = self.fs_root / "state"
         state_dir.mkdir(parents=True, exist_ok=True)
         return state_dir / "memory_store.json"
+
+    @staticmethod
+    def _derive_cipher_key(key_material: str) -> bytes:
+        return base64.urlsafe_b64encode(hashlib.sha256(key_material.encode()).digest())
+
+    def _build_mfa_cipher(self, key_material: str | None) -> Fernet | None:
+        material = key_material or os.getenv("MFA_SECRET_KEY") or os.getenv("JWT_SECRET")
+        if not material:
+            secret_path = self.fs_root / ".jwt_secret"
+            try:
+                if secret_path.exists():
+                    material = secret_path.read_text().strip()
+            except Exception:
+                pass
+        if not material:
+            self.logger.warning("mfa_secret_unencrypted", reason="missing_key_material")
+            return None
+        try:
+            return Fernet(self._derive_cipher_key(material))
+        except Exception as exc:
+            self.logger.warning("mfa_secret_cipher_init_failed", error=str(exc))
+            return None
 
     @staticmethod
     def _serialize_datetime(dt: datetime) -> str:
@@ -308,16 +334,51 @@ class MemoryStore:
     def get_password_record(self, user_id: str) -> Optional[tuple[str, str]]:
         return self.credentials.get(user_id)
 
+    def _encrypt_mfa_secret(self, secret: str) -> str:
+        if not secret:
+            return secret
+        if not self._mfa_cipher:
+            return secret
+        return self._mfa_cipher.encrypt(secret.encode()).decode()
+
+    def _decrypt_mfa_secret(self, secret: str) -> str:
+        if not secret:
+            return secret
+        if not self._mfa_cipher:
+            return secret
+        try:
+            return self._mfa_cipher.decrypt(secret.encode()).decode()
+        except InvalidToken:
+            self.logger.warning("mfa_secret_decrypt_failed")
+            return secret
+
     def set_user_mfa_secret(self, user_id: str, secret: str, enabled: bool = False) -> UserMFAConfig:
         if user_id not in self.users:
             raise ConstraintViolation("user not found for mfa", {"user_id": user_id})
-        record = UserMFAConfig(user_id=user_id, secret=secret, enabled=enabled)
+        encrypted_secret = self._encrypt_mfa_secret(secret)
+        record = UserMFAConfig(user_id=user_id, secret=encrypted_secret, enabled=enabled)
         self.mfa_secrets[user_id] = record
         self._persist_state()
-        return record
+        return UserMFAConfig(
+            user_id=user_id,
+            secret=secret,
+            enabled=enabled,
+            created_at=record.created_at,
+            meta=record.meta,
+        )
 
     def get_user_mfa_secret(self, user_id: str) -> Optional[UserMFAConfig]:
-        return self.mfa_secrets.get(user_id)
+        cfg = self.mfa_secrets.get(user_id)
+        if not cfg:
+            return None
+        decrypted = self._decrypt_mfa_secret(cfg.secret)
+        return UserMFAConfig(
+            user_id=cfg.user_id,
+            secret=decrypted,
+            enabled=cfg.enabled,
+            created_at=cfg.created_at,
+            meta=cfg.meta,
+        )
 
     def create_session(
         self,
