@@ -66,6 +66,29 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
         },
         "required": ["kind", "name", "handler"],
     },
+    "adapter": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "kind": {"const": "adapter.lora"},
+            "backend": {"type": "string"},
+            "provider": {"type": "string"},
+            "scope": {"type": "string"},
+            "user_id": {"type": ["string", "null"]},
+            "base_model": {"type": "string"},
+            "rank": {"type": ["number", "integer"]},
+            "layers": {"type": "array"},
+            "matrices": {"type": "array"},
+            "current_version": {"type": "integer", "minimum": 0},
+        },
+        "required": ["kind", "base_model", "current_version"],
+        "additionalProperties": True,
+    },
+    "artifact": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": True,
+    },
 }
 
 
