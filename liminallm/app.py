@@ -32,10 +32,17 @@ def _allowed_origins() -> List[str]:
     ]
 
 
+def _allow_credentials() -> bool:
+    flag = os.getenv("CORS_ALLOW_CREDENTIALS")
+    if flag is None:
+        return False
+    return flag.lower() in {"1", "true", "yes", "on"}
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins(),
-    allow_credentials=True,
+    allow_credentials=_allow_credentials(),
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -46,8 +53,12 @@ async def add_security_headers(request, call_next):
     response = await call_next(request)
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
-    response.headers.setdefault("Content-Security-Policy", "default-src 'self'")
+    if request.url.scheme == "https" and os.getenv("ENABLE_HSTS", "false").lower() in {"1", "true", "yes", "on"}:
+        response.headers.setdefault("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; script-src 'self'; style-src 'self'",
+    )
     return response
 register_exception_handlers(app)
 app.include_router(router)

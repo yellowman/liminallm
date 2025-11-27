@@ -736,7 +736,7 @@ async def record_preference(body: PreferenceEventRequest, principal: AuthContext
         routing_trace=body.routing_trace,
         adapter_gates=body.adapter_gates,
     )
-    runtime.clusterer.cluster_user_preferences(principal.user_id)
+    await runtime.clusterer.cluster_user_preferences(principal.user_id)
     runtime.clusterer.promote_skill_adapters()
     resp = PreferenceEventResponse(id=event.id, cluster_id=event.cluster_id, feedback=event.feedback, created_at=event.created_at)
     return Envelope(status="ok", data=resp)
@@ -1153,6 +1153,37 @@ async def auto_patch(body: AutoPatchRequest, principal: AuthContext = Depends(ge
         meta=audit.meta,
     )
     return Envelope(status="ok", data=resp)
+
+
+@router.get("/config", response_model=Envelope)
+async def get_config(principal: AuthContext = Depends(get_admin_user)):
+    """Expose runtime configuration for the admin console."""
+
+    runtime = get_runtime()
+    settings = get_settings().model_dump()
+    sensitive_tokens = ("secret", "token", "key", "password", "credential", "api", "url")
+    sanitized_settings = {
+        k: ("[redacted]" if any(tok in k for tok in sensitive_tokens) and v else v)
+        for k, v in settings.items()
+    }
+    return Envelope(
+        status="ok",
+        data={
+            "runtime_config": runtime.store.get_runtime_config() if hasattr(runtime.store, "get_runtime_config") else {},
+            "settings": sanitized_settings,
+        },
+    )
+
+
+@router.get("/files/limits", response_model=Envelope)
+async def get_file_limits(principal: AuthContext = Depends(get_user)):
+    runtime = get_runtime()
+    return Envelope(
+        status="ok",
+        data={
+            "max_upload_bytes": runtime.settings.max_upload_bytes,
+        },
+    )
 
 
 @router.post("/files/upload", response_model=Envelope)

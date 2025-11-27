@@ -47,6 +47,36 @@ class WorkflowEngine:
         self.cache = cache
         self._tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
+    async def _rollback_workflow(
+        self,
+        state_key: str,
+        workflow_trace: List[Dict[str, Any]],
+        vars_scope: Dict[str, Any],
+        *,
+        reason: str = "node_failure",
+    ) -> Optional[dict]:
+        rollback_state = {
+            "status": "rolled_back",
+            "reason": reason,
+            "timestamp": datetime.utcnow().isoformat(),
+            "vars": vars_scope,
+            "trace_length": len(workflow_trace),
+        }
+        try:
+            await self._persist_workflow_state(
+                state_key,
+                {
+                    "status": "rolling_back",
+                    "reason": reason,
+                    "updated_at": datetime.utcnow().isoformat(),
+                    "workflow_trace": workflow_trace,
+                },
+            )
+        except Exception as exc:
+            self.logger.warning("workflow_rollback_mark_failed", error=str(exc))
+            return None
+        return rollback_state
+
     async def run(
         self,
         workflow_id: Optional[str],
@@ -99,17 +129,28 @@ class WorkflowEngine:
                 self.logger.warning("workflow_loop_detected", node=node_id)
                 break
 
-            result, next_nodes = self._execute_node(
-                node,
-                user_message=user_message,
-                context_id=context_id,
-                conversation_id=conversation_id,
-                adapters=adapters,
-                history=history,
-                vars_scope=vars_scope,
-                user_id=user_id,
-                tenant_id=tenant_id,
-            )
+            try:
+                result, next_nodes = self._execute_node(
+                    node,
+                    user_message=user_message,
+                    context_id=context_id,
+                    conversation_id=conversation_id,
+                    adapters=adapters,
+                    history=history,
+                    vars_scope=vars_scope,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                )
+            except Exception as exc:
+                return await self._handle_node_failure(
+                    state_key,
+                    node_id,
+                    exc,
+                    vars_scope=vars_scope,
+                    context_snippets=context_snippets,
+                    workflow_trace=workflow_trace,
+                    routing_trace=routing_trace,
+                )
             workflow_trace.append({"node": node_id, **result})
             if result.get("outputs"):
                 vars_scope.update(result["outputs"])
@@ -127,7 +168,16 @@ class WorkflowEngine:
             usage = self._merge_usage(usage, node_usage or {})
 
             pending.extend(next_nodes)
-            if result.get("status") in {"end", "error"}:
+            if result.get("status") == "error" and not next_nodes:
+                return await self._record_terminal_failure(
+                    state_key,
+                    result,
+                    workflow_trace=workflow_trace,
+                    routing_trace=routing_trace,
+                    context_snippets=context_snippets,
+                    vars_scope=vars_scope,
+                )
+            if result.get("status") == "end":
                 break
 
         if not content:
@@ -152,6 +202,72 @@ class WorkflowEngine:
             },
         )
         await self.cache_conversation_state(conversation_id, history)
+        return result
+
+    async def _handle_node_failure(
+        self,
+        state_key: str,
+        node_id: str,
+        exc: Exception,
+        *,
+        vars_scope: Dict[str, Any],
+        context_snippets: List[str],
+        workflow_trace: List[Dict[str, Any]],
+        routing_trace: List[Dict[str, Any]],
+    ) -> dict:
+        self.logger.error("workflow_node_failed", node=node_id, error=str(exc))
+        failure_entry = {"node": node_id, "status": "error", "error": str(exc), "outputs": {}}
+        workflow_trace.append(failure_entry)
+        rollback_state = await self._rollback_workflow(state_key, workflow_trace, vars_scope)
+        if rollback_state:
+            failure_entry["rollback"] = rollback_state
+        await self._persist_workflow_state(
+            state_key,
+            {
+                "status": "failed",
+                "failed_at": datetime.utcnow().isoformat(),
+                "error": str(exc),
+                "workflow_trace": workflow_trace,
+                "vars": vars_scope,
+            },
+        )
+        return {
+            "status": "error",
+            "content": "workflow execution failed",
+            "error": str(exc),
+            "routing_trace": routing_trace,
+            "workflow_trace": workflow_trace,
+            "context_snippets": context_snippets,
+            "vars": vars_scope,
+            "rollback": rollback_state,
+        }
+
+    async def _record_terminal_failure(
+        self,
+        state_key: str,
+        result: Dict[str, Any],
+        *,
+        workflow_trace: List[Dict[str, Any]],
+        routing_trace: List[Dict[str, Any]],
+        context_snippets: List[str],
+        vars_scope: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        rollback_state = await self._rollback_workflow(state_key, workflow_trace, vars_scope, reason="tool_error")
+        if rollback_state:
+            result["rollback"] = rollback_state
+        result.setdefault("workflow_trace", workflow_trace)
+        result.setdefault("routing_trace", routing_trace)
+        result.setdefault("context_snippets", context_snippets)
+        result.setdefault("vars", vars_scope)
+        await self._persist_workflow_state(
+            state_key,
+            {
+                "status": "failed",
+                "completed_at": datetime.utcnow().isoformat(),
+                "result": result,
+                "error": result.get("error"),
+            },
+        )
         return result
 
     def _merge_usage(self, accum: Dict[str, Any], new_usage: Dict[str, Any]) -> Dict[str, Any]:

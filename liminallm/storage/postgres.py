@@ -18,6 +18,7 @@ from psycopg_pool import ConnectionPool
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service.artifact_validation import ArtifactValidationError, validate_artifact
+from liminallm.service.embeddings import cosine_similarity
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
     Artifact,
@@ -308,7 +309,7 @@ class PostgresStore:
         context_text: str | None = None,
         meta: dict | None = None,
     ) -> PreferenceEvent:
-        normalized_weight = weight if weight is not None else (score if score is not None else 1.0)
+        normalized_weight = weight if weight is not None else 1.0
         event_id = str(uuid.uuid4())
         with self._connect() as conn:
             msg_row = conn.execute(
@@ -378,7 +379,12 @@ class PostgresStore:
         return [v / norm for v in vec]
 
     def list_preference_events(
-        self, user_id: str | None = None, feedback: str | None = None, cluster_id: str | None = None
+        self,
+        user_id: str | None = None,
+        feedback: Iterable[str] | str | None = None,
+        cluster_id: str | None = None,
+        *,
+        tenant_id: str | None = None,
     ) -> list[PreferenceEvent]:
         clauses = []
         params: list[Any] = []
@@ -386,11 +392,17 @@ class PostgresStore:
             clauses.append("user_id = %s")
             params.append(user_id)
         if feedback:
-            clauses.append("feedback = %s")
-            params.append(feedback)
+            feedback_values = [feedback] if isinstance(feedback, str) else list(feedback)
+            if feedback_values:
+                placeholders = ", ".join(["%s"] * len(feedback_values))
+                clauses.append(f"feedback IN ({placeholders})")
+                params.extend(feedback_values)
         if cluster_id:
             clauses.append("cluster_id = %s")
             params.append(cluster_id)
+        if tenant_id:
+            clauses.append("user_id IN (SELECT id FROM app_user WHERE tenant_id = %s)")
+            params.append(tenant_id)
         query = "SELECT * FROM preference_event"
         if clauses:
             query = " ".join([query, "WHERE", " AND ".join(clauses)])
@@ -757,7 +769,12 @@ class PostgresStore:
         )
 
     def list_training_jobs(
-        self, user_id: str | None = None, status: str | None = None, *, limit: int | None = None
+        self,
+        user_id: str | None = None,
+        status: str | None = None,
+        *,
+        limit: int | None = None,
+        tenant_id: str | None = None,
     ) -> List[TrainingJob]:
         query = "SELECT * FROM training_job WHERE 1=1"
         params: list[Any] = []
@@ -767,6 +784,9 @@ class PostgresStore:
         if status:
             params.append(status)
             query += f" AND status = %s"
+        if tenant_id:
+            params.append(tenant_id)
+            query += " AND user_id IN (SELECT id FROM app_user WHERE tenant_id = %s)"
         query += " ORDER BY COALESCE(updated_at, created_at) DESC"
         if limit:
             params.append(limit)
@@ -1338,6 +1358,7 @@ class PostgresStore:
         page: int = 1,
         page_size: int = 100,
         owner_user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> List[Artifact]:
         offset = max(page - 1, 0) * max(page_size, 1)
         limit = max(page_size, 1)
@@ -1353,6 +1374,9 @@ class PostgresStore:
             if owner_user_id:
                 clauses.append("owner_user_id = %s")
                 params.append(owner_user_id)
+            if tenant_id:
+                clauses.append("owner_user_id IN (SELECT id FROM app_user WHERE tenant_id = %s)")
+                params.append(tenant_id)
             where = ""
             if clauses:
                 where = " WHERE " + " AND ".join(clauses)
@@ -1910,6 +1934,7 @@ class PostgresStore:
     def search_chunks_pgvector(
         self,
         context_ids: Optional[Sequence[str]],
+        query: str,
         query_embedding: List[float],
         limit: int = 4,
         filters: Optional[dict[str, Any]] = None,
@@ -1953,7 +1978,7 @@ class PostgresStore:
             query += where
             query += " ORDER BY kc.embedding <-> %s::vector LIMIT %s"
             rows = conn.execute(query, (*params, self._format_vector(query_embedding), limit)).fetchall()
-        return [
+        chunks = [
             KnowledgeChunk(
                 id=int(row["id"]),
                 context_id=str(row["context_id"]),
@@ -1966,6 +1991,52 @@ class PostgresStore:
             )
             for row in rows
         ]
+
+        def _tokenize(text: str) -> List[str]:
+            return re.findall(r"\w+", text.lower())
+
+        def _bm25_scores(query_tokens: Sequence[str], documents: List[List[str]]) -> List[float]:
+            if not query_tokens or not documents:
+                return [0.0 for _ in documents]
+            N = len(documents)
+            avgdl = sum(len(doc) for doc in documents) / float(N)
+            doc_freq: Dict[str, int] = {}
+            for doc in documents:
+                seen = set(doc)
+                for tok in seen:
+                    doc_freq[tok] = doc_freq.get(tok, 0) + 1
+            k1 = 1.5
+            b = 0.75
+            scores: List[float] = []
+            for doc in documents:
+                tf: Dict[str, int] = {}
+                for tok in doc:
+                    tf[tok] = tf.get(tok, 0) + 1
+                score = 0.0
+                for tok in query_tokens:
+                    df = doc_freq.get(tok, 0)
+                    if df == 0:
+                        continue
+                    idf = math.log(1 + (N - df + 0.5) / (df + 0.5))
+                    freq = tf.get(tok, 0)
+                    denom = freq + k1 * (1 - b + b * (len(doc) / (avgdl or 1.0)))
+                    score += idf * (freq * (k1 + 1)) / denom if denom else 0.0
+                scores.append(score)
+            return scores
+
+        bm25_scores = _bm25_scores(_tokenize(query or ""), [_tokenize(ch.content) for ch in chunks])
+        max_bm25 = max(bm25_scores) or 1.0
+        scored: list[tuple[KnowledgeChunk, float]] = []
+        for chunk, lex in zip(chunks, bm25_scores):
+            if not query_embedding or not chunk.embedding:
+                semantic_score = 0.0
+            else:
+                dim = min(len(query_embedding), len(chunk.embedding))
+                semantic_score = cosine_similarity(query_embedding[:dim], chunk.embedding[:dim])
+            hybrid = 0.45 * (lex / max_bm25) + 0.55 * semantic_score
+            scored.append((chunk, hybrid))
+        ranked = sorted(scored, key=lambda pair: pair[1], reverse=True)
+        return [chunk for chunk, _ in ranked[:limit]]
 
     def search_chunks(
         self,

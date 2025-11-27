@@ -74,6 +74,34 @@
             </div>
           </div>
 
+          <section class="panel-section" aria-label="Upload files">
+            <div class="section-header">
+              <h3>Upload knowledge</h3>
+            </div>
+            <p class="subtext">
+              Attach files to a context before asking questions. Leave Context ID blank to keep uploads private.
+            </p>
+            <div class="input-grid">
+              <div class="field compact">
+                <label for="upload-context-id">Context ID</label>
+                <input type="text" id="upload-context-id" placeholder="ctx_..." />
+              </div>
+              <div class="field compact">
+                <label for="upload-chunk-size">Chunk size (optional)</label>
+                <input type="number" id="upload-chunk-size" placeholder="512" min="64" step="64" />
+              </div>
+            </div>
+            <div class="field">
+              <label for="file-upload">File</label>
+              <input type="file" id="file-upload" aria-describedby="file-upload-hint" />
+              <div class="small" id="file-upload-hint"></div>
+            </div>
+            <div class="pill-row">
+              <button type="button" class="minor" id="upload-file-btn">Upload file</button>
+            </div>
+            <div class="small" id="file-upload-status" role="status"></div>
+          </section>
+
           <div id="messages" aria-live="polite"></div>
           <div id="messages-empty" class="empty">Start a new thread to see your conversation history here.</div>
 
@@ -91,6 +119,26 @@
             </div>
           </form>
           <div id="admin-warning" role="status"></div>
+
+          <div class="divider"></div>
+          <section id="preferences-section" aria-label="Preference feedback" class="panel-section">
+            <div class="section-header">
+              <h3>Preferences</h3>
+              <div class="pill-row">
+                <button type="button" class="ghost" id="thumbs-up" aria-label="Thumbs up">👍</button>
+                <button type="button" class="ghost" id="thumbs-down" aria-label="Thumbs down">👎</button>
+              </div>
+            </div>
+            <p class="subtext" id="preference-hint">Send feedback on the latest assistant response.</p>
+            <div class="field textarea-wrap">
+              <label for="preference-notes">Notes (optional)</label>
+              <textarea id="preference-notes" rows="2" placeholder="What worked or what should change?"></textarea>
+            </div>
+            <div class="meta" id="preference-target"></div>
+            <pre id="preference-meta" class="code-block" aria-live="polite"></pre>
+            <pre id="preference-routing" class="code-block" aria-live="polite"></pre>
+            <div class="small" id="preference-status"></div>
+          </section>
         </section>
       </main>
     </div>

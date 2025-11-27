@@ -137,6 +137,7 @@ def test_memory_store_pgvector_filters_fs_path(tmp_path):
 
     results = store.search_chunks_pgvector(
         [ctx.id],
+        "query",
         [1.0, 0.0],
         filters={"fs_path": "keep_me"},
         user_id=user.id,

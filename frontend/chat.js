@@ -11,6 +11,18 @@ const conversationLabel = document.getElementById('conversation-label');
 const adminLink = document.getElementById('admin-link');
 const authSubmit = document.getElementById('auth-submit');
 const sendBtn = document.getElementById('send-btn');
+const preferenceStatusEl = document.getElementById('preference-status');
+const preferenceMetaEl = document.getElementById('preference-meta');
+const preferenceRoutingEl = document.getElementById('preference-routing');
+const preferenceTargetEl = document.getElementById('preference-target');
+const preferenceHintEl = document.getElementById('preference-hint');
+const preferenceNotesEl = document.getElementById('preference-notes');
+const fileUploadInput = document.getElementById('file-upload');
+const fileUploadStatus = document.getElementById('file-upload-status');
+const fileUploadHint = document.getElementById('file-upload-hint');
+const fileUploadContextId = document.getElementById('upload-context-id');
+const fileUploadChunkSize = document.getElementById('upload-chunk-size');
+const fileUploadButton = document.getElementById('upload-file-btn');
 
 const sessionStorageKey = (key) => `liminal.${key}`;
 
@@ -23,15 +35,53 @@ const writeSession = (key, value) => {
   }
 };
 
-const state = {
-  accessToken: readSession('accessToken'),
-  refreshToken: readSession('refreshToken'),
-  sessionId: readSession('sessionId'),
-  tenantId: readSession('tenantId'),
-  role: readSession('role'),
-  userId: readSession('userId'),
-  conversationId: null,
+const persistedKeys = ['accessToken', 'refreshToken', 'sessionId', 'tenantId', 'role', 'userId'];
+
+const createState = (storage) => {
+  const backing = {
+    accessToken: storage.read('accessToken'),
+    refreshToken: storage.read('refreshToken'),
+    sessionId: storage.read('sessionId'),
+    tenantId: storage.read('tenantId'),
+    role: storage.read('role'),
+    userId: storage.read('userId'),
+    conversationId: null,
+    lastAssistant: null,
+  };
+
+  const sync = (key, value) => {
+    if (!persistedKeys.includes(key)) return;
+    storage.write(key, value);
+  };
+
+  const stateApi = {
+    resetAuth() {
+      persistedKeys.forEach((k) => {
+        backing[k] = null;
+        sync(k, null);
+      });
+      backing.lastAssistant = null;
+      backing.conversationId = null;
+    },
+    snapshot() {
+      return { ...backing };
+    },
+  };
+
+  return new Proxy(stateApi, {
+    get(target, prop) {
+      if (prop in target) return target[prop];
+      return backing[prop];
+    },
+    set(target, prop, value) {
+      backing[prop] = value;
+      sync(prop, value);
+      return true;
+    },
+  });
 };
+
+const state = createState({ read: readSession, write: writeSession });
 
 const randomIdempotencyKey = () => {
   if (window.crypto?.randomUUID) return window.crypto.randomUUID();
@@ -47,14 +97,69 @@ const stableHash = (str) => {
   return Math.abs(hash >>> 0).toString(16);
 };
 
-const headers = (idempotencyKey) => {
-  const h = { 'Content-Type': 'application/json' };
+const DEFAULT_UPLOAD_BYTES = 10 * 1024 * 1024;
+let uploadLimitBytes = null;
+const ALLOWED_UPLOAD_TYPES = ['text/plain', 'text/markdown', 'application/pdf', 'application/json', 'text/csv'];
+const ALLOWED_UPLOAD_EXTENSIONS = ['.txt', '.md', '.markdown', '.pdf', '.json', '.csv', '.yaml', '.yml'];
+
+const formatBytes = (bytes) => {
+  if (!bytes && bytes !== 0) return '0 bytes';
+  const thresh = 1024;
+  if (Math.abs(bytes) < thresh) return `${bytes} bytes`;
+  const units = ['KB', 'MB', 'GB'];
+  let u = -1;
+  let size = bytes;
+  do {
+    size /= thresh;
+    ++u;
+  } while (Math.abs(size) >= thresh && u < units.length - 1);
+  return `${size.toFixed(1)} ${units[u]}`;
+};
+
+const getUploadLimit = () => uploadLimitBytes || DEFAULT_UPLOAD_BYTES;
+
+const refreshUploadLimits = async () => {
+  if (!state.accessToken) return;
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/files/limits`,
+      { method: 'GET', headers: headers() },
+      'Failed to load upload limits'
+    );
+    uploadLimitBytes = envelope.data?.max_upload_bytes || uploadLimitBytes;
+    renderUploadHint();
+  } catch (err) {
+    console.warn('Unable to refresh upload limits', err);
+  }
+};
+
+const fetchWithRetry = async (url, options, retries = 3, backoffMs = 400) => {
+  let lastError;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      return await fetch(url, options);
+    } catch (err) {
+      lastError = err;
+      if (attempt === retries) break;
+      const delay = backoffMs * Math.pow(2, attempt);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+  const attempts = retries + 1;
+  const label = attempts === 1 ? 'attempt' : 'attempts';
+  throw new Error(`Request failed after ${attempts} ${label}: ${lastError?.message || 'unknown error'}`);
+};
+
+const authHeaders = (idempotencyKey) => {
+  const h = {};
   if (state.accessToken) h['Authorization'] = `Bearer ${state.accessToken}`;
   if (state.tenantId) h['X-Tenant-ID'] = state.tenantId;
   if (state.sessionId) h['session_id'] = state.sessionId;
   h['Idempotency-Key'] = idempotencyKey || randomIdempotencyKey();
   return h;
 };
+
+const headers = (idempotencyKey) => ({ 'Content-Type': 'application/json', ...authHeaders(idempotencyKey) });
 
 const showStatus = (message, isError = false) => {
   const target = isError ? errorEl : statusEl;
@@ -105,16 +210,96 @@ const persistAuth = (payload) => {
   state.role = payload.role;
   state.tenantId = payload.tenant_id;
   state.userId = payload.user_id;
-  writeSession('accessToken', state.accessToken);
-  writeSession('refreshToken', state.refreshToken);
-  writeSession('sessionId', state.sessionId);
-  writeSession('role', state.role);
-  writeSession('tenantId', state.tenantId);
-  writeSession('userId', state.userId);
   sessionIndicator.textContent = state.accessToken
     ? `Signed in as ${state.userId || payload.user_id || 'current'} (${state.role || 'user'})`
     : 'Not signed in';
   renderAdminNotice();
+  refreshUploadLimits();
+};
+
+const setUploadStatus = (message, isError = false) => {
+  if (!fileUploadStatus) return;
+  fileUploadStatus.textContent = message;
+  fileUploadStatus.style.color = isError ? '#b00020' : 'inherit';
+};
+
+const validateUploadFile = (file) => {
+  if (!file) return { ok: false, message: 'Choose a file to upload.' };
+  const limit = getUploadLimit();
+  if (file.size > limit) {
+    return {
+      ok: false,
+      message: `File too large (${formatBytes(file.size)}). Max allowed is ${formatBytes(limit)}.`,
+    };
+  }
+  const name = (file.name || '').toLowerCase();
+  const matchesType = file.type && ALLOWED_UPLOAD_TYPES.some((t) => file.type.startsWith(t));
+  const matchesExt = ALLOWED_UPLOAD_EXTENSIONS.some((ext) => name.endsWith(ext));
+  if (!matchesType && !matchesExt) {
+    return {
+      ok: false,
+      message: `Unsupported file type. Allowed: ${ALLOWED_UPLOAD_EXTENSIONS.join(', ')}`,
+    };
+  }
+  return { ok: true };
+};
+
+const renderUploadHint = () => {
+  if (!fileUploadHint) return;
+  const file = fileUploadInput?.files?.[0];
+  if (!file) {
+    fileUploadHint.textContent = `Up to ${formatBytes(getUploadLimit())}. Supported: ${ALLOWED_UPLOAD_EXTENSIONS.join(', ')}`;
+    return;
+  }
+  fileUploadHint.textContent = `${file.name} · ${formatBytes(file.size)} · ${file.type || 'unknown type'}`;
+};
+
+const handleFileUpload = async (event) => {
+  event?.preventDefault?.();
+  if (!fileUploadInput) return;
+  const file = fileUploadInput.files?.[0];
+  const validation = validateUploadFile(file);
+  if (!validation.ok) {
+    setUploadStatus(validation.message, true);
+    return;
+  }
+  if (!state.accessToken) {
+    setUploadStatus('Sign in before uploading files.', true);
+    return;
+  }
+
+  const contextId = (fileUploadContextId?.value || document.getElementById('context-id')?.value || '').trim();
+  const chunkSizeRaw = (fileUploadChunkSize?.value || '').trim();
+  const chunkSize = chunkSizeRaw ? Number(chunkSizeRaw) : null;
+  if (chunkSizeRaw && (!Number.isFinite(chunkSize) || chunkSize <= 0)) {
+    setUploadStatus('Chunk size must be a positive number.', true);
+    return;
+  }
+
+  const formData = new FormData();
+  formData.append('file', file);
+  if (contextId) formData.append('context_id', contextId);
+  if (chunkSize) formData.append('chunk_size', chunkSize);
+  const idempotencyKey = `upload-${stableHash(`${file.name}-${file.size}-${contextId || 'global'}`)}`;
+
+  setUploadStatus('Uploading...');
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/files/upload`,
+      {
+        method: 'POST',
+        headers: authHeaders(idempotencyKey),
+        body: formData,
+      },
+      'Upload failed'
+    );
+    const uploaded = envelope.data || {};
+    const destLabel = uploaded.context_id ? `context ${uploaded.context_id}` : 'your files area';
+    const chunkLabel = uploaded.chunk_count ? ` · ${uploaded.chunk_count} chunk(s) indexed` : '';
+    setUploadStatus(`Uploaded ${file.name} to ${destLabel}${chunkLabel}.`);
+  } catch (err) {
+    setUploadStatus(err.message, true);
+  }
 };
 
 const appendMessage = (role, content, meta = '') => {
@@ -142,7 +327,107 @@ const appendMessage = (role, content, meta = '') => {
 const setConversation = (id) => {
   state.conversationId = id;
   conversationLabel.textContent = id ? `Conversation ${id}` : 'New conversation';
+  if (!id) {
+    state.lastAssistant = null;
+    renderPreferencePanel();
+  }
 };
+
+const renderPreferencePanel = () => {
+  if (!preferenceStatusEl || !preferenceMetaEl || !preferenceRoutingEl || !preferenceTargetEl || !preferenceHintEl) return;
+  if (!state.lastAssistant) {
+    preferenceStatusEl.textContent = '';
+    preferenceMetaEl.textContent = '';
+    preferenceRoutingEl.textContent = '';
+    preferenceTargetEl.textContent = 'No assistant message selected yet.';
+    preferenceHintEl.textContent = 'Send a message to enable thumbs up/down feedback.';
+    return;
+  }
+  preferenceHintEl.textContent = 'Thumbs apply to the latest assistant response.';
+  const { conversationId, messageId, adapters, contextSnippets } = state.lastAssistant;
+  preferenceTargetEl.textContent = `Conversation ${conversationId} · Message ${messageId}`;
+  const meta = {
+    adapters: adapters || [],
+    context_snippets: contextSnippets?.length || 0,
+    adapter_gates: state.lastAssistant.adapterGates || [],
+  };
+  preferenceMetaEl.textContent = JSON.stringify(meta, null, 2);
+  if (state.lastAssistant.routingTrace?.length || state.lastAssistant.workflowTrace?.length) {
+    preferenceRoutingEl.textContent = JSON.stringify(
+      {
+        routing_trace: state.lastAssistant.routingTrace || [],
+        workflow_trace: state.lastAssistant.workflowTrace || [],
+      },
+      null,
+      2
+    );
+  } else {
+    preferenceRoutingEl.textContent = 'No routing trace';
+  }
+};
+
+let chatSocket = null;
+let chatSocketConnecting = false;
+let chatSocketReconnectTimer = null;
+
+const connectWebSocket = () => {
+  if (chatSocketConnecting) return chatSocket;
+  if (chatSocket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(chatSocket.readyState)) {
+    return chatSocket;
+  }
+  chatSocketConnecting = true;
+  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  const wsUrl = `${protocol}://${window.location.host}${apiBase}/chat/stream`;
+  chatSocket = new WebSocket(wsUrl);
+  chatSocket.onopen = () => {
+    chatSocketConnecting = false;
+  };
+  chatSocket.onerror = () => {
+    chatSocketConnecting = false;
+  };
+  chatSocket.onclose = () => {
+    chatSocketConnecting = false;
+    chatSocket = null;
+    if (chatSocketReconnectTimer) clearTimeout(chatSocketReconnectTimer);
+    chatSocketReconnectTimer = setTimeout(() => {
+      chatSocketReconnectTimer = null;
+      connectWebSocket();
+    }, 2000);
+  };
+  return chatSocket;
+};
+
+const ensureWebSocket = () =>
+  new Promise((resolve, reject) => {
+    const socket = connectWebSocket();
+    if (!socket) {
+      reject(new Error('WebSocket unavailable'));
+      return;
+    }
+    if (socket.readyState === WebSocket.OPEN) {
+      resolve(socket);
+      return;
+    }
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error('WebSocket connection timeout'));
+    }, 5000);
+    const cleanup = () => {
+      clearTimeout(timeout);
+      socket.removeEventListener('open', handleOpen);
+      socket.removeEventListener('error', handleError);
+    };
+    const handleOpen = () => {
+      cleanup();
+      resolve(socket);
+    };
+    const handleError = () => {
+      cleanup();
+      reject(new Error('WebSocket connection failed'));
+    };
+    socket.addEventListener('open', handleOpen);
+    socket.addEventListener('error', handleError);
+  });
 
 const extractError = (payload, fallback) => {
   const detail = payload?.detail || payload?.error || payload;
@@ -153,7 +438,7 @@ const extractError = (payload, fallback) => {
 };
 
 const requestEnvelope = async (url, options, fallbackMessage) => {
-  const resp = await fetch(url, options);
+  const resp = await fetchWithRetry(url, options);
   const text = await resp.text();
   const trimmed = text.trim();
   let payload;
@@ -220,28 +505,105 @@ const sendMessage = async (event) => {
     message: { content, mode: 'text' },
     context_id: document.getElementById('context-id').value || undefined,
     workflow_id: document.getElementById('workflow-id').value || undefined,
-    stream: false,
   };
   const idempotencyKey = `chat-${stableHash(JSON.stringify(payload))}`;
 
-  try {
-    const envelope = await requestEnvelope(
-      `${apiBase}/chat`,
-      {
-        method: 'POST',
-        headers: headers(idempotencyKey),
-        body: JSON.stringify(payload),
-      },
-      'Chat failed'
-    );
-    const data = envelope.data;
+  const handleChatResponse = (data) => {
     setConversation(data.conversation_id);
+    const structuredSegments = data.content_struct?.segments;
+    const renderedContent =
+      structuredSegments?.map((seg) => (typeof seg === 'string' ? seg : seg?.text || '')).join(' ')
+        || data.content;
+    const citations = data.content_struct?.citations || [];
     const metaBits = [];
     if (data.adapters?.length) metaBits.push(`adapters: ${data.adapters.join(', ')}`);
     if (data.context_snippets?.length) metaBits.push(`context: ${data.context_snippets.length} snippets`);
     if (data.usage?.total_tokens) metaBits.push(`usage: ${data.usage.total_tokens} tokens`);
-    appendMessage('assistant', data.content, metaBits.join(' · '));
+    if (citations.length) metaBits.push(`citations: ${citations.length}`);
+    appendMessage('assistant', renderedContent, metaBits.join(' · '));
+    state.lastAssistant = {
+      conversationId: data.conversation_id,
+      messageId: data.message_id,
+      adapters: data.adapters || [],
+      adapterGates: data.adapter_gates || [],
+      routingTrace: data.routing_trace || [],
+      workflowTrace: data.workflow_trace || [],
+      contextSnippets: data.context_snippets || [],
+    };
+    renderPreferencePanel();
     showStatus('');
+  };
+
+  const chatViaWebSocket = async () => {
+    const ws = await ensureWebSocket();
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const cleanup = () => {
+        ws.removeEventListener('message', handleMessage);
+        ws.removeEventListener('error', handleError);
+        ws.removeEventListener('close', handleClose);
+      };
+      const handleMessage = (event) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        try {
+          const envelope = JSON.parse(event.data);
+          if (envelope.status === 'ok') {
+            resolve(envelope.data);
+          } else {
+            reject(new Error(extractError(envelope.error, 'Chat failed')));
+          }
+        } catch (err) {
+          reject(err);
+        }
+      };
+      const handleError = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new Error('WebSocket connection failed'));
+      };
+      const handleClose = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new Error('Connection closed'));
+      };
+
+      ws.addEventListener('message', handleMessage);
+      ws.addEventListener('error', handleError);
+      ws.addEventListener('close', handleClose);
+      ws.send(
+        JSON.stringify({
+          idempotency_key: idempotencyKey,
+          request_id: randomIdempotencyKey(),
+          message: payload.message.content,
+          workflow_id: payload.workflow_id,
+          context_id: payload.context_id,
+          conversation_id: payload.conversation_id,
+          access_token: state.accessToken,
+          session_id: state.sessionId,
+          tenant_id: state.tenantId,
+        })
+      );
+    });
+  };
+
+  try {
+    const data = await chatViaWebSocket().catch(async () => {
+      const envelope = await requestEnvelope(
+        `${apiBase}/chat`,
+        {
+          method: 'POST',
+          headers: headers(idempotencyKey),
+          body: JSON.stringify({ ...payload, stream: false }),
+        },
+        'Chat failed'
+      );
+      return envelope.data;
+    });
+    handleChatResponse(data);
   } catch (err) {
     showStatus(err.message, true);
   } finally {
@@ -254,6 +616,37 @@ const newConversation = () => {
   messagesEl.innerHTML = '';
   showStatus('New thread ready');
   updateEmptyState();
+};
+
+const sendPreference = async (isPositive) => {
+  if (!state.lastAssistant) {
+    preferenceStatusEl.textContent = 'No assistant message to rate yet.';
+    return;
+  }
+  try {
+    preferenceStatusEl.textContent = 'Sending feedback...';
+    const body = {
+      conversation_id: state.lastAssistant.conversationId,
+      message_id: state.lastAssistant.messageId,
+      feedback: isPositive ? 'positive' : 'negative',
+      explicit_signal: isPositive ? 'thumbs_up' : 'thumbs_down',
+      routing_trace: state.lastAssistant.routingTrace || undefined,
+      adapter_gates: state.lastAssistant.adapterGates || undefined,
+      notes: preferenceNotesEl?.value || undefined,
+    };
+    await requestEnvelope(
+      `${apiBase}/preferences`,
+      {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify(body),
+      },
+      'Unable to record preference'
+    );
+    preferenceStatusEl.textContent = 'Thanks for your feedback!';
+  } catch (err) {
+    preferenceStatusEl.textContent = err.message;
+  }
 };
 
 const listConversations = async () => {
@@ -291,15 +684,7 @@ const logout = async () => {
   };
 
   await tryRevoke();
-  state.accessToken = null;
-  state.refreshToken = null;
-  state.sessionId = null;
-  state.role = null;
-  state.tenantId = null;
-  state.userId = null;
-  ['accessToken', 'refreshToken', 'sessionId', 'role', 'tenantId', 'userId'].forEach((k) =>
-    sessionStorage.removeItem(sessionStorageKey(k))
-  );
+  state.resetAuth();
   setConversation(null);
   messagesEl.innerHTML = '';
   sessionIndicator.textContent = 'Not signed in';
@@ -318,6 +703,12 @@ const refreshBtn = document.getElementById('refresh-conversations');
 if (refreshBtn) refreshBtn.addEventListener('click', listConversations);
 const logoutBtn = document.getElementById('logout');
 if (logoutBtn) logoutBtn.addEventListener('click', logout);
+const thumbsUpBtn = document.getElementById('thumbs-up');
+if (thumbsUpBtn) thumbsUpBtn.addEventListener('click', () => sendPreference(true));
+const thumbsDownBtn = document.getElementById('thumbs-down');
+if (thumbsDownBtn) thumbsDownBtn.addEventListener('click', () => sendPreference(false));
+if (fileUploadInput) fileUploadInput.addEventListener('change', renderUploadHint);
+if (fileUploadButton) fileUploadButton.addEventListener('click', handleFileUpload);
 
 // Bootstrap from stored credentials
 if (state.accessToken) {
@@ -334,3 +725,5 @@ if (state.accessToken) {
   renderAdminNotice();
 }
 updateEmptyState();
+renderPreferencePanel();
+renderUploadHint();

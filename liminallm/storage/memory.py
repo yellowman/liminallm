@@ -1,18 +1,24 @@
 from __future__ import annotations
 
+import base64
 import json
+import os
+import secrets
 import uuid
 import hashlib
 import math
 import re
+import shutil
 from datetime import datetime, timedelta
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
+from cryptography.fernet import Fernet, InvalidToken
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service.artifact_validation import ArtifactValidationError, validate_artifact
+from liminallm.service.embeddings import cosine_similarity
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
     Artifact,
@@ -37,7 +43,7 @@ from liminallm.storage.models import (
 class MemoryStore:
     """Minimal in-memory backing store for the initial prototype."""
 
-    def __init__(self, fs_root: str = "/tmp/liminallm") -> None:
+    def __init__(self, fs_root: str = "/tmp/liminallm", *, mfa_encryption_key: str | None = None) -> None:
         self.logger = get_logger(__name__)
         self.users: Dict[str, User] = {}
         self.sessions: Dict[str, Session] = {}
@@ -57,9 +63,11 @@ class MemoryStore:
         self.preference_events: Dict[str, PreferenceEvent] = {}
         self.training_jobs: Dict[str, TrainingJob] = {}
         self.semantic_clusters: Dict[str, SemanticCluster] = {}
+        self.adapter_router_state: Dict[str, AdapterRouterState] = {}
         self.mfa_secrets: Dict[str, UserMFAConfig] = {}
         self.fs_root = Path(fs_root)
         self.fs_root.mkdir(parents=True, exist_ok=True)
+        self._mfa_cipher = self._build_mfa_cipher(mfa_encryption_key)
 
         if not self._load_state():
             self.default_artifacts()
@@ -71,6 +79,38 @@ class MemoryStore:
         state_dir = self.fs_root / "state"
         state_dir.mkdir(parents=True, exist_ok=True)
         return state_dir / "memory_store.json"
+
+    @staticmethod
+    def _derive_cipher_key(key_material: str) -> bytes:
+        return base64.urlsafe_b64encode(hashlib.sha256(key_material.encode()).digest())
+
+    def _build_mfa_cipher(self, key_material: str | None) -> Fernet:
+        material = key_material or os.getenv("MFA_SECRET_KEY") or os.getenv("JWT_SECRET")
+        if not material:
+            shared_fs = Path(os.getenv("SHARED_FS_ROOT", "/srv/liminallm"))
+            secret_path = shared_fs / ".jwt_secret"
+            fallback_path = self.fs_root / ".jwt_secret"
+            for candidate in (secret_path, fallback_path):
+                try:
+                    if candidate.exists():
+                        material = candidate.read_text().strip()
+                        if material:
+                            break
+                except Exception:
+                    continue
+            if not material:
+                generated = secrets.token_urlsafe(64)
+                try:
+                    secret_path.parent.mkdir(parents=True, exist_ok=True)
+                    secret_path.write_text(generated)
+                    os.chmod(secret_path, 0o600)
+                    material = generated
+                except Exception as exc:
+                    raise RuntimeError("Unable to persist MFA encryption key") from exc
+        try:
+            return Fernet(self._derive_cipher_key(material))
+        except Exception as exc:
+            raise RuntimeError("Unable to initialize MFA cipher") from exc
 
     @staticmethod
     def _serialize_datetime(dt: datetime) -> str:
@@ -272,10 +312,12 @@ class MemoryStore:
                 self.contexts.pop(ctx_id, None)
                 self.context_sources.pop(ctx_id, None)
                 self.chunks.pop(ctx_id, None)
+        user_artifacts: list[str] = []
         for art_id, art in list(self.artifacts.items()):
             if art.owner_user_id == user_id:
                 self.artifacts.pop(art_id, None)
                 self.artifact_versions.pop(art_id, None)
+                user_artifacts.append(art_id)
         for evt_id, evt in list(self.preference_events.items()):
             if evt.user_id == user_id:
                 self.preference_events.pop(evt_id, None)
@@ -285,6 +327,12 @@ class MemoryStore:
         for cluster_id, cluster in list(self.semantic_clusters.items()):
             if cluster.user_id == user_id:
                 self.semantic_clusters.pop(cluster_id, None)
+        for state_id, state in list(self.adapter_router_state.items()):
+            if getattr(state, "artifact_id", None) in user_artifacts or getattr(state, "user_id", None) == user_id:
+                self.adapter_router_state.pop(state_id, None)
+        for art_id in user_artifacts:
+            shutil.rmtree(self.fs_root / "artifacts" / art_id, ignore_errors=True)
+        shutil.rmtree(self.fs_root / "users" / user_id, ignore_errors=True)
         self._persist_state()
         return True
 
@@ -297,16 +345,51 @@ class MemoryStore:
     def get_password_record(self, user_id: str) -> Optional[tuple[str, str]]:
         return self.credentials.get(user_id)
 
+    def _encrypt_mfa_secret(self, secret: str) -> str:
+        if not secret:
+            return secret
+        if not self._mfa_cipher:
+            raise RuntimeError("MFA cipher unavailable; secret cannot be stored")
+        return self._mfa_cipher.encrypt(secret.encode()).decode()
+
+    def _decrypt_mfa_secret(self, secret: str) -> str:
+        if not secret:
+            return secret
+        if not self._mfa_cipher:
+            raise RuntimeError("MFA cipher unavailable; cannot decrypt secret")
+        try:
+            return self._mfa_cipher.decrypt(secret.encode()).decode()
+        except InvalidToken:
+            self.logger.warning("mfa_secret_decrypt_failed")
+            return secret
+
     def set_user_mfa_secret(self, user_id: str, secret: str, enabled: bool = False) -> UserMFAConfig:
         if user_id not in self.users:
             raise ConstraintViolation("user not found for mfa", {"user_id": user_id})
-        record = UserMFAConfig(user_id=user_id, secret=secret, enabled=enabled)
+        encrypted_secret = self._encrypt_mfa_secret(secret)
+        record = UserMFAConfig(user_id=user_id, secret=encrypted_secret, enabled=enabled)
         self.mfa_secrets[user_id] = record
         self._persist_state()
-        return record
+        return UserMFAConfig(
+            user_id=user_id,
+            secret=secret,
+            enabled=enabled,
+            created_at=record.created_at,
+            meta=record.meta,
+        )
 
     def get_user_mfa_secret(self, user_id: str) -> Optional[UserMFAConfig]:
-        return self.mfa_secrets.get(user_id)
+        cfg = self.mfa_secrets.get(user_id)
+        if not cfg:
+            return None
+        decrypted = self._decrypt_mfa_secret(cfg.secret)
+        return UserMFAConfig(
+            user_id=cfg.user_id,
+            secret=decrypted,
+            enabled=cfg.enabled,
+            created_at=cfg.created_at,
+            meta=cfg.meta,
+        )
 
     def create_session(
         self,
@@ -469,7 +552,7 @@ class MemoryStore:
                 {"message_id": message_id, "conversation_id": conversation_id},
             )
         event_id = str(uuid.uuid4())
-        normalized_weight = weight if weight is not None else (score if score is not None else 1.0)
+        normalized_weight = weight if weight is not None else 1.0
         embedding = context_embedding or self._text_embedding(context_text or message.content)
         event = PreferenceEvent(
             id=event_id,
@@ -491,13 +574,25 @@ class MemoryStore:
         return event
 
     def list_preference_events(
-        self, user_id: Optional[str] = None, feedback: Optional[str] = None, cluster_id: Optional[str] = None
+        self,
+        user_id: Optional[str] = None,
+        feedback: Optional[Iterable[str] | str] = None,
+        cluster_id: Optional[str] = None,
+        *,
+        tenant_id: Optional[str] = None,
     ) -> List[PreferenceEvent]:
         events = list(self.preference_events.values())
+        if tenant_id:
+            events = [
+                e
+                for e in events
+                if e.user_id in self.users and self.users[e.user_id].tenant_id == tenant_id
+            ]
         if user_id:
             events = [e for e in events if e.user_id == user_id]
         if feedback:
-            events = [e for e in events if e.feedback == feedback]
+            feedback_values = {feedback} if isinstance(feedback, str) else set(feedback)
+            events = [e for e in events if e.feedback in feedback_values]
         if cluster_id:
             events = [e for e in events if e.cluster_id == cluster_id]
         return sorted(events, key=lambda e: e.created_at)
@@ -640,9 +735,16 @@ class MemoryStore:
         return job
 
     def list_training_jobs(
-        self, user_id: Optional[str] = None, status: Optional[str] = None, *, limit: Optional[int] = None
+        self,
+        user_id: Optional[str] = None,
+        status: Optional[str] = None,
+        *,
+        limit: Optional[int] = None,
+        tenant_id: Optional[str] = None,
     ) -> List[TrainingJob]:
         jobs = list(self.training_jobs.values())
+        if tenant_id:
+            jobs = [j for j in jobs if j.user_id in self.users and self.users[j.user_id].tenant_id == tenant_id]
         if user_id:
             jobs = [j for j in jobs if j.user_id == user_id]
         if status:
@@ -739,8 +841,17 @@ class MemoryStore:
         page: int = 1,
         page_size: int = 100,
         owner_user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> List[Artifact]:
         artifacts = list(self.artifacts.values())
+        if tenant_id:
+            artifacts = [
+                a
+                for a in artifacts
+                if a.owner_user_id
+                and a.owner_user_id in self.users
+                and self.users[a.owner_user_id].tenant_id == tenant_id
+            ]
         if owner_user_id:
             artifacts = [a for a in artifacts if a.owner_user_id == owner_user_id]
         if type_filter:
@@ -1047,15 +1158,6 @@ class MemoryStore:
         def _tokenize(text: str) -> List[str]:
             return re.findall(r"\w+", text.lower())
 
-        def _cosine(a: List[float], b: List[float]) -> float:
-            if not a or not b:
-                return 0.0
-            length = min(len(a), len(b))
-            dot = sum(a[i] * b[i] for i in range(length))
-            norm_a = sum(x * x for x in a) ** 0.5 or 1.0
-            norm_b = sum(x * x for x in b) ** 0.5 or 1.0
-            return dot / (norm_a * norm_b)
-
         def _bm25_scores(query_tokens: Sequence[str], documents: List[List[str]]) -> List[float]:
             if not query_tokens or not documents:
                 return [0.0 for _ in documents]
@@ -1088,7 +1190,13 @@ class MemoryStore:
         query_tokens = _tokenize(query)
         doc_tokens = [_tokenize(ch.content) for ch in candidates]
         bm25_scores = _bm25_scores(query_tokens, doc_tokens)
-        semantic_scores = [(_cosine(query_embedding, ch.embedding) if query_embedding else 0.0) for ch in candidates]
+        semantic_scores = []
+        for ch in candidates:
+            if not query_embedding or not ch.embedding:
+                semantic_scores.append(0.0)
+                continue
+            dim = min(len(query_embedding), len(ch.embedding))
+            semantic_scores.append(cosine_similarity(query_embedding[:dim], ch.embedding[:dim]))
         max_bm25 = max(bm25_scores) or 1.0
         combined: Dict[str, tuple[KnowledgeChunk, float]] = {}
         for chunk, lex, sem in zip(candidates, bm25_scores, semantic_scores):
@@ -1103,6 +1211,7 @@ class MemoryStore:
     def search_chunks_pgvector(
         self,
         context_ids: Optional[Sequence[str]],
+        query: str,
         query_embedding: List[float],
         limit: int = 4,
         filters: Optional[dict] = None,
@@ -1142,17 +1251,46 @@ class MemoryStore:
         if not allowed_chunks:
             return []
 
-        def _cosine(a: List[float], b: List[float]) -> float:
-            if not a or not b:
-                return 0.0
-            length = min(len(a), len(b))
-            dot = sum(a[i] * b[i] for i in range(length))
-            norm_a = sum(x * x for x in a) ** 0.5 or 1.0
-            norm_b = sum(x * x for x in b) ** 0.5 or 1.0
-            return dot / (norm_a * norm_b)
+        def _tokenize(text: str) -> List[str]:
+            return re.findall(r"\w+", text.lower())
 
-        bm25_scores = [0.0 for _ in allowed_chunks]
-        semantic_scores = [(_cosine(query_embedding, ch.embedding) if query_embedding else 0.0) for ch in allowed_chunks]
+        def _bm25_scores(query_tokens: Sequence[str], documents: List[List[str]]) -> List[float]:
+            if not query_tokens or not documents:
+                return [0.0 for _ in documents]
+            N = len(documents)
+            avgdl = sum(len(doc) for doc in documents) / float(N)
+            doc_freq: Dict[str, int] = {}
+            for doc in documents:
+                seen = set(doc)
+                for tok in seen:
+                    doc_freq[tok] = doc_freq.get(tok, 0) + 1
+            k1 = 1.5
+            b = 0.75
+            scores: List[float] = []
+            for doc in documents:
+                tf: Dict[str, int] = {}
+                for tok in doc:
+                    tf[tok] = tf.get(tok, 0) + 1
+                score = 0.0
+                for tok in query_tokens:
+                    df = doc_freq.get(tok, 0)
+                    if df == 0:
+                        continue
+                    idf = math.log(1 + (N - df + 0.5) / (df + 0.5))
+                    freq = tf.get(tok, 0)
+                    denom = freq + k1 * (1 - b + b * (len(doc) / (avgdl or 1.0)))
+                    score += idf * (freq * (k1 + 1)) / denom if denom else 0.0
+                scores.append(score)
+            return scores
+
+        bm25_scores = _bm25_scores(_tokenize(query or ""), [_tokenize(ch.content) for ch in allowed_chunks])
+        semantic_scores = []
+        for ch in allowed_chunks:
+            if not query_embedding or not ch.embedding:
+                semantic_scores.append(0.0)
+                continue
+            dim = min(len(query_embedding), len(ch.embedding))
+            semantic_scores.append(cosine_similarity(query_embedding[:dim], ch.embedding[:dim]))
         max_bm25 = max(bm25_scores) or 1.0
         combined: Dict[str, tuple[KnowledgeChunk, float]] = {}
         for chunk, lex, sem in zip(allowed_chunks, bm25_scores, semantic_scores):

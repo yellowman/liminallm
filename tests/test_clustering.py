@@ -1,6 +1,9 @@
 import json
 
 from liminallm.service.clustering import SemanticClusterer
+import asyncio
+import json
+
 from liminallm.storage.models import PreferenceEvent, SemanticCluster
 
 
@@ -60,7 +63,7 @@ def test_label_clusters_uses_llm_json_response():
     llm = RecordingLLM(json.dumps({"label": "Rust helpers", "description": "Helps write Rust code."}))
     clusterer = SemanticClusterer(store, llm=llm)
 
-    clusterer.label_clusters([CLUSTER], EVENTS)
+    asyncio.run(clusterer.label_clusters([CLUSTER], EVENTS))
 
     assert store.updates[0]["label"] == "Rust helpers"
     assert store.updates[0]["description"] == "Helps write Rust code."
@@ -72,7 +75,7 @@ def test_label_clusters_falls_back_without_llm_response():
     llm = RecordingLLM("")
     clusterer = SemanticClusterer(store, llm=llm)
 
-    clusterer.label_clusters([CLUSTER], EVENTS)
+    asyncio.run(clusterer.label_clusters([CLUSTER], EVENTS))
 
     assert store.updates[0]["label"].startswith("Write a Rust")
     assert "labeled_at" in (store.updates[0]["meta"] or {})

@@ -7,6 +7,9 @@ from ipaddress import IPv4Address, IPv6Address, ip_address
 from typing import Dict, List, Optional
 
 
+POSITIVE_FEEDBACK_VALUES = {"positive", "like"}
+
+
 @dataclass
 class User:
     id: str
@@ -33,11 +36,12 @@ class Session:
     tenant_id: str = "public"
     meta: Dict | None = None
     allow_expired: bool = field(default=False, repr=False, compare=False)
+    enforce_future_expiry: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.expires_at <= self.created_at:
             raise ValueError("session expiration must be after creation time")
-        if not self.allow_expired and self.expires_at <= datetime.utcnow():
+        if self.enforce_future_expiry and not self.allow_expired and self.expires_at <= datetime.utcnow():
             raise ValueError("session expiration must be in the future")
 
     @classmethod
@@ -65,6 +69,7 @@ class Session:
             mfa_verified=not mfa_required,
             tenant_id=tenant_id,
             meta=meta,
+            enforce_future_expiry=True,
         )
 
 

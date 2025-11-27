@@ -46,7 +46,7 @@
           <div id="admin-error" role="alert"></div>
         </section>
 
-        <section class="panel" id="admin-console" aria-label="Admin console" style="display: none">
+        <section class="panel hidden" id="admin-console" aria-label="Admin console">
           <div class="conversation-header">
             <div class="badge"><span class="dot"></span><span>System controls</span></div>
             <div class="small" id="admin-session-indicator"></div>
@@ -65,16 +65,21 @@
             <label for="patch-body">Patch JSON</label>
             <textarea id="patch-body" placeholder='{"op": "replace", "path": "..."}'></textarea>
           </div>
-          <div class="flex-row" style="margin-bottom: 14px; flex-wrap: wrap">
+          <div class="flex-row flex-wrap mb-14">
             <button class="primary" id="propose-patch">Propose patch</button>
             <button class="minor" id="refresh-patches">Refresh patches</button>
           </div>
 
-          <div class="field" style="margin-top: 12px">
+          <div class="field mt-12">
             <label for="decision-id">Decide / apply patch</label>
             <input type="text" id="decision-id" placeholder="patch id" />
           </div>
-          <div class="flex-row" style="flex-wrap: wrap; margin-bottom: 12px">
+          <div class="field compact">
+            <label for="decision-status">Decision status</label>
+            <input type="text" id="decision-status" list="patch-status-options" placeholder="approved | rejected" />
+            <datalist id="patch-status-options"></datalist>
+          </div>
+          <div class="flex-row flex-wrap mb-12">
             <button class="ghost" id="approve-patch">Approve</button>
             <button class="ghost" id="reject-patch">Reject</button>
             <button class="minor" id="apply-patch">Apply patch</button>
@@ -82,6 +87,14 @@
 
           <div id="admin-feedback" role="status" class="subtext"></div>
           <div id="patch-table-wrapper"></div>
+
+          <div class="divider"></div>
+
+          <div class="section-header">
+            <h3>Runtime config</h3>
+            <button class="minor" id="refresh-config">Refresh config</button>
+          </div>
+          <pre id="runtime-config" class="code-block" aria-live="polite"></pre>
 
           <div class="divider"></div>
 
@@ -138,7 +151,7 @@
             <label for="target-user-role">New role</label>
             <input type="text" id="target-user-role" placeholder="admin" />
           </div>
-          <div class="flex-row" style="flex-wrap: wrap; margin-bottom: 12px">
+          <div class="flex-row flex-wrap mb-12">
             <button class="ghost" id="set-user-role">Set role</button>
             <button class="ghost" id="delete-user">Delete user</button>
           </div>

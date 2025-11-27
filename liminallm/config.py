@@ -3,10 +3,15 @@ from __future__ import annotations
 import os
 import secrets
 from enum import Enum
+from pathlib import Path
 from typing import Any
 
 from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from liminallm.logging import get_logger
+
+logger = get_logger(__name__)
 
 
 class ModelBackend(str, Enum):
@@ -112,7 +117,29 @@ class Settings(BaseModel):
     def _ensure_jwt_secret(cls, value: str | None) -> str:
         if value:
             return value
-        return secrets.token_urlsafe(64)
+        # Persist a generated JWT secret so tokens remain valid across restarts
+        fs_root = Path(os.getenv("SHARED_FS_ROOT", "/srv/liminallm"))
+        secret_path = fs_root / ".jwt_secret"
+        secret_path.parent.mkdir(parents=True, exist_ok=True)
+
+        if secret_path.exists():
+            try:
+                persisted = secret_path.read_text().strip()
+                if persisted:
+                    return persisted
+            except Exception as exc:
+                logger.error("jwt_secret_read_failed", error=str(exc), path=str(secret_path))
+
+        generated = secrets.token_urlsafe(64)
+        try:
+            secret_path.write_text(generated)
+            os.chmod(secret_path, 0o600)
+        except Exception as exc:
+            logger.error("jwt_secret_persist_failed", error=str(exc), path=str(secret_path))
+            raise RuntimeError(
+                "Unable to persist JWT secret; set JWT_SECRET or make SHARED_FS_ROOT writable"
+            ) from exc
+        return generated
 
 
 def get_settings() -> Settings:
