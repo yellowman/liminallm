@@ -230,7 +230,8 @@ class WorkflowEngine:
                         meta=item.get("meta"),
                     )
                 )
-            except Exception:
+            except Exception as exc:
+                self.logger.warning("workflow_deserialize_message_failed", error=str(exc), item=item)
                 continue
         return deserialized
 
