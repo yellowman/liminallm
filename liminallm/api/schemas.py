@@ -361,6 +361,10 @@ class UserListResponse(BaseModel):
     items: List[UserResponse]
 
 
+class AdminCreateUserResponse(UserResponse):
+    password: str
+
+
 class AdminCreateUserRequest(BaseModel):
     email: str
     password: Optional[str] = None
