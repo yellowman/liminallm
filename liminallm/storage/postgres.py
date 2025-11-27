@@ -1199,7 +1199,7 @@ class PostgresStore:
             created_at=_row_value("created_at", datetime.utcnow()),
             updated_at=_row_value("updated_at", datetime.utcnow()),
             title=_row_value("title"),
-            status=_row_value("status"),
+            status=_row_value("status") or "open",
             active_context_id=_row_value("active_context_id"),
             meta=raw_meta,
         )

@@ -15,13 +15,20 @@ const state = {
   sessionId: localStorage.getItem('liminal.sessionId'),
   tenantId: localStorage.getItem('liminal.tenantId'),
   role: localStorage.getItem('liminal.role'),
+  userId: localStorage.getItem('liminal.userId'),
   conversationId: null,
+};
+
+const idempotencyKey = () => {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 };
 
 const headers = () => {
   const h = { 'Content-Type': 'application/json' };
   if (state.accessToken) h['Authorization'] = `Bearer ${state.accessToken}`;
   if (state.tenantId) h['X-Tenant-ID'] = state.tenantId;
+  h['Idempotency-Key'] = idempotencyKey();
   return h;
 };
 
@@ -54,13 +61,15 @@ const persistAuth = (payload) => {
   state.sessionId = payload.session_id;
   state.role = payload.role;
   state.tenantId = payload.tenant_id;
+  state.userId = payload.user_id;
   localStorage.setItem('liminal.accessToken', state.accessToken || '');
   localStorage.setItem('liminal.refreshToken', state.refreshToken || '');
   localStorage.setItem('liminal.sessionId', state.sessionId || '');
   localStorage.setItem('liminal.role', state.role || '');
   localStorage.setItem('liminal.tenantId', state.tenantId || '');
+  localStorage.setItem('liminal.userId', state.userId || '');
   sessionIndicator.textContent = state.accessToken
-    ? `Signed in as ${payload.user_id} (${state.role || 'user'})`
+    ? `Signed in as ${state.userId || payload.user_id || 'current'} (${state.role || 'user'})`
     : 'Not signed in';
   renderAdminNotice();
 };
@@ -182,7 +191,8 @@ const logout = () => {
   state.sessionId = null;
   state.role = null;
   state.tenantId = null;
-  ['liminal.accessToken', 'liminal.refreshToken', 'liminal.sessionId', 'liminal.role', 'liminal.tenantId'].forEach((k) =>
+  state.userId = null;
+  ['liminal.accessToken', 'liminal.refreshToken', 'liminal.sessionId', 'liminal.role', 'liminal.tenantId', 'liminal.userId'].forEach((k) =>
     localStorage.removeItem(k)
   );
   setConversation(null);
@@ -209,7 +219,7 @@ if (state.accessToken) {
     session_id: state.sessionId,
     role: state.role,
     tenant_id: state.tenantId,
-    user_id: 'current',
+    user_id: state.userId,
   });
   listConversations();
 } else {

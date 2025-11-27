@@ -201,7 +201,10 @@ class WorkflowEngine:
                     "sender": msg.sender,
                     "role": msg.role,
                     "content": msg.content,
+                    "content_struct": msg.content_struct,
                     "seq": msg.seq,
+                    "token_count_in": msg.token_count_in,
+                    "token_count_out": msg.token_count_out,
                     "created_at": msg.created_at.isoformat(),
                     "meta": msg.meta,
                 }
@@ -219,7 +222,10 @@ class WorkflowEngine:
                         sender=str(item.get("sender", "")),
                         role=str(item.get("role", "assistant")),
                         content=str(item.get("content", "")),
+                        content_struct=item.get("content_struct"),
                         seq=int(item.get("seq", 0)),
+                        token_count_in=item.get("token_count_in"),
+                        token_count_out=item.get("token_count_out"),
                         created_at=datetime.fromisoformat(str(item.get("created_at"))),
                         meta=item.get("meta"),
                     )

@@ -4,7 +4,7 @@ import base64
 import json
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Response, UploadFile, WebSocket, WebSocketDisconnect
@@ -220,9 +220,20 @@ def _get_owned_conversation(runtime, conversation_id: str, principal: AuthContex
     conversation = runtime.store.get_conversation(conversation_id, user_id=principal.user_id)
     if not conversation:
         raise _http_error("not_found", "conversation not found", status_code=404)
-    if conversation.user_id != principal.user_id:
-        raise _http_error("forbidden", "conversation is owned by another user", status_code=403)
     return conversation
+
+
+def _stringify_adapters(adapters: Any) -> list[str]:
+    adapter_list: list[str] = []
+    if not isinstance(adapters, list):
+        return adapter_list
+    for adapter in adapters:
+        if isinstance(adapter, dict):
+            name = adapter.get("name") or adapter.get("id")
+            adapter_list.append(str(name or adapter))
+        else:
+            adapter_list.append(str(adapter))
+    return adapter_list
 
 
 def _get_owned_context(runtime, context_id: str, principal: AuthContext) -> KnowledgeContext:
@@ -623,25 +634,26 @@ async def chat(
             runtime.settings.chat_rate_limit_window_seconds,
         )
         conversation: Conversation | None = None
-        if body.context_id:
-            _get_owned_context(runtime, body.context_id, principal)
+        context_id = body.context_id
         if body.conversation_id:
             conversation = _get_owned_conversation(runtime, body.conversation_id, principal)
-            conversation_id = conversation.id
         else:
             conversation = runtime.store.create_conversation(user_id=user_id, active_context_id=body.context_id)
-            conversation_id = conversation.id
-        if conversation and conversation.active_context_id:
-            _get_owned_context(runtime, conversation.active_context_id, principal)
+        conversation_id = conversation.id
+        context_id = context_id or conversation.active_context_id
+        if context_id:
+            _get_owned_context(runtime, context_id, principal)
         user_content = body.message.content
         voice_meta: dict = {}
         if body.message.mode == "voice":
             try:
                 audio_bytes = base64.b64decode(body.message.content)
-            except Exception:
-                audio_bytes = b""
+            except Exception as exc:
+                raise _http_error("bad_request", "invalid base64-encoded audio payload", status_code=400) from exc
             transcript = runtime.voice.transcribe(audio_bytes, user_id=user_id) or {}
-            user_content = transcript.get("transcript", body.message.content)
+            user_content = transcript.get("transcript") or transcript.get("text")
+            if not user_content:
+                raise _http_error("bad_request", "unable to transcribe audio", status_code=400)
             voice_meta = {"mode": "voice", "transcript": transcript}
         user_content_struct = normalize_content_struct(body.message.content_struct, user_content)
         runtime.store.append_message(
@@ -656,11 +668,12 @@ async def chat(
             body.workflow_id,
             conversation_id,
             user_content,
-            body.context_id,
+            context_id,
             user_id,
             tenant_id=principal.tenant_id,
         )
         orchestration_dict: dict[str, Any] = orchestration if isinstance(orchestration, dict) else {}
+        adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
         assistant_content_struct = normalize_content_struct(
             orchestration_dict.get("content_struct"),
             orchestration_dict.get("content"),
@@ -686,7 +699,7 @@ async def chat(
             content=assistant_msg.content,
             content_struct=assistant_msg.content_struct,
             workflow_id=body.workflow_id,
-            adapters=orchestration_dict.get("adapters", []),
+            adapters=adapter_names,
             adapter_gates=orchestration_dict.get("adapter_gates", []),
             usage=orchestration_dict.get("usage", {}),
             context_snippets=orchestration_dict.get("context_snippets", []),
@@ -1301,7 +1314,7 @@ async def synthesize_voice(body: VoiceSynthesisRequest, principal: AuthContext =
     return Envelope(status="ok", data=VoiceSynthesisResponse(**audio))
 
 
-@router.websocket("/v1/chat/stream")
+@router.websocket("/chat/stream")
 async def websocket_chat(ws: WebSocket):
     runtime = get_runtime()
     await ws.accept()
@@ -1328,30 +1341,32 @@ async def websocket_chat(ws: WebSocket):
         if cached:
             await ws.send_json(cached.model_dump())
             return
-        if runtime.cache:
-            allowed = await runtime.cache.check_rate_limit(
-                f"chat:{user_id}", runtime.settings.chat_rate_limit_per_minute, runtime.settings.chat_rate_limit_window_seconds
-            )
-            if not allowed:
-                await ws.close(code=4429)
-                return
+        await _enforce_rate_limit(
+            runtime,
+            f"chat:{user_id}",
+            runtime.settings.chat_rate_limit_per_minute,
+            runtime.settings.chat_rate_limit_window_seconds,
+        )
         convo_id = init.get("conversation_id")
         if convo_id:
-            _get_owned_conversation(runtime, convo_id, auth_ctx)
+            conversation = _get_owned_conversation(runtime, convo_id, auth_ctx)
         else:
-            convo_id = runtime.store.create_conversation(user_id=user_id).id
-        if init.get("context_id"):
-            _get_owned_context(runtime, init.get("context_id"), auth_ctx)
+            conversation = runtime.store.create_conversation(user_id=user_id)
+            convo_id = conversation.id
+        context_id = init.get("context_id") or conversation.active_context_id
+        if context_id:
+            _get_owned_context(runtime, context_id, auth_ctx)
         runtime.store.append_message(convo_id, sender="user", role="user", content=init.get("message", ""))
         orchestration = await runtime.workflow.run(
             init.get("workflow_id"),
             convo_id,
             init.get("message", ""),
-            init.get("context_id"),
+            context_id,
             user_id,
             tenant_id=auth_ctx.tenant_id,
         )
         orchestration_dict: dict[str, Any] = orchestration if isinstance(orchestration, dict) else {}
+        adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
         assistant_content_struct = normalize_content_struct(
             orchestration_dict.get("content_struct"),
             orchestration_dict.get("content"),
@@ -1379,7 +1394,7 @@ async def websocket_chat(ws: WebSocket):
                 content=assistant_msg.content,
                 content_struct=assistant_msg.content_struct,
                 workflow_id=init.get("workflow_id"),
-                adapters=orchestration_dict.get("adapters", []),
+                adapters=adapter_names,
                 adapter_gates=orchestration_dict.get("adapter_gates", []),
                 usage=orchestration_dict.get("usage", {}),
                 context_snippets=orchestration_dict.get("context_snippets", []),
