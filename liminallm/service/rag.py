@@ -105,11 +105,15 @@ class RAGService:
         user_id: Optional[str],
         tenant_id: Optional[str],
     ) -> List[KnowledgeChunk]:
+        allowed_ids = self._allowed_context_ids(context_ids, user_id=user_id, tenant_id=tenant_id)
+        if not allowed_ids:
+            return []
+
         query_embedding = self.embed(query)
         filters = {"embedding_model_id": self.embedding_model_id}
 
         return self.store.search_chunks_pgvector(  # type: ignore[attr-defined]
-            context_ids, query_embedding, limit, filters=filters, user_id=user_id, tenant_id=tenant_id
+            allowed_ids, query_embedding, limit, filters=filters, user_id=user_id, tenant_id=tenant_id
         )
 
     def _retrieve_local_hybrid(
