@@ -203,7 +203,7 @@ class AuthService:
         self, provider: str, code: str, state: str, *, tenant_id: Optional[str] = None
     ) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
         cached_state = await self.cache.pop_oauth_state(state) if self.cache else None
-        stored = cached_state or self._oauth_states.get(state)
+        stored = cached_state or self._oauth_states.pop(state, None)
         now = datetime.utcnow()
         async def _clear_oauth_state() -> None:
             self._oauth_states.pop(state, None)

@@ -663,22 +663,24 @@ async def chat(
             user_id,
             tenant_id=principal.tenant_id,
         )
+        orchestration_dict: dict[str, Any] = orchestration if isinstance(orchestration, dict) else {}
         assistant_content_struct = normalize_content_struct(
-            orchestration.get("content_struct") if isinstance(orchestration, dict) else None,
-            orchestration.get("content") if isinstance(orchestration, dict) else None,
+            orchestration_dict.get("content_struct"),
+            orchestration_dict.get("content"),
         )
+        assistant_content = orchestration_dict.get("content", "No response generated.")
         assistant_msg = runtime.store.append_message(
             conversation_id,
             sender="assistant",
             role="assistant",
-            content=orchestration["content"],
+            content=assistant_content,
             content_struct=assistant_content_struct,
             meta={
-                "adapters": orchestration.get("adapters", []),
-                "adapter_gates": orchestration.get("adapter_gates", []),
-                "routing_trace": orchestration.get("routing_trace", []),
-                "workflow_trace": orchestration.get("workflow_trace", []),
-                "usage": orchestration.get("usage", {}),
+                "adapters": orchestration_dict.get("adapters", []),
+                "adapter_gates": orchestration_dict.get("adapter_gates", []),
+                "routing_trace": orchestration_dict.get("routing_trace", []),
+                "workflow_trace": orchestration_dict.get("workflow_trace", []),
+                "usage": orchestration_dict.get("usage", {}),
             },
         )
         resp = ChatResponse(
@@ -1352,22 +1354,24 @@ async def websocket_chat(ws: WebSocket):
             user_id,
             tenant_id=auth_ctx.tenant_id,
         )
+        orchestration_dict: dict[str, Any] = orchestration if isinstance(orchestration, dict) else {}
         assistant_content_struct = normalize_content_struct(
-            orchestration.get("content_struct") if isinstance(orchestration, dict) else None,
-            orchestration.get("content") if isinstance(orchestration, dict) else None,
+            orchestration_dict.get("content_struct"),
+            orchestration_dict.get("content"),
         )
+        assistant_content = orchestration_dict.get("content", "No response generated.")
         assistant_msg = runtime.store.append_message(
             convo_id,
             sender="assistant",
             role="assistant",
-            content=orchestration["content"],
+            content=assistant_content,
             content_struct=assistant_content_struct,
             meta={
-                "adapters": orchestration.get("adapters", []),
-                "adapter_gates": orchestration.get("adapter_gates", []),
-                "routing_trace": orchestration.get("routing_trace", []),
-                "workflow_trace": orchestration.get("workflow_trace", []),
-                "usage": orchestration.get("usage", {}),
+                "adapters": orchestration_dict.get("adapters", []),
+                "adapter_gates": orchestration_dict.get("adapter_gates", []),
+                "routing_trace": orchestration_dict.get("routing_trace", []),
+                "workflow_trace": orchestration_dict.get("workflow_trace", []),
+                "usage": orchestration_dict.get("usage", {}),
             },
         )
         envelope = Envelope(
