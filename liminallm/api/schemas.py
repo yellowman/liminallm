@@ -157,7 +157,7 @@ class ChatResponse(BaseModel):
 class _SchemaPayload(BaseModel):
     """Common payload with a JSON schema, avoiding BaseModel.schema clash."""
 
-    model_config = ConfigDict(populate_by_name=True)
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 
     schema_: dict = Field(alias="schema")
 
