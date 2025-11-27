@@ -167,6 +167,10 @@ for v1 these can all live in one python app with clear module boundaries.
 - Authenticate with `/v1/auth/login`; the UI stores the issued bearer token/tenant ID locally and uses it for `/v1/chat`, `/v1/conversations`, and other API calls.
 - The admin console is separate at `/admin` and is guarded by the `admin` role (FastAPI enforces the role before serving the HTML). It surfaces config patch proposal/approval flows backed by `/v1/config/*` endpoints, tenant-scoped user administration (list/add/delete, role changes), adapter visibility, and a read-only inspector for database objects.
 
+### tests
+
+- Run `scripts/run_tests.sh` to mirror CI defaults; it compiles the code and executes `pytest` with in-memory stores enabled for deterministic local runs.
+
 ### adapters: local LoRA vs remote fine-tune IDs vs prompt-distilled
 
 - Router policies pick an adapter; the inference backend decides whether that means applying LoRA weights locally, swapping to a remote fine-tuned model ID, or injecting distilled prompt instructions on top of a black-box API.
