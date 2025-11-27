@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, List, Literal, Optional
 from uuid import uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class Envelope(BaseModel):
@@ -154,20 +154,30 @@ class ChatResponse(BaseModel):
     workflow_trace: List[dict] = Field(default_factory=list)
 
 
-class ArtifactRequest(BaseModel):
+class _SchemaPayload(BaseModel):
+    """Common payload with a JSON schema, avoiding BaseModel.schema clash."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    schema_: dict = Field(alias="schema")
+
+    @property
+    def schema(self) -> dict:  # pragma: no cover - compatibility shim
+        return self.schema_
+
+
+class ArtifactRequest(_SchemaPayload):
     type: Optional[str] = None
     name: str
     description: Optional[str] = ""
-    schema: dict
 
 
-class ArtifactResponse(BaseModel):
+class ArtifactResponse(_SchemaPayload):
     id: str
     type: str
     kind: Optional[str]
     name: str
     description: str
-    schema: dict
     owner_user_id: Optional[str]
     created_at: datetime
     updated_at: datetime
@@ -177,11 +187,10 @@ class ArtifactListResponse(BaseModel):
     items: List[ArtifactResponse]
 
 
-class ArtifactVersionResponse(BaseModel):
+class ArtifactVersionResponse(_SchemaPayload):
     id: int
     artifact_id: str
     version: int
-    schema: dict
     created_by: str
     change_note: Optional[str] = None
     created_at: datetime
