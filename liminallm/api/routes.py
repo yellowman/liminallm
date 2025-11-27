@@ -1413,6 +1413,14 @@ async def websocket_chat(ws: WebSocket):
         )
         await _store_idempotency_result("chat:ws", user_id, idempotency_key, envelope)
         await ws.send_json(envelope.model_dump())
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, dict) else None
+        error_payload = detail.get("error") if detail and "error" in detail else {"code": "server_error", "message": str(exc.detail)}
+        error_env = Envelope(status="error", error=error_payload, request_id=request_id or str(uuid4()))
+        if user_id:
+            await _store_idempotency_result("chat:ws", user_id, idempotency_key, error_env, status="failed")
+        await ws.send_json(error_env.model_dump())
+        await ws.close(code=4429 if exc.status_code == 429 else 1011)
     except WebSocketDisconnect:
         return
     except Exception as exc:
