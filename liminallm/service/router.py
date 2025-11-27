@@ -16,13 +16,14 @@ logger = get_logger(__name__)
 class RouterEngine:
     """Evaluate routing policy artifacts to choose adapters/tools."""
 
-    def __init__(self, cache: Optional[RedisCache] = None) -> None:
+    def __init__(self, cache: Optional[RedisCache] = None, *, similarity_boost_threshold: float = 0.6) -> None:
         self.safe_functions = {
             "cosine_similarity": cosine_similarity,
             "contains": lambda haystack, needle: needle in haystack if haystack is not None else False,
             "len": lambda value: len(value) if isinstance(value, (list, tuple, dict, str, bytes)) else 0,
         }
         self.cache = cache
+        self.similarity_boost_threshold = similarity_boost_threshold
 
     async def route(
         self,
@@ -151,7 +152,7 @@ class RouterEngine:
         for candidate in adapters:
             cand_id = candidate.get("id") or candidate.get("name")
             similarity = cosine_similarity(ctx_emb, self._adapter_embedding(candidate))
-            if similarity > 0.6 and cand_id:
+            if similarity > self.similarity_boost_threshold and cand_id:
                 weights[cand_id] = max(weights.get(cand_id, 0.0), similarity)
                 effects.append({"target": cand_id, "weight": similarity, "similarity": similarity})
         return effects

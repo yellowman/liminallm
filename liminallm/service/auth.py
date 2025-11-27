@@ -245,7 +245,9 @@ class AuthService:
             user_email = identity.get("email") or f"{provider_uid}@{provider}.oauth"
             handle = identity.get("handle") or provider_uid
             user = self.store.create_user(email=user_email, handle=handle, tenant_id=normalized_tenant)
-            self.store.save_password(user.id, "", "oauth")
+            # Store an unusable password marker so password-based auth cannot succeed for OAuth users
+            unusable_secret = base64.urlsafe_b64encode(os.urandom(24)).decode()
+            self.store.save_password(user.id, unusable_secret, "oauth")
         if hasattr(self.store, "link_user_auth_provider"):
             try:
                 self.store.link_user_auth_provider(user.id, provider, provider_uid)
@@ -477,6 +479,8 @@ class AuthService:
                     user_id = None
                 else:
                     self._email_verification_tokens.pop(token, None)
+        if isinstance(user_id, bytes):
+            user_id = user_id.decode()
         if not user_id:
             return False
         user = self.store.get_user(user_id)
@@ -507,17 +511,22 @@ class AuthService:
         except (InvalidHash, VerifyMismatchError):
             return False
 
-    def _verify_totp(self, secret: str, code: str, *, window: int = 1, interval: int = 30) -> bool:
+    def _verify_totp(self, secret: str, code: str, *, window: int = 0, interval: int = 30) -> bool:
         for offset in range(-window, window + 1):
-            if self._generate_totp(secret, time.time() + offset * interval, interval=interval) == code:
+            generated = self._generate_totp(secret, time.time() + offset * interval, interval=interval)
+            if generated and generated == code:
                 return True
         return False
 
     def _generate_totp(self, secret: str, timestamp: float, *, interval: int = 30, digits: int = 6) -> str:
         padded = secret + "=" * ((8 - len(secret) % 8) % 8)
-        key = base64.b32decode(padded, True)
+        try:
+            key = base64.b32decode(padded, True)
+        except Exception:
+            self.logger.warning("totp_secret_invalid")
+            return ""
         counter = int(timestamp // interval).to_bytes(8, "big")
-        digest = hmac.new(key, counter, hashlib.sha1).digest()
+        digest = hmac.new(key, counter, hashlib.sha256).digest()
         offset = digest[-1] & 0x0F
         code_int = (int.from_bytes(digest[offset : offset + 4], "big") & 0x7FFFFFFF) % (10**digits)
         return str(code_int).zfill(digits)
@@ -569,7 +578,11 @@ class AuthService:
         exp = payload.get("exp")
         if not exp:
             return None
-        if datetime.utcfromtimestamp(int(exp)) <= datetime.utcnow():
+        try:
+            exp_ts = float(exp)
+        except (TypeError, ValueError):
+            return None
+        if exp_ts <= time.time():
             return None
         return payload
 
@@ -620,12 +633,12 @@ class AuthService:
         if not isinstance(meta, dict):
             return False
         exp_raw = meta.get("refresh_exp")
-        exp_ts: Optional[int] = None
+        exp_ts: Optional[float] = None
         if isinstance(exp_raw, str) and exp_raw.isdigit():
-            exp_ts = int(exp_raw)
+            exp_ts = float(exp_raw)
         elif isinstance(exp_raw, (int, float)):
-            exp_ts = int(exp_raw)
-        if exp_ts and datetime.utcfromtimestamp(exp_ts) <= datetime.utcnow():
+            exp_ts = float(exp_raw)
+        if exp_ts is not None and exp_ts <= time.time():
             return False
         return meta.get("refresh_jti") == jti
 
@@ -634,7 +647,9 @@ class AuthService:
         ttl = None
         if isinstance(exp, (int, float)):
             ttl = max(int(exp - datetime.utcnow().timestamp()), 0)
-        if self.cache and ttl is not None:
+        if ttl is None:
+            ttl = max(int(self.settings.refresh_token_ttl_minutes * 60), 0)
+        if self.cache:
             try:
                 await self.cache.mark_refresh_revoked(jti, ttl)
             except Exception as exc:

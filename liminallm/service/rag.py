@@ -51,10 +51,11 @@ class RAGService:
         user_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
     ) -> List[KnowledgeChunk]:
-        if not query or not context_ids:
+        if not context_ids:
             return []
 
-        return self._retriever(context_ids, query, limit, user_id=user_id, tenant_id=tenant_id)
+        normalized_query = query or ""
+        return self._retriever(context_ids, normalized_query, limit, user_id=user_id, tenant_id=tenant_id)
 
     def _uses_pgvector(self) -> bool:
         return self.rag_mode in {"pgvector", "pg", "vector"}
@@ -62,20 +63,31 @@ class RAGService:
     def _allowed_context_ids(
         self, context_ids: Sequence[str], *, user_id: Optional[str], tenant_id: Optional[str]
     ) -> List[str]:
-        if not hasattr(self.store, "contexts"):
-            return list(context_ids)
-
-        contexts = getattr(self.store, "contexts")
-        users = getattr(self.store, "users", {})
         allowed: List[str] = []
+        if hasattr(self.store, "contexts"):
+            contexts = getattr(self.store, "contexts")
+            users = getattr(self.store, "users", {})
+            for ctx_id in context_ids:
+                ctx = contexts.get(ctx_id) if isinstance(contexts, dict) else None
+                if not ctx:
+                    continue
+                if user_id and ctx.owner_user_id != user_id:
+                    continue
+                if tenant_id:
+                    owner = users.get(ctx.owner_user_id) if isinstance(users, dict) else None
+                    if not owner or owner.tenant_id != tenant_id:
+                        continue
+                allowed.append(ctx_id)
+            return allowed
+
         for ctx_id in context_ids:
-            ctx = contexts.get(ctx_id) if isinstance(contexts, dict) else None
-            if not ctx:
+            context = getattr(self.store, "get_context", lambda *_: None)(ctx_id)
+            if not context:
                 continue
-            if user_id and ctx.owner_user_id != user_id:
+            if user_id and context.owner_user_id != user_id:
                 continue
             if tenant_id:
-                owner = users.get(ctx.owner_user_id) if isinstance(users, dict) else None
+                owner = getattr(self.store, "get_user", lambda *_: None)(context.owner_user_id)
                 if not owner or owner.tenant_id != tenant_id:
                     continue
             allowed.append(ctx_id)
@@ -140,7 +152,7 @@ class RAGService:
             segment = blob[idx : idx + chosen_chunk]
             chunks.append(
                 KnowledgeChunk(
-                    id=0,
+                    id=None,
                     context_id=context_id,
                     fs_path=default_path,
                     content=segment,

@@ -3,11 +3,10 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
-import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Protocol, Tuple
+from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 from liminallm.logging import get_logger
 from liminallm.service.fs import safe_join
@@ -152,7 +151,10 @@ class ApiAdapterBackend:
         fallback = messages[-1]["content"] if messages else ""
         return {
             "content": f"[api-backend model={target_model} adapters={self._adapter_summary(adapter_list)}] {fallback}",
-            "usage": {"prompt_tokens": len(fallback.split()), "completion_tokens": random.randint(5, 20)},
+            "usage": {
+                "prompt_tokens": len(fallback.split()),
+                "completion_tokens": max(5, min(20, len(fallback.split()))),
+            },
         }
 
     def _resolve_model(self, adapters: List[dict]) -> str:
@@ -318,12 +320,8 @@ class LocalJaxLoRABackend:
             return {}
         adapter_id = adapter.get("id", "unknown")
         path = Path(self._adapter_path(adapter, requested_user_id=user_id))
-        if path.name != "latest" and not (path / "params.json").exists():
-            candidates = sorted([p for p in path.glob("v*/params.json") if p.parent.is_dir()])
-            if candidates:
-                path = candidates[-1].parent
-        params_path = path / "params.json"
-        if not params_path.exists():
+        params_path = self._resolve_params_path(path)
+        if not params_path:
             return {}
         mtime = params_path.stat().st_mtime
         cached = self._adapter_cache.get(adapter_id)
@@ -335,11 +333,42 @@ class LocalJaxLoRABackend:
             digest = hashlib.sha256(payload).hexdigest()
             if digest != checksum:
                 raise ValueError("adapter checksum mismatch")
+        else:
+            logger.warning("adapter_checksum_missing", adapter_id=adapter_id, path=str(params_path))
         weights_raw = json.loads(payload.decode())
         self._ensure_jax()
         weights = {k: self._jnp.array(v, dtype=self._jnp.float32) for k, v in weights_raw.items()}
         self._adapter_cache[adapter_id] = (mtime, weights)
         return weights
+
+    def _resolve_params_path(self, path: Path) -> Optional[Path]:
+        if path.is_file() and path.name == "params.json":
+            return path
+        candidates: list[Path] = []
+        direct = path / "params.json"
+        if direct.exists():
+            candidates.append(direct)
+        latest = path / "latest" / "params.json"
+        if latest.exists():
+            candidates.append(latest)
+        versioned = [p for p in path.glob("v*/params.json") if p.parent.is_dir()]
+        versioned.sort(key=lambda p: self._version_sort_key(p.parent.name))
+        candidates.extend(versioned)
+        wildcard = [p for p in path.glob("*/params.json") if p.parent.is_dir()]
+        wildcard.sort(key=lambda p: p.stat().st_mtime)
+        candidates.extend(wildcard)
+        for candidate in reversed(candidates):
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _version_sort_key(self, name: str) -> Tuple[int, str]:
+        try:
+            if name.startswith("v"):
+                return int(name[1:]), name
+            return int(name), name
+        except ValueError:
+            return 0, name
 
 
     def _align_width(self, arr, width: int):
@@ -433,7 +462,7 @@ class LocalJaxLoRABackend:
         token_array = self._jax.device_put(token_array, self._device)
         attn_array = self._jax.device_put(attn_array, self._device)
 
-        weights = self._load_adapter_weights(adapter, user_id=user_id)
+        weights = self._blend_adapter_weights(adapters, user_id=user_id) if adapters else {}
         start = time.perf_counter()
         lora_scores = self._lora_forward(weights, token_array) if weights else self._jnp.zeros_like(token_array)
         lora_scores = lora_scores * attn_array
@@ -447,10 +476,33 @@ class LocalJaxLoRABackend:
                 "prompt_tokens": len(ids),
                 "completion_tokens": len(generated_ids),
                 "model": self.base_model,
-                "adapter_id": adapter.get("id") if isinstance(adapter, dict) else None,
+                "adapter_id": ",".join(str(a.get("id")) for a in adapters if a.get("id")) if adapters else None,
                 "latency_ms": round(duration * 1000, 2),
             },
         }
+
+    def _blend_adapter_weights(self, adapters: List[dict], user_id: Optional[str]) -> dict:
+        combined: dict[str, Any] = {}
+        counts: dict[str, int] = {}
+        for adapter in adapters:
+            weights = self._load_adapter_weights(adapter, user_id=user_id)
+            if not weights:
+                continue
+            for name, tensor in weights.items():
+                if name in combined:
+                    if combined[name].shape != tensor.shape:
+                        logger.warning(
+                            "adapter_shape_mismatch", adapter_id=adapter.get("id"), name=name
+                        )
+                        continue
+                    combined[name] = combined[name] + tensor
+                    counts[name] += 1
+                else:
+                    combined[name] = tensor
+                    counts[name] = 1
+        for name, tensor in combined.items():
+            combined[name] = tensor / max(counts.get(name, 1), 1)
+        return combined
 
     def _adapter_path(self, adapter: dict, *, requested_user_id: Optional[str]) -> str:
         if not adapter:

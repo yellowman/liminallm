@@ -64,13 +64,16 @@ class LLMService:
 
     def _inject_context(self, messages: List[dict], context_snippets: List[str]) -> List[dict]:
         if not context_snippets:
-            return messages
-        for msg in reversed(messages):
+            return list(messages)
+        updated: List[dict] = [dict(msg) for msg in messages]
+        for idx in range(len(updated) - 1, -1, -1):
+            msg = updated[idx]
             if msg.get("role") == "user":
                 msg["content"] = f"{msg.get('content', '')}\nContext: {' | '.join(context_snippets)}"
-                return messages
-        messages.append({"role": "system", "content": f"Context: {' | '.join(context_snippets)}"})
-        return messages
+                updated[idx] = msg
+                return updated
+        updated.append({"role": "system", "content": f"Context: {' | '.join(context_snippets)}"})
+        return updated
 
     def _normalize_adapters(self, adapters: List[dict]) -> List[dict]:
         normalized = []
@@ -135,7 +138,7 @@ class LLMService:
                 adapter_server_model=plug_adapter_server_model,
                 fs_root=fs_root,
             )
-        if mode == "local_lora":
+        if mode in {"local_lora", "local_gpu_lora"}:
             return LocalJaxLoRABackend(self.base_model, fs_root or "/srv/liminallm")
         if mode not in {"api_adapters", "adapter_server"}:
             mode = "api_adapters"

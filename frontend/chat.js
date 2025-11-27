@@ -19,16 +19,25 @@ const state = {
   conversationId: null,
 };
 
-const idempotencyKey = () => {
+const randomIdempotencyKey = () => {
   if (window.crypto?.randomUUID) return window.crypto.randomUUID();
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 };
 
-const headers = () => {
+const stableHash = (str) => {
+  let hash = 0;
+  for (const ch of str) {
+    hash = (hash << 5) - hash + ch.codePointAt(0);
+    hash |= 0;
+  }
+  return Math.abs(hash >>> 0).toString(16);
+};
+
+const headers = (idempotencyKey) => {
   const h = { 'Content-Type': 'application/json' };
   if (state.accessToken) h['Authorization'] = `Bearer ${state.accessToken}`;
   if (state.tenantId) h['X-Tenant-ID'] = state.tenantId;
-  h['Idempotency-Key'] = idempotencyKey();
+  h['Idempotency-Key'] = idempotencyKey || randomIdempotencyKey();
   return h;
 };
 
@@ -133,17 +142,20 @@ const sendMessage = async (event) => {
   document.getElementById('message-input').value = '';
   appendMessage('user', content);
   showStatus('Thinking...');
+  const payload = {
+    conversation_id: state.conversationId || undefined,
+    message: { content, mode: 'text' },
+    context_id: document.getElementById('context-id').value || undefined,
+    workflow_id: document.getElementById('workflow-id').value || undefined,
+    stream: false,
+  };
+  const idempotencyKey = `chat-${stableHash(JSON.stringify(payload))}`;
+
   try {
     const resp = await fetch(`${apiBase}/chat`, {
       method: 'POST',
-      headers: headers(),
-      body: JSON.stringify({
-        conversation_id: state.conversationId || undefined,
-        message: { content, mode: 'text' },
-        context_id: document.getElementById('context-id').value || undefined,
-        workflow_id: document.getElementById('workflow-id').value || undefined,
-        stream: false,
-      }),
+      headers: headers(idempotencyKey),
+      body: JSON.stringify(payload),
     });
     if (!resp.ok) throw new Error((await resp.json()).detail || 'Chat failed');
     const envelope = await resp.json();
