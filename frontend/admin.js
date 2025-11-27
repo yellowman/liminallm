@@ -66,6 +66,29 @@ const gatekeep = () => {
   return true;
 };
 
+const extractError = (payload, fallback) => {
+  const detail = payload?.detail || payload?.error || payload;
+  if (typeof detail === 'string') return detail;
+  if (detail?.message) return detail.message;
+  if (detail?.error?.message) return detail.error.message;
+  return fallback;
+};
+
+const requestEnvelope = async (url, options, fallbackMessage) => {
+  const resp = await fetch(url, options);
+  let payload;
+  try {
+    payload = await resp.json();
+  } catch (err) {
+    if (!resp.ok) throw new Error(fallbackMessage || resp.statusText || 'Request failed');
+    throw err;
+  }
+  if (!resp.ok) {
+    throw new Error(extractError(payload, fallbackMessage || 'Request failed'));
+  }
+  return payload;
+};
+
 const handleLogin = async (event) => {
   event.preventDefault();
   const body = {
@@ -74,13 +97,15 @@ const handleLogin = async (event) => {
     tenant_id: document.getElementById('admin-tenant').value || undefined,
   };
   try {
-    const resp = await fetch(`${apiBase}/auth/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!resp.ok) throw new Error((await resp.json()).detail || 'Login failed');
-    const envelope = await resp.json();
+    const envelope = await requestEnvelope(
+      `${apiBase}/auth/login`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+      'Login failed'
+    );
     persistAuth(envelope.data);
     if (!gatekeep()) throw new Error('Admin role required');
     showFeedback('Authenticated');
@@ -116,9 +141,11 @@ const renderPatchTable = (patches) => {
 
 const fetchPatches = async () => {
   try {
-    const resp = await fetch(`${apiBase}/config/patches`, { headers: headers() });
-    if (!resp.ok) throw new Error((await resp.json()).detail || 'Unable to load patches');
-    const envelope = await resp.json();
+    const envelope = await requestEnvelope(
+      `${apiBase}/config/patches`,
+      { headers: headers() },
+      'Unable to load patches'
+    );
     renderPatchTable(envelope.data.items || []);
     showFeedback(`Loaded ${envelope.data.items?.length || 0} patches`);
   } catch (err) {
@@ -142,16 +169,19 @@ const proposePatch = async () => {
     return;
   }
   try {
-    const resp = await fetch(`${apiBase}/config/propose_patch`, {
-      method: 'POST',
-      headers: headers(),
-      body: JSON.stringify({
-        artifact_id: artifact,
-        justification: justification || undefined,
-        patch: parsed,
-      }),
-    });
-    if (!resp.ok) throw new Error((await resp.json()).detail || 'Unable to propose patch');
+    await requestEnvelope(
+      `${apiBase}/config/propose_patch`,
+      {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({
+          artifact_id: artifact,
+          justification: justification || undefined,
+          patch: parsed,
+        }),
+      },
+      'Unable to propose patch'
+    );
     await fetchPatches();
     showFeedback('Patch proposed');
   } catch (err) {
@@ -171,15 +201,18 @@ const decidePatch = async (decision) => {
     return;
   }
   try {
-    const resp = await fetch(`${apiBase}/config/patches/${patchId}/decide`, {
-      method: 'POST',
-      headers: headers(),
-      body: JSON.stringify({
-        decision: normalizedDecision,
-        reason: `console ${normalizedDecision}`,
-      }),
-    });
-    if (!resp.ok) throw new Error((await resp.json()).detail || 'Unable to decide patch');
+    await requestEnvelope(
+      `${apiBase}/config/patches/${patchId}/decide`,
+      {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({
+          decision: normalizedDecision,
+          reason: `console ${normalizedDecision}`,
+        }),
+      },
+      'Unable to decide patch'
+    );
     await fetchPatches();
     showFeedback(`Patch ${decision}`);
   } catch (err) {
@@ -194,11 +227,14 @@ const applyPatch = async () => {
     return;
   }
   try {
-    const resp = await fetch(`${apiBase}/config/patches/${patchId}/apply`, {
-      method: 'POST',
-      headers: headers(),
-    });
-    if (!resp.ok) throw new Error((await resp.json()).detail || 'Unable to apply patch');
+    await requestEnvelope(
+      `${apiBase}/config/patches/${patchId}/apply`,
+      {
+        method: 'POST',
+        headers: headers(),
+      },
+      'Unable to apply patch'
+    );
     await fetchPatches();
     showFeedback('Patch applied');
   } catch (err) {
@@ -237,9 +273,11 @@ const fetchUsers = async () => {
   const limitInput = document.getElementById('user-limit');
   const limit = limitInput ? Number(limitInput.value || 50) : 50;
   try {
-    const resp = await fetch(`${apiBase}/admin/users?limit=${Math.max(1, limit)}`, { headers: headers() });
-    if (!resp.ok) throw new Error((await resp.json()).detail || 'Unable to load users');
-    const envelope = await resp.json();
+    const envelope = await requestEnvelope(
+      `${apiBase}/admin/users?limit=${Math.max(1, limit)}`,
+      { headers: headers() },
+      'Unable to load users'
+    );
     renderUsers(envelope.data.items || []);
   } catch (err) {
     showError(err.message);
@@ -259,21 +297,23 @@ const createUser = async () => {
     return;
   }
   try {
-    const resp = await fetch(`${apiBase}/admin/users`, {
-      method: 'POST',
-      headers: headers(),
-      body: JSON.stringify({
-        email,
-        password: password || undefined,
-        handle: handle || undefined,
-        tenant_id: tenant || undefined,
-        role: role || undefined,
-        plan_tier: plan || undefined,
-        is_active: active,
-      }),
-    });
-    if (!resp.ok) throw new Error((await resp.json()).detail || 'Unable to create user');
-    const envelope = await resp.json();
+    const envelope = await requestEnvelope(
+      `${apiBase}/admin/users`,
+      {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({
+          email,
+          password: password || undefined,
+          handle: handle || undefined,
+          tenant_id: tenant || undefined,
+          role: role || undefined,
+          plan_tier: plan || undefined,
+          is_active: active,
+        }),
+      },
+      'Unable to create user'
+    );
     fetchUsers();
     if (createdPasswordEl) {
       createdPasswordEl.textContent = `Password: ${envelope.data.password}`;
@@ -292,12 +332,15 @@ const setUserRole = async () => {
     return;
   }
   try {
-    const resp = await fetch(`${apiBase}/admin/users/${userId}/role`, {
-      method: 'POST',
-      headers: headers(),
-      body: JSON.stringify({ role }),
-    });
-    if (!resp.ok) throw new Error((await resp.json()).detail || 'Unable to set role');
+    await requestEnvelope(
+      `${apiBase}/admin/users/${userId}/role`,
+      {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ role }),
+      },
+      'Unable to set role'
+    );
     await fetchUsers();
     showFeedback('Role updated');
   } catch (err) {
@@ -312,8 +355,11 @@ const deleteUser = async () => {
     return;
   }
   try {
-    const resp = await fetch(`${apiBase}/admin/users/${userId}`, { method: 'DELETE', headers: headers() });
-    if (!resp.ok) throw new Error((await resp.json()).detail || 'Unable to delete user');
+    await requestEnvelope(
+      `${apiBase}/admin/users/${userId}`,
+      { method: 'DELETE', headers: headers() },
+      'Unable to delete user'
+    );
     await fetchUsers();
     showFeedback('User deleted');
   } catch (err) {
@@ -349,9 +395,11 @@ const renderAdapters = (adapters) => {
 
 const fetchAdapters = async () => {
   try {
-    const resp = await fetch(`${apiBase}/admin/adapters`, { headers: headers() });
-    if (!resp.ok) throw new Error((await resp.json()).detail || 'Unable to load adapters');
-    const envelope = await resp.json();
+    const envelope = await requestEnvelope(
+      `${apiBase}/admin/adapters`,
+      { headers: headers() },
+      'Unable to load adapters'
+    );
     renderAdapters(envelope.data.items || []);
   } catch (err) {
     showError(err.message);
@@ -363,11 +411,13 @@ const runInspect = async () => {
   const limit = document.getElementById('inspect-limit')?.value || 50;
   if (inspectOutput) inspectOutput.textContent = 'Loading...';
   try {
-    const resp = await fetch(`${apiBase}/admin/objects?limit=${limit}${kind ? `&kind=${kind}` : ''}`, {
-      headers: headers(),
-    });
-    if (!resp.ok) throw new Error((await resp.json()).detail || 'Unable to inspect objects');
-    const envelope = await resp.json();
+    const envelope = await requestEnvelope(
+      `${apiBase}/admin/objects?limit=${limit}${kind ? `&kind=${kind}` : ''}`,
+      {
+        headers: headers(),
+      },
+      'Unable to inspect objects'
+    );
     if (inspectOutput)
       inspectOutput.textContent = JSON.stringify(
         { summary: envelope.data.summary, details: envelope.data.details },
