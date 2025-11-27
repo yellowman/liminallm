@@ -74,6 +74,34 @@
             </div>
           </div>
 
+          <section class="panel-section" aria-label="Upload files">
+            <div class="section-header">
+              <h3>Upload knowledge</h3>
+            </div>
+            <p class="subtext">
+              Attach files to a context before asking questions. Leave Context ID blank to keep uploads private.
+            </p>
+            <div class="input-grid">
+              <div class="field compact">
+                <label for="upload-context-id">Context ID</label>
+                <input type="text" id="upload-context-id" placeholder="ctx_..." />
+              </div>
+              <div class="field compact">
+                <label for="upload-chunk-size">Chunk size (optional)</label>
+                <input type="number" id="upload-chunk-size" placeholder="512" min="64" step="64" />
+              </div>
+            </div>
+            <div class="field">
+              <label for="file-upload">File</label>
+              <input type="file" id="file-upload" aria-describedby="file-upload-hint" />
+              <div class="small" id="file-upload-hint"></div>
+            </div>
+            <div class="pill-row">
+              <button type="button" class="minor" id="upload-file-btn">Upload file</button>
+            </div>
+            <div class="small" id="file-upload-status" role="status"></div>
+          </section>
+
           <div id="messages" aria-live="polite"></div>
           <div id="messages-empty" class="empty">Start a new thread to see your conversation history here.</div>
 

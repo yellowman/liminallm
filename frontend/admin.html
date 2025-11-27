@@ -74,6 +74,11 @@
             <label for="decision-id">Decide / apply patch</label>
             <input type="text" id="decision-id" placeholder="patch id" />
           </div>
+          <div class="field compact">
+            <label for="decision-status">Decision status</label>
+            <input type="text" id="decision-status" list="patch-status-options" placeholder="approved | rejected" />
+            <datalist id="patch-status-options"></datalist>
+          </div>
           <div class="flex-row" style="flex-wrap: wrap; margin-bottom: 12px">
             <button class="ghost" id="approve-patch">Approve</button>
             <button class="ghost" id="reject-patch">Reject</button>

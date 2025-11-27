@@ -17,6 +17,12 @@ const preferenceRoutingEl = document.getElementById('preference-routing');
 const preferenceTargetEl = document.getElementById('preference-target');
 const preferenceHintEl = document.getElementById('preference-hint');
 const preferenceNotesEl = document.getElementById('preference-notes');
+const fileUploadInput = document.getElementById('file-upload');
+const fileUploadStatus = document.getElementById('file-upload-status');
+const fileUploadHint = document.getElementById('file-upload-hint');
+const fileUploadContextId = document.getElementById('upload-context-id');
+const fileUploadChunkSize = document.getElementById('upload-chunk-size');
+const fileUploadButton = document.getElementById('upload-file-btn');
 
 const sessionStorageKey = (key) => `liminal.${key}`;
 
@@ -29,16 +35,53 @@ const writeSession = (key, value) => {
   }
 };
 
-const state = {
-  accessToken: readSession('accessToken'),
-  refreshToken: readSession('refreshToken'),
-  sessionId: readSession('sessionId'),
-  tenantId: readSession('tenantId'),
-  role: readSession('role'),
-  userId: readSession('userId'),
-  conversationId: null,
-  lastAssistant: null,
+const persistedKeys = ['accessToken', 'refreshToken', 'sessionId', 'tenantId', 'role', 'userId'];
+
+const createState = (storage) => {
+  const backing = {
+    accessToken: storage.read('accessToken'),
+    refreshToken: storage.read('refreshToken'),
+    sessionId: storage.read('sessionId'),
+    tenantId: storage.read('tenantId'),
+    role: storage.read('role'),
+    userId: storage.read('userId'),
+    conversationId: null,
+    lastAssistant: null,
+  };
+
+  const sync = (key, value) => {
+    if (!persistedKeys.includes(key)) return;
+    storage.write(key, value);
+  };
+
+  const stateApi = {
+    resetAuth() {
+      persistedKeys.forEach((k) => {
+        backing[k] = null;
+        sync(k, null);
+      });
+      backing.lastAssistant = null;
+      backing.conversationId = null;
+    },
+    snapshot() {
+      return { ...backing };
+    },
+  };
+
+  return new Proxy(stateApi, {
+    get(target, prop) {
+      if (prop in target) return target[prop];
+      return backing[prop];
+    },
+    set(target, prop, value) {
+      backing[prop] = value;
+      sync(prop, value);
+      return true;
+    },
+  });
 };
+
+const state = createState({ read: readSession, write: writeSession });
 
 const randomIdempotencyKey = () => {
   if (window.crypto?.randomUUID) return window.crypto.randomUUID();
@@ -52,6 +95,24 @@ const stableHash = (str) => {
     hash |= 0;
   }
   return Math.abs(hash >>> 0).toString(16);
+};
+
+const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+const ALLOWED_UPLOAD_TYPES = ['text/plain', 'text/markdown', 'application/pdf', 'application/json', 'text/csv'];
+const ALLOWED_UPLOAD_EXTENSIONS = ['.txt', '.md', '.markdown', '.pdf', '.json', '.csv', '.yaml', '.yml'];
+
+const formatBytes = (bytes) => {
+  if (!bytes && bytes !== 0) return '0 bytes';
+  const thresh = 1024;
+  if (Math.abs(bytes) < thresh) return `${bytes} bytes`;
+  const units = ['KB', 'MB', 'GB'];
+  let u = -1;
+  let size = bytes;
+  do {
+    size /= thresh;
+    ++u;
+  } while (Math.abs(size) >= thresh && u < units.length - 1);
+  return `${size.toFixed(1)} ${units[u]}`;
 };
 
 const fetchWithRetry = async (url, options, retries = 3, backoffMs = 400) => {
@@ -73,14 +134,16 @@ const fetchWithRetry = async (url, options, retries = 3, backoffMs = 400) => {
   throw new Error(`Request failed after ${attempts} ${label}: ${lastError?.message || 'unknown error'}`);
 };
 
-const headers = (idempotencyKey) => {
-  const h = { 'Content-Type': 'application/json' };
+const authHeaders = (idempotencyKey) => {
+  const h = {};
   if (state.accessToken) h['Authorization'] = `Bearer ${state.accessToken}`;
   if (state.tenantId) h['X-Tenant-ID'] = state.tenantId;
   if (state.sessionId) h['session_id'] = state.sessionId;
   h['Idempotency-Key'] = idempotencyKey || randomIdempotencyKey();
   return h;
 };
+
+const headers = (idempotencyKey) => ({ 'Content-Type': 'application/json', ...authHeaders(idempotencyKey) });
 
 const showStatus = (message, isError = false) => {
   const target = isError ? errorEl : statusEl;
@@ -131,16 +194,94 @@ const persistAuth = (payload) => {
   state.role = payload.role;
   state.tenantId = payload.tenant_id;
   state.userId = payload.user_id;
-  writeSession('accessToken', state.accessToken);
-  writeSession('refreshToken', state.refreshToken);
-  writeSession('sessionId', state.sessionId);
-  writeSession('role', state.role);
-  writeSession('tenantId', state.tenantId);
-  writeSession('userId', state.userId);
   sessionIndicator.textContent = state.accessToken
     ? `Signed in as ${state.userId || payload.user_id || 'current'} (${state.role || 'user'})`
     : 'Not signed in';
   renderAdminNotice();
+};
+
+const setUploadStatus = (message, isError = false) => {
+  if (!fileUploadStatus) return;
+  fileUploadStatus.textContent = message;
+  fileUploadStatus.style.color = isError ? '#b00020' : 'inherit';
+};
+
+const validateUploadFile = (file) => {
+  if (!file) return { ok: false, message: 'Choose a file to upload.' };
+  if (file.size > MAX_UPLOAD_BYTES) {
+    return {
+      ok: false,
+      message: `File too large (${formatBytes(file.size)}). Max allowed is ${formatBytes(MAX_UPLOAD_BYTES)}.`,
+    };
+  }
+  const name = (file.name || '').toLowerCase();
+  const matchesType = file.type && ALLOWED_UPLOAD_TYPES.some((t) => file.type.startsWith(t));
+  const matchesExt = ALLOWED_UPLOAD_EXTENSIONS.some((ext) => name.endsWith(ext));
+  if (!matchesType && !matchesExt) {
+    return {
+      ok: false,
+      message: `Unsupported file type. Allowed: ${ALLOWED_UPLOAD_EXTENSIONS.join(', ')}`,
+    };
+  }
+  return { ok: true };
+};
+
+const renderUploadHint = () => {
+  if (!fileUploadHint) return;
+  const file = fileUploadInput?.files?.[0];
+  if (!file) {
+    fileUploadHint.textContent = `Up to ${formatBytes(MAX_UPLOAD_BYTES)}. Supported: ${ALLOWED_UPLOAD_EXTENSIONS.join(', ')}`;
+    return;
+  }
+  fileUploadHint.textContent = `${file.name} · ${formatBytes(file.size)} · ${file.type || 'unknown type'}`;
+};
+
+const handleFileUpload = async (event) => {
+  event?.preventDefault?.();
+  if (!fileUploadInput) return;
+  const file = fileUploadInput.files?.[0];
+  const validation = validateUploadFile(file);
+  if (!validation.ok) {
+    setUploadStatus(validation.message, true);
+    return;
+  }
+  if (!state.accessToken) {
+    setUploadStatus('Sign in before uploading files.', true);
+    return;
+  }
+
+  const contextId = (fileUploadContextId?.value || document.getElementById('context-id')?.value || '').trim();
+  const chunkSizeRaw = (fileUploadChunkSize?.value || '').trim();
+  const chunkSize = chunkSizeRaw ? Number(chunkSizeRaw) : null;
+  if (chunkSizeRaw && (!Number.isFinite(chunkSize) || chunkSize <= 0)) {
+    setUploadStatus('Chunk size must be a positive number.', true);
+    return;
+  }
+
+  const formData = new FormData();
+  formData.append('file', file);
+  if (contextId) formData.append('context_id', contextId);
+  if (chunkSize) formData.append('chunk_size', chunkSize);
+  const idempotencyKey = `upload-${stableHash(`${file.name}-${file.size}-${contextId || 'global'}`)}`;
+
+  setUploadStatus('Uploading...');
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/files/upload`,
+      {
+        method: 'POST',
+        headers: authHeaders(idempotencyKey),
+        body: formData,
+      },
+      'Upload failed'
+    );
+    const uploaded = envelope.data || {};
+    const destLabel = uploaded.context_id ? `context ${uploaded.context_id}` : 'your files area';
+    const chunkLabel = uploaded.chunk_count ? ` · ${uploaded.chunk_count} chunk(s) indexed` : '';
+    setUploadStatus(`Uploaded ${file.name} to ${destLabel}${chunkLabel}.`);
+  } catch (err) {
+    setUploadStatus(err.message, true);
+  }
 };
 
 const appendMessage = (role, content, meta = '') => {
@@ -525,15 +666,7 @@ const logout = async () => {
   };
 
   await tryRevoke();
-  state.accessToken = null;
-  state.refreshToken = null;
-  state.sessionId = null;
-  state.role = null;
-  state.tenantId = null;
-  state.userId = null;
-  ['accessToken', 'refreshToken', 'sessionId', 'role', 'tenantId', 'userId'].forEach((k) =>
-    sessionStorage.removeItem(sessionStorageKey(k))
-  );
+  state.resetAuth();
   setConversation(null);
   messagesEl.innerHTML = '';
   sessionIndicator.textContent = 'Not signed in';
@@ -556,6 +689,8 @@ const thumbsUpBtn = document.getElementById('thumbs-up');
 if (thumbsUpBtn) thumbsUpBtn.addEventListener('click', () => sendPreference(true));
 const thumbsDownBtn = document.getElementById('thumbs-down');
 if (thumbsDownBtn) thumbsDownBtn.addEventListener('click', () => sendPreference(false));
+if (fileUploadInput) fileUploadInput.addEventListener('change', renderUploadHint);
+if (fileUploadButton) fileUploadButton.addEventListener('click', handleFileUpload);
 
 // Bootstrap from stored credentials
 if (state.accessToken) {
@@ -573,3 +708,4 @@ if (state.accessToken) {
 }
 updateEmptyState();
 renderPreferencePanel();
+renderUploadHint();

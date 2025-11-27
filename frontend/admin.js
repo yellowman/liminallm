@@ -11,6 +11,8 @@ const adapterTableWrapper = document.getElementById('adapter-table-wrapper');
 const inspectOutput = document.getElementById('inspect-output');
 const createdPasswordEl = document.getElementById('created-user-password');
 const runtimeConfigEl = document.getElementById('runtime-config');
+const decisionStatusInput = document.getElementById('decision-status');
+const patchStatusOptions = document.getElementById('patch-status-options');
 
 const sessionStorageKey = (key) => `liminal.${key}`;
 const readSession = (key) => sessionStorage.getItem(sessionStorageKey(key));
@@ -29,6 +31,9 @@ const state = {
   tenantId: readSession('tenantId'),
   role: readSession('role'),
 };
+
+const defaultPatchStatuses = new Set(['pending', 'approved', 'rejected', 'applied']);
+let knownPatchStatuses = new Set(defaultPatchStatuses);
 
 const headers = () => {
   const h = { 'Content-Type': 'application/json' };
@@ -114,6 +119,15 @@ const requestEnvelope = async (url, options, fallbackMessage) => {
   return payload ?? {};
 };
 
+const setPatchStatusOptions = (statuses = []) => {
+  knownPatchStatuses = new Set([...defaultPatchStatuses, ...statuses.map((s) => (s || '').toLowerCase())]);
+  if (!patchStatusOptions) return;
+  patchStatusOptions.innerHTML = Array.from(knownPatchStatuses)
+    .sort()
+    .map((status) => `<option value="${status}"></option>`)
+    .join('');
+};
+
 const handleLogin = async (event) => {
   event.preventDefault();
   const body = {
@@ -147,8 +161,10 @@ const handleLogin = async (event) => {
 const renderPatchTable = (patches) => {
   if (!patches.length) {
     patchTableWrapper.innerHTML = '<div class="empty">No patch proposals</div>';
+    setPatchStatusOptions([]);
     return;
   }
+  setPatchStatusOptions(patches.map((p) => p.status).filter(Boolean));
   const rows = patches
     .map(
       (p) => `
@@ -234,17 +250,19 @@ const proposePatch = async () => {
   }
 };
 
-const decidePatch = async (decision) => {
+const decidePatch = async (fallbackDecision) => {
   const patchId = document.getElementById('decision-id').value;
   if (!patchId) {
     showError('Provide a patch id');
     return;
   }
-  const normalizedDecision = decision === 'reject' ? 'reject' : decision === 'approve' ? 'approve' : null;
-  if (!normalizedDecision) {
-    showError('Decision must be approve or reject');
+  const rawDecision = (decisionStatusInput?.value || fallbackDecision || '').trim();
+  if (!rawDecision) {
+    showError('Decision status is required');
     return;
   }
+  const normalizedDecision = rawDecision.toLowerCase();
+  knownPatchStatuses.add(normalizedDecision);
   try {
     await requestEnvelope(
       `${apiBase}/config/patches/${patchId}/decide`,
@@ -259,7 +277,8 @@ const decidePatch = async (decision) => {
       'Unable to decide patch'
     );
     await fetchPatches();
-    showFeedback(`Patch ${decision}`);
+    setPatchStatusOptions(Array.from(knownPatchStatuses));
+    showFeedback(`Patch ${normalizedDecision}`);
   } catch (err) {
     showError(err.message);
   }
@@ -495,6 +514,8 @@ const logout = async () => {
   window.location.href = '/';
 };
 
+setPatchStatusOptions([]);
+
 if (authForm) authForm.addEventListener('submit', handleLogin);
 const logoutBtn = document.getElementById('logout');
 if (logoutBtn) logoutBtn.addEventListener('click', logout);
@@ -503,9 +524,17 @@ if (refreshBtn) refreshBtn.addEventListener('click', fetchPatches);
 const proposeBtn = document.getElementById('propose-patch');
 if (proposeBtn) proposeBtn.addEventListener('click', proposePatch);
 const approveBtn = document.getElementById('approve-patch');
-if (approveBtn) approveBtn.addEventListener('click', () => decidePatch('approve'));
+if (approveBtn)
+  approveBtn.addEventListener('click', () => {
+    if (decisionStatusInput) decisionStatusInput.value = 'approved';
+    decidePatch('approved');
+  });
 const rejectBtn = document.getElementById('reject-patch');
-if (rejectBtn) rejectBtn.addEventListener('click', () => decidePatch('reject'));
+if (rejectBtn)
+  rejectBtn.addEventListener('click', () => {
+    if (decisionStatusInput) decisionStatusInput.value = 'rejected';
+    decidePatch('rejected');
+  });
 const applyBtn = document.getElementById('apply-patch');
 if (applyBtn) applyBtn.addEventListener('click', applyPatch);
 const refreshUsersBtn = document.getElementById('refresh-users');
