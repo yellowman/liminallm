@@ -109,6 +109,29 @@ const setConversation = (id) => {
   conversationLabel.textContent = id ? `Conversation ${id}` : 'New conversation';
 };
 
+const extractError = (payload, fallback) => {
+  const detail = payload?.detail || payload?.error || payload;
+  if (typeof detail === 'string') return detail;
+  if (detail?.message) return detail.message;
+  if (detail?.error?.message) return detail.error.message;
+  return fallback;
+};
+
+const requestEnvelope = async (url, options, fallbackMessage) => {
+  const resp = await fetch(url, options);
+  let payload;
+  try {
+    payload = await resp.json();
+  } catch (err) {
+    if (!resp.ok) throw new Error(fallbackMessage || resp.statusText || 'Request failed');
+    throw err;
+  }
+  if (!resp.ok) {
+    throw new Error(extractError(payload, fallbackMessage || 'Request failed'));
+  }
+  return payload;
+};
+
 const handleLogin = async (event) => {
   event.preventDefault();
   const body = {
@@ -117,13 +140,15 @@ const handleLogin = async (event) => {
     tenant_id: document.getElementById('tenant').value || undefined,
   };
   try {
-    const resp = await fetch(`${apiBase}/auth/login`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-    if (!resp.ok) throw new Error((await resp.json()).detail || 'Login failed');
-    const envelope = await resp.json();
+    const envelope = await requestEnvelope(
+      `${apiBase}/auth/login`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      },
+      'Login failed'
+    );
     persistAuth(envelope.data);
     showStatus('Signed in');
   } catch (err) {
@@ -152,13 +177,15 @@ const sendMessage = async (event) => {
   const idempotencyKey = `chat-${stableHash(JSON.stringify(payload))}`;
 
   try {
-    const resp = await fetch(`${apiBase}/chat`, {
-      method: 'POST',
-      headers: headers(idempotencyKey),
-      body: JSON.stringify(payload),
-    });
-    if (!resp.ok) throw new Error((await resp.json()).detail || 'Chat failed');
-    const envelope = await resp.json();
+    const envelope = await requestEnvelope(
+      `${apiBase}/chat`,
+      {
+        method: 'POST',
+        headers: headers(idempotencyKey),
+        body: JSON.stringify(payload),
+      },
+      'Chat failed'
+    );
     const data = envelope.data;
     setConversation(data.conversation_id);
     const metaBits = [];
@@ -181,9 +208,11 @@ const newConversation = () => {
 const listConversations = async () => {
   if (!state.accessToken) return;
   try {
-    const resp = await fetch(`${apiBase}/conversations`, { headers: headers() });
-    if (!resp.ok) throw new Error((await resp.json()).detail || 'Unable to load history');
-    const envelope = await resp.json();
+    const envelope = await requestEnvelope(
+      `${apiBase}/conversations`,
+      { headers: headers() },
+      'Unable to load history'
+    );
     const items = envelope.data.items || [];
     if (!items.length) {
       showStatus('No previous conversations for this user');
