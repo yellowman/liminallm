@@ -77,17 +77,21 @@ const extractError = (payload, fallback) => {
 
 const requestEnvelope = async (url, options, fallbackMessage) => {
   const resp = await fetch(url, options);
+  const text = await resp.text();
+  const trimmed = text.trim();
   let payload;
-  try {
-    payload = await resp.json();
-  } catch (err) {
-    if (!resp.ok) throw new Error(fallbackMessage || resp.statusText || 'Request failed');
-    throw err;
+  if (trimmed) {
+    try {
+      payload = JSON.parse(trimmed);
+    } catch (err) {
+      if (!resp.ok) throw new Error(fallbackMessage || resp.statusText || 'Request failed');
+      throw err;
+    }
   }
   if (!resp.ok) {
-    throw new Error(extractError(payload, fallbackMessage || 'Request failed'));
+    throw new Error(extractError(payload ?? trimmed, fallbackMessage || 'Request failed'));
   }
-  return payload;
+  return payload ?? {};
 };
 
 const handleLogin = async (event) => {
@@ -436,19 +440,20 @@ const runInspect = async () => {
   }
 };
 
-const logout = () => {
+const logout = async () => {
   const tryRevoke = async () => {
     try {
       await requestEnvelope(
         `${apiBase}/auth/logout`,
-        { method: 'POST', headers: headers() },
+        { method: 'POST', headers: headers(), keepalive: true },
         'Logout failed'
       );
     } catch (err) {
       console.warn('logout failed', err);
     }
   };
-  tryRevoke();
+
+  await tryRevoke();
   ['liminal.accessToken', 'liminal.refreshToken', 'liminal.sessionId', 'liminal.role', 'liminal.tenantId'].forEach((k) =>
     localStorage.removeItem(k)
   );
