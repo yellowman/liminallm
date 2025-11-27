@@ -6,7 +6,7 @@ import json
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 from liminallm.service.embeddings import cosine_similarity, pad_vectors
-from liminallm.storage.models import PreferenceEvent, SemanticCluster
+from liminallm.storage.models import POSITIVE_FEEDBACK_VALUES, PreferenceEvent, SemanticCluster
 
 
 class SemanticClusterer:
@@ -20,7 +20,11 @@ class SemanticClusterer:
     def cluster_user_preferences(
         self, user_id: str, *, k: int = 3, batch_size: int = 8, min_events: int = 3
     ) -> List[SemanticCluster]:
-        events = [e for e in self.store.list_preference_events(user_id=user_id, feedback="positive") if e.context_embedding]
+        events = [
+            e
+            for e in self.store.list_preference_events(user_id=user_id, feedback=POSITIVE_FEEDBACK_VALUES)
+            if e.context_embedding
+        ]
         if len(events) < min_events:
             return []
         embeddings = pad_vectors([list(e.context_embedding) for e in events])
@@ -145,7 +149,7 @@ class SemanticClusterer:
             events = self.store.list_preference_events(cluster_id=cluster.id)
             if len(events) < min_size or cluster.id in bound_clusters:
                 continue
-            positive = [e for e in events if e.feedback in {"positive", "like"} or (e.score or 0) > 0]
+            positive = [e for e in events if e.feedback in POSITIVE_FEEDBACK_VALUES or (e.score or 0) > 0]
             ratio = len(positive) / len(events) if events else 0.0
             if ratio < positive_ratio:
                 continue

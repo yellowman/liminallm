@@ -13,7 +13,7 @@ from liminallm.service.embeddings import deterministic_embedding
 from liminallm.service.fs import PathTraversalError, safe_join
 from liminallm.service.tokenizer_utils import DEFAULT_VOCAB_SIZE, vocab_size_from_tokenizer
 from liminallm.storage.errors import ConstraintViolation
-from liminallm.storage.models import Artifact, PreferenceEvent
+from liminallm.storage.models import POSITIVE_FEEDBACK_VALUES, Artifact, PreferenceEvent
 
 from liminallm.logging import get_logger
 
@@ -167,7 +167,11 @@ class TrainingService:
             raise ConstraintViolation("adapter ownership mismatch", {"adapter_id": adapter.id})
         adapter = self._assert_adapter_base(adapter)
         self._apply_adapter_vocab_size(adapter)
-        events = self.store.list_preference_events(user_id=user_id, feedback="positive", cluster_id=cluster_id)
+        events = self.store.list_preference_events(
+            user_id=user_id,
+            feedback=POSITIVE_FEEDBACK_VALUES,
+            cluster_id=cluster_id,
+        )
         if not events:
             return None
         cluster_meta = self._cluster_events(events, user_id)
@@ -285,7 +289,7 @@ class TrainingService:
             explicit_signal=explicit_signal,
             meta=meta or None,
         )
-        if feedback in {"positive", "like"} and self._should_enqueue_training_job(user_id):
+        if feedback in POSITIVE_FEEDBACK_VALUES and self._should_enqueue_training_job(user_id):
             adapter = self.ensure_user_adapter(user_id)
             self.store.create_training_job(
                 user_id=user_id, adapter_id=adapter.id, preference_event_ids=[event.id], dataset_path=None

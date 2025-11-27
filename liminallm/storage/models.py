@@ -7,6 +7,9 @@ from ipaddress import IPv4Address, IPv6Address, ip_address
 from typing import Dict, List, Optional
 
 
+POSITIVE_FEEDBACK_VALUES = {"positive", "like"}
+
+
 @dataclass
 class User:
     id: str

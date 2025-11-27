@@ -308,7 +308,7 @@ class PostgresStore:
         context_text: str | None = None,
         meta: dict | None = None,
     ) -> PreferenceEvent:
-        normalized_weight = weight if weight is not None else (score if score is not None else 1.0)
+        normalized_weight = weight if weight is not None else 1.0
         event_id = str(uuid.uuid4())
         with self._connect() as conn:
             msg_row = conn.execute(
@@ -378,7 +378,12 @@ class PostgresStore:
         return [v / norm for v in vec]
 
     def list_preference_events(
-        self, user_id: str | None = None, feedback: str | None = None, cluster_id: str | None = None
+        self,
+        user_id: str | None = None,
+        feedback: Iterable[str] | str | None = None,
+        cluster_id: str | None = None,
+        *,
+        tenant_id: str | None = None,
     ) -> list[PreferenceEvent]:
         clauses = []
         params: list[Any] = []
@@ -386,11 +391,17 @@ class PostgresStore:
             clauses.append("user_id = %s")
             params.append(user_id)
         if feedback:
-            clauses.append("feedback = %s")
-            params.append(feedback)
+            feedback_values = [feedback] if isinstance(feedback, str) else list(feedback)
+            if feedback_values:
+                placeholders = ", ".join(["%s"] * len(feedback_values))
+                clauses.append(f"feedback IN ({placeholders})")
+                params.extend(feedback_values)
         if cluster_id:
             clauses.append("cluster_id = %s")
             params.append(cluster_id)
+        if tenant_id:
+            clauses.append("user_id IN (SELECT id FROM app_user WHERE tenant_id = %s)")
+            params.append(tenant_id)
         query = "SELECT * FROM preference_event"
         if clauses:
             query = " ".join([query, "WHERE", " AND ".join(clauses)])
@@ -757,7 +768,12 @@ class PostgresStore:
         )
 
     def list_training_jobs(
-        self, user_id: str | None = None, status: str | None = None, *, limit: int | None = None
+        self,
+        user_id: str | None = None,
+        status: str | None = None,
+        *,
+        limit: int | None = None,
+        tenant_id: str | None = None,
     ) -> List[TrainingJob]:
         query = "SELECT * FROM training_job WHERE 1=1"
         params: list[Any] = []
@@ -767,6 +783,9 @@ class PostgresStore:
         if status:
             params.append(status)
             query += f" AND status = %s"
+        if tenant_id:
+            params.append(tenant_id)
+            query += " AND user_id IN (SELECT id FROM app_user WHERE tenant_id = %s)"
         query += " ORDER BY COALESCE(updated_at, created_at) DESC"
         if limit:
             params.append(limit)
@@ -1338,6 +1357,7 @@ class PostgresStore:
         page: int = 1,
         page_size: int = 100,
         owner_user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> List[Artifact]:
         offset = max(page - 1, 0) * max(page_size, 1)
         limit = max(page_size, 1)
@@ -1353,6 +1373,9 @@ class PostgresStore:
             if owner_user_id:
                 clauses.append("owner_user_id = %s")
                 params.append(owner_user_id)
+            if tenant_id:
+                clauses.append("owner_user_id IN (SELECT id FROM app_user WHERE tenant_id = %s)")
+                params.append(tenant_id)
             where = ""
             if clauses:
                 where = " WHERE " + " AND ".join(clauses)

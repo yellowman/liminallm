@@ -5,6 +5,7 @@ import uuid
 import hashlib
 import math
 import re
+import shutil
 from datetime import datetime, timedelta
 from ipaddress import ip_address
 from pathlib import Path
@@ -57,6 +58,7 @@ class MemoryStore:
         self.preference_events: Dict[str, PreferenceEvent] = {}
         self.training_jobs: Dict[str, TrainingJob] = {}
         self.semantic_clusters: Dict[str, SemanticCluster] = {}
+        self.adapter_router_state: Dict[str, AdapterRouterState] = {}
         self.mfa_secrets: Dict[str, UserMFAConfig] = {}
         self.fs_root = Path(fs_root)
         self.fs_root.mkdir(parents=True, exist_ok=True)
@@ -272,10 +274,12 @@ class MemoryStore:
                 self.contexts.pop(ctx_id, None)
                 self.context_sources.pop(ctx_id, None)
                 self.chunks.pop(ctx_id, None)
+        user_artifacts: list[str] = []
         for art_id, art in list(self.artifacts.items()):
             if art.owner_user_id == user_id:
                 self.artifacts.pop(art_id, None)
                 self.artifact_versions.pop(art_id, None)
+                user_artifacts.append(art_id)
         for evt_id, evt in list(self.preference_events.items()):
             if evt.user_id == user_id:
                 self.preference_events.pop(evt_id, None)
@@ -285,6 +289,12 @@ class MemoryStore:
         for cluster_id, cluster in list(self.semantic_clusters.items()):
             if cluster.user_id == user_id:
                 self.semantic_clusters.pop(cluster_id, None)
+        for state_id, state in list(self.adapter_router_state.items()):
+            if getattr(state, "artifact_id", None) in user_artifacts or getattr(state, "user_id", None) == user_id:
+                self.adapter_router_state.pop(state_id, None)
+        for art_id in user_artifacts:
+            shutil.rmtree(self.fs_root / "artifacts" / art_id, ignore_errors=True)
+        shutil.rmtree(self.fs_root / "users" / user_id, ignore_errors=True)
         self._persist_state()
         return True
 
@@ -469,7 +479,7 @@ class MemoryStore:
                 {"message_id": message_id, "conversation_id": conversation_id},
             )
         event_id = str(uuid.uuid4())
-        normalized_weight = weight if weight is not None else (score if score is not None else 1.0)
+        normalized_weight = weight if weight is not None else 1.0
         embedding = context_embedding or self._text_embedding(context_text or message.content)
         event = PreferenceEvent(
             id=event_id,
@@ -491,13 +501,25 @@ class MemoryStore:
         return event
 
     def list_preference_events(
-        self, user_id: Optional[str] = None, feedback: Optional[str] = None, cluster_id: Optional[str] = None
+        self,
+        user_id: Optional[str] = None,
+        feedback: Optional[Iterable[str] | str] = None,
+        cluster_id: Optional[str] = None,
+        *,
+        tenant_id: Optional[str] = None,
     ) -> List[PreferenceEvent]:
         events = list(self.preference_events.values())
+        if tenant_id:
+            events = [
+                e
+                for e in events
+                if e.user_id in self.users and self.users[e.user_id].tenant_id == tenant_id
+            ]
         if user_id:
             events = [e for e in events if e.user_id == user_id]
         if feedback:
-            events = [e for e in events if e.feedback == feedback]
+            feedback_values = {feedback} if isinstance(feedback, str) else set(feedback)
+            events = [e for e in events if e.feedback in feedback_values]
         if cluster_id:
             events = [e for e in events if e.cluster_id == cluster_id]
         return sorted(events, key=lambda e: e.created_at)
@@ -640,9 +662,16 @@ class MemoryStore:
         return job
 
     def list_training_jobs(
-        self, user_id: Optional[str] = None, status: Optional[str] = None, *, limit: Optional[int] = None
+        self,
+        user_id: Optional[str] = None,
+        status: Optional[str] = None,
+        *,
+        limit: Optional[int] = None,
+        tenant_id: Optional[str] = None,
     ) -> List[TrainingJob]:
         jobs = list(self.training_jobs.values())
+        if tenant_id:
+            jobs = [j for j in jobs if j.user_id in self.users and self.users[j.user_id].tenant_id == tenant_id]
         if user_id:
             jobs = [j for j in jobs if j.user_id == user_id]
         if status:
@@ -739,8 +768,17 @@ class MemoryStore:
         page: int = 1,
         page_size: int = 100,
         owner_user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
     ) -> List[Artifact]:
         artifacts = list(self.artifacts.values())
+        if tenant_id:
+            artifacts = [
+                a
+                for a in artifacts
+                if a.owner_user_id
+                and a.owner_user_id in self.users
+                and self.users[a.owner_user_id].tenant_id == tenant_id
+            ]
         if owner_user_id:
             artifacts = [a for a in artifacts if a.owner_user_id == owner_user_id]
         if type_filter:
