@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Any, List, Literal, Optional
 from uuid import uuid4
 
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class Envelope(BaseModel):
@@ -14,11 +14,26 @@ class Envelope(BaseModel):
     request_id: str = Field(default_factory=lambda: str(uuid4()))
 
 
+def _validate_email(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("email must be a string")
+    normalized = value.strip()
+    local, sep, domain = normalized.partition("@")
+    if not sep or not local or not domain or "." not in domain:
+        raise ValueError("invalid email address")
+    return normalized
+
+
 class SignupRequest(BaseModel):
-    email: EmailStr
+    email: str
     password: str
     handle: Optional[str] = None
     tenant_id: Optional[str] = None
+
+    @field_validator("email")
+    @classmethod
+    def _validate_signup_email(cls, value: str) -> str:
+        return _validate_email(value)
 
     @field_validator("password")
     @classmethod
@@ -45,10 +60,15 @@ class AuthResponse(BaseModel):
 
 
 class LoginRequest(BaseModel):
-    email: EmailStr
+    email: str
     password: str
     mfa_code: Optional[str] = None
     tenant_id: Optional[str] = None
+
+    @field_validator("email")
+    @classmethod
+    def _validate_login_email(cls, value: str) -> str:
+        return _validate_email(value)
 
 
 class TokenRefreshRequest(BaseModel):
@@ -77,7 +97,12 @@ class MFAVerifyRequest(BaseModel):
 
 
 class PasswordResetRequest(BaseModel):
-    email: EmailStr
+    email: str
+
+    @field_validator("email")
+    @classmethod
+    def _validate_password_reset_email(cls, value: str) -> str:
+        return _validate_email(value)
 
 
 class PasswordResetConfirm(BaseModel):
@@ -328,7 +353,7 @@ class UserListResponse(BaseModel):
 
 
 class AdminCreateUserRequest(BaseModel):
-    email: EmailStr
+    email: str
     password: Optional[str] = None
     handle: Optional[str] = None
     role: Optional[str] = None
@@ -336,6 +361,11 @@ class AdminCreateUserRequest(BaseModel):
     plan_tier: Optional[str] = None
     is_active: Optional[bool] = None
     meta: Optional[dict] = None
+
+    @field_validator("email")
+    @classmethod
+    def _validate_admin_email(cls, value: str) -> str:
+        return _validate_email(value)
 
 
 class UpdateUserRoleRequest(BaseModel):

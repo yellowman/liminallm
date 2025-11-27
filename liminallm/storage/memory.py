@@ -814,8 +814,17 @@ class MemoryStore:
         version_author: Optional[str] = None,
         change_note: Optional[str] = None,
     ) -> Optional[Artifact]:
+        schema_kind = schema.get("kind")
+        if schema_kind == "workflow.chat":
+            validator_type = "workflow"
+        elif schema_kind == "tool.spec":
+            validator_type = "tool"
+        elif schema_kind == "adapter.lora":
+            validator_type = "adapter"
+        else:
+            validator_type = "artifact"
         try:
-            validate_artifact("workflow" if schema.get("kind") == "workflow.chat" else "tool" if schema.get("kind") == "tool.spec" else "artifact", schema)  # type: ignore[arg-type]
+            validate_artifact(validator_type, schema)  # type: ignore[arg-type]
         except ArtifactValidationError as exc:
             self.logger.warning("artifact_validation_failed", errors=exc.errors)
             raise

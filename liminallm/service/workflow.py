@@ -593,13 +593,21 @@ class WorkflowEngine:
 
         ctx_chunks = self.rag.retrieve(allowed_ctx_ids, message, user_id=user_id, tenant_id=tenant_id)
         context_snippets = [c.text for c in ctx_chunks]
-        resp = self.llm.generate(
-            message or "",
-            adapters=adapters,
-            context_snippets=context_snippets,
-            history=history,
-            user_id=user_id,
-        )
+        try:
+            resp = self.llm.generate(
+                message or "",
+                adapters=adapters,
+                context_snippets=context_snippets,
+                history=history,
+                user_id=user_id,
+            )
+        except TypeError:
+            resp = self.llm.generate(
+                message or "",
+                adapters=adapters,
+                context_snippets=context_snippets,
+                history=history,
+            )
         return {"content": resp["content"], "usage": resp["usage"], "context_snippets": context_snippets}
 
     def _tool_rag_answer(
@@ -619,13 +627,21 @@ class WorkflowEngine:
 
         chunks = self.rag.retrieve(allowed_ctx_ids, question, user_id=user_id, tenant_id=tenant_id)
         snippets = [c.text for c in chunks]
-        resp = self.llm.generate(
-            question or "",
-            adapters=adapters,
-            context_snippets=snippets,
-            history=history,
-            user_id=user_id,
-        )
+        try:
+            resp = self.llm.generate(
+                question or "",
+                adapters=adapters,
+                context_snippets=snippets,
+                history=history,
+                user_id=user_id,
+            )
+        except TypeError:
+            resp = self.llm.generate(
+                question or "",
+                adapters=adapters,
+                context_snippets=snippets,
+                history=history,
+            )
         return {"content": resp["content"], "usage": resp["usage"], "context_snippets": snippets, "answer": resp["content"]}
 
     def _tool_intent_classifier(
