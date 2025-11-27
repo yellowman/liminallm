@@ -27,7 +27,7 @@ class RedisCache:
             sync_client.close()
 
     async def cache_session(self, session_id: str, user_id: str, expires_at: datetime) -> None:
-        ttl = int((expires_at - datetime.utcnow()).total_seconds())
+        ttl = max(1, int((expires_at - datetime.utcnow()).total_seconds()))
         await self.client.set(f"auth:session:{session_id}", user_id, ex=ttl)
 
     async def get_session_user(self, session_id: str) -> Optional[str]:
@@ -37,11 +37,14 @@ class RedisCache:
         await self.client.delete(f"auth:session:{session_id}")
 
     async def check_rate_limit(self, key: str, limit: int, window_seconds: int) -> bool:
-        now_bucket = int(datetime.utcnow().timestamp() // window_seconds)
+        now = datetime.utcnow()
+        now_bucket = int(now.timestamp() // window_seconds)
         redis_key = f"rate:{key}:{now_bucket}"
         current = await self.client.incr(redis_key)
         if current == 1:
-            await self.client.expire(redis_key, window_seconds)
+            bucket_end = (now_bucket + 1) * window_seconds
+            ttl = max(1, int(bucket_end - now.timestamp()))
+            await self.client.expire(redis_key, ttl)
         return current <= limit
 
     async def mark_refresh_revoked(self, jti: str, ttl_seconds: int) -> None:

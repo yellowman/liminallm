@@ -361,7 +361,6 @@ class MemoryStore:
         if not sess:
             return
         sess.mfa_verified = True
-        sess.mfa_required = True
         self._persist_state()
 
     # chat

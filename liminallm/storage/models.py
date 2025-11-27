@@ -33,6 +33,10 @@ class Session:
     tenant_id: str = "public"
     meta: Dict | None = None
 
+    def __post_init__(self) -> None:
+        if self.expires_at <= self.created_at:
+            raise ValueError("session expiration must be after creation time")
+
     @classmethod
     def new(
         cls,

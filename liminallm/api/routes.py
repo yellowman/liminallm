@@ -357,13 +357,12 @@ async def oauth_start(provider: str, body: OAuthStartRequest):
 
 
 @router.get("/auth/oauth/{provider}/callback", response_model=Envelope)
-async def oauth_callback(provider: str, code: str, state: str, tenant_id: Optional[str] = None, response: Response = None):
+async def oauth_callback(provider: str, code: str, state: str, response: Response, tenant_id: Optional[str] = None):
     runtime = get_runtime()
     user, session, tokens = await runtime.auth.complete_oauth(provider, code, state, tenant_id=tenant_id)
     if not user or not session:
         raise _http_error("unauthorized", "oauth verification failed", status_code=401)
-    if response:
-        _apply_session_cookies(response, session, tokens, refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes)
+    _apply_session_cookies(response, session, tokens, refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes)
     return Envelope(
         status="ok",
         data=AuthResponse(
@@ -383,17 +382,16 @@ async def oauth_callback(provider: str, code: str, state: str, tenant_id: Option
 @router.post("/auth/refresh", response_model=Envelope)
 async def refresh_tokens(
     body: TokenRefreshRequest,
+    response: Response,
     authorization: Optional[str] = Header(None),
     x_tenant_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Tenant-ID"),
-    response: Response = None,
 ):
     runtime = get_runtime()
     tenant_hint = body.tenant_id or x_tenant_id
     user, session, tokens = await runtime.auth.refresh_tokens(body.refresh_token, tenant_hint=tenant_hint)
     if not user or not session:
         raise _http_error("unauthorized", "invalid refresh", status_code=401)
-    if response:
-        _apply_session_cookies(response, session, tokens, refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes)
+    _apply_session_cookies(response, session, tokens, refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes)
     return Envelope(
         status="ok",
         data=AuthResponse(
@@ -591,9 +589,9 @@ async def verify_email(body: EmailVerificationRequest):
 
 @router.post("/auth/logout", response_model=Envelope)
 async def logout(
+    response: Response,
     session_id: Optional[str] = Header(None, convert_underscores=False),
     authorization: Optional[str] = Header(None),
-    response: Response = None,
 ):
     runtime = get_runtime()
     if authorization or session_id:
@@ -602,9 +600,8 @@ async def logout(
         if not target_session:
             raise _http_error("unauthorized", "invalid session", status_code=401)
         await runtime.auth.revoke(target_session)
-    if response:
-        response.delete_cookie("session_id", path="/")
-        response.delete_cookie("refresh_token", path="/")
+    response.delete_cookie("session_id", path="/")
+    response.delete_cookie("refresh_token", path="/")
     return Envelope(status="ok", data={"message": "session revoked"})
 
 
@@ -642,7 +639,7 @@ async def chat(
             try:
                 audio_bytes = base64.b64decode(body.message.content)
             except Exception:
-                audio_bytes = body.message.content.encode()
+                audio_bytes = b""
             transcript = runtime.voice.transcribe(audio_bytes, user_id=user_id) or {}
             user_content = transcript.get("transcript", body.message.content)
             voice_meta = {"mode": "voice", "transcript": transcript}
@@ -689,12 +686,12 @@ async def chat(
             content=assistant_msg.content,
             content_struct=assistant_msg.content_struct,
             workflow_id=body.workflow_id,
-            adapters=orchestration.get("adapters", []),
-            adapter_gates=orchestration.get("adapter_gates", []),
-            usage=orchestration.get("usage", {}),
-            context_snippets=orchestration.get("context_snippets", []),
-            routing_trace=orchestration.get("routing_trace", []),
-            workflow_trace=orchestration.get("workflow_trace", []),
+            adapters=orchestration_dict.get("adapters", []),
+            adapter_gates=orchestration_dict.get("adapter_gates", []),
+            usage=orchestration_dict.get("usage", {}),
+            context_snippets=orchestration_dict.get("context_snippets", []),
+            routing_trace=orchestration_dict.get("routing_trace", []),
+            workflow_trace=orchestration_dict.get("workflow_trace", []),
         )
         envelope = Envelope(status="ok", data=resp.model_dump(), request_id=idem.request_id)
         if runtime.cache:
@@ -1382,12 +1379,12 @@ async def websocket_chat(ws: WebSocket):
                 content=assistant_msg.content,
                 content_struct=assistant_msg.content_struct,
                 workflow_id=init.get("workflow_id"),
-                adapters=orchestration.get("adapters", []),
-                adapter_gates=orchestration.get("adapter_gates", []),
-                usage=orchestration.get("usage", {}),
-                context_snippets=orchestration.get("context_snippets", []),
-                routing_trace=orchestration.get("routing_trace", []),
-                workflow_trace=orchestration.get("workflow_trace", []),
+                adapters=orchestration_dict.get("adapters", []),
+                adapter_gates=orchestration_dict.get("adapter_gates", []),
+                usage=orchestration_dict.get("usage", {}),
+                context_snippets=orchestration_dict.get("context_snippets", []),
+                routing_trace=orchestration_dict.get("routing_trace", []),
+                workflow_trace=orchestration_dict.get("workflow_trace", []),
             ).model_dump(),
             request_id=request_id,
         )

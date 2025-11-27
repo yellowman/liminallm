@@ -162,7 +162,10 @@ class WorkflowEngine:
             return []
         cached: Optional[dict] = None
         if self.cache:
-            cached = await self.cache.get_conversation_summary(conversation_id)
+            try:
+                cached = await self.cache.get_conversation_summary(conversation_id)
+            except Exception as exc:
+                self.logger.warning("cache_conversation_summary_failed", error=str(exc))
         if cached and isinstance(cached.get("recent_messages"), list):
             deserialized = self._deserialize_messages(cached["recent_messages"])
             if deserialized:
