@@ -123,7 +123,7 @@ const setConversation = (id) => {
 
 const extractError = (payload, fallback) => {
   const detail = payload?.detail || payload?.error || payload;
-  if (typeof detail === 'string') return detail;
+  if (typeof detail === 'string') return detail.trim() || fallback;
   if (detail?.message) return detail.message;
   if (detail?.error?.message) return detail.error.message;
   return fallback;
