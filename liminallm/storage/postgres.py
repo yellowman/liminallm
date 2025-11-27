@@ -1254,15 +1254,20 @@ class PostgresStore:
             meta=meta,
         )
 
-    def list_messages(self, conversation_id: str, limit: int = 10, *, user_id: Optional[str] = None) -> List[Message]:
+    def list_messages(
+        self, conversation_id: str, limit: Optional[int] = None, *, user_id: Optional[str] = None
+    ) -> List[Message]:
         with self._connect() as conn:
             params: list[Any] = []
             query = "SELECT m.* FROM message m"
             if user_id:
                 query += " JOIN conversation c ON c.id = m.conversation_id AND c.user_id = %s"
                 params.append(user_id)
-            query += " WHERE m.conversation_id = %s ORDER BY m.seq DESC LIMIT %s"
-            params.extend([conversation_id, limit])
+            query += " WHERE m.conversation_id = %s ORDER BY m.seq DESC"
+            params.append(conversation_id)
+            if limit is not None:
+                query += " LIMIT %s"
+                params.append(limit)
             rows = conn.execute(query, tuple(params)).fetchall()
         messages: List[Message] = []
         for row in reversed(rows):

@@ -709,11 +709,20 @@ class MemoryStore:
             sections["config_patches"] = [_serialize(p) for p in list(self.config_patches.values())[:limit]]
         return sections
 
-    def list_messages(self, conversation_id: str, limit: int = 10, *, user_id: Optional[str] = None, **_: Any) -> List[Message]:
+    def list_messages(
+        self,
+        conversation_id: str,
+        limit: Optional[int] = None,
+        *,
+        user_id: Optional[str] = None,
+        **_: Any,
+    ) -> List[Message]:
         conv = self.get_conversation(conversation_id, user_id=user_id) if user_id else self.conversations.get(conversation_id)
         if not conv:
             return []
         msgs = self.messages.get(conversation_id, [])
+        if limit is None:
+            return list(msgs)
         return msgs[-limit:]
 
     def list_conversations(self, user_id: str, limit: int = 20) -> List[Conversation]:

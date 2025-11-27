@@ -1188,10 +1188,14 @@ async def upload_file(
 
 
 @router.get("/conversations/{conversation_id}/messages", response_model=Envelope)
-async def list_messages(conversation_id: str, principal: AuthContext = Depends(get_user)):
+async def list_messages(
+    conversation_id: str,
+    limit: Optional[int] = Query(None, ge=1, le=500),
+    principal: AuthContext = Depends(get_user),
+):
     runtime = get_runtime()
     _get_owned_conversation(runtime, conversation_id, principal)
-    msgs = runtime.store.list_messages(conversation_id, user_id=principal.user_id)
+    msgs = runtime.store.list_messages(conversation_id, limit=limit, user_id=principal.user_id)
     payload = [
         {
             "id": m.id,
