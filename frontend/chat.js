@@ -9,13 +9,24 @@ const adminWarning = document.getElementById('admin-warning');
 const conversationLabel = document.getElementById('conversation-label');
 const adminLink = document.getElementById('admin-link');
 
+const sessionStorageKey = (key) => `liminal.${key}`;
+
+const readSession = (key) => sessionStorage.getItem(sessionStorageKey(key));
+const writeSession = (key, value) => {
+  if (value) {
+    sessionStorage.setItem(sessionStorageKey(key), value);
+  } else {
+    sessionStorage.removeItem(sessionStorageKey(key));
+  }
+};
+
 const state = {
-  accessToken: localStorage.getItem('liminal.accessToken'),
-  refreshToken: localStorage.getItem('liminal.refreshToken'),
-  sessionId: localStorage.getItem('liminal.sessionId'),
-  tenantId: localStorage.getItem('liminal.tenantId'),
-  role: localStorage.getItem('liminal.role'),
-  userId: localStorage.getItem('liminal.userId'),
+  accessToken: readSession('accessToken'),
+  refreshToken: readSession('refreshToken'),
+  sessionId: readSession('sessionId'),
+  tenantId: readSession('tenantId'),
+  role: readSession('role'),
+  userId: readSession('userId'),
   conversationId: null,
 };
 
@@ -72,12 +83,12 @@ const persistAuth = (payload) => {
   state.role = payload.role;
   state.tenantId = payload.tenant_id;
   state.userId = payload.user_id;
-  localStorage.setItem('liminal.accessToken', state.accessToken || '');
-  localStorage.setItem('liminal.refreshToken', state.refreshToken || '');
-  localStorage.setItem('liminal.sessionId', state.sessionId || '');
-  localStorage.setItem('liminal.role', state.role || '');
-  localStorage.setItem('liminal.tenantId', state.tenantId || '');
-  localStorage.setItem('liminal.userId', state.userId || '');
+  writeSession('accessToken', state.accessToken);
+  writeSession('refreshToken', state.refreshToken);
+  writeSession('sessionId', state.sessionId);
+  writeSession('role', state.role);
+  writeSession('tenantId', state.tenantId);
+  writeSession('userId', state.userId);
   sessionIndicator.textContent = state.accessToken
     ? `Signed in as ${state.userId || payload.user_id || 'current'} (${state.role || 'user'})`
     : 'Not signed in';
@@ -112,7 +123,7 @@ const setConversation = (id) => {
 
 const extractError = (payload, fallback) => {
   const detail = payload?.detail || payload?.error || payload;
-  if (typeof detail === 'string') return detail;
+  if (typeof detail === 'string') return detail.trim() || fallback;
   if (detail?.message) return detail.message;
   if (detail?.error?.message) return detail.error.message;
   return fallback;
@@ -256,14 +267,9 @@ const logout = async () => {
   state.role = null;
   state.tenantId = null;
   state.userId = null;
-  [
-    'liminal.accessToken',
-    'liminal.refreshToken',
-    'liminal.sessionId',
-    'liminal.role',
-    'liminal.tenantId',
-    'liminal.userId',
-  ].forEach((k) => localStorage.removeItem(k));
+  ['accessToken', 'refreshToken', 'sessionId', 'role', 'tenantId', 'userId'].forEach((k) =>
+    sessionStorage.removeItem(sessionStorageKey(k))
+  );
   setConversation(null);
   messagesEl.innerHTML = '';
   sessionIndicator.textContent = 'Not signed in';

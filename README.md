@@ -294,6 +294,12 @@ MIT
   - `GET /v1/artifacts` → lists data-driven workflows/policies
 - admin config endpoints (`/v1/config/*`) require an admin-role token and are intended for the admin UI only
 
+## testing
+
+- Default tests run with in-memory stores: `TEST_MODE=true USE_MEMORY_STORE=true ALLOW_REDIS_FALLBACK_DEV=true ./scripts/run_tests.sh`
+- To exercise Postgres-backed behaviors, start a local Postgres instance and set `DATABASE_URL` plus `USE_MEMORY_STORE=false` before running the script.
+- CI runs compile-time checks and the pytest suite against a Postgres service via `.github/workflows/tests.yml`.
+
 ## operational hardening
 
 - local rate limits now fall back to in-process counters when Redis is unavailable (TEST_MODE), covering auth and chat flows
