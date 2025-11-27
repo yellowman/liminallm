@@ -1139,6 +1139,7 @@ class MemoryStore:
     def search_chunks_pgvector(
         self,
         context_ids: Optional[Sequence[str]],
+        query: str,
         query_embedding: List[float],
         limit: int = 4,
         filters: Optional[dict] = None,
@@ -1178,7 +1179,39 @@ class MemoryStore:
         if not allowed_chunks:
             return []
 
-        bm25_scores = [0.0 for _ in allowed_chunks]
+        def _tokenize(text: str) -> List[str]:
+            return re.findall(r"\w+", text.lower())
+
+        def _bm25_scores(query_tokens: Sequence[str], documents: List[List[str]]) -> List[float]:
+            if not query_tokens or not documents:
+                return [0.0 for _ in documents]
+            N = len(documents)
+            avgdl = sum(len(doc) for doc in documents) / float(N)
+            doc_freq: Dict[str, int] = {}
+            for doc in documents:
+                seen = set(doc)
+                for tok in seen:
+                    doc_freq[tok] = doc_freq.get(tok, 0) + 1
+            k1 = 1.5
+            b = 0.75
+            scores: List[float] = []
+            for doc in documents:
+                tf: Dict[str, int] = {}
+                for tok in doc:
+                    tf[tok] = tf.get(tok, 0) + 1
+                score = 0.0
+                for tok in query_tokens:
+                    df = doc_freq.get(tok, 0)
+                    if df == 0:
+                        continue
+                    idf = math.log(1 + (N - df + 0.5) / (df + 0.5))
+                    freq = tf.get(tok, 0)
+                    denom = freq + k1 * (1 - b + b * (len(doc) / (avgdl or 1.0)))
+                    score += idf * (freq * (k1 + 1)) / denom if denom else 0.0
+                scores.append(score)
+            return scores
+
+        bm25_scores = _bm25_scores(_tokenize(query or ""), [_tokenize(ch.content) for ch in allowed_chunks])
         semantic_scores = []
         for ch in allowed_chunks:
             if not query_embedding or not ch.embedding:

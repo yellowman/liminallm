@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import inspect
 import random
 from datetime import datetime
@@ -51,7 +52,7 @@ class SemanticClusterer:
             for evt in members:
                 self.store.update_preference_event(evt.id, cluster_id=cluster.id)
             results.append(cluster)
-        self.label_clusters(results, events)
+        await self.label_clusters(results, events)
         return results
 
     def _mini_batch_kmeans(
@@ -80,7 +81,9 @@ class SemanticClusterer:
             assignments[idx] = max(range(len(sims)), key=lambda i: sims[i])
         return centroids, assignments
 
-    def label_clusters(self, clusters: Iterable[SemanticCluster], events: Sequence[PreferenceEvent], samples: int = 3) -> None:
+    async def label_clusters(
+        self, clusters: Iterable[SemanticCluster], events: Sequence[PreferenceEvent], samples: int = 3
+    ) -> None:
         event_lookup = {e.cluster_id: [] for e in events if e.cluster_id}
         for evt in events:
             if evt.cluster_id in event_lookup:
@@ -93,7 +96,7 @@ class SemanticClusterer:
                 elif evt.context_text:
                     texts.append(evt.context_text)
             summary_prompt = "\n".join(texts) if texts else "No examples"
-            label, description = self._label_with_llm(cluster, summary_prompt)
+            label, description = await self._label_with_llm(cluster, summary_prompt)
             self.store.update_semantic_cluster(
                 cluster.id,
                 label=label,
@@ -101,14 +104,22 @@ class SemanticClusterer:
                 meta={"labeled_at": datetime.utcnow().isoformat()},
             )
 
-    def _label_with_llm(self, cluster: SemanticCluster, text: str) -> Tuple[str, str]:
+    async def _label_with_llm(self, cluster: SemanticCluster, text: str) -> Tuple[str, str]:
         if self.llm:
             prompt = (
                 "You label semantic clusters of user preference events. "
                 "Return JSON with fields 'label' (3-5 words) and 'description' (one sentence).\n"
                 f"Cluster size: {cluster.size}\nSample messages:\n{text}"
             )
-            resp = self.llm.generate(prompt, adapters=[], context_snippets=[], history=None)
+            generate_fn = getattr(self.llm, "generate", None)
+            if inspect.iscoroutinefunction(generate_fn):
+                resp = await generate_fn(prompt, adapters=[], context_snippets=[], history=None)
+            elif callable(getattr(asyncio, "to_thread", None)):
+                resp = await asyncio.to_thread(
+                    generate_fn, prompt, [], [], None
+                )
+            else:
+                resp = generate_fn(prompt, adapters=[], context_snippets=[], history=None)
             content = resp.get("content", "") if isinstance(resp, dict) else ""
             parsed = self._parse_label_response(content)
             if parsed:

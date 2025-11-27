@@ -113,7 +113,7 @@ class RAGService:
         filters = {"embedding_model_id": self.embedding_model_id}
 
         return self.store.search_chunks_pgvector(  # type: ignore[attr-defined]
-            allowed_ids, query_embedding, limit, filters=filters, user_id=user_id, tenant_id=tenant_id
+            allowed_ids, query, query_embedding, limit, filters=filters, user_id=user_id, tenant_id=tenant_id
         )
 
     def _retrieve_local_hybrid(

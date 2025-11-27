@@ -54,6 +54,25 @@ const stableHash = (str) => {
   return Math.abs(hash >>> 0).toString(16);
 };
 
+const fetchWithRetry = async (url, options, retries = 3, backoffMs = 400) => {
+  let attempt = 0;
+  let lastError;
+  while (attempt <= retries) {
+    try {
+      return await fetch(url, options);
+    } catch (err) {
+      lastError = err;
+      if (attempt === retries) break;
+      const delay = backoffMs * Math.pow(2, attempt);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+    attempt += 1;
+  }
+  const attempts = attempt + 1;
+  const label = attempts === 1 ? 'attempt' : 'attempts';
+  throw new Error(`Request failed after ${attempts} ${label}: ${lastError?.message || 'unknown error'}`);
+};
+
 const headers = (idempotencyKey) => {
   const h = { 'Content-Type': 'application/json' };
   if (state.accessToken) h['Authorization'] = `Bearer ${state.accessToken}`;
@@ -188,6 +207,69 @@ const renderPreferencePanel = () => {
   }
 };
 
+let chatSocket = null;
+let chatSocketConnecting = false;
+let chatSocketReconnectTimer = null;
+
+const connectWebSocket = () => {
+  if (chatSocketConnecting) return chatSocket;
+  if (chatSocket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(chatSocket.readyState)) {
+    return chatSocket;
+  }
+  chatSocketConnecting = true;
+  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+  const wsUrl = `${protocol}://${window.location.host}${apiBase}/chat/stream`;
+  chatSocket = new WebSocket(wsUrl);
+  chatSocket.onopen = () => {
+    chatSocketConnecting = false;
+  };
+  chatSocket.onerror = () => {
+    chatSocketConnecting = false;
+  };
+  chatSocket.onclose = () => {
+    chatSocketConnecting = false;
+    chatSocket = null;
+    if (chatSocketReconnectTimer) clearTimeout(chatSocketReconnectTimer);
+    chatSocketReconnectTimer = setTimeout(() => {
+      chatSocketReconnectTimer = null;
+      connectWebSocket();
+    }, 2000);
+  };
+  return chatSocket;
+};
+
+const ensureWebSocket = () =>
+  new Promise((resolve, reject) => {
+    const socket = connectWebSocket();
+    if (!socket) {
+      reject(new Error('WebSocket unavailable'));
+      return;
+    }
+    if (socket.readyState === WebSocket.OPEN) {
+      resolve(socket);
+      return;
+    }
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(new Error('WebSocket connection timeout'));
+    }, 5000);
+    const cleanup = () => {
+      clearTimeout(timeout);
+      socket.removeEventListener('open', handleOpen);
+      socket.removeEventListener('error', handleError);
+    };
+    const handleOpen = () => {
+      cleanup();
+      resolve(socket);
+    };
+    const handleError = () => {
+      cleanup();
+      reject(new Error('WebSocket connection failed'));
+    };
+    socket.addEventListener('open', handleOpen);
+    socket.addEventListener('error', handleError);
+  });
+
 const extractError = (payload, fallback) => {
   const detail = payload?.detail || payload?.error || payload;
   if (typeof detail === 'string') return detail.trim() || fallback;
@@ -197,7 +279,7 @@ const extractError = (payload, fallback) => {
 };
 
 const requestEnvelope = async (url, options, fallbackMessage) => {
-  const resp = await fetch(url, options);
+  const resp = await fetchWithRetry(url, options);
   const text = await resp.text();
   const trimmed = text.trim();
   let payload;
@@ -269,11 +351,17 @@ const sendMessage = async (event) => {
 
   const handleChatResponse = (data) => {
     setConversation(data.conversation_id);
+    const structuredSegments = data.content_struct?.segments;
+    const renderedContent =
+      structuredSegments?.map((seg) => (typeof seg === 'string' ? seg : seg?.text || '')).join(' ')
+        || data.content;
+    const citations = data.content_struct?.citations || [];
     const metaBits = [];
     if (data.adapters?.length) metaBits.push(`adapters: ${data.adapters.join(', ')}`);
     if (data.context_snippets?.length) metaBits.push(`context: ${data.context_snippets.length} snippets`);
     if (data.usage?.total_tokens) metaBits.push(`usage: ${data.usage.total_tokens} tokens`);
-    appendMessage('assistant', data.content, metaBits.join(' · '));
+    if (citations.length) metaBits.push(`citations: ${citations.length}`);
+    appendMessage('assistant', renderedContent, metaBits.join(' · '));
     state.lastAssistant = {
       conversationId: data.conversation_id,
       messageId: data.message_id,
@@ -287,33 +375,19 @@ const sendMessage = async (event) => {
     showStatus('');
   };
 
-  const chatViaWebSocket = () =>
-    new Promise((resolve, reject) => {
-      const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-      const wsUrl = `${protocol}://${window.location.host}${apiBase}/chat/stream`;
-      const ws = new WebSocket(wsUrl);
+  const chatViaWebSocket = async () => {
+    const ws = await ensureWebSocket();
+    return new Promise((resolve, reject) => {
       let settled = false;
-      ws.onerror = () => {
-        if (!settled) reject(new Error('WebSocket connection failed'));
+      const cleanup = () => {
+        ws.removeEventListener('message', handleMessage);
+        ws.removeEventListener('error', handleError);
+        ws.removeEventListener('close', handleClose);
       };
-      ws.onopen = () => {
-        ws.send(
-          JSON.stringify({
-            idempotency_key: idempotencyKey,
-            request_id: randomIdempotencyKey(),
-            message: payload.message.content,
-            workflow_id: payload.workflow_id,
-            context_id: payload.context_id,
-            conversation_id: payload.conversation_id,
-            access_token: state.accessToken,
-            session_id: state.sessionId,
-            tenant_id: state.tenantId,
-          })
-        );
-      };
-      ws.onmessage = (event) => {
+      const handleMessage = (event) => {
+        if (settled) return;
         settled = true;
-        ws.close();
+        cleanup();
         try {
           const envelope = JSON.parse(event.data);
           if (envelope.status === 'ok') {
@@ -325,10 +399,37 @@ const sendMessage = async (event) => {
           reject(err);
         }
       };
-      ws.onclose = () => {
-        if (!settled) reject(new Error('Connection closed'));
+      const handleError = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new Error('WebSocket connection failed'));
       };
+      const handleClose = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new Error('Connection closed'));
+      };
+
+      ws.addEventListener('message', handleMessage);
+      ws.addEventListener('error', handleError);
+      ws.addEventListener('close', handleClose);
+      ws.send(
+        JSON.stringify({
+          idempotency_key: idempotencyKey,
+          request_id: randomIdempotencyKey(),
+          message: payload.message.content,
+          workflow_id: payload.workflow_id,
+          context_id: payload.context_id,
+          conversation_id: payload.conversation_id,
+          access_token: state.accessToken,
+          session_id: state.sessionId,
+          tenant_id: state.tenantId,
+        })
+      );
     });
+  };
 
   try {
     const data = await chatViaWebSocket().catch(async () => {

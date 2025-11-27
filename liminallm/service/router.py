@@ -39,8 +39,9 @@ class RouterEngine:
         candidates = adapters or []
         cached = None
         ctx_hash = self._hash_embedding(ctx_emb)
-        if self.cache and user_id and ctx_hash:
-            cached = await self.cache.get_router_cache(user_id, ctx_hash)
+        cache_key = self._cache_key(ctx_hash, candidates)
+        if self.cache and user_id and cache_key:
+            cached = await self.cache.get_router_cache(user_id, cache_key)
         if cached:
             return cached
         weights: Dict[str, float] = {}
@@ -59,8 +60,8 @@ class RouterEngine:
                 trace.append({"id": "default_similarity_boost", "when": "auto", "fired": True, "action": {"type": "boost_by_similarity"}, "effect": similarity_effects})
         normalized = self._normalize_weights(weights, policy)
         routing = {"adapters": normalized, "trace": trace, "ctx_cluster": ctx_cluster}
-        if self.cache and user_id and ctx_hash:
-            await self.cache.set_router_cache(user_id, ctx_hash, routing)
+        if self.cache and user_id and cache_key:
+            await self.cache.set_router_cache(user_id, cache_key, routing)
         return routing
 
     def _hash_embedding(self, embedding: List[float]) -> str:
@@ -74,6 +75,24 @@ class RouterEngine:
             return ""
         packed = struct.pack(f">{len(embedding)}d", *[float(v) for v in embedding])
         return hashlib.blake2b(packed, digest_size=32).hexdigest()
+
+    def _hash_adapters(self, adapters: List[dict]) -> str:
+        if not adapters:
+            return "none"
+        identifiers = []
+        for adapter in adapters:
+            adapter_id = adapter.get("id") or adapter.get("name") or adapter.get("base_model") or "anon"
+            version = adapter.get("version") or adapter.get("hash") or ""
+            identifiers.append(f"{adapter_id}:{version}")
+        identifiers.sort()
+        payload = "|".join(identifiers)
+        return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
+
+    def _cache_key(self, ctx_hash: str, adapters: List[dict]) -> str:
+        if not ctx_hash:
+            return ""
+        adapter_hash = self._hash_adapters(adapters)
+        return f"{ctx_hash}:{adapter_hash}"
 
     def _eval_condition(
         self, expr: str, context_embedding: List[float], adapters: List[dict], safety_risk: Optional[str] = None, ctx_cluster: Optional[dict] = None
