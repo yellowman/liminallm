@@ -53,6 +53,7 @@ from liminallm.api.schemas import (
     UserListResponse,
     UserResponse,
     AdminCreateUserRequest,
+    AdminCreateUserResponse,
     UpdateUserRoleRequest,
     AdminInspectionResponse,
     ToolInvokeRequest,
@@ -447,7 +448,7 @@ async def admin_create_user(body: AdminCreateUserRequest, principal: AuthContext
         is_active=body.is_active,
         meta=body.meta,
     )
-    return Envelope(status="ok", data=_user_to_response(user))
+    return Envelope(status="ok", data=AdminCreateUserResponse(**_user_to_response(user).model_dump(), password=password))
 
 
 @router.post("/admin/users/{user_id}/role", response_model=Envelope)
