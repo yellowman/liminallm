@@ -14,6 +14,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service.artifact_validation import ArtifactValidationError, validate_artifact
+from liminallm.service.embeddings import cosine_similarity
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
     Artifact,
@@ -1085,15 +1086,6 @@ class MemoryStore:
         def _tokenize(text: str) -> List[str]:
             return re.findall(r"\w+", text.lower())
 
-        def _cosine(a: List[float], b: List[float]) -> float:
-            if not a or not b:
-                return 0.0
-            length = min(len(a), len(b))
-            dot = sum(a[i] * b[i] for i in range(length))
-            norm_a = sum(x * x for x in a) ** 0.5 or 1.0
-            norm_b = sum(x * x for x in b) ** 0.5 or 1.0
-            return dot / (norm_a * norm_b)
-
         def _bm25_scores(query_tokens: Sequence[str], documents: List[List[str]]) -> List[float]:
             if not query_tokens or not documents:
                 return [0.0 for _ in documents]
@@ -1126,7 +1118,13 @@ class MemoryStore:
         query_tokens = _tokenize(query)
         doc_tokens = [_tokenize(ch.content) for ch in candidates]
         bm25_scores = _bm25_scores(query_tokens, doc_tokens)
-        semantic_scores = [(_cosine(query_embedding, ch.embedding) if query_embedding else 0.0) for ch in candidates]
+        semantic_scores = []
+        for ch in candidates:
+            if not query_embedding or not ch.embedding:
+                semantic_scores.append(0.0)
+                continue
+            dim = min(len(query_embedding), len(ch.embedding))
+            semantic_scores.append(cosine_similarity(query_embedding[:dim], ch.embedding[:dim]))
         max_bm25 = max(bm25_scores) or 1.0
         combined: Dict[str, tuple[KnowledgeChunk, float]] = {}
         for chunk, lex, sem in zip(candidates, bm25_scores, semantic_scores):
@@ -1180,17 +1178,14 @@ class MemoryStore:
         if not allowed_chunks:
             return []
 
-        def _cosine(a: List[float], b: List[float]) -> float:
-            if not a or not b:
-                return 0.0
-            length = min(len(a), len(b))
-            dot = sum(a[i] * b[i] for i in range(length))
-            norm_a = sum(x * x for x in a) ** 0.5 or 1.0
-            norm_b = sum(x * x for x in b) ** 0.5 or 1.0
-            return dot / (norm_a * norm_b)
-
         bm25_scores = [0.0 for _ in allowed_chunks]
-        semantic_scores = [(_cosine(query_embedding, ch.embedding) if query_embedding else 0.0) for ch in allowed_chunks]
+        semantic_scores = []
+        for ch in allowed_chunks:
+            if not query_embedding or not ch.embedding:
+                semantic_scores.append(0.0)
+                continue
+            dim = min(len(query_embedding), len(ch.embedding))
+            semantic_scores.append(cosine_similarity(query_embedding[:dim], ch.embedding[:dim]))
         max_bm25 = max(bm25_scores) or 1.0
         combined: Dict[str, tuple[KnowledgeChunk, float]] = {}
         for chunk, lex, sem in zip(allowed_chunks, bm25_scores, semantic_scores):

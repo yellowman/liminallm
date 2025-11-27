@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import random
 from datetime import datetime
 import json
@@ -17,14 +18,14 @@ class SemanticClusterer:
         self.llm = llm
         self.training = training
 
-    def cluster_user_preferences(
+    async def cluster_user_preferences(
         self, user_id: str, *, k: int = 3, batch_size: int = 8, min_events: int = 3
     ) -> List[SemanticCluster]:
-        events = [
-            e
-            for e in self.store.list_preference_events(user_id=user_id, feedback=POSITIVE_FEEDBACK_VALUES)
-            if e.context_embedding
-        ]
+        events_raw = self.store.list_preference_events(user_id=user_id, feedback=POSITIVE_FEEDBACK_VALUES)
+        events = events_raw
+        if inspect.isawaitable(events_raw):
+            events = await events_raw
+        events = [e for e in events if e.context_embedding]
         if len(events) < min_events:
             return []
         embeddings = pad_vectors([list(e.context_embedding) for e in events])

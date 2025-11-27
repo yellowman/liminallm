@@ -19,6 +19,11 @@ from liminallm.logging import get_logger
 
 logger = get_logger(__name__)
 
+DEFAULT_TRAIN_BATCH_SIZE = 2
+DEFAULT_MAX_TOKEN_LENGTH = 512
+DEFAULT_GRAD_ACCUM_STEPS = 4
+DEFAULT_LORA_LEARNING_RATE = 2e-3
+
 
 class TrainingService:
     """Minimal LoRA adapter training loop following SPEC phase 2."""
@@ -437,8 +442,8 @@ class TrainingService:
     def _tokenize_batches(
         self,
         dataset_entries: Sequence[dict],
-        batch_size: int = 2,
-        max_length: int = 512,
+        batch_size: int = DEFAULT_TRAIN_BATCH_SIZE,
+        max_length: int = DEFAULT_MAX_TOKEN_LENGTH,
         base_model: Optional[str] = None,
     ) -> Iterator[dict]:
         """
@@ -523,7 +528,8 @@ class TrainingService:
         *,
         params_path: Path,
         checkpoint_dir: Optional[Path] = None,
-        accumulation_steps: int = 4,
+        accumulation_steps: int = DEFAULT_GRAD_ACCUM_STEPS,
+        learning_rate: float = DEFAULT_LORA_LEARNING_RATE,
     ) -> dict:
         """
         Train a single LoRA adapter with a supervised loss and checkpoints.
@@ -612,7 +618,7 @@ class TrainingService:
             denom = jnp.maximum(jnp.sum(mask), 1.0)
             return jnp.sum(masked) / denom
 
-        opt = optax.adam(2e-3)
+        opt = optax.adam(learning_rate)
         params_tree = _flatten_params(params)
         opt_state = opt.init(params_tree)
         grad_fn = jax.value_and_grad(forward)
