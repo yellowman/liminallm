@@ -23,6 +23,7 @@ const headers = () => {
   const h = { 'Content-Type': 'application/json' };
   if (state.accessToken) h['Authorization'] = `Bearer ${state.accessToken}`;
   if (state.tenantId) h['X-Tenant-ID'] = state.tenantId;
+  if (state.sessionId) h['session_id'] = state.sessionId;
   return h;
 };
 
@@ -94,6 +95,7 @@ const handleLogin = async (event) => {
   const body = {
     email: document.getElementById('admin-email').value,
     password: document.getElementById('admin-password').value,
+    mfa_code: document.getElementById('admin-mfa')?.value || undefined,
     tenant_id: document.getElementById('admin-tenant').value || undefined,
   };
   try {
@@ -106,6 +108,10 @@ const handleLogin = async (event) => {
       },
       'Login failed'
     );
+    if (envelope.data?.mfa_required && !envelope.data?.access_token) {
+      showError('MFA required. Enter your code and submit again.');
+      return;
+    }
     persistAuth(envelope.data);
     if (!gatekeep()) throw new Error('Admin role required');
     showFeedback('Authenticated');
@@ -431,6 +437,18 @@ const runInspect = async () => {
 };
 
 const logout = () => {
+  const tryRevoke = async () => {
+    try {
+      await requestEnvelope(
+        `${apiBase}/auth/logout`,
+        { method: 'POST', headers: headers() },
+        'Logout failed'
+      );
+    } catch (err) {
+      console.warn('logout failed', err);
+    }
+  };
+  tryRevoke();
   ['liminal.accessToken', 'liminal.refreshToken', 'liminal.sessionId', 'liminal.role', 'liminal.tenantId'].forEach((k) =>
     localStorage.removeItem(k)
   );

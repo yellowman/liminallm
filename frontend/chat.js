@@ -37,6 +37,7 @@ const headers = (idempotencyKey) => {
   const h = { 'Content-Type': 'application/json' };
   if (state.accessToken) h['Authorization'] = `Bearer ${state.accessToken}`;
   if (state.tenantId) h['X-Tenant-ID'] = state.tenantId;
+  if (state.sessionId) h['session_id'] = state.sessionId;
   h['Idempotency-Key'] = idempotencyKey || randomIdempotencyKey();
   return h;
 };
@@ -137,6 +138,7 @@ const handleLogin = async (event) => {
   const body = {
     email: document.getElementById('email').value,
     password: document.getElementById('password').value,
+    mfa_code: document.getElementById('mfa')?.value || undefined,
     tenant_id: document.getElementById('tenant').value || undefined,
   };
   try {
@@ -149,6 +151,10 @@ const handleLogin = async (event) => {
       },
       'Login failed'
     );
+    if (envelope.data?.mfa_required && !envelope.data?.access_token) {
+      showStatus('MFA required. Enter the code from your authenticator.', true);
+      return;
+    }
     persistAuth(envelope.data);
     showStatus('Signed in');
   } catch (err) {
@@ -227,6 +233,18 @@ const listConversations = async () => {
 };
 
 const logout = () => {
+  const tryRevoke = async () => {
+    try {
+      await requestEnvelope(
+        `${apiBase}/auth/logout`,
+        { method: 'POST', headers: headers() },
+        'Logout failed'
+      );
+    } catch (err) {
+      console.warn('logout failed', err);
+    }
+  };
+  tryRevoke();
   state.accessToken = null;
   state.refreshToken = null;
   state.sessionId = null;
