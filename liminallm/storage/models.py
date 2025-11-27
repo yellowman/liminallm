@@ -32,11 +32,12 @@ class Session:
     mfa_verified: bool = False
     tenant_id: str = "public"
     meta: Dict | None = None
+    allow_expired: bool = field(default=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if self.expires_at <= self.created_at:
             raise ValueError("session expiration must be after creation time")
-        if self.expires_at <= datetime.utcnow():
+        if not self.allow_expired and self.expires_at <= datetime.utcnow():
             raise ValueError("session expiration must be in the future")
 
     @classmethod

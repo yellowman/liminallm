@@ -1321,6 +1321,7 @@ class MemoryStore:
             mfa_verified=data.get("mfa_verified", False),
             tenant_id=data.get("tenant_id", "public"),
             meta=data.get("meta"),
+            allow_expired=True,
         )
 
     def _serialize_conversation(self, conversation: Conversation) -> dict:
