@@ -251,9 +251,14 @@ const logout = () => {
   state.role = null;
   state.tenantId = null;
   state.userId = null;
-  ['liminal.accessToken', 'liminal.refreshToken', 'liminal.sessionId', 'liminal.role', 'liminal.tenantId', 'liminal.userId'].forEach((k) =>
-    localStorage.removeItem(k)
-  );
+  [
+    'liminal.accessToken',
+    'liminal.refreshToken',
+    'liminal.sessionId',
+    'liminal.role',
+    'liminal.tenantId',
+    'liminal.userId',
+  ].forEach((k) => localStorage.removeItem(k));
   setConversation(null);
   messagesEl.innerHTML = '';
   sessionIndicator.textContent = 'Not signed in';
