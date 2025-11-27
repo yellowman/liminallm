@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import base64
+import json
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Response, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Response, UploadFile, WebSocket, WebSocketDisconnect
 
 from liminallm.content_struct import normalize_content_struct
 from liminallm.api.schemas import (
@@ -220,7 +221,7 @@ def _get_owned_conversation(runtime, conversation_id: str, principal: AuthContex
     if not conversation:
         raise _http_error("not_found", "conversation not found", status_code=404)
     if conversation.user_id != principal.user_id:
-        raise _http_error("forbidden", "forbidden", status_code=403)
+        raise _http_error("forbidden", "conversation is owned by another user", status_code=403)
     return conversation
 
 
@@ -229,7 +230,7 @@ def _get_owned_context(runtime, context_id: str, principal: AuthContext) -> Know
     if not ctx:
         raise _http_error("not_found", "context not found", status_code=404)
     if ctx.owner_user_id != principal.user_id:
-        raise _http_error("forbidden", "forbidden", status_code=403)
+        raise _http_error("forbidden", "context is owned by another user", status_code=403)
     return ctx
 
 
@@ -238,9 +239,10 @@ def _get_owned_artifact(runtime, artifact_id: str, principal: AuthContext):
     if not artifact:
         raise _http_error("not_found", "artifact not found", status_code=404)
     if artifact.owner_user_id and artifact.owner_user_id != principal.user_id:
-        raise _http_error("forbidden", "forbidden", status_code=403)
+        if principal.role != "admin":
+            raise _http_error("forbidden", "artifact is owned by another user", status_code=403)
     if not artifact.owner_user_id and principal.role != "admin":
-        raise _http_error("forbidden", "forbidden", status_code=403)
+        raise _http_error("forbidden", "artifact access requires admin privileges", status_code=403)
     return artifact
 
 
@@ -420,6 +422,12 @@ async def admin_list_users(
 @router.post("/admin/users", response_model=Envelope)
 async def admin_create_user(body: AdminCreateUserRequest, principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"admin:create_user:{principal.user_id}",
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
+    )
     user, password = await runtime.auth.admin_create_user(
         email=body.email,
         password=body.password,
@@ -436,6 +444,12 @@ async def admin_create_user(body: AdminCreateUserRequest, principal: AuthContext
 @router.post("/admin/users/{user_id}/role", response_model=Envelope)
 async def admin_set_role(user_id: str, body: UpdateUserRoleRequest, principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"admin:set_role:{principal.user_id}",
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
+    )
     user = runtime.auth.set_user_role(user_id, body.role)
     if not user:
         raise NotFoundError("user not found", detail={"user_id": user_id})
@@ -445,6 +459,12 @@ async def admin_set_role(user_id: str, body: UpdateUserRoleRequest, principal: A
 @router.delete("/admin/users/{user_id}", response_model=Envelope)
 async def admin_delete_user(user_id: str, principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"admin:delete_user:{principal.user_id}",
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
+    )
     removed = runtime.auth.delete_user(user_id)
     if not removed:
         raise NotFoundError("user not found", detail={"user_id": user_id})
@@ -623,7 +643,7 @@ async def chat(
                 audio_bytes = base64.b64decode(body.message.content)
             except Exception:
                 audio_bytes = body.message.content.encode()
-            transcript = runtime.voice.transcribe(audio_bytes, user_id=user_id)
+            transcript = runtime.voice.transcribe(audio_bytes, user_id=user_id) or {}
             user_content = transcript.get("transcript", body.message.content)
             voice_meta = {"mode": "voice", "transcript": transcript}
         user_content_struct = normalize_content_struct(body.message.content_struct, user_content)
@@ -736,8 +756,8 @@ async def preference_insights(principal: AuthContext = Depends(get_user)):
 async def list_artifacts(
     type: Optional[str] = None,
     kind: Optional[str] = None,
-    page: int = 1,
-    page_size: int = 100,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(100, ge=1, le=500),
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
@@ -939,7 +959,15 @@ async def create_artifact(
             return idem.cached
         if not isinstance(body.schema, dict):
             raise BadRequestError("artifact schema must be an object", detail={"provided_type": type(body.schema).__name__})
+        if any(not isinstance(key, str) for key in body.schema):
+            raise BadRequestError("artifact schema keys must be strings")
+        try:
+            json.dumps(body.schema)
+        except (TypeError, ValueError) as exc:
+            raise BadRequestError("artifact schema must be JSON serializable", detail={"error": str(exc)})
         schema_kind = body.schema.get("kind")
+        if schema_kind is not None and not isinstance(schema_kind, str):
+            raise BadRequestError("artifact kind must be a string", detail={"kind": schema_kind})
         type_prefix = body.type
         if schema_kind and not type_prefix:
             type_prefix = schema_kind.split(".", 1)[0]
@@ -1128,6 +1156,9 @@ async def upload_file(
         if len(contents) > max_bytes:
             raise _http_error("validation_error", "file too large", status_code=413)
         dest_path = safe_join(dest_dir, file.filename)
+        resolved_dest = dest_path.resolve()
+        if dest_dir.resolve() not in resolved_dest.parents and dest_dir.resolve() != resolved_dest:
+            raise _http_error("validation_error", "invalid file path", status_code=400)
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         dest_path.write_bytes(contents)
         chunk_count = None
@@ -1240,9 +1271,12 @@ async def list_chunks(context_id: str, principal: AuthContext = Depends(get_user
     runtime = get_runtime()
     _get_owned_context(runtime, context_id, principal)
     chunks = runtime.store.list_chunks(context_id, owner_user_id=principal.user_id)
+    for ch in chunks:
+        if ch.id is None:
+            raise _http_error("server_error", "chunk id missing for context", status_code=500)
     data = [
         KnowledgeChunkResponse(
-            id=ch.id if ch.id is not None else 0,
+            id=int(ch.id),
             context_id=ch.context_id,
             fs_path=ch.fs_path,
             content=ch.content,
@@ -1272,8 +1306,13 @@ async def synthesize_voice(body: VoiceSynthesisRequest, principal: AuthContext =
 async def websocket_chat(ws: WebSocket):
     runtime = get_runtime()
     await ws.accept()
+    user_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    request_id: Optional[str] = None
     try:
         init = await ws.receive_json()
+        idempotency_key = init.get("idempotency_key")
+        request_id = init.get("request_id")
         session_id = init.get("session_id")
         access_token = init.get("access_token")
         auth_ctx = await runtime.auth.authenticate(
@@ -1284,6 +1323,12 @@ async def websocket_chat(ws: WebSocket):
             await ws.close(code=4401)
             return
         user_id = auth_ctx.user_id
+        request_id, cached = await _resolve_idempotency(
+            "chat:ws", user_id, idempotency_key, require=True, request_id=request_id
+        )
+        if cached:
+            await ws.send_json(cached.model_dump())
+            return
         if runtime.cache:
             allowed = await runtime.cache.check_rate_limit(
                 f"chat:{user_id}", runtime.settings.chat_rate_limit_per_minute, runtime.settings.chat_rate_limit_window_seconds
@@ -1325,23 +1370,33 @@ async def websocket_chat(ws: WebSocket):
                 "usage": orchestration.get("usage", {}),
             },
         )
-        await ws.send_json(
-            Envelope(
-                status="ok",
-                data=ChatResponse(
-                    message_id=assistant_msg.id,
-                    conversation_id=convo_id,
-                    content=assistant_msg.content,
-                    content_struct=assistant_msg.content_struct,
-                    workflow_id=init.get("workflow_id"),
-                    adapters=orchestration.get("adapters", []),
-                    adapter_gates=orchestration.get("adapter_gates", []),
-                    usage=orchestration.get("usage", {}),
-                    context_snippets=orchestration.get("context_snippets", []),
-                    routing_trace=orchestration.get("routing_trace", []),
-                    workflow_trace=orchestration.get("workflow_trace", []),
-                ).model_dump(),
-            ).model_dump()
+        envelope = Envelope(
+            status="ok",
+            data=ChatResponse(
+                message_id=assistant_msg.id,
+                conversation_id=convo_id,
+                content=assistant_msg.content,
+                content_struct=assistant_msg.content_struct,
+                workflow_id=init.get("workflow_id"),
+                adapters=orchestration.get("adapters", []),
+                adapter_gates=orchestration.get("adapter_gates", []),
+                usage=orchestration.get("usage", {}),
+                context_snippets=orchestration.get("context_snippets", []),
+                routing_trace=orchestration.get("routing_trace", []),
+                workflow_trace=orchestration.get("workflow_trace", []),
+            ).model_dump(),
+            request_id=request_id,
         )
+        await _store_idempotency_result("chat:ws", user_id, idempotency_key, envelope)
+        await ws.send_json(envelope.model_dump())
     except WebSocketDisconnect:
         return
+    except Exception as exc:
+        error_env = Envelope(
+            status="error",
+            error={"code": "server_error", "message": str(exc)},
+            request_id=request_id or str(uuid4()),
+        )
+        if user_id:
+            await _store_idempotency_result("chat:ws", user_id, idempotency_key, error_env, status="failed")
+        await ws.close(code=1011)

@@ -1145,8 +1145,14 @@ class PostgresStore:
         return self._cache_session(sess)
 
     def set_session_meta(self, session_id: str, meta: dict) -> None:
+        if not isinstance(meta, dict):
+            raise ValueError("session meta must be a dictionary")
+        try:
+            serialized_meta = json.dumps(meta)
+        except TypeError as exc:
+            raise ValueError("session meta must be JSON serializable") from exc
         with self._connect() as conn:
-            conn.execute("UPDATE auth_session SET meta = %s WHERE id = %s", (json.dumps(meta), session_id))
+            conn.execute("UPDATE auth_session SET meta = %s WHERE id = %s", (serialized_meta, session_id))
         self._update_cached_session(session_id, meta=meta)
 
     # conversations
@@ -1339,8 +1345,10 @@ class PostgresStore:
             if owner_user_id:
                 clauses.append("owner_user_id = %s")
                 params.append(owner_user_id)
-            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-            query = f"SELECT * FROM artifact {where} ORDER BY created_at DESC LIMIT %s OFFSET %s"
+            where = ""
+            if clauses:
+                where = " WHERE " + " AND ".join(clauses)
+            query = "SELECT * FROM artifact" + where + " ORDER BY created_at DESC LIMIT %s OFFSET %s"
             params.extend([limit, offset])
             rows = conn.execute(query, tuple(params)).fetchall()
         artifacts: List[Artifact] = []
@@ -1921,20 +1929,22 @@ class PostgresStore:
         if filters and filters.get("embedding_model_id"):
             where_clauses.append("kc.meta->>'embedding_model_id' = %s")
             params.append(filters["embedding_model_id"])
-        where = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
+        where = ""
+        if where_clauses:
+            where = " WHERE " + " AND ".join(where_clauses)
         with self._connect() as conn:
-            rows = conn.execute(
-                f"""
+            query = (
+                " "
+                """
                 SELECT kc.id, kc.context_id, kc.fs_path, kc.content, kc.embedding, kc.chunk_index, kc.created_at, kc.meta
                 FROM knowledge_chunk kc
                 JOIN knowledge_context ctx ON kc.context_id = ctx.id
                 LEFT JOIN app_user u ON ctx.owner_user_id = u.id
-                {where}
-                ORDER BY kc.embedding <-> %s::vector
-                LIMIT %s
-                """,
-                (*params, self._format_vector(query_embedding), limit),
-            ).fetchall()
+                """
+            )
+            query += where
+            query += " ORDER BY kc.embedding <-> %s::vector LIMIT %s"
+            rows = conn.execute(query, (*params, self._format_vector(query_embedding), limit)).fetchall()
         return [
             KnowledgeChunk(
                 id=int(row["id"]),

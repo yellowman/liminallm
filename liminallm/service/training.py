@@ -58,6 +58,7 @@ class TrainingService:
             self._tokenizer_error = str(exc)
             self._base_vocab_size = self.default_vocab_size
             logger.warning("tokenizer_load_failed", base_model=model_name, error=str(exc))
+            raise
 
     def _vocab_size(self) -> int:
         if isinstance(self._adapter_vocab_size, int) and self._adapter_vocab_size > 0:
