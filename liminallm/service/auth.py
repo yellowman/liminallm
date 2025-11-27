@@ -511,7 +511,7 @@ class AuthService:
         except (InvalidHash, VerifyMismatchError):
             return False
 
-    def _verify_totp(self, secret: str, code: str, *, window: int = 0, interval: int = 30) -> bool:
+    def _verify_totp(self, secret: str, code: str, *, window: int = 1, interval: int = 30) -> bool:
         for offset in range(-window, window + 1):
             generated = self._generate_totp(secret, time.time() + offset * interval, interval=interval)
             if generated and generated == code:
