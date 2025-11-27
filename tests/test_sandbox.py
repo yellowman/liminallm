@@ -5,7 +5,7 @@ def test_safe_eval_expr_allows_basic_operations():
     names = {"x": 2, "y": 3, "add": lambda a, b: a + b}
     expr = "(x + y) == add(5, 0) and not (y < x)"
 
-    result = safe_eval_expr(expr, names)
+    result = safe_eval_expr(expr, names, allowed_callables={"add": names["add"]})
 
     assert result is True
 

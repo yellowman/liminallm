@@ -91,7 +91,7 @@ class RouterEngine:
             "none": None,
         }
         try:
-            return bool(safe_eval_expr(expr, local_scope))
+            return bool(safe_eval_expr(expr, local_scope, allowed_callables=self.safe_functions))
         except Exception as exc:
             logger.warning("routing_condition_evaluation_failed", expr=expr, error=str(exc))
             return False
