@@ -41,9 +41,11 @@
               <label for="tenant">Tenant (optional)</label>
               <input type="text" id="tenant" name="tenant" placeholder="tenant-123" />
             </div>
-            <button class="primary" type="submit">Continue</button>
+            <div class="form-actions">
+              <button class="primary" type="submit" id="auth-submit">Continue</button>
+              <div class="small" id="status" aria-live="polite"></div>
+            </div>
           </form>
-          <div id="status" aria-live="polite"></div>
           <div id="error-banner" role="alert"></div>
         </section>
 
@@ -53,7 +55,7 @@
               <span class="dot"></span>
               <span id="conversation-label">New conversation</span>
             </div>
-            <div class="flex-row">
+            <div class="pill-row">
               <button class="ghost" id="new-thread">New thread</button>
               <button class="minor" id="refresh-conversations">Refresh history</button>
             </div>
@@ -61,18 +63,19 @@
           <div class="subtext">
             Provide an optional context ID to ground retrieval-augmented answers and a workflow ID to steer execution.
           </div>
-          <div class="flex-row" style="gap: 14px; margin-bottom: 8px; flex-wrap: wrap">
-            <div class="field" style="flex: 1 1 220px; margin-bottom: 0">
+          <div class="input-grid">
+            <div class="field compact">
               <label for="context-id">Context ID</label>
               <input type="text" id="context-id" placeholder="ctx_..." />
             </div>
-            <div class="field" style="flex: 1 1 220px; margin-bottom: 0">
+            <div class="field compact">
               <label for="workflow-id">Workflow ID</label>
               <input type="text" id="workflow-id" placeholder="workflow.chat..." />
             </div>
           </div>
 
           <div id="messages" aria-live="polite"></div>
+          <div id="messages-empty" class="empty">Start a new thread to see your conversation history here.</div>
 
           <form id="chat-form">
             <div class="field textarea-wrap">
@@ -81,7 +84,10 @@
             </div>
             <div id="chat-actions">
               <div class="small" id="session-indicator">Not signed in</div>
-              <button type="submit" class="primary" id="send-btn">Send</button>
+              <div class="pill-row">
+                <button type="button" class="ghost" id="new-thread-secondary">Reset</button>
+                <button type="submit" class="primary" id="send-btn">Send</button>
+              </div>
             </div>
           </form>
           <div id="admin-warning" role="status"></div>

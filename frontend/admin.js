@@ -46,6 +46,7 @@ const showError = (msg) => {
 const showFeedback = (msg) => {
   if (!feedbackEl) return;
   feedbackEl.textContent = msg;
+  feedbackEl.style.display = msg ? 'block' : 'none';
 };
 
 const requireAdmin = () => state.role === 'admin';
@@ -64,10 +65,18 @@ const persistAuth = (payload) => {
 };
 
 const gatekeep = () => {
+  if (!state.accessToken) {
+    loginPanel.style.display = 'block';
+    consolePanel.style.display = 'none';
+    showError('');
+    showFeedback('Sign in with an admin account to manage patches and users.');
+    return false;
+  }
   if (!requireAdmin()) {
     loginPanel.style.display = 'block';
     consolePanel.style.display = 'none';
     showError('Admin role required. Sign in with an admin account.');
+    showFeedback('');
     return false;
   }
   loginPanel.style.display = 'none';

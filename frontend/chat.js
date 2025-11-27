@@ -1,5 +1,6 @@
 const apiBase = '/v1';
 const messagesEl = document.getElementById('messages');
+const messagesEmptyEl = document.getElementById('messages-empty');
 const authForm = document.getElementById('auth-form');
 const chatForm = document.getElementById('chat-form');
 const statusEl = document.getElementById('status');
@@ -8,6 +9,8 @@ const sessionIndicator = document.getElementById('session-indicator');
 const adminWarning = document.getElementById('admin-warning');
 const conversationLabel = document.getElementById('conversation-label');
 const adminLink = document.getElementById('admin-link');
+const authSubmit = document.getElementById('auth-submit');
+const sendBtn = document.getElementById('send-btn');
 
 const sessionStorageKey = (key) => `liminal.${key}`;
 
@@ -64,6 +67,25 @@ const showStatus = (message, isError = false) => {
   }
 };
 
+const toggleButtonBusy = (button, isBusy, busyLabel = 'Working...') => {
+  if (!button) return;
+  if (isBusy) {
+    button.dataset.label = button.textContent;
+    button.textContent = busyLabel;
+    button.disabled = true;
+  } else {
+    button.textContent = button.dataset.label || button.textContent;
+    button.disabled = false;
+    delete button.dataset.label;
+  }
+};
+
+const updateEmptyState = () => {
+  if (!messagesEmptyEl) return;
+  const hasMessages = messagesEl?.children?.length;
+  messagesEmptyEl.style.display = hasMessages ? 'none' : 'flex';
+};
+
 const renderAdminNotice = () => {
   if (state.role === 'admin') {
     adminWarning.textContent = 'You are signed in as an admin. Use the Admin link to approve router or workflow patches.';
@@ -114,6 +136,7 @@ const appendMessage = (role, content, meta = '') => {
   wrapper.appendChild(contentWrap);
   messagesEl.appendChild(wrapper);
   messagesEl.scrollTop = messagesEl.scrollHeight;
+  updateEmptyState();
 };
 
 const setConversation = (id) => {
@@ -157,6 +180,7 @@ const handleLogin = async (event) => {
     tenant_id: document.getElementById('tenant').value || undefined,
   };
   try {
+    toggleButtonBusy(authSubmit, true, 'Signing in...');
     const envelope = await requestEnvelope(
       `${apiBase}/auth/login`,
       {
@@ -174,6 +198,8 @@ const handleLogin = async (event) => {
     showStatus('Signed in');
   } catch (err) {
     showStatus(err.message, true);
+  } finally {
+    toggleButtonBusy(authSubmit, false);
   }
 };
 
@@ -185,6 +211,7 @@ const sendMessage = async (event) => {
     showStatus('Sign in to chat.', true);
     return;
   }
+  toggleButtonBusy(sendBtn, true, 'Sending...');
   document.getElementById('message-input').value = '';
   appendMessage('user', content);
   showStatus('Thinking...');
@@ -217,6 +244,8 @@ const sendMessage = async (event) => {
     showStatus('');
   } catch (err) {
     showStatus(err.message, true);
+  } finally {
+    toggleButtonBusy(sendBtn, false, 'Send');
   }
 };
 
@@ -224,6 +253,7 @@ const newConversation = () => {
   setConversation(null);
   messagesEl.innerHTML = '';
   showStatus('New thread ready');
+  updateEmptyState();
 };
 
 const listConversations = async () => {
@@ -274,6 +304,7 @@ const logout = async () => {
   messagesEl.innerHTML = '';
   sessionIndicator.textContent = 'Not signed in';
   renderAdminNotice();
+  updateEmptyState();
 };
 
 // Wire up events
@@ -281,6 +312,8 @@ if (authForm) authForm.addEventListener('submit', handleLogin);
 if (chatForm) chatForm.addEventListener('submit', sendMessage);
 const newThreadBtn = document.getElementById('new-thread');
 if (newThreadBtn) newThreadBtn.addEventListener('click', newConversation);
+const newThreadSecondaryBtn = document.getElementById('new-thread-secondary');
+if (newThreadSecondaryBtn) newThreadSecondaryBtn.addEventListener('click', newConversation);
 const refreshBtn = document.getElementById('refresh-conversations');
 if (refreshBtn) refreshBtn.addEventListener('click', listConversations);
 const logoutBtn = document.getElementById('logout');
@@ -300,3 +333,4 @@ if (state.accessToken) {
 } else {
   renderAdminNotice();
 }
+updateEmptyState();
