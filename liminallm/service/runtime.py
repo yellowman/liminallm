@@ -50,15 +50,17 @@ class Runtime:
                     "start Redis or set TEST_MODE=true/ALLOW_REDIS_FALLBACK_DEV=true for local fallback."
                 ) from redis_error
 
+            fallback_mode = "TEST_MODE" if self.settings.test_mode else "ALLOW_REDIS_FALLBACK_DEV"
+
             logger.warning(
                 "redis_disabled_fallback",
                 redis_url=self.settings.redis_url,
                 error=str(redis_error) if redis_error else "redis_url_missing",
                 message=(
-                    "Running without Redis under %s; rate limits, idempotency durability, and workflow/router caches "
-                    "are in-memory only."
+                    f"Running without Redis under {fallback_mode}; rate limits, idempotency durability, and "
+                    "workflow/router caches are in-memory only."
                 ),
-                mode="TEST_MODE" if self.settings.test_mode else "ALLOW_REDIS_FALLBACK_DEV",
+                mode=fallback_mode,
             )
         self.router = RouterEngine(cache=self.cache)
         runtime_config = {}
