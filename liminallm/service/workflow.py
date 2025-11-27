@@ -23,6 +23,8 @@ from liminallm.storage.models import Message
 from liminallm.storage.postgres import PostgresStore
 from liminallm.storage.redis_cache import RedisCache
 
+MAX_CONTEXT_SNIPPETS = 20
+
 
 class WorkflowEngine:
     """Executes workflow.chat graphs using a small tool registry."""
@@ -43,6 +45,7 @@ class WorkflowEngine:
         self.logger = get_logger(__name__)
         self.tool_registry = self._build_tool_registry()
         self.cache = cache
+        self._tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
     async def run(
         self,
@@ -72,6 +75,7 @@ class WorkflowEngine:
         vars_scope: Dict[str, Any] = {}
         workflow_trace: List[Dict[str, Any]] = []
         context_snippets: List[str] = []
+        context_seen = set()
         content = ""
         usage: Dict[str, Any] = {}
 
@@ -110,7 +114,13 @@ class WorkflowEngine:
             if result.get("outputs"):
                 vars_scope.update(result["outputs"])
             if result.get("context_snippets"):
-                context_snippets.extend(result["context_snippets"])
+                for snippet in result["context_snippets"]:
+                    if snippet in context_seen:
+                        continue
+                    if len(context_snippets) >= MAX_CONTEXT_SNIPPETS:
+                        break
+                    context_seen.add(snippet)
+                    context_snippets.append(snippet)
             if result.get("content"):
                 content = result["content"]
             node_usage = result.get("usage")
@@ -452,22 +462,16 @@ class WorkflowEngine:
                 tenant_id,
             )
 
-        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        future = executor.submit(_run_handler)
-        shutdown = False
+        future = self._tool_executor.submit(_run_handler)
+        cancelled = False
         try:
             return future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
             self.logger.warning("tool_timeout", tool=tool_name, timeout=timeout)
             cancelled = future.cancel()
-            executor.shutdown(wait=False, cancel_futures=True)
-            shutdown = True
             if not cancelled:
                 self.logger.warning("tool_timeout_cancellation_failed", tool=tool_name)
             return {"status": "error", "content": "tool timed out", "error": "timeout"}
-        finally:
-            if not shutdown:
-                executor.shutdown(wait=True, cancel_futures=True)
 
     def _builtin_tool_handlers(
         self,
@@ -707,3 +711,9 @@ class WorkflowEngine:
                 "workflow_condition_evaluation_failed", expr=expr, error=str(exc)
             )
             return False
+
+    def __del__(self) -> None:
+        try:
+            self._tool_executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass

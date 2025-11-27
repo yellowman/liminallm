@@ -52,9 +52,9 @@ class LLMService:
         if history:
             for msg in history:
                 messages.append({"role": msg.role, "content": msg.content})
-            messages = self._inject_context(messages, context_snippets)
-        else:
-            messages.append({"role": "user", "content": self._format_user(prompt, context_snippets)})
+
+        messages.append({"role": "user", "content": self._format_user(prompt, context_snippets)})
+        messages = self._inject_context(messages, context_snippets)
         return self.backend.generate(messages, normalized_adapters, user_id=user_id)
 
     def _format_user(self, prompt: str, context_snippets: List[str]) -> str:

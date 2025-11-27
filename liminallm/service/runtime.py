@@ -44,30 +44,21 @@ class Runtime:
                 self.cache = None
 
         if not self.cache:
-            if not self.settings.test_mode:
-                if self.settings.allow_redis_fallback_dev:
-                    logger.warning(
-                        "redis_fallback_blocked_without_test_mode",
-                        redis_url=self.settings.redis_url,
-                        error=str(redis_error) if redis_error else "redis_url_missing",
-                        message=(
-                            "Redis is required; set TEST_MODE=true for explicit test harnesses or start Redis. "
-                            "ALLOW_REDIS_FALLBACK_DEV is ignored without TEST_MODE."
-                        ),
-                    )
+            if not self.settings.test_mode and not self.settings.allow_redis_fallback_dev:
                 raise RuntimeError(
                     "Redis is required for sessions, rate limits, idempotency, and workflow caches; "
-                    "start Redis or set TEST_MODE=true for explicit test harnesses."
+                    "start Redis or set TEST_MODE=true/ALLOW_REDIS_FALLBACK_DEV=true for local fallback."
                 ) from redis_error
 
             logger.warning(
-                "redis_disabled_test_mode",
+                "redis_disabled_fallback",
                 redis_url=self.settings.redis_url,
                 error=str(redis_error) if redis_error else "redis_url_missing",
                 message=(
-                    "Running without Redis under TEST_MODE; rate limits, idempotency durability, and workflow/router caches "
-                    "are disabled."
+                    "Running without Redis under %s; rate limits, idempotency durability, and workflow/router caches "
+                    "are in-memory only."
                 ),
+                mode="TEST_MODE" if self.settings.test_mode else "ALLOW_REDIS_FALLBACK_DEV",
             )
         self.router = RouterEngine(cache=self.cache)
         runtime_config = {}
@@ -177,7 +168,7 @@ async def check_rate_limit(runtime: Runtime, key: str, limit: int, window_second
     """Enforce rate limits even when Redis is unavailable."""
 
     if limit <= 0:
-        return False
+        return True
     now = datetime.utcnow()
     if runtime.cache:
         return await runtime.cache.check_rate_limit(key, limit, window_seconds)

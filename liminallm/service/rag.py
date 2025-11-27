@@ -63,6 +63,9 @@ class RAGService:
     def _allowed_context_ids(
         self, context_ids: Sequence[str], *, user_id: Optional[str], tenant_id: Optional[str]
     ) -> List[str]:
+        if not user_id:
+            return []
+
         allowed: List[str] = []
         if hasattr(self.store, "contexts"):
             contexts = getattr(self.store, "contexts")
@@ -128,8 +131,9 @@ class RAGService:
             return []
 
         results: List[KnowledgeChunk] = []
+        per_context_limit = max(1, math.ceil(limit / len(allowed_ids)))
         for ctx_id in allowed_ids:
-            results.extend(legacy_search(ctx_id, query, query_embedding, limit))
+            results.extend(legacy_search(ctx_id, query, query_embedding, per_context_limit))
 
         filtered = [
             chunk for chunk in results if (chunk.meta or {}).get("embedding_model_id") == self.embedding_model_id
