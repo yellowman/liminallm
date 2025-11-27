@@ -53,13 +53,11 @@ class LLMService:
             for msg in history:
                 messages.append({"role": msg.role, "content": msg.content})
 
-        messages.append({"role": "user", "content": self._format_user(prompt, context_snippets)})
+        messages.append({"role": "user", "content": self._format_user(prompt)})
         messages = self._inject_context(messages, context_snippets)
         return self.backend.generate(messages, normalized_adapters, user_id=user_id)
 
-    def _format_user(self, prompt: str, context_snippets: List[str]) -> str:
-        if context_snippets:
-            return f"{prompt}\nContext: {' | '.join(context_snippets)}"
+    def _format_user(self, prompt: str) -> str:
         return prompt
 
     def _inject_context(self, messages: List[dict], context_snippets: List[str]) -> List[dict]:
@@ -69,7 +67,11 @@ class LLMService:
         for idx in range(len(updated) - 1, -1, -1):
             msg = updated[idx]
             if msg.get("role") == "user":
-                msg["content"] = f"{msg.get('content', '')}\nContext: {' | '.join(context_snippets)}"
+                context_text = f"Context: {' | '.join(context_snippets)}"
+                content = msg.get("content", "")
+                if context_text not in content:
+                    content = f"{content}\n{context_text}"
+                msg["content"] = content
                 updated[idx] = msg
                 return updated
         updated.append({"role": "system", "content": f"Context: {' | '.join(context_snippets)}"})
