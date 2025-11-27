@@ -1141,6 +1141,7 @@ class PostgresStore:
             mfa_verified=row.get("mfa_verified", False),
             tenant_id=row.get("tenant_id", "public"),
             meta=meta,
+            allow_expired=True,
         )
         return self._cache_session(sess)
 
