@@ -165,11 +165,19 @@ const decidePatch = async (decision) => {
     showError('Provide a patch id');
     return;
   }
+  const normalizedDecision = decision === 'reject' ? 'reject' : decision === 'approve' ? 'approve' : null;
+  if (!normalizedDecision) {
+    showError('Decision must be approve or reject');
+    return;
+  }
   try {
     const resp = await fetch(`${apiBase}/config/patches/${patchId}/decide`, {
       method: 'POST',
       headers: headers(),
-      body: JSON.stringify({ decision, reason: `console ${decision}` }),
+      body: JSON.stringify({
+        decision: normalizedDecision,
+        reason: `console ${normalizedDecision}`,
+      }),
     });
     if (!resp.ok) throw new Error((await resp.json()).detail || 'Unable to decide patch');
     await fetchPatches();
@@ -387,9 +395,9 @@ if (refreshBtn) refreshBtn.addEventListener('click', fetchPatches);
 const proposeBtn = document.getElementById('propose-patch');
 if (proposeBtn) proposeBtn.addEventListener('click', proposePatch);
 const approveBtn = document.getElementById('approve-patch');
-if (approveBtn) approveBtn.addEventListener('click', () => decidePatch('approved'));
+if (approveBtn) approveBtn.addEventListener('click', () => decidePatch('approve'));
 const rejectBtn = document.getElementById('reject-patch');
-if (rejectBtn) rejectBtn.addEventListener('click', () => decidePatch('rejected'));
+if (rejectBtn) rejectBtn.addEventListener('click', () => decidePatch('reject'));
 const applyBtn = document.getElementById('apply-patch');
 if (applyBtn) applyBtn.addEventListener('click', applyPatch);
 const refreshUsersBtn = document.getElementById('refresh-users');
