@@ -351,6 +351,26 @@ button.minor {
   gap: 10px;
 }
 
+.hidden {
+  display: none !important;
+}
+
+.flex-wrap {
+  flex-wrap: wrap;
+}
+
+.mb-14 {
+  margin-bottom: 14px;
+}
+
+.mb-12 {
+  margin-bottom: 12px;
+}
+
+.mt-12 {
+  margin-top: 12px;
+}
+
 .pill-row {
   display: flex;
   align-items: center;

@@ -97,7 +97,8 @@ const stableHash = (str) => {
   return Math.abs(hash >>> 0).toString(16);
 };
 
-const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+const DEFAULT_UPLOAD_BYTES = 10 * 1024 * 1024;
+let uploadLimitBytes = null;
 const ALLOWED_UPLOAD_TYPES = ['text/plain', 'text/markdown', 'application/pdf', 'application/json', 'text/csv'];
 const ALLOWED_UPLOAD_EXTENSIONS = ['.txt', '.md', '.markdown', '.pdf', '.json', '.csv', '.yaml', '.yml'];
 
@@ -115,10 +116,26 @@ const formatBytes = (bytes) => {
   return `${size.toFixed(1)} ${units[u]}`;
 };
 
+const getUploadLimit = () => uploadLimitBytes || DEFAULT_UPLOAD_BYTES;
+
+const refreshUploadLimits = async () => {
+  if (!state.accessToken) return;
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/files/limits`,
+      { method: 'GET', headers: headers() },
+      'Failed to load upload limits'
+    );
+    uploadLimitBytes = envelope.data?.max_upload_bytes || uploadLimitBytes;
+    renderUploadHint();
+  } catch (err) {
+    console.warn('Unable to refresh upload limits', err);
+  }
+};
+
 const fetchWithRetry = async (url, options, retries = 3, backoffMs = 400) => {
-  let attempt = 0;
   let lastError;
-  while (attempt <= retries) {
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
       return await fetch(url, options);
     } catch (err) {
@@ -127,9 +144,8 @@ const fetchWithRetry = async (url, options, retries = 3, backoffMs = 400) => {
       const delay = backoffMs * Math.pow(2, attempt);
       await new Promise((resolve) => setTimeout(resolve, delay));
     }
-    attempt += 1;
   }
-  const attempts = attempt + 1;
+  const attempts = retries + 1;
   const label = attempts === 1 ? 'attempt' : 'attempts';
   throw new Error(`Request failed after ${attempts} ${label}: ${lastError?.message || 'unknown error'}`);
 };
@@ -198,6 +214,7 @@ const persistAuth = (payload) => {
     ? `Signed in as ${state.userId || payload.user_id || 'current'} (${state.role || 'user'})`
     : 'Not signed in';
   renderAdminNotice();
+  refreshUploadLimits();
 };
 
 const setUploadStatus = (message, isError = false) => {
@@ -208,10 +225,11 @@ const setUploadStatus = (message, isError = false) => {
 
 const validateUploadFile = (file) => {
   if (!file) return { ok: false, message: 'Choose a file to upload.' };
-  if (file.size > MAX_UPLOAD_BYTES) {
+  const limit = getUploadLimit();
+  if (file.size > limit) {
     return {
       ok: false,
-      message: `File too large (${formatBytes(file.size)}). Max allowed is ${formatBytes(MAX_UPLOAD_BYTES)}.`,
+      message: `File too large (${formatBytes(file.size)}). Max allowed is ${formatBytes(limit)}.`,
     };
   }
   const name = (file.name || '').toLowerCase();
@@ -230,7 +248,7 @@ const renderUploadHint = () => {
   if (!fileUploadHint) return;
   const file = fileUploadInput?.files?.[0];
   if (!file) {
-    fileUploadHint.textContent = `Up to ${formatBytes(MAX_UPLOAD_BYTES)}. Supported: ${ALLOWED_UPLOAD_EXTENSIONS.join(', ')}`;
+    fileUploadHint.textContent = `Up to ${formatBytes(getUploadLimit())}. Supported: ${ALLOWED_UPLOAD_EXTENSIONS.join(', ')}`;
     return;
   }
   fileUploadHint.textContent = `${file.name} · ${formatBytes(file.size)} · ${file.type || 'unknown type'}`;

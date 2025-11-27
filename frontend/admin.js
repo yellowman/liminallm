@@ -73,20 +73,20 @@ const persistAuth = (payload) => {
 const gatekeep = () => {
   if (!state.accessToken) {
     loginPanel.style.display = 'block';
-    consolePanel.style.display = 'none';
+    consolePanel.classList.add('hidden');
     showError('');
     showFeedback('Sign in with an admin account to manage patches and users.');
     return false;
   }
   if (!requireAdmin()) {
     loginPanel.style.display = 'block';
-    consolePanel.style.display = 'none';
+    consolePanel.classList.add('hidden');
     showError('Admin role required. Sign in with an admin account.');
     showFeedback('');
     return false;
   }
   loginPanel.style.display = 'none';
-  consolePanel.style.display = 'block';
+  consolePanel.classList.remove('hidden');
   sessionIndicator.textContent = `Signed in as admin (${state.tenantId || 'global'})`;
   showError('');
   return true;

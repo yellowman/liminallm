@@ -1161,18 +1161,27 @@ async def get_config(principal: AuthContext = Depends(get_admin_user)):
 
     runtime = get_runtime()
     settings = get_settings().model_dump()
-    redacted_keys = {
-        "jwt_secret",
-        "database_url",
-        "redis_url",
-        "adapter_openai_api_key",
+    sensitive_tokens = ("secret", "token", "key", "password", "credential", "api", "url")
+    sanitized_settings = {
+        k: ("[redacted]" if any(tok in k for tok in sensitive_tokens) and v else v)
+        for k, v in settings.items()
     }
-    sanitized_settings = {k: ("[redacted]" if k in redacted_keys and v else v) for k, v in settings.items()}
     return Envelope(
         status="ok",
         data={
             "runtime_config": runtime.store.get_runtime_config() if hasattr(runtime.store, "get_runtime_config") else {},
             "settings": sanitized_settings,
+        },
+    )
+
+
+@router.get("/files/limits", response_model=Envelope)
+async def get_file_limits(principal: AuthContext = Depends(get_user)):
+    runtime = get_runtime()
+    return Envelope(
+        status="ok",
+        data={
+            "max_upload_bytes": runtime.settings.max_upload_bytes,
         },
     )
 

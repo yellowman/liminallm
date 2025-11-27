@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import secrets
 import uuid
 import hashlib
 import math
@@ -83,23 +84,33 @@ class MemoryStore:
     def _derive_cipher_key(key_material: str) -> bytes:
         return base64.urlsafe_b64encode(hashlib.sha256(key_material.encode()).digest())
 
-    def _build_mfa_cipher(self, key_material: str | None) -> Fernet | None:
+    def _build_mfa_cipher(self, key_material: str | None) -> Fernet:
         material = key_material or os.getenv("MFA_SECRET_KEY") or os.getenv("JWT_SECRET")
         if not material:
-            secret_path = self.fs_root / ".jwt_secret"
-            try:
-                if secret_path.exists():
-                    material = secret_path.read_text().strip()
-            except Exception:
-                pass
-        if not material:
-            self.logger.warning("mfa_secret_unencrypted", reason="missing_key_material")
-            return None
+            shared_fs = Path(os.getenv("SHARED_FS_ROOT", "/srv/liminallm"))
+            secret_path = shared_fs / ".jwt_secret"
+            fallback_path = self.fs_root / ".jwt_secret"
+            for candidate in (secret_path, fallback_path):
+                try:
+                    if candidate.exists():
+                        material = candidate.read_text().strip()
+                        if material:
+                            break
+                except Exception:
+                    continue
+            if not material:
+                generated = secrets.token_urlsafe(64)
+                try:
+                    secret_path.parent.mkdir(parents=True, exist_ok=True)
+                    secret_path.write_text(generated)
+                    os.chmod(secret_path, 0o600)
+                    material = generated
+                except Exception as exc:
+                    raise RuntimeError("Unable to persist MFA encryption key") from exc
         try:
             return Fernet(self._derive_cipher_key(material))
         except Exception as exc:
-            self.logger.warning("mfa_secret_cipher_init_failed", error=str(exc))
-            return None
+            raise RuntimeError("Unable to initialize MFA cipher") from exc
 
     @staticmethod
     def _serialize_datetime(dt: datetime) -> str:
@@ -338,14 +349,14 @@ class MemoryStore:
         if not secret:
             return secret
         if not self._mfa_cipher:
-            return secret
+            raise RuntimeError("MFA cipher unavailable; secret cannot be stored")
         return self._mfa_cipher.encrypt(secret.encode()).decode()
 
     def _decrypt_mfa_secret(self, secret: str) -> str:
         if not secret:
             return secret
         if not self._mfa_cipher:
-            return secret
+            raise RuntimeError("MFA cipher unavailable; cannot decrypt secret")
         try:
             return self._mfa_cipher.decrypt(secret.encode()).decode()
         except InvalidToken:

@@ -9,6 +9,10 @@ from typing import Any
 from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from liminallm.logging import get_logger
+
+logger = get_logger(__name__)
+
 
 class ModelBackend(str, Enum):
     """Accepted model backend modes as defined in SPEC §5."""
@@ -123,17 +127,18 @@ class Settings(BaseModel):
                 persisted = secret_path.read_text().strip()
                 if persisted:
                     return persisted
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.error("jwt_secret_read_failed", error=str(exc), path=str(secret_path))
 
         generated = secrets.token_urlsafe(64)
         try:
             secret_path.write_text(generated)
             os.chmod(secret_path, 0o600)
-        except Exception:
-            # If persistence fails we still return the generated secret, but tokens
-            # will rotate on restart until storage is writable.
-            pass
+        except Exception as exc:
+            logger.error("jwt_secret_persist_failed", error=str(exc), path=str(secret_path))
+            raise RuntimeError(
+                "Unable to persist JWT secret; set JWT_SECRET or make SHARED_FS_ROOT writable"
+            ) from exc
         return generated
 
 
