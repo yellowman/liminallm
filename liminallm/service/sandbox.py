@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import ast
 import operator
-from typing import Any, Mapping
+from collections.abc import Mapping, Sequence
+from typing import Any
 
 
 _BIN_OPS = {
@@ -86,7 +87,11 @@ def _eval_node(node: ast.AST, names: Mapping[str, Any]) -> Any:
         return True
 
     if isinstance(node, ast.Call):
-        func = _eval_node(node.func, names)
+        if not isinstance(node.func, ast.Name):
+            raise ValueError("callable references must be simple names")
+        if node.func.id not in names:
+            raise ValueError(f"unknown callable {node.func.id}")
+        func = names[node.func.id]
         if not callable(func):
             raise ValueError("call target is not callable")
         args = [_eval_node(arg, names) for arg in node.args]
@@ -96,6 +101,8 @@ def _eval_node(node: ast.AST, names: Mapping[str, Any]) -> Any:
     if isinstance(node, ast.Subscript):
         target = _eval_node(node.value, names)
         index = _eval_node(node.slice, names)
+        if not isinstance(target, (Mapping, Sequence, str, bytes)):
+            raise ValueError("subscript targets must be sequences or mappings")
         try:
             return target[index]
         except Exception as exc:

@@ -78,7 +78,7 @@ class ArtifactValidationError(Exception):
 def validate_artifact(type_: str, schema: Dict[str, Any]) -> None:
     validator_schema = _ARTIFACT_SCHEMAS.get(type_)
     if not validator_schema:
-        return
+        raise ArtifactValidationError("unknown artifact type", [type_])
     validator = Draft202012Validator(validator_schema)
     errors = sorted(validator.iter_errors(schema), key=lambda e: e.path)
     if errors:

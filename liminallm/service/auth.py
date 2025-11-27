@@ -202,12 +202,16 @@ class AuthService:
     async def complete_oauth(
         self, provider: str, code: str, state: str, *, tenant_id: Optional[str] = None
     ) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
-        cached_state = await self.cache.pop_oauth_state(state) if self.cache else None
-        stored = cached_state or self._oauth_states.pop(state, None)
+        cache_state_used = bool(self.cache)
+        if self.cache:
+            stored = await self.cache.pop_oauth_state(state)
+            self._oauth_states.pop(state, None)
+        else:
+            stored = self._oauth_states.pop(state, None)
         now = datetime.utcnow()
         async def _clear_oauth_state() -> None:
             self._oauth_states.pop(state, None)
-            if self.cache:
+            if self.cache and not cache_state_used:
                 await self.cache.pop_oauth_state(state)
 
         if not stored or stored[1] < now or stored[0] != provider:

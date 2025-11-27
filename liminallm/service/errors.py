@@ -27,4 +27,19 @@ class BadRequestError(ServiceError):
     status_code = 400
 
 
-__all__ = ["ServiceError", "ConflictError", "NotFoundError", "BadRequestError"]
+class AuthenticationError(ServiceError):
+    status_code = 401
+
+
+class SessionExpiredError(ServiceError):
+    status_code = 401
+
+
+__all__ = [
+    "ServiceError",
+    "ConflictError",
+    "NotFoundError",
+    "BadRequestError",
+    "AuthenticationError",
+    "SessionExpiredError",
+]

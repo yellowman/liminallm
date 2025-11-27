@@ -1105,12 +1105,12 @@ class PostgresStore:
         try:
             with self._connect() as conn:
                 conn.execute(
-                    "UPDATE auth_session SET mfa_verified = TRUE, mfa_required = TRUE WHERE id = %s",
+                    "UPDATE auth_session SET mfa_verified = TRUE WHERE id = %s",
                     (session_id,),
                 )
         except Exception as exc:
             self.logger.warning("mark_session_verified_failed", error=str(exc))
-        self._update_cached_session(session_id, mfa_verified=True, mfa_required=True)
+        self._update_cached_session(session_id, mfa_verified=True)
 
     def get_session(self, session_id: str) -> Optional[Session]:
         with self._connect() as conn:
@@ -1266,14 +1266,16 @@ class PostgresStore:
             rows = conn.execute(query, tuple(params)).fetchall()
         messages: List[Message] = []
         for row in reversed(rows):
-            content_struct = row.get("content_struct") if isinstance(row, dict) else row["content_struct"]
+            if not isinstance(row, dict):
+                raise TypeError("list_messages expects mapping rows")
+            content_struct = row.get("content_struct")
             if isinstance(content_struct, str):
                 try:
                     content_struct = json.loads(content_struct)
                 except Exception:
                     content_struct = None
-            content_struct = normalize_content_struct(content_struct, row.get("content") if isinstance(row, dict) else row["content"])
-            meta = row.get("meta") if isinstance(row, dict) else row["meta"]
+            content_struct = normalize_content_struct(content_struct, row.get("content"))
+            meta = row.get("meta")
             if isinstance(meta, str):
                 try:
                     meta = json.loads(meta)

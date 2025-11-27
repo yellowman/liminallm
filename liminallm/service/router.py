@@ -20,7 +20,7 @@ class RouterEngine:
         self.safe_functions = {
             "cosine_similarity": cosine_similarity,
             "contains": lambda haystack, needle: needle in haystack if haystack is not None else False,
-            "len": len,
+            "len": lambda value: len(value) if isinstance(value, (list, tuple, dict, str, bytes)) else 0,
         }
         self.cache = cache
 
