@@ -47,7 +47,11 @@ class ConfigOpsService:
 
     def decide_patch(self, patch_id: int, decision: str, reason: Optional[str] = None) -> ConfigPatchAudit:
         normalized = decision.lower()
-        if normalized not in {"approved", "rejected"}:
+        if normalized in {"approve", "approved"}:
+            normalized = "approved"
+        elif normalized in {"reject", "rejected"}:
+            normalized = "rejected"
+        else:
             raise BadRequestError("invalid decision", detail={"decision": decision})
         updated = self.store.update_config_patch_status(
             patch_id,
