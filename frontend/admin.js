@@ -11,12 +11,22 @@ const adapterTableWrapper = document.getElementById('adapter-table-wrapper');
 const inspectOutput = document.getElementById('inspect-output');
 const createdPasswordEl = document.getElementById('created-user-password');
 
+const sessionStorageKey = (key) => `liminal.${key}`;
+const readSession = (key) => sessionStorage.getItem(sessionStorageKey(key));
+const writeSession = (key, value) => {
+  if (value) {
+    sessionStorage.setItem(sessionStorageKey(key), value);
+  } else {
+    sessionStorage.removeItem(sessionStorageKey(key));
+  }
+};
+
 const state = {
-  accessToken: localStorage.getItem('liminal.accessToken'),
-  refreshToken: localStorage.getItem('liminal.refreshToken'),
-  sessionId: localStorage.getItem('liminal.sessionId'),
-  tenantId: localStorage.getItem('liminal.tenantId'),
-  role: localStorage.getItem('liminal.role'),
+  accessToken: readSession('accessToken'),
+  refreshToken: readSession('refreshToken'),
+  sessionId: readSession('sessionId'),
+  tenantId: readSession('tenantId'),
+  role: readSession('role'),
 };
 
 const headers = () => {
@@ -46,11 +56,11 @@ const persistAuth = (payload) => {
   state.sessionId = payload.session_id;
   state.role = payload.role;
   state.tenantId = payload.tenant_id;
-  localStorage.setItem('liminal.accessToken', state.accessToken || '');
-  localStorage.setItem('liminal.refreshToken', state.refreshToken || '');
-  localStorage.setItem('liminal.sessionId', state.sessionId || '');
-  localStorage.setItem('liminal.role', state.role || '');
-  localStorage.setItem('liminal.tenantId', state.tenantId || '');
+  writeSession('accessToken', state.accessToken);
+  writeSession('refreshToken', state.refreshToken);
+  writeSession('sessionId', state.sessionId);
+  writeSession('role', state.role);
+  writeSession('tenantId', state.tenantId);
 };
 
 const gatekeep = () => {
@@ -454,8 +464,8 @@ const logout = async () => {
   };
 
   await tryRevoke();
-  ['liminal.accessToken', 'liminal.refreshToken', 'liminal.sessionId', 'liminal.role', 'liminal.tenantId'].forEach((k) =>
-    localStorage.removeItem(k)
+  ['accessToken', 'refreshToken', 'sessionId', 'role', 'tenantId'].forEach((k) =>
+    sessionStorage.removeItem(sessionStorageKey(k))
   );
   window.location.href = '/';
 };
