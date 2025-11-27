@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, List, Optional
+from typing import Any, List, Literal, Optional
 from uuid import uuid4
 
 from pydantic import BaseModel, EmailStr, Field, field_validator
@@ -279,7 +279,7 @@ class PreferenceInsightsResponse(BaseModel):
 
 
 class ConfigPatchDecisionRequest(BaseModel):
-    decision: str
+    decision: Literal["approve", "reject"]
     reason: Optional[str] = None
 
 
@@ -328,7 +328,7 @@ class UserListResponse(BaseModel):
 
 
 class AdminCreateUserRequest(BaseModel):
-    email: str
+    email: EmailStr
     password: Optional[str] = None
     handle: Optional[str] = None
     role: Optional[str] = None
@@ -339,7 +339,7 @@ class AdminCreateUserRequest(BaseModel):
 
 
 class UpdateUserRoleRequest(BaseModel):
-    role: str
+    role: Literal["admin", "user"]
 
 
 class AdminInspectionResponse(BaseModel):

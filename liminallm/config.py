@@ -76,6 +76,8 @@ class Settings(BaseModel):
     login_rate_limit_per_minute: int = env_field(10, "LOGIN_RATE_LIMIT_PER_MINUTE")
     signup_rate_limit_per_minute: int = env_field(5, "SIGNUP_RATE_LIMIT_PER_MINUTE")
     reset_rate_limit_per_minute: int = env_field(5, "RESET_RATE_LIMIT_PER_MINUTE")
+    admin_rate_limit_per_minute: int = env_field(30, "ADMIN_RATE_LIMIT_PER_MINUTE")
+    admin_rate_limit_window_seconds: int = env_field(60, "ADMIN_RATE_LIMIT_WINDOW_SECONDS")
 
     model_config = ConfigDict(extra="ignore")
 

@@ -203,21 +203,25 @@ class AuthService:
         self, provider: str, code: str, state: str, *, tenant_id: Optional[str] = None
     ) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
         cached_state = await self.cache.pop_oauth_state(state) if self.cache else None
-        stored = cached_state or self._oauth_states.get(state)
+        stored = cached_state or self._oauth_states.pop(state, None)
         now = datetime.utcnow()
+        async def _clear_oauth_state() -> None:
+            self._oauth_states.pop(state, None)
+            if self.cache:
+                await self.cache.pop_oauth_state(state)
+
         if not stored or stored[1] < now or stored[0] != provider:
+            await _clear_oauth_state()
             return None, None, {}
         _, _, tenant_hint = stored
         if tenant_id and tenant_hint and tenant_id != tenant_hint:
+            await _clear_oauth_state()
             return None, None, {}
         identity = await self._exchange_oauth_code(provider, code)
         if not identity:
-            if not cached_state:
-                self._oauth_states.pop(state, None)
+            await _clear_oauth_state()
             return None, None, {}
-        self._oauth_states.pop(state, None)
-        if self.cache and not cached_state:
-            await self.cache.pop_oauth_state(state)
+        await _clear_oauth_state()
         provider_uid = identity.get("provider_uid")
         if not provider_uid:
             return None, None, {}
@@ -236,7 +240,8 @@ class AuthService:
             try:
                 self.store.link_user_auth_provider(user.id, provider, provider_uid)
             except Exception as exc:
-                self.logger.warning("link_oauth_provider_failed", error=str(exc))
+                self.logger.error("link_oauth_provider_failed", error=str(exc))
+                raise
         session = self.store.create_session(user.id, tenant_id=user.tenant_id)
         tokens = self._issue_tokens(user, session)
         if self.cache:
