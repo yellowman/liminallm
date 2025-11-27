@@ -10,6 +10,7 @@ const userTableWrapper = document.getElementById('user-table-wrapper');
 const adapterTableWrapper = document.getElementById('adapter-table-wrapper');
 const inspectOutput = document.getElementById('inspect-output');
 const createdPasswordEl = document.getElementById('created-user-password');
+const runtimeConfigEl = document.getElementById('runtime-config');
 
 const sessionStorageKey = (key) => `liminal.${key}`;
 const readSession = (key) => sessionStorage.getItem(sessionStorageKey(key));
@@ -179,6 +180,21 @@ const fetchPatches = async () => {
     showFeedback(`Loaded ${envelope.data.items?.length || 0} patches`);
   } catch (err) {
     showError(err.message);
+  }
+};
+
+const fetchRuntimeConfig = async () => {
+  if (!runtimeConfigEl) return;
+  runtimeConfigEl.textContent = 'Loading config...';
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/config`,
+      { headers: headers() },
+      'Unable to load config'
+    );
+    runtimeConfigEl.textContent = JSON.stringify(envelope.data, null, 2);
+  } catch (err) {
+    runtimeConfigEl.textContent = err.message;
   }
 };
 
@@ -504,11 +520,14 @@ const refreshAdaptersBtn = document.getElementById('refresh-adapters');
 if (refreshAdaptersBtn) refreshAdaptersBtn.addEventListener('click', fetchAdapters);
 const runInspectBtn = document.getElementById('run-inspect');
 if (runInspectBtn) runInspectBtn.addEventListener('click', runInspect);
+const refreshConfigBtn = document.getElementById('refresh-config');
+if (refreshConfigBtn) refreshConfigBtn.addEventListener('click', fetchRuntimeConfig);
 
 // Bootstrap existing session
 if (state.accessToken) {
   if (gatekeep()) {
     fetchPatches();
+    fetchRuntimeConfig();
     fetchUsers();
     fetchAdapters();
   }

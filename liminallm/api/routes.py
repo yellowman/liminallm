@@ -1155,6 +1155,28 @@ async def auto_patch(body: AutoPatchRequest, principal: AuthContext = Depends(ge
     return Envelope(status="ok", data=resp)
 
 
+@router.get("/config", response_model=Envelope)
+async def get_config(principal: AuthContext = Depends(get_admin_user)):
+    """Expose runtime configuration for the admin console."""
+
+    runtime = get_runtime()
+    settings = get_settings().model_dump()
+    redacted_keys = {
+        "jwt_secret",
+        "database_url",
+        "redis_url",
+        "adapter_openai_api_key",
+    }
+    sanitized_settings = {k: ("[redacted]" if k in redacted_keys and v else v) for k, v in settings.items()}
+    return Envelope(
+        status="ok",
+        data={
+            "runtime_config": runtime.store.get_runtime_config() if hasattr(runtime.store, "get_runtime_config") else {},
+            "settings": sanitized_settings,
+        },
+    )
+
+
 @router.post("/files/upload", response_model=Envelope)
 async def upload_file(
     file: UploadFile = File(...),

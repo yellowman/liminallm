@@ -11,6 +11,12 @@ const conversationLabel = document.getElementById('conversation-label');
 const adminLink = document.getElementById('admin-link');
 const authSubmit = document.getElementById('auth-submit');
 const sendBtn = document.getElementById('send-btn');
+const preferenceStatusEl = document.getElementById('preference-status');
+const preferenceMetaEl = document.getElementById('preference-meta');
+const preferenceRoutingEl = document.getElementById('preference-routing');
+const preferenceTargetEl = document.getElementById('preference-target');
+const preferenceHintEl = document.getElementById('preference-hint');
+const preferenceNotesEl = document.getElementById('preference-notes');
 
 const sessionStorageKey = (key) => `liminal.${key}`;
 
@@ -31,6 +37,7 @@ const state = {
   role: readSession('role'),
   userId: readSession('userId'),
   conversationId: null,
+  lastAssistant: null,
 };
 
 const randomIdempotencyKey = () => {
@@ -142,6 +149,43 @@ const appendMessage = (role, content, meta = '') => {
 const setConversation = (id) => {
   state.conversationId = id;
   conversationLabel.textContent = id ? `Conversation ${id}` : 'New conversation';
+  if (!id) {
+    state.lastAssistant = null;
+    renderPreferencePanel();
+  }
+};
+
+const renderPreferencePanel = () => {
+  if (!preferenceStatusEl || !preferenceMetaEl || !preferenceRoutingEl || !preferenceTargetEl || !preferenceHintEl) return;
+  if (!state.lastAssistant) {
+    preferenceStatusEl.textContent = '';
+    preferenceMetaEl.textContent = '';
+    preferenceRoutingEl.textContent = '';
+    preferenceTargetEl.textContent = 'No assistant message selected yet.';
+    preferenceHintEl.textContent = 'Send a message to enable thumbs up/down feedback.';
+    return;
+  }
+  preferenceHintEl.textContent = 'Thumbs apply to the latest assistant response.';
+  const { conversationId, messageId, adapters, contextSnippets } = state.lastAssistant;
+  preferenceTargetEl.textContent = `Conversation ${conversationId} · Message ${messageId}`;
+  const meta = {
+    adapters: adapters || [],
+    context_snippets: contextSnippets?.length || 0,
+    adapter_gates: state.lastAssistant.adapterGates || [],
+  };
+  preferenceMetaEl.textContent = JSON.stringify(meta, null, 2);
+  if (state.lastAssistant.routingTrace?.length || state.lastAssistant.workflowTrace?.length) {
+    preferenceRoutingEl.textContent = JSON.stringify(
+      {
+        routing_trace: state.lastAssistant.routingTrace || [],
+        workflow_trace: state.lastAssistant.workflowTrace || [],
+      },
+      null,
+      2
+    );
+  } else {
+    preferenceRoutingEl.textContent = 'No routing trace';
+  }
 };
 
 const extractError = (payload, fallback) => {
@@ -220,28 +264,86 @@ const sendMessage = async (event) => {
     message: { content, mode: 'text' },
     context_id: document.getElementById('context-id').value || undefined,
     workflow_id: document.getElementById('workflow-id').value || undefined,
-    stream: false,
   };
   const idempotencyKey = `chat-${stableHash(JSON.stringify(payload))}`;
 
-  try {
-    const envelope = await requestEnvelope(
-      `${apiBase}/chat`,
-      {
-        method: 'POST',
-        headers: headers(idempotencyKey),
-        body: JSON.stringify(payload),
-      },
-      'Chat failed'
-    );
-    const data = envelope.data;
+  const handleChatResponse = (data) => {
     setConversation(data.conversation_id);
     const metaBits = [];
     if (data.adapters?.length) metaBits.push(`adapters: ${data.adapters.join(', ')}`);
     if (data.context_snippets?.length) metaBits.push(`context: ${data.context_snippets.length} snippets`);
     if (data.usage?.total_tokens) metaBits.push(`usage: ${data.usage.total_tokens} tokens`);
     appendMessage('assistant', data.content, metaBits.join(' · '));
+    state.lastAssistant = {
+      conversationId: data.conversation_id,
+      messageId: data.message_id,
+      adapters: data.adapters || [],
+      adapterGates: data.adapter_gates || [],
+      routingTrace: data.routing_trace || [],
+      workflowTrace: data.workflow_trace || [],
+      contextSnippets: data.context_snippets || [],
+    };
+    renderPreferencePanel();
     showStatus('');
+  };
+
+  const chatViaWebSocket = () =>
+    new Promise((resolve, reject) => {
+      const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+      const wsUrl = `${protocol}://${window.location.host}${apiBase}/chat/stream`;
+      const ws = new WebSocket(wsUrl);
+      let settled = false;
+      ws.onerror = () => {
+        if (!settled) reject(new Error('WebSocket connection failed'));
+      };
+      ws.onopen = () => {
+        ws.send(
+          JSON.stringify({
+            idempotency_key: idempotencyKey,
+            request_id: randomIdempotencyKey(),
+            message: payload.message.content,
+            workflow_id: payload.workflow_id,
+            context_id: payload.context_id,
+            conversation_id: payload.conversation_id,
+            access_token: state.accessToken,
+            session_id: state.sessionId,
+            tenant_id: state.tenantId,
+          })
+        );
+      };
+      ws.onmessage = (event) => {
+        settled = true;
+        ws.close();
+        try {
+          const envelope = JSON.parse(event.data);
+          if (envelope.status === 'ok') {
+            resolve(envelope.data);
+          } else {
+            reject(new Error(extractError(envelope.error, 'Chat failed')));
+          }
+        } catch (err) {
+          reject(err);
+        }
+      };
+      ws.onclose = () => {
+        if (!settled) reject(new Error('Connection closed'));
+      };
+    });
+
+  try {
+    const data = await chatViaWebSocket().catch(async () => {
+      const envelope = await requestEnvelope(
+        `${apiBase}/chat`,
+        {
+          method: 'POST',
+          headers: headers(idempotencyKey),
+          body: JSON.stringify({ ...payload, stream: false }),
+        },
+        'Chat failed'
+      );
+      return envelope.data;
+    });
+    handleChatResponse(data);
   } catch (err) {
     showStatus(err.message, true);
   } finally {
@@ -254,6 +356,37 @@ const newConversation = () => {
   messagesEl.innerHTML = '';
   showStatus('New thread ready');
   updateEmptyState();
+};
+
+const sendPreference = async (isPositive) => {
+  if (!state.lastAssistant) {
+    preferenceStatusEl.textContent = 'No assistant message to rate yet.';
+    return;
+  }
+  try {
+    preferenceStatusEl.textContent = 'Sending feedback...';
+    const body = {
+      conversation_id: state.lastAssistant.conversationId,
+      message_id: state.lastAssistant.messageId,
+      feedback: isPositive ? 'positive' : 'negative',
+      explicit_signal: isPositive ? 'thumbs_up' : 'thumbs_down',
+      routing_trace: state.lastAssistant.routingTrace || undefined,
+      adapter_gates: state.lastAssistant.adapterGates || undefined,
+      notes: preferenceNotesEl?.value || undefined,
+    };
+    await requestEnvelope(
+      `${apiBase}/preferences`,
+      {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify(body),
+      },
+      'Unable to record preference'
+    );
+    preferenceStatusEl.textContent = 'Thanks for your feedback!';
+  } catch (err) {
+    preferenceStatusEl.textContent = err.message;
+  }
 };
 
 const listConversations = async () => {
@@ -318,6 +451,10 @@ const refreshBtn = document.getElementById('refresh-conversations');
 if (refreshBtn) refreshBtn.addEventListener('click', listConversations);
 const logoutBtn = document.getElementById('logout');
 if (logoutBtn) logoutBtn.addEventListener('click', logout);
+const thumbsUpBtn = document.getElementById('thumbs-up');
+if (thumbsUpBtn) thumbsUpBtn.addEventListener('click', () => sendPreference(true));
+const thumbsDownBtn = document.getElementById('thumbs-down');
+if (thumbsDownBtn) thumbsDownBtn.addEventListener('click', () => sendPreference(false));
 
 // Bootstrap from stored credentials
 if (state.accessToken) {
@@ -334,3 +471,4 @@ if (state.accessToken) {
   renderAdminNotice();
 }
 updateEmptyState();
+renderPreferencePanel();
