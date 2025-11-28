@@ -126,7 +126,7 @@ class EmailVerificationRequest(BaseModel):
 
 
 class ChatMessage(BaseModel):
-    content: str
+    content: str = Field(..., max_length=100000)  # 100KB max to prevent DoS
     mode: str = "text"
     content_struct: Optional[dict] = None
 
@@ -216,9 +216,9 @@ class ConfigPatchAuditResponse(BaseModel):
 
 
 class ConfigPatchRequest(BaseModel):
-    artifact_id: str
+    artifact_id: str = Field(..., max_length=255)
     patch: dict
-    justification: str
+    justification: str = Field(..., max_length=2000)
 
 
 class ConversationMessagesResponse(BaseModel):
@@ -240,9 +240,9 @@ class ConversationListResponse(BaseModel):
 
 
 class KnowledgeContextRequest(BaseModel):
-    name: str
-    description: str
-    text: Optional[str] = None
+    name: str = Field(..., max_length=255)
+    description: str = Field(..., max_length=2000)
+    text: Optional[str] = Field(default=None, max_length=10_000_000)  # 10MB max
     chunk_size: Optional[int] = Field(default=None, ge=64, le=4000)
 
 
@@ -333,7 +333,7 @@ class VoiceTranscriptionResponse(BaseModel):
 
 
 class VoiceSynthesisRequest(BaseModel):
-    text: str
+    text: str = Field(..., max_length=5000)  # Reasonable limit for TTS
     voice: Optional[str] = None
 
 

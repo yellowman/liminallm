@@ -425,7 +425,11 @@ async def admin_list_users(
     tenant_id: Optional[str] = None, limit: int = 100, principal: AuthContext = Depends(get_admin_user)
 ):
     runtime = get_runtime()
-    users = runtime.auth.list_users(tenant_id=tenant_id or principal.tenant_id, limit=min(limit, 500))
+    # Admin can only see users in their own tenant (prevent cross-tenant access)
+    target_tenant = tenant_id or principal.tenant_id
+    if target_tenant != principal.tenant_id:
+        raise _http_error("forbidden", "cannot access other tenant users", status_code=403)
+    users = runtime.auth.list_users(tenant_id=target_tenant, limit=min(limit, 500))
     return Envelope(status="ok", data=UserListResponse(items=[_user_to_response(u) for u in users]))
 
 
@@ -484,7 +488,8 @@ async def admin_delete_user(user_id: str, principal: AuthContext = Depends(get_a
 @router.get("/admin/adapters", response_model=Envelope)
 async def admin_list_adapters(principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
-    adapters = runtime.store.list_artifacts(type_filter="adapter")
+    # Filter adapters by tenant to prevent cross-tenant data exposure
+    adapters = runtime.store.list_artifacts(type_filter="adapter", tenant_id=principal.tenant_id)
     return Envelope(
         status="ok",
         data=ArtifactListResponse(
@@ -882,7 +887,9 @@ async def list_workflows(
     runtime = get_runtime()
     resolved_page_size = min(max(page_size, 1), 200)
     artifacts = runtime.store.list_artifacts(
-        type_filter="workflow", kind_filter="workflow.chat", page=page, page_size=resolved_page_size
+        type_filter="workflow", kind_filter="workflow.chat",
+        owner_user_id=principal.user_id,  # Filter by owner
+        page=page, page_size=resolved_page_size
     )
     items = [
         ArtifactResponse(
@@ -905,6 +912,8 @@ async def list_workflows(
 @router.get("/artifacts/{artifact_id}/versions", response_model=Envelope)
 async def list_artifact_versions(artifact_id: str, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
+    # Verify ownership before listing versions
+    _get_owned_artifact(runtime, artifact_id, principal)
     versions = runtime.store.list_artifact_versions(artifact_id)
     if not versions:
         artifact = runtime.store.get_artifact(artifact_id)
@@ -1159,17 +1168,30 @@ async def auto_patch(body: AutoPatchRequest, principal: AuthContext = Depends(ge
 async def get_config(principal: AuthContext = Depends(get_admin_user)):
     """Expose runtime configuration for the admin console."""
 
+    def _sanitize_dict(data: dict) -> dict:
+        """Recursively sanitize sensitive fields in config dictionaries."""
+        sensitive_tokens = ("secret", "token", "key", "password", "credential", "api_key", "private", "auth")
+        sanitized = {}
+        for k, v in data.items():
+            k_lower = k.lower()
+            if any(tok in k_lower for tok in sensitive_tokens):
+                sanitized[k] = "[REDACTED]"
+            elif isinstance(v, dict):
+                sanitized[k] = _sanitize_dict(v)
+            else:
+                sanitized[k] = v
+        return sanitized
+
     runtime = get_runtime()
     settings = get_settings().model_dump()
-    sensitive_tokens = ("secret", "token", "key", "password", "credential", "api", "url")
-    sanitized_settings = {
-        k: ("[redacted]" if any(tok in k for tok in sensitive_tokens) and v else v)
-        for k, v in settings.items()
-    }
+    sanitized_settings = _sanitize_dict(settings)
+    # Also sanitize runtime_config to prevent data leakage
+    runtime_config = runtime.store.get_runtime_config() if hasattr(runtime.store, "get_runtime_config") else {}
+    sanitized_runtime_config = _sanitize_dict(runtime_config) if isinstance(runtime_config, dict) else runtime_config
     return Envelope(
         status="ok",
         data={
-            "runtime_config": runtime.store.get_runtime_config() if hasattr(runtime.store, "get_runtime_config") else {},
+            "runtime_config": sanitized_runtime_config,
             "settings": sanitized_settings,
         },
     )
@@ -1194,16 +1216,25 @@ async def upload_file(
     principal: AuthContext = Depends(get_user),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
+    import re
     runtime = get_runtime()
     async with IdempotencyGuard("files:upload", principal.user_id, idempotency_key, require=True) as idem:
         if idem.cached:
             return idem.cached
+        # Sanitize filename to prevent path traversal and other attacks
+        raw_filename = file.filename or "untitled"
+        # Remove path separators and keep only safe characters
+        safe_filename = re.sub(r'[^\w\-_\. ]', '_', raw_filename)
+        safe_filename = safe_filename.lstrip('.')  # Prevent hidden files
+        safe_filename = safe_filename[:255]  # Limit length
+        if not safe_filename:
+            safe_filename = "untitled"
         dest_dir = Path(runtime.settings.shared_fs_root) / "users" / principal.user_id / "files"
         max_bytes = max(1, runtime.settings.max_upload_bytes)
         contents = await file.read(max_bytes + 1)
         if len(contents) > max_bytes:
             raise _http_error("validation_error", "file too large", status_code=413)
-        dest_path = safe_join(dest_dir, file.filename)
+        dest_path = safe_join(dest_dir, safe_filename)
         resolved_dest = dest_path.resolve()
         if dest_dir.resolve() not in resolved_dest.parents and dest_dir.resolve() != resolved_dest:
             raise _http_error("validation_error", "invalid file path", status_code=400)
@@ -1211,10 +1242,11 @@ async def upload_file(
         dest_path.write_bytes(contents)
         chunk_count = None
         if context_id:
-            _get_owned_context(runtime, context_id, principal)
             try:
+                _get_owned_context(runtime, context_id, principal)
                 chunk_count = runtime.rag.ingest_file(context_id, str(dest_path), chunk_size=chunk_size)
-            except ConstraintViolation:
+            except Exception:
+                # Clean up file on any error (not just ConstraintViolation)
                 dest_path.unlink(missing_ok=True)
                 raise
         resp = FileUploadResponse(fs_path=file.filename, context_id=context_id, chunk_count=chunk_count)
@@ -1342,7 +1374,18 @@ async def list_chunks(context_id: str, principal: AuthContext = Depends(get_user
 @router.post("/voice/transcribe", response_model=Envelope)
 async def transcribe_voice(file: UploadFile = File(...), principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
-    audio_bytes = await file.read()
+    # Rate limit voice transcription (resource-intensive)
+    await _enforce_rate_limit(
+        runtime,
+        f"voice:transcribe:{principal.user_id}",
+        runtime.settings.chat_rate_limit_per_minute,  # Use chat rate limit as default
+        60,
+    )
+    # Limit audio file size to 10MB
+    max_audio_bytes = 10 * 1024 * 1024
+    audio_bytes = await file.read(max_audio_bytes + 1)
+    if len(audio_bytes) > max_audio_bytes:
+        raise _http_error("validation_error", "audio file too large (max 10MB)", status_code=413)
     result = runtime.voice.transcribe(audio_bytes, user_id=principal.user_id)
     return Envelope(status="ok", data=VoiceTranscriptionResponse(**result))
 
@@ -1350,6 +1393,16 @@ async def transcribe_voice(file: UploadFile = File(...), principal: AuthContext 
 @router.post("/voice/synthesize", response_model=Envelope)
 async def synthesize_voice(body: VoiceSynthesisRequest, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
+    # Rate limit voice synthesis (resource-intensive)
+    await _enforce_rate_limit(
+        runtime,
+        f"voice:synthesize:{principal.user_id}",
+        runtime.settings.chat_rate_limit_per_minute,  # Use chat rate limit as default
+        60,
+    )
+    # Limit text length to prevent resource exhaustion
+    if len(body.text) > 5000:
+        raise _http_error("validation_error", "text too long for synthesis (max 5000 chars)", status_code=400)
     audio = runtime.voice.synthesize(body.text, user_id=principal.user_id, voice=body.voice)
     return Envelope(status="ok", data=VoiceSynthesisResponse(**audio))
 
