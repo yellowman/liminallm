@@ -137,7 +137,9 @@ class SemanticClusterer:
             label = str(payload.get("label", "")).strip()
             description = str(payload.get("description", "")).strip()
             if label or description:
-                return label or description[:64] or "Unlabeled cluster", description or label
+                final_label = label or description[:64] or "Unlabeled cluster"
+                final_description = description or label or "Unlabeled cluster"
+                return final_label, final_description
         except (TypeError, ValueError, AttributeError):
             pass
         lines = [line.strip() for line in content.splitlines() if line.strip()]

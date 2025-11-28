@@ -103,12 +103,12 @@ class PostgresStore:
 
     def _cache_session(self, session: Session) -> Session:
         """Store session in the in-memory cache and return it."""
-        # Evict oldest entries if cache is at capacity
+        # Evict soonest-to-expire entries if cache is at capacity
         if len(self.sessions) >= _MAX_SESSION_CACHE_SIZE:
-            # Remove ~10% of oldest entries by created_at
+            # Remove ~10% of entries closest to expiration
             sorted_sessions = sorted(
                 self.sessions.values(),
-                key=lambda s: s.created_at if s.created_at else datetime.min,
+                key=lambda s: s.expires_at if s.expires_at else datetime.min,
             )
             evict_count = max(1, _MAX_SESSION_CACHE_SIZE // 10)
             for old_session in sorted_sessions[:evict_count]:

@@ -2,8 +2,12 @@ import asyncio
 import inspect
 import os
 import sys
+import tempfile
 from pathlib import Path
 
+# Create temp directory for tests before any imports that might initialize runtime
+_test_tmp_dir = tempfile.mkdtemp(prefix="liminallm_test_")
+os.environ.setdefault("SHARED_FS_ROOT", _test_tmp_dir)
 os.environ.setdefault("TEST_MODE", "true")
 os.environ.setdefault("USE_MEMORY_STORE", "true")
 os.environ.setdefault("ALLOW_REDIS_FALLBACK_DEV", "true")

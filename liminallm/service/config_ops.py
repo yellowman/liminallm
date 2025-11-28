@@ -93,7 +93,7 @@ class ConfigOpsService:
         return (
             f"You are a config engineer. Given the artifact named '{artifact.name}' of type {artifact.type}, propose a JSON patch.\n"
             f"Artifact description: {description}\n"
-            f"Existing schema (truncated to 2KB): {json.dumps(artifact.schema)[:2000]}\n"
+            f"Existing schema (truncated to 2KB): {self._safe_truncate_json(artifact.schema, 2000)}\n"
             f"Goal: {goal_line}\n"
             f"Preference insights: {summary_blob}\n"
             "Respond with JSON representing a JSON-patch style object."
@@ -109,6 +109,28 @@ class ConfigOpsService:
         except Exception as exc:
             logger.warning("config_patch_llm_error", error=str(exc))
         return self._fallback_patch()
+
+    def _safe_truncate_json(self, obj: dict, max_chars: int) -> str:
+        """Truncate JSON while maintaining valid syntax by removing trailing keys."""
+        full_json = json.dumps(obj, indent=None, separators=(",", ":"))
+        if len(full_json) <= max_chars:
+            return full_json
+        # Truncate by removing keys from a shallow copy until it fits
+        if isinstance(obj, dict):
+            truncated: dict = {}
+            # Reserve space for the _truncated marker
+            marker_overhead = len(',"_truncated":true')
+            target_max = max_chars - marker_overhead
+            for key, value in obj.items():
+                # Test size before adding
+                test_dict = {**truncated, key: value}
+                test_json = json.dumps(test_dict, indent=None, separators=(",", ":"))
+                if len(test_json) > target_max:
+                    break
+                truncated[key] = value
+            truncated["_truncated"] = True
+            return json.dumps(truncated, indent=None, separators=(",", ":"))
+        return full_json[:max_chars - 3] + "..."
 
     def _fallback_patch(self) -> dict:
         timestamp = datetime.utcnow().isoformat()

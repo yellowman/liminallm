@@ -29,11 +29,13 @@ def test_get_preference_event_round_trip(memory_store: MemoryStore):
         message.id,
         feedback="thumbs_up",
         score=0.9,
+        weight=0.9,
     )
 
     fetched = memory_store.get_preference_event(event.id)
 
     assert fetched is event
+    assert fetched.score == pytest.approx(0.9)
     assert fetched.weight == pytest.approx(0.9)
     assert fetched.feedback == "thumbs_up"
 

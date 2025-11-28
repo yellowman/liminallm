@@ -572,14 +572,14 @@ if (proposeBtn) proposeBtn.addEventListener('click', proposePatch);
 const approveBtn = document.getElementById('approve-patch');
 if (approveBtn)
   approveBtn.addEventListener('click', () => {
-    if (decisionStatusInput) decisionStatusInput.value = 'approved';
-    decidePatch('approved');
+    if (decisionStatusInput) decisionStatusInput.value = 'approve';
+    decidePatch('approve');
   });
 const rejectBtn = document.getElementById('reject-patch');
 if (rejectBtn)
   rejectBtn.addEventListener('click', () => {
-    if (decisionStatusInput) decisionStatusInput.value = 'rejected';
-    decidePatch('rejected');
+    if (decisionStatusInput) decisionStatusInput.value = 'reject';
+    decidePatch('reject');
   });
 const applyBtn = document.getElementById('apply-patch');
 if (applyBtn) applyBtn.addEventListener('click', applyPatch);

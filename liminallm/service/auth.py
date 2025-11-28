@@ -351,7 +351,7 @@ class AuthService:
             sess = self.store.get_session(session_id)
         if not sess:
             return None
-        if not sess or sess.expires_at <= datetime.utcnow():
+        if sess.expires_at <= datetime.utcnow():
             return None
         user = self.store.get_user(sess.user_id)
         if not user:
