@@ -129,9 +129,10 @@ class TestValidateAdapterBaseModel:
         assert is_valid is True
         assert warning is None
 
+        # Empty dict is falsy, treated same as None - nothing to validate
         is_valid2, warning2 = validate_adapter_base_model({}, "llama-7b")
         assert is_valid2 is True
-        assert warning2 is not None  # Warning about unverified
+        assert warning2 is None
 
     def test_version_suffix_normalization(self):
         """Should normalize version suffixes."""

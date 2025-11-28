@@ -21,7 +21,7 @@ class TestAdapterChecksumValidation:
 
         backend = LocalJaxLoRABackend.__new__(LocalJaxLoRABackend)
         backend._fs_root = str(tmp_path)
-        backend._base_model = "test-model"
+        backend.base_model = "test-model"
         backend._adapter_cache = {}
         backend._jnp = None
         backend._jax = None
@@ -146,12 +146,19 @@ class TestAdapterChecksumValidation:
                     with patch("liminallm.service.model_backend.logger") as mock_logger:
                         mock_backend._load_adapter_weights(adapter)
 
-                        # Should log warning about missing checksum
-                        mock_logger.warning.assert_called_once()
-                        call_args = mock_logger.warning.call_args
-                        assert call_args[0][0] == "adapter_checksum_missing"
-                        assert "message" in call_args[1]
-                        assert "production" in call_args[1]["message"].lower()
+                        # Should log warning about missing checksum (may also log base_model warning)
+                        assert mock_logger.warning.call_count >= 1
+                        # Find the checksum warning among all warnings
+                        checksum_warning_found = False
+                        for call in mock_logger.warning.call_args_list:
+                            if call[0][0] == "adapter_checksum_missing":
+                                checksum_warning_found = True
+                                assert "message" in call[1]
+                                assert "production" in call[1]["message"].lower()
+                                break
+                        assert (
+                            checksum_warning_found
+                        ), "Expected adapter_checksum_missing warning"
 
     def test_checksum_from_schema_field(self, mock_backend, tmp_path, valid_weights):
         """Checksum can be provided in schema.checksum field."""
