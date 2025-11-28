@@ -360,7 +360,7 @@ class WorkflowEngine:
 
         Retry settings are read from node metadata with defaults:
         - max_retries: 2 (hard cap at 3 per SPEC §18)
-        - backoff_ms: 1000 (doubles each retry: 1s, 4s)
+        - backoff_ms: 1000 (quadruples each retry: 1s, 4s per SPEC §18)
         """
         node_id = node.get("id", "unknown")
         max_retries = min(
