@@ -170,12 +170,20 @@ async def _set_cached_idempotency_record(
 
 
 async def check_rate_limit(runtime: Runtime, key: str, limit: int, window_seconds: int) -> bool:
-    """Enforce rate limits even when Redis is unavailable."""
+    """Enforce rate limits even when Redis is unavailable.
 
+    Per SPEC §18, rate limits use Redis token bucket with configurable defaults.
+    """
     if limit <= 0:
         return True
     if window_seconds <= 0:
-        window_seconds = 60  # Default to 1 minute if invalid window
+        logger.warning(
+            "rate_limit_invalid_window",
+            key=key,
+            window_seconds=window_seconds,
+            message="Invalid rate limit window_seconds; defaulting to 60 seconds",
+        )
+        window_seconds = 60  # Default to 1 minute if invalid window per SPEC §18
     now = datetime.utcnow()
     if runtime.cache:
         return await runtime.cache.check_rate_limit(key, limit, window_seconds)

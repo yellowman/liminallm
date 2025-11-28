@@ -316,6 +316,11 @@ class LocalJaxLoRABackend:
         return ids, attention
 
     def _load_adapter_weights(self, adapter: dict, *, user_id: Optional[str] = None) -> dict:
+        """Load adapter weights from filesystem with checksum verification.
+
+        Per SPEC §18, checksum of params is verified against schema.checksum before activation.
+        Missing checksums are logged as security warnings but allowed for backwards compatibility.
+        """
         if not adapter:
             return {}
         adapter_id = adapter.get("id", "unknown")
@@ -330,11 +335,25 @@ class LocalJaxLoRABackend:
         payload = params_path.read_bytes()
         checksum = adapter.get("checksum") or adapter.get("schema", {}).get("checksum")
         if checksum:
+            # SPEC §18: checksum verified against schema.checksum before activation
             digest = hashlib.sha256(payload).hexdigest()
             if digest != checksum:
-                raise ValueError("adapter checksum mismatch")
+                logger.error(
+                    "adapter_checksum_mismatch",
+                    adapter_id=adapter_id,
+                    path=str(params_path),
+                    expected=checksum,
+                    actual=digest,
+                )
+                raise ValueError("adapter checksum mismatch - refusing to load potentially tampered weights")
         else:
-            logger.warning("adapter_checksum_missing", adapter_id=adapter_id, path=str(params_path))
+            # SPEC §18 requires checksum verification; missing checksums are a security concern
+            logger.warning(
+                "adapter_checksum_missing",
+                adapter_id=adapter_id,
+                path=str(params_path),
+                message="Adapter loaded without checksum verification - add schema.checksum for production use",
+            )
         weights_raw = json.loads(payload.decode())
         self._ensure_jax()
         weights = {k: self._jnp.array(v, dtype=self._jnp.float32) for k, v in weights_raw.items()}

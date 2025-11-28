@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import re
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -18,6 +19,7 @@ from psycopg_pool import ConnectionPool
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service.artifact_validation import ArtifactValidationError, validate_artifact
+from liminallm.service.bm25 import tokenize_text as _tokenize_text, compute_bm25_scores as _compute_bm25_scores
 from liminallm.service.embeddings import cosine_similarity
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
@@ -40,49 +42,6 @@ from liminallm.storage.models import (
 
 _MAX_SESSION_CACHE_SIZE = 10000
 
-# BM25 constants
-_BM25_K1 = 1.5
-_BM25_B = 0.75
-
-
-def _tokenize_text(text: str) -> List[str]:
-    """Tokenize text for BM25 scoring."""
-    return re.findall(r"\w+", text.lower())
-
-
-def _compute_bm25_scores(
-    query_tokens: Sequence[str],
-    documents: List[List[str]],
-    k1: float = _BM25_K1,
-    b: float = _BM25_B,
-) -> List[float]:
-    """Compute BM25 relevance scores for documents against query tokens."""
-    if not query_tokens or not documents:
-        return [0.0 for _ in documents]
-    N = len(documents)
-    avgdl = sum(len(doc) for doc in documents) / float(N)
-    doc_freq: dict[str, int] = {}
-    for doc in documents:
-        seen = set(doc)
-        for tok in seen:
-            doc_freq[tok] = doc_freq.get(tok, 0) + 1
-    scores: List[float] = []
-    for doc in documents:
-        tf: dict[str, int] = {}
-        for tok in doc:
-            tf[tok] = tf.get(tok, 0) + 1
-        score = 0.0
-        for tok in query_tokens:
-            df = doc_freq.get(tok, 0)
-            if df == 0:
-                continue
-            idf = math.log(1 + (N - df + 0.5) / (df + 0.5))
-            freq = tf.get(tok, 0)
-            denom = freq + k1 * (1 - b + b * (len(doc) / (avgdl or 1.0)))
-            score += idf * (freq * (k1 + 1)) / denom if denom else 0.0
-        scores.append(score)
-    return scores
-
 
 class PostgresStore:
     """Thin Postgres-backed store to persist kernel primitives."""
@@ -96,41 +55,52 @@ class PostgresStore:
             self.dsn, min_size=2, max_size=10, kwargs={"row_factory": dict_row, "autocommit": False}
         )
         self.sessions: dict[str, Session] = {}
+        self._session_lock = threading.Lock()
         self._ensure_runtime_config_table()
         self._verify_required_schema()
         self._load_training_state()
         self._ensure_default_artifacts()
 
     def _cache_session(self, session: Session) -> Session:
-        """Store session in the in-memory cache and return it."""
-        # Evict soonest-to-expire entries if cache is at capacity
-        if len(self.sessions) >= _MAX_SESSION_CACHE_SIZE:
-            # Remove ~10% of entries closest to expiration
-            sorted_sessions = sorted(
-                self.sessions.values(),
-                key=lambda s: s.expires_at if s.expires_at else datetime.min,
-            )
-            evict_count = max(1, _MAX_SESSION_CACHE_SIZE // 10)
-            for old_session in sorted_sessions[:evict_count]:
-                self.sessions.pop(old_session.id, None)
+        """Store session in the in-memory cache and return it.
 
-        self.sessions[session.id] = session
-        return session
+        Thread-safe per SPEC §18 inference/adapter cache discipline.
+        """
+        with self._session_lock:
+            # Evict soonest-to-expire entries if cache is at capacity
+            if len(self.sessions) >= _MAX_SESSION_CACHE_SIZE:
+                # Remove ~10% of entries closest to expiration
+                sorted_sessions = sorted(
+                    self.sessions.values(),
+                    key=lambda s: s.expires_at if s.expires_at else datetime.min,
+                )
+                evict_count = max(1, _MAX_SESSION_CACHE_SIZE // 10)
+                for old_session in sorted_sessions[:evict_count]:
+                    self.sessions.pop(old_session.id, None)
+
+            self.sessions[session.id] = session
+            return session
 
     def _evict_session(self, session_id: str) -> None:
-        """Remove a session from the in-memory cache if present."""
+        """Remove a session from the in-memory cache if present.
 
-        self.sessions.pop(session_id, None)
+        Thread-safe per SPEC §18.
+        """
+        with self._session_lock:
+            self.sessions.pop(session_id, None)
 
     def _update_cached_session(self, session_id: str, **updates: Any) -> None:
-        """Apply field updates to a cached session if it exists."""
+        """Apply field updates to a cached session if it exists.
 
-        sess = self.sessions.get(session_id)
-        if not sess:
-            return
-        for field, value in updates.items():
-            setattr(sess, field, value)
-        self.sessions[session_id] = sess
+        Thread-safe per SPEC §18.
+        """
+        with self._session_lock:
+            sess = self.sessions.get(session_id)
+            if not sess:
+                return
+            for field, value in updates.items():
+                setattr(sess, field, value)
+            self.sessions[session_id] = sess
 
     def _connect(self):
         return self.pool.connection()
@@ -1173,9 +1143,11 @@ class PostgresStore:
     def revoke_user_sessions(self, user_id: str) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM auth_session WHERE user_id = %s", (user_id,))
-        stale_ids = [sid for sid, sess in self.sessions.items() if sess.user_id == user_id]
-        for sid in stale_ids:
-            self._evict_session(sid)
+        # Thread-safe iteration over session cache per SPEC §18
+        with self._session_lock:
+            stale_ids = [sid for sid, sess in self.sessions.items() if sess.user_id == user_id]
+            for sid in stale_ids:
+                self.sessions.pop(sid, None)
 
     def mark_session_verified(self, session_id: str) -> None:
         try:

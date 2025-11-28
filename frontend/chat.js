@@ -129,7 +129,7 @@ const refreshUploadLimits = async () => {
     uploadLimitBytes = envelope.data?.max_upload_bytes || uploadLimitBytes;
     renderUploadHint();
   } catch (err) {
-    console.warn('Unable to refresh upload limits', err);
+    // Silently ignore upload limit refresh failures - non-critical
   }
 };
 
@@ -488,7 +488,7 @@ const tryRefreshToken = async () => {
       return true;
     }
   } catch (err) {
-    console.warn('Token refresh failed', err);
+    // Token refresh failed - will fall through to require re-authentication
   }
   return false;
 };
@@ -691,6 +691,14 @@ const newConversation = () => {
   updateEmptyState();
 };
 
+const sanitizeNotes = (notes) => {
+  if (!notes || typeof notes !== 'string') return undefined;
+  // Trim and limit length to prevent abuse
+  const trimmed = notes.trim().slice(0, 2000);
+  if (!trimmed) return undefined;
+  return trimmed;
+};
+
 const sendPreference = async (isPositive) => {
   if (!state.lastAssistant) {
     preferenceStatusEl.textContent = 'No assistant message to rate yet.';
@@ -705,7 +713,7 @@ const sendPreference = async (isPositive) => {
       explicit_signal: isPositive ? 'thumbs_up' : 'thumbs_down',
       routing_trace: state.lastAssistant.routingTrace || undefined,
       adapter_gates: state.lastAssistant.adapterGates || undefined,
-      notes: preferenceNotesEl?.value || undefined,
+      notes: sanitizeNotes(preferenceNotesEl?.value),
     };
     const idempotencyKey = `pref-${stableHash(JSON.stringify({
       cid: body.conversation_id,
@@ -757,7 +765,7 @@ const logout = async () => {
         'Logout failed'
       );
     } catch (err) {
-      console.warn('logout failed', err);
+      // Logout API call failed - continue with local cleanup
     }
   };
 
