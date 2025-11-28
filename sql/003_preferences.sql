@@ -21,9 +21,10 @@ CREATE TABLE IF NOT EXISTS preference_event (
 );
 
 -- Semantic clusters for emergent skills/domains
+-- user_id is nullable to allow global clusters per SPEC §2.4
 CREATE TABLE IF NOT EXISTS semantic_cluster (
   id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id         UUID NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+  user_id         UUID REFERENCES app_user(id) ON DELETE CASCADE,
   centroid        VECTOR,
   size            INT NOT NULL,
   label           TEXT,
