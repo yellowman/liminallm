@@ -62,7 +62,7 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
             "kind": {"const": "tool.spec"},
             "name": {"type": "string"},
             "handler": {"type": "string"},
-            "timeout_seconds": {"type": "number", "minimum": 0},
+            "timeout_seconds": {"type": "number", "exclusiveMinimum": 0},
         },
         "required": ["kind", "name", "handler"],
     },
