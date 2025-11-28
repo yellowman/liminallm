@@ -546,6 +546,75 @@ for `hybrid` adapters:
 
 this allows the same adapter artifact to work across deployment modes without modification.
 
+### 5.0.2 provider capabilities (implementation detail)
+
+different API providers handle adapters in fundamentally different ways. the kernel maintains a capability registry to format requests correctly:
+
+**remote styles:**
+
+| Style | Description | Example Providers |
+|-------|-------------|-------------------|
+| `model_id` | Fine-tuned model as endpoint; one adapter per request | OpenAI, Azure, Vertex, Bedrock |
+| `adapter_param` | Adapter ID in request body; multi-adapter supported | Together, LoRAX, adapter_server |
+| `none` | No remote adapter support; local/prompt only | local_lora, local_gpu_lora |
+
+**provider capability matrix:**
+
+| Provider | Remote Style | Multi-Adapter | Gate Weights | Max Adapters |
+|----------|-------------|---------------|--------------|--------------|
+| `openai` | model_id | ✗ | ✗ | 1 |
+| `azure` | model_id | ✗ | ✗ | 1 |
+| `vertex` | model_id | ✗ | ✗ | 1 |
+| `bedrock` | model_id | ✗ | ✗ | 1 |
+| `together` | adapter_param | ✓ | ✓ | 3 |
+| `lorax` | adapter_param | ✓ | ✓ | 5 |
+| `adapter_server` | adapter_param | ✓ | ✓ | 3 |
+| `sagemaker` | adapter_param | ✗ | ✗ | 1 |
+| `local_lora` | none | ✓ | ✓ | 3 |
+
+**adapter schema fields by provider type:**
+
+for `model_id` providers (OpenAI, Azure, etc.):
+```json
+{
+  "mode": "remote",
+  "remote_model_id": "ft:gpt-4o-mini-2024-07-18:org:custom:abc123"
+}
+```
+
+for `adapter_param` providers (Together, LoRAX, etc.):
+```json
+{
+  "mode": "remote",
+  "remote_adapter_id": "user-123/my-lora-adapter",
+  "weight": 0.8
+}
+```
+
+**request formatting:**
+
+- `model_id` style: adapter's `remote_model_id` becomes the `model` parameter
+- `adapter_param` style: adapter IDs passed as `extra_body.adapter_id` (or provider-specific param)
+- when multiple adapters exceed `max_adapters`, lowest-weight adapters are dropped and logged
+
+**hybrid mode with remote fallback:**
+
+hybrid adapters can include both `prompt_instructions` (for prompt injection) and `remote_model_id`/`remote_adapter_id` (for API passthrough):
+
+```json
+{
+  "mode": "hybrid",
+  "prompt_instructions": "You are a coding assistant...",
+  "remote_adapter_id": "user-123/code-lora",
+  "weight": 0.9
+}
+```
+
+when using API backend:
+1. prompt instructions are always injected into system message
+2. if adapter has remote ID and provider supports it, also passed to API
+3. if no remote ID or provider doesn't support, only prompt injection used
+
 ### 5.1 base model
 
 - JAX/Flax implementation of a decoder-only transformer:

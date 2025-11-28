@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import secrets
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -85,6 +86,155 @@ BACKEND_ADAPTER_COMPATIBILITY: dict[str, set[str]] = {
 def get_compatible_adapter_modes(backend: str) -> set[str]:
     """Return adapter modes compatible with the given backend."""
     return BACKEND_ADAPTER_COMPATIBILITY.get(backend.lower(), {AdapterMode.PROMPT})
+
+
+class RemoteStyle(str, Enum):
+    """How remote adapters are passed to API providers.
+
+    SPEC §5.0.2: Different providers accept adapters in different ways:
+    - MODEL_ID: Fine-tuned model as endpoint (OpenAI ft:..., Azure, Vertex)
+    - ADAPTER_PARAM: Adapter ID passed as request parameter (Together, LoRAX)
+    - NONE: Provider doesn't support remote adapters (prompt-only)
+    """
+
+    MODEL_ID = "model_id"  # Adapter = separate model endpoint
+    ADAPTER_PARAM = "adapter_param"  # Adapter ID in request body/params
+    NONE = "none"  # No remote adapter support
+
+
+@dataclass
+class ProviderCapabilities:
+    """Capabilities of an LLM API provider for adapter handling.
+
+    Defines how the provider handles fine-tuned models and LoRA adapters,
+    enabling proper routing and request formatting per provider.
+    """
+
+    remote_style: RemoteStyle  # How remote adapters are specified
+    multi_adapter: bool  # Can compose multiple adapters per request
+    gate_weights: bool  # Supports per-adapter gate weights
+    max_adapters: int  # Maximum concurrent adapters (1 for model_id style)
+    adapter_param_name: str = "adapter_id"  # Parameter name for adapter_param style
+    supports_streaming: bool = True
+    model_id_prefix: str = ""  # e.g., "ft:" for OpenAI fine-tunes
+
+
+# Provider capability registry - defines how each backend handles adapters
+PROVIDER_CAPABILITIES: dict[str, ProviderCapabilities] = {
+    # Fine-tuned model as endpoint providers (one adapter = one model)
+    "openai": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+        model_id_prefix="ft:",
+    ),
+    "azure": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+    ),
+    "azure_openai": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+    ),
+    "vertex": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+    ),
+    "gemini": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+    ),
+    "google": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+    ),
+    "bedrock": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+    ),
+    # Adapter-parameter style providers (support multi-adapter)
+    "together": ProviderCapabilities(
+        remote_style=RemoteStyle.ADAPTER_PARAM,
+        multi_adapter=True,
+        gate_weights=True,
+        max_adapters=3,
+        adapter_param_name="adapter_id",
+    ),
+    "together.ai": ProviderCapabilities(
+        remote_style=RemoteStyle.ADAPTER_PARAM,
+        multi_adapter=True,
+        gate_weights=True,
+        max_adapters=3,
+        adapter_param_name="adapter_id",
+    ),
+    "lorax": ProviderCapabilities(
+        remote_style=RemoteStyle.ADAPTER_PARAM,
+        multi_adapter=True,
+        gate_weights=True,
+        max_adapters=5,
+        adapter_param_name="adapter_id",
+    ),
+    "adapter_server": ProviderCapabilities(
+        remote_style=RemoteStyle.ADAPTER_PARAM,
+        multi_adapter=True,
+        gate_weights=True,
+        max_adapters=3,
+        adapter_param_name="adapter_id",
+    ),
+    "sagemaker": ProviderCapabilities(
+        remote_style=RemoteStyle.ADAPTER_PARAM,
+        multi_adapter=False,  # Depends on setup
+        gate_weights=False,
+        max_adapters=1,
+        adapter_param_name="adapter_id",
+    ),
+    "aws_sagemaker": ProviderCapabilities(
+        remote_style=RemoteStyle.ADAPTER_PARAM,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+        adapter_param_name="adapter_id",
+    ),
+    # Local backends
+    "local_lora": ProviderCapabilities(
+        remote_style=RemoteStyle.NONE,
+        multi_adapter=True,
+        gate_weights=True,
+        max_adapters=3,
+    ),
+    "local_gpu_lora": ProviderCapabilities(
+        remote_style=RemoteStyle.NONE,
+        multi_adapter=True,
+        gate_weights=True,
+        max_adapters=3,
+    ),
+}
+
+# Default capabilities for unknown providers (conservative)
+DEFAULT_PROVIDER_CAPABILITIES = ProviderCapabilities(
+    remote_style=RemoteStyle.MODEL_ID,
+    multi_adapter=False,
+    gate_weights=False,
+    max_adapters=1,
+)
+
+
+def get_provider_capabilities(provider: str) -> ProviderCapabilities:
+    """Get capabilities for a provider, with sensible defaults for unknown providers."""
+    return PROVIDER_CAPABILITIES.get(provider.lower(), DEFAULT_PROVIDER_CAPABILITIES)
 
 
 def env_field(default: Any, env: str, **kwargs):
