@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import math
+import time
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from liminallm.logging import get_logger
+
+# SPEC §9/§18: Default retry and timeout settings
+DEFAULT_NODE_TIMEOUT_MS = 15000  # 15 seconds per node
+DEFAULT_NODE_MAX_RETRIES = 2  # Up to 2 retries (3 total attempts), hard cap at 3
+DEFAULT_BACKOFF_MS = 1000  # Initial backoff 1s, doubles each retry (1s, 4s per SPEC)
+MAX_RETRIES_HARD_CAP = 3  # SPEC §18: hard cap at 3 retries
+DEFAULT_WORKFLOW_TIMEOUT_MS = 60000  # 60 seconds total workflow timeout
 
 from liminallm.service.errors import BadRequestError
 from liminallm.service.llm import LLMService
@@ -92,6 +101,10 @@ class WorkflowEngine:
         if not workflow_schema:
             workflow_schema = self._default_workflow()
 
+        # SPEC §9: workflow-level timeout_ms caps total wall clock
+        workflow_timeout_ms = workflow_schema.get("timeout_ms", DEFAULT_WORKFLOW_TIMEOUT_MS)
+        workflow_start_time = time.monotonic()
+
         adapters, routing_trace, adapter_gates = await self._select_adapters(user_message, user_id, context_id)
         history = await self._load_conversation_history(conversation_id, user_id=user_id, tenant_id=tenant_id)
 
@@ -119,6 +132,37 @@ class WorkflowEngine:
         await self._persist_workflow_state(state_key, {"status": "running", "started_at": datetime.utcnow().isoformat()})
 
         while pending and visited < max_steps:
+            # SPEC §9: Check workflow-level timeout before executing next node
+            elapsed_ms = (time.monotonic() - workflow_start_time) * 1000
+            if elapsed_ms >= workflow_timeout_ms:
+                self.logger.warning(
+                    "workflow_timeout",
+                    workflow_id=workflow_id,
+                    elapsed_ms=elapsed_ms,
+                    timeout_ms=workflow_timeout_ms,
+                )
+                timeout_result = {
+                    "status": "error",
+                    "content": "workflow execution timed out",
+                    "error": "workflow_timeout",
+                    "elapsed_ms": elapsed_ms,
+                    "timeout_ms": workflow_timeout_ms,
+                    "routing_trace": routing_trace,
+                    "workflow_trace": workflow_trace,
+                    "context_snippets": context_snippets,
+                    "vars": vars_scope,
+                }
+                await self._persist_workflow_state(
+                    state_key,
+                    {
+                        "status": "timeout",
+                        "failed_at": datetime.utcnow().isoformat(),
+                        "error": "workflow_timeout",
+                        "elapsed_ms": elapsed_ms,
+                    },
+                )
+                return timeout_result
+
             node_id = pending.pop(0)
             node = node_map.get(node_id)
             if not node:
@@ -129,23 +173,27 @@ class WorkflowEngine:
                 self.logger.warning("workflow_loop_detected", node=node_id)
                 break
 
-            try:
-                result, next_nodes = self._execute_node(
-                    node,
-                    user_message=user_message,
-                    context_id=context_id,
-                    conversation_id=conversation_id,
-                    adapters=adapters,
-                    history=history,
-                    vars_scope=vars_scope,
-                    user_id=user_id,
-                    tenant_id=tenant_id,
-                )
-            except Exception as exc:
+            # SPEC §9/§18: Execute node with retry and exponential backoff
+            result, next_nodes = await self._execute_node_with_retry(
+                node,
+                user_message=user_message,
+                context_id=context_id,
+                conversation_id=conversation_id,
+                adapters=adapters,
+                history=history,
+                vars_scope=vars_scope,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                workflow_start_time=workflow_start_time,
+                workflow_timeout_ms=workflow_timeout_ms,
+            )
+
+            # Check if node execution failed after all retries
+            if result.get("status") == "error" and result.get("retries_exhausted"):
                 return await self._handle_node_failure(
                     state_key,
                     node_id,
-                    exc,
+                    Exception(result.get("error", "node execution failed")),
                     vars_scope=vars_scope,
                     context_snippets=context_snippets,
                     workflow_trace=workflow_trace,
@@ -269,6 +317,120 @@ class WorkflowEngine:
             },
         )
         return result
+
+    async def _execute_node_with_retry(
+        self,
+        node: Dict[str, Any],
+        *,
+        user_message: str,
+        context_id: Optional[str],
+        conversation_id: Optional[str],
+        adapters: List[dict],
+        history: List[Any],
+        vars_scope: Dict[str, Any],
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+        workflow_start_time: float,
+        workflow_timeout_ms: float,
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        """Execute a node with SPEC §9/§18 exponential backoff retry logic.
+
+        Retry settings are read from node metadata with defaults:
+        - max_retries: 2 (hard cap at 3 per SPEC §18)
+        - backoff_ms: 1000 (doubles each retry: 1s, 4s)
+        """
+        node_id = node.get("id", "unknown")
+        max_retries = min(
+            node.get("max_retries", DEFAULT_NODE_MAX_RETRIES),
+            MAX_RETRIES_HARD_CAP,
+        )
+        backoff_ms = node.get("backoff_ms", DEFAULT_BACKOFF_MS)
+
+        last_error: Optional[Exception] = None
+        attempt = 0
+
+        while attempt <= max_retries:
+            # Check workflow timeout before each attempt
+            elapsed_ms = (time.monotonic() - workflow_start_time) * 1000
+            remaining_ms = workflow_timeout_ms - elapsed_ms
+            if remaining_ms <= 0:
+                return (
+                    {
+                        "status": "error",
+                        "error": "workflow_timeout_during_retry",
+                        "retries_exhausted": True,
+                        "attempts": attempt,
+                    },
+                    [],
+                )
+
+            try:
+                result, next_nodes = self._execute_node(
+                    node,
+                    user_message=user_message,
+                    context_id=context_id,
+                    conversation_id=conversation_id,
+                    adapters=adapters,
+                    history=history,
+                    vars_scope=vars_scope,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                )
+
+                # If node executed successfully or has an on_error handler, return
+                if result.get("status") != "error" or node.get("on_error"):
+                    if attempt > 0:
+                        result["retry_attempts"] = attempt
+                    return result, next_nodes
+
+                # Node returned an error status - treat as retryable
+                last_error = Exception(result.get("error", "node returned error status"))
+
+            except Exception as exc:
+                last_error = exc
+                self.logger.warning(
+                    "workflow_node_retry",
+                    node=node_id,
+                    attempt=attempt + 1,
+                    max_retries=max_retries,
+                    error=str(exc),
+                )
+
+            attempt += 1
+
+            # If we have more retries, apply exponential backoff
+            if attempt <= max_retries:
+                # Exponential backoff: backoff_ms * (2 ^ (attempt - 1))
+                # For default 1000ms: attempt 1 = 1s, attempt 2 = 2s, attempt 3 = 4s
+                current_backoff_ms = backoff_ms * (2 ** (attempt - 1))
+
+                # Don't sleep longer than remaining workflow timeout
+                sleep_ms = min(current_backoff_ms, remaining_ms - 100)  # Leave 100ms buffer
+                if sleep_ms > 0:
+                    self.logger.info(
+                        "workflow_node_backoff",
+                        node=node_id,
+                        attempt=attempt,
+                        backoff_ms=sleep_ms,
+                    )
+                    await asyncio.sleep(sleep_ms / 1000.0)
+
+        # All retries exhausted
+        self.logger.error(
+            "workflow_node_retries_exhausted",
+            node=node_id,
+            attempts=attempt,
+            error=str(last_error),
+        )
+        return (
+            {
+                "status": "error",
+                "error": str(last_error) if last_error else "unknown error",
+                "retries_exhausted": True,
+                "attempts": attempt,
+            },
+            [],
+        )
 
     def _merge_usage(self, accum: Dict[str, Any], new_usage: Dict[str, Any]) -> Dict[str, Any]:
         merged = dict(accum)

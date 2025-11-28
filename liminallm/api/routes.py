@@ -645,7 +645,8 @@ async def chat(
 ):
     runtime = get_runtime()
     user_id = principal.user_id
-    async with IdempotencyGuard("chat", user_id, idempotency_key, require=True) as idem:
+    # SPEC §18: Accept Idempotency-Key when provided (optional)
+    async with IdempotencyGuard("chat", user_id, idempotency_key, require=False) as idem:
         if idem.cached:
             return idem.cached
         await _enforce_rate_limit(
@@ -961,8 +962,9 @@ async def invoke_tool(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     runtime = get_runtime()
+    # SPEC §18: Accept Idempotency-Key when provided (optional)
     async with IdempotencyGuard(
-        f"tools:{tool_id}:invoke", principal.user_id, idempotency_key, require=True
+        f"tools:{tool_id}:invoke", principal.user_id, idempotency_key, require=False
     ) as idem:
         if idem.cached:
             return idem.cached
@@ -997,7 +999,8 @@ async def create_artifact(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     runtime = get_runtime()
-    async with IdempotencyGuard("artifacts:create", principal.user_id, idempotency_key, require=True) as idem:
+    # SPEC §18: Accept Idempotency-Key when provided (optional)
+    async with IdempotencyGuard("artifacts:create", principal.user_id, idempotency_key, require=False) as idem:
         if idem.cached:
             return idem.cached
         if not isinstance(body.schema, dict):
@@ -1277,7 +1280,8 @@ async def upload_file(
         runtime.settings.files_upload_rate_limit_per_minute,
         60,
     )
-    async with IdempotencyGuard("files:upload", principal.user_id, idempotency_key, require=True) as idem:
+    # SPEC §18: Accept Idempotency-Key when provided (optional)
+    async with IdempotencyGuard("files:upload", principal.user_id, idempotency_key, require=False) as idem:
         if idem.cached:
             return idem.cached
         # Sanitize filename to prevent path traversal and other attacks
@@ -1364,7 +1368,8 @@ async def create_context(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     runtime = get_runtime()
-    async with IdempotencyGuard("contexts:create", principal.user_id, idempotency_key, require=True) as idem:
+    # SPEC §18: Accept Idempotency-Key when provided (optional)
+    async with IdempotencyGuard("contexts:create", principal.user_id, idempotency_key, require=False) as idem:
         if idem.cached:
             return idem.cached
         ctx_meta = {"embedding_model_id": runtime.rag.embedding_model_id}
@@ -1487,8 +1492,9 @@ async def websocket_chat(ws: WebSocket):
             await ws.close(code=4401)
             return
         user_id = auth_ctx.user_id
+        # SPEC §18: Accept Idempotency-Key when provided (optional)
         request_id, cached = await _resolve_idempotency(
-            "chat:ws", user_id, idempotency_key, require=True, request_id=request_id
+            "chat:ws", user_id, idempotency_key, require=False, request_id=request_id
         )
         if cached:
             await ws.send_json(cached.model_dump())
