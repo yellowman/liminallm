@@ -442,11 +442,14 @@ async def admin_create_user(body: AdminCreateUserRequest, principal: AuthContext
         runtime.settings.admin_rate_limit_per_minute,
         runtime.settings.admin_rate_limit_window_seconds,
     )
+    target_tenant = body.tenant_id or principal.tenant_id
+    if target_tenant != principal.tenant_id:
+        raise _http_error("forbidden", "cannot create users in other tenant", status_code=403)
     user, password = await runtime.auth.admin_create_user(
         email=body.email,
         password=body.password,
         handle=body.handle,
-        tenant_id=body.tenant_id or principal.tenant_id,
+        tenant_id=target_tenant,
         role=body.role,
         plan_tier=body.plan_tier,
         is_active=body.is_active,
@@ -1547,13 +1550,15 @@ async def websocket_chat(ws: WebSocket):
         if user_id:
             await _store_idempotency_result("chat:ws", user_id, idempotency_key, error_env, status="failed")
         await ws.send_json(error_env.model_dump())
-        await ws.close(code=4429 if exc.status_code == 429 else 1011)
+        status_code = getattr(exc, "status_code", 500)
+        await ws.close(code=4429 if status_code == 429 else 1011)
     except WebSocketDisconnect:
         return
     except Exception as exc:
+        logger.exception("unhandled_websocket_error", user_id=user_id, conversation_id=conversation_id)
         error_env = Envelope(
             status="error",
-            error={"code": "server_error", "message": str(exc)},
+            error={"code": "server_error", "message": "An internal error occurred"},
             request_id=request_id or str(uuid4()),
         )
         if user_id:
