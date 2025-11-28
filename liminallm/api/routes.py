@@ -743,6 +743,7 @@ async def record_preference(body: PreferenceEventRequest, principal: AuthContext
         explicit_signal=body.explicit_signal,
         routing_trace=body.routing_trace,
         adapter_gates=body.adapter_gates,
+        notes=body.notes,
     )
     await runtime.clusterer.cluster_user_preferences(principal.user_id)
     runtime.clusterer.promote_skill_adapters()
@@ -765,6 +766,7 @@ async def record_routing_feedback(body: PreferenceEventRequest, principal: AuthC
         weight=body.weight,
         routing_trace=body.routing_trace,
         adapter_gates=body.adapter_gates,
+        notes=body.notes,
     )
     resp = PreferenceEventResponse(id=event.id, cluster_id=event.cluster_id, feedback=event.feedback, created_at=event.created_at)
     return Envelope(status="ok", data=resp)

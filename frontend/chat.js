@@ -621,7 +621,8 @@ const sendMessage = async (event) => {
             reject(new Error(extractError(envelope.error, 'Chat failed')));
           }
         } catch (err) {
-          reject(err);
+          const isParseError = err instanceof SyntaxError;
+          reject(new Error(isParseError ? 'Received invalid response from server' : err.message));
         }
       };
       const handleError = () => {

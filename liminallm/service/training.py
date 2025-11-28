@@ -274,6 +274,7 @@ class TrainingService:
         explicit_signal: Optional[str] = None,
         routing_trace: Optional[List[dict]] = None,
         adapter_gates: Optional[List[dict]] = None,
+        notes: Optional[str] = None,
     ) -> PreferenceEvent:
         embedding = deterministic_embedding(context_text or "")
         meta = {}
@@ -281,6 +282,8 @@ class TrainingService:
             meta["routing_trace"] = routing_trace
         if adapter_gates:
             meta["adapter_gates"] = adapter_gates
+        if notes:
+            meta["notes"] = notes
         event = self.store.record_preference_event(
             user_id=user_id,
             conversation_id=conversation_id,
