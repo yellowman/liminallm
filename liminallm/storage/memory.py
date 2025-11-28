@@ -39,6 +39,49 @@ from liminallm.storage.models import (
     UserMFAConfig,
 )
 
+# BM25 constants
+_BM25_K1 = 1.5
+_BM25_B = 0.75
+
+
+def _tokenize_text(text: str) -> List[str]:
+    """Tokenize text for BM25 scoring."""
+    return re.findall(r"\w+", text.lower())
+
+
+def _compute_bm25_scores(
+    query_tokens: Sequence[str],
+    documents: List[List[str]],
+    k1: float = _BM25_K1,
+    b: float = _BM25_B,
+) -> List[float]:
+    """Compute BM25 relevance scores for documents against query tokens."""
+    if not query_tokens or not documents:
+        return [0.0 for _ in documents]
+    N = len(documents)
+    avgdl = sum(len(doc) for doc in documents) / float(N)
+    doc_freq: Dict[str, int] = {}
+    for doc in documents:
+        seen = set(doc)
+        for tok in seen:
+            doc_freq[tok] = doc_freq.get(tok, 0) + 1
+    scores: List[float] = []
+    for doc in documents:
+        tf: Dict[str, int] = {}
+        for tok in doc:
+            tf[tok] = tf.get(tok, 0) + 1
+        score = 0.0
+        for tok in query_tokens:
+            df = doc_freq.get(tok, 0)
+            if df == 0:
+                continue
+            idf = math.log(1 + (N - df + 0.5) / (df + 0.5))
+            freq = tf.get(tok, 0)
+            denom = freq + k1 * (1 - b + b * (len(doc) / (avgdl or 1.0)))
+            score += idf * (freq * (k1 + 1)) / denom if denom else 0.0
+        scores.append(score)
+    return scores
+
 
 class MemoryStore:
     """Minimal in-memory backing store for the initial prototype."""
@@ -1166,41 +1209,9 @@ class MemoryStore:
         if not candidates:
             return []
 
-        def _tokenize(text: str) -> List[str]:
-            return re.findall(r"\w+", text.lower())
-
-        def _bm25_scores(query_tokens: Sequence[str], documents: List[List[str]]) -> List[float]:
-            if not query_tokens or not documents:
-                return [0.0 for _ in documents]
-            N = len(documents)
-            avgdl = sum(len(doc) for doc in documents) / float(N)
-            doc_freq: Dict[str, int] = {}
-            for doc in documents:
-                seen = set(doc)
-                for tok in seen:
-                    doc_freq[tok] = doc_freq.get(tok, 0) + 1
-            k1 = 1.5
-            b = 0.75
-            scores: List[float] = []
-            for doc in documents:
-                tf: Dict[str, int] = {}
-                for tok in doc:
-                    tf[tok] = tf.get(tok, 0) + 1
-                score = 0.0
-                for tok in query_tokens:
-                    df = doc_freq.get(tok, 0)
-                    if df == 0:
-                        continue
-                    idf = math.log(1 + (N - df + 0.5) / (df + 0.5))
-                    freq = tf.get(tok, 0)
-                    denom = freq + k1 * (1 - b + b * (len(doc) / (avgdl or 1.0)))
-                    score += idf * (freq * (k1 + 1)) / denom if denom else 0.0
-                scores.append(score)
-            return scores
-
-        query_tokens = _tokenize(query)
-        doc_tokens = [_tokenize(ch.content) for ch in candidates]
-        bm25_scores = _bm25_scores(query_tokens, doc_tokens)
+        query_tokens = _tokenize_text(query)
+        doc_tokens = [_tokenize_text(ch.content) for ch in candidates]
+        bm25_scores = _compute_bm25_scores(query_tokens, doc_tokens)
         semantic_scores = []
         for ch in candidates:
             if not query_embedding or not ch.embedding:
@@ -1262,56 +1273,18 @@ class MemoryStore:
         if not allowed_chunks:
             return []
 
-        def _tokenize(text: str) -> List[str]:
-            return re.findall(r"\w+", text.lower())
-
-        def _bm25_scores(query_tokens: Sequence[str], documents: List[List[str]]) -> List[float]:
-            if not query_tokens or not documents:
-                return [0.0 for _ in documents]
-            N = len(documents)
-            avgdl = sum(len(doc) for doc in documents) / float(N)
-            doc_freq: Dict[str, int] = {}
-            for doc in documents:
-                seen = set(doc)
-                for tok in seen:
-                    doc_freq[tok] = doc_freq.get(tok, 0) + 1
-            k1 = 1.5
-            b = 0.75
-            scores: List[float] = []
-            for doc in documents:
-                tf: Dict[str, int] = {}
-                for tok in doc:
-                    tf[tok] = tf.get(tok, 0) + 1
-                score = 0.0
-                for tok in query_tokens:
-                    df = doc_freq.get(tok, 0)
-                    if df == 0:
-                        continue
-                    idf = math.log(1 + (N - df + 0.5) / (df + 0.5))
-                    freq = tf.get(tok, 0)
-                    denom = freq + k1 * (1 - b + b * (len(doc) / (avgdl or 1.0)))
-                    score += idf * (freq * (k1 + 1)) / denom if denom else 0.0
-                scores.append(score)
-            return scores
-
-        bm25_scores = _bm25_scores(_tokenize(query or ""), [_tokenize(ch.content) for ch in allowed_chunks])
-        semantic_scores = []
+        # pgvector mode: pure vector similarity (no BM25) per SPEC §3
+        # Sort by cosine similarity to emulate pgvector ORDER BY embedding <-> query
+        scored: List[tuple[KnowledgeChunk, float]] = []
         for ch in allowed_chunks:
-            if not query_embedding or not ch.embedding:
-                semantic_scores.append(0.0)
+            if not ch.embedding:
+                scored.append((ch, 0.0))
                 continue
             dim = min(len(query_embedding), len(ch.embedding))
-            semantic_scores.append(cosine_similarity(query_embedding[:dim], ch.embedding[:dim]))
-        max_bm25 = max(bm25_scores) or 1.0
-        combined: Dict[str, tuple[KnowledgeChunk, float]] = {}
-        for chunk, lex, sem in zip(allowed_chunks, bm25_scores, semantic_scores):
-            hybrid = 0.45 * (lex / max_bm25) + 0.55 * sem
-            key = " ".join(chunk.content.split()).lower() or str(chunk.id or "")
-            existing = combined.get(key)
-            if not existing or hybrid > existing[1]:
-                combined[key] = (chunk, hybrid)
-        ranked = sorted(combined.values(), key=lambda pair: pair[1], reverse=True)
-        return [pair[0] for pair in ranked[:limit]]
+            sim = cosine_similarity(query_embedding[:dim], ch.embedding[:dim])
+            scored.append((ch, sim))
+        ranked = sorted(scored, key=lambda pair: pair[1], reverse=True)
+        return [chunk for chunk, _ in ranked[:limit]]
 
     def _persist_state(self) -> None:
         state = {

@@ -1065,6 +1065,13 @@ async def patch_artifact(artifact_id: str, body: ArtifactRequest, principal: Aut
 @router.post("/config/propose_patch", response_model=Envelope)
 async def propose_patch(body: ConfigPatchRequest, principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
+    # Rate limit configops per SPEC §18: 30 req/hour
+    await _enforce_rate_limit(
+        runtime,
+        f"configops:{principal.user_id}",
+        runtime.settings.configops_rate_limit_per_hour,
+        3600,
+    )
     proposer = "human_admin" if principal.role == "admin" else "user"
     audit = runtime.store.record_config_patch(
         artifact_id=body.artifact_id, proposer=proposer, patch=body.patch, justification=body.justification
@@ -1087,6 +1094,13 @@ async def propose_patch(body: ConfigPatchRequest, principal: AuthContext = Depen
 @router.get("/config/patches", response_model=Envelope)
 async def list_config_patches(status: Optional[str] = None, principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
+    # Rate limit configops per SPEC §18: 30 req/hour
+    await _enforce_rate_limit(
+        runtime,
+        f"configops:{principal.user_id}",
+        runtime.settings.configops_rate_limit_per_hour,
+        3600,
+    )
     patches = runtime.store.list_config_patches(status)
     items = [
         ConfigPatchAuditResponse(
@@ -1109,6 +1123,13 @@ async def list_config_patches(status: Optional[str] = None, principal: AuthConte
 @router.post("/config/patches/{patch_id}/decide", response_model=Envelope)
 async def decide_config_patch(patch_id: int, body: ConfigPatchDecisionRequest, principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
+    # Rate limit configops per SPEC §18: 30 req/hour
+    await _enforce_rate_limit(
+        runtime,
+        f"configops:{principal.user_id}",
+        runtime.settings.configops_rate_limit_per_hour,
+        3600,
+    )
     decision = runtime.config_ops.decide_patch(patch_id, body.decision, body.reason)
     resp = ConfigPatchAuditResponse(
         id=decision.id,
@@ -1128,6 +1149,13 @@ async def decide_config_patch(patch_id: int, body: ConfigPatchDecisionRequest, p
 @router.post("/config/patches/{patch_id}/apply", response_model=Envelope)
 async def apply_config_patch(patch_id: int, principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
+    # Rate limit configops per SPEC §18: 30 req/hour
+    await _enforce_rate_limit(
+        runtime,
+        f"configops:{principal.user_id}",
+        runtime.settings.configops_rate_limit_per_hour,
+        3600,
+    )
     result = runtime.config_ops.apply_patch(patch_id, approver_user_id=principal.user_id)
     patch = result.get("patch")
     resp = ConfigPatchAuditResponse(
@@ -1148,6 +1176,13 @@ async def apply_config_patch(patch_id: int, principal: AuthContext = Depends(get
 @router.post("/config/auto_patch", response_model=Envelope)
 async def auto_patch(body: AutoPatchRequest, principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
+    # Rate limit configops per SPEC §18: 30 req/hour
+    await _enforce_rate_limit(
+        runtime,
+        f"configops:{principal.user_id}",
+        runtime.settings.configops_rate_limit_per_hour,
+        3600,
+    )
     audit = runtime.config_ops.auto_generate_patch(body.artifact_id, principal.user_id, goal=body.goal)
     resp = ConfigPatchAuditResponse(
         id=audit.id,
@@ -1218,6 +1253,13 @@ async def upload_file(
 ):
     import re
     runtime = get_runtime()
+    # Rate limit file uploads per SPEC §18: 10 req/min
+    await _enforce_rate_limit(
+        runtime,
+        f"files:upload:{principal.user_id}",
+        runtime.settings.files_upload_rate_limit_per_minute,
+        60,
+    )
     async with IdempotencyGuard("files:upload", principal.user_id, idempotency_key, require=True) as idem:
         if idem.cached:
             return idem.cached
@@ -1249,7 +1291,7 @@ async def upload_file(
                 # Clean up file on any error (not just ConstraintViolation)
                 dest_path.unlink(missing_ok=True)
                 raise
-        resp = FileUploadResponse(fs_path=file.filename, context_id=context_id, chunk_count=chunk_count)
+        resp = FileUploadResponse(fs_path=safe_filename, context_id=context_id, chunk_count=chunk_count)
         envelope = Envelope(status="ok", data=resp, request_id=idem.request_id)
         await idem.store_result(envelope)
         return envelope

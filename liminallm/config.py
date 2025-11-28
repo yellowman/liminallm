@@ -83,6 +83,8 @@ class Settings(BaseModel):
     reset_rate_limit_per_minute: int = env_field(5, "RESET_RATE_LIMIT_PER_MINUTE")
     admin_rate_limit_per_minute: int = env_field(30, "ADMIN_RATE_LIMIT_PER_MINUTE")
     admin_rate_limit_window_seconds: int = env_field(60, "ADMIN_RATE_LIMIT_WINDOW_SECONDS")
+    files_upload_rate_limit_per_minute: int = env_field(10, "FILES_UPLOAD_RATE_LIMIT_PER_MINUTE")
+    configops_rate_limit_per_hour: int = env_field(30, "CONFIGOPS_RATE_LIMIT_PER_HOUR")
 
     model_config = ConfigDict(extra="ignore")
 

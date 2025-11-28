@@ -38,6 +38,52 @@ from liminallm.storage.models import (
 )
 
 
+_MAX_SESSION_CACHE_SIZE = 10000
+
+# BM25 constants
+_BM25_K1 = 1.5
+_BM25_B = 0.75
+
+
+def _tokenize_text(text: str) -> List[str]:
+    """Tokenize text for BM25 scoring."""
+    return re.findall(r"\w+", text.lower())
+
+
+def _compute_bm25_scores(
+    query_tokens: Sequence[str],
+    documents: List[List[str]],
+    k1: float = _BM25_K1,
+    b: float = _BM25_B,
+) -> List[float]:
+    """Compute BM25 relevance scores for documents against query tokens."""
+    if not query_tokens or not documents:
+        return [0.0 for _ in documents]
+    N = len(documents)
+    avgdl = sum(len(doc) for doc in documents) / float(N)
+    doc_freq: dict[str, int] = {}
+    for doc in documents:
+        seen = set(doc)
+        for tok in seen:
+            doc_freq[tok] = doc_freq.get(tok, 0) + 1
+    scores: List[float] = []
+    for doc in documents:
+        tf: dict[str, int] = {}
+        for tok in doc:
+            tf[tok] = tf.get(tok, 0) + 1
+        score = 0.0
+        for tok in query_tokens:
+            df = doc_freq.get(tok, 0)
+            if df == 0:
+                continue
+            idf = math.log(1 + (N - df + 0.5) / (df + 0.5))
+            freq = tf.get(tok, 0)
+            denom = freq + k1 * (1 - b + b * (len(doc) / (avgdl or 1.0)))
+            score += idf * (freq * (k1 + 1)) / denom if denom else 0.0
+        scores.append(score)
+    return scores
+
+
 class PostgresStore:
     """Thin Postgres-backed store to persist kernel primitives."""
 
@@ -57,6 +103,16 @@ class PostgresStore:
 
     def _cache_session(self, session: Session) -> Session:
         """Store session in the in-memory cache and return it."""
+        # Evict oldest entries if cache is at capacity
+        if len(self.sessions) >= _MAX_SESSION_CACHE_SIZE:
+            # Remove ~10% of oldest entries by created_at
+            sorted_sessions = sorted(
+                self.sessions.values(),
+                key=lambda s: s.created_at if s.created_at else datetime.min,
+            )
+            evict_count = max(1, _MAX_SESSION_CACHE_SIZE // 10)
+            for old_session in sorted_sessions[:evict_count]:
+                self.sessions.pop(old_session.id, None)
 
         self.sessions[session.id] = session
         return session
@@ -1978,7 +2034,9 @@ class PostgresStore:
             query += where
             query += " ORDER BY kc.embedding <-> %s::vector LIMIT %s"
             rows = conn.execute(query, (*params, self._format_vector(query_embedding), limit)).fetchall()
-        chunks = [
+        # pgvector mode: results already ordered by vector similarity via SQL
+        # No BM25 re-ranking per SPEC §3 - pure vector search for pgvector mode
+        return [
             KnowledgeChunk(
                 id=int(row["id"]),
                 context_id=str(row["context_id"]),
@@ -1992,52 +2050,6 @@ class PostgresStore:
             for row in rows
         ]
 
-        def _tokenize(text: str) -> List[str]:
-            return re.findall(r"\w+", text.lower())
-
-        def _bm25_scores(query_tokens: Sequence[str], documents: List[List[str]]) -> List[float]:
-            if not query_tokens or not documents:
-                return [0.0 for _ in documents]
-            N = len(documents)
-            avgdl = sum(len(doc) for doc in documents) / float(N)
-            doc_freq: Dict[str, int] = {}
-            for doc in documents:
-                seen = set(doc)
-                for tok in seen:
-                    doc_freq[tok] = doc_freq.get(tok, 0) + 1
-            k1 = 1.5
-            b = 0.75
-            scores: List[float] = []
-            for doc in documents:
-                tf: Dict[str, int] = {}
-                for tok in doc:
-                    tf[tok] = tf.get(tok, 0) + 1
-                score = 0.0
-                for tok in query_tokens:
-                    df = doc_freq.get(tok, 0)
-                    if df == 0:
-                        continue
-                    idf = math.log(1 + (N - df + 0.5) / (df + 0.5))
-                    freq = tf.get(tok, 0)
-                    denom = freq + k1 * (1 - b + b * (len(doc) / (avgdl or 1.0)))
-                    score += idf * (freq * (k1 + 1)) / denom if denom else 0.0
-                scores.append(score)
-            return scores
-
-        bm25_scores = _bm25_scores(_tokenize(query or ""), [_tokenize(ch.content) for ch in chunks])
-        max_bm25 = max(bm25_scores) or 1.0
-        scored: list[tuple[KnowledgeChunk, float]] = []
-        for chunk, lex in zip(chunks, bm25_scores):
-            if not query_embedding or not chunk.embedding:
-                semantic_score = 0.0
-            else:
-                dim = min(len(query_embedding), len(chunk.embedding))
-                semantic_score = cosine_similarity(query_embedding[:dim], chunk.embedding[:dim])
-            hybrid = 0.45 * (lex / max_bm25) + 0.55 * semantic_score
-            scored.append((chunk, hybrid))
-        ranked = sorted(scored, key=lambda pair: pair[1], reverse=True)
-        return [chunk for chunk, _ in ranked[:limit]]
-
     def search_chunks(
         self,
         context_id: Optional[str],
@@ -2046,9 +2058,6 @@ class PostgresStore:
         limit: int = 4,
     ) -> List[KnowledgeChunk]:
         """Non-pgvector hybrid search; suitable for tests and tiny corpora only."""
-
-        def _tokenize(text: str) -> List[str]:
-            return re.findall(r"\w+", text.lower())
 
         def _cosine(a: List[float], b: List[float]) -> float:
             if not a or not b:
@@ -2059,41 +2068,12 @@ class PostgresStore:
             norm_b = sum(x * x for x in b) ** 0.5 or 1.0
             return dot / (norm_a * norm_b)
 
-        def _bm25_scores(query_tokens: Sequence[str], documents: List[List[str]]) -> List[float]:
-            if not query_tokens or not documents:
-                return [0.0 for _ in documents]
-            N = len(documents)
-            avgdl = sum(len(doc) for doc in documents) / float(N)
-            doc_freq: dict[str, int] = {}
-            for doc in documents:
-                seen = set(doc)
-                for tok in seen:
-                    doc_freq[tok] = doc_freq.get(tok, 0) + 1
-            k1 = 1.5
-            b = 0.75
-            scores: List[float] = []
-            for doc in documents:
-                tf: dict[str, int] = {}
-                for tok in doc:
-                    tf[tok] = tf.get(tok, 0) + 1
-                score = 0.0
-                for tok in query_tokens:
-                    df = doc_freq.get(tok, 0)
-                    if df == 0:
-                        continue
-                    idf = math.log(1 + (N - df + 0.5) / (df + 0.5))
-                    freq = tf.get(tok, 0)
-                    denom = freq + k1 * (1 - b + b * (len(doc) / (avgdl or 1.0)))
-                    score += idf * (freq * (k1 + 1)) / denom if denom else 0.0
-                scores.append(score)
-            return scores
-
         candidates = self.list_chunks(context_id)
         if not candidates:
             return []
-        query_tokens = _tokenize(query)
-        documents = [_tokenize(ch.content) for ch in candidates]
-        bm25_scores = _bm25_scores(query_tokens, documents)
+        query_tokens = _tokenize_text(query)
+        documents = [_tokenize_text(ch.content) for ch in candidates]
+        bm25_scores = _compute_bm25_scores(query_tokens, documents)
         semantic_scores = [(_cosine(query_embedding, ch.embedding) if query_embedding else 0.0) for ch in candidates]
         max_bm25 = max(bm25_scores) or 1.0
         combined: dict[str, tuple[KnowledgeChunk, float]] = {}

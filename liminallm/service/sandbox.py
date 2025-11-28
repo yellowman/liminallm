@@ -30,9 +30,20 @@ _CMP_OPS = {
 }
 
 
-def _eval_node(node: ast.AST, names: Mapping[str, Any], allowed_callables: Mapping[str, Any] | None) -> Any:
+_MAX_RECURSION_DEPTH = 100
+
+
+def _eval_node(
+    node: ast.AST,
+    names: Mapping[str, Any],
+    allowed_callables: Mapping[str, Any] | None,
+    _depth: int = 0,
+) -> Any:
+    if _depth > _MAX_RECURSION_DEPTH:
+        raise ValueError("expression too deeply nested")
+
     if isinstance(node, ast.Expression):
-        return _eval_node(node.body, names, allowed_callables)
+        return _eval_node(node.body, names, allowed_callables, _depth + 1)
 
     if isinstance(node, ast.Constant):
         return node.value
@@ -46,14 +57,14 @@ def _eval_node(node: ast.AST, names: Mapping[str, Any], allowed_callables: Mappi
         if isinstance(node.op, ast.And):
             result = True
             for value in node.values:
-                result = bool(_eval_node(value, names, allowed_callables))
+                result = bool(_eval_node(value, names, allowed_callables, _depth + 1))
                 if not result:
                     break
             return result
         if isinstance(node.op, ast.Or):
             result = False
             for value in node.values:
-                result = bool(_eval_node(value, names, allowed_callables))
+                result = bool(_eval_node(value, names, allowed_callables, _depth + 1))
                 if result:
                     break
             return result
@@ -61,26 +72,26 @@ def _eval_node(node: ast.AST, names: Mapping[str, Any], allowed_callables: Mappi
 
     if isinstance(node, ast.UnaryOp):
         if isinstance(node.op, ast.Not):
-            return not bool(_eval_node(node.operand, names, allowed_callables))
+            return not bool(_eval_node(node.operand, names, allowed_callables, _depth + 1))
         if isinstance(node.op, ast.USub):
-            return -_eval_node(node.operand, names, allowed_callables)
+            return -_eval_node(node.operand, names, allowed_callables, _depth + 1)
         if isinstance(node.op, ast.UAdd):
-            return +_eval_node(node.operand, names, allowed_callables)
+            return +_eval_node(node.operand, names, allowed_callables, _depth + 1)
         raise ValueError("unsupported unary operator")
 
     if isinstance(node, ast.BinOp):
         op = _BIN_OPS.get(type(node.op))
         if op is None:
             raise ValueError("unsupported binary operator")
-        return op(_eval_node(node.left, names, allowed_callables), _eval_node(node.right, names, allowed_callables))
+        return op(_eval_node(node.left, names, allowed_callables, _depth + 1), _eval_node(node.right, names, allowed_callables, _depth + 1))
 
     if isinstance(node, ast.Compare):
-        left = _eval_node(node.left, names, allowed_callables)
+        left = _eval_node(node.left, names, allowed_callables, _depth + 1)
         for op_node, comparator in zip(node.ops, node.comparators):
             op = _CMP_OPS.get(type(op_node))
             if op is None:
                 raise ValueError("unsupported comparator")
-            right = _eval_node(comparator, names, allowed_callables)
+            right = _eval_node(comparator, names, allowed_callables, _depth + 1)
             if not op(left, right):
                 return False
             left = right
@@ -94,17 +105,17 @@ def _eval_node(node: ast.AST, names: Mapping[str, Any], allowed_callables: Mappi
         func = allowed_callables[node.func.id]
         if not callable(func):
             raise ValueError("call target is not callable")
-        args = [_eval_node(arg, names, allowed_callables) for arg in node.args]
+        args = [_eval_node(arg, names, allowed_callables, _depth + 1) for arg in node.args]
         # Reject **kwargs unpacking (kw.arg is None when using **dict syntax)
         for kw in node.keywords:
             if kw.arg is None:
                 raise ValueError("keyword unpacking (**kwargs) not permitted")
-        kwargs = {kw.arg: _eval_node(kw.value, names, allowed_callables) for kw in node.keywords}
+        kwargs = {kw.arg: _eval_node(kw.value, names, allowed_callables, _depth + 1) for kw in node.keywords}
         return func(*args, **kwargs)
 
     if isinstance(node, ast.Subscript):
-        target = _eval_node(node.value, names, allowed_callables)
-        index = _eval_node(node.slice, names, allowed_callables)
+        target = _eval_node(node.value, names, allowed_callables, _depth + 1)
+        index = _eval_node(node.slice, names, allowed_callables, _depth + 1)
         if not isinstance(target, (Mapping, Sequence, str, bytes)):
             raise ValueError("subscript targets must be sequences or mappings")
         try:
@@ -113,14 +124,14 @@ def _eval_node(node: ast.AST, names: Mapping[str, Any], allowed_callables: Mappi
             raise ValueError(f"invalid subscript access: {exc}")
 
     if isinstance(node, ast.Tuple):
-        return tuple(_eval_node(elt, names, allowed_callables) for elt in node.elts)
+        return tuple(_eval_node(elt, names, allowed_callables, _depth + 1) for elt in node.elts)
 
     if isinstance(node, ast.List):
-        return [_eval_node(elt, names, allowed_callables) for elt in node.elts]
+        return [_eval_node(elt, names, allowed_callables, _depth + 1) for elt in node.elts]
 
     if isinstance(node, ast.Dict):
         return {
-            _eval_node(k, names, allowed_callables): _eval_node(v, names, allowed_callables)
+            _eval_node(k, names, allowed_callables, _depth + 1): _eval_node(v, names, allowed_callables, _depth + 1)
             for k, v in zip(node.keys, node.values)
         }
 

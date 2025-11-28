@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from typing import Any, List, Literal, Optional
 from uuid import uuid4
@@ -14,13 +15,27 @@ class Envelope(BaseModel):
     request_id: str = Field(default_factory=lambda: str(uuid4()))
 
 
+_EMAIL_REGEX = re.compile(
+    r"^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+    r"(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$"
+)
+
+
 def _validate_email(value: str) -> str:
     if not isinstance(value, str):
         raise ValueError("email must be a string")
-    normalized = value.strip()
+    normalized = value.strip().lower()
+    if len(normalized) > 254:
+        raise ValueError("email address too long")
+    if len(normalized) < 3:
+        raise ValueError("email address too short")
     local, sep, domain = normalized.partition("@")
-    if not sep or not local or not domain or "." not in domain:
+    if not sep or not local or not domain:
         raise ValueError("invalid email address")
+    if len(local) > 64:
+        raise ValueError("email local part too long")
+    if not _EMAIL_REGEX.match(normalized):
+        raise ValueError("invalid email address format")
     return normalized
 
 
@@ -40,10 +55,8 @@ class SignupRequest(BaseModel):
     def _validate_password(cls, value: str) -> str:
         if len(value) < 8:
             raise ValueError("password must be at least 8 characters")
-        if not any(c.islower() for c in value) or not any(c.isupper() for c in value):
-            raise ValueError("password must include upper and lower case letters")
-        if not any(c.isdigit() for c in value):
-            raise ValueError("password must include a digit")
+        if len(value) > 128:
+            raise ValueError("password must be at most 128 characters")
         return value
 
 
@@ -114,10 +127,8 @@ class PasswordResetConfirm(BaseModel):
     def _validate_new_password(cls, value: str) -> str:
         if len(value) < 8:
             raise ValueError("password must be at least 8 characters")
-        if not any(c.islower() for c in value) or not any(c.isupper() for c in value):
-            raise ValueError("password must include upper and lower case letters")
-        if not any(c.isdigit() for c in value):
-            raise ValueError("password must include a digit")
+        if len(value) > 128:
+            raise ValueError("password must be at most 128 characters")
         return value
 
 

@@ -137,8 +137,22 @@ const fetchWithRetry = async (url, options, retries = 3, backoffMs = 400) => {
   let lastError;
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
-      return await fetch(url, options);
+      const resp = await fetch(url, options);
+      // Don't retry client errors (4xx) - they won't succeed on retry
+      if (resp.status >= 400 && resp.status < 500) {
+        return resp;
+      }
+      // Only retry on server errors (5xx) or network failures
+      if (!resp.ok && resp.status >= 500) {
+        lastError = new Error(`Server error: ${resp.status}`);
+        if (attempt === retries) return resp;
+        const delay = backoffMs * Math.pow(2, attempt);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        continue;
+      }
+      return resp;
     } catch (err) {
+      // Network error - retry
       lastError = err;
       if (attempt === retries) break;
       const delay = backoffMs * Math.pow(2, attempt);
@@ -552,10 +566,6 @@ const sendMessage = async (event) => {
     showStatus('Sign in to chat.', true);
     return;
   }
-  toggleButtonBusy(sendBtn, true, 'Sending...');
-  document.getElementById('message-input').value = '';
-  appendMessage('user', content);
-  showStatus('Thinking...');
   const payload = {
     conversation_id: state.conversationId || undefined,
     message: { content, mode: 'text' },
@@ -647,6 +657,12 @@ const sendMessage = async (event) => {
   };
 
   try {
+    // UI updates inside try block so finally can reset the button on any error
+    toggleButtonBusy(sendBtn, true, 'Sending...');
+    document.getElementById('message-input').value = '';
+    appendMessage('user', content);
+    showStatus('Thinking...');
+
     const data = await chatViaWebSocket().catch(async () => {
       const envelope = await requestEnvelope(
         `${apiBase}/chat`,
