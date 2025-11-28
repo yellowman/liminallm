@@ -1273,24 +1273,18 @@ class MemoryStore:
         if not allowed_chunks:
             return []
 
-        bm25_scores = _compute_bm25_scores(_tokenize_text(query or ""), [_tokenize_text(ch.content) for ch in allowed_chunks])
-        semantic_scores = []
+        # pgvector mode: pure vector similarity (no BM25) per SPEC §3
+        # Sort by cosine similarity to emulate pgvector ORDER BY embedding <-> query
+        scored: List[tuple[KnowledgeChunk, float]] = []
         for ch in allowed_chunks:
-            if not query_embedding or not ch.embedding:
-                semantic_scores.append(0.0)
+            if not ch.embedding:
+                scored.append((ch, 0.0))
                 continue
             dim = min(len(query_embedding), len(ch.embedding))
-            semantic_scores.append(cosine_similarity(query_embedding[:dim], ch.embedding[:dim]))
-        max_bm25 = max(bm25_scores) or 1.0
-        combined: Dict[str, tuple[KnowledgeChunk, float]] = {}
-        for chunk, lex, sem in zip(allowed_chunks, bm25_scores, semantic_scores):
-            hybrid = 0.45 * (lex / max_bm25) + 0.55 * sem
-            key = " ".join(chunk.content.split()).lower() or str(chunk.id or "")
-            existing = combined.get(key)
-            if not existing or hybrid > existing[1]:
-                combined[key] = (chunk, hybrid)
-        ranked = sorted(combined.values(), key=lambda pair: pair[1], reverse=True)
-        return [pair[0] for pair in ranked[:limit]]
+            sim = cosine_similarity(query_embedding[:dim], ch.embedding[:dim])
+            scored.append((ch, sim))
+        ranked = sorted(scored, key=lambda pair: pair[1], reverse=True)
+        return [chunk for chunk, _ in ranked[:limit]]
 
     def _persist_state(self) -> None:
         state = {

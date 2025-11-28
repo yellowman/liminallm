@@ -2034,7 +2034,9 @@ class PostgresStore:
             query += where
             query += " ORDER BY kc.embedding <-> %s::vector LIMIT %s"
             rows = conn.execute(query, (*params, self._format_vector(query_embedding), limit)).fetchall()
-        chunks = [
+        # pgvector mode: results already ordered by vector similarity via SQL
+        # No BM25 re-ranking per SPEC §3 - pure vector search for pgvector mode
+        return [
             KnowledgeChunk(
                 id=int(row["id"]),
                 context_id=str(row["context_id"]),
@@ -2047,20 +2049,6 @@ class PostgresStore:
             )
             for row in rows
         ]
-
-        bm25_scores = _compute_bm25_scores(_tokenize_text(query or ""), [_tokenize_text(ch.content) for ch in chunks])
-        max_bm25 = max(bm25_scores) or 1.0
-        scored: list[tuple[KnowledgeChunk, float]] = []
-        for chunk, lex in zip(chunks, bm25_scores):
-            if not query_embedding or not chunk.embedding:
-                semantic_score = 0.0
-            else:
-                dim = min(len(query_embedding), len(chunk.embedding))
-                semantic_score = cosine_similarity(query_embedding[:dim], chunk.embedding[:dim])
-            hybrid = 0.45 * (lex / max_bm25) + 0.55 * semantic_score
-            scored.append((chunk, hybrid))
-        ranked = sorted(scored, key=lambda pair: pair[1], reverse=True)
-        return [chunk for chunk, _ in ranked[:limit]]
 
     def search_chunks(
         self,
