@@ -117,14 +117,19 @@ class ConfigOpsService:
             return full_json
         # Truncate by removing keys from a shallow copy until it fits
         if isinstance(obj, dict):
-            truncated = {}
+            truncated: dict = {}
+            # Reserve space for the _truncated marker
+            marker_overhead = len(',"_truncated":true')
+            target_max = max_chars - marker_overhead
             for key, value in obj.items():
-                truncated[key] = value
-                test_json = json.dumps(truncated, indent=None, separators=(",", ":"))
-                if len(test_json) > max_chars - 20:  # Leave room for truncation notice
+                # Test size before adding
+                test_dict = {**truncated, key: value}
+                test_json = json.dumps(test_dict, indent=None, separators=(",", ":"))
+                if len(test_json) > target_max:
                     break
+                truncated[key] = value
             truncated["_truncated"] = True
-            return json.dumps(truncated, indent=None, separators=(",", ":"))[:max_chars]
+            return json.dumps(truncated, indent=None, separators=(",", ":"))
         return full_json[:max_chars - 3] + "..."
 
     def _fallback_patch(self) -> dict:
