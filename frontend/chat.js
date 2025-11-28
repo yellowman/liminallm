@@ -285,8 +285,8 @@ const handleFileUpload = async (event) => {
   const contextId = (fileUploadContextId?.value || document.getElementById('context-id')?.value || '').trim();
   const chunkSizeRaw = (fileUploadChunkSize?.value || '').trim();
   const chunkSize = chunkSizeRaw ? Number(chunkSizeRaw) : null;
-  if (chunkSizeRaw && (!Number.isFinite(chunkSize) || chunkSize <= 0)) {
-    setUploadStatus('Chunk size must be a positive number.', true);
+  if (chunkSizeRaw && (!Number.isFinite(chunkSize) || chunkSize < 64 || chunkSize > 4000)) {
+    setUploadStatus('Chunk size must be between 64 and 4000.', true);
     return;
   }
 
@@ -707,11 +707,16 @@ const sendPreference = async (isPositive) => {
       adapter_gates: state.lastAssistant.adapterGates || undefined,
       notes: preferenceNotesEl?.value || undefined,
     };
+    const idempotencyKey = `pref-${stableHash(JSON.stringify({
+      cid: body.conversation_id,
+      mid: body.message_id,
+      fb: body.feedback,
+    }))}`;
     await requestEnvelope(
       `${apiBase}/preferences`,
       {
         method: 'POST',
-        headers: headers(),
+        headers: headers(idempotencyKey),
         body: JSON.stringify(body),
       },
       'Unable to record preference'

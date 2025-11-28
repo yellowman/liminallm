@@ -174,6 +174,8 @@ async def check_rate_limit(runtime: Runtime, key: str, limit: int, window_second
 
     if limit <= 0:
         return True
+    if window_seconds <= 0:
+        window_seconds = 60  # Default to 1 minute if invalid window
     now = datetime.utcnow()
     if runtime.cache:
         return await runtime.cache.check_rate_limit(key, limit, window_seconds)

@@ -532,6 +532,12 @@ async def request_mfa(body: MFARequest):
     auth_ctx = await runtime.auth.resolve_session(body.session_id, allow_pending_mfa=True)
     if not auth_ctx:
         raise _http_error("unauthorized", "invalid session", status_code=401)
+    await _enforce_rate_limit(
+        runtime,
+        f"mfa:request:{auth_ctx.user_id}",
+        runtime.settings.mfa_rate_limit_per_minute,
+        60,
+    )
     challenge = await runtime.auth.issue_mfa_challenge(user_id=auth_ctx.user_id)
     return Envelope(status="ok", data=challenge)
 
@@ -542,6 +548,12 @@ async def verify_mfa(body: MFAVerifyRequest, response: Response):
     auth_ctx = await runtime.auth.resolve_session(body.session_id, allow_pending_mfa=True)
     if not auth_ctx:
         raise _http_error("unauthorized", "invalid session", status_code=401)
+    await _enforce_rate_limit(
+        runtime,
+        f"mfa:verify:{auth_ctx.user_id}",
+        runtime.settings.mfa_rate_limit_per_minute,
+        60,
+    )
     ok = await runtime.auth.verify_mfa_challenge(user_id=auth_ctx.user_id, code=body.code, session_id=body.session_id)
     if not ok:
         raise _http_error("unauthorized", "invalid mfa", status_code=401)
@@ -1557,7 +1569,7 @@ async def websocket_chat(ws: WebSocket):
     except WebSocketDisconnect:
         return
     except Exception as exc:
-        logger.exception("unhandled_websocket_error", user_id=user_id, conversation_id=conversation_id)
+        logger.exception("unhandled_websocket_error", user_id=user_id, conversation_id=convo_id)
         error_env = Envelope(
             status="error",
             error={"code": "server_error", "message": "An internal error occurred"},

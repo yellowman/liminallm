@@ -1129,9 +1129,9 @@ class MemoryStore:
         return self.contexts.get(context_id)
 
     def list_contexts(self, owner_user_id: Optional[str] = None) -> List[KnowledgeContext]:
-        if owner_user_id:
-            return [ctx for ctx in self.contexts.values() if ctx.owner_user_id == owner_user_id]
-        return list(self.contexts.values())
+        if not owner_user_id:
+            return []
+        return [ctx for ctx in self.contexts.values() if ctx.owner_user_id == owner_user_id]
 
     def add_context_source(
         self, context_id: str, fs_path: str, recursive: bool = True, meta: Optional[Dict] = None
