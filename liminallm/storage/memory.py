@@ -258,8 +258,15 @@ class MemoryStore:
         return user
 
     def link_user_auth_provider(self, user_id: str, provider: str, provider_uid: str) -> None:
-        mapping = UserAuthProvider(id=len(self.providers) + 1, user_id=user_id, provider=provider, provider_uid=provider_uid)
+        # Check for existing mapping (avoid duplicates like postgres ON CONFLICT DO NOTHING)
+        for existing in self.providers:
+            if existing.provider == provider and existing.provider_uid == provider_uid:
+                return  # Already linked, do nothing
+        # Generate unique ID
+        max_id = max((p.id for p in self.providers), default=0)
+        mapping = UserAuthProvider(id=max_id + 1, user_id=user_id, provider=provider, provider_uid=provider_uid)
         self.providers.append(mapping)
+        self._persist_state()
 
     def get_user_by_provider(self, provider: str, provider_uid: str) -> Optional[User]:
         for mapping in self.providers:
@@ -300,6 +307,10 @@ class MemoryStore:
             return False
         self.users.pop(user_id, None)
         self.mfa_secrets.pop(user_id, None)
+        # Clean up user credentials
+        self.credentials.pop(user_id, None)
+        # Clean up auth providers for this user
+        self.providers = [p for p in self.providers if p.user_id != user_id]
         for sess_id, sess in list(self.sessions.items()):
             if sess.user_id == user_id:
                 self.sessions.pop(sess_id, None)

@@ -461,8 +461,14 @@ class TrainingService:
         def _encode(text: str) -> List[int]:
             if self.tokenizer is not None:
                 return list(self.tokenizer.encode(text, truncation=True, max_length=max_length))
+            # Use deterministic hashing instead of Python's randomized hash()
             tokens = text.split()
-            return [hash(tok) % vocab_size for tok in tokens[:max_length]]
+            def stable_hash(s: str) -> int:
+                h = 0
+                for ch in s:
+                    h = (h * 31 + ord(ch)) & 0xFFFFFFFF
+                return h
+            return [stable_hash(tok) % vocab_size for tok in tokens[:max_length]]
 
         for i in range(0, len(dataset_entries), batch_size):
             batch = dataset_entries[i : i + batch_size]
@@ -648,8 +654,14 @@ class TrainingService:
     def _bucket_embedding(self, embedding: Sequence[float], user_id: str) -> Optional[str]:
         if not embedding:
             return None
+        # Use deterministic hashing instead of Python's randomized hash()
         rounded = tuple(round(v, 1) for v in embedding[:8])
-        return f"{user_id}-c{abs(hash(rounded)) % 1_000_000:06d}"
+        h = 0
+        for val in rounded:
+            # Convert float to string for consistent hashing
+            for ch in str(val):
+                h = (h * 31 + ord(ch)) & 0xFFFFFFFF
+        return f"{user_id}-c{h % 1_000_000:06d}"
 
     def _cluster_events(self, events: Sequence[PreferenceEvent], user_id: str) -> List[dict]:
         clusters: dict[str, dict] = {}

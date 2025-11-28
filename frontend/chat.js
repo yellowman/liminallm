@@ -370,6 +370,27 @@ let chatSocket = null;
 let chatSocketConnecting = false;
 let chatSocketReconnectTimer = null;
 
+// Cleanup WebSocket on page unload to prevent memory leaks
+const cleanupWebSocket = () => {
+  if (chatSocketReconnectTimer) {
+    clearTimeout(chatSocketReconnectTimer);
+    chatSocketReconnectTimer = null;
+  }
+  if (chatSocket) {
+    chatSocket.onopen = null;
+    chatSocket.onerror = null;
+    chatSocket.onclose = null;
+    chatSocket.onmessage = null;
+    if (chatSocket.readyState === WebSocket.OPEN || chatSocket.readyState === WebSocket.CONNECTING) {
+      chatSocket.close();
+    }
+    chatSocket = null;
+  }
+  chatSocketConnecting = false;
+};
+
+window.addEventListener('beforeunload', cleanupWebSocket);
+
 const connectWebSocket = () => {
   if (chatSocketConnecting) return chatSocket;
   if (chatSocket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(chatSocket.readyState)) {
@@ -437,8 +458,43 @@ const extractError = (payload, fallback) => {
   return fallback;
 };
 
+// Attempt to refresh access token using refresh token
+const tryRefreshToken = async () => {
+  if (!state.refreshToken) return false;
+  try {
+    const resp = await fetch(`${apiBase}/auth/refresh`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: state.refreshToken, tenant_id: state.tenantId }),
+    });
+    if (!resp.ok) return false;
+    const envelope = await resp.json();
+    if (envelope.data?.access_token) {
+      persistAuth(envelope.data);
+      return true;
+    }
+  } catch (err) {
+    console.warn('Token refresh failed', err);
+  }
+  return false;
+};
+
 const requestEnvelope = async (url, options, fallbackMessage) => {
-  const resp = await fetchWithRetry(url, options);
+  let resp = await fetchWithRetry(url, options);
+
+  // If unauthorized and we have a refresh token, try to refresh and retry
+  if (resp.status === 401 && state.refreshToken) {
+    const refreshed = await tryRefreshToken();
+    if (refreshed) {
+      // Update authorization header with new token and retry
+      const newOptions = { ...options };
+      if (newOptions.headers) {
+        newOptions.headers = { ...newOptions.headers, Authorization: `Bearer ${state.accessToken}` };
+      }
+      resp = await fetchWithRetry(url, newOptions);
+    }
+  }
+
   const text = await resp.text();
   const trimmed = text.trim();
   let payload;

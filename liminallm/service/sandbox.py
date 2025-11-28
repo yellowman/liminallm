@@ -95,7 +95,11 @@ def _eval_node(node: ast.AST, names: Mapping[str, Any], allowed_callables: Mappi
         if not callable(func):
             raise ValueError("call target is not callable")
         args = [_eval_node(arg, names, allowed_callables) for arg in node.args]
-        kwargs = {kw.arg: _eval_node(kw.value, names, allowed_callables) for kw in node.keywords if kw.arg is not None}
+        # Reject **kwargs unpacking (kw.arg is None when using **dict syntax)
+        for kw in node.keywords:
+            if kw.arg is None:
+                raise ValueError("keyword unpacking (**kwargs) not permitted")
+        kwargs = {kw.arg: _eval_node(kw.value, names, allowed_callables) for kw in node.keywords}
         return func(*args, **kwargs)
 
     if isinstance(node, ast.Subscript):

@@ -518,7 +518,8 @@ class LocalJaxLoRABackend:
             base = self.fs_root.resolve()
             candidate = (Path(str(explicit)) if isinstance(explicit, (str, Path)) else Path(""))
             resolved = (candidate if candidate.is_absolute() else base / candidate).resolve()
-            if base not in resolved.parents and resolved != base:
+            # Path must be within fs_root: base must be a parent of resolved, or they must be equal
+            if not (base in resolved.parents or resolved == base):
                 raise ValueError("adapter path must reside within fs_root")
             return str(resolved)
         adapter_id = adapter.get("id", "unknown")

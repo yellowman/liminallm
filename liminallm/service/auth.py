@@ -427,7 +427,8 @@ class AuthService:
         return True
 
     async def initiate_password_reset(self, email: str) -> str:
-        token = hashlib.sha256(f"reset-{email}-{os.urandom(32)}".encode()).hexdigest()
+        # Use raw bytes for proper entropy (not string representation)
+        token = hashlib.sha256(b"reset-" + email.encode() + os.urandom(32)).hexdigest()
         # Persist a short-lived reset token with TTL in Redis if available
         if self.cache:
             expires_at = datetime.utcnow() + timedelta(minutes=15)
@@ -459,7 +460,8 @@ class AuthService:
         return True
 
     async def request_email_verification(self, user: User) -> str:
-        token = hashlib.sha256(f"verify-{user.email}-{os.urandom(32)}".encode()).hexdigest()
+        # Use raw bytes for proper entropy (not string representation)
+        token = hashlib.sha256(b"verify-" + user.email.encode() + os.urandom(32)).hexdigest()
         expires_at = datetime.utcnow() + timedelta(hours=24)
         if self.cache:
             await self.cache.client.set(f"verify:{token}", user.id, ex=int((expires_at - datetime.utcnow()).total_seconds()))

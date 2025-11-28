@@ -16,6 +16,15 @@ const patchStatusOptions = document.getElementById('patch-status-options');
 
 const sessionStorageKey = (key) => `liminal.${key}`;
 const readSession = (key) => sessionStorage.getItem(sessionStorageKey(key));
+
+// XSS protection: escape HTML entities
+const escapeHtml = (str) => {
+  if (str == null) return '';
+  const text = String(str);
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+};
 const writeSession = (key, value) => {
   if (value) {
     sessionStorage.setItem(sessionStorageKey(key), value);
@@ -169,12 +178,12 @@ const renderPatchTable = (patches) => {
     .map(
       (p) => `
         <tr>
-          <td>${p.id}</td>
-          <td>${p.artifact_id}</td>
-          <td>${p.status}</td>
-          <td>${p.justification || ''}</td>
-          <td>${p.decided_at || ''}</td>
-          <td>${p.applied_at || ''}</td>
+          <td>${escapeHtml(p.id)}</td>
+          <td>${escapeHtml(p.artifact_id)}</td>
+          <td>${escapeHtml(p.status)}</td>
+          <td>${escapeHtml(p.justification || '')}</td>
+          <td>${escapeHtml(p.decided_at || '')}</td>
+          <td>${escapeHtml(p.applied_at || '')}</td>
         </tr>`
     )
     .join('');
@@ -316,13 +325,13 @@ const renderUsers = (users) => {
     .map(
       (u) => `
         <tr>
-          <td>${u.id}</td>
-          <td>${u.email}</td>
-          <td>${u.role}</td>
-          <td>${u.tenant_id}</td>
-          <td>${u.plan_tier || ''}</td>
+          <td>${escapeHtml(u.id)}</td>
+          <td>${escapeHtml(u.email)}</td>
+          <td>${escapeHtml(u.role)}</td>
+          <td>${escapeHtml(u.tenant_id)}</td>
+          <td>${escapeHtml(u.plan_tier || '')}</td>
           <td>${u.is_active ? 'active' : 'disabled'}</td>
-          <td>${u.created_at}</td>
+          <td>${escapeHtml(u.created_at)}</td>
         </tr>`
     )
     .join('');
@@ -441,12 +450,12 @@ const renderAdapters = (adapters) => {
     .map(
       (a) => `
         <tr>
-          <td>${a.id}</td>
-          <td>${a.name}</td>
-          <td>${a.type}</td>
-          <td>${a.kind || ''}</td>
-          <td>${a.owner_user_id || ''}</td>
-          <td>${a.updated_at}</td>
+          <td>${escapeHtml(a.id)}</td>
+          <td>${escapeHtml(a.name)}</td>
+          <td>${escapeHtml(a.type)}</td>
+          <td>${escapeHtml(a.kind || '')}</td>
+          <td>${escapeHtml(a.owner_user_id || '')}</td>
+          <td>${escapeHtml(a.updated_at)}</td>
         </tr>`
     )
     .join('');
