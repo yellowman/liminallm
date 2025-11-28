@@ -497,6 +497,55 @@ all redis keys should be namespaced, e.g.:
   - providers with adapter-id style APIs include Together AI Serverless Multi-LoRA (`adapter_id`), SageMaker adapter inference components, or custom LoRAX deployments behind OpenAI-compatible routes.
   - both modes share the same artifact metadata; only the transport differs, so workflows/policies remain data-driven.
 
+### 5.0.1 adapter mode schema field (clarification)
+
+to support seamless switching between deployment modes, each adapter artifact includes an explicit `mode` field in its schema:
+
+```json
+{
+  "kind": "adapter.lora",
+  "mode": "hybrid",  // local | remote | prompt | hybrid
+  "backend": "hybrid",
+  "provider": "local",
+  "base_model": "llama-7b",
+  "rank": 4,
+  "fs_dir": "/users/{user_id}/adapters/{adapter_id}",
+  "remote_model_id": null,
+  "prompt_instructions": "You are a helpful coding assistant..."
+}
+```
+
+**adapter modes:**
+
+| Mode | Weights | Execution | Use Case |
+|------|---------|-----------|----------|
+| `local` | Filesystem (`params.json`) | LocalJaxLoRABackend | Self-hosted GPU inference |
+| `remote` | External service | API passthrough (`adapter_id`) | Cloud fine-tuned models |
+| `prompt` | None | System prompt injection | Behavior without weights |
+| `hybrid` | Filesystem + prompt | Local when available, prompt fallback | Portable adapters |
+
+**mode compatibility matrix:**
+
+| Backend | local | remote | prompt | hybrid |
+|---------|-------|--------|--------|--------|
+| local_lora | ✓ | ✗ | ✓ | ✓ |
+| openai | ✗ | ✓ | ✓ | ✓ |
+| together | ✗ | ✓ | ✓ | ✓ |
+| lorax | ✗ | ✓ | ✓ | ✓ |
+
+**router filtering:**
+
+the router filters adapters before policy evaluation, only considering those compatible with the active backend mode. incompatible adapters are logged and excluded from routing decisions.
+
+**hybrid mode behavior:**
+
+for `hybrid` adapters:
+- if running local backend: load weights from `fs_dir`
+- if running API backend: extract `prompt_instructions` and inject into system prompt
+- if adapter has `remote_model_id`: also pass to API for backends that support it
+
+this allows the same adapter artifact to work across deployment modes without modification.
+
 ### 5.1 base model
 
 - JAX/Flax implementation of a decoder-only transformer:
@@ -1427,9 +1476,18 @@ the following are treated as constants the kernel must honor; LLM edits happen o
   - retries: default 2 retries with exponential backoff (1s, 4s); per-node override allowed but capped at 3; node timeout default 15s, hard cap 60s.
 
 - **inference/adapter cache discipline**
-  - per-GPU adapter cache budget configured in bytes (e.g., 6GB); eviction LRU with pinning for persona adapter of active user; checksum of `params.npz` verified against `schema.checksum` before activation.
+  - per-GPU adapter cache budget configured in bytes (e.g., 6GB); eviction LRU with pinning for persona adapter of active user; checksum of `params.json` verified against `schema.checksum` before activation.
   - per-request adapter cap = 3; if router selects more, lowest-weight adapters are dropped and the trace records the drop.
   - cancellation: orchestrator issues `{event:"cancel", request_id}`; worker aborts decode, frees KV cache and adapter refs, and emits `cancel_ack` with partial tokens if any.
+
+- **adapter mode configuration**
+  - `DEFAULT_ADAPTER_MODE` environment variable (default: `hybrid`): controls mode for newly created adapters.
+  - valid values: `local`, `remote`, `prompt`, `hybrid` (see §5.0.1 for mode definitions).
+  - `MODEL_BACKEND` determines which adapter modes are compatible:
+    - `local_lora`/`local_gpu_lora`: supports `local`, `prompt`, `hybrid`
+    - API backends (`openai`, `together`, `lorax`, etc.): support `remote`, `prompt`, `hybrid`
+  - router automatically filters incompatible adapters before policy evaluation; filtered adapters logged with `adapter_filtered_by_mode` event.
+  - existing adapters without `mode` field are migrated on first access: `backend=local` → `local` or `hybrid` (if has prompt_instructions); `backend=api/remote` → `remote`.
 
 - **training pipeline knobs**
   - dataset: JSONL on the shared filesystem `/users/{u}/adapters/{id}/train_jobs/{job}/dataset.jsonl` with fields `{prompt, target, weight, context, conversation_id, message_id}`; max 2k tokens per sample; dedupe by `(conversation_id, message_id)`.

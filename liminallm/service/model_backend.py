@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Tuple
 
+from liminallm.config import AdapterMode
 from liminallm.logging import get_logger
 from liminallm.service.fs import safe_join
 from liminallm.service.tokenizer_utils import DEFAULT_VOCAB_SIZE, vocab_size_from_tokenizer
@@ -35,6 +36,51 @@ _ADAPTER_ID_PROVIDERS = {
 }
 
 logger = get_logger(__name__)
+
+
+def get_adapter_mode(adapter: dict) -> str:
+    """Extract adapter mode from schema, inferring from legacy fields if needed."""
+    if not adapter:
+        return AdapterMode.PROMPT
+
+    # Check explicit mode field first
+    mode = adapter.get("mode") or adapter.get("schema", {}).get("mode")
+    if mode:
+        return mode
+
+    # Infer from legacy backend/provider fields
+    backend = (adapter.get("backend") or "").lower()
+    provider = (adapter.get("provider") or "").lower()
+
+    if backend in {"prompt", "prompt_distill"}:
+        return AdapterMode.PROMPT
+    if backend in {"local", "local_lora"} or provider == "local":
+        if adapter.get("prompt_instructions") or adapter.get("behavior_prompt"):
+            return AdapterMode.HYBRID
+        return AdapterMode.LOCAL
+    if backend in {"api", "remote"} or adapter.get("remote_model_id"):
+        return AdapterMode.REMOTE
+    if backend == "hybrid":
+        return AdapterMode.HYBRID
+
+    return AdapterMode.HYBRID  # Default for backwards compatibility
+
+
+def filter_adapters_by_mode(adapters: List[dict], compatible_modes: set) -> List[dict]:
+    """Filter adapters to only those compatible with the current backend mode."""
+    result = []
+    for adapter in adapters:
+        mode = get_adapter_mode(adapter)
+        if mode in compatible_modes:
+            result.append(adapter)
+        else:
+            logger.debug(
+                "adapter_mode_incompatible",
+                adapter_id=adapter.get("id"),
+                mode=mode,
+                compatible_modes=list(compatible_modes),
+            )
+    return result
 
 _OPENAI_SPEC = importlib.util.find_spec("openai")
 if _OPENAI_SPEC:
@@ -107,7 +153,16 @@ def list_adapter_plugs() -> List[AdapterPlug]:
 
 
 class ApiAdapterBackend:
-    """Backend that targets external APIs, optionally using fine-tuned model IDs as adapters."""
+    """Backend that targets external APIs, optionally using fine-tuned model IDs as adapters.
+
+    Supports SPEC §5 dual-mode operation:
+    - REMOTE adapters: Pass adapter_id to external service
+    - PROMPT adapters: Inject behavior via system prompt
+    - HYBRID adapters: Use prompt injection when local weights unavailable
+    """
+
+    # Modes compatible with this backend
+    COMPATIBLE_MODES = {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID}
 
     def __init__(
         self,
@@ -126,12 +181,18 @@ class ApiAdapterBackend:
 
     def generate(self, messages: List[dict], adapters: List[dict], *, user_id: Optional[str] = None) -> dict:
         adapter_list = adapters or []
-        target_model = self._resolve_model(adapter_list)
-        extra_body = self._resolve_extra_body(adapter_list)
+        # Filter to compatible adapters and inject prompts for hybrid/prompt mode
+        compatible_adapters, prompt_injection = self._process_adapters(adapter_list)
+        target_model = self._resolve_model(compatible_adapters)
+        extra_body = self._resolve_extra_body(compatible_adapters)
+
+        # Inject adapter prompts if any hybrid/prompt adapters
+        augmented_messages = self._inject_adapter_prompts(messages, prompt_injection)
+
         if self.client:
             completion = self.client.chat.completions.create(
                 model=target_model,
-                messages=messages,
+                messages=augmented_messages,
                 temperature=0.2,
                 extra_body=extra_body,
             )
@@ -148,14 +209,85 @@ class ApiAdapterBackend:
                 "total_tokens": getattr(completion.usage, "total_tokens", 0),
             }
             return {"content": content, "usage": usage}
-        fallback = messages[-1]["content"] if messages else ""
+        fallback = augmented_messages[-1]["content"] if augmented_messages else ""
         return {
-            "content": f"[api-backend model={target_model} adapters={self._adapter_summary(adapter_list)}] {fallback}",
+            "content": f"[api-backend model={target_model} adapters={self._adapter_summary(compatible_adapters)}] {fallback}",
             "usage": {
                 "prompt_tokens": len(fallback.split()),
                 "completion_tokens": max(5, min(20, len(fallback.split()))),
             },
         }
+
+    def _process_adapters(self, adapters: List[dict]) -> Tuple[List[dict], List[str]]:
+        """Process adapters, extracting prompt injections for non-weight adapters.
+
+        Returns:
+            Tuple of (adapters for API passthrough, prompt injections)
+        """
+        api_adapters = []
+        prompt_injections = []
+
+        for adapter in adapters:
+            mode = get_adapter_mode(adapter)
+
+            if mode == AdapterMode.REMOTE:
+                # Remote adapter - pass through to API
+                api_adapters.append(adapter)
+            elif mode in {AdapterMode.PROMPT, AdapterMode.HYBRID}:
+                # Extract prompt instructions for injection
+                prompt = self._extract_prompt_instructions(adapter)
+                if prompt:
+                    prompt_injections.append(prompt)
+                # For hybrid with remote_model_id, also pass to API
+                if mode == AdapterMode.HYBRID and adapter.get("remote_model_id"):
+                    api_adapters.append(adapter)
+            elif mode == AdapterMode.LOCAL:
+                # Local-only adapter - can't use in API mode, log warning
+                logger.warning(
+                    "adapter_mode_incompatible_api",
+                    adapter_id=adapter.get("id"),
+                    mode=mode,
+                    message="Local adapter cannot be used with API backend; skipping",
+                )
+
+        return api_adapters, prompt_injections
+
+    def _extract_prompt_instructions(self, adapter: dict) -> Optional[str]:
+        """Extract prompt instructions from adapter for injection."""
+        for key in ("prompt_instructions", "behavior_prompt", "instructions", "prompt_template"):
+            value = adapter.get(key) or adapter.get("schema", {}).get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        # Try applicability.natural_language
+        applicability = adapter.get("applicability") or adapter.get("schema", {}).get("applicability")
+        if isinstance(applicability, dict):
+            natural = applicability.get("natural_language")
+            if isinstance(natural, str) and natural.strip():
+                return natural.strip()
+        # Fall back to description
+        description = adapter.get("description") or adapter.get("schema", {}).get("description")
+        if isinstance(description, str) and description.strip():
+            return description.strip()
+        return None
+
+    def _inject_adapter_prompts(self, messages: List[dict], prompts: List[str]) -> List[dict]:
+        """Inject adapter prompt instructions into message list."""
+        if not prompts:
+            return messages
+
+        prompt_text = "\n".join(f"- {p}" for p in prompts)
+        system_addition = f"\n\nAdapter guidance:\n{prompt_text}"
+
+        # Find and augment system message, or prepend new one
+        augmented = [dict(m) for m in messages]
+        for i, msg in enumerate(augmented):
+            if msg.get("role") == "system":
+                augmented[i] = {**msg, "content": msg.get("content", "") + system_addition}
+                return augmented
+
+        # No system message found, prepend one
+        augmented.insert(0, {"role": "system", "content": f"Adapter guidance:\n{prompt_text}"})
+        return augmented
 
     def _resolve_model(self, adapters: List[dict]) -> str:
         if self._uses_adapter_id(adapters):
@@ -210,12 +342,20 @@ class ApiAdapterBackend:
 class LocalJaxLoRABackend:
     """Backend for local JAX generation with filesystem-backed LoRA adapters.
 
+    Supports SPEC §5 dual-mode operation:
+    - LOCAL adapters: Load weights from filesystem, apply LoRA math
+    - HYBRID adapters: Load local weights, with prompt fallback
+    - PROMPT adapters: Inject behavior via system prompt (no weights)
+
     The backend keeps a tokenizer and (optional) Flax model resident, reads
     LoRA matrices from ``fs_root`` paths, and runs a lightweight JAX forward
     pass that mirrors the training sketch in ``TrainingService``. It performs
     fixed-shape padding, enforces conservative limits, and emits usage stats
     so callers can track prompt/completion token counts.
     """
+
+    # Modes compatible with this backend
+    COMPATIBLE_MODES = {AdapterMode.LOCAL, AdapterMode.HYBRID, AdapterMode.PROMPT}
 
     def __init__(
         self,

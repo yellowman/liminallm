@@ -40,6 +40,53 @@ class RagMode(str, Enum):
     MEMORY = "memory"
 
 
+class AdapterMode(str, Enum):
+    """Adapter execution modes for dual local/API support.
+
+    SPEC §5 clarification: Adapters can operate in different modes depending
+    on deployment. This enum explicitly tracks where adapter weights live
+    and how they're applied during inference.
+
+    - LOCAL: Weights stored on filesystem, loaded by LocalJaxLoRABackend
+    - REMOTE: Weights hosted by external service (Together, LoRAX, etc.)
+    - PROMPT: No weights; adapter behavior injected via system prompt
+    - HYBRID: Local weights with prompt fallback for API mode
+    """
+
+    LOCAL = "local"
+    REMOTE = "remote"
+    PROMPT = "prompt"
+    HYBRID = "hybrid"
+
+
+# Mapping of ModelBackend to compatible AdapterModes
+BACKEND_ADAPTER_COMPATIBILITY: dict[str, set[str]] = {
+    # API backends can use remote adapters or prompt-based
+    "openai": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "azure": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "azure_openai": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "vertex": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "gemini": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "google": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "bedrock": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    # Adapter-aware API backends support remote adapter IDs
+    "together": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "together.ai": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "lorax": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "adapter_server": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "sagemaker": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "aws_sagemaker": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    # Local backend supports local weights
+    "local_lora": {AdapterMode.LOCAL, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "local_gpu_lora": {AdapterMode.LOCAL, AdapterMode.PROMPT, AdapterMode.HYBRID},
+}
+
+
+def get_compatible_adapter_modes(backend: str) -> set[str]:
+    """Return adapter modes compatible with the given backend."""
+    return BACKEND_ADAPTER_COMPATIBILITY.get(backend.lower(), {AdapterMode.PROMPT})
+
+
 def env_field(default: Any, env: str, **kwargs):
     extra = kwargs.pop("json_schema_extra", {}) or {}
     extra = {**extra, "env": env}
@@ -57,6 +104,11 @@ class Settings(BaseModel):
     adapter_openai_api_key: str | None = env_field(None, "OPENAI_ADAPTER_API_KEY")
     adapter_openai_base_url: str | None = env_field(None, "OPENAI_ADAPTER_BASE_URL")
     adapter_server_model: str | None = env_field(None, "ADAPTER_SERVER_MODEL")
+    default_adapter_mode: AdapterMode = env_field(
+        AdapterMode.HYBRID,
+        "DEFAULT_ADAPTER_MODE",
+        description="Default mode for new adapters: local, remote, prompt, or hybrid",
+    )
     allow_signup: bool = env_field(True, "ALLOW_SIGNUP")
     use_memory_store: bool = env_field(False, "USE_MEMORY_STORE")
     allow_redis_fallback_dev: bool = env_field(False, "ALLOW_REDIS_FALLBACK_DEV")
@@ -114,6 +166,11 @@ class Settings(BaseModel):
     @classmethod
     def _validate_rag_mode(cls, value: RagMode) -> RagMode:
         return RagMode(value)
+
+    @field_validator("default_adapter_mode")
+    @classmethod
+    def _validate_adapter_mode(cls, value: AdapterMode) -> AdapterMode:
+        return AdapterMode(value)
 
     @field_validator("jwt_secret")
     @classmethod

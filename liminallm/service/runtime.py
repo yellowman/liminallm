@@ -62,7 +62,7 @@ class Runtime:
                 ),
                 mode=fallback_mode,
             )
-        self.router = RouterEngine(cache=self.cache)
+        self.router = RouterEngine(cache=self.cache, backend_mode=backend_mode)
         runtime_config = {}
         db_backend_mode = None
         if hasattr(self.store, "get_runtime_config"):
@@ -95,7 +95,11 @@ class Runtime:
             embedding_model_id=self.settings.embedding_model_id,
         )
         self.training = TrainingService(
-            self.store, self.settings.shared_fs_root, runtime_base_model=resolved_base_model
+            self.store,
+            self.settings.shared_fs_root,
+            runtime_base_model=resolved_base_model,
+            default_adapter_mode=self.settings.default_adapter_mode,
+            backend_mode=backend_mode,
         )
         self.clusterer = SemanticClusterer(self.store, self.llm, self.training)
         self.workflow = WorkflowEngine(self.store, self.llm, self.router, self.rag, cache=self.cache)

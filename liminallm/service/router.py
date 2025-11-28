@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import struct
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
+from liminallm.config import AdapterMode, get_compatible_adapter_modes
 from liminallm.logging import get_logger
+from liminallm.service.model_backend import get_adapter_mode
 
 from .embeddings import EMBEDDING_DIM, cosine_similarity, ensure_embedding_dim
 from .sandbox import safe_eval_expr
@@ -14,9 +16,20 @@ logger = get_logger(__name__)
 
 
 class RouterEngine:
-    """Evaluate routing policy artifacts to choose adapters/tools."""
+    """Evaluate routing policy artifacts to choose adapters/tools.
 
-    def __init__(self, cache: Optional[RedisCache] = None, *, similarity_boost_threshold: float = 0.6) -> None:
+    Supports SPEC §5/§8 dual-mode operation:
+    - Filters adapters by compatibility with current backend mode
+    - Only routes to adapters that can be executed by the active backend
+    """
+
+    def __init__(
+        self,
+        cache: Optional[RedisCache] = None,
+        *,
+        similarity_boost_threshold: float = 0.6,
+        backend_mode: Optional[str] = None,
+    ) -> None:
         self.safe_functions = {
             "cosine_similarity": cosine_similarity,
             "contains": lambda haystack, needle: needle in haystack if haystack is not None else False,
@@ -24,6 +37,8 @@ class RouterEngine:
         }
         self.cache = cache
         self.similarity_boost_threshold = similarity_boost_threshold
+        self.backend_mode = backend_mode
+        self._compatible_modes = get_compatible_adapter_modes(backend_mode or "openai")
 
     async def route(
         self,
@@ -36,7 +51,11 @@ class RouterEngine:
         user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         ctx_emb = ensure_embedding_dim(context_embedding, dim=EMBEDDING_DIM) if context_embedding else []
-        candidates = adapters or []
+
+        # Filter adapters to only those compatible with current backend mode
+        all_adapters = adapters or []
+        candidates, filtered_out = self._filter_by_mode(all_adapters)
+
         cached = None
         ctx_hash = self._hash_embedding(ctx_emb)
         cache_key = self._cache_key(ctx_hash, candidates)
@@ -46,6 +65,17 @@ class RouterEngine:
             return cached
         weights: Dict[str, float] = {}
         trace: List[Dict[str, Any]] = []
+
+        # Log filtered adapters for debugging
+        if filtered_out:
+            trace.append({
+                "id": "mode_filter",
+                "when": "pre_routing",
+                "fired": True,
+                "action": {"type": "filter_by_mode", "compatible_modes": list(self._compatible_modes)},
+                "effect": {"filtered_out": filtered_out},
+            })
+
         rules = policy.get("rules", []) if policy else []
         for rule in rules:
             condition = rule.get("when", "true")
@@ -63,6 +93,32 @@ class RouterEngine:
         if self.cache and user_id and cache_key:
             await self.cache.set_router_cache(user_id, cache_key, routing)
         return routing
+
+    def _filter_by_mode(self, adapters: List[dict]) -> Tuple[List[dict], List[str]]:
+        """Filter adapters to only those compatible with current backend mode.
+
+        Returns:
+            Tuple of (compatible adapters, list of filtered adapter IDs)
+        """
+        compatible = []
+        filtered_ids = []
+
+        for adapter in adapters:
+            mode = get_adapter_mode(adapter)
+            if mode in self._compatible_modes:
+                compatible.append(adapter)
+            else:
+                adapter_id = adapter.get("id") or adapter.get("name") or "unknown"
+                filtered_ids.append(adapter_id)
+                logger.debug(
+                    "adapter_filtered_by_mode",
+                    adapter_id=adapter_id,
+                    adapter_mode=mode,
+                    backend_mode=self.backend_mode,
+                    compatible_modes=list(self._compatible_modes),
+                )
+
+        return compatible, filtered_ids
 
     def _hash_embedding(self, embedding: List[float]) -> str:
         """Return a deterministic hash for a numeric embedding.
