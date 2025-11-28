@@ -478,6 +478,8 @@ class AuthService:
             if stored:
                 user_id, expires_at = stored
                 if expires_at <= datetime.utcnow():
+                    # Remove expired token to prevent memory leak
+                    self._email_verification_tokens.pop(token, None)
                     user_id = None
                 else:
                     self._email_verification_tokens.pop(token, None)
@@ -528,7 +530,8 @@ class AuthService:
             self.logger.warning("totp_secret_invalid")
             return ""
         counter = int(timestamp // interval).to_bytes(8, "big")
-        digest = hmac.new(key, counter, hashlib.sha256).digest()
+        # TOTP standard uses SHA1 - do not change without migration
+        digest = hmac.new(key, counter, hashlib.sha1).digest()
         offset = digest[-1] & 0x0F
         code_int = (int.from_bytes(digest[offset : offset + 4], "big") & 0x7FFFFFFF) % (10**digits)
         return str(code_int).zfill(digits)

@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Sequence
 
+from liminallm.config import AdapterMode, get_compatible_adapter_modes
 from liminallm.service.embeddings import deterministic_embedding
 from liminallm.service.fs import PathTraversalError, safe_join
 from liminallm.service.tokenizer_utils import DEFAULT_VOCAB_SIZE, vocab_size_from_tokenizer
@@ -26,9 +27,24 @@ DEFAULT_LORA_LEARNING_RATE = 2e-3
 
 
 class TrainingService:
-    """Minimal LoRA adapter training loop following SPEC phase 2."""
+    """Minimal LoRA adapter training loop following SPEC phase 2.
 
-    def __init__(self, store, fs_root: str, *, runtime_base_model: Optional[str] = None) -> None:
+    Supports dual-mode operation per SPEC §5 clarification:
+    - LOCAL mode: Train and store weights on filesystem for LocalJaxLoRABackend
+    - REMOTE mode: Train locally, then sync to external adapter server
+    - PROMPT mode: No weights; inject behavior via system prompt
+    - HYBRID mode: Store local weights + prompt fallback for API backends
+    """
+
+    def __init__(
+        self,
+        store,
+        fs_root: str,
+        *,
+        runtime_base_model: Optional[str] = None,
+        default_adapter_mode: str = AdapterMode.HYBRID,
+        backend_mode: Optional[str] = None,
+    ) -> None:
         self.store = store
         self.fs_root = Path(fs_root)
         self.default_vocab_size = DEFAULT_VOCAB_SIZE
@@ -39,6 +55,9 @@ class TrainingService:
         self._tokenizer_model: Optional[str] = None
         self.runtime_base_model = runtime_base_model
         self.training_job_cooldown_seconds = 300
+        self.default_adapter_mode = default_adapter_mode
+        self.backend_mode = backend_mode
+        self._compatible_modes = get_compatible_adapter_modes(backend_mode or "openai")
 
     def _ensure_tokenizer(self, base_model: Optional[str]) -> None:
         model_name = base_model or self.runtime_base_model
@@ -103,7 +122,22 @@ class TrainingService:
             return refreshed or adapter
         return adapter
 
-    def ensure_user_adapter(self, user_id: str, *, rank: int = 4, adapter_id_override: Optional[str] = None) -> Artifact:
+    def ensure_user_adapter(
+        self,
+        user_id: str,
+        *,
+        rank: int = 4,
+        adapter_id_override: Optional[str] = None,
+        adapter_mode: Optional[str] = None,
+    ) -> Artifact:
+        """Ensure a user has an adapter, creating one if needed.
+
+        Args:
+            user_id: Owner of the adapter
+            rank: LoRA rank for new adapters
+            adapter_id_override: Specific adapter ID to use
+            adapter_mode: Override default adapter mode (local/remote/prompt/hybrid)
+        """
         existing = [a for a in self.store.list_artifacts(type_filter="adapter") if a.owner_user_id == user_id]
         if adapter_id_override:
             existing = [a for a in existing if a.id == adapter_id_override]
@@ -130,17 +164,28 @@ class TrainingService:
                     migration_plan=migration_plan,
                 )
                 raise ConstraintViolation("adapter base incompatible", migration_plan)
+            needs_update = False
+            updated_schema = dict(adapter.schema)
             if runtime_base and not stored_base:
-                updated_schema = dict(adapter.schema)
                 updated_schema["base_model"] = runtime_base
+                needs_update = True
+            # Migrate existing adapters to include mode if missing
+            if "mode" not in updated_schema:
+                updated_schema["mode"] = self._infer_adapter_mode(updated_schema)
+                needs_update = True
+            if needs_update:
                 self.store.update_artifact(adapter.id, updated_schema)
                 adapter = self.store.get_artifact(adapter.id) or adapter
             return adapter
+
+        # Create new adapter with explicit mode
+        resolved_mode = adapter_mode or self.default_adapter_mode
         adapter_id = adapter_id_override
         adapter_schema = {
             "kind": "adapter.lora",
-            "backend": "local",
-            "provider": "local",
+            "mode": resolved_mode,  # Explicit adapter mode
+            "backend": self._mode_to_backend(resolved_mode),
+            "provider": self._mode_to_provider(resolved_mode),
             "scope": "per-user",
             "user_id": user_id,
             "base_model": self.runtime_base_model or "jax-base",
@@ -156,11 +201,51 @@ class TrainingService:
             description="Per-user persona adapter",
             owner_user_id=user_id,
         )
-        adapter_fs_dir = self._adapter_dir(user_id, adapter.id, adapter_schema)
-        adapter_schema["fs_dir"] = str(adapter_fs_dir)
-        adapter_schema.setdefault("cephfs_dir", str(adapter_fs_dir))
+        # Only set fs_dir for modes that use local storage
+        if resolved_mode in {AdapterMode.LOCAL, AdapterMode.HYBRID}:
+            adapter_fs_dir = self._adapter_dir(user_id, adapter.id, adapter_schema)
+            adapter_schema["fs_dir"] = str(adapter_fs_dir)
+            adapter_schema.setdefault("cephfs_dir", str(adapter_fs_dir))
         self.store.update_artifact(adapter.id, adapter_schema)
         return self.store.get_artifact(adapter.id) or adapter
+
+    def _infer_adapter_mode(self, schema: dict) -> str:
+        """Infer adapter mode from legacy schema fields."""
+        backend = (schema.get("backend") or "").lower()
+        provider = (schema.get("provider") or "").lower()
+
+        if backend in {"prompt", "prompt_distill"}:
+            return AdapterMode.PROMPT
+        if backend in {"local", "local_lora"} or provider == "local":
+            # If has prompt_instructions, it's hybrid
+            if schema.get("prompt_instructions") or schema.get("behavior_prompt"):
+                return AdapterMode.HYBRID
+            return AdapterMode.LOCAL
+        if backend in {"api", "remote"} or schema.get("remote_model_id"):
+            return AdapterMode.REMOTE
+        # Default to hybrid for backwards compatibility
+        return AdapterMode.HYBRID
+
+    def _mode_to_backend(self, mode: str) -> str:
+        """Map adapter mode to backend field value."""
+        if mode == AdapterMode.LOCAL:
+            return "local"
+        if mode == AdapterMode.REMOTE:
+            return "api"
+        if mode == AdapterMode.PROMPT:
+            return "prompt"
+        # HYBRID uses local backend with prompt fallback
+        return "hybrid"
+
+    def _mode_to_provider(self, mode: str) -> str:
+        """Map adapter mode to provider field value."""
+        if mode == AdapterMode.LOCAL:
+            return "local"
+        if mode == AdapterMode.REMOTE:
+            return self.backend_mode or "api"
+        if mode == AdapterMode.PROMPT:
+            return "prompt"
+        return "hybrid"
 
     def train_from_preferences(
         self, user_id: str, adapter_id: Optional[str] = None, cluster_id: Optional[str] = None

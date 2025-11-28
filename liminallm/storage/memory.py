@@ -18,6 +18,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service.artifact_validation import ArtifactValidationError, validate_artifact
+from liminallm.service.bm25 import tokenize_text as _tokenize_text, compute_bm25_scores as _compute_bm25_scores
 from liminallm.service.embeddings import cosine_similarity
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
@@ -38,49 +39,6 @@ from liminallm.storage.models import (
     UserAuthProvider,
     UserMFAConfig,
 )
-
-# BM25 constants
-_BM25_K1 = 1.5
-_BM25_B = 0.75
-
-
-def _tokenize_text(text: str) -> List[str]:
-    """Tokenize text for BM25 scoring."""
-    return re.findall(r"\w+", text.lower())
-
-
-def _compute_bm25_scores(
-    query_tokens: Sequence[str],
-    documents: List[List[str]],
-    k1: float = _BM25_K1,
-    b: float = _BM25_B,
-) -> List[float]:
-    """Compute BM25 relevance scores for documents against query tokens."""
-    if not query_tokens or not documents:
-        return [0.0 for _ in documents]
-    N = len(documents)
-    avgdl = sum(len(doc) for doc in documents) / float(N)
-    doc_freq: Dict[str, int] = {}
-    for doc in documents:
-        seen = set(doc)
-        for tok in seen:
-            doc_freq[tok] = doc_freq.get(tok, 0) + 1
-    scores: List[float] = []
-    for doc in documents:
-        tf: Dict[str, int] = {}
-        for tok in doc:
-            tf[tok] = tf.get(tok, 0) + 1
-        score = 0.0
-        for tok in query_tokens:
-            df = doc_freq.get(tok, 0)
-            if df == 0:
-                continue
-            idf = math.log(1 + (N - df + 0.5) / (df + 0.5))
-            freq = tf.get(tok, 0)
-            denom = freq + k1 * (1 - b + b * (len(doc) / (avgdl or 1.0)))
-            score += idf * (freq * (k1 + 1)) / denom if denom else 0.0
-        scores.append(score)
-    return scores
 
 
 class MemoryStore:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import secrets
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
@@ -40,6 +41,202 @@ class RagMode(str, Enum):
     MEMORY = "memory"
 
 
+class AdapterMode(str, Enum):
+    """Adapter execution modes for dual local/API support.
+
+    SPEC §5 clarification: Adapters can operate in different modes depending
+    on deployment. This enum explicitly tracks where adapter weights live
+    and how they're applied during inference.
+
+    - LOCAL: Weights stored on filesystem, loaded by LocalJaxLoRABackend
+    - REMOTE: Weights hosted by external service (Together, LoRAX, etc.)
+    - PROMPT: No weights; adapter behavior injected via system prompt
+    - HYBRID: Local weights with prompt fallback for API mode
+    """
+
+    LOCAL = "local"
+    REMOTE = "remote"
+    PROMPT = "prompt"
+    HYBRID = "hybrid"
+
+
+# Mapping of ModelBackend to compatible AdapterModes
+BACKEND_ADAPTER_COMPATIBILITY: dict[str, set[str]] = {
+    # API backends can use remote adapters or prompt-based
+    "openai": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "azure": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "azure_openai": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "vertex": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "gemini": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "google": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "bedrock": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    # Adapter-aware API backends support remote adapter IDs
+    "together": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "together.ai": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "lorax": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "adapter_server": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "sagemaker": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "aws_sagemaker": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    # Local backend supports local weights
+    "local_lora": {AdapterMode.LOCAL, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "local_gpu_lora": {AdapterMode.LOCAL, AdapterMode.PROMPT, AdapterMode.HYBRID},
+}
+
+
+def get_compatible_adapter_modes(backend: str) -> set[str]:
+    """Return adapter modes compatible with the given backend."""
+    return BACKEND_ADAPTER_COMPATIBILITY.get(backend.lower(), {AdapterMode.PROMPT})
+
+
+class RemoteStyle(str, Enum):
+    """How remote adapters are passed to API providers.
+
+    SPEC §5.0.2: Different providers accept adapters in different ways:
+    - MODEL_ID: Fine-tuned model as endpoint (OpenAI ft:..., Azure, Vertex)
+    - ADAPTER_PARAM: Adapter ID passed as request parameter (Together, LoRAX)
+    - NONE: Provider doesn't support remote adapters (prompt-only)
+    """
+
+    MODEL_ID = "model_id"  # Adapter = separate model endpoint
+    ADAPTER_PARAM = "adapter_param"  # Adapter ID in request body/params
+    NONE = "none"  # No remote adapter support
+
+
+@dataclass
+class ProviderCapabilities:
+    """Capabilities of an LLM API provider for adapter handling.
+
+    Defines how the provider handles fine-tuned models and LoRA adapters,
+    enabling proper routing and request formatting per provider.
+    """
+
+    remote_style: RemoteStyle  # How remote adapters are specified
+    multi_adapter: bool  # Can compose multiple adapters per request
+    gate_weights: bool  # Supports per-adapter gate weights
+    max_adapters: int  # Maximum concurrent adapters (1 for model_id style)
+    adapter_param_name: str = "adapter_id"  # Parameter name for adapter_param style
+    supports_streaming: bool = True
+    model_id_prefix: str = ""  # e.g., "ft:" for OpenAI fine-tunes
+
+
+# Provider capability registry - defines how each backend handles adapters
+PROVIDER_CAPABILITIES: dict[str, ProviderCapabilities] = {
+    # Fine-tuned model as endpoint providers (one adapter = one model)
+    "openai": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+        model_id_prefix="ft:",
+    ),
+    "azure": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+    ),
+    "azure_openai": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+    ),
+    "vertex": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+    ),
+    "gemini": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+    ),
+    "google": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+    ),
+    "bedrock": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+    ),
+    # Adapter-parameter style providers (support multi-adapter)
+    "together": ProviderCapabilities(
+        remote_style=RemoteStyle.ADAPTER_PARAM,
+        multi_adapter=True,
+        gate_weights=True,
+        max_adapters=3,
+        adapter_param_name="adapter_id",
+    ),
+    "together.ai": ProviderCapabilities(
+        remote_style=RemoteStyle.ADAPTER_PARAM,
+        multi_adapter=True,
+        gate_weights=True,
+        max_adapters=3,
+        adapter_param_name="adapter_id",
+    ),
+    "lorax": ProviderCapabilities(
+        remote_style=RemoteStyle.ADAPTER_PARAM,
+        multi_adapter=True,
+        gate_weights=True,
+        max_adapters=5,
+        adapter_param_name="adapter_id",
+    ),
+    "adapter_server": ProviderCapabilities(
+        remote_style=RemoteStyle.ADAPTER_PARAM,
+        multi_adapter=True,
+        gate_weights=True,
+        max_adapters=3,
+        adapter_param_name="adapter_id",
+    ),
+    "sagemaker": ProviderCapabilities(
+        remote_style=RemoteStyle.ADAPTER_PARAM,
+        multi_adapter=False,  # Depends on setup
+        gate_weights=False,
+        max_adapters=1,
+        adapter_param_name="adapter_id",
+    ),
+    "aws_sagemaker": ProviderCapabilities(
+        remote_style=RemoteStyle.ADAPTER_PARAM,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+        adapter_param_name="adapter_id",
+    ),
+    # Local backends
+    "local_lora": ProviderCapabilities(
+        remote_style=RemoteStyle.NONE,
+        multi_adapter=True,
+        gate_weights=True,
+        max_adapters=3,
+    ),
+    "local_gpu_lora": ProviderCapabilities(
+        remote_style=RemoteStyle.NONE,
+        multi_adapter=True,
+        gate_weights=True,
+        max_adapters=3,
+    ),
+}
+
+# Default capabilities for unknown providers (conservative)
+DEFAULT_PROVIDER_CAPABILITIES = ProviderCapabilities(
+    remote_style=RemoteStyle.MODEL_ID,
+    multi_adapter=False,
+    gate_weights=False,
+    max_adapters=1,
+)
+
+
+def get_provider_capabilities(provider: str) -> ProviderCapabilities:
+    """Get capabilities for a provider, with sensible defaults for unknown providers."""
+    return PROVIDER_CAPABILITIES.get(provider.lower(), DEFAULT_PROVIDER_CAPABILITIES)
+
+
 def env_field(default: Any, env: str, **kwargs):
     extra = kwargs.pop("json_schema_extra", {}) or {}
     extra = {**extra, "env": env}
@@ -57,6 +254,11 @@ class Settings(BaseModel):
     adapter_openai_api_key: str | None = env_field(None, "OPENAI_ADAPTER_API_KEY")
     adapter_openai_base_url: str | None = env_field(None, "OPENAI_ADAPTER_BASE_URL")
     adapter_server_model: str | None = env_field(None, "ADAPTER_SERVER_MODEL")
+    default_adapter_mode: AdapterMode = env_field(
+        AdapterMode.HYBRID,
+        "DEFAULT_ADAPTER_MODE",
+        description="Default mode for new adapters: local, remote, prompt, or hybrid",
+    )
     allow_signup: bool = env_field(True, "ALLOW_SIGNUP")
     use_memory_store: bool = env_field(False, "USE_MEMORY_STORE")
     allow_redis_fallback_dev: bool = env_field(False, "ALLOW_REDIS_FALLBACK_DEV")
@@ -114,6 +316,11 @@ class Settings(BaseModel):
     @classmethod
     def _validate_rag_mode(cls, value: RagMode) -> RagMode:
         return RagMode(value)
+
+    @field_validator("default_adapter_mode")
+    @classmethod
+    def _validate_adapter_mode(cls, value: AdapterMode) -> AdapterMode:
+        return AdapterMode(value)
 
     @field_validator("jwt_secret")
     @classmethod

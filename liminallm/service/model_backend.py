@@ -8,6 +8,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Tuple
 
+from liminallm.config import (
+    AdapterMode,
+    ProviderCapabilities,
+    RemoteStyle,
+    get_provider_capabilities,
+)
 from liminallm.logging import get_logger
 from liminallm.service.fs import safe_join
 from liminallm.service.tokenizer_utils import DEFAULT_VOCAB_SIZE, vocab_size_from_tokenizer
@@ -35,6 +41,51 @@ _ADAPTER_ID_PROVIDERS = {
 }
 
 logger = get_logger(__name__)
+
+
+def get_adapter_mode(adapter: dict) -> str:
+    """Extract adapter mode from schema, inferring from legacy fields if needed."""
+    if not adapter:
+        return AdapterMode.PROMPT
+
+    # Check explicit mode field first
+    mode = adapter.get("mode") or adapter.get("schema", {}).get("mode")
+    if mode:
+        return mode
+
+    # Infer from legacy backend/provider fields
+    backend = (adapter.get("backend") or "").lower()
+    provider = (adapter.get("provider") or "").lower()
+
+    if backend in {"prompt", "prompt_distill"}:
+        return AdapterMode.PROMPT
+    if backend in {"local", "local_lora"} or provider == "local":
+        if adapter.get("prompt_instructions") or adapter.get("behavior_prompt"):
+            return AdapterMode.HYBRID
+        return AdapterMode.LOCAL
+    if backend in {"api", "remote"} or adapter.get("remote_model_id"):
+        return AdapterMode.REMOTE
+    if backend == "hybrid":
+        return AdapterMode.HYBRID
+
+    return AdapterMode.HYBRID  # Default for backwards compatibility
+
+
+def filter_adapters_by_mode(adapters: List[dict], compatible_modes: set) -> List[dict]:
+    """Filter adapters to only those compatible with the current backend mode."""
+    result = []
+    for adapter in adapters:
+        mode = get_adapter_mode(adapter)
+        if mode in compatible_modes:
+            result.append(adapter)
+        else:
+            logger.debug(
+                "adapter_mode_incompatible",
+                adapter_id=adapter.get("id"),
+                mode=mode,
+                compatible_modes=list(compatible_modes),
+            )
+    return result
 
 _OPENAI_SPEC = importlib.util.find_spec("openai")
 if _OPENAI_SPEC:
@@ -107,7 +158,19 @@ def list_adapter_plugs() -> List[AdapterPlug]:
 
 
 class ApiAdapterBackend:
-    """Backend that targets external APIs, optionally using fine-tuned model IDs as adapters."""
+    """Backend that targets external APIs with capability-aware adapter handling.
+
+    Supports SPEC §5.0.2 provider-specific adapter handling:
+    - MODEL_ID style (OpenAI, Azure, Vertex): One fine-tuned model per request
+    - ADAPTER_PARAM style (Together, LoRAX): adapter_id parameter with multi-adapter
+    - PROMPT style: Inject behavior via system prompt (universal fallback)
+
+    The backend inspects provider capabilities to determine how to format
+    adapter requests, respecting multi-adapter limits and gate weight support.
+    """
+
+    # Modes compatible with this backend
+    COMPATIBLE_MODES = {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID}
 
     def __init__(
         self,
@@ -117,21 +180,46 @@ class ApiAdapterBackend:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         adapter_server_model: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> None:
         self.base_model = base_model
         self.adapter_server_model = adapter_server_model
         self.adapter_mode = adapter_mode
         self.mode = adapter_mode
         self.client = _OpenAIClient(api_key=api_key, base_url=base_url) if api_key and _OpenAIClient else None
+        # Infer provider from adapter_mode if not specified
+        self.provider = provider or self._infer_provider(adapter_mode)
+        self.capabilities = get_provider_capabilities(self.provider)
+
+    def _infer_provider(self, adapter_mode: str) -> str:
+        """Infer provider from adapter_mode string."""
+        mode_lower = (adapter_mode or "").lower()
+        if mode_lower in {"openai", "azure", "azure_openai", "vertex", "gemini", "bedrock"}:
+            return mode_lower
+        if mode_lower in {"together", "together.ai"}:
+            return "together"
+        if mode_lower in {"lorax", "adapter_server"}:
+            return mode_lower
+        if mode_lower in {"sagemaker", "aws_sagemaker"}:
+            return "sagemaker"
+        # Default to openai-style for unknown modes
+        return "openai"
 
     def generate(self, messages: List[dict], adapters: List[dict], *, user_id: Optional[str] = None) -> dict:
         adapter_list = adapters or []
-        target_model = self._resolve_model(adapter_list)
-        extra_body = self._resolve_extra_body(adapter_list)
+        # Process adapters based on provider capabilities
+        processed = self._process_adapters_for_provider(adapter_list)
+        target_model = processed["model"]
+        extra_body = processed["extra_body"]
+        prompt_injections = processed["prompt_injections"]
+
+        # Inject adapter prompts if any hybrid/prompt adapters
+        augmented_messages = self._inject_adapter_prompts(messages, prompt_injections)
+
         if self.client:
             completion = self.client.chat.completions.create(
                 model=target_model,
-                messages=messages,
+                messages=augmented_messages,
                 temperature=0.2,
                 extra_body=extra_body,
             )
@@ -147,68 +235,228 @@ class ApiAdapterBackend:
                 "completion_tokens": getattr(completion.usage, "completion_tokens", 0),
                 "total_tokens": getattr(completion.usage, "total_tokens", 0),
             }
-            return {"content": content, "usage": usage}
-        fallback = messages[-1]["content"] if messages else ""
+            return {"content": content, "usage": usage, "adapters_applied": processed["applied"]}
+        fallback = augmented_messages[-1]["content"] if augmented_messages else ""
         return {
-            "content": f"[api-backend model={target_model} adapters={self._adapter_summary(adapter_list)}] {fallback}",
+            "content": f"[api-backend model={target_model} provider={self.provider} adapters={processed['applied']}] {fallback}",
             "usage": {
                 "prompt_tokens": len(fallback.split()),
                 "completion_tokens": max(5, min(20, len(fallback.split()))),
             },
+            "adapters_applied": processed["applied"],
         }
 
-    def _resolve_model(self, adapters: List[dict]) -> str:
-        if self._uses_adapter_id(adapters):
-            return self.adapter_server_model or self.base_model
-        if self.adapter_mode == "api_adapters" and adapters:
-            for adapter in adapters:
-                if self._is_prompt_style(adapter):
-                    continue
-                backend = (adapter.get("backend") or "").lower()
-                provider = (adapter.get("provider") or "").lower()
-                remote_model = adapter.get("remote_model_id") or adapter.get("model_id")
-                if remote_model and (backend in {"api", "remote", ""} or provider in _MODEL_ID_PROVIDERS):
-                    return remote_model
-            first = adapters[0]
-            if not self._is_prompt_style(first) and (first.get("backend") or "").lower() not in {"local"}:
-                return first.get("remote_model_id") or first.get("model_id") or self.base_model
-        return self.adapter_server_model or self.base_model
+    def _process_adapters_for_provider(self, adapters: List[dict]) -> dict:
+        """Process adapters based on provider capabilities.
 
-    def _resolve_extra_body(self, adapters: List[dict]) -> Optional[dict]:
-        if self._uses_adapter_id(adapters):
-            adapter_ids = [a.get("id") for a in adapters if a.get("id") and not self._is_prompt_style(a)]
-            if adapter_ids:
-                return {"adapter_id": adapter_ids}
+        Returns dict with:
+        - model: Target model ID
+        - extra_body: Additional request body parameters
+        - prompt_injections: List of prompt strings to inject
+        - applied: List of adapter IDs that were applied
+        - dropped: List of adapter IDs that were dropped
+        """
+        prompt_injections: List[str] = []
+        remote_adapters: List[dict] = []
+        applied: List[str] = []
+        dropped: List[str] = []
+
+        for adapter in adapters:
+            mode = get_adapter_mode(adapter)
+            adapter_id = adapter.get("id") or adapter.get("name") or "unknown"
+
+            if mode == AdapterMode.LOCAL:
+                # Local-only adapter - can't use in API mode
+                logger.warning(
+                    "adapter_mode_incompatible_api",
+                    adapter_id=adapter_id,
+                    mode=mode,
+                    provider=self.provider,
+                )
+                dropped.append(adapter_id)
+                continue
+
+            if mode == AdapterMode.PROMPT:
+                # Pure prompt adapter
+                prompt = self._extract_prompt_instructions(adapter)
+                if prompt:
+                    prompt_injections.append(prompt)
+                    applied.append(f"{adapter_id}:prompt")
+                continue
+
+            if mode == AdapterMode.HYBRID:
+                # Hybrid: always extract prompt, optionally add to remote
+                prompt = self._extract_prompt_instructions(adapter)
+                if prompt:
+                    prompt_injections.append(prompt)
+                # Check if has remote component
+                if adapter.get("remote_model_id") or adapter.get("remote_adapter_id"):
+                    remote_adapters.append(adapter)
+                    applied.append(f"{adapter_id}:hybrid")
+                else:
+                    applied.append(f"{adapter_id}:prompt")
+                continue
+
+            if mode == AdapterMode.REMOTE:
+                remote_adapters.append(adapter)
+
+        # Process remote adapters based on provider remote_style
+        model, extra_body, remote_applied, remote_dropped = self._format_remote_adapters(remote_adapters)
+
+        applied.extend(remote_applied)
+        dropped.extend(remote_dropped)
+
+        return {
+            "model": model,
+            "extra_body": extra_body,
+            "prompt_injections": prompt_injections,
+            "applied": applied,
+            "dropped": dropped,
+        }
+
+    def _format_remote_adapters(
+        self, adapters: List[dict]
+    ) -> Tuple[str, Optional[dict], List[str], List[str]]:
+        """Format remote adapters based on provider capabilities.
+
+        Returns:
+            Tuple of (model_id, extra_body, applied_ids, dropped_ids)
+        """
+        if not adapters:
+            return self.base_model, None, [], []
+
+        applied: List[str] = []
+        dropped: List[str] = []
+        caps = self.capabilities
+
+        if caps.remote_style == RemoteStyle.MODEL_ID:
+            # Provider uses fine-tuned model as endpoint (OpenAI style)
+            # Can only use ONE adapter - pick highest weight or first
+            selected = self._select_best_adapter(adapters, max_count=1)[0] if adapters else None
+            if selected:
+                model_id = selected.get("remote_model_id") or selected.get("model_id")
+                if model_id:
+                    applied.append(f"{selected.get('id', 'unknown')}:model_id")
+                    # Drop other adapters
+                    for a in adapters:
+                        if a is not selected:
+                            dropped.append(a.get("id") or "unknown")
+                            logger.debug(
+                                "adapter_dropped_single_model",
+                                adapter_id=a.get("id"),
+                                reason="provider only supports one model_id",
+                                provider=self.provider,
+                            )
+                    return model_id, None, applied, dropped
+            # No valid remote_model_id found, fall back to base
+            return self.base_model, None, [], [a.get("id", "unknown") for a in adapters]
+
+        elif caps.remote_style == RemoteStyle.ADAPTER_PARAM:
+            # Provider uses adapter_id parameter (Together, LoRAX style)
+            # Can use multiple adapters up to max_adapters
+            selected = self._select_best_adapter(adapters, max_count=caps.max_adapters)
+            adapter_ids: List[str] = []
+            gate_weights: List[float] = []
+
+            for adapter in selected:
+                aid = adapter.get("remote_adapter_id") or adapter.get("adapter_id") or adapter.get("id")
+                if aid:
+                    adapter_ids.append(aid)
+                    applied.append(f"{adapter.get('id', 'unknown')}:adapter_param")
+                    if caps.gate_weights:
+                        weight = adapter.get("weight") or adapter.get("gate_weight") or 1.0
+                        gate_weights.append(float(weight))
+
+            # Mark dropped adapters
+            for a in adapters:
+                if a not in selected:
+                    dropped.append(a.get("id") or "unknown")
+                    logger.debug(
+                        "adapter_dropped_max_exceeded",
+                        adapter_id=a.get("id"),
+                        max_adapters=caps.max_adapters,
+                        provider=self.provider,
+                    )
+
+            if not adapter_ids:
+                return self.adapter_server_model or self.base_model, None, [], []
+
+            # Build extra_body based on provider
+            extra_body: dict = {caps.adapter_param_name: adapter_ids if len(adapter_ids) > 1 else adapter_ids[0]}
+            if caps.gate_weights and gate_weights:
+                extra_body["adapter_weights"] = gate_weights if len(gate_weights) > 1 else gate_weights[0]
+
+            return self.adapter_server_model or self.base_model, extra_body, applied, dropped
+
+        else:
+            # RemoteStyle.NONE - shouldn't have remote adapters
+            for a in adapters:
+                dropped.append(a.get("id") or "unknown")
+            return self.base_model, None, [], dropped
+
+    def _select_best_adapter(self, adapters: List[dict], max_count: int) -> List[dict]:
+        """Select best adapters up to max_count, sorted by weight descending."""
+        if not adapters:
+            return []
+
+        # Sort by weight/gate_weight descending
+        def get_weight(a: dict) -> float:
+            return float(a.get("weight") or a.get("gate_weight") or 1.0)
+
+        sorted_adapters = sorted(adapters, key=get_weight, reverse=True)
+        return sorted_adapters[:max_count]
+
+    def _process_adapters(self, adapters: List[dict]) -> Tuple[List[dict], List[str]]:
+        """Legacy method - delegates to _process_adapters_for_provider."""
+        result = self._process_adapters_for_provider(adapters)
+        # Return in legacy format for backwards compatibility
+        return [], result["prompt_injections"]
+
+    def _extract_prompt_instructions(self, adapter: dict) -> Optional[str]:
+        """Extract prompt instructions from adapter for injection."""
+        for key in ("prompt_instructions", "behavior_prompt", "instructions", "prompt_template"):
+            value = adapter.get(key) or adapter.get("schema", {}).get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        # Try applicability.natural_language
+        applicability = adapter.get("applicability") or adapter.get("schema", {}).get("applicability")
+        if isinstance(applicability, dict):
+            natural = applicability.get("natural_language")
+            if isinstance(natural, str) and natural.strip():
+                return natural.strip()
+        # Fall back to description
+        description = adapter.get("description") or adapter.get("schema", {}).get("description")
+        if isinstance(description, str) and description.strip():
+            return description.strip()
         return None
 
-    def _adapter_summary(self, adapters: List[dict]) -> str:
-        if not adapters:
-            return "none"
-        return ",".join([a.get("id") or a.get("remote_model_id") or "anon" for a in adapters])
+    def _inject_adapter_prompts(self, messages: List[dict], prompts: List[str]) -> List[dict]:
+        """Inject adapter prompt instructions into message list."""
+        if not prompts:
+            return messages
 
-    def _uses_adapter_id(self, adapters: List[dict]) -> bool:
-        if not adapters:
-            return False
-        if self.adapter_mode == "adapter_server":
-            return True
-        for adapter in adapters:
-            if self._is_prompt_style(adapter):
-                continue
-            backend = (adapter.get("backend") or "").lower()
-            provider = (adapter.get("provider") or "").lower()
-            if backend in {"adapter_server", "adapter_id", "multi_lora"}:
-                return True
-            if provider in _ADAPTER_ID_PROVIDERS:
-                return True
-        return False
+        prompt_text = "\n".join(f"- {p}" for p in prompts)
+        system_addition = f"\n\nAdapter guidance:\n{prompt_text}"
 
-    def _is_prompt_style(self, adapter: dict) -> bool:
-        backend = (adapter.get("backend") or "").lower()
-        return backend in {"prompt", "prompt_distill", "hybrid"}
+        # Find and augment system message, or prepend new one
+        augmented = [dict(m) for m in messages]
+        for i, msg in enumerate(augmented):
+            if msg.get("role") == "system":
+                augmented[i] = {**msg, "content": msg.get("content", "") + system_addition}
+                return augmented
+
+        # No system message found, prepend one
+        augmented.insert(0, {"role": "system", "content": f"Adapter guidance:\n{prompt_text}"})
+        return augmented
 
 
 class LocalJaxLoRABackend:
     """Backend for local JAX generation with filesystem-backed LoRA adapters.
+
+    Supports SPEC §5 dual-mode operation:
+    - LOCAL adapters: Load weights from filesystem, apply LoRA math
+    - HYBRID adapters: Load local weights, with prompt fallback
+    - PROMPT adapters: Inject behavior via system prompt (no weights)
 
     The backend keeps a tokenizer and (optional) Flax model resident, reads
     LoRA matrices from ``fs_root`` paths, and runs a lightweight JAX forward
@@ -216,6 +464,9 @@ class LocalJaxLoRABackend:
     fixed-shape padding, enforces conservative limits, and emits usage stats
     so callers can track prompt/completion token counts.
     """
+
+    # Modes compatible with this backend
+    COMPATIBLE_MODES = {AdapterMode.LOCAL, AdapterMode.HYBRID, AdapterMode.PROMPT}
 
     def __init__(
         self,
@@ -316,6 +567,11 @@ class LocalJaxLoRABackend:
         return ids, attention
 
     def _load_adapter_weights(self, adapter: dict, *, user_id: Optional[str] = None) -> dict:
+        """Load adapter weights from filesystem with checksum verification.
+
+        Per SPEC §18, checksum of params is verified against schema.checksum before activation.
+        Missing checksums are logged as security warnings but allowed for backwards compatibility.
+        """
         if not adapter:
             return {}
         adapter_id = adapter.get("id", "unknown")
@@ -330,11 +586,25 @@ class LocalJaxLoRABackend:
         payload = params_path.read_bytes()
         checksum = adapter.get("checksum") or adapter.get("schema", {}).get("checksum")
         if checksum:
+            # SPEC §18: checksum verified against schema.checksum before activation
             digest = hashlib.sha256(payload).hexdigest()
             if digest != checksum:
-                raise ValueError("adapter checksum mismatch")
+                logger.error(
+                    "adapter_checksum_mismatch",
+                    adapter_id=adapter_id,
+                    path=str(params_path),
+                    expected=checksum,
+                    actual=digest,
+                )
+                raise ValueError("adapter checksum mismatch - refusing to load potentially tampered weights")
         else:
-            logger.warning("adapter_checksum_missing", adapter_id=adapter_id, path=str(params_path))
+            # SPEC §18 requires checksum verification; missing checksums are a security concern
+            logger.warning(
+                "adapter_checksum_missing",
+                adapter_id=adapter_id,
+                path=str(params_path),
+                message="Adapter loaded without checksum verification - add schema.checksum for production use",
+            )
         weights_raw = json.loads(payload.decode())
         self._ensure_jax()
         weights = {k: self._jnp.array(v, dtype=self._jnp.float32) for k, v in weights_raw.items()}

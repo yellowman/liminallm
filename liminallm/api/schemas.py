@@ -8,10 +8,20 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
+class ErrorBody(BaseModel):
+    """SPEC §18 error envelope body with stable code values."""
+
+    code: str  # stable codes: unauthorized, forbidden, not_found, rate_limited, validation_error, conflict, server_error
+    message: str
+    details: Optional[Any] = None  # object, array, or null
+
+
 class Envelope(BaseModel):
+    """SPEC §18 API envelope format."""
+
     status: str = Field(..., pattern="^(ok|error)$")
     data: Optional[Any] = None
-    error: Optional[dict] = None
+    error: Optional[ErrorBody] = None
     request_id: str = Field(default_factory=lambda: str(uuid4()))
 
 

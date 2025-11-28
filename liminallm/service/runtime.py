@@ -62,7 +62,7 @@ class Runtime:
                 ),
                 mode=fallback_mode,
             )
-        self.router = RouterEngine(cache=self.cache)
+        # Compute backend_mode before creating services that need it
         runtime_config = {}
         db_backend_mode = None
         if hasattr(self.store, "get_runtime_config"):
@@ -70,6 +70,7 @@ class Runtime:
             db_backend_mode = runtime_config.get("model_backend")
         resolved_base_model = runtime_config.get("model_path") or self.settings.model_path
         backend_mode = db_backend_mode or self.settings.model_backend
+        self.router = RouterEngine(cache=self.cache, backend_mode=backend_mode)
         adapter_configs = {
             "openai": {
                 "api_key": self.settings.adapter_openai_api_key,
@@ -95,7 +96,11 @@ class Runtime:
             embedding_model_id=self.settings.embedding_model_id,
         )
         self.training = TrainingService(
-            self.store, self.settings.shared_fs_root, runtime_base_model=resolved_base_model
+            self.store,
+            self.settings.shared_fs_root,
+            runtime_base_model=resolved_base_model,
+            default_adapter_mode=self.settings.default_adapter_mode,
+            backend_mode=backend_mode,
         )
         self.clusterer = SemanticClusterer(self.store, self.llm, self.training)
         self.workflow = WorkflowEngine(self.store, self.llm, self.router, self.rag, cache=self.cache)
@@ -170,12 +175,20 @@ async def _set_cached_idempotency_record(
 
 
 async def check_rate_limit(runtime: Runtime, key: str, limit: int, window_seconds: int) -> bool:
-    """Enforce rate limits even when Redis is unavailable."""
+    """Enforce rate limits even when Redis is unavailable.
 
+    Per SPEC §18, rate limits use Redis token bucket with configurable defaults.
+    """
     if limit <= 0:
         return True
     if window_seconds <= 0:
-        window_seconds = 60  # Default to 1 minute if invalid window
+        logger.warning(
+            "rate_limit_invalid_window",
+            key=key,
+            window_seconds=window_seconds,
+            message="Invalid rate limit window_seconds; defaulting to 60 seconds",
+        )
+        window_seconds = 60  # Default to 1 minute if invalid window per SPEC §18
     now = datetime.utcnow()
     if runtime.cache:
         return await runtime.cache.check_rate_limit(key, limit, window_seconds)
