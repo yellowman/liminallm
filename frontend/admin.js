@@ -44,12 +44,49 @@ const state = {
 const defaultPatchStatuses = new Set(['pending', 'approved', 'rejected', 'applied']);
 let knownPatchStatuses = new Set(defaultPatchStatuses);
 
-const headers = () => {
+const randomIdempotencyKey = () => {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+};
+
+const headers = (idempotencyKey) => {
   const h = { 'Content-Type': 'application/json' };
   if (state.accessToken) h['Authorization'] = `Bearer ${state.accessToken}`;
   if (state.tenantId) h['X-Tenant-ID'] = state.tenantId;
   if (state.sessionId) h['session_id'] = state.sessionId;
+  h['Idempotency-Key'] = idempotencyKey || randomIdempotencyKey();
   return h;
+};
+
+const fetchWithRetry = async (url, options, retries = 3, backoffMs = 400) => {
+  let lastError;
+  for (let attempt = 0; attempt <= retries; attempt += 1) {
+    try {
+      const resp = await fetch(url, options);
+      // Don't retry client errors (4xx) - they won't succeed on retry
+      if (resp.status >= 400 && resp.status < 500) {
+        return resp;
+      }
+      // Only retry on server errors (5xx) or network failures
+      if (!resp.ok && resp.status >= 500) {
+        lastError = new Error(`Server error: ${resp.status}`);
+        if (attempt === retries) return resp;
+        const delay = backoffMs * Math.pow(2, attempt);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+        continue;
+      }
+      return resp;
+    } catch (err) {
+      // Network error - retry
+      lastError = err;
+      if (attempt === retries) break;
+      const delay = backoffMs * Math.pow(2, attempt);
+      await new Promise((resolve) => setTimeout(resolve, delay));
+    }
+  }
+  const attempts = retries + 1;
+  const label = attempts === 1 ? 'attempt' : 'attempts';
+  throw new Error(`Request failed after ${attempts} ${label}: ${lastError?.message || 'unknown error'}`);
 };
 
 const showError = (msg) => {
@@ -110,7 +147,7 @@ const extractError = (payload, fallback) => {
 };
 
 const requestEnvelope = async (url, options, fallbackMessage) => {
-  const resp = await fetch(url, options);
+  const resp = await fetchWithRetry(url, options);
   const text = await resp.text();
   const trimmed = text.trim();
   let payload;
