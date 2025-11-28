@@ -1291,7 +1291,7 @@ async def upload_file(
                 # Clean up file on any error (not just ConstraintViolation)
                 dest_path.unlink(missing_ok=True)
                 raise
-        resp = FileUploadResponse(fs_path=file.filename, context_id=context_id, chunk_count=chunk_count)
+        resp = FileUploadResponse(fs_path=safe_filename, context_id=context_id, chunk_count=chunk_count)
         envelope = Envelope(status="ok", data=resp, request_id=idem.request_id)
         await idem.store_result(envelope)
         return envelope
