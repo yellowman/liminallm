@@ -1,3 +1,4 @@
+import threading
 import uuid
 from pathlib import Path
 
@@ -15,6 +16,7 @@ def test_postgres_store_cache_helpers(tmp_path: Path):
     store.pool = DummyPool()
     store.fs_root = tmp_path
     store.sessions = {}
+    store._session_lock = threading.Lock()  # Required for thread-safe cache ops
 
     session = Session.new(str(uuid.uuid4()))
     cached = store._cache_session(session)

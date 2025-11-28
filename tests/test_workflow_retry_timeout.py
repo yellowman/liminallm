@@ -125,11 +125,23 @@ class TestWorkflowTimeout:
     @pytest.mark.asyncio
     async def test_workflow_respects_timeout_ms_from_schema(self, workflow_engine):
         """Workflow should use timeout_ms from workflow schema."""
-        # Create a workflow with a very short timeout
-        with patch.object(workflow_engine.store, "get_latest_workflow") as mock:
-            mock.return_value = {
+        # Mock time.monotonic to simulate elapsed time exceeding the timeout
+        # First call returns 0 (start time), subsequent calls return 1.0 (1 second later)
+        call_count = 0
+        real_monotonic = time.monotonic
+
+        def mock_monotonic():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return 0.0  # Start time
+            return 1.0  # 1 second elapsed - exceeds 100ms timeout
+
+        with patch.object(workflow_engine.store, "get_latest_workflow") as mock_workflow, \
+             patch("time.monotonic", mock_monotonic):
+            mock_workflow.return_value = {
                 "kind": "workflow.chat",
-                "timeout_ms": 1,  # 1ms timeout - will expire immediately
+                "timeout_ms": 100,  # 100ms timeout
                 "entrypoint": "slow_node",
                 "nodes": [
                     {
@@ -181,10 +193,21 @@ class TestWorkflowTimeout:
     @pytest.mark.asyncio
     async def test_workflow_timeout_includes_elapsed_time(self, workflow_engine):
         """Timeout result should include elapsed time info."""
-        with patch.object(workflow_engine.store, "get_latest_workflow") as mock:
-            mock.return_value = {
+        # Mock time.monotonic to simulate elapsed time exceeding the timeout
+        call_count = 0
+
+        def mock_monotonic():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return 0.0  # Start time
+            return 1.0  # 1 second elapsed - exceeds 100ms timeout
+
+        with patch.object(workflow_engine.store, "get_latest_workflow") as mock_workflow, \
+             patch("time.monotonic", mock_monotonic):
+            mock_workflow.return_value = {
                 "kind": "workflow.chat",
-                "timeout_ms": 1,
+                "timeout_ms": 100,
                 "entrypoint": "node1",
                 "nodes": [
                     {"id": "node1", "type": "tool_call", "tool": "llm.generic"}
