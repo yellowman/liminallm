@@ -18,11 +18,20 @@ class VoiceService:
         self.fs_root = Path(fs_root)
 
     def transcribe(self, audio_bytes: bytes, *, user_id: Optional[str] = None) -> dict:
-        transcript = audio_bytes.decode("utf-8", errors="ignore") or f"[audio {len(audio_bytes)} bytes]"
+        transcript = (
+            audio_bytes.decode("utf-8", errors="ignore")
+            or f"[audio {len(audio_bytes)} bytes]"
+        )
         duration_ms = min(len(audio_bytes) * 2, 120_000)
-        return {"transcript": transcript, "duration_ms": duration_ms, "user_id": user_id}
+        return {
+            "transcript": transcript,
+            "duration_ms": duration_ms,
+            "user_id": user_id,
+        }
 
-    def synthesize(self, text: str, *, user_id: Optional[str] = None, voice: Optional[str] = None) -> dict:
+    def synthesize(
+        self, text: str, *, user_id: Optional[str] = None, voice: Optional[str] = None
+    ) -> dict:
         voice_dir = self.fs_root / "voice" / (user_id or "shared")
         voice_dir.mkdir(parents=True, exist_ok=True)
         file_path = voice_dir / f"{uuid.uuid4()}.txt"

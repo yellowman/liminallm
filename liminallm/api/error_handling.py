@@ -29,7 +29,12 @@ def _error_code_for_status(status_code: int) -> str:
     return _STATUS_TO_CODE.get(status_code, "server_error")
 
 
-def _error_response(status_code: int, message: str, details: dict | list | None = None, code: str | None = None) -> JSONResponse:
+def _error_response(
+    status_code: int,
+    message: str,
+    details: dict | list | None = None,
+    code: str | None = None,
+) -> JSONResponse:
     """Create a SPEC §18 compliant error response envelope."""
     error_code = code or _error_code_for_status(status_code)
     error_body = ErrorBody(code=error_code, message=message, details=details)
@@ -59,7 +64,11 @@ def register_exception_handlers(app: FastAPI) -> None:
     @app.exception_handler(HTTPException)
     async def handle_http_exception(request: Request, exc: HTTPException):  # type: ignore[unused-argument]
         detail = exc.detail if isinstance(exc.detail, dict) else {"detail": exc.detail}
-        message = detail.get("detail", "http error") if isinstance(detail, dict) else str(exc.detail)
+        message = (
+            detail.get("detail", "http error")
+            if isinstance(detail, dict)
+            else str(exc.detail)
+        )
         details = detail if isinstance(detail, dict) else None
         return _error_response(exc.status_code, message, details)
 

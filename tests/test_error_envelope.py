@@ -11,6 +11,7 @@ These tests verify that error responses conform to the stable API envelope forma
     "request_id": "<uuid>"
 }
 """
+
 import pytest
 from pydantic import ValidationError
 
@@ -243,6 +244,7 @@ class TestErrorResponseFactory:
         body = response.body.decode()
         # Should still be valid JSON
         import json
+
         data = json.loads(body)
         assert data["error"]["details"] is None
 
@@ -255,6 +257,7 @@ class TestErrorResponseFactory:
         )
 
         import json
+
         data = json.loads(response.body.decode())
         assert isinstance(data["error"]["details"], list)
         assert len(data["error"]["details"]) == 2

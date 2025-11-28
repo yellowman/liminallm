@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import pytest
-from pathlib import Path
 
 from liminallm.config import AdapterMode, get_compatible_adapter_modes
 from liminallm.service.training import TrainingService
@@ -37,9 +36,7 @@ class TestTrainingServiceInit:
     def test_backend_mode_sets_compatible_modes(self, tmp_path):
         """Should set compatible modes based on backend_mode."""
         store = MemoryStore(fs_root=str(tmp_path))
-        training = TrainingService(
-            store, fs_root=str(tmp_path), backend_mode="openai"
-        )
+        training = TrainingService(store, fs_root=str(tmp_path), backend_mode="openai")
 
         # OpenAI compatible modes
         assert AdapterMode.REMOTE in training._compatible_modes
@@ -271,7 +268,7 @@ class TestEnsureUserAdapter:
         user = store.create_user("test@example.com")
 
         # Create adapter directly without mode field (with required fields)
-        legacy_adapter = store.create_artifact(
+        store.create_artifact(
             type_="adapter",
             name="legacy_adapter",
             schema={
@@ -302,7 +299,7 @@ class TestEnsureUserAdapter:
         user = store.create_user("test@example.com")
 
         # Create adapter with explicit mode (with required fields)
-        existing = store.create_artifact(
+        store.create_artifact(
             type_="adapter",
             name="existing_adapter",
             schema={
@@ -390,9 +387,7 @@ class TestCompatibleModesIntegration:
     def test_training_uses_compatible_modes(self, tmp_path):
         """TrainingService should use get_compatible_adapter_modes."""
         store = MemoryStore(fs_root=str(tmp_path))
-        training = TrainingService(
-            store, fs_root=str(tmp_path), backend_mode="openai"
-        )
+        training = TrainingService(store, fs_root=str(tmp_path), backend_mode="openai")
 
         expected = get_compatible_adapter_modes("openai")
         assert training._compatible_modes == expected

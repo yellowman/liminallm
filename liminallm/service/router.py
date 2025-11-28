@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import struct
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
-from liminallm.config import AdapterMode, get_compatible_adapter_modes
+from liminallm.config import get_compatible_adapter_modes
 from liminallm.logging import get_logger
 from liminallm.service.model_backend import get_adapter_mode
 
@@ -32,8 +32,12 @@ class RouterEngine:
     ) -> None:
         self.safe_functions = {
             "cosine_similarity": cosine_similarity,
-            "contains": lambda haystack, needle: needle in haystack if haystack is not None else False,
-            "len": lambda value: len(value) if isinstance(value, (list, tuple, dict, str, bytes)) else 0,
+            "contains": lambda haystack, needle: (
+                needle in haystack if haystack is not None else False
+            ),
+            "len": lambda value: (
+                len(value) if isinstance(value, (list, tuple, dict, str, bytes)) else 0
+            ),
         }
         self.cache = cache
         self.similarity_boost_threshold = similarity_boost_threshold
@@ -50,7 +54,11 @@ class RouterEngine:
         ctx_cluster: Optional[dict] = None,
         user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        ctx_emb = ensure_embedding_dim(context_embedding, dim=EMBEDDING_DIM) if context_embedding else []
+        ctx_emb = (
+            ensure_embedding_dim(context_embedding, dim=EMBEDDING_DIM)
+            if context_embedding
+            else []
+        )
 
         # Filter adapters to only those compatible with current backend mode
         all_adapters = adapters or []
@@ -68,26 +76,53 @@ class RouterEngine:
 
         # Log filtered adapters for debugging
         if filtered_out:
-            trace.append({
-                "id": "mode_filter",
-                "when": "pre_routing",
-                "fired": True,
-                "action": {"type": "filter_by_mode", "compatible_modes": list(self._compatible_modes)},
-                "effect": {"filtered_out": filtered_out},
-            })
+            trace.append(
+                {
+                    "id": "mode_filter",
+                    "when": "pre_routing",
+                    "fired": True,
+                    "action": {
+                        "type": "filter_by_mode",
+                        "compatible_modes": list(self._compatible_modes),
+                    },
+                    "effect": {"filtered_out": filtered_out},
+                }
+            )
 
         rules = policy.get("rules", []) if policy else []
         for rule in rules:
             condition = rule.get("when", "true")
-            fired = self._eval_condition(condition, ctx_emb, candidates, safety_risk, ctx_cluster)
+            fired = self._eval_condition(
+                condition, ctx_emb, candidates, safety_risk, ctx_cluster
+            )
             effect = None
             if fired:
-                effect = self._apply_action(rule.get("action", {}), candidates, ctx_emb, weights)
-            trace.append({"id": rule.get("id"), "when": condition, "fired": fired, "action": rule.get("action"), "effect": effect})
+                effect = self._apply_action(
+                    rule.get("action", {}), candidates, ctx_emb, weights
+                )
+            trace.append(
+                {
+                    "id": rule.get("id"),
+                    "when": condition,
+                    "fired": fired,
+                    "action": rule.get("action"),
+                    "effect": effect,
+                }
+            )
         if not weights and ctx_emb:
-            similarity_effects = self._apply_similarity_boost(candidates, ctx_emb, weights)
+            similarity_effects = self._apply_similarity_boost(
+                candidates, ctx_emb, weights
+            )
             if similarity_effects:
-                trace.append({"id": "default_similarity_boost", "when": "auto", "fired": True, "action": {"type": "boost_by_similarity"}, "effect": similarity_effects})
+                trace.append(
+                    {
+                        "id": "default_similarity_boost",
+                        "when": "auto",
+                        "fired": True,
+                        "action": {"type": "boost_by_similarity"},
+                        "effect": similarity_effects,
+                    }
+                )
         normalized = self._normalize_weights(weights, policy)
         routing = {"adapters": normalized, "trace": trace, "ctx_cluster": ctx_cluster}
         if self.cache and user_id and cache_key:
@@ -137,7 +172,12 @@ class RouterEngine:
             return "none"
         identifiers = []
         for adapter in adapters:
-            adapter_id = adapter.get("id") or adapter.get("name") or adapter.get("base_model") or "anon"
+            adapter_id = (
+                adapter.get("id")
+                or adapter.get("name")
+                or adapter.get("base_model")
+                or "anon"
+            )
             version = adapter.get("version") or adapter.get("hash") or ""
             identifiers.append(f"{adapter_id}:{version}")
         identifiers.sort()
@@ -151,7 +191,12 @@ class RouterEngine:
         return f"{ctx_hash}:{adapter_hash}"
 
     def _eval_condition(
-        self, expr: str, context_embedding: List[float], adapters: List[dict], safety_risk: Optional[str] = None, ctx_cluster: Optional[dict] = None
+        self,
+        expr: str,
+        context_embedding: List[float],
+        adapters: List[dict],
+        safety_risk: Optional[str] = None,
+        ctx_cluster: Optional[dict] = None,
     ) -> bool:
         expr = expr or ""
         if expr.strip() in {"true", "True", "1"}:
@@ -167,19 +212,32 @@ class RouterEngine:
             "none": None,
         }
         try:
-            return bool(safe_eval_expr(expr, local_scope, allowed_callables=self.safe_functions))
+            return bool(
+                safe_eval_expr(expr, local_scope, allowed_callables=self.safe_functions)
+            )
         except Exception as exc:
-            logger.warning("routing_condition_evaluation_failed", expr=expr, error=str(exc))
+            logger.warning(
+                "routing_condition_evaluation_failed", expr=expr, error=str(exc)
+            )
             return False
 
     def _apply_action(
-        self, action: dict, adapters: List[dict], ctx_emb: List[float], weights: Dict[str, float]
+        self,
+        action: dict,
+        adapters: List[dict],
+        ctx_emb: List[float],
+        weights: Dict[str, float],
     ) -> Dict[str, Any]:
         action_type = action.get("type")
         weight = action.get("weight", 1.0)
         overwrite = action.get("overwrite", False)
 
-        def _record(target_id: Optional[str], applied_weight: float, similarity: Optional[float] = None, ranked: Optional[List[dict]] = None) -> Dict[str, Any]:
+        def _record(
+            target_id: Optional[str],
+            applied_weight: float,
+            similarity: Optional[float] = None,
+            ranked: Optional[List[dict]] = None,
+        ) -> Dict[str, Any]:
             record: Dict[str, Any] = {"target": target_id, "weight": applied_weight}
             if similarity is not None:
                 record["similarity"] = similarity
@@ -196,18 +254,32 @@ class RouterEngine:
 
         ranked_candidates: List[dict] = []
         if action_type == "activate_adapter_by_id":
-            target_id, target_similarity = self._resolve_adapter(action.get("adapter_id"), adapters, ctx_emb)
+            target_id, target_similarity = self._resolve_adapter(
+                action.get("adapter_id"), adapters, ctx_emb
+            )
         elif action_type == "activate_adapter_by_type":
-            target_id, target_similarity, ranked_candidates = self._resolve_adapter_by_field("adapter_type", action.get("adapter_type"), adapters, ctx_emb)
+            target_id, target_similarity, ranked_candidates = (
+                self._resolve_adapter_by_field(
+                    "adapter_type", action.get("adapter_type"), adapters, ctx_emb
+                )
+            )
         elif action_type == "activate_adapter_by_cluster":
-            target_id, target_similarity, ranked_candidates = self._resolve_adapter_by_field("cluster_id", action.get("cluster_id"), adapters, ctx_emb)
+            target_id, target_similarity, ranked_candidates = (
+                self._resolve_adapter_by_field(
+                    "cluster_id", action.get("cluster_id"), adapters, ctx_emb
+                )
+            )
         elif action_type == "deactivate_adapter":
-            target_id, _ = self._resolve_adapter(action.get("adapter_id"), adapters, ctx_emb)
+            target_id, _ = self._resolve_adapter(
+                action.get("adapter_id"), adapters, ctx_emb
+            )
             if target_id:
                 weights.pop(target_id, None)
             return _record(target_id, 0.0)
         elif action_type == "scale_adapter_weight":
-            target_id, _ = self._resolve_adapter(action.get("adapter_id"), adapters, ctx_emb)
+            target_id, _ = self._resolve_adapter(
+                action.get("adapter_id"), adapters, ctx_emb
+            )
             if target_id and target_id in weights:
                 weights[target_id] *= action.get("scale", 1.0)
             return _record(target_id, weights.get(target_id, 0.0))
@@ -222,17 +294,23 @@ class RouterEngine:
             weights[target_id] = max(weights[target_id], applied_weight)
         return _record(target_id, applied_weight, target_similarity, ranked_candidates)
 
-    def _apply_similarity_boost(self, adapters: List[dict], ctx_emb: List[float], weights: Dict[str, float]) -> List[dict]:
+    def _apply_similarity_boost(
+        self, adapters: List[dict], ctx_emb: List[float], weights: Dict[str, float]
+    ) -> List[dict]:
         effects: List[dict] = []
         for candidate in adapters:
             cand_id = candidate.get("id") or candidate.get("name")
             similarity = cosine_similarity(ctx_emb, self._adapter_embedding(candidate))
             if similarity > self.similarity_boost_threshold and cand_id:
                 weights[cand_id] = max(weights.get(cand_id, 0.0), similarity)
-                effects.append({"target": cand_id, "weight": similarity, "similarity": similarity})
+                effects.append(
+                    {"target": cand_id, "weight": similarity, "similarity": similarity}
+                )
         return effects
 
-    def _resolve_weight(self, configured_weight: Any, similarity: Optional[float]) -> float:
+    def _resolve_weight(
+        self, configured_weight: Any, similarity: Optional[float]
+    ) -> float:
         if isinstance(configured_weight, (int, float)):
             return float(configured_weight)
         if isinstance(configured_weight, str) and configured_weight == "similarity":
@@ -261,7 +339,11 @@ class RouterEngine:
         return None, None
 
     def _resolve_adapter_by_field(
-        self, field: str, value: Optional[str], adapters: List[dict], ctx_emb: List[float]
+        self,
+        field: str,
+        value: Optional[str],
+        adapters: List[dict],
+        ctx_emb: List[float],
     ) -> Tuple[Optional[str], Optional[float], List[dict]]:
         if value == "closest":
             cand_id, sim = self._resolve_adapter("closest", adapters, ctx_emb)
@@ -276,7 +358,9 @@ class RouterEngine:
                 ranked.append(
                     {
                         "id": cand_id,
-                        "similarity": cosine_similarity(ctx_emb, self._adapter_embedding(candidate)),
+                        "similarity": cosine_similarity(
+                            ctx_emb, self._adapter_embedding(candidate)
+                        ),
                     }
                 )
         ranked = sorted(
@@ -288,7 +372,9 @@ class RouterEngine:
         top = ranked[0]
         return str(top.get("id")), float(top.get("similarity") or 0.0), ranked
 
-    def _normalize_weights(self, weights: Dict[str, float], policy: dict) -> List[Dict[str, Any]]:
+    def _normalize_weights(
+        self, weights: Dict[str, float], policy: dict
+    ) -> List[Dict[str, Any]]:
         max_active = policy.get("max_active_adapters", 3)
         weight_floor = policy.get("weight_floor", 0.05)
         # clamp to 0..1
@@ -302,11 +388,13 @@ class RouterEngine:
         if not filtered:
             return []
         ranked = sorted(filtered.items(), key=lambda kv: kv[1], reverse=True)
-        return [{"id": adapter_id, "weight": weight} for adapter_id, weight in ranked[:max_active]]
+        return [
+            {"id": adapter_id, "weight": weight}
+            for adapter_id, weight in ranked[:max_active]
+        ]
 
     def _adapter_embedding(self, adapter: dict) -> List[float]:
         emb = adapter.get("embedding") or adapter.get("centroid") or []
         if not isinstance(emb, list):
             return ensure_embedding_dim([], dim=EMBEDDING_DIM)
         return ensure_embedding_dim(emb, dim=EMBEDDING_DIM)
-

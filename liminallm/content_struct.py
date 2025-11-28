@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional, TypedDict
 
-SegmentType = Literal["text", "code", "citation", "tool_call", "attachment", "redaction"]
+SegmentType = Literal[
+    "text", "code", "citation", "tool_call", "attachment", "redaction"
+]
 
 
 class ContentSegment(TypedDict, total=False):
@@ -58,9 +60,38 @@ class ContentStruct(TypedDict, total=False):
 _SEGMENT_KEYS: Dict[SegmentType, List[str]] = {
     "text": ["text", "start", "end", "tags", "meta"],
     "code": ["text", "language", "start", "end", "tags", "meta"],
-    "citation": ["text", "source_id", "chunk_id", "score", "locator", "start", "end", "tags", "meta"],
-    "tool_call": ["name", "arguments", "result", "status", "duration_ms", "start", "end", "tags", "meta"],
-    "attachment": ["kind", "uri", "mime", "description", "start", "end", "tags", "meta"],
+    "citation": [
+        "text",
+        "source_id",
+        "chunk_id",
+        "score",
+        "locator",
+        "start",
+        "end",
+        "tags",
+        "meta",
+    ],
+    "tool_call": [
+        "name",
+        "arguments",
+        "result",
+        "status",
+        "duration_ms",
+        "start",
+        "end",
+        "tags",
+        "meta",
+    ],
+    "attachment": [
+        "kind",
+        "uri",
+        "mime",
+        "description",
+        "start",
+        "end",
+        "tags",
+        "meta",
+    ],
     "redaction": ["text", "reason", "policy", "start", "end", "tags", "meta"],
 }
 
@@ -79,7 +110,9 @@ def _coerce_segment(segment: Any) -> Optional[ContentSegment]:
     return normalized
 
 
-def normalize_content_struct(content_struct: Optional[dict], content: Optional[str] = None) -> Optional[ContentStruct]:
+def normalize_content_struct(
+    content_struct: Optional[dict], content: Optional[str] = None
+) -> Optional[ContentStruct]:
     """Return a sanitized ``content_struct`` payload or ``None``.
 
     - Accepts dictionaries with a ``segments`` list and filters segments down to

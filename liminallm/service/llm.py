@@ -60,7 +60,9 @@ class LLMService:
     def _format_user(self, prompt: str) -> str:
         return prompt
 
-    def _inject_context(self, messages: List[dict], context_snippets: List[str]) -> List[dict]:
+    def _inject_context(
+        self, messages: List[dict], context_snippets: List[str]
+    ) -> List[dict]:
         if not context_snippets:
             return list(messages)
         updated: List[dict] = [dict(msg) for msg in messages]
@@ -74,7 +76,9 @@ class LLMService:
                 msg["content"] = content
                 updated[idx] = msg
                 return updated
-        updated.append({"role": "system", "content": f"Context: {' | '.join(context_snippets)}"})
+        updated.append(
+            {"role": "system", "content": f"Context: {' | '.join(context_snippets)}"}
+        )
         return updated
 
     def _normalize_adapters(self, adapters: List[dict]) -> List[dict]:
@@ -93,7 +97,12 @@ class LLMService:
             backend = (adapter.get("backend") or "").lower()
             if backend not in prompt_backends:
                 continue
-            name = adapter.get("name") or adapter.get("id") or adapter.get("base_model") or "adapter"
+            name = (
+                adapter.get("name")
+                or adapter.get("id")
+                or adapter.get("base_model")
+                or "adapter"
+            )
             instructions = self._extract_prompt_instructions(adapter)
             if instructions:
                 lines.append(f"{name}: {instructions}")
@@ -103,7 +112,12 @@ class LLMService:
         return [{"role": "system", "content": f"Adapter guidance:\n{joined}"}]
 
     def _extract_prompt_instructions(self, adapter: dict) -> str:
-        for key in ("prompt_instructions", "behavior_prompt", "instructions", "prompt_template"):
+        for key in (
+            "prompt_instructions",
+            "behavior_prompt",
+            "instructions",
+            "prompt_template",
+        ):
             value = adapter.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
@@ -132,7 +146,9 @@ class LLMService:
             plug_config = self.adapter_configs.get(plug.key, {})
             plug_api_key = plug_config.get("api_key", api_key)
             plug_base_url = plug_config.get("base_url", base_url)
-            plug_adapter_server_model = plug_config.get("adapter_server_model", adapter_server_model)
+            plug_adapter_server_model = plug_config.get(
+                "adapter_server_model", adapter_server_model
+            )
             return plug.build_backend(
                 base_model=self.base_model,
                 api_key=plug_api_key,

@@ -3,9 +3,9 @@
 Per SPEC §18, adapter checksums must be verified against schema.checksum
 before activation to prevent loading tampered weights.
 """
+
 import hashlib
 import json
-from pathlib import Path
 from unittest.mock import patch, MagicMock
 
 import pytest
@@ -21,7 +21,7 @@ class TestAdapterChecksumValidation:
 
         backend = LocalJaxLoRABackend.__new__(LocalJaxLoRABackend)
         backend._fs_root = str(tmp_path)
-        backend._base_model = "test-model"
+        backend.base_model = "test-model"
         backend._adapter_cache = {}
         backend._jnp = None
         backend._jax = None
@@ -56,7 +56,11 @@ class TestAdapterChecksumValidation:
 
         # Mock _adapter_path to return our test directory
         with patch.object(mock_backend, "_adapter_path", return_value=str(adapter_dir)):
-            with patch.object(mock_backend, "_resolve_params_path", return_value=adapter_dir / "params.json"):
+            with patch.object(
+                mock_backend,
+                "_resolve_params_path",
+                return_value=adapter_dir / "params.json",
+            ):
                 with patch.object(mock_backend, "_ensure_jax"):
                     # Mock jnp.array to just return the value
                     mock_jnp = MagicMock()
@@ -80,13 +84,19 @@ class TestAdapterChecksumValidation:
         }
 
         with patch.object(mock_backend, "_adapter_path", return_value=str(adapter_dir)):
-            with patch.object(mock_backend, "_resolve_params_path", return_value=adapter_dir / "params.json"):
+            with patch.object(
+                mock_backend,
+                "_resolve_params_path",
+                return_value=adapter_dir / "params.json",
+            ):
                 with pytest.raises(ValueError, match="checksum mismatch"):
                     mock_backend._load_adapter_weights(adapter)
 
     def test_checksum_mismatch_logs_error(self, mock_backend, tmp_path, valid_weights):
         """Checksum mismatch logs detailed error before raising."""
-        adapter_dir, correct_checksum = self.create_adapter_file(tmp_path, valid_weights)
+        adapter_dir, correct_checksum = self.create_adapter_file(
+            tmp_path, valid_weights
+        )
 
         adapter = {
             "id": "test-adapter",
@@ -94,7 +104,11 @@ class TestAdapterChecksumValidation:
         }
 
         with patch.object(mock_backend, "_adapter_path", return_value=str(adapter_dir)):
-            with patch.object(mock_backend, "_resolve_params_path", return_value=adapter_dir / "params.json"):
+            with patch.object(
+                mock_backend,
+                "_resolve_params_path",
+                return_value=adapter_dir / "params.json",
+            ):
                 with patch("liminallm.service.model_backend.logger") as mock_logger:
                     with pytest.raises(ValueError):
                         mock_backend._load_adapter_weights(adapter)
@@ -118,7 +132,11 @@ class TestAdapterChecksumValidation:
         }
 
         with patch.object(mock_backend, "_adapter_path", return_value=str(adapter_dir)):
-            with patch.object(mock_backend, "_resolve_params_path", return_value=adapter_dir / "params.json"):
+            with patch.object(
+                mock_backend,
+                "_resolve_params_path",
+                return_value=adapter_dir / "params.json",
+            ):
                 with patch.object(mock_backend, "_ensure_jax"):
                     mock_jnp = MagicMock()
                     mock_jnp.array = lambda v, dtype: v
@@ -126,14 +144,21 @@ class TestAdapterChecksumValidation:
                     mock_backend._jnp = mock_jnp
 
                     with patch("liminallm.service.model_backend.logger") as mock_logger:
-                        weights = mock_backend._load_adapter_weights(adapter)
+                        mock_backend._load_adapter_weights(adapter)
 
-                        # Should log warning about missing checksum
-                        mock_logger.warning.assert_called_once()
-                        call_args = mock_logger.warning.call_args
-                        assert call_args[0][0] == "adapter_checksum_missing"
-                        assert "message" in call_args[1]
-                        assert "production" in call_args[1]["message"].lower()
+                        # Should log warning about missing checksum (may also log base_model warning)
+                        assert mock_logger.warning.call_count >= 1
+                        # Find the checksum warning among all warnings
+                        checksum_warning_found = False
+                        for call in mock_logger.warning.call_args_list:
+                            if call[0][0] == "adapter_checksum_missing":
+                                checksum_warning_found = True
+                                assert "message" in call[1]
+                                assert "production" in call[1]["message"].lower()
+                                break
+                        assert (
+                            checksum_warning_found
+                        ), "Expected adapter_checksum_missing warning"
 
     def test_checksum_from_schema_field(self, mock_backend, tmp_path, valid_weights):
         """Checksum can be provided in schema.checksum field."""
@@ -145,7 +170,11 @@ class TestAdapterChecksumValidation:
         }
 
         with patch.object(mock_backend, "_adapter_path", return_value=str(adapter_dir)):
-            with patch.object(mock_backend, "_resolve_params_path", return_value=adapter_dir / "params.json"):
+            with patch.object(
+                mock_backend,
+                "_resolve_params_path",
+                return_value=adapter_dir / "params.json",
+            ):
                 with patch.object(mock_backend, "_ensure_jax"):
                     mock_jnp = MagicMock()
                     mock_jnp.array = lambda v, dtype: v
@@ -158,7 +187,9 @@ class TestAdapterChecksumValidation:
 
     def test_top_level_checksum_preferred(self, mock_backend, tmp_path, valid_weights):
         """Top-level checksum is preferred over schema.checksum."""
-        adapter_dir, correct_checksum = self.create_adapter_file(tmp_path, valid_weights)
+        adapter_dir, correct_checksum = self.create_adapter_file(
+            tmp_path, valid_weights
+        )
 
         adapter = {
             "id": "test-adapter",
@@ -167,7 +198,11 @@ class TestAdapterChecksumValidation:
         }
 
         with patch.object(mock_backend, "_adapter_path", return_value=str(adapter_dir)):
-            with patch.object(mock_backend, "_resolve_params_path", return_value=adapter_dir / "params.json"):
+            with patch.object(
+                mock_backend,
+                "_resolve_params_path",
+                return_value=adapter_dir / "params.json",
+            ):
                 with patch.object(mock_backend, "_ensure_jax"):
                     mock_jnp = MagicMock()
                     mock_jnp.array = lambda v, dtype: v
@@ -200,16 +235,23 @@ class TestAdapterChecksumValidation:
 
         # Pre-populate cache
         cached_weights = {"cached": True}
-        mock_backend._adapter_cache["test-adapter"] = (params_path.stat().st_mtime, cached_weights)
+        mock_backend._adapter_cache["test-adapter"] = (
+            params_path.stat().st_mtime,
+            cached_weights,
+        )
 
         with patch.object(mock_backend, "_adapter_path", return_value=str(adapter_dir)):
-            with patch.object(mock_backend, "_resolve_params_path", return_value=params_path):
+            with patch.object(
+                mock_backend, "_resolve_params_path", return_value=params_path
+            ):
                 weights = mock_backend._load_adapter_weights(adapter)
 
                 # Should return cached weights
                 assert weights == cached_weights
 
-    def test_modified_file_invalidates_cache(self, mock_backend, tmp_path, valid_weights):
+    def test_modified_file_invalidates_cache(
+        self, mock_backend, tmp_path, valid_weights
+    ):
         """Modified file invalidates cache and re-verifies checksum."""
         adapter_dir, checksum = self.create_adapter_file(tmp_path, valid_weights)
         params_path = adapter_dir / "params.json"
@@ -223,7 +265,9 @@ class TestAdapterChecksumValidation:
         mock_backend._adapter_cache["test-adapter"] = (0, {"old": True})
 
         with patch.object(mock_backend, "_adapter_path", return_value=str(adapter_dir)):
-            with patch.object(mock_backend, "_resolve_params_path", return_value=params_path):
+            with patch.object(
+                mock_backend, "_resolve_params_path", return_value=params_path
+            ):
                 with patch.object(mock_backend, "_ensure_jax"):
                     mock_jnp = MagicMock()
                     mock_jnp.array = lambda v, dtype: v

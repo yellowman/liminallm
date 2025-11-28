@@ -9,8 +9,24 @@ def test_router_applies_rules_and_normalizes():
     engine = RouterEngine()
     policy = {
         "rules": [
-            {"id": "activate_primary", "when": "true", "action": {"type": "activate_adapter_by_id", "adapter_id": "a1", "weight": 0.8}},
-            {"id": "scale_secondary", "when": "true", "action": {"type": "activate_adapter_by_id", "adapter_id": "a2", "weight": 0.6}},
+            {
+                "id": "activate_primary",
+                "when": "true",
+                "action": {
+                    "type": "activate_adapter_by_id",
+                    "adapter_id": "a1",
+                    "weight": 0.8,
+                },
+            },
+            {
+                "id": "scale_secondary",
+                "when": "true",
+                "action": {
+                    "type": "activate_adapter_by_id",
+                    "adapter_id": "a2",
+                    "weight": 0.6,
+                },
+            },
         ],
         "max_active_adapters": 2,
     }

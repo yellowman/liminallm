@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import pytest
 
-from liminallm.config import AdapterMode, RemoteStyle, get_provider_capabilities
+from liminallm.config import AdapterMode, RemoteStyle
 from liminallm.service.model_backend import (
     ApiAdapterBackend,
     filter_adapters_by_mode,
@@ -454,7 +453,10 @@ class TestSelectBestAdapter:
 
 
 class TestExtractPromptInstructions:
-    """Test prompt instruction extraction from adapter."""
+    """Test prompt instruction extraction from adapter.
+
+    Tests SPEC §5.0.1 prompt instruction handling with explicit priority order.
+    """
 
     def test_extract_prompt_instructions(self):
         """Should extract from prompt_instructions field."""
@@ -474,6 +476,15 @@ class TestExtractPromptInstructions:
 
         assert result == "Act as expert"
 
+    def test_extract_system_prompt(self):
+        """Should extract from system_prompt field."""
+        backend = ApiAdapterBackend("gpt-4", provider="openai")
+
+        adapter = {"system_prompt": "You are a coding assistant"}
+        result = backend._extract_prompt_instructions(adapter)
+
+        assert result == "You are a coding assistant"
+
     def test_extract_from_schema(self):
         """Should check schema dict for instructions."""
         backend = ApiAdapterBackend("gpt-4", provider="openai")
@@ -492,14 +503,68 @@ class TestExtractPromptInstructions:
 
         assert result == "For technical questions"
 
-    def test_fallback_to_description(self):
-        """Should fall back to description if no prompt fields."""
+    def test_no_fallback_to_description_without_flag(self):
+        """Should NOT fall back to description without explicit flag.
+
+        This is a key change from the original behavior - generic description
+        fields should not be used for prompt injection unless explicitly opted in.
+        """
         backend = ApiAdapterBackend("gpt-4", provider="openai")
 
         adapter = {"description": "A helpful assistant"}
         result = backend._extract_prompt_instructions(adapter)
 
+        # Description should NOT be used without opt-in flag
+        assert result is None
+
+    def test_description_used_with_explicit_flag(self):
+        """Should use description when use_description_as_prompt=True."""
+        backend = ApiAdapterBackend("gpt-4", provider="openai")
+
+        adapter = {
+            "description": "A helpful assistant",
+            "use_description_as_prompt": True,
+        }
+        result = backend._extract_prompt_instructions(adapter)
+
         assert result == "A helpful assistant"
+
+    def test_description_flag_in_schema(self):
+        """Should check schema for use_description_as_prompt flag."""
+        backend = ApiAdapterBackend("gpt-4", provider="openai")
+
+        adapter = {
+            "schema": {
+                "description": "Expert coder",
+                "use_description_as_prompt": True,
+            }
+        }
+        result = backend._extract_prompt_instructions(adapter)
+
+        assert result == "Expert coder"
+
+    def test_priority_order(self):
+        """Should respect priority order: prompt_instructions > applicability > description."""
+        backend = ApiAdapterBackend("gpt-4", provider="openai")
+
+        # When all fields present, prompt_instructions wins
+        adapter = {
+            "prompt_instructions": "Priority 1",
+            "applicability": {"natural_language": "Priority 2"},
+            "description": "Priority 3",
+            "use_description_as_prompt": True,
+        }
+        result = backend._extract_prompt_instructions(adapter)
+        assert result == "Priority 1"
+
+        # Without prompt_instructions, applicability wins
+        adapter2 = {
+            "applicability": {"natural_language": "Priority 2"},
+            "description": "Priority 3",
+            "use_description_as_prompt": True,
+        }
+        result2 = backend._extract_prompt_instructions(adapter2)
+        assert result2 == "Priority 2"
 
     def test_returns_none_for_empty(self):
         """Should return None if no instructions found."""
@@ -516,6 +581,19 @@ class TestExtractPromptInstructions:
         result = backend._extract_prompt_instructions(adapter)
 
         assert result == "padded text"
+
+    def test_ignores_empty_strings(self):
+        """Should ignore empty or whitespace-only values."""
+        backend = ApiAdapterBackend("gpt-4", provider="openai")
+
+        adapter = {
+            "prompt_instructions": "   ",
+            "behavior_prompt": "",
+            "applicability": {"natural_language": "Valid"},
+        }
+        result = backend._extract_prompt_instructions(adapter)
+
+        assert result == "Valid"
 
 
 # ==============================================================================

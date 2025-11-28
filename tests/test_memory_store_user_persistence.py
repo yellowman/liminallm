@@ -33,10 +33,17 @@ def test_delete_user_cleans_router_state_and_files(tmp_path):
     adapter = store.create_artifact(
         "adapter",
         name="cleanup",
-        schema={"kind": "adapter.lora", "backend": "local", "base_model": "stub", "current_version": 0},
+        schema={
+            "kind": "adapter.lora",
+            "backend": "local",
+            "base_model": "stub",
+            "current_version": 0,
+        },
         owner_user_id=user.id,
     )
-    store.adapter_router_state["state-1"] = AdapterRouterState(artifact_id=adapter.id, base_model="stub")
+    store.adapter_router_state["state-1"] = AdapterRouterState(
+        artifact_id=adapter.id, base_model="stub"
+    )
 
     user_file = Path(tmp_path) / "users" / user.id / "files" / "upload.txt"
     user_file.parent.mkdir(parents=True, exist_ok=True)

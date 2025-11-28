@@ -16,7 +16,9 @@ def memory_store(tmp_path):
 def _create_user_conversation_message(store: MemoryStore):
     user = store.create_user("test@example.com")
     conversation = store.create_conversation(user.id, title="test conversation")
-    message = store.append_message(conversation.id, sender=user.id, role="user", content="hello")
+    message = store.append_message(
+        conversation.id, sender=user.id, role="user", content="hello"
+    )
     return user, conversation, message
 
 
@@ -95,7 +97,11 @@ def test_get_training_job_round_trip(memory_store: MemoryStore):
 
 
 def test_get_latest_workflow_returns_newest_schema(memory_store: MemoryStore):
-    workflow = next(a for a in memory_store.list_artifacts(type_filter="workflow") if a.name == "default_chat_workflow")
+    workflow = next(
+        a
+        for a in memory_store.list_artifacts(type_filter="workflow")
+        if a.name == "default_chat_workflow"
+    )
     updated_schema = deepcopy(workflow.schema)
     updated_schema["description"] = "updated"
 

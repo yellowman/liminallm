@@ -246,7 +246,9 @@ def env_field(default: Any, env: str, **kwargs):
 class Settings(BaseModel):
     """Runtime settings aligned with the SPEC kernel contracts."""
 
-    database_url: str = env_field("postgresql://localhost:5432/liminallm", "DATABASE_URL")
+    database_url: str = env_field(
+        "postgresql://localhost:5432/liminallm", "DATABASE_URL"
+    )
     redis_url: str = env_field("redis://localhost:6379/0", "REDIS_URL")
     shared_fs_root: str = env_field("/srv/liminallm", "SHARED_FS_ROOT")
     model_path: str = env_field("gpt-4o-mini", "MODEL_PATH")
@@ -268,7 +270,9 @@ class Settings(BaseModel):
         description="Toggle deterministic testing behaviors; required for CI pathways described in SPEC §14.",
     )
     chat_rate_limit_per_minute: int = env_field(60, "CHAT_RATE_LIMIT_PER_MINUTE")
-    chat_rate_limit_window_seconds: int = env_field(60, "CHAT_RATE_LIMIT_WINDOW_SECONDS")
+    chat_rate_limit_window_seconds: int = env_field(
+        60, "CHAT_RATE_LIMIT_WINDOW_SECONDS"
+    )
     enable_mfa: bool = env_field(True, "ENABLE_MFA")
     jwt_secret: str = env_field(None, "JWT_SECRET")
     jwt_issuer: str = env_field("liminallm", "JWT_ISSUER")
@@ -285,8 +289,12 @@ class Settings(BaseModel):
     reset_rate_limit_per_minute: int = env_field(5, "RESET_RATE_LIMIT_PER_MINUTE")
     mfa_rate_limit_per_minute: int = env_field(5, "MFA_RATE_LIMIT_PER_MINUTE")
     admin_rate_limit_per_minute: int = env_field(30, "ADMIN_RATE_LIMIT_PER_MINUTE")
-    admin_rate_limit_window_seconds: int = env_field(60, "ADMIN_RATE_LIMIT_WINDOW_SECONDS")
-    files_upload_rate_limit_per_minute: int = env_field(10, "FILES_UPLOAD_RATE_LIMIT_PER_MINUTE")
+    admin_rate_limit_window_seconds: int = env_field(
+        60, "ADMIN_RATE_LIMIT_WINDOW_SECONDS"
+    )
+    files_upload_rate_limit_per_minute: int = env_field(
+        10, "FILES_UPLOAD_RATE_LIMIT_PER_MINUTE"
+    )
     configops_rate_limit_per_hour: int = env_field(30, "CONFIGOPS_RATE_LIMIT_PER_HOUR")
 
     model_config = ConfigDict(extra="ignore")
@@ -338,14 +346,18 @@ class Settings(BaseModel):
                 if persisted:
                     return persisted
             except Exception as exc:
-                logger.error("jwt_secret_read_failed", error=str(exc), path=str(secret_path))
+                logger.error(
+                    "jwt_secret_read_failed", error=str(exc), path=str(secret_path)
+                )
 
         generated = secrets.token_urlsafe(64)
         try:
             secret_path.write_text(generated)
             os.chmod(secret_path, 0o600)
         except Exception as exc:
-            logger.error("jwt_secret_persist_failed", error=str(exc), path=str(secret_path))
+            logger.error(
+                "jwt_secret_persist_failed", error=str(exc), path=str(secret_path)
+            )
             raise RuntimeError(
                 "Unable to persist JWT secret; set JWT_SECRET or make SHARED_FS_ROOT writable"
             ) from exc

@@ -1,12 +1,15 @@
-import pytest
-
 from liminallm.content_struct import normalize_content_struct
 
 
 def test_normalize_preserves_known_segments():
     struct = {
         "segments": [
-            {"type": "code", "text": "print('hi')", "language": "python", "unknown": "x"},
+            {
+                "type": "code",
+                "text": "print('hi')",
+                "language": "python",
+                "unknown": "x",
+            },
             {
                 "type": "citation",
                 "text": "cite",
@@ -15,7 +18,12 @@ def test_normalize_preserves_known_segments():
                 "score": 0.9,
                 "meta": {"note": "keep"},
             },
-            {"type": "tool_call", "name": "lookup", "arguments": {"id": "123"}, "result": {"status": "ok"}},
+            {
+                "type": "tool_call",
+                "name": "lookup",
+                "arguments": {"id": "123"},
+                "result": {"status": "ok"},
+            },
         ]
     }
     normalized = normalize_content_struct(struct)
