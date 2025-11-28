@@ -27,7 +27,9 @@ from liminallm.storage.redis_cache import RedisCache
 # SPEC §9/§18: Default retry and timeout settings
 DEFAULT_NODE_TIMEOUT_MS = 15000  # 15 seconds per node
 DEFAULT_NODE_MAX_RETRIES = 2  # Up to 2 retries (3 total attempts), hard cap at 3
-DEFAULT_BACKOFF_MS = 1000  # Initial backoff 1s, doubles each retry (1s, 4s per SPEC)
+DEFAULT_BACKOFF_MS = (
+    1000  # Initial backoff 1s, quadruples each retry (1s, 4s per SPEC §18)
+)
 MAX_RETRIES_HARD_CAP = 3  # SPEC §18: hard cap at 3 retries
 DEFAULT_WORKFLOW_TIMEOUT_MS = 60000  # 60 seconds total workflow timeout
 MAX_CONTEXT_SNIPPETS = 20
@@ -423,9 +425,9 @@ class WorkflowEngine:
 
             # If we have more retries, apply exponential backoff
             if attempt <= max_retries:
-                # Exponential backoff: backoff_ms * (2 ^ (attempt - 1))
-                # For default 1000ms: attempt 1 = 1s, attempt 2 = 2s, attempt 3 = 4s
-                current_backoff_ms = backoff_ms * (2 ** (attempt - 1))
+                # Exponential backoff: backoff_ms * (4 ^ (attempt - 1))
+                # Per SPEC §18: 1s, 4s, 16s progression (quadruple each retry)
+                current_backoff_ms = backoff_ms * (4 ** (attempt - 1))
 
                 # Don't sleep longer than remaining workflow timeout
                 sleep_ms = min(

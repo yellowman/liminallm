@@ -422,11 +422,11 @@ class TestRetryBackoff:
                 workflow_timeout_ms=60000,
             )
 
-            # Should have exponential backoff: 1000, 2000, 4000 ms
+            # Should have exponential backoff per SPEC §18: 1000, 4000, 16000 ms
             assert len(backoff_times) == 3
             assert backoff_times[0] == 1000  # First backoff: 1s
-            assert backoff_times[1] == 2000  # Second backoff: 2s
-            assert backoff_times[2] == 4000  # Third backoff: 4s
+            assert backoff_times[1] == 4000  # Second backoff: 4s (quadruple)
+            assert backoff_times[2] == 16000  # Third backoff: 16s (quadruple)
 
     @pytest.mark.asyncio
     async def test_retry_respects_workflow_timeout(self, workflow_engine):
