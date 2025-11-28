@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import pytest
 
 from liminallm.config import (
     AdapterMode,
@@ -324,13 +323,17 @@ class TestProviderConsistency:
         for provider, caps in PROVIDER_CAPABILITIES.items():
             if caps.remote_style == RemoteStyle.MODEL_ID:
                 assert caps.max_adapters == 1, f"{provider} should have max_adapters=1"
-                assert caps.multi_adapter is False, f"{provider} should have multi_adapter=False"
+                assert (
+                    caps.multi_adapter is False
+                ), f"{provider} should have multi_adapter=False"
 
     def test_adapter_param_providers_have_param_name(self):
         """ADAPTER_PARAM providers should have adapter_param_name set."""
         for provider, caps in PROVIDER_CAPABILITIES.items():
             if caps.remote_style == RemoteStyle.ADAPTER_PARAM:
-                assert caps.adapter_param_name, f"{provider} should have adapter_param_name"
+                assert (
+                    caps.adapter_param_name
+                ), f"{provider} should have adapter_param_name"
 
     def test_local_providers_have_none_style(self):
         """Local providers should have NONE remote style."""
@@ -344,6 +347,6 @@ class TestProviderConsistency:
         for provider, caps in PROVIDER_CAPABILITIES.items():
             if caps.gate_weights:
                 # If gate_weights is True, should also have multi_adapter or max_adapters > 1
-                assert caps.multi_adapter or caps.max_adapters > 1, (
-                    f"{provider} has gate_weights but no multi-adapter support"
-                )
+                assert (
+                    caps.multi_adapter or caps.max_adapters > 1
+                ), f"{provider} has gate_weights but no multi-adapter support"

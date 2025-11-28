@@ -2,28 +2,31 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
-import re
 import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
 from ipaddress import ip_address
-from typing import Any, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
-import psycopg
 from psycopg import errors
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
-from liminallm.service.artifact_validation import ArtifactValidationError, validate_artifact
-from liminallm.service.bm25 import tokenize_text as _tokenize_text, compute_bm25_scores as _compute_bm25_scores
-from liminallm.service.embeddings import cosine_similarity
+from liminallm.service.artifact_validation import (
+    ArtifactValidationError,
+    validate_artifact,
+)
+from liminallm.service.bm25 import (
+    tokenize_text as _tokenize_text,
+    compute_bm25_scores as _compute_bm25_scores,
+)
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
     Artifact,
+    ArtifactVersion,
     ConfigPatchAudit,
     ContextSource,
     Conversation,
@@ -52,7 +55,10 @@ class PostgresStore:
         self.fs_root.mkdir(parents=True, exist_ok=True)
         self.logger = get_logger(__name__)
         self.pool = ConnectionPool(
-            self.dsn, min_size=2, max_size=10, kwargs={"row_factory": dict_row, "autocommit": False}
+            self.dsn,
+            min_size=2,
+            max_size=10,
+            kwargs={"row_factory": dict_row, "autocommit": False},
         )
         self.sessions: dict[str, Session] = {}
         self._session_lock = threading.Lock()
@@ -148,7 +154,9 @@ class PostgresStore:
         with self._connect() as conn:
             missing_tables = []
             for table in required_tables:
-                row = conn.execute("SELECT to_regclass(%s) AS oid", (f"public.{table}",)).fetchone()
+                row = conn.execute(
+                    "SELECT to_regclass(%s) AS oid", (f"public.{table}",)
+                ).fetchone()
                 if not row or not row.get("oid"):
                     missing_tables.append(table)
 
@@ -159,13 +167,17 @@ class PostgresStore:
                     )
                 )
 
-            vector_ext = conn.execute("SELECT extname FROM pg_extension WHERE extname = 'vector'").fetchone()
+            vector_ext = conn.execute(
+                "SELECT extname FROM pg_extension WHERE extname = 'vector'"
+            ).fetchone()
             if not vector_ext:
                 raise RuntimeError(
                     "pgvector extension is missing. Install it and rerun scripts/migrate.sh to satisfy SPEC §3 RAG requirements."
                 )
 
-            citext_ext = conn.execute("SELECT extname FROM pg_extension WHERE extname = 'citext'").fetchone()
+            citext_ext = conn.execute(
+                "SELECT extname FROM pg_extension WHERE extname = 'citext'"
+            ).fetchone()
             if not citext_ext:
                 raise RuntimeError(
                     "citext extension is missing. Install it and rerun scripts/migrate.sh to satisfy SPEC §2 auth expectations."
@@ -289,7 +301,11 @@ class PostgresStore:
                 change_note="Seeded default workflow",
             )
 
-        seeded_tools = {art.schema.get("name") for art in existing if isinstance(art.schema, dict) and art.schema.get("kind") == "tool.spec"}
+        seeded_tools = {
+            art.schema.get("name")
+            for art in existing
+            if isinstance(art.schema, dict) and art.schema.get("kind") == "tool.spec"
+        }
         default_tools = [
             {
                 "kind": "tool.spec",
@@ -302,7 +318,10 @@ class PostgresStore:
                 "kind": "tool.spec",
                 "name": "rag.answer_with_context_v1",
                 "description": "Retrieval augmented answer with pgvector context.",
-                "inputs": {"message": {"type": "string"}, "context_id": {"type": "string", "optional": True}},
+                "inputs": {
+                    "message": {"type": "string"},
+                    "context_id": {"type": "string", "optional": True},
+                },
                 "handler": "rag.answer_with_context_v1",
             },
         ]
@@ -343,13 +362,17 @@ class PostgresStore:
                 (message_id,),
             ).fetchone()
             if not msg_row:
-                raise ConstraintViolation("preference message missing", {"message_id": message_id})
+                raise ConstraintViolation(
+                    "preference message missing", {"message_id": message_id}
+                )
             if msg_row.get("conversation_id") != conversation_id:
                 raise ConstraintViolation(
                     "preference message conversation mismatch",
                     {"message_id": message_id, "conversation_id": conversation_id},
                 )
-            embedding = context_embedding or self._text_embedding(context_text or msg_row.get("content"))
+            embedding = context_embedding or self._text_embedding(
+                context_text or msg_row.get("content")
+            )
             row = conn.execute(
                 """
                 INSERT INTO preference_event (
@@ -387,7 +410,9 @@ class PostgresStore:
             cluster_id=cluster_id,
             context_text=context_text,
             corrected_text=corrected_text,
-            created_at=row.get("created_at", datetime.utcnow()) if row else datetime.utcnow(),
+            created_at=(
+                row.get("created_at", datetime.utcnow()) if row else datetime.utcnow()
+            ),
             weight=normalized_weight,
             meta=meta,
         )
@@ -418,7 +443,9 @@ class PostgresStore:
             clauses.append("user_id = %s")
             params.append(user_id)
         if feedback:
-            feedback_values = [feedback] if isinstance(feedback, str) else list(feedback)
+            feedback_values = (
+                [feedback] if isinstance(feedback, str) else list(feedback)
+            )
             if feedback_values:
                 placeholders = ", ".join(["%s"] * len(feedback_values))
                 clauses.append(f"feedback IN ({placeholders})")
@@ -455,7 +482,9 @@ class PostgresStore:
             for row in rows
         ]
 
-    def update_preference_event(self, event_id: str, *, cluster_id: str | None = None) -> PreferenceEvent | None:
+    def update_preference_event(
+        self, event_id: str, *, cluster_id: str | None = None
+    ) -> PreferenceEvent | None:
         if cluster_id is None:
             return self.get_preference_event(event_id)
         with self._connect() as conn:
@@ -484,7 +513,9 @@ class PostgresStore:
 
     def get_preference_event(self, event_id: str) -> PreferenceEvent | None:
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM preference_event WHERE id = %s", (event_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM preference_event WHERE id = %s", (event_id,)
+            ).fetchone()
         if not row:
             return None
         return PreferenceEvent(
@@ -526,9 +557,16 @@ class PostgresStore:
             user_id=user_id,
             centroid=list(centroid),
             size=size,
-            label=label if label is not None else (existing.label if existing else None),
-            description=description if description is not None else (existing.description if existing else None),
-            sample_message_ids=sample_message_ids or (existing.sample_message_ids if existing else []),
+            label=(
+                label if label is not None else (existing.label if existing else None)
+            ),
+            description=(
+                description
+                if description is not None
+                else (existing.description if existing else None)
+            ),
+            sample_message_ids=sample_message_ids
+            or (existing.sample_message_ids if existing else []),
             created_at=created_at,
             updated_at=now,
             meta=meta or (existing.meta if existing else None),
@@ -568,7 +606,9 @@ class PostgresStore:
             size=size,
             label=row.get("label") if row else cluster.label,
             description=row.get("description") if row else cluster.description,
-            sample_message_ids=row.get("sample_message_ids") if row else cluster.sample_message_ids,
+            sample_message_ids=(
+                row.get("sample_message_ids") if row else cluster.sample_message_ids
+            ),
             created_at=row.get("created_at", created_at) if row else created_at,
             updated_at=row.get("updated_at", now) if row else now,
             meta=row.get("meta") if row else cluster.meta,
@@ -626,14 +666,19 @@ class PostgresStore:
             meta=row.get("meta"),
         )
 
-    def list_semantic_clusters(self, user_id: str | None = None) -> list[SemanticCluster]:
+    def list_semantic_clusters(
+        self, user_id: str | None = None
+    ) -> list[SemanticCluster]:
         with self._connect() as conn:
             if user_id:
                 rows = conn.execute(
-                    "SELECT * FROM semantic_cluster WHERE user_id = %s ORDER BY updated_at DESC", (user_id,)
+                    "SELECT * FROM semantic_cluster WHERE user_id = %s ORDER BY updated_at DESC",
+                    (user_id,),
                 ).fetchall()
             else:
-                rows = conn.execute("SELECT * FROM semantic_cluster ORDER BY updated_at DESC", ()).fetchall()
+                rows = conn.execute(
+                    "SELECT * FROM semantic_cluster ORDER BY updated_at DESC", ()
+                ).fetchall()
         return [
             SemanticCluster(
                 id=str(row["id"]),
@@ -652,7 +697,9 @@ class PostgresStore:
 
     def get_semantic_cluster(self, cluster_id: str) -> SemanticCluster | None:
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM semantic_cluster WHERE id = %s", (cluster_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM semantic_cluster WHERE id = %s", (cluster_id,)
+            ).fetchone()
         if not row:
             return None
         return SemanticCluster(
@@ -762,7 +809,9 @@ class PostgresStore:
         return TrainingJob(
             id=str(row["id"]),
             user_id=str(row["user_id"]),
-            adapter_id=str(adapter_id_value) if adapter_id_value else existing.adapter_id,
+            adapter_id=(
+                str(adapter_id_value) if adapter_id_value else existing.adapter_id
+            ),
             status=row.get("status", existing.status),
             num_events=row.get("num_events", existing.num_events),
             created_at=row.get("created_at", existing.created_at),
@@ -776,13 +825,17 @@ class PostgresStore:
 
     def get_training_job(self, job_id: str) -> TrainingJob | None:
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM training_job WHERE id = %s", (job_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM training_job WHERE id = %s", (job_id,)
+            ).fetchone()
         if not row:
             return None
         return TrainingJob(
             id=str(row["id"]),
             user_id=str(row["user_id"]),
-            adapter_id=self._require_training_adapter_id(row.get("adapter_id"), row.get("id")),
+            adapter_id=self._require_training_adapter_id(
+                row.get("adapter_id"), row.get("id")
+            ),
             status=row.get("status", "queued"),
             num_events=row.get("num_events"),
             created_at=row.get("created_at", datetime.utcnow()),
@@ -806,10 +859,10 @@ class PostgresStore:
         params: list[Any] = []
         if user_id:
             params.append(user_id)
-            query += f" AND user_id = %s"
+            query += " AND user_id = %s"
         if status:
             params.append(status)
-            query += f" AND status = %s"
+            query += " AND status = %s"
         if tenant_id:
             params.append(tenant_id)
             query += " AND user_id IN (SELECT id FROM app_user WHERE tenant_id = %s)"
@@ -823,7 +876,9 @@ class PostgresStore:
             TrainingJob(
                 id=str(row["id"]),
                 user_id=str(row["user_id"]),
-                adapter_id=self._require_training_adapter_id(row.get("adapter_id"), row.get("id")),
+                adapter_id=self._require_training_adapter_id(
+                    row.get("adapter_id"), row.get("id")
+                ),
                 status=row.get("status", "queued"),
                 num_events=row.get("num_events"),
                 created_at=row.get("created_at", datetime.utcnow()),
@@ -889,7 +944,9 @@ class PostgresStore:
             meta=normalized_meta,
         )
 
-    def link_user_auth_provider(self, user_id: str, provider: str, provider_uid: str) -> None:
+    def link_user_auth_provider(
+        self, user_id: str, provider: str, provider_uid: str
+    ) -> None:
         with self._connect() as conn:
             conn.execute(
                 """
@@ -920,7 +977,9 @@ class PostgresStore:
             meta=row.get("meta"),
         )
 
-    def save_password(self, user_id: str, password_hash: str, password_algo: str) -> None:
+    def save_password(
+        self, user_id: str, password_hash: str, password_algo: str
+    ) -> None:
         with self._connect() as conn:
             conn.execute(
                 """
@@ -937,13 +996,16 @@ class PostgresStore:
     def get_password_record(self, user_id: str) -> Optional[tuple[str, str]]:
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT password_hash, password_algo FROM user_auth_credential WHERE user_id = %s", (user_id,)
+                "SELECT password_hash, password_algo FROM user_auth_credential WHERE user_id = %s",
+                (user_id,),
             ).fetchone()
         if not row:
             return None
         return str(row["password_hash"]), str(row["password_algo"])
 
-    def set_user_mfa_secret(self, user_id: str, secret: str, enabled: bool = False) -> UserMFAConfig:
+    def set_user_mfa_secret(
+        self, user_id: str, secret: str, enabled: bool = False
+    ) -> UserMFAConfig:
         record = UserMFAConfig(user_id=user_id, secret=secret, enabled=enabled)
         try:
             with self._connect() as conn:
@@ -982,7 +1044,9 @@ class PostgresStore:
 
     def get_user_by_email(self, email: str) -> Optional[User]:
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM app_user WHERE email = %s", (email,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM app_user WHERE email = %s", (email,)
+            ).fetchone()
         if not row:
             return None
         return User(
@@ -999,7 +1063,9 @@ class PostgresStore:
 
     def get_user(self, user_id: str) -> Optional[User]:
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM app_user WHERE id = %s", (user_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM app_user WHERE id = %s", (user_id,)
+            ).fetchone()
         if not row:
             return None
         return User(
@@ -1014,7 +1080,9 @@ class PostgresStore:
             meta=row.get("meta"),
         )
 
-    def list_users(self, tenant_id: Optional[str] = None, limit: int = 100) -> List[User]:
+    def list_users(
+        self, tenant_id: Optional[str] = None, limit: int = 100
+    ) -> List[User]:
         with self._connect() as conn:
             if tenant_id:
                 rows = conn.execute(
@@ -1022,7 +1090,9 @@ class PostgresStore:
                     (tenant_id, limit),
                 ).fetchall()
             else:
-                rows = conn.execute("SELECT * FROM app_user ORDER BY created_at DESC LIMIT %s", (limit,)).fetchall()
+                rows = conn.execute(
+                    "SELECT * FROM app_user ORDER BY created_at DESC LIMIT %s", (limit,)
+                ).fetchall()
         users: List[User] = []
         for row in rows:
             users.append(
@@ -1043,7 +1113,8 @@ class PostgresStore:
     def update_user_role(self, user_id: str, role: str) -> Optional[User]:
         with self._connect() as conn:
             row = conn.execute(
-                "UPDATE app_user SET role = %s, updated_at = now() WHERE id = %s RETURNING *", (role, user_id)
+                "UPDATE app_user SET role = %s, updated_at = now() WHERE id = %s RETURNING *",
+                (role, user_id),
             ).fetchone()
         if not row:
             return None
@@ -1145,7 +1216,9 @@ class PostgresStore:
             conn.execute("DELETE FROM auth_session WHERE user_id = %s", (user_id,))
         # Thread-safe iteration over session cache per SPEC §18
         with self._session_lock:
-            stale_ids = [sid for sid, sess in self.sessions.items() if sess.user_id == user_id]
+            stale_ids = [
+                sid for sid, sess in self.sessions.items() if sess.user_id == user_id
+            ]
             for sid in stale_ids:
                 self.sessions.pop(sid, None)
 
@@ -1162,7 +1235,9 @@ class PostgresStore:
 
     def get_session(self, session_id: str) -> Optional[Session]:
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM auth_session WHERE id = %s", (session_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM auth_session WHERE id = %s", (session_id,)
+            ).fetchone()
         if not row:
             return None
         meta = row.get("meta")
@@ -1201,11 +1276,19 @@ class PostgresStore:
         except TypeError as exc:
             raise ValueError("session meta must be JSON serializable") from exc
         with self._connect() as conn:
-            conn.execute("UPDATE auth_session SET meta = %s WHERE id = %s", (serialized_meta, session_id))
+            conn.execute(
+                "UPDATE auth_session SET meta = %s WHERE id = %s",
+                (serialized_meta, session_id),
+            )
         self._update_cached_session(session_id, meta=meta)
 
     # conversations
-    def create_conversation(self, user_id: str, title: Optional[str] = None, active_context_id: Optional[str] = None) -> Conversation:
+    def create_conversation(
+        self,
+        user_id: str,
+        title: Optional[str] = None,
+        active_context_id: Optional[str] = None,
+    ) -> Conversation:
         conv_id = str(uuid.uuid4())
         now = datetime.utcnow()
         try:
@@ -1215,10 +1298,22 @@ class PostgresStore:
                     (conv_id, user_id, title, now, now, active_context_id),
                 )
         except errors.ForeignKeyViolation:
-            raise ConstraintViolation("conversation owner or context missing", {"user_id": user_id, "context_id": active_context_id})
-        return Conversation(id=conv_id, user_id=user_id, title=title, created_at=now, updated_at=now, active_context_id=active_context_id)
+            raise ConstraintViolation(
+                "conversation owner or context missing",
+                {"user_id": user_id, "context_id": active_context_id},
+            )
+        return Conversation(
+            id=conv_id,
+            user_id=user_id,
+            title=title,
+            created_at=now,
+            updated_at=now,
+            active_context_id=active_context_id,
+        )
 
-    def get_conversation(self, conversation_id: str, *, user_id: Optional[str] = None) -> Optional[Conversation]:
+    def get_conversation(
+        self, conversation_id: str, *, user_id: Optional[str] = None
+    ) -> Optional[Conversation]:
         with self._connect() as conn:
             params: tuple[Any, ...] = (conversation_id,)
             query = "SELECT * FROM conversation WHERE id = %s"
@@ -1228,6 +1323,7 @@ class PostgresStore:
             row = conn.execute(query, params).fetchone()
         if not row:
             return None
+
         def _row_value(key: str, default: Optional[Any] = None) -> Optional[Any]:
             if hasattr(row, "get"):
                 return row.get(key, default)
@@ -1263,10 +1359,15 @@ class PostgresStore:
         content_struct: Optional[dict] = None,
     ) -> Message:
         try:
-            normalized_content_struct = normalize_content_struct(content_struct, content)
+            normalized_content_struct = normalize_content_struct(
+                content_struct, content
+            )
             with self._connect() as conn:
                 with conn.transaction():
-                    conn.execute("SELECT 1 FROM conversation WHERE id = %s FOR UPDATE", (conversation_id,))
+                    conn.execute(
+                        "SELECT 1 FROM conversation WHERE id = %s FOR UPDATE",
+                        (conversation_id,),
+                    )
                     seq_row = conn.execute(
                         "SELECT COUNT(*) AS c FROM message WHERE conversation_id = %s",
                         (conversation_id,),
@@ -1282,15 +1383,24 @@ class PostgresStore:
                             sender,
                             role,
                             content,
-                            json.dumps(normalized_content_struct) if normalized_content_struct is not None else None,
+                            (
+                                json.dumps(normalized_content_struct)
+                                if normalized_content_struct is not None
+                                else None
+                            ),
                             seq,
                             now,
                             json.dumps(meta) if meta else None,
                         ),
                     )
-                    conn.execute("UPDATE conversation SET updated_at = %s WHERE id = %s", (now, conversation_id))
+                    conn.execute(
+                        "UPDATE conversation SET updated_at = %s WHERE id = %s",
+                        (now, conversation_id),
+                    )
         except errors.ForeignKeyViolation:
-            raise ConstraintViolation("conversation not found", {"conversation_id": conversation_id})
+            raise ConstraintViolation(
+                "conversation not found", {"conversation_id": conversation_id}
+            )
         return Message(
             id=msg_id,
             conversation_id=conversation_id,
@@ -1304,7 +1414,11 @@ class PostgresStore:
         )
 
     def list_messages(
-        self, conversation_id: str, limit: Optional[int] = None, *, user_id: Optional[str] = None
+        self,
+        conversation_id: str,
+        limit: Optional[int] = None,
+        *,
+        user_id: Optional[str] = None,
     ) -> List[Message]:
         with self._connect() as conn:
             params: list[Any] = []
@@ -1328,7 +1442,9 @@ class PostgresStore:
                     content_struct = json.loads(content_struct)
                 except Exception:
                     content_struct = None
-            content_struct = normalize_content_struct(content_struct, row.get("content"))
+            content_struct = normalize_content_struct(
+                content_struct, row.get("content")
+            )
             meta = row.get("meta")
             if isinstance(meta, str):
                 try:
@@ -1403,12 +1519,18 @@ class PostgresStore:
                 clauses.append("owner_user_id = %s")
                 params.append(owner_user_id)
             if tenant_id:
-                clauses.append("owner_user_id IN (SELECT id FROM app_user WHERE tenant_id = %s)")
+                clauses.append(
+                    "owner_user_id IN (SELECT id FROM app_user WHERE tenant_id = %s)"
+                )
                 params.append(tenant_id)
             where = ""
             if clauses:
                 where = " WHERE " + " AND ".join(clauses)
-            query = "SELECT * FROM artifact" + where + " ORDER BY created_at DESC LIMIT %s OFFSET %s"
+            query = (
+                "SELECT * FROM artifact"
+                + where
+                + " ORDER BY created_at DESC LIMIT %s OFFSET %s"
+            )
             params.extend([limit, offset])
             rows = conn.execute(query, tuple(params)).fetchall()
         artifacts: List[Artifact] = []
@@ -1420,12 +1542,15 @@ class PostgresStore:
                     name=row["name"],
                     description=row.get("description") or "",
                     schema=row.get("schema") or {},
-                    owner_user_id=(str(row["owner_user_id"]) if row.get("owner_user_id") else None),
+                    owner_user_id=(
+                        str(row["owner_user_id"]) if row.get("owner_user_id") else None
+                    ),
                     visibility=row.get("visibility", "private"),
                     created_at=row.get("created_at", datetime.utcnow()),
                     updated_at=row.get("updated_at", datetime.utcnow()),
                     fs_path=row.get("fs_path"),
-                    base_model=row.get("base_model") or (row.get("schema") or {}).get("base_model"),
+                    base_model=row.get("base_model")
+                    or (row.get("schema") or {}).get("base_model"),
                     meta=row.get("meta"),
                 )
             )
@@ -1433,7 +1558,9 @@ class PostgresStore:
 
     def get_artifact(self, artifact_id: str) -> Optional[Artifact]:
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM artifact WHERE id = %s", (artifact_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM artifact WHERE id = %s", (artifact_id,)
+            ).fetchone()
         if not row:
             return None
         schema = row.get("schema") if isinstance(row, dict) else row["schema"]
@@ -1449,7 +1576,9 @@ class PostgresStore:
             name=row["name"],
             description=row.get("description") or "",
             schema=schema or {},
-            owner_user_id=(str(row["owner_user_id"]) if row.get("owner_user_id") else None),
+            owner_user_id=(
+                str(row["owner_user_id"]) if row.get("owner_user_id") else None
+            ),
             visibility=row.get("visibility", "private"),
             created_at=row.get("created_at", datetime.utcnow()),
             updated_at=row.get("updated_at", datetime.utcnow()),
@@ -1480,7 +1609,16 @@ class PostgresStore:
             with self._connect() as conn, conn.transaction():
                 conn.execute(
                     "INSERT INTO artifact (id, owner_user_id, type, name, description, schema, fs_path, base_model) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
-                    (artifact_id, owner_user_id, type_, name, description, json.dumps(schema), fs_path, schema.get("base_model")),
+                    (
+                        artifact_id,
+                        owner_user_id,
+                        type_,
+                        name,
+                        description,
+                        json.dumps(schema),
+                        fs_path,
+                        schema.get("base_model"),
+                    ),
                 )
                 conn.execute(
                     "INSERT INTO artifact_version (artifact_id, version, schema, fs_path, base_model, created_by, change_note) VALUES (%s, %s, %s, %s, %s, %s, %s)",
@@ -1495,7 +1633,9 @@ class PostgresStore:
                     ),
                 )
         except errors.ForeignKeyViolation:
-            raise ConstraintViolation("artifact owner missing", {"owner_user_id": owner_user_id})
+            raise ConstraintViolation(
+                "artifact owner missing", {"owner_user_id": owner_user_id}
+            )
         return Artifact(
             id=artifact_id,
             type=type_,
@@ -1531,13 +1671,22 @@ class PostgresStore:
             self.logger.warning("artifact_validation_failed", errors=exc.errors)
             raise
         with self._connect() as conn, conn.transaction():
-            row = conn.execute("SELECT * FROM artifact WHERE id = %s", (artifact_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM artifact WHERE id = %s", (artifact_id,)
+            ).fetchone()
             if not row:
                 return None
-            versions = conn.execute("SELECT COALESCE(MAX(version), 0) AS v FROM artifact_version WHERE artifact_id = %s", (artifact_id,)).fetchone()
+            versions = conn.execute(
+                "SELECT COALESCE(MAX(version), 0) AS v FROM artifact_version WHERE artifact_id = %s",
+                (artifact_id,),
+            ).fetchone()
             next_version = (versions["v"] or 0) + 1
             fs_path = self._persist_payload(artifact_id, next_version, schema)
-            base_model = schema.get("base_model") if "base_model" in schema else row.get("base_model")
+            base_model = (
+                schema.get("base_model")
+                if "base_model" in schema
+                else row.get("base_model")
+            )
             conn.execute(
                 "UPDATE artifact SET schema = %s, description = COALESCE(%s, description), updated_at = now(), fs_path = %s, base_model = %s WHERE id = %s",
                 (json.dumps(schema), description, fs_path, base_model, artifact_id),
@@ -1550,7 +1699,9 @@ class PostgresStore:
                     json.dumps(schema),
                     fs_path,
                     base_model,
-                    version_author or (str(row["owner_user_id"]) if row.get("owner_user_id") else None) or "system_llm",
+                    version_author
+                    or (str(row["owner_user_id"]) if row.get("owner_user_id") else None)
+                    or "system_llm",
                     change_note,
                 ),
             )
@@ -1561,7 +1712,9 @@ class PostgresStore:
             name=row["name"],
             description=description or row.get("description") or "",
             schema=schema,
-            owner_user_id=(str(row["owner_user_id"]) if row.get("owner_user_id") else None),
+            owner_user_id=(
+                str(row["owner_user_id"]) if row.get("owner_user_id") else None
+            ),
             fs_path=fs_path,
             visibility=row.get("visibility", "private"),
             base_model=new_base_model,
@@ -1580,7 +1733,9 @@ class PostgresStore:
                 try:
                     schema = json.loads(schema)
                 except Exception as exc:
-                    self.logger.warning("artifact_version_schema_parse_failed", error=str(exc))
+                    self.logger.warning(
+                        "artifact_version_schema_parse_failed", error=str(exc)
+                    )
                     schema = {}
             versions.append(
                 ArtifactVersion(
@@ -1592,7 +1747,8 @@ class PostgresStore:
                     change_note=row.get("change_note"),
                     created_at=row.get("created_at", datetime.utcnow()),
                     fs_path=row.get("fs_path"),
-                    base_model=row.get("base_model") or (schema or {}).get("base_model"),
+                    base_model=row.get("base_model")
+                    or (schema or {}).get("base_model"),
                     meta=row.get("meta"),
                 )
             )
@@ -1622,7 +1778,9 @@ class PostgresStore:
                 schema = {}
         return schema
 
-    def list_adapter_router_state(self, user_id: Optional[str] = None) -> list[AdapterRouterState]:
+    def list_adapter_router_state(
+        self, user_id: Optional[str] = None
+    ) -> list[AdapterRouterState]:
         """Return adapter router state rows scoped by user ownership when provided."""
 
         query = (
@@ -1651,16 +1809,26 @@ class PostgresStore:
                     artifact_id=str(row["artifact_id"]),
                     base_model=row.get("base_model") if isinstance(row, dict) else None,
                     centroid_vec=centroid_vec if centroid_vec is not None else [],
-                    usage_count=row.get("usage_count", 0) if isinstance(row, dict) else 0,
-                    success_score=row.get("success_score", 0.0) if isinstance(row, dict) else 0.0,
-                    last_used_at=row.get("last_used_at") if isinstance(row, dict) else None,
-                    last_trained_at=row.get("last_trained_at") if isinstance(row, dict) else None,
+                    usage_count=(
+                        row.get("usage_count", 0) if isinstance(row, dict) else 0
+                    ),
+                    success_score=(
+                        row.get("success_score", 0.0) if isinstance(row, dict) else 0.0
+                    ),
+                    last_used_at=(
+                        row.get("last_used_at") if isinstance(row, dict) else None
+                    ),
+                    last_trained_at=(
+                        row.get("last_trained_at") if isinstance(row, dict) else None
+                    ),
                     meta=meta,
                 )
             )
         return states
 
-    def record_config_patch(self, artifact_id: str, proposer: str, patch: dict, justification: Optional[str]) -> ConfigPatchAudit:
+    def record_config_patch(
+        self, artifact_id: str, proposer: str, patch: dict, justification: Optional[str]
+    ) -> ConfigPatchAudit:
         with self._connect() as conn:
             row = conn.execute(
                 "INSERT INTO config_patch (artifact_id, proposer, patch, justification, status) VALUES (%s, %s, %s, %s, %s) RETURNING id, created_at, decided_at, applied_at, status, meta",
@@ -1672,19 +1840,37 @@ class PostgresStore:
             proposer=proposer,
             patch=patch,
             justification=justification,
-            status=row.get("status", "pending") if isinstance(row, dict) else row["status"],
-            created_at=row.get("created_at", datetime.utcnow()) if isinstance(row, dict) else row["created_at"],
-            decided_at=row.get("decided_at") if isinstance(row, dict) else row.get("decided_at"),
-            applied_at=row.get("applied_at") if isinstance(row, dict) else row.get("applied_at"),
+            status=(
+                row.get("status", "pending") if isinstance(row, dict) else row["status"]
+            ),
+            created_at=(
+                row.get("created_at", datetime.utcnow())
+                if isinstance(row, dict)
+                else row["created_at"]
+            ),
+            decided_at=(
+                row.get("decided_at")
+                if isinstance(row, dict)
+                else row.get("decided_at")
+            ),
+            applied_at=(
+                row.get("applied_at")
+                if isinstance(row, dict)
+                else row.get("applied_at")
+            ),
             meta=row.get("meta") if isinstance(row, dict) else row.get("meta"),
         )
 
     def get_config_patch(self, patch_id: int) -> Optional[ConfigPatchAudit]:
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM config_patch WHERE id = %s", (patch_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM config_patch WHERE id = %s", (patch_id,)
+            ).fetchone()
         return self._config_patch_from_row(row) if row else None
 
-    def list_config_patches(self, status: Optional[str] = None) -> List[ConfigPatchAudit]:
+    def list_config_patches(
+        self, status: Optional[str] = None
+    ) -> List[ConfigPatchAudit]:
         query = "SELECT * FROM config_patch"
         params: tuple = ()
         if status:
@@ -1696,10 +1882,18 @@ class PostgresStore:
         return [self._config_patch_from_row(row) for row in rows]
 
     def update_config_patch_status(
-        self, patch_id: int, status: str, *, meta: Optional[Dict] = None, mark_decided: bool = False, mark_applied: bool = False
+        self,
+        patch_id: int,
+        status: str,
+        *,
+        meta: Optional[Dict] = None,
+        mark_decided: bool = False,
+        mark_applied: bool = False,
     ) -> Optional[ConfigPatchAudit]:
         with self._connect() as conn, conn.transaction():
-            existing = conn.execute("SELECT * FROM config_patch WHERE id = %s", (patch_id,)).fetchone()
+            existing = conn.execute(
+                "SELECT * FROM config_patch WHERE id = %s", (patch_id,)
+            ).fetchone()
             if not existing:
                 return None
             now = datetime.utcnow()
@@ -1708,13 +1902,23 @@ class PostgresStore:
                 try:
                     existing_meta = json.loads(existing_meta)
                 except Exception as exc:
-                    self.logger.warning("config_patch_meta_parse_failed", error=str(exc))
+                    self.logger.warning(
+                        "config_patch_meta_parse_failed", error=str(exc)
+                    )
                     existing_meta = {}
             merged_meta: Dict = dict(existing_meta)
             if meta:
                 merged_meta.update(meta)
-            decided_at = existing.get("decided_at") if isinstance(existing, dict) else existing["decided_at"]
-            applied_at = existing.get("applied_at") if isinstance(existing, dict) else existing["applied_at"]
+            decided_at = (
+                existing.get("decided_at")
+                if isinstance(existing, dict)
+                else existing["decided_at"]
+            )
+            applied_at = (
+                existing.get("applied_at")
+                if isinstance(existing, dict)
+                else existing["applied_at"]
+            )
             if mark_decided and not decided_at:
                 decided_at = now
             if mark_applied:
@@ -1723,12 +1927,16 @@ class PostgresStore:
                 "UPDATE config_patch SET status = %s, decided_at = %s, applied_at = %s, meta = %s WHERE id = %s",
                 (status, decided_at, applied_at, json.dumps(merged_meta), patch_id),
             )
-            row = conn.execute("SELECT * FROM config_patch WHERE id = %s", (patch_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM config_patch WHERE id = %s", (patch_id,)
+            ).fetchone()
         return self._config_patch_from_row(row) if row else None
 
     def _config_patch_from_row(self, row) -> ConfigPatchAudit:
         raw_patch = row.get("patch") if isinstance(row, dict) else row["patch"]
-        patch_data = raw_patch if isinstance(raw_patch, dict) else json.loads(raw_patch or "{}")
+        patch_data = (
+            raw_patch if isinstance(raw_patch, dict) else json.loads(raw_patch or "{}")
+        )
         meta = row.get("meta") if isinstance(row, dict) else row.get("meta")
         if isinstance(meta, str):
             try:
@@ -1736,19 +1944,41 @@ class PostgresStore:
             except Exception as exc:
                 self.logger.warning("config_patch_meta_parse_failed", error=str(exc))
                 meta = {}
-        decided_at = row.get("decided_at") if isinstance(row, dict) else row.get("decided_at")
-        applied_at = row.get("applied_at") if isinstance(row, dict) else row.get("applied_at")
+        decided_at = (
+            row.get("decided_at") if isinstance(row, dict) else row.get("decided_at")
+        )
+        applied_at = (
+            row.get("applied_at") if isinstance(row, dict) else row.get("applied_at")
+        )
         created = row.get("created_at") if isinstance(row, dict) else row["created_at"]
         return ConfigPatchAudit(
             id=int(row["id"]),
             artifact_id=str(row["artifact_id"]),
             proposer=row.get("proposer") if isinstance(row, dict) else row["proposer"],
             patch=patch_data,
-            justification=row.get("justification") if isinstance(row, dict) else row["justification"],
-            status=row.get("status", "pending") if isinstance(row, dict) else row["status"],
-            created_at=created if isinstance(created, datetime) else datetime.fromisoformat(str(created)),
-            decided_at=decided_at if isinstance(decided_at, datetime) or decided_at is None else datetime.fromisoformat(str(decided_at)),
-            applied_at=applied_at if isinstance(applied_at, datetime) or applied_at is None else datetime.fromisoformat(str(applied_at)),
+            justification=(
+                row.get("justification")
+                if isinstance(row, dict)
+                else row["justification"]
+            ),
+            status=(
+                row.get("status", "pending") if isinstance(row, dict) else row["status"]
+            ),
+            created_at=(
+                created
+                if isinstance(created, datetime)
+                else datetime.fromisoformat(str(created))
+            ),
+            decided_at=(
+                decided_at
+                if isinstance(decided_at, datetime) or decided_at is None
+                else datetime.fromisoformat(str(decided_at))
+            ),
+            applied_at=(
+                applied_at
+                if isinstance(applied_at, datetime) or applied_at is None
+                else datetime.fromisoformat(str(applied_at))
+            ),
             meta=meta if isinstance(meta, dict) else {},
         )
 
@@ -1800,7 +2030,9 @@ class PostgresStore:
     ) -> KnowledgeContext:
         ctx_id = str(uuid.uuid4())
         if not owner_user_id:
-            raise ConstraintViolation("context owner required", {"owner_user_id": owner_user_id})
+            raise ConstraintViolation(
+                "context owner required", {"owner_user_id": owner_user_id}
+            )
         try:
             with self._connect() as conn:
                 conn.execute(
@@ -1808,7 +2040,9 @@ class PostgresStore:
                     (ctx_id, owner_user_id, name, description, fs_path, meta),
                 )
         except errors.ForeignKeyViolation:
-            raise ConstraintViolation("context owner missing", {"owner_user_id": owner_user_id})
+            raise ConstraintViolation(
+                "context owner missing", {"owner_user_id": owner_user_id}
+            )
         except errors.NotNullViolation as exc:
             missing_field = getattr(getattr(exc, "diag", None), "column_name", None)
             error_fields = {"owner_user_id": owner_user_id}
@@ -1816,12 +2050,19 @@ class PostgresStore:
                 error_fields[missing_field] = None
             raise ConstraintViolation("context fields required", error_fields) from exc
         return KnowledgeContext(
-            id=ctx_id, owner_user_id=owner_user_id, name=name, description=description, fs_path=fs_path, meta=meta
+            id=ctx_id,
+            owner_user_id=owner_user_id,
+            name=name,
+            description=description,
+            fs_path=fs_path,
+            meta=meta,
         )
 
     def get_context(self, context_id: str) -> Optional[KnowledgeContext]:
         with self._connect() as conn:
-            row = conn.execute("SELECT * FROM knowledge_context WHERE id = %s", (context_id,)).fetchone()
+            row = conn.execute(
+                "SELECT * FROM knowledge_context WHERE id = %s", (context_id,)
+            ).fetchone()
         if not row:
             return None
 
@@ -1850,7 +2091,9 @@ class PostgresStore:
             meta=raw_meta,
         )
 
-    def list_contexts(self, owner_user_id: Optional[str] = None) -> List[KnowledgeContext]:
+    def list_contexts(
+        self, owner_user_id: Optional[str] = None
+    ) -> List[KnowledgeContext]:
         if not owner_user_id:
             return []
         with self._connect() as conn:
@@ -1875,22 +2118,42 @@ class PostgresStore:
         return contexts
 
     def add_context_source(
-        self, context_id: str, fs_path: str, recursive: bool = True, meta: Optional[dict] = None
+        self,
+        context_id: str,
+        fs_path: str,
+        recursive: bool = True,
+        meta: Optional[dict] = None,
     ) -> ContextSource:
         if not fs_path or not fs_path.strip():
-            raise ConstraintViolation("fs_path required for context_source", {"fs_path": fs_path})
+            raise ConstraintViolation(
+                "fs_path required for context_source", {"fs_path": fs_path}
+            )
         src_id = str(uuid.uuid4())
         try:
             with self._connect() as conn:
                 conn.execute(
                     "INSERT INTO context_source (id, context_id, fs_path, recursive, meta) VALUES (%s, %s, %s, %s, %s)",
-                    (src_id, context_id, fs_path, recursive, json.dumps(meta) if meta else None),
+                    (
+                        src_id,
+                        context_id,
+                        fs_path,
+                        recursive,
+                        json.dumps(meta) if meta else None,
+                    ),
                 )
         except errors.ForeignKeyViolation:
             raise ConstraintViolation("context not found", {"context_id": context_id})
-        return ContextSource(id=src_id, context_id=context_id, fs_path=fs_path, recursive=recursive, meta=meta)
+        return ContextSource(
+            id=src_id,
+            context_id=context_id,
+            fs_path=fs_path,
+            recursive=recursive,
+            meta=meta,
+        )
 
-    def list_context_sources(self, context_id: Optional[str] = None) -> List[ContextSource]:
+    def list_context_sources(
+        self, context_id: Optional[str] = None
+    ) -> List[ContextSource]:
         with self._connect() as conn:
             if context_id:
                 rows = conn.execute(
@@ -1898,7 +2161,9 @@ class PostgresStore:
                     (context_id,),
                 ).fetchall()
             else:
-                rows = conn.execute("SELECT * FROM context_source ORDER BY context_id, fs_path ASC", ()).fetchall()
+                rows = conn.execute(
+                    "SELECT * FROM context_source ORDER BY context_id, fs_path ASC", ()
+                ).fetchall()
         return [
             ContextSource(
                 id=str(row["id"]),
@@ -1915,7 +2180,10 @@ class PostgresStore:
             with self._connect() as conn:
                 for chunk in chunks:
                     if not chunk.fs_path or not str(chunk.fs_path).strip():
-                        raise ConstraintViolation("fs_path required for knowledge_chunk", {"fs_path": chunk.fs_path})
+                        raise ConstraintViolation(
+                            "fs_path required for knowledge_chunk",
+                            {"fs_path": chunk.fs_path},
+                        )
                     conn.execute(
                         "INSERT INTO knowledge_chunk (context_id, fs_path, chunk_index, content, embedding, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s)",
                         (
@@ -1931,7 +2199,9 @@ class PostgresStore:
         except errors.ForeignKeyViolation:
             raise ConstraintViolation("context not found", {"context_id": context_id})
 
-    def list_chunks(self, context_id: Optional[str] = None, *, owner_user_id: Optional[str] = None) -> List[KnowledgeChunk]:
+    def list_chunks(
+        self, context_id: Optional[str] = None, *, owner_user_id: Optional[str] = None
+    ) -> List[KnowledgeChunk]:
         with self._connect() as conn:
             if context_id:
                 params: list[Any] = []
@@ -2014,7 +2284,9 @@ class PostgresStore:
             )
             query += where
             query += " ORDER BY kc.embedding <-> %s::vector LIMIT %s"
-            rows = conn.execute(query, (*params, self._format_vector(query_embedding), limit)).fetchall()
+            rows = conn.execute(
+                query, (*params, self._format_vector(query_embedding), limit)
+            ).fetchall()
         # pgvector mode: results already ordered by vector similarity via SQL
         # No BM25 re-ranking per SPEC §3 - pure vector search for pgvector mode
         return [
@@ -2055,7 +2327,10 @@ class PostgresStore:
         query_tokens = _tokenize_text(query)
         documents = [_tokenize_text(ch.content) for ch in candidates]
         bm25_scores = _compute_bm25_scores(query_tokens, documents)
-        semantic_scores = [(_cosine(query_embedding, ch.embedding) if query_embedding else 0.0) for ch in candidates]
+        semantic_scores = [
+            (_cosine(query_embedding, ch.embedding) if query_embedding else 0.0)
+            for ch in candidates
+        ]
         max_bm25 = max(bm25_scores) or 1.0
         combined: dict[str, tuple[KnowledgeChunk, float]] = {}
         for chunk, lex, sem in zip(candidates, bm25_scores, semantic_scores):
@@ -2067,7 +2342,13 @@ class PostgresStore:
         ranked = sorted(combined.values(), key=lambda pair: pair[1], reverse=True)
         return [pair[0] for pair in ranked[:limit]]
 
-    def inspect_state(self, *, tenant_id: Optional[str] = None, kind: Optional[str] = None, limit: int = 50) -> dict:
+    def inspect_state(
+        self,
+        *,
+        tenant_id: Optional[str] = None,
+        kind: Optional[str] = None,
+        limit: int = 50,
+    ) -> dict:
         def _serialize(row: dict) -> dict:
             data = dict(row)
             for key, value in list(data.items()):
@@ -2080,10 +2361,14 @@ class PostgresStore:
             if kind in (None, "users"):
                 if tenant_id:
                     rows = conn.execute(
-                        "SELECT * FROM app_user WHERE tenant_id = %s ORDER BY created_at DESC LIMIT %s", (tenant_id, limit)
+                        "SELECT * FROM app_user WHERE tenant_id = %s ORDER BY created_at DESC LIMIT %s",
+                        (tenant_id, limit),
                     ).fetchall()
                 else:
-                    rows = conn.execute("SELECT * FROM app_user ORDER BY created_at DESC LIMIT %s", (limit,)).fetchall()
+                    rows = conn.execute(
+                        "SELECT * FROM app_user ORDER BY created_at DESC LIMIT %s",
+                        (limit,),
+                    ).fetchall()
                 sections["users"] = [_serialize(row) for row in rows]
             if kind in (None, "sessions"):
                 rows = conn.execute(
@@ -2119,7 +2404,9 @@ class PostgresStore:
                 ).fetchall()
                 sections["messages"] = [_serialize(row) for row in rows]
             if kind in (None, "artifacts"):
-                rows = conn.execute("SELECT * FROM artifact ORDER BY created_at DESC LIMIT %s", (limit,)).fetchall()
+                rows = conn.execute(
+                    "SELECT * FROM artifact ORDER BY created_at DESC LIMIT %s", (limit,)
+                ).fetchall()
                 sections["artifacts"] = [_serialize(row) for row in rows]
             if kind in (None, "contexts"):
                 rows = conn.execute(
@@ -2163,7 +2450,8 @@ class PostgresStore:
                 sections["training_jobs"] = [_serialize(row) for row in rows]
             if kind in (None, "config_patches"):
                 rows = conn.execute(
-                    "SELECT * FROM config_patch ORDER BY created_at DESC LIMIT %s", (limit,)
+                    "SELECT * FROM config_patch ORDER BY created_at DESC LIMIT %s",
+                    (limit,),
                 ).fetchall()
                 sections["config_patches"] = [_serialize(row) for row in rows]
         return sections
@@ -2188,4 +2476,8 @@ class PostgresStore:
             path.unlink()
             self.logger.info("removed_legacy_training_state_file", path=str(path))
         except OSError as exc:
-            self.logger.warning("remove_legacy_training_state_file_failed", path=str(path), error=str(exc))
+            self.logger.warning(
+                "remove_legacy_training_state_file_failed",
+                path=str(path),
+                error=str(exc),
+            )

@@ -12,15 +12,15 @@ os.environ.setdefault("TEST_MODE", "true")
 os.environ.setdefault("USE_MEMORY_STORE", "true")
 os.environ.setdefault("ALLOW_REDIS_FALLBACK_DEV", "true")
 
-import pytest
-from fastapi.dependencies import utils as fastapi_dep_utils
+import pytest  # noqa: E402
+from fastapi.dependencies import utils as fastapi_dep_utils  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-from liminallm.service.runtime import reset_runtime_for_tests
+from liminallm.service.runtime import reset_runtime_for_tests  # noqa: E402
 
 
 # Avoid import-time failures for routes that rely on python-multipart in constrained test environments.

@@ -3,6 +3,7 @@
 Per SPEC §18, rate limits use Redis token bucket with configurable defaults.
 Invalid window_seconds should be logged and default to 60 seconds.
 """
+
 import asyncio
 from datetime import datetime
 from unittest.mock import MagicMock, AsyncMock, patch
@@ -49,7 +50,7 @@ class TestCheckRateLimit:
         from liminallm.service.runtime import check_rate_limit
 
         with patch("liminallm.service.runtime.logger") as mock_logger:
-            result = await check_rate_limit(mock_runtime, "test_key", 10, 0)
+            await check_rate_limit(mock_runtime, "test_key", 10, 0)
 
             mock_logger.warning.assert_called_once()
             call_args = mock_logger.warning.call_args
@@ -62,7 +63,7 @@ class TestCheckRateLimit:
         from liminallm.service.runtime import check_rate_limit
 
         with patch("liminallm.service.runtime.logger") as mock_logger:
-            result = await check_rate_limit(mock_runtime, "test_key", 10, -5)
+            await check_rate_limit(mock_runtime, "test_key", 10, -5)
 
             mock_logger.warning.assert_called_once()
             call_args = mock_logger.warning.call_args
@@ -73,7 +74,7 @@ class TestCheckRateLimit:
         from liminallm.service.runtime import check_rate_limit
 
         with patch("liminallm.service.runtime.logger") as mock_logger:
-            result = await check_rate_limit(mock_runtime, "test_key", 10, 60)
+            await check_rate_limit(mock_runtime, "test_key", 10, 60)
 
             mock_logger.warning.assert_not_called()
 
@@ -110,7 +111,7 @@ class TestCheckRateLimit:
         """Uses Redis cache when available."""
         from liminallm.service.runtime import check_rate_limit
 
-        result = await check_rate_limit(mock_runtime_with_cache, "test_key", 10, 60)
+        await check_rate_limit(mock_runtime_with_cache, "test_key", 10, 60)
 
         mock_runtime_with_cache.cache.check_rate_limit.assert_called_once_with(
             "test_key", 10, 60
@@ -141,6 +142,7 @@ class TestCheckRateLimit:
         # Manually simulate window expiry by backdating the window start
         window_start, count = mock_runtime._local_rate_limits["test_key"]
         from datetime import timedelta
+
         expired_start = datetime.utcnow() - timedelta(seconds=2)
         mock_runtime._local_rate_limits["test_key"] = (expired_start, count)
 

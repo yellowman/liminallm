@@ -34,20 +34,19 @@ class AuthStore(Protocol):
         plan_tier: str = "free",
         is_active: bool = True,
         meta: Optional[dict] = None,
-    ) -> User:
-        ...
+    ) -> User: ...
 
-    def save_password(self, user_id: str, password_hash: str, password_algo: str) -> None:
-        ...
+    def save_password(
+        self, user_id: str, password_hash: str, password_algo: str
+    ) -> None: ...
 
-    def get_password_record(self, user_id: str) -> Optional[tuple[str, str]]:
-        ...
+    def get_password_record(self, user_id: str) -> Optional[tuple[str, str]]: ...
 
-    def set_user_mfa_secret(self, user_id: str, secret: str, enabled: bool = False) -> UserMFAConfig:
-        ...
+    def set_user_mfa_secret(
+        self, user_id: str, secret: str, enabled: bool = False
+    ) -> UserMFAConfig: ...
 
-    def get_user_mfa_secret(self, user_id: str) -> Optional[UserMFAConfig]:
-        ...
+    def get_user_mfa_secret(self, user_id: str) -> Optional[UserMFAConfig]: ...
 
     def create_session(
         self,
@@ -59,35 +58,28 @@ class AuthStore(Protocol):
         mfa_required: bool = False,
         tenant_id: str = "public",
         meta: Optional[dict] = None,
-    ) -> Session:
-        ...
+    ) -> Session: ...
 
-    def get_session(self, session_id: str) -> Optional[Session]:
-        ...
+    def get_session(self, session_id: str) -> Optional[Session]: ...
 
-    def set_session_meta(self, session_id: str, meta: dict) -> None:
-        ...
+    def set_session_meta(self, session_id: str, meta: dict) -> None: ...
 
-    def revoke_session(self, session_id: str) -> None:
-        ...
+    def revoke_session(self, session_id: str) -> None: ...
 
-    def mark_session_verified(self, session_id: str) -> None:
-        ...
+    def mark_session_verified(self, session_id: str) -> None: ...
 
-    def get_user_by_email(self, email: str) -> Optional[User]:
-        ...
+    def get_user_by_email(self, email: str) -> Optional[User]: ...
 
-    def get_user(self, user_id: str) -> Optional[User]:
-        ...
+    def get_user(self, user_id: str) -> Optional[User]: ...
 
-    def update_user_role(self, user_id: str, role: str) -> Optional[User]:
-        ...
+    def update_user_role(self, user_id: str, role: str) -> Optional[User]: ...
 
-    def delete_user(self, user_id: str) -> bool:
-        ...
+    def delete_user(self, user_id: str) -> bool: ...
 
-    def list_users(self, tenant_id: Optional[str] = None, limit: int = 100) -> List[User]:
-        ...
+    def list_users(
+        self, tenant_id: Optional[str] = None, limit: int = 100
+    ) -> List[User]: ...
+
 
 @dataclass
 class AuthContext:
@@ -169,15 +161,29 @@ class AuthService:
         self.store.save_password(user.id, pwd_hash, algo)
         return user, pwd
 
-    async def start_oauth(self, provider: str, redirect_uri: Optional[str] = None, *, tenant_id: Optional[str] = None) -> dict:
+    async def start_oauth(
+        self,
+        provider: str,
+        redirect_uri: Optional[str] = None,
+        *,
+        tenant_id: Optional[str] = None,
+    ) -> dict:
         state = uuid.uuid4().hex
         expires_at = datetime.utcnow() + timedelta(minutes=10)
         self._oauth_states[state] = (provider, expires_at, tenant_id)
         if self.cache:
             await self.cache.set_oauth_state(state, provider, expires_at, tenant_id)
-        base_url = redirect_uri or self.settings.adapter_openai_base_url or "https://auth.example.com/callback"
+        base_url = (
+            redirect_uri
+            or self.settings.adapter_openai_base_url
+            or "https://auth.example.com/callback"
+        )
         authorization_url = f"{base_url}?provider={provider}&state={state}"
-        return {"authorization_url": authorization_url, "state": state, "provider": provider}
+        return {
+            "authorization_url": authorization_url,
+            "state": state,
+            "provider": provider,
+        }
 
     def register_oauth_code(self, provider: str, code: str, payload: dict) -> None:
         """Record an exchanged OAuth payload for testing or offline flows."""
@@ -215,6 +221,7 @@ class AuthService:
         else:
             self._oauth_states.pop(state, None)
         now = datetime.utcnow()
+
         async def _clear_oauth_state() -> None:
             self._oauth_states.pop(state, None)
             if self.cache and not cache_state_used:
@@ -244,7 +251,9 @@ class AuthService:
         if not user:
             user_email = identity.get("email") or f"{provider_uid}@{provider}.oauth"
             handle = identity.get("handle") or provider_uid
-            user = self.store.create_user(email=user_email, handle=handle, tenant_id=normalized_tenant)
+            user = self.store.create_user(
+                email=user_email, handle=handle, tenant_id=normalized_tenant
+            )
             # Store an unusable password marker so password-based auth cannot succeed for OAuth users
             unusable_secret = base64.urlsafe_b64encode(os.urandom(24)).decode()
             self.store.save_password(user.id, unusable_secret, "oauth")
@@ -260,7 +269,9 @@ class AuthService:
             await self.cache.cache_session(session.id, user.id, session.expires_at)
         return user, session, tokens
 
-    def list_users(self, tenant_id: Optional[str] = None, limit: int = 100) -> list[User]:
+    def list_users(
+        self, tenant_id: Optional[str] = None, limit: int = 100
+    ) -> list[User]:
         return self.store.list_users(tenant_id=tenant_id, limit=limit)
 
     def set_user_role(self, user_id: str, role: str) -> Optional[User]:
@@ -284,7 +295,9 @@ class AuthService:
             return None, None, {}
         mfa_cfg = self.store.get_user_mfa_secret(user.id) if self.mfa_enabled else None
         require_mfa = bool(self.mfa_enabled and mfa_cfg and mfa_cfg.enabled)
-        session = self.store.create_session(user.id, mfa_required=require_mfa, tenant_id=user.tenant_id)
+        session = self.store.create_session(
+            user.id, mfa_required=require_mfa, tenant_id=user.tenant_id
+        )
         tokens: dict[str, str] = {}
         if require_mfa and mfa_cfg:
             if mfa_code and self._verify_totp(mfa_cfg.secret, mfa_code):
@@ -299,7 +312,9 @@ class AuthService:
             await self.cache.cache_session(session.id, user.id, session.expires_at)
         return user, session, tokens
 
-    async def refresh_tokens(self, refresh_token: str, tenant_hint: Optional[str] = None) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
+    async def refresh_tokens(
+        self, refresh_token: str, tenant_hint: Optional[str] = None
+    ) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
         payload = self._decode_jwt(refresh_token)
         if not payload or payload.get("token_type") != "refresh":
             return None, None, {}
@@ -326,9 +341,15 @@ class AuthService:
     async def revoke(self, session_id: str) -> None:
         sess = self.store.get_session(session_id)
         if sess:
-            refresh_jti = (sess.meta or {}).get("refresh_jti") if isinstance(sess.meta, dict) else None
+            refresh_jti = (
+                (sess.meta or {}).get("refresh_jti")
+                if isinstance(sess.meta, dict)
+                else None
+            )
             if refresh_jti:
-                await self._revoke_refresh_token(refresh_jti, (sess.meta or {}).get("refresh_exp"))
+                await self._revoke_refresh_token(
+                    refresh_jti, (sess.meta or {}).get("refresh_exp")
+                )
         self.store.revoke_session(session_id)
         if self.cache:
             await self.cache.revoke_session(session_id)
@@ -360,11 +381,23 @@ class AuthService:
             return None
         if required_role and not self._role_allows(user.role, required_role):
             return None
-        if self.cache and (not sess.mfa_required or sess.mfa_verified or not self.mfa_enabled):
+        if self.cache and (
+            not sess.mfa_required or sess.mfa_verified or not self.mfa_enabled
+        ):
             await self.cache.cache_session(sess.id, sess.user_id, sess.expires_at)
-        if sess.mfa_required and not sess.mfa_verified and self.mfa_enabled and not allow_pending_mfa:
+        if (
+            sess.mfa_required
+            and not sess.mfa_verified
+            and self.mfa_enabled
+            and not allow_pending_mfa
+        ):
             return None
-        return AuthContext(user_id=user.id, role=user.role, tenant_id=user.tenant_id, session_id=sess.id)
+        return AuthContext(
+            user_id=user.id,
+            role=user.role,
+            tenant_id=user.tenant_id,
+            session_id=sess.id,
+        )
 
     async def authenticate(
         self,
@@ -392,7 +425,9 @@ class AuthService:
             required_role=required_role,
         )
 
-    def issue_tokens_for_session(self, session_id: str) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
+    def issue_tokens_for_session(
+        self, session_id: str
+    ) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
         sess = self.store.get_session(session_id)
         if not sess or sess.expires_at <= datetime.utcnow():
             return None, None, {}
@@ -408,12 +443,18 @@ class AuthService:
         if not self.mfa_enabled:
             return {"status": "disabled"}
         existing = self.store.get_user_mfa_secret(user_id)
-        secret = existing.secret if existing else base64.b32encode(os.urandom(10)).decode("utf-8").rstrip("=")
+        secret = (
+            existing.secret
+            if existing
+            else base64.b32encode(os.urandom(10)).decode("utf-8").rstrip("=")
+        )
         self.store.set_user_mfa_secret(user_id, secret, enabled=False)
         uri = f"otpauth://totp/liminallm:{user_id}?secret={secret}&issuer=LiminalLM"
         return {"otpauth_uri": uri}
 
-    async def verify_mfa_challenge(self, user_id: str, code: str, session_id: Optional[str] = None) -> bool:
+    async def verify_mfa_challenge(
+        self, user_id: str, code: str, session_id: Optional[str] = None
+    ) -> bool:
         if not self.mfa_enabled:
             return True
         cfg = self.store.get_user_mfa_secret(user_id)
@@ -433,7 +474,9 @@ class AuthService:
         if self.cache:
             expires_at = datetime.utcnow() + timedelta(minutes=15)
             await self.cache.client.set(
-                f"reset:{token}", email, ex=int((expires_at - datetime.utcnow()).total_seconds())
+                f"reset:{token}",
+                email,
+                ex=int((expires_at - datetime.utcnow()).total_seconds()),
             )
         return token
 
@@ -454,17 +497,25 @@ class AuthService:
             try:
                 self.store.revoke_user_sessions(user.id)  # type: ignore[attr-defined]
             except Exception as exc:
-                self.logger.warning("revoke_sessions_failed", user_id=user.id, error=str(exc))
+                self.logger.warning(
+                    "revoke_sessions_failed", user_id=user.id, error=str(exc)
+                )
         if self.cache:
             await self.cache.client.delete(f"reset:{token}")
         return True
 
     async def request_email_verification(self, user: User) -> str:
         # Use raw bytes for proper entropy (not string representation)
-        token = hashlib.sha256(b"verify-" + user.email.encode() + os.urandom(32)).hexdigest()
+        token = hashlib.sha256(
+            b"verify-" + user.email.encode() + os.urandom(32)
+        ).hexdigest()
         expires_at = datetime.utcnow() + timedelta(hours=24)
         if self.cache:
-            await self.cache.client.set(f"verify:{token}", user.id, ex=int((expires_at - datetime.utcnow()).total_seconds()))
+            await self.cache.client.set(
+                f"verify:{token}",
+                user.id,
+                ex=int((expires_at - datetime.utcnow()).total_seconds()),
+            )
         else:
             self._email_verification_tokens[token] = (user.id, expires_at)
         return token
@@ -515,14 +566,20 @@ class AuthService:
         except (InvalidHash, VerifyMismatchError):
             return False
 
-    def _verify_totp(self, secret: str, code: str, *, window: int = 1, interval: int = 30) -> bool:
+    def _verify_totp(
+        self, secret: str, code: str, *, window: int = 1, interval: int = 30
+    ) -> bool:
         for offset in range(-window, window + 1):
-            generated = self._generate_totp(secret, time.time() + offset * interval, interval=interval)
+            generated = self._generate_totp(
+                secret, time.time() + offset * interval, interval=interval
+            )
             if generated and generated == code:
                 return True
         return False
 
-    def _generate_totp(self, secret: str, timestamp: float, *, interval: int = 30, digits: int = 6) -> str:
+    def _generate_totp(
+        self, secret: str, timestamp: float, *, interval: int = 30, digits: int = 6
+    ) -> str:
         padded = secret + "=" * ((8 - len(secret) % 8) % 8)
         try:
             key = base64.b32decode(padded, True)
@@ -533,7 +590,9 @@ class AuthService:
         # TOTP standard uses SHA1 - do not change without migration
         digest = hmac.new(key, counter, hashlib.sha1).digest()
         offset = digest[-1] & 0x0F
-        code_int = (int.from_bytes(digest[offset : offset + 4], "big") & 0x7FFFFFFF) % (10**digits)
+        code_int = (int.from_bytes(digest[offset : offset + 4], "big") & 0x7FFFFFFF) % (
+            10**digits
+        )
         return str(code_int).zfill(digits)
 
     def _mark_session_verified(self, session_id: str) -> None:
@@ -548,10 +607,16 @@ class AuthService:
 
     def _encode_jwt(self, payload: dict[str, Any]) -> str:
         header = {"alg": "HS256", "typ": "JWT"}
-        header_enc = self._encode_segment(json.dumps(header, separators=(",", ":")).encode())
-        payload_enc = self._encode_segment(json.dumps(payload, separators=(",", ":")).encode())
+        header_enc = self._encode_segment(
+            json.dumps(header, separators=(",", ":")).encode()
+        )
+        payload_enc = self._encode_segment(
+            json.dumps(payload, separators=(",", ":")).encode()
+        )
         signing_input = f"{header_enc}.{payload_enc}"
-        signature = hmac.new(self.settings.jwt_secret.encode(), signing_input.encode(), hashlib.sha256).digest()
+        signature = hmac.new(
+            self.settings.jwt_secret.encode(), signing_input.encode(), hashlib.sha256
+        ).digest()
         return f"{signing_input}.{self._encode_segment(signature)}"
 
     def _decode_jwt(self, token: str) -> Optional[dict[str, Any]]:
@@ -561,7 +626,11 @@ class AuthService:
             return None
         signing_input = f"{header_b64}.{payload_b64}"
         expected_sig = self._encode_segment(
-            hmac.new(self.settings.jwt_secret.encode(), signing_input.encode(), hashlib.sha256).digest()
+            hmac.new(
+                self.settings.jwt_secret.encode(),
+                signing_input.encode(),
+                hashlib.sha256,
+            ).digest()
         )
         if not hmac.compare_digest(expected_sig, sig_b64):
             return None
@@ -593,8 +662,16 @@ class AuthService:
 
     def _issue_tokens(self, user: User, session: Session) -> dict[str, str]:
         now = datetime.utcnow()
-        access_exp = int((now + timedelta(minutes=self.settings.access_token_ttl_minutes)).timestamp())
-        refresh_exp = int((now + timedelta(minutes=self.settings.refresh_token_ttl_minutes)).timestamp())
+        access_exp = int(
+            (
+                now + timedelta(minutes=self.settings.access_token_ttl_minutes)
+            ).timestamp()
+        )
+        refresh_exp = int(
+            (
+                now + timedelta(minutes=self.settings.refresh_token_ttl_minutes)
+            ).timestamp()
+        )
         refresh_jti = str(uuid.uuid4())
         access_payload = {
             "iss": self.settings.jwt_issuer,
@@ -627,7 +704,9 @@ class AuthService:
             "expires_at": datetime.utcfromtimestamp(access_exp).isoformat(),
         }
 
-    def _persist_session_meta(self, session: Session, refresh_jti: str, refresh_exp: int) -> None:
+    def _persist_session_meta(
+        self, session: Session, refresh_jti: str, refresh_exp: int
+    ) -> None:
         meta = dict(session.meta or {})
         meta.update({"refresh_jti": refresh_jti, "refresh_exp": refresh_exp})
         session.meta = meta
@@ -658,7 +737,9 @@ class AuthService:
             try:
                 await self.cache.mark_refresh_revoked(jti, ttl)
             except Exception as exc:
-                logger.warning("cache_revoked_refresh_token_failed", jti=jti, error=str(exc))
+                logger.warning(
+                    "cache_revoked_refresh_token_failed", jti=jti, error=str(exc)
+                )
                 return
 
     async def _is_refresh_revoked(self, jti: str) -> bool:
@@ -668,7 +749,9 @@ class AuthService:
             try:
                 return await self.cache.is_refresh_revoked(jti)
             except Exception as exc:
-                logger.warning("check_revoked_refresh_token_failed", jti=jti, error=str(exc))
+                logger.warning(
+                    "check_revoked_refresh_token_failed", jti=jti, error=str(exc)
+                )
                 return False
         return False
 
@@ -705,12 +788,25 @@ class AuthService:
         user = self.store.get_user(payload.get("sub"))
         if not user:
             return None
-        if payload.get("tenant_id") != user.tenant_id or payload.get("role") != user.role:
+        if (
+            payload.get("tenant_id") != user.tenant_id
+            or payload.get("role") != user.role
+        ):
             return None
         if tenant_hint and tenant_hint != user.tenant_id:
             return None
         if required_role and not self._role_allows(user.role, required_role):
             return None
-        if sess.mfa_required and not sess.mfa_verified and self.mfa_enabled and not allow_pending_mfa:
+        if (
+            sess.mfa_required
+            and not sess.mfa_verified
+            and self.mfa_enabled
+            and not allow_pending_mfa
+        ):
             return None
-        return AuthContext(user_id=user.id, role=user.role, tenant_id=user.tenant_id, session_id=sess.id)
+        return AuthContext(
+            user_id=user.id,
+            role=user.role,
+            tenant_id=user.tenant_id,
+            session_id=sess.id,
+        )

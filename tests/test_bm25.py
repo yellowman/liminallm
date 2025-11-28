@@ -3,7 +3,6 @@
 These tests verify the BM25 implementation used for hybrid RAG retrieval
 per SPEC §2.5 retrieval strategy.
 """
-import pytest
 
 from liminallm.service.bm25 import (
     BM25_K1,

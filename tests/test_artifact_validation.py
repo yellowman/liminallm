@@ -1,6 +1,9 @@
 import pytest
 
-from liminallm.service.artifact_validation import ArtifactValidationError, validate_artifact
+from liminallm.service.artifact_validation import (
+    ArtifactValidationError,
+    validate_artifact,
+)
 
 
 def test_validate_artifact_accepts_valid_workflow():
@@ -8,7 +11,14 @@ def test_validate_artifact_accepts_valid_workflow():
         "kind": "workflow.chat",
         "entrypoint": "start",
         "nodes": [
-            {"id": "start", "type": "tool_call", "tool": "demo", "inputs": {}, "outputs": ["x"], "next": "end"},
+            {
+                "id": "start",
+                "type": "tool_call",
+                "tool": "demo",
+                "inputs": {},
+                "outputs": ["x"],
+                "next": "end",
+            },
             {"id": "end", "type": "end"},
         ],
     }

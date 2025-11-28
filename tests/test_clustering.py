@@ -2,7 +2,6 @@ import json
 
 from liminallm.service.clustering import SemanticClusterer
 import asyncio
-import json
 
 from liminallm.storage.models import PreferenceEvent, SemanticCluster
 
@@ -21,8 +20,17 @@ class StubStore:
     def __init__(self) -> None:
         self.updates = []
 
-    def update_semantic_cluster(self, cluster_id, *, label=None, description=None, meta=None):
-        self.updates.append({"cluster_id": cluster_id, "label": label, "description": description, "meta": meta})
+    def update_semantic_cluster(
+        self, cluster_id, *, label=None, description=None, meta=None
+    ):
+        self.updates.append(
+            {
+                "cluster_id": cluster_id,
+                "label": label,
+                "description": description,
+                "meta": meta,
+            }
+        )
 
 
 CLUSTER = SemanticCluster(
@@ -60,7 +68,9 @@ EVENTS = [
 
 def test_label_clusters_uses_llm_json_response():
     store = StubStore()
-    llm = RecordingLLM(json.dumps({"label": "Rust helpers", "description": "Helps write Rust code."}))
+    llm = RecordingLLM(
+        json.dumps({"label": "Rust helpers", "description": "Helps write Rust code."})
+    )
     clusterer = SemanticClusterer(store, llm=llm)
 
     asyncio.run(clusterer.label_clusters([CLUSTER], EVENTS))

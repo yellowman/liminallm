@@ -10,13 +10,15 @@ from typing import Any, Dict, List, Optional, Protocol, Tuple
 
 from liminallm.config import (
     AdapterMode,
-    ProviderCapabilities,
     RemoteStyle,
     get_provider_capabilities,
 )
 from liminallm.logging import get_logger
 from liminallm.service.fs import safe_join
-from liminallm.service.tokenizer_utils import DEFAULT_VOCAB_SIZE, vocab_size_from_tokenizer
+from liminallm.service.tokenizer_utils import (
+    DEFAULT_VOCAB_SIZE,
+    vocab_size_from_tokenizer,
+)
 
 # providers that expose fine-tuned models as first-class endpoints (model IDs)
 _MODEL_ID_PROVIDERS = {
@@ -87,6 +89,126 @@ def filter_adapters_by_mode(adapters: List[dict], compatible_modes: set) -> List
             )
     return result
 
+
+def validate_adapter_base_model(
+    adapter: dict,
+    backend_base_model: str,
+    *,
+    strict: bool = False,
+) -> Tuple[bool, Optional[str]]:
+    """Validate that adapter was trained on a compatible base model.
+
+    Per SPEC §5.1, LoRA adapters are tied to specific base models. Using an adapter
+    with an incompatible base model can produce incorrect or degraded outputs.
+
+    Args:
+        adapter: Adapter dict with optional base_model field
+        backend_base_model: The base model the inference backend is using
+        strict: If True, reject adapters with missing base_model field
+
+    Returns:
+        Tuple of (is_valid, warning_message)
+        - is_valid: True if adapter is compatible or validation can't be determined
+        - warning_message: Human-readable warning if validation failed or uncertain
+    """
+    if not adapter:
+        return True, None
+
+    adapter_id = adapter.get("id") or adapter.get("name") or "unknown"
+    schema = adapter.get("schema", {})
+
+    # Extract adapter's base model
+    adapter_base = (
+        adapter.get("base_model")
+        or schema.get("base_model")
+        or adapter.get("model")
+        or schema.get("model")
+    )
+
+    if not adapter_base:
+        if strict:
+            return (
+                False,
+                f"Adapter '{adapter_id}' missing base_model field (strict mode)",
+            )
+        logger.warning(
+            "adapter_base_model_missing",
+            adapter_id=adapter_id,
+            backend_base_model=backend_base_model,
+            message="Adapter has no base_model field; compatibility cannot be verified",
+        )
+        return (
+            True,
+            f"Adapter '{adapter_id}' has no base_model; compatibility unverified",
+        )
+
+    # Normalize model names for comparison
+    def normalize_model_name(name: str) -> str:
+        """Normalize model name for fuzzy matching."""
+        name = name.lower().strip()
+        # Remove common prefixes/suffixes
+        for prefix in ("models/", "model/", "hf://", "huggingface/"):
+            if name.startswith(prefix):
+                name = name[len(prefix) :]
+        # Remove version suffixes for family comparison
+        # e.g., "llama-7b-v1.0" -> "llama-7b"
+        for suffix in ("-v1", "-v2", "-v1.0", "-v2.0", ".0", ".1"):
+            if name.endswith(suffix):
+                name = name[: -len(suffix)]
+        return name
+
+    adapter_normalized = normalize_model_name(adapter_base)
+    backend_normalized = normalize_model_name(backend_base_model)
+
+    # Check for exact match (after normalization)
+    if adapter_normalized == backend_normalized:
+        return True, None
+
+    # Check for model family compatibility (e.g., llama-7b adapter on llama-7b-chat)
+    # Extract base family name (first part before version/variant)
+    def extract_family(name: str) -> str:
+        # Split on common separators and take base
+        for sep in ("-chat", "-instruct", "-base", "-hf", "-gguf"):
+            if sep in name:
+                name = name.split(sep)[0]
+        return name
+
+    adapter_family = extract_family(adapter_normalized)
+    backend_family = extract_family(backend_normalized)
+
+    if adapter_family == backend_family:
+        # Same family but different variant - likely compatible but warn
+        logger.info(
+            "adapter_base_model_variant_match",
+            adapter_id=adapter_id,
+            adapter_base_model=adapter_base,
+            backend_base_model=backend_base_model,
+            message="Adapter base model is variant of backend model; proceeding with caution",
+        )
+        return (
+            True,
+            f"Adapter '{adapter_id}' trained on '{adapter_base}' (variant of '{backend_base_model}')",
+        )
+
+    # Incompatible base models
+    logger.warning(
+        "adapter_base_model_mismatch",
+        adapter_id=adapter_id,
+        adapter_base_model=adapter_base,
+        backend_base_model=backend_base_model,
+        message="Adapter was trained on different base model; outputs may be degraded",
+    )
+    if strict:
+        return (
+            False,
+            f"Adapter '{adapter_id}' incompatible: trained on '{adapter_base}', backend uses '{backend_base_model}'",
+        )
+    return (
+        True,
+        f"Adapter '{adapter_id}' trained on '{adapter_base}' but backend uses '{backend_base_model}'",
+    )
+
+
 _OPENAI_SPEC = importlib.util.find_spec("openai")
 if _OPENAI_SPEC:
     from openai import OpenAI as _OpenAIClient  # pragma: no cover
@@ -99,8 +221,13 @@ class ModelBackend(Protocol):
 
     mode: str
 
-    def generate(self, messages: List[dict], adapters: List[dict], *, user_id: Optional[str] = None) -> dict:
-        ...
+    def generate(
+        self,
+        messages: List[dict],
+        adapters: List[dict],
+        *,
+        user_id: Optional[str] = None,
+    ) -> dict: ...
 
 
 @dataclass(frozen=True)
@@ -123,7 +250,11 @@ class AdapterPlug:
     ) -> ModelBackend:
         if self.backend_mode == "local_lora":
             return LocalJaxLoRABackend(base_model, fs_root or "/srv/liminallm")
-        adapter_mode = "adapter_server" if self.backend_mode == "adapter_server" else "api_adapters"
+        adapter_mode = (
+            "adapter_server"
+            if self.backend_mode == "adapter_server"
+            else "api_adapters"
+        )
         if adapter_mode not in {"api_adapters", "adapter_server"}:
             adapter_mode = "api_adapters"
         return ApiAdapterBackend(
@@ -186,7 +317,11 @@ class ApiAdapterBackend:
         self.adapter_server_model = adapter_server_model
         self.adapter_mode = adapter_mode
         self.mode = adapter_mode
-        self.client = _OpenAIClient(api_key=api_key, base_url=base_url) if api_key and _OpenAIClient else None
+        self.client = (
+            _OpenAIClient(api_key=api_key, base_url=base_url)
+            if api_key and _OpenAIClient
+            else None
+        )
         # Infer provider from adapter_mode if not specified
         self.provider = provider or self._infer_provider(adapter_mode)
         self.capabilities = get_provider_capabilities(self.provider)
@@ -194,7 +329,14 @@ class ApiAdapterBackend:
     def _infer_provider(self, adapter_mode: str) -> str:
         """Infer provider from adapter_mode string."""
         mode_lower = (adapter_mode or "").lower()
-        if mode_lower in {"openai", "azure", "azure_openai", "vertex", "gemini", "bedrock"}:
+        if mode_lower in {
+            "openai",
+            "azure",
+            "azure_openai",
+            "vertex",
+            "gemini",
+            "bedrock",
+        }:
             return mode_lower
         if mode_lower in {"together", "together.ai"}:
             return "together"
@@ -205,7 +347,13 @@ class ApiAdapterBackend:
         # Default to openai-style for unknown modes
         return "openai"
 
-    def generate(self, messages: List[dict], adapters: List[dict], *, user_id: Optional[str] = None) -> dict:
+    def generate(
+        self,
+        messages: List[dict],
+        adapters: List[dict],
+        *,
+        user_id: Optional[str] = None,
+    ) -> dict:
         adapter_list = adapters or []
         # Process adapters based on provider capabilities
         processed = self._process_adapters_for_provider(adapter_list)
@@ -226,7 +374,9 @@ class ApiAdapterBackend:
             choices = getattr(completion, "choices", None) or []
             first_choice = next(iter(choices), None)
             if not first_choice:
-                logger.warning("API completion returned no choices; returning empty content")
+                logger.warning(
+                    "API completion returned no choices; returning empty content"
+                )
                 content = ""
             else:
                 content = first_choice.message.content or ""
@@ -235,7 +385,11 @@ class ApiAdapterBackend:
                 "completion_tokens": getattr(completion.usage, "completion_tokens", 0),
                 "total_tokens": getattr(completion.usage, "total_tokens", 0),
             }
-            return {"content": content, "usage": usage, "adapters_applied": processed["applied"]}
+            return {
+                "content": content,
+                "usage": usage,
+                "adapters_applied": processed["applied"],
+            }
         fallback = augmented_messages[-1]["content"] if augmented_messages else ""
         return {
             "content": f"[api-backend model={target_model} provider={self.provider} adapters={processed['applied']}] {fallback}",
@@ -301,7 +455,9 @@ class ApiAdapterBackend:
                 remote_adapters.append(adapter)
 
         # Process remote adapters based on provider remote_style
-        model, extra_body, remote_applied, remote_dropped = self._format_remote_adapters(remote_adapters)
+        model, extra_body, remote_applied, remote_dropped = (
+            self._format_remote_adapters(remote_adapters)
+        )
 
         applied.extend(remote_applied)
         dropped.extend(remote_dropped)
@@ -332,7 +488,11 @@ class ApiAdapterBackend:
         if caps.remote_style == RemoteStyle.MODEL_ID:
             # Provider uses fine-tuned model as endpoint (OpenAI style)
             # Can only use ONE adapter - pick highest weight or first
-            selected = self._select_best_adapter(adapters, max_count=1)[0] if adapters else None
+            selected = (
+                self._select_best_adapter(adapters, max_count=1)[0]
+                if adapters
+                else None
+            )
             if selected:
                 model_id = selected.get("remote_model_id") or selected.get("model_id")
                 if model_id:
@@ -359,12 +519,18 @@ class ApiAdapterBackend:
             gate_weights: List[float] = []
 
             for adapter in selected:
-                aid = adapter.get("remote_adapter_id") or adapter.get("adapter_id") or adapter.get("id")
+                aid = (
+                    adapter.get("remote_adapter_id")
+                    or adapter.get("adapter_id")
+                    or adapter.get("id")
+                )
                 if aid:
                     adapter_ids.append(aid)
                     applied.append(f"{adapter.get('id', 'unknown')}:adapter_param")
                     if caps.gate_weights:
-                        weight = adapter.get("weight") or adapter.get("gate_weight") or 1.0
+                        weight = (
+                            adapter.get("weight") or adapter.get("gate_weight") or 1.0
+                        )
                         gate_weights.append(float(weight))
 
             # Mark dropped adapters
@@ -382,11 +548,22 @@ class ApiAdapterBackend:
                 return self.adapter_server_model or self.base_model, None, [], []
 
             # Build extra_body based on provider
-            extra_body: dict = {caps.adapter_param_name: adapter_ids if len(adapter_ids) > 1 else adapter_ids[0]}
+            extra_body: dict = {
+                caps.adapter_param_name: (
+                    adapter_ids if len(adapter_ids) > 1 else adapter_ids[0]
+                )
+            }
             if caps.gate_weights and gate_weights:
-                extra_body["adapter_weights"] = gate_weights if len(gate_weights) > 1 else gate_weights[0]
+                extra_body["adapter_weights"] = (
+                    gate_weights if len(gate_weights) > 1 else gate_weights[0]
+                )
 
-            return self.adapter_server_model or self.base_model, extra_body, applied, dropped
+            return (
+                self.adapter_server_model or self.base_model,
+                extra_body,
+                applied,
+                dropped,
+            )
 
         else:
             # RemoteStyle.NONE - shouldn't have remote adapters
@@ -413,24 +590,73 @@ class ApiAdapterBackend:
         return [], result["prompt_injections"]
 
     def _extract_prompt_instructions(self, adapter: dict) -> Optional[str]:
-        """Extract prompt instructions from adapter for injection."""
-        for key in ("prompt_instructions", "behavior_prompt", "instructions", "prompt_template"):
-            value = adapter.get(key) or adapter.get("schema", {}).get(key)
+        """Extract prompt instructions from adapter for system prompt injection.
+
+        Uses explicit priority order to find the most suitable prompt text:
+        1. Explicit prompt fields (prompt_instructions, behavior_prompt, etc.)
+        2. Applicability natural language description (designed for LLM context)
+        3. System prompt field (explicit system message content)
+
+        NOTE: Generic 'description' field is intentionally NOT used as fallback
+        because it typically contains human-readable metadata (e.g., "LoRA adapter
+        for code review") rather than LLM-oriented behavioral instructions.
+
+        Args:
+            adapter: Adapter dict with potential prompt fields
+
+        Returns:
+            Prompt instructions string or None if no suitable prompt found
+        """
+        schema = adapter.get("schema", {})
+
+        # Priority 1: Explicit prompt instruction fields (most specific)
+        prompt_fields = (
+            "prompt_instructions",  # Primary field for behavioral guidance
+            "behavior_prompt",  # Alternative naming
+            "system_prompt",  # Explicit system message content
+            "instructions",  # Generic instructions
+            "prompt_template",  # Template-style instructions
+        )
+        for key in prompt_fields:
+            value = adapter.get(key) or schema.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
-        # Try applicability.natural_language
-        applicability = adapter.get("applicability") or adapter.get("schema", {}).get("applicability")
+
+        # Priority 2: Applicability natural language (SPEC §6.1 - designed for LLM context)
+        # This field is explicitly intended to describe adapter behavior in natural language
+        applicability = adapter.get("applicability") or schema.get("applicability")
         if isinstance(applicability, dict):
             natural = applicability.get("natural_language")
             if isinstance(natural, str) and natural.strip():
                 return natural.strip()
-        # Fall back to description
-        description = adapter.get("description") or adapter.get("schema", {}).get("description")
-        if isinstance(description, str) and description.strip():
-            return description.strip()
+
+        # Priority 3: Check for explicit 'use_description_as_prompt' flag
+        # Only use description if adapter explicitly opts in
+        use_desc = adapter.get("use_description_as_prompt") or schema.get(
+            "use_description_as_prompt"
+        )
+        if use_desc:
+            description = adapter.get("description") or schema.get("description")
+            if isinstance(description, str) and description.strip():
+                logger.debug(
+                    "adapter_using_description_as_prompt",
+                    adapter_id=adapter.get("id"),
+                    reason="use_description_as_prompt=true",
+                )
+                return description.strip()
+
+        # No suitable prompt found - caller should handle gracefully
+        logger.debug(
+            "adapter_no_prompt_instructions",
+            adapter_id=adapter.get("id"),
+            mode=get_adapter_mode(adapter),
+            message="Adapter has no prompt_instructions; behavior may be undefined in prompt mode",
+        )
         return None
 
-    def _inject_adapter_prompts(self, messages: List[dict], prompts: List[str]) -> List[dict]:
+    def _inject_adapter_prompts(
+        self, messages: List[dict], prompts: List[str]
+    ) -> List[dict]:
         """Inject adapter prompt instructions into message list."""
         if not prompts:
             return messages
@@ -442,11 +668,16 @@ class ApiAdapterBackend:
         augmented = [dict(m) for m in messages]
         for i, msg in enumerate(augmented):
             if msg.get("role") == "system":
-                augmented[i] = {**msg, "content": msg.get("content", "") + system_addition}
+                augmented[i] = {
+                    **msg,
+                    "content": msg.get("content", "") + system_addition,
+                }
                 return augmented
 
         # No system message found, prepend one
-        augmented.insert(0, {"role": "system", "content": f"Adapter guidance:\n{prompt_text}"})
+        augmented.insert(
+            0, {"role": "system", "content": f"Adapter guidance:\n{prompt_text}"}
+        )
         return augmented
 
 
@@ -518,7 +749,9 @@ class LocalJaxLoRABackend:
             self._tokenizer = None
             self._base_vocab_size = self.default_vocab_size
             self._tokenizer_error = str(exc)
-            logger.warning("tokenizer_load_failed", base_model=self.base_model, error=str(exc))
+            logger.warning(
+                "tokenizer_load_failed", base_model=self.base_model, error=str(exc)
+            )
 
     def _vocab_size(self) -> int:
         if isinstance(self._adapter_vocab_size, int) and self._adapter_vocab_size > 0:
@@ -529,7 +762,9 @@ class LocalJaxLoRABackend:
     def _normalize_messages(self, messages: List[dict]) -> str:
         if not messages:
             return ""
-        return "\n".join([f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages])
+        return "\n".join(
+            [f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages]
+        )
 
     def _apply_adapter_vocab_size(self, adapter: dict) -> None:
         self._adapter_vocab_size = None
@@ -540,7 +775,35 @@ class LocalJaxLoRABackend:
         if isinstance(vocab_size, int) and vocab_size > 0:
             self._adapter_vocab_size = vocab_size
 
+    def _deterministic_token_hash(self, token: str, vocab_size: int) -> int:
+        """Compute deterministic hash for a token.
+
+        Unlike Python's built-in hash(), this produces consistent results across
+        Python processes and versions by using a fixed-seed algorithm based on
+        character codes. This ensures reproducibility for tokenizer fallback mode.
+
+        The algorithm uses FNV-1a hash which is fast, simple, and deterministic.
+        """
+        # FNV-1a parameters for 32-bit
+        FNV_PRIME = 0x01000193
+        FNV_OFFSET = 0x811C9DC5
+
+        h = FNV_OFFSET
+        for char in token.encode("utf-8"):
+            h ^= char
+            h = (h * FNV_PRIME) & 0xFFFFFFFF  # Keep 32-bit
+
+        return h % vocab_size
+
     def _tokenize(self, text: str) -> Tuple[List[int], List[int]]:
+        """Tokenize text into token IDs and attention mask.
+
+        Uses the configured tokenizer if available, otherwise falls back to
+        a deterministic whitespace-based tokenizer with FNV-1a hashing.
+
+        Returns:
+            Tuple of (token_ids, attention_mask)
+        """
         self._ensure_tokenizer()
         if self._tokenizer:
             encoded = self._tokenizer(
@@ -552,12 +815,21 @@ class LocalJaxLoRABackend:
             ids = encoded["input_ids"][0].tolist()
             attention = encoded["attention_mask"][0].tolist()
             return ids, attention
+
+        # Fallback: deterministic whitespace tokenization with FNV-1a hash
+        # This produces consistent results across Python versions and processes
+        vocab_size = self._vocab_size()
         tokens = text.split()
-        ids = [hash(tok) % self._vocab_size() for tok in tokens[: self.max_seq_len]]
+        ids = [
+            self._deterministic_token_hash(tok, vocab_size)
+            for tok in tokens[: self.max_seq_len]
+        ]
         attention = [1] * len(ids)
         return ids, attention
 
-    def _pad_batch(self, ids: List[int], attention: List[int]) -> Tuple[List[int], List[int]]:
+    def _pad_batch(
+        self, ids: List[int], attention: List[int]
+    ) -> Tuple[List[int], List[int]]:
         length = min(len(ids), self.max_seq_len)
         ids = ids[:length]
         attention = attention[:length]
@@ -566,15 +838,49 @@ class LocalJaxLoRABackend:
             attention = [0]
         return ids, attention
 
-    def _load_adapter_weights(self, adapter: dict, *, user_id: Optional[str] = None) -> dict:
-        """Load adapter weights from filesystem with checksum verification.
+    def _load_adapter_weights(
+        self,
+        adapter: dict,
+        *,
+        user_id: Optional[str] = None,
+        strict_base_model: bool = False,
+    ) -> dict:
+        """Load adapter weights from filesystem with checksum and base model verification.
 
         Per SPEC §18, checksum of params is verified against schema.checksum before activation.
-        Missing checksums are logged as security warnings but allowed for backwards compatibility.
+        Per SPEC §5.1, base model compatibility is validated to prevent degraded outputs.
+
+        Args:
+            adapter: Adapter dict with weights path and metadata
+            user_id: User context for ownership validation
+            strict_base_model: If True, reject adapters with incompatible base model
+
+        Returns:
+            Weight dict with LoRA matrices as JAX arrays
+
+        Raises:
+            ValueError: If checksum mismatch or base model incompatible (in strict mode)
         """
         if not adapter:
             return {}
         adapter_id = adapter.get("id", "unknown")
+
+        # Validate base model compatibility before loading weights
+        is_compatible, warning = validate_adapter_base_model(
+            adapter, self.base_model, strict=strict_base_model
+        )
+        if not is_compatible:
+            raise ValueError(
+                warning or f"Adapter '{adapter_id}' incompatible with base model"
+            )
+        if warning:
+            # Log warning but continue - adapter may still work
+            logger.info(
+                "adapter_base_model_warning",
+                adapter_id=adapter_id,
+                warning=warning,
+            )
+
         path = Path(self._adapter_path(adapter, requested_user_id=user_id))
         params_path = self._resolve_params_path(path)
         if not params_path:
@@ -596,7 +902,9 @@ class LocalJaxLoRABackend:
                     expected=checksum,
                     actual=digest,
                 )
-                raise ValueError("adapter checksum mismatch - refusing to load potentially tampered weights")
+                raise ValueError(
+                    "adapter checksum mismatch - refusing to load potentially tampered weights"
+                )
         else:
             # SPEC §18 requires checksum verification; missing checksums are a security concern
             logger.warning(
@@ -607,7 +915,10 @@ class LocalJaxLoRABackend:
             )
         weights_raw = json.loads(payload.decode())
         self._ensure_jax()
-        weights = {k: self._jnp.array(v, dtype=self._jnp.float32) for k, v in weights_raw.items()}
+        weights = {
+            k: self._jnp.array(v, dtype=self._jnp.float32)
+            for k, v in weights_raw.items()
+        }
         self._adapter_cache[adapter_id] = (mtime, weights)
         return weights
 
@@ -640,7 +951,6 @@ class LocalJaxLoRABackend:
         except ValueError:
             return 0, name
 
-
     def _align_width(self, arr, width: int):
         if arr.shape[1] > width:
             return arr[:, :width]
@@ -660,7 +970,10 @@ class LocalJaxLoRABackend:
         return arr
 
     def _lora_forward(self, params: dict, inputs):
-        hidden_dim = max((mat.shape[1] for name, mat in params.items() if name.endswith(".A")), default=16)
+        hidden_dim = max(
+            (mat.shape[1] for name, mat in params.items() if name.endswith(".A")),
+            default=16,
+        )
         vocab_size = max(self._vocab_size(), 1)
 
         if inputs.ndim == 2:
@@ -668,7 +981,9 @@ class LocalJaxLoRABackend:
                 max_token = int(self._jnp.max(inputs))
                 vocab_size = max(vocab_size, max_token + 1)
             emb_table = self._jnp.sin(
-                self._jnp.arange(vocab_size * hidden_dim, dtype=self._jnp.float32).reshape(vocab_size, hidden_dim)
+                self._jnp.arange(
+                    vocab_size * hidden_dim, dtype=self._jnp.float32
+                ).reshape(vocab_size, hidden_dim)
                 / float(hidden_dim)
             )
             clipped = self._jnp.clip(inputs, 0, vocab_size - 1)
@@ -699,7 +1014,11 @@ class LocalJaxLoRABackend:
             try:  # pragma: no cover - optional dependency
                 return self._tokenizer.decode(token_ids, skip_special_tokens=True)
             except Exception as exc:
-                logger.warning("tokenizer_decode_failed", base_model=self.base_model, error=str(exc))
+                logger.warning(
+                    "tokenizer_decode_failed",
+                    base_model=self.base_model,
+                    error=str(exc),
+                )
         return " ".join([f"tok-{tid}" for tid in token_ids])
 
     def _sample_tokens(self, lora_scores, seed_token: int) -> List[int]:
@@ -713,7 +1032,13 @@ class LocalJaxLoRABackend:
             score = score * 0.9 + 0.1 * token
         return generated
 
-    def generate(self, messages: List[dict], adapters: List[dict], *, user_id: Optional[str] = None) -> dict:
+    def generate(
+        self,
+        messages: List[dict],
+        adapters: List[dict],
+        *,
+        user_id: Optional[str] = None,
+    ) -> dict:
         prompt = self._normalize_messages(messages)
         adapter = adapters[0] if adapters else {}
         self._apply_adapter_vocab_size(adapter)
@@ -732,9 +1057,15 @@ class LocalJaxLoRABackend:
         token_array = self._jax.device_put(token_array, self._device)
         attn_array = self._jax.device_put(attn_array, self._device)
 
-        weights = self._blend_adapter_weights(adapters, user_id=user_id) if adapters else {}
+        weights = (
+            self._blend_adapter_weights(adapters, user_id=user_id) if adapters else {}
+        )
         start = time.perf_counter()
-        lora_scores = self._lora_forward(weights, token_array) if weights else self._jnp.zeros_like(token_array)
+        lora_scores = (
+            self._lora_forward(weights, token_array)
+            if weights
+            else self._jnp.zeros_like(token_array)
+        )
         lora_scores = lora_scores * attn_array
         generated_ids = self._sample_tokens(lora_scores, seed_token=token_array[0][-1])
         completion = self._decode(generated_ids)
@@ -746,32 +1077,91 @@ class LocalJaxLoRABackend:
                 "prompt_tokens": len(ids),
                 "completion_tokens": len(generated_ids),
                 "model": self.base_model,
-                "adapter_id": ",".join(str(a.get("id")) for a in adapters if a.get("id")) if adapters else None,
+                "adapter_id": (
+                    ",".join(str(a.get("id")) for a in adapters if a.get("id"))
+                    if adapters
+                    else None
+                ),
                 "latency_ms": round(duration * 1000, 2),
             },
         }
 
-    def _blend_adapter_weights(self, adapters: List[dict], user_id: Optional[str]) -> dict:
+    def _blend_adapter_weights(
+        self, adapters: List[dict], user_id: Optional[str]
+    ) -> dict:
+        """Blend multiple adapter weights using router-assigned gate weights.
+
+        Per SPEC §5.2, effective weight composition is:
+            W_eff = W_base + Σ_j (g_j * α_j * B_j @ A_j)
+
+        Where g_j is the gate weight from the router. This implementation
+        respects per-adapter weights rather than simple averaging.
+
+        Args:
+            adapters: List of adapter dicts, each may have 'weight' or 'gate_weight'
+            user_id: User context for path resolution and ownership checks
+
+        Returns:
+            Combined weight dict with properly weighted LoRA matrices
+        """
+        if not adapters:
+            return {}
+
         combined: dict[str, Any] = {}
-        counts: dict[str, int] = {}
+        total_weight: dict[str, float] = {}
+
         for adapter in adapters:
             weights = self._load_adapter_weights(adapter, user_id=user_id)
             if not weights:
                 continue
+
+            # Extract gate weight from adapter (router-assigned or default 1.0)
+            # Note: Can't use `or` chain because 0.0 is falsy in Python
+            gate_weight = adapter.get("weight")
+            if gate_weight is None:
+                gate_weight = adapter.get("gate_weight")
+            if gate_weight is None:
+                gate_weight = adapter.get("schema", {}).get("weight")
+            if gate_weight is None:
+                gate_weight = 1.0
+            gate_weight = float(gate_weight)
+
+            # Clamp gate weight to [0, 1] per SPEC §8.1 guardrails
+            gate_weight = max(0.0, min(1.0, gate_weight))
+
+            if gate_weight == 0.0:
+                logger.debug(
+                    "adapter_zero_weight_skipped",
+                    adapter_id=adapter.get("id"),
+                )
+                continue
+
             for name, tensor in weights.items():
                 if name in combined:
                     if combined[name].shape != tensor.shape:
                         logger.warning(
-                            "adapter_shape_mismatch", adapter_id=adapter.get("id"), name=name
+                            "adapter_shape_mismatch",
+                            adapter_id=adapter.get("id"),
+                            name=name,
+                            expected_shape=combined[name].shape,
+                            actual_shape=tensor.shape,
                         )
                         continue
-                    combined[name] = combined[name] + tensor
-                    counts[name] += 1
+                    # Weighted accumulation: W += g_j * W_j
+                    combined[name] = combined[name] + (gate_weight * tensor)
+                    total_weight[name] += gate_weight
                 else:
-                    combined[name] = tensor
-                    counts[name] = 1
+                    combined[name] = gate_weight * tensor
+                    total_weight[name] = gate_weight
+
+        # Normalize by total weight to maintain scale
+        # If weights sum to 1.0, this is a no-op; otherwise it prevents
+        # over-amplification when sum > 1 or under-representation when sum < 1
         for name, tensor in combined.items():
-            combined[name] = tensor / max(counts.get(name, 1), 1)
+            w = total_weight.get(name, 1.0)
+            if w > 0.0 and w != 1.0:
+                combined[name] = tensor / w
+
         return combined
 
     def _adapter_path(self, adapter: dict, *, requested_user_id: Optional[str]) -> str:
@@ -780,14 +1170,28 @@ class LocalJaxLoRABackend:
         explicit = adapter.get("cephfs_dir") or adapter.get("fs_dir")
         if explicit:
             if not requested_user_id:
-                raise ValueError("adapter path resolution requires requesting user context")
-            owner = adapter.get("owner_user_id") or adapter.get("schema", {}).get("owner_user_id")
-            visibility = adapter.get("visibility") or adapter.get("schema", {}).get("visibility")
-            if owner and owner != requested_user_id and visibility not in {"shared", "global"}:
+                raise ValueError(
+                    "adapter path resolution requires requesting user context"
+                )
+            owner = adapter.get("owner_user_id") or adapter.get("schema", {}).get(
+                "owner_user_id"
+            )
+            visibility = adapter.get("visibility") or adapter.get("schema", {}).get(
+                "visibility"
+            )
+            if (
+                owner
+                and owner != requested_user_id
+                and visibility not in {"shared", "global"}
+            ):
                 raise ValueError("adapter owner mismatch")
             base = self.fs_root.resolve()
-            candidate = (Path(str(explicit)) if isinstance(explicit, (str, Path)) else Path(""))
-            resolved = (candidate if candidate.is_absolute() else base / candidate).resolve()
+            candidate = (
+                Path(str(explicit)) if isinstance(explicit, (str, Path)) else Path("")
+            )
+            resolved = (
+                candidate if candidate.is_absolute() else base / candidate
+            ).resolve()
             # Path must be within fs_root: base must be a parent of resolved, or they must be equal
             if not (base in resolved.parents or resolved == base):
                 raise ValueError("adapter path must reside within fs_root")

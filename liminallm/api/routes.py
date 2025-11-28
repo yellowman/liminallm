@@ -7,9 +7,20 @@ from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, File, Form, Header, HTTPException, Query, Response, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 
-from liminallm.content_struct import normalize_content_struct
 from liminallm.api.schemas import (
     ArtifactListResponse,
     ArtifactRequest,
@@ -61,11 +72,11 @@ from liminallm.api.schemas import (
     ToolSpecListResponse,
     WorkflowListResponse,
 )
+from liminallm.config import get_settings
+from liminallm.content_struct import normalize_content_struct
+from liminallm.logging import get_logger
 from liminallm.service.auth import AuthContext
 from liminallm.service.errors import BadRequestError, NotFoundError
-from liminallm.storage.errors import ConstraintViolation
-from liminallm.storage.models import Conversation, KnowledgeContext, Session
-from liminallm.config import get_settings
 from liminallm.service.fs import safe_join
 from liminallm.service.runtime import (
     IDEMPOTENCY_TTL_SECONDS,
@@ -74,19 +85,34 @@ from liminallm.service.runtime import (
     check_rate_limit,
     get_runtime,
 )
+from liminallm.storage.models import Conversation, KnowledgeContext, Session
+
+logger = get_logger(__name__)
 
 router = APIRouter(prefix="/v1")
 
 
-def _http_error(code: str, message: str, status_code: int, details: Optional[dict | str] = None) -> HTTPException:
-    payload: dict[str, object] = {"status": "error", "error": {"code": code, "message": message}}
+def _http_error(
+    code: str, message: str, status_code: int, details: Optional[dict | str] = None
+) -> HTTPException:
+    payload: dict[str, object] = {
+        "status": "error",
+        "error": {"code": code, "message": message},
+    }
     if details is not None:
         payload["error"]["details"] = details  # type: ignore[index]
     return HTTPException(status_code=status_code, detail=payload)
 
 
 class IdempotencyGuard:
-    def __init__(self, route: str, user_id: str, idempotency_key: Optional[str], *, require: bool = False):
+    def __init__(
+        self,
+        route: str,
+        user_id: str,
+        idempotency_key: Optional[str],
+        *,
+        require: bool = False,
+    ):
         self.route = route
         self.user_id = user_id
         self.idempotency_key = idempotency_key
@@ -98,7 +124,11 @@ class IdempotencyGuard:
     async def __aenter__(self) -> "IdempotencyGuard":
         self.request_id = self.request_id or str(uuid4())
         self.request_id, self.cached = await _resolve_idempotency(
-            self.route, self.user_id, self.idempotency_key, require=self.require, request_id=self.request_id
+            self.route,
+            self.user_id,
+            self.idempotency_key,
+            require=self.require,
+            request_id=self.request_id,
         )
         return self
 
@@ -108,41 +138,64 @@ class IdempotencyGuard:
                 self.route,
                 self.user_id,
                 self.idempotency_key,
-                Envelope(status="error", error={"code": "server_error", "message": str(exc)}, request_id=self.request_id),
+                Envelope(
+                    status="error",
+                    error={"code": "server_error", "message": str(exc)},
+                    request_id=self.request_id,
+                ),
                 status="failed",
             )
             self._stored = True
         return False
 
-    async def store_result(self, envelope: Envelope, *, status: str = "completed") -> None:
-        await _store_idempotency_result(self.route, self.user_id, self.idempotency_key, envelope, status=status)
+    async def store_result(
+        self, envelope: Envelope, *, status: str = "completed"
+    ) -> None:
+        await _store_idempotency_result(
+            self.route, self.user_id, self.idempotency_key, envelope, status=status
+        )
         self._stored = True
 
     async def store_error(self, message: str) -> None:
         if not self.request_id:
             return
         await self.store_result(
-            Envelope(status="error", error={"code": "server_error", "message": message}, request_id=self.request_id),
+            Envelope(
+                status="error",
+                error={"code": "server_error", "message": message},
+                request_id=self.request_id,
+            ),
             status="failed",
         )
 
 
-async def _enforce_rate_limit(runtime, key: str, limit: int, window_seconds: int) -> None:
+async def _enforce_rate_limit(
+    runtime, key: str, limit: int, window_seconds: int
+) -> None:
     allowed = await check_rate_limit(runtime, key, limit, window_seconds)
     if not allowed:
         raise _http_error("rate_limited", "rate limit exceeded", status_code=429)
 
 
 async def _resolve_idempotency(
-    route: str, user_id: str, idempotency_key: Optional[str], *, require: bool = False, request_id: Optional[str] = None
+    route: str,
+    user_id: str,
+    idempotency_key: Optional[str],
+    *,
+    require: bool = False,
+    request_id: Optional[str] = None,
 ) -> tuple[str, Optional[Envelope]]:
     request_id = request_id or str(uuid4())
     runtime = get_runtime()
     if not idempotency_key:
         if require:
-            raise _http_error("validation_error", "Idempotency-Key header required", status_code=400)
+            raise _http_error(
+                "validation_error", "Idempotency-Key header required", status_code=400
+            )
         return request_id, None
-    record = await _get_cached_idempotency_record(runtime, route, user_id, idempotency_key)
+    record = await _get_cached_idempotency_record(
+        runtime, route, user_id, idempotency_key
+    )
     if record:
         status = record.get("status")
         if status == "in_progress":
@@ -157,7 +210,11 @@ async def _resolve_idempotency(
         route,
         user_id,
         idempotency_key,
-        {"status": "in_progress", "request_id": request_id, "started_at": datetime.utcnow().isoformat()},
+        {
+            "status": "in_progress",
+            "request_id": request_id,
+            "started_at": datetime.utcnow().isoformat(),
+        },
         ttl_seconds=IDEMPOTENCY_TTL_SECONDS,
     )
     return request_id, None
@@ -187,7 +244,9 @@ async def _store_idempotency_result(
 async def get_user(
     authorization: Optional[str] = Header(None),
     session_id: Optional[str] = Header(None, convert_underscores=False),
-    x_tenant_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Tenant-ID"),
+    x_tenant_id: Optional[str] = Header(
+        None, convert_underscores=False, alias="X-Tenant-ID"
+    ),
 ) -> AuthContext:
     runtime = get_runtime()
     ctx = await runtime.auth.authenticate(
@@ -203,7 +262,9 @@ async def get_user(
 async def get_admin_user(
     authorization: Optional[str] = Header(None),
     session_id: Optional[str] = Header(None, convert_underscores=False),
-    x_tenant_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Tenant-ID"),
+    x_tenant_id: Optional[str] = Header(
+        None, convert_underscores=False, alias="X-Tenant-ID"
+    ),
 ) -> AuthContext:
     runtime = get_runtime()
     ctx = await runtime.auth.authenticate(
@@ -217,8 +278,12 @@ async def get_admin_user(
     return ctx
 
 
-def _get_owned_conversation(runtime, conversation_id: str, principal: AuthContext) -> Conversation:
-    conversation = runtime.store.get_conversation(conversation_id, user_id=principal.user_id)
+def _get_owned_conversation(
+    runtime, conversation_id: str, principal: AuthContext
+) -> Conversation:
+    conversation = runtime.store.get_conversation(
+        conversation_id, user_id=principal.user_id
+    )
     if not conversation:
         raise _http_error("not_found", "conversation not found", status_code=404)
     return conversation
@@ -237,12 +302,16 @@ def _stringify_adapters(adapters: Any) -> list[str]:
     return adapter_list
 
 
-def _get_owned_context(runtime, context_id: str, principal: AuthContext) -> KnowledgeContext:
+def _get_owned_context(
+    runtime, context_id: str, principal: AuthContext
+) -> KnowledgeContext:
     ctx = runtime.store.get_context(context_id)
     if not ctx:
         raise _http_error("not_found", "context not found", status_code=404)
     if ctx.owner_user_id != principal.user_id:
-        raise _http_error("forbidden", "context is owned by another user", status_code=403)
+        raise _http_error(
+            "forbidden", "context is owned by another user", status_code=403
+        )
     return ctx
 
 
@@ -252,9 +321,13 @@ def _get_owned_artifact(runtime, artifact_id: str, principal: AuthContext):
         raise _http_error("not_found", "artifact not found", status_code=404)
     if artifact.owner_user_id and artifact.owner_user_id != principal.user_id:
         if principal.role != "admin":
-            raise _http_error("forbidden", "artifact is owned by another user", status_code=403)
+            raise _http_error(
+                "forbidden", "artifact is owned by another user", status_code=403
+            )
     if not artifact.owner_user_id and principal.role != "admin":
-        raise _http_error("forbidden", "artifact access requires admin privileges", status_code=403)
+        raise _http_error(
+            "forbidden", "artifact access requires admin privileges", status_code=403
+        )
     return artifact
 
 
@@ -272,7 +345,9 @@ def _user_to_response(user) -> UserResponse:
     )
 
 
-def _apply_session_cookies(response: Response, session: Session, tokens: dict, *, refresh_ttl_minutes: int) -> None:
+def _apply_session_cookies(
+    response: Response, session: Session, tokens: dict, *, refresh_ttl_minutes: int
+) -> None:
     response.set_cookie(
         "session_id",
         session.id,
@@ -308,9 +383,17 @@ async def signup(body: SignupRequest, response: Response):
         60,
     )
     user, session, tokens = await runtime.auth.signup(
-        email=body.email, password=body.password, handle=body.handle, tenant_id=body.tenant_id
+        email=body.email,
+        password=body.password,
+        handle=body.handle,
+        tenant_id=body.tenant_id,
     )
-    _apply_session_cookies(response, session, tokens, refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes)
+    _apply_session_cookies(
+        response,
+        session,
+        tokens,
+        refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes,
+    )
     return Envelope(
         status="ok",
         data=AuthResponse(
@@ -337,11 +420,19 @@ async def login(body: LoginRequest, response: Response):
         60,
     )
     user, session, tokens = await runtime.auth.login(
-        email=body.email, password=body.password, mfa_code=body.mfa_code, tenant_id=body.tenant_id
+        email=body.email,
+        password=body.password,
+        mfa_code=body.mfa_code,
+        tenant_id=body.tenant_id,
     )
     if not user or not session:
         raise _http_error("unauthorized", "invalid credentials", status_code=401)
-    _apply_session_cookies(response, session, tokens, refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes)
+    _apply_session_cookies(
+        response,
+        session,
+        tokens,
+        refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes,
+    )
     return Envelope(
         status="ok",
         data=AuthResponse(
@@ -361,20 +452,39 @@ async def login(body: LoginRequest, response: Response):
 @router.post("/auth/oauth/{provider}/start", response_model=Envelope)
 async def oauth_start(provider: str, body: OAuthStartRequest):
     runtime = get_runtime()
-    start = await runtime.auth.start_oauth(provider, redirect_uri=body.redirect_uri, tenant_id=body.tenant_id)
+    start = await runtime.auth.start_oauth(
+        provider, redirect_uri=body.redirect_uri, tenant_id=body.tenant_id
+    )
     return Envelope(
         status="ok",
-        data=OAuthStartResponse(authorization_url=start["authorization_url"], state=start["state"], provider=provider),
+        data=OAuthStartResponse(
+            authorization_url=start["authorization_url"],
+            state=start["state"],
+            provider=provider,
+        ),
     )
 
 
 @router.get("/auth/oauth/{provider}/callback", response_model=Envelope)
-async def oauth_callback(provider: str, code: str, state: str, response: Response, tenant_id: Optional[str] = None):
+async def oauth_callback(
+    provider: str,
+    code: str,
+    state: str,
+    response: Response,
+    tenant_id: Optional[str] = None,
+):
     runtime = get_runtime()
-    user, session, tokens = await runtime.auth.complete_oauth(provider, code, state, tenant_id=tenant_id)
+    user, session, tokens = await runtime.auth.complete_oauth(
+        provider, code, state, tenant_id=tenant_id
+    )
     if not user or not session:
         raise _http_error("unauthorized", "oauth verification failed", status_code=401)
-    _apply_session_cookies(response, session, tokens, refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes)
+    _apply_session_cookies(
+        response,
+        session,
+        tokens,
+        refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes,
+    )
     return Envelope(
         status="ok",
         data=AuthResponse(
@@ -396,14 +506,23 @@ async def refresh_tokens(
     body: TokenRefreshRequest,
     response: Response,
     authorization: Optional[str] = Header(None),
-    x_tenant_id: Optional[str] = Header(None, convert_underscores=False, alias="X-Tenant-ID"),
+    x_tenant_id: Optional[str] = Header(
+        None, convert_underscores=False, alias="X-Tenant-ID"
+    ),
 ):
     runtime = get_runtime()
     tenant_hint = body.tenant_id or x_tenant_id
-    user, session, tokens = await runtime.auth.refresh_tokens(body.refresh_token, tenant_hint=tenant_hint)
+    user, session, tokens = await runtime.auth.refresh_tokens(
+        body.refresh_token, tenant_hint=tenant_hint
+    )
     if not user or not session:
         raise _http_error("unauthorized", "invalid refresh", status_code=401)
-    _apply_session_cookies(response, session, tokens, refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes)
+    _apply_session_cookies(
+        response,
+        session,
+        tokens,
+        refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes,
+    )
     return Envelope(
         status="ok",
         data=AuthResponse(
@@ -422,19 +541,27 @@ async def refresh_tokens(
 
 @router.get("/admin/users", response_model=Envelope)
 async def admin_list_users(
-    tenant_id: Optional[str] = None, limit: int = 100, principal: AuthContext = Depends(get_admin_user)
+    tenant_id: Optional[str] = None,
+    limit: int = 100,
+    principal: AuthContext = Depends(get_admin_user),
 ):
     runtime = get_runtime()
     # Admin can only see users in their own tenant (prevent cross-tenant access)
     target_tenant = tenant_id or principal.tenant_id
     if target_tenant != principal.tenant_id:
-        raise _http_error("forbidden", "cannot access other tenant users", status_code=403)
+        raise _http_error(
+            "forbidden", "cannot access other tenant users", status_code=403
+        )
     users = runtime.auth.list_users(tenant_id=target_tenant, limit=min(limit, 500))
-    return Envelope(status="ok", data=UserListResponse(items=[_user_to_response(u) for u in users]))
+    return Envelope(
+        status="ok", data=UserListResponse(items=[_user_to_response(u) for u in users])
+    )
 
 
 @router.post("/admin/users", response_model=Envelope)
-async def admin_create_user(body: AdminCreateUserRequest, principal: AuthContext = Depends(get_admin_user)):
+async def admin_create_user(
+    body: AdminCreateUserRequest, principal: AuthContext = Depends(get_admin_user)
+):
     runtime = get_runtime()
     await _enforce_rate_limit(
         runtime,
@@ -444,7 +571,9 @@ async def admin_create_user(body: AdminCreateUserRequest, principal: AuthContext
     )
     target_tenant = body.tenant_id or principal.tenant_id
     if target_tenant != principal.tenant_id:
-        raise _http_error("forbidden", "cannot create users in other tenant", status_code=403)
+        raise _http_error(
+            "forbidden", "cannot create users in other tenant", status_code=403
+        )
     user, password = await runtime.auth.admin_create_user(
         email=body.email,
         password=body.password,
@@ -455,11 +584,20 @@ async def admin_create_user(body: AdminCreateUserRequest, principal: AuthContext
         is_active=body.is_active,
         meta=body.meta,
     )
-    return Envelope(status="ok", data=AdminCreateUserResponse(**_user_to_response(user).model_dump(), password=password))
+    return Envelope(
+        status="ok",
+        data=AdminCreateUserResponse(
+            **_user_to_response(user).model_dump(), password=password
+        ),
+    )
 
 
 @router.post("/admin/users/{user_id}/role", response_model=Envelope)
-async def admin_set_role(user_id: str, body: UpdateUserRoleRequest, principal: AuthContext = Depends(get_admin_user)):
+async def admin_set_role(
+    user_id: str,
+    body: UpdateUserRoleRequest,
+    principal: AuthContext = Depends(get_admin_user),
+):
     runtime = get_runtime()
     await _enforce_rate_limit(
         runtime,
@@ -474,7 +612,9 @@ async def admin_set_role(user_id: str, body: UpdateUserRoleRequest, principal: A
 
 
 @router.delete("/admin/users/{user_id}", response_model=Envelope)
-async def admin_delete_user(user_id: str, principal: AuthContext = Depends(get_admin_user)):
+async def admin_delete_user(
+    user_id: str, principal: AuthContext = Depends(get_admin_user)
+):
     runtime = get_runtime()
     await _enforce_rate_limit(
         runtime,
@@ -492,7 +632,9 @@ async def admin_delete_user(user_id: str, principal: AuthContext = Depends(get_a
 async def admin_list_adapters(principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
     # Filter adapters by tenant to prevent cross-tenant data exposure
-    adapters = runtime.store.list_artifacts(type_filter="adapter", tenant_id=principal.tenant_id)
+    adapters = runtime.store.list_artifacts(
+        type_filter="adapter", tenant_id=principal.tenant_id
+    )
     return Envelope(
         status="ok",
         data=ArtifactListResponse(
@@ -516,20 +658,28 @@ async def admin_list_adapters(principal: AuthContext = Depends(get_admin_user)):
 
 @router.get("/admin/objects", response_model=Envelope)
 async def admin_inspect_objects(
-    kind: Optional[str] = None, limit: int = 50, principal: AuthContext = Depends(get_admin_user)
+    kind: Optional[str] = None,
+    limit: int = 50,
+    principal: AuthContext = Depends(get_admin_user),
 ):
     runtime = get_runtime()
     if not hasattr(runtime.store, "inspect_state"):
         raise BadRequestError("inspect not supported")
-    details = runtime.store.inspect_state(kind=kind, tenant_id=principal.tenant_id, limit=min(limit, 500))
+    details = runtime.store.inspect_state(
+        kind=kind, tenant_id=principal.tenant_id, limit=min(limit, 500)
+    )
     summary = {k: len(v) for k, v in details.items()}
-    return Envelope(status="ok", data=AdminInspectionResponse(summary=summary, details=details))
+    return Envelope(
+        status="ok", data=AdminInspectionResponse(summary=summary, details=details)
+    )
 
 
 @router.post("/auth/mfa/request", response_model=Envelope)
 async def request_mfa(body: MFARequest):
     runtime = get_runtime()
-    auth_ctx = await runtime.auth.resolve_session(body.session_id, allow_pending_mfa=True)
+    auth_ctx = await runtime.auth.resolve_session(
+        body.session_id, allow_pending_mfa=True
+    )
     if not auth_ctx:
         raise _http_error("unauthorized", "invalid session", status_code=401)
     await _enforce_rate_limit(
@@ -545,7 +695,9 @@ async def request_mfa(body: MFARequest):
 @router.post("/auth/mfa/verify", response_model=Envelope)
 async def verify_mfa(body: MFAVerifyRequest, response: Response):
     runtime = get_runtime()
-    auth_ctx = await runtime.auth.resolve_session(body.session_id, allow_pending_mfa=True)
+    auth_ctx = await runtime.auth.resolve_session(
+        body.session_id, allow_pending_mfa=True
+    )
     if not auth_ctx:
         raise _http_error("unauthorized", "invalid session", status_code=401)
     await _enforce_rate_limit(
@@ -554,7 +706,9 @@ async def verify_mfa(body: MFAVerifyRequest, response: Response):
         runtime.settings.mfa_rate_limit_per_minute,
         60,
     )
-    ok = await runtime.auth.verify_mfa_challenge(user_id=auth_ctx.user_id, code=body.code, session_id=body.session_id)
+    ok = await runtime.auth.verify_mfa_challenge(
+        user_id=auth_ctx.user_id, code=body.code, session_id=body.session_id
+    )
     if not ok:
         raise _http_error("unauthorized", "invalid mfa", status_code=401)
     user, session, tokens = runtime.auth.issue_tokens_for_session(body.session_id)
@@ -573,7 +727,12 @@ async def verify_mfa(body: MFAVerifyRequest, response: Response):
                 tenant_id=user.tenant_id,
             ).model_dump()
         )
-        _apply_session_cookies(response, session, tokens, refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes)
+        _apply_session_cookies(
+            response,
+            session,
+            tokens,
+            refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes,
+        )
     return Envelope(status="ok", data=resp)
 
 
@@ -586,7 +745,7 @@ async def request_reset(body: PasswordResetRequest):
         runtime.settings.reset_rate_limit_per_minute,
         60,
     )
-    token = await runtime.auth.initiate_password_reset(body.email)
+    await runtime.auth.initiate_password_reset(body.email)
     # Token delivery should be handled out-of-band; avoid exposing it directly.
     return Envelope(status="ok", data={"status": "sent"})
 
@@ -627,7 +786,9 @@ async def logout(
 ):
     runtime = get_runtime()
     if authorization or session_id:
-        ctx = await runtime.auth.authenticate(authorization, session_id, allow_pending_mfa=True)
+        ctx = await runtime.auth.authenticate(
+            authorization, session_id, allow_pending_mfa=True
+        )
         target_session = session_id or (ctx.session_id if ctx else None)
         if not target_session:
             raise _http_error("unauthorized", "invalid session", status_code=401)
@@ -646,7 +807,9 @@ async def chat(
     runtime = get_runtime()
     user_id = principal.user_id
     # SPEC §18: Accept Idempotency-Key when provided (optional)
-    async with IdempotencyGuard("chat", user_id, idempotency_key, require=False) as idem:
+    async with IdempotencyGuard(
+        "chat", user_id, idempotency_key, require=False
+    ) as idem:
         if idem.cached:
             return idem.cached
         await _enforce_rate_limit(
@@ -659,12 +822,16 @@ async def chat(
         context_id = body.context_id
         validated_context_id: str | None = None
         if body.conversation_id:
-            conversation = _get_owned_conversation(runtime, body.conversation_id, principal)
+            conversation = _get_owned_conversation(
+                runtime, body.conversation_id, principal
+            )
         else:
             if context_id:
                 _get_owned_context(runtime, context_id, principal)
                 validated_context_id = context_id
-            conversation = runtime.store.create_conversation(user_id=user_id, active_context_id=body.context_id)
+            conversation = runtime.store.create_conversation(
+                user_id=user_id, active_context_id=body.context_id
+            )
         conversation_id = conversation.id
         context_id = context_id or conversation.active_context_id
         if context_id and context_id != validated_context_id:
@@ -675,13 +842,21 @@ async def chat(
             try:
                 audio_bytes = base64.b64decode(body.message.content)
             except Exception as exc:
-                raise _http_error("bad_request", "invalid base64-encoded audio payload", status_code=400) from exc
+                raise _http_error(
+                    "bad_request",
+                    "invalid base64-encoded audio payload",
+                    status_code=400,
+                ) from exc
             transcript = runtime.voice.transcribe(audio_bytes, user_id=user_id) or {}
             user_content = transcript.get("transcript") or transcript.get("text")
             if not user_content:
-                raise _http_error("bad_request", "unable to transcribe audio", status_code=400)
+                raise _http_error(
+                    "bad_request", "unable to transcribe audio", status_code=400
+                )
             voice_meta = {"mode": "voice", "transcript": transcript}
-        user_content_struct = normalize_content_struct(body.message.content_struct, user_content)
+        user_content_struct = normalize_content_struct(
+            body.message.content_struct, user_content
+        )
         runtime.store.append_message(
             conversation_id,
             sender="user",
@@ -698,7 +873,9 @@ async def chat(
             user_id,
             tenant_id=principal.tenant_id,
         )
-        orchestration_dict: dict[str, Any] = orchestration if isinstance(orchestration, dict) else {}
+        orchestration_dict: dict[str, Any] = (
+            orchestration if isinstance(orchestration, dict) else {}
+        )
         adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
         assistant_content_struct = normalize_content_struct(
             orchestration_dict.get("content_struct"),
@@ -732,9 +909,13 @@ async def chat(
             routing_trace=orchestration_dict.get("routing_trace", []),
             workflow_trace=orchestration_dict.get("workflow_trace", []),
         )
-        envelope = Envelope(status="ok", data=resp.model_dump(), request_id=idem.request_id)
+        envelope = Envelope(
+            status="ok", data=resp.model_dump(), request_id=idem.request_id
+        )
         if runtime.cache:
-            history = runtime.store.list_messages(conversation_id, user_id=principal.user_id)
+            history = runtime.store.list_messages(
+                conversation_id, user_id=principal.user_id
+            )
             await runtime.workflow.cache_conversation_state(conversation_id, history)
         await idem.store_result(envelope)
         return envelope
@@ -742,7 +923,9 @@ async def chat(
 
 
 @router.post("/preferences", response_model=Envelope)
-async def record_preference(body: PreferenceEventRequest, principal: AuthContext = Depends(get_user)):
+async def record_preference(
+    body: PreferenceEventRequest, principal: AuthContext = Depends(get_user)
+):
     runtime = get_runtime()
     event = runtime.training.record_feedback_event(
         user_id=principal.user_id,
@@ -760,12 +943,19 @@ async def record_preference(body: PreferenceEventRequest, principal: AuthContext
     )
     await runtime.clusterer.cluster_user_preferences(principal.user_id)
     runtime.clusterer.promote_skill_adapters()
-    resp = PreferenceEventResponse(id=event.id, cluster_id=event.cluster_id, feedback=event.feedback, created_at=event.created_at)
+    resp = PreferenceEventResponse(
+        id=event.id,
+        cluster_id=event.cluster_id,
+        feedback=event.feedback,
+        created_at=event.created_at,
+    )
     return Envelope(status="ok", data=resp)
 
 
 @router.post("/preferences/routing_feedback", response_model=Envelope)
-async def record_routing_feedback(body: PreferenceEventRequest, principal: AuthContext = Depends(get_user)):
+async def record_routing_feedback(
+    body: PreferenceEventRequest, principal: AuthContext = Depends(get_user)
+):
     runtime = get_runtime()
     event = runtime.training.record_feedback_event(
         user_id=principal.user_id,
@@ -781,7 +971,12 @@ async def record_routing_feedback(body: PreferenceEventRequest, principal: AuthC
         adapter_gates=body.adapter_gates,
         notes=body.notes,
     )
-    resp = PreferenceEventResponse(id=event.id, cluster_id=event.cluster_id, feedback=event.feedback, created_at=event.created_at)
+    resp = PreferenceEventResponse(
+        id=event.id,
+        cluster_id=event.cluster_id,
+        feedback=event.feedback,
+        created_at=event.created_at,
+    )
     return Envelope(status="ok", data=resp)
 
 
@@ -875,14 +1070,21 @@ async def list_tool_specs(
         for a in artifacts
     ]
     next_page = page + 1 if len(items) == resolved_page_size else None
-    return Envelope(status="ok", data=ToolSpecListResponse(items=items, next_page=next_page, page_size=resolved_page_size))
+    return Envelope(
+        status="ok",
+        data=ToolSpecListResponse(
+            items=items, next_page=next_page, page_size=resolved_page_size
+        ),
+    )
 
 
 @router.get("/tools/specs/{artifact_id}", response_model=Envelope)
 async def get_tool_spec(artifact_id: str, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     artifact = _get_owned_artifact(runtime, artifact_id, principal)
-    if not (isinstance(artifact.schema, dict) and artifact.schema.get("kind") == "tool.spec"):
+    if not (
+        isinstance(artifact.schema, dict) and artifact.schema.get("kind") == "tool.spec"
+    ):
         raise NotFoundError("tool spec not found", detail={"artifact_id": artifact_id})
     resp = ArtifactResponse(
         id=artifact.id,
@@ -905,9 +1107,11 @@ async def list_workflows(
     runtime = get_runtime()
     resolved_page_size = min(max(page_size, 1), 200)
     artifacts = runtime.store.list_artifacts(
-        type_filter="workflow", kind_filter="workflow.chat",
+        type_filter="workflow",
+        kind_filter="workflow.chat",
         owner_user_id=principal.user_id,  # Filter by owner
-        page=page, page_size=resolved_page_size
+        page=page,
+        page_size=resolved_page_size,
     )
     items = [
         ArtifactResponse(
@@ -924,11 +1128,18 @@ async def list_workflows(
         for a in artifacts
     ]
     next_page = page + 1 if len(items) == resolved_page_size else None
-    return Envelope(status="ok", data=WorkflowListResponse(items=items, next_page=next_page, page_size=resolved_page_size))
+    return Envelope(
+        status="ok",
+        data=WorkflowListResponse(
+            items=items, next_page=next_page, page_size=resolved_page_size
+        ),
+    )
 
 
 @router.get("/artifacts/{artifact_id}/versions", response_model=Envelope)
-async def list_artifact_versions(artifact_id: str, principal: AuthContext = Depends(get_user)):
+async def list_artifact_versions(
+    artifact_id: str, principal: AuthContext = Depends(get_user)
+):
     runtime = get_runtime()
     # Verify ownership before listing versions
     _get_owned_artifact(runtime, artifact_id, principal)
@@ -936,7 +1147,9 @@ async def list_artifact_versions(artifact_id: str, principal: AuthContext = Depe
     if not versions:
         artifact = runtime.store.get_artifact(artifact_id)
         if not artifact:
-            raise NotFoundError("artifact not found", detail={"artifact_id": artifact_id})
+            raise NotFoundError(
+                "artifact not found", detail={"artifact_id": artifact_id}
+            )
     items = [
         ArtifactVersionResponse(
             id=v.id,
@@ -969,7 +1182,10 @@ async def invoke_tool(
         if idem.cached:
             return idem.cached
         artifact = _get_owned_artifact(runtime, tool_id, principal)
-        if not (isinstance(artifact.schema, dict) and artifact.schema.get("kind") == "tool.spec"):
+        if not (
+            isinstance(artifact.schema, dict)
+            and artifact.schema.get("kind") == "tool.spec"
+        ):
             raise NotFoundError("tool spec not found", detail={"artifact_id": tool_id})
         result = runtime.workflow.invoke_tool(
             artifact.schema,
@@ -985,7 +1201,9 @@ async def invoke_tool(
             outputs=result.get("outputs", {}) if isinstance(result, dict) else {},
             content=result.get("content") if isinstance(result, dict) else None,
             usage=result.get("usage") if isinstance(result, dict) else None,
-            context_snippets=result.get("context_snippets") if isinstance(result, dict) else None,
+            context_snippets=(
+                result.get("context_snippets") if isinstance(result, dict) else None
+            ),
         )
         envelope = Envelope(status="ok", data=response, request_id=idem.request_id)
         await idem.store_result(envelope)
@@ -1000,25 +1218,41 @@ async def create_artifact(
 ):
     runtime = get_runtime()
     # SPEC §18: Accept Idempotency-Key when provided (optional)
-    async with IdempotencyGuard("artifacts:create", principal.user_id, idempotency_key, require=False) as idem:
+    async with IdempotencyGuard(
+        "artifacts:create", principal.user_id, idempotency_key, require=False
+    ) as idem:
         if idem.cached:
             return idem.cached
         if not isinstance(body.schema, dict):
-            raise BadRequestError("artifact schema must be an object", detail={"provided_type": type(body.schema).__name__})
+            raise BadRequestError(
+                "artifact schema must be an object",
+                detail={"provided_type": type(body.schema).__name__},
+            )
         if any(not isinstance(key, str) for key in body.schema):
             raise BadRequestError("artifact schema keys must be strings")
         try:
             json.dumps(body.schema)
         except (TypeError, ValueError) as exc:
-            raise BadRequestError("artifact schema must be JSON serializable", detail={"error": str(exc)})
+            raise BadRequestError(
+                "artifact schema must be JSON serializable", detail={"error": str(exc)}
+            )
         schema_kind = body.schema.get("kind")
         if schema_kind is not None and not isinstance(schema_kind, str):
-            raise BadRequestError("artifact kind must be a string", detail={"kind": schema_kind})
+            raise BadRequestError(
+                "artifact kind must be a string", detail={"kind": schema_kind}
+            )
         type_prefix = body.type
         if schema_kind and not type_prefix:
             type_prefix = schema_kind.split(".", 1)[0]
-        if schema_kind and type_prefix and not schema_kind.startswith(f"{type_prefix}."):
-            raise BadRequestError("kind must start with the type prefix", detail={"kind": schema_kind, "type": type_prefix})
+        if (
+            schema_kind
+            and type_prefix
+            and not schema_kind.startswith(f"{type_prefix}.")
+        ):
+            raise BadRequestError(
+                "kind must start with the type prefix",
+                detail={"kind": schema_kind, "type": type_prefix},
+            )
         if not type_prefix:
             raise BadRequestError("type or kind is required")
         artifact_schema = dict(body.schema)
@@ -1035,7 +1269,11 @@ async def create_artifact(
         resp = ArtifactResponse(
             id=artifact.id,
             type=artifact.type,
-            kind=artifact.schema.get("kind") if isinstance(artifact.schema, dict) else None,
+            kind=(
+                artifact.schema.get("kind")
+                if isinstance(artifact.schema, dict)
+                else None
+            ),
             name=artifact.name,
             description=artifact.description,
             schema=artifact.schema,
@@ -1049,16 +1287,24 @@ async def create_artifact(
 
 
 @router.patch("/artifacts/{artifact_id}", response_model=Envelope)
-async def patch_artifact(artifact_id: str, body: ArtifactRequest, principal: AuthContext = Depends(get_user)):
+async def patch_artifact(
+    artifact_id: str, body: ArtifactRequest, principal: AuthContext = Depends(get_user)
+):
     runtime = get_runtime()
     current = _get_owned_artifact(runtime, artifact_id, principal)
     if not isinstance(body.schema, dict):
-        raise BadRequestError("artifact schema must be an object", detail={"provided_type": type(body.schema).__name__})
+        raise BadRequestError(
+            "artifact schema must be an object",
+            detail={"provided_type": type(body.schema).__name__},
+        )
     schema_kind = body.schema.get("kind")
     artifact_schema = dict(body.schema)
     if schema_kind:
         if not schema_kind.startswith(f"{current.type}."):
-            raise BadRequestError("kind must start with the type prefix", detail={"kind": schema_kind, "type": current.type})
+            raise BadRequestError(
+                "kind must start with the type prefix",
+                detail={"kind": schema_kind, "type": current.type},
+            )
         artifact_schema["kind"] = schema_kind
     artifact = runtime.store.update_artifact(
         artifact_id,
@@ -1083,7 +1329,9 @@ async def patch_artifact(artifact_id: str, body: ArtifactRequest, principal: Aut
 
 
 @router.post("/config/propose_patch", response_model=Envelope)
-async def propose_patch(body: ConfigPatchRequest, principal: AuthContext = Depends(get_admin_user)):
+async def propose_patch(
+    body: ConfigPatchRequest, principal: AuthContext = Depends(get_admin_user)
+):
     runtime = get_runtime()
     # Rate limit configops per SPEC §18: 30 req/hour
     await _enforce_rate_limit(
@@ -1094,7 +1342,10 @@ async def propose_patch(body: ConfigPatchRequest, principal: AuthContext = Depen
     )
     proposer = "human_admin" if principal.role == "admin" else "user"
     audit = runtime.store.record_config_patch(
-        artifact_id=body.artifact_id, proposer=proposer, patch=body.patch, justification=body.justification
+        artifact_id=body.artifact_id,
+        proposer=proposer,
+        patch=body.patch,
+        justification=body.justification,
     )
     resp = ConfigPatchAuditResponse(
         id=audit.id,
@@ -1112,7 +1363,9 @@ async def propose_patch(body: ConfigPatchRequest, principal: AuthContext = Depen
 
 
 @router.get("/config/patches", response_model=Envelope)
-async def list_config_patches(status: Optional[str] = None, principal: AuthContext = Depends(get_admin_user)):
+async def list_config_patches(
+    status: Optional[str] = None, principal: AuthContext = Depends(get_admin_user)
+):
     runtime = get_runtime()
     # Rate limit configops per SPEC §18: 30 req/hour
     await _enforce_rate_limit(
@@ -1141,7 +1394,11 @@ async def list_config_patches(status: Optional[str] = None, principal: AuthConte
 
 
 @router.post("/config/patches/{patch_id}/decide", response_model=Envelope)
-async def decide_config_patch(patch_id: int, body: ConfigPatchDecisionRequest, principal: AuthContext = Depends(get_admin_user)):
+async def decide_config_patch(
+    patch_id: int,
+    body: ConfigPatchDecisionRequest,
+    principal: AuthContext = Depends(get_admin_user),
+):
     runtime = get_runtime()
     # Rate limit configops per SPEC §18: 30 req/hour
     await _enforce_rate_limit(
@@ -1167,7 +1424,9 @@ async def decide_config_patch(patch_id: int, body: ConfigPatchDecisionRequest, p
 
 
 @router.post("/config/patches/{patch_id}/apply", response_model=Envelope)
-async def apply_config_patch(patch_id: int, principal: AuthContext = Depends(get_admin_user)):
+async def apply_config_patch(
+    patch_id: int, principal: AuthContext = Depends(get_admin_user)
+):
     runtime = get_runtime()
     # Rate limit configops per SPEC §18: 30 req/hour
     await _enforce_rate_limit(
@@ -1176,7 +1435,9 @@ async def apply_config_patch(patch_id: int, principal: AuthContext = Depends(get
         runtime.settings.configops_rate_limit_per_hour,
         3600,
     )
-    result = runtime.config_ops.apply_patch(patch_id, approver_user_id=principal.user_id)
+    result = runtime.config_ops.apply_patch(
+        patch_id, approver_user_id=principal.user_id
+    )
     patch = result.get("patch")
     resp = ConfigPatchAuditResponse(
         id=patch.id,
@@ -1194,7 +1455,9 @@ async def apply_config_patch(patch_id: int, principal: AuthContext = Depends(get
 
 
 @router.post("/config/auto_patch", response_model=Envelope)
-async def auto_patch(body: AutoPatchRequest, principal: AuthContext = Depends(get_admin_user)):
+async def auto_patch(
+    body: AutoPatchRequest, principal: AuthContext = Depends(get_admin_user)
+):
     runtime = get_runtime()
     # Rate limit configops per SPEC §18: 30 req/hour
     await _enforce_rate_limit(
@@ -1203,7 +1466,9 @@ async def auto_patch(body: AutoPatchRequest, principal: AuthContext = Depends(ge
         runtime.settings.configops_rate_limit_per_hour,
         3600,
     )
-    audit = runtime.config_ops.auto_generate_patch(body.artifact_id, principal.user_id, goal=body.goal)
+    audit = runtime.config_ops.auto_generate_patch(
+        body.artifact_id, principal.user_id, goal=body.goal
+    )
     resp = ConfigPatchAuditResponse(
         id=audit.id,
         artifact_id=audit.artifact_id,
@@ -1225,7 +1490,16 @@ async def get_config(principal: AuthContext = Depends(get_admin_user)):
 
     def _sanitize_dict(data: dict) -> dict:
         """Recursively sanitize sensitive fields in config dictionaries."""
-        sensitive_tokens = ("secret", "token", "key", "password", "credential", "api_key", "private", "auth")
+        sensitive_tokens = (
+            "secret",
+            "token",
+            "key",
+            "password",
+            "credential",
+            "api_key",
+            "private",
+            "auth",
+        )
         sanitized = {}
         for k, v in data.items():
             k_lower = k.lower()
@@ -1241,8 +1515,16 @@ async def get_config(principal: AuthContext = Depends(get_admin_user)):
     settings = get_settings().model_dump()
     sanitized_settings = _sanitize_dict(settings)
     # Also sanitize runtime_config to prevent data leakage
-    runtime_config = runtime.store.get_runtime_config() if hasattr(runtime.store, "get_runtime_config") else {}
-    sanitized_runtime_config = _sanitize_dict(runtime_config) if isinstance(runtime_config, dict) else runtime_config
+    runtime_config = (
+        runtime.store.get_runtime_config()
+        if hasattr(runtime.store, "get_runtime_config")
+        else {}
+    )
+    sanitized_runtime_config = (
+        _sanitize_dict(runtime_config)
+        if isinstance(runtime_config, dict)
+        else runtime_config
+    )
     return Envelope(
         status="ok",
         data={
@@ -1272,6 +1554,7 @@ async def upload_file(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     import re
+
     runtime = get_runtime()
     # Rate limit file uploads per SPEC §18: 10 req/min
     await _enforce_rate_limit(
@@ -1281,25 +1564,35 @@ async def upload_file(
         60,
     )
     # SPEC §18: Accept Idempotency-Key when provided (optional)
-    async with IdempotencyGuard("files:upload", principal.user_id, idempotency_key, require=False) as idem:
+    async with IdempotencyGuard(
+        "files:upload", principal.user_id, idempotency_key, require=False
+    ) as idem:
         if idem.cached:
             return idem.cached
         # Sanitize filename to prevent path traversal and other attacks
         raw_filename = file.filename or "untitled"
         # Remove path separators and keep only safe characters
-        safe_filename = re.sub(r'[^\w\-_\. ]', '_', raw_filename)
-        safe_filename = safe_filename.lstrip('.')  # Prevent hidden files
+        safe_filename = re.sub(r"[^\w\-_\. ]", "_", raw_filename)
+        safe_filename = safe_filename.lstrip(".")  # Prevent hidden files
         safe_filename = safe_filename[:255]  # Limit length
         if not safe_filename:
             safe_filename = "untitled"
-        dest_dir = Path(runtime.settings.shared_fs_root) / "users" / principal.user_id / "files"
+        dest_dir = (
+            Path(runtime.settings.shared_fs_root)
+            / "users"
+            / principal.user_id
+            / "files"
+        )
         max_bytes = max(1, runtime.settings.max_upload_bytes)
         contents = await file.read(max_bytes + 1)
         if len(contents) > max_bytes:
             raise _http_error("validation_error", "file too large", status_code=413)
         dest_path = safe_join(dest_dir, safe_filename)
         resolved_dest = dest_path.resolve()
-        if dest_dir.resolve() not in resolved_dest.parents and dest_dir.resolve() != resolved_dest:
+        if (
+            dest_dir.resolve() not in resolved_dest.parents
+            and dest_dir.resolve() != resolved_dest
+        ):
             raise _http_error("validation_error", "invalid file path", status_code=400)
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         dest_path.write_bytes(contents)
@@ -1307,12 +1600,16 @@ async def upload_file(
         if context_id:
             try:
                 _get_owned_context(runtime, context_id, principal)
-                chunk_count = runtime.rag.ingest_file(context_id, str(dest_path), chunk_size=chunk_size)
+                chunk_count = runtime.rag.ingest_file(
+                    context_id, str(dest_path), chunk_size=chunk_size
+                )
             except Exception:
                 # Clean up file on any error (not just ConstraintViolation)
                 dest_path.unlink(missing_ok=True)
                 raise
-        resp = FileUploadResponse(fs_path=safe_filename, context_id=context_id, chunk_count=chunk_count)
+        resp = FileUploadResponse(
+            fs_path=safe_filename, context_id=context_id, chunk_count=chunk_count
+        )
         envelope = Envelope(status="ok", data=resp, request_id=idem.request_id)
         await idem.store_result(envelope)
         return envelope
@@ -1326,7 +1623,9 @@ async def list_messages(
 ):
     runtime = get_runtime()
     _get_owned_conversation(runtime, conversation_id, principal)
-    msgs = runtime.store.list_messages(conversation_id, limit=limit, user_id=principal.user_id)
+    msgs = runtime.store.list_messages(
+        conversation_id, limit=limit, user_id=principal.user_id
+    )
     payload = [
         {
             "id": m.id,
@@ -1340,7 +1639,12 @@ async def list_messages(
         }
         for m in msgs
     ]
-    return Envelope(status="ok", data=ConversationMessagesResponse(conversation_id=conversation_id, messages=payload))
+    return Envelope(
+        status="ok",
+        data=ConversationMessagesResponse(
+            conversation_id=conversation_id, messages=payload
+        ),
+    )
 
 
 @router.get("/conversations", response_model=Envelope)
@@ -1369,12 +1673,17 @@ async def create_context(
 ):
     runtime = get_runtime()
     # SPEC §18: Accept Idempotency-Key when provided (optional)
-    async with IdempotencyGuard("contexts:create", principal.user_id, idempotency_key, require=False) as idem:
+    async with IdempotencyGuard(
+        "contexts:create", principal.user_id, idempotency_key, require=False
+    ) as idem:
         if idem.cached:
             return idem.cached
         ctx_meta = {"embedding_model_id": runtime.rag.embedding_model_id}
         ctx = runtime.store.upsert_context(
-            owner_user_id=principal.user_id, name=body.name, description=body.description, meta=ctx_meta
+            owner_user_id=principal.user_id,
+            name=body.name,
+            description=body.description,
+            meta=ctx_meta,
         )
         if body.text:
             runtime.rag.ingest_text(ctx.id, body.text, chunk_size=body.chunk_size)
@@ -1421,7 +1730,9 @@ async def list_chunks(context_id: str, principal: AuthContext = Depends(get_user
     chunks = runtime.store.list_chunks(context_id, owner_user_id=principal.user_id)
     for ch in chunks:
         if ch.id is None:
-            raise _http_error("server_error", "chunk id missing for context", status_code=500)
+            raise _http_error(
+                "server_error", "chunk id missing for context", status_code=500
+            )
     data = [
         KnowledgeChunkResponse(
             id=int(ch.id),
@@ -1436,7 +1747,9 @@ async def list_chunks(context_id: str, principal: AuthContext = Depends(get_user
 
 
 @router.post("/voice/transcribe", response_model=Envelope)
-async def transcribe_voice(file: UploadFile = File(...), principal: AuthContext = Depends(get_user)):
+async def transcribe_voice(
+    file: UploadFile = File(...), principal: AuthContext = Depends(get_user)
+):
     runtime = get_runtime()
     # Rate limit voice transcription (resource-intensive)
     await _enforce_rate_limit(
@@ -1449,13 +1762,17 @@ async def transcribe_voice(file: UploadFile = File(...), principal: AuthContext 
     max_audio_bytes = 10 * 1024 * 1024
     audio_bytes = await file.read(max_audio_bytes + 1)
     if len(audio_bytes) > max_audio_bytes:
-        raise _http_error("validation_error", "audio file too large (max 10MB)", status_code=413)
+        raise _http_error(
+            "validation_error", "audio file too large (max 10MB)", status_code=413
+        )
     result = runtime.voice.transcribe(audio_bytes, user_id=principal.user_id)
     return Envelope(status="ok", data=VoiceTranscriptionResponse(**result))
 
 
 @router.post("/voice/synthesize", response_model=Envelope)
-async def synthesize_voice(body: VoiceSynthesisRequest, principal: AuthContext = Depends(get_user)):
+async def synthesize_voice(
+    body: VoiceSynthesisRequest, principal: AuthContext = Depends(get_user)
+):
     runtime = get_runtime()
     # Rate limit voice synthesis (resource-intensive)
     await _enforce_rate_limit(
@@ -1466,8 +1783,14 @@ async def synthesize_voice(body: VoiceSynthesisRequest, principal: AuthContext =
     )
     # Limit text length to prevent resource exhaustion
     if len(body.text) > 5000:
-        raise _http_error("validation_error", "text too long for synthesis (max 5000 chars)", status_code=400)
-    audio = runtime.voice.synthesize(body.text, user_id=principal.user_id, voice=body.voice)
+        raise _http_error(
+            "validation_error",
+            "text too long for synthesis (max 5000 chars)",
+            status_code=400,
+        )
+    audio = runtime.voice.synthesize(
+        body.text, user_id=principal.user_id, voice=body.voice
+    )
     return Envelope(status="ok", data=VoiceSynthesisResponse(**audio))
 
 
@@ -1514,7 +1837,9 @@ async def websocket_chat(ws: WebSocket):
         context_id = init.get("context_id") or conversation.active_context_id
         if context_id:
             _get_owned_context(runtime, context_id, auth_ctx)
-        runtime.store.append_message(convo_id, sender="user", role="user", content=init.get("message", ""))
+        runtime.store.append_message(
+            convo_id, sender="user", role="user", content=init.get("message", "")
+        )
         orchestration = await runtime.workflow.run(
             init.get("workflow_id"),
             convo_id,
@@ -1523,7 +1848,9 @@ async def websocket_chat(ws: WebSocket):
             user_id,
             tenant_id=auth_ctx.tenant_id,
         )
-        orchestration_dict: dict[str, Any] = orchestration if isinstance(orchestration, dict) else {}
+        orchestration_dict: dict[str, Any] = (
+            orchestration if isinstance(orchestration, dict) else {}
+        )
         adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
         assistant_content_struct = normalize_content_struct(
             orchestration_dict.get("content_struct"),
@@ -1565,22 +1892,34 @@ async def websocket_chat(ws: WebSocket):
         await ws.send_json(envelope.model_dump())
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, dict) else None
-        error_payload = detail.get("error") if detail and "error" in detail else {"code": "server_error", "message": str(exc.detail)}
-        error_env = Envelope(status="error", error=error_payload, request_id=request_id or str(uuid4()))
+        error_payload = (
+            detail.get("error")
+            if detail and "error" in detail
+            else {"code": "server_error", "message": str(exc.detail)}
+        )
+        error_env = Envelope(
+            status="error", error=error_payload, request_id=request_id or str(uuid4())
+        )
         if user_id:
-            await _store_idempotency_result("chat:ws", user_id, idempotency_key, error_env, status="failed")
+            await _store_idempotency_result(
+                "chat:ws", user_id, idempotency_key, error_env, status="failed"
+            )
         await ws.send_json(error_env.model_dump())
         status_code = getattr(exc, "status_code", 500)
         await ws.close(code=4429 if status_code == 429 else 1011)
     except WebSocketDisconnect:
         return
-    except Exception as exc:
-        logger.exception("unhandled_websocket_error", user_id=user_id, conversation_id=convo_id)
+    except Exception:
+        logger.exception(
+            "unhandled_websocket_error", user_id=user_id, conversation_id=convo_id
+        )
         error_env = Envelope(
             status="error",
             error={"code": "server_error", "message": "An internal error occurred"},
             request_id=request_id or str(uuid4()),
         )
         if user_id:
-            await _store_idempotency_result("chat:ws", user_id, idempotency_key, error_env, status="failed")
+            await _store_idempotency_result(
+                "chat:ws", user_id, idempotency_key, error_env, status="failed"
+            )
         await ws.close(code=1011)

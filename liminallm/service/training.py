@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import random
-import shutil
 import uuid
 from dataclasses import asdict
 from datetime import datetime
@@ -12,7 +11,10 @@ from typing import Iterable, Iterator, List, Optional, Sequence
 from liminallm.config import AdapterMode, get_compatible_adapter_modes
 from liminallm.service.embeddings import deterministic_embedding
 from liminallm.service.fs import PathTraversalError, safe_join
-from liminallm.service.tokenizer_utils import DEFAULT_VOCAB_SIZE, vocab_size_from_tokenizer
+from liminallm.service.tokenizer_utils import (
+    DEFAULT_VOCAB_SIZE,
+    vocab_size_from_tokenizer,
+)
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import POSITIVE_FEEDBACK_VALUES, Artifact, PreferenceEvent
 
@@ -81,7 +83,9 @@ class TrainingService:
             self._tokenizer_model = model_name
             self._tokenizer_error = str(exc)
             self._base_vocab_size = self.default_vocab_size
-            logger.warning("tokenizer_load_failed", base_model=model_name, error=str(exc))
+            logger.warning(
+                "tokenizer_load_failed", base_model=model_name, error=str(exc)
+            )
             raise
 
     def _vocab_size(self) -> int:
@@ -99,7 +103,9 @@ class TrainingService:
 
     def _assert_adapter_base(self, adapter: Artifact) -> Artifact:
         runtime_base = self.runtime_base_model
-        stored_base = adapter.schema.get("base_model") if adapter and adapter.schema else None
+        stored_base = (
+            adapter.schema.get("base_model") if adapter and adapter.schema else None
+        )
         if runtime_base and stored_base and stored_base != runtime_base:
             migration_plan = {
                 "expected_base": runtime_base,
@@ -138,7 +144,11 @@ class TrainingService:
             adapter_id_override: Specific adapter ID to use
             adapter_mode: Override default adapter mode (local/remote/prompt/hybrid)
         """
-        existing = [a for a in self.store.list_artifacts(type_filter="adapter") if a.owner_user_id == user_id]
+        existing = [
+            a
+            for a in self.store.list_artifacts(type_filter="adapter")
+            if a.owner_user_id == user_id
+        ]
         if adapter_id_override:
             existing = [a for a in existing if a.id == adapter_id_override]
             if not existing:
@@ -180,7 +190,7 @@ class TrainingService:
 
         # Create new adapter with explicit mode
         resolved_mode = adapter_mode or self.default_adapter_mode
-        adapter_id = adapter_id_override
+        _ = adapter_id_override  # Reserved for future use in adapter creation
         adapter_schema = {
             "kind": "adapter.lora",
             "mode": resolved_mode,  # Explicit adapter mode
@@ -248,13 +258,22 @@ class TrainingService:
         return "hybrid"
 
     def train_from_preferences(
-        self, user_id: str, adapter_id: Optional[str] = None, cluster_id: Optional[str] = None
+        self,
+        user_id: str,
+        adapter_id: Optional[str] = None,
+        cluster_id: Optional[str] = None,
     ) -> Optional[dict]:
-        adapter = self.ensure_user_adapter(user_id) if not adapter_id else self.store.get_artifact(adapter_id)
+        adapter = (
+            self.ensure_user_adapter(user_id)
+            if not adapter_id
+            else self.store.get_artifact(adapter_id)
+        )
         if not adapter:
             raise ConstraintViolation("adapter missing", {"adapter_id": adapter_id})
         if adapter.owner_user_id and adapter.owner_user_id != user_id:
-            raise ConstraintViolation("adapter ownership mismatch", {"adapter_id": adapter.id})
+            raise ConstraintViolation(
+                "adapter ownership mismatch", {"adapter_id": adapter.id}
+            )
         adapter = self._assert_adapter_base(adapter)
         self._apply_adapter_vocab_size(adapter)
         events = self.store.list_preference_events(
@@ -266,7 +285,11 @@ class TrainingService:
             return None
         cluster_meta = self._cluster_events(events, user_id)
         dataset_entries = list(self._build_examples(events))
-        token_batches = list(self._tokenize_batches(dataset_entries, base_model=adapter.schema.get("base_model")))
+        token_batches = list(
+            self._tokenize_batches(
+                dataset_entries, base_model=adapter.schema.get("base_model")
+            )
+        )
         vocab_size = self._vocab_size()
         if adapter.schema.get("vocab_size") != vocab_size:
             adapter_schema = dict(adapter.schema)
@@ -288,7 +311,10 @@ class TrainingService:
         self.store.update_training_job(
             job.id,
             dataset_path=str(dataset_path),
-            meta={"token_batches": [b["shape"] for b in token_batches], "clusters": cluster_meta},
+            meta={
+                "token_batches": [b["shape"] for b in token_batches],
+                "clusters": cluster_meta,
+            },
         )
         next_version = int(adapter.schema.get("current_version", 0)) + 1
         adapter_dir = self._adapter_dir(user_id, adapter.id, adapter.schema)
@@ -382,10 +408,15 @@ class TrainingService:
             explicit_signal=explicit_signal,
             meta=meta or None,
         )
-        if feedback in POSITIVE_FEEDBACK_VALUES and self._should_enqueue_training_job(user_id):
+        if feedback in POSITIVE_FEEDBACK_VALUES and self._should_enqueue_training_job(
+            user_id
+        ):
             adapter = self.ensure_user_adapter(user_id)
             self.store.create_training_job(
-                user_id=user_id, adapter_id=adapter.id, preference_event_ids=[event.id], dataset_path=None
+                user_id=user_id,
+                adapter_id=adapter.id,
+                preference_event_ids=[event.id],
+                dataset_path=None,
             )
         return event
 
@@ -408,7 +439,11 @@ class TrainingService:
         if callable(list_fn):
             jobs = list_fn(user_id=user_id)
         elif hasattr(self.store, "training_jobs"):
-            jobs = [j for j in getattr(self.store, "training_jobs", {}).values() if j.user_id == user_id]
+            jobs = [
+                j
+                for j in getattr(self.store, "training_jobs", {}).values()
+                if j.user_id == user_id
+            ]
         else:
             jobs = []
         try:
@@ -426,13 +461,17 @@ class TrainingService:
         except Exception as exc:
             status = "error"
             error_detail = f"preference retrieval failed: {exc}"
-            logger.warning("list_preference_events_failed", user_id=user_id, error=str(exc))
+            logger.warning(
+                "list_preference_events_failed", user_id=user_id, error=str(exc)
+            )
         totals = {"positive": 0, "negative": 0, "neutral": 0}
         routing_feedback: dict[str, int] = {}
         for event in events:
             totals[event.feedback] = totals.get(event.feedback, 0) + 1
             if event.meta and event.meta.get("routing_trace"):
-                routing_feedback["routing_trace_present"] = routing_feedback.get("routing_trace_present", 0) + 1
+                routing_feedback["routing_trace_present"] = (
+                    routing_feedback.get("routing_trace_present", 0) + 1
+                )
         clusters: List[dict] = []
         clusters_error: Optional[str] = None
         if hasattr(self.store, "list_semantic_clusters"):
@@ -448,7 +487,9 @@ class TrainingService:
                     )
             except Exception as exc:
                 clusters_error = str(exc)
-                logger.warning("list_semantic_clusters_failed", user_id=user_id, error=str(exc))
+                logger.warning(
+                    "list_semantic_clusters_failed", user_id=user_id, error=str(exc)
+                )
         adapter_candidates = [a for a in self.store.list_artifacts(type_filter="adapter")]  # type: ignore[arg-type]
         adapters = [
             {
@@ -461,9 +502,14 @@ class TrainingService:
             for a in adapter_candidates
         ]
         adapter_state = self._collect_adapter_router_state(user_id)
-        if status == "ok" and not events and not clusters and (
-            adapter_state.get("status") in {"no_data", "unavailable"}
-            or not adapter_state.get("entries")
+        if (
+            status == "ok"
+            and not events
+            and not clusters
+            and (
+                adapter_state.get("status") in {"no_data", "unavailable"}
+                or not adapter_state.get("entries")
+            )
         ):
             status = "no_data"
         return {
@@ -472,7 +518,9 @@ class TrainingService:
             "totals": totals,
             "events": [asdict(e) for e in events[-10:]],
             "clusters": clusters,
-            "clusters_status": "error" if clusters_error else ("ok" if clusters else "no_data"),
+            "clusters_status": (
+                "error" if clusters_error else ("ok" if clusters else "no_data")
+            ),
             "clusters_error": clusters_error,
             "adapters": adapters,
             "routing_feedback": routing_feedback,
@@ -484,7 +532,9 @@ class TrainingService:
             try:
                 states = self.store.list_adapter_router_state(user_id=user_id)  # type: ignore[attr-defined]
             except Exception as exc:
-                logger.warning("list_adapter_router_state_failed", user_id=user_id, error=str(exc))
+                logger.warning(
+                    "list_adapter_router_state_failed", user_id=user_id, error=str(exc)
+                )
                 return {"status": "error", "error": str(exc)}
             parsed: List[dict] = []
             for state in states or []:
@@ -502,10 +552,14 @@ class TrainingService:
 
     def _build_examples(self, events: Iterable[PreferenceEvent]) -> Iterable[dict]:
         for event in events:
-            messages = self.store.list_messages(event.conversation_id, limit=200, user_id=event.user_id)
+            messages = self.store.list_messages(
+                event.conversation_id, limit=200, user_id=event.user_id
+            )
             prompt_chunks: List[str] = []
             target_text = event.corrected_text
-            cluster_id = event.cluster_id or self._bucket_embedding(event.context_embedding, event.user_id)
+            cluster_id = event.cluster_id or self._bucket_embedding(
+                event.context_embedding, event.user_id
+            )
             for msg in messages:
                 prompt_chunks.append(f"{msg.role.upper()}: {msg.content}")
                 if msg.id == event.message_id and not target_text:
@@ -548,14 +602,18 @@ class TrainingService:
 
         def _encode(text: str) -> List[int]:
             if self.tokenizer is not None:
-                return list(self.tokenizer.encode(text, truncation=True, max_length=max_length))
+                return list(
+                    self.tokenizer.encode(text, truncation=True, max_length=max_length)
+                )
             # Use deterministic hashing instead of Python's randomized hash()
             tokens = text.split()
+
             def stable_hash(s: str) -> int:
                 h = 0
                 for ch in s:
                     h = (h * 31 + ord(ch)) & 0xFFFFFFFF
                 return h
+
             return [stable_hash(tok) % vocab_size for tok in tokens[:max_length]]
 
         for i in range(0, len(dataset_entries), batch_size):
@@ -573,7 +631,10 @@ class TrainingService:
             yield {
                 "input_ids": [_pad(p, max_prompt) for p in prompts],
                 "labels": [_pad(t, max_target) for t in targets],
-                "attention_mask": [[1] * min(len(p), max_prompt) + [0] * max(0, max_prompt - len(p)) for p in prompts],
+                "attention_mask": [
+                    [1] * min(len(p), max_prompt) + [0] * max(0, max_prompt - len(p))
+                    for p in prompts
+                ],
                 "shape": {
                     "batch": len(batch),
                     "prompt_len": max_prompt,
@@ -581,20 +642,36 @@ class TrainingService:
                 },
             }
 
-    def _adapter_dir(self, user_id: str, adapter_id: str, adapter_schema: Optional[dict] = None) -> Path:
+    def _adapter_dir(
+        self, user_id: str, adapter_id: str, adapter_schema: Optional[dict] = None
+    ) -> Path:
         adapter_schema = adapter_schema or {}
         explicit = adapter_schema.get("cephfs_dir") or adapter_schema.get("fs_dir")
         if explicit:
             candidate = Path(explicit)
             base_root = Path(self.fs_root).resolve()
-            resolved = candidate if candidate.is_absolute() else safe_join(base_root, str(candidate))
+            resolved = (
+                candidate
+                if candidate.is_absolute()
+                else safe_join(base_root, str(candidate))
+            )
             if base_root not in resolved.parents and resolved != base_root:
-                raise PathTraversalError("adapter directory must reside under shared_fs_root")
+                raise PathTraversalError(
+                    "adapter directory must reside under shared_fs_root"
+                )
             return resolved
         return safe_join(self.fs_root, f"adapters/{adapter_id}")
 
-    def _job_dir(self, user_id: str, adapter_id: str, job_id: str, adapter_schema: Optional[dict] = None) -> Path:
-        return safe_join(self._adapter_dir(user_id, adapter_id, adapter_schema), f"jobs/{job_id}")
+    def _job_dir(
+        self,
+        user_id: str,
+        adapter_id: str,
+        job_id: str,
+        adapter_schema: Optional[dict] = None,
+    ) -> Path:
+        return safe_join(
+            self._adapter_dir(user_id, adapter_id, adapter_schema), f"jobs/{job_id}"
+        )
 
     def _update_latest_symlink(self, adapter_dir: Path, version_dir: Path) -> None:
         latest = adapter_dir / "latest"
@@ -604,15 +681,23 @@ class TrainingService:
         temp.symlink_to(version_dir, target_is_directory=True)
         temp.replace(latest)
 
-    def _init_lora_weights(self, rank: int, layers: List[int], matrices: List[str]) -> dict:
+    def _init_lora_weights(
+        self, rank: int, layers: List[int], matrices: List[str]
+    ) -> dict:
         weights: dict[str, list[list[float]]] = {}
         hidden_dim = max(rank * 4, 8)
         for layer in layers:
             for matrix in matrices:
                 key_a = f"layer_{layer}.{matrix}.A"
                 key_b = f"layer_{layer}.{matrix}.B"
-                weights[key_a] = [[random.uniform(-0.01, 0.01) for _ in range(hidden_dim)] for _ in range(rank)]
-                weights[key_b] = [[random.uniform(-0.01, 0.01) for _ in range(rank)] for _ in range(hidden_dim)]
+                weights[key_a] = [
+                    [random.uniform(-0.01, 0.01) for _ in range(hidden_dim)]
+                    for _ in range(rank)
+                ]
+                weights[key_b] = [
+                    [random.uniform(-0.01, 0.01) for _ in range(rank)]
+                    for _ in range(hidden_dim)
+                ]
         return weights
 
     def _run_jax_optax_training(
@@ -641,7 +726,9 @@ class TrainingService:
             import jax.numpy as jnp
             import optax
         except Exception as exc:
-            logger.warning("training_loop_skipped", reason="jax_optax_unavailable", error=str(exc))
+            logger.warning(
+                "training_loop_skipped", reason="jax_optax_unavailable", error=str(exc)
+            )
             return {"status": "skipped", "reason": "jax/optax not installed"}
 
         vocab_size = max(self._vocab_size(), 1)
@@ -660,7 +747,9 @@ class TrainingService:
         hidden_dim = hidden_dim or 16
 
         emb_table = jnp.sin(
-            jnp.arange(vocab_size * hidden_dim, dtype=jnp.float32).reshape(vocab_size, hidden_dim)
+            jnp.arange(vocab_size * hidden_dim, dtype=jnp.float32).reshape(
+                vocab_size, hidden_dim
+            )
             / float(hidden_dim)
         )
 
@@ -707,7 +796,9 @@ class TrainingService:
             logits = jnp.einsum("bsh,vh->bsv", lora_embeds, emb_table)
             labels = jnp.clip(labels, 0, vocab_size - 1)
             log_probs = jax.nn.log_softmax(logits, axis=-1)
-            nll = -jnp.take_along_axis(log_probs, labels[..., None], axis=-1).squeeze(-1)
+            nll = -jnp.take_along_axis(log_probs, labels[..., None], axis=-1).squeeze(
+                -1
+            )
             masked = nll * mask
             denom = jnp.maximum(jnp.sum(mask), 1.0)
             return jnp.sum(masked) / denom
@@ -722,24 +813,48 @@ class TrainingService:
 
         for step, batch in enumerate(batches, start=1):
             value, grads = grad_fn(params_tree, batch)
-            accum_grads = grads if accum_grads is None else jax.tree_util.tree_map(lambda a, b: a + b, accum_grads, grads)
+            accum_grads = (
+                grads
+                if accum_grads is None
+                else jax.tree_util.tree_map(lambda a, b: a + b, accum_grads, grads)
+            )
             accum_count += 1
             if accum_count < accumulation_steps and step < len(batches):
-                trace.append({"loss": float(value), "shape": batch["shape"], "accumulating": True})
+                trace.append(
+                    {
+                        "loss": float(value),
+                        "shape": batch["shape"],
+                        "accumulating": True,
+                    }
+                )
                 continue
 
-            mean_grads = jax.tree_util.tree_map(lambda g: g / float(accum_count), accum_grads)
+            mean_grads = jax.tree_util.tree_map(
+                lambda g: g / float(accum_count), accum_grads
+            )
             updates, opt_state = opt.update(mean_grads, opt_state, params_tree)
             params_tree = optax.apply_updates(params_tree, updates)
-            trace.append({"loss": float(value), "shape": batch["shape"], "accumulated": accum_count})
+            trace.append(
+                {
+                    "loss": float(value),
+                    "shape": batch["shape"],
+                    "accumulated": accum_count,
+                }
+            )
             _checkpoint(step, params_tree)
             accum_grads = None
             accum_count = 0
 
         params_path.write_text(json.dumps(_to_python(params_tree), indent=2))
-        return {"status": "ok", "steps": trace[-10:], "final_params_path": str(params_path)}
+        return {
+            "status": "ok",
+            "steps": trace[-10:],
+            "final_params_path": str(params_path),
+        }
 
-    def _bucket_embedding(self, embedding: Sequence[float], user_id: str) -> Optional[str]:
+    def _bucket_embedding(
+        self, embedding: Sequence[float], user_id: str
+    ) -> Optional[str]:
         if not embedding:
             return None
         # Use deterministic hashing instead of Python's randomized hash()
@@ -751,10 +866,14 @@ class TrainingService:
                 h = (h * 31 + ord(ch)) & 0xFFFFFFFF
         return f"{user_id}-c{h % 1_000_000:06d}"
 
-    def _cluster_events(self, events: Sequence[PreferenceEvent], user_id: str) -> List[dict]:
+    def _cluster_events(
+        self, events: Sequence[PreferenceEvent], user_id: str
+    ) -> List[dict]:
         clusters: dict[str, dict] = {}
         for event in events:
-            cluster_id = event.cluster_id or self._bucket_embedding(event.context_embedding, user_id)
+            cluster_id = event.cluster_id or self._bucket_embedding(
+                event.context_embedding, user_id
+            )
             cluster_key = cluster_id or f"{user_id}-conv-{event.conversation_id}"
             cluster = clusters.setdefault(cluster_key, {"embeddings": [], "events": []})
             if event.context_embedding:

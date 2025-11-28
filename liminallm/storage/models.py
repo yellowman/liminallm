@@ -41,7 +41,11 @@ class Session:
     def __post_init__(self) -> None:
         if self.expires_at <= self.created_at:
             raise ValueError("session expiration must be after creation time")
-        if self.enforce_future_expiry and not self.allow_expired and self.expires_at <= datetime.utcnow():
+        if (
+            self.enforce_future_expiry
+            and not self.allow_expired
+            and self.expires_at <= datetime.utcnow()
+        ):
             raise ValueError("session expiration must be in the future")
 
     @classmethod

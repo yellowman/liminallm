@@ -26,7 +26,9 @@ class RedisCache:
         finally:
             sync_client.close()
 
-    async def cache_session(self, session_id: str, user_id: str, expires_at: datetime) -> None:
+    async def cache_session(
+        self, session_id: str, user_id: str, expires_at: datetime
+    ) -> None:
         ttl = max(1, int((expires_at - datetime.utcnow()).total_seconds()))
         await self.client.set(f"auth:session:{session_id}", user_id, ex=ttl)
 
@@ -57,7 +59,9 @@ class RedisCache:
         cached = await self.client.get(f"router:last:{user_id}:{ctx_hash}")
         return json.loads(cached) if cached else None
 
-    async def set_router_cache(self, user_id: str, ctx_hash: str, payload: dict, ttl_seconds: int = 300) -> None:
+    async def set_router_cache(
+        self, user_id: str, ctx_hash: str, payload: dict, ttl_seconds: int = 300
+    ) -> None:
         await self.client.set(
             f"router:last:{user_id}:{ctx_hash}", json.dumps(payload), ex=ttl_seconds
         )
@@ -66,7 +70,9 @@ class RedisCache:
         cached = await self.client.get(f"workflow:state:{state_key}")
         return json.loads(cached) if cached else None
 
-    async def set_workflow_state(self, state_key: str, state: dict, ttl_seconds: int = 1800) -> None:
+    async def set_workflow_state(
+        self, state_key: str, state: dict, ttl_seconds: int = 1800
+    ) -> None:
         await self.client.set(
             f"workflow:state:{state_key}", json.dumps(state), ex=ttl_seconds
         )
@@ -93,7 +99,9 @@ class RedisCache:
         }
         await self.client.set(f"auth:oauth:{state}", json.dumps(payload), ex=ttl)
 
-    async def pop_oauth_state(self, state: str) -> Optional[tuple[str, datetime, Optional[str]]]:
+    async def pop_oauth_state(
+        self, state: str
+    ) -> Optional[tuple[str, datetime, Optional[str]]]:
         key = f"auth:oauth:{state}"
         cached = await self.client.get(key)
         if cached is None:
@@ -101,15 +109,26 @@ class RedisCache:
         await self.client.delete(key)
         data = json.loads(cached)
         expires_raw = data.get("expires_at")
-        expires_at = datetime.fromisoformat(expires_raw) if isinstance(expires_raw, str) else datetime.utcnow()
+        expires_at = (
+            datetime.fromisoformat(expires_raw)
+            if isinstance(expires_raw, str)
+            else datetime.utcnow()
+        )
         return data.get("provider"), expires_at, data.get("tenant_id")
 
-    async def get_idempotency_record(self, route: str, user_id: str, key: str) -> Optional[dict]:
+    async def get_idempotency_record(
+        self, route: str, user_id: str, key: str
+    ) -> Optional[dict]:
         cached = await self.client.get(f"idemp:{route}:{user_id}:{key}")
         return json.loads(cached) if cached else None
 
     async def set_idempotency_record(
-        self, route: str, user_id: str, key: str, record: dict, ttl_seconds: int = 60 * 60 * 24
+        self,
+        route: str,
+        user_id: str,
+        key: str,
+        record: dict,
+        ttl_seconds: int = 60 * 60 * 24,
     ) -> None:
         await self.client.set(
             f"idemp:{route}:{user_id}:{key}", json.dumps(record), ex=ttl_seconds

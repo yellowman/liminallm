@@ -8,12 +8,14 @@ class RecordingRAG:
         self.calls = []
 
     def retrieve(self, context_ids, query, limit=4, *, user_id=None, tenant_id=None):
-        self.calls.append({
-            "context_ids": context_ids,
-            "query": query,
-            "user_id": user_id,
-            "tenant_id": tenant_id,
-        })
+        self.calls.append(
+            {
+                "context_ids": context_ids,
+                "query": query,
+                "user_id": user_id,
+                "tenant_id": tenant_id,
+            }
+        )
         return []
 
 
@@ -23,7 +25,9 @@ class StubLLM:
 
 
 class StubRouter:
-    async def route(self, policy, context_embedding, candidates, *, ctx_cluster=None, user_id=None):
+    async def route(
+        self, policy, context_embedding, candidates, *, ctx_cluster=None, user_id=None
+    ):
         return {"adapters": [], "trace": []}
 
 
@@ -46,7 +50,9 @@ async def test_workflow_rag_tools_receive_identity():
         user_id="user-1",
         tenant_id="tenant-1",
     )
-    await engine.run(None, None, "question?", "ctx-2", user_id="user-1", tenant_id="tenant-1")
+    await engine.run(
+        None, None, "question?", "ctx-2", user_id="user-1", tenant_id="tenant-1"
+    )
 
     assert rag.calls[0]["user_id"] == "user-1"
     assert rag.calls[0]["tenant_id"] == "tenant-1"

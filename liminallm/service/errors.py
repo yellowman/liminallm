@@ -8,7 +8,13 @@ class ServiceError(Exception):
 
     status_code: int = 400
 
-    def __init__(self, message: str, *, status_code: Optional[int] = None, detail: Optional[dict] = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: Optional[int] = None,
+        detail: Optional[dict] = None,
+    ) -> None:
         super().__init__(message)
         self.message = message
         self.status_code = status_code or self.status_code
