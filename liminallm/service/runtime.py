@@ -113,10 +113,13 @@ class Runtime:
         self._local_rate_limit_lock = asyncio.Lock()
 
 
-runtime = Runtime()
+runtime: Runtime | None = None
 
 
 def get_runtime() -> Runtime:
+    global runtime
+    if runtime is None:
+        runtime = Runtime()
     return runtime
 
 
