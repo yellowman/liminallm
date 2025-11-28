@@ -5,6 +5,9 @@ and external API modes:
 1. Weighted adapter blending (respects router gate weights)
 2. Base model compatibility validation
 3. Deterministic tokenizer fallback (FNV-1a hash)
+
+NOTE: Tests that use LocalJaxLoRABackend require JAX. The entire module
+is skipped when JAX is not installed to prevent CI failures.
 """
 
 from __future__ import annotations
@@ -12,6 +15,9 @@ from __future__ import annotations
 import json
 
 import pytest
+
+# Skip entire module if JAX is not available - LocalJaxLoRABackend requires JAX
+pytest.importorskip("jax", reason="JAX not installed - skipping LocalJaxLoRABackend tests")
 
 from liminallm.service.model_backend import (
     LocalJaxLoRABackend,
