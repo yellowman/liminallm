@@ -14,21 +14,11 @@ import pytest
 
 from liminallm.config import AdapterMode
 
-# Check if JAX is available
-try:
-    import jax  # noqa: F401
+# Use pytest.importorskip to skip ALL tests in this module if JAX is not available
+# This is more robust than pytestmark as it works at import time
+jax = pytest.importorskip("jax", reason="JAX not installed - skipping LocalJaxLoRABackend tests")
 
-    HAS_JAX = True
-except ImportError:
-    HAS_JAX = False
-
-# Skip entire module if JAX not available
-pytestmark = pytest.mark.skipif(not HAS_JAX, reason="JAX not installed")
-
-
-# Only import LocalJaxLoRABackend if JAX is available to avoid import errors
-if HAS_JAX:
-    from liminallm.service.model_backend import LocalJaxLoRABackend
+from liminallm.service.model_backend import LocalJaxLoRABackend
 
 
 # ==============================================================================
@@ -37,7 +27,7 @@ if HAS_JAX:
 
 
 @pytest.fixture
-def backend_with_adapters(tmp_path: Path) -> Tuple["LocalJaxLoRABackend", Path]:
+def backend_with_adapters(tmp_path: Path) -> Tuple[LocalJaxLoRABackend, Path]:
     """Create a LocalJaxLoRABackend with test adapters."""
     backend = LocalJaxLoRABackend("test-model", str(tmp_path))
 
