@@ -62,7 +62,7 @@ class Runtime:
                 ),
                 mode=fallback_mode,
             )
-        self.router = RouterEngine(cache=self.cache, backend_mode=backend_mode)
+        # Compute backend_mode before creating services that need it
         runtime_config = {}
         db_backend_mode = None
         if hasattr(self.store, "get_runtime_config"):
@@ -70,6 +70,7 @@ class Runtime:
             db_backend_mode = runtime_config.get("model_backend")
         resolved_base_model = runtime_config.get("model_path") or self.settings.model_path
         backend_mode = db_backend_mode or self.settings.model_backend
+        self.router = RouterEngine(cache=self.cache, backend_mode=backend_mode)
         adapter_configs = {
             "openai": {
                 "api_key": self.settings.adapter_openai_api_key,

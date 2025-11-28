@@ -108,7 +108,7 @@ class IdempotencyGuard:
                 self.route,
                 self.user_id,
                 self.idempotency_key,
-                Envelope(status="error", error={"message": str(exc)}, request_id=self.request_id),
+                Envelope(status="error", error={"code": "server_error", "message": str(exc)}, request_id=self.request_id),
                 status="failed",
             )
             self._stored = True
