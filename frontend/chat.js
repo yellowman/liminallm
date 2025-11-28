@@ -566,10 +566,6 @@ const sendMessage = async (event) => {
     showStatus('Sign in to chat.', true);
     return;
   }
-  toggleButtonBusy(sendBtn, true, 'Sending...');
-  document.getElementById('message-input').value = '';
-  appendMessage('user', content);
-  showStatus('Thinking...');
   const payload = {
     conversation_id: state.conversationId || undefined,
     message: { content, mode: 'text' },
@@ -661,6 +657,12 @@ const sendMessage = async (event) => {
   };
 
   try {
+    // UI updates inside try block so finally can reset the button on any error
+    toggleButtonBusy(sendBtn, true, 'Sending...');
+    document.getElementById('message-input').value = '';
+    appendMessage('user', content);
+    showStatus('Thinking...');
+
     const data = await chatViaWebSocket().catch(async () => {
       const envelope = await requestEnvelope(
         `${apiBase}/chat`,
