@@ -29,8 +29,12 @@ class Runtime:
 
     def __init__(self):
         self.settings = get_settings()
-        self.store = MemoryStore(fs_root=self.settings.shared_fs_root) if self.settings.use_memory_store else PostgresStore(
-            self.settings.database_url, fs_root=self.settings.shared_fs_root
+        self.store = (
+            MemoryStore(fs_root=self.settings.shared_fs_root)
+            if self.settings.use_memory_store
+            else PostgresStore(
+                self.settings.database_url, fs_root=self.settings.shared_fs_root
+            )
         )
         self.cache = None
         redis_error: Exception | None = None
@@ -44,13 +48,18 @@ class Runtime:
                 self.cache = None
 
         if not self.cache:
-            if not self.settings.test_mode and not self.settings.allow_redis_fallback_dev:
+            if (
+                not self.settings.test_mode
+                and not self.settings.allow_redis_fallback_dev
+            ):
                 raise RuntimeError(
                     "Redis is required for sessions, rate limits, idempotency, and workflow caches; "
                     "start Redis or set TEST_MODE=true/ALLOW_REDIS_FALLBACK_DEV=true for local fallback."
                 ) from redis_error
 
-            fallback_mode = "TEST_MODE" if self.settings.test_mode else "ALLOW_REDIS_FALLBACK_DEV"
+            fallback_mode = (
+                "TEST_MODE" if self.settings.test_mode else "ALLOW_REDIS_FALLBACK_DEV"
+            )
 
             logger.warning(
                 "redis_disabled_fallback",
@@ -68,7 +77,9 @@ class Runtime:
         if hasattr(self.store, "get_runtime_config"):
             runtime_config = self.store.get_runtime_config() or {}
             db_backend_mode = runtime_config.get("model_backend")
-        resolved_base_model = runtime_config.get("model_path") or self.settings.model_path
+        resolved_base_model = (
+            runtime_config.get("model_path") or self.settings.model_path
+        )
         backend_mode = db_backend_mode or self.settings.model_backend
         self.router = RouterEngine(cache=self.cache, backend_mode=backend_mode)
         adapter_configs = {
@@ -103,9 +114,13 @@ class Runtime:
             backend_mode=backend_mode,
         )
         self.clusterer = SemanticClusterer(self.store, self.llm, self.training)
-        self.workflow = WorkflowEngine(self.store, self.llm, self.router, self.rag, cache=self.cache)
+        self.workflow = WorkflowEngine(
+            self.store, self.llm, self.router, self.rag, cache=self.cache
+        )
         self.voice = VoiceService(self.settings.shared_fs_root)
-        self.config_ops = ConfigOpsService(self.store, self.llm, self.router, self.training)
+        self.config_ops = ConfigOpsService(
+            self.store, self.llm, self.router, self.training
+        )
         self.auth = AuthService(
             self.store,
             self.cache,
@@ -143,7 +158,9 @@ def reset_runtime_for_tests() -> Runtime:
 IDEMPOTENCY_TTL_SECONDS = 60 * 60 * 24
 
 
-async def _get_cached_idempotency_record(runtime: Runtime, route: str, user_id: str, key: str) -> Optional[dict]:
+async def _get_cached_idempotency_record(
+    runtime: Runtime, route: str, user_id: str, key: str
+) -> Optional[dict]:
     now = datetime.utcnow()
     if runtime.cache:
         return await runtime.cache.get_idempotency_record(route, user_id, key)
@@ -168,13 +185,20 @@ async def _set_cached_idempotency_record(
 ) -> None:
     expires_at = datetime.utcnow() + timedelta(seconds=ttl_seconds)
     if runtime.cache:
-        await runtime.cache.set_idempotency_record(route, user_id, key, record, ttl_seconds=ttl_seconds)
+        await runtime.cache.set_idempotency_record(
+            route, user_id, key, record, ttl_seconds=ttl_seconds
+        )
         return
     async with runtime._local_idempotency_lock:
-        runtime._local_idempotency[(route, user_id, key)] = {**record, "expires_at": expires_at}
+        runtime._local_idempotency[(route, user_id, key)] = {
+            **record,
+            "expires_at": expires_at,
+        }
 
 
-async def check_rate_limit(runtime: Runtime, key: str, limit: int, window_seconds: int) -> bool:
+async def check_rate_limit(
+    runtime: Runtime, key: str, limit: int, window_seconds: int
+) -> bool:
     """Enforce rate limits even when Redis is unavailable.
 
     Per SPEC §18, rate limits use Redis token bucket with configurable defaults.

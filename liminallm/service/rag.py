@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import math
 import os
-import uuid
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 
@@ -55,13 +54,19 @@ class RAGService:
             return []
 
         normalized_query = query or ""
-        return self._retriever(context_ids, normalized_query, limit, user_id=user_id, tenant_id=tenant_id)
+        return self._retriever(
+            context_ids, normalized_query, limit, user_id=user_id, tenant_id=tenant_id
+        )
 
     def _uses_pgvector(self) -> bool:
         return self.rag_mode in {"pgvector", "pg", "vector"}
 
     def _allowed_context_ids(
-        self, context_ids: Sequence[str], *, user_id: Optional[str], tenant_id: Optional[str]
+        self,
+        context_ids: Sequence[str],
+        *,
+        user_id: Optional[str],
+        tenant_id: Optional[str],
     ) -> List[str]:
         if not user_id:
             return []
@@ -77,7 +82,11 @@ class RAGService:
                 if user_id and ctx.owner_user_id != user_id:
                     continue
                 if tenant_id:
-                    owner = users.get(ctx.owner_user_id) if isinstance(users, dict) else None
+                    owner = (
+                        users.get(ctx.owner_user_id)
+                        if isinstance(users, dict)
+                        else None
+                    )
                     if not owner or owner.tenant_id != tenant_id:
                         continue
                 allowed.append(ctx_id)
@@ -90,7 +99,9 @@ class RAGService:
             if user_id and context.owner_user_id != user_id:
                 continue
             if tenant_id:
-                owner = getattr(self.store, "get_user", lambda *_: None)(context.owner_user_id)
+                owner = getattr(self.store, "get_user", lambda *_: None)(
+                    context.owner_user_id
+                )
                 if not owner or owner.tenant_id != tenant_id:
                     continue
             allowed.append(ctx_id)
@@ -105,7 +116,9 @@ class RAGService:
         user_id: Optional[str],
         tenant_id: Optional[str],
     ) -> List[KnowledgeChunk]:
-        allowed_ids = self._allowed_context_ids(context_ids, user_id=user_id, tenant_id=tenant_id)
+        allowed_ids = self._allowed_context_ids(
+            context_ids, user_id=user_id, tenant_id=tenant_id
+        )
         if not allowed_ids:
             return []
 
@@ -113,7 +126,13 @@ class RAGService:
         filters = {"embedding_model_id": self.embedding_model_id}
 
         return self.store.search_chunks_pgvector(  # type: ignore[attr-defined]
-            allowed_ids, query, query_embedding, limit, filters=filters, user_id=user_id, tenant_id=tenant_id
+            allowed_ids,
+            query,
+            query_embedding,
+            limit,
+            filters=filters,
+            user_id=user_id,
+            tenant_id=tenant_id,
         )
 
     def _retrieve_local_hybrid(
@@ -125,27 +144,39 @@ class RAGService:
         user_id: Optional[str],
         tenant_id: Optional[str],
     ) -> List[KnowledgeChunk]:
-        allowed_ids = self._allowed_context_ids(context_ids, user_id=user_id, tenant_id=tenant_id)
+        allowed_ids = self._allowed_context_ids(
+            context_ids, user_id=user_id, tenant_id=tenant_id
+        )
         if not allowed_ids:
             return []
 
         query_embedding = self.embed(query)
-        legacy_search = getattr(self.store, "search_chunks", None) or getattr(self.store, "search_chunks_legacy", None)
+        legacy_search = getattr(self.store, "search_chunks", None) or getattr(
+            self.store, "search_chunks_legacy", None
+        )
         if not callable(legacy_search):
             return []
 
         results: List[KnowledgeChunk] = []
         per_context_limit = max(1, math.ceil(limit / len(allowed_ids)))
         for ctx_id in allowed_ids:
-            results.extend(legacy_search(ctx_id, query, query_embedding, per_context_limit))
+            results.extend(
+                legacy_search(ctx_id, query, query_embedding, per_context_limit)
+            )
 
         filtered = [
-            chunk for chunk in results if (chunk.meta or {}).get("embedding_model_id") == self.embedding_model_id
+            chunk
+            for chunk in results
+            if (chunk.meta or {}).get("embedding_model_id") == self.embedding_model_id
         ]
         return filtered[:limit]
 
     def ingest_text(
-        self, context_id: str, text: str, chunk_size: Optional[int] = None, source_path: Optional[str] = None
+        self,
+        context_id: str,
+        text: str,
+        chunk_size: Optional[int] = None,
+        source_path: Optional[str] = None,
     ) -> int:
         if not hasattr(self.store, "add_chunks"):
             return 0
@@ -173,9 +204,13 @@ class RAGService:
             self.store.add_chunks(context_id, chunks)  # type: ignore[attr-defined]
         return len(chunks)
 
-    def ingest_file(self, context_id: str, path: str, chunk_size: Optional[int] = None) -> int:
+    def ingest_file(
+        self, context_id: str, path: str, chunk_size: Optional[int] = None
+    ) -> int:
         data = Path(path).read_text(encoding="utf-8", errors="ignore")
-        return self.ingest_text(context_id, data, chunk_size=chunk_size, source_path=path)
+        return self.ingest_text(
+            context_id, data, chunk_size=chunk_size, source_path=path
+        )
 
     def embed_text(self, text: str) -> List[float]:
         """Backward-compatible hook: use the deterministic embedding pipeline."""

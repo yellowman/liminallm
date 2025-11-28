@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from jsonschema import Draft202012Validator, ValidationError
+from jsonschema import Draft202012Validator
 
 
 _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
@@ -29,7 +29,9 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
                                 "type": "object",
                                 "properties": {
                                     "when": {},
-                                    "next": {"anyOf": [{"type": "string"}, {"type": "array"}]},
+                                    "next": {
+                                        "anyOf": [{"type": "string"}, {"type": "array"}]
+                                    },
                                 },
                                 "required": ["when", "next"],
                             },

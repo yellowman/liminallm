@@ -8,7 +8,11 @@ import json
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 from liminallm.service.embeddings import cosine_similarity, pad_vectors
-from liminallm.storage.models import POSITIVE_FEEDBACK_VALUES, PreferenceEvent, SemanticCluster
+from liminallm.storage.models import (
+    POSITIVE_FEEDBACK_VALUES,
+    PreferenceEvent,
+    SemanticCluster,
+)
 
 
 class SemanticClusterer:
@@ -22,7 +26,9 @@ class SemanticClusterer:
     async def cluster_user_preferences(
         self, user_id: str, *, k: int = 3, batch_size: int = 8, min_events: int = 3
     ) -> List[SemanticCluster]:
-        events_raw = self.store.list_preference_events(user_id=user_id, feedback=POSITIVE_FEEDBACK_VALUES)
+        events_raw = self.store.list_preference_events(
+            user_id=user_id, feedback=POSITIVE_FEEDBACK_VALUES
+        )
         events = events_raw
         if inspect.isawaitable(events_raw):
             events = await events_raw
@@ -31,8 +37,12 @@ class SemanticClusterer:
             return []
         embeddings = pad_vectors([list(e.context_embedding) for e in events])
         k = min(k, len(embeddings))
-        centroids, assignments = self._mini_batch_kmeans(embeddings, k=k, batch_size=batch_size)
-        cluster_events: Dict[int, list[PreferenceEvent]] = {i: [] for i in range(len(centroids))}
+        centroids, assignments = self._mini_batch_kmeans(
+            embeddings, k=k, batch_size=batch_size
+        )
+        cluster_events: Dict[int, list[PreferenceEvent]] = {
+            i: [] for i in range(len(centroids))
+        }
         for idx, event in enumerate(events):
             cluster_idx = assignments[idx]
             cluster_events.setdefault(cluster_idx, []).append(event)
@@ -56,7 +66,11 @@ class SemanticClusterer:
         return results
 
     def _mini_batch_kmeans(
-        self, embeddings: Sequence[Sequence[float]], k: int, batch_size: int = 8, iters: int = 10
+        self,
+        embeddings: Sequence[Sequence[float]],
+        k: int,
+        batch_size: int = 8,
+        iters: int = 10,
     ) -> Tuple[List[List[float]], List[int]]:
         if not embeddings or k <= 0:
             return [], []
@@ -66,7 +80,9 @@ class SemanticClusterer:
             return [], []
         assignments = [0 for _ in embeddings]
         for _ in range(iters):
-            batch_indices = random.sample(range(len(embeddings)), min(batch_size, len(embeddings)))
+            batch_indices = random.sample(
+                range(len(embeddings)), min(batch_size, len(embeddings))
+            )
             for idx in batch_indices:
                 vec = embeddings[idx]
                 sims = [cosine_similarity(vec, c) for c in centroids]
@@ -74,7 +90,9 @@ class SemanticClusterer:
                 assignments[idx] = best
                 # simple centroid update
                 lr = 0.2
-                centroids[best] = [c + lr * (v - c) for c, v in zip(centroids[best], vec)]
+                centroids[best] = [
+                    c + lr * (v - c) for c, v in zip(centroids[best], vec)
+                ]
         # final assignment
         for idx, vec in enumerate(embeddings):
             sims = [cosine_similarity(vec, c) for c in centroids]
@@ -82,7 +100,10 @@ class SemanticClusterer:
         return centroids, assignments
 
     async def label_clusters(
-        self, clusters: Iterable[SemanticCluster], events: Sequence[PreferenceEvent], samples: int = 3
+        self,
+        clusters: Iterable[SemanticCluster],
+        events: Sequence[PreferenceEvent],
+        samples: int = 3,
     ) -> None:
         event_lookup = {e.cluster_id: [] for e in events if e.cluster_id}
         for evt in events:
@@ -104,7 +125,9 @@ class SemanticClusterer:
                 meta={"labeled_at": datetime.utcnow().isoformat()},
             )
 
-    async def _label_with_llm(self, cluster: SemanticCluster, text: str) -> Tuple[str, str]:
+    async def _label_with_llm(
+        self, cluster: SemanticCluster, text: str
+    ) -> Tuple[str, str]:
         if self.llm:
             prompt = (
                 "You label semantic clusters of user preference events. "
@@ -113,19 +136,24 @@ class SemanticClusterer:
             )
             generate_fn = getattr(self.llm, "generate", None)
             if inspect.iscoroutinefunction(generate_fn):
-                resp = await generate_fn(prompt, adapters=[], context_snippets=[], history=None)
-            elif callable(getattr(asyncio, "to_thread", None)):
-                resp = await asyncio.to_thread(
-                    generate_fn, prompt, [], [], None
+                resp = await generate_fn(
+                    prompt, adapters=[], context_snippets=[], history=None
                 )
+            elif callable(getattr(asyncio, "to_thread", None)):
+                resp = await asyncio.to_thread(generate_fn, prompt, [], [], None)
             else:
-                resp = generate_fn(prompt, adapters=[], context_snippets=[], history=None)
+                resp = generate_fn(
+                    prompt, adapters=[], context_snippets=[], history=None
+                )
             content = resp.get("content", "") if isinstance(resp, dict) else ""
             parsed = self._parse_label_response(content)
             if parsed:
                 return parsed
         fallback = text.split(" ")[:5]
-        return (" ".join(fallback) or "Unlabeled cluster", text[:140] or "No description")
+        return (
+            " ".join(fallback) or "Unlabeled cluster",
+            text[:140] or "No description",
+        )
 
     def _parse_label_response(self, content: str) -> Tuple[str, str] | None:
         if not content:
@@ -158,12 +186,18 @@ class SemanticClusterer:
         promoted: List[str] = []
         clusters = self.store.list_semantic_clusters()
         adapters = self.store.list_artifacts(type_filter="adapter")  # type: ignore[arg-type]
-        bound_clusters = {a.schema.get("cluster_id") for a in adapters if isinstance(a.schema, dict)}
+        bound_clusters = {
+            a.schema.get("cluster_id") for a in adapters if isinstance(a.schema, dict)
+        }
         for cluster in clusters:
             events = self.store.list_preference_events(cluster_id=cluster.id)
             if len(events) < min_size or cluster.id in bound_clusters:
                 continue
-            positive = [e for e in events if e.feedback in POSITIVE_FEEDBACK_VALUES or (e.score or 0) > 0]
+            positive = [
+                e
+                for e in events
+                if e.feedback in POSITIVE_FEEDBACK_VALUES or (e.score or 0) > 0
+            ]
             ratio = len(positive) / len(events) if events else 0.0
             if ratio < positive_ratio:
                 continue
@@ -185,7 +219,9 @@ class SemanticClusterer:
                 owner_user_id=owner_id,
             )
             if self.training:
-                self.training.ensure_user_adapter(owner_id, adapter_id_override=adapter.id)
+                self.training.ensure_user_adapter(
+                    owner_id, adapter_id_override=adapter.id
+                )
                 create_training_job = getattr(self.store, "create_training_job", None)
                 if callable(create_training_job):
                     create_training_job(

@@ -72,7 +72,9 @@ def _eval_node(
 
     if isinstance(node, ast.UnaryOp):
         if isinstance(node.op, ast.Not):
-            return not bool(_eval_node(node.operand, names, allowed_callables, _depth + 1))
+            return not bool(
+                _eval_node(node.operand, names, allowed_callables, _depth + 1)
+            )
         if isinstance(node.op, ast.USub):
             return -_eval_node(node.operand, names, allowed_callables, _depth + 1)
         if isinstance(node.op, ast.UAdd):
@@ -83,7 +85,10 @@ def _eval_node(
         op = _BIN_OPS.get(type(node.op))
         if op is None:
             raise ValueError("unsupported binary operator")
-        return op(_eval_node(node.left, names, allowed_callables, _depth + 1), _eval_node(node.right, names, allowed_callables, _depth + 1))
+        return op(
+            _eval_node(node.left, names, allowed_callables, _depth + 1),
+            _eval_node(node.right, names, allowed_callables, _depth + 1),
+        )
 
     if isinstance(node, ast.Compare):
         left = _eval_node(node.left, names, allowed_callables, _depth + 1)
@@ -105,12 +110,17 @@ def _eval_node(
         func = allowed_callables[node.func.id]
         if not callable(func):
             raise ValueError("call target is not callable")
-        args = [_eval_node(arg, names, allowed_callables, _depth + 1) for arg in node.args]
+        args = [
+            _eval_node(arg, names, allowed_callables, _depth + 1) for arg in node.args
+        ]
         # Reject **kwargs unpacking (kw.arg is None when using **dict syntax)
         for kw in node.keywords:
             if kw.arg is None:
                 raise ValueError("keyword unpacking (**kwargs) not permitted")
-        kwargs = {kw.arg: _eval_node(kw.value, names, allowed_callables, _depth + 1) for kw in node.keywords}
+        kwargs = {
+            kw.arg: _eval_node(kw.value, names, allowed_callables, _depth + 1)
+            for kw in node.keywords
+        }
         return func(*args, **kwargs)
 
     if isinstance(node, ast.Subscript):
@@ -124,21 +134,31 @@ def _eval_node(
             raise ValueError(f"invalid subscript access: {exc}")
 
     if isinstance(node, ast.Tuple):
-        return tuple(_eval_node(elt, names, allowed_callables, _depth + 1) for elt in node.elts)
+        return tuple(
+            _eval_node(elt, names, allowed_callables, _depth + 1) for elt in node.elts
+        )
 
     if isinstance(node, ast.List):
-        return [_eval_node(elt, names, allowed_callables, _depth + 1) for elt in node.elts]
+        return [
+            _eval_node(elt, names, allowed_callables, _depth + 1) for elt in node.elts
+        ]
 
     if isinstance(node, ast.Dict):
         return {
-            _eval_node(k, names, allowed_callables, _depth + 1): _eval_node(v, names, allowed_callables, _depth + 1)
+            _eval_node(k, names, allowed_callables, _depth + 1): _eval_node(
+                v, names, allowed_callables, _depth + 1
+            )
             for k, v in zip(node.keys, node.values)
         }
 
     raise ValueError(f"unsupported expression node: {type(node).__name__}")
 
 
-def safe_eval_expr(expr: str, names: Mapping[str, Any], allowed_callables: Mapping[str, Any] | None = None) -> Any:
+def safe_eval_expr(
+    expr: str,
+    names: Mapping[str, Any],
+    allowed_callables: Mapping[str, Any] | None = None,
+) -> Any:
     """Evaluate an expression with a constrained AST allowlist.
 
     Only supports boolean operators, comparisons, indexing, numeric ops, and calling

@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import asyncio
 import time
-from typing import Any, Dict, List, Optional
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import Optional
+from unittest.mock import patch
 
 import pytest
 
@@ -128,7 +127,6 @@ class TestWorkflowTimeout:
         # Mock time.monotonic to simulate elapsed time exceeding the timeout
         # First call returns 0 (start time), subsequent calls return 1.0 (1 second later)
         call_count = 0
-        real_monotonic = time.monotonic
 
         def mock_monotonic():
             nonlocal call_count
@@ -137,8 +135,10 @@ class TestWorkflowTimeout:
                 return 0.0  # Start time
             return 1.0  # 1 second elapsed - exceeds 100ms timeout
 
-        with patch.object(workflow_engine.store, "get_latest_workflow") as mock_workflow, \
-             patch("time.monotonic", mock_monotonic):
+        with (
+            patch.object(workflow_engine.store, "get_latest_workflow") as mock_workflow,
+            patch("time.monotonic", mock_monotonic),
+        ):
             mock_workflow.return_value = {
                 "kind": "workflow.chat",
                 "timeout_ms": 100,  # 100ms timeout
@@ -164,7 +164,9 @@ class TestWorkflowTimeout:
             assert "timeout" in result.get("error", "").lower()
 
     @pytest.mark.asyncio
-    async def test_workflow_uses_default_timeout_when_not_specified(self, workflow_engine):
+    async def test_workflow_uses_default_timeout_when_not_specified(
+        self, workflow_engine
+    ):
         """Workflow should use default timeout when not specified in schema."""
         with patch.object(workflow_engine.store, "get_latest_workflow") as mock:
             mock.return_value = {
@@ -203,15 +205,15 @@ class TestWorkflowTimeout:
                 return 0.0  # Start time
             return 1.0  # 1 second elapsed - exceeds 100ms timeout
 
-        with patch.object(workflow_engine.store, "get_latest_workflow") as mock_workflow, \
-             patch("time.monotonic", mock_monotonic):
+        with (
+            patch.object(workflow_engine.store, "get_latest_workflow") as mock_workflow,
+            patch("time.monotonic", mock_monotonic),
+        ):
             mock_workflow.return_value = {
                 "kind": "workflow.chat",
                 "timeout_ms": 100,
                 "entrypoint": "node1",
-                "nodes": [
-                    {"id": "node1", "type": "tool_call", "tool": "llm.generic"}
-                ],
+                "nodes": [{"id": "node1", "type": "tool_call", "tool": "llm.generic"}],
             }
 
             result = await workflow_engine.run(
@@ -246,12 +248,13 @@ class TestRetryBackoff:
                 return {"status": "error", "error": "transient failure"}
             return {"content": "success", "status": "ok", "usage": {}}
 
-        with patch.object(
-            workflow_engine, "_builtin_tool_handlers"
-        ) as mock_handlers:
+        with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
             mock_handlers.return_value = {"test.tool": failing_tool}
 
-            workflow_engine.tool_registry["test.tool"] = {"name": "test.tool", "timeout_seconds": 30}
+            workflow_engine.tool_registry["test.tool"] = {
+                "name": "test.tool",
+                "timeout_seconds": 30,
+            }
 
             node = {
                 "id": "retry_node",
@@ -290,12 +293,13 @@ class TestRetryBackoff:
             call_count += 1
             raise Exception("permanent failure")
 
-        with patch.object(
-            workflow_engine, "_builtin_tool_handlers"
-        ) as mock_handlers:
+        with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
             mock_handlers.return_value = {"test.tool": always_failing_tool}
 
-            workflow_engine.tool_registry["test.tool"] = {"name": "test.tool", "timeout_seconds": 30}
+            workflow_engine.tool_registry["test.tool"] = {
+                "name": "test.tool",
+                "timeout_seconds": 30,
+            }
 
             node = {
                 "id": "failing_node",
@@ -336,12 +340,13 @@ class TestRetryBackoff:
             call_count += 1
             raise Exception("failure")
 
-        with patch.object(
-            workflow_engine, "_builtin_tool_handlers"
-        ) as mock_handlers:
+        with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
             mock_handlers.return_value = {"test.tool": always_failing_tool}
 
-            workflow_engine.tool_registry["test.tool"] = {"name": "test.tool", "timeout_seconds": 30}
+            workflow_engine.tool_registry["test.tool"] = {
+                "name": "test.tool",
+                "timeout_seconds": 30,
+            }
 
             node = {
                 "id": "capped_node",
@@ -383,12 +388,16 @@ class TestRetryBackoff:
             call_count += 1
             raise Exception("failure")
 
-        with patch.object(
-            workflow_engine, "_builtin_tool_handlers"
-        ) as mock_handlers, patch("asyncio.sleep", mock_sleep):
+        with (
+            patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers,
+            patch("asyncio.sleep", mock_sleep),
+        ):
             mock_handlers.return_value = {"test.tool": always_failing_tool}
 
-            workflow_engine.tool_registry["test.tool"] = {"name": "test.tool", "timeout_seconds": 30}
+            workflow_engine.tool_registry["test.tool"] = {
+                "name": "test.tool",
+                "timeout_seconds": 30,
+            }
 
             node = {
                 "id": "backoff_node",
@@ -429,12 +438,13 @@ class TestRetryBackoff:
             call_count += 1
             raise Exception("failure")
 
-        with patch.object(
-            workflow_engine, "_builtin_tool_handlers"
-        ) as mock_handlers:
+        with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
             mock_handlers.return_value = {"test.tool": slow_failing_tool}
 
-            workflow_engine.tool_registry["test.tool"] = {"name": "test.tool", "timeout_seconds": 30}
+            workflow_engine.tool_registry["test.tool"] = {
+                "name": "test.tool",
+                "timeout_seconds": 30,
+            }
 
             node = {
                 "id": "timeout_node",
@@ -472,12 +482,13 @@ class TestRetryBackoff:
             call_count += 1
             return {"status": "error", "error": "handled failure"}
 
-        with patch.object(
-            workflow_engine, "_builtin_tool_handlers"
-        ) as mock_handlers:
+        with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
             mock_handlers.return_value = {"test.tool": failing_tool}
 
-            workflow_engine.tool_registry["test.tool"] = {"name": "test.tool", "timeout_seconds": 30}
+            workflow_engine.tool_registry["test.tool"] = {
+                "name": "test.tool",
+                "timeout_seconds": 30,
+            }
 
             node = {
                 "id": "handled_node",
@@ -517,12 +528,13 @@ class TestRetryBackoff:
                 raise Exception("transient")
             return {"content": "ok", "status": "ok", "usage": {}}
 
-        with patch.object(
-            workflow_engine, "_builtin_tool_handlers"
-        ) as mock_handlers:
+        with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
             mock_handlers.return_value = {"test.tool": eventual_success}
 
-            workflow_engine.tool_registry["test.tool"] = {"name": "test.tool", "timeout_seconds": 30}
+            workflow_engine.tool_registry["test.tool"] = {
+                "name": "test.tool",
+                "timeout_seconds": 30,
+            }
 
             node = {
                 "id": "eventual_node",
@@ -576,12 +588,13 @@ class TestRetryTimeoutIntegration:
             call_count += 1
             raise Exception("failure")
 
-        with patch.object(
-            workflow_engine, "_builtin_tool_handlers"
-        ) as mock_handlers:
+        with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
             mock_handlers.return_value = {"test.tool": failing_tool}
 
-            workflow_engine.tool_registry["test.tool"] = {"name": "test.tool", "timeout_seconds": 30}
+            workflow_engine.tool_registry["test.tool"] = {
+                "name": "test.tool",
+                "timeout_seconds": 30,
+            }
 
             # Node without max_retries or backoff_ms
             node = {

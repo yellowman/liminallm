@@ -3,13 +3,13 @@
 Per SPEC §18, session cache operations must be thread-safe to prevent
 race conditions under concurrent requests.
 """
+
 import threading
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List
 
-import pytest
 
 from liminallm.storage.models import Session
 from liminallm.storage.postgres import PostgresStore, _MAX_SESSION_CACHE_SIZE
@@ -113,8 +113,8 @@ class TestSessionCacheEviction:
         store._cache_session(new_session)
 
         # Should have evicted ~10% of oldest sessions
-        evict_count = max(1, _MAX_SESSION_CACHE_SIZE // 10)
-        expected_remaining = _MAX_SESSION_CACHE_SIZE - evict_count + 1
+        # (evict_count and expected_remaining calculated for documentation)
+        _ = max(1, _MAX_SESSION_CACHE_SIZE // 10)  # evict_count
 
         # Allow some tolerance for timing
         assert len(store.sessions) <= _MAX_SESSION_CACHE_SIZE
@@ -200,7 +200,9 @@ class TestSessionCacheThreadSafety:
         def update_session(field_name: str, value: str):
             try:
                 for i in range(iterations):
-                    store._update_cached_session(session.id, **{field_name: f"{value}-{i}"})
+                    store._update_cached_session(
+                        session.id, **{field_name: f"{value}-{i}"}
+                    )
             except Exception as e:
                 errors.append(e)
 
@@ -247,7 +249,8 @@ class TestSessionCacheThreadSafety:
                 # Simulate revoke_user_sessions iteration
                 with store._session_lock:
                     stale_ids = [
-                        sid for sid, sess in store.sessions.items()
+                        sid
+                        for sid, sess in store.sessions.items()
                         if sess.user_id == user_id
                     ]
                     for sid in stale_ids:

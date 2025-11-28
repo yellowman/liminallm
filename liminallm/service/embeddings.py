@@ -37,7 +37,9 @@ def cosine_similarity(a: Iterable[float], b: Iterable[float]) -> float:
     return num / denom if denom else 0.0
 
 
-def ensure_embedding_dim(vec: Iterable[float] | None, *, dim: int = EMBEDDING_DIM) -> List[float]:
+def ensure_embedding_dim(
+    vec: Iterable[float] | None, *, dim: int = EMBEDDING_DIM
+) -> List[float]:
     if not vec:
         return [0.0] * dim
     trimmed = list(vec)[:dim]
@@ -46,7 +48,9 @@ def ensure_embedding_dim(vec: Iterable[float] | None, *, dim: int = EMBEDDING_DI
     return trimmed
 
 
-def pad_vectors(vectors: list[list[float]], *, dim: int = EMBEDDING_DIM) -> list[list[float]]:
+def pad_vectors(
+    vectors: list[list[float]], *, dim: int = EMBEDDING_DIM
+) -> list[list[float]]:
     if not vectors:
         return []
     return [ensure_embedding_dim(v, dim=dim) for v in vectors]
@@ -55,7 +59,12 @@ def pad_vectors(vectors: list[list[float]], *, dim: int = EMBEDDING_DIM) -> list
 class EmbeddingsService:
     """Wrapper for embedding providers with a stable model identifier."""
 
-    def __init__(self, model_id: str, *, encoder: Callable[[str], List[float]] = deterministic_embedding):
+    def __init__(
+        self,
+        model_id: str,
+        *,
+        encoder: Callable[[str], List[float]] = deterministic_embedding,
+    ):
         self.model_id = model_id
         self._encoder = encoder
 

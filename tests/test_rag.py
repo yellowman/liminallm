@@ -9,8 +9,12 @@ def _setup_store() -> tuple[RAGService, str, str, str, str]:
     store = MemoryStore(fs_root=f"/tmp/liminallm-test-rag-{uuid.uuid4()}")
     user_a = store.create_user("a@example.com", tenant_id="tenant_a")
     user_b = store.create_user("b@example.com", tenant_id="tenant_b")
-    ctx_a = store.upsert_context(owner_user_id=user_a.id, name="tenant_a_ctx", description="ctx")
-    ctx_b = store.upsert_context(owner_user_id=user_b.id, name="tenant_b_ctx", description="ctx")
+    ctx_a = store.upsert_context(
+        owner_user_id=user_a.id, name="tenant_a_ctx", description="ctx"
+    )
+    ctx_b = store.upsert_context(
+        owner_user_id=user_b.id, name="tenant_b_ctx", description="ctx"
+    )
     service = RAGService(store)
     service.ingest_text(ctx_a.id, "tenant a data")
     service.ingest_text(ctx_b.id, "tenant b data")
@@ -28,11 +32,15 @@ def test_retrieve_requires_context_scope():
 def test_retrieve_filters_by_user_and_tenant():
     service, ctx_a, ctx_b, user_a, _ = _setup_store()
 
-    allowed = service.retrieve([ctx_a], "tenant a data", user_id=user_a, tenant_id="tenant_a")
+    allowed = service.retrieve(
+        [ctx_a], "tenant a data", user_id=user_a, tenant_id="tenant_a"
+    )
     assert allowed
     assert all(chunk.context_id == ctx_a for chunk in allowed)
 
-    blocked = service.retrieve([ctx_b], "tenant b data", user_id=user_a, tenant_id="tenant_a")
+    blocked = service.retrieve(
+        [ctx_b], "tenant b data", user_id=user_a, tenant_id="tenant_a"
+    )
     assert blocked == []
 
 
@@ -53,12 +61,23 @@ class LegacyOnlyStore:
         self._chunk_id_seq = 1
 
     def add_user(self, tenant_id: str) -> User:
-        user = User(id=str(uuid.uuid4()), email=f"user-{tenant_id}@example.com", tenant_id=tenant_id)
+        user = User(
+            id=str(uuid.uuid4()),
+            email=f"user-{tenant_id}@example.com",
+            tenant_id=tenant_id,
+        )
         self.users[user.id] = user
         return user
 
-    def upsert_context(self, owner_user_id: str, name: str, description: str) -> KnowledgeContext:
-        ctx = KnowledgeContext(id=str(uuid.uuid4()), owner_user_id=owner_user_id, name=name, description=description)
+    def upsert_context(
+        self, owner_user_id: str, name: str, description: str
+    ) -> KnowledgeContext:
+        ctx = KnowledgeContext(
+            id=str(uuid.uuid4()),
+            owner_user_id=owner_user_id,
+            name=name,
+            description=description,
+        )
         self.contexts[ctx.id] = ctx
         return ctx
 
@@ -71,7 +90,11 @@ class LegacyOnlyStore:
             bucket.append(chunk)
 
     def search_chunks_legacy(
-        self, context_id: str | None, query: str, query_embedding: list[float] | None, limit: int = 4
+        self,
+        context_id: str | None,
+        query: str,
+        query_embedding: list[float] | None,
+        limit: int = 4,
     ) -> list[KnowledgeChunk]:
         return list(self.chunks.get(context_id or "", []))[:limit]
 
@@ -81,7 +104,9 @@ def test_local_hybrid_without_pgvector():
     owner = store.add_user("tenant_legacy")
     ctx = store.upsert_context(owner.id, "legacy", "local hybrid")
 
-    rag = RAGService(store, rag_mode="local_hybrid", embedding_model_id="legacy-embedding")
+    rag = RAGService(
+        store, rag_mode="local_hybrid", embedding_model_id="legacy-embedding"
+    )
     rag.ingest_text(ctx.id, "legacy search path")
     existing_chunks = store.chunks.get(ctx.id, [])
     store.add_chunks(
@@ -99,12 +124,19 @@ def test_local_hybrid_without_pgvector():
         ],
     )
 
-    allowed = rag.retrieve([ctx.id], "legacy", user_id=owner.id, tenant_id="tenant_legacy")
+    allowed = rag.retrieve(
+        [ctx.id], "legacy", user_id=owner.id, tenant_id="tenant_legacy"
+    )
     assert allowed
-    assert all((chunk.meta or {}).get("embedding_model_id") == "legacy-embedding" for chunk in allowed)
+    assert all(
+        (chunk.meta or {}).get("embedding_model_id") == "legacy-embedding"
+        for chunk in allowed
+    )
 
     blocked_user = store.add_user("other")
-    denied = rag.retrieve([ctx.id], "legacy", user_id=blocked_user.id, tenant_id="other")
+    denied = rag.retrieve(
+        [ctx.id], "legacy", user_id=blocked_user.id, tenant_id="other"
+    )
     assert denied == []
 
 

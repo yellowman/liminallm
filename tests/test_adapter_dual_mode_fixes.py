@@ -10,9 +10,6 @@ and external API modes:
 from __future__ import annotations
 
 import json
-import tempfile
-from pathlib import Path
-from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -84,7 +81,9 @@ class TestValidateAdapterBaseModel:
     def test_mismatch_strict_mode(self):
         """Should reject mismatched models in strict mode."""
         adapter = {"id": "a1", "base_model": "mistral-7b"}
-        is_valid, warning = validate_adapter_base_model(adapter, "llama-7b", strict=True)
+        is_valid, warning = validate_adapter_base_model(
+            adapter, "llama-7b", strict=True
+        )
 
         assert is_valid is False
         assert "incompatible" in warning.lower()
@@ -101,7 +100,9 @@ class TestValidateAdapterBaseModel:
     def test_missing_base_model_strict(self):
         """Should reject missing base_model in strict mode."""
         adapter = {"id": "a1"}
-        is_valid, warning = validate_adapter_base_model(adapter, "llama-7b", strict=True)
+        is_valid, warning = validate_adapter_base_model(
+            adapter, "llama-7b", strict=True
+        )
 
         assert is_valid is False
         assert "missing" in warning.lower()
@@ -278,19 +279,23 @@ class TestWeightedAdapterBlending:
         adapter1_dir = tmp_path / "adapters" / "adapter1"
         adapter1_dir.mkdir(parents=True)
         (adapter1_dir / "params.json").write_text(
-            json.dumps({
-                "layer0.A": [[1.0, 0.0], [0.0, 1.0]],
-                "layer0.B": [[1.0, 0.0], [0.0, 1.0]],
-            })
+            json.dumps(
+                {
+                    "layer0.A": [[1.0, 0.0], [0.0, 1.0]],
+                    "layer0.B": [[1.0, 0.0], [0.0, 1.0]],
+                }
+            )
         )
 
         adapter2_dir = tmp_path / "adapters" / "adapter2"
         adapter2_dir.mkdir(parents=True)
         (adapter2_dir / "params.json").write_text(
-            json.dumps({
-                "layer0.A": [[2.0, 0.0], [0.0, 2.0]],
-                "layer0.B": [[2.0, 0.0], [0.0, 2.0]],
-            })
+            json.dumps(
+                {
+                    "layer0.A": [[2.0, 0.0], [0.0, 2.0]],
+                    "layer0.B": [[2.0, 0.0], [0.0, 2.0]],
+                }
+            )
         )
 
         return backend, tmp_path
@@ -497,9 +502,7 @@ class TestDualModeIntegration:
         # Create adapter with mismatched base model
         adapter_dir = tmp_path / "adapters" / "mismatch"
         adapter_dir.mkdir(parents=True)
-        (adapter_dir / "params.json").write_text(
-            json.dumps({"layer0.A": [[1.0]]})
-        )
+        (adapter_dir / "params.json").write_text(json.dumps({"layer0.A": [[1.0]]}))
 
         adapter = {
             "id": "mismatch",
@@ -517,9 +520,7 @@ class TestDualModeIntegration:
 
         adapter_dir = tmp_path / "adapters" / "mismatch"
         adapter_dir.mkdir(parents=True)
-        (adapter_dir / "params.json").write_text(
-            json.dumps({"layer0.A": [[1.0]]})
-        )
+        (adapter_dir / "params.json").write_text(json.dumps({"layer0.A": [[1.0]]}))
 
         adapter = {
             "id": "mismatch",

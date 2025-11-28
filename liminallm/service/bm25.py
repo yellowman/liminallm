@@ -3,6 +3,7 @@
 Shared implementation per SPEC §2.5 retrieval strategy to avoid duplication
 between PostgresStore and MemoryStore.
 """
+
 from __future__ import annotations
 
 import math

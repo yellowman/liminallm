@@ -31,7 +31,9 @@ def test_security_headers_and_health(fresh_app):
     assert response.headers["X-Frame-Options"] == "DENY"
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     # HSTS header only sent for HTTPS requests with ENABLE_HSTS=true
-    assert "Strict-Transport-Security" not in response.headers or response.headers["Strict-Transport-Security"].startswith("max-age=")
+    assert "Strict-Transport-Security" not in response.headers or response.headers[
+        "Strict-Transport-Security"
+    ].startswith("max-age=")
     assert response.headers["Content-Security-Policy"].startswith("default-src")
     assert response.headers["access-control-allow-origin"] == "http://localhost:3000"
 

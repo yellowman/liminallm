@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -10,9 +10,7 @@ from fastapi import HTTPException
 from liminallm.api.routes import (
     IdempotencyGuard,
     _resolve_idempotency,
-    _store_idempotency_result,
 )
-from liminallm.api.schemas import Envelope
 
 
 # ==============================================================================
@@ -55,7 +53,13 @@ class TestIdempotencyGuardOptional:
             # Should raise validation error
             mock_resolve.side_effect = HTTPException(
                 status_code=400,
-                detail={"status": "error", "error": {"code": "validation_error", "message": "Idempotency-Key header required"}},
+                detail={
+                    "status": "error",
+                    "error": {
+                        "code": "validation_error",
+                        "message": "Idempotency-Key header required",
+                    },
+                },
             )
 
             with pytest.raises(HTTPException) as exc_info:
@@ -134,9 +138,10 @@ class TestResolveIdempotency:
             "request_id": "prev-req-id",
         }
 
-        with patch("liminallm.api.routes.get_runtime") as mock_runtime, patch(
-            "liminallm.api.routes._get_cached_idempotency_record"
-        ) as mock_get:
+        with (
+            patch("liminallm.api.routes.get_runtime") as mock_runtime,
+            patch("liminallm.api.routes._get_cached_idempotency_record") as mock_get,
+        ):
             mock_runtime.return_value = MagicMock()
             mock_get.return_value = {
                 "status": "completed",
@@ -158,9 +163,10 @@ class TestResolveIdempotency:
     @pytest.mark.asyncio
     async def test_raises_conflict_when_in_progress(self):
         """Should raise 409 Conflict when prior request is still in progress."""
-        with patch("liminallm.api.routes.get_runtime") as mock_runtime, patch(
-            "liminallm.api.routes._get_cached_idempotency_record"
-        ) as mock_get:
+        with (
+            patch("liminallm.api.routes.get_runtime") as mock_runtime,
+            patch("liminallm.api.routes._get_cached_idempotency_record") as mock_get,
+        ):
             mock_runtime.return_value = MagicMock()
             mock_get.return_value = {
                 "status": "in_progress",
@@ -222,14 +228,8 @@ class TestSpecCompliance:
         """SPEC §18 lists POST endpoints that should accept Idempotency-Key."""
         # Per SPEC: /v1/chat, /v1/tools/run, /v1/artifacts
         # These should all use require=False
-        expected_endpoints = [
-            "chat",
-            "tools",
-            "artifacts",
-            "files",  # files/upload
-            "contexts",  # contexts create
-        ]
         # Verified by code inspection - all use require=False
+        assert True  # Placeholder - manual verification test
 
     @pytest.mark.asyncio
     async def test_idempotency_ttl_24h(self):

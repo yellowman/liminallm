@@ -46,7 +46,14 @@ app.add_middleware(
     # Restrict to only required HTTP methods
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     # Restrict to only required headers
-    allow_headers=["Content-Type", "Authorization", "X-Tenant-ID", "session_id", "Idempotency-Key", "X-CSRF-Token"],
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+        "X-Tenant-ID",
+        "session_id",
+        "Idempotency-Key",
+        "X-CSRF-Token",
+    ],
 )
 
 
@@ -57,14 +64,25 @@ async def add_security_headers(request, call_next):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-XSS-Protection", "1; mode=block")
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
-    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()")
-    if request.url.scheme == "https" and os.getenv("ENABLE_HSTS", "false").lower() in {"1", "true", "yes", "on"}:
-        response.headers.setdefault("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+    response.headers.setdefault(
+        "Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()"
+    )
+    if request.url.scheme == "https" and os.getenv("ENABLE_HSTS", "false").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        response.headers.setdefault(
+            "Strict-Transport-Security", "max-age=63072000; includeSubDomains"
+        )
     response.headers.setdefault(
         "Content-Security-Policy",
         "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'",
     )
     return response
+
+
 register_exception_handlers(app)
 app.include_router(router)
 

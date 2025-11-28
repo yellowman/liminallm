@@ -9,7 +9,9 @@ def _create_user_and_conversation(store: MemoryStore, suffix: str = ""):
 
 
 def _append_assistant_message(store: MemoryStore, conversation_id: str, sender_id: str):
-    return store.append_message(conversation_id, sender=sender_id, role="assistant", content="hello")
+    return store.append_message(
+        conversation_id, sender=sender_id, role="assistant", content="hello"
+    )
 
 
 def test_feedback_enqueues_single_training_job_with_cooldown(tmp_path):

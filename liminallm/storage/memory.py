@@ -6,10 +6,8 @@ import os
 import secrets
 import uuid
 import hashlib
-import math
-import re
 import shutil
-from datetime import datetime, timedelta
+from datetime import datetime
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -17,8 +15,14 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from cryptography.fernet import Fernet, InvalidToken
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
-from liminallm.service.artifact_validation import ArtifactValidationError, validate_artifact
-from liminallm.service.bm25 import tokenize_text as _tokenize_text, compute_bm25_scores as _compute_bm25_scores
+from liminallm.service.artifact_validation import (
+    ArtifactValidationError,
+    validate_artifact,
+)
+from liminallm.service.bm25 import (
+    tokenize_text as _tokenize_text,
+    compute_bm25_scores as _compute_bm25_scores,
+)
 from liminallm.service.embeddings import cosine_similarity
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
@@ -44,7 +48,9 @@ from liminallm.storage.models import (
 class MemoryStore:
     """Minimal in-memory backing store for the initial prototype."""
 
-    def __init__(self, fs_root: str = "/tmp/liminallm", *, mfa_encryption_key: str | None = None) -> None:
+    def __init__(
+        self, fs_root: str = "/tmp/liminallm", *, mfa_encryption_key: str | None = None
+    ) -> None:
         self.logger = get_logger(__name__)
         self.users: Dict[str, User] = {}
         self.sessions: Dict[str, Session] = {}
@@ -86,7 +92,9 @@ class MemoryStore:
         return base64.urlsafe_b64encode(hashlib.sha256(key_material.encode()).digest())
 
     def _build_mfa_cipher(self, key_material: str | None) -> Fernet:
-        material = key_material or os.getenv("MFA_SECRET_KEY") or os.getenv("JWT_SECRET")
+        material = (
+            key_material or os.getenv("MFA_SECRET_KEY") or os.getenv("JWT_SECRET")
+        )
         if not material:
             shared_fs = Path(os.getenv("SHARED_FS_ROOT", "/srv/liminallm"))
             secret_path = shared_fs / ".jwt_secret"
@@ -204,7 +212,10 @@ class MemoryStore:
             for node in nodes:
                 if not isinstance(node, dict):
                     continue
-                if node.get("id") != "classify" or node.get("tool") != "llm.intent_classifier_v1":
+                if (
+                    node.get("id") != "classify"
+                    or node.get("tool") != "llm.intent_classifier_v1"
+                ):
                     continue
                 inputs = node.get("inputs") or {}
                 if "message" not in inputs:
@@ -258,14 +269,18 @@ class MemoryStore:
         self._persist_state()
         return user
 
-    def link_user_auth_provider(self, user_id: str, provider: str, provider_uid: str) -> None:
+    def link_user_auth_provider(
+        self, user_id: str, provider: str, provider_uid: str
+    ) -> None:
         # Check for existing mapping (avoid duplicates like postgres ON CONFLICT DO NOTHING)
         for existing in self.providers:
             if existing.provider == provider and existing.provider_uid == provider_uid:
                 return  # Already linked, do nothing
         # Generate unique ID
         max_id = max((p.id for p in self.providers), default=0)
-        mapping = UserAuthProvider(id=max_id + 1, user_id=user_id, provider=provider, provider_uid=provider_uid)
+        mapping = UserAuthProvider(
+            id=max_id + 1, user_id=user_id, provider=provider, provider_uid=provider_uid
+        )
         self.providers.append(mapping)
         self._persist_state()
 
@@ -281,8 +296,12 @@ class MemoryStore:
     def get_user(self, user_id: str) -> Optional[User]:
         return self.users.get(user_id)
 
-    def list_users(self, tenant_id: Optional[str] = None, limit: int = 100) -> List[User]:
-        results = [u for u in self.users.values() if not tenant_id or u.tenant_id == tenant_id]
+    def list_users(
+        self, tenant_id: Optional[str] = None, limit: int = 100
+    ) -> List[User]:
+        results = [
+            u for u in self.users.values() if not tenant_id or u.tenant_id == tenant_id
+        ]
         return sorted(results, key=lambda u: u.created_at, reverse=True)[:limit]
 
     def update_user_role(self, user_id: str, role: str) -> Optional[User]:
@@ -340,7 +359,10 @@ class MemoryStore:
             if cluster.user_id == user_id:
                 self.semantic_clusters.pop(cluster_id, None)
         for state_id, state in list(self.adapter_router_state.items()):
-            if getattr(state, "artifact_id", None) in user_artifacts or getattr(state, "user_id", None) == user_id:
+            if (
+                getattr(state, "artifact_id", None) in user_artifacts
+                or getattr(state, "user_id", None) == user_id
+            ):
                 self.adapter_router_state.pop(state_id, None)
         for art_id in user_artifacts:
             shutil.rmtree(self.fs_root / "artifacts" / art_id, ignore_errors=True)
@@ -348,9 +370,13 @@ class MemoryStore:
         self._persist_state()
         return True
 
-    def save_password(self, user_id: str, password_hash: str, password_algo: str) -> None:
+    def save_password(
+        self, user_id: str, password_hash: str, password_algo: str
+    ) -> None:
         if user_id not in self.users:
-            raise ConstraintViolation("user not found for credentials", {"user_id": user_id})
+            raise ConstraintViolation(
+                "user not found for credentials", {"user_id": user_id}
+            )
         self.credentials[user_id] = (password_hash, password_algo)
         self._persist_state()
 
@@ -375,11 +401,15 @@ class MemoryStore:
             self.logger.warning("mfa_secret_decrypt_failed")
             return secret
 
-    def set_user_mfa_secret(self, user_id: str, secret: str, enabled: bool = False) -> UserMFAConfig:
+    def set_user_mfa_secret(
+        self, user_id: str, secret: str, enabled: bool = False
+    ) -> UserMFAConfig:
         if user_id not in self.users:
             raise ConstraintViolation("user not found for mfa", {"user_id": user_id})
         encrypted_secret = self._encrypt_mfa_secret(secret)
-        record = UserMFAConfig(user_id=user_id, secret=encrypted_secret, enabled=enabled)
+        record = UserMFAConfig(
+            user_id=user_id, secret=encrypted_secret, enabled=enabled
+        )
         self.mfa_secrets[user_id] = record
         self._persist_state()
         return UserMFAConfig(
@@ -459,20 +489,38 @@ class MemoryStore:
         self._persist_state()
 
     # chat
-    def create_conversation(self, user_id: str, title: Optional[str] = None, active_context_id: Optional[str] = None) -> Conversation:
+    def create_conversation(
+        self,
+        user_id: str,
+        title: Optional[str] = None,
+        active_context_id: Optional[str] = None,
+    ) -> Conversation:
         if user_id not in self.users:
-            raise ConstraintViolation("conversation owner missing", {"user_id": user_id})
+            raise ConstraintViolation(
+                "conversation owner missing", {"user_id": user_id}
+            )
         if active_context_id and active_context_id not in self.contexts:
-            raise ConstraintViolation("active context missing", {"context_id": active_context_id})
+            raise ConstraintViolation(
+                "active context missing", {"context_id": active_context_id}
+            )
         conv_id = str(uuid.uuid4())
         now = datetime.utcnow()
-        conv = Conversation(id=conv_id, user_id=user_id, created_at=now, updated_at=now, title=title, active_context_id=active_context_id)
+        conv = Conversation(
+            id=conv_id,
+            user_id=user_id,
+            created_at=now,
+            updated_at=now,
+            title=title,
+            active_context_id=active_context_id,
+        )
         self.conversations[conv_id] = conv
         self.messages[conv_id] = []
         self._persist_state()
         return conv
 
-    def get_conversation(self, conversation_id: str, *, user_id: Optional[str] = None) -> Optional[Conversation]:
+    def get_conversation(
+        self, conversation_id: str, *, user_id: Optional[str] = None
+    ) -> Optional[Conversation]:
         conv = self.conversations.get(conversation_id)
         if not conv:
             return None
@@ -490,7 +538,9 @@ class MemoryStore:
         content_struct: Optional[dict] = None,
     ) -> Message:
         if conversation_id not in self.conversations:
-            raise ConstraintViolation("conversation not found", {"conversation_id": conversation_id})
+            raise ConstraintViolation(
+                "conversation not found", {"conversation_id": conversation_id}
+            )
         normalized_content_struct = normalize_content_struct(content_struct, content)
         seq = len(self.messages.get(conversation_id, []))
         msg = Message(
@@ -542,7 +592,9 @@ class MemoryStore:
         if user_id not in self.users:
             raise ConstraintViolation("preference user missing", {"user_id": user_id})
         if conversation_id not in self.conversations:
-            raise ConstraintViolation("preference conversation missing", {"conversation_id": conversation_id})
+            raise ConstraintViolation(
+                "preference conversation missing", {"conversation_id": conversation_id}
+            )
         message = None
         message_conversation_id = None
         for cid, messages in self.messages.items():
@@ -565,7 +617,9 @@ class MemoryStore:
             )
         event_id = str(uuid.uuid4())
         normalized_weight = weight if weight is not None else 1.0
-        embedding = context_embedding or self._text_embedding(context_text or message.content)
+        embedding = context_embedding or self._text_embedding(
+            context_text or message.content
+        )
         event = PreferenceEvent(
             id=event_id,
             user_id=user_id,
@@ -598,7 +652,8 @@ class MemoryStore:
             events = [
                 e
                 for e in events
-                if e.user_id in self.users and self.users[e.user_id].tenant_id == tenant_id
+                if e.user_id in self.users
+                and self.users[e.user_id].tenant_id == tenant_id
             ]
         if user_id:
             events = [e for e in events if e.user_id == user_id]
@@ -612,7 +667,9 @@ class MemoryStore:
     def get_preference_event(self, event_id: str) -> Optional[PreferenceEvent]:
         return self.preference_events.get(event_id)
 
-    def update_preference_event(self, event_id: str, *, cluster_id: Optional[str] = None) -> Optional[PreferenceEvent]:
+    def update_preference_event(
+        self, event_id: str, *, cluster_id: Optional[str] = None
+    ) -> Optional[PreferenceEvent]:
         event = self.preference_events.get(event_id)
         if not event:
             return None
@@ -643,9 +700,16 @@ class MemoryStore:
             user_id=user_id,
             centroid=list(centroid),
             size=size,
-            label=label if label is not None else (existing.label if existing else None),
-            description=description if description is not None else (existing.description if existing else None),
-            sample_message_ids=sample_message_ids or (existing.sample_message_ids if existing else []),
+            label=(
+                label if label is not None else (existing.label if existing else None)
+            ),
+            description=(
+                description
+                if description is not None
+                else (existing.description if existing else None)
+            ),
+            sample_message_ids=sample_message_ids
+            or (existing.sample_message_ids if existing else []),
             created_at=created_at,
             updated_at=now,
             meta=meta or (existing.meta if existing else None),
@@ -681,7 +745,9 @@ class MemoryStore:
         self._persist_state()
         return cluster
 
-    def list_semantic_clusters(self, user_id: Optional[str] = None) -> List[SemanticCluster]:
+    def list_semantic_clusters(
+        self, user_id: Optional[str] = None
+    ) -> List[SemanticCluster]:
         clusters = list(self.semantic_clusters.values())
         if user_id:
             clusters = [c for c in clusters if c.user_id == user_id]
@@ -756,7 +822,12 @@ class MemoryStore:
     ) -> List[TrainingJob]:
         jobs = list(self.training_jobs.values())
         if tenant_id:
-            jobs = [j for j in jobs if j.user_id in self.users and self.users[j.user_id].tenant_id == tenant_id]
+            jobs = [
+                j
+                for j in jobs
+                if j.user_id in self.users
+                and self.users[j.user_id].tenant_id == tenant_id
+            ]
         if user_id:
             jobs = [j for j in jobs if j.user_id == user_id]
         if status:
@@ -764,7 +835,13 @@ class MemoryStore:
         jobs.sort(key=lambda j: j.updated_at or j.created_at, reverse=True)
         return jobs if limit is None else jobs[:limit]
 
-    def inspect_state(self, *, tenant_id: Optional[str] = None, kind: Optional[str] = None, limit: int = 50) -> dict:
+    def inspect_state(
+        self,
+        *,
+        tenant_id: Optional[str] = None,
+        kind: Optional[str] = None,
+        limit: int = 50,
+    ) -> dict:
         def _serialize(obj: Any) -> dict:
             if hasattr(obj, "__dict__"):
                 data = dict(obj.__dict__)
@@ -779,17 +856,35 @@ class MemoryStore:
 
         sections: dict[str, list] = {}
         if kind in (None, "users"):
-            sections["users"] = [_serialize(u) for u in self.list_users(tenant_id=tenant_id, limit=limit)]
+            sections["users"] = [
+                _serialize(u) for u in self.list_users(tenant_id=tenant_id, limit=limit)
+            ]
         if kind in (None, "sessions"):
-            sessions = [s for s in self.sessions.values() if not tenant_id or s.tenant_id == tenant_id]
-            sections["sessions"] = [_serialize(s) for s in sorted(sessions, key=lambda s: s.created_at, reverse=True)[:limit]]
+            sessions = [
+                s
+                for s in self.sessions.values()
+                if not tenant_id or s.tenant_id == tenant_id
+            ]
+            sections["sessions"] = [
+                _serialize(s)
+                for s in sorted(sessions, key=lambda s: s.created_at, reverse=True)[
+                    :limit
+                ]
+            ]
         if kind in (None, "conversations"):
             convs = [
                 c
                 for c in self.conversations.values()
-                if not tenant_id or (self.users.get(c.user_id) and self.users[c.user_id].tenant_id == tenant_id)
+                if not tenant_id
+                or (
+                    self.users.get(c.user_id)
+                    and self.users[c.user_id].tenant_id == tenant_id
+                )
             ]
-            sections["conversations"] = [_serialize(c) for c in sorted(convs, key=lambda c: c.updated_at, reverse=True)[:limit]]
+            sections["conversations"] = [
+                _serialize(c)
+                for c in sorted(convs, key=lambda c: c.updated_at, reverse=True)[:limit]
+            ]
         if kind in (None, "messages"):
             flattened: list[Message] = []
             for msgs in self.messages.values():
@@ -800,11 +895,27 @@ class MemoryStore:
                         if not user or user.tenant_id != tenant_id:
                             continue
                     flattened.append(msg)
-            sections["messages"] = [_serialize(m) for m in sorted(flattened, key=lambda m: m.created_at, reverse=True)[:limit]]
+            sections["messages"] = [
+                _serialize(m)
+                for m in sorted(flattened, key=lambda m: m.created_at, reverse=True)[
+                    :limit
+                ]
+            ]
         if kind in (None, "artifacts"):
-            sections["artifacts"] = [_serialize(a) for a in list(self.artifacts.values())[:limit]]
+            sections["artifacts"] = [
+                _serialize(a) for a in list(self.artifacts.values())[:limit]
+            ]
         if kind in (None, "contexts"):
-            contexts = [c for c in self.contexts.values() if not tenant_id or (c.owner_user_id and self.users.get(c.owner_user_id) and self.users[c.owner_user_id].tenant_id == tenant_id)]
+            contexts = [
+                c
+                for c in self.contexts.values()
+                if not tenant_id
+                or (
+                    c.owner_user_id
+                    and self.users.get(c.owner_user_id)
+                    and self.users[c.owner_user_id].tenant_id == tenant_id
+                )
+            ]
             sections["contexts"] = [_serialize(c) for c in contexts[:limit]]
         if kind in (None, "chunks"):
             flattened_chunks: list[KnowledgeChunk] = []
@@ -817,10 +928,20 @@ class MemoryStore:
                 flattened_chunks.extend(chunk_list)
             sections["chunks"] = [_serialize(ch) for ch in flattened_chunks[:limit]]
         if kind in (None, "training_jobs"):
-            jobs = [t for t in self.training_jobs.values() if not tenant_id or (self.users.get(t.user_id) and self.users[t.user_id].tenant_id == tenant_id)]
+            jobs = [
+                t
+                for t in self.training_jobs.values()
+                if not tenant_id
+                or (
+                    self.users.get(t.user_id)
+                    and self.users[t.user_id].tenant_id == tenant_id
+                )
+            ]
             sections["training_jobs"] = [_serialize(t) for t in jobs[:limit]]
         if kind in (None, "config_patches"):
-            sections["config_patches"] = [_serialize(p) for p in list(self.config_patches.values())[:limit]]
+            sections["config_patches"] = [
+                _serialize(p) for p in list(self.config_patches.values())[:limit]
+            ]
         return sections
 
     def list_messages(
@@ -831,7 +952,11 @@ class MemoryStore:
         user_id: Optional[str] = None,
         **_: Any,
     ) -> List[Message]:
-        conv = self.get_conversation(conversation_id, user_id=user_id) if user_id else self.conversations.get(conversation_id)
+        conv = (
+            self.get_conversation(conversation_id, user_id=user_id)
+            if user_id
+            else self.conversations.get(conversation_id)
+        )
         if not conv:
             return []
         msgs = self.messages.get(conversation_id, [])
@@ -898,7 +1023,9 @@ class MemoryStore:
             self.logger.warning("artifact_validation_failed", errors=exc.errors)
             raise
         if owner_user_id and owner_user_id not in self.users:
-            raise ConstraintViolation("artifact owner missing", {"owner_user_id": owner_user_id})
+            raise ConstraintViolation(
+                "artifact owner missing", {"owner_user_id": owner_user_id}
+            )
         artifact_id = str(uuid.uuid4())
         fs_path = self.persist_artifact_payload(artifact_id, schema)
         author = version_author or owner_user_id or "system_llm"
@@ -993,7 +1120,9 @@ class MemoryStore:
         payload_path.write_text(json.dumps(schema, indent=2))
         return str(payload_path)
 
-    def record_config_patch(self, artifact_id: str, proposer: str, patch: dict, justification: Optional[str]) -> ConfigPatchAudit:
+    def record_config_patch(
+        self, artifact_id: str, proposer: str, patch: dict, justification: Optional[str]
+    ) -> ConfigPatchAudit:
         audit_id = max(self.config_patches.keys(), default=0) + 1
         audit = ConfigPatchAudit(
             id=audit_id,
@@ -1009,14 +1138,22 @@ class MemoryStore:
     def get_config_patch(self, patch_id: int) -> Optional[ConfigPatchAudit]:
         return self.config_patches.get(patch_id)
 
-    def list_config_patches(self, status: Optional[str] = None) -> List[ConfigPatchAudit]:
+    def list_config_patches(
+        self, status: Optional[str] = None
+    ) -> List[ConfigPatchAudit]:
         patches = list(self.config_patches.values())
         if status:
             patches = [p for p in patches if p.status == status]
         return sorted(patches, key=lambda p: p.created_at, reverse=True)
 
     def update_config_patch_status(
-        self, patch_id: int, status: str, *, meta: Optional[Dict] = None, mark_decided: bool = False, mark_applied: bool = False
+        self,
+        patch_id: int,
+        status: str,
+        *,
+        meta: Optional[Dict] = None,
+        mark_decided: bool = False,
+        mark_applied: bool = False,
     ) -> Optional[ConfigPatchAudit]:
         patch = self.config_patches.get(patch_id)
         if not patch:
@@ -1045,7 +1182,9 @@ class MemoryStore:
             return None
         return versions[-1].schema
 
-    def list_adapter_router_state(self, user_id: Optional[str] = None) -> list[AdapterRouterState]:
+    def list_adapter_router_state(
+        self, user_id: Optional[str] = None
+    ) -> list[AdapterRouterState]:
         """Return synthetic router state for adapters in memory."""
 
         adapters = [a for a in self.artifacts.values() if a.type == "adapter"]
@@ -1072,12 +1211,21 @@ class MemoryStore:
         meta: Optional[dict] = None,
     ) -> KnowledgeContext:
         if not owner_user_id:
-            raise ConstraintViolation("context owner required", {"owner_user_id": owner_user_id})
+            raise ConstraintViolation(
+                "context owner required", {"owner_user_id": owner_user_id}
+            )
         if owner_user_id not in self.users:
-            raise ConstraintViolation("context owner missing", {"owner_user_id": owner_user_id})
+            raise ConstraintViolation(
+                "context owner missing", {"owner_user_id": owner_user_id}
+            )
         ctx_id = str(uuid.uuid4())
         ctx = KnowledgeContext(
-            id=ctx_id, owner_user_id=owner_user_id, name=name, description=description, fs_path=fs_path, meta=meta
+            id=ctx_id,
+            owner_user_id=owner_user_id,
+            name=name,
+            description=description,
+            fs_path=fs_path,
+            meta=meta,
         )
         self.contexts[ctx.id] = ctx
         self._persist_state()
@@ -1086,18 +1234,28 @@ class MemoryStore:
     def get_context(self, context_id: str) -> Optional[KnowledgeContext]:
         return self.contexts.get(context_id)
 
-    def list_contexts(self, owner_user_id: Optional[str] = None) -> List[KnowledgeContext]:
+    def list_contexts(
+        self, owner_user_id: Optional[str] = None
+    ) -> List[KnowledgeContext]:
         if not owner_user_id:
             return []
-        return [ctx for ctx in self.contexts.values() if ctx.owner_user_id == owner_user_id]
+        return [
+            ctx for ctx in self.contexts.values() if ctx.owner_user_id == owner_user_id
+        ]
 
     def add_context_source(
-        self, context_id: str, fs_path: str, recursive: bool = True, meta: Optional[Dict] = None
+        self,
+        context_id: str,
+        fs_path: str,
+        recursive: bool = True,
+        meta: Optional[Dict] = None,
     ) -> ContextSource:
         if context_id not in self.contexts:
             raise ConstraintViolation("context not found", {"context_id": context_id})
         if not fs_path or not fs_path.strip():
-            raise ConstraintViolation("fs_path required for context_source", {"fs_path": fs_path})
+            raise ConstraintViolation(
+                "fs_path required for context_source", {"fs_path": fs_path}
+            )
         source = ContextSource(
             id=str(uuid.uuid4()),
             context_id=context_id,
@@ -1110,7 +1268,9 @@ class MemoryStore:
         self._persist_state()
         return source
 
-    def list_context_sources(self, context_id: Optional[str] = None) -> List[ContextSource]:
+    def list_context_sources(
+        self, context_id: Optional[str] = None
+    ) -> List[ContextSource]:
         if context_id:
             return list(self.context_sources.get(context_id, []))
         all_sources: List[ContextSource] = []
@@ -1124,7 +1284,9 @@ class MemoryStore:
         existing = self.chunks.setdefault(context_id, [])
         for chunk in chunks:
             if not chunk.fs_path or not str(chunk.fs_path).strip():
-                raise ConstraintViolation("fs_path required for knowledge_chunk", {"fs_path": chunk.fs_path})
+                raise ConstraintViolation(
+                    "fs_path required for knowledge_chunk", {"fs_path": chunk.fs_path}
+                )
             chunk_id = getattr(chunk, "id", None)
             if isinstance(chunk_id, str):
                 try:
@@ -1140,7 +1302,9 @@ class MemoryStore:
             existing.append(chunk)
         self._persist_state()
 
-    def list_chunks(self, context_id: Optional[str] = None, *, owner_user_id: Optional[str] = None) -> List[KnowledgeChunk]:
+    def list_chunks(
+        self, context_id: Optional[str] = None, *, owner_user_id: Optional[str] = None
+    ) -> List[KnowledgeChunk]:
         if context_id:
             ctx = self.contexts.get(context_id)
             if owner_user_id and (not ctx or ctx.owner_user_id != owner_user_id):
@@ -1176,7 +1340,9 @@ class MemoryStore:
                 semantic_scores.append(0.0)
                 continue
             dim = min(len(query_embedding), len(ch.embedding))
-            semantic_scores.append(cosine_similarity(query_embedding[:dim], ch.embedding[:dim]))
+            semantic_scores.append(
+                cosine_similarity(query_embedding[:dim], ch.embedding[:dim])
+            )
         max_bm25 = max(bm25_scores) or 1.0
         combined: Dict[str, tuple[KnowledgeChunk, float]] = {}
         for chunk, lex, sem in zip(candidates, bm25_scores, semantic_scores):
@@ -1222,12 +1388,17 @@ class MemoryStore:
 
         if filters and filters.get("embedding_model_id"):
             allowed_chunks = [
-                c for c in allowed_chunks if (c.meta or {}).get("embedding_model_id") == filters.get("embedding_model_id")
+                c
+                for c in allowed_chunks
+                if (c.meta or {}).get("embedding_model_id")
+                == filters.get("embedding_model_id")
             ]
         if not allowed_chunks:
             return []
         if filters and filters.get("fs_path"):
-            allowed_chunks = [c for c in allowed_chunks if c.fs_path == filters["fs_path"]]
+            allowed_chunks = [
+                c for c in allowed_chunks if c.fs_path == filters["fs_path"]
+            ]
         if not allowed_chunks:
             return []
 
@@ -1249,25 +1420,57 @@ class MemoryStore:
             "users": [self._serialize_user(u) for u in self.users.values()],
             "sessions": [self._serialize_session(s) for s in self.sessions.values()],
             "credentials": [
-                {"user_id": user_id, "password_hash": creds[0], "password_algo": creds[1]}
+                {
+                    "user_id": user_id,
+                    "password_hash": creds[0],
+                    "password_algo": creds[1],
+                }
                 for user_id, creds in self.credentials.items()
             ],
             "providers": [self._serialize_provider(p) for p in self.providers],
-            "conversations": [self._serialize_conversation(c) for c in self.conversations.values()],
-            "messages": [self._serialize_message(m) for msgs in self.messages.values() for m in msgs],
+            "conversations": [
+                self._serialize_conversation(c) for c in self.conversations.values()
+            ],
+            "messages": [
+                self._serialize_message(m)
+                for msgs in self.messages.values()
+                for m in msgs
+            ],
             "artifacts": [self._serialize_artifact(a) for a in self.artifacts.values()],
             "artifact_versions": [
-                self._serialize_artifact_version(v) for versions in self.artifact_versions.values() for v in versions
+                self._serialize_artifact_version(v)
+                for versions in self.artifact_versions.values()
+                for v in versions
             ],
-            "config_patches": [self._serialize_config_patch(cp) for cp in self.config_patches.values()],
+            "config_patches": [
+                self._serialize_config_patch(cp) for cp in self.config_patches.values()
+            ],
             "runtime_config": self.runtime_config,
-            "contexts": [self._serialize_context(ctx) for ctx in self.contexts.values()],
-            "context_sources": [self._serialize_context_source(src) for srcs in self.context_sources.values() for src in srcs],
-            "chunks": [self._serialize_chunk(ch) for chs in self.chunks.values() for ch in chs],
-            "preference_events": [self._serialize_preference_event(e) for e in self.preference_events.values()],
-            "training_jobs": [self._serialize_training_job(j) for j in self.training_jobs.values()],
-            "semantic_clusters": [self._serialize_semantic_cluster(c) for c in self.semantic_clusters.values()],
-            "mfa_secrets": [self._serialize_mfa_config(cfg) for cfg in self.mfa_secrets.values()],
+            "contexts": [
+                self._serialize_context(ctx) for ctx in self.contexts.values()
+            ],
+            "context_sources": [
+                self._serialize_context_source(src)
+                for srcs in self.context_sources.values()
+                for src in srcs
+            ],
+            "chunks": [
+                self._serialize_chunk(ch) for chs in self.chunks.values() for ch in chs
+            ],
+            "preference_events": [
+                self._serialize_preference_event(e)
+                for e in self.preference_events.values()
+            ],
+            "training_jobs": [
+                self._serialize_training_job(j) for j in self.training_jobs.values()
+            ],
+            "semantic_clusters": [
+                self._serialize_semantic_cluster(c)
+                for c in self.semantic_clusters.values()
+            ],
+            "mfa_secrets": [
+                self._serialize_mfa_config(cfg) for cfg in self.mfa_secrets.values()
+            ],
         }
         path = self._state_path()
         try:
@@ -1281,20 +1484,29 @@ class MemoryStore:
             return False
         data = json.loads(path.read_text())
         self.users = {u["id"]: self._deserialize_user(u) for u in data.get("users", [])}
-        self.sessions = {s["id"]: self._deserialize_session(s) for s in data.get("sessions", [])}
+        self.sessions = {
+            s["id"]: self._deserialize_session(s) for s in data.get("sessions", [])
+        }
         self.credentials = {
             entry["user_id"]: (entry["password_hash"], entry.get("password_algo", ""))
             for entry in data.get("credentials", [])
         }
-        self.providers = [self._deserialize_provider(p) for p in data.get("providers", [])]
-        self.conversations = {c["id"]: self._deserialize_conversation(c) for c in data.get("conversations", [])}
+        self.providers = [
+            self._deserialize_provider(p) for p in data.get("providers", [])
+        ]
+        self.conversations = {
+            c["id"]: self._deserialize_conversation(c)
+            for c in data.get("conversations", [])
+        }
         self.messages = {}
         for msg_data in data.get("messages", []):
             msg = self._deserialize_message(msg_data)
             self.messages.setdefault(msg.conversation_id, []).append(msg)
         for convo_messages in self.messages.values():
             convo_messages.sort(key=lambda m: m.seq)
-        self.artifacts = {a["id"]: self._deserialize_artifact(a) for a in data.get("artifacts", [])}
+        self.artifacts = {
+            a["id"]: self._deserialize_artifact(a) for a in data.get("artifacts", [])
+        }
         self.artifact_versions = {}
         for version_data in data.get("artifact_versions", []):
             version = self._deserialize_artifact_version(version_data)
@@ -1303,7 +1515,11 @@ class MemoryStore:
         for versions in self.artifact_versions.values():
             versions.sort(key=lambda v: v.version)
         max_artifact_version_id = max(
-            (version.id for versions in self.artifact_versions.values() for version in versions),
+            (
+                version.id
+                for versions in self.artifact_versions.values()
+                for version in versions
+            ),
             default=0,
         )
         self._artifact_version_seq = max_artifact_version_id + 1
@@ -1312,7 +1528,10 @@ class MemoryStore:
         for cp in data.get("config_patches", []):
             deserialized = self._deserialize_config_patch(cp)
             self.config_patches[deserialized.id] = deserialized
-        self.contexts = {ctx["id"]: self._deserialize_context(ctx) for ctx in data.get("contexts", [])}
+        self.contexts = {
+            ctx["id"]: self._deserialize_context(ctx)
+            for ctx in data.get("contexts", [])
+        }
         self.context_sources = {}
         for src_data in data.get("context_sources", []):
             source = self._deserialize_context_source(src_data)
@@ -1321,16 +1540,27 @@ class MemoryStore:
         for chunk_data in data.get("chunks", []):
             chunk = self._deserialize_chunk(chunk_data)
             self.chunks.setdefault(chunk.context_id, []).append(chunk)
-        max_chunk_id = max((chunk.id or 0 for chunks in self.chunks.values() for chunk in chunks), default=0)
+        max_chunk_id = max(
+            (chunk.id or 0 for chunks in self.chunks.values() for chunk in chunks),
+            default=0,
+        )
         self._chunk_id_seq = max_chunk_id + 1
         self.preference_events = {
-            e["id"]: self._deserialize_preference_event(e) for e in data.get("preference_events", [])
+            e["id"]: self._deserialize_preference_event(e)
+            for e in data.get("preference_events", [])
         }
-        self.training_jobs = {j["id"]: self._deserialize_training_job(j) for j in data.get("training_jobs", [])}
+        self.training_jobs = {
+            j["id"]: self._deserialize_training_job(j)
+            for j in data.get("training_jobs", [])
+        }
         self.semantic_clusters = {
-            c["id"]: self._deserialize_semantic_cluster(c) for c in data.get("semantic_clusters", [])
+            c["id"]: self._deserialize_semantic_cluster(c)
+            for c in data.get("semantic_clusters", [])
         }
-        self.mfa_secrets = {cfg["user_id"]: self._deserialize_mfa_config(cfg) for cfg in data.get("mfa_secrets", [])}
+        self.mfa_secrets = {
+            cfg["user_id"]: self._deserialize_mfa_config(cfg)
+            for cfg in data.get("mfa_secrets", [])
+        }
         return True
 
     def _serialize_user(self, user: User) -> dict:
@@ -1374,7 +1604,9 @@ class MemoryStore:
             user_id=str(data["user_id"]),
             provider=data["provider"],
             provider_uid=data["provider_uid"],
-            created_at=self._deserialize_datetime(data.get("created_at", datetime.utcnow().isoformat())),
+            created_at=self._deserialize_datetime(
+                data.get("created_at", datetime.utcnow().isoformat())
+            ),
         )
 
     def _serialize_session(self, session: Session) -> dict:
@@ -1536,8 +1768,12 @@ class MemoryStore:
             "justification": patch.justification,
             "status": patch.status,
             "created_at": self._serialize_datetime(patch.created_at),
-            "decided_at": self._serialize_datetime(patch.decided_at) if patch.decided_at else None,
-            "applied_at": self._serialize_datetime(patch.applied_at) if patch.applied_at else None,
+            "decided_at": (
+                self._serialize_datetime(patch.decided_at) if patch.decided_at else None
+            ),
+            "applied_at": (
+                self._serialize_datetime(patch.applied_at) if patch.applied_at else None
+            ),
             "meta": patch.meta,
         }
 
@@ -1550,8 +1786,16 @@ class MemoryStore:
             justification=data.get("justification"),
             status=data.get("status", "pending"),
             created_at=self._deserialize_datetime(data["created_at"]),
-            decided_at=self._deserialize_datetime(data["decided_at"]) if data.get("decided_at") else None,
-            applied_at=self._deserialize_datetime(data["applied_at"]) if data.get("applied_at") else None,
+            decided_at=(
+                self._deserialize_datetime(data["decided_at"])
+                if data.get("decided_at")
+                else None
+            ),
+            applied_at=(
+                self._deserialize_datetime(data["applied_at"])
+                if data.get("applied_at")
+                else None
+            ),
             meta=data.get("meta"),
         )
 
@@ -1681,7 +1925,9 @@ class MemoryStore:
             status=data.get("status", "queued"),
             num_events=data.get("num_events"),
             created_at=self._deserialize_datetime(data["created_at"]),
-            updated_at=self._deserialize_datetime(data.get("updated_at", data["created_at"])),
+            updated_at=self._deserialize_datetime(
+                data.get("updated_at", data["created_at"])
+            ),
             loss=data.get("loss"),
             preference_event_ids=list(data.get("preference_event_ids", [])),
             dataset_path=data.get("dataset_path"),
@@ -1712,8 +1958,12 @@ class MemoryStore:
             label=data.get("label"),
             description=data.get("description"),
             sample_message_ids=list(data.get("sample_message_ids", [])),
-            created_at=self._deserialize_datetime(data.get("created_at", datetime.utcnow().isoformat())),
-            updated_at=self._deserialize_datetime(data.get("updated_at", datetime.utcnow().isoformat())),
+            created_at=self._deserialize_datetime(
+                data.get("created_at", datetime.utcnow().isoformat())
+            ),
+            updated_at=self._deserialize_datetime(
+                data.get("updated_at", datetime.utcnow().isoformat())
+            ),
             meta=data.get("meta"),
         )
 
@@ -1731,6 +1981,8 @@ class MemoryStore:
             user_id=data["user_id"],
             secret=data["secret"],
             enabled=bool(data.get("enabled", False)),
-            created_at=self._deserialize_datetime(data.get("created_at", datetime.utcnow().isoformat())),
+            created_at=self._deserialize_datetime(
+                data.get("created_at", datetime.utcnow().isoformat())
+            ),
             meta=data.get("meta"),
         )

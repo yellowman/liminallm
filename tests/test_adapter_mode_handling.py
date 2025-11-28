@@ -2,9 +2,8 @@
 
 from __future__ import annotations
 
-import pytest
 
-from liminallm.config import AdapterMode, RemoteStyle, get_provider_capabilities
+from liminallm.config import AdapterMode, RemoteStyle
 from liminallm.service.model_backend import (
     ApiAdapterBackend,
     filter_adapters_by_mode,

@@ -9,7 +9,9 @@ logger = get_logger(__name__)
 DEFAULT_VOCAB_SIZE = 32000
 
 
-def vocab_size_from_tokenizer(tokenizer: Any, *, fallback: int = DEFAULT_VOCAB_SIZE) -> int:
+def vocab_size_from_tokenizer(
+    tokenizer: Any, *, fallback: int = DEFAULT_VOCAB_SIZE
+) -> int:
     """Return the vocabulary size for a tokenizer with safe fallbacks.
 
     The helper mirrors the usage across backends and training flows while
