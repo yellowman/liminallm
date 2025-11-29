@@ -1491,13 +1491,120 @@ that’s the whole point: minimal glue, maximal evolution.
 ## 17. front-end expectations (LLM-visible, thin client)
 
 - single-page app speaking the public APIs; no domain knowledge baked in.
-- components:
-- chat view: conversation list, message stream, token streaming via SSE/WS, inline citations to filesystem paths.
-  - artifact browser/editor: render JSON schemas for workflows/policies/adapters, allow proposing patches through ConfigOps endpoints.
-  - context manager: upload files, bind contexts to conversations, show ingestion status.
-  - feedback controls: thumbs/emoji and free-text feedback hooked to `preference_event` creation.
-- state management driven by API responses; LLM-readable tooltips/descriptions fetched from artifact metadata to keep UI descriptive without hard-coded taxonomies.
-- accessibility/performance: optimistic UI for chat, background refresh for workflow/router traces, offline-safe storage only for draft messages (no secret caching).
+
+### 17.1 layout architecture
+
+- **sidebar-main layout**: persistent conversation list sidebar (280px) with main content area.
+- **tab navigation**: four primary tabs organize functionality:
+  - **Chat**: conversation interface with message streaming
+  - **Contexts**: knowledge context management
+  - **Artifacts**: system artifact browser
+  - **Settings**: user preferences and session info
+- responsive breakpoints: sidebar hidden on mobile (<1080px), single-column tabs on small screens (<640px).
+
+### 17.2 conversation sidebar
+
+- **conversation list**: paginated list of user conversations sorted by `updated_at`.
+- **search**: client-side filter by title or conversation ID.
+- **active indicator**: highlight currently loaded conversation.
+- **new conversation**: button to reset chat state and start fresh thread.
+- API endpoints: `GET /v1/conversations`, `GET /v1/conversations/{id}`, `GET /v1/conversations/{id}/messages`.
+
+### 17.3 chat view (Chat tab)
+
+- **message stream**: scrollable container with message bubbles differentiated by role (user/assistant/system).
+- **token streaming**: WebSocket primary with HTTP fallback; display streaming indicator during generation.
+- **citation rendering**: inline clickable links for citations from `content_struct.citations`; each citation shows source filename/path as tooltip.
+- **context binding**: dropdown to select active `knowledge_context` for RAG-grounded responses.
+- **workflow override**: optional text input for `workflow_id` to steer execution.
+- **optimistic UI**: user messages displayed immediately before server confirmation.
+- **collapsible sections**:
+  - **Upload knowledge**: file upload with context selection and chunk size configuration.
+  - **Preferences**: thumbs up/down feedback with optional notes, displays routing metadata and trace.
+
+### 17.4 context manager (Contexts tab)
+
+- **context creation form**: name (required) and description fields; `POST /v1/contexts` on submit.
+- **contexts list**: card layout showing context name, description, ID prefix, and creation date.
+- **context selection**: click to load details; selected context highlighted.
+- **context details panel**:
+  - full ID, description, visibility badge, creation timestamp.
+  - chunk count and preview of recent chunks via `GET /v1/contexts/{id}/chunks`.
+- **context selects**: chat and upload dropdowns populated from `state.contexts` and updated on context CRUD.
+
+### 17.5 artifact browser (Artifacts tab)
+
+- **filter controls**:
+  - type dropdown: all, workflow, policy, adapter, tool.
+  - visibility dropdown: all, private, shared, global.
+- **artifacts table**: sortable columns for type, name, visibility, version, updated date.
+- **type badges**: color-coded labels (workflow=blue, policy=pink, adapter=green, tool=amber).
+- **visibility badges**: color-coded (private=red, shared=amber, global=green).
+- **artifact details panel**:
+  - header with name and type badge.
+  - detail rows: ID, description, version, owner.
+  - **schema viewer**: syntax-highlighted JSON display of `artifact.schema`.
+- **version history table**: list of `artifact_version` entries with version number, timestamp, and change summary.
+- API endpoints: `GET /v1/artifacts`, `GET /v1/artifacts/{id}`, `GET /v1/artifacts/{id}/versions`.
+
+### 17.6 settings panel (Settings tab)
+
+- **session information**: display user ID, role, tenant, truncated session ID.
+- **local storage management**:
+  - draft count indicator.
+  - clear drafts button (removes all from localStorage).
+  - export drafts button (downloads JSON file).
+- **upload limits**: display max file size and allowed extensions from `GET /v1/files/limits`.
+- **about section**: version and build info from `/healthz`.
+
+### 17.7 draft persistence (offline-safe)
+
+- drafts stored in localStorage under key `liminal.drafts` as `{ [conversationId]: { text, savedAt } }`.
+- auto-save: 1-second debounce on message input changes.
+- draft restoration: on conversation load, restore any saved draft to input field.
+- draft indicator: displays count of saved drafts in chat input area.
+- new conversation drafts stored under key `_new`.
+
+### 17.8 file upload
+
+- **upload section**: collapsible panel within Chat tab.
+- **context selection**: dropdown to choose target context (or private/no context).
+- **chunk size**: optional numeric input (64–4000 range validation).
+- **file validation**: client-side checks for size limit and allowed extensions before upload.
+- **upload status**: progress and result feedback inline.
+- API endpoint: `POST /v1/files/upload` with multipart form data.
+
+### 17.9 feedback controls
+
+- **thumbs up/down buttons**: visible in preferences section; disabled until assistant message exists.
+- **notes field**: optional free-text input for additional feedback context.
+- **target display**: shows conversation ID and message ID of feedback target.
+- **metadata display**: JSON preview of adapters, context snippets, and adapter gates.
+- **routing trace display**: JSON preview of routing and workflow traces when available.
+- API endpoint: `POST /v1/preferences`.
+
+### 17.10 auth flow
+
+- **auth panel**: shown when not authenticated; hidden after successful login.
+- **login form**: email, password, optional MFA code, optional tenant ID.
+- **MFA handling**: if `mfa_required` returned without token, prompt user to enter code.
+- **token management**: access token, refresh token, session ID stored in sessionStorage.
+- **auto-refresh**: on 401 response, attempt token refresh before failing.
+- **logout**: calls `POST /v1/auth/logout`, clears storage, reloads page.
+
+### 17.11 API integration patterns
+
+- **request headers**: `Authorization: Bearer`, `X-Tenant-ID`, `session_id`, `Idempotency-Key` (auto-generated UUID).
+- **envelope handling**: parse `{ status, data, error }` responses; extract error messages from `error.message` or `detail`.
+- **retry logic**: exponential backoff (400ms base, 3 retries) for 5xx errors; no retry on 4xx.
+- **WebSocket protocol**: connect to `/v1/chat/stream`; send auth + message in initial frame; handle `token`, `message_done`, `error` events.
+
+### 17.12 styling system
+
+- CSS custom properties for theming: `--accent`, `--text`, `--panel`, `--border`, etc.
+- component classes: `.panel`, `.badge`, `.table`, `.code-block`, `.context-card`, `.type-badge`, `.visibility-badge`.
+- utility classes: `.hidden`, `.flex-row`, `.pill-row`, `.divider`, `.mb-14`, `.monospace`.
+- responsive: media queries at 1080px (hide sidebar) and 640px (single-column layout).
 
 ---
 
