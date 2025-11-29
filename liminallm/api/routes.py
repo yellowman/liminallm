@@ -414,6 +414,10 @@ def _generate_conversation_title(message: str, max_length: int = 50) -> str:
     # Clean up whitespace
     cleaned = " ".join(message.split())
 
+    # Handle whitespace-only input after cleanup
+    if not cleaned:
+        return "New conversation"
+
     if len(cleaned) <= max_length:
         return cleaned
 
