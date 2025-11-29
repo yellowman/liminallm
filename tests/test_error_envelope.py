@@ -223,11 +223,12 @@ class TestErrorResponseFactory:
         assert "required" in body
 
     def test_error_response_custom_code(self):
-        """_error_response accepts custom error code override."""
-        response = _error_response(400, "Custom error", code="custom_code")
+        """_error_response accepts custom error code override (must be valid SPEC §18 code)."""
+        # Custom code must be a valid SPEC §18 error code
+        response = _error_response(400, "Custom error", code="conflict")
 
         body = response.body.decode()
-        assert "custom_code" in body
+        assert "conflict" in body
 
     def test_error_response_includes_request_id(self):
         """_error_response includes request_id in envelope."""

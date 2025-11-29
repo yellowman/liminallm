@@ -112,24 +112,16 @@ class LLMService:
         return [{"role": "system", "content": f"Adapter guidance:\n{joined}"}]
 
     def _extract_prompt_instructions(self, adapter: dict) -> str:
-        for key in (
-            "prompt_instructions",
-            "behavior_prompt",
-            "instructions",
-            "prompt_template",
-        ):
-            value = adapter.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        applicability = adapter.get("applicability")
-        if isinstance(applicability, dict):
-            natural = applicability.get("natural_language")
-            if isinstance(natural, str) and natural.strip():
-                return natural.strip()
-        description = adapter.get("description")
-        if isinstance(description, str) and description.strip():
-            return description.strip()
-        return ""
+        """Extract prompt instructions using shared utility for consistency.
+
+        See liminallm.service.prompt_utils.extract_prompt_instructions for
+        the canonical implementation and priority order per SPEC §5.0.1.
+        """
+        from liminallm.service.prompt_utils import extract_prompt_instructions
+
+        adapter_id = adapter.get("id") or adapter.get("name") or "unknown"
+        result = extract_prompt_instructions(adapter, log_source=adapter_id)
+        return result or ""
 
     def _build_backend(
         self,

@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import secrets
+import threading
 import uuid
 import hashlib
 import shutil
@@ -67,6 +68,11 @@ class MemoryStore:
         self.chunks: Dict[str, List[KnowledgeChunk]] = {}
         self._chunk_id_seq: int = 1
         self._artifact_version_seq: int = 1
+        # Thread lock for sequence counters to prevent race conditions
+        self._seq_lock = threading.Lock()
+        # RLock for all data operations to ensure thread safety
+        # Using RLock to allow nested acquisitions within the same thread
+        self._data_lock = threading.RLock()
         self.preference_events: Dict[str, PreferenceEvent] = {}
         self.training_jobs: Dict[str, TrainingJob] = {}
         self.semantic_clusters: Dict[str, SemanticCluster] = {}
@@ -197,9 +203,16 @@ class MemoryStore:
         self._persist_state()
 
     def _next_artifact_version_id(self) -> int:
-        next_id = self._artifact_version_seq
-        self._artifact_version_seq += 1
-        return next_id
+        with self._seq_lock:
+            next_id = self._artifact_version_seq
+            self._artifact_version_seq += 1
+            return next_id
+
+    def _next_chunk_id(self) -> int:
+        with self._seq_lock:
+            next_id = self._chunk_id_seq
+            self._chunk_id_seq += 1
+            return next_id
 
     def _backfill_default_classifier_inputs(self) -> bool:
         """Ensure default workflow classifier passes the user message to the tool."""
@@ -250,125 +263,134 @@ class MemoryStore:
         is_active: bool = True,
         meta: Optional[Dict] = None,
     ) -> User:
-        if any(existing.email == email for existing in self.users.values()):
-            raise ConstraintViolation("email already exists", {"field": "email"})
-        user_id = str(uuid.uuid4())
-        normalized_meta = meta.copy() if meta else {}
-        normalized_meta.setdefault("email_verified", False)
-        user = User(
-            id=user_id,
-            email=email,
-            handle=handle,
-            tenant_id=tenant_id,
-            role=role,
-            plan_tier=plan_tier,
-            is_active=is_active,
-            meta=normalized_meta,
-        )
-        self.users[user_id] = user
-        self._persist_state()
-        return user
+        with self._data_lock:
+            if any(existing.email == email for existing in self.users.values()):
+                raise ConstraintViolation("email already exists", {"field": "email"})
+            user_id = str(uuid.uuid4())
+            normalized_meta = meta.copy() if meta else {}
+            normalized_meta.setdefault("email_verified", False)
+            user = User(
+                id=user_id,
+                email=email,
+                handle=handle,
+                tenant_id=tenant_id,
+                role=role,
+                plan_tier=plan_tier,
+                is_active=is_active,
+                meta=normalized_meta,
+            )
+            self.users[user_id] = user
+            self._persist_state()
+            return user
 
     def link_user_auth_provider(
         self, user_id: str, provider: str, provider_uid: str
     ) -> None:
-        # Check for existing mapping (avoid duplicates like postgres ON CONFLICT DO NOTHING)
-        for existing in self.providers:
-            if existing.provider == provider and existing.provider_uid == provider_uid:
-                return  # Already linked, do nothing
-        # Generate unique ID
-        max_id = max((p.id for p in self.providers), default=0)
-        mapping = UserAuthProvider(
-            id=max_id + 1, user_id=user_id, provider=provider, provider_uid=provider_uid
-        )
-        self.providers.append(mapping)
-        self._persist_state()
+        with self._data_lock:
+            # Check for existing mapping (avoid duplicates like postgres ON CONFLICT DO NOTHING)
+            for existing in self.providers:
+                if existing.provider == provider and existing.provider_uid == provider_uid:
+                    return  # Already linked, do nothing
+            # Generate unique ID
+            max_id = max((p.id for p in self.providers), default=0)
+            mapping = UserAuthProvider(
+                id=max_id + 1, user_id=user_id, provider=provider, provider_uid=provider_uid
+            )
+            self.providers.append(mapping)
+            self._persist_state()
 
     def get_user_by_provider(self, provider: str, provider_uid: str) -> Optional[User]:
-        for mapping in self.providers:
-            if mapping.provider == provider and mapping.provider_uid == provider_uid:
-                return self.users.get(mapping.user_id)
-        return None
+        with self._data_lock:
+            for mapping in self.providers:
+                if mapping.provider == provider and mapping.provider_uid == provider_uid:
+                    return self.users.get(mapping.user_id)
+            return None
 
     def get_user_by_email(self, email: str) -> Optional[User]:
-        return next((u for u in self.users.values() if u.email == email), None)
+        with self._data_lock:
+            return next((u for u in self.users.values() if u.email == email), None)
 
     def get_user(self, user_id: str) -> Optional[User]:
-        return self.users.get(user_id)
+        with self._data_lock:
+            return self.users.get(user_id)
 
     def list_users(
         self, tenant_id: Optional[str] = None, limit: int = 100
     ) -> List[User]:
-        results = [
-            u for u in self.users.values() if not tenant_id or u.tenant_id == tenant_id
-        ]
-        return sorted(results, key=lambda u: u.created_at, reverse=True)[:limit]
+        with self._data_lock:
+            results = [
+                u for u in self.users.values() if not tenant_id or u.tenant_id == tenant_id
+            ]
+            return sorted(results, key=lambda u: u.created_at, reverse=True)[:limit]
 
     def update_user_role(self, user_id: str, role: str) -> Optional[User]:
-        user = self.users.get(user_id)
-        if not user:
-            return None
-        user.role = role
-        self._persist_state()
-        return user
+        with self._data_lock:
+            user = self.users.get(user_id)
+            if not user:
+                return None
+            user.role = role
+            self._persist_state()
+            return user
 
     def mark_email_verified(self, user_id: str) -> Optional[User]:
-        user = self.users.get(user_id)
-        if not user:
-            return None
-        meta = user.meta or {}
-        meta["email_verified"] = True
-        user.meta = meta
-        self._persist_state()
-        return user
+        with self._data_lock:
+            user = self.users.get(user_id)
+            if not user:
+                return None
+            meta = user.meta or {}
+            meta["email_verified"] = True
+            user.meta = meta
+            self._persist_state()
+            return user
 
     def delete_user(self, user_id: str) -> bool:
-        if user_id not in self.users:
-            return False
-        self.users.pop(user_id, None)
-        self.mfa_secrets.pop(user_id, None)
-        # Clean up user credentials
-        self.credentials.pop(user_id, None)
-        # Clean up auth providers for this user
-        self.providers = [p for p in self.providers if p.user_id != user_id]
-        for sess_id, sess in list(self.sessions.items()):
-            if sess.user_id == user_id:
-                self.sessions.pop(sess_id, None)
-        for conv_id, conv in list(self.conversations.items()):
-            if conv.user_id == user_id:
-                self.messages.pop(conv_id, None)
-                self.conversations.pop(conv_id, None)
-        for ctx_id, ctx in list(self.contexts.items()):
-            if ctx.owner_user_id == user_id:
-                self.contexts.pop(ctx_id, None)
-                self.context_sources.pop(ctx_id, None)
-                self.chunks.pop(ctx_id, None)
-        user_artifacts: list[str] = []
-        for art_id, art in list(self.artifacts.items()):
-            if art.owner_user_id == user_id:
-                self.artifacts.pop(art_id, None)
-                self.artifact_versions.pop(art_id, None)
-                user_artifacts.append(art_id)
-        for evt_id, evt in list(self.preference_events.items()):
-            if evt.user_id == user_id:
-                self.preference_events.pop(evt_id, None)
-        for job_id, job in list(self.training_jobs.items()):
-            if job.user_id == user_id:
-                self.training_jobs.pop(job_id, None)
-        for cluster_id, cluster in list(self.semantic_clusters.items()):
-            if cluster.user_id == user_id:
-                self.semantic_clusters.pop(cluster_id, None)
-        for state_id, state in list(self.adapter_router_state.items()):
-            if (
-                getattr(state, "artifact_id", None) in user_artifacts
-                or getattr(state, "user_id", None) == user_id
-            ):
-                self.adapter_router_state.pop(state_id, None)
-        for art_id in user_artifacts:
-            shutil.rmtree(self.fs_root / "artifacts" / art_id, ignore_errors=True)
-        shutil.rmtree(self.fs_root / "users" / user_id, ignore_errors=True)
-        self._persist_state()
-        return True
+        with self._data_lock:
+            if user_id not in self.users:
+                return False
+            self.users.pop(user_id, None)
+            self.mfa_secrets.pop(user_id, None)
+            # Clean up user credentials
+            self.credentials.pop(user_id, None)
+            # Clean up auth providers for this user
+            self.providers = [p for p in self.providers if p.user_id != user_id]
+            for sess_id, sess in list(self.sessions.items()):
+                if sess.user_id == user_id:
+                    self.sessions.pop(sess_id, None)
+            for conv_id, conv in list(self.conversations.items()):
+                if conv.user_id == user_id:
+                    self.messages.pop(conv_id, None)
+                    self.conversations.pop(conv_id, None)
+            for ctx_id, ctx in list(self.contexts.items()):
+                if ctx.owner_user_id == user_id:
+                    self.contexts.pop(ctx_id, None)
+                    self.context_sources.pop(ctx_id, None)
+                    self.chunks.pop(ctx_id, None)
+            user_artifacts: list[str] = []
+            for art_id, art in list(self.artifacts.items()):
+                if art.owner_user_id == user_id:
+                    self.artifacts.pop(art_id, None)
+                    self.artifact_versions.pop(art_id, None)
+                    user_artifacts.append(art_id)
+            for evt_id, evt in list(self.preference_events.items()):
+                if evt.user_id == user_id:
+                    self.preference_events.pop(evt_id, None)
+            for job_id, job in list(self.training_jobs.items()):
+                if job.user_id == user_id:
+                    self.training_jobs.pop(job_id, None)
+            for cluster_id, cluster in list(self.semantic_clusters.items()):
+                if cluster.user_id == user_id:
+                    self.semantic_clusters.pop(cluster_id, None)
+            for state_id, state in list(self.adapter_router_state.items()):
+                if (
+                    getattr(state, "artifact_id", None) in user_artifacts
+                    or getattr(state, "user_id", None) == user_id
+                ):
+                    self.adapter_router_state.pop(state_id, None)
+            for art_id in user_artifacts:
+                shutil.rmtree(self.fs_root / "artifacts" / art_id, ignore_errors=True)
+            shutil.rmtree(self.fs_root / "users" / user_id, ignore_errors=True)
+            self._persist_state()
+            return True
 
     def save_password(
         self, user_id: str, password_hash: str, password_algo: str
@@ -444,49 +466,55 @@ class MemoryStore:
         tenant_id: str = "public",
         meta: Optional[Dict] = None,
     ) -> Session:
-        if user_id not in self.users:
-            raise ConstraintViolation("user does not exist", {"user_id": user_id})
-        sess = Session.new(
-            user_id=user_id,
-            ttl_minutes=ttl_minutes,
-            user_agent=user_agent,
-            ip_addr=ip_addr,
-            mfa_required=mfa_required,
-            tenant_id=tenant_id,
-            meta=meta,
-        )
-        self.sessions[sess.id] = sess
-        self._persist_state()
-        return sess
+        with self._data_lock:
+            if user_id not in self.users:
+                raise ConstraintViolation("user does not exist", {"user_id": user_id})
+            sess = Session.new(
+                user_id=user_id,
+                ttl_minutes=ttl_minutes,
+                user_agent=user_agent,
+                ip_addr=ip_addr,
+                mfa_required=mfa_required,
+                tenant_id=tenant_id,
+                meta=meta,
+            )
+            self.sessions[sess.id] = sess
+            self._persist_state()
+            return sess
 
     def get_session(self, session_id: str) -> Optional[Session]:
-        return self.sessions.get(session_id)
+        with self._data_lock:
+            return self.sessions.get(session_id)
 
     def set_session_meta(self, session_id: str, meta: Dict) -> None:
-        sess = self.sessions.get(session_id)
-        if not sess:
-            return
-        sess.meta = meta
-        self.sessions[session_id] = sess
-        self._persist_state()
-
-    def revoke_session(self, session_id: str) -> None:
-        self.sessions.pop(session_id, None)
-        self._persist_state()
-
-    def revoke_user_sessions(self, user_id: str) -> None:
-        stale = [sid for sid, sess in self.sessions.items() if sess.user_id == user_id]
-        for sid in stale:
-            self.sessions.pop(sid, None)
-        if stale:
+        with self._data_lock:
+            sess = self.sessions.get(session_id)
+            if not sess:
+                return
+            sess.meta = meta
+            self.sessions[session_id] = sess
             self._persist_state()
 
+    def revoke_session(self, session_id: str) -> None:
+        with self._data_lock:
+            self.sessions.pop(session_id, None)
+            self._persist_state()
+
+    def revoke_user_sessions(self, user_id: str) -> None:
+        with self._data_lock:
+            stale = [sid for sid, sess in self.sessions.items() if sess.user_id == user_id]
+            for sid in stale:
+                self.sessions.pop(sid, None)
+            if stale:
+                self._persist_state()
+
     def mark_session_verified(self, session_id: str) -> None:
-        sess = self.sessions.get(session_id)
-        if not sess:
-            return
-        sess.mfa_verified = True
-        self._persist_state()
+        with self._data_lock:
+            sess = self.sessions.get(session_id)
+            if not sess:
+                return
+            sess.mfa_verified = True
+            self._persist_state()
 
     # chat
     def create_conversation(
@@ -1294,11 +1322,13 @@ class MemoryStore:
                 except ValueError:
                     chunk_id = None
             if not chunk_id or int(chunk_id) <= 0:
-                chunk.id = self._chunk_id_seq
-                self._chunk_id_seq += 1
+                # Use thread-safe method for ID assignment
+                chunk.id = self._next_chunk_id()
             else:
                 chunk.id = int(chunk_id)
-                self._chunk_id_seq = max(self._chunk_id_seq, chunk.id + 1)
+                # Update sequence counter safely
+                with self._seq_lock:
+                    self._chunk_id_seq = max(self._chunk_id_seq, chunk.id + 1)
             existing.append(chunk)
         self._persist_state()
 

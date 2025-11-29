@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path as FilePath
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -14,6 +14,7 @@ from fastapi import (
     Form,
     Header,
     HTTPException,
+    Path,
     Query,
     Response,
     UploadFile,
@@ -151,10 +152,20 @@ class IdempotencyGuard:
     async def store_result(
         self, envelope: Envelope, *, status: str = "completed"
     ) -> None:
+        """Store result in idempotency cache.
+
+        Args:
+            envelope: Response envelope to store
+            status: Status to record. Only "completed" marks the operation as
+                    fully done - intermediate statuses like "processing" still
+                    allow error recording via __aexit__.
+        """
         await _store_idempotency_result(
             self.route, self.user_id, self.idempotency_key, envelope, status=status
         )
-        self._stored = True
+        # Only mark as stored for final states to allow error recording for intermediate states
+        if status in {"completed", "failed"}:
+            self._stored = True
 
     async def store_error(self, message: str) -> None:
         if not self.request_id:
@@ -169,12 +180,51 @@ class IdempotencyGuard:
         )
 
 
+class RateLimitInfo:
+    """Rate limit state for adding response headers."""
+
+    __slots__ = ("limit", "remaining", "reset_seconds")
+
+    def __init__(self, limit: int, remaining: int, reset_seconds: int):
+        self.limit = limit
+        self.remaining = remaining
+        self.reset_seconds = reset_seconds
+
+    def apply_headers(self, response: Response) -> None:
+        """Apply rate limit headers to response per IETF draft-polli-ratelimit-headers."""
+        response.headers["X-RateLimit-Limit"] = str(self.limit)
+        response.headers["X-RateLimit-Remaining"] = str(max(0, self.remaining))
+        response.headers["X-RateLimit-Reset"] = str(self.reset_seconds)
+
+
 async def _enforce_rate_limit(
-    runtime, key: str, limit: int, window_seconds: int
-) -> None:
-    allowed = await check_rate_limit(runtime, key, limit, window_seconds)
+    runtime, key: str, limit: int, window_seconds: int, *, response: Optional[Response] = None
+) -> RateLimitInfo:
+    """Enforce rate limit and optionally apply headers to response.
+
+    Args:
+        runtime: Application runtime context
+        key: Rate limit key (e.g., "chat:{user_id}")
+        limit: Maximum requests allowed in window
+        window_seconds: Rate limit window in seconds
+        response: Optional response to add rate limit headers to
+
+    Returns:
+        RateLimitInfo with current rate limit state
+
+    Raises:
+        HTTPException with 429 if rate limit exceeded
+    """
+    allowed, remaining = await check_rate_limit(runtime, key, limit, window_seconds, return_remaining=True)
+    info = RateLimitInfo(limit, remaining, window_seconds)
+
+    if response is not None:
+        info.apply_headers(response)
+
     if not allowed:
         raise _http_error("rate_limited", "rate limit exceeded", status_code=429)
+
+    return info
 
 
 async def _resolve_idempotency(
@@ -345,6 +395,37 @@ def _user_to_response(user) -> UserResponse:
     )
 
 
+def _get_artifact_kind(schema: Any) -> Optional[str]:
+    """Extract 'kind' from artifact schema, handling None/non-dict safely."""
+    if isinstance(schema, dict):
+        return schema.get("kind")
+    return None
+
+
+def _generate_conversation_title(message: str, max_length: int = 50) -> str:
+    """Generate a conversation title from the first message.
+
+    Creates a human-readable title by truncating the message content.
+    Preserves word boundaries where possible.
+    """
+    if not message:
+        return "New conversation"
+
+    # Clean up whitespace
+    cleaned = " ".join(message.split())
+
+    if len(cleaned) <= max_length:
+        return cleaned
+
+    # Truncate at word boundary if possible
+    truncated = cleaned[:max_length]
+    last_space = truncated.rfind(" ")
+    if last_space > max_length // 2:
+        truncated = truncated[:last_space]
+
+    return truncated.rstrip(".,!?;:") + "..."
+
+
 def _apply_session_cookies(
     response: Response, session: Session, tokens: dict, *, refresh_ttl_minutes: int
 ) -> None:
@@ -370,8 +451,17 @@ def _apply_session_cookies(
         )
 
 
-@router.post("/auth/signup", response_model=Envelope, status_code=201)
+@router.post("/auth/signup", response_model=Envelope, status_code=201, tags=["auth"])
 async def signup(body: SignupRequest, response: Response):
+    """Create a new user account.
+
+    Registers a new user with email and password credentials. Returns session
+    tokens and sets authentication cookies. Rate limited per email address.
+
+    Raises:
+        403: If signup is disabled in settings
+        429: If rate limit exceeded for this email
+    """
     settings = get_settings()
     if not settings.allow_signup:
         raise _http_error("forbidden", "signup disabled", status_code=403)
@@ -410,8 +500,17 @@ async def signup(body: SignupRequest, response: Response):
     )
 
 
-@router.post("/auth/login", response_model=Envelope)
+@router.post("/auth/login", response_model=Envelope, tags=["auth"])
 async def login(body: LoginRequest, response: Response):
+    """Authenticate user with email and password.
+
+    Validates credentials and returns session tokens with authentication cookies.
+    Supports optional MFA verification via mfa_code parameter.
+
+    Raises:
+        401: If credentials are invalid
+        429: If rate limit exceeded for this email
+    """
     runtime = get_runtime()
     await _enforce_rate_limit(
         runtime,
@@ -449,8 +548,16 @@ async def login(body: LoginRequest, response: Response):
     )
 
 
-@router.post("/auth/oauth/{provider}/start", response_model=Envelope)
-async def oauth_start(provider: str, body: OAuthStartRequest):
+@router.post("/auth/oauth/{provider}/start", response_model=Envelope, tags=["auth"])
+async def oauth_start(
+    provider: str = Path(..., description="OAuth provider (google, github, etc.)"),
+    body: OAuthStartRequest = ...,
+):
+    """Start OAuth authentication flow.
+
+    Returns authorization URL for the specified OAuth provider.
+    Client should redirect user to this URL to complete authentication.
+    """
     runtime = get_runtime()
     start = await runtime.auth.start_oauth(
         provider, redirect_uri=body.redirect_uri, tenant_id=body.tenant_id
@@ -465,14 +572,19 @@ async def oauth_start(provider: str, body: OAuthStartRequest):
     )
 
 
-@router.get("/auth/oauth/{provider}/callback", response_model=Envelope)
+@router.get("/auth/oauth/{provider}/callback", response_model=Envelope, tags=["auth"])
 async def oauth_callback(
-    provider: str,
-    code: str,
-    state: str,
-    response: Response,
-    tenant_id: Optional[str] = None,
+    provider: str = Path(..., description="OAuth provider"),
+    code: str = Query(..., description="Authorization code from OAuth provider"),
+    state: str = Query(..., description="State parameter for CSRF protection"),
+    response: Response = ...,
+    tenant_id: Optional[str] = Query(None, description="Optional tenant ID"),
 ):
+    """Complete OAuth authentication flow.
+
+    Exchanges authorization code for tokens and creates user session.
+    Called by OAuth provider after user authorizes the application.
+    """
     runtime = get_runtime()
     user, session, tokens = await runtime.auth.complete_oauth(
         provider, code, state, tenant_id=tenant_id
@@ -501,7 +613,7 @@ async def oauth_callback(
     )
 
 
-@router.post("/auth/refresh", response_model=Envelope)
+@router.post("/auth/refresh", response_model=Envelope, tags=["auth"])
 async def refresh_tokens(
     body: TokenRefreshRequest,
     response: Response,
@@ -539,12 +651,17 @@ async def refresh_tokens(
     )
 
 
-@router.get("/admin/users", response_model=Envelope)
+@router.get("/admin/users", response_model=Envelope, tags=["admin"])
 async def admin_list_users(
     tenant_id: Optional[str] = None,
-    limit: int = 100,
+    limit: int = Query(100, ge=1, le=500, description="Maximum users to return"),
     principal: AuthContext = Depends(get_admin_user),
 ):
+    """List users in the admin's tenant.
+
+    Returns:
+        List of users with their roles and metadata.
+    """
     runtime = get_runtime()
     # Admin can only see users in their own tenant (prevent cross-tenant access)
     target_tenant = tenant_id or principal.tenant_id
@@ -552,13 +669,13 @@ async def admin_list_users(
         raise _http_error(
             "forbidden", "cannot access other tenant users", status_code=403
         )
-    users = runtime.auth.list_users(tenant_id=target_tenant, limit=min(limit, 500))
+    users = runtime.auth.list_users(tenant_id=target_tenant, limit=limit)
     return Envelope(
         status="ok", data=UserListResponse(items=[_user_to_response(u) for u in users])
     )
 
 
-@router.post("/admin/users", response_model=Envelope)
+@router.post("/admin/users", response_model=Envelope, tags=["admin"])
 async def admin_create_user(
     body: AdminCreateUserRequest, principal: AuthContext = Depends(get_admin_user)
 ):
@@ -592,7 +709,7 @@ async def admin_create_user(
     )
 
 
-@router.post("/admin/users/{user_id}/role", response_model=Envelope)
+@router.post("/admin/users/{user_id}/role", response_model=Envelope, tags=["admin"])
 async def admin_set_role(
     user_id: str,
     body: UpdateUserRoleRequest,
@@ -611,7 +728,7 @@ async def admin_set_role(
     return Envelope(status="ok", data=_user_to_response(user))
 
 
-@router.delete("/admin/users/{user_id}", response_model=Envelope)
+@router.delete("/admin/users/{user_id}", response_model=Envelope, tags=["admin"])
 async def admin_delete_user(
     user_id: str, principal: AuthContext = Depends(get_admin_user)
 ):
@@ -628,7 +745,7 @@ async def admin_delete_user(
     return Envelope(status="ok", data={"deleted": True, "user_id": user_id})
 
 
-@router.get("/admin/adapters", response_model=Envelope)
+@router.get("/admin/adapters", response_model=Envelope, tags=["admin"])
 async def admin_list_adapters(principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
     # Filter adapters by tenant to prevent cross-tenant data exposure
@@ -656,7 +773,7 @@ async def admin_list_adapters(principal: AuthContext = Depends(get_admin_user)):
     )
 
 
-@router.get("/admin/objects", response_model=Envelope)
+@router.get("/admin/objects", response_model=Envelope, tags=["admin"])
 async def admin_inspect_objects(
     kind: Optional[str] = None,
     limit: int = 50,
@@ -674,7 +791,7 @@ async def admin_inspect_objects(
     )
 
 
-@router.post("/auth/mfa/request", response_model=Envelope)
+@router.post("/auth/mfa/request", response_model=Envelope, tags=["auth"])
 async def request_mfa(body: MFARequest):
     runtime = get_runtime()
     auth_ctx = await runtime.auth.resolve_session(
@@ -692,7 +809,7 @@ async def request_mfa(body: MFARequest):
     return Envelope(status="ok", data=challenge)
 
 
-@router.post("/auth/mfa/verify", response_model=Envelope)
+@router.post("/auth/mfa/verify", response_model=Envelope, tags=["auth"])
 async def verify_mfa(body: MFAVerifyRequest, response: Response):
     runtime = get_runtime()
     auth_ctx = await runtime.auth.resolve_session(
@@ -736,7 +853,7 @@ async def verify_mfa(body: MFAVerifyRequest, response: Response):
     return Envelope(status="ok", data=resp)
 
 
-@router.post("/auth/reset/request", response_model=Envelope)
+@router.post("/auth/reset/request", response_model=Envelope, tags=["auth"])
 async def request_reset(body: PasswordResetRequest):
     runtime = get_runtime()
     await _enforce_rate_limit(
@@ -750,7 +867,7 @@ async def request_reset(body: PasswordResetRequest):
     return Envelope(status="ok", data={"status": "sent"})
 
 
-@router.post("/auth/reset/confirm", response_model=Envelope)
+@router.post("/auth/reset/confirm", response_model=Envelope, tags=["auth"])
 async def confirm_reset(body: PasswordResetConfirm):
     runtime = get_runtime()
     ok = await runtime.auth.complete_password_reset(body.token, body.new_password)
@@ -759,7 +876,7 @@ async def confirm_reset(body: PasswordResetConfirm):
     return Envelope(status="ok", data={"status": "reset"})
 
 
-@router.post("/auth/request_email_verification", response_model=Envelope)
+@router.post("/auth/request_email_verification", response_model=Envelope, tags=["auth"])
 async def request_email_verification(principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     user = runtime.store.get_user(principal.user_id)
@@ -769,7 +886,7 @@ async def request_email_verification(principal: AuthContext = Depends(get_user))
     return Envelope(status="ok", data={"status": "sent"})
 
 
-@router.post("/auth/verify_email", response_model=Envelope)
+@router.post("/auth/verify_email", response_model=Envelope, tags=["auth"])
 async def verify_email(body: EmailVerificationRequest):
     runtime = get_runtime()
     ok = await runtime.auth.complete_email_verification(body.token)
@@ -778,7 +895,7 @@ async def verify_email(body: EmailVerificationRequest):
     return Envelope(status="ok", data={"status": "verified"})
 
 
-@router.post("/auth/logout", response_model=Envelope)
+@router.post("/auth/logout", response_model=Envelope, tags=["auth"])
 async def logout(
     response: Response,
     session_id: Optional[str] = Header(None, convert_underscores=False),
@@ -798,12 +915,23 @@ async def logout(
     return Envelope(status="ok", data={"message": "session revoked"})
 
 
-@router.post("/chat", response_model=Envelope)
+@router.post("/chat", response_model=Envelope, tags=["chat"])
 async def chat(
     body: ChatRequest,
     principal: AuthContext = Depends(get_user),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
+    """Process a chat message and generate a response.
+
+    Routes the message through the workflow engine, applies relevant adapters,
+    and returns the assistant's response. Supports voice transcription, RAG
+    context, and idempotency via the Idempotency-Key header.
+
+    Raises:
+        401: If authentication fails
+        404: If conversation or context not found
+        429: If rate limit exceeded
+    """
     runtime = get_runtime()
     user_id = principal.user_id
     # SPEC §18: Accept Idempotency-Key when provided (optional)
@@ -829,8 +957,10 @@ async def chat(
             if context_id:
                 _get_owned_context(runtime, context_id, principal)
                 validated_context_id = context_id
+            # Generate title from first message for new conversations
+            auto_title = _generate_conversation_title(body.message.content)
             conversation = runtime.store.create_conversation(
-                user_id=user_id, active_context_id=body.context_id
+                user_id=user_id, active_context_id=body.context_id, title=auto_title
             )
         conversation_id = conversation.id
         context_id = context_id or conversation.active_context_id
@@ -922,11 +1052,28 @@ async def chat(
     # Exceptions bubble through the guard which records failed states
 
 
-@router.post("/preferences", response_model=Envelope)
+@router.post("/preferences", response_model=Envelope, tags=["preferences"])
 async def record_preference(
-    body: PreferenceEventRequest, principal: AuthContext = Depends(get_user)
+    body: PreferenceEventRequest,
+    response: Response,
+    principal: AuthContext = Depends(get_user),
 ):
+    """Record user preference feedback for an assistant message.
+
+    Rate limited to 30 requests per minute to protect clustering resources.
+    """
     runtime = get_runtime()
+    settings = get_settings()
+
+    # Rate limit preference recording (triggers expensive clustering operations)
+    await _enforce_rate_limit(
+        runtime,
+        f"preferences:{principal.user_id}",
+        limit=30,
+        window_seconds=60,
+        response=response,
+    )
+
     event = runtime.training.record_feedback_event(
         user_id=principal.user_id,
         conversation_id=body.conversation_id,
@@ -952,11 +1099,27 @@ async def record_preference(
     return Envelope(status="ok", data=resp)
 
 
-@router.post("/preferences/routing_feedback", response_model=Envelope)
+@router.post("/preferences/routing_feedback", response_model=Envelope, tags=["preferences"])
 async def record_routing_feedback(
-    body: PreferenceEventRequest, principal: AuthContext = Depends(get_user)
+    body: PreferenceEventRequest,
+    response: Response,
+    principal: AuthContext = Depends(get_user),
 ):
+    """Record routing-specific feedback for adapter selection improvement.
+
+    Rate limited to 30 requests per minute to protect clustering resources.
+    """
     runtime = get_runtime()
+
+    # Rate limit routing feedback (shares limit with general preferences)
+    await _enforce_rate_limit(
+        runtime,
+        f"preferences:{principal.user_id}",
+        limit=30,
+        window_seconds=60,
+        response=response,
+    )
+
     event = runtime.training.record_feedback_event(
         user_id=principal.user_id,
         conversation_id=body.conversation_id,
@@ -980,27 +1143,68 @@ async def record_routing_feedback(
     return Envelope(status="ok", data=resp)
 
 
-@router.get("/preferences/insights", response_model=Envelope)
-async def preference_insights(principal: AuthContext = Depends(get_user)):
+@router.get("/preferences/insights", response_model=Envelope, tags=["preferences"])
+async def preference_insights(
+    response: Response,
+    principal: AuthContext = Depends(get_user),
+):
+    """Get user preference insights and cluster summaries.
+
+    Rate limited to 60 requests per minute.
+    """
     runtime = get_runtime()
+
+    # Rate limit insights queries
+    await _enforce_rate_limit(
+        runtime,
+        f"preferences_insights:{principal.user_id}",
+        limit=60,
+        window_seconds=60,
+        response=response,
+    )
+
     summary = runtime.training.summarize_preferences(principal.user_id)
     return Envelope(status="ok", data=PreferenceInsightsResponse(**summary))
 
 
-@router.get("/artifacts", response_model=Envelope)
+@router.get("/artifacts", response_model=Envelope, tags=["artifacts"])
 async def list_artifacts(
     type: Optional[str] = None,
     kind: Optional[str] = None,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(100, ge=1, le=500),
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(100, ge=1, le=500, description="Items per page"),
     principal: AuthContext = Depends(get_user),
 ):
+    """List artifacts owned by the current user.
+
+    Supports filtering by type and kind, with pagination.
+
+    Args:
+        type: Filter by artifact type (e.g., 'adapter', 'workflow')
+        kind: Filter by artifact kind (e.g., 'adapter.lora', 'workflow.linear')
+        page: Page number (1-indexed)
+        page_size: Number of items per page (max 500)
+
+    Returns:
+        Paginated list of artifacts with metadata.
+    """
     runtime = get_runtime()
     kind_filter = kind or (type if type and "." in type else None)
     type_filter = type if type and "." not in type else None
     if not type_filter and kind_filter:
         type_filter = kind_filter.split(".", 1)[0]
     resolved_page_size = min(max(page_size, 1), 500)
+
+    # Get one extra item to determine if there are more pages
+    raw_items = list(runtime.store.list_artifacts(
+        type_filter=type_filter,
+        kind_filter=kind_filter,
+        owner_user_id=principal.user_id,
+        page=page,
+        page_size=resolved_page_size + 1,
+    ))
+
+    has_next = len(raw_items) > resolved_page_size
     items = [
         ArtifactResponse(
             id=a.id,
@@ -1013,19 +1217,25 @@ async def list_artifacts(
             created_at=a.created_at,
             updated_at=a.updated_at,
         )
-        for a in runtime.store.list_artifacts(
-            type_filter=type_filter,
-            kind_filter=kind_filter,
-            owner_user_id=principal.user_id,
-            page=page,
-            page_size=resolved_page_size,
-        )
+        for a in raw_items[:resolved_page_size]
     ]
-    return Envelope(status="ok", data=ArtifactListResponse(items=items))
+
+    return Envelope(
+        status="ok",
+        data=ArtifactListResponse(
+            items=items,
+            has_next=has_next,
+            next_page=page + 1 if has_next else None,
+            page_size=resolved_page_size,
+        ),
+    )
 
 
-@router.get("/artifacts/{artifact_id}", response_model=Envelope)
-async def get_artifact(artifact_id: str, principal: AuthContext = Depends(get_user)):
+@router.get("/artifacts/{artifact_id}", response_model=Envelope, tags=["artifacts"])
+async def get_artifact(
+    artifact_id: str = Path(..., max_length=255, description="Artifact identifier"),
+    principal: AuthContext = Depends(get_user),
+):
     runtime = get_runtime()
     artifact = _get_owned_artifact(runtime, artifact_id, principal)
     resp = ArtifactResponse(
@@ -1042,9 +1252,11 @@ async def get_artifact(artifact_id: str, principal: AuthContext = Depends(get_us
     return Envelope(status="ok", data=resp)
 
 
-@router.get("/tools/specs", response_model=Envelope)
+@router.get("/tools/specs", response_model=Envelope, tags=["tools"])
 async def list_tool_specs(
-    page: int = 1, page_size: int = 50, principal: AuthContext = Depends(get_user)
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(50, ge=1, le=200, description="Items per page"),
+    principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
     resolved_page_size = min(max(page_size, 1), 200)
@@ -1078,8 +1290,11 @@ async def list_tool_specs(
     )
 
 
-@router.get("/tools/specs/{artifact_id}", response_model=Envelope)
-async def get_tool_spec(artifact_id: str, principal: AuthContext = Depends(get_user)):
+@router.get("/tools/specs/{artifact_id}", response_model=Envelope, tags=["tools"])
+async def get_tool_spec(
+    artifact_id: str = Path(..., max_length=255, description="Tool spec artifact ID"),
+    principal: AuthContext = Depends(get_user),
+):
     runtime = get_runtime()
     artifact = _get_owned_artifact(runtime, artifact_id, principal)
     if not (
@@ -1100,9 +1315,11 @@ async def get_tool_spec(artifact_id: str, principal: AuthContext = Depends(get_u
     return Envelope(status="ok", data=resp)
 
 
-@router.get("/workflows", response_model=Envelope)
+@router.get("/workflows", response_model=Envelope, tags=["workflows"])
 async def list_workflows(
-    page: int = 1, page_size: int = 50, principal: AuthContext = Depends(get_user)
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(50, ge=1, le=200, description="Items per page"),
+    principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
     resolved_page_size = min(max(page_size, 1), 200)
@@ -1136,7 +1353,7 @@ async def list_workflows(
     )
 
 
-@router.get("/artifacts/{artifact_id}/versions", response_model=Envelope)
+@router.get("/artifacts/{artifact_id}/versions", response_model=Envelope, tags=["artifacts"])
 async def list_artifact_versions(
     artifact_id: str, principal: AuthContext = Depends(get_user)
 ):
@@ -1167,7 +1384,7 @@ async def list_artifact_versions(
     return Envelope(status="ok", data=ArtifactVersionListResponse(items=items))
 
 
-@router.post("/tools/{tool_id}/invoke", response_model=Envelope)
+@router.post("/tools/{tool_id}/invoke", response_model=Envelope, tags=["tools"])
 async def invoke_tool(
     tool_id: str,
     body: ToolInvokeRequest,
@@ -1210,7 +1427,7 @@ async def invoke_tool(
         return envelope
 
 
-@router.post("/artifacts", response_model=Envelope, status_code=201)
+@router.post("/artifacts", response_model=Envelope, status_code=201, tags=["artifacts"])
 async def create_artifact(
     body: ArtifactRequest,
     principal: AuthContext = Depends(get_user),
@@ -1286,7 +1503,7 @@ async def create_artifact(
         return envelope
 
 
-@router.patch("/artifacts/{artifact_id}", response_model=Envelope)
+@router.patch("/artifacts/{artifact_id}", response_model=Envelope, tags=["artifacts"])
 async def patch_artifact(
     artifact_id: str, body: ArtifactRequest, principal: AuthContext = Depends(get_user)
 ):
@@ -1328,7 +1545,7 @@ async def patch_artifact(
     return Envelope(status="ok", data=resp)
 
 
-@router.post("/config/propose_patch", response_model=Envelope)
+@router.post("/config/propose_patch", response_model=Envelope, tags=["config"])
 async def propose_patch(
     body: ConfigPatchRequest, principal: AuthContext = Depends(get_admin_user)
 ):
@@ -1362,7 +1579,7 @@ async def propose_patch(
     return Envelope(status="ok", data=resp)
 
 
-@router.get("/config/patches", response_model=Envelope)
+@router.get("/config/patches", response_model=Envelope, tags=["config"])
 async def list_config_patches(
     status: Optional[str] = None, principal: AuthContext = Depends(get_admin_user)
 ):
@@ -1393,7 +1610,7 @@ async def list_config_patches(
     return Envelope(status="ok", data=ConfigPatchListResponse(items=items))
 
 
-@router.post("/config/patches/{patch_id}/decide", response_model=Envelope)
+@router.post("/config/patches/{patch_id}/decide", response_model=Envelope, tags=["config"])
 async def decide_config_patch(
     patch_id: int,
     body: ConfigPatchDecisionRequest,
@@ -1423,7 +1640,7 @@ async def decide_config_patch(
     return Envelope(status="ok", data=resp)
 
 
-@router.post("/config/patches/{patch_id}/apply", response_model=Envelope)
+@router.post("/config/patches/{patch_id}/apply", response_model=Envelope, tags=["config"])
 async def apply_config_patch(
     patch_id: int, principal: AuthContext = Depends(get_admin_user)
 ):
@@ -1451,10 +1668,14 @@ async def apply_config_patch(
         applied_at=patch.applied_at or patch.decided_at or patch.created_at,
         meta=patch.meta,
     )
-    return Envelope(status="ok", data=resp)
+    # Include warning if status update failed (partial success)
+    envelope_data = resp.model_dump()
+    if result.get("warning"):
+        envelope_data["warning"] = result["warning"]
+    return Envelope(status="ok", data=envelope_data)
 
 
-@router.post("/config/auto_patch", response_model=Envelope)
+@router.post("/config/auto_patch", response_model=Envelope, tags=["config"])
 async def auto_patch(
     body: AutoPatchRequest, principal: AuthContext = Depends(get_admin_user)
 ):
@@ -1484,7 +1705,7 @@ async def auto_patch(
     return Envelope(status="ok", data=resp)
 
 
-@router.get("/config", response_model=Envelope)
+@router.get("/config", response_model=Envelope, tags=["config"])
 async def get_config(principal: AuthContext = Depends(get_admin_user)):
     """Expose runtime configuration for the admin console."""
 
@@ -1534,7 +1755,7 @@ async def get_config(principal: AuthContext = Depends(get_admin_user)):
     )
 
 
-@router.get("/files/limits", response_model=Envelope)
+@router.get("/files/limits", response_model=Envelope, tags=["files"])
 async def get_file_limits(principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     return Envelope(
@@ -1545,7 +1766,7 @@ async def get_file_limits(principal: AuthContext = Depends(get_user)):
     )
 
 
-@router.post("/files/upload", response_model=Envelope)
+@router.post("/files/upload", response_model=Envelope, tags=["files"])
 async def upload_file(
     file: UploadFile = File(...),
     context_id: Optional[str] = Form(None),
@@ -1578,7 +1799,7 @@ async def upload_file(
         if not safe_filename:
             safe_filename = "untitled"
         dest_dir = (
-            Path(runtime.settings.shared_fs_root)
+            FilePath(runtime.settings.shared_fs_root)
             / "users"
             / principal.user_id
             / "files"
@@ -1595,6 +1816,26 @@ async def upload_file(
         ):
             raise _http_error("validation_error", "invalid file path", status_code=400)
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Atomic idempotency: record intent BEFORE writing file
+        # This prevents duplicate file writes if idempotency storage fails after file write
+        # Per SPEC §18: Idempotency must work reliably for POST endpoints
+        pending_envelope = Envelope(
+            status="pending",
+            data={"fs_path": safe_filename, "context_id": context_id},
+            request_id=idem.request_id,
+        )
+        try:
+            await idem.store_result(pending_envelope, status="processing")
+        except Exception as exc:
+            # If we can't record idempotency, log but continue (degraded mode)
+            logger.warning(
+                "file_upload_idempotency_pre_record_failed",
+                error=str(exc),
+                request_id=idem.request_id,
+            )
+
+        # Now write the file
         dest_path.write_bytes(contents)
         chunk_count = None
         if context_id:
@@ -1607,6 +1848,8 @@ async def upload_file(
                 # Clean up file on any error (not just ConstraintViolation)
                 dest_path.unlink(missing_ok=True)
                 raise
+
+        # Update idempotency with final result
         resp = FileUploadResponse(
             fs_path=safe_filename, context_id=context_id, chunk_count=chunk_count
         )
@@ -1615,7 +1858,7 @@ async def upload_file(
         return envelope
 
 
-@router.get("/conversations/{conversation_id}/messages", response_model=Envelope)
+@router.get("/conversations/{conversation_id}/messages", response_model=Envelope, tags=["conversations"])
 async def list_messages(
     conversation_id: str,
     limit: Optional[int] = Query(None, ge=1, le=500),
@@ -1647,7 +1890,7 @@ async def list_messages(
     )
 
 
-@router.get("/conversations", response_model=Envelope)
+@router.get("/conversations", response_model=Envelope, tags=["conversations"])
 async def list_conversations(principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     convs = runtime.store.list_conversations(principal.user_id)
@@ -1665,7 +1908,7 @@ async def list_conversations(principal: AuthContext = Depends(get_user)):
     return Envelope(status="ok", data=ConversationListResponse(items=items))
 
 
-@router.post("/contexts", response_model=Envelope, status_code=201)
+@router.post("/contexts", response_model=Envelope, status_code=201, tags=["knowledge"])
 async def create_context(
     body: KnowledgeContextRequest,
     principal: AuthContext = Depends(get_user),
@@ -1704,7 +1947,7 @@ async def create_context(
         return envelope
 
 
-@router.get("/contexts", response_model=Envelope)
+@router.get("/contexts", response_model=Envelope, tags=["knowledge"])
 async def list_contexts(principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     contexts = runtime.store.list_contexts(owner_user_id=principal.user_id)
@@ -1723,8 +1966,11 @@ async def list_contexts(principal: AuthContext = Depends(get_user)):
     return Envelope(status="ok", data=KnowledgeContextListResponse(items=items))
 
 
-@router.get("/contexts/{context_id}/chunks", response_model=Envelope)
-async def list_chunks(context_id: str, principal: AuthContext = Depends(get_user)):
+@router.get("/contexts/{context_id}/chunks", response_model=Envelope, tags=["knowledge"])
+async def list_chunks(
+    context_id: str = Path(..., max_length=255, description="Knowledge context ID"),
+    principal: AuthContext = Depends(get_user),
+):
     runtime = get_runtime()
     _get_owned_context(runtime, context_id, principal)
     chunks = runtime.store.list_chunks(context_id, owner_user_id=principal.user_id)
@@ -1746,7 +1992,7 @@ async def list_chunks(context_id: str, principal: AuthContext = Depends(get_user
     return Envelope(status="ok", data=KnowledgeChunkListResponse(items=data))
 
 
-@router.post("/voice/transcribe", response_model=Envelope)
+@router.post("/voice/transcribe", response_model=Envelope, tags=["voice"])
 async def transcribe_voice(
     file: UploadFile = File(...), principal: AuthContext = Depends(get_user)
 ):
@@ -1769,7 +2015,7 @@ async def transcribe_voice(
     return Envelope(status="ok", data=VoiceTranscriptionResponse(**result))
 
 
-@router.post("/voice/synthesize", response_model=Envelope)
+@router.post("/voice/synthesize", response_model=Envelope, tags=["voice"])
 async def synthesize_voice(
     body: VoiceSynthesisRequest, principal: AuthContext = Depends(get_user)
 ):
@@ -1796,15 +2042,19 @@ async def synthesize_voice(
 
 @router.websocket("/chat/stream")
 async def websocket_chat(ws: WebSocket):
+    """Handle WebSocket chat connections for streaming responses."""
     runtime = get_runtime()
     await ws.accept()
     user_id: Optional[str] = None
     idempotency_key: Optional[str] = None
-    request_id: Optional[str] = None
+    # Generate request_id immediately to ensure traceability even on early errors
+    request_id: str = str(uuid4())
+    convo_id: Optional[str] = None
     try:
         init = await ws.receive_json()
         idempotency_key = init.get("idempotency_key")
-        request_id = init.get("request_id")
+        # Use client-provided request_id if available, otherwise keep generated one
+        request_id = init.get("request_id") or request_id
         session_id = init.get("session_id")
         access_token = init.get("access_token")
         auth_ctx = await runtime.auth.authenticate(
@@ -1832,7 +2082,12 @@ async def websocket_chat(ws: WebSocket):
         if convo_id:
             conversation = _get_owned_conversation(runtime, convo_id, auth_ctx)
         else:
-            conversation = runtime.store.create_conversation(user_id=user_id)
+            # Generate title from first message for new conversations
+            user_message = init.get("message", "")
+            auto_title = _generate_conversation_title(user_message)
+            conversation = runtime.store.create_conversation(
+                user_id=user_id, title=auto_title
+            )
             convo_id = conversation.id
         context_id = init.get("context_id") or conversation.active_context_id
         if context_id:
@@ -1898,7 +2153,7 @@ async def websocket_chat(ws: WebSocket):
             else {"code": "server_error", "message": str(exc.detail)}
         )
         error_env = Envelope(
-            status="error", error=error_payload, request_id=request_id or str(uuid4())
+            status="error", error=error_payload, request_id=request_id
         )
         if user_id:
             await _store_idempotency_result(
@@ -1911,12 +2166,15 @@ async def websocket_chat(ws: WebSocket):
         return
     except Exception:
         logger.exception(
-            "unhandled_websocket_error", user_id=user_id, conversation_id=convo_id
+            "unhandled_websocket_error",
+            user_id=user_id,
+            conversation_id=convo_id,
+            request_id=request_id,
         )
         error_env = Envelope(
             status="error",
             error={"code": "server_error", "message": "An internal error occurred"},
-            request_id=request_id or str(uuid4()),
+            request_id=request_id,
         )
         if user_id:
             await _store_idempotency_result(

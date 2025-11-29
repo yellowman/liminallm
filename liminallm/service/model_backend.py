@@ -15,6 +15,7 @@ from liminallm.config import (
 )
 from liminallm.logging import get_logger
 from liminallm.service.fs import safe_join
+from liminallm.service.prompt_utils import extract_prompt_instructions
 from liminallm.service.tokenizer_utils import (
     DEFAULT_VOCAB_SIZE,
     vocab_size_from_tokenizer,
@@ -46,7 +47,35 @@ logger = get_logger(__name__)
 
 
 def get_adapter_mode(adapter: dict) -> str:
-    """Extract adapter mode from schema, inferring from legacy fields if needed."""
+    """Extract adapter mode from schema, inferring from legacy fields if needed.
+
+    Per SPEC §5.0.1, adapter modes determine how adapters are applied during inference:
+
+    - LOCAL: Adapter has trained LoRA weights stored locally (fs_dir).
+      Requires local JAX/transformer backend. Best for fine-tuned behavior.
+
+    - REMOTE: Adapter is hosted by external provider (Together, LoRAX, etc.).
+      Uses remote_model_id or remote_adapter_id. Supports provider scaling.
+
+    - PROMPT: Adapter contributes only prompt/system instructions.
+      No LoRA weights needed. Useful for behavior modification via prompting.
+
+    - HYBRID: Combines LOCAL weights with PROMPT fallback.
+      Uses LoRA when available, prompt instructions otherwise.
+      DEFAULT for backwards compatibility: existing adapters without explicit
+      mode may have both weights and prompts, so HYBRID ensures both are used.
+
+    Mode selection priority:
+    1. Explicit 'mode' field in adapter or schema
+    2. Inference from 'backend' or 'provider' fields
+    3. Default to HYBRID (safest for legacy adapters)
+
+    Args:
+        adapter: Adapter dict with mode, backend, provider fields
+
+    Returns:
+        AdapterMode string (local, remote, prompt, hybrid)
+    """
     if not adapter:
         return AdapterMode.PROMPT
 
@@ -70,7 +99,10 @@ def get_adapter_mode(adapter: dict) -> str:
     if backend == "hybrid":
         return AdapterMode.HYBRID
 
-    return AdapterMode.HYBRID  # Default for backwards compatibility
+    # Default to HYBRID for backwards compatibility:
+    # Legacy adapters may have both LoRA weights and prompt instructions,
+    # so HYBRID ensures both mechanisms are available during inference.
+    return AdapterMode.HYBRID
 
 
 def filter_adapters_by_mode(adapters: List[dict], compatible_modes: set) -> List[dict]:
@@ -528,9 +560,13 @@ class ApiAdapterBackend:
                     adapter_ids.append(aid)
                     applied.append(f"{adapter.get('id', 'unknown')}:adapter_param")
                     if caps.gate_weights:
-                        weight = (
-                            adapter.get("weight") or adapter.get("gate_weight") or 1.0
-                        )
+                        # Use explicit None checks to handle weight=0.0 correctly
+                        # (0.0 is falsy in Python but is a valid weight for disabling adapters)
+                        weight = adapter.get("weight")
+                        if weight is None:
+                            weight = adapter.get("gate_weight")
+                        if weight is None:
+                            weight = 1.0
                         gate_weights.append(float(weight))
 
             # Mark dropped adapters
@@ -577,8 +613,14 @@ class ApiAdapterBackend:
             return []
 
         # Sort by weight/gate_weight descending
+        # Use explicit None checks to handle weight=0.0 correctly
         def get_weight(a: dict) -> float:
-            return float(a.get("weight") or a.get("gate_weight") or 1.0)
+            weight = a.get("weight")
+            if weight is None:
+                weight = a.get("gate_weight")
+            if weight is None:
+                weight = 1.0
+            return float(weight)
 
         sorted_adapters = sorted(adapters, key=get_weight, reverse=True)
         return sorted_adapters[:max_count]
@@ -592,14 +634,8 @@ class ApiAdapterBackend:
     def _extract_prompt_instructions(self, adapter: dict) -> Optional[str]:
         """Extract prompt instructions from adapter for system prompt injection.
 
-        Uses explicit priority order to find the most suitable prompt text:
-        1. Explicit prompt fields (prompt_instructions, behavior_prompt, etc.)
-        2. Applicability natural language description (designed for LLM context)
-        3. System prompt field (explicit system message content)
-
-        NOTE: Generic 'description' field is intentionally NOT used as fallback
-        because it typically contains human-readable metadata (e.g., "LoRA adapter
-        for code review") rather than LLM-oriented behavioral instructions.
+        Delegates to shared prompt_utils.extract_prompt_instructions for consistent
+        behavior across all backends per SPEC §5.0.1.
 
         Args:
             adapter: Adapter dict with potential prompt fields
@@ -607,52 +643,19 @@ class ApiAdapterBackend:
         Returns:
             Prompt instructions string or None if no suitable prompt found
         """
-        schema = adapter.get("schema", {})
+        adapter_id = adapter.get("id") or adapter.get("name") or "unknown"
+        result = extract_prompt_instructions(adapter, log_source=adapter_id)
 
-        # Priority 1: Explicit prompt instruction fields (most specific)
-        prompt_fields = (
-            "prompt_instructions",  # Primary field for behavioral guidance
-            "behavior_prompt",  # Alternative naming
-            "system_prompt",  # Explicit system message content
-            "instructions",  # Generic instructions
-            "prompt_template",  # Template-style instructions
-        )
-        for key in prompt_fields:
-            value = adapter.get(key) or schema.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
+        if result is None:
+            # Log when no prompt found for debugging
+            logger.debug(
+                "adapter_no_prompt_instructions",
+                adapter_id=adapter_id,
+                mode=get_adapter_mode(adapter),
+                message="Adapter has no prompt_instructions; behavior may be undefined in prompt mode",
+            )
 
-        # Priority 2: Applicability natural language (SPEC §6.1 - designed for LLM context)
-        # This field is explicitly intended to describe adapter behavior in natural language
-        applicability = adapter.get("applicability") or schema.get("applicability")
-        if isinstance(applicability, dict):
-            natural = applicability.get("natural_language")
-            if isinstance(natural, str) and natural.strip():
-                return natural.strip()
-
-        # Priority 3: Check for explicit 'use_description_as_prompt' flag
-        # Only use description if adapter explicitly opts in
-        use_desc = adapter.get("use_description_as_prompt") or schema.get(
-            "use_description_as_prompt"
-        )
-        if use_desc:
-            description = adapter.get("description") or schema.get("description")
-            if isinstance(description, str) and description.strip():
-                logger.debug(
-                    "adapter_using_description_as_prompt",
-                    adapter_id=adapter.get("id"),
-                    reason="use_description_as_prompt=true",
-                )
-                return description.strip()
-
-        # No suitable prompt found - caller should handle gracefully
-        logger.debug(
-            "adapter_no_prompt_instructions",
-            adapter_id=adapter.get("id"),
-            mode=get_adapter_mode(adapter),
-            message="Adapter has no prompt_instructions; behavior may be undefined in prompt mode",
-        )
-        return None
+        return result
 
     def _inject_adapter_prompts(
         self, messages: List[dict], prompts: List[str]
@@ -1043,6 +1046,20 @@ class LocalJaxLoRABackend:
         adapter = adapters[0] if adapters else {}
         self._apply_adapter_vocab_size(adapter)
         ids, attention = self._tokenize(prompt)
+
+        # Handle empty prompts gracefully
+        if not ids:
+            return {
+                "content": "",
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "model": self.base_model,
+                    "adapter_id": None,
+                    "latency_ms": 0.0,
+                },
+            }
+
         ids, attention = self._pad_batch(ids, attention)
         if len(ids) > self.max_seq_len:
             raise ValueError(f"prompt exceeds max length ({self.max_seq_len})")
@@ -1067,6 +1084,7 @@ class LocalJaxLoRABackend:
             else self._jnp.zeros_like(token_array)
         )
         lora_scores = lora_scores * attn_array
+        # Use the last token as seed; array is guaranteed non-empty due to check above
         generated_ids = self._sample_tokens(lora_scores, seed_token=token_array[0][-1])
         completion = self._decode(generated_ids)
         duration = time.perf_counter() - start

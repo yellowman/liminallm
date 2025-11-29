@@ -2,13 +2,43 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
+from liminallm.logging import get_logger
 from liminallm.service.embeddings import deterministic_embedding
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.postgres import PostgresStore
 from liminallm.storage.models import KnowledgeChunk
+
+logger = get_logger(__name__)
+
+# Default overlap per SPEC §2.5: "50 token overlap"
+DEFAULT_OVERLAP_TOKENS = 50
+
+
+def _simple_tokenize(text: str) -> List[str]:
+    """Simple word-based tokenizer for chunking.
+
+    Per SPEC §2.5: Uses token-based chunking. This is a simple whitespace/punctuation
+    tokenizer that approximates token boundaries for chunking purposes.
+    """
+    # Split on whitespace and punctuation while preserving meaningful tokens
+    return re.findall(r"\b\w+\b|[^\w\s]", text)
+
+
+def _detokenize(tokens: List[str]) -> str:
+    """Reconstruct text from tokens, handling spacing."""
+    if not tokens:
+        return ""
+    result = []
+    for i, token in enumerate(tokens):
+        # Add space before non-punctuation tokens (except first)
+        if i > 0 and re.match(r"\w", token):
+            result.append(" ")
+        result.append(token)
+    return "".join(result)
 
 
 class RAGService:
@@ -68,18 +98,40 @@ class RAGService:
         user_id: Optional[str],
         tenant_id: Optional[str],
     ) -> List[str]:
+        """Filter context IDs to only those accessible by the user.
+
+        Per SPEC §12.2, user isolation is mandatory for RAG retrieval.
+        This method logs warnings when contexts are filtered out to aid debugging.
+
+        Args:
+            context_ids: Requested context IDs
+            user_id: Requesting user ID (required for access)
+            tenant_id: Optional tenant ID for multi-tenant filtering
+
+        Returns:
+            List of accessible context IDs (may be empty if none accessible)
+        """
         if not user_id:
+            logger.warning(
+                "rag_retrieval_no_user_id",
+                context_ids=list(context_ids),
+                message="RAG retrieval requires user_id for access control; returning empty results",
+            )
             return []
 
         allowed: List[str] = []
+        filtered_reasons: Dict[str, str] = {}
+
         if hasattr(self.store, "contexts"):
             contexts = getattr(self.store, "contexts")
             users = getattr(self.store, "users", {})
             for ctx_id in context_ids:
                 ctx = contexts.get(ctx_id) if isinstance(contexts, dict) else None
                 if not ctx:
+                    filtered_reasons[ctx_id] = "not_found"
                     continue
                 if user_id and ctx.owner_user_id != user_id:
+                    filtered_reasons[ctx_id] = "owner_mismatch"
                     continue
                 if tenant_id:
                     owner = (
@@ -88,23 +140,39 @@ class RAGService:
                         else None
                     )
                     if not owner or owner.tenant_id != tenant_id:
+                        filtered_reasons[ctx_id] = "tenant_mismatch"
                         continue
                 allowed.append(ctx_id)
-            return allowed
-
-        for ctx_id in context_ids:
-            context = getattr(self.store, "get_context", lambda *_: None)(ctx_id)
-            if not context:
-                continue
-            if user_id and context.owner_user_id != user_id:
-                continue
-            if tenant_id:
-                owner = getattr(self.store, "get_user", lambda *_: None)(
-                    context.owner_user_id
-                )
-                if not owner or owner.tenant_id != tenant_id:
+        else:
+            for ctx_id in context_ids:
+                context = getattr(self.store, "get_context", lambda *_: None)(ctx_id)
+                if not context:
+                    filtered_reasons[ctx_id] = "not_found"
                     continue
-            allowed.append(ctx_id)
+                if user_id and context.owner_user_id != user_id:
+                    filtered_reasons[ctx_id] = "owner_mismatch"
+                    continue
+                if tenant_id:
+                    owner = getattr(self.store, "get_user", lambda *_: None)(
+                        context.owner_user_id
+                    )
+                    if not owner or owner.tenant_id != tenant_id:
+                        filtered_reasons[ctx_id] = "tenant_mismatch"
+                        continue
+                allowed.append(ctx_id)
+
+        # Log if any contexts were filtered for debugging
+        if filtered_reasons:
+            logger.info(
+                "rag_contexts_filtered",
+                user_id=user_id,
+                tenant_id=tenant_id,
+                requested_count=len(context_ids),
+                allowed_count=len(allowed),
+                filtered=filtered_reasons,
+                message="Some requested contexts were filtered due to access control",
+            )
+
         return allowed
 
     def _retrieve_pgvector(
@@ -177,18 +245,77 @@ class RAGService:
         text: str,
         chunk_size: Optional[int] = None,
         source_path: Optional[str] = None,
+        overlap_tokens: Optional[int] = None,
     ) -> int:
+        """Ingest text into chunks using token-based sliding window with overlap.
+
+        Per SPEC §2.5: Uses token-based splitter (300-500 tokens with 50 token overlap).
+        This implementation:
+        - Tokenizes the input text
+        - Creates chunks with specified token count
+        - Applies overlap between consecutive chunks for context continuity
+        """
         if not hasattr(self.store, "add_chunks"):
             return 0
         lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
         blob = " ".join(lines)
         if not blob:
             return 0
-        chosen_chunk = max(chunk_size or self.default_chunk_size, 64)
+
+        # Tokenize the text per SPEC §2.5 requirement for token-based chunking
+        tokens = _simple_tokenize(blob)
+        if not tokens:
+            return 0
+
+        chosen_chunk_tokens = max(chunk_size or self.default_chunk_size, 64)
+        # Use default overlap if not specified (SPEC §2.5: 50 token overlap)
+        effective_overlap = overlap_tokens if overlap_tokens is not None else DEFAULT_OVERLAP_TOKENS
+        # Ensure overlap doesn't exceed chunk size
+        effective_overlap = min(effective_overlap, chosen_chunk_tokens // 2)
+        # Step size accounts for overlap
+        step_size = max(1, chosen_chunk_tokens - effective_overlap)
+
         chunks: List[KnowledgeChunk] = []
         default_path = source_path or "inline"
-        for idx in range(0, len(blob), chosen_chunk):
-            segment = blob[idx : idx + chosen_chunk]
+        chunk_index = 0
+
+        # Minimum tokens for a standalone final chunk (avoid losing meaningful content)
+        min_final_chunk_tokens = max(10, effective_overlap // 2)
+
+        for start in range(0, len(tokens), step_size):
+            end = min(start + chosen_chunk_tokens, len(tokens))
+            chunk_tokens = tokens[start:end]
+
+            # Skip only if this is a truly tiny trailing fragment
+            # Use a smaller threshold to avoid losing meaningful final content
+            if chunk_index > 0 and len(chunk_tokens) < min_final_chunk_tokens:
+                # Append remaining tokens to the previous chunk instead of dropping
+                if chunks and chunk_tokens:
+                    prev_chunk = chunks[-1]
+                    prev_content = prev_chunk.content
+                    extra_segment = _detokenize(chunk_tokens)
+                    if extra_segment.strip():
+                        # Update the previous chunk to include the trailing content
+                        combined_content = prev_content + " " + extra_segment.strip()
+                        prev_meta = dict(prev_chunk.meta or {})
+                        prev_meta["end_token"] = end
+                        prev_meta["token_count"] = prev_meta.get("token_count", 0) + len(chunk_tokens)
+                        prev_meta["includes_trailing"] = True
+                        chunks[-1] = KnowledgeChunk(
+                            id=prev_chunk.id,
+                            context_id=prev_chunk.context_id,
+                            fs_path=prev_chunk.fs_path,
+                            content=combined_content,
+                            embedding=self.embed(combined_content),
+                            chunk_index=prev_chunk.chunk_index,
+                            meta=prev_meta,
+                        )
+                break
+
+            segment = _detokenize(chunk_tokens)
+            if not segment.strip():
+                continue
+
             chunks.append(
                 KnowledgeChunk(
                     id=None,
@@ -196,10 +323,22 @@ class RAGService:
                     fs_path=default_path,
                     content=segment,
                     embedding=self.embed(segment),
-                    chunk_index=math.floor(idx / chosen_chunk),
-                    meta={"embedding_model_id": self.embedding_model_id},
+                    chunk_index=chunk_index,
+                    meta={
+                        "embedding_model_id": self.embedding_model_id,
+                        "token_count": len(chunk_tokens),
+                        "start_token": start,
+                        "end_token": end,
+                        "overlap_tokens": effective_overlap if chunk_index > 0 else 0,
+                    },
                 )
             )
+            chunk_index += 1
+
+            # Break if we've processed all tokens
+            if end >= len(tokens):
+                break
+
         if chunks:
             self.store.add_chunks(context_id, chunks)  # type: ignore[attr-defined]
         return len(chunks)

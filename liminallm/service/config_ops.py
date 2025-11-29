@@ -76,6 +76,17 @@ class ConfigOpsService:
     def apply_patch(
         self, patch_id: int, approver_user_id: Optional[str] = None
     ) -> dict:
+        """Apply an approved patch to its target artifact.
+
+        This operation is performed in two steps:
+        1. Update the artifact schema with the patch
+        2. Mark the patch as applied
+
+        Error Recovery:
+            If step 2 fails after step 1 succeeds, the artifact is still modified
+            but the patch status remains unchanged. In this case, we log the error
+            and return with a warning flag to indicate partial success.
+        """
         patch = self.store.get_config_patch(patch_id)
         if not patch:
             raise NotFoundError("patch not found", detail={"patch_id": patch_id})
@@ -84,17 +95,42 @@ class ConfigOpsService:
             raise NotFoundError(
                 "artifact missing", detail={"artifact_id": patch.artifact_id}
             )
+
+        # Store original schema for potential logging
+        original_schema = copy.deepcopy(artifact.schema)
+
+        # Step 1: Apply patch to artifact
         new_schema = self._apply_patch_to_schema(artifact.schema, patch.patch)
         updated = self.store.update_artifact(
             artifact.id, new_schema, artifact.description
         )
-        applied_patch = self.store.update_config_patch_status(
-            patch_id,
-            "applied",
-            meta={"applied_by": approver_user_id} if approver_user_id else None,
-            mark_applied=True,
-        )
-        return {"artifact": updated, "patch": applied_patch or patch}
+
+        # Step 2: Mark patch as applied
+        applied_patch = None
+        status_update_failed = False
+        try:
+            applied_patch = self.store.update_config_patch_status(
+                patch_id,
+                "applied",
+                meta={"applied_by": approver_user_id} if approver_user_id else None,
+                mark_applied=True,
+            )
+        except Exception as exc:
+            # Log the error but don't fail - artifact is already updated
+            status_update_failed = True
+            logger.error(
+                "config_patch_status_update_failed",
+                patch_id=patch_id,
+                artifact_id=artifact.id,
+                error=str(exc),
+                message="Artifact was updated but patch status could not be marked as applied",
+            )
+
+        result = {"artifact": updated, "patch": applied_patch or patch}
+        if status_update_failed:
+            result["warning"] = "Patch applied but status update failed - patch may appear unapplied"
+
+        return result
 
     def _build_prompt(self, artifact: Artifact, goal: Optional[str]) -> str:
         insights = (

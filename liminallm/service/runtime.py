@@ -196,15 +196,28 @@ async def _set_cached_idempotency_record(
         }
 
 
+from typing import Union, Tuple as TypingTuple
+
+
 async def check_rate_limit(
-    runtime: Runtime, key: str, limit: int, window_seconds: int
-) -> bool:
+    runtime: Runtime, key: str, limit: int, window_seconds: int, *, return_remaining: bool = False
+) -> Union[bool, TypingTuple[bool, int]]:
     """Enforce rate limits even when Redis is unavailable.
 
     Per SPEC §18, rate limits use Redis token bucket with configurable defaults.
+
+    Args:
+        runtime: Runtime instance with cache
+        key: Rate limit key
+        limit: Maximum requests per window
+        window_seconds: Window duration in seconds
+        return_remaining: If True, return tuple of (allowed, remaining)
+
+    Returns:
+        bool if return_remaining is False, else (bool, int) tuple
     """
     if limit <= 0:
-        return True
+        return (True, limit) if return_remaining else True
     if window_seconds <= 0:
         logger.warning(
             "rate_limit_invalid_window",
@@ -215,13 +228,18 @@ async def check_rate_limit(
         window_seconds = 60  # Default to 1 minute if invalid window per SPEC §18
     now = datetime.utcnow()
     if runtime.cache:
-        return await runtime.cache.check_rate_limit(key, limit, window_seconds)
+        result = await runtime.cache.check_rate_limit(key, limit, window_seconds, return_remaining=return_remaining)
+        return result
     window = timedelta(seconds=window_seconds)
     async with runtime._local_rate_limit_lock:
         window_start, count = runtime._local_rate_limits.get(key, (now, 0))
         if now - window_start >= window:
             window_start, count = now, 0
-        if count + 1 > limit:
-            return False
-        runtime._local_rate_limits[key] = (window_start, count + 1)
-    return True
+        new_count = count + 1
+        allowed = new_count <= limit
+        if allowed:
+            runtime._local_rate_limits[key] = (window_start, new_count)
+        remaining = max(0, limit - new_count)
+    if return_remaining:
+        return (allowed, remaining)
+    return allowed

@@ -51,7 +51,9 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(ServiceError)
     async def handle_service_error(request, exc: ServiceError):  # type: ignore[unused-argument]
-        return _error_response(exc.status_code, exc.message, exc.detail)
+        # Use the error_code from the exception for SPEC §18 compliance
+        error_code = getattr(exc, "error_code", None)
+        return _error_response(exc.status_code, exc.message, exc.detail, code=error_code)
 
     @app.exception_handler(ArtifactValidationError)
     async def handle_validation_error(request, exc: ArtifactValidationError):  # type: ignore[unused-argument]
@@ -63,6 +65,15 @@ def register_exception_handlers(app: FastAPI) -> None:
 
     @app.exception_handler(HTTPException)
     async def handle_http_exception(request: Request, exc: HTTPException):  # type: ignore[unused-argument]
+        # Handle SPEC §18 compliant error envelope from _http_error()
+        if isinstance(exc.detail, dict) and "error" in exc.detail:
+            error_obj = exc.detail["error"]
+            if isinstance(error_obj, dict):
+                message = error_obj.get("message", "http error")
+                code = error_obj.get("code")
+                details = error_obj.get("details")
+                return _error_response(exc.status_code, message, details, code=code)
+        # Fallback for plain HTTPException or non-conforming detail
         detail = exc.detail if isinstance(exc.detail, dict) else {"detail": exc.detail}
         message = (
             detail.get("detail", "http error")

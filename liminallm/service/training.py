@@ -343,13 +343,22 @@ class TrainingService:
         updated_schema["fs_dir"] = str(adapter_dir)
         self.store.update_artifact(adapter.id, updated_schema)
         self._update_latest_symlink(adapter_dir, version_dir)
-        loss = 1.0 / (1 + len(dataset_entries))
         training_trace = self._run_jax_optax_training(
             weights,
             token_batches,
             params_path=params_path,
             checkpoint_dir=version_dir / "checkpoints",
         )
+        # Extract actual loss from JAX training instead of using heuristic
+        # Per SPEC §5.4: metrics = loss and preference alignment rate
+        loss = 1.0 / (1 + len(dataset_entries))  # Fallback heuristic
+        if training_trace.get("status") == "ok" and training_trace.get("steps"):
+            # Use actual final loss from training if available
+            final_step = training_trace["steps"][-1]
+            if isinstance(final_step, dict) and "loss" in final_step:
+                actual_loss = final_step.get("loss")
+                if isinstance(actual_loss, (int, float)) and actual_loss >= 0:
+                    loss = float(actual_loss)
         self.store.update_training_job(
             job.id,
             status="succeeded",

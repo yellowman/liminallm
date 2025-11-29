@@ -114,7 +114,7 @@ class TestCheckRateLimit:
         await check_rate_limit(mock_runtime_with_cache, "test_key", 10, 60)
 
         mock_runtime_with_cache.cache.check_rate_limit.assert_called_once_with(
-            "test_key", 10, 60
+            "test_key", 10, 60, return_remaining=False
         )
 
     async def test_fallback_to_local_without_redis(self, mock_runtime):
