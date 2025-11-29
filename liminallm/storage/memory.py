@@ -1016,6 +1016,7 @@ class MemoryStore:
         page_size: int = 100,
         owner_user_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
+        visibility: Optional[str] = None,
     ) -> List[Artifact]:
         artifacts = list(self.artifacts.values())
         if tenant_id:
@@ -1036,6 +1037,8 @@ class MemoryStore:
                 for a in artifacts
                 if isinstance(a.schema, dict) and a.schema.get("kind") == kind_filter
             ]
+        if visibility:
+            artifacts = [a for a in artifacts if getattr(a, "visibility", "private") == visibility]
         start = max(page - 1, 0) * max(page_size, 1)
         end = start + max(page_size, 1)
         return artifacts[start:end]
@@ -1291,13 +1294,15 @@ class MemoryStore:
         return self.contexts.get(context_id)
 
     def list_contexts(
-        self, owner_user_id: Optional[str] = None
+        self, owner_user_id: Optional[str] = None, limit: int = 100
     ) -> List[KnowledgeContext]:
         if not owner_user_id:
             return []
-        return [
+        contexts = [
             ctx for ctx in self.contexts.values() if ctx.owner_user_id == owner_user_id
         ]
+        contexts.sort(key=lambda c: c.created_at, reverse=True)
+        return contexts[:limit]
 
     def add_context_source(
         self,

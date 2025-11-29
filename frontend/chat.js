@@ -563,7 +563,7 @@ const loadConversation = async (conversationId) => {
       'Failed to load messages'
     );
 
-    renderMessages(messagesEnvelope.data?.items || []);
+    renderMessages(messagesEnvelope.data?.messages || []);
     renderConversationList();
 
     // Load draft

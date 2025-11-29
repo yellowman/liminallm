@@ -1630,6 +1630,7 @@ class PostgresStore:
         page_size: int = 100,
         owner_user_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
+        visibility: Optional[str] = None,
     ) -> List[Artifact]:
         offset = max(page - 1, 0) * max(page_size, 1)
         limit = max(page_size, 1)
@@ -1650,6 +1651,9 @@ class PostgresStore:
                     "owner_user_id IN (SELECT id FROM app_user WHERE tenant_id = %s)"
                 )
                 params.append(tenant_id)
+            if visibility:
+                clauses.append("visibility = %s")
+                params.append(visibility)
             where = ""
             if clauses:
                 where = " WHERE " + " AND ".join(clauses)
@@ -2247,14 +2251,14 @@ class PostgresStore:
         )
 
     def list_contexts(
-        self, owner_user_id: Optional[str] = None
+        self, owner_user_id: Optional[str] = None, limit: int = 100
     ) -> List[KnowledgeContext]:
         if not owner_user_id:
             return []
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM knowledge_context WHERE owner_user_id = %s ORDER BY created_at DESC",
-                (owner_user_id,),
+                "SELECT * FROM knowledge_context WHERE owner_user_id = %s ORDER BY created_at DESC LIMIT %s",
+                (owner_user_id, limit),
             ).fetchall()
         contexts: List[KnowledgeContext] = []
         for row in rows:

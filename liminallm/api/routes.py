@@ -1224,17 +1224,19 @@ async def preference_insights(
 async def list_artifacts(
     type: Optional[str] = None,
     kind: Optional[str] = None,
+    visibility: Optional[str] = Query(None, pattern="^(private|shared|global)$", description="Filter by visibility"),
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(100, ge=1, le=500, description="Items per page"),
     principal: AuthContext = Depends(get_user),
 ):
     """List artifacts owned by the current user.
 
-    Supports filtering by type and kind, with pagination.
+    Supports filtering by type, kind, and visibility, with pagination.
 
     Args:
         type: Filter by artifact type (e.g., 'adapter', 'workflow')
         kind: Filter by artifact kind (e.g., 'adapter.lora', 'workflow.linear')
+        visibility: Filter by visibility ('private', 'shared', 'global')
         page: Page number (1-indexed)
         page_size: Number of items per page (max 500)
 
@@ -1255,6 +1257,7 @@ async def list_artifacts(
         owner_user_id=principal.user_id,
         page=page,
         page_size=resolved_page_size + 1,
+        visibility=visibility,
     ))
 
     has_next = len(raw_items) > resolved_page_size
@@ -1978,9 +1981,12 @@ async def list_messages(
 
 
 @router.get("/conversations", response_model=Envelope, tags=["conversations"])
-async def list_conversations(principal: AuthContext = Depends(get_user)):
+async def list_conversations(
+    limit: int = Query(50, ge=1, le=500, description="Maximum conversations to return"),
+    principal: AuthContext = Depends(get_user),
+):
     runtime = get_runtime()
-    convs = runtime.store.list_conversations(principal.user_id)
+    convs = runtime.store.list_conversations(principal.user_id, limit=limit)
     items = [
         ConversationSummary(
             id=c.id,
@@ -2035,9 +2041,12 @@ async def create_context(
 
 
 @router.get("/contexts", response_model=Envelope, tags=["knowledge"])
-async def list_contexts(principal: AuthContext = Depends(get_user)):
+async def list_contexts(
+    limit: int = Query(100, ge=1, le=500, description="Maximum contexts to return"),
+    principal: AuthContext = Depends(get_user),
+):
     runtime = get_runtime()
-    contexts = runtime.store.list_contexts(owner_user_id=principal.user_id)
+    contexts = runtime.store.list_contexts(owner_user_id=principal.user_id, limit=limit)
     items = [
         KnowledgeContextResponse(
             id=c.id,
