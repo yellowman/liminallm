@@ -74,7 +74,13 @@ class RedisCache:
 
     async def get_router_cache(self, user_id: str, ctx_hash: str) -> Optional[dict]:
         cached = await self.client.get(f"router:last:{user_id}:{ctx_hash}")
-        return json.loads(cached) if cached else None
+        if not cached:
+            return None
+        try:
+            return json.loads(cached)
+        except (json.JSONDecodeError, TypeError):
+            # Corrupted cache entry - treat as cache miss
+            return None
 
     async def set_router_cache(
         self, user_id: str, ctx_hash: str, payload: dict, ttl_seconds: int = 300
@@ -85,7 +91,13 @@ class RedisCache:
 
     async def get_workflow_state(self, state_key: str) -> Optional[dict]:
         cached = await self.client.get(f"workflow:state:{state_key}")
-        return json.loads(cached) if cached else None
+        if not cached:
+            return None
+        try:
+            return json.loads(cached)
+        except (json.JSONDecodeError, TypeError):
+            # Corrupted cache entry - treat as cache miss
+            return None
 
     async def set_workflow_state(
         self, state_key: str, state: dict, ttl_seconds: int = 1800
@@ -96,7 +108,13 @@ class RedisCache:
 
     async def get_conversation_summary(self, conversation_id: str) -> Optional[dict]:
         cached = await self.client.get(f"chat:summary:{conversation_id}")
-        return json.loads(cached) if cached else None
+        if not cached:
+            return None
+        try:
+            return json.loads(cached)
+        except (json.JSONDecodeError, TypeError):
+            # Corrupted cache entry - treat as cache miss
+            return None
 
     async def set_conversation_summary(
         self, conversation_id: str, summary: Dict[str, Any], ttl_seconds: int = 3600
@@ -119,12 +137,43 @@ class RedisCache:
     async def pop_oauth_state(
         self, state: str
     ) -> Optional[tuple[str, datetime, Optional[str]]]:
+        """Atomically get and delete OAuth state to prevent replay attacks.
+
+        Uses Redis GETDEL command (Redis 6.2+) or Lua script fallback to ensure
+        atomicity. This prevents race conditions where two concurrent requests
+        could both consume the same OAuth state.
+
+        Args:
+            state: The OAuth state token to consume
+
+        Returns:
+            Tuple of (provider, expires_at, tenant_id) or None if not found
+        """
         key = f"auth:oauth:{state}"
-        cached = await self.client.get(key)
+
+        # Try GETDEL first (Redis 6.2+) for atomic get-and-delete
+        try:
+            cached = await self.client.getdel(key)
+        except AttributeError:
+            # Fallback for older redis-py versions: use Lua script for atomicity
+            lua_script = """
+            local value = redis.call('GET', KEYS[1])
+            if value then
+                redis.call('DEL', KEYS[1])
+            end
+            return value
+            """
+            cached = await self.client.eval(lua_script, 1, key)
+
         if cached is None:
             return None
-        await self.client.delete(key)
-        data = json.loads(cached)
+
+        try:
+            data = json.loads(cached)
+        except (json.JSONDecodeError, TypeError):
+            # Corrupted data - already deleted, return None
+            return None
+
         expires_raw = data.get("expires_at")
         expires_at = (
             datetime.fromisoformat(expires_raw)
@@ -137,7 +186,13 @@ class RedisCache:
         self, route: str, user_id: str, key: str
     ) -> Optional[dict]:
         cached = await self.client.get(f"idemp:{route}:{user_id}:{key}")
-        return json.loads(cached) if cached else None
+        if not cached:
+            return None
+        try:
+            return json.loads(cached)
+        except (json.JSONDecodeError, TypeError):
+            # Corrupted idempotency record - treat as not found
+            return None
 
     async def set_idempotency_record(
         self,

@@ -1157,8 +1157,135 @@ class PostgresStore:
         )
 
     def delete_user(self, user_id: str) -> bool:
+        """Delete user and cascade to all related records.
+
+        Per SPEC §12, user deletion must clean up all associated data to prevent
+        orphaned records and ensure complete data removal for privacy compliance.
+
+        Deletes (in order to respect foreign key constraints):
+        - User MFA config
+        - User auth credentials
+        - User auth providers
+        - Sessions
+        - Messages (via conversation)
+        - Conversations
+        - Knowledge chunks (via context)
+        - Context sources (via context)
+        - Knowledge contexts
+        - Config patches (via artifact)
+        - Artifact versions (via artifact)
+        - Artifacts
+        - Preference events
+        - Training jobs
+        - Semantic clusters
+        - Adapter router state
+        - The user record itself
+        """
         with self._connect() as conn:
+            # Check if user exists first
+            exists = conn.execute(
+                "SELECT 1 FROM app_user WHERE id = %s", (user_id,)
+            ).fetchone()
+            if not exists:
+                return False
+
+            # Get user's artifacts for cascade (needed for config patches, versions, router state)
+            artifact_rows = conn.execute(
+                "SELECT id FROM artifact WHERE owner_user_id = %s", (user_id,)
+            ).fetchall()
+            artifact_ids = [str(row["id"]) for row in artifact_rows]
+
+            # Get user's contexts for cascade (needed for chunks, sources)
+            context_rows = conn.execute(
+                "SELECT id FROM knowledge_context WHERE owner_user_id = %s", (user_id,)
+            ).fetchall()
+            context_ids = [str(row["id"]) for row in context_rows]
+
+            # Get user's conversations for cascade (needed for messages)
+            conv_rows = conn.execute(
+                "SELECT id FROM conversation WHERE user_id = %s", (user_id,)
+            ).fetchall()
+            conv_ids = [str(row["id"]) for row in conv_rows]
+
+            # Delete in reverse dependency order
+
+            # 1. Delete messages for user's conversations
+            if conv_ids:
+                conn.execute(
+                    "DELETE FROM message WHERE conversation_id = ANY(%s)", (conv_ids,)
+                )
+
+            # 2. Delete conversations
+            conn.execute("DELETE FROM conversation WHERE user_id = %s", (user_id,))
+
+            # 3. Delete knowledge chunks for user's contexts
+            if context_ids:
+                conn.execute(
+                    "DELETE FROM knowledge_chunk WHERE context_id = ANY(%s)", (context_ids,)
+                )
+
+            # 4. Delete context sources for user's contexts
+            if context_ids:
+                conn.execute(
+                    "DELETE FROM context_source WHERE context_id = ANY(%s)", (context_ids,)
+                )
+
+            # 5. Delete knowledge contexts
+            conn.execute("DELETE FROM knowledge_context WHERE owner_user_id = %s", (user_id,))
+
+            # 6. Delete config patches for user's artifacts
+            if artifact_ids:
+                conn.execute(
+                    "DELETE FROM config_patch_audit WHERE artifact_id = ANY(%s)", (artifact_ids,)
+                )
+
+            # 7. Delete artifact versions for user's artifacts
+            if artifact_ids:
+                conn.execute(
+                    "DELETE FROM artifact_version WHERE artifact_id = ANY(%s)", (artifact_ids,)
+                )
+
+            # 8. Delete adapter router state for user's artifacts
+            if artifact_ids:
+                conn.execute(
+                    "DELETE FROM adapter_router_state WHERE artifact_id = ANY(%s)", (artifact_ids,)
+                )
+
+            # 9. Delete artifacts
+            conn.execute("DELETE FROM artifact WHERE owner_user_id = %s", (user_id,))
+
+            # 10. Delete preference events
+            conn.execute("DELETE FROM preference_event WHERE user_id = %s", (user_id,))
+
+            # 11. Delete training jobs
+            conn.execute("DELETE FROM training_job WHERE user_id = %s", (user_id,))
+
+            # 12. Delete semantic clusters
+            conn.execute("DELETE FROM semantic_cluster WHERE user_id = %s", (user_id,))
+
+            # 13. Delete sessions
+            conn.execute("DELETE FROM auth_session WHERE user_id = %s", (user_id,))
+
+            # 14. Delete MFA config
+            conn.execute("DELETE FROM user_mfa_config WHERE user_id = %s", (user_id,))
+
+            # 15. Delete auth credentials
+            conn.execute("DELETE FROM user_auth_credential WHERE user_id = %s", (user_id,))
+
+            # 16. Delete auth providers
+            conn.execute("DELETE FROM user_auth_provider WHERE user_id = %s", (user_id,))
+
+            # 17. Finally delete the user
             result = conn.execute("DELETE FROM app_user WHERE id = %s", (user_id,))
+
+            # Clean up session cache
+            with self._session_lock:
+                stale_ids = [
+                    sid for sid, sess in self.sessions.items() if sess.user_id == user_id
+                ]
+                for sid in stale_ids:
+                    self.sessions.pop(sid, None)
+
             return result.rowcount > 0
 
     # sessions

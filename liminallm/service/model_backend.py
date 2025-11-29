@@ -1046,6 +1046,20 @@ class LocalJaxLoRABackend:
         adapter = adapters[0] if adapters else {}
         self._apply_adapter_vocab_size(adapter)
         ids, attention = self._tokenize(prompt)
+
+        # Handle empty prompts gracefully
+        if not ids:
+            return {
+                "content": "",
+                "usage": {
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "model": self.base_model,
+                    "adapter_id": None,
+                    "latency_ms": 0.0,
+                },
+            }
+
         ids, attention = self._pad_batch(ids, attention)
         if len(ids) > self.max_seq_len:
             raise ValueError(f"prompt exceeds max length ({self.max_seq_len})")
@@ -1070,6 +1084,7 @@ class LocalJaxLoRABackend:
             else self._jnp.zeros_like(token_array)
         )
         lora_scores = lora_scores * attn_array
+        # Use the last token as seed; array is guaranteed non-empty due to check above
         generated_ids = self._sample_tokens(lora_scores, seed_token=token_array[0][-1])
         completion = self._decode(generated_ids)
         duration = time.perf_counter() - start

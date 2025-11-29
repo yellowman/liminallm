@@ -654,9 +654,14 @@ async def refresh_tokens(
 @router.get("/admin/users", response_model=Envelope, tags=["admin"])
 async def admin_list_users(
     tenant_id: Optional[str] = None,
-    limit: int = 100,
+    limit: int = Query(100, ge=1, le=500, description="Maximum users to return"),
     principal: AuthContext = Depends(get_admin_user),
 ):
+    """List users in the admin's tenant.
+
+    Returns:
+        List of users with their roles and metadata.
+    """
     runtime = get_runtime()
     # Admin can only see users in their own tenant (prevent cross-tenant access)
     target_tenant = tenant_id or principal.tenant_id
@@ -664,7 +669,7 @@ async def admin_list_users(
         raise _http_error(
             "forbidden", "cannot access other tenant users", status_code=403
         )
-    users = runtime.auth.list_users(tenant_id=target_tenant, limit=min(limit, 500))
+    users = runtime.auth.list_users(tenant_id=target_tenant, limit=limit)
     return Envelope(
         status="ok", data=UserListResponse(items=[_user_to_response(u) for u in users])
     )
@@ -1049,9 +1054,26 @@ async def chat(
 
 @router.post("/preferences", response_model=Envelope, tags=["preferences"])
 async def record_preference(
-    body: PreferenceEventRequest, principal: AuthContext = Depends(get_user)
+    body: PreferenceEventRequest,
+    response: Response,
+    principal: AuthContext = Depends(get_user),
 ):
+    """Record user preference feedback for an assistant message.
+
+    Rate limited to 30 requests per minute to protect clustering resources.
+    """
     runtime = get_runtime()
+    settings = get_settings()
+
+    # Rate limit preference recording (triggers expensive clustering operations)
+    await _enforce_rate_limit(
+        runtime,
+        f"preferences:{principal.user_id}",
+        limit=30,
+        window_seconds=60,
+        response=response,
+    )
+
     event = runtime.training.record_feedback_event(
         user_id=principal.user_id,
         conversation_id=body.conversation_id,
@@ -1079,9 +1101,25 @@ async def record_preference(
 
 @router.post("/preferences/routing_feedback", response_model=Envelope, tags=["preferences"])
 async def record_routing_feedback(
-    body: PreferenceEventRequest, principal: AuthContext = Depends(get_user)
+    body: PreferenceEventRequest,
+    response: Response,
+    principal: AuthContext = Depends(get_user),
 ):
+    """Record routing-specific feedback for adapter selection improvement.
+
+    Rate limited to 30 requests per minute to protect clustering resources.
+    """
     runtime = get_runtime()
+
+    # Rate limit routing feedback (shares limit with general preferences)
+    await _enforce_rate_limit(
+        runtime,
+        f"preferences:{principal.user_id}",
+        limit=30,
+        window_seconds=60,
+        response=response,
+    )
+
     event = runtime.training.record_feedback_event(
         user_id=principal.user_id,
         conversation_id=body.conversation_id,
@@ -1106,8 +1144,25 @@ async def record_routing_feedback(
 
 
 @router.get("/preferences/insights", response_model=Envelope, tags=["preferences"])
-async def preference_insights(principal: AuthContext = Depends(get_user)):
+async def preference_insights(
+    response: Response,
+    principal: AuthContext = Depends(get_user),
+):
+    """Get user preference insights and cluster summaries.
+
+    Rate limited to 60 requests per minute.
+    """
     runtime = get_runtime()
+
+    # Rate limit insights queries
+    await _enforce_rate_limit(
+        runtime,
+        f"preferences_insights:{principal.user_id}",
+        limit=60,
+        window_seconds=60,
+        response=response,
+    )
+
     summary = runtime.training.summarize_preferences(principal.user_id)
     return Envelope(status="ok", data=PreferenceInsightsResponse(**summary))
 
@@ -1116,16 +1171,40 @@ async def preference_insights(principal: AuthContext = Depends(get_user)):
 async def list_artifacts(
     type: Optional[str] = None,
     kind: Optional[str] = None,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(100, ge=1, le=500),
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(100, ge=1, le=500, description="Items per page"),
     principal: AuthContext = Depends(get_user),
 ):
+    """List artifacts owned by the current user.
+
+    Supports filtering by type and kind, with pagination.
+
+    Args:
+        type: Filter by artifact type (e.g., 'adapter', 'workflow')
+        kind: Filter by artifact kind (e.g., 'adapter.lora', 'workflow.linear')
+        page: Page number (1-indexed)
+        page_size: Number of items per page (max 500)
+
+    Returns:
+        Paginated list of artifacts with metadata.
+    """
     runtime = get_runtime()
     kind_filter = kind or (type if type and "." in type else None)
     type_filter = type if type and "." not in type else None
     if not type_filter and kind_filter:
         type_filter = kind_filter.split(".", 1)[0]
     resolved_page_size = min(max(page_size, 1), 500)
+
+    # Get one extra item to determine if there are more pages
+    raw_items = list(runtime.store.list_artifacts(
+        type_filter=type_filter,
+        kind_filter=kind_filter,
+        owner_user_id=principal.user_id,
+        page=page,
+        page_size=resolved_page_size + 1,
+    ))
+
+    has_next = len(raw_items) > resolved_page_size
     items = [
         ArtifactResponse(
             id=a.id,
@@ -1138,15 +1217,18 @@ async def list_artifacts(
             created_at=a.created_at,
             updated_at=a.updated_at,
         )
-        for a in runtime.store.list_artifacts(
-            type_filter=type_filter,
-            kind_filter=kind_filter,
-            owner_user_id=principal.user_id,
-            page=page,
-            page_size=resolved_page_size,
-        )
+        for a in raw_items[:resolved_page_size]
     ]
-    return Envelope(status="ok", data=ArtifactListResponse(items=items))
+
+    return Envelope(
+        status="ok",
+        data=ArtifactListResponse(
+            items=items,
+            has_next=has_next,
+            next_page=page + 1 if has_next else None,
+            page_size=resolved_page_size,
+        ),
+    )
 
 
 @router.get("/artifacts/{artifact_id}", response_model=Envelope, tags=["artifacts"])

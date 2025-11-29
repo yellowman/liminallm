@@ -6,11 +6,13 @@ import re
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 
+from liminallm.logging import get_logger
 from liminallm.service.embeddings import deterministic_embedding
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.postgres import PostgresStore
 from liminallm.storage.models import KnowledgeChunk
 
+logger = get_logger(__name__)
 
 # Default overlap per SPEC §2.5: "50 token overlap"
 DEFAULT_OVERLAP_TOKENS = 50
@@ -277,12 +279,37 @@ class RAGService:
         default_path = source_path or "inline"
         chunk_index = 0
 
+        # Minimum tokens for a standalone final chunk (avoid losing meaningful content)
+        min_final_chunk_tokens = max(10, effective_overlap // 2)
+
         for start in range(0, len(tokens), step_size):
             end = min(start + chosen_chunk_tokens, len(tokens))
             chunk_tokens = tokens[start:end]
 
-            # Skip if we've reached the end and this would be a tiny fragment
-            if chunk_index > 0 and len(chunk_tokens) < effective_overlap:
+            # Skip only if this is a truly tiny trailing fragment
+            # Use a smaller threshold to avoid losing meaningful final content
+            if chunk_index > 0 and len(chunk_tokens) < min_final_chunk_tokens:
+                # Append remaining tokens to the previous chunk instead of dropping
+                if chunks and chunk_tokens:
+                    prev_chunk = chunks[-1]
+                    prev_content = prev_chunk.content
+                    extra_segment = _detokenize(chunk_tokens)
+                    if extra_segment.strip():
+                        # Update the previous chunk to include the trailing content
+                        combined_content = prev_content + " " + extra_segment.strip()
+                        prev_meta = dict(prev_chunk.meta or {})
+                        prev_meta["end_token"] = end
+                        prev_meta["token_count"] = prev_meta.get("token_count", 0) + len(chunk_tokens)
+                        prev_meta["includes_trailing"] = True
+                        chunks[-1] = KnowledgeChunk(
+                            id=prev_chunk.id,
+                            context_id=prev_chunk.context_id,
+                            fs_path=prev_chunk.fs_path,
+                            content=combined_content,
+                            embedding=self.embed(combined_content),
+                            chunk_index=prev_chunk.chunk_index,
+                            meta=prev_meta,
+                        )
                 break
 
             segment = _detokenize(chunk_tokens)
