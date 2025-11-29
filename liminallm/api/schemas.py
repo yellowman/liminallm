@@ -72,10 +72,35 @@ def _validate_email(value: str) -> str:
     return normalized
 
 
+_HANDLE_PATTERN = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def _validate_handle(value: Optional[str]) -> Optional[str]:
+    """Validate handle format: alphanumeric with underscores/hyphens, max 64 chars."""
+    if value is None:
+        return None
+    if len(value) > 64:
+        raise ValueError("handle must be at most 64 characters")
+    if len(value) < 1:
+        raise ValueError("handle must be at least 1 character")
+    if not _HANDLE_PATTERN.match(value):
+        raise ValueError("handle must contain only alphanumeric characters, underscores, and hyphens")
+    return value
+
+
+def _validate_password_strength(value: str) -> str:
+    """Validate password meets minimum requirements."""
+    if len(value) < 8:
+        raise ValueError("password must be at least 8 characters")
+    if len(value) > 128:
+        raise ValueError("password must be at most 128 characters")
+    return value
+
+
 class SignupRequest(BaseModel):
     email: str
     password: str
-    handle: Optional[str] = None
+    handle: Optional[str] = Field(default=None, max_length=64)
     tenant_id: Optional[str] = None
 
     @field_validator("email")
@@ -86,11 +111,12 @@ class SignupRequest(BaseModel):
     @field_validator("password")
     @classmethod
     def _validate_password(cls, value: str) -> str:
-        if len(value) < 8:
-            raise ValueError("password must be at least 8 characters")
-        if len(value) > 128:
-            raise ValueError("password must be at most 128 characters")
-        return value
+        return _validate_password_strength(value)
+
+    @field_validator("handle")
+    @classmethod
+    def _validate_handle(cls, value: Optional[str]) -> Optional[str]:
+        return _validate_handle(value)
 
 
 class AuthResponse(BaseModel):
@@ -170,8 +196,8 @@ class EmailVerificationRequest(BaseModel):
 
 
 class ChatMessage(BaseModel):
-    content: str = Field(..., max_length=100000)  # 100KB max to prevent DoS
-    mode: str = "text"
+    content: str = Field(..., min_length=1, max_length=100000)  # 100KB max to prevent DoS
+    mode: str = Field(default="text", pattern="^(text|voice|structured)$")
     content_struct: Optional[dict] = None
 
 
@@ -229,6 +255,10 @@ class ArtifactResponse(_SchemaPayload):
 
 class ArtifactListResponse(BaseModel):
     items: List[ArtifactResponse]
+    total_count: Optional[int] = Field(default=None, description="Total number of matching artifacts (when available)")
+    has_next: Optional[bool] = Field(default=None, description="Whether more items exist beyond this page")
+    next_page: Optional[int] = Field(default=None, description="Next page number, if available")
+    page_size: int = Field(default=100, description="Number of items per page")
 
 
 class ArtifactVersionResponse(_SchemaPayload):
@@ -259,10 +289,42 @@ class ConfigPatchAuditResponse(BaseModel):
     meta: Optional[dict] = None
 
 
+_JSON_PATCH_OPS = frozenset({"add", "remove", "replace", "move", "copy", "test"})
+
+
 class ConfigPatchRequest(BaseModel):
     artifact_id: str = Field(..., max_length=255)
     patch: dict
-    justification: str = Field(..., max_length=2000)
+    justification: str = Field(..., min_length=1, max_length=2000)
+
+    @field_validator("patch")
+    @classmethod
+    def _validate_patch_format(cls, value: dict) -> dict:
+        """Validate patch is a valid JSON Patch format (RFC 6902)."""
+        ops = value.get("ops") or value.get("operations")
+        if ops is None:
+            # Patch may be a single operation or list of operations directly
+            if isinstance(value, list):
+                ops = value
+            elif "op" in value and "path" in value:
+                ops = [value]
+            else:
+                raise ValueError("patch must contain 'ops' or 'operations' array, or be a valid JSON Patch operation")
+
+        if not isinstance(ops, list):
+            raise ValueError("patch operations must be an array")
+
+        for i, op in enumerate(ops):
+            if not isinstance(op, dict):
+                raise ValueError(f"patch operation {i} must be an object")
+            if "op" not in op:
+                raise ValueError(f"patch operation {i} missing 'op' field")
+            if op["op"] not in _JSON_PATCH_OPS:
+                raise ValueError(f"patch operation {i} has invalid 'op': {op['op']}")
+            if "path" not in op:
+                raise ValueError(f"patch operation {i} missing 'path' field")
+
+        return value
 
 
 class ConversationMessagesResponse(BaseModel):
@@ -281,10 +343,13 @@ class ConversationSummary(BaseModel):
 
 class ConversationListResponse(BaseModel):
     items: List[ConversationSummary]
+    total_count: Optional[int] = Field(default=None, description="Total number of conversations")
+    has_next: Optional[bool] = Field(default=None, description="Whether more items exist")
+    next_page: Optional[int] = Field(default=None, description="Next page number")
 
 
 class KnowledgeContextRequest(BaseModel):
-    name: str = Field(..., max_length=255)
+    name: str = Field(..., min_length=1, max_length=255)
     description: str = Field(..., max_length=2000)
     text: Optional[str] = Field(default=None, max_length=10_000_000)  # 10MB max
     chunk_size: Optional[int] = Field(default=None, ge=64, le=4000)
@@ -302,6 +367,8 @@ class KnowledgeContextResponse(BaseModel):
 
 class KnowledgeContextListResponse(BaseModel):
     items: List[KnowledgeContextResponse]
+    total_count: Optional[int] = Field(default=None, description="Total number of contexts")
+    has_next: Optional[bool] = Field(default=None, description="Whether more items exist")
 
 
 class KnowledgeChunkResponse(BaseModel):
@@ -327,13 +394,13 @@ class PreferenceEventRequest(BaseModel):
     message_id: str
     feedback: str = Field(..., pattern="^(positive|negative|neutral|like|dislike)$")
     explicit_signal: Optional[str] = None
-    score: Optional[float] = None
+    score: Optional[float] = Field(default=None, ge=-1.0, le=1.0)  # SPEC §2.6 bounds
     context_text: Optional[str] = None
     corrected_text: Optional[str] = None
-    weight: Optional[float] = None
+    weight: Optional[float] = Field(default=None, ge=0.0, le=1.0)  # SPEC §8.1 gate weight bounds
     routing_trace: Optional[List[dict]] = None
     adapter_gates: Optional[List[dict]] = None
-    notes: Optional[str] = None
+    notes: Optional[str] = Field(default=None, max_length=2000)
 
 
 class PreferenceEventResponse(BaseModel):
@@ -411,11 +478,11 @@ class AdminCreateUserResponse(UserResponse):
 
 class AdminCreateUserRequest(BaseModel):
     email: str
-    password: Optional[str] = None
-    handle: Optional[str] = None
-    role: Optional[str] = None
+    password: Optional[str] = Field(default=None, description="If not provided, a random password will be generated")
+    handle: Optional[str] = Field(default=None, max_length=64)
+    role: Optional[Literal["admin", "user"]] = Field(default=None)
     tenant_id: Optional[str] = None
-    plan_tier: Optional[str] = None
+    plan_tier: Optional[Literal["free", "pro", "enterprise"]] = Field(default=None)
     is_active: Optional[bool] = None
     meta: Optional[dict] = None
 
@@ -423,6 +490,18 @@ class AdminCreateUserRequest(BaseModel):
     @classmethod
     def _validate_admin_email(cls, value: str) -> str:
         return _validate_email(value)
+
+    @field_validator("password")
+    @classmethod
+    def _validate_admin_password(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None:
+            return _validate_password_strength(value)
+        return value
+
+    @field_validator("handle")
+    @classmethod
+    def _validate_admin_handle(cls, value: Optional[str]) -> Optional[str]:
+        return _validate_handle(value)
 
 
 class UpdateUserRoleRequest(BaseModel):

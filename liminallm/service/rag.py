@@ -4,7 +4,7 @@ import math
 import os
 import re
 from pathlib import Path
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 from liminallm.service.embeddings import deterministic_embedding
 from liminallm.storage.memory import MemoryStore
@@ -96,18 +96,40 @@ class RAGService:
         user_id: Optional[str],
         tenant_id: Optional[str],
     ) -> List[str]:
+        """Filter context IDs to only those accessible by the user.
+
+        Per SPEC §12.2, user isolation is mandatory for RAG retrieval.
+        This method logs warnings when contexts are filtered out to aid debugging.
+
+        Args:
+            context_ids: Requested context IDs
+            user_id: Requesting user ID (required for access)
+            tenant_id: Optional tenant ID for multi-tenant filtering
+
+        Returns:
+            List of accessible context IDs (may be empty if none accessible)
+        """
         if not user_id:
+            logger.warning(
+                "rag_retrieval_no_user_id",
+                context_ids=list(context_ids),
+                message="RAG retrieval requires user_id for access control; returning empty results",
+            )
             return []
 
         allowed: List[str] = []
+        filtered_reasons: Dict[str, str] = {}
+
         if hasattr(self.store, "contexts"):
             contexts = getattr(self.store, "contexts")
             users = getattr(self.store, "users", {})
             for ctx_id in context_ids:
                 ctx = contexts.get(ctx_id) if isinstance(contexts, dict) else None
                 if not ctx:
+                    filtered_reasons[ctx_id] = "not_found"
                     continue
                 if user_id and ctx.owner_user_id != user_id:
+                    filtered_reasons[ctx_id] = "owner_mismatch"
                     continue
                 if tenant_id:
                     owner = (
@@ -116,23 +138,39 @@ class RAGService:
                         else None
                     )
                     if not owner or owner.tenant_id != tenant_id:
+                        filtered_reasons[ctx_id] = "tenant_mismatch"
                         continue
                 allowed.append(ctx_id)
-            return allowed
-
-        for ctx_id in context_ids:
-            context = getattr(self.store, "get_context", lambda *_: None)(ctx_id)
-            if not context:
-                continue
-            if user_id and context.owner_user_id != user_id:
-                continue
-            if tenant_id:
-                owner = getattr(self.store, "get_user", lambda *_: None)(
-                    context.owner_user_id
-                )
-                if not owner or owner.tenant_id != tenant_id:
+        else:
+            for ctx_id in context_ids:
+                context = getattr(self.store, "get_context", lambda *_: None)(ctx_id)
+                if not context:
+                    filtered_reasons[ctx_id] = "not_found"
                     continue
-            allowed.append(ctx_id)
+                if user_id and context.owner_user_id != user_id:
+                    filtered_reasons[ctx_id] = "owner_mismatch"
+                    continue
+                if tenant_id:
+                    owner = getattr(self.store, "get_user", lambda *_: None)(
+                        context.owner_user_id
+                    )
+                    if not owner or owner.tenant_id != tenant_id:
+                        filtered_reasons[ctx_id] = "tenant_mismatch"
+                        continue
+                allowed.append(ctx_id)
+
+        # Log if any contexts were filtered for debugging
+        if filtered_reasons:
+            logger.info(
+                "rag_contexts_filtered",
+                user_id=user_id,
+                tenant_id=tenant_id,
+                requested_count=len(context_ids),
+                allowed_count=len(allowed),
+                filtered=filtered_reasons,
+                message="Some requested contexts were filtered due to access control",
+            )
+
         return allowed
 
     def _retrieve_pgvector(

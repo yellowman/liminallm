@@ -3,7 +3,7 @@ from __future__ import annotations
 import base64
 import json
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path as FilePath
 from typing import Any, Optional
 from uuid import uuid4
 
@@ -14,6 +14,7 @@ from fastapi import (
     Form,
     Header,
     HTTPException,
+    Path,
     Query,
     Response,
     UploadFile,
@@ -169,12 +170,51 @@ class IdempotencyGuard:
         )
 
 
+class RateLimitInfo:
+    """Rate limit state for adding response headers."""
+
+    __slots__ = ("limit", "remaining", "reset_seconds")
+
+    def __init__(self, limit: int, remaining: int, reset_seconds: int):
+        self.limit = limit
+        self.remaining = remaining
+        self.reset_seconds = reset_seconds
+
+    def apply_headers(self, response: Response) -> None:
+        """Apply rate limit headers to response per IETF draft-polli-ratelimit-headers."""
+        response.headers["X-RateLimit-Limit"] = str(self.limit)
+        response.headers["X-RateLimit-Remaining"] = str(max(0, self.remaining))
+        response.headers["X-RateLimit-Reset"] = str(self.reset_seconds)
+
+
 async def _enforce_rate_limit(
-    runtime, key: str, limit: int, window_seconds: int
-) -> None:
-    allowed = await check_rate_limit(runtime, key, limit, window_seconds)
+    runtime, key: str, limit: int, window_seconds: int, *, response: Optional[Response] = None
+) -> RateLimitInfo:
+    """Enforce rate limit and optionally apply headers to response.
+
+    Args:
+        runtime: Application runtime context
+        key: Rate limit key (e.g., "chat:{user_id}")
+        limit: Maximum requests allowed in window
+        window_seconds: Rate limit window in seconds
+        response: Optional response to add rate limit headers to
+
+    Returns:
+        RateLimitInfo with current rate limit state
+
+    Raises:
+        HTTPException with 429 if rate limit exceeded
+    """
+    allowed, remaining = await check_rate_limit(runtime, key, limit, window_seconds, return_remaining=True)
+    info = RateLimitInfo(limit, remaining, window_seconds)
+
+    if response is not None:
+        info.apply_headers(response)
+
     if not allowed:
         raise _http_error("rate_limited", "rate limit exceeded", status_code=429)
+
+    return info
 
 
 async def _resolve_idempotency(
@@ -345,6 +385,13 @@ def _user_to_response(user) -> UserResponse:
     )
 
 
+def _get_artifact_kind(schema: Any) -> Optional[str]:
+    """Extract 'kind' from artifact schema, handling None/non-dict safely."""
+    if isinstance(schema, dict):
+        return schema.get("kind")
+    return None
+
+
 def _apply_session_cookies(
     response: Response, session: Session, tokens: dict, *, refresh_ttl_minutes: int
 ) -> None:
@@ -370,8 +417,17 @@ def _apply_session_cookies(
         )
 
 
-@router.post("/auth/signup", response_model=Envelope, status_code=201)
+@router.post("/auth/signup", response_model=Envelope, status_code=201, tags=["auth"])
 async def signup(body: SignupRequest, response: Response):
+    """Create a new user account.
+
+    Registers a new user with email and password credentials. Returns session
+    tokens and sets authentication cookies. Rate limited per email address.
+
+    Raises:
+        403: If signup is disabled in settings
+        429: If rate limit exceeded for this email
+    """
     settings = get_settings()
     if not settings.allow_signup:
         raise _http_error("forbidden", "signup disabled", status_code=403)
@@ -410,8 +466,17 @@ async def signup(body: SignupRequest, response: Response):
     )
 
 
-@router.post("/auth/login", response_model=Envelope)
+@router.post("/auth/login", response_model=Envelope, tags=["auth"])
 async def login(body: LoginRequest, response: Response):
+    """Authenticate user with email and password.
+
+    Validates credentials and returns session tokens with authentication cookies.
+    Supports optional MFA verification via mfa_code parameter.
+
+    Raises:
+        401: If credentials are invalid
+        429: If rate limit exceeded for this email
+    """
     runtime = get_runtime()
     await _enforce_rate_limit(
         runtime,
@@ -449,8 +514,16 @@ async def login(body: LoginRequest, response: Response):
     )
 
 
-@router.post("/auth/oauth/{provider}/start", response_model=Envelope)
-async def oauth_start(provider: str, body: OAuthStartRequest):
+@router.post("/auth/oauth/{provider}/start", response_model=Envelope, tags=["auth"])
+async def oauth_start(
+    provider: str = Path(..., description="OAuth provider (google, github, etc.)"),
+    body: OAuthStartRequest = ...,
+):
+    """Start OAuth authentication flow.
+
+    Returns authorization URL for the specified OAuth provider.
+    Client should redirect user to this URL to complete authentication.
+    """
     runtime = get_runtime()
     start = await runtime.auth.start_oauth(
         provider, redirect_uri=body.redirect_uri, tenant_id=body.tenant_id
@@ -465,14 +538,19 @@ async def oauth_start(provider: str, body: OAuthStartRequest):
     )
 
 
-@router.get("/auth/oauth/{provider}/callback", response_model=Envelope)
+@router.get("/auth/oauth/{provider}/callback", response_model=Envelope, tags=["auth"])
 async def oauth_callback(
-    provider: str,
-    code: str,
-    state: str,
-    response: Response,
-    tenant_id: Optional[str] = None,
+    provider: str = Path(..., description="OAuth provider"),
+    code: str = Query(..., description="Authorization code from OAuth provider"),
+    state: str = Query(..., description="State parameter for CSRF protection"),
+    response: Response = ...,
+    tenant_id: Optional[str] = Query(None, description="Optional tenant ID"),
 ):
+    """Complete OAuth authentication flow.
+
+    Exchanges authorization code for tokens and creates user session.
+    Called by OAuth provider after user authorizes the application.
+    """
     runtime = get_runtime()
     user, session, tokens = await runtime.auth.complete_oauth(
         provider, code, state, tenant_id=tenant_id
@@ -501,7 +579,7 @@ async def oauth_callback(
     )
 
 
-@router.post("/auth/refresh", response_model=Envelope)
+@router.post("/auth/refresh", response_model=Envelope, tags=["auth"])
 async def refresh_tokens(
     body: TokenRefreshRequest,
     response: Response,
@@ -539,7 +617,7 @@ async def refresh_tokens(
     )
 
 
-@router.get("/admin/users", response_model=Envelope)
+@router.get("/admin/users", response_model=Envelope, tags=["admin"])
 async def admin_list_users(
     tenant_id: Optional[str] = None,
     limit: int = 100,
@@ -558,7 +636,7 @@ async def admin_list_users(
     )
 
 
-@router.post("/admin/users", response_model=Envelope)
+@router.post("/admin/users", response_model=Envelope, tags=["admin"])
 async def admin_create_user(
     body: AdminCreateUserRequest, principal: AuthContext = Depends(get_admin_user)
 ):
@@ -592,7 +670,7 @@ async def admin_create_user(
     )
 
 
-@router.post("/admin/users/{user_id}/role", response_model=Envelope)
+@router.post("/admin/users/{user_id}/role", response_model=Envelope, tags=["admin"])
 async def admin_set_role(
     user_id: str,
     body: UpdateUserRoleRequest,
@@ -611,7 +689,7 @@ async def admin_set_role(
     return Envelope(status="ok", data=_user_to_response(user))
 
 
-@router.delete("/admin/users/{user_id}", response_model=Envelope)
+@router.delete("/admin/users/{user_id}", response_model=Envelope, tags=["admin"])
 async def admin_delete_user(
     user_id: str, principal: AuthContext = Depends(get_admin_user)
 ):
@@ -628,7 +706,7 @@ async def admin_delete_user(
     return Envelope(status="ok", data={"deleted": True, "user_id": user_id})
 
 
-@router.get("/admin/adapters", response_model=Envelope)
+@router.get("/admin/adapters", response_model=Envelope, tags=["admin"])
 async def admin_list_adapters(principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
     # Filter adapters by tenant to prevent cross-tenant data exposure
@@ -656,7 +734,7 @@ async def admin_list_adapters(principal: AuthContext = Depends(get_admin_user)):
     )
 
 
-@router.get("/admin/objects", response_model=Envelope)
+@router.get("/admin/objects", response_model=Envelope, tags=["admin"])
 async def admin_inspect_objects(
     kind: Optional[str] = None,
     limit: int = 50,
@@ -674,7 +752,7 @@ async def admin_inspect_objects(
     )
 
 
-@router.post("/auth/mfa/request", response_model=Envelope)
+@router.post("/auth/mfa/request", response_model=Envelope, tags=["auth"])
 async def request_mfa(body: MFARequest):
     runtime = get_runtime()
     auth_ctx = await runtime.auth.resolve_session(
@@ -692,7 +770,7 @@ async def request_mfa(body: MFARequest):
     return Envelope(status="ok", data=challenge)
 
 
-@router.post("/auth/mfa/verify", response_model=Envelope)
+@router.post("/auth/mfa/verify", response_model=Envelope, tags=["auth"])
 async def verify_mfa(body: MFAVerifyRequest, response: Response):
     runtime = get_runtime()
     auth_ctx = await runtime.auth.resolve_session(
@@ -736,7 +814,7 @@ async def verify_mfa(body: MFAVerifyRequest, response: Response):
     return Envelope(status="ok", data=resp)
 
 
-@router.post("/auth/reset/request", response_model=Envelope)
+@router.post("/auth/reset/request", response_model=Envelope, tags=["auth"])
 async def request_reset(body: PasswordResetRequest):
     runtime = get_runtime()
     await _enforce_rate_limit(
@@ -750,7 +828,7 @@ async def request_reset(body: PasswordResetRequest):
     return Envelope(status="ok", data={"status": "sent"})
 
 
-@router.post("/auth/reset/confirm", response_model=Envelope)
+@router.post("/auth/reset/confirm", response_model=Envelope, tags=["auth"])
 async def confirm_reset(body: PasswordResetConfirm):
     runtime = get_runtime()
     ok = await runtime.auth.complete_password_reset(body.token, body.new_password)
@@ -759,7 +837,7 @@ async def confirm_reset(body: PasswordResetConfirm):
     return Envelope(status="ok", data={"status": "reset"})
 
 
-@router.post("/auth/request_email_verification", response_model=Envelope)
+@router.post("/auth/request_email_verification", response_model=Envelope, tags=["auth"])
 async def request_email_verification(principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     user = runtime.store.get_user(principal.user_id)
@@ -769,7 +847,7 @@ async def request_email_verification(principal: AuthContext = Depends(get_user))
     return Envelope(status="ok", data={"status": "sent"})
 
 
-@router.post("/auth/verify_email", response_model=Envelope)
+@router.post("/auth/verify_email", response_model=Envelope, tags=["auth"])
 async def verify_email(body: EmailVerificationRequest):
     runtime = get_runtime()
     ok = await runtime.auth.complete_email_verification(body.token)
@@ -778,7 +856,7 @@ async def verify_email(body: EmailVerificationRequest):
     return Envelope(status="ok", data={"status": "verified"})
 
 
-@router.post("/auth/logout", response_model=Envelope)
+@router.post("/auth/logout", response_model=Envelope, tags=["auth"])
 async def logout(
     response: Response,
     session_id: Optional[str] = Header(None, convert_underscores=False),
@@ -798,12 +876,23 @@ async def logout(
     return Envelope(status="ok", data={"message": "session revoked"})
 
 
-@router.post("/chat", response_model=Envelope)
+@router.post("/chat", response_model=Envelope, tags=["chat"])
 async def chat(
     body: ChatRequest,
     principal: AuthContext = Depends(get_user),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
+    """Process a chat message and generate a response.
+
+    Routes the message through the workflow engine, applies relevant adapters,
+    and returns the assistant's response. Supports voice transcription, RAG
+    context, and idempotency via the Idempotency-Key header.
+
+    Raises:
+        401: If authentication fails
+        404: If conversation or context not found
+        429: If rate limit exceeded
+    """
     runtime = get_runtime()
     user_id = principal.user_id
     # SPEC §18: Accept Idempotency-Key when provided (optional)
@@ -922,7 +1011,7 @@ async def chat(
     # Exceptions bubble through the guard which records failed states
 
 
-@router.post("/preferences", response_model=Envelope)
+@router.post("/preferences", response_model=Envelope, tags=["preferences"])
 async def record_preference(
     body: PreferenceEventRequest, principal: AuthContext = Depends(get_user)
 ):
@@ -952,7 +1041,7 @@ async def record_preference(
     return Envelope(status="ok", data=resp)
 
 
-@router.post("/preferences/routing_feedback", response_model=Envelope)
+@router.post("/preferences/routing_feedback", response_model=Envelope, tags=["preferences"])
 async def record_routing_feedback(
     body: PreferenceEventRequest, principal: AuthContext = Depends(get_user)
 ):
@@ -980,14 +1069,14 @@ async def record_routing_feedback(
     return Envelope(status="ok", data=resp)
 
 
-@router.get("/preferences/insights", response_model=Envelope)
+@router.get("/preferences/insights", response_model=Envelope, tags=["preferences"])
 async def preference_insights(principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     summary = runtime.training.summarize_preferences(principal.user_id)
     return Envelope(status="ok", data=PreferenceInsightsResponse(**summary))
 
 
-@router.get("/artifacts", response_model=Envelope)
+@router.get("/artifacts", response_model=Envelope, tags=["artifacts"])
 async def list_artifacts(
     type: Optional[str] = None,
     kind: Optional[str] = None,
@@ -1024,8 +1113,11 @@ async def list_artifacts(
     return Envelope(status="ok", data=ArtifactListResponse(items=items))
 
 
-@router.get("/artifacts/{artifact_id}", response_model=Envelope)
-async def get_artifact(artifact_id: str, principal: AuthContext = Depends(get_user)):
+@router.get("/artifacts/{artifact_id}", response_model=Envelope, tags=["artifacts"])
+async def get_artifact(
+    artifact_id: str = Path(..., max_length=255, description="Artifact identifier"),
+    principal: AuthContext = Depends(get_user),
+):
     runtime = get_runtime()
     artifact = _get_owned_artifact(runtime, artifact_id, principal)
     resp = ArtifactResponse(
@@ -1042,7 +1134,7 @@ async def get_artifact(artifact_id: str, principal: AuthContext = Depends(get_us
     return Envelope(status="ok", data=resp)
 
 
-@router.get("/tools/specs", response_model=Envelope)
+@router.get("/tools/specs", response_model=Envelope, tags=["tools"])
 async def list_tool_specs(
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(50, ge=1, le=200, description="Items per page"),
@@ -1080,8 +1172,11 @@ async def list_tool_specs(
     )
 
 
-@router.get("/tools/specs/{artifact_id}", response_model=Envelope)
-async def get_tool_spec(artifact_id: str, principal: AuthContext = Depends(get_user)):
+@router.get("/tools/specs/{artifact_id}", response_model=Envelope, tags=["tools"])
+async def get_tool_spec(
+    artifact_id: str = Path(..., max_length=255, description="Tool spec artifact ID"),
+    principal: AuthContext = Depends(get_user),
+):
     runtime = get_runtime()
     artifact = _get_owned_artifact(runtime, artifact_id, principal)
     if not (
@@ -1102,7 +1197,7 @@ async def get_tool_spec(artifact_id: str, principal: AuthContext = Depends(get_u
     return Envelope(status="ok", data=resp)
 
 
-@router.get("/workflows", response_model=Envelope)
+@router.get("/workflows", response_model=Envelope, tags=["workflows"])
 async def list_workflows(
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(50, ge=1, le=200, description="Items per page"),
@@ -1140,7 +1235,7 @@ async def list_workflows(
     )
 
 
-@router.get("/artifacts/{artifact_id}/versions", response_model=Envelope)
+@router.get("/artifacts/{artifact_id}/versions", response_model=Envelope, tags=["artifacts"])
 async def list_artifact_versions(
     artifact_id: str, principal: AuthContext = Depends(get_user)
 ):
@@ -1171,7 +1266,7 @@ async def list_artifact_versions(
     return Envelope(status="ok", data=ArtifactVersionListResponse(items=items))
 
 
-@router.post("/tools/{tool_id}/invoke", response_model=Envelope)
+@router.post("/tools/{tool_id}/invoke", response_model=Envelope, tags=["tools"])
 async def invoke_tool(
     tool_id: str,
     body: ToolInvokeRequest,
@@ -1214,7 +1309,7 @@ async def invoke_tool(
         return envelope
 
 
-@router.post("/artifacts", response_model=Envelope, status_code=201)
+@router.post("/artifacts", response_model=Envelope, status_code=201, tags=["artifacts"])
 async def create_artifact(
     body: ArtifactRequest,
     principal: AuthContext = Depends(get_user),
@@ -1290,7 +1385,7 @@ async def create_artifact(
         return envelope
 
 
-@router.patch("/artifacts/{artifact_id}", response_model=Envelope)
+@router.patch("/artifacts/{artifact_id}", response_model=Envelope, tags=["artifacts"])
 async def patch_artifact(
     artifact_id: str, body: ArtifactRequest, principal: AuthContext = Depends(get_user)
 ):
@@ -1332,7 +1427,7 @@ async def patch_artifact(
     return Envelope(status="ok", data=resp)
 
 
-@router.post("/config/propose_patch", response_model=Envelope)
+@router.post("/config/propose_patch", response_model=Envelope, tags=["config"])
 async def propose_patch(
     body: ConfigPatchRequest, principal: AuthContext = Depends(get_admin_user)
 ):
@@ -1366,7 +1461,7 @@ async def propose_patch(
     return Envelope(status="ok", data=resp)
 
 
-@router.get("/config/patches", response_model=Envelope)
+@router.get("/config/patches", response_model=Envelope, tags=["config"])
 async def list_config_patches(
     status: Optional[str] = None, principal: AuthContext = Depends(get_admin_user)
 ):
@@ -1397,7 +1492,7 @@ async def list_config_patches(
     return Envelope(status="ok", data=ConfigPatchListResponse(items=items))
 
 
-@router.post("/config/patches/{patch_id}/decide", response_model=Envelope)
+@router.post("/config/patches/{patch_id}/decide", response_model=Envelope, tags=["config"])
 async def decide_config_patch(
     patch_id: int,
     body: ConfigPatchDecisionRequest,
@@ -1427,7 +1522,7 @@ async def decide_config_patch(
     return Envelope(status="ok", data=resp)
 
 
-@router.post("/config/patches/{patch_id}/apply", response_model=Envelope)
+@router.post("/config/patches/{patch_id}/apply", response_model=Envelope, tags=["config"])
 async def apply_config_patch(
     patch_id: int, principal: AuthContext = Depends(get_admin_user)
 ):
@@ -1458,7 +1553,7 @@ async def apply_config_patch(
     return Envelope(status="ok", data=resp)
 
 
-@router.post("/config/auto_patch", response_model=Envelope)
+@router.post("/config/auto_patch", response_model=Envelope, tags=["config"])
 async def auto_patch(
     body: AutoPatchRequest, principal: AuthContext = Depends(get_admin_user)
 ):
@@ -1488,7 +1583,7 @@ async def auto_patch(
     return Envelope(status="ok", data=resp)
 
 
-@router.get("/config", response_model=Envelope)
+@router.get("/config", response_model=Envelope, tags=["config"])
 async def get_config(principal: AuthContext = Depends(get_admin_user)):
     """Expose runtime configuration for the admin console."""
 
@@ -1538,7 +1633,7 @@ async def get_config(principal: AuthContext = Depends(get_admin_user)):
     )
 
 
-@router.get("/files/limits", response_model=Envelope)
+@router.get("/files/limits", response_model=Envelope, tags=["files"])
 async def get_file_limits(principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     return Envelope(
@@ -1549,7 +1644,7 @@ async def get_file_limits(principal: AuthContext = Depends(get_user)):
     )
 
 
-@router.post("/files/upload", response_model=Envelope)
+@router.post("/files/upload", response_model=Envelope, tags=["files"])
 async def upload_file(
     file: UploadFile = File(...),
     context_id: Optional[str] = Form(None),
@@ -1582,7 +1677,7 @@ async def upload_file(
         if not safe_filename:
             safe_filename = "untitled"
         dest_dir = (
-            Path(runtime.settings.shared_fs_root)
+            FilePath(runtime.settings.shared_fs_root)
             / "users"
             / principal.user_id
             / "files"
@@ -1641,7 +1736,7 @@ async def upload_file(
         return envelope
 
 
-@router.get("/conversations/{conversation_id}/messages", response_model=Envelope)
+@router.get("/conversations/{conversation_id}/messages", response_model=Envelope, tags=["conversations"])
 async def list_messages(
     conversation_id: str,
     limit: Optional[int] = Query(None, ge=1, le=500),
@@ -1673,7 +1768,7 @@ async def list_messages(
     )
 
 
-@router.get("/conversations", response_model=Envelope)
+@router.get("/conversations", response_model=Envelope, tags=["conversations"])
 async def list_conversations(principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     convs = runtime.store.list_conversations(principal.user_id)
@@ -1691,7 +1786,7 @@ async def list_conversations(principal: AuthContext = Depends(get_user)):
     return Envelope(status="ok", data=ConversationListResponse(items=items))
 
 
-@router.post("/contexts", response_model=Envelope, status_code=201)
+@router.post("/contexts", response_model=Envelope, status_code=201, tags=["knowledge"])
 async def create_context(
     body: KnowledgeContextRequest,
     principal: AuthContext = Depends(get_user),
@@ -1730,7 +1825,7 @@ async def create_context(
         return envelope
 
 
-@router.get("/contexts", response_model=Envelope)
+@router.get("/contexts", response_model=Envelope, tags=["knowledge"])
 async def list_contexts(principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     contexts = runtime.store.list_contexts(owner_user_id=principal.user_id)
@@ -1749,8 +1844,11 @@ async def list_contexts(principal: AuthContext = Depends(get_user)):
     return Envelope(status="ok", data=KnowledgeContextListResponse(items=items))
 
 
-@router.get("/contexts/{context_id}/chunks", response_model=Envelope)
-async def list_chunks(context_id: str, principal: AuthContext = Depends(get_user)):
+@router.get("/contexts/{context_id}/chunks", response_model=Envelope, tags=["knowledge"])
+async def list_chunks(
+    context_id: str = Path(..., max_length=255, description="Knowledge context ID"),
+    principal: AuthContext = Depends(get_user),
+):
     runtime = get_runtime()
     _get_owned_context(runtime, context_id, principal)
     chunks = runtime.store.list_chunks(context_id, owner_user_id=principal.user_id)
@@ -1772,7 +1870,7 @@ async def list_chunks(context_id: str, principal: AuthContext = Depends(get_user
     return Envelope(status="ok", data=KnowledgeChunkListResponse(items=data))
 
 
-@router.post("/voice/transcribe", response_model=Envelope)
+@router.post("/voice/transcribe", response_model=Envelope, tags=["voice"])
 async def transcribe_voice(
     file: UploadFile = File(...), principal: AuthContext = Depends(get_user)
 ):
@@ -1795,7 +1893,7 @@ async def transcribe_voice(
     return Envelope(status="ok", data=VoiceTranscriptionResponse(**result))
 
 
-@router.post("/voice/synthesize", response_model=Envelope)
+@router.post("/voice/synthesize", response_model=Envelope, tags=["voice"])
 async def synthesize_voice(
     body: VoiceSynthesisRequest, principal: AuthContext = Depends(get_user)
 ):

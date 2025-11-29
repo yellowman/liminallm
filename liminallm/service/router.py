@@ -21,6 +21,16 @@ class RouterEngine:
     Supports SPEC §5/§8 dual-mode operation:
     - Filters adapters by compatibility with current backend mode
     - Only routes to adapters that can be executed by the active backend
+
+    Thread Safety:
+        The RouterEngine is thread-safe for concurrent requests. All internal
+        caches are read-only after initialization, and Redis cache operations
+        are atomic. Multiple concurrent route() calls can safely execute.
+
+    Attributes:
+        cache: Optional Redis cache for router state
+        similarity_boost_threshold: Minimum similarity for context-based boosting
+        backend_mode: Current backend mode (affects adapter filtering)
     """
 
     def __init__(
@@ -311,11 +321,27 @@ class RouterEngine:
     def _resolve_weight(
         self, configured_weight: Any, similarity: Optional[float]
     ) -> float:
+        """Resolve configured weight to a float value, clamped to [0, 1].
+
+        Per SPEC §8.1, gate weights must be clamped to [0, 1] to prevent
+        over-amplification or negative weighting of adapters.
+
+        Args:
+            configured_weight: Weight value (float, int, or "similarity" string)
+            similarity: Similarity score to use if configured_weight is "similarity"
+
+        Returns:
+            Weight value clamped to [0.0, 1.0]
+        """
+        weight: float
         if isinstance(configured_weight, (int, float)):
-            return float(configured_weight)
-        if isinstance(configured_weight, str) and configured_weight == "similarity":
-            return float(similarity or 0.0)
-        return 1.0
+            weight = float(configured_weight)
+        elif isinstance(configured_weight, str) and configured_weight == "similarity":
+            weight = float(similarity or 0.0)
+        else:
+            weight = 1.0
+        # SPEC §8.1: clamp gate weights to [0, 1]
+        return max(0.0, min(1.0, weight))
 
     def _resolve_adapter(
         self, adapter_id: Optional[str], adapters: List[dict], ctx_emb: List[float]

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple, Union
 
 import redis.asyncio as redis
 
@@ -38,7 +38,20 @@ class RedisCache:
     async def revoke_session(self, session_id: str) -> None:
         await self.client.delete(f"auth:session:{session_id}")
 
-    async def check_rate_limit(self, key: str, limit: int, window_seconds: int) -> bool:
+    async def check_rate_limit(
+        self, key: str, limit: int, window_seconds: int, *, return_remaining: bool = False
+    ) -> Union[bool, Tuple[bool, int]]:
+        """Check rate limit using Redis token bucket.
+
+        Args:
+            key: Rate limit key
+            limit: Maximum requests per window
+            window_seconds: Window duration in seconds
+            return_remaining: If True, return (allowed, remaining) tuple
+
+        Returns:
+            bool if return_remaining is False, else (allowed, remaining) tuple
+        """
         now = datetime.utcnow()
         now_bucket = int(now.timestamp() // window_seconds)
         redis_key = f"rate:{key}:{now_bucket}"
@@ -47,7 +60,11 @@ class RedisCache:
             bucket_end = (now_bucket + 1) * window_seconds
             ttl = max(1, int(bucket_end - now.timestamp()))
             await self.client.expire(redis_key, ttl)
-        return current <= limit
+        allowed = current <= limit
+        if return_remaining:
+            remaining = max(0, limit - current)
+            return (allowed, remaining)
+        return allowed
 
     async def mark_refresh_revoked(self, jti: str, ttl_seconds: int) -> None:
         await self.client.set(f"auth:refresh:revoked:{jti}", "1", ex=ttl_seconds)
