@@ -1227,6 +1227,7 @@ async def list_artifacts(
     visibility: Optional[str] = Query(None, pattern="^(private|shared|global)$", description="Filter by visibility"),
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     page_size: int = Query(100, ge=1, le=500, description="Items per page"),
+    limit: Optional[int] = Query(None, ge=1, le=500, description="Alias for page_size (for frontend compatibility)"),
     principal: AuthContext = Depends(get_user),
 ):
     """List artifacts owned by the current user.
@@ -1248,7 +1249,9 @@ async def list_artifacts(
     type_filter = type if type and "." not in type else None
     if not type_filter and kind_filter:
         type_filter = kind_filter.split(".", 1)[0]
-    resolved_page_size = min(max(page_size, 1), 500)
+    # Accept 'limit' as alias for 'page_size' for frontend compatibility
+    effective_page_size = limit if limit is not None else page_size
+    resolved_page_size = min(max(effective_page_size, 1), 500)
 
     # Get one extra item to determine if there are more pages
     raw_items = list(runtime.store.list_artifacts(
@@ -1439,12 +1442,14 @@ async def list_workflows(
 
 @router.get("/artifacts/{artifact_id}/versions", response_model=Envelope, tags=["artifacts"])
 async def list_artifact_versions(
-    artifact_id: str, principal: AuthContext = Depends(get_user)
+    artifact_id: str = Path(..., max_length=255, description="Artifact identifier"),
+    limit: int = Query(100, ge=1, le=500, description="Maximum versions to return"),
+    principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
     # Verify ownership before listing versions
     _get_owned_artifact(runtime, artifact_id, principal)
-    versions = runtime.store.list_artifact_versions(artifact_id)
+    versions = runtime.store.list_artifact_versions(artifact_id, limit=limit)
     if not versions:
         artifact = runtime.store.get_artifact(artifact_id)
         if not artifact:
@@ -2001,6 +2006,31 @@ async def list_conversations(
     return Envelope(status="ok", data=ConversationListResponse(items=items))
 
 
+@router.get("/conversations/{conversation_id}", response_model=Envelope, tags=["conversations"])
+async def get_conversation(
+    conversation_id: str = Path(..., max_length=255, description="Conversation identifier"),
+    principal: AuthContext = Depends(get_user),
+):
+    """Get a single conversation by ID.
+
+    Returns conversation details including title, status, and metadata.
+    Only the conversation owner can access it.
+    """
+    runtime = get_runtime()
+    conversation = _get_owned_conversation(runtime, conversation_id, principal)
+    return Envelope(
+        status="ok",
+        data=ConversationSummary(
+            id=conversation.id,
+            created_at=conversation.created_at,
+            updated_at=conversation.updated_at,
+            title=conversation.title,
+            status=conversation.status,
+            active_context_id=conversation.active_context_id,
+        ),
+    )
+
+
 @router.post("/contexts", response_model=Envelope, status_code=201, tags=["knowledge"])
 async def create_context(
     body: KnowledgeContextRequest,
@@ -2065,11 +2095,12 @@ async def list_contexts(
 @router.get("/contexts/{context_id}/chunks", response_model=Envelope, tags=["knowledge"])
 async def list_chunks(
     context_id: str = Path(..., max_length=255, description="Knowledge context ID"),
+    limit: int = Query(100, ge=1, le=500, description="Maximum chunks to return"),
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
     _get_owned_context(runtime, context_id, principal)
-    chunks = runtime.store.list_chunks(context_id, owner_user_id=principal.user_id)
+    chunks = runtime.store.list_chunks(context_id, owner_user_id=principal.user_id, limit=limit)
     for ch in chunks:
         if ch.id is None:
             raise _http_error(

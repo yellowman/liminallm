@@ -1851,12 +1851,16 @@ class PostgresStore:
             base_model=new_base_model,
         )
 
-    def list_artifact_versions(self, artifact_id: str) -> List[ArtifactVersion]:
+    def list_artifact_versions(
+        self, artifact_id: str, *, limit: Optional[int] = None
+    ) -> List[ArtifactVersion]:
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM artifact_version WHERE artifact_id = %s ORDER BY version DESC",
-                (artifact_id,),
-            ).fetchall()
+            query = "SELECT * FROM artifact_version WHERE artifact_id = %s ORDER BY version DESC"
+            params: list[Any] = [artifact_id]
+            if limit is not None:
+                query += " LIMIT %s"
+                params.append(limit)
+            rows = conn.execute(query, tuple(params)).fetchall()
         versions: List[ArtifactVersion] = []
         for row in rows:
             schema = row.get("schema") if isinstance(row, dict) else row["schema"]
@@ -2359,7 +2363,11 @@ class PostgresStore:
             raise ConstraintViolation("context not found", {"context_id": context_id})
 
     def list_chunks(
-        self, context_id: Optional[str] = None, *, owner_user_id: Optional[str] = None
+        self,
+        context_id: Optional[str] = None,
+        *,
+        owner_user_id: Optional[str] = None,
+        limit: Optional[int] = None,
     ) -> List[KnowledgeChunk]:
         with self._connect() as conn:
             if context_id:
@@ -2370,14 +2378,19 @@ class PostgresStore:
                     params.append(owner_user_id)
                 query += " WHERE kc.context_id = %s ORDER BY kc.chunk_index ASC"
                 params.append(context_id)
+                if limit is not None:
+                    query += " LIMIT %s"
+                    params.append(limit)
                 rows = conn.execute(query, tuple(params)).fetchall()
             else:
                 if not owner_user_id:
                     return []
-                rows = conn.execute(
-                    "SELECT kc.* FROM knowledge_chunk kc JOIN knowledge_context ctx ON ctx.id = kc.context_id WHERE ctx.owner_user_id = %s ORDER BY kc.created_at DESC",
-                    (owner_user_id,),
-                ).fetchall()
+                params = [owner_user_id]
+                query = "SELECT kc.* FROM knowledge_chunk kc JOIN knowledge_context ctx ON ctx.id = kc.context_id WHERE ctx.owner_user_id = %s ORDER BY kc.created_at DESC"
+                if limit is not None:
+                    query += " LIMIT %s"
+                    params.append(limit)
+                rows = conn.execute(query, tuple(params)).fetchall()
         chunks: List[KnowledgeChunk] = []
         for row in rows:
             chunks.append(

@@ -1145,9 +1145,14 @@ class MemoryStore:
         self._persist_state()
         return artifact
 
-    def list_artifact_versions(self, artifact_id: str) -> List[ArtifactVersion]:
+    def list_artifact_versions(
+        self, artifact_id: str, *, limit: Optional[int] = None
+    ) -> List[ArtifactVersion]:
         versions = list(self.artifact_versions.get(artifact_id, []))
-        return sorted(versions, key=lambda v: v.version, reverse=True)
+        sorted_versions = sorted(versions, key=lambda v: v.version, reverse=True)
+        if limit is not None:
+            sorted_versions = sorted_versions[:limit]
+        return sorted_versions
 
     def get_artifact_current_version(self, artifact_id: str) -> int:
         """Get the current (highest) version number for an artifact."""
@@ -1366,13 +1371,20 @@ class MemoryStore:
         self._persist_state()
 
     def list_chunks(
-        self, context_id: Optional[str] = None, *, owner_user_id: Optional[str] = None
+        self,
+        context_id: Optional[str] = None,
+        *,
+        owner_user_id: Optional[str] = None,
+        limit: Optional[int] = None,
     ) -> List[KnowledgeChunk]:
         if context_id:
             ctx = self.contexts.get(context_id)
             if owner_user_id and (not ctx or ctx.owner_user_id != owner_user_id):
                 return []
-            return list(self.chunks.get(context_id, []))
+            result = list(self.chunks.get(context_id, []))
+            if limit is not None:
+                result = result[:limit]
+            return result
         if not owner_user_id:
             return []
         chunks: List[KnowledgeChunk] = []
@@ -1381,6 +1393,8 @@ class MemoryStore:
                 ctx = self.contexts.get(vals[0].context_id)
                 if ctx and ctx.owner_user_id == owner_user_id:
                     chunks.extend(vals)
+        if limit is not None:
+            chunks = chunks[:limit]
         return chunks
 
     def search_chunks(
