@@ -152,10 +152,20 @@ class IdempotencyGuard:
     async def store_result(
         self, envelope: Envelope, *, status: str = "completed"
     ) -> None:
+        """Store result in idempotency cache.
+
+        Args:
+            envelope: Response envelope to store
+            status: Status to record. Only "completed" marks the operation as
+                    fully done - intermediate statuses like "processing" still
+                    allow error recording via __aexit__.
+        """
         await _store_idempotency_result(
             self.route, self.user_id, self.idempotency_key, envelope, status=status
         )
-        self._stored = True
+        # Only mark as stored for final states to allow error recording for intermediate states
+        if status in {"completed", "failed"}:
+            self._stored = True
 
     async def store_error(self, message: str) -> None:
         if not self.request_id:
@@ -390,6 +400,30 @@ def _get_artifact_kind(schema: Any) -> Optional[str]:
     if isinstance(schema, dict):
         return schema.get("kind")
     return None
+
+
+def _generate_conversation_title(message: str, max_length: int = 50) -> str:
+    """Generate a conversation title from the first message.
+
+    Creates a human-readable title by truncating the message content.
+    Preserves word boundaries where possible.
+    """
+    if not message:
+        return "New conversation"
+
+    # Clean up whitespace
+    cleaned = " ".join(message.split())
+
+    if len(cleaned) <= max_length:
+        return cleaned
+
+    # Truncate at word boundary if possible
+    truncated = cleaned[:max_length]
+    last_space = truncated.rfind(" ")
+    if last_space > max_length // 2:
+        truncated = truncated[:last_space]
+
+    return truncated.rstrip(".,!?;:") + "..."
 
 
 def _apply_session_cookies(
@@ -918,8 +952,10 @@ async def chat(
             if context_id:
                 _get_owned_context(runtime, context_id, principal)
                 validated_context_id = context_id
+            # Generate title from first message for new conversations
+            auto_title = _generate_conversation_title(body.message.content)
             conversation = runtime.store.create_conversation(
-                user_id=user_id, active_context_id=body.context_id
+                user_id=user_id, active_context_id=body.context_id, title=auto_title
             )
         conversation_id = conversation.id
         context_id = context_id or conversation.active_context_id
@@ -1550,7 +1586,11 @@ async def apply_config_patch(
         applied_at=patch.applied_at or patch.decided_at or patch.created_at,
         meta=patch.meta,
     )
-    return Envelope(status="ok", data=resp)
+    # Include warning if status update failed (partial success)
+    envelope_data = resp.model_dump()
+    if result.get("warning"):
+        envelope_data["warning"] = result["warning"]
+    return Envelope(status="ok", data=envelope_data)
 
 
 @router.post("/config/auto_patch", response_model=Envelope, tags=["config"])
@@ -1920,15 +1960,19 @@ async def synthesize_voice(
 
 @router.websocket("/chat/stream")
 async def websocket_chat(ws: WebSocket):
+    """Handle WebSocket chat connections for streaming responses."""
     runtime = get_runtime()
     await ws.accept()
     user_id: Optional[str] = None
     idempotency_key: Optional[str] = None
-    request_id: Optional[str] = None
+    # Generate request_id immediately to ensure traceability even on early errors
+    request_id: str = str(uuid4())
+    convo_id: Optional[str] = None
     try:
         init = await ws.receive_json()
         idempotency_key = init.get("idempotency_key")
-        request_id = init.get("request_id")
+        # Use client-provided request_id if available, otherwise keep generated one
+        request_id = init.get("request_id") or request_id
         session_id = init.get("session_id")
         access_token = init.get("access_token")
         auth_ctx = await runtime.auth.authenticate(
@@ -1956,7 +2000,12 @@ async def websocket_chat(ws: WebSocket):
         if convo_id:
             conversation = _get_owned_conversation(runtime, convo_id, auth_ctx)
         else:
-            conversation = runtime.store.create_conversation(user_id=user_id)
+            # Generate title from first message for new conversations
+            user_message = init.get("message", "")
+            auto_title = _generate_conversation_title(user_message)
+            conversation = runtime.store.create_conversation(
+                user_id=user_id, title=auto_title
+            )
             convo_id = conversation.id
         context_id = init.get("context_id") or conversation.active_context_id
         if context_id:
@@ -2022,7 +2071,7 @@ async def websocket_chat(ws: WebSocket):
             else {"code": "server_error", "message": str(exc.detail)}
         )
         error_env = Envelope(
-            status="error", error=error_payload, request_id=request_id or str(uuid4())
+            status="error", error=error_payload, request_id=request_id
         )
         if user_id:
             await _store_idempotency_result(
@@ -2035,12 +2084,15 @@ async def websocket_chat(ws: WebSocket):
         return
     except Exception:
         logger.exception(
-            "unhandled_websocket_error", user_id=user_id, conversation_id=convo_id
+            "unhandled_websocket_error",
+            user_id=user_id,
+            conversation_id=convo_id,
+            request_id=request_id,
         )
         error_env = Envelope(
             status="error",
             error={"code": "server_error", "message": "An internal error occurred"},
-            request_id=request_id or str(uuid4()),
+            request_id=request_id,
         )
         if user_id:
             await _store_idempotency_result(
