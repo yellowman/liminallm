@@ -920,6 +920,16 @@ const sendMessage = async (event) => {
                 resolve(msg.data || {});
                 break;
 
+              case 'streaming_complete':
+                // Final event with message_id and conversation_id after DB save
+                if (!settled) {
+                  settled = true;
+                  cleanup();
+                  finalData = msg.data || {};
+                  resolve(finalData);
+                }
+                break;
+
               case 'error':
                 settled = true;
                 cleanup();
@@ -1022,15 +1032,17 @@ const sendMessage = async (event) => {
       if (!document.querySelector('.message.assistant.streaming, .message.assistant:last-child')) {
         handleChatResponse(data);
       } else {
-        // Just update state for streaming (message already rendered)
-        state.lastResponse = {
-          usage: data.usage || {},
+        // Update state for streaming (message already rendered)
+        state.lastAssistant = {
+          conversationId: data.conversation_id,
+          messageId: data.message_id,
           adapters: data.adapters || [],
           adapterGates: data.adapter_gates || [],
           routingTrace: data.routing_trace || [],
           workflowTrace: data.workflow_trace || [],
           contextSnippets: data.context_snippets || [],
         };
+        setConversation(data.conversation_id);
         renderPreferencePanel();
         fetchConversations();
       }
