@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Any, List, Literal, Optional
+from typing import Any, List, Literal, Optional, Union
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -294,22 +294,36 @@ _JSON_PATCH_OPS = frozenset({"add", "remove", "replace", "move", "copy", "test"}
 
 class ConfigPatchRequest(BaseModel):
     artifact_id: str = Field(..., max_length=255)
-    patch: dict
+    patch: Union[dict, List[dict]]  # RFC 6902: array of ops, or wrapper dict with "ops"/"operations"
     justification: str = Field(..., min_length=1, max_length=2000)
 
     @field_validator("patch")
     @classmethod
-    def _validate_patch_format(cls, value: dict) -> dict:
-        """Validate patch is a valid JSON Patch format (RFC 6902)."""
-        ops = value.get("ops") or value.get("operations")
-        if ops is None:
-            # Patch may be a single operation or list of operations directly
-            if isinstance(value, list):
-                ops = value
-            elif "op" in value and "path" in value:
-                ops = [value]
-            else:
-                raise ValueError("patch must contain 'ops' or 'operations' array, or be a valid JSON Patch operation")
+    def _validate_patch_format(cls, value: Union[dict, List[dict]]) -> dict:
+        """Validate patch is a valid JSON Patch format (RFC 6902).
+
+        Accepts:
+        - RFC 6902 array of operations: [{"op": "add", "path": "/foo", "value": "bar"}]
+        - Wrapper dict with "ops" or "operations" key: {"ops": [...]}
+        - Single operation dict: {"op": "add", "path": "/foo", "value": "bar"}
+
+        Returns normalized dict with "ops" key for consistent internal storage.
+        """
+        # Handle RFC 6902 array format directly
+        if isinstance(value, list):
+            ops = value
+        else:
+            # Dict format - check for ops/operations wrapper or single operation
+            ops = value.get("ops") or value.get("operations")
+            if ops is None:
+                if "op" in value and "path" in value:
+                    # Single operation dict
+                    ops = [value]
+                else:
+                    raise ValueError(
+                        "patch must be an RFC 6902 array, contain 'ops'/'operations' array, "
+                        "or be a valid JSON Patch operation with 'op' and 'path' fields"
+                    )
 
         if not isinstance(ops, list):
             raise ValueError("patch operations must be an array")
@@ -324,7 +338,8 @@ class ConfigPatchRequest(BaseModel):
             if "path" not in op:
                 raise ValueError(f"patch operation {i} missing 'path' field")
 
-        return value
+        # Normalize to dict with "ops" key for consistent internal storage
+        return {"ops": ops}
 
 
 class ConversationMessagesResponse(BaseModel):
