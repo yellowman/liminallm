@@ -6,7 +6,7 @@ import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Protocol, Tuple
+from typing import Any, AsyncIterator, Dict, Iterator, List, Optional, Protocol, Tuple
 
 from liminallm.config import (
     AdapterMode,
@@ -261,6 +261,22 @@ class ModelBackend(Protocol):
         user_id: Optional[str] = None,
     ) -> dict: ...
 
+    def generate_stream(
+        self,
+        messages: List[dict],
+        adapters: List[dict],
+        *,
+        user_id: Optional[str] = None,
+    ) -> Iterator[dict]:
+        """Stream tokens from the model.
+
+        Yields dicts with:
+        - {"event": "token", "data": "token_text"}
+        - {"event": "message_done", "data": {"content": "full_text", "usage": {...}}}
+        - {"event": "error", "data": {"code": "...", "message": "..."}}
+        """
+        ...
+
 
 @dataclass(frozen=True)
 class AdapterPlug:
@@ -431,6 +447,94 @@ class ApiAdapterBackend:
             },
             "adapters_applied": processed["applied"],
         }
+
+    def generate_stream(
+        self,
+        messages: List[dict],
+        adapters: List[dict],
+        *,
+        user_id: Optional[str] = None,
+    ) -> Iterator[dict]:
+        """Stream tokens from the model per SPEC §18.
+
+        Yields events:
+        - {"event": "token", "data": "token_text"}
+        - {"event": "message_done", "data": {"content": "full_text", "usage": {...}}}
+        - {"event": "error", "data": {"code": "...", "message": "..."}}
+        """
+        adapter_list = adapters or []
+        processed = self._process_adapters_for_provider(adapter_list)
+        target_model = processed["model"]
+        extra_body = processed["extra_body"]
+        prompt_injections = processed["prompt_injections"]
+        augmented_messages = self._inject_adapter_prompts(messages, prompt_injections)
+
+        if self.client:
+            try:
+                stream = self.client.chat.completions.create(
+                    model=target_model,
+                    messages=augmented_messages,
+                    temperature=0.2,
+                    extra_body=extra_body,
+                    stream=True,
+                )
+                full_content = ""
+                prompt_tokens = 0
+                completion_tokens = 0
+
+                for chunk in stream:
+                    choices = getattr(chunk, "choices", None) or []
+                    if not choices:
+                        continue
+                    delta = choices[0].delta
+                    if delta and delta.content:
+                        token_text = delta.content
+                        full_content += token_text
+                        completion_tokens += 1
+                        yield {"event": "token", "data": token_text}
+
+                    # Check for usage in final chunk
+                    if hasattr(chunk, "usage") and chunk.usage:
+                        prompt_tokens = getattr(chunk.usage, "prompt_tokens", 0)
+                        completion_tokens = getattr(chunk.usage, "completion_tokens", completion_tokens)
+
+                yield {
+                    "event": "message_done",
+                    "data": {
+                        "content": full_content,
+                        "usage": {
+                            "prompt_tokens": prompt_tokens,
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": prompt_tokens + completion_tokens,
+                        },
+                        "adapters_applied": processed["applied"],
+                    },
+                }
+            except Exception as exc:
+                logger.error("streaming_error", error=str(exc))
+                yield {
+                    "event": "error",
+                    "data": {"code": "server_error", "message": str(exc)},
+                }
+        else:
+            # Fallback: simulate streaming for non-API mode
+            fallback = augmented_messages[-1]["content"] if augmented_messages else ""
+            response = f"[api-backend model={target_model}] {fallback}"
+            # Simulate token-by-token streaming
+            for word in response.split():
+                yield {"event": "token", "data": word + " "}
+            yield {
+                "event": "message_done",
+                "data": {
+                    "content": response,
+                    "usage": {
+                        "prompt_tokens": len(fallback.split()),
+                        "completion_tokens": len(response.split()),
+                        "total_tokens": len(fallback.split()) + len(response.split()),
+                    },
+                    "adapters_applied": processed["applied"],
+                },
+            }
 
     def _process_adapters_for_provider(self, adapters: List[dict]) -> dict:
         """Process adapters based on provider capabilities.
@@ -1103,6 +1207,38 @@ class LocalJaxLoRABackend:
                 "latency_ms": round(duration * 1000, 2),
             },
         }
+
+    def generate_stream(
+        self,
+        messages: List[dict],
+        adapters: List[dict],
+        *,
+        user_id: Optional[str] = None,
+    ) -> Iterator[dict]:
+        """Stream tokens from local LoRA model per SPEC §18.
+
+        For local models, we simulate streaming by yielding tokens one at a time
+        from the generated response.
+        """
+        try:
+            result = self.generate(messages, adapters, user_id=user_id)
+            content = result.get("content", "")
+            # Simulate token streaming by yielding characters/words
+            for char in content:
+                yield {"event": "token", "data": char}
+            yield {
+                "event": "message_done",
+                "data": {
+                    "content": content,
+                    "usage": result.get("usage", {}),
+                },
+            }
+        except Exception as exc:
+            logger.error("local_streaming_error", error=str(exc))
+            yield {
+                "event": "error",
+                "data": {"code": "server_error", "message": str(exc)},
+            }
 
     def _blend_adapter_weights(
         self, adapters: List[dict], user_id: Optional[str]

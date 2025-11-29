@@ -542,6 +542,28 @@ button.minor:hover {
   50% { opacity: 1; }
 }
 
+/* Streaming message style */
+.message.streaming .bubble {
+  border-left: 3px solid var(--accent);
+  padding-left: 12px;
+}
+
+.message.streaming .bubble::after {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 14px;
+  background: var(--accent);
+  margin-left: 2px;
+  animation: blink 0.7s step-end infinite;
+  vertical-align: text-bottom;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
 /* Draft indicator */
 .draft-indicator {
   position: absolute;

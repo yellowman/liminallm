@@ -690,6 +690,58 @@ const appendMessage = (role, content, meta = '') => {
   return wrapper;
 };
 
+/**
+ * Create a streaming message element that can be updated token-by-token.
+ * Returns an object with update() and finalize() methods.
+ */
+const createStreamingMessage = (role) => {
+  const wrapper = document.createElement('div');
+  wrapper.className = `message ${role} streaming`;
+  const roleEl = document.createElement('div');
+  roleEl.className = 'role';
+  roleEl.textContent = role;
+  const bubble = document.createElement('div');
+  bubble.className = 'bubble';
+  bubble.textContent = '';
+  const metaEl = document.createElement('div');
+  metaEl.className = 'meta';
+  wrapper.appendChild(roleEl);
+  const contentWrap = document.createElement('div');
+  contentWrap.appendChild(bubble);
+  contentWrap.appendChild(metaEl);
+  wrapper.appendChild(contentWrap);
+
+  if (messagesEl) {
+    messagesEl.appendChild(wrapper);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
+  updateEmptyState();
+
+  let content = '';
+
+  return {
+    /** Append a token to the message */
+    update(token) {
+      content += token;
+      bubble.textContent = content;
+      if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
+    },
+    /** Finalize the message with optional meta info */
+    finalize(meta = '') {
+      wrapper.classList.remove('streaming');
+      if (meta) metaEl.textContent = meta;
+    },
+    /** Get the accumulated content */
+    getContent() {
+      return content;
+    },
+    /** Get the wrapper element */
+    getElement() {
+      return wrapper;
+    },
+  };
+};
+
 const scrollToBottom = () => {
   if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
 };
@@ -816,36 +868,119 @@ const sendMessage = async (event) => {
     fetchConversations(); // Update sidebar
   };
 
-  const chatViaWebSocket = async () => {
+  /**
+   * SPEC §18: Streaming WebSocket chat with token events.
+   * Handles events: token, trace, message_done, error, cancel_ack
+   */
+  const chatViaWebSocketStreaming = async () => {
     const ws = await ensureWebSocket();
     return new Promise((resolve, reject) => {
       let settled = false;
+      let streamingMsg = null;
+      let finalData = null;
+
       const cleanup = () => {
         ws.removeEventListener('message', handleMessage);
         ws.removeEventListener('error', handleError);
         ws.removeEventListener('close', handleClose);
       };
+
       const handleMessage = (event) => {
         if (settled) return;
-        settled = true;
-        cleanup();
         try {
-          const envelope = JSON.parse(event.data);
-          if (envelope.status === 'ok') {
-            resolve(envelope.data);
-          } else {
-            reject(new Error(extractError(envelope.error, 'Chat failed')));
+          const msg = JSON.parse(event.data);
+
+          // SPEC §18: Check for streaming events ({"event": "...", "data": "..."})
+          if (msg.event) {
+            switch (msg.event) {
+              case 'token':
+                // Create streaming message on first token
+                if (!streamingMsg) {
+                  streamingMsg = createStreamingMessage('assistant');
+                  showStatus('');
+                }
+                streamingMsg.update(msg.data || '');
+                break;
+
+              case 'trace':
+                // Optional: Could show trace info in UI
+                console.debug('Workflow trace:', msg.data);
+                break;
+
+              case 'message_done':
+                // Streaming complete
+                settled = true;
+                cleanup();
+                if (streamingMsg) {
+                  const adapters = (msg.data?.adapters || []).map(a => a?.name || a?.id || a).filter(Boolean);
+                  streamingMsg.finalize(adapters.length ? `Adapters: ${adapters.join(', ')}` : '');
+                }
+                resolve(msg.data || {});
+                break;
+
+              case 'error':
+                settled = true;
+                cleanup();
+                if (streamingMsg) {
+                  streamingMsg.finalize('Error occurred');
+                }
+                reject(new Error(msg.data?.message || 'Streaming error'));
+                break;
+
+              case 'cancel_ack':
+                settled = true;
+                cleanup();
+                if (streamingMsg) {
+                  streamingMsg.finalize('Cancelled');
+                }
+                resolve({ cancelled: true });
+                break;
+
+              default:
+                console.debug('Unknown streaming event:', msg.event);
+            }
+          } else if (msg.status) {
+            // Legacy non-streaming response format
+            settled = true;
+            cleanup();
+            if (msg.status === 'ok') {
+              resolve(msg.data);
+            } else {
+              reject(new Error(extractError(msg.error, 'Chat failed')));
+            }
           }
         } catch (err) {
-          reject(new Error(err instanceof SyntaxError ? 'Received invalid response' : err.message));
+          if (!settled) {
+            settled = true;
+            cleanup();
+            reject(new Error(err instanceof SyntaxError ? 'Received invalid response' : err.message));
+          }
         }
       };
-      const handleError = () => { if (!settled) { settled = true; cleanup(); reject(new Error('WebSocket failed')); } };
-      const handleClose = () => { if (!settled) { settled = true; cleanup(); reject(new Error('Connection closed')); } };
+
+      const handleError = () => {
+        if (!settled) {
+          settled = true;
+          cleanup();
+          if (streamingMsg) streamingMsg.finalize('Connection error');
+          reject(new Error('WebSocket failed'));
+        }
+      };
+
+      const handleClose = () => {
+        if (!settled) {
+          settled = true;
+          cleanup();
+          if (streamingMsg) streamingMsg.finalize('Connection closed');
+          reject(new Error('Connection closed'));
+        }
+      };
 
       ws.addEventListener('message', handleMessage);
       ws.addEventListener('error', handleError);
       ws.addEventListener('close', handleClose);
+
+      // SPEC §18: stream: true enables token streaming
       ws.send(JSON.stringify({
         idempotency_key: idempotencyKey,
         request_id: randomIdempotencyKey(),
@@ -856,6 +991,7 @@ const sendMessage = async (event) => {
         access_token: state.accessToken,
         session_id: state.sessionId,
         tenant_id: state.tenantId,
+        stream: true,
       }));
     });
   };
@@ -867,7 +1003,8 @@ const sendMessage = async (event) => {
     appendMessage('user', content);
     showStatus('Thinking...');
 
-    const data = await chatViaWebSocket().catch(async () => {
+    const data = await chatViaWebSocketStreaming().catch(async () => {
+      // Fallback to REST API if WebSocket fails
       const envelope = await requestEnvelope(
         `${apiBase}/chat`,
         { method: 'POST', headers: headers(idempotencyKey), body: JSON.stringify({ ...payload, stream: false }) },
@@ -875,7 +1012,27 @@ const sendMessage = async (event) => {
       );
       return envelope.data;
     });
-    handleChatResponse(data);
+
+    // Only call handleChatResponse for non-streaming or fallback responses
+    // Streaming messages are already rendered by createStreamingMessage
+    if (data && !data.cancelled && data.message_id) {
+      // For non-streaming fallback, render the message
+      if (!document.querySelector('.message.assistant.streaming, .message.assistant:last-child')) {
+        handleChatResponse(data);
+      } else {
+        // Just update state for streaming (message already rendered)
+        state.lastResponse = {
+          usage: data.usage || {},
+          adapters: data.adapters || [],
+          adapterGates: data.adapter_gates || [],
+          routingTrace: data.routing_trace || [],
+          workflowTrace: data.workflow_trace || [],
+          contextSnippets: data.context_snippets || [],
+        };
+        renderPreferencePanel();
+        fetchConversations();
+      }
+    }
   } catch (err) {
     showStatus(err.message, true);
   } finally {

@@ -2191,56 +2191,141 @@ async def websocket_chat(ws: WebSocket):
         runtime.store.append_message(
             convo_id, sender="user", role="user", content=init.get("message", "")
         )
-        orchestration = await runtime.workflow.run(
-            init.get("workflow_id"),
-            convo_id,
-            init.get("message", ""),
-            context_id,
-            user_id,
-            tenant_id=auth_ctx.tenant_id,
-        )
-        orchestration_dict: dict[str, Any] = (
-            orchestration if isinstance(orchestration, dict) else {}
-        )
-        adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
-        assistant_content_struct = normalize_content_struct(
-            orchestration_dict.get("content_struct"),
-            orchestration_dict.get("content"),
-        )
-        assistant_content = orchestration_dict.get("content", "No response generated.")
-        assistant_msg = runtime.store.append_message(
-            convo_id,
-            sender="assistant",
-            role="assistant",
-            content=assistant_content,
-            content_struct=assistant_content_struct,
-            meta={
-                "adapters": orchestration_dict.get("adapters", []),
-                "adapter_gates": orchestration_dict.get("adapter_gates", []),
-                "routing_trace": orchestration_dict.get("routing_trace", []),
-                "workflow_trace": orchestration_dict.get("workflow_trace", []),
-                "usage": orchestration_dict.get("usage", {}),
-            },
-        )
-        envelope = Envelope(
-            status="ok",
-            data=ChatResponse(
-                message_id=assistant_msg.id,
-                conversation_id=convo_id,
-                content=assistant_msg.content,
-                content_struct=assistant_msg.content_struct,
-                workflow_id=init.get("workflow_id"),
-                adapters=adapter_names,
-                adapter_gates=orchestration_dict.get("adapter_gates", []),
-                usage=orchestration_dict.get("usage", {}),
-                context_snippets=orchestration_dict.get("context_snippets", []),
-                routing_trace=orchestration_dict.get("routing_trace", []),
-                workflow_trace=orchestration_dict.get("workflow_trace", []),
-            ).model_dump(),
-            request_id=request_id,
-        )
-        await _store_idempotency_result("chat:ws", user_id, idempotency_key, envelope)
-        await ws.send_json(envelope.model_dump())
+
+        # SPEC §18: Check if streaming is requested (default True for WebSocket)
+        stream_enabled = init.get("stream", True)
+
+        if stream_enabled:
+            # Streaming mode: emit token, trace, message_done, error events
+            cancel_event = asyncio.Event()
+            full_content = ""
+            orchestration_dict: dict[str, Any] = {}
+
+            try:
+                async for event in runtime.workflow.run_streaming(
+                    init.get("workflow_id"),
+                    convo_id,
+                    init.get("message", ""),
+                    context_id,
+                    user_id,
+                    tenant_id=auth_ctx.tenant_id,
+                    cancel_event=cancel_event,
+                ):
+                    event_type = event.get("event")
+                    event_data = event.get("data")
+
+                    # SPEC §18: WebSockets wrap as {"event": "token", "data": "..."}
+                    await ws.send_json({"event": event_type, "data": event_data})
+
+                    if event_type == "token":
+                        full_content += event_data if isinstance(event_data, str) else ""
+                    elif event_type == "message_done":
+                        orchestration_dict = event_data if isinstance(event_data, dict) else {}
+                    elif event_type == "error":
+                        # Error already sent, close connection
+                        await ws.close(code=1011)
+                        return
+                    elif event_type == "cancel_ack":
+                        await ws.close(code=1000)
+                        return
+
+            except WebSocketDisconnect:
+                cancel_event.set()
+                return
+
+            # Save assistant message after streaming completes
+            adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
+            assistant_content = orchestration_dict.get("content", full_content or "No response generated.")
+            assistant_content_struct = normalize_content_struct(
+                orchestration_dict.get("content_struct"),
+                assistant_content,
+            )
+            assistant_msg = runtime.store.append_message(
+                convo_id,
+                sender="assistant",
+                role="assistant",
+                content=assistant_content,
+                content_struct=assistant_content_struct,
+                meta={
+                    "adapters": orchestration_dict.get("adapters", []),
+                    "adapter_gates": orchestration_dict.get("adapter_gates", []),
+                    "routing_trace": orchestration_dict.get("routing_trace", []),
+                    "workflow_trace": orchestration_dict.get("workflow_trace", []),
+                    "usage": orchestration_dict.get("usage", {}),
+                },
+            )
+            # Store idempotency result for completed streaming
+            envelope = Envelope(
+                status="ok",
+                data=ChatResponse(
+                    message_id=assistant_msg.id,
+                    conversation_id=convo_id,
+                    content=assistant_msg.content,
+                    content_struct=assistant_msg.content_struct,
+                    workflow_id=init.get("workflow_id"),
+                    adapters=adapter_names,
+                    adapter_gates=orchestration_dict.get("adapter_gates", []),
+                    usage=orchestration_dict.get("usage", {}),
+                    context_snippets=orchestration_dict.get("context_snippets", []),
+                    routing_trace=orchestration_dict.get("routing_trace", []),
+                    workflow_trace=orchestration_dict.get("workflow_trace", []),
+                ).model_dump(),
+                request_id=request_id,
+            )
+            await _store_idempotency_result("chat:ws", user_id, idempotency_key, envelope)
+
+        else:
+            # Non-streaming mode: single response (legacy behavior)
+            orchestration = await runtime.workflow.run(
+                init.get("workflow_id"),
+                convo_id,
+                init.get("message", ""),
+                context_id,
+                user_id,
+                tenant_id=auth_ctx.tenant_id,
+            )
+            orchestration_dict = (
+                orchestration if isinstance(orchestration, dict) else {}
+            )
+            adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
+            assistant_content_struct = normalize_content_struct(
+                orchestration_dict.get("content_struct"),
+                orchestration_dict.get("content"),
+            )
+            assistant_content = orchestration_dict.get("content", "No response generated.")
+            assistant_msg = runtime.store.append_message(
+                convo_id,
+                sender="assistant",
+                role="assistant",
+                content=assistant_content,
+                content_struct=assistant_content_struct,
+                meta={
+                    "adapters": orchestration_dict.get("adapters", []),
+                    "adapter_gates": orchestration_dict.get("adapter_gates", []),
+                    "routing_trace": orchestration_dict.get("routing_trace", []),
+                    "workflow_trace": orchestration_dict.get("workflow_trace", []),
+                    "usage": orchestration_dict.get("usage", {}),
+                },
+            )
+            envelope = Envelope(
+                status="ok",
+                data=ChatResponse(
+                    message_id=assistant_msg.id,
+                    conversation_id=convo_id,
+                    content=assistant_msg.content,
+                    content_struct=assistant_msg.content_struct,
+                    workflow_id=init.get("workflow_id"),
+                    adapters=adapter_names,
+                    adapter_gates=orchestration_dict.get("adapter_gates", []),
+                    usage=orchestration_dict.get("usage", {}),
+                    context_snippets=orchestration_dict.get("context_snippets", []),
+                    routing_trace=orchestration_dict.get("routing_trace", []),
+                    workflow_trace=orchestration_dict.get("workflow_trace", []),
+                ).model_dump(),
+                request_id=request_id,
+            )
+            await _store_idempotency_result("chat:ws", user_id, idempotency_key, envelope)
+            await ws.send_json(envelope.model_dump())
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, dict) else None
         error_payload = (

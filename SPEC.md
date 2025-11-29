@@ -1513,7 +1513,7 @@ that’s the whole point: minimal glue, maximal evolution.
 ### 17.3 chat view (Chat tab)
 
 - **message stream**: scrollable container with message bubbles differentiated by role (user/assistant/system).
-- **token streaming**: WebSocket primary with HTTP fallback; display streaming indicator during generation.
+- **token streaming**: WebSocket primary with HTTP fallback; display blinking cursor during streaming; accumulates tokens into message bubble in real-time; supports cancel via connection close.
 - **citation rendering**: inline clickable links for citations from `content_struct.citations`; each citation shows source filename/path as tooltip.
 - **context binding**: dropdown to select active `knowledge_context` for RAG-grounded responses.
 - **workflow override**: optional text input for `workflow_id` to steer execution.
@@ -1597,7 +1597,7 @@ that’s the whole point: minimal glue, maximal evolution.
 - **request headers**: `Authorization: Bearer`, `X-Tenant-ID`, `session_id`, `Idempotency-Key` (auto-generated UUID).
 - **envelope handling**: parse `{ status, data, error }` responses; extract error messages from `error.message` or `detail`.
 - **retry logic**: exponential backoff (400ms base, 3 retries) for 5xx errors; no retry on 4xx.
-- **WebSocket protocol**: connect to `/v1/chat/stream`; send auth + message in initial frame `{ access_token, session_id, tenant_id, message, conversation_id?, context_id?, workflow_id? }`; receive complete response envelope `{ status, data: ChatResponse }`; token streaming planned for future enhancement.
+- **WebSocket protocol**: connect to `/v1/chat/stream`; send auth + message in initial frame `{ access_token, session_id, tenant_id, message, conversation_id?, context_id?, workflow_id?, stream?: bool }`; when `stream: true` (default), receive streaming events `{ event: "token"|"trace"|"message_done"|"error"|"cancel_ack", data: ... }`; when `stream: false`, receive single envelope `{ status, data: ChatResponse }`. Frontend displays blinking cursor during streaming and accumulates tokens into message bubble.
 
 ### 17.12 styling system
 
