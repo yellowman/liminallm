@@ -343,6 +343,37 @@
                   <span class="setting-value monospace" id="setting-build">-</span>
                 </div>
               </div>
+
+              <!-- Admin Settings Section (only visible to admins) -->
+              <div id="admin-settings-section" style="display: none;">
+                <div class="divider"></div>
+                <h3>Admin Settings</h3>
+                <p class="subtext">System-wide settings (admin only). Changes take effect immediately.</p>
+
+                <div class="form-group">
+                  <label for="admin-default-page-size">Default page size</label>
+                  <input type="number" id="admin-default-page-size" min="1" max="1000" value="100" />
+                  <span class="small">Default number of items per page (1-1000)</span>
+                </div>
+
+                <div class="form-group">
+                  <label for="admin-max-page-size">Max page size</label>
+                  <input type="number" id="admin-max-page-size" min="1" max="1000" value="500" />
+                  <span class="small">Maximum allowed page size (1-1000)</span>
+                </div>
+
+                <div class="form-group">
+                  <label for="admin-default-conversations-limit">Default conversations limit</label>
+                  <input type="number" id="admin-default-conversations-limit" min="1" max="500" value="50" />
+                  <span class="small">Default limit for conversation list (1-500)</span>
+                </div>
+
+                <div class="pill-row" style="margin-top: 1rem;">
+                  <button class="primary" id="save-admin-settings-btn">Save settings</button>
+                  <button class="ghost" id="reload-admin-settings-btn">Reload</button>
+                </div>
+                <div id="admin-settings-status" class="small" role="status"></div>
+              </div>
             </div>
           </section>
         </div>

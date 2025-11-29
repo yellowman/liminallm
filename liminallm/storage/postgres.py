@@ -2182,6 +2182,17 @@ class PostgresStore:
         except Exception:
             return {}
 
+    def set_runtime_config(self, config: dict) -> dict:
+        """Update runtime configuration via admin UI.
+
+        Merges provided config with existing config and persists to database.
+        Returns the updated full config.
+        """
+        existing = self.get_runtime_config()
+        merged = {**existing, **config}
+        self._set_runtime_config(merged)
+        return merged
+
     # knowledge
     def upsert_context(
         self,

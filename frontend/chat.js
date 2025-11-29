@@ -414,6 +414,8 @@ const renderAdminNotice = () => {
     }
     if (adminLink) adminLink.style.display = 'none';
   }
+  // Show/hide admin settings section based on role
+  renderAdminSettingsSection();
 };
 
 const persistAuth = (payload) => {
@@ -1541,6 +1543,90 @@ const handleExportDrafts = () => {
 };
 
 // =============================================================================
+// Admin Settings
+// =============================================================================
+
+const fetchAdminSettings = async () => {
+  if (state.role !== 'admin') return;
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/admin/settings`,
+      { method: 'GET', headers: authHeaders() },
+      'Failed to load admin settings'
+    );
+
+    const data = envelope.data;
+    if (data) {
+      const defaultPageSize = $('admin-default-page-size');
+      const maxPageSize = $('admin-max-page-size');
+      const defaultConversationsLimit = $('admin-default-conversations-limit');
+
+      if (defaultPageSize) defaultPageSize.value = data.default_page_size || 100;
+      if (maxPageSize) maxPageSize.value = data.max_page_size || 500;
+      if (defaultConversationsLimit) defaultConversationsLimit.value = data.default_conversations_limit || 50;
+    }
+  } catch {
+    // Ignore - admin settings are optional
+  }
+};
+
+const saveAdminSettings = async () => {
+  if (state.role !== 'admin') return;
+
+  const statusEl = $('admin-settings-status');
+  const defaultPageSize = parseInt($('admin-default-page-size')?.value, 10);
+  const maxPageSize = parseInt($('admin-max-page-size')?.value, 10);
+  const defaultConversationsLimit = parseInt($('admin-default-conversations-limit')?.value, 10);
+
+  // Validate inputs
+  if (isNaN(defaultPageSize) || defaultPageSize < 1 || defaultPageSize > 1000) {
+    if (statusEl) statusEl.textContent = 'Invalid default page size (1-1000)';
+    return;
+  }
+  if (isNaN(maxPageSize) || maxPageSize < 1 || maxPageSize > 1000) {
+    if (statusEl) statusEl.textContent = 'Invalid max page size (1-1000)';
+    return;
+  }
+  if (isNaN(defaultConversationsLimit) || defaultConversationsLimit < 1 || defaultConversationsLimit > 500) {
+    if (statusEl) statusEl.textContent = 'Invalid conversations limit (1-500)';
+    return;
+  }
+
+  try {
+    if (statusEl) statusEl.textContent = 'Saving...';
+
+    await requestEnvelope(
+      `${apiBase}/admin/settings`,
+      {
+        method: 'PATCH',
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          default_page_size: defaultPageSize,
+          max_page_size: maxPageSize,
+          default_conversations_limit: defaultConversationsLimit,
+        }),
+      },
+      'Failed to save admin settings'
+    );
+
+    if (statusEl) statusEl.textContent = 'Settings saved successfully';
+  } catch (err) {
+    if (statusEl) statusEl.textContent = `Error: ${err.message}`;
+  }
+};
+
+const renderAdminSettingsSection = () => {
+  const section = $('admin-settings-section');
+  if (section) {
+    section.style.display = state.role === 'admin' ? 'block' : 'none';
+  }
+  if (state.role === 'admin') {
+    fetchAdminSettings();
+  }
+};
+
+// =============================================================================
 // Auto-save drafts
 // =============================================================================
 
@@ -1595,6 +1681,10 @@ const initEventListeners = () => {
   // Settings
   $('clear-drafts-btn')?.addEventListener('click', handleClearDrafts);
   $('export-drafts-btn')?.addEventListener('click', handleExportDrafts);
+
+  // Admin settings
+  $('save-admin-settings-btn')?.addEventListener('click', saveAdminSettings);
+  $('reload-admin-settings-btn')?.addEventListener('click', fetchAdminSettings);
 };
 
 // =============================================================================

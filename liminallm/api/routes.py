@@ -68,6 +68,8 @@ from liminallm.api.schemas import (
     AdminCreateUserResponse,
     UpdateUserRoleRequest,
     AdminInspectionResponse,
+    AdminSettingsResponse,
+    AdminSettingsUpdateRequest,
     ToolInvokeRequest,
     ToolInvokeResponse,
     ToolSpecListResponse,
@@ -402,6 +404,26 @@ def _get_artifact_kind(schema: Any) -> Optional[str]:
     return None
 
 
+def _get_pagination_settings(runtime) -> dict:
+    """Get pagination settings from runtime config with fallback to env settings.
+
+    Returns dict with: default_page_size, max_page_size, default_conversations_limit
+    """
+    settings = get_settings()
+    runtime_config = (
+        runtime.store.get_runtime_config()
+        if hasattr(runtime.store, "get_runtime_config")
+        else {}
+    )
+    return {
+        "default_page_size": runtime_config.get("default_page_size", settings.default_page_size),
+        "max_page_size": runtime_config.get("max_page_size", settings.max_page_size),
+        "default_conversations_limit": runtime_config.get(
+            "default_conversations_limit", settings.default_conversations_limit
+        ),
+    }
+
+
 def _generate_conversation_title(message: str, max_length: int = 50) -> str:
     """Generate a conversation title from the first message.
 
@@ -681,8 +703,8 @@ async def admin_list_users(
         List of users with their roles and metadata.
     """
     runtime = get_runtime()
-    settings = get_settings()
-    resolved_limit = min(limit or settings.default_page_size, settings.max_page_size)
+    paging = _get_pagination_settings(runtime)
+    resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"])
     # Admin can only see users in their own tenant (prevent cross-tenant access)
     target_tenant = tenant_id or principal.tenant_id
     if target_tenant != principal.tenant_id:
@@ -807,8 +829,8 @@ async def admin_inspect_objects(
     principal: AuthContext = Depends(get_admin_user),
 ):
     runtime = get_runtime()
-    settings = get_settings()
-    resolved_limit = min(limit or settings.default_conversations_limit, settings.max_page_size)
+    paging = _get_pagination_settings(runtime)
+    resolved_limit = min(limit or paging["default_conversations_limit"], paging["max_page_size"])
     if not hasattr(runtime.store, "inspect_state"):
         raise BadRequestError("inspect not supported")
     details = runtime.store.inspect_state(
@@ -817,6 +839,90 @@ async def admin_inspect_objects(
     summary = {k: len(v) for k, v in details.items()}
     return Envelope(
         status="ok", data=AdminInspectionResponse(summary=summary, details=details)
+    )
+
+
+@router.get("/admin/settings", response_model=Envelope, tags=["admin"])
+async def get_admin_settings(principal: AuthContext = Depends(get_admin_user)):
+    """Get current runtime settings configurable via admin UI.
+
+    Returns pagination limits, model settings, and other runtime configuration
+    that can be modified without restarting the server.
+    """
+    runtime = get_runtime()
+    settings = get_settings()
+    runtime_config = (
+        runtime.store.get_runtime_config()
+        if hasattr(runtime.store, "get_runtime_config")
+        else {}
+    )
+
+    # Merge runtime config with env defaults (runtime config takes precedence)
+    return Envelope(
+        status="ok",
+        data=AdminSettingsResponse(
+            default_page_size=runtime_config.get("default_page_size", settings.default_page_size),
+            max_page_size=runtime_config.get("max_page_size", settings.max_page_size),
+            default_conversations_limit=runtime_config.get(
+                "default_conversations_limit", settings.default_conversations_limit
+            ),
+            model_backend=runtime_config.get("model_backend"),
+            model_path=runtime_config.get("model_path"),
+        ),
+    )
+
+
+@router.patch("/admin/settings", response_model=Envelope, tags=["admin"])
+async def update_admin_settings(
+    body: AdminSettingsUpdateRequest,
+    principal: AuthContext = Depends(get_admin_user),
+):
+    """Update runtime settings via admin UI.
+
+    Only provided fields are updated. Changes take effect immediately
+    without requiring a server restart.
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"admin:settings:{principal.user_id}",
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
+    )
+
+    if not hasattr(runtime.store, "set_runtime_config"):
+        raise BadRequestError("runtime config update not supported by storage backend")
+
+    # Build update dict from non-None fields
+    update = {}
+    if body.default_page_size is not None:
+        update["default_page_size"] = body.default_page_size
+    if body.max_page_size is not None:
+        update["max_page_size"] = body.max_page_size
+    if body.default_conversations_limit is not None:
+        update["default_conversations_limit"] = body.default_conversations_limit
+    if body.model_backend is not None:
+        update["model_backend"] = body.model_backend
+    if body.model_path is not None:
+        update["model_path"] = body.model_path
+
+    if not update:
+        raise BadRequestError("no settings provided to update")
+
+    updated_config = runtime.store.set_runtime_config(update)
+    settings = get_settings()
+
+    return Envelope(
+        status="ok",
+        data=AdminSettingsResponse(
+            default_page_size=updated_config.get("default_page_size", settings.default_page_size),
+            max_page_size=updated_config.get("max_page_size", settings.max_page_size),
+            default_conversations_limit=updated_config.get(
+                "default_conversations_limit", settings.default_conversations_limit
+            ),
+            model_backend=updated_config.get("model_backend"),
+            model_path=updated_config.get("model_path"),
+        ),
     )
 
 
@@ -1249,14 +1355,14 @@ async def list_artifacts(
         Paginated list of artifacts with metadata.
     """
     runtime = get_runtime()
-    settings = get_settings()
+    paging = _get_pagination_settings(runtime)
     kind_filter = kind or (type if type and "." in type else None)
     type_filter = type if type and "." not in type else None
     if not type_filter and kind_filter:
         type_filter = kind_filter.split(".", 1)[0]
     # Accept 'limit' as alias for 'page_size' for frontend compatibility
-    effective_page_size = limit if limit is not None else (page_size or settings.default_page_size)
-    resolved_page_size = min(max(effective_page_size, 1), settings.max_page_size)
+    effective_page_size = limit if limit is not None else (page_size or paging["default_page_size"])
+    resolved_page_size = min(max(effective_page_size, 1), paging["max_page_size"])
 
     # Get one extra item to determine if there are more pages
     raw_items = list(runtime.store.list_artifacts(
@@ -1452,8 +1558,8 @@ async def list_artifact_versions(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
-    settings = get_settings()
-    resolved_limit = min(limit or settings.default_page_size, settings.max_page_size)
+    paging = _get_pagination_settings(runtime)
+    resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"])
     # Verify ownership before listing versions
     _get_owned_artifact(runtime, artifact_id, principal)
     versions = runtime.store.list_artifact_versions(artifact_id, limit=resolved_limit)
@@ -1967,8 +2073,8 @@ async def list_messages(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
-    settings = get_settings()
-    resolved_limit = min(limit or settings.default_page_size, settings.max_page_size) if limit else None
+    paging = _get_pagination_settings(runtime)
+    resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"]) if limit else None
     _get_owned_conversation(runtime, conversation_id, principal)
     msgs = runtime.store.list_messages(
         conversation_id, limit=resolved_limit, user_id=principal.user_id
@@ -2000,8 +2106,8 @@ async def list_conversations(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
-    settings = get_settings()
-    resolved_limit = min(limit or settings.default_conversations_limit, settings.max_page_size)
+    paging = _get_pagination_settings(runtime)
+    resolved_limit = min(limit or paging["default_conversations_limit"], paging["max_page_size"])
     convs = runtime.store.list_conversations(principal.user_id, limit=resolved_limit)
     items = [
         ConversationSummary(
@@ -2087,8 +2193,8 @@ async def list_contexts(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
-    settings = get_settings()
-    resolved_limit = min(limit or settings.default_page_size, settings.max_page_size)
+    paging = _get_pagination_settings(runtime)
+    resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"])
     contexts = runtime.store.list_contexts(owner_user_id=principal.user_id, limit=resolved_limit)
     items = [
         KnowledgeContextResponse(
@@ -2112,8 +2218,8 @@ async def list_chunks(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
-    settings = get_settings()
-    resolved_limit = min(limit or settings.default_page_size, settings.max_page_size)
+    paging = _get_pagination_settings(runtime)
+    resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"])
     _get_owned_context(runtime, context_id, principal)
     chunks = runtime.store.list_chunks(context_id, owner_user_id=principal.user_id, limit=resolved_limit)
     for ch in chunks:

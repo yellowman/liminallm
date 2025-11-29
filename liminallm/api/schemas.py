@@ -535,6 +535,29 @@ class AdminInspectionResponse(BaseModel):
     details: dict
 
 
+class AdminSettingsResponse(BaseModel):
+    """Runtime settings configurable via admin UI."""
+
+    # Pagination settings per SPEC §18
+    default_page_size: int = Field(default=100, ge=1, le=1000, description="Default page size for list endpoints")
+    max_page_size: int = Field(default=500, ge=1, le=1000, description="Maximum page size for list endpoints")
+    default_conversations_limit: int = Field(default=50, ge=1, le=500, description="Default limit for conversation list")
+
+    # Model settings
+    model_backend: Optional[str] = Field(default=None, description="Model backend override (openai, azure, etc.)")
+    model_path: Optional[str] = Field(default=None, description="Model path/name override")
+
+
+class AdminSettingsUpdateRequest(BaseModel):
+    """Request to update admin settings. All fields are optional - only provided fields are updated."""
+
+    default_page_size: Optional[int] = Field(default=None, ge=1, le=1000, description="Default page size for list endpoints")
+    max_page_size: Optional[int] = Field(default=None, ge=1, le=1000, description="Maximum page size for list endpoints")
+    default_conversations_limit: Optional[int] = Field(default=None, ge=1, le=500, description="Default limit for conversation list")
+    model_backend: Optional[str] = Field(default=None, description="Model backend override")
+    model_path: Optional[str] = Field(default=None, description="Model path/name override")
+
+
 class ToolInvokeRequest(BaseModel):
     inputs: dict = Field(default_factory=dict)
     conversation_id: Optional[str] = None

@@ -1240,6 +1240,16 @@ class MemoryStore:
 
         return dict(self.runtime_config)
 
+    def set_runtime_config(self, config: dict) -> dict:
+        """Update runtime configuration via admin UI.
+
+        Merges provided config with existing config and persists.
+        Returns the updated full config.
+        """
+        self.runtime_config.update(config)
+        self._persist_state()
+        return dict(self.runtime_config)
+
     def get_latest_workflow(self, workflow_id: str) -> Optional[dict]:
         versions = self.artifact_versions.get(workflow_id)
         if not versions:
