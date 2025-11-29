@@ -179,12 +179,11 @@ class TestTokenBasedRAGChunking:
             rag = RAGService(store, default_chunk_size=50, rag_mode="memory")
 
             # Create a test context
-            user_id = "test-user"
-            store.create_user("test@test.com", tenant_id="test")
-            ctx = store.create_context(
+            user = store.create_user("test@test.com", tenant_id="test")
+            ctx = store.upsert_context(
                 name="test",
                 description="test context",
-                owner_user_id=list(store.users.keys())[0],
+                owner_user_id=user.id,
             )
 
             # Ingest long text
@@ -213,11 +212,11 @@ class TestTokenBasedRAGChunking:
             rag = RAGService(store, default_chunk_size=100, rag_mode="memory")
 
             # Create context
-            store.create_user("test@test.com")
-            ctx = store.create_context(
+            user = store.create_user("test@test.com")
+            ctx = store.upsert_context(
                 name="test",
                 description="test",
-                owner_user_id=list(store.users.keys())[0],
+                owner_user_id=user.id,
             )
 
             text = "This is a test text with multiple words for chunking."
@@ -363,14 +362,18 @@ class TestRefreshTokenRevocationSecurity:
     async def test_cache_failure_defaults_to_revoked(self):
         """When Redis cache fails, should assume token is revoked (safe default)."""
         from liminallm.service.auth import AuthService
+        from liminallm.config import Settings
         from unittest.mock import AsyncMock
 
         # Create auth service with failing cache
         mock_store = MagicMock()
         mock_cache = MagicMock()
         mock_cache.is_refresh_revoked = AsyncMock(side_effect=Exception("Redis unavailable"))
+        mock_settings = MagicMock(spec=Settings)
+        mock_settings.jwt_secret = "test-secret-key-at-least-32-chars"
+        mock_settings.jwt_algorithm = "HS256"
 
-        auth = AuthService(store=mock_store, cache=mock_cache)
+        auth = AuthService(store=mock_store, cache=mock_cache, settings=mock_settings)
         auth.revoked_refresh_tokens = set()  # Empty local set
 
         # Should return True (revoked) when cache fails
@@ -381,13 +384,17 @@ class TestRefreshTokenRevocationSecurity:
     async def test_cache_success_returns_actual_value(self):
         """When cache succeeds, should return actual revocation status."""
         from liminallm.service.auth import AuthService
+        from liminallm.config import Settings
         from unittest.mock import AsyncMock
 
         mock_store = MagicMock()
         mock_cache = MagicMock()
         mock_cache.is_refresh_revoked = AsyncMock(return_value=False)
+        mock_settings = MagicMock(spec=Settings)
+        mock_settings.jwt_secret = "test-secret-key-at-least-32-chars"
+        mock_settings.jwt_algorithm = "HS256"
 
-        auth = AuthService(store=mock_store, cache=mock_cache)
+        auth = AuthService(store=mock_store, cache=mock_cache, settings=mock_settings)
         auth.revoked_refresh_tokens = set()
 
         result = await auth._is_refresh_revoked("test-jti")
@@ -428,17 +435,37 @@ class TestPaginationValidation:
 
     def test_page_must_be_positive(self):
         """page parameter must be >= 1."""
-        from fastapi import Query
+        from pydantic import BaseModel, Field, ValidationError
 
-        # The Query validation should enforce ge=1
-        # This is tested via the schema validation
-        page_query = Query(1, ge=1, description="Page number")
-        assert page_query.ge == 1
+        class PaginationParams(BaseModel):
+            page: int = Field(1, ge=1, description="Page number")
+
+        # Valid page
+        params = PaginationParams(page=1)
+        assert params.page == 1
+
+        # Invalid page should raise
+        with pytest.raises(ValidationError):
+            PaginationParams(page=0)
+
+        with pytest.raises(ValidationError):
+            PaginationParams(page=-1)
 
     def test_page_size_must_be_bounded(self):
         """page_size parameter must be 1-200."""
-        from fastapi import Query
+        from pydantic import BaseModel, Field, ValidationError
 
-        page_size_query = Query(50, ge=1, le=200, description="Items per page")
-        assert page_size_query.ge == 1
-        assert page_size_query.le == 200
+        class PaginationParams(BaseModel):
+            page_size: int = Field(50, ge=1, le=200, description="Items per page")
+
+        # Valid page_size
+        params = PaginationParams(page_size=50)
+        assert params.page_size == 50
+
+        # Too small
+        with pytest.raises(ValidationError):
+            PaginationParams(page_size=0)
+
+        # Too large
+        with pytest.raises(ValidationError):
+            PaginationParams(page_size=201)

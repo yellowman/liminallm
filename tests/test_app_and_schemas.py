@@ -27,7 +27,11 @@ def test_security_headers_and_health(fresh_app):
     response = client.get("/healthz", headers={"Origin": "http://localhost:3000"})
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    data = response.json()
+    # Health check now returns detailed response per SPEC §18
+    assert data["status"] in {"healthy", "unhealthy"}
+    assert "checks" in data
+    assert "version" in data
     assert response.headers["X-Frame-Options"] == "DENY"
     assert response.headers["X-Content-Type-Options"] == "nosniff"
     # HSTS header only sent for HTTPS requests with ENABLE_HSTS=true
