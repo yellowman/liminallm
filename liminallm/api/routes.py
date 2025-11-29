@@ -767,9 +767,14 @@ async def admin_delete_user(
 async def admin_list_adapters(principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
     # Filter adapters by tenant to prevent cross-tenant data exposure
-    adapters = runtime.store.list_artifacts(
+    adapters = list(runtime.store.list_artifacts(
         type_filter="adapter", tenant_id=principal.tenant_id
-    )
+    ))
+
+    # Batch fetch current versions
+    artifact_ids = [a.id for a in adapters]
+    versions = runtime.store.get_artifact_current_versions(artifact_ids)
+
     return Envelope(
         status="ok",
         data=ArtifactListResponse(
@@ -783,6 +788,7 @@ async def admin_list_adapters(principal: AuthContext = Depends(get_admin_user)):
                     schema=a.schema,
                     owner_user_id=a.owner_user_id,
                     visibility=getattr(a, "visibility", "private"),
+                    version=versions.get(a.id, 1),
                     created_at=a.created_at,
                     updated_at=a.updated_at,
                 )
@@ -1252,6 +1258,12 @@ async def list_artifacts(
     ))
 
     has_next = len(raw_items) > resolved_page_size
+    page_items = raw_items[:resolved_page_size]
+
+    # Batch fetch current versions for all artifacts
+    artifact_ids = [a.id for a in page_items]
+    versions = runtime.store.get_artifact_current_versions(artifact_ids)
+
     items = [
         ArtifactResponse(
             id=a.id,
@@ -1262,10 +1274,11 @@ async def list_artifacts(
             schema=a.schema,
             owner_user_id=a.owner_user_id,
             visibility=getattr(a, "visibility", "private"),
+            version=versions.get(a.id, 1),
             created_at=a.created_at,
             updated_at=a.updated_at,
         )
-        for a in raw_items[:resolved_page_size]
+        for a in page_items
     ]
 
     return Envelope(
@@ -1286,6 +1299,7 @@ async def get_artifact(
 ):
     runtime = get_runtime()
     artifact = _get_owned_artifact(runtime, artifact_id, principal)
+    current_version = runtime.store.get_artifact_current_version(artifact_id)
     resp = ArtifactResponse(
         id=artifact.id,
         type=artifact.type,
@@ -1295,6 +1309,7 @@ async def get_artifact(
         schema=artifact.schema,
         owner_user_id=artifact.owner_user_id,
         visibility=getattr(artifact, "visibility", "private"),
+        version=current_version,
         created_at=artifact.created_at,
         updated_at=artifact.updated_at,
     )
@@ -1309,13 +1324,18 @@ async def list_tool_specs(
 ):
     runtime = get_runtime()
     resolved_page_size = min(max(page_size, 1), 200)
-    artifacts = runtime.store.list_artifacts(
+    artifacts = list(runtime.store.list_artifacts(
         type_filter="tool",
         kind_filter="tool.spec",
         owner_user_id=principal.user_id,
         page=page,
         page_size=resolved_page_size,
-    )
+    ))
+
+    # Batch fetch current versions
+    artifact_ids = [a.id for a in artifacts]
+    versions = runtime.store.get_artifact_current_versions(artifact_ids)
+
     items = [
         ArtifactResponse(
             id=a.id,
@@ -1326,6 +1346,7 @@ async def list_tool_specs(
             schema=a.schema,
             owner_user_id=a.owner_user_id,
             visibility=getattr(a, "visibility", "private"),
+            version=versions.get(a.id, 1),
             created_at=a.created_at,
             updated_at=a.updated_at,
         )
@@ -1351,6 +1372,7 @@ async def get_tool_spec(
         isinstance(artifact.schema, dict) and artifact.schema.get("kind") == "tool.spec"
     ):
         raise NotFoundError("tool spec not found", detail={"artifact_id": artifact_id})
+    current_version = runtime.store.get_artifact_current_version(artifact_id)
     resp = ArtifactResponse(
         id=artifact.id,
         type=artifact.type,
@@ -1360,6 +1382,7 @@ async def get_tool_spec(
         schema=artifact.schema,
         owner_user_id=artifact.owner_user_id,
         visibility=getattr(artifact, "visibility", "private"),
+        version=current_version,
         created_at=artifact.created_at,
         updated_at=artifact.updated_at,
     )
@@ -1374,13 +1397,18 @@ async def list_workflows(
 ):
     runtime = get_runtime()
     resolved_page_size = min(max(page_size, 1), 200)
-    artifacts = runtime.store.list_artifacts(
+    artifacts = list(runtime.store.list_artifacts(
         type_filter="workflow",
         kind_filter="workflow.chat",
         owner_user_id=principal.user_id,  # Filter by owner
         page=page,
         page_size=resolved_page_size,
-    )
+    ))
+
+    # Batch fetch current versions
+    artifact_ids = [a.id for a in artifacts]
+    versions = runtime.store.get_artifact_current_versions(artifact_ids)
+
     items = [
         ArtifactResponse(
             id=a.id,
@@ -1391,6 +1419,7 @@ async def list_workflows(
             schema=a.schema,
             owner_user_id=a.owner_user_id,
             visibility=getattr(a, "visibility", "private"),
+            version=versions.get(a.id, 1),
             created_at=a.created_at,
             updated_at=a.updated_at,
         )
@@ -1534,6 +1563,7 @@ async def create_artifact(
             owner_user_id=principal.user_id,
             version_author=principal.user_id,
         )
+        # New artifact starts at version 1
         resp = ArtifactResponse(
             id=artifact.id,
             type=artifact.type,
@@ -1547,6 +1577,7 @@ async def create_artifact(
             schema=artifact.schema,
             owner_user_id=artifact.owner_user_id,
             visibility=getattr(artifact, "visibility", "private"),
+            version=1,
             created_at=artifact.created_at,
             updated_at=artifact.updated_at,
         )
@@ -1583,6 +1614,8 @@ async def patch_artifact(
     )
     if not artifact:
         raise NotFoundError("artifact not found", detail={"artifact_id": artifact_id})
+    # Get the new version after update
+    current_version = runtime.store.get_artifact_current_version(artifact_id)
     resp = ArtifactResponse(
         id=artifact.id,
         type=artifact.type,
@@ -1592,6 +1625,7 @@ async def patch_artifact(
         schema=artifact.schema,
         owner_user_id=artifact.owner_user_id,
         visibility=getattr(artifact, "visibility", "private"),
+        version=current_version,
         created_at=artifact.created_at,
         updated_at=artifact.updated_at,
     )

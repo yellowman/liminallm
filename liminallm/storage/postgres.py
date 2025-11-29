@@ -1881,6 +1881,34 @@ class PostgresStore:
             )
         return versions
 
+    def get_artifact_current_version(self, artifact_id: str) -> int:
+        """Get the current (highest) version number for an artifact."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(version) as max_version FROM artifact_version WHERE artifact_id = %s",
+                (artifact_id,),
+            ).fetchone()
+        if row and row.get("max_version"):
+            return row["max_version"]
+        return 1
+
+    def get_artifact_current_versions(self, artifact_ids: List[str]) -> Dict[str, int]:
+        """Get current versions for multiple artifacts efficiently."""
+        if not artifact_ids:
+            return {}
+        with self._connect() as conn:
+            # Use a single query with GROUP BY for efficiency
+            placeholders = ", ".join(["%s"] * len(artifact_ids))
+            rows = conn.execute(
+                f"SELECT artifact_id, MAX(version) as max_version FROM artifact_version "
+                f"WHERE artifact_id IN ({placeholders}) GROUP BY artifact_id",
+                tuple(artifact_ids),
+            ).fetchall()
+        result: Dict[str, int] = {aid: 1 for aid in artifact_ids}  # Default to 1
+        for row in rows:
+            result[str(row["artifact_id"])] = row["max_version"]
+        return result
+
     def persist_artifact_payload(self, artifact_id: str, schema: dict) -> str:
         """Public wrapper kept for parity with MemoryStore."""
 

@@ -1146,6 +1146,21 @@ class MemoryStore:
         versions = list(self.artifact_versions.get(artifact_id, []))
         return sorted(versions, key=lambda v: v.version, reverse=True)
 
+    def get_artifact_current_version(self, artifact_id: str) -> int:
+        """Get the current (highest) version number for an artifact."""
+        versions = self.artifact_versions.get(artifact_id, [])
+        if not versions:
+            return 1
+        return max(v.version for v in versions)
+
+    def get_artifact_current_versions(self, artifact_ids: List[str]) -> Dict[str, int]:
+        """Get current versions for multiple artifacts efficiently."""
+        result: Dict[str, int] = {}
+        for artifact_id in artifact_ids:
+            versions = self.artifact_versions.get(artifact_id, [])
+            result[artifact_id] = max((v.version for v in versions), default=1)
+        return result
+
     def _persist_payload(self, artifact_id: str, schema: dict) -> str:
         return self.persist_artifact_payload(artifact_id, schema)
 
