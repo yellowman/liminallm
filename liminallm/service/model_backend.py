@@ -15,6 +15,7 @@ from liminallm.config import (
 )
 from liminallm.logging import get_logger
 from liminallm.service.fs import safe_join
+from liminallm.service.prompt_utils import extract_prompt_instructions
 from liminallm.service.tokenizer_utils import (
     DEFAULT_VOCAB_SIZE,
     vocab_size_from_tokenizer,
@@ -633,14 +634,8 @@ class ApiAdapterBackend:
     def _extract_prompt_instructions(self, adapter: dict) -> Optional[str]:
         """Extract prompt instructions from adapter for system prompt injection.
 
-        Uses explicit priority order to find the most suitable prompt text:
-        1. Explicit prompt fields (prompt_instructions, behavior_prompt, etc.)
-        2. Applicability natural language description (designed for LLM context)
-        3. System prompt field (explicit system message content)
-
-        NOTE: Generic 'description' field is intentionally NOT used as fallback
-        because it typically contains human-readable metadata (e.g., "LoRA adapter
-        for code review") rather than LLM-oriented behavioral instructions.
+        Delegates to shared prompt_utils.extract_prompt_instructions for consistent
+        behavior across all backends per SPEC §5.0.1.
 
         Args:
             adapter: Adapter dict with potential prompt fields
@@ -648,52 +643,19 @@ class ApiAdapterBackend:
         Returns:
             Prompt instructions string or None if no suitable prompt found
         """
-        schema = adapter.get("schema", {})
+        adapter_id = adapter.get("id") or adapter.get("name") or "unknown"
+        result = extract_prompt_instructions(adapter, log_source=adapter_id)
 
-        # Priority 1: Explicit prompt instruction fields (most specific)
-        prompt_fields = (
-            "prompt_instructions",  # Primary field for behavioral guidance
-            "behavior_prompt",  # Alternative naming
-            "system_prompt",  # Explicit system message content
-            "instructions",  # Generic instructions
-            "prompt_template",  # Template-style instructions
-        )
-        for key in prompt_fields:
-            value = adapter.get(key) or schema.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
+        if result is None:
+            # Log when no prompt found for debugging
+            logger.debug(
+                "adapter_no_prompt_instructions",
+                adapter_id=adapter_id,
+                mode=get_adapter_mode(adapter),
+                message="Adapter has no prompt_instructions; behavior may be undefined in prompt mode",
+            )
 
-        # Priority 2: Applicability natural language (SPEC §6.1 - designed for LLM context)
-        # This field is explicitly intended to describe adapter behavior in natural language
-        applicability = adapter.get("applicability") or schema.get("applicability")
-        if isinstance(applicability, dict):
-            natural = applicability.get("natural_language")
-            if isinstance(natural, str) and natural.strip():
-                return natural.strip()
-
-        # Priority 3: Check for explicit 'use_description_as_prompt' flag
-        # Only use description if adapter explicitly opts in
-        use_desc = adapter.get("use_description_as_prompt") or schema.get(
-            "use_description_as_prompt"
-        )
-        if use_desc:
-            description = adapter.get("description") or schema.get("description")
-            if isinstance(description, str) and description.strip():
-                logger.debug(
-                    "adapter_using_description_as_prompt",
-                    adapter_id=adapter.get("id"),
-                    reason="use_description_as_prompt=true",
-                )
-                return description.strip()
-
-        # No suitable prompt found - caller should handle gracefully
-        logger.debug(
-            "adapter_no_prompt_instructions",
-            adapter_id=adapter.get("id"),
-            mode=get_adapter_mode(adapter),
-            message="Adapter has no prompt_instructions; behavior may be undefined in prompt mode",
-        )
-        return None
+        return result
 
     def _inject_adapter_prompts(
         self, messages: List[dict], prompts: List[str]
