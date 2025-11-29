@@ -672,7 +672,7 @@ async def refresh_tokens(
 @router.get("/admin/users", response_model=Envelope, tags=["admin"])
 async def admin_list_users(
     tenant_id: Optional[str] = None,
-    limit: int = Query(100, ge=1, le=500, description="Maximum users to return"),
+    limit: Optional[int] = Query(None, ge=1, description="Maximum users to return"),
     principal: AuthContext = Depends(get_admin_user),
 ):
     """List users in the admin's tenant.
@@ -681,13 +681,15 @@ async def admin_list_users(
         List of users with their roles and metadata.
     """
     runtime = get_runtime()
+    settings = get_settings()
+    resolved_limit = min(limit or settings.default_page_size, settings.max_page_size)
     # Admin can only see users in their own tenant (prevent cross-tenant access)
     target_tenant = tenant_id or principal.tenant_id
     if target_tenant != principal.tenant_id:
         raise _http_error(
             "forbidden", "cannot access other tenant users", status_code=403
         )
-    users = runtime.auth.list_users(tenant_id=target_tenant, limit=limit)
+    users = runtime.auth.list_users(tenant_id=target_tenant, limit=resolved_limit)
     return Envelope(
         status="ok", data=UserListResponse(items=[_user_to_response(u) for u in users])
     )
@@ -801,14 +803,16 @@ async def admin_list_adapters(principal: AuthContext = Depends(get_admin_user)):
 @router.get("/admin/objects", response_model=Envelope, tags=["admin"])
 async def admin_inspect_objects(
     kind: Optional[str] = None,
-    limit: int = 50,
+    limit: Optional[int] = Query(None, ge=1, description="Maximum objects to return"),
     principal: AuthContext = Depends(get_admin_user),
 ):
     runtime = get_runtime()
+    settings = get_settings()
+    resolved_limit = min(limit or settings.default_conversations_limit, settings.max_page_size)
     if not hasattr(runtime.store, "inspect_state"):
         raise BadRequestError("inspect not supported")
     details = runtime.store.inspect_state(
-        kind=kind, tenant_id=principal.tenant_id, limit=min(limit, 500)
+        kind=kind, tenant_id=principal.tenant_id, limit=resolved_limit
     )
     summary = {k: len(v) for k, v in details.items()}
     return Envelope(
@@ -1226,8 +1230,8 @@ async def list_artifacts(
     kind: Optional[str] = None,
     visibility: Optional[str] = Query(None, pattern="^(private|shared|global)$", description="Filter by visibility"),
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
-    page_size: int = Query(100, ge=1, le=500, description="Items per page"),
-    limit: Optional[int] = Query(None, ge=1, le=500, description="Alias for page_size (for frontend compatibility)"),
+    page_size: Optional[int] = Query(None, ge=1, description="Items per page"),
+    limit: Optional[int] = Query(None, ge=1, description="Alias for page_size (for frontend compatibility)"),
     principal: AuthContext = Depends(get_user),
 ):
     """List artifacts owned by the current user.
@@ -1239,19 +1243,20 @@ async def list_artifacts(
         kind: Filter by artifact kind (e.g., 'adapter.lora', 'workflow.linear')
         visibility: Filter by visibility ('private', 'shared', 'global')
         page: Page number (1-indexed)
-        page_size: Number of items per page (max 500)
+        page_size: Number of items per page
 
     Returns:
         Paginated list of artifacts with metadata.
     """
     runtime = get_runtime()
+    settings = get_settings()
     kind_filter = kind or (type if type and "." in type else None)
     type_filter = type if type and "." not in type else None
     if not type_filter and kind_filter:
         type_filter = kind_filter.split(".", 1)[0]
     # Accept 'limit' as alias for 'page_size' for frontend compatibility
-    effective_page_size = limit if limit is not None else page_size
-    resolved_page_size = min(max(effective_page_size, 1), 500)
+    effective_page_size = limit if limit is not None else (page_size or settings.default_page_size)
+    resolved_page_size = min(max(effective_page_size, 1), settings.max_page_size)
 
     # Get one extra item to determine if there are more pages
     raw_items = list(runtime.store.list_artifacts(
@@ -1443,13 +1448,15 @@ async def list_workflows(
 @router.get("/artifacts/{artifact_id}/versions", response_model=Envelope, tags=["artifacts"])
 async def list_artifact_versions(
     artifact_id: str = Path(..., max_length=255, description="Artifact identifier"),
-    limit: int = Query(100, ge=1, le=500, description="Maximum versions to return"),
+    limit: Optional[int] = Query(None, ge=1, description="Maximum versions to return"),
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
+    settings = get_settings()
+    resolved_limit = min(limit or settings.default_page_size, settings.max_page_size)
     # Verify ownership before listing versions
     _get_owned_artifact(runtime, artifact_id, principal)
-    versions = runtime.store.list_artifact_versions(artifact_id, limit=limit)
+    versions = runtime.store.list_artifact_versions(artifact_id, limit=resolved_limit)
     if not versions:
         artifact = runtime.store.get_artifact(artifact_id)
         if not artifact:
@@ -1956,13 +1963,15 @@ async def upload_file(
 @router.get("/conversations/{conversation_id}/messages", response_model=Envelope, tags=["conversations"])
 async def list_messages(
     conversation_id: str,
-    limit: Optional[int] = Query(None, ge=1, le=500),
+    limit: Optional[int] = Query(None, ge=1, description="Maximum messages to return"),
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
+    settings = get_settings()
+    resolved_limit = min(limit or settings.default_page_size, settings.max_page_size) if limit else None
     _get_owned_conversation(runtime, conversation_id, principal)
     msgs = runtime.store.list_messages(
-        conversation_id, limit=limit, user_id=principal.user_id
+        conversation_id, limit=resolved_limit, user_id=principal.user_id
     )
     payload = [
         {
@@ -1987,11 +1996,13 @@ async def list_messages(
 
 @router.get("/conversations", response_model=Envelope, tags=["conversations"])
 async def list_conversations(
-    limit: int = Query(50, ge=1, le=500, description="Maximum conversations to return"),
+    limit: Optional[int] = Query(None, ge=1, description="Maximum conversations to return"),
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
-    convs = runtime.store.list_conversations(principal.user_id, limit=limit)
+    settings = get_settings()
+    resolved_limit = min(limit or settings.default_conversations_limit, settings.max_page_size)
+    convs = runtime.store.list_conversations(principal.user_id, limit=resolved_limit)
     items = [
         ConversationSummary(
             id=c.id,
@@ -2072,11 +2083,13 @@ async def create_context(
 
 @router.get("/contexts", response_model=Envelope, tags=["knowledge"])
 async def list_contexts(
-    limit: int = Query(100, ge=1, le=500, description="Maximum contexts to return"),
+    limit: Optional[int] = Query(None, ge=1, description="Maximum contexts to return"),
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
-    contexts = runtime.store.list_contexts(owner_user_id=principal.user_id, limit=limit)
+    settings = get_settings()
+    resolved_limit = min(limit or settings.default_page_size, settings.max_page_size)
+    contexts = runtime.store.list_contexts(owner_user_id=principal.user_id, limit=resolved_limit)
     items = [
         KnowledgeContextResponse(
             id=c.id,
@@ -2095,12 +2108,14 @@ async def list_contexts(
 @router.get("/contexts/{context_id}/chunks", response_model=Envelope, tags=["knowledge"])
 async def list_chunks(
     context_id: str = Path(..., max_length=255, description="Knowledge context ID"),
-    limit: int = Query(100, ge=1, le=500, description="Maximum chunks to return"),
+    limit: Optional[int] = Query(None, ge=1, description="Maximum chunks to return"),
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
+    settings = get_settings()
+    resolved_limit = min(limit or settings.default_page_size, settings.max_page_size)
     _get_owned_context(runtime, context_id, principal)
-    chunks = runtime.store.list_chunks(context_id, owner_user_id=principal.user_id, limit=limit)
+    chunks = runtime.store.list_chunks(context_id, owner_user_id=principal.user_id, limit=resolved_limit)
     for ch in chunks:
         if ch.id is None:
             raise _http_error(
