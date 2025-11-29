@@ -1630,6 +1630,7 @@ class PostgresStore:
         page_size: int = 100,
         owner_user_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
+        visibility: Optional[str] = None,
     ) -> List[Artifact]:
         offset = max(page - 1, 0) * max(page_size, 1)
         limit = max(page_size, 1)
@@ -1650,6 +1651,9 @@ class PostgresStore:
                     "owner_user_id IN (SELECT id FROM app_user WHERE tenant_id = %s)"
                 )
                 params.append(tenant_id)
+            if visibility:
+                clauses.append("visibility = %s")
+                params.append(visibility)
             where = ""
             if clauses:
                 where = " WHERE " + " AND ".join(clauses)
@@ -1847,12 +1851,16 @@ class PostgresStore:
             base_model=new_base_model,
         )
 
-    def list_artifact_versions(self, artifact_id: str) -> List[ArtifactVersion]:
+    def list_artifact_versions(
+        self, artifact_id: str, *, limit: Optional[int] = None
+    ) -> List[ArtifactVersion]:
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM artifact_version WHERE artifact_id = %s ORDER BY version DESC",
-                (artifact_id,),
-            ).fetchall()
+            query = "SELECT * FROM artifact_version WHERE artifact_id = %s ORDER BY version DESC"
+            params: list[Any] = [artifact_id]
+            if limit is not None:
+                query += " LIMIT %s"
+                params.append(limit)
+            rows = conn.execute(query, tuple(params)).fetchall()
         versions: List[ArtifactVersion] = []
         for row in rows:
             schema = row.get("schema") if isinstance(row, dict) else row["schema"]
@@ -1880,6 +1888,34 @@ class PostgresStore:
                 )
             )
         return versions
+
+    def get_artifact_current_version(self, artifact_id: str) -> int:
+        """Get the current (highest) version number for an artifact."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(version) as max_version FROM artifact_version WHERE artifact_id = %s",
+                (artifact_id,),
+            ).fetchone()
+        if row and row.get("max_version"):
+            return row["max_version"]
+        return 1
+
+    def get_artifact_current_versions(self, artifact_ids: List[str]) -> Dict[str, int]:
+        """Get current versions for multiple artifacts efficiently."""
+        if not artifact_ids:
+            return {}
+        with self._connect() as conn:
+            # Use a single query with GROUP BY for efficiency
+            placeholders = ", ".join(["%s"] * len(artifact_ids))
+            rows = conn.execute(
+                f"SELECT artifact_id, MAX(version) as max_version FROM artifact_version "
+                f"WHERE artifact_id IN ({placeholders}) GROUP BY artifact_id",
+                tuple(artifact_ids),
+            ).fetchall()
+        result: Dict[str, int] = {aid: 1 for aid in artifact_ids}  # Default to 1
+        for row in rows:
+            result[str(row["artifact_id"])] = row["max_version"]
+        return result
 
     def persist_artifact_payload(self, artifact_id: str, schema: dict) -> str:
         """Public wrapper kept for parity with MemoryStore."""
@@ -2146,6 +2182,17 @@ class PostgresStore:
         except Exception:
             return {}
 
+    def set_runtime_config(self, config: dict) -> dict:
+        """Update runtime configuration via admin UI.
+
+        Merges provided config with existing config and persists to database.
+        Returns the updated full config.
+        """
+        existing = self.get_runtime_config()
+        merged = {**existing, **config}
+        self._set_runtime_config(merged)
+        return merged
+
     # knowledge
     def upsert_context(
         self,
@@ -2219,14 +2266,14 @@ class PostgresStore:
         )
 
     def list_contexts(
-        self, owner_user_id: Optional[str] = None
+        self, owner_user_id: Optional[str] = None, limit: int = 100
     ) -> List[KnowledgeContext]:
         if not owner_user_id:
             return []
         with self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM knowledge_context WHERE owner_user_id = %s ORDER BY created_at DESC",
-                (owner_user_id,),
+                "SELECT * FROM knowledge_context WHERE owner_user_id = %s ORDER BY created_at DESC LIMIT %s",
+                (owner_user_id, limit),
             ).fetchall()
         contexts: List[KnowledgeContext] = []
         for row in rows:
@@ -2327,7 +2374,11 @@ class PostgresStore:
             raise ConstraintViolation("context not found", {"context_id": context_id})
 
     def list_chunks(
-        self, context_id: Optional[str] = None, *, owner_user_id: Optional[str] = None
+        self,
+        context_id: Optional[str] = None,
+        *,
+        owner_user_id: Optional[str] = None,
+        limit: Optional[int] = None,
     ) -> List[KnowledgeChunk]:
         with self._connect() as conn:
             if context_id:
@@ -2338,14 +2389,19 @@ class PostgresStore:
                     params.append(owner_user_id)
                 query += " WHERE kc.context_id = %s ORDER BY kc.chunk_index ASC"
                 params.append(context_id)
+                if limit is not None:
+                    query += " LIMIT %s"
+                    params.append(limit)
                 rows = conn.execute(query, tuple(params)).fetchall()
             else:
                 if not owner_user_id:
                     return []
-                rows = conn.execute(
-                    "SELECT kc.* FROM knowledge_chunk kc JOIN knowledge_context ctx ON ctx.id = kc.context_id WHERE ctx.owner_user_id = %s ORDER BY kc.created_at DESC",
-                    (owner_user_id,),
-                ).fetchall()
+                params = [owner_user_id]
+                query = "SELECT kc.* FROM knowledge_chunk kc JOIN knowledge_context ctx ON ctx.id = kc.context_id WHERE ctx.owner_user_id = %s ORDER BY kc.created_at DESC"
+                if limit is not None:
+                    query += " LIMIT %s"
+                    params.append(limit)
+                rows = conn.execute(query, tuple(params)).fetchall()
         chunks: List[KnowledgeChunk] = []
         for row in rows:
             chunks.append(

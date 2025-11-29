@@ -68,6 +68,8 @@ from liminallm.api.schemas import (
     AdminCreateUserResponse,
     UpdateUserRoleRequest,
     AdminInspectionResponse,
+    AdminSettingsResponse,
+    AdminSettingsUpdateRequest,
     ToolInvokeRequest,
     ToolInvokeResponse,
     ToolSpecListResponse,
@@ -402,6 +404,26 @@ def _get_artifact_kind(schema: Any) -> Optional[str]:
     return None
 
 
+def _get_pagination_settings(runtime) -> dict:
+    """Get pagination settings from runtime config with fallback to env settings.
+
+    Returns dict with: default_page_size, max_page_size, default_conversations_limit
+    """
+    settings = get_settings()
+    runtime_config = (
+        runtime.store.get_runtime_config()
+        if hasattr(runtime.store, "get_runtime_config")
+        else {}
+    )
+    return {
+        "default_page_size": runtime_config.get("default_page_size", settings.default_page_size),
+        "max_page_size": runtime_config.get("max_page_size", settings.max_page_size),
+        "default_conversations_limit": runtime_config.get(
+            "default_conversations_limit", settings.default_conversations_limit
+        ),
+    }
+
+
 def _generate_conversation_title(message: str, max_length: int = 50) -> str:
     """Generate a conversation title from the first message.
 
@@ -563,6 +585,13 @@ async def oauth_start(
     Client should redirect user to this URL to complete authentication.
     """
     runtime = get_runtime()
+    # Rate limit OAuth start to prevent state token exhaustion
+    await _enforce_rate_limit(
+        runtime,
+        f"oauth:start:{provider}",
+        limit=20,
+        window_seconds=60,
+    )
     start = await runtime.auth.start_oauth(
         provider, redirect_uri=body.redirect_uri, tenant_id=body.tenant_id
     )
@@ -579,10 +608,10 @@ async def oauth_start(
 @router.get("/auth/oauth/{provider}/callback", response_model=Envelope, tags=["auth"])
 async def oauth_callback(
     provider: str = Path(..., description="OAuth provider"),
-    code: str = Query(..., description="Authorization code from OAuth provider"),
-    state: str = Query(..., description="State parameter for CSRF protection"),
+    code: str = Query(..., max_length=512, description="Authorization code from OAuth provider"),
+    state: str = Query(..., max_length=128, description="State parameter for CSRF protection"),
     response: Response = ...,
-    tenant_id: Optional[str] = Query(None, description="Optional tenant ID"),
+    tenant_id: Optional[str] = Query(None, max_length=128, description="Optional tenant ID"),
 ):
     """Complete OAuth authentication flow.
 
@@ -590,6 +619,13 @@ async def oauth_callback(
     Called by OAuth provider after user authorizes the application.
     """
     runtime = get_runtime()
+    # Rate limit OAuth callback to prevent code brute-forcing
+    await _enforce_rate_limit(
+        runtime,
+        f"oauth:callback:{provider}",
+        limit=10,
+        window_seconds=60,
+    )
     user, session, tokens = await runtime.auth.complete_oauth(
         provider, code, state, tenant_id=tenant_id
     )
@@ -658,7 +694,7 @@ async def refresh_tokens(
 @router.get("/admin/users", response_model=Envelope, tags=["admin"])
 async def admin_list_users(
     tenant_id: Optional[str] = None,
-    limit: int = Query(100, ge=1, le=500, description="Maximum users to return"),
+    limit: Optional[int] = Query(None, ge=1, description="Maximum users to return"),
     principal: AuthContext = Depends(get_admin_user),
 ):
     """List users in the admin's tenant.
@@ -667,13 +703,15 @@ async def admin_list_users(
         List of users with their roles and metadata.
     """
     runtime = get_runtime()
+    paging = _get_pagination_settings(runtime)
+    resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"])
     # Admin can only see users in their own tenant (prevent cross-tenant access)
     target_tenant = tenant_id or principal.tenant_id
     if target_tenant != principal.tenant_id:
         raise _http_error(
             "forbidden", "cannot access other tenant users", status_code=403
         )
-    users = runtime.auth.list_users(tenant_id=target_tenant, limit=limit)
+    users = runtime.auth.list_users(tenant_id=target_tenant, limit=resolved_limit)
     return Envelope(
         status="ok", data=UserListResponse(items=[_user_to_response(u) for u in users])
     )
@@ -753,9 +791,14 @@ async def admin_delete_user(
 async def admin_list_adapters(principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
     # Filter adapters by tenant to prevent cross-tenant data exposure
-    adapters = runtime.store.list_artifacts(
+    adapters = list(runtime.store.list_artifacts(
         type_filter="adapter", tenant_id=principal.tenant_id
-    )
+    ))
+
+    # Batch fetch current versions
+    artifact_ids = [a.id for a in adapters]
+    versions = runtime.store.get_artifact_current_versions(artifact_ids)
+
     return Envelope(
         status="ok",
         data=ArtifactListResponse(
@@ -768,6 +811,8 @@ async def admin_list_adapters(principal: AuthContext = Depends(get_admin_user)):
                     description=a.description,
                     schema=a.schema,
                     owner_user_id=a.owner_user_id,
+                    visibility=getattr(a, "visibility", "private"),
+                    version=versions.get(a.id, 1),
                     created_at=a.created_at,
                     updated_at=a.updated_at,
                 )
@@ -780,18 +825,104 @@ async def admin_list_adapters(principal: AuthContext = Depends(get_admin_user)):
 @router.get("/admin/objects", response_model=Envelope, tags=["admin"])
 async def admin_inspect_objects(
     kind: Optional[str] = None,
-    limit: int = 50,
+    limit: Optional[int] = Query(None, ge=1, description="Maximum objects to return"),
     principal: AuthContext = Depends(get_admin_user),
 ):
     runtime = get_runtime()
+    paging = _get_pagination_settings(runtime)
+    resolved_limit = min(limit or paging["default_conversations_limit"], paging["max_page_size"])
     if not hasattr(runtime.store, "inspect_state"):
         raise BadRequestError("inspect not supported")
     details = runtime.store.inspect_state(
-        kind=kind, tenant_id=principal.tenant_id, limit=min(limit, 500)
+        kind=kind, tenant_id=principal.tenant_id, limit=resolved_limit
     )
     summary = {k: len(v) for k, v in details.items()}
     return Envelope(
         status="ok", data=AdminInspectionResponse(summary=summary, details=details)
+    )
+
+
+@router.get("/admin/settings", response_model=Envelope, tags=["admin"])
+async def get_admin_settings(principal: AuthContext = Depends(get_admin_user)):
+    """Get current runtime settings configurable via admin UI.
+
+    Returns pagination limits, model settings, and other runtime configuration
+    that can be modified without restarting the server.
+    """
+    runtime = get_runtime()
+    settings = get_settings()
+    runtime_config = (
+        runtime.store.get_runtime_config()
+        if hasattr(runtime.store, "get_runtime_config")
+        else {}
+    )
+
+    # Merge runtime config with env defaults (runtime config takes precedence)
+    return Envelope(
+        status="ok",
+        data=AdminSettingsResponse(
+            default_page_size=runtime_config.get("default_page_size", settings.default_page_size),
+            max_page_size=runtime_config.get("max_page_size", settings.max_page_size),
+            default_conversations_limit=runtime_config.get(
+                "default_conversations_limit", settings.default_conversations_limit
+            ),
+            model_backend=runtime_config.get("model_backend"),
+            model_path=runtime_config.get("model_path"),
+        ),
+    )
+
+
+@router.patch("/admin/settings", response_model=Envelope, tags=["admin"])
+async def update_admin_settings(
+    body: AdminSettingsUpdateRequest,
+    principal: AuthContext = Depends(get_admin_user),
+):
+    """Update runtime settings via admin UI.
+
+    Only provided fields are updated. Changes take effect immediately
+    without requiring a server restart.
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"admin:settings:{principal.user_id}",
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
+    )
+
+    if not hasattr(runtime.store, "set_runtime_config"):
+        raise BadRequestError("runtime config update not supported by storage backend")
+
+    # Build update dict from non-None fields
+    update = {}
+    if body.default_page_size is not None:
+        update["default_page_size"] = body.default_page_size
+    if body.max_page_size is not None:
+        update["max_page_size"] = body.max_page_size
+    if body.default_conversations_limit is not None:
+        update["default_conversations_limit"] = body.default_conversations_limit
+    if body.model_backend is not None:
+        update["model_backend"] = body.model_backend
+    if body.model_path is not None:
+        update["model_path"] = body.model_path
+
+    if not update:
+        raise BadRequestError("no settings provided to update")
+
+    updated_config = runtime.store.set_runtime_config(update)
+    settings = get_settings()
+
+    return Envelope(
+        status="ok",
+        data=AdminSettingsResponse(
+            default_page_size=updated_config.get("default_page_size", settings.default_page_size),
+            max_page_size=updated_config.get("max_page_size", settings.max_page_size),
+            default_conversations_limit=updated_config.get(
+                "default_conversations_limit", settings.default_conversations_limit
+            ),
+            model_backend=updated_config.get("model_backend"),
+            model_path=updated_config.get("model_path"),
+        ),
     )
 
 
@@ -874,6 +1005,13 @@ async def request_reset(body: PasswordResetRequest):
 @router.post("/auth/reset/confirm", response_model=Envelope, tags=["auth"])
 async def confirm_reset(body: PasswordResetConfirm):
     runtime = get_runtime()
+    # Rate limit to prevent token brute-forcing
+    await _enforce_rate_limit(
+        runtime,
+        "reset:confirm",
+        limit=5,
+        window_seconds=300,
+    )
     ok = await runtime.auth.complete_password_reset(body.token, body.new_password)
     if not ok:
         raise _http_error("validation_error", "invalid token", status_code=400)
@@ -883,6 +1021,13 @@ async def confirm_reset(body: PasswordResetConfirm):
 @router.post("/auth/request_email_verification", response_model=Envelope, tags=["auth"])
 async def request_email_verification(principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
+    # Rate limit to prevent email spam
+    await _enforce_rate_limit(
+        runtime,
+        f"verify:request:{principal.user_id}",
+        limit=5,
+        window_seconds=300,
+    )
     user = runtime.store.get_user(principal.user_id)
     if not user:
         raise _http_error("not_found", "user not found", status_code=404)
@@ -893,6 +1038,13 @@ async def request_email_verification(principal: AuthContext = Depends(get_user))
 @router.post("/auth/verify_email", response_model=Envelope, tags=["auth"])
 async def verify_email(body: EmailVerificationRequest):
     runtime = get_runtime()
+    # Rate limit to prevent token brute-forcing
+    await _enforce_rate_limit(
+        runtime,
+        "verify:email",
+        limit=10,
+        window_seconds=300,
+    )
     ok = await runtime.auth.complete_email_verification(body.token)
     if not ok:
         raise _http_error("validation_error", "invalid token", status_code=400)
@@ -910,12 +1062,19 @@ async def logout(
         ctx = await runtime.auth.authenticate(
             authorization, session_id, allow_pending_mfa=True
         )
-        target_session = session_id or (ctx.session_id if ctx else None)
-        if not target_session:
+        if not ctx:
             raise _http_error("unauthorized", "invalid session", status_code=401)
-        await runtime.auth.revoke(target_session)
-    response.delete_cookie("session_id", path="/")
-    response.delete_cookie("refresh_token", path="/")
+        # SECURITY: Only allow revoking the authenticated user's own session
+        target_session = session_id or ctx.session_id
+        if target_session and target_session != ctx.session_id:
+            # Verify session ownership before revoking
+            sess = runtime.store.get_session(target_session)
+            if not sess or sess.user_id != ctx.user_id:
+                raise _http_error("forbidden", "cannot revoke other user sessions", status_code=403)
+        if target_session:
+            await runtime.auth.revoke(target_session)
+    response.delete_cookie("session_id", path="/", secure=True, samesite="lax")
+    response.delete_cookie("refresh_token", path="/", secure=True, samesite="lax")
     return Envelope(status="ok", data={"message": "session revoked"})
 
 
@@ -1175,29 +1334,35 @@ async def preference_insights(
 async def list_artifacts(
     type: Optional[str] = None,
     kind: Optional[str] = None,
+    visibility: Optional[str] = Query(None, pattern="^(private|shared|global)$", description="Filter by visibility"),
     page: int = Query(1, ge=1, description="Page number (1-indexed)"),
-    page_size: int = Query(100, ge=1, le=500, description="Items per page"),
+    page_size: Optional[int] = Query(None, ge=1, description="Items per page"),
+    limit: Optional[int] = Query(None, ge=1, description="Alias for page_size (for frontend compatibility)"),
     principal: AuthContext = Depends(get_user),
 ):
     """List artifacts owned by the current user.
 
-    Supports filtering by type and kind, with pagination.
+    Supports filtering by type, kind, and visibility, with pagination.
 
     Args:
         type: Filter by artifact type (e.g., 'adapter', 'workflow')
         kind: Filter by artifact kind (e.g., 'adapter.lora', 'workflow.linear')
+        visibility: Filter by visibility ('private', 'shared', 'global')
         page: Page number (1-indexed)
-        page_size: Number of items per page (max 500)
+        page_size: Number of items per page
 
     Returns:
         Paginated list of artifacts with metadata.
     """
     runtime = get_runtime()
+    paging = _get_pagination_settings(runtime)
     kind_filter = kind or (type if type and "." in type else None)
     type_filter = type if type and "." not in type else None
     if not type_filter and kind_filter:
         type_filter = kind_filter.split(".", 1)[0]
-    resolved_page_size = min(max(page_size, 1), 500)
+    # Accept 'limit' as alias for 'page_size' for frontend compatibility
+    effective_page_size = limit if limit is not None else (page_size or paging["default_page_size"])
+    resolved_page_size = min(max(effective_page_size, 1), paging["max_page_size"])
 
     # Get one extra item to determine if there are more pages
     raw_items = list(runtime.store.list_artifacts(
@@ -1206,9 +1371,16 @@ async def list_artifacts(
         owner_user_id=principal.user_id,
         page=page,
         page_size=resolved_page_size + 1,
+        visibility=visibility,
     ))
 
     has_next = len(raw_items) > resolved_page_size
+    page_items = raw_items[:resolved_page_size]
+
+    # Batch fetch current versions for all artifacts
+    artifact_ids = [a.id for a in page_items]
+    versions = runtime.store.get_artifact_current_versions(artifact_ids)
+
     items = [
         ArtifactResponse(
             id=a.id,
@@ -1218,10 +1390,12 @@ async def list_artifacts(
             description=a.description,
             schema=a.schema,
             owner_user_id=a.owner_user_id,
+            visibility=getattr(a, "visibility", "private"),
+            version=versions.get(a.id, 1),
             created_at=a.created_at,
             updated_at=a.updated_at,
         )
-        for a in raw_items[:resolved_page_size]
+        for a in page_items
     ]
 
     return Envelope(
@@ -1242,6 +1416,7 @@ async def get_artifact(
 ):
     runtime = get_runtime()
     artifact = _get_owned_artifact(runtime, artifact_id, principal)
+    current_version = runtime.store.get_artifact_current_version(artifact_id)
     resp = ArtifactResponse(
         id=artifact.id,
         type=artifact.type,
@@ -1250,6 +1425,8 @@ async def get_artifact(
         description=artifact.description,
         schema=artifact.schema,
         owner_user_id=artifact.owner_user_id,
+        visibility=getattr(artifact, "visibility", "private"),
+        version=current_version,
         created_at=artifact.created_at,
         updated_at=artifact.updated_at,
     )
@@ -1264,13 +1441,18 @@ async def list_tool_specs(
 ):
     runtime = get_runtime()
     resolved_page_size = min(max(page_size, 1), 200)
-    artifacts = runtime.store.list_artifacts(
+    artifacts = list(runtime.store.list_artifacts(
         type_filter="tool",
         kind_filter="tool.spec",
         owner_user_id=principal.user_id,
         page=page,
         page_size=resolved_page_size,
-    )
+    ))
+
+    # Batch fetch current versions
+    artifact_ids = [a.id for a in artifacts]
+    versions = runtime.store.get_artifact_current_versions(artifact_ids)
+
     items = [
         ArtifactResponse(
             id=a.id,
@@ -1280,6 +1462,8 @@ async def list_tool_specs(
             description=a.description,
             schema=a.schema,
             owner_user_id=a.owner_user_id,
+            visibility=getattr(a, "visibility", "private"),
+            version=versions.get(a.id, 1),
             created_at=a.created_at,
             updated_at=a.updated_at,
         )
@@ -1305,6 +1489,7 @@ async def get_tool_spec(
         isinstance(artifact.schema, dict) and artifact.schema.get("kind") == "tool.spec"
     ):
         raise NotFoundError("tool spec not found", detail={"artifact_id": artifact_id})
+    current_version = runtime.store.get_artifact_current_version(artifact_id)
     resp = ArtifactResponse(
         id=artifact.id,
         type=artifact.type,
@@ -1313,6 +1498,8 @@ async def get_tool_spec(
         description=artifact.description,
         schema=artifact.schema,
         owner_user_id=artifact.owner_user_id,
+        visibility=getattr(artifact, "visibility", "private"),
+        version=current_version,
         created_at=artifact.created_at,
         updated_at=artifact.updated_at,
     )
@@ -1327,13 +1514,18 @@ async def list_workflows(
 ):
     runtime = get_runtime()
     resolved_page_size = min(max(page_size, 1), 200)
-    artifacts = runtime.store.list_artifacts(
+    artifacts = list(runtime.store.list_artifacts(
         type_filter="workflow",
         kind_filter="workflow.chat",
         owner_user_id=principal.user_id,  # Filter by owner
         page=page,
         page_size=resolved_page_size,
-    )
+    ))
+
+    # Batch fetch current versions
+    artifact_ids = [a.id for a in artifacts]
+    versions = runtime.store.get_artifact_current_versions(artifact_ids)
+
     items = [
         ArtifactResponse(
             id=a.id,
@@ -1343,6 +1535,8 @@ async def list_workflows(
             description=a.description,
             schema=a.schema,
             owner_user_id=a.owner_user_id,
+            visibility=getattr(a, "visibility", "private"),
+            version=versions.get(a.id, 1),
             created_at=a.created_at,
             updated_at=a.updated_at,
         )
@@ -1359,12 +1553,16 @@ async def list_workflows(
 
 @router.get("/artifacts/{artifact_id}/versions", response_model=Envelope, tags=["artifacts"])
 async def list_artifact_versions(
-    artifact_id: str, principal: AuthContext = Depends(get_user)
+    artifact_id: str = Path(..., max_length=255, description="Artifact identifier"),
+    limit: Optional[int] = Query(None, ge=1, description="Maximum versions to return"),
+    principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
+    paging = _get_pagination_settings(runtime)
+    resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"])
     # Verify ownership before listing versions
     _get_owned_artifact(runtime, artifact_id, principal)
-    versions = runtime.store.list_artifact_versions(artifact_id)
+    versions = runtime.store.list_artifact_versions(artifact_id, limit=resolved_limit)
     if not versions:
         artifact = runtime.store.get_artifact(artifact_id)
         if not artifact:
@@ -1453,10 +1651,9 @@ async def create_artifact(
             raise BadRequestError("artifact schema keys must be strings")
         try:
             json.dumps(body.schema)
-        except (TypeError, ValueError) as exc:
-            raise BadRequestError(
-                "artifact schema must be JSON serializable", detail={"error": str(exc)}
-            )
+        except (TypeError, ValueError):
+            # SECURITY: Don't expose internal error details
+            raise BadRequestError("artifact schema must be JSON serializable")
         schema_kind = body.schema.get("kind")
         if schema_kind is not None and not isinstance(schema_kind, str):
             raise BadRequestError(
@@ -1487,6 +1684,7 @@ async def create_artifact(
             owner_user_id=principal.user_id,
             version_author=principal.user_id,
         )
+        # New artifact starts at version 1
         resp = ArtifactResponse(
             id=artifact.id,
             type=artifact.type,
@@ -1499,6 +1697,8 @@ async def create_artifact(
             description=artifact.description,
             schema=artifact.schema,
             owner_user_id=artifact.owner_user_id,
+            visibility=getattr(artifact, "visibility", "private"),
+            version=1,
             created_at=artifact.created_at,
             updated_at=artifact.updated_at,
         )
@@ -1535,6 +1735,8 @@ async def patch_artifact(
     )
     if not artifact:
         raise NotFoundError("artifact not found", detail={"artifact_id": artifact_id})
+    # Get the new version after update
+    current_version = runtime.store.get_artifact_current_version(artifact_id)
     resp = ArtifactResponse(
         id=artifact.id,
         type=artifact.type,
@@ -1543,6 +1745,8 @@ async def patch_artifact(
         description=artifact.description,
         schema=artifact.schema,
         owner_user_id=artifact.owner_user_id,
+        visibility=getattr(artifact, "visibility", "private"),
+        version=current_version,
         created_at=artifact.created_at,
         updated_at=artifact.updated_at,
     )
@@ -1773,8 +1977,8 @@ async def get_file_limits(principal: AuthContext = Depends(get_user)):
 @router.post("/files/upload", response_model=Envelope, tags=["files"])
 async def upload_file(
     file: UploadFile = File(...),
-    context_id: Optional[str] = Form(None),
-    chunk_size: Optional[int] = Form(None),
+    context_id: Optional[str] = Form(None, max_length=255),
+    chunk_size: Optional[int] = Form(None, ge=64, le=4000),
     principal: AuthContext = Depends(get_user),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
@@ -1831,11 +2035,11 @@ async def upload_file(
         )
         try:
             await idem.store_result(pending_envelope, status="processing")
-        except Exception as exc:
+        except Exception:
             # If we can't record idempotency, log but continue (degraded mode)
+            # SECURITY: Don't log exception details that may contain sensitive info
             logger.warning(
                 "file_upload_idempotency_pre_record_failed",
-                error=str(exc),
                 request_id=idem.request_id,
             )
 
@@ -1865,13 +2069,15 @@ async def upload_file(
 @router.get("/conversations/{conversation_id}/messages", response_model=Envelope, tags=["conversations"])
 async def list_messages(
     conversation_id: str,
-    limit: Optional[int] = Query(None, ge=1, le=500),
+    limit: Optional[int] = Query(None, ge=1, description="Maximum messages to return"),
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
+    paging = _get_pagination_settings(runtime)
+    resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"]) if limit else None
     _get_owned_conversation(runtime, conversation_id, principal)
     msgs = runtime.store.list_messages(
-        conversation_id, limit=limit, user_id=principal.user_id
+        conversation_id, limit=resolved_limit, user_id=principal.user_id
     )
     payload = [
         {
@@ -1895,9 +2101,14 @@ async def list_messages(
 
 
 @router.get("/conversations", response_model=Envelope, tags=["conversations"])
-async def list_conversations(principal: AuthContext = Depends(get_user)):
+async def list_conversations(
+    limit: Optional[int] = Query(None, ge=1, description="Maximum conversations to return"),
+    principal: AuthContext = Depends(get_user),
+):
     runtime = get_runtime()
-    convs = runtime.store.list_conversations(principal.user_id)
+    paging = _get_pagination_settings(runtime)
+    resolved_limit = min(limit or paging["default_conversations_limit"], paging["max_page_size"])
+    convs = runtime.store.list_conversations(principal.user_id, limit=resolved_limit)
     items = [
         ConversationSummary(
             id=c.id,
@@ -1910,6 +2121,31 @@ async def list_conversations(principal: AuthContext = Depends(get_user)):
         for c in convs
     ]
     return Envelope(status="ok", data=ConversationListResponse(items=items))
+
+
+@router.get("/conversations/{conversation_id}", response_model=Envelope, tags=["conversations"])
+async def get_conversation(
+    conversation_id: str = Path(..., max_length=255, description="Conversation identifier"),
+    principal: AuthContext = Depends(get_user),
+):
+    """Get a single conversation by ID.
+
+    Returns conversation details including title, status, and metadata.
+    Only the conversation owner can access it.
+    """
+    runtime = get_runtime()
+    conversation = _get_owned_conversation(runtime, conversation_id, principal)
+    return Envelope(
+        status="ok",
+        data=ConversationSummary(
+            id=conversation.id,
+            created_at=conversation.created_at,
+            updated_at=conversation.updated_at,
+            title=conversation.title,
+            status=conversation.status,
+            active_context_id=conversation.active_context_id,
+        ),
+    )
 
 
 @router.post("/contexts", response_model=Envelope, status_code=201, tags=["knowledge"])
@@ -1952,9 +2188,14 @@ async def create_context(
 
 
 @router.get("/contexts", response_model=Envelope, tags=["knowledge"])
-async def list_contexts(principal: AuthContext = Depends(get_user)):
+async def list_contexts(
+    limit: Optional[int] = Query(None, ge=1, description="Maximum contexts to return"),
+    principal: AuthContext = Depends(get_user),
+):
     runtime = get_runtime()
-    contexts = runtime.store.list_contexts(owner_user_id=principal.user_id)
+    paging = _get_pagination_settings(runtime)
+    resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"])
+    contexts = runtime.store.list_contexts(owner_user_id=principal.user_id, limit=resolved_limit)
     items = [
         KnowledgeContextResponse(
             id=c.id,
@@ -1973,11 +2214,14 @@ async def list_contexts(principal: AuthContext = Depends(get_user)):
 @router.get("/contexts/{context_id}/chunks", response_model=Envelope, tags=["knowledge"])
 async def list_chunks(
     context_id: str = Path(..., max_length=255, description="Knowledge context ID"),
+    limit: Optional[int] = Query(None, ge=1, description="Maximum chunks to return"),
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
+    paging = _get_pagination_settings(runtime)
+    resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"])
     _get_owned_context(runtime, context_id, principal)
-    chunks = runtime.store.list_chunks(context_id, owner_user_id=principal.user_id)
+    chunks = runtime.store.list_chunks(context_id, owner_user_id=principal.user_id, limit=resolved_limit)
     for ch in chunks:
         if ch.id is None:
             raise _http_error(
@@ -2099,56 +2343,141 @@ async def websocket_chat(ws: WebSocket):
         runtime.store.append_message(
             convo_id, sender="user", role="user", content=init.get("message", "")
         )
-        orchestration = await runtime.workflow.run(
-            init.get("workflow_id"),
-            convo_id,
-            init.get("message", ""),
-            context_id,
-            user_id,
-            tenant_id=auth_ctx.tenant_id,
-        )
-        orchestration_dict: dict[str, Any] = (
-            orchestration if isinstance(orchestration, dict) else {}
-        )
-        adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
-        assistant_content_struct = normalize_content_struct(
-            orchestration_dict.get("content_struct"),
-            orchestration_dict.get("content"),
-        )
-        assistant_content = orchestration_dict.get("content", "No response generated.")
-        assistant_msg = runtime.store.append_message(
-            convo_id,
-            sender="assistant",
-            role="assistant",
-            content=assistant_content,
-            content_struct=assistant_content_struct,
-            meta={
-                "adapters": orchestration_dict.get("adapters", []),
-                "adapter_gates": orchestration_dict.get("adapter_gates", []),
-                "routing_trace": orchestration_dict.get("routing_trace", []),
-                "workflow_trace": orchestration_dict.get("workflow_trace", []),
-                "usage": orchestration_dict.get("usage", {}),
-            },
-        )
-        envelope = Envelope(
-            status="ok",
-            data=ChatResponse(
-                message_id=assistant_msg.id,
-                conversation_id=convo_id,
-                content=assistant_msg.content,
-                content_struct=assistant_msg.content_struct,
-                workflow_id=init.get("workflow_id"),
-                adapters=adapter_names,
-                adapter_gates=orchestration_dict.get("adapter_gates", []),
-                usage=orchestration_dict.get("usage", {}),
-                context_snippets=orchestration_dict.get("context_snippets", []),
-                routing_trace=orchestration_dict.get("routing_trace", []),
-                workflow_trace=orchestration_dict.get("workflow_trace", []),
-            ).model_dump(),
-            request_id=request_id,
-        )
-        await _store_idempotency_result("chat:ws", user_id, idempotency_key, envelope)
-        await ws.send_json(envelope.model_dump())
+
+        # SPEC §18: Check if streaming is requested (default True for WebSocket)
+        stream_enabled = init.get("stream", True)
+
+        if stream_enabled:
+            # Streaming mode: emit token, trace, message_done, error events
+            cancel_event = asyncio.Event()
+            full_content = ""
+            orchestration_dict: dict[str, Any] = {}
+
+            try:
+                async for event in runtime.workflow.run_streaming(
+                    init.get("workflow_id"),
+                    convo_id,
+                    init.get("message", ""),
+                    context_id,
+                    user_id,
+                    tenant_id=auth_ctx.tenant_id,
+                    cancel_event=cancel_event,
+                ):
+                    event_type = event.get("event")
+                    event_data = event.get("data")
+
+                    # SPEC §18: WebSockets wrap as {"event": "token", "data": "..."}
+                    await ws.send_json({"event": event_type, "data": event_data})
+
+                    if event_type == "token":
+                        full_content += event_data if isinstance(event_data, str) else ""
+                    elif event_type == "message_done":
+                        orchestration_dict = event_data if isinstance(event_data, dict) else {}
+                    elif event_type == "error":
+                        # Error already sent, close connection
+                        await ws.close(code=1011)
+                        return
+                    elif event_type == "cancel_ack":
+                        await ws.close(code=1000)
+                        return
+
+            except WebSocketDisconnect:
+                cancel_event.set()
+                return
+
+            # Save assistant message after streaming completes
+            adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
+            assistant_content = orchestration_dict.get("content", full_content or "No response generated.")
+            assistant_content_struct = normalize_content_struct(
+                orchestration_dict.get("content_struct"),
+                assistant_content,
+            )
+            assistant_msg = runtime.store.append_message(
+                convo_id,
+                sender="assistant",
+                role="assistant",
+                content=assistant_content,
+                content_struct=assistant_content_struct,
+                meta={
+                    "adapters": orchestration_dict.get("adapters", []),
+                    "adapter_gates": orchestration_dict.get("adapter_gates", []),
+                    "routing_trace": orchestration_dict.get("routing_trace", []),
+                    "workflow_trace": orchestration_dict.get("workflow_trace", []),
+                    "usage": orchestration_dict.get("usage", {}),
+                },
+            )
+            # Store idempotency result for completed streaming
+            envelope = Envelope(
+                status="ok",
+                data=ChatResponse(
+                    message_id=assistant_msg.id,
+                    conversation_id=convo_id,
+                    content=assistant_msg.content,
+                    content_struct=assistant_msg.content_struct,
+                    workflow_id=init.get("workflow_id"),
+                    adapters=adapter_names,
+                    adapter_gates=orchestration_dict.get("adapter_gates", []),
+                    usage=orchestration_dict.get("usage", {}),
+                    context_snippets=orchestration_dict.get("context_snippets", []),
+                    routing_trace=orchestration_dict.get("routing_trace", []),
+                    workflow_trace=orchestration_dict.get("workflow_trace", []),
+                ).model_dump(),
+                request_id=request_id,
+            )
+            await _store_idempotency_result("chat:ws", user_id, idempotency_key, envelope)
+
+        else:
+            # Non-streaming mode: single response (legacy behavior)
+            orchestration = await runtime.workflow.run(
+                init.get("workflow_id"),
+                convo_id,
+                init.get("message", ""),
+                context_id,
+                user_id,
+                tenant_id=auth_ctx.tenant_id,
+            )
+            orchestration_dict = (
+                orchestration if isinstance(orchestration, dict) else {}
+            )
+            adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
+            assistant_content_struct = normalize_content_struct(
+                orchestration_dict.get("content_struct"),
+                orchestration_dict.get("content"),
+            )
+            assistant_content = orchestration_dict.get("content", "No response generated.")
+            assistant_msg = runtime.store.append_message(
+                convo_id,
+                sender="assistant",
+                role="assistant",
+                content=assistant_content,
+                content_struct=assistant_content_struct,
+                meta={
+                    "adapters": orchestration_dict.get("adapters", []),
+                    "adapter_gates": orchestration_dict.get("adapter_gates", []),
+                    "routing_trace": orchestration_dict.get("routing_trace", []),
+                    "workflow_trace": orchestration_dict.get("workflow_trace", []),
+                    "usage": orchestration_dict.get("usage", {}),
+                },
+            )
+            envelope = Envelope(
+                status="ok",
+                data=ChatResponse(
+                    message_id=assistant_msg.id,
+                    conversation_id=convo_id,
+                    content=assistant_msg.content,
+                    content_struct=assistant_msg.content_struct,
+                    workflow_id=init.get("workflow_id"),
+                    adapters=adapter_names,
+                    adapter_gates=orchestration_dict.get("adapter_gates", []),
+                    usage=orchestration_dict.get("usage", {}),
+                    context_snippets=orchestration_dict.get("context_snippets", []),
+                    routing_trace=orchestration_dict.get("routing_trace", []),
+                    workflow_trace=orchestration_dict.get("workflow_trace", []),
+                ).model_dump(),
+                request_id=request_id,
+            )
+            await _store_idempotency_result("chat:ws", user_id, idempotency_key, envelope)
+            await ws.send_json(envelope.model_dump())
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, dict) else None
         error_payload = (
@@ -2169,7 +2498,9 @@ async def websocket_chat(ws: WebSocket):
     except WebSocketDisconnect:
         return
     except Exception:
-        logger.exception(
+        # SECURITY: Use logger.error instead of logger.exception to avoid
+        # exposing full stack traces that may reveal implementation details
+        logger.error(
             "unhandled_websocket_error",
             user_id=user_id,
             conversation_id=convo_id,

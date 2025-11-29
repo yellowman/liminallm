@@ -41,7 +41,7 @@ class RedisCache:
     async def check_rate_limit(
         self, key: str, limit: int, window_seconds: int, *, return_remaining: bool = False
     ) -> Union[bool, Tuple[bool, int]]:
-        """Check rate limit using Redis token bucket.
+        """Check rate limit using Redis token bucket with atomic operations.
 
         Args:
             key: Rate limit key
@@ -55,11 +55,16 @@ class RedisCache:
         now = datetime.utcnow()
         now_bucket = int(now.timestamp() // window_seconds)
         redis_key = f"rate:{key}:{now_bucket}"
-        current = await self.client.incr(redis_key)
-        if current == 1:
-            bucket_end = (now_bucket + 1) * window_seconds
-            ttl = max(1, int(bucket_end - now.timestamp()))
-            await self.client.expire(redis_key, ttl)
+        bucket_end = (now_bucket + 1) * window_seconds
+        ttl = max(1, int(bucket_end - now.timestamp()))
+
+        # Use pipeline for atomic INCR + EXPIRE to prevent race conditions
+        pipe = self.client.pipeline()
+        pipe.incr(redis_key)
+        pipe.expire(redis_key, ttl)
+        results = await pipe.execute()
+        current = results[0]
+
         allowed = current <= limit
         if return_remaining:
             remaining = max(0, limit - current)

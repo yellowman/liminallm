@@ -395,15 +395,17 @@ class MemoryStore:
     def save_password(
         self, user_id: str, password_hash: str, password_algo: str
     ) -> None:
-        if user_id not in self.users:
-            raise ConstraintViolation(
-                "user not found for credentials", {"user_id": user_id}
-            )
-        self.credentials[user_id] = (password_hash, password_algo)
-        self._persist_state()
+        with self._data_lock:
+            if user_id not in self.users:
+                raise ConstraintViolation(
+                    "user not found for credentials", {"user_id": user_id}
+                )
+            self.credentials[user_id] = (password_hash, password_algo)
+            self._persist_state()
 
     def get_password_record(self, user_id: str) -> Optional[tuple[str, str]]:
-        return self.credentials.get(user_id)
+        with self._data_lock:
+            return self.credentials.get(user_id)
 
     def _encrypt_mfa_secret(self, secret: str) -> str:
         if not secret:
@@ -426,34 +428,36 @@ class MemoryStore:
     def set_user_mfa_secret(
         self, user_id: str, secret: str, enabled: bool = False
     ) -> UserMFAConfig:
-        if user_id not in self.users:
-            raise ConstraintViolation("user not found for mfa", {"user_id": user_id})
-        encrypted_secret = self._encrypt_mfa_secret(secret)
-        record = UserMFAConfig(
-            user_id=user_id, secret=encrypted_secret, enabled=enabled
-        )
-        self.mfa_secrets[user_id] = record
-        self._persist_state()
-        return UserMFAConfig(
-            user_id=user_id,
-            secret=secret,
-            enabled=enabled,
-            created_at=record.created_at,
-            meta=record.meta,
-        )
+        with self._data_lock:
+            if user_id not in self.users:
+                raise ConstraintViolation("user not found for mfa", {"user_id": user_id})
+            encrypted_secret = self._encrypt_mfa_secret(secret)
+            record = UserMFAConfig(
+                user_id=user_id, secret=encrypted_secret, enabled=enabled
+            )
+            self.mfa_secrets[user_id] = record
+            self._persist_state()
+            return UserMFAConfig(
+                user_id=user_id,
+                secret=secret,
+                enabled=enabled,
+                created_at=record.created_at,
+                meta=record.meta,
+            )
 
     def get_user_mfa_secret(self, user_id: str) -> Optional[UserMFAConfig]:
-        cfg = self.mfa_secrets.get(user_id)
-        if not cfg:
-            return None
-        decrypted = self._decrypt_mfa_secret(cfg.secret)
-        return UserMFAConfig(
-            user_id=cfg.user_id,
-            secret=decrypted,
-            enabled=cfg.enabled,
-            created_at=cfg.created_at,
-            meta=cfg.meta,
-        )
+        with self._data_lock:
+            cfg = self.mfa_secrets.get(user_id)
+            if not cfg:
+                return None
+            decrypted = self._decrypt_mfa_secret(cfg.secret)
+            return UserMFAConfig(
+                user_id=cfg.user_id,
+                secret=decrypted,
+                enabled=cfg.enabled,
+                created_at=cfg.created_at,
+                meta=cfg.meta,
+            )
 
     def create_session(
         self,
@@ -565,28 +569,30 @@ class MemoryStore:
         meta: Optional[Dict] = None,
         content_struct: Optional[dict] = None,
     ) -> Message:
-        if conversation_id not in self.conversations:
-            raise ConstraintViolation(
-                "conversation not found", {"conversation_id": conversation_id}
+        with self._data_lock:
+            if conversation_id not in self.conversations:
+                raise ConstraintViolation(
+                    "conversation not found", {"conversation_id": conversation_id}
+                )
+            normalized_content_struct = normalize_content_struct(content_struct, content)
+            # Thread-safe sequence number generation
+            seq = len(self.messages.get(conversation_id, []))
+            msg = Message(
+                id=str(uuid.uuid4()),
+                conversation_id=conversation_id,
+                sender=sender,
+                role=role,
+                content=content,
+                content_struct=normalized_content_struct,
+                seq=seq,
+                created_at=datetime.utcnow(),
+                meta=meta,
             )
-        normalized_content_struct = normalize_content_struct(content_struct, content)
-        seq = len(self.messages.get(conversation_id, []))
-        msg = Message(
-            id=str(uuid.uuid4()),
-            conversation_id=conversation_id,
-            sender=sender,
-            role=role,
-            content=content,
-            content_struct=normalized_content_struct,
-            seq=seq,
-            created_at=datetime.utcnow(),
-            meta=meta,
-        )
-        self.messages.setdefault(conversation_id, []).append(msg)
-        if conversation_id in self.conversations:
-            self.conversations[conversation_id].updated_at = msg.created_at
-        self._persist_state()
-        return msg
+            self.messages.setdefault(conversation_id, []).append(msg)
+            if conversation_id in self.conversations:
+                self.conversations[conversation_id].updated_at = msg.created_at
+            self._persist_state()
+            return msg
 
     # preference events
     def _text_embedding(self, text: Optional[str]) -> List[float]:
@@ -617,55 +623,56 @@ class MemoryStore:
         context_text: Optional[str] = None,
         meta: Optional[Dict] = None,
     ) -> PreferenceEvent:
-        if user_id not in self.users:
-            raise ConstraintViolation("preference user missing", {"user_id": user_id})
-        if conversation_id not in self.conversations:
-            raise ConstraintViolation(
-                "preference conversation missing", {"conversation_id": conversation_id}
-            )
-        message = None
-        message_conversation_id = None
-        for cid, messages in self.messages.items():
-            for msg in messages:
-                if msg.id == message_id:
-                    message = msg
-                    message_conversation_id = cid
+        with self._data_lock:
+            if user_id not in self.users:
+                raise ConstraintViolation("preference user missing", {"user_id": user_id})
+            if conversation_id not in self.conversations:
+                raise ConstraintViolation(
+                    "preference conversation missing", {"conversation_id": conversation_id}
+                )
+            message = None
+            message_conversation_id = None
+            for cid, messages in self.messages.items():
+                for msg in messages:
+                    if msg.id == message_id:
+                        message = msg
+                        message_conversation_id = cid
+                        break
+                if message:
                     break
-            if message:
-                break
-        if not message:
-            raise ConstraintViolation(
-                "preference message missing",
-                {"message_id": message_id, "conversation_id": conversation_id},
+            if not message:
+                raise ConstraintViolation(
+                    "preference message missing",
+                    {"message_id": message_id, "conversation_id": conversation_id},
+                )
+            if message_conversation_id != conversation_id:
+                raise ConstraintViolation(
+                    "preference message conversation mismatch",
+                    {"message_id": message_id, "conversation_id": conversation_id},
+                )
+            event_id = str(uuid.uuid4())
+            normalized_weight = weight if weight is not None else 1.0
+            embedding = context_embedding or self._text_embedding(
+                context_text or message.content
             )
-        if message_conversation_id != conversation_id:
-            raise ConstraintViolation(
-                "preference message conversation mismatch",
-                {"message_id": message_id, "conversation_id": conversation_id},
+            event = PreferenceEvent(
+                id=event_id,
+                user_id=user_id,
+                conversation_id=conversation_id,
+                message_id=message_id,
+                feedback=feedback,
+                score=score,
+                explicit_signal=explicit_signal,
+                context_embedding=embedding,
+                cluster_id=cluster_id,
+                context_text=context_text,
+                corrected_text=corrected_text,
+                weight=normalized_weight,
+                meta=meta,
             )
-        event_id = str(uuid.uuid4())
-        normalized_weight = weight if weight is not None else 1.0
-        embedding = context_embedding or self._text_embedding(
-            context_text or message.content
-        )
-        event = PreferenceEvent(
-            id=event_id,
-            user_id=user_id,
-            conversation_id=conversation_id,
-            message_id=message_id,
-            feedback=feedback,
-            score=score,
-            explicit_signal=explicit_signal,
-            context_embedding=embedding,
-            cluster_id=cluster_id,
-            context_text=context_text,
-            corrected_text=corrected_text,
-            weight=normalized_weight,
-            meta=meta,
-        )
-        self.preference_events[event_id] = event
-        self._persist_state()
-        return event
+            self.preference_events[event_id] = event
+            self._persist_state()
+            return event
 
     def list_preference_events(
         self,
@@ -693,18 +700,20 @@ class MemoryStore:
         return sorted(events, key=lambda e: e.created_at)
 
     def get_preference_event(self, event_id: str) -> Optional[PreferenceEvent]:
-        return self.preference_events.get(event_id)
+        with self._data_lock:
+            return self.preference_events.get(event_id)
 
     def update_preference_event(
         self, event_id: str, *, cluster_id: Optional[str] = None
     ) -> Optional[PreferenceEvent]:
-        event = self.preference_events.get(event_id)
-        if not event:
-            return None
-        if cluster_id:
-            event.cluster_id = cluster_id
-        self._persist_state()
-        return event
+        with self._data_lock:
+            event = self.preference_events.get(event_id)
+            if not event:
+                return None
+            if cluster_id:
+                event.cluster_id = cluster_id
+            self._persist_state()
+            return event
 
     # semantic clusters
     def upsert_semantic_cluster(
@@ -1007,6 +1016,7 @@ class MemoryStore:
         page_size: int = 100,
         owner_user_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
+        visibility: Optional[str] = None,
     ) -> List[Artifact]:
         artifacts = list(self.artifacts.values())
         if tenant_id:
@@ -1027,6 +1037,8 @@ class MemoryStore:
                 for a in artifacts
                 if isinstance(a.schema, dict) and a.schema.get("kind") == kind_filter
             ]
+        if visibility:
+            artifacts = [a for a in artifacts if getattr(a, "visibility", "private") == visibility]
         start = max(page - 1, 0) * max(page_size, 1)
         end = start + max(page_size, 1)
         return artifacts[start:end]
@@ -1133,9 +1145,29 @@ class MemoryStore:
         self._persist_state()
         return artifact
 
-    def list_artifact_versions(self, artifact_id: str) -> List[ArtifactVersion]:
+    def list_artifact_versions(
+        self, artifact_id: str, *, limit: Optional[int] = None
+    ) -> List[ArtifactVersion]:
         versions = list(self.artifact_versions.get(artifact_id, []))
-        return sorted(versions, key=lambda v: v.version, reverse=True)
+        sorted_versions = sorted(versions, key=lambda v: v.version, reverse=True)
+        if limit is not None:
+            sorted_versions = sorted_versions[:limit]
+        return sorted_versions
+
+    def get_artifact_current_version(self, artifact_id: str) -> int:
+        """Get the current (highest) version number for an artifact."""
+        versions = self.artifact_versions.get(artifact_id, [])
+        if not versions:
+            return 1
+        return max(v.version for v in versions)
+
+    def get_artifact_current_versions(self, artifact_ids: List[str]) -> Dict[str, int]:
+        """Get current versions for multiple artifacts efficiently."""
+        result: Dict[str, int] = {}
+        for artifact_id in artifact_ids:
+            versions = self.artifact_versions.get(artifact_id, [])
+            result[artifact_id] = max((v.version for v in versions), default=1)
+        return result
 
     def _persist_payload(self, artifact_id: str, schema: dict) -> str:
         return self.persist_artifact_payload(artifact_id, schema)
@@ -1143,23 +1175,27 @@ class MemoryStore:
     def persist_artifact_payload(self, artifact_id: str, schema: dict) -> str:
         artifact_dir = self.fs_root / "artifacts" / artifact_id
         artifact_dir.mkdir(parents=True, exist_ok=True)
-        version = len(self.artifact_versions.get(artifact_id, [])) + 1
-        payload_path = artifact_dir / f"v{version}.json"
-        payload_path.write_text(json.dumps(schema, indent=2))
+        # Thread-safe version calculation to prevent race conditions
+        with self._seq_lock:
+            version = len(self.artifact_versions.get(artifact_id, [])) + 1
+            payload_path = artifact_dir / f"v{version}.json"
+            payload_path.write_text(json.dumps(schema, indent=2))
         return str(payload_path)
 
     def record_config_patch(
         self, artifact_id: str, proposer: str, patch: dict, justification: Optional[str]
     ) -> ConfigPatchAudit:
-        audit_id = max(self.config_patches.keys(), default=0) + 1
-        audit = ConfigPatchAudit(
-            id=audit_id,
-            artifact_id=artifact_id,
-            proposer=proposer,
-            patch=patch,
-            justification=justification,
-        )
-        self.config_patches[audit.id] = audit
+        # Thread-safe ID generation to prevent collisions
+        with self._seq_lock:
+            audit_id = max(self.config_patches.keys(), default=0) + 1
+            audit = ConfigPatchAudit(
+                id=audit_id,
+                artifact_id=artifact_id,
+                proposer=proposer,
+                patch=patch,
+                justification=justification,
+            )
+            self.config_patches[audit.id] = audit
         self._persist_state()
         return audit
 
@@ -1202,6 +1238,16 @@ class MemoryStore:
     def get_runtime_config(self) -> dict:
         """Return the runtime configuration persisted for the web admin UI."""
 
+        return dict(self.runtime_config)
+
+    def set_runtime_config(self, config: dict) -> dict:
+        """Update runtime configuration via admin UI.
+
+        Merges provided config with existing config and persists.
+        Returns the updated full config.
+        """
+        self.runtime_config.update(config)
+        self._persist_state()
         return dict(self.runtime_config)
 
     def get_latest_workflow(self, workflow_id: str) -> Optional[dict]:
@@ -1263,13 +1309,15 @@ class MemoryStore:
         return self.contexts.get(context_id)
 
     def list_contexts(
-        self, owner_user_id: Optional[str] = None
+        self, owner_user_id: Optional[str] = None, limit: int = 100
     ) -> List[KnowledgeContext]:
         if not owner_user_id:
             return []
-        return [
+        contexts = [
             ctx for ctx in self.contexts.values() if ctx.owner_user_id == owner_user_id
         ]
+        contexts.sort(key=lambda c: c.created_at, reverse=True)
+        return contexts[:limit]
 
     def add_context_source(
         self,
@@ -1333,13 +1381,20 @@ class MemoryStore:
         self._persist_state()
 
     def list_chunks(
-        self, context_id: Optional[str] = None, *, owner_user_id: Optional[str] = None
+        self,
+        context_id: Optional[str] = None,
+        *,
+        owner_user_id: Optional[str] = None,
+        limit: Optional[int] = None,
     ) -> List[KnowledgeChunk]:
         if context_id:
             ctx = self.contexts.get(context_id)
             if owner_user_id and (not ctx or ctx.owner_user_id != owner_user_id):
                 return []
-            return list(self.chunks.get(context_id, []))
+            result = list(self.chunks.get(context_id, []))
+            if limit is not None:
+                result = result[:limit]
+            return result
         if not owner_user_id:
             return []
         chunks: List[KnowledgeChunk] = []
@@ -1348,6 +1403,8 @@ class MemoryStore:
                 ctx = self.contexts.get(vals[0].context_id)
                 if ctx and ctx.owner_user_id == owner_user_id:
                     chunks.extend(vals)
+        if limit is not None:
+            chunks = chunks[:limit]
         return chunks
 
     def search_chunks(
@@ -1510,9 +1567,11 @@ class MemoryStore:
 
     def _load_state(self) -> bool:
         path = self._state_path()
-        if not path.exists():
+        # Use try-except instead of exists() to avoid TOCTOU race condition
+        try:
+            data = json.loads(path.read_text())
+        except FileNotFoundError:
             return False
-        data = json.loads(path.read_text())
         self.users = {u["id"]: self._deserialize_user(u) for u in data.get("users", [])}
         self.sessions = {
             s["id"]: self._deserialize_session(s) for s in data.get("sessions", [])

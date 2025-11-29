@@ -5,7 +5,7 @@ import concurrent.futures
 import math
 import time
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from liminallm.logging import get_logger
 from liminallm.service.embeddings import (
@@ -265,6 +265,275 @@ class WorkflowEngine:
         )
         await self.cache_conversation_state(conversation_id, history)
         return result
+
+    async def run_streaming(
+        self,
+        workflow_id: Optional[str],
+        conversation_id: Optional[str],
+        user_message: str,
+        context_id: Optional[str],
+        user_id: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        cancel_event: Optional[asyncio.Event] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Execute workflow with streaming token output per SPEC §18.
+
+        Yields events:
+        - {"event": "token", "data": "token_text"}
+        - {"event": "trace", "data": {...workflow_trace...}}
+        - {"event": "message_done", "data": {"content": "...", "usage": {...}, ...}}
+        - {"event": "error", "data": {"code": "...", "message": "..."}}
+        - {"event": "cancel_ack", "data": {}}
+        """
+        workflow_schema = None
+        if workflow_id:
+            workflow_schema = self.store.get_latest_workflow(workflow_id)
+        if not workflow_schema:
+            workflow_schema = self._default_workflow()
+
+        workflow_timeout_ms = workflow_schema.get(
+            "timeout_ms", DEFAULT_WORKFLOW_TIMEOUT_MS
+        )
+        workflow_start_time = time.monotonic()
+
+        adapters, routing_trace, adapter_gates = await self._select_adapters(
+            user_message, user_id, context_id
+        )
+        history = await self._load_conversation_history(
+            conversation_id, user_id=user_id, tenant_id=tenant_id
+        )
+
+        node_map = {
+            n.get("id"): n for n in workflow_schema.get("nodes", []) if n.get("id")
+        }
+        if not node_map:
+            yield {"event": "error", "data": {"code": "validation_error", "message": "workflow has no nodes"}}
+            return
+
+        entry = workflow_schema.get("entrypoint") or next(iter(node_map), None)
+        if not entry or entry not in node_map:
+            entry = next(iter(node_map)) if node_map else None
+
+        vars_scope: Dict[str, Any] = {}
+        workflow_trace: List[Dict[str, Any]] = []
+        context_snippets: List[str] = []
+        context_seen = set()
+        content = ""
+        usage: Dict[str, Any] = {}
+
+        pending: List[str] = [entry] if entry else []
+        visited = 0
+        max_steps = max(1, min(100, len(node_map) * 2 + 10))
+        visited_nodes: Dict[str, int] = {}
+        max_visits_per_node = max(2, math.ceil(max_steps / max(1, len(node_map))))
+
+        while pending and visited < max_steps:
+            # Check for cancellation
+            if cancel_event and cancel_event.is_set():
+                yield {"event": "cancel_ack", "data": {}}
+                return
+
+            # Check workflow timeout
+            elapsed_ms = (time.monotonic() - workflow_start_time) * 1000
+            if elapsed_ms >= workflow_timeout_ms:
+                yield {
+                    "event": "error",
+                    "data": {
+                        "code": "server_error",
+                        "message": "workflow execution timed out",
+                    },
+                }
+                return
+
+            node_id = pending.pop(0)
+            node = node_map.get(node_id)
+            if not node:
+                continue
+
+            visited += 1
+            visited_nodes[node_id] = visited_nodes.get(node_id, 0) + 1
+            if visited_nodes[node_id] > max_visits_per_node:
+                self.logger.warning("workflow_loop_detected", node=node_id)
+                break
+
+            node_type = node.get("type", "tool_call")
+            tool_name = node.get("tool", "")
+
+            # Handle streaming for LLM-based tools
+            if node_type == "tool_call" and tool_name in {"llm.generic", "llm.generic_chat_v1"}:
+                # Stream tokens from LLM
+                async for event in self._stream_llm_node(
+                    node,
+                    user_message=user_message,
+                    context_id=context_id,
+                    adapters=adapters,
+                    history=history,
+                    vars_scope=vars_scope,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    cancel_event=cancel_event,
+                ):
+                    if event["event"] == "token":
+                        yield event
+                    elif event["event"] == "message_done":
+                        # Update state from completed message
+                        data = event.get("data", {})
+                        content = data.get("content", "")
+                        node_usage = data.get("usage", {})
+                        usage = self._merge_usage(usage, node_usage)
+                        workflow_trace.append({
+                            "node": node_id,
+                            "status": "ok",
+                            "content": content,
+                            "usage": node_usage,
+                        })
+                        # Emit trace event
+                        yield {"event": "trace", "data": {"workflow_trace": workflow_trace[-1]}}
+                    elif event["event"] == "error":
+                        yield event
+                        return
+                    elif event["event"] == "cancel_ack":
+                        yield event
+                        return
+
+                # Move to next nodes
+                next_nodes = node.get("next")
+                if isinstance(next_nodes, str):
+                    pending.append(next_nodes)
+                elif isinstance(next_nodes, list):
+                    pending.extend([n for n in next_nodes if n])
+
+            else:
+                # Non-streaming node execution (switch, parallel, RAG, etc.)
+                result, next_nodes = await self._execute_node_with_retry(
+                    node,
+                    user_message=user_message,
+                    context_id=context_id,
+                    conversation_id=conversation_id,
+                    adapters=adapters,
+                    history=history,
+                    vars_scope=vars_scope,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    workflow_start_time=workflow_start_time,
+                    workflow_timeout_ms=workflow_timeout_ms,
+                )
+
+                if result.get("status") == "error" and result.get("retries_exhausted"):
+                    yield {
+                        "event": "error",
+                        "data": {
+                            "code": "server_error",
+                            "message": result.get("error", "node execution failed"),
+                        },
+                    }
+                    return
+
+                workflow_trace.append({"node": node_id, **result})
+                yield {"event": "trace", "data": {"workflow_trace": workflow_trace[-1]}}
+
+                if result.get("outputs"):
+                    vars_scope.update(result["outputs"])
+                if result.get("context_snippets"):
+                    for snippet in result["context_snippets"]:
+                        if snippet in context_seen:
+                            continue
+                        if len(context_snippets) >= MAX_CONTEXT_SNIPPETS:
+                            break
+                        context_seen.add(snippet)
+                        context_snippets.append(snippet)
+                if result.get("content"):
+                    content = result["content"]
+                node_usage = result.get("usage")
+                usage = self._merge_usage(usage, node_usage or {})
+
+                pending.extend(next_nodes)
+                if result.get("status") == "error" and not next_nodes:
+                    yield {
+                        "event": "error",
+                        "data": {"code": "server_error", "message": result.get("error", "")},
+                    }
+                    return
+                if result.get("status") == "end":
+                    break
+
+        if not content:
+            content = "No response generated."
+
+        # Emit final message_done with complete response
+        yield {
+            "event": "message_done",
+            "data": {
+                "content": content,
+                "usage": usage,
+                "adapters": adapters,
+                "adapter_gates": adapter_gates,
+                "context_snippets": context_snippets,
+                "workflow_trace": workflow_trace,
+                "routing_trace": routing_trace,
+                "vars": vars_scope,
+            },
+        }
+
+        await self.cache_conversation_state(conversation_id, history)
+
+    async def _stream_llm_node(
+        self,
+        node: Dict[str, Any],
+        *,
+        user_message: str,
+        context_id: Optional[str],
+        adapters: List[dict],
+        history: List[Any],
+        vars_scope: Dict[str, Any],
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+        cancel_event: Optional[asyncio.Event] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Stream tokens from an LLM node."""
+        inputs = self._resolve_inputs(node.get("inputs", {}), user_message, vars_scope)
+        message = (
+            inputs.get("message") or inputs.get("prompt") or inputs.get("text") or ""
+        )
+        if not message:
+            message = user_message
+
+        ctx_ids = self._resolve_context_ids(inputs.get("context_id"), context_id)
+        allowed_ctx_ids = self._validate_context_scope(
+            ctx_ids, user_id=user_id, tenant_id=tenant_id
+        )
+
+        ctx_chunks = self.rag.retrieve(
+            allowed_ctx_ids, message, user_id=user_id, tenant_id=tenant_id
+        )
+        context_snippets = [c.text for c in ctx_chunks]
+
+        # Stream from LLM
+        try:
+            stream = self.llm.generate_stream(
+                message or "",
+                adapters=adapters,
+                context_snippets=context_snippets,
+                history=history,
+                user_id=user_id,
+            )
+
+            # Wrap synchronous iterator for async
+            loop = asyncio.get_event_loop()
+            for event in stream:
+                if cancel_event and cancel_event.is_set():
+                    yield {"event": "cancel_ack", "data": {}}
+                    return
+                yield event
+                # Yield control to allow other tasks
+                await asyncio.sleep(0)
+
+        except Exception as exc:
+            self.logger.error("llm_stream_error", error=str(exc))
+            yield {
+                "event": "error",
+                "data": {"code": "server_error", "message": str(exc)},
+            }
 
     async def _handle_node_failure(
         self,

@@ -173,11 +173,20 @@ class AuthService:
         self._oauth_states[state] = (provider, expires_at, tenant_id)
         if self.cache:
             await self.cache.set_oauth_state(state, provider, expires_at, tenant_id)
-        base_url = (
-            redirect_uri
-            or self.settings.adapter_openai_base_url
-            or "https://auth.example.com/callback"
-        )
+        # SECURITY: Validate redirect_uri against allowlist to prevent open redirect
+        allowed_redirect_uris = getattr(self.settings, "oauth_allowed_redirect_uris", None)
+        if redirect_uri:
+            if allowed_redirect_uris and redirect_uri not in allowed_redirect_uris:
+                self.logger.warning(
+                    "oauth_invalid_redirect_uri",
+                    redirect_uri=redirect_uri,
+                    allowed=list(allowed_redirect_uris) if allowed_redirect_uris else [],
+                )
+                redirect_uri = None  # Fall back to default
+        base_url = redirect_uri or self.settings.adapter_openai_base_url
+        if not base_url:
+            self.logger.error("oauth_no_redirect_uri_configured", provider=provider)
+            raise ValueError("No OAuth redirect URI configured")
         authorization_url = f"{base_url}?provider={provider}&state={state}"
         return {
             "authorization_url": authorization_url,
@@ -573,7 +582,8 @@ class AuthService:
             generated = self._generate_totp(
                 secret, time.time() + offset * interval, interval=interval
             )
-            if generated and generated == code:
+            # SECURITY: Use constant-time comparison to prevent timing attacks
+            if generated and hmac.compare_digest(generated, code):
                 return True
         return False
 

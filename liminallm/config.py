@@ -297,6 +297,23 @@ class Settings(BaseModel):
     )
     configops_rate_limit_per_hour: int = env_field(30, "CONFIGOPS_RATE_LIMIT_PER_HOUR")
 
+    # Pagination defaults per SPEC §18
+    default_page_size: int = env_field(
+        100,
+        "DEFAULT_PAGE_SIZE",
+        description="Default page size for list endpoints (SPEC §18)",
+    )
+    max_page_size: int = env_field(
+        500,
+        "MAX_PAGE_SIZE",
+        description="Maximum page size for list endpoints (SPEC §18)",
+    )
+    default_conversations_limit: int = env_field(
+        50,
+        "DEFAULT_CONVERSATIONS_LIMIT",
+        description="Default limit for conversation list",
+    )
+
     model_config = ConfigDict(extra="ignore")
 
     @classmethod

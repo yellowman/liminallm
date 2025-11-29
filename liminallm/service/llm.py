@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Iterator, List, Optional
 
 from liminallm.service.model_backend import (
     ApiAdapterBackend,
@@ -56,6 +56,32 @@ class LLMService:
         messages.append({"role": "user", "content": self._format_user(prompt)})
         messages = self._inject_context(messages, context_snippets)
         return self.backend.generate(messages, normalized_adapters, user_id=user_id)
+
+    def generate_stream(
+        self,
+        prompt: str,
+        adapters: List[dict],
+        context_snippets: List[str],
+        history: Optional[List[Message]] = None,
+        *,
+        user_id: Optional[str] = None,
+    ) -> Iterator[dict]:
+        """Stream tokens from the LLM per SPEC §18.
+
+        Yields events:
+        - {"event": "token", "data": "token_text"}
+        - {"event": "message_done", "data": {"content": "full_text", "usage": {...}}}
+        - {"event": "error", "data": {"code": "...", "message": "..."}}
+        """
+        normalized_adapters = self._normalize_adapters(adapters)
+        messages = [{"role": "system", "content": "You are a concise assistant."}]
+        messages.extend(self._build_adapter_prompts(normalized_adapters))
+        if history:
+            for msg in history:
+                messages.append({"role": msg.role, "content": msg.content})
+        messages.append({"role": "user", "content": self._format_user(prompt)})
+        messages = self._inject_context(messages, context_snippets)
+        yield from self.backend.generate_stream(messages, normalized_adapters, user_id=user_id)
 
     def _format_user(self, prompt: str) -> str:
         return prompt
