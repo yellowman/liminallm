@@ -20,126 +20,332 @@
         </div>
       </header>
 
-      <main class="layout">
-        <section class="panel" id="auth-panel">
-          <h2>Sign in</h2>
-          <p class="subtext">Use your account to start or resume conversations.</p>
-          <form id="auth-form">
-            <div class="field">
-              <label for="email">Email</label>
-              <input type="email" id="email" name="email" placeholder="you@example.com" required />
-            </div>
-            <div class="field">
-              <label for="password">Password</label>
-              <input type="password" id="password" name="password" placeholder="••••••••" required />
-            </div>
-            <div class="field">
-              <label for="mfa">MFA code (if required)</label>
-              <input type="text" id="mfa" name="mfa" placeholder="123456" inputmode="numeric" />
-            </div>
-            <div class="field">
-              <label for="tenant">Tenant (optional)</label>
-              <input type="text" id="tenant" name="tenant" placeholder="tenant-123" />
-            </div>
-            <div class="form-actions">
-              <button class="primary" type="submit" id="auth-submit">Continue</button>
-              <div class="small" id="status" aria-live="polite"></div>
-            </div>
-          </form>
-          <div id="error-banner" role="alert"></div>
-        </section>
+      <main class="layout-with-sidebar">
+        <!-- Left Sidebar: Conversations -->
+        <aside class="sidebar" id="conversations-sidebar">
+          <div class="sidebar-header">
+            <h3>Conversations</h3>
+            <button class="icon-btn" id="new-conversation-btn" title="New conversation">+</button>
+          </div>
+          <div class="sidebar-search">
+            <input type="text" id="conversation-search" placeholder="Search conversations..." />
+          </div>
+          <div id="conversation-list" class="conversation-list">
+            <div class="empty">Sign in to see conversations</div>
+          </div>
+        </aside>
 
-        <section class="panel chat-panel" aria-label="Chat workspace">
-          <div class="conversation-header">
-            <div class="badge">
-              <span class="dot"></span>
-              <span id="conversation-label">New conversation</span>
-            </div>
-            <div class="pill-row">
-              <button class="ghost" id="new-thread">New thread</button>
-              <button class="minor" id="refresh-conversations">Refresh history</button>
-            </div>
-          </div>
-          <div class="subtext">
-            Provide an optional context ID to ground retrieval-augmented answers and a workflow ID to steer execution.
-          </div>
-          <div class="input-grid">
-            <div class="field compact">
-              <label for="context-id">Context ID</label>
-              <input type="text" id="context-id" placeholder="ctx_..." />
-            </div>
-            <div class="field compact">
-              <label for="workflow-id">Workflow ID</label>
-              <input type="text" id="workflow-id" placeholder="workflow.chat..." />
-            </div>
-          </div>
-
-          <section class="panel-section" aria-label="Upload files">
-            <div class="section-header">
-              <h3>Upload knowledge</h3>
-            </div>
-            <p class="subtext">
-              Attach files to a context before asking questions. Leave Context ID blank to keep uploads private.
-            </p>
-            <div class="input-grid">
-              <div class="field compact">
-                <label for="upload-context-id">Context ID</label>
-                <input type="text" id="upload-context-id" placeholder="ctx_..." />
+        <!-- Main Content Area -->
+        <div class="main-content">
+          <!-- Auth Panel (shown when not logged in) -->
+          <section class="panel" id="auth-panel">
+            <h2>Sign in</h2>
+            <p class="subtext">Use your account to start or resume conversations.</p>
+            <form id="auth-form">
+              <div class="field">
+                <label for="email">Email</label>
+                <input type="email" id="email" name="email" placeholder="you@example.com" required />
               </div>
-              <div class="field compact">
-                <label for="upload-chunk-size">Chunk size (optional)</label>
-                <input type="number" id="upload-chunk-size" placeholder="512" min="64" step="64" />
+              <div class="field">
+                <label for="password">Password</label>
+                <input type="password" id="password" name="password" placeholder="••••••••" required />
               </div>
-            </div>
-            <div class="field">
-              <label for="file-upload">File</label>
-              <input type="file" id="file-upload" aria-describedby="file-upload-hint" />
-              <div class="small" id="file-upload-hint"></div>
-            </div>
-            <div class="pill-row">
-              <button type="button" class="minor" id="upload-file-btn">Upload file</button>
-            </div>
-            <div class="small" id="file-upload-status" role="status"></div>
+              <div class="field">
+                <label for="mfa">MFA code (if required)</label>
+                <input type="text" id="mfa" name="mfa" placeholder="123456" inputmode="numeric" />
+              </div>
+              <div class="field">
+                <label for="tenant">Tenant (optional)</label>
+                <input type="text" id="tenant" name="tenant" placeholder="tenant-123" />
+              </div>
+              <div class="form-actions">
+                <button class="primary" type="submit" id="auth-submit">Continue</button>
+                <div class="small" id="status" aria-live="polite"></div>
+              </div>
+            </form>
+            <div id="error-banner" role="alert"></div>
           </section>
 
-          <div id="messages" aria-live="polite"></div>
-          <div id="messages-empty" class="empty">Start a new thread to see your conversation history here.</div>
+          <!-- Tab Navigation -->
+          <nav class="tab-nav" id="main-tabs" aria-label="Main navigation">
+            <button class="tab-btn active" data-tab="chat-tab" aria-selected="true">Chat</button>
+            <button class="tab-btn" data-tab="contexts-tab" aria-selected="false">Contexts</button>
+            <button class="tab-btn" data-tab="artifacts-tab" aria-selected="false">Artifacts</button>
+            <button class="tab-btn" data-tab="settings-tab" aria-selected="false">Settings</button>
+          </nav>
 
-          <form id="chat-form">
-            <div class="field textarea-wrap">
-              <label for="message-input">Message</label>
-              <textarea id="message-input" placeholder="Ask anything..." rows="3"></textarea>
-            </div>
-            <div id="chat-actions">
-              <div class="small" id="session-indicator">Not signed in</div>
-              <div class="pill-row">
-                <button type="button" class="ghost" id="new-thread-secondary">Reset</button>
-                <button type="submit" class="primary" id="send-btn">Send</button>
+          <!-- Chat Tab -->
+          <section class="tab-panel active" id="chat-tab" aria-label="Chat workspace">
+            <div class="panel chat-panel">
+              <div class="conversation-header">
+                <div class="badge">
+                  <span class="dot"></span>
+                  <span id="conversation-label">New conversation</span>
+                </div>
+                <div class="pill-row">
+                  <button class="ghost" id="new-thread">New thread</button>
+                  <button class="minor" id="refresh-conversations">Refresh history</button>
+                </div>
               </div>
-            </div>
-          </form>
-          <div id="admin-warning" role="status"></div>
+              <div class="subtext">
+                Provide an optional context ID to ground retrieval-augmented answers and a workflow ID to steer execution.
+              </div>
+              <div class="input-grid">
+                <div class="field compact">
+                  <label for="context-id">Context ID</label>
+                  <select id="context-id">
+                    <option value="">No context</option>
+                  </select>
+                </div>
+                <div class="field compact">
+                  <label for="workflow-id">Workflow ID</label>
+                  <input type="text" id="workflow-id" placeholder="workflow.chat..." />
+                </div>
+              </div>
 
-          <div class="divider"></div>
-          <section id="preferences-section" aria-label="Preference feedback" class="panel-section">
-            <div class="section-header">
-              <h3>Preferences</h3>
-              <div class="pill-row">
-                <button type="button" class="ghost" id="thumbs-up" aria-label="Thumbs up">👍</button>
-                <button type="button" class="ghost" id="thumbs-down" aria-label="Thumbs down">👎</button>
-              </div>
+              <section class="panel-section collapsed" id="upload-section" aria-label="Upload files">
+                <div class="section-header clickable" id="upload-section-toggle">
+                  <h3>Upload knowledge <span class="toggle-icon">+</span></h3>
+                </div>
+                <div class="section-content">
+                  <p class="subtext">
+                    Attach files to a context before asking questions. Leave Context ID blank to keep uploads private.
+                  </p>
+                  <div class="input-grid">
+                    <div class="field compact">
+                      <label for="upload-context-id">Context ID</label>
+                      <select id="upload-context-id">
+                        <option value="">Private (no context)</option>
+                      </select>
+                    </div>
+                    <div class="field compact">
+                      <label for="upload-chunk-size">Chunk size (optional)</label>
+                      <input type="number" id="upload-chunk-size" placeholder="512" min="64" max="4000" step="64" />
+                    </div>
+                  </div>
+                  <div class="field">
+                    <label for="file-upload">File</label>
+                    <input type="file" id="file-upload" aria-describedby="file-upload-hint" />
+                    <div class="small" id="file-upload-hint"></div>
+                  </div>
+                  <div class="pill-row">
+                    <button type="button" class="minor" id="upload-file-btn">Upload file</button>
+                  </div>
+                  <div class="small" id="file-upload-status" role="status"></div>
+                </div>
+              </section>
+
+              <div id="messages" aria-live="polite"></div>
+              <div id="messages-empty" class="empty">Start a new thread to see your conversation history here.</div>
+
+              <form id="chat-form">
+                <div class="field textarea-wrap">
+                  <label for="message-input">Message</label>
+                  <textarea id="message-input" placeholder="Ask anything..." rows="3"></textarea>
+                  <div class="draft-indicator" id="draft-indicator"></div>
+                </div>
+                <div id="chat-actions">
+                  <div class="small" id="session-indicator">Not signed in</div>
+                  <div class="pill-row">
+                    <button type="button" class="ghost" id="new-thread-secondary">Reset</button>
+                    <button type="submit" class="primary" id="send-btn">Send</button>
+                  </div>
+                </div>
+              </form>
+              <div id="admin-warning" role="status"></div>
+
+              <div class="divider"></div>
+              <section id="preferences-section" aria-label="Preference feedback" class="panel-section collapsed">
+                <div class="section-header clickable" id="preferences-toggle">
+                  <h3>Preferences <span class="toggle-icon">+</span></h3>
+                  <div class="pill-row">
+                    <button type="button" class="ghost" id="thumbs-up" aria-label="Thumbs up">+1</button>
+                    <button type="button" class="ghost" id="thumbs-down" aria-label="Thumbs down">-1</button>
+                  </div>
+                </div>
+                <div class="section-content">
+                  <p class="subtext" id="preference-hint">Send feedback on the latest assistant response.</p>
+                  <div class="field textarea-wrap">
+                    <label for="preference-notes">Notes (optional)</label>
+                    <textarea id="preference-notes" rows="2" placeholder="What worked or what should change?"></textarea>
+                  </div>
+                  <div class="meta" id="preference-target"></div>
+                  <pre id="preference-meta" class="code-block" aria-live="polite"></pre>
+                  <pre id="preference-routing" class="code-block" aria-live="polite"></pre>
+                  <div class="small" id="preference-status"></div>
+                </div>
+              </section>
             </div>
-            <p class="subtext" id="preference-hint">Send feedback on the latest assistant response.</p>
-            <div class="field textarea-wrap">
-              <label for="preference-notes">Notes (optional)</label>
-              <textarea id="preference-notes" rows="2" placeholder="What worked or what should change?"></textarea>
-            </div>
-            <div class="meta" id="preference-target"></div>
-            <pre id="preference-meta" class="code-block" aria-live="polite"></pre>
-            <pre id="preference-routing" class="code-block" aria-live="polite"></pre>
-            <div class="small" id="preference-status"></div>
           </section>
-        </section>
+
+          <!-- Contexts Tab -->
+          <section class="tab-panel" id="contexts-tab" aria-label="Context management">
+            <div class="panel">
+              <div class="section-header">
+                <h2>Knowledge Contexts</h2>
+                <div class="pill-row">
+                  <button class="minor" id="refresh-contexts">Refresh</button>
+                </div>
+              </div>
+              <p class="subtext">Create and manage knowledge contexts for RAG-powered conversations.</p>
+
+              <div class="divider"></div>
+
+              <h3>Create new context</h3>
+              <div class="input-grid">
+                <div class="field">
+                  <label for="new-context-name">Name</label>
+                  <input type="text" id="new-context-name" placeholder="My Project Docs" required />
+                </div>
+                <div class="field">
+                  <label for="new-context-description">Description</label>
+                  <input type="text" id="new-context-description" placeholder="Documentation for my project" />
+                </div>
+              </div>
+              <div class="pill-row mb-14">
+                <button class="primary" id="create-context-btn">Create Context</button>
+              </div>
+              <div id="context-create-status" class="small" role="status"></div>
+
+              <div class="divider"></div>
+
+              <h3>Your contexts</h3>
+              <div id="contexts-list" class="contexts-list">
+                <div class="empty">No contexts yet. Create one above.</div>
+              </div>
+
+              <div class="divider"></div>
+
+              <h3>Context details</h3>
+              <div id="context-details" class="context-details">
+                <div class="empty">Select a context to view details</div>
+              </div>
+            </div>
+          </section>
+
+          <!-- Artifacts Tab -->
+          <section class="tab-panel" id="artifacts-tab" aria-label="Artifact browser">
+            <div class="panel">
+              <div class="section-header">
+                <h2>Artifacts</h2>
+                <div class="pill-row">
+                  <button class="minor" id="refresh-artifacts">Refresh</button>
+                </div>
+              </div>
+              <p class="subtext">Browse and inspect system artifacts: workflows, policies, adapters, and tools.</p>
+
+              <div class="input-grid mb-14">
+                <div class="field compact">
+                  <label for="artifact-type-filter">Filter by type</label>
+                  <select id="artifact-type-filter">
+                    <option value="">All types</option>
+                    <option value="workflow">Workflows</option>
+                    <option value="policy">Policies</option>
+                    <option value="adapter">Adapters</option>
+                    <option value="tool">Tools</option>
+                  </select>
+                </div>
+                <div class="field compact">
+                  <label for="artifact-visibility-filter">Visibility</label>
+                  <select id="artifact-visibility-filter">
+                    <option value="">All</option>
+                    <option value="private">Private</option>
+                    <option value="shared">Shared</option>
+                    <option value="global">Global</option>
+                  </select>
+                </div>
+              </div>
+
+              <div id="artifacts-list" class="artifacts-list table-wrapper">
+                <div class="empty">No artifacts found</div>
+              </div>
+
+              <div class="divider"></div>
+
+              <h3>Artifact details</h3>
+              <div id="artifact-details" class="artifact-details">
+                <div class="empty">Select an artifact to view details</div>
+              </div>
+
+              <div class="divider"></div>
+
+              <h3>Version history</h3>
+              <div id="artifact-versions" class="artifact-versions">
+                <div class="empty">Select an artifact to view version history</div>
+              </div>
+            </div>
+          </section>
+
+          <!-- Settings Tab -->
+          <section class="tab-panel" id="settings-tab" aria-label="User settings">
+            <div class="panel">
+              <div class="section-header">
+                <h2>Settings</h2>
+              </div>
+              <p class="subtext">Configure your preferences and account settings.</p>
+
+              <div class="divider"></div>
+
+              <h3>Session information</h3>
+              <div class="settings-grid">
+                <div class="setting-item">
+                  <span class="setting-label">User ID</span>
+                  <span class="setting-value" id="setting-user-id">-</span>
+                </div>
+                <div class="setting-item">
+                  <span class="setting-label">Role</span>
+                  <span class="setting-value" id="setting-role">-</span>
+                </div>
+                <div class="setting-item">
+                  <span class="setting-label">Tenant</span>
+                  <span class="setting-value" id="setting-tenant">-</span>
+                </div>
+                <div class="setting-item">
+                  <span class="setting-label">Session ID</span>
+                  <span class="setting-value monospace" id="setting-session-id">-</span>
+                </div>
+              </div>
+
+              <div class="divider"></div>
+
+              <h3>Local storage</h3>
+              <p class="subtext">Draft messages are saved locally in your browser.</p>
+              <div class="pill-row">
+                <button class="minor" id="clear-drafts-btn">Clear saved drafts</button>
+                <button class="ghost" id="export-drafts-btn">Export drafts</button>
+              </div>
+              <div id="drafts-status" class="small" role="status"></div>
+
+              <div class="divider"></div>
+
+              <h3>Upload limits</h3>
+              <div class="settings-grid">
+                <div class="setting-item">
+                  <span class="setting-label">Max file size</span>
+                  <span class="setting-value" id="setting-max-upload">Loading...</span>
+                </div>
+                <div class="setting-item">
+                  <span class="setting-label">Allowed types</span>
+                  <span class="setting-value" id="setting-allowed-types">.txt, .md, .pdf, .json, .csv, .yaml</span>
+                </div>
+              </div>
+
+              <div class="divider"></div>
+
+              <h3>About</h3>
+              <div class="settings-grid">
+                <div class="setting-item">
+                  <span class="setting-label">Version</span>
+                  <span class="setting-value" id="setting-version">-</span>
+                </div>
+                <div class="setting-item">
+                  <span class="setting-label">Build</span>
+                  <span class="setting-value monospace" id="setting-build">-</span>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
       </main>
     </div>
   </body>
