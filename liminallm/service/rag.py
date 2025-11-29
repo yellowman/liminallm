@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence
 
@@ -9,6 +10,33 @@ from liminallm.service.embeddings import deterministic_embedding
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.postgres import PostgresStore
 from liminallm.storage.models import KnowledgeChunk
+
+
+# Default overlap per SPEC §2.5: "50 token overlap"
+DEFAULT_OVERLAP_TOKENS = 50
+
+
+def _simple_tokenize(text: str) -> List[str]:
+    """Simple word-based tokenizer for chunking.
+
+    Per SPEC §2.5: Uses token-based chunking. This is a simple whitespace/punctuation
+    tokenizer that approximates token boundaries for chunking purposes.
+    """
+    # Split on whitespace and punctuation while preserving meaningful tokens
+    return re.findall(r"\b\w+\b|[^\w\s]", text)
+
+
+def _detokenize(tokens: List[str]) -> str:
+    """Reconstruct text from tokens, handling spacing."""
+    if not tokens:
+        return ""
+    result = []
+    for i, token in enumerate(tokens):
+        # Add space before non-punctuation tokens (except first)
+        if i > 0 and re.match(r"\w", token):
+            result.append(" ")
+        result.append(token)
+    return "".join(result)
 
 
 class RAGService:
@@ -177,18 +205,52 @@ class RAGService:
         text: str,
         chunk_size: Optional[int] = None,
         source_path: Optional[str] = None,
+        overlap_tokens: Optional[int] = None,
     ) -> int:
+        """Ingest text into chunks using token-based sliding window with overlap.
+
+        Per SPEC §2.5: Uses token-based splitter (300-500 tokens with 50 token overlap).
+        This implementation:
+        - Tokenizes the input text
+        - Creates chunks with specified token count
+        - Applies overlap between consecutive chunks for context continuity
+        """
         if not hasattr(self.store, "add_chunks"):
             return 0
         lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
         blob = " ".join(lines)
         if not blob:
             return 0
-        chosen_chunk = max(chunk_size or self.default_chunk_size, 64)
+
+        # Tokenize the text per SPEC §2.5 requirement for token-based chunking
+        tokens = _simple_tokenize(blob)
+        if not tokens:
+            return 0
+
+        chosen_chunk_tokens = max(chunk_size or self.default_chunk_size, 64)
+        # Use default overlap if not specified (SPEC §2.5: 50 token overlap)
+        effective_overlap = overlap_tokens if overlap_tokens is not None else DEFAULT_OVERLAP_TOKENS
+        # Ensure overlap doesn't exceed chunk size
+        effective_overlap = min(effective_overlap, chosen_chunk_tokens // 2)
+        # Step size accounts for overlap
+        step_size = max(1, chosen_chunk_tokens - effective_overlap)
+
         chunks: List[KnowledgeChunk] = []
         default_path = source_path or "inline"
-        for idx in range(0, len(blob), chosen_chunk):
-            segment = blob[idx : idx + chosen_chunk]
+        chunk_index = 0
+
+        for start in range(0, len(tokens), step_size):
+            end = min(start + chosen_chunk_tokens, len(tokens))
+            chunk_tokens = tokens[start:end]
+
+            # Skip if we've reached the end and this would be a tiny fragment
+            if chunk_index > 0 and len(chunk_tokens) < effective_overlap:
+                break
+
+            segment = _detokenize(chunk_tokens)
+            if not segment.strip():
+                continue
+
             chunks.append(
                 KnowledgeChunk(
                     id=None,
@@ -196,10 +258,22 @@ class RAGService:
                     fs_path=default_path,
                     content=segment,
                     embedding=self.embed(segment),
-                    chunk_index=math.floor(idx / chosen_chunk),
-                    meta={"embedding_model_id": self.embedding_model_id},
+                    chunk_index=chunk_index,
+                    meta={
+                        "embedding_model_id": self.embedding_model_id,
+                        "token_count": len(chunk_tokens),
+                        "start_token": start,
+                        "end_token": end,
+                        "overlap_tokens": effective_overlap if chunk_index > 0 else 0,
+                    },
                 )
             )
+            chunk_index += 1
+
+            # Break if we've processed all tokens
+            if end >= len(tokens):
+                break
+
         if chunks:
             self.store.add_chunks(context_id, chunks)  # type: ignore[attr-defined]
         return len(chunks)

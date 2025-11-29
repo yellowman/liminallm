@@ -4,6 +4,7 @@ import base64
 import json
 import os
 import secrets
+import threading
 import uuid
 import hashlib
 import shutil
@@ -67,6 +68,8 @@ class MemoryStore:
         self.chunks: Dict[str, List[KnowledgeChunk]] = {}
         self._chunk_id_seq: int = 1
         self._artifact_version_seq: int = 1
+        # Thread lock for sequence counters to prevent race conditions
+        self._seq_lock = threading.Lock()
         self.preference_events: Dict[str, PreferenceEvent] = {}
         self.training_jobs: Dict[str, TrainingJob] = {}
         self.semantic_clusters: Dict[str, SemanticCluster] = {}
@@ -197,9 +200,16 @@ class MemoryStore:
         self._persist_state()
 
     def _next_artifact_version_id(self) -> int:
-        next_id = self._artifact_version_seq
-        self._artifact_version_seq += 1
-        return next_id
+        with self._seq_lock:
+            next_id = self._artifact_version_seq
+            self._artifact_version_seq += 1
+            return next_id
+
+    def _next_chunk_id(self) -> int:
+        with self._seq_lock:
+            next_id = self._chunk_id_seq
+            self._chunk_id_seq += 1
+            return next_id
 
     def _backfill_default_classifier_inputs(self) -> bool:
         """Ensure default workflow classifier passes the user message to the tool."""
@@ -1294,11 +1304,13 @@ class MemoryStore:
                 except ValueError:
                     chunk_id = None
             if not chunk_id or int(chunk_id) <= 0:
-                chunk.id = self._chunk_id_seq
-                self._chunk_id_seq += 1
+                # Use thread-safe method for ID assignment
+                chunk.id = self._next_chunk_id()
             else:
                 chunk.id = int(chunk_id)
-                self._chunk_id_seq = max(self._chunk_id_seq, chunk.id + 1)
+                # Update sequence counter safely
+                with self._seq_lock:
+                    self._chunk_id_seq = max(self._chunk_id_seq, chunk.id + 1)
             existing.append(chunk)
         self._persist_state()
 

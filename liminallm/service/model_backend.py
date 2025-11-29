@@ -46,7 +46,35 @@ logger = get_logger(__name__)
 
 
 def get_adapter_mode(adapter: dict) -> str:
-    """Extract adapter mode from schema, inferring from legacy fields if needed."""
+    """Extract adapter mode from schema, inferring from legacy fields if needed.
+
+    Per SPEC §5.0.1, adapter modes determine how adapters are applied during inference:
+
+    - LOCAL: Adapter has trained LoRA weights stored locally (fs_dir).
+      Requires local JAX/transformer backend. Best for fine-tuned behavior.
+
+    - REMOTE: Adapter is hosted by external provider (Together, LoRAX, etc.).
+      Uses remote_model_id or remote_adapter_id. Supports provider scaling.
+
+    - PROMPT: Adapter contributes only prompt/system instructions.
+      No LoRA weights needed. Useful for behavior modification via prompting.
+
+    - HYBRID: Combines LOCAL weights with PROMPT fallback.
+      Uses LoRA when available, prompt instructions otherwise.
+      DEFAULT for backwards compatibility: existing adapters without explicit
+      mode may have both weights and prompts, so HYBRID ensures both are used.
+
+    Mode selection priority:
+    1. Explicit 'mode' field in adapter or schema
+    2. Inference from 'backend' or 'provider' fields
+    3. Default to HYBRID (safest for legacy adapters)
+
+    Args:
+        adapter: Adapter dict with mode, backend, provider fields
+
+    Returns:
+        AdapterMode string (local, remote, prompt, hybrid)
+    """
     if not adapter:
         return AdapterMode.PROMPT
 
@@ -70,7 +98,10 @@ def get_adapter_mode(adapter: dict) -> str:
     if backend == "hybrid":
         return AdapterMode.HYBRID
 
-    return AdapterMode.HYBRID  # Default for backwards compatibility
+    # Default to HYBRID for backwards compatibility:
+    # Legacy adapters may have both LoRA weights and prompt instructions,
+    # so HYBRID ensures both mechanisms are available during inference.
+    return AdapterMode.HYBRID
 
 
 def filter_adapters_by_mode(adapters: List[dict], compatible_modes: set) -> List[dict]:
@@ -528,9 +559,13 @@ class ApiAdapterBackend:
                     adapter_ids.append(aid)
                     applied.append(f"{adapter.get('id', 'unknown')}:adapter_param")
                     if caps.gate_weights:
-                        weight = (
-                            adapter.get("weight") or adapter.get("gate_weight") or 1.0
-                        )
+                        # Use explicit None checks to handle weight=0.0 correctly
+                        # (0.0 is falsy in Python but is a valid weight for disabling adapters)
+                        weight = adapter.get("weight")
+                        if weight is None:
+                            weight = adapter.get("gate_weight")
+                        if weight is None:
+                            weight = 1.0
                         gate_weights.append(float(weight))
 
             # Mark dropped adapters
@@ -577,8 +612,14 @@ class ApiAdapterBackend:
             return []
 
         # Sort by weight/gate_weight descending
+        # Use explicit None checks to handle weight=0.0 correctly
         def get_weight(a: dict) -> float:
-            return float(a.get("weight") or a.get("gate_weight") or 1.0)
+            weight = a.get("weight")
+            if weight is None:
+                weight = a.get("gate_weight")
+            if weight is None:
+                weight = 1.0
+            return float(weight)
 
         sorted_adapters = sorted(adapters, key=get_weight, reverse=True)
         return sorted_adapters[:max_count]

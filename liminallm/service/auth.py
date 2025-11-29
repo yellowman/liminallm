@@ -749,10 +749,15 @@ class AuthService:
             try:
                 return await self.cache.is_refresh_revoked(jti)
             except Exception as exc:
+                # SECURITY: Default to revoked when cache is unavailable to prevent
+                # accepting potentially revoked tokens during Redis outages.
+                # This forces re-authentication rather than risking privilege escalation.
                 logger.warning(
-                    "check_revoked_refresh_token_failed", jti=jti, error=str(exc)
+                    "check_revoked_refresh_token_failed_defaulting_to_revoked",
+                    jti=jti,
+                    error=str(exc),
                 )
-                return False
+                return True
         return False
 
     def _role_allows(self, role: str, required: str) -> bool:

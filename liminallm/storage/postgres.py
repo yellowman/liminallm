@@ -2246,20 +2246,28 @@ class PostgresStore:
         limit: int = 4,
         filters: Optional[dict[str, Any]] = None,
         *,
-        user_id: Optional[str] = None,
+        user_id: str,  # REQUIRED per SPEC §12.2 - user isolation is mandatory
         tenant_id: Optional[str] = None,
     ) -> List[KnowledgeChunk]:
-        """Primary pgvector-backed retrieval over knowledge chunks."""
+        """Primary pgvector-backed retrieval over knowledge chunks.
+
+        SECURITY: user_id is required to enforce data isolation per SPEC §12.2.
+        All queries MUST be filtered by user_id to prevent cross-user data leakage.
+        """
 
         if not query_embedding or not context_ids:
+            return []
+        if not user_id:
+            # Defense in depth: reject if user_id somehow bypasses type checking
+            self.logger.error("search_chunks_pgvector_missing_user_id")
             return []
         where_clauses: list[str] = []
         params: list[Any] = []
         where_clauses.append("kc.context_id = ANY(%s)")
         params.append(list(context_ids))
-        if user_id:
-            where_clauses.append("ctx.owner_user_id = %s")
-            params.append(user_id)
+        # Always enforce user isolation - this is not optional
+        where_clauses.append("ctx.owner_user_id = %s")
+        params.append(user_id)
         if tenant_id:
             where_clauses.append("u.tenant_id = %s")
             params.append(tenant_id)

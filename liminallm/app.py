@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
 from pathlib import Path
-from typing import List
+from typing import Any, Dict, List
 
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,7 +16,11 @@ from liminallm.logging import get_logger
 
 logger = get_logger(__name__)
 
-app = FastAPI(title="LiminalLM Kernel", version="0.1.0")
+# Version info per SPEC §18
+__version__ = "0.1.0"
+__build__ = os.getenv("BUILD_SHA", "dev")
+
+app = FastAPI(title="LiminalLM Kernel", version=__version__)
 
 
 def _allowed_origins() -> List[str]:
@@ -118,8 +123,90 @@ async def serve_admin() -> FileResponse:
 
 
 @app.get("/healthz")
-async def health() -> dict:
-    return {"status": "ok"}
+async def health() -> Dict[str, Any]:
+    """Health check endpoint per SPEC §18.
+
+    Performs dependency checks for:
+    - Database connectivity
+    - Redis availability (if configured)
+    - Filesystem mount status
+
+    Reports build/version info.
+    """
+    from liminallm.service.runtime import get_runtime
+
+    checks: Dict[str, Dict[str, Any]] = {}
+    overall_healthy = True
+
+    # Version/build info per SPEC §18
+    version_info = {
+        "version": __version__,
+        "build": __build__,
+    }
+
+    # Database check
+    try:
+        runtime = get_runtime()
+        if hasattr(runtime.store, "verify_connection"):
+            runtime.store.verify_connection()
+            checks["database"] = {"status": "healthy"}
+        elif hasattr(runtime.store, "_connect"):
+            # Postgres store - try a simple query
+            with runtime.store._connect() as conn:
+                conn.execute("SELECT 1").fetchone()
+            checks["database"] = {"status": "healthy"}
+        else:
+            # Memory store - always healthy if runtime exists
+            checks["database"] = {"status": "healthy", "type": "memory"}
+    except Exception as exc:
+        logger.error("health_check_database_failed", error=str(exc))
+        checks["database"] = {"status": "unhealthy", "error": str(exc)}
+        overall_healthy = False
+
+    # Redis check (if configured)
+    try:
+        runtime = get_runtime()
+        if hasattr(runtime, "cache") and runtime.cache is not None:
+            runtime.cache.verify_connection()
+            checks["redis"] = {"status": "healthy"}
+        else:
+            checks["redis"] = {"status": "not_configured"}
+    except Exception as exc:
+        logger.error("health_check_redis_failed", error=str(exc))
+        checks["redis"] = {"status": "unhealthy", "error": str(exc)}
+        # Redis failure is degraded, not fatal
+        checks["redis"]["degraded"] = True
+
+    # Filesystem check
+    try:
+        runtime = get_runtime()
+        fs_root = getattr(runtime.store, "fs_root", None)
+        if fs_root:
+            fs_path = Path(fs_root)
+            if fs_path.exists() and fs_path.is_dir():
+                # Try to write/read a health check file
+                health_file = fs_path / ".health_check"
+                health_file.write_text(datetime.utcnow().isoformat())
+                health_file.read_text()
+                health_file.unlink(missing_ok=True)
+                checks["filesystem"] = {"status": "healthy", "path": str(fs_root)}
+            else:
+                checks["filesystem"] = {"status": "unhealthy", "error": "path not accessible"}
+                overall_healthy = False
+        else:
+            checks["filesystem"] = {"status": "not_configured"}
+    except Exception as exc:
+        logger.error("health_check_filesystem_failed", error=str(exc))
+        checks["filesystem"] = {"status": "unhealthy", "error": str(exc)}
+        overall_healthy = False
+
+    status = "healthy" if overall_healthy else "unhealthy"
+    return {
+        "status": status,
+        "checks": checks,
+        **version_info,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
 
 
 def create_app() -> FastAPI:

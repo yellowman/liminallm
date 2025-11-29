@@ -1044,7 +1044,9 @@ async def get_artifact(artifact_id: str, principal: AuthContext = Depends(get_us
 
 @router.get("/tools/specs", response_model=Envelope)
 async def list_tool_specs(
-    page: int = 1, page_size: int = 50, principal: AuthContext = Depends(get_user)
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(50, ge=1, le=200, description="Items per page"),
+    principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
     resolved_page_size = min(max(page_size, 1), 200)
@@ -1102,7 +1104,9 @@ async def get_tool_spec(artifact_id: str, principal: AuthContext = Depends(get_u
 
 @router.get("/workflows", response_model=Envelope)
 async def list_workflows(
-    page: int = 1, page_size: int = 50, principal: AuthContext = Depends(get_user)
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
+    page_size: int = Query(50, ge=1, le=200, description="Items per page"),
+    principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
     resolved_page_size = min(max(page_size, 1), 200)
@@ -1595,6 +1599,26 @@ async def upload_file(
         ):
             raise _http_error("validation_error", "invalid file path", status_code=400)
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Atomic idempotency: record intent BEFORE writing file
+        # This prevents duplicate file writes if idempotency storage fails after file write
+        # Per SPEC §18: Idempotency must work reliably for POST endpoints
+        pending_envelope = Envelope(
+            status="pending",
+            data={"fs_path": safe_filename, "context_id": context_id},
+            request_id=idem.request_id,
+        )
+        try:
+            await idem.store_result(pending_envelope, status="processing")
+        except Exception as exc:
+            # If we can't record idempotency, log but continue (degraded mode)
+            logger.warning(
+                "file_upload_idempotency_pre_record_failed",
+                error=str(exc),
+                request_id=idem.request_id,
+            )
+
+        # Now write the file
         dest_path.write_bytes(contents)
         chunk_count = None
         if context_id:
@@ -1607,6 +1631,8 @@ async def upload_file(
                 # Clean up file on any error (not just ConstraintViolation)
                 dest_path.unlink(missing_ok=True)
                 raise
+
+        # Update idempotency with final result
         resp = FileUploadResponse(
             fs_path=safe_filename, context_id=context_id, chunk_count=chunk_count
         )

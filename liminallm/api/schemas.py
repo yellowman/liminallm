@@ -8,12 +8,35 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
+_VALID_ERROR_CODES = frozenset({
+    "unauthorized",
+    "forbidden",
+    "not_found",
+    "rate_limited",
+    "validation_error",
+    "conflict",
+    "server_error",
+})
+
+
 class ErrorBody(BaseModel):
     """SPEC §18 error envelope body with stable code values."""
 
-    code: str  # stable codes: unauthorized, forbidden, not_found, rate_limited, validation_error, conflict, server_error
+    code: str = Field(
+        ...,
+        description="Stable error code per SPEC §18",
+    )
     message: str
     details: Optional[Any] = None  # object, array, or null
+
+    @field_validator("code")
+    @classmethod
+    def _validate_error_code(cls, value: str) -> str:
+        if value not in _VALID_ERROR_CODES:
+            raise ValueError(
+                f"Invalid error code '{value}'. Must be one of: {', '.join(sorted(_VALID_ERROR_CODES))}"
+            )
+        return value
 
 
 class Envelope(BaseModel):
