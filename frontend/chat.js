@@ -978,7 +978,7 @@ const selectContext = async (contextId) => {
         <div class="divider"></div>
         <h4>Recent chunks</h4>
         <div class="code-block">${chunks.slice(0, 5).map((c) =>
-          `[${escapeHtml(c.id.slice(0, 8))}] ${escapeHtml((c.text || '').slice(0, 100))}...`
+          `[${escapeHtml(String(c.id).slice(0, 8))}] ${escapeHtml((c.content || '').slice(0, 100))}...`
         ).join('\n\n')}</div>
       ` : ''}
     `;
@@ -1158,7 +1158,7 @@ const fetchArtifactVersions = async (artifactId) => {
         <tr>
           <td>v${v.version}</td>
           <td>${new Date(v.created_at).toLocaleString()}</td>
-          <td>${escapeHtml(v.change_summary || '-')}</td>
+          <td>${escapeHtml(v.change_note || '-')}</td>
         </tr>
       `)
       .join('');

@@ -249,6 +249,8 @@ class ArtifactResponse(_SchemaPayload):
     name: str
     description: str
     owner_user_id: Optional[str]
+    visibility: str = "private"
+    version: int = 1
     created_at: datetime
     updated_at: datetime
 

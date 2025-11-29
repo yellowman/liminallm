@@ -782,6 +782,7 @@ async def admin_list_adapters(principal: AuthContext = Depends(get_admin_user)):
                     description=a.description,
                     schema=a.schema,
                     owner_user_id=a.owner_user_id,
+                    visibility=getattr(a, "visibility", "private"),
                     created_at=a.created_at,
                     updated_at=a.updated_at,
                 )
@@ -1260,6 +1261,7 @@ async def list_artifacts(
             description=a.description,
             schema=a.schema,
             owner_user_id=a.owner_user_id,
+            visibility=getattr(a, "visibility", "private"),
             created_at=a.created_at,
             updated_at=a.updated_at,
         )
@@ -1292,6 +1294,7 @@ async def get_artifact(
         description=artifact.description,
         schema=artifact.schema,
         owner_user_id=artifact.owner_user_id,
+        visibility=getattr(artifact, "visibility", "private"),
         created_at=artifact.created_at,
         updated_at=artifact.updated_at,
     )
@@ -1322,6 +1325,7 @@ async def list_tool_specs(
             description=a.description,
             schema=a.schema,
             owner_user_id=a.owner_user_id,
+            visibility=getattr(a, "visibility", "private"),
             created_at=a.created_at,
             updated_at=a.updated_at,
         )
@@ -1355,6 +1359,7 @@ async def get_tool_spec(
         description=artifact.description,
         schema=artifact.schema,
         owner_user_id=artifact.owner_user_id,
+        visibility=getattr(artifact, "visibility", "private"),
         created_at=artifact.created_at,
         updated_at=artifact.updated_at,
     )
@@ -1385,6 +1390,7 @@ async def list_workflows(
             description=a.description,
             schema=a.schema,
             owner_user_id=a.owner_user_id,
+            visibility=getattr(a, "visibility", "private"),
             created_at=a.created_at,
             updated_at=a.updated_at,
         )
@@ -1540,6 +1546,7 @@ async def create_artifact(
             description=artifact.description,
             schema=artifact.schema,
             owner_user_id=artifact.owner_user_id,
+            visibility=getattr(artifact, "visibility", "private"),
             created_at=artifact.created_at,
             updated_at=artifact.updated_at,
         )
@@ -1584,6 +1591,7 @@ async def patch_artifact(
         description=artifact.description,
         schema=artifact.schema,
         owner_user_id=artifact.owner_user_id,
+        visibility=getattr(artifact, "visibility", "private"),
         created_at=artifact.created_at,
         updated_at=artifact.updated_at,
     )

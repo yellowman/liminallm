@@ -1597,7 +1597,7 @@ that’s the whole point: minimal glue, maximal evolution.
 - **request headers**: `Authorization: Bearer`, `X-Tenant-ID`, `session_id`, `Idempotency-Key` (auto-generated UUID).
 - **envelope handling**: parse `{ status, data, error }` responses; extract error messages from `error.message` or `detail`.
 - **retry logic**: exponential backoff (400ms base, 3 retries) for 5xx errors; no retry on 4xx.
-- **WebSocket protocol**: connect to `/v1/chat/stream`; send auth + message in initial frame; handle `token`, `message_done`, `error` events.
+- **WebSocket protocol**: connect to `/v1/chat/stream`; send auth + message in initial frame `{ access_token, session_id, tenant_id, message, conversation_id?, context_id?, workflow_id? }`; receive complete response envelope `{ status, data: ChatResponse }`; token streaming planned for future enhancement.
 
 ### 17.12 styling system
 
@@ -1616,7 +1616,7 @@ the following are treated as constants the kernel must honor; LLM edits happen o
   - success: `{ "status": "ok", "data": <payload>, "request_id": "uuid" }`; error: `{ "status": "error", "error": { "code": "string", "message": "string", "details": <object|array|null> }, "request_id": "uuid" }`.
   - pagination: either `{ data: [...], next_cursor: "opaque" }` or `{ page, page_size, total }`; choose per-endpoint but keep stable once published.
   - idempotency: POST endpoints that create side effects (`/v1/chat`, `/v1/tools/run`, `/v1/artifacts`) accept `Idempotency-Key`; server replays prior response within a 24h TTL and returns `409` if the prior attempt is still running.
-  - auth header is `Authorization: Bearer <token>` in REST; WebSockets require an initial `{ "type": "auth", "session": "<session_id or bearer token>" }` frame before any `chat_start` frames; unauthenticated sockets close with code `4401`.
+  - auth header is `Authorization: Bearer <token>` in REST; WebSockets accept inline auth in the initial message frame: `{ "access_token": "...", "session_id": "...", "tenant_id": "...", "message": "...", ... }`; unauthenticated sockets close with code `4401`.
   - streaming events: `token`, `message_done`, `error`, `cancel_ack`, `trace` (router/workflow trace snapshot). SSE uses `event:` labels; WebSockets wrap as `{ "event": "token", "data": "..." }`.
   - minimal REST surface (kernel-stable):
     - `POST /v1/auth/login { email, password, mfa_code? } → { access_token, refresh_token, user }`.
