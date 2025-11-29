@@ -2074,7 +2074,7 @@ async def list_messages(
 ):
     runtime = get_runtime()
     paging = _get_pagination_settings(runtime)
-    resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"]) if limit else None
+    resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"])
     _get_owned_conversation(runtime, conversation_id, principal)
     msgs = runtime.store.list_messages(
         conversation_id, limit=resolved_limit, user_id=principal.user_id
@@ -2425,6 +2425,21 @@ async def websocket_chat(ws: WebSocket):
                 request_id=request_id,
             )
             await _store_idempotency_result("chat:ws", user_id, idempotency_key, envelope)
+
+            # Send final event with message_id and conversation_id to client
+            await ws.send_json({
+                "event": "streaming_complete",
+                "data": {
+                    "message_id": assistant_msg.id,
+                    "conversation_id": convo_id,
+                    "adapters": adapter_names,
+                    "adapter_gates": orchestration_dict.get("adapter_gates", []),
+                    "usage": orchestration_dict.get("usage", {}),
+                    "context_snippets": orchestration_dict.get("context_snippets", []),
+                    "routing_trace": orchestration_dict.get("routing_trace", []),
+                    "workflow_trace": orchestration_dict.get("workflow_trace", []),
+                }
+            })
 
         else:
             # Non-streaming mode: single response (legacy behavior)
