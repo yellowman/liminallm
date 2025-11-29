@@ -1342,15 +1342,16 @@ response:
 - `POST /v1/files/upload` — multipart; stores under `/users/{u}/files`; returns `fs_path`; optional `context_id` form field triggers chunking + embedding ingestion into that knowledge context.
 - `GET /v1/files` — list user files (paginated).
 - `POST /v1/contexts` — create `knowledge_context`, attach file paths.
-- `GET /v1/contexts` — list contexts + stats; supports `?owner=me|global`.
+- `GET /v1/contexts?limit=N` — list contexts + stats; supports `?owner=me|global`.
+- `GET /v1/contexts/{id}/chunks?limit=N` — list chunks for a context; default limit 100, max 500.
 
 ### 13.4 artifacts
 
-- `GET /v1/artifacts?type=workflow|policy|adapter|tool` — list accessible artifacts.
+- `GET /v1/artifacts?type=workflow|policy|adapter|tool&visibility=private|shared|global&limit=N&page=N&page_size=N` — list accessible artifacts; `limit` is accepted as alias for `page_size`.
 - `GET /v1/artifacts/{id}` — fetch current version + metadata.
 - `POST /v1/artifacts` — create; validates `schema.kind` using per-kind schema.
 - `PATCH /v1/artifacts/{id}` — update via JSON Patch; writes new `artifact_version`.
-- `GET /v1/artifacts/{id}/versions` — list versions.
+- `GET /v1/artifacts/{id}/versions?limit=N` — list versions; default limit 100, max 500.
 
 ### 13.5 config ops
 
@@ -1614,7 +1615,7 @@ the following are treated as constants the kernel must honor; LLM edits happen o
 
 - **API envelopes & transports**
   - success: `{ "status": "ok", "data": <payload>, "request_id": "uuid" }`; error: `{ "status": "error", "error": { "code": "string", "message": "string", "details": <object|array|null> }, "request_id": "uuid" }`.
-  - pagination: either `{ data: [...], next_cursor: "opaque" }` or `{ page, page_size, total }`; choose per-endpoint but keep stable once published.
+  - pagination: either `{ data: [...], next_cursor: "opaque" }` or `{ page, page_size, total }`; choose per-endpoint but keep stable once published. For simple bounded queries, `limit` is accepted as an alias for `page_size` (defaults to 100, max 500).
   - idempotency: POST endpoints that create side effects (`/v1/chat`, `/v1/tools/run`, `/v1/artifacts`) accept `Idempotency-Key`; server replays prior response within a 24h TTL and returns `409` if the prior attempt is still running.
   - auth header is `Authorization: Bearer <token>` in REST; WebSockets accept inline auth in the initial message frame: `{ "access_token": "...", "session_id": "...", "tenant_id": "...", "message": "...", ... }`; unauthenticated sockets close with code `4401`.
   - streaming events: `token`, `message_done`, `error`, `cancel_ack`, `trace` (router/workflow trace snapshot). SSE uses `event:` labels; WebSockets wrap as `{ "event": "token", "data": "..." }`.
@@ -1623,7 +1624,7 @@ the following are treated as constants the kernel must honor; LLM edits happen o
     - `POST /v1/auth/refresh { refresh_token } → { access_token, refresh_token }`.
     - `POST /v1/chat { conversation_id?, message, context_ids?, artifact_ids?, stream: bool } → { conversation_id, message_id, stream_id? }`; stream events carry `{ event, data, request_id }` with `trace` payloads showing router/workflow steps.
     - `POST /v1/chat/cancel { request_id }`.
-    - `GET /v1/conversations?cursor=...` and `GET /v1/conversations/{id}/messages?cursor=...` return paged lists.
+    - `GET /v1/conversations?limit=N` returns paginated conversation list; `GET /v1/conversations/{id}` returns single conversation; `GET /v1/conversations/{id}/messages?limit=N` returns messages.
     - `POST /v1/artifacts { type, name, schema, visibility?, fs_path? }` and `PATCH /v1/artifacts/{id}`; both emit a new `artifact_version` row and validate JSON Schema against `type` registry.
     - `POST /v1/config/patches { artifact_id, patch, justification }` queues a ConfigOps proposal; `POST /v1/config/apply { patch_id }` (admin-only) applies a validated patch.
     - `POST /v1/tools/run { tool_id, input }` executes a tool node outside a workflow (for testing) with the same retry/timeout caps.
