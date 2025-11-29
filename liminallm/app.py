@@ -180,7 +180,8 @@ async def health() -> Dict[str, Any]:
             checks["database"] = {"status": "healthy", "type": "memory"}
     except Exception as exc:
         logger.error("health_check_database_failed", error=str(exc))
-        checks["database"] = {"status": "unhealthy", "error": str(exc)}
+        # SECURITY: Don't expose internal error details in response
+        checks["database"] = {"status": "unhealthy"}
         overall_healthy = False
 
     # Redis check (if configured)
@@ -193,9 +194,8 @@ async def health() -> Dict[str, Any]:
             checks["redis"] = {"status": "not_configured"}
     except Exception as exc:
         logger.error("health_check_redis_failed", error=str(exc))
-        checks["redis"] = {"status": "unhealthy", "error": str(exc)}
-        # Redis failure is degraded, not fatal
-        checks["redis"]["degraded"] = True
+        # SECURITY: Don't expose internal error details in response
+        checks["redis"] = {"status": "unhealthy", "degraded": True}
 
     # Filesystem check
     try:
@@ -209,15 +209,17 @@ async def health() -> Dict[str, Any]:
                 health_file.write_text(datetime.utcnow().isoformat())
                 health_file.read_text()
                 health_file.unlink(missing_ok=True)
-                checks["filesystem"] = {"status": "healthy", "path": str(fs_root)}
+                # SECURITY: Don't expose filesystem paths in response
+                checks["filesystem"] = {"status": "healthy"}
             else:
-                checks["filesystem"] = {"status": "unhealthy", "error": "path not accessible"}
+                checks["filesystem"] = {"status": "unhealthy"}
                 overall_healthy = False
         else:
             checks["filesystem"] = {"status": "not_configured"}
     except Exception as exc:
         logger.error("health_check_filesystem_failed", error=str(exc))
-        checks["filesystem"] = {"status": "unhealthy", "error": str(exc)}
+        # SECURITY: Don't expose internal error details in response
+        checks["filesystem"] = {"status": "unhealthy"}
         overall_healthy = False
 
     status = "healthy" if overall_healthy else "unhealthy"

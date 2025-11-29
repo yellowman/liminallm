@@ -563,6 +563,13 @@ async def oauth_start(
     Client should redirect user to this URL to complete authentication.
     """
     runtime = get_runtime()
+    # Rate limit OAuth start to prevent state token exhaustion
+    await _enforce_rate_limit(
+        runtime,
+        f"oauth:start:{provider}",
+        limit=20,
+        window_seconds=60,
+    )
     start = await runtime.auth.start_oauth(
         provider, redirect_uri=body.redirect_uri, tenant_id=body.tenant_id
     )
@@ -579,10 +586,10 @@ async def oauth_start(
 @router.get("/auth/oauth/{provider}/callback", response_model=Envelope, tags=["auth"])
 async def oauth_callback(
     provider: str = Path(..., description="OAuth provider"),
-    code: str = Query(..., description="Authorization code from OAuth provider"),
-    state: str = Query(..., description="State parameter for CSRF protection"),
+    code: str = Query(..., max_length=512, description="Authorization code from OAuth provider"),
+    state: str = Query(..., max_length=128, description="State parameter for CSRF protection"),
     response: Response = ...,
-    tenant_id: Optional[str] = Query(None, description="Optional tenant ID"),
+    tenant_id: Optional[str] = Query(None, max_length=128, description="Optional tenant ID"),
 ):
     """Complete OAuth authentication flow.
 
@@ -590,6 +597,13 @@ async def oauth_callback(
     Called by OAuth provider after user authorizes the application.
     """
     runtime = get_runtime()
+    # Rate limit OAuth callback to prevent code brute-forcing
+    await _enforce_rate_limit(
+        runtime,
+        f"oauth:callback:{provider}",
+        limit=10,
+        window_seconds=60,
+    )
     user, session, tokens = await runtime.auth.complete_oauth(
         provider, code, state, tenant_id=tenant_id
     )
@@ -874,6 +888,13 @@ async def request_reset(body: PasswordResetRequest):
 @router.post("/auth/reset/confirm", response_model=Envelope, tags=["auth"])
 async def confirm_reset(body: PasswordResetConfirm):
     runtime = get_runtime()
+    # Rate limit to prevent token brute-forcing
+    await _enforce_rate_limit(
+        runtime,
+        "reset:confirm",
+        limit=5,
+        window_seconds=300,
+    )
     ok = await runtime.auth.complete_password_reset(body.token, body.new_password)
     if not ok:
         raise _http_error("validation_error", "invalid token", status_code=400)
@@ -883,6 +904,13 @@ async def confirm_reset(body: PasswordResetConfirm):
 @router.post("/auth/request_email_verification", response_model=Envelope, tags=["auth"])
 async def request_email_verification(principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
+    # Rate limit to prevent email spam
+    await _enforce_rate_limit(
+        runtime,
+        f"verify:request:{principal.user_id}",
+        limit=5,
+        window_seconds=300,
+    )
     user = runtime.store.get_user(principal.user_id)
     if not user:
         raise _http_error("not_found", "user not found", status_code=404)
@@ -893,6 +921,13 @@ async def request_email_verification(principal: AuthContext = Depends(get_user))
 @router.post("/auth/verify_email", response_model=Envelope, tags=["auth"])
 async def verify_email(body: EmailVerificationRequest):
     runtime = get_runtime()
+    # Rate limit to prevent token brute-forcing
+    await _enforce_rate_limit(
+        runtime,
+        "verify:email",
+        limit=10,
+        window_seconds=300,
+    )
     ok = await runtime.auth.complete_email_verification(body.token)
     if not ok:
         raise _http_error("validation_error", "invalid token", status_code=400)
@@ -910,12 +945,19 @@ async def logout(
         ctx = await runtime.auth.authenticate(
             authorization, session_id, allow_pending_mfa=True
         )
-        target_session = session_id or (ctx.session_id if ctx else None)
-        if not target_session:
+        if not ctx:
             raise _http_error("unauthorized", "invalid session", status_code=401)
-        await runtime.auth.revoke(target_session)
-    response.delete_cookie("session_id", path="/")
-    response.delete_cookie("refresh_token", path="/")
+        # SECURITY: Only allow revoking the authenticated user's own session
+        target_session = session_id or ctx.session_id
+        if target_session and target_session != ctx.session_id:
+            # Verify session ownership before revoking
+            sess = runtime.store.get_session(target_session)
+            if not sess or sess.user_id != ctx.user_id:
+                raise _http_error("forbidden", "cannot revoke other user sessions", status_code=403)
+        if target_session:
+            await runtime.auth.revoke(target_session)
+    response.delete_cookie("session_id", path="/", secure=True, samesite="lax")
+    response.delete_cookie("refresh_token", path="/", secure=True, samesite="lax")
     return Envelope(status="ok", data={"message": "session revoked"})
 
 
@@ -1453,10 +1495,9 @@ async def create_artifact(
             raise BadRequestError("artifact schema keys must be strings")
         try:
             json.dumps(body.schema)
-        except (TypeError, ValueError) as exc:
-            raise BadRequestError(
-                "artifact schema must be JSON serializable", detail={"error": str(exc)}
-            )
+        except (TypeError, ValueError):
+            # SECURITY: Don't expose internal error details
+            raise BadRequestError("artifact schema must be JSON serializable")
         schema_kind = body.schema.get("kind")
         if schema_kind is not None and not isinstance(schema_kind, str):
             raise BadRequestError(
@@ -1773,8 +1814,8 @@ async def get_file_limits(principal: AuthContext = Depends(get_user)):
 @router.post("/files/upload", response_model=Envelope, tags=["files"])
 async def upload_file(
     file: UploadFile = File(...),
-    context_id: Optional[str] = Form(None),
-    chunk_size: Optional[int] = Form(None),
+    context_id: Optional[str] = Form(None, max_length=255),
+    chunk_size: Optional[int] = Form(None, ge=64, le=4000),
     principal: AuthContext = Depends(get_user),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
@@ -1831,11 +1872,11 @@ async def upload_file(
         )
         try:
             await idem.store_result(pending_envelope, status="processing")
-        except Exception as exc:
+        except Exception:
             # If we can't record idempotency, log but continue (degraded mode)
+            # SECURITY: Don't log exception details that may contain sensitive info
             logger.warning(
                 "file_upload_idempotency_pre_record_failed",
-                error=str(exc),
                 request_id=idem.request_id,
             )
 
@@ -2169,7 +2210,9 @@ async def websocket_chat(ws: WebSocket):
     except WebSocketDisconnect:
         return
     except Exception:
-        logger.exception(
+        # SECURITY: Use logger.error instead of logger.exception to avoid
+        # exposing full stack traces that may reveal implementation details
+        logger.error(
             "unhandled_websocket_error",
             user_id=user_id,
             conversation_id=convo_id,

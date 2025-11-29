@@ -101,7 +101,7 @@ class SignupRequest(BaseModel):
     email: str
     password: str
     handle: Optional[str] = Field(default=None, max_length=64)
-    tenant_id: Optional[str] = None
+    tenant_id: Optional[str] = Field(default=None, max_length=128)
 
     @field_validator("email")
     @classmethod
@@ -134,8 +134,8 @@ class AuthResponse(BaseModel):
 class LoginRequest(BaseModel):
     email: str
     password: str
-    mfa_code: Optional[str] = None
-    tenant_id: Optional[str] = None
+    mfa_code: Optional[str] = Field(default=None, max_length=10)
+    tenant_id: Optional[str] = Field(default=None, max_length=128)
 
     @field_validator("email")
     @classmethod
@@ -144,13 +144,13 @@ class LoginRequest(BaseModel):
 
 
 class TokenRefreshRequest(BaseModel):
-    refresh_token: str
-    tenant_id: Optional[str] = None
+    refresh_token: str = Field(..., max_length=2048)
+    tenant_id: Optional[str] = Field(default=None, max_length=128)
 
 
 class OAuthStartRequest(BaseModel):
-    redirect_uri: Optional[str] = None
-    tenant_id: Optional[str] = None
+    redirect_uri: Optional[str] = Field(default=None, max_length=2048)
+    tenant_id: Optional[str] = Field(default=None, max_length=128)
 
 
 class OAuthStartResponse(BaseModel):
@@ -160,12 +160,12 @@ class OAuthStartResponse(BaseModel):
 
 
 class MFARequest(BaseModel):
-    session_id: str
+    session_id: str = Field(..., max_length=128)
 
 
 class MFAVerifyRequest(BaseModel):
-    session_id: str
-    code: str
+    session_id: str = Field(..., max_length=128)
+    code: str = Field(..., max_length=10)
 
 
 class PasswordResetRequest(BaseModel):
@@ -178,7 +178,7 @@ class PasswordResetRequest(BaseModel):
 
 
 class PasswordResetConfirm(BaseModel):
-    token: str
+    token: str = Field(..., max_length=256)
     new_password: str
 
     @field_validator("new_password")
@@ -192,7 +192,7 @@ class PasswordResetConfirm(BaseModel):
 
 
 class EmailVerificationRequest(BaseModel):
-    token: str
+    token: str = Field(..., max_length=256)
 
 
 class ChatMessage(BaseModel):
@@ -327,6 +327,11 @@ class ConfigPatchRequest(BaseModel):
 
         if not isinstance(ops, list):
             raise ValueError("patch operations must be an array")
+
+        # SECURITY: Limit number of operations to prevent DoS via resource exhaustion
+        MAX_PATCH_OPS = 100
+        if len(ops) > MAX_PATCH_OPS:
+            raise ValueError(f"patch contains too many operations (max {MAX_PATCH_OPS})")
 
         for i, op in enumerate(ops):
             if not isinstance(op, dict):
