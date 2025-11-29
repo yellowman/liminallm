@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 
 from liminallm.api.routes import get_admin_user, router
 from liminallm.api.error_handling import register_exception_handlers
-from liminallm.logging import get_logger
+from liminallm.logging import get_logger, set_correlation_id
 
 logger = get_logger(__name__)
 
@@ -58,8 +58,28 @@ app.add_middleware(
         "session_id",
         "Idempotency-Key",
         "X-CSRF-Token",
+        "X-Request-ID",  # For correlation ID tracing per SPEC §15.2
     ],
 )
+
+
+@app.middleware("http")
+async def add_correlation_id(request, call_next):
+    """Add correlation ID to each request for tracing per SPEC §15.2.
+
+    Correlation IDs enable request tracing across logs. The ID is:
+    1. Extracted from X-Request-ID header if provided by client
+    2. Otherwise generated as a new UUID
+
+    The correlation ID is:
+    - Set in context for structured logging
+    - Returned in X-Request-ID response header for client tracing
+    """
+    client_request_id = request.headers.get("X-Request-ID")
+    correlation_id = set_correlation_id(client_request_id)
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = correlation_id
+    return response
 
 
 @app.middleware("http")
