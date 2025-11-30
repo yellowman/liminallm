@@ -6,7 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
-from fastapi import Depends, FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -258,6 +258,66 @@ async def health() -> Dict[str, Any]:
         **version_info,
         "timestamp": datetime.utcnow().isoformat(),
     }
+
+
+@app.get("/metrics", response_class=Response)
+async def metrics() -> Response:
+    """Prometheus-compatible metrics endpoint.
+
+    Exposes application metrics in Prometheus text format for monitoring.
+    """
+    from liminallm.service.runtime import get_runtime
+
+    lines = []
+
+    # Application info
+    lines.append('# HELP liminallm_info Application version info')
+    lines.append('# TYPE liminallm_info gauge')
+    lines.append(f'liminallm_info{{version="{__version__}",build="{__build__}"}} 1')
+
+    try:
+        runtime = get_runtime()
+
+        # User count
+        if hasattr(runtime.store, "list_users"):
+            try:
+                all_users = runtime.store.list_users(limit=10000)
+                user_count = len(all_users)
+                lines.append('# HELP liminallm_users_total Total number of users')
+                lines.append('# TYPE liminallm_users_total gauge')
+                lines.append(f'liminallm_users_total {user_count}')
+            except Exception:
+                pass
+
+        # Active sessions (if Redis available)
+        if hasattr(runtime, "cache") and runtime.cache is not None:
+            lines.append('# HELP liminallm_cache_available Redis cache availability')
+            lines.append('# TYPE liminallm_cache_available gauge')
+            lines.append('liminallm_cache_available 1')
+        else:
+            lines.append('# HELP liminallm_cache_available Redis cache availability')
+            lines.append('# TYPE liminallm_cache_available gauge')
+            lines.append('liminallm_cache_available 0')
+
+        # Database status
+        db_healthy = 0
+        try:
+            if hasattr(runtime.store, "_connect"):
+                with runtime.store._connect() as conn:
+                    conn.execute("SELECT 1").fetchone()
+                db_healthy = 1
+            else:
+                db_healthy = 1  # Memory store
+        except Exception:
+            pass
+        lines.append('# HELP liminallm_database_healthy Database connection health')
+        lines.append('# TYPE liminallm_database_healthy gauge')
+        lines.append(f'liminallm_database_healthy {db_healthy}')
+
+    except Exception as exc:
+        logger.error("metrics_collection_failed", error=str(exc))
+
+    return Response(content="\n".join(lines) + "\n", media_type="text/plain")
 
 
 def create_app() -> FastAPI:

@@ -197,13 +197,7 @@ const createCitationModal = () => {
   document.body.appendChild(modal);
 };
 
-// Close citation modal on escape key
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') {
-    const modal = document.getElementById('citation-modal');
-    if (modal) modal.classList.remove('active');
-  }
-});
+// Escape key handler moved to initEventListeners() for consistent initialization
 
 const randomIdempotencyKey = () => {
   if (window.crypto?.randomUUID) return window.crypto.randomUUID();
@@ -1409,7 +1403,7 @@ const sendMessage = async (event) => {
     return new Promise((resolve, reject) => {
       let settled = false;
       let streamingMsg = null;
-      let messageDoneData = null;
+      let messageDoneData = {};
 
       const cleanup = () => {
         ws.removeEventListener('message', handleMessage);
@@ -1512,7 +1506,7 @@ const sendMessage = async (event) => {
           settled = true;
           cleanup();
           // If we got message_done but not streaming_complete, resolve with what we have
-          if (messageDoneData) {
+          if (Object.keys(messageDoneData).length > 0) {
             if (streamingMsg) streamingMsg.finalize('');
             resolve(messageDoneData);
           } else {
@@ -3814,6 +3808,14 @@ const initEventListeners = () => {
   if (voiceOutputBtn) {
     voiceOutputBtn.addEventListener('click', readLastResponse);
   }
+
+  // Close citation modal on escape key
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      const modal = document.getElementById('citation-modal');
+      if (modal) modal.classList.remove('active');
+    }
+  });
 };
 
 // =============================================================================

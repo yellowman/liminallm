@@ -2654,11 +2654,21 @@ async def add_context_source(
                 recursive=body.recursive,
             )
         except Exception as exc:
+            # Clean up the source record since ingestion failed
             logger.warning(
                 "context_source_ingest_failed",
                 context_id=context_id,
                 fs_path=body.fs_path,
                 error=str(exc),
+            )
+            try:
+                runtime.store.delete_context_source(source.id)
+            except Exception:
+                pass  # Best effort cleanup
+            raise _http_error(
+                "ingest_failed",
+                f"Failed to index source: {exc}",
+                status_code=500,
             )
 
         envelope = Envelope(
