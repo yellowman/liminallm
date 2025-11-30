@@ -411,6 +411,20 @@ class ConversationListResponse(BaseModel):
     next_page: Optional[int] = Field(default=None, description="Next page number")
 
 
+class CreateConversationRequest(BaseModel):
+    title: Optional[str] = Field(default=None, max_length=255)
+    context_id: Optional[str] = Field(default=None, max_length=255)
+
+
+class CreateConversationResponse(BaseModel):
+    id: str
+    created_at: datetime
+    updated_at: datetime
+    title: Optional[str]
+    status: str
+    active_context_id: Optional[str]
+
+
 class KnowledgeContextRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     description: str = Field(..., max_length=2000)

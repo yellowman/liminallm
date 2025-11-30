@@ -50,6 +50,8 @@ from liminallm.api.schemas import (
     ConversationListResponse,
     ConversationMessagesResponse,
     ConversationSummary,
+    CreateConversationRequest,
+    CreateConversationResponse,
     EmailVerificationRequest,
     Envelope,
     FileUploadResponse,
@@ -1092,6 +1094,12 @@ async def disable_mfa(body: MFADisableRequest, principal: AuthContext = Depends(
         raise _http_error("unauthorized", "invalid MFA code", status_code=401)
     # Disable MFA by setting enabled=False
     runtime.store.set_user_mfa_secret(principal.user_id, mfa_cfg.secret, enabled=False)
+
+    # SECURITY: Revoke all other sessions to force re-authentication
+    await runtime.auth.revoke_all_user_sessions(
+        principal.user_id, except_session_id=principal.session_id
+    )
+
     return Envelope(status="ok", data={"status": "disabled"})
 
 
@@ -1289,6 +1297,11 @@ async def change_password(
     # Save new password
     runtime.auth.save_password(principal.user_id, body.new_password)
 
+    # SECURITY: Revoke all other sessions to force re-authentication
+    await runtime.auth.revoke_all_user_sessions(
+        principal.user_id, except_session_id=principal.session_id
+    )
+
     return Envelope(status="ok", data={"status": "changed"})
 
 
@@ -1381,7 +1394,7 @@ async def chat(
                     "invalid base64-encoded audio payload",
                     status_code=400,
                 ) from exc
-            transcript = runtime.voice.transcribe(audio_bytes, user_id=user_id) or {}
+            transcript = await runtime.voice.transcribe(audio_bytes, user_id=user_id) or {}
             user_content = transcript.get("transcript") or transcript.get("text")
             if not user_content:
                 raise _http_error(
@@ -2268,6 +2281,17 @@ async def get_config(principal: AuthContext = Depends(get_admin_user)):
             "api_key",
             "private",
             "auth",
+            "dsn",
+            "connection_string",
+            "bearer",
+            "access_token",
+            "refresh_token",
+            "signing",
+            "encryption",
+            "smtp_password",
+            "oauth_client_secret",
+            "jwt_secret",
+            "hash_salt",
         )
         sanitized = {}
         for k, v in data.items():
@@ -2452,9 +2476,56 @@ async def list_messages(
     )
 
 
+@router.post("/conversations", response_model=Envelope, status_code=201, tags=["conversations"])
+async def create_conversation(
+    body: CreateConversationRequest,
+    principal: AuthContext = Depends(get_user),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+):
+    """Create a new conversation.
+
+    Allows creating an empty conversation that can later be populated
+    with messages via the chat endpoint.
+    """
+    runtime = get_runtime()
+    async with IdempotencyGuard(
+        "conversations:create", principal.user_id, idempotency_key, require=False
+    ) as idem:
+        if idem.cached:
+            return idem.cached
+        await _enforce_rate_limit(
+            runtime,
+            f"write:{principal.user_id}",
+            runtime.settings.write_rate_limit_per_minute,
+            60,
+        )
+        # Validate context_id if provided
+        if body.context_id:
+            _get_owned_context(runtime, body.context_id, principal)
+        conversation = runtime.store.create_conversation(
+            user_id=principal.user_id,
+            title=body.title,
+            active_context_id=body.context_id,
+        )
+        response = Envelope(
+            status="ok",
+            data=CreateConversationResponse(
+                id=conversation.id,
+                created_at=conversation.created_at,
+                updated_at=conversation.updated_at,
+                title=conversation.title,
+                status=conversation.status,
+                active_context_id=conversation.active_context_id,
+            ),
+        )
+        idem.result = response
+        return response
+
+
 @router.get("/conversations", response_model=Envelope, tags=["conversations"])
 async def list_conversations(
     limit: Optional[int] = Query(None, ge=1, description="Maximum conversations to return"),
+    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
@@ -2466,7 +2537,13 @@ async def list_conversations(
     )
     paging = _get_pagination_settings(runtime)
     resolved_limit = min(limit or paging["default_conversations_limit"], paging["max_page_size"])
-    convs = runtime.store.list_conversations(principal.user_id, limit=resolved_limit)
+    # Fetch one extra to determine if more items exist
+    convs = runtime.store.list_conversations(
+        principal.user_id, limit=resolved_limit + 1, offset=(page - 1) * resolved_limit
+    )
+    has_next = len(convs) > resolved_limit
+    if has_next:
+        convs = convs[:resolved_limit]
     items = [
         ConversationSummary(
             id=c.id,
@@ -2478,7 +2555,14 @@ async def list_conversations(
         )
         for c in convs
     ]
-    return Envelope(status="ok", data=ConversationListResponse(items=items))
+    return Envelope(
+        status="ok",
+        data=ConversationListResponse(
+            items=items,
+            has_next=has_next,
+            next_page=page + 1 if has_next else None,
+        ),
+    )
 
 
 @router.get("/conversations/{conversation_id}", response_model=Envelope, tags=["conversations"])

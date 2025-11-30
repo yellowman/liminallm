@@ -271,6 +271,23 @@ const ALLOWED_UPLOAD_EXTENSIONS = ['.txt', '.md', '.markdown', '.pdf', '.json', 
 
 const getUploadLimit = () => uploadLimitBytes || DEFAULT_UPLOAD_BYTES;
 
+/**
+ * Create a debounced version of a function.
+ * @param {Function} fn - Function to debounce
+ * @param {number} waitMs - Delay in milliseconds
+ * @returns {Function} Debounced function
+ */
+const debounce = (fn, waitMs) => {
+  let timeoutId = null;
+  return (...args) => {
+    if (timeoutId) clearTimeout(timeoutId);
+    timeoutId = setTimeout(() => {
+      timeoutId = null;
+      fn(...args);
+    }, waitMs);
+  };
+};
+
 const authHeaders = (idempotencyKey) => {
   const h = {};
   if (state.accessToken) h['Authorization'] = `Bearer ${state.accessToken}`;
@@ -287,6 +304,15 @@ const fetchWithRetry = async (url, options, retries = 3, backoffMs = 400) => {
   for (let attempt = 0; attempt <= retries; attempt += 1) {
     try {
       const resp = await fetch(url, options);
+      // Handle 429 rate limit with exponential backoff
+      if (resp.status === 429) {
+        const retryAfter = resp.headers.get('Retry-After');
+        const waitMs = retryAfter ? parseInt(retryAfter, 10) * 1000 : backoffMs * Math.pow(2, attempt + 2);
+        lastError = new Error('Rate limit exceeded');
+        if (attempt === retries) return resp;
+        await new Promise((r) => setTimeout(r, Math.min(waitMs, 30000)));
+        continue;
+      }
       if (resp.status >= 400 && resp.status < 500) return resp;
       if (!resp.ok && resp.status >= 500) {
         lastError = new Error(`Server error: ${resp.status}`);
@@ -1253,6 +1279,9 @@ const scrollToBottom = () => {
 let chatSocket = null;
 let chatSocketConnecting = false;
 let chatSocketReconnectTimer = null;
+let chatSocketReconnectAttempts = 0;
+const WS_MAX_RECONNECT_DELAY = 30000; // 30 seconds max delay
+const WS_BASE_RECONNECT_DELAY = 1000; // 1 second base delay
 let isStreaming = false;
 
 const updateStreamingUI = (streaming) => {
@@ -1309,16 +1338,25 @@ const connectWebSocket = () => {
   const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
   const wsUrl = `${protocol}://${window.location.host}${apiBase}/chat/stream`;
   chatSocket = new WebSocket(wsUrl);
-  chatSocket.onopen = () => { chatSocketConnecting = false; };
+  chatSocket.onopen = () => {
+    chatSocketConnecting = false;
+    chatSocketReconnectAttempts = 0; // Reset on successful connection
+  };
   chatSocket.onerror = () => { chatSocketConnecting = false; };
   chatSocket.onclose = () => {
     chatSocketConnecting = false;
     chatSocket = null;
     if (chatSocketReconnectTimer) clearTimeout(chatSocketReconnectTimer);
+    // Exponential backoff: delay = base * 2^attempts, capped at max
+    const delay = Math.min(
+      WS_BASE_RECONNECT_DELAY * Math.pow(2, chatSocketReconnectAttempts),
+      WS_MAX_RECONNECT_DELAY
+    );
+    chatSocketReconnectAttempts += 1;
     chatSocketReconnectTimer = setTimeout(() => {
       chatSocketReconnectTimer = null;
       connectWebSocket();
-    }, 2000);
+    }, delay);
   };
   return chatSocket;
 };
@@ -3712,8 +3750,8 @@ const initEventListeners = () => {
   $('new-conversation-btn')?.addEventListener('click', newConversation);
   $('refresh-conversations')?.addEventListener('click', fetchConversations);
 
-  // Conversation search
-  conversationSearchEl?.addEventListener('input', renderConversationList);
+  // Conversation search (debounced to avoid excessive re-renders)
+  conversationSearchEl?.addEventListener('input', debounce(renderConversationList, 150));
 
   // Preferences
   $('thumbs-up')?.addEventListener('click', () => sendPreference(true));
