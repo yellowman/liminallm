@@ -15,6 +15,7 @@ from liminallm.service.training import TrainingService
 from liminallm.service.training_worker import TrainingWorker
 from liminallm.service.voice import VoiceService
 from liminallm.service.workflow import WorkflowEngine
+from liminallm.service.email import EmailService
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.postgres import PostgresStore
 from liminallm.storage.redis_cache import RedisCache
@@ -133,6 +134,16 @@ class Runtime:
             self.cache,
             self.settings,
             mfa_enabled=self.settings.enable_mfa,
+        )
+        self.email = EmailService(
+            smtp_host=self.settings.smtp_host,
+            smtp_port=self.settings.smtp_port,
+            smtp_user=self.settings.smtp_user,
+            smtp_password=self.settings.smtp_password,
+            smtp_use_tls=self.settings.smtp_use_tls,
+            from_email=self.settings.email_from_address,
+            from_name=self.settings.email_from_name,
+            base_url=self.settings.app_base_url,
         )
         # Training worker for background job processing
         self.training_worker = TrainingWorker(

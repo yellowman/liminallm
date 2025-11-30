@@ -269,6 +269,15 @@ class Settings(BaseModel):
     oauth_microsoft_client_id: str | None = env_field(None, "OAUTH_MICROSOFT_CLIENT_ID")
     oauth_microsoft_client_secret: str | None = env_field(None, "OAUTH_MICROSOFT_CLIENT_SECRET")
     oauth_redirect_uri: str | None = env_field(None, "OAUTH_REDIRECT_URI")
+    # Email service settings
+    smtp_host: str | None = env_field(None, "SMTP_HOST")
+    smtp_port: int = env_field(587, "SMTP_PORT")
+    smtp_user: str | None = env_field(None, "SMTP_USER")
+    smtp_password: str | None = env_field(None, "SMTP_PASSWORD")
+    smtp_use_tls: bool = env_field(True, "SMTP_USE_TLS")
+    email_from_address: str | None = env_field(None, "EMAIL_FROM_ADDRESS")
+    email_from_name: str = env_field("LiminalLM", "EMAIL_FROM_NAME")
+    app_base_url: str = env_field("http://localhost:8000", "APP_BASE_URL")
     default_adapter_mode: AdapterMode = env_field(
         AdapterMode.HYBRID,
         "DEFAULT_ADAPTER_MODE",
@@ -380,12 +389,27 @@ class Settings(BaseModel):
         # Persist a generated JWT secret so tokens remain valid across restarts
         fs_root = Path(os.getenv("SHARED_FS_ROOT", "/srv/liminallm"))
         secret_path = fs_root / ".jwt_secret"
-        secret_path.parent.mkdir(parents=True, exist_ok=True)
 
-        if secret_path.exists():
+        # Create directory with restrictive permissions
+        try:
+            fs_root.mkdir(parents=True, exist_ok=True)
+            # Ensure directory has restrictive permissions
+            os.chmod(fs_root, 0o700)
+        except PermissionError:
+            # Directory may already exist with different permissions (e.g., in container)
+            pass
+        except Exception as exc:
+            logger.warning(
+                "jwt_secret_dir_setup",
+                error=str(exc),
+                path=str(fs_root),
+                message="Could not set directory permissions",
+            )
+
+        if secret_path.exists() and not secret_path.is_symlink():
             try:
                 persisted = secret_path.read_text().strip()
-                if persisted:
+                if persisted and len(persisted) >= 32:  # Minimum reasonable secret length
                     return persisted
             except Exception as exc:
                 logger.error(
@@ -394,14 +418,29 @@ class Settings(BaseModel):
 
         generated = secrets.token_urlsafe(64)
         try:
-            secret_path.write_text(generated)
-            os.chmod(secret_path, 0o600)
+            # Use atomic write pattern: write to temp file then rename
+            import tempfile
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(fs_root), prefix=".jwt_secret_", suffix=".tmp"
+            )
+            try:
+                os.write(fd, generated.encode())
+                os.fchmod(fd, 0o600)  # Set permissions before closing
+            finally:
+                os.close(fd)
+            os.rename(tmp_path, str(secret_path))
         except Exception as exc:
+            # Clean up temp file if it exists
+            try:
+                if "tmp_path" in locals():
+                    os.unlink(tmp_path)
+            except Exception:
+                pass
             logger.error(
                 "jwt_secret_persist_failed", error=str(exc), path=str(secret_path)
             )
             raise RuntimeError(
-                "Unable to persist JWT secret; set JWT_SECRET or make SHARED_FS_ROOT writable"
+                "Unable to persist JWT secret; set JWT_SECRET env var or make SHARED_FS_ROOT writable"
             ) from exc
         return generated
 

@@ -845,6 +845,141 @@ const handleResetConfirm = async (event) => {
 };
 
 // =============================================================================
+// Email Token URL Handlers
+// =============================================================================
+
+let pendingResetToken = '';
+
+const handleResetTokenCallback = async () => {
+  const urlParams = new URLSearchParams(window.location.search);
+  const resetToken = urlParams.get('reset_token');
+
+  if (!resetToken) {
+    return false;
+  }
+
+  // Clear URL params
+  window.history.replaceState({}, document.title, window.location.pathname);
+
+  // Store the token for the form
+  pendingResetToken = resetToken;
+
+  // Show the reset form with just the new password field visible
+  showAuthForm('reset');
+
+  const resetStatus = $('reset-status');
+  const resetCodeSection = $('reset-code-section');
+  const resetRequestForm = $('reset-request-form');
+
+  // Hide the email request section and show the password input
+  if (resetRequestForm) resetRequestForm.classList.add('hidden');
+  if (resetCodeSection) {
+    resetCodeSection.classList.remove('hidden');
+    // Hide the code input since we have the token from URL
+    const codeField = resetCodeSection.querySelector('.field:first-child');
+    if (codeField) codeField.classList.add('hidden');
+  }
+
+  // Update the description
+  const subtext = resetCodeSection?.previousElementSibling;
+  if (subtext && subtext.classList.contains('subtext')) {
+    subtext.textContent = 'Enter your new password.';
+  }
+
+  if (resetStatus) resetStatus.textContent = 'Password reset link verified. Enter your new password.';
+
+  return true;
+};
+
+const handleResetWithToken = async (event) => {
+  event.preventDefault();
+  const resetStatus = $('reset-status');
+  const confirmSubmit = $('reset-confirm-submit');
+
+  const newPassword = $('reset-new-password')?.value;
+
+  if (!newPassword) {
+    if (resetStatus) resetStatus.textContent = 'New password is required';
+    return;
+  }
+
+  if (newPassword.length < 8) {
+    if (resetStatus) resetStatus.textContent = 'Password must be at least 8 characters';
+    return;
+  }
+
+  if (!pendingResetToken) {
+    if (resetStatus) resetStatus.textContent = 'Reset token expired. Please request a new reset link.';
+    return;
+  }
+
+  try {
+    toggleButtonBusy(confirmSubmit, true, 'Resetting...');
+    if (resetStatus) resetStatus.textContent = '';
+
+    await requestEnvelope(
+      `${apiBase}/auth/reset/confirm`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: pendingResetToken,
+          new_password: newPassword,
+        }),
+      },
+      'Password reset failed'
+    );
+
+    pendingResetToken = '';
+    if (resetStatus) resetStatus.textContent = 'Password reset successful! You can now sign in.';
+
+    // Clear form and show login after delay
+    if ($('reset-new-password')) $('reset-new-password').value = '';
+    setTimeout(() => showAuthForm('login'), 1500);
+  } catch (err) {
+    if (resetStatus) resetStatus.textContent = err.message;
+  } finally {
+    toggleButtonBusy(confirmSubmit, false);
+  }
+};
+
+const handleVerifyTokenCallback = async () => {
+  const urlParams = new URLSearchParams(window.location.search);
+  const verifyToken = urlParams.get('verify_token');
+
+  if (!verifyToken) {
+    return false;
+  }
+
+  // Clear URL params
+  window.history.replaceState({}, document.title, window.location.pathname);
+
+  // Show a verification status message
+  showStatus('Verifying email...');
+
+  try {
+    await requestEnvelope(
+      `${apiBase}/auth/verify_email`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: verifyToken }),
+      },
+      'Email verification failed'
+    );
+
+    showStatus('Email verified successfully! You can now sign in.');
+
+    // Show login form
+    showAuthForm('login');
+  } catch (err) {
+    showStatus(`Email verification failed: ${err.message}`);
+  }
+
+  return true;
+};
+
+// =============================================================================
 // Conversations
 // =============================================================================
 
@@ -1118,6 +1253,32 @@ const scrollToBottom = () => {
 let chatSocket = null;
 let chatSocketConnecting = false;
 let chatSocketReconnectTimer = null;
+let isStreaming = false;
+
+const updateStreamingUI = (streaming) => {
+  isStreaming = streaming;
+  const sendBtn = $('send-btn');
+  const stopBtn = $('stop-stream-btn');
+  if (streaming) {
+    if (sendBtn) sendBtn.classList.add('hidden');
+    if (stopBtn) stopBtn.classList.remove('hidden');
+  } else {
+    if (sendBtn) sendBtn.classList.remove('hidden');
+    if (stopBtn) stopBtn.classList.add('hidden');
+  }
+};
+
+const cancelStreaming = () => {
+  if (!isStreaming || !chatSocket || chatSocket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  try {
+    chatSocket.send(JSON.stringify({ action: 'cancel' }));
+    showStatus('Cancelling...');
+  } catch (err) {
+    console.warn('Failed to send cancel:', err);
+  }
+};
 
 const cleanupWebSocket = () => {
   if (chatSocketReconnectTimer) {
@@ -1377,6 +1538,7 @@ const sendMessage = async (event) => {
     saveDraft(state.conversationId, '');
     appendMessage('user', content);
     showStatus('Thinking...');
+    updateStreamingUI(true);
 
     const data = await chatViaWebSocketStreaming().catch(async () => {
       // Fallback to REST API if WebSocket fails
@@ -1414,6 +1576,7 @@ const sendMessage = async (event) => {
     showStatus(err.message, true);
   } finally {
     toggleButtonBusy(sendBtn, false, 'Send');
+    updateStreamingUI(false);
   }
 };
 
@@ -3088,13 +3251,21 @@ const initEventListeners = () => {
   $('oauth-google')?.addEventListener('click', () => startOAuth('google'));
   $('oauth-github')?.addEventListener('click', () => startOAuth('github'));
   $('oauth-microsoft')?.addEventListener('click', () => startOAuth('microsoft'));
-  $('reset-confirm-form')?.addEventListener('submit', handleResetConfirm);
+  $('reset-confirm-form')?.addEventListener('submit', (event) => {
+    // Use token-based handler if we have a pending token from URL
+    if (pendingResetToken) {
+      handleResetWithToken(event);
+    } else {
+      handleResetConfirm(event);
+    }
+  });
 
   // Chat
   if (chatForm) chatForm.addEventListener('submit', sendMessage);
   $('message-input')?.addEventListener('input', handleMessageInputChange);
   $('new-thread')?.addEventListener('click', newConversation);
   $('new-thread-secondary')?.addEventListener('click', newConversation);
+  $('stop-stream-btn')?.addEventListener('click', cancelStreaming);
   $('new-conversation-btn')?.addEventListener('click', newConversation);
   $('refresh-conversations')?.addEventListener('click', fetchConversations);
 
@@ -3174,6 +3345,20 @@ const init = async () => {
   const isOAuthCallback = await handleOAuthCallback();
   if (isOAuthCallback) {
     // OAuth callback was handled, UI already updated
+    updateEmptyState();
+    return;
+  }
+
+  // Handle password reset token from email link
+  const isResetCallback = await handleResetTokenCallback();
+  if (isResetCallback) {
+    updateEmptyState();
+    return;
+  }
+
+  // Handle email verification token from email link
+  const isVerifyCallback = await handleVerifyTokenCallback();
+  if (isVerifyCallback) {
     updateEmptyState();
     return;
   }

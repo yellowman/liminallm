@@ -1000,8 +1000,12 @@ async def request_reset(body: PasswordResetRequest):
         runtime.settings.reset_rate_limit_per_minute,
         60,
     )
-    await runtime.auth.initiate_password_reset(body.email)
-    # Token delivery should be handled out-of-band; avoid exposing it directly.
+    # Check if user exists before generating token (don't reveal if user exists)
+    user = runtime.store.get_user_by_email(body.email)
+    if user:
+        token = await runtime.auth.initiate_password_reset(body.email)
+        runtime.email.send_password_reset(body.email, token)
+    # Always return success to prevent email enumeration
     return Envelope(status="ok", data={"status": "sent"})
 
 
@@ -1034,7 +1038,8 @@ async def request_email_verification(principal: AuthContext = Depends(get_user))
     user = runtime.store.get_user(principal.user_id)
     if not user:
         raise _http_error("not_found", "user not found", status_code=404)
-    await runtime.auth.request_email_verification(user)
+    token = await runtime.auth.request_email_verification(user)
+    runtime.email.send_email_verification(user.email, token)
     return Envelope(status="ok", data={"status": "sent"})
 
 
@@ -2441,6 +2446,27 @@ async def websocket_chat(ws: WebSocket):
             full_content = ""
             orchestration_dict: dict[str, Any] = {}
 
+            # Concurrent task to listen for cancel requests while streaming
+            async def listen_for_cancel():
+                try:
+                    while not cancel_event.is_set():
+                        try:
+                            msg = await asyncio.wait_for(ws.receive_json(), timeout=0.5)
+                            if msg.get("action") == "cancel":
+                                cancel_event.set()
+                                return
+                            elif msg.get("action") == "ping":
+                                await ws.send_json({"event": "pong", "data": None})
+                        except asyncio.TimeoutError:
+                            continue
+                        except WebSocketDisconnect:
+                            cancel_event.set()
+                            return
+                except Exception:
+                    pass  # Listener task should exit silently on errors
+
+            cancel_listener = asyncio.create_task(listen_for_cancel())
+
             try:
                 async for event in runtime.workflow.run_streaming(
                     init.get("workflow_id"),
@@ -2463,15 +2489,20 @@ async def websocket_chat(ws: WebSocket):
                         orchestration_dict = event_data if isinstance(event_data, dict) else {}
                     elif event_type == "error":
                         # Error already sent, close connection
+                        cancel_listener.cancel()
                         await ws.close(code=1011)
                         return
                     elif event_type == "cancel_ack":
+                        cancel_listener.cancel()
                         await ws.close(code=1000)
                         return
 
             except WebSocketDisconnect:
                 cancel_event.set()
+                cancel_listener.cancel()
                 return
+            finally:
+                cancel_listener.cancel()
 
             # Save assistant message after streaming completes
             adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
@@ -2600,7 +2631,23 @@ async def websocket_chat(ws: WebSocket):
         await ws.close(code=4429 if status_code == 429 else 1011)
     except WebSocketDisconnect:
         return
-    except Exception:
+    except json.JSONDecodeError:
+        # Handle invalid JSON in initial message
+        logger.warning(
+            "websocket_invalid_json",
+            request_id=request_id,
+        )
+        error_env = Envelope(
+            status="error",
+            error={"code": "invalid_json", "message": "Invalid JSON in request"},
+            request_id=request_id,
+        )
+        try:
+            await ws.send_json(error_env.model_dump())
+        except Exception:
+            pass
+        await ws.close(code=1003)
+    except Exception as exc:
         # SECURITY: Use logger.error instead of logger.exception to avoid
         # exposing full stack traces that may reveal implementation details
         logger.error(
@@ -2608,6 +2655,7 @@ async def websocket_chat(ws: WebSocket):
             user_id=user_id,
             conversation_id=convo_id,
             request_id=request_id,
+            error_type=type(exc).__name__,
         )
         error_env = Envelope(
             status="error",
@@ -2618,4 +2666,9 @@ async def websocket_chat(ws: WebSocket):
             await _store_idempotency_result(
                 "chat:ws", user_id, idempotency_key, error_env, status="failed"
             )
+        # Send error envelope to client before closing
+        try:
+            await ws.send_json(error_env.model_dump())
+        except Exception:
+            pass  # Connection may already be closed
         await ws.close(code=1011)

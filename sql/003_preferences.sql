@@ -2,6 +2,22 @@
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 CREATE EXTENSION IF NOT EXISTS vector;
 
+-- Semantic clusters for emergent skills/domains
+-- user_id is nullable to allow global clusters per SPEC §2.4
+-- MUST be created before preference_event which references it
+CREATE TABLE IF NOT EXISTS semantic_cluster (
+  id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id         UUID REFERENCES app_user(id) ON DELETE CASCADE,
+  centroid        VECTOR,
+  size            INT NOT NULL,
+  label           TEXT,
+  description     TEXT,
+  sample_message_ids UUID[],
+  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+  meta            JSONB
+);
+
 -- Preference events capture explicit feedback with optional clustering context
 CREATE TABLE IF NOT EXISTS preference_event (
   id                 UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -18,21 +34,6 @@ CREATE TABLE IF NOT EXISTS preference_event (
   cluster_id         UUID REFERENCES semantic_cluster(id) ON DELETE SET NULL,
   weight             DOUBLE PRECISION DEFAULT 1.0,
   meta               JSONB
-);
-
--- Semantic clusters for emergent skills/domains
--- user_id is nullable to allow global clusters per SPEC §2.4
-CREATE TABLE IF NOT EXISTS semantic_cluster (
-  id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  user_id         UUID REFERENCES app_user(id) ON DELETE CASCADE,
-  centroid        VECTOR,
-  size            INT NOT NULL,
-  label           TEXT,
-  description     TEXT,
-  sample_message_ids UUID[],
-  created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-  updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-  meta            JSONB
 );
 
 -- Adapter routing state for centroids and usage
