@@ -12,6 +12,7 @@ from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
 from liminallm.service.router import RouterEngine
 from liminallm.service.training import TrainingService
+from liminallm.service.training_worker import TrainingWorker
 from liminallm.service.voice import VoiceService
 from liminallm.service.workflow import WorkflowEngine
 from liminallm.storage.memory import MemoryStore
@@ -126,6 +127,13 @@ class Runtime:
             self.cache,
             self.settings,
             mfa_enabled=self.settings.enable_mfa,
+        )
+        # Training worker for background job processing
+        self.training_worker = TrainingWorker(
+            store=self.store,
+            training_service=self.training,
+            clusterer=self.clusterer,
+            poll_interval=self.settings.training_worker_poll_interval,
         )
         self._local_idempotency: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         self._local_idempotency_lock = asyncio.Lock()

@@ -23,6 +23,14 @@ from liminallm.service.bm25 import (
     tokenize_text as _tokenize_text,
     compute_bm25_scores as _compute_bm25_scores,
 )
+from liminallm.storage.common import (
+    compute_text_embedding,
+    get_default_chat_workflow_schema,
+    get_default_tool_specs,
+    hybrid_search_chunks,
+    normalize_preference_weight,
+    cosine_similarity,
+)
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
     Artifact,
@@ -238,60 +246,12 @@ class PostgresStore:
             )
 
     def _ensure_default_artifacts(self) -> None:
-        """Seed the default workflow artifact if the database is empty."""
-
+        """Seed default artifacts using common schema definitions."""
         existing = self.list_artifacts()
-        if any(artifact.name == "default_chat_workflow" for artifact in existing):
-            seeded_workflow = True
-        else:
-            seeded_workflow = False
 
-        if not seeded_workflow:
-            default_schema = {
-                "kind": "workflow.chat",
-                "entrypoint": "classify",
-                "nodes": [
-                    {
-                        "id": "classify",
-                        "type": "tool_call",
-                        "tool": "llm.intent_classifier_v1",
-                        "inputs": {"message": "${input.message}"},
-                        "outputs": ["intent"],
-                        "next": "route",
-                    },
-                    {
-                        "id": "route",
-                        "type": "switch",
-                        "branches": [
-                            {"when": "vars.intent == 'qa_with_docs'", "next": "rag"},
-                            {"when": "vars.intent == 'code_edit'", "next": "code"},
-                            {"when": "true", "next": "plain_chat"},
-                        ],
-                    },
-                    {
-                        "id": "rag",
-                        "type": "tool_call",
-                        "tool": "rag.answer_with_context_v1",
-                        "inputs": {"message": "${input.message}"},
-                        "next": "end",
-                    },
-                    {
-                        "id": "code",
-                        "type": "tool_call",
-                        "tool": "agent.code_v1",
-                        "inputs": {"message": "${input.message}"},
-                        "next": "end",
-                    },
-                    {
-                        "id": "plain_chat",
-                        "type": "tool_call",
-                        "tool": "llm.generic",
-                        "inputs": {"message": "${input.message}"},
-                        "next": "end",
-                    },
-                    {"id": "end", "type": "end"},
-                ],
-            }
+        # Seed default chat workflow if not present
+        if not any(artifact.name == "default_chat_workflow" for artifact in existing):
+            default_schema = get_default_chat_workflow_schema()
             self.create_artifact(
                 "workflow",
                 "default_chat_workflow",
@@ -301,31 +261,13 @@ class PostgresStore:
                 change_note="Seeded default workflow",
             )
 
+        # Seed default tool specs if not present
         seeded_tools = {
             art.schema.get("name")
             for art in existing
             if isinstance(art.schema, dict) and art.schema.get("kind") == "tool.spec"
         }
-        default_tools = [
-            {
-                "kind": "tool.spec",
-                "name": "llm.generic",
-                "description": "Plain chat response from the base model.",
-                "inputs": {"message": {"type": "string"}},
-                "handler": "llm.generic",
-            },
-            {
-                "kind": "tool.spec",
-                "name": "rag.answer_with_context_v1",
-                "description": "Retrieval augmented answer with pgvector context.",
-                "inputs": {
-                    "message": {"type": "string"},
-                    "context_id": {"type": "string", "optional": True},
-                },
-                "handler": "rag.answer_with_context_v1",
-            },
-        ]
-        for spec in default_tools:
+        for spec in get_default_tool_specs():
             if spec["name"] in seeded_tools:
                 continue
             self.create_artifact(
@@ -370,7 +312,7 @@ class PostgresStore:
                     "preference message conversation mismatch",
                     {"message_id": message_id, "conversation_id": conversation_id},
                 )
-            embedding = context_embedding or self._text_embedding(
+            embedding = context_embedding or compute_text_embedding(
                 context_text or msg_row.get("content")
             )
             row = conn.execute(
@@ -417,17 +359,7 @@ class PostgresStore:
             meta=meta,
         )
 
-    def _text_embedding(self, text: Optional[str]) -> list[float]:
-        if not text:
-            return []
-        tokens = text.lower().split()
-        dim = 64
-        vec = [0.0] * dim
-        for tok in tokens:
-            h = int(hashlib.sha256(tok.encode()).hexdigest(), 16)
-            vec[h % dim] += 1.0
-        norm = sum(v * v for v in vec) ** 0.5 or 1.0
-        return [v / norm for v in vec]
+    # _text_embedding moved to common.compute_text_embedding
 
     def list_preference_events(
         self,

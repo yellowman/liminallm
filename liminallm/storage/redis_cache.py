@@ -210,3 +210,7 @@ class RedisCache:
         await self.client.set(
             f"idemp:{route}:{user_id}:{key}", json.dumps(record), ex=ttl_seconds
         )
+
+    async def delete_workflow_state(self, state_key: str) -> None:
+        """Delete workflow state from cache during rollback or cleanup."""
+        await self.client.delete(f"workflow:state:{state_key}")

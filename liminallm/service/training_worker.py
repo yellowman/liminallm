@@ -1,0 +1,376 @@
+"""Background worker for processing training jobs.
+
+This module provides a worker that periodically checks for queued training jobs
+and executes them using the TrainingService. It handles:
+- Picking up queued jobs
+- Running JAX/Optax training
+- Updating job status
+- Error handling and retries
+- Connecting emergent skills to training
+"""
+
+from __future__ import annotations
+
+import asyncio
+from datetime import datetime
+from typing import TYPE_CHECKING, List, Optional
+
+from liminallm.logging import get_logger
+
+if TYPE_CHECKING:
+    from liminallm.service.clustering import SemanticClusterer
+    from liminallm.service.training import TrainingService
+    from liminallm.storage.memory import MemoryStore
+    from liminallm.storage.postgres import PostgresStore
+
+logger = get_logger(__name__)
+
+# Worker configuration
+DEFAULT_POLL_INTERVAL_SECONDS = 60
+DEFAULT_BATCH_SIZE = 5
+DEFAULT_MAX_RETRIES = 3
+DEFAULT_RETRY_DELAY_SECONDS = 30
+
+
+class TrainingWorker:
+    """Background worker for processing training jobs.
+
+    The worker runs in a loop, periodically checking for queued jobs
+    and processing them using the TrainingService.
+    """
+
+    def __init__(
+        self,
+        store: "PostgresStore | MemoryStore",
+        training_service: "TrainingService",
+        clusterer: Optional["SemanticClusterer"] = None,
+        *,
+        poll_interval: int = DEFAULT_POLL_INTERVAL_SECONDS,
+        batch_size: int = DEFAULT_BATCH_SIZE,
+        max_retries: int = DEFAULT_MAX_RETRIES,
+        retry_delay: int = DEFAULT_RETRY_DELAY_SECONDS,
+    ) -> None:
+        self.store = store
+        self.training = training_service
+        self.clusterer = clusterer
+        self.poll_interval = poll_interval
+        self.batch_size = batch_size
+        self.max_retries = max_retries
+        self.retry_delay = retry_delay
+        self._running = False
+        self._task: Optional[asyncio.Task] = None
+
+    async def start(self) -> None:
+        """Start the background worker."""
+        if self._running:
+            logger.warning("training_worker_already_running")
+            return
+
+        self._running = True
+        self._task = asyncio.create_task(self._run_loop())
+        logger.info("training_worker_started", poll_interval=self.poll_interval)
+
+    async def stop(self) -> None:
+        """Stop the background worker."""
+        self._running = False
+        if self._task:
+            self._task.cancel()
+            try:
+                await self._task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+        logger.info("training_worker_stopped")
+
+    async def _run_loop(self) -> None:
+        """Main worker loop."""
+        while self._running:
+            try:
+                await self._process_queued_jobs()
+            except Exception as exc:
+                logger.error("training_worker_loop_error", error=str(exc))
+
+            await asyncio.sleep(self.poll_interval)
+
+    async def _process_queued_jobs(self) -> None:
+        """Process a batch of queued training jobs."""
+        jobs = self._get_queued_jobs()
+        if not jobs:
+            return
+
+        logger.info("training_worker_processing", job_count=len(jobs))
+
+        for job in jobs[:self.batch_size]:
+            await self._process_job(job)
+
+    def _get_queued_jobs(self) -> List:
+        """Get queued training jobs from the store."""
+        list_fn = getattr(self.store, "list_training_jobs", None)
+        if callable(list_fn):
+            all_jobs = list_fn()
+            return [j for j in all_jobs if j.status == "queued"]
+
+        # MemoryStore fallback
+        if hasattr(self.store, "training_jobs"):
+            return [
+                j for j in self.store.training_jobs.values()
+                if j.status == "queued"
+            ]
+
+        return []
+
+    async def _process_job(self, job) -> None:
+        """Process a single training job."""
+        job_id = job.id
+        user_id = job.user_id
+        adapter_id = job.adapter_id
+
+        logger.info(
+            "training_job_starting",
+            job_id=job_id,
+            user_id=user_id,
+            adapter_id=adapter_id,
+        )
+
+        # Mark job as running
+        self.store.update_training_job(job_id, status="running")
+
+        attempt = 0
+        last_error: Optional[str] = None
+
+        while attempt < self.max_retries:
+            try:
+                # Run the actual training
+                result = await asyncio.to_thread(
+                    self._execute_training,
+                    user_id=user_id,
+                    adapter_id=adapter_id,
+                    cluster_id=self._get_cluster_id(job),
+                )
+
+                if result:
+                    # Training succeeded
+                    self.store.update_training_job(
+                        job_id,
+                        status="succeeded",
+                        loss=result.get("loss"),
+                        new_version=result.get("version"),
+                        meta={
+                            "jax_trace": result.get("jax_trace"),
+                            "clusters": result.get("clusters"),
+                            "completed_at": datetime.utcnow().isoformat(),
+                        },
+                    )
+                    logger.info(
+                        "training_job_succeeded",
+                        job_id=job_id,
+                        loss=result.get("loss"),
+                        version=result.get("version"),
+                    )
+
+                    # Trigger clustering after successful training
+                    await self._run_post_training_clustering(user_id)
+                    return
+                else:
+                    # No events to train on
+                    self.store.update_training_job(
+                        job_id,
+                        status="skipped",
+                        meta={"reason": "no_preference_events"},
+                    )
+                    logger.info("training_job_skipped", job_id=job_id, reason="no_events")
+                    return
+
+            except Exception as exc:
+                attempt += 1
+                last_error = str(exc)
+                logger.warning(
+                    "training_job_attempt_failed",
+                    job_id=job_id,
+                    attempt=attempt,
+                    error=last_error,
+                )
+
+                if attempt < self.max_retries:
+                    await asyncio.sleep(self.retry_delay)
+
+        # All retries exhausted
+        self.store.update_training_job(
+            job_id,
+            status="failed",
+            meta={
+                "error": last_error,
+                "attempts": attempt,
+                "failed_at": datetime.utcnow().isoformat(),
+            },
+        )
+        logger.error(
+            "training_job_failed",
+            job_id=job_id,
+            error=last_error,
+            attempts=attempt,
+        )
+
+    def _execute_training(
+        self,
+        user_id: str,
+        adapter_id: str,
+        cluster_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """Execute the actual training via TrainingService."""
+        result = self.training.train_from_preferences(
+            user_id=user_id,
+            adapter_id=adapter_id,
+            cluster_id=cluster_id,
+        )
+
+        if result:
+            # Extract version from result
+            version_dir = result.get("version_dir", "")
+            version = None
+            if "v" in version_dir:
+                try:
+                    version_str = version_dir.split("/")[-1].replace("v", "")
+                    version = int(version_str)
+                except (ValueError, IndexError):
+                    pass
+
+            return {
+                "loss": result.get("loss"),
+                "version": version or result.get("new_version"),
+                "jax_trace": result.get("jax_trace"),
+                "clusters": result.get("clusters"),
+            }
+
+        return None
+
+    def _get_cluster_id(self, job) -> Optional[str]:
+        """Extract cluster_id from job metadata if present."""
+        if job.meta and isinstance(job.meta, dict):
+            return job.meta.get("cluster_id")
+        return None
+
+    async def _run_post_training_clustering(self, user_id: str) -> None:
+        """Run clustering after successful training to detect emergent skills."""
+        if not self.clusterer:
+            return
+
+        try:
+            clusters = await self.clusterer.cluster_user_preferences(user_id)
+            if clusters:
+                logger.info(
+                    "post_training_clustering_complete",
+                    user_id=user_id,
+                    cluster_count=len(clusters),
+                )
+
+                # Check for skill promotion opportunities
+                promoted = self.clusterer.promote_skill_adapters(
+                    min_size=5,
+                    positive_ratio=0.7,
+                )
+                if promoted:
+                    logger.info(
+                        "emergent_skills_promoted",
+                        user_id=user_id,
+                        adapter_ids=promoted,
+                    )
+        except Exception as exc:
+            logger.warning(
+                "post_training_clustering_failed",
+                user_id=user_id,
+                error=str(exc),
+            )
+
+    async def process_emergent_skills(self) -> List[str]:
+        """Manually trigger emergent skill detection and training.
+
+        This scans all users for cluster promotion opportunities
+        and creates training jobs for newly created skill adapters.
+        """
+        if not self.clusterer:
+            logger.warning("emergent_skills_no_clusterer")
+            return []
+
+        promoted_adapters: List[str] = []
+
+        # Get all users with preference events
+        users = self._get_users_with_preferences()
+
+        for user_id in users:
+            try:
+                # Run clustering
+                clusters = await self.clusterer.cluster_user_preferences(user_id)
+
+                if clusters:
+                    # Promote eligible clusters to skill adapters
+                    promoted = self.clusterer.promote_skill_adapters(
+                        min_size=5,
+                        positive_ratio=0.7,
+                    )
+                    promoted_adapters.extend(promoted)
+
+            except Exception as exc:
+                logger.warning(
+                    "emergent_skill_processing_failed",
+                    user_id=user_id,
+                    error=str(exc),
+                )
+
+        logger.info(
+            "emergent_skills_processed",
+            promoted_count=len(promoted_adapters),
+            adapter_ids=promoted_adapters,
+        )
+
+        return promoted_adapters
+
+    def _get_users_with_preferences(self) -> List[str]:
+        """Get list of users who have preference events."""
+        users: set[str] = set()
+
+        list_fn = getattr(self.store, "list_preference_events", None)
+        if callable(list_fn):
+            events = list_fn()
+            for event in events:
+                if event.user_id:
+                    users.add(event.user_id)
+        elif hasattr(self.store, "preference_events"):
+            for event in self.store.preference_events.values():
+                if event.user_id:
+                    users.add(event.user_id)
+
+        return list(users)
+
+
+async def create_training_worker(
+    store: "PostgresStore | MemoryStore",
+    training_service: "TrainingService",
+    clusterer: Optional["SemanticClusterer"] = None,
+    *,
+    auto_start: bool = True,
+    poll_interval: int = DEFAULT_POLL_INTERVAL_SECONDS,
+) -> TrainingWorker:
+    """Factory function to create and optionally start a training worker.
+
+    Args:
+        store: Database store
+        training_service: TrainingService instance
+        clusterer: Optional SemanticClusterer for emergent skills
+        auto_start: Whether to start the worker immediately
+        poll_interval: How often to check for queued jobs
+
+    Returns:
+        TrainingWorker instance
+    """
+    worker = TrainingWorker(
+        store=store,
+        training_service=training_service,
+        clusterer=clusterer,
+        poll_interval=poll_interval,
+    )
+
+    if auto_start:
+        await worker.start()
+
+    return worker

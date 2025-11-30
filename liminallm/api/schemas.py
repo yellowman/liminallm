@@ -405,6 +405,26 @@ class KnowledgeChunkListResponse(BaseModel):
     items: List[KnowledgeChunkResponse]
 
 
+class ContextSourceRequest(BaseModel):
+    """Request to add a source path to a knowledge context."""
+    fs_path: str = Field(..., min_length=1, max_length=4096, description="Source path to index")
+    recursive: bool = Field(default=True, description="Whether to recursively index subdirectories")
+
+
+class ContextSourceResponse(BaseModel):
+    """Response containing context source details."""
+    id: str
+    context_id: str
+    fs_path: str
+    recursive: bool
+    meta: Optional[dict] = None
+
+
+class ContextSourceListResponse(BaseModel):
+    """Response containing a list of context sources."""
+    items: List[ContextSourceResponse]
+
+
 class FileUploadResponse(BaseModel):
     fs_path: str
     context_id: Optional[str] = None

@@ -351,6 +351,83 @@ class RAGService:
             context_id, data, chunk_size=chunk_size, source_path=path
         )
 
+    def ingest_path(
+        self,
+        context_id: str,
+        fs_path: str,
+        *,
+        recursive: bool = True,
+        chunk_size: Optional[int] = None,
+        extensions: Optional[List[str]] = None,
+    ) -> int:
+        """Ingest content from a filesystem path (file or directory).
+
+        Args:
+            context_id: Knowledge context to add chunks to
+            fs_path: Path to file or directory
+            recursive: Whether to recursively process subdirectories
+            chunk_size: Optional chunk size override
+            extensions: File extensions to include (e.g., ['.txt', '.md', '.py'])
+                       If None, defaults to common text file extensions.
+
+        Returns:
+            Total number of chunks created
+        """
+        path = Path(fs_path)
+
+        # Default extensions for text-like files
+        if extensions is None:
+            extensions = [
+                ".txt", ".md", ".rst", ".py", ".js", ".ts", ".jsx", ".tsx",
+                ".html", ".css", ".json", ".yaml", ".yml", ".xml", ".csv",
+                ".sql", ".sh", ".bash", ".go", ".rs", ".java", ".c", ".cpp",
+                ".h", ".hpp", ".rb", ".php", ".swift", ".kt", ".scala",
+            ]
+
+        total_chunks = 0
+
+        if path.is_file():
+            # Single file
+            if not extensions or path.suffix.lower() in extensions:
+                try:
+                    total_chunks += self.ingest_file(context_id, str(path), chunk_size)
+                except Exception as exc:
+                    self._logger.warning(
+                        "ingest_path_file_failed",
+                        path=str(path),
+                        error=str(exc),
+                    )
+            return total_chunks
+
+        if not path.is_dir():
+            self._logger.warning("ingest_path_not_found", path=str(path))
+            return 0
+
+        # Directory - iterate through files
+        pattern = "**/*" if recursive else "*"
+        for file_path in path.glob(pattern):
+            if not file_path.is_file():
+                continue
+            if extensions and file_path.suffix.lower() not in extensions:
+                continue
+            try:
+                total_chunks += self.ingest_file(context_id, str(file_path), chunk_size)
+            except Exception as exc:
+                self._logger.warning(
+                    "ingest_path_file_failed",
+                    path=str(file_path),
+                    error=str(exc),
+                )
+
+        self._logger.info(
+            "ingest_path_completed",
+            context_id=context_id,
+            fs_path=fs_path,
+            recursive=recursive,
+            total_chunks=total_chunks,
+        )
+        return total_chunks
+
     def embed_text(self, text: str) -> List[float]:
         """Backward-compatible hook: use the deterministic embedding pipeline."""
 

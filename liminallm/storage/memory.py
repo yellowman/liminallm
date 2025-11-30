@@ -25,6 +25,15 @@ from liminallm.service.bm25 import (
     compute_bm25_scores as _compute_bm25_scores,
 )
 from liminallm.service.embeddings import cosine_similarity
+from liminallm.storage.common import (
+    compute_text_embedding,
+    get_default_chat_workflow_schema,
+    get_default_tool_specs,
+    hybrid_search_chunks,
+    normalize_preference_weight,
+    validate_chunk_fs_path,
+    validate_context_source_fs_path,
+)
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
     Artifact,
@@ -136,52 +145,9 @@ class MemoryStore:
         return datetime.fromisoformat(raw)
 
     def default_artifacts(self) -> None:
+        """Seed default workflow artifact using common schema."""
         chat_workflow_id = str(uuid.uuid4())
-        default_schema = {
-            "kind": "workflow.chat",
-            "entrypoint": "classify",
-            "nodes": [
-                {
-                    "id": "classify",
-                    "type": "tool_call",
-                    "tool": "llm.intent_classifier_v1",
-                    "inputs": {"message": "${input.message}"},
-                    "outputs": ["intent"],
-                    "next": "route",
-                },
-                {
-                    "id": "route",
-                    "type": "switch",
-                    "branches": [
-                        {"when": "vars.intent == 'qa_with_docs'", "next": "rag"},
-                        {"when": "vars.intent == 'code_edit'", "next": "code"},
-                        {"when": "true", "next": "plain_chat"},
-                    ],
-                },
-                {
-                    "id": "rag",
-                    "type": "tool_call",
-                    "tool": "rag.answer_with_context_v1",
-                    "inputs": {"message": "${input.message}"},
-                    "next": "end",
-                },
-                {
-                    "id": "code",
-                    "type": "tool_call",
-                    "tool": "agent.code_v1",
-                    "inputs": {"message": "${input.message}"},
-                    "next": "end",
-                },
-                {
-                    "id": "plain_chat",
-                    "type": "tool_call",
-                    "tool": "llm.generic",
-                    "inputs": {"message": "${input.message}"},
-                    "next": "end",
-                },
-                {"id": "end", "type": "end"},
-            ],
-        }
+        default_schema = get_default_chat_workflow_schema()
         payload_path = self.persist_artifact_payload(chat_workflow_id, default_schema)
         self.artifacts[chat_workflow_id] = Artifact(
             id=chat_workflow_id,
@@ -594,18 +560,7 @@ class MemoryStore:
             self._persist_state()
             return msg
 
-    # preference events
-    def _text_embedding(self, text: Optional[str]) -> List[float]:
-        if not text:
-            return []
-        tokens = text.lower().split()
-        dim = 64
-        vec = [0.0] * dim
-        for tok in tokens:
-            h = int(hashlib.sha256(tok.encode()).hexdigest(), 16)
-            vec[h % dim] += 1.0
-        norm = sum(v * v for v in vec) ** 0.5 or 1.0
-        return [v / norm for v in vec]
+    # preference events - using common.compute_text_embedding for embeddings
 
     def record_preference_event(
         self,
@@ -651,8 +606,8 @@ class MemoryStore:
                     {"message_id": message_id, "conversation_id": conversation_id},
                 )
             event_id = str(uuid.uuid4())
-            normalized_weight = weight if weight is not None else 1.0
-            embedding = context_embedding or self._text_embedding(
+            normalized_weight = normalize_preference_weight(weight)
+            embedding = context_embedding or compute_text_embedding(
                 context_text or message.content
             )
             event = PreferenceEvent(
@@ -1414,32 +1369,20 @@ class MemoryStore:
         query_embedding: Optional[List[float]],
         limit: int = 4,
     ) -> List[KnowledgeChunk]:
+        """Hybrid BM25 + semantic search using common implementation."""
         candidates = self.list_chunks(context_id)
         if not candidates:
             return []
 
-        query_tokens = _tokenize_text(query)
-        doc_tokens = [_tokenize_text(ch.content) for ch in candidates]
-        bm25_scores = _compute_bm25_scores(query_tokens, doc_tokens)
-        semantic_scores = []
-        for ch in candidates:
-            if not query_embedding or not ch.embedding:
-                semantic_scores.append(0.0)
-                continue
-            dim = min(len(query_embedding), len(ch.embedding))
-            semantic_scores.append(
-                cosine_similarity(query_embedding[:dim], ch.embedding[:dim])
-            )
-        max_bm25 = max(bm25_scores) or 1.0
-        combined: Dict[str, tuple[KnowledgeChunk, float]] = {}
-        for chunk, lex, sem in zip(candidates, bm25_scores, semantic_scores):
-            hybrid = 0.45 * (lex / max_bm25) + 0.55 * sem
-            key = " ".join(chunk.content.split()).lower() or str(chunk.id or "")
-            existing = combined.get(key)
-            if not existing or hybrid > existing[1]:
-                combined[key] = (chunk, hybrid)
-        ranked = sorted(combined.values(), key=lambda pair: pair[1], reverse=True)
-        return [pair[0] for pair in ranked[:limit]]
+        return hybrid_search_chunks(
+            candidates=candidates,
+            query=query,
+            query_embedding=query_embedding,
+            limit=limit,
+            tokenize_fn=_tokenize_text,
+            bm25_scores_fn=_compute_bm25_scores,
+            cosine_fn=cosine_similarity,
+        )
 
     def search_chunks_pgvector(
         self,

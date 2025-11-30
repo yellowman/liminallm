@@ -55,6 +55,9 @@ from liminallm.api.schemas import (
     KnowledgeContextRequest,
     KnowledgeContextListResponse,
     KnowledgeContextResponse,
+    ContextSourceRequest,
+    ContextSourceResponse,
+    ContextSourceListResponse,
     FileUploadResponse,
     PreferenceEventRequest,
     PreferenceEventResponse,
@@ -2238,6 +2241,91 @@ async def list_chunks(
         for ch in chunks
     ]
     return Envelope(status="ok", data=KnowledgeChunkListResponse(items=data))
+
+
+@router.post("/contexts/{context_id}/sources", response_model=Envelope, status_code=201, tags=["knowledge"])
+async def add_context_source(
+    context_id: str = Path(..., max_length=255, description="Knowledge context ID"),
+    body: ContextSourceRequest = ...,
+    principal: AuthContext = Depends(get_user),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+):
+    """Add a source path to a knowledge context for indexing.
+
+    The source path will be indexed and its content split into chunks
+    that can be retrieved during RAG queries.
+    """
+    runtime = get_runtime()
+
+    async with IdempotencyGuard(
+        "context_sources:create", principal.user_id, idempotency_key, require=False
+    ) as idem:
+        if idem.cached:
+            return idem.cached
+
+        # Verify context ownership
+        _get_owned_context(runtime, context_id, principal)
+
+        # Add the source
+        source = runtime.store.add_context_source(
+            context_id=context_id,
+            fs_path=body.fs_path,
+            recursive=body.recursive,
+        )
+
+        # Trigger indexing via RAG service
+        try:
+            runtime.rag.ingest_path(
+                context_id=context_id,
+                fs_path=body.fs_path,
+                recursive=body.recursive,
+            )
+        except Exception as exc:
+            logger.warning(
+                "context_source_ingest_failed",
+                context_id=context_id,
+                fs_path=body.fs_path,
+                error=str(exc),
+            )
+
+        envelope = Envelope(
+            status="ok",
+            data=ContextSourceResponse(
+                id=source.id,
+                context_id=source.context_id,
+                fs_path=source.fs_path,
+                recursive=source.recursive,
+                meta=source.meta,
+            ),
+            request_id=idem.request_id,
+        )
+        await idem.store_result(envelope)
+        return envelope
+
+
+@router.get("/contexts/{context_id}/sources", response_model=Envelope, tags=["knowledge"])
+async def list_context_sources(
+    context_id: str = Path(..., max_length=255, description="Knowledge context ID"),
+    principal: AuthContext = Depends(get_user),
+):
+    """List all source paths for a knowledge context."""
+    runtime = get_runtime()
+
+    # Verify context ownership
+    _get_owned_context(runtime, context_id, principal)
+
+    sources = runtime.store.list_context_sources(context_id)
+    items = [
+        ContextSourceResponse(
+            id=s.id,
+            context_id=s.context_id,
+            fs_path=s.fs_path,
+            recursive=s.recursive,
+            meta=s.meta,
+        )
+        for s in sources
+    ]
+    return Envelope(status="ok", data=ContextSourceListResponse(items=items))
 
 
 @router.post("/voice/transcribe", response_model=Envelope, tags=["voice"])

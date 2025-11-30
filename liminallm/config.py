@@ -297,6 +297,18 @@ class Settings(BaseModel):
     )
     configops_rate_limit_per_hour: int = env_field(30, "CONFIGOPS_RATE_LIMIT_PER_HOUR")
 
+    # Training worker settings
+    training_worker_enabled: bool = env_field(
+        True,
+        "TRAINING_WORKER_ENABLED",
+        description="Enable background training job worker",
+    )
+    training_worker_poll_interval: int = env_field(
+        60,
+        "TRAINING_WORKER_POLL_INTERVAL",
+        description="Training worker poll interval in seconds",
+    )
+
     # Pagination defaults per SPEC §18
     default_page_size: int = env_field(
         100,
