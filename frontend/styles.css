@@ -615,6 +615,33 @@ button.minor:hover {
   overflow-y: auto;
 }
 
+/* Voice buttons */
+.voice-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border-radius: 50%;
+}
+
+.voice-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+.voice-btn.recording {
+  background: var(--error);
+  color: white;
+  animation: pulse 1s ease-in-out infinite;
+}
+
+.voice-btn.playing {
+  background: var(--accent);
+  color: white;
+}
+
 /* Streaming indicator */
 .streaming-indicator {
   display: inline-block;

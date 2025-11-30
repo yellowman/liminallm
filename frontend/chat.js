@@ -1493,6 +1493,178 @@ const sendPreference = async (isPositive) => {
 };
 
 // =============================================================================
+// Voice Input/Output
+// =============================================================================
+
+let mediaRecorder = null;
+let audioChunks = [];
+let isRecording = false;
+let currentAudio = null;
+
+const voiceInputBtn = $('voice-input-btn');
+const voiceOutputBtn = $('voice-output-btn');
+
+const startVoiceRecording = async () => {
+  if (isRecording) return;
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mediaRecorder = new MediaRecorder(stream);
+    audioChunks = [];
+
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) {
+        audioChunks.push(e.data);
+      }
+    };
+
+    mediaRecorder.onstop = async () => {
+      const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+      stream.getTracks().forEach(track => track.stop());
+      await transcribeAudio(audioBlob);
+    };
+
+    mediaRecorder.start();
+    isRecording = true;
+    if (voiceInputBtn) {
+      voiceInputBtn.classList.add('recording');
+      voiceInputBtn.title = 'Release to stop recording';
+    }
+  } catch (err) {
+    console.error('Microphone access denied:', err);
+    alert('Could not access microphone. Please check permissions.');
+  }
+};
+
+const stopVoiceRecording = () => {
+  if (!isRecording || !mediaRecorder) return;
+
+  mediaRecorder.stop();
+  isRecording = false;
+  if (voiceInputBtn) {
+    voiceInputBtn.classList.remove('recording');
+    voiceInputBtn.title = 'Hold to record';
+  }
+};
+
+const transcribeAudio = async (audioBlob) => {
+  if (!state.accessToken) {
+    alert('Please sign in to use voice input.');
+    return;
+  }
+
+  try {
+    const formData = new FormData();
+    formData.append('file', audioBlob, 'recording.webm');
+
+    const response = await fetch(`${apiBase}/voice/transcribe`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${state.accessToken}`,
+      },
+      body: formData,
+    });
+
+    const envelope = await response.json();
+    if (envelope.status === 'ok' && envelope.data?.text) {
+      // Insert transcribed text into the message input
+      const messageInput = $('message-input');
+      if (messageInput) {
+        messageInput.value = (messageInput.value + ' ' + envelope.data.text).trim();
+        messageInput.focus();
+      }
+    } else {
+      console.error('Transcription failed:', envelope);
+    }
+  } catch (err) {
+    console.error('Transcription error:', err);
+  }
+};
+
+const speakText = async (text) => {
+  if (!text) return;
+
+  // Stop any currently playing audio
+  if (currentAudio) {
+    currentAudio.pause();
+    currentAudio = null;
+  }
+
+  if (!state.accessToken) {
+    // Fall back to browser speech synthesis
+    const utterance = new SpeechSynthesisUtterance(text);
+    window.speechSynthesis.speak(utterance);
+    return;
+  }
+
+  try {
+    if (voiceOutputBtn) voiceOutputBtn.classList.add('playing');
+
+    const response = await fetch(`${apiBase}/voice/synthesize`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${state.accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ text }),
+    });
+
+    const envelope = await response.json();
+    if (envelope.status === 'ok' && envelope.data?.audio_url) {
+      currentAudio = new Audio(envelope.data.audio_url);
+      currentAudio.onended = () => {
+        if (voiceOutputBtn) voiceOutputBtn.classList.remove('playing');
+      };
+      currentAudio.onerror = () => {
+        if (voiceOutputBtn) voiceOutputBtn.classList.remove('playing');
+        // Fall back to browser speech synthesis
+        const utterance = new SpeechSynthesisUtterance(text);
+        window.speechSynthesis.speak(utterance);
+      };
+      currentAudio.play();
+    } else {
+      // Fall back to browser speech synthesis
+      if (voiceOutputBtn) voiceOutputBtn.classList.remove('playing');
+      const utterance = new SpeechSynthesisUtterance(text);
+      window.speechSynthesis.speak(utterance);
+    }
+  } catch (err) {
+    console.error('Speech synthesis error:', err);
+    if (voiceOutputBtn) voiceOutputBtn.classList.remove('playing');
+    // Fall back to browser speech synthesis
+    const utterance = new SpeechSynthesisUtterance(text);
+    window.speechSynthesis.speak(utterance);
+  }
+};
+
+const readLastResponse = () => {
+  if (!state.lastAssistant?.content) {
+    alert('No assistant response to read.');
+    return;
+  }
+  speakText(state.lastAssistant.content);
+};
+
+// Voice button event listeners
+if (voiceInputBtn) {
+  voiceInputBtn.addEventListener('mousedown', startVoiceRecording);
+  voiceInputBtn.addEventListener('mouseup', stopVoiceRecording);
+  voiceInputBtn.addEventListener('mouseleave', stopVoiceRecording);
+  voiceInputBtn.addEventListener('touchstart', (e) => {
+    e.preventDefault();
+    startVoiceRecording();
+  });
+  voiceInputBtn.addEventListener('touchend', (e) => {
+    e.preventDefault();
+    stopVoiceRecording();
+  });
+}
+
+if (voiceOutputBtn) {
+  voiceOutputBtn.addEventListener('click', readLastResponse);
+}
+
+// =============================================================================
 // File upload
 // =============================================================================
 
