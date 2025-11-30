@@ -44,6 +44,8 @@ from liminallm.api.schemas import (
     MFAVerifyRequest,
     MFADisableRequest,
     MFAStatusResponse,
+    UserSettingsRequest,
+    UserSettingsResponse,
     AutoPatchRequest,
     OAuthStartRequest,
     OAuthStartResponse,
@@ -1120,6 +1122,74 @@ async def get_current_user(principal: AuthContext = Depends(get_user)):
             is_active=user.is_active,
             plan_tier=user.plan_tier or "free",
             meta=user.meta,
+        ),
+    )
+
+
+@router.get("/settings", response_model=Envelope, tags=["settings"])
+async def get_user_settings(principal: AuthContext = Depends(get_user)):
+    """Get the current user's settings.
+
+    Returns user preferences like locale, timezone, voice settings.
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        runtime.settings.read_rate_limit_per_minute,
+        60,
+    )
+    settings = runtime.store.get_user_settings(principal.user_id)
+    if not settings:
+        # Return empty settings if none exist
+        return Envelope(
+            status="ok",
+            data=UserSettingsResponse(),
+        )
+    return Envelope(
+        status="ok",
+        data=UserSettingsResponse(
+            locale=settings.locale,
+            timezone=settings.timezone,
+            default_voice=settings.default_voice,
+            default_style=settings.default_style,
+            flags=settings.flags,
+        ),
+    )
+
+
+@router.patch("/settings", response_model=Envelope, tags=["settings"])
+async def update_user_settings(
+    body: UserSettingsRequest,
+    principal: AuthContext = Depends(get_user),
+):
+    """Update the current user's settings.
+
+    Only provided fields will be updated; omitted fields remain unchanged.
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"write:{principal.user_id}",
+        runtime.settings.chat_rate_limit_per_minute,
+        60,
+    )
+    settings = runtime.store.set_user_settings(
+        principal.user_id,
+        locale=body.locale,
+        timezone=body.timezone,
+        default_voice=body.default_voice,
+        default_style=body.default_style,
+        flags=body.flags,
+    )
+    return Envelope(
+        status="ok",
+        data=UserSettingsResponse(
+            locale=settings.locale,
+            timezone=settings.timezone,
+            default_voice=settings.default_voice,
+            default_style=settings.default_style,
+            flags=settings.flags,
         ),
     )
 

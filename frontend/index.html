@@ -661,6 +661,61 @@
 
               <div class="divider"></div>
 
+              <h3>Preferences</h3>
+              <p class="subtext">Customize your experience with locale, timezone, and voice settings.</p>
+              <form id="user-settings-form">
+                <div class="input-grid">
+                  <div class="field">
+                    <label for="setting-locale">Locale</label>
+                    <select id="setting-locale">
+                      <option value="">Auto-detect</option>
+                      <option value="en-US">English (US)</option>
+                      <option value="en-GB">English (UK)</option>
+                      <option value="es-ES">Spanish (Spain)</option>
+                      <option value="fr-FR">French (France)</option>
+                      <option value="de-DE">German (Germany)</option>
+                      <option value="ja-JP">Japanese</option>
+                      <option value="zh-CN">Chinese (Simplified)</option>
+                    </select>
+                  </div>
+                  <div class="field">
+                    <label for="setting-timezone">Timezone</label>
+                    <select id="setting-timezone">
+                      <option value="">Auto-detect</option>
+                      <option value="UTC">UTC</option>
+                      <option value="America/New_York">Eastern Time (US)</option>
+                      <option value="America/Chicago">Central Time (US)</option>
+                      <option value="America/Denver">Mountain Time (US)</option>
+                      <option value="America/Los_Angeles">Pacific Time (US)</option>
+                      <option value="Europe/London">London</option>
+                      <option value="Europe/Paris">Paris</option>
+                      <option value="Europe/Berlin">Berlin</option>
+                      <option value="Asia/Tokyo">Tokyo</option>
+                      <option value="Asia/Shanghai">Shanghai</option>
+                      <option value="Australia/Sydney">Sydney</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="field">
+                  <label for="setting-default-voice">Default Voice</label>
+                  <select id="setting-default-voice">
+                    <option value="">System default</option>
+                    <option value="alloy">Alloy</option>
+                    <option value="echo">Echo</option>
+                    <option value="fable">Fable</option>
+                    <option value="onyx">Onyx</option>
+                    <option value="nova">Nova</option>
+                    <option value="shimmer">Shimmer</option>
+                  </select>
+                </div>
+                <div class="pill-row">
+                  <button type="submit" class="primary" id="save-user-settings-btn">Save Preferences</button>
+                </div>
+              </form>
+              <div id="user-settings-status" class="small" role="status"></div>
+
+              <div class="divider"></div>
+
               <h3>Local storage</h3>
               <p class="subtext">Draft messages are saved locally in your browser.</p>
               <div class="pill-row">

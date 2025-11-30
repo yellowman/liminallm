@@ -177,6 +177,24 @@ class MFAStatusResponse(BaseModel):
     configured: bool = Field(..., description="Whether MFA secret is configured (pending verification)")
 
 
+class UserSettingsRequest(BaseModel):
+    """Request to update user settings."""
+    locale: Optional[str] = Field(None, max_length=10, description="Locale code (e.g., en-US)")
+    timezone: Optional[str] = Field(None, max_length=64, description="Timezone (e.g., America/New_York)")
+    default_voice: Optional[str] = Field(None, max_length=64, description="Default voice ID for TTS")
+    default_style: Optional[dict] = Field(None, description="Default style preferences")
+    flags: Optional[dict] = Field(None, description="Feature flags")
+
+
+class UserSettingsResponse(BaseModel):
+    """User settings response."""
+    locale: Optional[str] = None
+    timezone: Optional[str] = None
+    default_voice: Optional[str] = None
+    default_style: Optional[dict] = None
+    flags: Optional[dict] = None
+
+
 class PasswordResetRequest(BaseModel):
     email: str
 

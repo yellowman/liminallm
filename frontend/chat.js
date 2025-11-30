@@ -550,6 +550,7 @@ const handleLogin = async (event) => {
       fetchHealth(),
       fetchMfaStatus(),
       fetchEmailVerificationStatus(),
+      fetchUserSettings(),
     ]);
   } catch (err) {
     showStatus(err.message, true);
@@ -677,6 +678,7 @@ const handleOAuthCallback = async () => {
         fetchHealth(),
         fetchMfaStatus(),
         fetchEmailVerificationStatus(),
+        fetchUserSettings(),
       ]);
     } else {
       if (oauthStatus) oauthStatus.textContent = 'OAuth completed but no token received';
@@ -2650,6 +2652,91 @@ const resendVerificationEmail = async () => {
 };
 
 // =============================================================================
+// User Settings (Preferences)
+// =============================================================================
+
+const fetchUserSettings = async () => {
+  if (!state.accessToken) return;
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/settings`,
+      { headers: headers() },
+      'Failed to load settings'
+    );
+
+    const data = envelope.data || {};
+    const localeSelect = $('setting-locale');
+    const timezoneSelect = $('setting-timezone');
+    const voiceSelect = $('setting-default-voice');
+
+    if (localeSelect) localeSelect.value = data.locale || '';
+    if (timezoneSelect) timezoneSelect.value = data.timezone || '';
+    if (voiceSelect) voiceSelect.value = data.default_voice || '';
+  } catch (err) {
+    // Silently fail - user might not have settings yet
+  }
+};
+
+const saveUserSettings = async (event) => {
+  event.preventDefault();
+
+  const statusEl = $('user-settings-status');
+  const saveBtn = $('save-user-settings-btn');
+
+  if (!state.accessToken) {
+    if (statusEl) {
+      statusEl.textContent = 'Sign in to save settings';
+      statusEl.style.color = '#b00020';
+    }
+    return;
+  }
+
+  const locale = $('setting-locale')?.value || null;
+  const timezone = $('setting-timezone')?.value || null;
+  const defaultVoice = $('setting-default-voice')?.value || null;
+
+  try {
+    if (saveBtn) saveBtn.disabled = true;
+    if (statusEl) {
+      statusEl.textContent = 'Saving...';
+      statusEl.style.color = 'inherit';
+    }
+
+    await requestEnvelope(
+      `${apiBase}/settings`,
+      {
+        method: 'PATCH',
+        headers: authHeaders(),
+        body: JSON.stringify({
+          locale: locale || null,
+          timezone: timezone || null,
+          default_voice: defaultVoice || null,
+        }),
+      },
+      'Failed to save settings'
+    );
+
+    if (statusEl) {
+      statusEl.textContent = 'Settings saved!';
+      statusEl.style.color = '#0a7';
+    }
+
+    // Clear success message after a few seconds
+    setTimeout(() => {
+      if (statusEl) statusEl.textContent = '';
+    }, 3000);
+  } catch (err) {
+    if (statusEl) {
+      statusEl.textContent = err.message || 'Failed to save';
+      statusEl.style.color = '#b00020';
+    }
+  } finally {
+    if (saveBtn) saveBtn.disabled = false;
+  }
+};
+
+// =============================================================================
 // Admin Settings
 // =============================================================================
 
@@ -3597,6 +3684,9 @@ const initEventListeners = () => {
   // Email verification
   $('resend-verification-btn')?.addEventListener('click', resendVerificationEmail);
 
+  // User settings (preferences)
+  $('user-settings-form')?.addEventListener('submit', saveUserSettings);
+
   // Admin settings
   $('save-admin-settings-btn')?.addEventListener('click', saveAdminSettings);
   $('reload-admin-settings-btn')?.addEventListener('click', fetchAdminSettings);
@@ -3685,6 +3775,7 @@ const init = async () => {
       fetchHealth(),
       fetchMfaStatus(),
       fetchEmailVerificationStatus(),
+      fetchUserSettings(),
     ]);
   }
 
