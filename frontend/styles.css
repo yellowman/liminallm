@@ -1045,6 +1045,335 @@ button.minor:hover {
 .visibility-badge.shared { background: #fef3c7; color: #92400e; }
 .visibility-badge.global { background: #d1fae5; color: #065f46; }
 
+/* Auth form links */
+.auth-links {
+  margin-top: 16px;
+  text-align: center;
+}
+
+.link-btn {
+  background: none;
+  border: none;
+  color: var(--accent);
+  cursor: pointer;
+  font-size: 13px;
+  text-decoration: underline;
+  padding: 4px 8px;
+}
+
+.link-btn:hover {
+  color: var(--accent-strong);
+}
+
+/* Tools list */
+.tools-list {
+  display: grid;
+  gap: 8px;
+}
+
+.tool-card {
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.tool-card:hover {
+  border-color: var(--accent);
+  box-shadow: 0 4px 12px rgba(16, 163, 127, 0.1);
+}
+
+.tool-card.selected {
+  border-color: var(--accent);
+  background: var(--accent-light);
+}
+
+.tool-name {
+  font-weight: 600;
+  margin-bottom: 4px;
+  font-family: var(--font-mono);
+  font-size: 14px;
+}
+
+.tool-description {
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+/* Tool details */
+.tool-details {
+  background: var(--panel-muted);
+  border-radius: 10px;
+  padding: 16px;
+}
+
+.tool-details .detail-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 12px;
+}
+
+.tool-details h4 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.tool-details .detail-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.tool-details .detail-row:last-child {
+  border-bottom: none;
+}
+
+.tool-details .detail-label {
+  color: var(--text-muted);
+}
+
+/* Workflow list */
+.workflows-list {
+  display: grid;
+  gap: 8px;
+}
+
+.workflow-card {
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.workflow-card:hover {
+  border-color: var(--accent);
+  box-shadow: 0 4px 12px rgba(16, 163, 127, 0.1);
+}
+
+.workflow-card.selected {
+  border-color: var(--accent);
+  background: var(--accent-light);
+}
+
+.workflow-name {
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.workflow-meta {
+  display: flex;
+  gap: 8px;
+  font-size: 12px;
+  align-items: center;
+}
+
+/* Workflow details */
+.workflow-details {
+  background: var(--panel-muted);
+  border-radius: 10px;
+  padding: 16px;
+}
+
+.workflow-details .detail-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  margin-bottom: 12px;
+}
+
+.workflow-details h4 {
+  margin: 0;
+  font-size: 16px;
+}
+
+.workflow-details .detail-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.workflow-details .detail-label {
+  color: var(--text-muted);
+}
+
+/* Insights stats grid */
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 12px;
+}
+
+.stat-card {
+  background: var(--panel-muted);
+  border-radius: 10px;
+  padding: 16px;
+  text-align: center;
+}
+
+.stat-value {
+  font-size: 32px;
+  font-weight: 700;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+
+.stat-label {
+  font-size: 12px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+/* Insights adapters */
+.insights-adapters {
+  display: grid;
+  gap: 8px;
+}
+
+.adapter-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 10px 14px;
+  background: var(--panel-muted);
+  border-radius: 8px;
+}
+
+.adapter-name {
+  font-weight: 600;
+  font-size: 13px;
+}
+
+.adapter-score {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+/* Insights recent */
+.insights-recent {
+  display: grid;
+  gap: 4px;
+}
+
+.preference-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  background: var(--panel-muted);
+  border-radius: 8px;
+  border-left: 3px solid var(--border);
+}
+
+.preference-item.positive {
+  border-left-color: #10b981;
+}
+
+.preference-item.negative {
+  border-left-color: #ef4444;
+}
+
+.feedback-icon {
+  font-weight: 700;
+  font-size: 14px;
+  width: 24px;
+  text-align: center;
+}
+
+.preference-item.positive .feedback-icon {
+  color: #10b981;
+}
+
+.preference-item.negative .feedback-icon {
+  color: #ef4444;
+}
+
+.preference-message {
+  flex: 1;
+  font-size: 13px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.preference-date {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+/* Insights clusters */
+.insights-clusters {
+  display: grid;
+  gap: 8px;
+}
+
+.cluster-card {
+  padding: 14px;
+  background: var(--panel-muted);
+  border-radius: 10px;
+  border-left: 3px solid var(--accent);
+}
+
+.cluster-label {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.cluster-description {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-bottom: 8px;
+}
+
+.cluster-meta {
+  display: flex;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.cluster-meta .has-adapter {
+  background: var(--accent-light);
+  color: var(--accent-strong);
+  padding: 2px 6px;
+  border-radius: 4px;
+}
+
+/* Form group for admin settings */
+.form-group {
+  margin-bottom: 16px;
+}
+
+.form-group label {
+  display: block;
+  font-weight: 600;
+  margin-bottom: 6px;
+  font-size: 13px;
+}
+
+.form-group input {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 14px;
+  background: var(--panel-muted);
+}
+
+.form-group .small {
+  margin-top: 4px;
+  display: block;
+}
+
 /* Responsive */
 @media (max-width: 1080px) {
   .layout-with-sidebar {

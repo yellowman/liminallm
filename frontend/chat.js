@@ -470,6 +470,20 @@ const initCollapsibleSections = () => {
 };
 
 // =============================================================================
+// Auth form switching
+// =============================================================================
+
+const showAuthForm = (formName) => {
+  const loginContainer = $('login-form-container');
+  const signupContainer = $('signup-form-container');
+  const resetContainer = $('reset-form-container');
+
+  if (loginContainer) loginContainer.classList.toggle('hidden', formName !== 'login');
+  if (signupContainer) signupContainer.classList.toggle('hidden', formName !== 'signup');
+  if (resetContainer) resetContainer.classList.toggle('hidden', formName !== 'reset');
+};
+
+// =============================================================================
 // Auth management
 // =============================================================================
 
@@ -559,6 +573,164 @@ const logout = async () => {
   updateAuthUI();
   renderAdminNotice();
   updateEmptyState();
+};
+
+// =============================================================================
+// Signup
+// =============================================================================
+
+const handleSignup = async (event) => {
+  event.preventDefault();
+  const signupStatus = $('signup-status');
+  const signupSubmit = $('signup-submit');
+
+  const email = $('signup-email')?.value?.trim();
+  const password = $('signup-password')?.value;
+  const confirm = $('signup-confirm')?.value;
+  const tenant = $('signup-tenant')?.value?.trim() || undefined;
+
+  if (!email || !password) {
+    if (signupStatus) signupStatus.textContent = 'Email and password are required';
+    return;
+  }
+
+  if (password !== confirm) {
+    if (signupStatus) signupStatus.textContent = 'Passwords do not match';
+    return;
+  }
+
+  if (password.length < 8) {
+    if (signupStatus) signupStatus.textContent = 'Password must be at least 8 characters';
+    return;
+  }
+
+  try {
+    toggleButtonBusy(signupSubmit, true, 'Creating...');
+    if (signupStatus) signupStatus.textContent = '';
+
+    await requestEnvelope(
+      `${apiBase}/auth/signup`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password, tenant_id: tenant }),
+      },
+      'Signup failed'
+    );
+
+    if (signupStatus) signupStatus.textContent = 'Account created! You can now sign in.';
+
+    // Clear form and switch to login
+    if ($('signup-email')) $('signup-email').value = '';
+    if ($('signup-password')) $('signup-password').value = '';
+    if ($('signup-confirm')) $('signup-confirm').value = '';
+
+    // Pre-fill login email
+    if ($('email')) $('email').value = email;
+
+    setTimeout(() => showAuthForm('login'), 1500);
+  } catch (err) {
+    if (signupStatus) signupStatus.textContent = err.message;
+  } finally {
+    toggleButtonBusy(signupSubmit, false);
+  }
+};
+
+// =============================================================================
+// Password Reset
+// =============================================================================
+
+let resetEmailForConfirm = '';
+
+const handleResetRequest = async (event) => {
+  event.preventDefault();
+  const resetStatus = $('reset-status');
+  const resetSubmit = $('reset-request-submit');
+  const resetCodeSection = $('reset-code-section');
+
+  const email = $('reset-email')?.value?.trim();
+
+  if (!email) {
+    if (resetStatus) resetStatus.textContent = 'Email is required';
+    return;
+  }
+
+  try {
+    toggleButtonBusy(resetSubmit, true, 'Sending...');
+    if (resetStatus) resetStatus.textContent = '';
+
+    await requestEnvelope(
+      `${apiBase}/auth/reset/request`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      },
+      'Reset request failed'
+    );
+
+    resetEmailForConfirm = email;
+    if (resetStatus) resetStatus.textContent = 'Reset code sent! Check your email.';
+    if (resetCodeSection) resetCodeSection.classList.remove('hidden');
+  } catch (err) {
+    if (resetStatus) resetStatus.textContent = err.message;
+  } finally {
+    toggleButtonBusy(resetSubmit, false);
+  }
+};
+
+const handleResetConfirm = async (event) => {
+  event.preventDefault();
+  const resetStatus = $('reset-status');
+  const confirmSubmit = $('reset-confirm-submit');
+
+  const code = $('reset-code')?.value?.trim();
+  const newPassword = $('reset-new-password')?.value;
+
+  if (!code || !newPassword) {
+    if (resetStatus) resetStatus.textContent = 'Code and new password are required';
+    return;
+  }
+
+  if (newPassword.length < 8) {
+    if (resetStatus) resetStatus.textContent = 'Password must be at least 8 characters';
+    return;
+  }
+
+  try {
+    toggleButtonBusy(confirmSubmit, true, 'Resetting...');
+    if (resetStatus) resetStatus.textContent = '';
+
+    await requestEnvelope(
+      `${apiBase}/auth/reset/confirm`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: resetEmailForConfirm,
+          code,
+          new_password: newPassword,
+        }),
+      },
+      'Password reset failed'
+    );
+
+    if (resetStatus) resetStatus.textContent = 'Password reset successful! You can now sign in.';
+
+    // Clear form
+    if ($('reset-code')) $('reset-code').value = '';
+    if ($('reset-new-password')) $('reset-new-password').value = '';
+    if ($('reset-code-section')) $('reset-code-section').classList.add('hidden');
+
+    // Pre-fill login email
+    if ($('email')) $('email').value = resetEmailForConfirm;
+
+    setTimeout(() => showAuthForm('login'), 1500);
+  } catch (err) {
+    if (resetStatus) resetStatus.textContent = err.message;
+  } finally {
+    toggleButtonBusy(confirmSubmit, false);
+  }
 };
 
 // =============================================================================
@@ -1891,6 +2063,350 @@ const renderAdminSettingsSection = () => {
 };
 
 // =============================================================================
+// Tools
+// =============================================================================
+
+let selectedTool = null;
+let tools = [];
+let workflows = [];
+
+const fetchTools = async () => {
+  if (!state.accessToken) return;
+
+  const toolsList = $('tools-list');
+  if (toolsList) toolsList.innerHTML = '<div class="empty">Loading tools...</div>';
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/tools/specs`,
+      { headers: headers() },
+      'Failed to load tools'
+    );
+
+    tools = envelope.data?.items || [];
+    renderToolsList();
+  } catch (err) {
+    if (toolsList) toolsList.innerHTML = `<div class="empty">Error: ${escapeHtml(err.message)}</div>`;
+  }
+};
+
+const renderToolsList = () => {
+  const toolsList = $('tools-list');
+  if (!toolsList) return;
+
+  if (!tools.length) {
+    toolsList.innerHTML = '<div class="empty">No tools available</div>';
+    return;
+  }
+
+  toolsList.innerHTML = tools
+    .map((tool) => {
+      const isSelected = selectedTool?.id === tool.id;
+      const name = tool.name || tool.schema?.name || tool.id;
+      const description = tool.description || tool.schema?.description || 'No description';
+      return `
+        <div class="tool-card ${isSelected ? 'selected' : ''}" data-id="${escapeHtml(tool.id)}">
+          <div class="tool-name">${escapeHtml(name)}</div>
+          <div class="tool-description">${escapeHtml(description)}</div>
+        </div>
+      `;
+    })
+    .join('');
+
+  toolsList.querySelectorAll('.tool-card').forEach((card) => {
+    card.addEventListener('click', () => selectTool(card.dataset.id));
+  });
+};
+
+const selectTool = async (toolId) => {
+  const tool = tools.find((t) => t.id === toolId);
+  if (!tool) return;
+
+  selectedTool = tool;
+  renderToolsList();
+
+  const details = $('tool-details');
+  const invokeSection = $('tool-invoke-section');
+  const invokePlaceholder = $('tool-invoke-placeholder');
+
+  if (details) {
+    const schema = tool.schema || {};
+    const inputs = schema.inputs || {};
+
+    details.innerHTML = `
+      <div class="detail-header">
+        <h4>${escapeHtml(tool.name || schema.name || tool.id)}</h4>
+      </div>
+      <div class="detail-row">
+        <span class="detail-label">ID</span>
+        <span class="monospace">${escapeHtml(tool.id)}</span>
+      </div>
+      <div class="detail-row">
+        <span class="detail-label">Handler</span>
+        <span class="monospace">${escapeHtml(schema.handler || '-')}</span>
+      </div>
+      <div class="detail-row">
+        <span class="detail-label">Description</span>
+        <span>${escapeHtml(tool.description || schema.description || '-')}</span>
+      </div>
+      <div class="divider"></div>
+      <h4>Inputs</h4>
+      <pre class="schema-viewer">${escapeHtml(JSON.stringify(inputs, null, 2))}</pre>
+    `;
+  }
+
+  // Show invoke section
+  if (invokeSection) invokeSection.classList.remove('hidden');
+  if (invokePlaceholder) invokePlaceholder.style.display = 'none';
+
+  // Pre-populate input template
+  const invokeInput = $('tool-invoke-input');
+  if (invokeInput) {
+    const schema = tool.schema || {};
+    const inputs = schema.inputs || {};
+    const template = {};
+    Object.keys(inputs).forEach((key) => {
+      template[key] = inputs[key].type === 'string' ? '' : null;
+    });
+    invokeInput.value = JSON.stringify(template, null, 2);
+  }
+};
+
+const invokeTool = async (event) => {
+  event.preventDefault();
+
+  if (!selectedTool) return;
+
+  const statusEl = $('tool-invoke-status');
+  const resultEl = $('tool-invoke-result');
+  const inputEl = $('tool-invoke-input');
+  const invokeBtn = $('tool-invoke-btn');
+
+  let inputData;
+  try {
+    inputData = JSON.parse(inputEl?.value || '{}');
+  } catch {
+    if (statusEl) statusEl.textContent = 'Invalid JSON input';
+    return;
+  }
+
+  try {
+    toggleButtonBusy(invokeBtn, true, 'Invoking...');
+    if (statusEl) statusEl.textContent = '';
+    if (resultEl) resultEl.style.display = 'none';
+
+    const envelope = await requestEnvelope(
+      `${apiBase}/tools/${selectedTool.id}/invoke`,
+      {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ inputs: inputData }),
+      },
+      'Tool invocation failed'
+    );
+
+    if (statusEl) statusEl.textContent = 'Tool invoked successfully';
+    if (resultEl) {
+      resultEl.textContent = JSON.stringify(envelope.data, null, 2);
+      resultEl.style.display = 'block';
+    }
+  } catch (err) {
+    if (statusEl) statusEl.textContent = err.message;
+  } finally {
+    toggleButtonBusy(invokeBtn, false);
+  }
+};
+
+const fetchWorkflows = async () => {
+  if (!state.accessToken) return;
+
+  const workflowsList = $('workflows-list');
+  if (workflowsList) workflowsList.innerHTML = '<div class="empty">Loading workflows...</div>';
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/workflows`,
+      { headers: headers() },
+      'Failed to load workflows'
+    );
+
+    workflows = envelope.data?.items || [];
+    renderWorkflowsList();
+  } catch (err) {
+    if (workflowsList) workflowsList.innerHTML = `<div class="empty">Error: ${escapeHtml(err.message)}</div>`;
+  }
+};
+
+let selectedWorkflow = null;
+
+const renderWorkflowsList = () => {
+  const workflowsList = $('workflows-list');
+  if (!workflowsList) return;
+
+  if (!workflows.length) {
+    workflowsList.innerHTML = '<div class="empty">No workflows configured</div>';
+    return;
+  }
+
+  workflowsList.innerHTML = workflows
+    .map((wf) => {
+      const isSelected = selectedWorkflow?.id === wf.id;
+      return `
+        <div class="workflow-card ${isSelected ? 'selected' : ''}" data-id="${escapeHtml(wf.id)}">
+          <div class="workflow-name">${escapeHtml(wf.name || wf.id)}</div>
+          <div class="workflow-meta">
+            <span class="visibility-badge ${wf.visibility || 'private'}">${wf.visibility || 'private'}</span>
+            <span>v${wf.version || 1}</span>
+          </div>
+        </div>
+      `;
+    })
+    .join('');
+
+  workflowsList.querySelectorAll('.workflow-card').forEach((card) => {
+    card.addEventListener('click', () => selectWorkflow(card.dataset.id));
+  });
+};
+
+const selectWorkflow = (workflowId) => {
+  const wf = workflows.find((w) => w.id === workflowId);
+  if (!wf) return;
+
+  selectedWorkflow = wf;
+  renderWorkflowsList();
+
+  const details = $('workflow-details');
+  if (details) {
+    const schema = wf.schema || {};
+    details.innerHTML = `
+      <div class="detail-header">
+        <h4>${escapeHtml(wf.name || wf.id)}</h4>
+        <span class="visibility-badge ${wf.visibility || 'private'}">${wf.visibility || 'private'}</span>
+      </div>
+      <div class="detail-row">
+        <span class="detail-label">ID</span>
+        <span class="monospace">${escapeHtml(wf.id)}</span>
+      </div>
+      <div class="detail-row">
+        <span class="detail-label">Entrypoint</span>
+        <span class="monospace">${escapeHtml(schema.entrypoint || '-')}</span>
+      </div>
+      <div class="detail-row">
+        <span class="detail-label">Nodes</span>
+        <span>${(schema.nodes || []).length} nodes</span>
+      </div>
+      <div class="divider"></div>
+      <h4>Schema</h4>
+      <pre class="schema-viewer">${escapeHtml(JSON.stringify(schema, null, 2))}</pre>
+    `;
+  }
+};
+
+const refreshToolsAndWorkflows = async () => {
+  await Promise.all([fetchTools(), fetchWorkflows()]);
+};
+
+// =============================================================================
+// Preference Insights
+// =============================================================================
+
+const fetchInsights = async () => {
+  if (!state.accessToken) return;
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/preferences/insights`,
+      { headers: headers() },
+      'Failed to load insights'
+    );
+
+    renderInsights(envelope.data || {});
+  } catch (err) {
+    console.warn('Failed to fetch insights:', err.message);
+    // Show error state
+    const totalEl = $('insights-total-events');
+    if (totalEl) totalEl.textContent = 'Error';
+  }
+};
+
+const renderInsights = (data) => {
+  // Summary stats
+  const totalEl = $('insights-total-events');
+  const positiveEl = $('insights-positive-count');
+  const negativeEl = $('insights-negative-count');
+  const neutralEl = $('insights-neutral-count');
+
+  if (totalEl) totalEl.textContent = data.total_events ?? '-';
+  if (positiveEl) positiveEl.textContent = data.positive_count ?? '-';
+  if (negativeEl) negativeEl.textContent = data.negative_count ?? '-';
+  if (neutralEl) neutralEl.textContent = data.neutral_count ?? '-';
+
+  // Top adapters
+  const adaptersEl = $('insights-top-adapters');
+  if (adaptersEl) {
+    const adapters = data.top_adapters || [];
+    if (!adapters.length) {
+      adaptersEl.innerHTML = '<div class="empty">No adapter data yet</div>';
+    } else {
+      adaptersEl.innerHTML = adapters
+        .map((a) => `
+          <div class="adapter-item">
+            <span class="adapter-name">${escapeHtml(a.adapter_id || a.name || 'Unknown')}</span>
+            <span class="adapter-score">+${a.positive_count || 0} / -${a.negative_count || 0}</span>
+          </div>
+        `)
+        .join('');
+    }
+  }
+
+  // Recent preferences
+  const recentEl = $('insights-recent-list');
+  if (recentEl) {
+    const recent = data.recent_events || [];
+    if (!recent.length) {
+      recentEl.innerHTML = '<div class="empty">No preference events yet</div>';
+    } else {
+      recentEl.innerHTML = recent
+        .map((e) => {
+          const feedback = e.feedback || 'neutral';
+          const date = e.created_at ? new Date(e.created_at).toLocaleDateString() : '-';
+          const icon = feedback === 'positive' ? '+1' : feedback === 'negative' ? '-1' : '·';
+          return `
+            <div class="preference-item ${feedback}">
+              <span class="feedback-icon">${icon}</span>
+              <span class="preference-message">${escapeHtml((e.context_text || '').slice(0, 80))}${e.context_text?.length > 80 ? '...' : ''}</span>
+              <span class="preference-date">${date}</span>
+            </div>
+          `;
+        })
+        .join('');
+    }
+  }
+
+  // Clusters
+  const clustersEl = $('insights-clusters');
+  if (clustersEl) {
+    const clusters = data.clusters || [];
+    if (!clusters.length) {
+      clustersEl.innerHTML = '<div class="empty">No clusters identified yet</div>';
+    } else {
+      clustersEl.innerHTML = clusters
+        .map((c) => `
+          <div class="cluster-card">
+            <div class="cluster-label">${escapeHtml(c.label || 'Unlabeled')}</div>
+            <div class="cluster-description">${escapeHtml(c.description || '-')}</div>
+            <div class="cluster-meta">
+              <span>${c.size || 0} events</span>
+              ${c.adapter_id ? `<span class="has-adapter">Has adapter</span>` : ''}
+            </div>
+          </div>
+        `)
+        .join('');
+    }
+  }
+};
+
+// =============================================================================
 // Auto-save drafts
 // =============================================================================
 
@@ -1913,6 +2429,19 @@ const initEventListeners = () => {
   // Auth
   if (authForm) authForm.addEventListener('submit', handleLogin);
   $('logout')?.addEventListener('click', logout);
+
+  // Auth form switching
+  $('show-signup')?.addEventListener('click', () => showAuthForm('signup'));
+  $('show-reset')?.addEventListener('click', () => showAuthForm('reset'));
+  $('show-login-from-signup')?.addEventListener('click', () => showAuthForm('login'));
+  $('show-login-from-reset')?.addEventListener('click', () => showAuthForm('login'));
+
+  // Signup
+  $('signup-form')?.addEventListener('submit', handleSignup);
+
+  // Password reset
+  $('reset-request-form')?.addEventListener('submit', handleResetRequest);
+  $('reset-confirm-form')?.addEventListener('submit', handleResetConfirm);
 
   // Chat
   if (chatForm) chatForm.addEventListener('submit', sendMessage);
@@ -1937,6 +2466,13 @@ const initEventListeners = () => {
   $('refresh-artifacts')?.addEventListener('click', fetchArtifacts);
   $('artifact-type-filter')?.addEventListener('change', fetchArtifacts);
   $('artifact-visibility-filter')?.addEventListener('change', fetchArtifacts);
+
+  // Tools
+  $('refresh-tools')?.addEventListener('click', refreshToolsAndWorkflows);
+  $('tool-invoke-form')?.addEventListener('submit', invokeTool);
+
+  // Insights
+  $('refresh-insights')?.addEventListener('click', fetchInsights);
 
   // File upload
   if (fileUploadInput) fileUploadInput.addEventListener('change', renderUploadHint);
@@ -1984,6 +2520,9 @@ const init = async () => {
       fetchConversations(),
       fetchContexts(),
       fetchArtifacts(),
+      fetchTools(),
+      fetchWorkflows(),
+      fetchInsights(),
       fetchHealth(),
     ]);
   }

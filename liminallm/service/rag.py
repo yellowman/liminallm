@@ -505,7 +505,3 @@ class RAGService:
         )
         return total_chunks
 
-    def embed_text(self, text: str) -> List[float]:
-        """Backward-compatible hook: use the deterministic embedding pipeline."""
-
-        return self.embed(text)

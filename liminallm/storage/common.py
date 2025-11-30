@@ -6,7 +6,6 @@ consistent behavior across storage backends.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import uuid
 from datetime import datetime
@@ -14,57 +13,30 @@ from ipaddress import ip_address
 from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 from liminallm.storage.errors import ConstraintViolation
+# Import from canonical location to avoid duplication
+from liminallm.service.embeddings import (
+    cosine_similarity,
+    deterministic_embedding,
+)
 
 if TYPE_CHECKING:
     from liminallm.storage.models import KnowledgeChunk, SemanticCluster
 
 
 # ============================================================================
-# TEXT EMBEDDING - Deterministic hash-based embedding
+# TEXT EMBEDDING - Re-export from embeddings service
 # ============================================================================
 
+# Alias for backwards compatibility with storage code
 def compute_text_embedding(text: Optional[str], dim: int = 64) -> List[float]:
     """Generate deterministic hash-based embedding from text.
 
-    This is used for simple similarity comparisons when a full embedding
-    model is not available. Each token is hashed and contributes to a
-    fixed-dimension vector which is then normalized.
-
-    Args:
-        text: Input text to embed
-        dim: Embedding dimension (default 64)
-
-    Returns:
-        Normalized embedding vector, or empty list if text is None/empty
+    This is a thin wrapper around deterministic_embedding for backwards
+    compatibility with storage code. Returns empty list for None/empty text.
     """
     if not text:
         return []
-    tokens = text.lower().split()
-    vec = [0.0] * dim
-    for tok in tokens:
-        h = int(hashlib.sha256(tok.encode()).hexdigest(), 16)
-        vec[h % dim] += 1.0
-    norm = sum(v * v for v in vec) ** 0.5 or 1.0
-    return [v / norm for v in vec]
-
-
-def cosine_similarity(vec_a: List[float], vec_b: List[float]) -> float:
-    """Compute cosine similarity between two vectors.
-
-    Args:
-        vec_a: First vector
-        vec_b: Second vector
-
-    Returns:
-        Cosine similarity score between -1 and 1
-    """
-    if not vec_a or not vec_b:
-        return 0.0
-    dim = min(len(vec_a), len(vec_b))
-    dot = sum(a * b for a, b in zip(vec_a[:dim], vec_b[:dim]))
-    norm_a = sum(a * a for a in vec_a[:dim]) ** 0.5 or 1.0
-    norm_b = sum(b * b for b in vec_b[:dim]) ** 0.5 or 1.0
-    return dot / (norm_a * norm_b)
+    return deterministic_embedding(text, dim=dim)
 
 
 # ============================================================================

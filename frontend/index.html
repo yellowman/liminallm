@@ -39,30 +39,105 @@
         <div class="main-content">
           <!-- Auth Panel (shown when not logged in) -->
           <section class="panel" id="auth-panel">
-            <h2>Sign in</h2>
-            <p class="subtext">Use your account to start or resume conversations.</p>
-            <form id="auth-form">
-              <div class="field">
-                <label for="email">Email</label>
-                <input type="email" id="email" name="email" placeholder="you@example.com" required />
+            <!-- Login Form -->
+            <div id="login-form-container">
+              <h2>Sign in</h2>
+              <p class="subtext">Use your account to start or resume conversations.</p>
+              <form id="auth-form">
+                <div class="field">
+                  <label for="email">Email</label>
+                  <input type="email" id="email" name="email" placeholder="you@example.com" required />
+                </div>
+                <div class="field">
+                  <label for="password">Password</label>
+                  <input type="password" id="password" name="password" placeholder="••••••••" required />
+                </div>
+                <div class="field">
+                  <label for="mfa">MFA code (if required)</label>
+                  <input type="text" id="mfa" name="mfa" placeholder="123456" inputmode="numeric" />
+                </div>
+                <div class="field">
+                  <label for="tenant">Tenant (optional)</label>
+                  <input type="text" id="tenant" name="tenant" placeholder="tenant-123" />
+                </div>
+                <div class="form-actions">
+                  <button class="primary" type="submit" id="auth-submit">Continue</button>
+                  <div class="small" id="status" aria-live="polite"></div>
+                </div>
+              </form>
+              <div class="auth-links">
+                <button type="button" class="link-btn" id="show-signup">Create an account</button>
+                <button type="button" class="link-btn" id="show-reset">Forgot password?</button>
               </div>
-              <div class="field">
-                <label for="password">Password</label>
-                <input type="password" id="password" name="password" placeholder="••••••••" required />
+            </div>
+
+            <!-- Signup Form -->
+            <div id="signup-form-container" class="hidden">
+              <h2>Create account</h2>
+              <p class="subtext">Sign up to start using LiminalLM.</p>
+              <form id="signup-form">
+                <div class="field">
+                  <label for="signup-email">Email</label>
+                  <input type="email" id="signup-email" name="email" placeholder="you@example.com" required />
+                </div>
+                <div class="field">
+                  <label for="signup-password">Password</label>
+                  <input type="password" id="signup-password" name="password" placeholder="••••••••" minlength="8" required />
+                </div>
+                <div class="field">
+                  <label for="signup-confirm">Confirm password</label>
+                  <input type="password" id="signup-confirm" name="confirm" placeholder="••••••••" required />
+                </div>
+                <div class="field">
+                  <label for="signup-tenant">Tenant (optional)</label>
+                  <input type="text" id="signup-tenant" name="tenant" placeholder="tenant-123" />
+                </div>
+                <div class="form-actions">
+                  <button class="primary" type="submit" id="signup-submit">Create account</button>
+                </div>
+              </form>
+              <div id="signup-status" class="small" role="status"></div>
+              <div class="auth-links">
+                <button type="button" class="link-btn" id="show-login-from-signup">Already have an account? Sign in</button>
               </div>
-              <div class="field">
-                <label for="mfa">MFA code (if required)</label>
-                <input type="text" id="mfa" name="mfa" placeholder="123456" inputmode="numeric" />
+            </div>
+
+            <!-- Password Reset Form -->
+            <div id="reset-form-container" class="hidden">
+              <h2>Reset password</h2>
+              <p class="subtext">Enter your email to receive a reset code.</p>
+              <form id="reset-request-form">
+                <div class="field">
+                  <label for="reset-email">Email</label>
+                  <input type="email" id="reset-email" name="email" placeholder="you@example.com" required />
+                </div>
+                <div class="form-actions">
+                  <button class="primary" type="submit" id="reset-request-submit">Send reset code</button>
+                </div>
+              </form>
+              <div id="reset-code-section" class="hidden">
+                <div class="divider"></div>
+                <p class="subtext">Enter the code sent to your email and your new password.</p>
+                <form id="reset-confirm-form">
+                  <div class="field">
+                    <label for="reset-code">Reset code</label>
+                    <input type="text" id="reset-code" name="code" placeholder="Enter code from email" required />
+                  </div>
+                  <div class="field">
+                    <label for="reset-new-password">New password</label>
+                    <input type="password" id="reset-new-password" name="password" placeholder="••••••••" minlength="8" required />
+                  </div>
+                  <div class="form-actions">
+                    <button class="primary" type="submit" id="reset-confirm-submit">Reset password</button>
+                  </div>
+                </form>
               </div>
-              <div class="field">
-                <label for="tenant">Tenant (optional)</label>
-                <input type="text" id="tenant" name="tenant" placeholder="tenant-123" />
+              <div id="reset-status" class="small" role="status"></div>
+              <div class="auth-links">
+                <button type="button" class="link-btn" id="show-login-from-reset">Back to sign in</button>
               </div>
-              <div class="form-actions">
-                <button class="primary" type="submit" id="auth-submit">Continue</button>
-                <div class="small" id="status" aria-live="polite"></div>
-              </div>
-            </form>
+            </div>
+
             <div id="error-banner" role="alert"></div>
           </section>
 
@@ -71,6 +146,8 @@
             <button class="tab-btn active" data-tab="chat-tab" aria-selected="true">Chat</button>
             <button class="tab-btn" data-tab="contexts-tab" aria-selected="false">Contexts</button>
             <button class="tab-btn" data-tab="artifacts-tab" aria-selected="false">Artifacts</button>
+            <button class="tab-btn" data-tab="tools-tab" aria-selected="false">Tools</button>
+            <button class="tab-btn" data-tab="insights-tab" aria-selected="false">Insights</button>
             <button class="tab-btn" data-tab="settings-tab" aria-selected="false">Settings</button>
           </nav>
 
@@ -287,6 +364,128 @@
               <h3>Version history</h3>
               <div id="artifact-versions" class="artifact-versions">
                 <div class="empty">Select an artifact to view version history</div>
+              </div>
+            </div>
+          </section>
+
+          <!-- Tools Tab -->
+          <section class="tab-panel" id="tools-tab" aria-label="Tools and Workflows">
+            <div class="panel">
+              <div class="section-header">
+                <h2>Tools & Workflows</h2>
+                <div class="pill-row">
+                  <button class="minor" id="refresh-tools">Refresh</button>
+                </div>
+              </div>
+              <p class="subtext">Browse available tools and workflows. Invoke tools directly or manage workflow configurations.</p>
+
+              <div class="divider"></div>
+
+              <h3>Available Tools</h3>
+              <p class="subtext">System-registered tool specifications that can be invoked in workflows.</p>
+              <div id="tools-list" class="tools-list">
+                <div class="empty">Loading tools...</div>
+              </div>
+
+              <div class="divider"></div>
+
+              <h3>Tool Details</h3>
+              <div id="tool-details" class="tool-details">
+                <div class="empty">Select a tool to view details and invoke it</div>
+              </div>
+
+              <div class="divider"></div>
+
+              <h3>Invoke Tool</h3>
+              <div id="tool-invoke-section" class="hidden">
+                <form id="tool-invoke-form">
+                  <div class="field">
+                    <label for="tool-invoke-input">Input (JSON)</label>
+                    <textarea id="tool-invoke-input" rows="4" placeholder='{"message": "Hello"}'></textarea>
+                  </div>
+                  <div class="pill-row">
+                    <button type="submit" class="primary" id="tool-invoke-btn">Invoke</button>
+                  </div>
+                </form>
+                <div id="tool-invoke-status" class="small" role="status"></div>
+                <div id="tool-invoke-result" class="code-block" style="display: none;"></div>
+              </div>
+              <div id="tool-invoke-placeholder" class="empty">Select a tool above to invoke it</div>
+
+              <div class="divider"></div>
+
+              <h3>Workflows</h3>
+              <p class="subtext">Active workflow configurations for routing and processing messages.</p>
+              <div id="workflows-list" class="workflows-list">
+                <div class="empty">Loading workflows...</div>
+              </div>
+
+              <div class="divider"></div>
+
+              <h3>Workflow Details</h3>
+              <div id="workflow-details" class="workflow-details">
+                <div class="empty">Select a workflow to view its configuration</div>
+              </div>
+            </div>
+          </section>
+
+          <!-- Insights Tab -->
+          <section class="tab-panel" id="insights-tab" aria-label="Preference Insights">
+            <div class="panel">
+              <div class="section-header">
+                <h2>Preference Insights</h2>
+                <div class="pill-row">
+                  <button class="minor" id="refresh-insights">Refresh</button>
+                </div>
+              </div>
+              <p class="subtext">View your preference history and insights about how your feedback shapes model behavior.</p>
+
+              <div class="divider"></div>
+
+              <h3>Summary</h3>
+              <div id="insights-summary" class="insights-summary">
+                <div class="stats-grid">
+                  <div class="stat-card">
+                    <div class="stat-value" id="insights-total-events">-</div>
+                    <div class="stat-label">Total Events</div>
+                  </div>
+                  <div class="stat-card">
+                    <div class="stat-value" id="insights-positive-count">-</div>
+                    <div class="stat-label">Positive</div>
+                  </div>
+                  <div class="stat-card">
+                    <div class="stat-value" id="insights-negative-count">-</div>
+                    <div class="stat-label">Negative</div>
+                  </div>
+                  <div class="stat-card">
+                    <div class="stat-value" id="insights-neutral-count">-</div>
+                    <div class="stat-label">Neutral</div>
+                  </div>
+                </div>
+              </div>
+
+              <div class="divider"></div>
+
+              <h3>Top Adapters</h3>
+              <p class="subtext">Adapters that have received the most positive feedback.</p>
+              <div id="insights-top-adapters" class="insights-adapters">
+                <div class="empty">No adapter data yet</div>
+              </div>
+
+              <div class="divider"></div>
+
+              <h3>Recent Preferences</h3>
+              <p class="subtext">Your most recent feedback events.</p>
+              <div id="insights-recent-list" class="insights-recent">
+                <div class="empty">No preference events yet</div>
+              </div>
+
+              <div class="divider"></div>
+
+              <h3>Clusters</h3>
+              <p class="subtext">Semantic clusters identified from your preferences. These represent emergent skill areas.</p>
+              <div id="insights-clusters" class="insights-clusters">
+                <div class="empty">No clusters identified yet</div>
               </div>
             </div>
           </section>
