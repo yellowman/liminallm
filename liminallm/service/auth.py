@@ -620,7 +620,7 @@ class AuthService:
         if hasattr(self.store, "revoke_user_sessions"):
             # Use store method if available for better performance
             try:
-                self.store.revoke_user_sessions(user_id)  # type: ignore[attr-defined]
+                self.store.revoke_user_sessions(user_id, except_session_id)  # type: ignore[attr-defined]
                 revoked_count = -1  # Unknown count when using bulk method
             except Exception as exc:
                 self.logger.warning(

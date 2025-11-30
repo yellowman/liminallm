@@ -10,3 +10,8 @@ The more we can achieve with proper structure and well-architected design, the b
 
 ### Planning and Resource Management
 Planning and careful use of resources is of the utmost importance. Use constraints with all subagents in planning and preparation to get better results. Think before acting, and scope work appropriately.
+
+## Security Guidelines
+
+### Tenant Isolation
+Always derive `tenant_id` from the authenticated JWT token, never from request parameters or user input. This prevents tenant spoofing attacks and ensures proper data isolation in multi-tenant contexts.
