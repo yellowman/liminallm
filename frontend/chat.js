@@ -824,8 +824,7 @@ const handleResetConfirm = async (event) => {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          email: resetEmailForConfirm,
-          code,
+          token: code,
           new_password: newPassword,
         }),
       },
@@ -2065,8 +2064,9 @@ let audioChunks = [];
 let isRecording = false;
 let currentAudio = null;
 
-const voiceInputBtn = $('voice-input-btn');
-const voiceOutputBtn = $('voice-output-btn');
+// Voice button references - initialized lazily in initEventListeners
+let voiceInputBtn = null;
+let voiceOutputBtn = null;
 
 const startVoiceRecording = async () => {
   if (isRecording) return;
@@ -2130,11 +2130,11 @@ const transcribeAudio = async (audioBlob) => {
     });
 
     const envelope = await response.json();
-    if (envelope.status === 'ok' && envelope.data?.text) {
+    if (envelope.status === 'ok' && envelope.data?.transcript) {
       // Insert transcribed text into the message input
       const messageInput = $('message-input');
       if (messageInput) {
-        messageInput.value = (messageInput.value + ' ' + envelope.data.text).trim();
+        messageInput.value = (messageInput.value + ' ' + envelope.data.transcript).trim();
         messageInput.focus();
       }
     } else {
@@ -2212,24 +2212,7 @@ const readLastResponse = () => {
   speakText(content);
 };
 
-// Voice button event listeners
-if (voiceInputBtn) {
-  voiceInputBtn.addEventListener('mousedown', startVoiceRecording);
-  voiceInputBtn.addEventListener('mouseup', stopVoiceRecording);
-  voiceInputBtn.addEventListener('mouseleave', stopVoiceRecording);
-  voiceInputBtn.addEventListener('touchstart', (e) => {
-    e.preventDefault();
-    startVoiceRecording();
-  });
-  voiceInputBtn.addEventListener('touchend', (e) => {
-    e.preventDefault();
-    stopVoiceRecording();
-  });
-}
-
-if (voiceOutputBtn) {
-  voiceOutputBtn.addEventListener('click', readLastResponse);
-}
+// Voice button event listeners are initialized in initEventListeners() after DOM ready
 
 // =============================================================================
 // File upload
@@ -3799,6 +3782,28 @@ const initEventListeners = () => {
   $('approve-patch-btn')?.addEventListener('click', () => decidePatch('approve'));
   $('reject-patch-btn')?.addEventListener('click', () => decidePatch('reject'));
   $('apply-patch-btn')?.addEventListener('click', applyPatch);
+
+  // Voice input/output buttons - must be initialized after DOM ready
+  voiceInputBtn = $('voice-input-btn');
+  voiceOutputBtn = $('voice-output-btn');
+
+  if (voiceInputBtn) {
+    voiceInputBtn.addEventListener('mousedown', startVoiceRecording);
+    voiceInputBtn.addEventListener('mouseup', stopVoiceRecording);
+    voiceInputBtn.addEventListener('mouseleave', stopVoiceRecording);
+    voiceInputBtn.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      startVoiceRecording();
+    });
+    voiceInputBtn.addEventListener('touchend', (e) => {
+      e.preventDefault();
+      stopVoiceRecording();
+    });
+  }
+
+  if (voiceOutputBtn) {
+    voiceOutputBtn.addEventListener('click', readLastResponse);
+  }
 };
 
 // =============================================================================

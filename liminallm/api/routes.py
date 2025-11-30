@@ -108,25 +108,29 @@ router = APIRouter(prefix="/v1")
 # Registry for active streaming requests - maps request_id to cancel_event
 # Used by POST /chat/cancel to cancel in-progress streaming requests per SPEC §18
 _active_requests: Dict[str, asyncio.Event] = {}
+_active_requests_lock = asyncio.Lock()
 
 
-def _register_cancel_event(request_id: str, cancel_event: asyncio.Event) -> None:
+async def _register_cancel_event(request_id: str, cancel_event: asyncio.Event) -> None:
     """Register a cancel event for an active streaming request."""
-    _active_requests[request_id] = cancel_event
+    async with _active_requests_lock:
+        _active_requests[request_id] = cancel_event
 
 
-def _unregister_cancel_event(request_id: str) -> None:
+async def _unregister_cancel_event(request_id: str) -> None:
     """Unregister a cancel event when request completes."""
-    _active_requests.pop(request_id, None)
+    async with _active_requests_lock:
+        _active_requests.pop(request_id, None)
 
 
-def _cancel_request(request_id: str) -> bool:
+async def _cancel_request(request_id: str) -> bool:
     """Cancel an active request by request_id. Returns True if cancelled."""
-    cancel_event = _active_requests.get(request_id)
-    if cancel_event and not cancel_event.is_set():
-        cancel_event.set()
-        return True
-    return False
+    async with _active_requests_lock:
+        cancel_event = _active_requests.get(request_id)
+        if cancel_event and not cancel_event.is_set():
+            cancel_event.set()
+            return True
+        return False
 
 
 def _http_error(
@@ -1104,7 +1108,8 @@ async def request_reset(body: PasswordResetRequest):
     user = runtime.store.get_user_by_email(body.email)
     if user:
         token = await runtime.auth.initiate_password_reset(body.email)
-        runtime.email.send_password_reset(body.email, token)
+        # Run blocking SMTP in thread to avoid blocking event loop
+        await asyncio.to_thread(runtime.email.send_password_reset, body.email, token)
     # Always return success to prevent email enumeration
     return Envelope(status="ok", data={"status": "sent"})
 
@@ -1239,7 +1244,8 @@ async def request_email_verification(principal: AuthContext = Depends(get_user))
     if not user:
         raise _http_error("not_found", "user not found", status_code=404)
     token = await runtime.auth.request_email_verification(user)
-    runtime.email.send_email_verification(user.email, token)
+    # Run blocking SMTP in thread to avoid blocking event loop
+    await asyncio.to_thread(runtime.email.send_email_verification, user.email, token)
     return Envelope(status="ok", data={"status": "sent"})
 
 
@@ -1477,7 +1483,7 @@ async def cancel_chat(
     request_id = body.request_id
 
     # Try to cancel in-memory active request
-    cancelled = _cancel_request(request_id)
+    cancelled = await _cancel_request(request_id)
 
     if cancelled:
         logger.info("chat_request_cancelled", request_id=request_id, user_id=principal.user_id)
@@ -2812,7 +2818,7 @@ async def websocket_chat(ws: WebSocket):
             # Streaming mode: emit token, trace, message_done, error events
             cancel_event = asyncio.Event()
             # Register cancel event so POST /chat/cancel can cancel this request
-            _register_cancel_event(request_id, cancel_event)
+            await _register_cancel_event(request_id, cancel_event)
             full_content = ""
             orchestration_dict: dict[str, Any] = {}
 
@@ -2870,11 +2876,11 @@ async def websocket_chat(ws: WebSocket):
             except WebSocketDisconnect:
                 cancel_event.set()
                 cancel_listener.cancel()
-                _unregister_cancel_event(request_id)
+                await _unregister_cancel_event(request_id)
                 return
             finally:
                 cancel_listener.cancel()
-                _unregister_cancel_event(request_id)
+                await _unregister_cancel_event(request_id)
 
             # Save assistant message after streaming completes
             adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))

@@ -474,7 +474,7 @@ class AuthService:
         tenant_id: Optional[str] = None,
     ) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
         user = self.store.get_user_by_email(email)
-        if not user or not self._verify_password(user.id, password):
+        if not user or not self.verify_password(user.id, password):
             return None, None, {}
         if tenant_id and tenant_id != user.tenant_id:
             return None, None, {}
@@ -764,7 +764,8 @@ class AuthService:
         digest = self._pwd_hasher.hash(password)
         return digest, algo
 
-    def _verify_password(self, user_id: str, password: str) -> bool:
+    def verify_password(self, user_id: str, password: str) -> bool:
+        """Verify a user's password against stored hash."""
         record = self.store.get_password_record(user_id)
         if not record:
             return False
