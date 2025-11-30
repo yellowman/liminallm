@@ -79,14 +79,91 @@ class RAGService:
         *,
         user_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        min_token_count: int = 10,
     ) -> List[KnowledgeChunk]:
+        """Retrieve relevant chunks for a query.
+
+        Args:
+            context_ids: Context IDs to search within
+            query: Search query
+            limit: Maximum number of chunks to return
+            user_id: User ID for access control
+            tenant_id: Tenant ID for multi-tenant filtering
+            max_tokens: Optional maximum total tokens across all returned chunks.
+                       Uses token_count from chunk metadata if available.
+            min_token_count: Minimum tokens per chunk (filters out very short chunks)
+
+        Returns:
+            List of relevant chunks, optionally limited by total token budget
+        """
         if not context_ids:
             return []
 
         normalized_query = query or ""
-        return self._retriever(
-            context_ids, normalized_query, limit, user_id=user_id, tenant_id=tenant_id
+        results = self._retriever(
+            context_ids, normalized_query, limit * 2 if max_tokens else limit,
+            user_id=user_id, tenant_id=tenant_id
         )
+
+        # Filter out very short chunks (likely noise)
+        if min_token_count > 0:
+            results = [
+                chunk for chunk in results
+                if self._get_chunk_token_count(chunk) >= min_token_count
+            ]
+
+        # Apply token budget if specified
+        if max_tokens is not None and max_tokens > 0:
+            results = self._apply_token_budget(results, max_tokens, limit)
+
+        return results[:limit]
+
+    def _get_chunk_token_count(self, chunk: KnowledgeChunk) -> int:
+        """Get token count from chunk metadata, or estimate from content."""
+        if chunk.meta and isinstance(chunk.meta.get("token_count"), int):
+            return chunk.meta["token_count"]
+        # Estimate ~4 chars per token as fallback
+        return len(chunk.content) // 4
+
+    def _apply_token_budget(
+        self,
+        chunks: List[KnowledgeChunk],
+        max_tokens: int,
+        limit: int,
+    ) -> List[KnowledgeChunk]:
+        """Select chunks that fit within the token budget.
+
+        Prioritizes chunks in their existing order (by relevance score)
+        while respecting the total token budget.
+        """
+        selected: List[KnowledgeChunk] = []
+        total_tokens = 0
+
+        for chunk in chunks:
+            if len(selected) >= limit:
+                break
+
+            chunk_tokens = self._get_chunk_token_count(chunk)
+
+            # Check if adding this chunk would exceed budget
+            if total_tokens + chunk_tokens > max_tokens:
+                # If we have no chunks yet, include at least one
+                if not selected:
+                    selected.append(chunk)
+                    total_tokens += chunk_tokens
+                continue
+
+            selected.append(chunk)
+            total_tokens += chunk_tokens
+
+        logger.debug(
+            "rag_token_budget_applied",
+            max_tokens=max_tokens,
+            total_tokens=total_tokens,
+            chunk_count=len(selected),
+        )
+        return selected
 
     def _uses_pgvector(self) -> bool:
         return self.rag_mode in {"pgvector", "pg", "vector"}

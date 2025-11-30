@@ -132,6 +132,79 @@ const escapeHtml = (str) => {
   return div.innerHTML;
 };
 
+// Citation modal for displaying source content
+const showCitationModal = (element) => {
+  try {
+    const data = JSON.parse(element.dataset.citation || '{}');
+    const modal = document.getElementById('citation-modal');
+    const content = document.getElementById('citation-modal-content');
+    const title = document.getElementById('citation-modal-title');
+
+    if (!modal) {
+      // Create modal dynamically if it doesn't exist
+      createCitationModal();
+      return showCitationModal(element);
+    }
+
+    // Set modal content
+    const sourcePath = data.source_path || data.chunk_id || 'Unknown Source';
+    title.textContent = sourcePath.split('/').pop() || sourcePath;
+
+    // Build content display
+    let html = '';
+    if (data.source_path) {
+      html += `<div class="citation-meta"><strong>Source:</strong> ${escapeHtml(data.source_path)}</div>`;
+    }
+    if (data.context_id) {
+      html += `<div class="citation-meta"><strong>Context:</strong> ${escapeHtml(data.context_id)}</div>`;
+    }
+    if (data.chunk_index !== undefined) {
+      html += `<div class="citation-meta"><strong>Chunk:</strong> #${data.chunk_index}</div>`;
+    }
+    if (data.content) {
+      html += `<div class="citation-content"><pre>${escapeHtml(data.content)}</pre></div>`;
+    } else {
+      html += `<div class="citation-content"><em>No content preview available</em></div>`;
+    }
+
+    content.innerHTML = html;
+    modal.classList.add('active');
+
+    // Close on click outside
+    modal.onclick = (e) => {
+      if (e.target === modal) {
+        modal.classList.remove('active');
+      }
+    };
+  } catch (err) {
+    console.error('Failed to parse citation data:', err);
+  }
+};
+
+const createCitationModal = () => {
+  const modal = document.createElement('div');
+  modal.id = 'citation-modal';
+  modal.className = 'modal-overlay';
+  modal.innerHTML = `
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 id="citation-modal-title">Citation</h3>
+        <button class="modal-close" onclick="document.getElementById('citation-modal').classList.remove('active')">&times;</button>
+      </div>
+      <div id="citation-modal-content" class="modal-body"></div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+};
+
+// Close citation modal on escape key
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    const modal = document.getElementById('citation-modal');
+    if (modal) modal.classList.remove('active');
+  }
+});
+
 const randomIdempotencyKey = () => {
   if (window.crypto?.randomUUID) return window.crypto.randomUUID();
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -649,7 +722,14 @@ const renderMessage = (m) => {
         ${citations.map((c, i) => {
           const path = escapeHtml(c.source_path || c.chunk_id || `Citation ${i + 1}`);
           const label = path.split('/').pop() || path;
-          return `<span class="citation-link" title="${path}">${escapeHtml(label)}</span>`;
+          const snippetData = escapeHtml(JSON.stringify({
+            source_path: c.source_path || '',
+            chunk_id: c.chunk_id || '',
+            content: c.content || c.snippet || '',
+            context_id: c.context_id || '',
+            chunk_index: c.chunk_index,
+          }));
+          return `<span class="citation-link" title="${path}" data-citation='${snippetData}' onclick="showCitationModal(this)">${escapeHtml(label)}</span>`;
         }).join('')}
       </div>
     `;
