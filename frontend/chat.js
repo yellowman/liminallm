@@ -2075,8 +2075,9 @@ let voiceOutputBtn = null;
 const startVoiceRecording = async () => {
   if (isRecording) return;
 
+  let stream = null;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
     mediaRecorder = new MediaRecorder(stream);
     audioChunks = [];
 
@@ -2099,6 +2100,10 @@ const startVoiceRecording = async () => {
       voiceInputBtn.title = 'Release to stop recording';
     }
   } catch (err) {
+    // Clean up stream if it was obtained but recording failed to start
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop());
+    }
     console.error('Microphone access denied:', err);
     alert('Could not access microphone. Please check permissions.');
   }
