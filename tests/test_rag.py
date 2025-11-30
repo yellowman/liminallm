@@ -16,8 +16,9 @@ def _setup_store() -> tuple[RAGService, str, str, str, str]:
         owner_user_id=user_b.id, name="tenant_b_ctx", description="ctx"
     )
     service = RAGService(store)
-    service.ingest_text(ctx_a.id, "tenant a data")
-    service.ingest_text(ctx_b.id, "tenant b data")
+    # Use longer content to ensure chunks have >= 10 tokens (min_token_count filter)
+    service.ingest_text(ctx_a.id, "This is tenant A data with enough content to pass the minimum token count filter for retrieval")
+    service.ingest_text(ctx_b.id, "This is tenant B data with enough content to pass the minimum token count filter for retrieval")
     return service, ctx_a.id, ctx_b.id, user_a.id, user_b.id
 
 
@@ -107,7 +108,8 @@ def test_local_hybrid_without_pgvector():
     rag = RAGService(
         store, rag_mode="local_hybrid", embedding_model_id="legacy-embedding"
     )
-    rag.ingest_text(ctx.id, "legacy search path")
+    # Use longer content to ensure chunks have >= 10 tokens (min_token_count filter)
+    rag.ingest_text(ctx.id, "This is legacy search path content with enough tokens to pass the minimum token count filter")
     existing_chunks = store.chunks.get(ctx.id, [])
     store.add_chunks(
         ctx.id,
@@ -116,7 +118,7 @@ def test_local_hybrid_without_pgvector():
                 id=None,
                 context_id=ctx.id,
                 fs_path="inline",
-                content="other model",
+                content="This is other model content with enough tokens to pass the minimum token count filter",
                 embedding=[],
                 chunk_index=len(existing_chunks),
                 meta={"embedding_model_id": "other"},
