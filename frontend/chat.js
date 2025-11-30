@@ -1145,14 +1145,15 @@ const renderMessage = (m) => {
         ${citations.map((c, i) => {
           const path = escapeHtml(c.source_path || c.chunk_id || `Citation ${i + 1}`);
           const label = path.split('/').pop() || path;
-          const snippetData = escapeHtml(JSON.stringify({
+          // JSON.stringify escapes internal quotes; only need & and " for double-quoted attr
+          const snippetData = JSON.stringify({
             source_path: c.source_path || '',
             chunk_id: c.chunk_id || '',
             content: c.content || c.snippet || '',
             context_id: c.context_id || '',
             chunk_index: c.chunk_index,
-          }));
-          return `<span class="citation-link" title="${path}" data-citation='${snippetData}' onclick="showCitationModal(this)">${escapeHtml(label)}</span>`;
+          }).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+          return `<span class="citation-link" title="${path}" data-citation="${snippetData}" onclick="showCitationModal(this)">${escapeHtml(label)}</span>`;
         }).join('')}
       </div>
     `;
