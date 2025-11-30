@@ -14,4 +14,4 @@ Planning and careful use of resources is of the utmost importance. Use constrain
 ## Security Guidelines
 
 ### Tenant Isolation
-Always derive `tenant_id` from the JWT token, never from request parameters or user input. This prevents tenant spoofing attacks and ensures proper data isolation in multi-tenant contexts.
+Always derive `tenant_id` from the authenticated JWT token, never from request parameters or user input. This prevents tenant spoofing attacks and ensures proper data isolation in multi-tenant contexts.
