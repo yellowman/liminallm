@@ -1409,7 +1409,7 @@ const sendMessage = async (event) => {
     return new Promise((resolve, reject) => {
       let settled = false;
       let streamingMsg = null;
-      let messageDoneData = null;
+      let messageDoneData = {};
 
       const cleanup = () => {
         ws.removeEventListener('message', handleMessage);
@@ -1512,7 +1512,7 @@ const sendMessage = async (event) => {
           settled = true;
           cleanup();
           // If we got message_done but not streaming_complete, resolve with what we have
-          if (messageDoneData) {
+          if (Object.keys(messageDoneData).length > 0) {
             if (streamingMsg) streamingMsg.finalize('');
             resolve(messageDoneData);
           } else {
