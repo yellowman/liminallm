@@ -62,7 +62,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 # Health check
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:${PORT}/v1/health || exit 1
+    CMD curl -f http://localhost:${PORT}/healthz || exit 1
 
 # Switch to non-root user
 USER liminallm

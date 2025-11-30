@@ -284,6 +284,24 @@ for v1 these can all live in one python app with clear module boundaries.
 
 MIT
 
+## docker deployment
+
+```bash
+# Set required secrets
+export POSTGRES_PASSWORD=your-secure-password
+export JWT_SECRET=$(openssl rand -hex 32)
+
+# Start all services (app, postgres, redis)
+docker-compose up -d
+
+# With nginx reverse proxy for production
+docker-compose --profile production up -d
+```
+
+The stack exposes:
+- `/healthz` - health check with dependency status
+- `/metrics` - Prometheus-compatible metrics
+
 ## dev quickstart (prototype)
 
 - install dependencies: `pip install -e .`
