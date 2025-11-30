@@ -52,6 +52,7 @@ from liminallm.storage.models import (
     User,
     UserAuthProvider,
     UserMFAConfig,
+    UserSettings,
 )
 
 
@@ -87,6 +88,7 @@ class MemoryStore:
         self.semantic_clusters: Dict[str, SemanticCluster] = {}
         self.adapter_router_state: Dict[str, AdapterRouterState] = {}
         self.mfa_secrets: Dict[str, UserMFAConfig] = {}
+        self.user_settings: Dict[str, UserSettings] = {}
         self.fs_root = Path(fs_root)
         self.fs_root.mkdir(parents=True, exist_ok=True)
         self._mfa_cipher = self._build_mfa_cipher(mfa_encryption_key)
@@ -424,6 +426,36 @@ class MemoryStore:
                 created_at=cfg.created_at,
                 meta=cfg.meta,
             )
+
+    def get_user_settings(self, user_id: str) -> Optional[UserSettings]:
+        """Get user settings/preferences."""
+        with self._data_lock:
+            return self.user_settings.get(user_id)
+
+    def set_user_settings(
+        self,
+        user_id: str,
+        *,
+        locale: Optional[str] = None,
+        timezone: Optional[str] = None,
+        default_voice: Optional[str] = None,
+        default_style: Optional[dict] = None,
+        flags: Optional[dict] = None,
+    ) -> UserSettings:
+        """Create or update user settings."""
+        with self._data_lock:
+            existing = self.user_settings.get(user_id)
+            settings = UserSettings(
+                user_id=user_id,
+                locale=locale if locale is not None else (existing.locale if existing else None),
+                timezone=timezone if timezone is not None else (existing.timezone if existing else None),
+                default_voice=default_voice if default_voice is not None else (existing.default_voice if existing else None),
+                default_style=default_style if default_style is not None else (existing.default_style if existing else None),
+                flags=flags if flags is not None else (existing.flags if existing else None),
+            )
+            self.user_settings[user_id] = settings
+            self._persist_state()
+            return settings
 
     def create_session(
         self,

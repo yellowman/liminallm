@@ -2196,11 +2196,14 @@ const speakText = async (text) => {
 };
 
 const readLastResponse = () => {
-  if (!state.lastAssistant?.content) {
+  // Get the last assistant message content from DOM
+  const lastAssistantBubble = document.querySelector('.message.assistant:last-of-type .bubble');
+  const content = lastAssistantBubble?.textContent?.trim();
+  if (!content) {
     alert('No assistant response to read.');
     return;
   }
-  speakText(state.lastAssistant.content);
+  speakText(content);
 };
 
 // Voice button event listeners

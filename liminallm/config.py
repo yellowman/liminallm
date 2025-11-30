@@ -318,6 +318,7 @@ class Settings(BaseModel):
         10, "FILES_UPLOAD_RATE_LIMIT_PER_MINUTE"
     )
     configops_rate_limit_per_hour: int = env_field(30, "CONFIGOPS_RATE_LIMIT_PER_HOUR")
+    read_rate_limit_per_minute: int = env_field(120, "READ_RATE_LIMIT_PER_MINUTE")
 
     # Training worker settings
     training_worker_enabled: bool = env_field(

@@ -469,7 +469,7 @@ class RAGService:
                 try:
                     total_chunks += self.ingest_file(context_id, str(path), chunk_size)
                 except Exception as exc:
-                    self._logger.warning(
+                    logger.warning(
                         "ingest_path_file_failed",
                         path=str(path),
                         error=str(exc),
@@ -477,7 +477,7 @@ class RAGService:
             return total_chunks
 
         if not path.is_dir():
-            self._logger.warning("ingest_path_not_found", path=str(path))
+            logger.warning("ingest_path_not_found", path=str(path))
             return 0
 
         # Directory - iterate through files
@@ -490,13 +490,13 @@ class RAGService:
             try:
                 total_chunks += self.ingest_file(context_id, str(file_path), chunk_size)
             except Exception as exc:
-                self._logger.warning(
+                logger.warning(
                     "ingest_path_file_failed",
                     path=str(file_path),
                     error=str(exc),
                 )
 
-        self._logger.info(
+        logger.info(
             "ingest_path_completed",
             context_id=context_id,
             fs_path=fs_path,

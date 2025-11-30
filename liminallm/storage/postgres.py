@@ -48,6 +48,7 @@ from liminallm.storage.models import (
     TrainingJob,
     User,
     UserMFAConfig,
+    UserSettings,
 )
 
 
@@ -973,6 +974,68 @@ class PostgresStore:
             self.logger.warning("get_user_mfa_secret_failed", error=str(exc))
             return None
         return None
+
+    def get_user_settings(self, user_id: str) -> Optional[UserSettings]:
+        """Get user settings/preferences."""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM user_settings WHERE user_id = %s", (user_id,)
+                ).fetchone()
+                if not row:
+                    return None
+                return UserSettings(
+                    user_id=str(row["user_id"]),
+                    locale=row.get("locale"),
+                    timezone=row.get("timezone"),
+                    default_voice=row.get("default_voice"),
+                    default_style=row.get("default_style"),
+                    flags=row.get("flags"),
+                )
+        except Exception as exc:
+            self.logger.warning("get_user_settings_failed", error=str(exc))
+            return None
+
+    def set_user_settings(
+        self,
+        user_id: str,
+        *,
+        locale: Optional[str] = None,
+        timezone: Optional[str] = None,
+        default_voice: Optional[str] = None,
+        default_style: Optional[dict] = None,
+        flags: Optional[dict] = None,
+    ) -> UserSettings:
+        """Create or update user settings."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_settings (user_id, locale, timezone, default_voice, default_style, flags)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    locale = COALESCE(EXCLUDED.locale, user_settings.locale),
+                    timezone = COALESCE(EXCLUDED.timezone, user_settings.timezone),
+                    default_voice = COALESCE(EXCLUDED.default_voice, user_settings.default_voice),
+                    default_style = COALESCE(EXCLUDED.default_style, user_settings.default_style),
+                    flags = COALESCE(EXCLUDED.flags, user_settings.flags)
+                """,
+                (
+                    user_id,
+                    locale,
+                    timezone,
+                    default_voice,
+                    json.dumps(default_style) if default_style else None,
+                    json.dumps(flags) if flags else None,
+                ),
+            )
+        return UserSettings(
+            user_id=user_id,
+            locale=locale,
+            timezone=timezone,
+            default_voice=default_voice,
+            default_style=default_style,
+            flags=flags,
+        )
 
     def get_user_by_email(self, email: str) -> Optional[User]:
         with self._connect() as conn:
