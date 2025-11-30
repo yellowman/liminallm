@@ -197,13 +197,7 @@ const createCitationModal = () => {
   document.body.appendChild(modal);
 };
 
-// Close citation modal on escape key
-document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') {
-    const modal = document.getElementById('citation-modal');
-    if (modal) modal.classList.remove('active');
-  }
-});
+// Escape key handler moved to initEventListeners() for consistent initialization
 
 const randomIdempotencyKey = () => {
   if (window.crypto?.randomUUID) return window.crypto.randomUUID();
@@ -3814,6 +3808,14 @@ const initEventListeners = () => {
   if (voiceOutputBtn) {
     voiceOutputBtn.addEventListener('click', readLastResponse);
   }
+
+  // Close citation modal on escape key
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') {
+      const modal = document.getElementById('citation-modal');
+      if (modal) modal.classList.remove('active');
+    }
+  });
 };
 
 // =============================================================================
