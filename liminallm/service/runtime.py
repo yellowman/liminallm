@@ -118,7 +118,13 @@ class Runtime:
         self.workflow = WorkflowEngine(
             self.store, self.llm, self.router, self.rag, cache=self.cache
         )
-        self.voice = VoiceService(self.settings.shared_fs_root)
+        self.voice = VoiceService(
+            self.settings.shared_fs_root,
+            api_key=self.settings.voice_api_key,
+            transcription_model=self.settings.voice_transcription_model,
+            synthesis_model=self.settings.voice_synthesis_model,
+            default_voice=self.settings.voice_default_voice,
+        )
         self.config_ops = ConfigOpsService(
             self.store, self.llm, self.router, self.training
         )

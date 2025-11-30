@@ -256,6 +256,19 @@ class Settings(BaseModel):
     adapter_openai_api_key: str | None = env_field(None, "OPENAI_ADAPTER_API_KEY")
     adapter_openai_base_url: str | None = env_field(None, "OPENAI_ADAPTER_BASE_URL")
     adapter_server_model: str | None = env_field(None, "ADAPTER_SERVER_MODEL")
+    # Voice service settings
+    voice_api_key: str | None = env_field(None, "VOICE_API_KEY")
+    voice_transcription_model: str = env_field("whisper-1", "VOICE_TRANSCRIPTION_MODEL")
+    voice_synthesis_model: str = env_field("tts-1", "VOICE_SYNTHESIS_MODEL")
+    voice_default_voice: str = env_field("alloy", "VOICE_DEFAULT_VOICE")
+    # OAuth settings
+    oauth_google_client_id: str | None = env_field(None, "OAUTH_GOOGLE_CLIENT_ID")
+    oauth_google_client_secret: str | None = env_field(None, "OAUTH_GOOGLE_CLIENT_SECRET")
+    oauth_github_client_id: str | None = env_field(None, "OAUTH_GITHUB_CLIENT_ID")
+    oauth_github_client_secret: str | None = env_field(None, "OAUTH_GITHUB_CLIENT_SECRET")
+    oauth_microsoft_client_id: str | None = env_field(None, "OAUTH_MICROSOFT_CLIENT_ID")
+    oauth_microsoft_client_secret: str | None = env_field(None, "OAUTH_MICROSOFT_CLIENT_SECRET")
+    oauth_redirect_uri: str | None = env_field(None, "OAUTH_REDIRECT_URI")
     default_adapter_mode: AdapterMode = env_field(
         AdapterMode.HYBRID,
         "DEFAULT_ADAPTER_MODE",

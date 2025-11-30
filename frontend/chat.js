@@ -2285,6 +2285,7 @@ const renderAdminSettingsSection = () => {
     fetchAdminUsers();
     fetchAdminAdapters();
     fetchAdminObjects();
+    fetchConfigPatches();
   }
 };
 
@@ -2538,6 +2539,169 @@ const renderAdminObjects = (objects) => {
       `;
     })
     .join('');
+};
+
+// =============================================================================
+// Admin Config Patches
+// =============================================================================
+
+let selectedPatch = null;
+
+const fetchConfigPatches = async () => {
+  if (state.role !== 'admin') return;
+
+  const tbody = $('patches-table-body');
+  if (tbody) tbody.innerHTML = '<tr><td colspan="6" class="empty">Loading patches...</td></tr>';
+
+  try {
+    const statusFilter = $('patches-status-filter')?.value || '';
+    const url = statusFilter
+      ? `${apiBase}/config/patches?status=${statusFilter}`
+      : `${apiBase}/config/patches`;
+
+    const envelope = await requestEnvelope(url, { headers: authHeaders() }, 'Failed to load patches');
+
+    const patches = envelope.data?.items || [];
+    renderConfigPatches(patches);
+  } catch (err) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="6" class="empty">Error: ${escapeHtml(err.message)}</td></tr>`;
+  }
+};
+
+const renderConfigPatches = (patches) => {
+  const tbody = $('patches-table-body');
+  if (!tbody) return;
+
+  if (!patches.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty">No config patches found</td></tr>';
+    $('patch-details-section')?.classList.add('hidden');
+    return;
+  }
+
+  tbody.innerHTML = patches
+    .map((patch) => {
+      const created = patch.created_at ? new Date(patch.created_at).toLocaleDateString() : '-';
+      const statusClass = patch.status === 'pending' ? 'pending' : patch.status === 'approved' ? 'approved' : patch.status === 'applied' ? 'applied' : 'rejected';
+      return `
+        <tr class="clickable" data-patch-id="${patch.id}">
+          <td>${escapeHtml(String(patch.id))}</td>
+          <td class="monospace">${escapeHtml(patch.artifact_id?.slice(0, 8) || '-')}...</td>
+          <td>${escapeHtml(patch.proposer || '-')}</td>
+          <td><span class="patch-status ${statusClass}">${escapeHtml(patch.status)}</span></td>
+          <td>${escapeHtml(created)}</td>
+          <td>
+            <button class="ghost view-patch-btn" data-patch-id="${patch.id}">View</button>
+          </td>
+        </tr>
+      `;
+    })
+    .join('');
+
+  // Add click handlers
+  tbody.querySelectorAll('.view-patch-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const patchId = btn.dataset.patchId;
+      const patch = patches.find((p) => String(p.id) === patchId);
+      if (patch) selectPatch(patch);
+    });
+  });
+
+  tbody.querySelectorAll('tr.clickable').forEach((row) => {
+    row.addEventListener('click', () => {
+      const patchId = row.dataset.patchId;
+      const patch = patches.find((p) => String(p.id) === patchId);
+      if (patch) selectPatch(patch);
+    });
+  });
+};
+
+const selectPatch = (patch) => {
+  selectedPatch = patch;
+  const detailsSection = $('patch-details-section');
+  const detailsContent = $('patch-details-content');
+  const approveBtn = $('approve-patch-btn');
+  const rejectBtn = $('reject-patch-btn');
+  const applyBtn = $('apply-patch-btn');
+
+  if (!detailsSection || !detailsContent) return;
+
+  detailsSection.classList.remove('hidden');
+
+  // Render patch details
+  const patchJson = JSON.stringify(patch.patch || {}, null, 2);
+  detailsContent.innerHTML = `
+    <div class="detail-row"><span class="detail-label">Patch ID</span><span>${escapeHtml(String(patch.id))}</span></div>
+    <div class="detail-row"><span class="detail-label">Artifact</span><span class="monospace">${escapeHtml(patch.artifact_id || '-')}</span></div>
+    <div class="detail-row"><span class="detail-label">Proposer</span><span>${escapeHtml(patch.proposer || '-')}</span></div>
+    <div class="detail-row"><span class="detail-label">Status</span><span class="patch-status ${patch.status}">${escapeHtml(patch.status)}</span></div>
+    <div class="detail-row"><span class="detail-label">Justification</span><span>${escapeHtml(patch.justification || 'None provided')}</span></div>
+    <div class="detail-row"><span class="detail-label">Created</span><span>${patch.created_at ? new Date(patch.created_at).toLocaleString() : '-'}</span></div>
+    ${patch.decided_at ? `<div class="detail-row"><span class="detail-label">Decided</span><span>${new Date(patch.decided_at).toLocaleString()}</span></div>` : ''}
+    ${patch.applied_at ? `<div class="detail-row"><span class="detail-label">Applied</span><span>${new Date(patch.applied_at).toLocaleString()}</span></div>` : ''}
+    <div class="patch-code">
+      <label>Patch Content</label>
+      <pre class="code-block">${escapeHtml(patchJson)}</pre>
+    </div>
+  `;
+
+  // Update button states based on status
+  if (approveBtn) approveBtn.disabled = patch.status !== 'pending';
+  if (rejectBtn) rejectBtn.disabled = patch.status !== 'pending';
+  if (applyBtn) applyBtn.disabled = patch.status !== 'approved';
+
+  // Clear any previous status
+  const statusEl = $('patch-action-status');
+  if (statusEl) statusEl.textContent = '';
+};
+
+const decidePatch = async (decision) => {
+  if (!selectedPatch) return;
+
+  const statusEl = $('patch-action-status');
+
+  try {
+    if (statusEl) statusEl.textContent = `${decision === 'approve' ? 'Approving' : 'Rejecting'} patch...`;
+
+    await requestEnvelope(
+      `${apiBase}/config/patches/${selectedPatch.id}/decide`,
+      {
+        method: 'POST',
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision }),
+      },
+      `Failed to ${decision} patch`
+    );
+
+    if (statusEl) statusEl.textContent = `Patch ${decision}d successfully`;
+    fetchConfigPatches();
+  } catch (err) {
+    if (statusEl) statusEl.textContent = `Error: ${err.message}`;
+  }
+};
+
+const applyPatch = async () => {
+  if (!selectedPatch || selectedPatch.status !== 'approved') return;
+
+  const statusEl = $('patch-action-status');
+
+  try {
+    if (statusEl) statusEl.textContent = 'Applying patch...';
+
+    await requestEnvelope(
+      `${apiBase}/config/patches/${selectedPatch.id}/apply`,
+      {
+        method: 'POST',
+        headers: authHeaders(),
+      },
+      'Failed to apply patch'
+    );
+
+    if (statusEl) statusEl.textContent = 'Patch applied successfully';
+    fetchConfigPatches();
+  } catch (err) {
+    if (statusEl) statusEl.textContent = `Error: ${err.message}`;
+  }
 };
 
 // =============================================================================
@@ -2984,6 +3148,13 @@ const initEventListeners = () => {
   // Admin adapters and objects
   $('refresh-adapters-btn')?.addEventListener('click', fetchAdminAdapters);
   $('refresh-objects-btn')?.addEventListener('click', fetchAdminObjects);
+
+  // Admin config patches
+  $('refresh-patches-btn')?.addEventListener('click', fetchConfigPatches);
+  $('patches-status-filter')?.addEventListener('change', fetchConfigPatches);
+  $('approve-patch-btn')?.addEventListener('click', () => decidePatch('approve'));
+  $('reject-patch-btn')?.addEventListener('click', () => decidePatch('reject'));
+  $('apply-patch-btn')?.addEventListener('click', applyPatch);
 };
 
 // =============================================================================

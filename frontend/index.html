@@ -755,6 +755,55 @@
                     </tbody>
                   </table>
                 </div>
+
+                <!-- Config Patches -->
+                <div class="divider"></div>
+                <h3>Config Patches</h3>
+                <p class="subtext">Review and manage proposed artifact configuration changes.</p>
+
+                <div class="pill-row mb-12">
+                  <button class="ghost" id="refresh-patches-btn">Refresh</button>
+                  <select id="patches-status-filter">
+                    <option value="">All statuses</option>
+                    <option value="pending">Pending</option>
+                    <option value="approved">Approved</option>
+                    <option value="rejected">Rejected</option>
+                    <option value="applied">Applied</option>
+                  </select>
+                </div>
+
+                <div class="table-wrapper">
+                  <table class="table" id="patches-table">
+                    <thead>
+                      <tr>
+                        <th>ID</th>
+                        <th>Artifact</th>
+                        <th>Proposer</th>
+                        <th>Status</th>
+                        <th>Created</th>
+                        <th>Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody id="patches-table-body">
+                      <tr><td colspan="6" class="empty">Loading patches...</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+
+                <!-- Patch Details Modal -->
+                <div id="patch-details-section" class="hidden">
+                  <div class="divider"></div>
+                  <h4>Patch Details</h4>
+                  <div id="patch-details-content" class="patch-details">
+                    <!-- Filled by JavaScript -->
+                  </div>
+                  <div class="pill-row mt-12">
+                    <button class="primary" id="approve-patch-btn">Approve</button>
+                    <button class="ghost" id="reject-patch-btn">Reject</button>
+                    <button class="minor" id="apply-patch-btn" disabled>Apply</button>
+                  </div>
+                  <div id="patch-action-status" class="small" role="status"></div>
+                </div>
               </div>
             </div>
           </section>

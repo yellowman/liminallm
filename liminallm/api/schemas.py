@@ -483,19 +483,24 @@ class VoiceTranscriptionResponse(BaseModel):
     transcript: str
     duration_ms: int
     user_id: Optional[str] = None
+    model: Optional[str] = None
+    language: Optional[str] = None
 
 
 class VoiceSynthesisRequest(BaseModel):
     text: str = Field(..., max_length=5000)  # Reasonable limit for TTS
     voice: Optional[str] = None
+    speed: float = Field(default=1.0, ge=0.25, le=4.0)
 
 
 class VoiceSynthesisResponse(BaseModel):
     audio_path: str
+    audio_url: Optional[str] = None
     format: str
     sample_rate: int
     duration_ms: int
     voice: str
+    model: Optional[str] = None
 
 
 class UserResponse(BaseModel):

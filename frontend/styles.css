@@ -1491,6 +1491,77 @@ button.minor:hover {
   cursor: not-allowed;
 }
 
+/* Config patches */
+.patch-status {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.patch-status.pending {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.patch-status.approved {
+  background: #d1fae5;
+  color: #065f46;
+}
+
+.patch-status.rejected {
+  background: #fee2e2;
+  color: #991b1b;
+}
+
+.patch-status.applied {
+  background: #dbeafe;
+  color: #1e40af;
+}
+
+.patch-details {
+  background: var(--panel-muted);
+  border-radius: 10px;
+  padding: 16px;
+}
+
+.patch-details .detail-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+}
+
+.patch-details .detail-row:last-of-type {
+  border-bottom: none;
+}
+
+.patch-details .detail-label {
+  color: var(--text-muted);
+}
+
+.patch-code {
+  margin-top: 16px;
+}
+
+.patch-code label {
+  display: block;
+  font-weight: 600;
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+
+#patches-status-filter {
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  font-size: 13px;
+}
+
 /* Responsive */
 @media (max-width: 1080px) {
   .layout-with-sidebar {

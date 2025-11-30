@@ -2347,7 +2347,7 @@ async def transcribe_voice(
         raise _http_error(
             "validation_error", "audio file too large (max 10MB)", status_code=413
         )
-    result = runtime.voice.transcribe(audio_bytes, user_id=principal.user_id)
+    result = await runtime.voice.transcribe(audio_bytes, user_id=principal.user_id)
     return Envelope(status="ok", data=VoiceTranscriptionResponse(**result))
 
 
@@ -2370,8 +2370,8 @@ async def synthesize_voice(
             "text too long for synthesis (max 5000 chars)",
             status_code=400,
         )
-    audio = runtime.voice.synthesize(
-        body.text, user_id=principal.user_id, voice=body.voice
+    audio = await runtime.voice.synthesize(
+        body.text, user_id=principal.user_id, voice=body.voice, speed=body.speed
     )
     return Envelope(status="ok", data=VoiceSynthesisResponse(**audio))
 
