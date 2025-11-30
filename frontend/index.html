@@ -587,6 +587,80 @@
 
               <div class="divider"></div>
 
+              <h3>Email Verification</h3>
+              <p class="subtext">Verify your email address to unlock all features.</p>
+              <div class="settings-grid">
+                <div class="setting-item">
+                  <span class="setting-label">Email Status</span>
+                  <span class="setting-value" id="setting-email-verified">Loading...</span>
+                </div>
+                <div class="setting-item">
+                  <span class="setting-label">Email Address</span>
+                  <span class="setting-value" id="setting-email-address">-</span>
+                </div>
+              </div>
+              <div id="email-verify-actions" class="pill-row">
+                <button class="minor hidden" id="resend-verification-btn">Resend verification email</button>
+              </div>
+              <div id="email-verify-status" class="small" role="status"></div>
+
+              <div class="divider"></div>
+
+              <h3>Two-Factor Authentication</h3>
+              <p class="subtext">Protect your account with a TOTP authenticator app.</p>
+              <div class="settings-grid">
+                <div class="setting-item">
+                  <span class="setting-label">MFA Status</span>
+                  <span class="setting-value" id="setting-mfa-status">Loading...</span>
+                </div>
+              </div>
+
+              <!-- MFA Setup Section (hidden by default) -->
+              <div id="mfa-setup-section" class="hidden">
+                <div class="mfa-qr-container" id="mfa-qr-container">
+                  <p class="subtext">Scan this QR code with your authenticator app (Google Authenticator, Authy, etc.):</p>
+                  <div id="mfa-qr-code" class="mfa-qr-code"></div>
+                  <div class="field">
+                    <label>Or enter this secret manually:</label>
+                    <code id="mfa-secret-display" class="mfa-secret"></code>
+                  </div>
+                </div>
+                <form id="mfa-verify-form">
+                  <div class="field">
+                    <label for="mfa-setup-code">Enter code from authenticator</label>
+                    <input type="text" id="mfa-setup-code" placeholder="123456" maxlength="6" inputmode="numeric" pattern="[0-9]*" required />
+                  </div>
+                  <div class="pill-row">
+                    <button type="submit" class="primary" id="mfa-verify-btn">Verify & Enable</button>
+                    <button type="button" class="ghost" id="mfa-cancel-btn">Cancel</button>
+                  </div>
+                </form>
+                <div id="mfa-setup-status" class="small" role="status"></div>
+              </div>
+
+              <!-- MFA Disable Section (hidden by default) -->
+              <div id="mfa-disable-section" class="hidden">
+                <form id="mfa-disable-form">
+                  <div class="field">
+                    <label for="mfa-disable-code">Enter current MFA code to disable</label>
+                    <input type="text" id="mfa-disable-code" placeholder="123456" maxlength="6" inputmode="numeric" pattern="[0-9]*" required />
+                  </div>
+                  <div class="pill-row">
+                    <button type="submit" class="ghost" id="mfa-disable-btn">Disable MFA</button>
+                    <button type="button" class="ghost" id="mfa-disable-cancel-btn">Cancel</button>
+                  </div>
+                </form>
+                <div id="mfa-disable-status" class="small" role="status"></div>
+              </div>
+
+              <!-- MFA Actions -->
+              <div id="mfa-actions" class="pill-row">
+                <button class="primary hidden" id="mfa-enable-btn">Enable MFA</button>
+                <button class="ghost hidden" id="mfa-show-disable-btn">Disable MFA</button>
+              </div>
+
+              <div class="divider"></div>
+
               <h3>Local storage</h3>
               <p class="subtext">Draft messages are saved locally in your browser.</p>
               <div class="pill-row">

@@ -168,6 +168,15 @@ class MFAVerifyRequest(BaseModel):
     code: str = Field(..., max_length=10)
 
 
+class MFADisableRequest(BaseModel):
+    code: str = Field(..., max_length=10, description="Current TOTP code to verify identity")
+
+
+class MFAStatusResponse(BaseModel):
+    enabled: bool = Field(..., description="Whether MFA is currently enabled")
+    configured: bool = Field(..., description="Whether MFA secret is configured (pending verification)")
+
+
 class PasswordResetRequest(BaseModel):
     email: str
 

@@ -548,6 +548,8 @@ const handleLogin = async (event) => {
       fetchContexts(),
       fetchArtifacts(),
       fetchHealth(),
+      fetchMfaStatus(),
+      fetchEmailVerificationStatus(),
     ]);
   } catch (err) {
     showStatus(err.message, true);
@@ -673,6 +675,8 @@ const handleOAuthCallback = async () => {
         fetchContexts(),
         fetchArtifacts(),
         fetchHealth(),
+        fetchMfaStatus(),
+        fetchEmailVerificationStatus(),
       ]);
     } else {
       if (oauthStatus) oauthStatus.textContent = 'OAuth completed but no token received';
@@ -2368,6 +2372,284 @@ const handleExportDrafts = () => {
 };
 
 // =============================================================================
+// MFA Settings
+// =============================================================================
+
+let pendingMfaSecret = null;
+
+const fetchMfaStatus = async () => {
+  const statusEl = $('setting-mfa-status');
+  const enableBtn = $('mfa-enable-btn');
+  const disableBtn = $('mfa-show-disable-btn');
+
+  if (!state.accessToken) {
+    if (statusEl) statusEl.textContent = 'Sign in to manage MFA';
+    return;
+  }
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/auth/mfa/status`,
+      { headers: headers() },
+      'Failed to check MFA status'
+    );
+
+    const { enabled, configured } = envelope.data;
+    if (statusEl) {
+      statusEl.textContent = enabled ? 'Enabled' : 'Disabled';
+      statusEl.style.color = enabled ? '#0a7' : 'inherit';
+    }
+
+    // Show/hide appropriate buttons
+    if (enableBtn) enableBtn.classList.toggle('hidden', enabled);
+    if (disableBtn) disableBtn.classList.toggle('hidden', !enabled);
+  } catch (err) {
+    if (statusEl) statusEl.textContent = 'Unable to check';
+  }
+};
+
+const startMfaSetup = async () => {
+  if (!state.accessToken || !state.sessionId) {
+    setMfaSetupStatus('Sign in first', true);
+    return;
+  }
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/auth/mfa/request`,
+      {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ session_id: state.sessionId }),
+      },
+      'Failed to start MFA setup'
+    );
+
+    const { otpauth_uri, status } = envelope.data;
+    if (status === 'disabled') {
+      setMfaSetupStatus('MFA is disabled on this server', true);
+      return;
+    }
+
+    // Extract secret from URI for manual entry
+    const secretMatch = otpauth_uri?.match(/secret=([A-Z2-7]+)/i);
+    pendingMfaSecret = secretMatch ? secretMatch[1] : null;
+
+    // Show setup section
+    $('mfa-setup-section')?.classList.remove('hidden');
+    $('mfa-enable-btn')?.classList.add('hidden');
+
+    // Display secret for manual entry
+    const secretDisplay = $('mfa-secret-display');
+    if (secretDisplay) secretDisplay.textContent = pendingMfaSecret || 'N/A';
+
+    // Generate QR code using a simple text display (or use qrcode library if available)
+    const qrContainer = $('mfa-qr-code');
+    if (qrContainer) {
+      // Create a simple link to the otpauth URI that mobile apps can scan
+      qrContainer.innerHTML = `
+        <div class="qr-placeholder">
+          <p>Open your authenticator app and add a new account using this URI:</p>
+          <code style="word-break: break-all; font-size: 0.75rem;">${otpauth_uri || 'N/A'}</code>
+        </div>
+      `;
+    }
+
+    setMfaSetupStatus('Enter the 6-digit code from your authenticator app');
+  } catch (err) {
+    setMfaSetupStatus(err.message || 'Failed to start MFA setup', true);
+  }
+};
+
+const verifyMfaSetup = async (event) => {
+  event.preventDefault();
+
+  const codeInput = $('mfa-setup-code');
+  const code = codeInput?.value?.trim();
+
+  if (!code || code.length !== 6) {
+    setMfaSetupStatus('Enter a 6-digit code', true);
+    return;
+  }
+
+  if (!state.sessionId) {
+    setMfaSetupStatus('No session. Please sign in again.', true);
+    return;
+  }
+
+  try {
+    await requestEnvelope(
+      `${apiBase}/auth/mfa/verify`,
+      {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ session_id: state.sessionId, code }),
+      },
+      'Invalid code. Try again.'
+    );
+
+    // Success - hide setup, refresh status
+    $('mfa-setup-section')?.classList.add('hidden');
+    if (codeInput) codeInput.value = '';
+    pendingMfaSecret = null;
+
+    setMfaSetupStatus('');
+    await fetchMfaStatus();
+
+    alert('MFA enabled successfully!');
+  } catch (err) {
+    setMfaSetupStatus(err.message || 'Verification failed', true);
+  }
+};
+
+const cancelMfaSetup = () => {
+  $('mfa-setup-section')?.classList.add('hidden');
+  $('mfa-enable-btn')?.classList.remove('hidden');
+  const codeInput = $('mfa-setup-code');
+  if (codeInput) codeInput.value = '';
+  pendingMfaSecret = null;
+  setMfaSetupStatus('');
+};
+
+const showMfaDisable = () => {
+  $('mfa-disable-section')?.classList.remove('hidden');
+  $('mfa-show-disable-btn')?.classList.add('hidden');
+};
+
+const hideMfaDisable = () => {
+  $('mfa-disable-section')?.classList.add('hidden');
+  $('mfa-show-disable-btn')?.classList.remove('hidden');
+  const codeInput = $('mfa-disable-code');
+  if (codeInput) codeInput.value = '';
+  setMfaDisableStatus('');
+};
+
+const disableMfa = async (event) => {
+  event.preventDefault();
+
+  const codeInput = $('mfa-disable-code');
+  const code = codeInput?.value?.trim();
+
+  if (!code || code.length !== 6) {
+    setMfaDisableStatus('Enter your current 6-digit MFA code', true);
+    return;
+  }
+
+  try {
+    await requestEnvelope(
+      `${apiBase}/auth/mfa/disable`,
+      {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ code }),
+      },
+      'Invalid code. Try again.'
+    );
+
+    // Success
+    hideMfaDisable();
+    await fetchMfaStatus();
+
+    alert('MFA disabled.');
+  } catch (err) {
+    setMfaDisableStatus(err.message || 'Failed to disable MFA', true);
+  }
+};
+
+const setMfaSetupStatus = (message, isError = false) => {
+  const el = $('mfa-setup-status');
+  if (!el) return;
+  el.textContent = message;
+  el.style.color = isError ? '#b00020' : 'inherit';
+};
+
+const setMfaDisableStatus = (message, isError = false) => {
+  const el = $('mfa-disable-status');
+  if (!el) return;
+  el.textContent = message;
+  el.style.color = isError ? '#b00020' : 'inherit';
+};
+
+// =============================================================================
+// Email Verification
+// =============================================================================
+
+const fetchEmailVerificationStatus = async () => {
+  const statusEl = $('setting-email-verified');
+  const emailEl = $('setting-email-address');
+  const resendBtn = $('resend-verification-btn');
+
+  if (!state.accessToken) {
+    if (statusEl) statusEl.textContent = 'Sign in to check';
+    return;
+  }
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/me`,
+      { headers: headers() },
+      'Failed to load profile'
+    );
+
+    const { email, meta } = envelope.data;
+    const isVerified = meta?.email_verified === true;
+
+    if (emailEl) emailEl.textContent = email || '-';
+    if (statusEl) {
+      statusEl.textContent = isVerified ? 'Verified' : 'Not verified';
+      statusEl.style.color = isVerified ? '#0a7' : '#b00020';
+    }
+
+    // Show/hide resend button
+    if (resendBtn) resendBtn.classList.toggle('hidden', isVerified);
+  } catch (err) {
+    if (statusEl) statusEl.textContent = 'Unable to check';
+  }
+};
+
+const resendVerificationEmail = async () => {
+  const statusEl = $('email-verify-status');
+  const resendBtn = $('resend-verification-btn');
+
+  if (!state.accessToken) {
+    if (statusEl) {
+      statusEl.textContent = 'Sign in first';
+      statusEl.style.color = '#b00020';
+    }
+    return;
+  }
+
+  try {
+    if (resendBtn) resendBtn.disabled = true;
+    if (statusEl) {
+      statusEl.textContent = 'Sending...';
+      statusEl.style.color = 'inherit';
+    }
+
+    await requestEnvelope(
+      `${apiBase}/auth/request_email_verification`,
+      {
+        method: 'POST',
+        headers: authHeaders(),
+      },
+      'Failed to send verification email'
+    );
+
+    if (statusEl) {
+      statusEl.textContent = 'Verification email sent! Check your inbox.';
+      statusEl.style.color = '#0a7';
+    }
+  } catch (err) {
+    if (statusEl) {
+      statusEl.textContent = err.message || 'Failed to send';
+      statusEl.style.color = '#b00020';
+    }
+  } finally {
+    if (resendBtn) resendBtn.disabled = false;
+  }
+};
+
+// =============================================================================
 // Admin Settings
 // =============================================================================
 
@@ -3304,6 +3586,17 @@ const initEventListeners = () => {
   $('clear-drafts-btn')?.addEventListener('click', handleClearDrafts);
   $('export-drafts-btn')?.addEventListener('click', handleExportDrafts);
 
+  // MFA settings
+  $('mfa-enable-btn')?.addEventListener('click', startMfaSetup);
+  $('mfa-verify-form')?.addEventListener('submit', verifyMfaSetup);
+  $('mfa-cancel-btn')?.addEventListener('click', cancelMfaSetup);
+  $('mfa-show-disable-btn')?.addEventListener('click', showMfaDisable);
+  $('mfa-disable-form')?.addEventListener('submit', disableMfa);
+  $('mfa-disable-cancel-btn')?.addEventListener('click', hideMfaDisable);
+
+  // Email verification
+  $('resend-verification-btn')?.addEventListener('click', resendVerificationEmail);
+
   // Admin settings
   $('save-admin-settings-btn')?.addEventListener('click', saveAdminSettings);
   $('reload-admin-settings-btn')?.addEventListener('click', fetchAdminSettings);
@@ -3390,6 +3683,8 @@ const init = async () => {
       fetchWorkflows(),
       fetchInsights(),
       fetchHealth(),
+      fetchMfaStatus(),
+      fetchEmailVerificationStatus(),
     ]);
   }
 
