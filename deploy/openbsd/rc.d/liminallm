@@ -1,0 +1,73 @@
+#!/bin/ksh
+#
+# LiminalLM rc.d script for OpenBSD
+# Place in /etc/rc.d/liminallm
+# chmod 755 /etc/rc.d/liminallm
+#
+# Enable in /etc/rc.conf.local:
+#   liminallm_flags=""
+#   pkg_scripts="liminallm"
+#
+# Or:
+#   rcctl enable liminallm
+#   rcctl start liminallm
+
+daemon="/usr/local/bin/python3"
+daemon_flags="-m uvicorn liminallm.api.routes:app --host 127.0.0.1 --port 8000 --workers 4"
+daemon_user="_liminallm"
+daemon_logger="daemon.info"
+
+# Working directory
+daemon_chdir="/var/liminallm"
+
+# PID file location
+pexp="/usr/local/bin/python.*uvicorn.*liminallm"
+
+# Environment file
+liminallm_env="/etc/liminallm/env"
+
+. /etc/rc.d/rc.subr
+
+rc_bg=YES
+rc_reload=NO
+
+rc_pre() {
+	# Load environment variables
+	if [ -r "${liminallm_env}" ]; then
+		set -a
+		. "${liminallm_env}"
+		set +a
+	fi
+
+	# Ensure run directory exists
+	install -d -o ${daemon_user} -g ${daemon_user} -m 750 /var/run/liminallm
+
+	# Ensure data directory exists
+	install -d -o ${daemon_user} -g ${daemon_user} -m 750 /var/liminallm
+
+	# Ensure log directory exists
+	install -d -o ${daemon_user} -g ${daemon_user} -m 750 /var/log/liminallm
+}
+
+rc_start() {
+	rc_pre
+
+	# Export required environment variables
+	export DATABASE_URL
+	export REDIS_URL
+	export SHARED_FS_ROOT="/var/liminallm"
+	export OPENAI_API_KEY
+	export JWT_SECRET
+
+	${rcexec} "${daemon} ${daemon_flags} >> /var/log/liminallm/app.log 2>&1"
+}
+
+rc_check() {
+	pgrep -q -f "${pexp}"
+}
+
+rc_stop() {
+	pkill -f "${pexp}"
+}
+
+rc_cmd $1
