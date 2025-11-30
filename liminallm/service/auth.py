@@ -646,8 +646,33 @@ class AuthService:
         cfg = self.store.get_user_mfa_secret(user_id)
         if not cfg:
             return False
+
+        # Check MFA lockout (5 failed attempts = 5 minute lockout per SPEC §18)
+        lockout_key = f"mfa:lockout:{user_id}"
+        attempts_key = f"mfa:attempts:{user_id}"
+
+        if self.cache:
+            locked = await self.cache.client.get(lockout_key)
+            if locked:
+                self.logger.warning("mfa_locked_out", user_id=user_id)
+                return False
+
         if not self._verify_totp(cfg.secret, code):
+            # Track failed attempt
+            if self.cache:
+                attempts = await self.cache.client.incr(attempts_key)
+                await self.cache.client.expire(attempts_key, 300)  # 5 minute window
+                if attempts >= 5:
+                    # Lock out for 5 minutes
+                    await self.cache.client.set(lockout_key, "1", ex=300)
+                    await self.cache.client.delete(attempts_key)
+                    self.logger.warning("mfa_lockout_triggered", user_id=user_id, attempts=attempts)
             return False
+
+        # Success - clear any failed attempts
+        if self.cache:
+            await self.cache.client.delete(attempts_key)
+
         self.store.set_user_mfa_secret(user_id, cfg.secret, enabled=True)
         if session_id:
             self._mark_session_verified(session_id)

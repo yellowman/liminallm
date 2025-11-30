@@ -387,3 +387,57 @@ class TestHealth:
         assert response.status_code == 200
         data = response.json()
         assert data["status"] in ["healthy", "ok"]
+
+
+class TestChatCancel:
+    """Tests for chat cancel endpoint per SPEC §18."""
+
+    def test_cancel_nonexistent_request(self, client, auth_headers):
+        """Test cancelling a request that doesn't exist."""
+        response = client.post(
+            "/v1/chat/cancel",
+            headers=auth_headers,
+            json={"request_id": "nonexistent-request-id-12345"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "ok"
+        assert data["data"]["cancelled"] is False
+        assert "not found" in data["data"]["message"].lower()
+
+    def test_cancel_requires_auth(self, client):
+        """Test that cancel endpoint requires authentication."""
+        response = client.post(
+            "/v1/chat/cancel",
+            json={"request_id": "some-request-id"},
+        )
+
+        assert response.status_code in [401, 403]
+
+    def test_cancel_request_id_required(self, client, auth_headers):
+        """Test that request_id is required."""
+        response = client.post(
+            "/v1/chat/cancel",
+            headers=auth_headers,
+            json={},
+        )
+
+        assert response.status_code == 422  # Validation error
+
+    def test_cancel_response_structure(self, client, auth_headers):
+        """Test the cancel response follows SPEC §18 envelope format."""
+        response = client.post(
+            "/v1/chat/cancel",
+            headers=auth_headers,
+            json={"request_id": "test-request-id"},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        # SPEC §18: Envelope with status, data
+        assert "status" in data
+        assert "data" in data
+        assert "request_id" in data["data"]
+        assert "cancelled" in data["data"]
+        assert "message" in data["data"]

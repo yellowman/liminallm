@@ -2652,6 +2652,90 @@ const resendVerificationEmail = async () => {
 };
 
 // =============================================================================
+// Password Change
+// =============================================================================
+
+const changePassword = async (event) => {
+  event.preventDefault();
+
+  const statusEl = $('password-change-status');
+  const submitBtn = $('change-password-btn');
+  const currentPwd = $('current-password');
+  const newPwd = $('new-password');
+  const confirmPwd = $('confirm-password');
+
+  const setStatus = (msg, isError = false) => {
+    if (statusEl) {
+      statusEl.textContent = msg;
+      statusEl.style.color = isError ? '#b00020' : '#0a7';
+    }
+  };
+
+  if (!state.accessToken) {
+    setStatus('Sign in to change password', true);
+    return;
+  }
+
+  const currentPassword = currentPwd?.value?.trim();
+  const newPassword = newPwd?.value;
+  const confirmPassword = confirmPwd?.value;
+
+  if (!currentPassword) {
+    setStatus('Enter your current password', true);
+    return;
+  }
+
+  if (!newPassword || newPassword.length < 8) {
+    setStatus('New password must be at least 8 characters', true);
+    return;
+  }
+
+  if (newPassword !== confirmPassword) {
+    setStatus('New passwords do not match', true);
+    return;
+  }
+
+  if (currentPassword === newPassword) {
+    setStatus('New password must be different from current password', true);
+    return;
+  }
+
+  try {
+    if (submitBtn) submitBtn.disabled = true;
+    setStatus('Changing password...');
+
+    await requestEnvelope(
+      `${apiBase}/auth/password/change`,
+      {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({
+          current_password: currentPassword,
+          new_password: newPassword,
+        }),
+      },
+      'Failed to change password'
+    );
+
+    // Clear form
+    if (currentPwd) currentPwd.value = '';
+    if (newPwd) newPwd.value = '';
+    if (confirmPwd) confirmPwd.value = '';
+
+    setStatus('Password changed successfully!');
+
+    // Clear success message after a few seconds
+    setTimeout(() => {
+      if (statusEl) statusEl.textContent = '';
+    }, 5000);
+  } catch (err) {
+    setStatus(err.message || 'Failed to change password', true);
+  } finally {
+    if (submitBtn) submitBtn.disabled = false;
+  }
+};
+
+// =============================================================================
 // User Settings (Preferences)
 // =============================================================================
 
@@ -3683,6 +3767,9 @@ const initEventListeners = () => {
 
   // Email verification
   $('resend-verification-btn')?.addEventListener('click', resendVerificationEmail);
+
+  // Password change
+  $('password-change-form')?.addEventListener('submit', changePassword);
 
   // User settings (preferences)
   $('user-settings-form')?.addEventListener('submit', saveUserSettings);

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from datetime import datetime
 from pathlib import Path as FilePath
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 from uuid import uuid4
 
 from fastapi import (
@@ -29,6 +30,8 @@ from liminallm.api.schemas import (
     ArtifactVersionListResponse,
     ArtifactVersionResponse,
     AuthResponse,
+    ChatCancelRequest,
+    ChatCancelResponse,
     ChatRequest,
     ChatResponse,
     ConversationMessagesResponse,
@@ -49,6 +52,7 @@ from liminallm.api.schemas import (
     AutoPatchRequest,
     OAuthStartRequest,
     OAuthStartResponse,
+    PasswordChangeRequest,
     PasswordResetConfirm,
     PasswordResetRequest,
     EmailVerificationRequest,
@@ -100,6 +104,29 @@ from liminallm.storage.models import Conversation, KnowledgeContext, Session
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/v1")
+
+# Registry for active streaming requests - maps request_id to cancel_event
+# Used by POST /chat/cancel to cancel in-progress streaming requests per SPEC §18
+_active_requests: Dict[str, asyncio.Event] = {}
+
+
+def _register_cancel_event(request_id: str, cancel_event: asyncio.Event) -> None:
+    """Register a cancel event for an active streaming request."""
+    _active_requests[request_id] = cancel_event
+
+
+def _unregister_cancel_event(request_id: str) -> None:
+    """Unregister a cancel event when request completes."""
+    _active_requests.pop(request_id, None)
+
+
+def _cancel_request(request_id: str) -> bool:
+    """Cancel an active request by request_id. Returns True if cancelled."""
+    cancel_event = _active_requests.get(request_id)
+    if cancel_event and not cancel_event.is_set():
+        cancel_event.set()
+        return True
+    return False
 
 
 def _http_error(
@@ -1228,6 +1255,33 @@ async def verify_email(body: EmailVerificationRequest):
     return Envelope(status="ok", data={"status": "verified"})
 
 
+@router.post("/auth/password/change", response_model=Envelope, tags=["auth"])
+async def change_password(
+    body: PasswordChangeRequest,
+    principal: AuthContext = Depends(get_user),
+):
+    """Change the current user's password.
+
+    Requires the current password for verification.
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"password:change:{principal.user_id}",
+        limit=5,
+        window_seconds=300,
+    )
+
+    # Verify current password
+    if not runtime.auth.verify_password(principal.user_id, body.current_password):
+        raise _http_error("unauthorized", "current password is incorrect", status_code=401)
+
+    # Save new password
+    runtime.auth.save_password(principal.user_id, body.new_password)
+
+    return Envelope(status="ok", data={"status": "changed"})
+
+
 @router.post("/auth/logout", response_model=Envelope, tags=["auth"])
 async def logout(
     response: Response,
@@ -1390,6 +1444,63 @@ async def chat(
         await idem.store_result(envelope)
         return envelope
     # Exceptions bubble through the guard which records failed states
+
+
+@router.post("/chat/cancel", response_model=Envelope, tags=["chat"])
+async def cancel_chat(
+    body: ChatCancelRequest,
+    principal: AuthContext = Depends(get_user),
+):
+    """Cancel an in-progress chat request per SPEC §18.
+
+    Cancellation signals the orchestrator to abort decode, free KV cache and
+    adapter refs, and emit cancel_ack with partial tokens if any.
+
+    Returns:
+        cancelled: True if request was found and cancelled
+        message: Human-readable status
+    """
+    runtime = get_runtime()
+
+    # Rate limit cancellation requests (5 per minute per user)
+    await _enforce_rate_limit(
+        runtime,
+        f"chat_cancel:{principal.user_id}",
+        limit=5,
+        window_seconds=60,
+    )
+
+    request_id = body.request_id
+
+    # Try to cancel in-memory active request
+    cancelled = _cancel_request(request_id)
+
+    if cancelled:
+        logger.info("chat_request_cancelled", request_id=request_id, user_id=principal.user_id)
+        return Envelope(
+            status="ok",
+            data=ChatCancelResponse(
+                request_id=request_id,
+                cancelled=True,
+                message="Request cancelled successfully",
+            ).model_dump(),
+        )
+
+    # Request not found in active requests - may have already completed or never existed
+    # Per SPEC §18, this is not an error condition
+    logger.info(
+        "chat_cancel_request_not_found",
+        request_id=request_id,
+        user_id=principal.user_id,
+    )
+    return Envelope(
+        status="ok",
+        data=ChatCancelResponse(
+            request_id=request_id,
+            cancelled=False,
+            message="Request not found or already completed",
+        ).model_dump(),
+    )
 
 
 @router.post("/preferences", response_model=Envelope, tags=["preferences"])
@@ -2697,6 +2808,8 @@ async def websocket_chat(ws: WebSocket):
         if stream_enabled:
             # Streaming mode: emit token, trace, message_done, error events
             cancel_event = asyncio.Event()
+            # Register cancel event so POST /chat/cancel can cancel this request
+            _register_cancel_event(request_id, cancel_event)
             full_content = ""
             orchestration_dict: dict[str, Any] = {}
 
@@ -2754,9 +2867,11 @@ async def websocket_chat(ws: WebSocket):
             except WebSocketDisconnect:
                 cancel_event.set()
                 cancel_listener.cancel()
+                _unregister_cancel_event(request_id)
                 return
             finally:
                 cancel_listener.cancel()
+                _unregister_cancel_event(request_id)
 
             # Save assistant message after streaming completes
             adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))

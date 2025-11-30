@@ -606,6 +606,29 @@
 
               <div class="divider"></div>
 
+              <h3>Change Password</h3>
+              <p class="subtext">Update your account password.</p>
+              <form id="password-change-form">
+                <div class="field">
+                  <label for="current-password">Current Password</label>
+                  <input type="password" id="current-password" placeholder="Enter current password" required autocomplete="current-password" />
+                </div>
+                <div class="field">
+                  <label for="new-password">New Password</label>
+                  <input type="password" id="new-password" placeholder="Enter new password (min 8 characters)" required minlength="8" autocomplete="new-password" />
+                </div>
+                <div class="field">
+                  <label for="confirm-password">Confirm New Password</label>
+                  <input type="password" id="confirm-password" placeholder="Confirm new password" required minlength="8" autocomplete="new-password" />
+                </div>
+                <div class="pill-row">
+                  <button type="submit" class="primary" id="change-password-btn">Change Password</button>
+                </div>
+              </form>
+              <div id="password-change-status" class="small" role="status"></div>
+
+              <div class="divider"></div>
+
               <h3>Two-Factor Authentication</h3>
               <p class="subtext">Protect your account with a TOTP authenticator app.</p>
               <div class="settings-grid">

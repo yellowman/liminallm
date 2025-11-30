@@ -218,6 +218,21 @@ class PasswordResetConfirm(BaseModel):
         return value
 
 
+class PasswordChangeRequest(BaseModel):
+    """Request to change password (requires current password)."""
+    current_password: str = Field(..., min_length=1, max_length=128)
+    new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def _validate_new_password(cls, value: str) -> str:
+        if len(value) < 8:
+            raise ValueError("password must be at least 8 characters")
+        if len(value) > 128:
+            raise ValueError("password must be at most 128 characters")
+        return value
+
+
 class EmailVerificationRequest(BaseModel):
     token: str = Field(..., max_length=256)
 
@@ -504,6 +519,18 @@ class ConfigPatchListResponse(BaseModel):
 class AutoPatchRequest(BaseModel):
     artifact_id: str
     goal: Optional[str] = None
+
+
+class ChatCancelRequest(BaseModel):
+    """Request to cancel an in-progress chat request per SPEC §18."""
+    request_id: str = Field(..., max_length=128, description="The request_id of the chat request to cancel")
+
+
+class ChatCancelResponse(BaseModel):
+    """Response from chat cancellation."""
+    request_id: str
+    cancelled: bool = Field(..., description="Whether the request was successfully cancelled")
+    message: str = Field(..., description="Human-readable status message")
 
 
 class VoiceTranscriptionResponse(BaseModel):
