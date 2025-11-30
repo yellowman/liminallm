@@ -8,16 +8,15 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime
 from ipaddress import ip_address
-from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
-from liminallm.storage.errors import ConstraintViolation
 # Import from canonical location to avoid duplication
 from liminallm.service.embeddings import (
     cosine_similarity,
     deterministic_embedding,
 )
+from liminallm.storage.errors import ConstraintViolation
 
 if TYPE_CHECKING:
     from liminallm.storage.models import KnowledgeChunk, SemanticCluster

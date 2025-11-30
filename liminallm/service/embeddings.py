@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 from typing import Callable, Iterable, List
 
-
 # Fixed embedding size shared across routing/RAG/clustering
 EMBEDDING_DIM = 64
 

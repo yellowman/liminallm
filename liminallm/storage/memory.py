@@ -1,19 +1,20 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import secrets
+import shutil
 import threading
 import uuid
-import hashlib
-import shutil
 from datetime import datetime
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from cryptography.fernet import Fernet, InvalidToken
+
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service.artifact_validation import (
@@ -21,24 +22,23 @@ from liminallm.service.artifact_validation import (
     validate_artifact,
 )
 from liminallm.service.bm25 import (
-    tokenize_text as _tokenize_text,
     compute_bm25_scores as _compute_bm25_scores,
+)
+from liminallm.service.bm25 import (
+    tokenize_text as _tokenize_text,
 )
 from liminallm.service.embeddings import cosine_similarity
 from liminallm.storage.common import (
     compute_text_embedding,
     get_default_chat_workflow_schema,
-    get_default_tool_specs,
     hybrid_search_chunks,
     normalize_preference_weight,
-    validate_chunk_fs_path,
-    validate_context_source_fs_path,
 )
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
+    AdapterRouterState,
     Artifact,
     ArtifactVersion,
-    AdapterRouterState,
     ConfigPatchAudit,
     ContextSource,
     Conversation,

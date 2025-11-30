@@ -7,7 +7,6 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-
 _VALID_ERROR_CODES = frozenset({
     "unauthorized",
     "forbidden",

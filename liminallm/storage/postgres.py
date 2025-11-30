@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import threading
 import uuid
 from datetime import datetime
-from pathlib import Path
 from ipaddress import ip_address
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from psycopg import errors
@@ -20,25 +19,24 @@ from liminallm.service.artifact_validation import (
     validate_artifact,
 )
 from liminallm.service.bm25 import (
-    tokenize_text as _tokenize_text,
     compute_bm25_scores as _compute_bm25_scores,
+)
+from liminallm.service.bm25 import (
+    tokenize_text as _tokenize_text,
 )
 from liminallm.storage.common import (
     compute_text_embedding,
     get_default_chat_workflow_schema,
     get_default_tool_specs,
-    hybrid_search_chunks,
-    normalize_preference_weight,
-    cosine_similarity,
 )
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
+    AdapterRouterState,
     Artifact,
     ArtifactVersion,
     ConfigPatchAudit,
     ContextSource,
     Conversation,
-    AdapterRouterState,
     KnowledgeChunk,
     KnowledgeContext,
     Message,
@@ -50,7 +48,6 @@ from liminallm.storage.models import (
     UserMFAConfig,
     UserSettings,
 )
-
 
 _MAX_SESSION_CACHE_SIZE = 10000
 

@@ -5,6 +5,7 @@ import json
 from datetime import datetime
 from typing import Any, Dict, Optional
 
+from liminallm.logging import get_logger
 from liminallm.service.errors import BadRequestError, NotFoundError
 from liminallm.service.llm import LLMService
 from liminallm.service.router import RouterEngine
@@ -12,8 +13,6 @@ from liminallm.service.training import TrainingService
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.models import Artifact, ConfigPatchAudit
 from liminallm.storage.postgres import PostgresStore
-
-from liminallm.logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -95,9 +94,6 @@ class ConfigOpsService:
             raise NotFoundError(
                 "artifact missing", detail={"artifact_id": patch.artifact_id}
             )
-
-        # Store original schema for potential logging
-        original_schema = copy.deepcopy(artifact.schema)
 
         # Step 1: Apply patch to artifact
         new_schema = self._apply_patch_to_schema(artifact.schema, patch.patch)

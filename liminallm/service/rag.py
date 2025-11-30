@@ -9,8 +9,8 @@ from typing import Callable, Dict, List, Optional, Sequence
 from liminallm.logging import get_logger
 from liminallm.service.embeddings import deterministic_embedding
 from liminallm.storage.memory import MemoryStore
-from liminallm.storage.postgres import PostgresStore
 from liminallm.storage.models import KnowledgeChunk
+from liminallm.storage.postgres import PostgresStore
 
 logger = get_logger(__name__)
 

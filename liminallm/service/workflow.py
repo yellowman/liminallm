@@ -7,7 +7,16 @@ import math
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    AsyncIterator,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from liminallm.logging import get_logger
 from liminallm.service.embeddings import (
@@ -958,8 +967,7 @@ class WorkflowEngine:
                 user_id=user_id,
             )
 
-            # Wrap synchronous iterator for async
-            loop = asyncio.get_event_loop()
+            # Iterate through synchronous stream, yielding control for async
             for event in stream:
                 if cancel_event and cancel_event.is_set():
                     yield {"event": "cancel_ack", "data": {}}

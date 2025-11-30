@@ -3,9 +3,9 @@ from __future__ import annotations
 from typing import Iterator, List, Optional
 
 from liminallm.service.model_backend import (
-    ApiAdapterBackend,
-    AdapterPlug,
     BUILTIN_ADAPTER_PLUGS,
+    AdapterPlug,
+    ApiAdapterBackend,
     LocalJaxLoRABackend,
     ModelBackend,
 )

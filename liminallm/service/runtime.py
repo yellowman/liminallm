@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 from liminallm.config import get_settings, reset_settings_cache
-from liminallm.service.config_ops import ConfigOpsService
+from liminallm.logging import get_logger
 from liminallm.service.auth import AuthService
 from liminallm.service.clustering import SemanticClusterer
+from liminallm.service.config_ops import ConfigOpsService
+from liminallm.service.email import EmailService
+from liminallm.service.embeddings import EmbeddingsService
 from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
 from liminallm.service.router import RouterEngine
@@ -15,13 +18,9 @@ from liminallm.service.training import TrainingService
 from liminallm.service.training_worker import TrainingWorker
 from liminallm.service.voice import VoiceService
 from liminallm.service.workflow import WorkflowEngine
-from liminallm.service.email import EmailService
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.postgres import PostgresStore
 from liminallm.storage.redis_cache import RedisCache, SyncRedisCache
-from liminallm.service.embeddings import EmbeddingsService
-
-from liminallm.logging import get_logger
 
 logger = get_logger(__name__)
 
@@ -244,12 +243,9 @@ async def _set_cached_idempotency_record(
         }
 
 
-from typing import Union, Tuple as TypingTuple
-
-
 async def check_rate_limit(
     runtime: Runtime, key: str, limit: int, window_seconds: int, *, return_remaining: bool = False
-) -> Union[bool, TypingTuple[bool, int]]:
+) -> Union[bool, Tuple[bool, int]]:
     """Enforce rate limits even when Redis is unavailable.
 
     Per SPEC §18, rate limits use Redis token bucket with configurable defaults.

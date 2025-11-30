@@ -11,8 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from liminallm.api.routes import get_admin_user, router
 from liminallm.api.error_handling import register_exception_handlers
+from liminallm.api.routes import get_admin_user, router
 from liminallm.logging import get_logger, set_correlation_id
 
 logger = get_logger(__name__)

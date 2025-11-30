@@ -11,15 +11,14 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, List, Optional, Protocol, Tuple
 
+import httpx
 from argon2 import PasswordHasher, Type
 from argon2.exceptions import InvalidHash, VerifyMismatchError
-import httpx
 
 from liminallm.config import Settings
+from liminallm.logging import get_logger
 from liminallm.storage.models import Session, User, UserMFAConfig
 from liminallm.storage.redis_cache import RedisCache
-
-from liminallm.logging import get_logger
 
 # OAuth provider configurations
 OAUTH_PROVIDERS = {
