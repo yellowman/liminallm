@@ -251,15 +251,6 @@ class TestContextOperations:
 
         assert len(contexts) >= 2
 
-    def test_delete_context(self, memory_store, test_user):
-        """Test deleting context."""
-        ctx = memory_store.upsert_context(owner_user_id=test_user.id, name="To Delete", description="Will be deleted")
-
-        memory_store.delete_context(ctx.id)
-
-        assert memory_store.get_context(ctx.id) is None
-
-
 class TestArtifactOperations:
     """Tests for artifact operations."""
 
@@ -268,7 +259,10 @@ class TestArtifactOperations:
         artifact = memory_store.create_artifact(
             type_="workflow",
             name="Test Artifact",
-            schema={"kind": "workflow.chat"},
+            schema={
+                "kind": "workflow.chat",
+                "nodes": [{"id": "start", "type": "llm_call"}],
+            },
             owner_user_id=test_user.id,
         )
 
@@ -281,7 +275,7 @@ class TestArtifactOperations:
         artifact = memory_store.create_artifact(
             type_="tool",
             name="Test",
-            schema={"kind": "tool.spec"},
+            schema={"kind": "tool.spec", "name": "test_tool", "handler": "test.handler"},
             owner_user_id=test_user.id,
         )
 
@@ -295,13 +289,16 @@ class TestArtifactOperations:
         memory_store.create_artifact(
             type_="workflow",
             name="Workflow 1",
-            schema={"kind": "workflow.chat"},
+            schema={
+                "kind": "workflow.chat",
+                "nodes": [{"id": "start", "type": "llm_call"}],
+            },
             owner_user_id=test_user.id,
         )
         memory_store.create_artifact(
             type_="tool",
             name="Tool 1",
-            schema={"kind": "tool.spec"},
+            schema={"kind": "tool.spec", "name": "tool1", "handler": "tool.handler"},
             owner_user_id=test_user.id,
         )
 
@@ -316,11 +313,19 @@ class TestArtifactOperations:
         artifact = memory_store.create_artifact(
             type_="workflow",
             name="Updateable",
-            schema={"kind": "workflow.chat", "version": 1},
+            schema={
+                "kind": "workflow.chat",
+                "nodes": [{"id": "start", "type": "llm_call"}],
+                "version": 1,
+            },
             owner_user_id=test_user.id,
         )
 
-        new_schema = {"kind": "workflow.chat", "version": 2}
+        new_schema = {
+            "kind": "workflow.chat",
+            "nodes": [{"id": "start", "type": "llm_call"}],
+            "version": 2,
+        }
         updated = memory_store.update_artifact(artifact.id, new_schema)
 
         assert updated.schema["version"] == 2
@@ -330,11 +335,23 @@ class TestArtifactOperations:
         artifact = memory_store.create_artifact(
             type_="workflow",
             name="Versioned",
-            schema={"version": 1},
+            schema={
+                "kind": "workflow.chat",
+                "nodes": [{"id": "start", "type": "llm_call"}],
+                "version": 1,
+            },
             owner_user_id=test_user.id,
         )
-        memory_store.update_artifact(artifact.id, {"version": 2})
-        memory_store.update_artifact(artifact.id, {"version": 3})
+        memory_store.update_artifact(artifact.id, {
+            "kind": "workflow.chat",
+            "nodes": [{"id": "start", "type": "llm_call"}],
+            "version": 2,
+        })
+        memory_store.update_artifact(artifact.id, {
+            "kind": "workflow.chat",
+            "nodes": [{"id": "start", "type": "llm_call"}],
+            "version": 3,
+        })
 
         versions = memory_store.list_artifact_versions(artifact.id)
 

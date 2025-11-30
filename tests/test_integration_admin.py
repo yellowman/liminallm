@@ -23,26 +23,28 @@ def client():
 @pytest.fixture
 def admin_user(client):
     """Create an admin user and return credentials."""
+    import uuid
+    unique_email = f"admin_{uuid.uuid4().hex[:8]}@example.com"
+
     # First create a regular user via signup
     response = client.post(
         "/v1/auth/signup",
-        json={"email": "admin@example.com", "password": "AdminPassword123!"},
+        json={"email": unique_email, "password": "AdminPassword123!"},
     )
+    assert response.status_code == 201, f"Signup failed: {response.text}"
     user_id = response.json()["data"]["user_id"]
     access_token = response.json()["data"]["access_token"]
 
     # Promote to admin via direct store access (in tests only)
     runtime = get_runtime()
-    user = runtime.store.get_user(user_id)
-    if user:
-        user.role = "admin"
-        runtime.store.update_user(user_id, role="admin")
+    runtime.store.update_user_role(user_id, role="admin")
 
     # Re-login to get updated token with admin role
     login_resp = client.post(
         "/v1/auth/login",
-        json={"email": "admin@example.com", "password": "AdminPassword123!"},
+        json={"email": unique_email, "password": "AdminPassword123!"},
     )
+    assert login_resp.status_code == 200, f"Login failed: {login_resp.text}"
     return {
         "user_id": user_id,
         "access_token": login_resp.json()["data"]["access_token"],
@@ -53,10 +55,13 @@ def admin_user(client):
 @pytest.fixture
 def regular_user(client):
     """Create a regular (non-admin) user and return credentials."""
+    import uuid
+    unique_email = f"regular_{uuid.uuid4().hex[:8]}@example.com"
     response = client.post(
         "/v1/auth/signup",
-        json={"email": "regular@example.com", "password": "RegularPassword123!"},
+        json={"email": unique_email, "password": "RegularPassword123!"},
     )
+    assert response.status_code == 201, f"Signup failed: {response.text}"
     access_token = response.json()["data"]["access_token"]
     return {
         "user_id": response.json()["data"]["user_id"],

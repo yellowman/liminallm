@@ -23,10 +23,13 @@ def client():
 @pytest.fixture
 def auth_headers(client):
     """Create a test user and return auth headers."""
+    import uuid
+    unique_email = f"chattest_{uuid.uuid4().hex[:8]}@example.com"
     response = client.post(
         "/v1/auth/signup",
-        json={"email": "chattest@example.com", "password": "TestPassword123!"},
+        json={"email": unique_email, "password": "TestPassword123!"},
     )
+    assert response.status_code == 201, f"Signup failed: {response.text}"
     access_token = response.json()["data"]["access_token"]
     return {"Authorization": f"Bearer {access_token}"}
 
@@ -382,7 +385,7 @@ class TestHealth:
 
     def test_health_check(self, client):
         """Test health check endpoint."""
-        response = client.get("/v1/health")
+        response = client.get("/healthz")
 
         assert response.status_code == 200
         data = response.json()

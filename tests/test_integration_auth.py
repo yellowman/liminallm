@@ -25,7 +25,8 @@ def client():
 
 @pytest.fixture
 def test_user_email():
-    return "testuser@example.com"
+    import uuid
+    return f"testuser_{uuid.uuid4().hex[:8]}@example.com"
 
 
 @pytest.fixture

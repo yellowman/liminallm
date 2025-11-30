@@ -19,10 +19,13 @@ def client():
 @pytest.fixture
 def auth_headers(client):
     """Create a test user and return auth headers."""
+    import uuid
+    unique_email = f"ratelimit_{uuid.uuid4().hex[:8]}@example.com"
     response = client.post(
         "/v1/auth/signup",
-        json={"email": "ratelimit@example.com", "password": "TestPassword123!"},
+        json={"email": unique_email, "password": "TestPassword123!"},
     )
+    assert response.status_code == 201, f"Signup failed: {response.text}"
     access_token = response.json()["data"]["access_token"]
     return {"Authorization": f"Bearer {access_token}"}
 
