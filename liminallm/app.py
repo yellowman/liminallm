@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
@@ -10,8 +11,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
-from liminallm.api.routes import get_admin_user, router
 from liminallm.api.error_handling import register_exception_handlers
+from liminallm.api.routes import get_admin_user, router
 from liminallm.logging import get_logger, set_correlation_id
 
 logger = get_logger(__name__)
@@ -20,7 +21,34 @@ logger = get_logger(__name__)
 __version__ = "0.1.0"
 __build__ = os.getenv("BUILD_SHA", "dev")
 
-app = FastAPI(title="LiminalLM Kernel", version=__version__)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup and shutdown events."""
+    # Startup
+    from liminallm.service.runtime import get_runtime
+
+    try:
+        runtime = get_runtime()
+        if runtime.settings.training_worker_enabled:
+            await runtime.training_worker.start()
+            logger.info("training_worker_started_on_startup")
+    except Exception as exc:
+        logger.error("startup_training_worker_failed", error=str(exc))
+
+    yield
+
+    # Shutdown
+    try:
+        runtime = get_runtime()
+        if runtime.training_worker:
+            await runtime.training_worker.stop()
+            logger.info("training_worker_stopped_on_shutdown")
+    except Exception as exc:
+        logger.error("shutdown_training_worker_failed", error=str(exc))
+
+
+app = FastAPI(title="LiminalLM Kernel", version=__version__, lifespan=lifespan)
 
 
 def _allowed_origins() -> List[str]:
@@ -110,6 +138,7 @@ async def add_security_headers(request, call_next):
 
 register_exception_handlers(app)
 app.include_router(router)
+
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "frontend"
 if STATIC_DIR.exists():

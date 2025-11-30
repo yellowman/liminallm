@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path as FilePath
-from typing import Any, Optional
+from typing import Any, Dict, Optional
 from uuid import uuid4
 
 from fastapi import (
@@ -23,56 +24,66 @@ from fastapi import (
 )
 
 from liminallm.api.schemas import (
+    AdminCreateUserRequest,
+    AdminCreateUserResponse,
+    AdminInspectionResponse,
+    AdminSettingsResponse,
+    AdminSettingsUpdateRequest,
     ArtifactListResponse,
     ArtifactRequest,
     ArtifactResponse,
     ArtifactVersionListResponse,
     ArtifactVersionResponse,
     AuthResponse,
+    AutoPatchRequest,
+    ChatCancelRequest,
+    ChatCancelResponse,
     ChatRequest,
     ChatResponse,
-    ConversationMessagesResponse,
-    ConversationListResponse,
-    ConversationSummary,
     ConfigPatchAuditResponse,
     ConfigPatchDecisionRequest,
     ConfigPatchListResponse,
     ConfigPatchRequest,
-    Envelope,
-    LoginRequest,
-    MFARequest,
-    MFAVerifyRequest,
-    AutoPatchRequest,
-    OAuthStartRequest,
-    OAuthStartResponse,
-    PasswordResetConfirm,
-    PasswordResetRequest,
+    ContextSourceListResponse,
+    ContextSourceRequest,
+    ContextSourceResponse,
+    ConversationListResponse,
+    ConversationMessagesResponse,
+    ConversationSummary,
     EmailVerificationRequest,
-    SignupRequest,
-    TokenRefreshRequest,
+    Envelope,
+    FileUploadResponse,
     KnowledgeChunkListResponse,
     KnowledgeChunkResponse,
-    KnowledgeContextRequest,
     KnowledgeContextListResponse,
+    KnowledgeContextRequest,
     KnowledgeContextResponse,
-    FileUploadResponse,
+    LoginRequest,
+    MFADisableRequest,
+    MFARequest,
+    MFAStatusResponse,
+    MFAVerifyRequest,
+    OAuthStartRequest,
+    OAuthStartResponse,
+    PasswordChangeRequest,
+    PasswordResetConfirm,
+    PasswordResetRequest,
     PreferenceEventRequest,
     PreferenceEventResponse,
     PreferenceInsightsResponse,
-    VoiceSynthesisRequest,
-    VoiceSynthesisResponse,
-    VoiceTranscriptionResponse,
-    UserListResponse,
-    UserResponse,
-    AdminCreateUserRequest,
-    AdminCreateUserResponse,
-    UpdateUserRoleRequest,
-    AdminInspectionResponse,
-    AdminSettingsResponse,
-    AdminSettingsUpdateRequest,
+    SignupRequest,
+    TokenRefreshRequest,
     ToolInvokeRequest,
     ToolInvokeResponse,
     ToolSpecListResponse,
+    UpdateUserRoleRequest,
+    UserListResponse,
+    UserResponse,
+    UserSettingsRequest,
+    UserSettingsResponse,
+    VoiceSynthesisRequest,
+    VoiceSynthesisResponse,
+    VoiceTranscriptionResponse,
     WorkflowListResponse,
 )
 from liminallm.config import get_settings
@@ -93,6 +104,33 @@ from liminallm.storage.models import Conversation, KnowledgeContext, Session
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/v1")
+
+# Registry for active streaming requests - maps request_id to cancel_event
+# Used by POST /chat/cancel to cancel in-progress streaming requests per SPEC §18
+_active_requests: Dict[str, asyncio.Event] = {}
+_active_requests_lock = asyncio.Lock()
+
+
+async def _register_cancel_event(request_id: str, cancel_event: asyncio.Event) -> None:
+    """Register a cancel event for an active streaming request."""
+    async with _active_requests_lock:
+        _active_requests[request_id] = cancel_event
+
+
+async def _unregister_cancel_event(request_id: str) -> None:
+    """Unregister a cancel event when request completes."""
+    async with _active_requests_lock:
+        _active_requests.pop(request_id, None)
+
+
+async def _cancel_request(request_id: str) -> bool:
+    """Cancel an active request by request_id. Returns True if cancelled."""
+    async with _active_requests_lock:
+        cancel_event = _active_requests.get(request_id)
+        if cancel_event and not cancel_event.is_set():
+            cancel_event.set()
+            return True
+        return False
 
 
 def _http_error(
@@ -455,13 +493,17 @@ def _generate_conversation_title(message: str, max_length: int = 50) -> str:
 def _apply_session_cookies(
     response: Response, session: Session, tokens: dict, *, refresh_ttl_minutes: int
 ) -> None:
+    # Convert naive datetime to UTC-aware for cookie expiration
+    expires_at = session.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
     response.set_cookie(
         "session_id",
         session.id,
         httponly=True,
         secure=True,
         samesite="lax",
-        expires=session.expires_at,
+        expires=expires_at,
         path="/",
     )
     refresh_token = tokens.get("refresh_token")
@@ -703,6 +745,12 @@ async def admin_list_users(
         List of users with their roles and metadata.
     """
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"admin:read:{principal.user_id}",
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
+    )
     paging = _get_pagination_settings(runtime)
     resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"])
     # Admin can only see users in their own tenant (prevent cross-tenant access)
@@ -790,6 +838,12 @@ async def admin_delete_user(
 @router.get("/admin/adapters", response_model=Envelope, tags=["admin"])
 async def admin_list_adapters(principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"admin:read:{principal.user_id}",
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
+    )
     # Filter adapters by tenant to prevent cross-tenant data exposure
     adapters = list(runtime.store.list_artifacts(
         type_filter="adapter", tenant_id=principal.tenant_id
@@ -829,6 +883,12 @@ async def admin_inspect_objects(
     principal: AuthContext = Depends(get_admin_user),
 ):
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"admin:read:{principal.user_id}",
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
+    )
     paging = _get_pagination_settings(runtime)
     resolved_limit = min(limit or paging["default_conversations_limit"], paging["max_page_size"])
     if not hasattr(runtime.store, "inspect_state"):
@@ -850,6 +910,12 @@ async def get_admin_settings(principal: AuthContext = Depends(get_admin_user)):
     that can be modified without restarting the server.
     """
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"admin:read:{principal.user_id}",
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
+    )
     settings = get_settings()
     runtime_config = (
         runtime.store.get_runtime_config()
@@ -988,6 +1054,47 @@ async def verify_mfa(body: MFAVerifyRequest, response: Response):
     return Envelope(status="ok", data=resp)
 
 
+@router.get("/auth/mfa/status", response_model=Envelope, tags=["auth"])
+async def get_mfa_status(principal: AuthContext = Depends(get_user)):
+    """Get the current MFA status for the authenticated user."""
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"mfa:status:{principal.user_id}",
+        runtime.settings.read_rate_limit_per_minute,
+        60,
+    )
+    mfa_cfg = runtime.store.get_user_mfa_secret(principal.user_id)
+    return Envelope(
+        status="ok",
+        data=MFAStatusResponse(
+            enabled=mfa_cfg.enabled if mfa_cfg else False,
+            configured=mfa_cfg is not None,
+        ),
+    )
+
+
+@router.post("/auth/mfa/disable", response_model=Envelope, tags=["auth"])
+async def disable_mfa(body: MFADisableRequest, principal: AuthContext = Depends(get_user)):
+    """Disable MFA for the authenticated user. Requires current TOTP code."""
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"mfa:disable:{principal.user_id}",
+        runtime.settings.mfa_rate_limit_per_minute,
+        60,
+    )
+    mfa_cfg = runtime.store.get_user_mfa_secret(principal.user_id)
+    if not mfa_cfg or not mfa_cfg.enabled:
+        raise _http_error("validation_error", "MFA not enabled", status_code=400)
+    # Verify the code before disabling
+    if not runtime.auth._verify_totp(mfa_cfg.secret, body.code):
+        raise _http_error("unauthorized", "invalid MFA code", status_code=401)
+    # Disable MFA by setting enabled=False
+    runtime.store.set_user_mfa_secret(principal.user_id, mfa_cfg.secret, enabled=False)
+    return Envelope(status="ok", data={"status": "disabled"})
+
+
 @router.post("/auth/reset/request", response_model=Envelope, tags=["auth"])
 async def request_reset(body: PasswordResetRequest):
     runtime = get_runtime()
@@ -997,8 +1104,13 @@ async def request_reset(body: PasswordResetRequest):
         runtime.settings.reset_rate_limit_per_minute,
         60,
     )
-    await runtime.auth.initiate_password_reset(body.email)
-    # Token delivery should be handled out-of-band; avoid exposing it directly.
+    # Check if user exists before generating token (don't reveal if user exists)
+    user = runtime.store.get_user_by_email(body.email)
+    if user:
+        token = await runtime.auth.initiate_password_reset(body.email)
+        # Run blocking SMTP in thread to avoid blocking event loop
+        await asyncio.to_thread(runtime.email.send_password_reset, body.email, token)
+    # Always return success to prevent email enumeration
     return Envelope(status="ok", data={"status": "sent"})
 
 
@@ -1018,6 +1130,106 @@ async def confirm_reset(body: PasswordResetConfirm):
     return Envelope(status="ok", data={"status": "reset"})
 
 
+@router.get("/me", response_model=Envelope, tags=["auth"])
+async def get_current_user(principal: AuthContext = Depends(get_user)):
+    """Get the current user's profile.
+
+    Returns user details including email verification status.
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        runtime.settings.read_rate_limit_per_minute,
+        60,
+    )
+    user = runtime.store.get_user(principal.user_id)
+    if not user:
+        raise _http_error("not_found", "user not found", status_code=404)
+    return Envelope(
+        status="ok",
+        data=UserResponse(
+            id=user.id,
+            email=user.email,
+            handle=user.handle,
+            role=user.role,
+            tenant_id=user.tenant_id or "global",
+            created_at=user.created_at,
+            is_active=user.is_active,
+            plan_tier=user.plan_tier or "free",
+            meta=user.meta,
+        ),
+    )
+
+
+@router.get("/settings", response_model=Envelope, tags=["settings"])
+async def get_user_settings(principal: AuthContext = Depends(get_user)):
+    """Get the current user's settings.
+
+    Returns user preferences like locale, timezone, voice settings.
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        runtime.settings.read_rate_limit_per_minute,
+        60,
+    )
+    settings = runtime.store.get_user_settings(principal.user_id)
+    if not settings:
+        # Return empty settings if none exist
+        return Envelope(
+            status="ok",
+            data=UserSettingsResponse(),
+        )
+    return Envelope(
+        status="ok",
+        data=UserSettingsResponse(
+            locale=settings.locale,
+            timezone=settings.timezone,
+            default_voice=settings.default_voice,
+            default_style=settings.default_style,
+            flags=settings.flags,
+        ),
+    )
+
+
+@router.patch("/settings", response_model=Envelope, tags=["settings"])
+async def update_user_settings(
+    body: UserSettingsRequest,
+    principal: AuthContext = Depends(get_user),
+):
+    """Update the current user's settings.
+
+    Only provided fields will be updated; omitted fields remain unchanged.
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"write:{principal.user_id}",
+        runtime.settings.chat_rate_limit_per_minute,
+        60,
+    )
+    settings = runtime.store.set_user_settings(
+        principal.user_id,
+        locale=body.locale,
+        timezone=body.timezone,
+        default_voice=body.default_voice,
+        default_style=body.default_style,
+        flags=body.flags,
+    )
+    return Envelope(
+        status="ok",
+        data=UserSettingsResponse(
+            locale=settings.locale,
+            timezone=settings.timezone,
+            default_voice=settings.default_voice,
+            default_style=settings.default_style,
+            flags=settings.flags,
+        ),
+    )
+
+
 @router.post("/auth/request_email_verification", response_model=Envelope, tags=["auth"])
 async def request_email_verification(principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
@@ -1031,7 +1243,9 @@ async def request_email_verification(principal: AuthContext = Depends(get_user))
     user = runtime.store.get_user(principal.user_id)
     if not user:
         raise _http_error("not_found", "user not found", status_code=404)
-    await runtime.auth.request_email_verification(user)
+    token = await runtime.auth.request_email_verification(user)
+    # Run blocking SMTP in thread to avoid blocking event loop
+    await asyncio.to_thread(runtime.email.send_email_verification, user.email, token)
     return Envelope(status="ok", data={"status": "sent"})
 
 
@@ -1049,6 +1263,33 @@ async def verify_email(body: EmailVerificationRequest):
     if not ok:
         raise _http_error("validation_error", "invalid token", status_code=400)
     return Envelope(status="ok", data={"status": "verified"})
+
+
+@router.post("/auth/password/change", response_model=Envelope, tags=["auth"])
+async def change_password(
+    body: PasswordChangeRequest,
+    principal: AuthContext = Depends(get_user),
+):
+    """Change the current user's password.
+
+    Requires the current password for verification.
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"password:change:{principal.user_id}",
+        limit=5,
+        window_seconds=300,
+    )
+
+    # Verify current password
+    if not runtime.auth.verify_password(principal.user_id, body.current_password):
+        raise _http_error("unauthorized", "current password is incorrect", status_code=401)
+
+    # Save new password
+    runtime.auth.save_password(principal.user_id, body.new_password)
+
+    return Envelope(status="ok", data={"status": "changed"})
 
 
 @router.post("/auth/logout", response_model=Envelope, tags=["auth"])
@@ -1215,6 +1456,63 @@ async def chat(
     # Exceptions bubble through the guard which records failed states
 
 
+@router.post("/chat/cancel", response_model=Envelope, tags=["chat"])
+async def cancel_chat(
+    body: ChatCancelRequest,
+    principal: AuthContext = Depends(get_user),
+):
+    """Cancel an in-progress chat request per SPEC §18.
+
+    Cancellation signals the orchestrator to abort decode, free KV cache and
+    adapter refs, and emit cancel_ack with partial tokens if any.
+
+    Returns:
+        cancelled: True if request was found and cancelled
+        message: Human-readable status
+    """
+    runtime = get_runtime()
+
+    # Rate limit cancellation requests (5 per minute per user)
+    await _enforce_rate_limit(
+        runtime,
+        f"chat_cancel:{principal.user_id}",
+        limit=5,
+        window_seconds=60,
+    )
+
+    request_id = body.request_id
+
+    # Try to cancel in-memory active request
+    cancelled = await _cancel_request(request_id)
+
+    if cancelled:
+        logger.info("chat_request_cancelled", request_id=request_id, user_id=principal.user_id)
+        return Envelope(
+            status="ok",
+            data=ChatCancelResponse(
+                request_id=request_id,
+                cancelled=True,
+                message="Request cancelled successfully",
+            ).model_dump(),
+        )
+
+    # Request not found in active requests - may have already completed or never existed
+    # Per SPEC §18, this is not an error condition
+    logger.info(
+        "chat_cancel_request_not_found",
+        request_id=request_id,
+        user_id=principal.user_id,
+    )
+    return Envelope(
+        status="ok",
+        data=ChatCancelResponse(
+            request_id=request_id,
+            cancelled=False,
+            message="Request not found or already completed",
+        ).model_dump(),
+    )
+
+
 @router.post("/preferences", response_model=Envelope, tags=["preferences"])
 async def record_preference(
     body: PreferenceEventRequest,
@@ -1226,7 +1524,6 @@ async def record_preference(
     Rate limited to 30 requests per minute to protect clustering resources.
     """
     runtime = get_runtime()
-    settings = get_settings()
 
     # Rate limit preference recording (triggers expensive clustering operations)
     await _enforce_rate_limit(
@@ -1355,6 +1652,12 @@ async def list_artifacts(
         Paginated list of artifacts with metadata.
     """
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        runtime.settings.read_rate_limit_per_minute,
+        60,
+    )
     paging = _get_pagination_settings(runtime)
     kind_filter = kind or (type if type and "." in type else None)
     type_filter = type if type and "." not in type else None
@@ -1415,6 +1718,12 @@ async def get_artifact(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        runtime.settings.read_rate_limit_per_minute,
+        60,
+    )
     artifact = _get_owned_artifact(runtime, artifact_id, principal)
     current_version = runtime.store.get_artifact_current_version(artifact_id)
     resp = ArtifactResponse(
@@ -1440,6 +1749,12 @@ async def list_tool_specs(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        runtime.settings.read_rate_limit_per_minute,
+        60,
+    )
     resolved_page_size = min(max(page_size, 1), 200)
     artifacts = list(runtime.store.list_artifacts(
         type_filter="tool",
@@ -1484,6 +1799,12 @@ async def get_tool_spec(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        runtime.settings.read_rate_limit_per_minute,
+        60,
+    )
     artifact = _get_owned_artifact(runtime, artifact_id, principal)
     if not (
         isinstance(artifact.schema, dict) and artifact.schema.get("kind") == "tool.spec"
@@ -1513,6 +1834,12 @@ async def list_workflows(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        runtime.settings.read_rate_limit_per_minute,
+        60,
+    )
     resolved_page_size = min(max(page_size, 1), 200)
     artifacts = list(runtime.store.list_artifacts(
         type_filter="workflow",
@@ -1558,6 +1885,12 @@ async def list_artifact_versions(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        runtime.settings.read_rate_limit_per_minute,
+        60,
+    )
     paging = _get_pagination_settings(runtime)
     resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"])
     # Verify ownership before listing versions
@@ -1916,6 +2249,13 @@ async def auto_patch(
 @router.get("/config", response_model=Envelope, tags=["config"])
 async def get_config(principal: AuthContext = Depends(get_admin_user)):
     """Expose runtime configuration for the admin console."""
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"admin:read:{principal.user_id}",
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
+    )
 
     def _sanitize_dict(data: dict) -> dict:
         """Recursively sanitize sensitive fields in config dictionaries."""
@@ -1966,6 +2306,12 @@ async def get_config(principal: AuthContext = Depends(get_admin_user)):
 @router.get("/files/limits", response_model=Envelope, tags=["files"])
 async def get_file_limits(principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        runtime.settings.read_rate_limit_per_minute,
+        60,
+    )
     return Envelope(
         status="ok",
         data={
@@ -2073,6 +2419,12 @@ async def list_messages(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        runtime.settings.read_rate_limit_per_minute,
+        60,
+    )
     paging = _get_pagination_settings(runtime)
     resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"])
     _get_owned_conversation(runtime, conversation_id, principal)
@@ -2106,6 +2458,12 @@ async def list_conversations(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        runtime.settings.read_rate_limit_per_minute,
+        60,
+    )
     paging = _get_pagination_settings(runtime)
     resolved_limit = min(limit or paging["default_conversations_limit"], paging["max_page_size"])
     convs = runtime.store.list_conversations(principal.user_id, limit=resolved_limit)
@@ -2134,6 +2492,12 @@ async def get_conversation(
     Only the conversation owner can access it.
     """
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        runtime.settings.read_rate_limit_per_minute,
+        60,
+    )
     conversation = _get_owned_conversation(runtime, conversation_id, principal)
     return Envelope(
         status="ok",
@@ -2193,6 +2557,12 @@ async def list_contexts(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        runtime.settings.read_rate_limit_per_minute,
+        60,
+    )
     paging = _get_pagination_settings(runtime)
     resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"])
     contexts = runtime.store.list_contexts(owner_user_id=principal.user_id, limit=resolved_limit)
@@ -2218,6 +2588,12 @@ async def list_chunks(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        runtime.settings.read_rate_limit_per_minute,
+        60,
+    )
     paging = _get_pagination_settings(runtime)
     resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"])
     _get_owned_context(runtime, context_id, principal)
@@ -2240,6 +2616,97 @@ async def list_chunks(
     return Envelope(status="ok", data=KnowledgeChunkListResponse(items=data))
 
 
+@router.post("/contexts/{context_id}/sources", response_model=Envelope, status_code=201, tags=["knowledge"])
+async def add_context_source(
+    context_id: str = Path(..., max_length=255, description="Knowledge context ID"),
+    body: ContextSourceRequest = ...,
+    principal: AuthContext = Depends(get_user),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
+):
+    """Add a source path to a knowledge context for indexing.
+
+    The source path will be indexed and its content split into chunks
+    that can be retrieved during RAG queries.
+    """
+    runtime = get_runtime()
+
+    async with IdempotencyGuard(
+        "context_sources:create", principal.user_id, idempotency_key, require=False
+    ) as idem:
+        if idem.cached:
+            return idem.cached
+
+        # Verify context ownership
+        _get_owned_context(runtime, context_id, principal)
+
+        # Add the source
+        source = runtime.store.add_context_source(
+            context_id=context_id,
+            fs_path=body.fs_path,
+            recursive=body.recursive,
+        )
+
+        # Trigger indexing via RAG service
+        try:
+            runtime.rag.ingest_path(
+                context_id=context_id,
+                fs_path=body.fs_path,
+                recursive=body.recursive,
+            )
+        except Exception as exc:
+            logger.warning(
+                "context_source_ingest_failed",
+                context_id=context_id,
+                fs_path=body.fs_path,
+                error=str(exc),
+            )
+
+        envelope = Envelope(
+            status="ok",
+            data=ContextSourceResponse(
+                id=source.id,
+                context_id=source.context_id,
+                fs_path=source.fs_path,
+                recursive=source.recursive,
+                meta=source.meta,
+            ),
+            request_id=idem.request_id,
+        )
+        await idem.store_result(envelope)
+        return envelope
+
+
+@router.get("/contexts/{context_id}/sources", response_model=Envelope, tags=["knowledge"])
+async def list_context_sources(
+    context_id: str = Path(..., max_length=255, description="Knowledge context ID"),
+    principal: AuthContext = Depends(get_user),
+):
+    """List all source paths for a knowledge context."""
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        runtime.settings.read_rate_limit_per_minute,
+        60,
+    )
+
+    # Verify context ownership
+    _get_owned_context(runtime, context_id, principal)
+
+    sources = runtime.store.list_context_sources(context_id)
+    items = [
+        ContextSourceResponse(
+            id=s.id,
+            context_id=s.context_id,
+            fs_path=s.fs_path,
+            recursive=s.recursive,
+            meta=s.meta,
+        )
+        for s in sources
+    ]
+    return Envelope(status="ok", data=ContextSourceListResponse(items=items))
+
+
 @router.post("/voice/transcribe", response_model=Envelope, tags=["voice"])
 async def transcribe_voice(
     file: UploadFile = File(...), principal: AuthContext = Depends(get_user)
@@ -2259,7 +2726,7 @@ async def transcribe_voice(
         raise _http_error(
             "validation_error", "audio file too large (max 10MB)", status_code=413
         )
-    result = runtime.voice.transcribe(audio_bytes, user_id=principal.user_id)
+    result = await runtime.voice.transcribe(audio_bytes, user_id=principal.user_id)
     return Envelope(status="ok", data=VoiceTranscriptionResponse(**result))
 
 
@@ -2282,8 +2749,8 @@ async def synthesize_voice(
             "text too long for synthesis (max 5000 chars)",
             status_code=400,
         )
-    audio = runtime.voice.synthesize(
-        body.text, user_id=principal.user_id, voice=body.voice
+    audio = await runtime.voice.synthesize(
+        body.text, user_id=principal.user_id, voice=body.voice, speed=body.speed
     )
     return Envelope(status="ok", data=VoiceSynthesisResponse(**audio))
 
@@ -2350,8 +2817,31 @@ async def websocket_chat(ws: WebSocket):
         if stream_enabled:
             # Streaming mode: emit token, trace, message_done, error events
             cancel_event = asyncio.Event()
+            # Register cancel event so POST /chat/cancel can cancel this request
+            await _register_cancel_event(request_id, cancel_event)
             full_content = ""
             orchestration_dict: dict[str, Any] = {}
+
+            # Concurrent task to listen for cancel requests while streaming
+            async def listen_for_cancel():
+                try:
+                    while not cancel_event.is_set():
+                        try:
+                            msg = await asyncio.wait_for(ws.receive_json(), timeout=0.5)
+                            if msg.get("action") == "cancel":
+                                cancel_event.set()
+                                return
+                            elif msg.get("action") == "ping":
+                                await ws.send_json({"event": "pong", "data": None})
+                        except asyncio.TimeoutError:
+                            continue
+                        except WebSocketDisconnect:
+                            cancel_event.set()
+                            return
+                except Exception:
+                    pass  # Listener task should exit silently on errors
+
+            cancel_listener = asyncio.create_task(listen_for_cancel())
 
             try:
                 async for event in runtime.workflow.run_streaming(
@@ -2375,15 +2865,22 @@ async def websocket_chat(ws: WebSocket):
                         orchestration_dict = event_data if isinstance(event_data, dict) else {}
                     elif event_type == "error":
                         # Error already sent, close connection
+                        cancel_listener.cancel()
                         await ws.close(code=1011)
                         return
                     elif event_type == "cancel_ack":
+                        cancel_listener.cancel()
                         await ws.close(code=1000)
                         return
 
             except WebSocketDisconnect:
                 cancel_event.set()
+                cancel_listener.cancel()
+                await _unregister_cancel_event(request_id)
                 return
+            finally:
+                cancel_listener.cancel()
+                await _unregister_cancel_event(request_id)
 
             # Save assistant message after streaming completes
             adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
@@ -2512,7 +3009,23 @@ async def websocket_chat(ws: WebSocket):
         await ws.close(code=4429 if status_code == 429 else 1011)
     except WebSocketDisconnect:
         return
-    except Exception:
+    except json.JSONDecodeError:
+        # Handle invalid JSON in initial message
+        logger.warning(
+            "websocket_invalid_json",
+            request_id=request_id,
+        )
+        error_env = Envelope(
+            status="error",
+            error={"code": "invalid_json", "message": "Invalid JSON in request"},
+            request_id=request_id,
+        )
+        try:
+            await ws.send_json(error_env.model_dump())
+        except Exception:
+            pass
+        await ws.close(code=1003)
+    except Exception as exc:
         # SECURITY: Use logger.error instead of logger.exception to avoid
         # exposing full stack traces that may reveal implementation details
         logger.error(
@@ -2520,6 +3033,7 @@ async def websocket_chat(ws: WebSocket):
             user_id=user_id,
             conversation_id=convo_id,
             request_id=request_id,
+            error_type=type(exc).__name__,
         )
         error_env = Envelope(
             status="error",
@@ -2530,4 +3044,9 @@ async def websocket_chat(ws: WebSocket):
             await _store_idempotency_result(
                 "chat:ws", user_id, idempotency_key, error_env, status="failed"
             )
+        # Send error envelope to client before closing
+        try:
+            await ws.send_json(error_env.model_dump())
+        except Exception:
+            pass  # Connection may already be closed
         await ws.close(code=1011)

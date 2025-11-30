@@ -7,7 +7,6 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-
 _VALID_ERROR_CODES = frozenset({
     "unauthorized",
     "forbidden",
@@ -168,6 +167,33 @@ class MFAVerifyRequest(BaseModel):
     code: str = Field(..., max_length=10)
 
 
+class MFADisableRequest(BaseModel):
+    code: str = Field(..., max_length=10, description="Current TOTP code to verify identity")
+
+
+class MFAStatusResponse(BaseModel):
+    enabled: bool = Field(..., description="Whether MFA is currently enabled")
+    configured: bool = Field(..., description="Whether MFA secret is configured (pending verification)")
+
+
+class UserSettingsRequest(BaseModel):
+    """Request to update user settings."""
+    locale: Optional[str] = Field(None, max_length=10, description="Locale code (e.g., en-US)")
+    timezone: Optional[str] = Field(None, max_length=64, description="Timezone (e.g., America/New_York)")
+    default_voice: Optional[str] = Field(None, max_length=64, description="Default voice ID for TTS")
+    default_style: Optional[dict] = Field(None, description="Default style preferences")
+    flags: Optional[dict] = Field(None, description="Feature flags")
+
+
+class UserSettingsResponse(BaseModel):
+    """User settings response."""
+    locale: Optional[str] = None
+    timezone: Optional[str] = None
+    default_voice: Optional[str] = None
+    default_style: Optional[dict] = None
+    flags: Optional[dict] = None
+
+
 class PasswordResetRequest(BaseModel):
     email: str
 
@@ -179,6 +205,21 @@ class PasswordResetRequest(BaseModel):
 
 class PasswordResetConfirm(BaseModel):
     token: str = Field(..., max_length=256)
+    new_password: str
+
+    @field_validator("new_password")
+    @classmethod
+    def _validate_new_password(cls, value: str) -> str:
+        if len(value) < 8:
+            raise ValueError("password must be at least 8 characters")
+        if len(value) > 128:
+            raise ValueError("password must be at most 128 characters")
+        return value
+
+
+class PasswordChangeRequest(BaseModel):
+    """Request to change password (requires current password)."""
+    current_password: str = Field(..., min_length=1, max_length=128)
     new_password: str
 
     @field_validator("new_password")
@@ -405,6 +446,26 @@ class KnowledgeChunkListResponse(BaseModel):
     items: List[KnowledgeChunkResponse]
 
 
+class ContextSourceRequest(BaseModel):
+    """Request to add a source path to a knowledge context."""
+    fs_path: str = Field(..., min_length=1, max_length=4096, description="Source path to index")
+    recursive: bool = Field(default=True, description="Whether to recursively index subdirectories")
+
+
+class ContextSourceResponse(BaseModel):
+    """Response containing context source details."""
+    id: str
+    context_id: str
+    fs_path: str
+    recursive: bool
+    meta: Optional[dict] = None
+
+
+class ContextSourceListResponse(BaseModel):
+    """Response containing a list of context sources."""
+    items: List[ContextSourceResponse]
+
+
 class FileUploadResponse(BaseModel):
     fs_path: str
     context_id: Optional[str] = None
@@ -459,23 +520,40 @@ class AutoPatchRequest(BaseModel):
     goal: Optional[str] = None
 
 
+class ChatCancelRequest(BaseModel):
+    """Request to cancel an in-progress chat request per SPEC §18."""
+    request_id: str = Field(..., max_length=128, description="The request_id of the chat request to cancel")
+
+
+class ChatCancelResponse(BaseModel):
+    """Response from chat cancellation."""
+    request_id: str
+    cancelled: bool = Field(..., description="Whether the request was successfully cancelled")
+    message: str = Field(..., description="Human-readable status message")
+
+
 class VoiceTranscriptionResponse(BaseModel):
     transcript: str
     duration_ms: int
     user_id: Optional[str] = None
+    model: Optional[str] = None
+    language: Optional[str] = None
 
 
 class VoiceSynthesisRequest(BaseModel):
     text: str = Field(..., max_length=5000)  # Reasonable limit for TTS
     voice: Optional[str] = None
+    speed: float = Field(default=1.0, ge=0.25, le=4.0)
 
 
 class VoiceSynthesisResponse(BaseModel):
     audio_path: str
+    audio_url: Optional[str] = None
     format: str
     sample_rate: int
     duration_ms: int
     voice: str
+    model: Optional[str] = None
 
 
 class UserResponse(BaseModel):

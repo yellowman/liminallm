@@ -5,7 +5,6 @@ import operator
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-
 _BIN_OPS = {
     ast.Add: operator.add,
     ast.Sub: operator.sub,

@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS conversation (
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   status          TEXT NOT NULL DEFAULT 'open',
-  active_context_id UUID REFERENCES knowledge_context(id) ON DELETE SET NULL,
+  active_context_id UUID,  -- FK added in 002_knowledge.sql after knowledge_context exists
   meta            JSONB
 );
 

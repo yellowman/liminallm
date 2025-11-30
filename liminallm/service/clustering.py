@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import random
 from datetime import datetime
-import json
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 from liminallm.service.embeddings import cosine_similarity, pad_vectors

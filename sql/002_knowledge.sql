@@ -33,3 +33,17 @@ CREATE TABLE IF NOT EXISTS knowledge_chunk (
 CREATE INDEX IF NOT EXISTS knowledge_chunk_context_idx ON knowledge_chunk (context_id);
 CREATE INDEX IF NOT EXISTS knowledge_chunk_embedding_idx ON knowledge_chunk
 USING ivfflat (embedding) WITH (lists = 100);
+
+-- Add FK constraint for conversation.active_context_id now that knowledge_context exists
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM information_schema.table_constraints
+    WHERE constraint_name = 'conversation_active_context_id_fkey'
+      AND table_name = 'conversation'
+  ) THEN
+    ALTER TABLE conversation
+      ADD CONSTRAINT conversation_active_context_id_fkey
+      FOREIGN KEY (active_context_id) REFERENCES knowledge_context(id) ON DELETE SET NULL;
+  END IF;
+END $$;

@@ -1,0 +1,132 @@
+# LiminalLM Production Docker Compose
+# Includes app, PostgreSQL with pgvector, and Redis
+
+version: '3.8'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: liminallm-app
+    restart: unless-stopped
+    ports:
+      - "${HOST_PORT:-8000}:8000"
+    environment:
+      # Database
+      DATABASE_URL: postgres://liminallm:${POSTGRES_PASSWORD}@postgres:5432/liminallm
+      # Redis
+      REDIS_URL: redis://redis:6379/0
+      # Storage
+      SHARED_FS_ROOT: /srv/liminallm
+      # Model configuration
+      MODEL_BACKEND: ${MODEL_BACKEND:-openai}
+      MODEL_PATH: ${MODEL_PATH:-}
+      ADAPTER_OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ADAPTER_OPENAI_BASE_URL: ${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      ADAPTER_SERVER_MODEL: ${ADAPTER_SERVER_MODEL:-gpt-4o}
+      EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-text-embedding-3-small}
+      # Voice (optional)
+      VOICE_API_KEY: ${OPENAI_API_KEY:-}
+      VOICE_TRANSCRIPTION_MODEL: ${VOICE_TRANSCRIPTION_MODEL:-whisper-1}
+      VOICE_SYNTHESIS_MODEL: ${VOICE_SYNTHESIS_MODEL:-tts-1}
+      VOICE_DEFAULT_VOICE: ${VOICE_DEFAULT_VOICE:-alloy}
+      # Auth
+      JWT_SECRET: ${JWT_SECRET:-}
+      JWT_ISSUER: ${JWT_ISSUER:-liminallm}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-liminal-clients}
+      ACCESS_TOKEN_TTL_MINUTES: ${ACCESS_TOKEN_TTL_MINUTES:-30}
+      REFRESH_TOKEN_TTL_MINUTES: ${REFRESH_TOKEN_TTL_MINUTES:-1440}
+      ENABLE_MFA: ${ENABLE_MFA:-true}
+      # Email (optional)
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
+      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-}
+      EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-LiminalLM}
+      APP_BASE_URL: ${APP_BASE_URL:-http://localhost:8000}
+      # OAuth (optional)
+      OAUTH_GOOGLE_CLIENT_ID: ${OAUTH_GOOGLE_CLIENT_ID:-}
+      OAUTH_GOOGLE_CLIENT_SECRET: ${OAUTH_GOOGLE_CLIENT_SECRET:-}
+      OAUTH_GITHUB_CLIENT_ID: ${OAUTH_GITHUB_CLIENT_ID:-}
+      OAUTH_GITHUB_CLIENT_SECRET: ${OAUTH_GITHUB_CLIENT_SECRET:-}
+      OAUTH_MICROSOFT_CLIENT_ID: ${OAUTH_MICROSOFT_CLIENT_ID:-}
+      OAUTH_MICROSOFT_CLIENT_SECRET: ${OAUTH_MICROSOFT_CLIENT_SECRET:-}
+      OAUTH_REDIRECT_URI: ${OAUTH_REDIRECT_URI:-}
+      # Rate limits
+      CHAT_RATE_LIMIT_PER_MINUTE: ${CHAT_RATE_LIMIT_PER_MINUTE:-60}
+      RESET_RATE_LIMIT_PER_MINUTE: ${RESET_RATE_LIMIT_PER_MINUTE:-5}
+    volumes:
+      - liminallm-data:/srv/liminallm
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: liminallm-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: liminallm
+      POSTGRES_USER: liminallm
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./sql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U liminallm -d liminallm"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    container_name: liminallm-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Optional: Nginx reverse proxy for production
+  nginx:
+    image: nginx:alpine
+    container_name: liminallm-nginx
+    restart: unless-stopped
+    ports:
+      - "${NGINX_HTTP_PORT:-80}:80"
+      - "${NGINX_HTTPS_PORT:-443}:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    depends_on:
+      - app
+    profiles:
+      - production
+
+volumes:
+  liminallm-data:
+    driver: local
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+
+networks:
+  default:
+    name: liminallm-network

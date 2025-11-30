@@ -7,10 +7,10 @@ from typing import Any, Dict, List, Optional, Tuple
 from liminallm.config import get_compatible_adapter_modes
 from liminallm.logging import get_logger
 from liminallm.service.model_backend import get_adapter_mode
+from liminallm.storage.redis_cache import RedisCache
 
 from .embeddings import EMBEDDING_DIM, cosine_similarity, ensure_embedding_dim
 from .sandbox import safe_eval_expr
-from liminallm.storage.redis_cache import RedisCache
 
 logger = get_logger(__name__)
 

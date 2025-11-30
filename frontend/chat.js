@@ -132,6 +132,79 @@ const escapeHtml = (str) => {
   return div.innerHTML;
 };
 
+// Citation modal for displaying source content
+const showCitationModal = (element) => {
+  try {
+    const data = JSON.parse(element.dataset.citation || '{}');
+    const modal = document.getElementById('citation-modal');
+    const content = document.getElementById('citation-modal-content');
+    const title = document.getElementById('citation-modal-title');
+
+    if (!modal) {
+      // Create modal dynamically if it doesn't exist
+      createCitationModal();
+      return showCitationModal(element);
+    }
+
+    // Set modal content
+    const sourcePath = data.source_path || data.chunk_id || 'Unknown Source';
+    title.textContent = sourcePath.split('/').pop() || sourcePath;
+
+    // Build content display
+    let html = '';
+    if (data.source_path) {
+      html += `<div class="citation-meta"><strong>Source:</strong> ${escapeHtml(data.source_path)}</div>`;
+    }
+    if (data.context_id) {
+      html += `<div class="citation-meta"><strong>Context:</strong> ${escapeHtml(data.context_id)}</div>`;
+    }
+    if (data.chunk_index !== undefined) {
+      html += `<div class="citation-meta"><strong>Chunk:</strong> #${data.chunk_index}</div>`;
+    }
+    if (data.content) {
+      html += `<div class="citation-content"><pre>${escapeHtml(data.content)}</pre></div>`;
+    } else {
+      html += `<div class="citation-content"><em>No content preview available</em></div>`;
+    }
+
+    content.innerHTML = html;
+    modal.classList.add('active');
+
+    // Close on click outside
+    modal.onclick = (e) => {
+      if (e.target === modal) {
+        modal.classList.remove('active');
+      }
+    };
+  } catch (err) {
+    console.error('Failed to parse citation data:', err);
+  }
+};
+
+const createCitationModal = () => {
+  const modal = document.createElement('div');
+  modal.id = 'citation-modal';
+  modal.className = 'modal-overlay';
+  modal.innerHTML = `
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 id="citation-modal-title">Citation</h3>
+        <button class="modal-close" onclick="document.getElementById('citation-modal').classList.remove('active')">&times;</button>
+      </div>
+      <div id="citation-modal-content" class="modal-body"></div>
+    </div>
+  `;
+  document.body.appendChild(modal);
+};
+
+// Close citation modal on escape key
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    const modal = document.getElementById('citation-modal');
+    if (modal) modal.classList.remove('active');
+  }
+});
+
 const randomIdempotencyKey = () => {
   if (window.crypto?.randomUUID) return window.crypto.randomUUID();
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -397,6 +470,20 @@ const initCollapsibleSections = () => {
 };
 
 // =============================================================================
+// Auth form switching
+// =============================================================================
+
+const showAuthForm = (formName) => {
+  const loginContainer = $('login-form-container');
+  const signupContainer = $('signup-form-container');
+  const resetContainer = $('reset-form-container');
+
+  if (loginContainer) loginContainer.classList.toggle('hidden', formName !== 'login');
+  if (signupContainer) signupContainer.classList.toggle('hidden', formName !== 'signup');
+  if (resetContainer) resetContainer.classList.toggle('hidden', formName !== 'reset');
+};
+
+// =============================================================================
 // Auth management
 // =============================================================================
 
@@ -461,6 +548,9 @@ const handleLogin = async (event) => {
       fetchContexts(),
       fetchArtifacts(),
       fetchHealth(),
+      fetchMfaStatus(),
+      fetchEmailVerificationStatus(),
+      fetchUserSettings(),
     ]);
   } catch (err) {
     showStatus(err.message, true);
@@ -486,6 +576,412 @@ const logout = async () => {
   updateAuthUI();
   renderAdminNotice();
   updateEmptyState();
+};
+
+// =============================================================================
+// OAuth
+// =============================================================================
+
+const startOAuth = async (provider) => {
+  const oauthStatus = $('oauth-status');
+  const btn = $(`oauth-${provider}`);
+
+  try {
+    if (btn) btn.disabled = true;
+    if (oauthStatus) oauthStatus.textContent = `Connecting to ${provider}...`;
+
+    const tenant = $('tenant')?.value?.trim() || undefined;
+    const redirectUri = window.location.origin + window.location.pathname;
+
+    const envelope = await requestEnvelope(
+      `${apiBase}/auth/oauth/${provider}/start`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          redirect_uri: redirectUri,
+          tenant_id: tenant,
+        }),
+      },
+      `Failed to start ${provider} login`
+    );
+
+    const authUrl = envelope.data?.authorization_url;
+    if (authUrl) {
+      // Store the state for callback verification
+      sessionStorage.setItem('oauth_state', envelope.data?.state || '');
+      sessionStorage.setItem('oauth_provider', provider);
+      // Redirect to OAuth provider
+      window.location.href = authUrl;
+    } else {
+      if (oauthStatus) oauthStatus.textContent = 'No authorization URL returned';
+    }
+  } catch (err) {
+    if (oauthStatus) oauthStatus.textContent = err.message;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+};
+
+const handleOAuthCallback = async () => {
+  // Check if this is an OAuth callback
+  const urlParams = new URLSearchParams(window.location.search);
+  const code = urlParams.get('code');
+  const state = urlParams.get('state');
+  const provider = urlParams.get('provider') || sessionStorage.getItem('oauth_provider');
+
+  if (!code || !state || !provider) {
+    return false;
+  }
+
+  const oauthStatus = $('oauth-status');
+  const storedState = sessionStorage.getItem('oauth_state');
+
+  // Verify state matches
+  if (storedState && state !== storedState) {
+    if (oauthStatus) oauthStatus.textContent = 'OAuth state mismatch. Please try again.';
+    sessionStorage.removeItem('oauth_state');
+    sessionStorage.removeItem('oauth_provider');
+    return true;
+  }
+
+  try {
+    if (oauthStatus) oauthStatus.textContent = 'Completing sign in...';
+
+    const tenant = $('tenant')?.value?.trim() || undefined;
+
+    const envelope = await requestEnvelope(
+      `${apiBase}/auth/oauth/${provider}/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`,
+      {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+      },
+      `OAuth callback failed`
+    );
+
+    // Clear OAuth session data
+    sessionStorage.removeItem('oauth_state');
+    sessionStorage.removeItem('oauth_provider');
+
+    // Clear URL params
+    window.history.replaceState({}, document.title, window.location.pathname);
+
+    if (envelope.data?.access_token) {
+      persistAuth(envelope.data);
+      showStatus('Signed in with ' + provider);
+
+      // Load initial data
+      await Promise.all([
+        fetchConversations(),
+        fetchContexts(),
+        fetchArtifacts(),
+        fetchHealth(),
+        fetchMfaStatus(),
+        fetchEmailVerificationStatus(),
+        fetchUserSettings(),
+      ]);
+    } else {
+      if (oauthStatus) oauthStatus.textContent = 'OAuth completed but no token received';
+    }
+  } catch (err) {
+    if (oauthStatus) oauthStatus.textContent = err.message;
+    sessionStorage.removeItem('oauth_state');
+    sessionStorage.removeItem('oauth_provider');
+  }
+
+  return true;
+};
+
+// =============================================================================
+// Signup
+// =============================================================================
+
+const handleSignup = async (event) => {
+  event.preventDefault();
+  const signupStatus = $('signup-status');
+  const signupSubmit = $('signup-submit');
+
+  const email = $('signup-email')?.value?.trim();
+  const password = $('signup-password')?.value;
+  const confirm = $('signup-confirm')?.value;
+  const tenant = $('signup-tenant')?.value?.trim() || undefined;
+
+  if (!email || !password) {
+    if (signupStatus) signupStatus.textContent = 'Email and password are required';
+    return;
+  }
+
+  if (password !== confirm) {
+    if (signupStatus) signupStatus.textContent = 'Passwords do not match';
+    return;
+  }
+
+  if (password.length < 8) {
+    if (signupStatus) signupStatus.textContent = 'Password must be at least 8 characters';
+    return;
+  }
+
+  try {
+    toggleButtonBusy(signupSubmit, true, 'Creating...');
+    if (signupStatus) signupStatus.textContent = '';
+
+    await requestEnvelope(
+      `${apiBase}/auth/signup`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password, tenant_id: tenant }),
+      },
+      'Signup failed'
+    );
+
+    if (signupStatus) signupStatus.textContent = 'Account created! You can now sign in.';
+
+    // Clear form and switch to login
+    if ($('signup-email')) $('signup-email').value = '';
+    if ($('signup-password')) $('signup-password').value = '';
+    if ($('signup-confirm')) $('signup-confirm').value = '';
+
+    // Pre-fill login email
+    if ($('email')) $('email').value = email;
+
+    setTimeout(() => showAuthForm('login'), 1500);
+  } catch (err) {
+    if (signupStatus) signupStatus.textContent = err.message;
+  } finally {
+    toggleButtonBusy(signupSubmit, false);
+  }
+};
+
+// =============================================================================
+// Password Reset
+// =============================================================================
+
+let resetEmailForConfirm = '';
+
+const handleResetRequest = async (event) => {
+  event.preventDefault();
+  const resetStatus = $('reset-status');
+  const resetSubmit = $('reset-request-submit');
+  const resetCodeSection = $('reset-code-section');
+
+  const email = $('reset-email')?.value?.trim();
+
+  if (!email) {
+    if (resetStatus) resetStatus.textContent = 'Email is required';
+    return;
+  }
+
+  try {
+    toggleButtonBusy(resetSubmit, true, 'Sending...');
+    if (resetStatus) resetStatus.textContent = '';
+
+    await requestEnvelope(
+      `${apiBase}/auth/reset/request`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email }),
+      },
+      'Reset request failed'
+    );
+
+    resetEmailForConfirm = email;
+    if (resetStatus) resetStatus.textContent = 'Reset code sent! Check your email.';
+    if (resetCodeSection) resetCodeSection.classList.remove('hidden');
+  } catch (err) {
+    if (resetStatus) resetStatus.textContent = err.message;
+  } finally {
+    toggleButtonBusy(resetSubmit, false);
+  }
+};
+
+const handleResetConfirm = async (event) => {
+  event.preventDefault();
+  const resetStatus = $('reset-status');
+  const confirmSubmit = $('reset-confirm-submit');
+
+  const code = $('reset-code')?.value?.trim();
+  const newPassword = $('reset-new-password')?.value;
+
+  if (!code || !newPassword) {
+    if (resetStatus) resetStatus.textContent = 'Code and new password are required';
+    return;
+  }
+
+  if (newPassword.length < 8) {
+    if (resetStatus) resetStatus.textContent = 'Password must be at least 8 characters';
+    return;
+  }
+
+  try {
+    toggleButtonBusy(confirmSubmit, true, 'Resetting...');
+    if (resetStatus) resetStatus.textContent = '';
+
+    await requestEnvelope(
+      `${apiBase}/auth/reset/confirm`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: code,
+          new_password: newPassword,
+        }),
+      },
+      'Password reset failed'
+    );
+
+    if (resetStatus) resetStatus.textContent = 'Password reset successful! You can now sign in.';
+
+    // Clear form
+    if ($('reset-code')) $('reset-code').value = '';
+    if ($('reset-new-password')) $('reset-new-password').value = '';
+    if ($('reset-code-section')) $('reset-code-section').classList.add('hidden');
+
+    // Pre-fill login email
+    if ($('email')) $('email').value = resetEmailForConfirm;
+
+    setTimeout(() => showAuthForm('login'), 1500);
+  } catch (err) {
+    if (resetStatus) resetStatus.textContent = err.message;
+  } finally {
+    toggleButtonBusy(confirmSubmit, false);
+  }
+};
+
+// =============================================================================
+// Email Token URL Handlers
+// =============================================================================
+
+let pendingResetToken = '';
+
+const handleResetTokenCallback = async () => {
+  const urlParams = new URLSearchParams(window.location.search);
+  const resetToken = urlParams.get('reset_token');
+
+  if (!resetToken) {
+    return false;
+  }
+
+  // Clear URL params
+  window.history.replaceState({}, document.title, window.location.pathname);
+
+  // Store the token for the form
+  pendingResetToken = resetToken;
+
+  // Show the reset form with just the new password field visible
+  showAuthForm('reset');
+
+  const resetStatus = $('reset-status');
+  const resetCodeSection = $('reset-code-section');
+  const resetRequestForm = $('reset-request-form');
+
+  // Hide the email request section and show the password input
+  if (resetRequestForm) resetRequestForm.classList.add('hidden');
+  if (resetCodeSection) {
+    resetCodeSection.classList.remove('hidden');
+    // Hide the code input since we have the token from URL
+    const codeField = resetCodeSection.querySelector('.field:first-child');
+    if (codeField) codeField.classList.add('hidden');
+  }
+
+  // Update the description
+  const subtext = resetCodeSection?.previousElementSibling;
+  if (subtext && subtext.classList.contains('subtext')) {
+    subtext.textContent = 'Enter your new password.';
+  }
+
+  if (resetStatus) resetStatus.textContent = 'Password reset link verified. Enter your new password.';
+
+  return true;
+};
+
+const handleResetWithToken = async (event) => {
+  event.preventDefault();
+  const resetStatus = $('reset-status');
+  const confirmSubmit = $('reset-confirm-submit');
+
+  const newPassword = $('reset-new-password')?.value;
+
+  if (!newPassword) {
+    if (resetStatus) resetStatus.textContent = 'New password is required';
+    return;
+  }
+
+  if (newPassword.length < 8) {
+    if (resetStatus) resetStatus.textContent = 'Password must be at least 8 characters';
+    return;
+  }
+
+  if (!pendingResetToken) {
+    if (resetStatus) resetStatus.textContent = 'Reset token expired. Please request a new reset link.';
+    return;
+  }
+
+  try {
+    toggleButtonBusy(confirmSubmit, true, 'Resetting...');
+    if (resetStatus) resetStatus.textContent = '';
+
+    await requestEnvelope(
+      `${apiBase}/auth/reset/confirm`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          token: pendingResetToken,
+          new_password: newPassword,
+        }),
+      },
+      'Password reset failed'
+    );
+
+    pendingResetToken = '';
+    if (resetStatus) resetStatus.textContent = 'Password reset successful! You can now sign in.';
+
+    // Clear form and show login after delay
+    if ($('reset-new-password')) $('reset-new-password').value = '';
+    setTimeout(() => showAuthForm('login'), 1500);
+  } catch (err) {
+    if (resetStatus) resetStatus.textContent = err.message;
+  } finally {
+    toggleButtonBusy(confirmSubmit, false);
+  }
+};
+
+const handleVerifyTokenCallback = async () => {
+  const urlParams = new URLSearchParams(window.location.search);
+  const verifyToken = urlParams.get('verify_token');
+
+  if (!verifyToken) {
+    return false;
+  }
+
+  // Clear URL params
+  window.history.replaceState({}, document.title, window.location.pathname);
+
+  // Show a verification status message
+  showStatus('Verifying email...');
+
+  try {
+    await requestEnvelope(
+      `${apiBase}/auth/verify_email`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: verifyToken }),
+      },
+      'Email verification failed'
+    );
+
+    showStatus('Email verified successfully! You can now sign in.');
+
+    // Show login form
+    showAuthForm('login');
+  } catch (err) {
+    showStatus(`Email verification failed: ${err.message}`);
+  }
+
+  return true;
 };
 
 // =============================================================================
@@ -649,7 +1145,15 @@ const renderMessage = (m) => {
         ${citations.map((c, i) => {
           const path = escapeHtml(c.source_path || c.chunk_id || `Citation ${i + 1}`);
           const label = path.split('/').pop() || path;
-          return `<span class="citation-link" title="${path}">${escapeHtml(label)}</span>`;
+          // JSON.stringify escapes internal quotes; only need & and " for double-quoted attr
+          const snippetData = JSON.stringify({
+            source_path: c.source_path || '',
+            chunk_id: c.chunk_id || '',
+            content: c.content || c.snippet || '',
+            context_id: c.context_id || '',
+            chunk_index: c.chunk_index,
+          }).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+          return `<span class="citation-link" title="${path}" data-citation="${snippetData}" onclick="showCitationModal(this)">${escapeHtml(label)}</span>`;
         }).join('')}
       </div>
     `;
@@ -755,6 +1259,32 @@ const scrollToBottom = () => {
 let chatSocket = null;
 let chatSocketConnecting = false;
 let chatSocketReconnectTimer = null;
+let isStreaming = false;
+
+const updateStreamingUI = (streaming) => {
+  isStreaming = streaming;
+  const sendBtn = $('send-btn');
+  const stopBtn = $('stop-stream-btn');
+  if (streaming) {
+    if (sendBtn) sendBtn.classList.add('hidden');
+    if (stopBtn) stopBtn.classList.remove('hidden');
+  } else {
+    if (sendBtn) sendBtn.classList.remove('hidden');
+    if (stopBtn) stopBtn.classList.add('hidden');
+  }
+};
+
+const cancelStreaming = () => {
+  if (!isStreaming || !chatSocket || chatSocket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+  try {
+    chatSocket.send(JSON.stringify({ action: 'cancel' }));
+    showStatus('Cancelling...');
+  } catch (err) {
+    console.warn('Failed to send cancel:', err);
+  }
+};
 
 const cleanupWebSocket = () => {
   if (chatSocketReconnectTimer) {
@@ -872,14 +1402,14 @@ const sendMessage = async (event) => {
 
   /**
    * SPEC §18: Streaming WebSocket chat with token events.
-   * Handles events: token, trace, message_done, error, cancel_ack
+   * Handles events: token, trace, message_done, streaming_complete, error, cancel_ack
    */
   const chatViaWebSocketStreaming = async () => {
     const ws = await ensureWebSocket();
     return new Promise((resolve, reject) => {
       let settled = false;
       let streamingMsg = null;
-      let finalData = null;
+      let messageDoneData = null;
 
       const cleanup = () => {
         ws.removeEventListener('message', handleMessage);
@@ -910,24 +1440,22 @@ const sendMessage = async (event) => {
                 break;
 
               case 'message_done':
-                // Streaming complete
-                settled = true;
-                cleanup();
+                // Streaming visually complete, but wait for streaming_complete for IDs
+                messageDoneData = msg.data || {};
                 if (streamingMsg) {
-                  const adapters = (msg.data?.adapters || []).map(a => a?.name || a?.id || a).filter(Boolean);
+                  const adapters = (messageDoneData.adapters || []).map(a => a?.name || a?.id || a).filter(Boolean);
                   streamingMsg.finalize(adapters.length ? `Adapters: ${adapters.join(', ')}` : '');
                 }
-                resolve(msg.data || {});
+                // Don't resolve yet - wait for streaming_complete with message_id
                 break;
 
               case 'streaming_complete':
                 // Final event with message_id and conversation_id after DB save
-                if (!settled) {
-                  settled = true;
-                  cleanup();
-                  finalData = msg.data || {};
-                  resolve(finalData);
-                }
+                settled = true;
+                cleanup();
+                // Merge with any data from message_done
+                const finalData = { ...messageDoneData, ...(msg.data || {}) };
+                resolve(finalData);
                 break;
 
               case 'error':
@@ -983,8 +1511,14 @@ const sendMessage = async (event) => {
         if (!settled) {
           settled = true;
           cleanup();
-          if (streamingMsg) streamingMsg.finalize('Connection closed');
-          reject(new Error('Connection closed'));
+          // If we got message_done but not streaming_complete, resolve with what we have
+          if (messageDoneData) {
+            if (streamingMsg) streamingMsg.finalize('');
+            resolve(messageDoneData);
+          } else {
+            if (streamingMsg) streamingMsg.finalize('Connection closed');
+            reject(new Error('Connection closed'));
+          }
         }
       };
 
@@ -1014,6 +1548,7 @@ const sendMessage = async (event) => {
     saveDraft(state.conversationId, '');
     appendMessage('user', content);
     showStatus('Thinking...');
+    updateStreamingUI(true);
 
     const data = await chatViaWebSocketStreaming().catch(async () => {
       // Fallback to REST API if WebSocket fails
@@ -1051,6 +1586,7 @@ const sendMessage = async (event) => {
     showStatus(err.message, true);
   } finally {
     toggleButtonBusy(sendBtn, false, 'Send');
+    updateStreamingUI(false);
   }
 };
 
@@ -1155,6 +1691,118 @@ const selectContext = async (contextId) => {
     `;
   } catch (err) {
     details.innerHTML = `<div class="empty">Error loading context: ${escapeHtml(err.message)}</div>`;
+  }
+
+  // Also load sources for this context
+  await fetchContextSources(contextId);
+
+  // Show the add source section
+  const addSourceSection = $('add-source-section');
+  if (addSourceSection) addSourceSection.classList.remove('hidden');
+};
+
+// =============================================================================
+// Context Sources
+// =============================================================================
+
+const fetchContextSources = async (contextId) => {
+  const sourcesList = $('context-sources-list');
+  if (!sourcesList) return;
+
+  if (!contextId) {
+    sourcesList.innerHTML = '<div class="empty">Select a context to view sources</div>';
+    return;
+  }
+
+  try {
+    sourcesList.innerHTML = '<div class="empty">Loading sources...</div>';
+
+    const envelope = await requestEnvelope(
+      `${apiBase}/contexts/${contextId}/sources`,
+      { headers: headers() },
+      'Failed to load sources'
+    );
+
+    const sources = envelope.data?.items || [];
+    renderContextSources(sources);
+  } catch (err) {
+    sourcesList.innerHTML = `<div class="empty">Error: ${escapeHtml(err.message)}</div>`;
+  }
+};
+
+const renderContextSources = (sources) => {
+  const sourcesList = $('context-sources-list');
+  if (!sourcesList) return;
+
+  if (!sources.length) {
+    sourcesList.innerHTML = '<div class="empty">No sources added yet</div>';
+    return;
+  }
+
+  sourcesList.innerHTML = sources
+    .map((s) => {
+      const date = s.created_at ? new Date(s.created_at).toLocaleDateString() : '-';
+      return `
+        <div class="source-item">
+          <div class="source-path monospace">${escapeHtml(s.fs_path || s.path || '-')}</div>
+          <div class="source-meta">
+            <span>${s.recursive ? 'Recursive' : 'Single file'}</span>
+            <span>Added ${date}</span>
+          </div>
+        </div>
+      `;
+    })
+    .join('');
+};
+
+const addContextSource = async (event) => {
+  event.preventDefault();
+
+  if (!state.selectedContext) {
+    const statusEl = $('add-source-status');
+    if (statusEl) statusEl.textContent = 'No context selected';
+    return;
+  }
+
+  const pathEl = $('source-path');
+  const recursiveEl = $('source-recursive');
+  const statusEl = $('add-source-status');
+  const submitBtn = $('add-source-btn');
+
+  const fsPath = pathEl?.value?.trim();
+  const recursive = recursiveEl?.checked ?? true;
+
+  if (!fsPath) {
+    if (statusEl) statusEl.textContent = 'Path is required';
+    return;
+  }
+
+  try {
+    toggleButtonBusy(submitBtn, true, 'Adding...');
+    if (statusEl) statusEl.textContent = '';
+
+    await requestEnvelope(
+      `${apiBase}/contexts/${state.selectedContext.id}/sources`,
+      {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ fs_path: fsPath, recursive }),
+      },
+      'Failed to add source'
+    );
+
+    if (statusEl) statusEl.textContent = 'Source added and ingested!';
+    if (pathEl) pathEl.value = '';
+
+    // Reload sources
+    await fetchContextSources(state.selectedContext.id);
+
+    // Also reload the context details to update chunk count
+    await selectContext(state.selectedContext.id);
+  } catch (err) {
+    if (statusEl) statusEl.textContent = err.message;
+  } finally {
+    toggleButtonBusy(submitBtn, false);
   }
 };
 
@@ -1413,6 +2061,170 @@ const sendPreference = async (isPositive) => {
 };
 
 // =============================================================================
+// Voice Input/Output
+// =============================================================================
+
+let mediaRecorder = null;
+let audioChunks = [];
+let isRecording = false;
+let currentAudio = null;
+
+// Voice button references - initialized lazily in initEventListeners
+let voiceInputBtn = null;
+let voiceOutputBtn = null;
+
+const startVoiceRecording = async () => {
+  if (isRecording) return;
+
+  let stream = null;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    mediaRecorder = new MediaRecorder(stream);
+    audioChunks = [];
+
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data.size > 0) {
+        audioChunks.push(e.data);
+      }
+    };
+
+    mediaRecorder.onstop = async () => {
+      const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+      stream.getTracks().forEach(track => track.stop());
+      await transcribeAudio(audioBlob);
+    };
+
+    mediaRecorder.start();
+    isRecording = true;
+    if (voiceInputBtn) {
+      voiceInputBtn.classList.add('recording');
+      voiceInputBtn.title = 'Release to stop recording';
+    }
+  } catch (err) {
+    // Clean up stream if it was obtained but recording failed to start
+    if (stream) {
+      stream.getTracks().forEach(track => track.stop());
+    }
+    console.error('Microphone access denied:', err);
+    alert('Could not access microphone. Please check permissions.');
+  }
+};
+
+const stopVoiceRecording = () => {
+  if (!isRecording || !mediaRecorder) return;
+
+  mediaRecorder.stop();
+  isRecording = false;
+  if (voiceInputBtn) {
+    voiceInputBtn.classList.remove('recording');
+    voiceInputBtn.title = 'Hold to record';
+  }
+};
+
+const transcribeAudio = async (audioBlob) => {
+  if (!state.accessToken) {
+    alert('Please sign in to use voice input.');
+    return;
+  }
+
+  try {
+    const formData = new FormData();
+    formData.append('file', audioBlob, 'recording.webm');
+
+    const response = await fetch(`${apiBase}/voice/transcribe`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${state.accessToken}`,
+      },
+      body: formData,
+    });
+
+    const envelope = await response.json();
+    if (envelope.status === 'ok' && envelope.data?.transcript) {
+      // Insert transcribed text into the message input
+      const messageInput = $('message-input');
+      if (messageInput) {
+        messageInput.value = (messageInput.value + ' ' + envelope.data.transcript).trim();
+        messageInput.focus();
+      }
+    } else {
+      console.error('Transcription failed:', envelope);
+    }
+  } catch (err) {
+    console.error('Transcription error:', err);
+  }
+};
+
+const speakText = async (text) => {
+  if (!text) return;
+
+  // Stop any currently playing audio
+  if (currentAudio) {
+    currentAudio.pause();
+    currentAudio = null;
+  }
+
+  if (!state.accessToken) {
+    // Fall back to browser speech synthesis
+    const utterance = new SpeechSynthesisUtterance(text);
+    window.speechSynthesis.speak(utterance);
+    return;
+  }
+
+  try {
+    if (voiceOutputBtn) voiceOutputBtn.classList.add('playing');
+
+    const response = await fetch(`${apiBase}/voice/synthesize`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${state.accessToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ text }),
+    });
+
+    const envelope = await response.json();
+    if (envelope.status === 'ok' && envelope.data?.audio_url) {
+      currentAudio = new Audio(envelope.data.audio_url);
+      currentAudio.onended = () => {
+        if (voiceOutputBtn) voiceOutputBtn.classList.remove('playing');
+      };
+      currentAudio.onerror = () => {
+        if (voiceOutputBtn) voiceOutputBtn.classList.remove('playing');
+        // Fall back to browser speech synthesis
+        const utterance = new SpeechSynthesisUtterance(text);
+        window.speechSynthesis.speak(utterance);
+      };
+      currentAudio.play();
+    } else {
+      // Fall back to browser speech synthesis
+      if (voiceOutputBtn) voiceOutputBtn.classList.remove('playing');
+      const utterance = new SpeechSynthesisUtterance(text);
+      window.speechSynthesis.speak(utterance);
+    }
+  } catch (err) {
+    console.error('Speech synthesis error:', err);
+    if (voiceOutputBtn) voiceOutputBtn.classList.remove('playing');
+    // Fall back to browser speech synthesis
+    const utterance = new SpeechSynthesisUtterance(text);
+    window.speechSynthesis.speak(utterance);
+  }
+};
+
+const readLastResponse = () => {
+  // Get the last assistant message content from DOM
+  const lastAssistantBubble = document.querySelector('.message.assistant:last-of-type .bubble');
+  const content = lastAssistantBubble?.textContent?.trim();
+  if (!content) {
+    alert('No assistant response to read.');
+    return;
+  }
+  speakText(content);
+};
+
+// Voice button event listeners are initialized in initEventListeners() after DOM ready
+
+// =============================================================================
 // File upload
 // =============================================================================
 
@@ -1555,6 +2367,453 @@ const handleExportDrafts = () => {
 };
 
 // =============================================================================
+// MFA Settings
+// =============================================================================
+
+let pendingMfaSecret = null;
+
+const fetchMfaStatus = async () => {
+  const statusEl = $('setting-mfa-status');
+  const enableBtn = $('mfa-enable-btn');
+  const disableBtn = $('mfa-show-disable-btn');
+
+  if (!state.accessToken) {
+    if (statusEl) statusEl.textContent = 'Sign in to manage MFA';
+    return;
+  }
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/auth/mfa/status`,
+      { headers: headers() },
+      'Failed to check MFA status'
+    );
+
+    const { enabled, configured } = envelope.data;
+    if (statusEl) {
+      statusEl.textContent = enabled ? 'Enabled' : 'Disabled';
+      statusEl.style.color = enabled ? '#0a7' : 'inherit';
+    }
+
+    // Show/hide appropriate buttons
+    if (enableBtn) enableBtn.classList.toggle('hidden', enabled);
+    if (disableBtn) disableBtn.classList.toggle('hidden', !enabled);
+  } catch (err) {
+    if (statusEl) statusEl.textContent = 'Unable to check';
+  }
+};
+
+const startMfaSetup = async () => {
+  if (!state.accessToken || !state.sessionId) {
+    setMfaSetupStatus('Sign in first', true);
+    return;
+  }
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/auth/mfa/request`,
+      {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ session_id: state.sessionId }),
+      },
+      'Failed to start MFA setup'
+    );
+
+    const { otpauth_uri, status } = envelope.data;
+    if (status === 'disabled') {
+      setMfaSetupStatus('MFA is disabled on this server', true);
+      return;
+    }
+
+    // Extract secret from URI for manual entry
+    const secretMatch = otpauth_uri?.match(/secret=([A-Z2-7]+)/i);
+    pendingMfaSecret = secretMatch ? secretMatch[1] : null;
+
+    // Show setup section
+    $('mfa-setup-section')?.classList.remove('hidden');
+    $('mfa-enable-btn')?.classList.add('hidden');
+
+    // Display secret for manual entry
+    const secretDisplay = $('mfa-secret-display');
+    if (secretDisplay) secretDisplay.textContent = pendingMfaSecret || 'N/A';
+
+    // Generate QR code using a simple text display (or use qrcode library if available)
+    const qrContainer = $('mfa-qr-code');
+    if (qrContainer) {
+      // Create a simple link to the otpauth URI that mobile apps can scan
+      qrContainer.innerHTML = `
+        <div class="qr-placeholder">
+          <p>Open your authenticator app and add a new account using this URI:</p>
+          <code style="word-break: break-all; font-size: 0.75rem;">${otpauth_uri || 'N/A'}</code>
+        </div>
+      `;
+    }
+
+    setMfaSetupStatus('Enter the 6-digit code from your authenticator app');
+  } catch (err) {
+    setMfaSetupStatus(err.message || 'Failed to start MFA setup', true);
+  }
+};
+
+const verifyMfaSetup = async (event) => {
+  event.preventDefault();
+
+  const codeInput = $('mfa-setup-code');
+  const code = codeInput?.value?.trim();
+
+  if (!code || code.length !== 6) {
+    setMfaSetupStatus('Enter a 6-digit code', true);
+    return;
+  }
+
+  if (!state.sessionId) {
+    setMfaSetupStatus('No session. Please sign in again.', true);
+    return;
+  }
+
+  try {
+    await requestEnvelope(
+      `${apiBase}/auth/mfa/verify`,
+      {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ session_id: state.sessionId, code }),
+      },
+      'Invalid code. Try again.'
+    );
+
+    // Success - hide setup, refresh status
+    $('mfa-setup-section')?.classList.add('hidden');
+    if (codeInput) codeInput.value = '';
+    pendingMfaSecret = null;
+
+    setMfaSetupStatus('');
+    await fetchMfaStatus();
+
+    alert('MFA enabled successfully!');
+  } catch (err) {
+    setMfaSetupStatus(err.message || 'Verification failed', true);
+  }
+};
+
+const cancelMfaSetup = () => {
+  $('mfa-setup-section')?.classList.add('hidden');
+  $('mfa-enable-btn')?.classList.remove('hidden');
+  const codeInput = $('mfa-setup-code');
+  if (codeInput) codeInput.value = '';
+  pendingMfaSecret = null;
+  setMfaSetupStatus('');
+};
+
+const showMfaDisable = () => {
+  $('mfa-disable-section')?.classList.remove('hidden');
+  $('mfa-show-disable-btn')?.classList.add('hidden');
+};
+
+const hideMfaDisable = () => {
+  $('mfa-disable-section')?.classList.add('hidden');
+  $('mfa-show-disable-btn')?.classList.remove('hidden');
+  const codeInput = $('mfa-disable-code');
+  if (codeInput) codeInput.value = '';
+  setMfaDisableStatus('');
+};
+
+const disableMfa = async (event) => {
+  event.preventDefault();
+
+  const codeInput = $('mfa-disable-code');
+  const code = codeInput?.value?.trim();
+
+  if (!code || code.length !== 6) {
+    setMfaDisableStatus('Enter your current 6-digit MFA code', true);
+    return;
+  }
+
+  try {
+    await requestEnvelope(
+      `${apiBase}/auth/mfa/disable`,
+      {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({ code }),
+      },
+      'Invalid code. Try again.'
+    );
+
+    // Success
+    hideMfaDisable();
+    await fetchMfaStatus();
+
+    alert('MFA disabled.');
+  } catch (err) {
+    setMfaDisableStatus(err.message || 'Failed to disable MFA', true);
+  }
+};
+
+const setMfaSetupStatus = (message, isError = false) => {
+  const el = $('mfa-setup-status');
+  if (!el) return;
+  el.textContent = message;
+  el.style.color = isError ? '#b00020' : 'inherit';
+};
+
+const setMfaDisableStatus = (message, isError = false) => {
+  const el = $('mfa-disable-status');
+  if (!el) return;
+  el.textContent = message;
+  el.style.color = isError ? '#b00020' : 'inherit';
+};
+
+// =============================================================================
+// Email Verification
+// =============================================================================
+
+const fetchEmailVerificationStatus = async () => {
+  const statusEl = $('setting-email-verified');
+  const emailEl = $('setting-email-address');
+  const resendBtn = $('resend-verification-btn');
+
+  if (!state.accessToken) {
+    if (statusEl) statusEl.textContent = 'Sign in to check';
+    return;
+  }
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/me`,
+      { headers: headers() },
+      'Failed to load profile'
+    );
+
+    const { email, meta } = envelope.data;
+    const isVerified = meta?.email_verified === true;
+
+    if (emailEl) emailEl.textContent = email || '-';
+    if (statusEl) {
+      statusEl.textContent = isVerified ? 'Verified' : 'Not verified';
+      statusEl.style.color = isVerified ? '#0a7' : '#b00020';
+    }
+
+    // Show/hide resend button
+    if (resendBtn) resendBtn.classList.toggle('hidden', isVerified);
+  } catch (err) {
+    if (statusEl) statusEl.textContent = 'Unable to check';
+  }
+};
+
+const resendVerificationEmail = async () => {
+  const statusEl = $('email-verify-status');
+  const resendBtn = $('resend-verification-btn');
+
+  if (!state.accessToken) {
+    if (statusEl) {
+      statusEl.textContent = 'Sign in first';
+      statusEl.style.color = '#b00020';
+    }
+    return;
+  }
+
+  try {
+    if (resendBtn) resendBtn.disabled = true;
+    if (statusEl) {
+      statusEl.textContent = 'Sending...';
+      statusEl.style.color = 'inherit';
+    }
+
+    await requestEnvelope(
+      `${apiBase}/auth/request_email_verification`,
+      {
+        method: 'POST',
+        headers: authHeaders(),
+      },
+      'Failed to send verification email'
+    );
+
+    if (statusEl) {
+      statusEl.textContent = 'Verification email sent! Check your inbox.';
+      statusEl.style.color = '#0a7';
+    }
+  } catch (err) {
+    if (statusEl) {
+      statusEl.textContent = err.message || 'Failed to send';
+      statusEl.style.color = '#b00020';
+    }
+  } finally {
+    if (resendBtn) resendBtn.disabled = false;
+  }
+};
+
+// =============================================================================
+// Password Change
+// =============================================================================
+
+const changePassword = async (event) => {
+  event.preventDefault();
+
+  const statusEl = $('password-change-status');
+  const submitBtn = $('change-password-btn');
+  const currentPwd = $('current-password');
+  const newPwd = $('new-password');
+  const confirmPwd = $('confirm-password');
+
+  const setStatus = (msg, isError = false) => {
+    if (statusEl) {
+      statusEl.textContent = msg;
+      statusEl.style.color = isError ? '#b00020' : '#0a7';
+    }
+  };
+
+  if (!state.accessToken) {
+    setStatus('Sign in to change password', true);
+    return;
+  }
+
+  const currentPassword = currentPwd?.value?.trim();
+  const newPassword = newPwd?.value;
+  const confirmPassword = confirmPwd?.value;
+
+  if (!currentPassword) {
+    setStatus('Enter your current password', true);
+    return;
+  }
+
+  if (!newPassword || newPassword.length < 8) {
+    setStatus('New password must be at least 8 characters', true);
+    return;
+  }
+
+  if (newPassword !== confirmPassword) {
+    setStatus('New passwords do not match', true);
+    return;
+  }
+
+  if (currentPassword === newPassword) {
+    setStatus('New password must be different from current password', true);
+    return;
+  }
+
+  try {
+    if (submitBtn) submitBtn.disabled = true;
+    setStatus('Changing password...');
+
+    await requestEnvelope(
+      `${apiBase}/auth/password/change`,
+      {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify({
+          current_password: currentPassword,
+          new_password: newPassword,
+        }),
+      },
+      'Failed to change password'
+    );
+
+    // Clear form
+    if (currentPwd) currentPwd.value = '';
+    if (newPwd) newPwd.value = '';
+    if (confirmPwd) confirmPwd.value = '';
+
+    setStatus('Password changed successfully!');
+
+    // Clear success message after a few seconds
+    setTimeout(() => {
+      if (statusEl) statusEl.textContent = '';
+    }, 5000);
+  } catch (err) {
+    setStatus(err.message || 'Failed to change password', true);
+  } finally {
+    if (submitBtn) submitBtn.disabled = false;
+  }
+};
+
+// =============================================================================
+// User Settings (Preferences)
+// =============================================================================
+
+const fetchUserSettings = async () => {
+  if (!state.accessToken) return;
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/settings`,
+      { headers: headers() },
+      'Failed to load settings'
+    );
+
+    const data = envelope.data || {};
+    const localeSelect = $('setting-locale');
+    const timezoneSelect = $('setting-timezone');
+    const voiceSelect = $('setting-default-voice');
+
+    if (localeSelect) localeSelect.value = data.locale || '';
+    if (timezoneSelect) timezoneSelect.value = data.timezone || '';
+    if (voiceSelect) voiceSelect.value = data.default_voice || '';
+  } catch (err) {
+    // Silently fail - user might not have settings yet
+  }
+};
+
+const saveUserSettings = async (event) => {
+  event.preventDefault();
+
+  const statusEl = $('user-settings-status');
+  const saveBtn = $('save-user-settings-btn');
+
+  if (!state.accessToken) {
+    if (statusEl) {
+      statusEl.textContent = 'Sign in to save settings';
+      statusEl.style.color = '#b00020';
+    }
+    return;
+  }
+
+  const locale = $('setting-locale')?.value || null;
+  const timezone = $('setting-timezone')?.value || null;
+  const defaultVoice = $('setting-default-voice')?.value || null;
+
+  try {
+    if (saveBtn) saveBtn.disabled = true;
+    if (statusEl) {
+      statusEl.textContent = 'Saving...';
+      statusEl.style.color = 'inherit';
+    }
+
+    await requestEnvelope(
+      `${apiBase}/settings`,
+      {
+        method: 'PATCH',
+        headers: authHeaders(),
+        body: JSON.stringify({
+          locale: locale || null,
+          timezone: timezone || null,
+          default_voice: defaultVoice || null,
+        }),
+      },
+      'Failed to save settings'
+    );
+
+    if (statusEl) {
+      statusEl.textContent = 'Settings saved!';
+      statusEl.style.color = '#0a7';
+    }
+
+    // Clear success message after a few seconds
+    setTimeout(() => {
+      if (statusEl) statusEl.textContent = '';
+    }, 3000);
+  } catch (err) {
+    if (statusEl) {
+      statusEl.textContent = err.message || 'Failed to save';
+      statusEl.style.color = '#b00020';
+    }
+  } finally {
+    if (saveBtn) saveBtn.disabled = false;
+  }
+};
+
+// =============================================================================
 // Admin Settings
 // =============================================================================
 
@@ -1635,6 +2894,769 @@ const renderAdminSettingsSection = () => {
   }
   if (state.role === 'admin') {
     fetchAdminSettings();
+    fetchAdminUsers();
+    fetchAdminAdapters();
+    fetchAdminObjects();
+    fetchConfigPatches();
+  }
+};
+
+// =============================================================================
+// Admin Users Management
+// =============================================================================
+
+const fetchAdminUsers = async () => {
+  if (state.role !== 'admin') return;
+
+  const tbody = $('users-table-body');
+  if (tbody) tbody.innerHTML = '<tr><td colspan="5" class="empty">Loading users...</td></tr>';
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/admin/users`,
+      { headers: authHeaders() },
+      'Failed to load users'
+    );
+
+    const users = envelope.data?.items || [];
+    renderAdminUsers(users);
+  } catch (err) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="5" class="empty">Error: ${escapeHtml(err.message)}</td></tr>`;
+  }
+};
+
+const renderAdminUsers = (users) => {
+  const tbody = $('users-table-body');
+  if (!tbody) return;
+
+  if (!users.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">No users found</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = users
+    .map((user) => {
+      const created = user.created_at ? new Date(user.created_at).toLocaleDateString() : '-';
+      const isSelf = user.id === state.userId;
+      return `
+        <tr data-user-id="${escapeHtml(user.id)}">
+          <td>${escapeHtml(user.email || '-')}</td>
+          <td>
+            <select class="user-role-select" ${isSelf ? 'disabled title="Cannot change own role"' : ''}>
+              <option value="user" ${user.role === 'user' ? 'selected' : ''}>User</option>
+              <option value="admin" ${user.role === 'admin' ? 'selected' : ''}>Admin</option>
+            </select>
+          </td>
+          <td class="monospace">${escapeHtml(user.tenant_id || 'default')}</td>
+          <td>${escapeHtml(created)}</td>
+          <td>
+            <button class="ghost delete-user-btn" ${isSelf ? 'disabled title="Cannot delete self"' : ''}>Delete</button>
+          </td>
+        </tr>
+      `;
+    })
+    .join('');
+
+  // Add event listeners for role changes
+  tbody.querySelectorAll('.user-role-select').forEach((select) => {
+    select.addEventListener('change', async (e) => {
+      const row = e.target.closest('tr');
+      const userId = row?.dataset.userId;
+      const newRole = e.target.value;
+      if (userId) await changeUserRole(userId, newRole);
+    });
+  });
+
+  // Add event listeners for delete buttons
+  tbody.querySelectorAll('.delete-user-btn').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      const row = e.target.closest('tr');
+      const userId = row?.dataset.userId;
+      if (userId && confirm('Are you sure you want to delete this user?')) {
+        await deleteUser(userId);
+      }
+    });
+  });
+};
+
+const createAdminUser = async () => {
+  const statusEl = $('create-user-status');
+  const email = $('new-user-email')?.value?.trim();
+  const password = $('new-user-password')?.value;
+  const role = $('new-user-role')?.value || 'user';
+
+  if (!email || !password) {
+    if (statusEl) statusEl.textContent = 'Email and password are required';
+    return;
+  }
+
+  try {
+    if (statusEl) statusEl.textContent = 'Creating user...';
+
+    await requestEnvelope(
+      `${apiBase}/admin/users`,
+      {
+        method: 'POST',
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password, role }),
+      },
+      'Failed to create user'
+    );
+
+    if (statusEl) statusEl.textContent = 'User created successfully';
+    $('new-user-email').value = '';
+    $('new-user-password').value = '';
+    $('new-user-role').value = 'user';
+    $('add-user-form-section')?.classList.add('hidden');
+
+    fetchAdminUsers();
+  } catch (err) {
+    if (statusEl) statusEl.textContent = `Error: ${err.message}`;
+  }
+};
+
+const changeUserRole = async (userId, newRole) => {
+  try {
+    await requestEnvelope(
+      `${apiBase}/admin/users/${userId}/role`,
+      {
+        method: 'POST',
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role: newRole }),
+      },
+      'Failed to change user role'
+    );
+
+    fetchAdminUsers();
+  } catch (err) {
+    alert(`Failed to change role: ${err.message}`);
+    fetchAdminUsers();
+  }
+};
+
+const deleteUser = async (userId) => {
+  try {
+    await requestEnvelope(
+      `${apiBase}/admin/users/${userId}`,
+      { method: 'DELETE', headers: authHeaders() },
+      'Failed to delete user'
+    );
+
+    fetchAdminUsers();
+  } catch (err) {
+    alert(`Failed to delete user: ${err.message}`);
+  }
+};
+
+// =============================================================================
+// Admin Adapters List
+// =============================================================================
+
+const fetchAdminAdapters = async () => {
+  if (state.role !== 'admin') return;
+
+  const tbody = $('adapters-table-body');
+  if (tbody) tbody.innerHTML = '<tr><td colspan="5" class="empty">Loading adapters...</td></tr>';
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/admin/adapters`,
+      { headers: authHeaders() },
+      'Failed to load adapters'
+    );
+
+    const adapters = envelope.data?.items || [];
+    renderAdminAdapters(adapters);
+  } catch (err) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="5" class="empty">Error: ${escapeHtml(err.message)}</td></tr>`;
+  }
+};
+
+const renderAdminAdapters = (adapters) => {
+  const tbody = $('adapters-table-body');
+  if (!tbody) return;
+
+  if (!adapters.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">No adapters found</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = adapters
+    .map((adapter) => {
+      const created = adapter.created_at ? new Date(adapter.created_at).toLocaleDateString() : '-';
+      return `
+        <tr>
+          <td class="monospace">${escapeHtml(adapter.id?.slice(0, 8) || '-')}...</td>
+          <td class="monospace">${escapeHtml(adapter.user_id?.slice(0, 8) || '-')}...</td>
+          <td class="monospace">${escapeHtml(adapter.cluster_id?.slice(0, 8) || '-')}...</td>
+          <td>${escapeHtml(adapter.base_model_id || '-')}</td>
+          <td>${escapeHtml(created)}</td>
+        </tr>
+      `;
+    })
+    .join('');
+};
+
+// =============================================================================
+// Admin Storage Objects
+// =============================================================================
+
+const fetchAdminObjects = async () => {
+  if (state.role !== 'admin') return;
+
+  const tbody = $('objects-table-body');
+  if (tbody) tbody.innerHTML = '<tr><td colspan="5" class="empty">Loading objects...</td></tr>';
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/admin/objects`,
+      { headers: authHeaders() },
+      'Failed to load objects'
+    );
+
+    const objects = envelope.data?.items || [];
+    renderAdminObjects(objects);
+  } catch (err) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="5" class="empty">Error: ${escapeHtml(err.message)}</td></tr>`;
+  }
+};
+
+const renderAdminObjects = (objects) => {
+  const tbody = $('objects-table-body');
+  if (!tbody) return;
+
+  if (!objects.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">No storage objects found</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = objects
+    .map((obj) => {
+      const created = obj.created_at ? new Date(obj.created_at).toLocaleDateString() : '-';
+      const sizeDisplay = obj.size_bytes
+        ? obj.size_bytes > 1024 * 1024
+          ? `${(obj.size_bytes / (1024 * 1024)).toFixed(1)} MB`
+          : obj.size_bytes > 1024
+          ? `${(obj.size_bytes / 1024).toFixed(1)} KB`
+          : `${obj.size_bytes} B`
+        : '-';
+      return `
+        <tr>
+          <td class="monospace">${escapeHtml(obj.key || obj.object_key || '-')}</td>
+          <td>${escapeHtml(obj.bucket || obj.bucket_name || 'default')}</td>
+          <td>${escapeHtml(sizeDisplay)}</td>
+          <td>${escapeHtml(obj.content_type || obj.mime_type || '-')}</td>
+          <td>${escapeHtml(created)}</td>
+        </tr>
+      `;
+    })
+    .join('');
+};
+
+// =============================================================================
+// Admin Config Patches
+// =============================================================================
+
+let selectedPatch = null;
+
+const fetchConfigPatches = async () => {
+  if (state.role !== 'admin') return;
+
+  const tbody = $('patches-table-body');
+  if (tbody) tbody.innerHTML = '<tr><td colspan="6" class="empty">Loading patches...</td></tr>';
+
+  try {
+    const statusFilter = $('patches-status-filter')?.value || '';
+    const url = statusFilter
+      ? `${apiBase}/config/patches?status=${statusFilter}`
+      : `${apiBase}/config/patches`;
+
+    const envelope = await requestEnvelope(url, { headers: authHeaders() }, 'Failed to load patches');
+
+    const patches = envelope.data?.items || [];
+    renderConfigPatches(patches);
+  } catch (err) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="6" class="empty">Error: ${escapeHtml(err.message)}</td></tr>`;
+  }
+};
+
+const renderConfigPatches = (patches) => {
+  const tbody = $('patches-table-body');
+  if (!tbody) return;
+
+  if (!patches.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty">No config patches found</td></tr>';
+    $('patch-details-section')?.classList.add('hidden');
+    return;
+  }
+
+  tbody.innerHTML = patches
+    .map((patch) => {
+      const created = patch.created_at ? new Date(patch.created_at).toLocaleDateString() : '-';
+      const statusClass = patch.status === 'pending' ? 'pending' : patch.status === 'approved' ? 'approved' : patch.status === 'applied' ? 'applied' : 'rejected';
+      return `
+        <tr class="clickable" data-patch-id="${patch.id}">
+          <td>${escapeHtml(String(patch.id))}</td>
+          <td class="monospace">${escapeHtml(patch.artifact_id?.slice(0, 8) || '-')}...</td>
+          <td>${escapeHtml(patch.proposer || '-')}</td>
+          <td><span class="patch-status ${statusClass}">${escapeHtml(patch.status)}</span></td>
+          <td>${escapeHtml(created)}</td>
+          <td>
+            <button class="ghost view-patch-btn" data-patch-id="${patch.id}">View</button>
+          </td>
+        </tr>
+      `;
+    })
+    .join('');
+
+  // Add click handlers
+  tbody.querySelectorAll('.view-patch-btn').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const patchId = btn.dataset.patchId;
+      const patch = patches.find((p) => String(p.id) === patchId);
+      if (patch) selectPatch(patch);
+    });
+  });
+
+  tbody.querySelectorAll('tr.clickable').forEach((row) => {
+    row.addEventListener('click', () => {
+      const patchId = row.dataset.patchId;
+      const patch = patches.find((p) => String(p.id) === patchId);
+      if (patch) selectPatch(patch);
+    });
+  });
+};
+
+const selectPatch = (patch) => {
+  selectedPatch = patch;
+  const detailsSection = $('patch-details-section');
+  const detailsContent = $('patch-details-content');
+  const approveBtn = $('approve-patch-btn');
+  const rejectBtn = $('reject-patch-btn');
+  const applyBtn = $('apply-patch-btn');
+
+  if (!detailsSection || !detailsContent) return;
+
+  detailsSection.classList.remove('hidden');
+
+  // Render patch details
+  const patchJson = JSON.stringify(patch.patch || {}, null, 2);
+  detailsContent.innerHTML = `
+    <div class="detail-row"><span class="detail-label">Patch ID</span><span>${escapeHtml(String(patch.id))}</span></div>
+    <div class="detail-row"><span class="detail-label">Artifact</span><span class="monospace">${escapeHtml(patch.artifact_id || '-')}</span></div>
+    <div class="detail-row"><span class="detail-label">Proposer</span><span>${escapeHtml(patch.proposer || '-')}</span></div>
+    <div class="detail-row"><span class="detail-label">Status</span><span class="patch-status ${patch.status}">${escapeHtml(patch.status)}</span></div>
+    <div class="detail-row"><span class="detail-label">Justification</span><span>${escapeHtml(patch.justification || 'None provided')}</span></div>
+    <div class="detail-row"><span class="detail-label">Created</span><span>${patch.created_at ? new Date(patch.created_at).toLocaleString() : '-'}</span></div>
+    ${patch.decided_at ? `<div class="detail-row"><span class="detail-label">Decided</span><span>${new Date(patch.decided_at).toLocaleString()}</span></div>` : ''}
+    ${patch.applied_at ? `<div class="detail-row"><span class="detail-label">Applied</span><span>${new Date(patch.applied_at).toLocaleString()}</span></div>` : ''}
+    <div class="patch-code">
+      <label>Patch Content</label>
+      <pre class="code-block">${escapeHtml(patchJson)}</pre>
+    </div>
+  `;
+
+  // Update button states based on status
+  if (approveBtn) approveBtn.disabled = patch.status !== 'pending';
+  if (rejectBtn) rejectBtn.disabled = patch.status !== 'pending';
+  if (applyBtn) applyBtn.disabled = patch.status !== 'approved';
+
+  // Clear any previous status
+  const statusEl = $('patch-action-status');
+  if (statusEl) statusEl.textContent = '';
+};
+
+const decidePatch = async (decision) => {
+  if (!selectedPatch) return;
+
+  const statusEl = $('patch-action-status');
+
+  try {
+    if (statusEl) statusEl.textContent = `${decision === 'approve' ? 'Approving' : 'Rejecting'} patch...`;
+
+    await requestEnvelope(
+      `${apiBase}/config/patches/${selectedPatch.id}/decide`,
+      {
+        method: 'POST',
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ decision }),
+      },
+      `Failed to ${decision} patch`
+    );
+
+    if (statusEl) statusEl.textContent = `Patch ${decision}d successfully`;
+    fetchConfigPatches();
+  } catch (err) {
+    if (statusEl) statusEl.textContent = `Error: ${err.message}`;
+  }
+};
+
+const applyPatch = async () => {
+  if (!selectedPatch || selectedPatch.status !== 'approved') return;
+
+  const statusEl = $('patch-action-status');
+
+  try {
+    if (statusEl) statusEl.textContent = 'Applying patch...';
+
+    await requestEnvelope(
+      `${apiBase}/config/patches/${selectedPatch.id}/apply`,
+      {
+        method: 'POST',
+        headers: authHeaders(),
+      },
+      'Failed to apply patch'
+    );
+
+    if (statusEl) statusEl.textContent = 'Patch applied successfully';
+    fetchConfigPatches();
+  } catch (err) {
+    if (statusEl) statusEl.textContent = `Error: ${err.message}`;
+  }
+};
+
+// =============================================================================
+// Tools
+// =============================================================================
+
+let selectedTool = null;
+let tools = [];
+let workflows = [];
+
+const fetchTools = async () => {
+  if (!state.accessToken) return;
+
+  const toolsList = $('tools-list');
+  if (toolsList) toolsList.innerHTML = '<div class="empty">Loading tools...</div>';
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/tools/specs`,
+      { headers: headers() },
+      'Failed to load tools'
+    );
+
+    tools = envelope.data?.items || [];
+    renderToolsList();
+  } catch (err) {
+    if (toolsList) toolsList.innerHTML = `<div class="empty">Error: ${escapeHtml(err.message)}</div>`;
+  }
+};
+
+const renderToolsList = () => {
+  const toolsList = $('tools-list');
+  if (!toolsList) return;
+
+  if (!tools.length) {
+    toolsList.innerHTML = '<div class="empty">No tools available</div>';
+    return;
+  }
+
+  toolsList.innerHTML = tools
+    .map((tool) => {
+      const isSelected = selectedTool?.id === tool.id;
+      const name = tool.name || tool.schema?.name || tool.id;
+      const description = tool.description || tool.schema?.description || 'No description';
+      return `
+        <div class="tool-card ${isSelected ? 'selected' : ''}" data-id="${escapeHtml(tool.id)}">
+          <div class="tool-name">${escapeHtml(name)}</div>
+          <div class="tool-description">${escapeHtml(description)}</div>
+        </div>
+      `;
+    })
+    .join('');
+
+  toolsList.querySelectorAll('.tool-card').forEach((card) => {
+    card.addEventListener('click', () => selectTool(card.dataset.id));
+  });
+};
+
+const selectTool = async (toolId) => {
+  const tool = tools.find((t) => t.id === toolId);
+  if (!tool) return;
+
+  selectedTool = tool;
+  renderToolsList();
+
+  const details = $('tool-details');
+  const invokeSection = $('tool-invoke-section');
+  const invokePlaceholder = $('tool-invoke-placeholder');
+
+  if (details) {
+    const schema = tool.schema || {};
+    const inputs = schema.inputs || {};
+
+    details.innerHTML = `
+      <div class="detail-header">
+        <h4>${escapeHtml(tool.name || schema.name || tool.id)}</h4>
+      </div>
+      <div class="detail-row">
+        <span class="detail-label">ID</span>
+        <span class="monospace">${escapeHtml(tool.id)}</span>
+      </div>
+      <div class="detail-row">
+        <span class="detail-label">Handler</span>
+        <span class="monospace">${escapeHtml(schema.handler || '-')}</span>
+      </div>
+      <div class="detail-row">
+        <span class="detail-label">Description</span>
+        <span>${escapeHtml(tool.description || schema.description || '-')}</span>
+      </div>
+      <div class="divider"></div>
+      <h4>Inputs</h4>
+      <pre class="schema-viewer">${escapeHtml(JSON.stringify(inputs, null, 2))}</pre>
+    `;
+  }
+
+  // Show invoke section
+  if (invokeSection) invokeSection.classList.remove('hidden');
+  if (invokePlaceholder) invokePlaceholder.style.display = 'none';
+
+  // Pre-populate input template
+  const invokeInput = $('tool-invoke-input');
+  if (invokeInput) {
+    const schema = tool.schema || {};
+    const inputs = schema.inputs || {};
+    const template = {};
+    Object.keys(inputs).forEach((key) => {
+      template[key] = inputs[key].type === 'string' ? '' : null;
+    });
+    invokeInput.value = JSON.stringify(template, null, 2);
+  }
+};
+
+const invokeTool = async (event) => {
+  event.preventDefault();
+
+  if (!selectedTool) return;
+
+  const statusEl = $('tool-invoke-status');
+  const resultEl = $('tool-invoke-result');
+  const inputEl = $('tool-invoke-input');
+  const invokeBtn = $('tool-invoke-btn');
+
+  let inputData;
+  try {
+    inputData = JSON.parse(inputEl?.value || '{}');
+  } catch {
+    if (statusEl) statusEl.textContent = 'Invalid JSON input';
+    return;
+  }
+
+  try {
+    toggleButtonBusy(invokeBtn, true, 'Invoking...');
+    if (statusEl) statusEl.textContent = '';
+    if (resultEl) resultEl.style.display = 'none';
+
+    const envelope = await requestEnvelope(
+      `${apiBase}/tools/${selectedTool.id}/invoke`,
+      {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ inputs: inputData }),
+      },
+      'Tool invocation failed'
+    );
+
+    if (statusEl) statusEl.textContent = 'Tool invoked successfully';
+    if (resultEl) {
+      resultEl.textContent = JSON.stringify(envelope.data, null, 2);
+      resultEl.style.display = 'block';
+    }
+  } catch (err) {
+    if (statusEl) statusEl.textContent = err.message;
+  } finally {
+    toggleButtonBusy(invokeBtn, false);
+  }
+};
+
+const fetchWorkflows = async () => {
+  if (!state.accessToken) return;
+
+  const workflowsList = $('workflows-list');
+  if (workflowsList) workflowsList.innerHTML = '<div class="empty">Loading workflows...</div>';
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/workflows`,
+      { headers: headers() },
+      'Failed to load workflows'
+    );
+
+    workflows = envelope.data?.items || [];
+    renderWorkflowsList();
+  } catch (err) {
+    if (workflowsList) workflowsList.innerHTML = `<div class="empty">Error: ${escapeHtml(err.message)}</div>`;
+  }
+};
+
+let selectedWorkflow = null;
+
+const renderWorkflowsList = () => {
+  const workflowsList = $('workflows-list');
+  if (!workflowsList) return;
+
+  if (!workflows.length) {
+    workflowsList.innerHTML = '<div class="empty">No workflows configured</div>';
+    return;
+  }
+
+  workflowsList.innerHTML = workflows
+    .map((wf) => {
+      const isSelected = selectedWorkflow?.id === wf.id;
+      return `
+        <div class="workflow-card ${isSelected ? 'selected' : ''}" data-id="${escapeHtml(wf.id)}">
+          <div class="workflow-name">${escapeHtml(wf.name || wf.id)}</div>
+          <div class="workflow-meta">
+            <span class="visibility-badge ${wf.visibility || 'private'}">${wf.visibility || 'private'}</span>
+            <span>v${wf.version || 1}</span>
+          </div>
+        </div>
+      `;
+    })
+    .join('');
+
+  workflowsList.querySelectorAll('.workflow-card').forEach((card) => {
+    card.addEventListener('click', () => selectWorkflow(card.dataset.id));
+  });
+};
+
+const selectWorkflow = (workflowId) => {
+  const wf = workflows.find((w) => w.id === workflowId);
+  if (!wf) return;
+
+  selectedWorkflow = wf;
+  renderWorkflowsList();
+
+  const details = $('workflow-details');
+  if (details) {
+    const schema = wf.schema || {};
+    details.innerHTML = `
+      <div class="detail-header">
+        <h4>${escapeHtml(wf.name || wf.id)}</h4>
+        <span class="visibility-badge ${wf.visibility || 'private'}">${wf.visibility || 'private'}</span>
+      </div>
+      <div class="detail-row">
+        <span class="detail-label">ID</span>
+        <span class="monospace">${escapeHtml(wf.id)}</span>
+      </div>
+      <div class="detail-row">
+        <span class="detail-label">Entrypoint</span>
+        <span class="monospace">${escapeHtml(schema.entrypoint || '-')}</span>
+      </div>
+      <div class="detail-row">
+        <span class="detail-label">Nodes</span>
+        <span>${(schema.nodes || []).length} nodes</span>
+      </div>
+      <div class="divider"></div>
+      <h4>Schema</h4>
+      <pre class="schema-viewer">${escapeHtml(JSON.stringify(schema, null, 2))}</pre>
+    `;
+  }
+};
+
+const refreshToolsAndWorkflows = async () => {
+  await Promise.all([fetchTools(), fetchWorkflows()]);
+};
+
+// =============================================================================
+// Preference Insights
+// =============================================================================
+
+const fetchInsights = async () => {
+  if (!state.accessToken) return;
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/preferences/insights`,
+      { headers: headers() },
+      'Failed to load insights'
+    );
+
+    renderInsights(envelope.data || {});
+  } catch (err) {
+    console.warn('Failed to fetch insights:', err.message);
+    // Show error state
+    const totalEl = $('insights-total-events');
+    if (totalEl) totalEl.textContent = 'Error';
+  }
+};
+
+const renderInsights = (data) => {
+  // Summary stats
+  const totalEl = $('insights-total-events');
+  const positiveEl = $('insights-positive-count');
+  const negativeEl = $('insights-negative-count');
+  const neutralEl = $('insights-neutral-count');
+
+  if (totalEl) totalEl.textContent = data.total_events ?? '-';
+  if (positiveEl) positiveEl.textContent = data.positive_count ?? '-';
+  if (negativeEl) negativeEl.textContent = data.negative_count ?? '-';
+  if (neutralEl) neutralEl.textContent = data.neutral_count ?? '-';
+
+  // Top adapters
+  const adaptersEl = $('insights-top-adapters');
+  if (adaptersEl) {
+    const adapters = data.top_adapters || [];
+    if (!adapters.length) {
+      adaptersEl.innerHTML = '<div class="empty">No adapter data yet</div>';
+    } else {
+      adaptersEl.innerHTML = adapters
+        .map((a) => `
+          <div class="adapter-item">
+            <span class="adapter-name">${escapeHtml(a.adapter_id || a.name || 'Unknown')}</span>
+            <span class="adapter-score">+${a.positive_count || 0} / -${a.negative_count || 0}</span>
+          </div>
+        `)
+        .join('');
+    }
+  }
+
+  // Recent preferences
+  const recentEl = $('insights-recent-list');
+  if (recentEl) {
+    const recent = data.recent_events || [];
+    if (!recent.length) {
+      recentEl.innerHTML = '<div class="empty">No preference events yet</div>';
+    } else {
+      recentEl.innerHTML = recent
+        .map((e) => {
+          const feedback = e.feedback || 'neutral';
+          const date = e.created_at ? new Date(e.created_at).toLocaleDateString() : '-';
+          const icon = feedback === 'positive' ? '+1' : feedback === 'negative' ? '-1' : '·';
+          return `
+            <div class="preference-item ${feedback}">
+              <span class="feedback-icon">${icon}</span>
+              <span class="preference-message">${escapeHtml((e.context_text || '').slice(0, 80))}${e.context_text?.length > 80 ? '...' : ''}</span>
+              <span class="preference-date">${date}</span>
+            </div>
+          `;
+        })
+        .join('');
+    }
+  }
+
+  // Clusters
+  const clustersEl = $('insights-clusters');
+  if (clustersEl) {
+    const clusters = data.clusters || [];
+    if (!clusters.length) {
+      clustersEl.innerHTML = '<div class="empty">No clusters identified yet</div>';
+    } else {
+      clustersEl.innerHTML = clusters
+        .map((c) => `
+          <div class="cluster-card">
+            <div class="cluster-label">${escapeHtml(c.label || 'Unlabeled')}</div>
+            <div class="cluster-description">${escapeHtml(c.description || '-')}</div>
+            <div class="cluster-meta">
+              <span>${c.size || 0} events</span>
+              ${c.adapter_id ? `<span class="has-adapter">Has adapter</span>` : ''}
+            </div>
+          </div>
+        `)
+        .join('');
+    }
   }
 };
 
@@ -1662,11 +3684,37 @@ const initEventListeners = () => {
   if (authForm) authForm.addEventListener('submit', handleLogin);
   $('logout')?.addEventListener('click', logout);
 
+  // Auth form switching
+  $('show-signup')?.addEventListener('click', () => showAuthForm('signup'));
+  $('show-reset')?.addEventListener('click', () => showAuthForm('reset'));
+  $('show-login-from-signup')?.addEventListener('click', () => showAuthForm('login'));
+  $('show-login-from-reset')?.addEventListener('click', () => showAuthForm('login'));
+
+  // Signup
+  $('signup-form')?.addEventListener('submit', handleSignup);
+
+  // Password reset
+  $('reset-request-form')?.addEventListener('submit', handleResetRequest);
+
+  // OAuth
+  $('oauth-google')?.addEventListener('click', () => startOAuth('google'));
+  $('oauth-github')?.addEventListener('click', () => startOAuth('github'));
+  $('oauth-microsoft')?.addEventListener('click', () => startOAuth('microsoft'));
+  $('reset-confirm-form')?.addEventListener('submit', (event) => {
+    // Use token-based handler if we have a pending token from URL
+    if (pendingResetToken) {
+      handleResetWithToken(event);
+    } else {
+      handleResetConfirm(event);
+    }
+  });
+
   // Chat
   if (chatForm) chatForm.addEventListener('submit', sendMessage);
   $('message-input')?.addEventListener('input', handleMessageInputChange);
   $('new-thread')?.addEventListener('click', newConversation);
   $('new-thread-secondary')?.addEventListener('click', newConversation);
+  $('stop-stream-btn')?.addEventListener('click', cancelStreaming);
   $('new-conversation-btn')?.addEventListener('click', newConversation);
   $('refresh-conversations')?.addEventListener('click', fetchConversations);
 
@@ -1680,11 +3728,19 @@ const initEventListeners = () => {
   // Contexts
   $('create-context-btn')?.addEventListener('click', createContext);
   $('refresh-contexts')?.addEventListener('click', fetchContexts);
+  $('add-source-form')?.addEventListener('submit', addContextSource);
 
   // Artifacts
   $('refresh-artifacts')?.addEventListener('click', fetchArtifacts);
   $('artifact-type-filter')?.addEventListener('change', fetchArtifacts);
   $('artifact-visibility-filter')?.addEventListener('change', fetchArtifacts);
+
+  // Tools
+  $('refresh-tools')?.addEventListener('click', refreshToolsAndWorkflows);
+  $('tool-invoke-form')?.addEventListener('submit', invokeTool);
+
+  // Insights
+  $('refresh-insights')?.addEventListener('click', fetchInsights);
 
   // File upload
   if (fileUploadInput) fileUploadInput.addEventListener('change', renderUploadHint);
@@ -1694,9 +3750,70 @@ const initEventListeners = () => {
   $('clear-drafts-btn')?.addEventListener('click', handleClearDrafts);
   $('export-drafts-btn')?.addEventListener('click', handleExportDrafts);
 
+  // MFA settings
+  $('mfa-enable-btn')?.addEventListener('click', startMfaSetup);
+  $('mfa-verify-form')?.addEventListener('submit', verifyMfaSetup);
+  $('mfa-cancel-btn')?.addEventListener('click', cancelMfaSetup);
+  $('mfa-show-disable-btn')?.addEventListener('click', showMfaDisable);
+  $('mfa-disable-form')?.addEventListener('submit', disableMfa);
+  $('mfa-disable-cancel-btn')?.addEventListener('click', hideMfaDisable);
+
+  // Email verification
+  $('resend-verification-btn')?.addEventListener('click', resendVerificationEmail);
+
+  // Password change
+  $('password-change-form')?.addEventListener('submit', changePassword);
+
+  // User settings (preferences)
+  $('user-settings-form')?.addEventListener('submit', saveUserSettings);
+
   // Admin settings
   $('save-admin-settings-btn')?.addEventListener('click', saveAdminSettings);
   $('reload-admin-settings-btn')?.addEventListener('click', fetchAdminSettings);
+
+  // Admin users management
+  $('refresh-users-btn')?.addEventListener('click', fetchAdminUsers);
+  $('show-add-user-btn')?.addEventListener('click', () => {
+    $('add-user-form-section')?.classList.remove('hidden');
+  });
+  $('cancel-add-user-btn')?.addEventListener('click', () => {
+    $('add-user-form-section')?.classList.add('hidden');
+    $('create-user-status').textContent = '';
+  });
+  $('create-user-btn')?.addEventListener('click', createAdminUser);
+
+  // Admin adapters and objects
+  $('refresh-adapters-btn')?.addEventListener('click', fetchAdminAdapters);
+  $('refresh-objects-btn')?.addEventListener('click', fetchAdminObjects);
+
+  // Admin config patches
+  $('refresh-patches-btn')?.addEventListener('click', fetchConfigPatches);
+  $('patches-status-filter')?.addEventListener('change', fetchConfigPatches);
+  $('approve-patch-btn')?.addEventListener('click', () => decidePatch('approve'));
+  $('reject-patch-btn')?.addEventListener('click', () => decidePatch('reject'));
+  $('apply-patch-btn')?.addEventListener('click', applyPatch);
+
+  // Voice input/output buttons - must be initialized after DOM ready
+  voiceInputBtn = $('voice-input-btn');
+  voiceOutputBtn = $('voice-output-btn');
+
+  if (voiceInputBtn) {
+    voiceInputBtn.addEventListener('mousedown', startVoiceRecording);
+    voiceInputBtn.addEventListener('mouseup', stopVoiceRecording);
+    voiceInputBtn.addEventListener('mouseleave', stopVoiceRecording);
+    voiceInputBtn.addEventListener('touchstart', (e) => {
+      e.preventDefault();
+      startVoiceRecording();
+    });
+    voiceInputBtn.addEventListener('touchend', (e) => {
+      e.preventDefault();
+      stopVoiceRecording();
+    });
+  }
+
+  if (voiceOutputBtn) {
+    voiceOutputBtn.addEventListener('click', readLastResponse);
+  }
 };
 
 // =============================================================================
@@ -1711,6 +3828,28 @@ const init = async () => {
   updateDraftIndicator();
   renderPreferencePanel();
   renderUploadHint();
+
+  // Handle OAuth callback if present
+  const isOAuthCallback = await handleOAuthCallback();
+  if (isOAuthCallback) {
+    // OAuth callback was handled, UI already updated
+    updateEmptyState();
+    return;
+  }
+
+  // Handle password reset token from email link
+  const isResetCallback = await handleResetTokenCallback();
+  if (isResetCallback) {
+    updateEmptyState();
+    return;
+  }
+
+  // Handle email verification token from email link
+  const isVerifyCallback = await handleVerifyTokenCallback();
+  if (isVerifyCallback) {
+    updateEmptyState();
+    return;
+  }
 
   // Load draft for current conversation
   const messageInput = $('message-input');
@@ -1732,7 +3871,13 @@ const init = async () => {
       fetchConversations(),
       fetchContexts(),
       fetchArtifacts(),
+      fetchTools(),
+      fetchWorkflows(),
+      fetchInsights(),
       fetchHealth(),
+      fetchMfaStatus(),
+      fetchEmailVerificationStatus(),
+      fetchUserSettings(),
     ]);
   }
 

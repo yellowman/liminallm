@@ -10,7 +10,6 @@ import math
 import re
 from typing import List, Sequence
 
-
 # BM25 hyperparameters (standard defaults)
 BM25_K1 = 1.5
 BM25_B = 0.75

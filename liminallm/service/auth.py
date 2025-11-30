@@ -11,14 +11,36 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any, List, Optional, Protocol, Tuple
 
+import httpx
 from argon2 import PasswordHasher, Type
 from argon2.exceptions import InvalidHash, VerifyMismatchError
 
 from liminallm.config import Settings
+from liminallm.logging import get_logger
 from liminallm.storage.models import Session, User, UserMFAConfig
 from liminallm.storage.redis_cache import RedisCache
 
-from liminallm.logging import get_logger
+# OAuth provider configurations
+OAUTH_PROVIDERS = {
+    "google": {
+        "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
+        "token_url": "https://oauth2.googleapis.com/token",
+        "userinfo_url": "https://www.googleapis.com/oauth2/v2/userinfo",
+        "scope": "openid email profile",
+    },
+    "github": {
+        "auth_url": "https://github.com/login/oauth/authorize",
+        "token_url": "https://github.com/login/oauth/access_token",
+        "userinfo_url": "https://api.github.com/user",
+        "scope": "read:user user:email",
+    },
+    "microsoft": {
+        "auth_url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+        "token_url": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+        "userinfo_url": "https://graph.microsoft.com/v1.0/me",
+        "scope": "openid email profile User.Read",
+    },
+}
 
 logger = get_logger(__name__)
 
@@ -161,6 +183,16 @@ class AuthService:
         self.store.save_password(user.id, pwd_hash, algo)
         return user, pwd
 
+    def _get_oauth_credentials(self, provider: str) -> tuple[Optional[str], Optional[str]]:
+        """Get OAuth client credentials for a provider."""
+        if provider == "google":
+            return self.settings.oauth_google_client_id, self.settings.oauth_google_client_secret
+        elif provider == "github":
+            return self.settings.oauth_github_client_id, self.settings.oauth_github_client_secret
+        elif provider == "microsoft":
+            return self.settings.oauth_microsoft_client_id, self.settings.oauth_microsoft_client_secret
+        return None, None
+
     async def start_oauth(
         self,
         provider: str,
@@ -168,26 +200,44 @@ class AuthService:
         *,
         tenant_id: Optional[str] = None,
     ) -> dict:
+        if provider not in OAUTH_PROVIDERS:
+            raise ValueError(f"Unsupported OAuth provider: {provider}")
+
+        client_id, client_secret = self._get_oauth_credentials(provider)
+        if not client_id:
+            self.logger.warning("oauth_not_configured", provider=provider)
+            raise ValueError(f"OAuth provider {provider} is not configured")
+
         state = uuid.uuid4().hex
         expires_at = datetime.utcnow() + timedelta(minutes=10)
         self._oauth_states[state] = (provider, expires_at, tenant_id)
         if self.cache:
             await self.cache.set_oauth_state(state, provider, expires_at, tenant_id)
-        # SECURITY: Validate redirect_uri against allowlist to prevent open redirect
-        allowed_redirect_uris = getattr(self.settings, "oauth_allowed_redirect_uris", None)
-        if redirect_uri:
-            if allowed_redirect_uris and redirect_uri not in allowed_redirect_uris:
-                self.logger.warning(
-                    "oauth_invalid_redirect_uri",
-                    redirect_uri=redirect_uri,
-                    allowed=list(allowed_redirect_uris) if allowed_redirect_uris else [],
-                )
-                redirect_uri = None  # Fall back to default
-        base_url = redirect_uri or self.settings.adapter_openai_base_url
-        if not base_url:
+
+        # Use configured redirect URI or fall back to settings
+        callback_uri = redirect_uri or self.settings.oauth_redirect_uri
+        if not callback_uri:
             self.logger.error("oauth_no_redirect_uri_configured", provider=provider)
             raise ValueError("No OAuth redirect URI configured")
-        authorization_url = f"{base_url}?provider={provider}&state={state}"
+
+        # Build proper OAuth authorization URL
+        provider_config = OAUTH_PROVIDERS[provider]
+        params = {
+            "client_id": client_id,
+            "redirect_uri": callback_uri,
+            "response_type": "code",
+            "scope": provider_config["scope"],
+            "state": state,
+        }
+        # Add provider-specific parameters
+        if provider == "google":
+            params["access_type"] = "offline"
+            params["prompt"] = "consent"
+
+        from urllib.parse import urlencode
+        query_string = urlencode(params)
+        authorization_url = f"{provider_config['auth_url']}?{query_string}"
+
         return {
             "authorization_url": authorization_url,
             "state": state,
@@ -200,6 +250,11 @@ class AuthService:
         self._oauth_code_registry[(provider, code)] = payload
 
     async def _exchange_oauth_code(self, provider: str, code: str) -> Optional[dict]:
+        """Exchange OAuth authorization code for user identity.
+
+        First checks cache/registry (for testing), then calls real OAuth providers.
+        """
+        # Check cache first (for testing or pre-registered codes)
         cached_payload: Optional[dict] = None
         if self.cache:
             raw = await self.cache.client.get(f"auth:oauth:code:{provider}:{code}")
@@ -212,7 +267,128 @@ class AuthService:
                     await self.cache.client.delete(f"auth:oauth:code:{provider}:{code}")
         if not cached_payload:
             cached_payload = self._oauth_code_registry.pop((provider, code), None)
-        return cached_payload
+        if cached_payload:
+            return cached_payload
+
+        # No cached payload - exchange code with real OAuth provider
+        if provider not in OAUTH_PROVIDERS:
+            self.logger.error("oauth_unknown_provider", provider=provider)
+            return None
+
+        client_id, client_secret = self._get_oauth_credentials(provider)
+        if not client_id or not client_secret:
+            self.logger.error("oauth_credentials_missing", provider=provider)
+            return None
+
+        redirect_uri = self.settings.oauth_redirect_uri
+        if not redirect_uri:
+            self.logger.error("oauth_redirect_uri_missing", provider=provider)
+            return None
+
+        provider_config = OAUTH_PROVIDERS[provider]
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                # Exchange code for access token
+                token_data = {
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "code": code,
+                    "redirect_uri": redirect_uri,
+                    "grant_type": "authorization_code",
+                }
+
+                headers = {"Accept": "application/json"}
+                token_response = await client.post(
+                    provider_config["token_url"],
+                    data=token_data,
+                    headers=headers,
+                )
+                token_response.raise_for_status()
+                token_result = token_response.json()
+
+                access_token = token_result.get("access_token")
+                if not access_token:
+                    self.logger.error("oauth_no_access_token", provider=provider)
+                    return None
+
+                # Fetch user info
+                userinfo_headers = {"Authorization": f"Bearer {access_token}"}
+                # GitHub requires a special header
+                if provider == "github":
+                    userinfo_headers["Accept"] = "application/vnd.github+json"
+
+                userinfo_response = await client.get(
+                    provider_config["userinfo_url"],
+                    headers=userinfo_headers,
+                )
+                userinfo_response.raise_for_status()
+                userinfo = userinfo_response.json()
+
+                # Extract user identity based on provider
+                identity = self._parse_oauth_userinfo(provider, userinfo)
+
+                # For GitHub, we may need to fetch email separately
+                if provider == "github" and not identity.get("email"):
+                    emails_response = await client.get(
+                        "https://api.github.com/user/emails",
+                        headers=userinfo_headers,
+                    )
+                    if emails_response.status_code == 200:
+                        emails = emails_response.json()
+                        primary_email = next(
+                            (e["email"] for e in emails if e.get("primary") and e.get("verified")),
+                            None,
+                        )
+                        if primary_email:
+                            identity["email"] = primary_email
+
+                self.logger.info(
+                    "oauth_exchange_success",
+                    provider=provider,
+                    provider_uid=identity.get("provider_uid"),
+                )
+                return identity
+
+        except httpx.HTTPStatusError as e:
+            self.logger.error(
+                "oauth_exchange_http_error",
+                provider=provider,
+                status_code=e.response.status_code,
+                error=str(e),
+            )
+            return None
+        except Exception as e:
+            self.logger.error("oauth_exchange_error", provider=provider, error=str(e))
+            return None
+
+    def _parse_oauth_userinfo(self, provider: str, userinfo: dict) -> dict:
+        """Parse user info from OAuth provider into standardized format."""
+        if provider == "google":
+            return {
+                "provider_uid": userinfo.get("id"),
+                "email": userinfo.get("email"),
+                "handle": userinfo.get("name") or userinfo.get("email", "").split("@")[0],
+                "name": userinfo.get("name"),
+                "picture": userinfo.get("picture"),
+            }
+        elif provider == "github":
+            return {
+                "provider_uid": str(userinfo.get("id")),
+                "email": userinfo.get("email"),
+                "handle": userinfo.get("login"),
+                "name": userinfo.get("name"),
+                "picture": userinfo.get("avatar_url"),
+            }
+        elif provider == "microsoft":
+            return {
+                "provider_uid": userinfo.get("id"),
+                "email": userinfo.get("mail") or userinfo.get("userPrincipalName"),
+                "handle": userinfo.get("displayName") or userinfo.get("userPrincipalName", "").split("@")[0],
+                "name": userinfo.get("displayName"),
+                "picture": None,  # Microsoft requires a separate Graph API call for photos
+            }
+        return {"provider_uid": userinfo.get("id") or userinfo.get("sub")}
 
     async def complete_oauth(
         self, provider: str, code: str, state: str, *, tenant_id: Optional[str] = None
@@ -298,7 +474,7 @@ class AuthService:
         tenant_id: Optional[str] = None,
     ) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
         user = self.store.get_user_by_email(email)
-        if not user or not self._verify_password(user.id, password):
+        if not user or not self.verify_password(user.id, password):
             return None, None, {}
         if tenant_id and tenant_id != user.tenant_id:
             return None, None, {}
@@ -469,8 +645,33 @@ class AuthService:
         cfg = self.store.get_user_mfa_secret(user_id)
         if not cfg:
             return False
+
+        # Check MFA lockout (5 failed attempts = 5 minute lockout per SPEC §18)
+        lockout_key = f"mfa:lockout:{user_id}"
+        attempts_key = f"mfa:attempts:{user_id}"
+
+        if self.cache:
+            locked = await self.cache.client.get(lockout_key)
+            if locked:
+                self.logger.warning("mfa_locked_out", user_id=user_id)
+                return False
+
         if not self._verify_totp(cfg.secret, code):
+            # Track failed attempt
+            if self.cache:
+                attempts = await self.cache.client.incr(attempts_key)
+                await self.cache.client.expire(attempts_key, 300)  # 5 minute window
+                if attempts >= 5:
+                    # Lock out for 5 minutes
+                    await self.cache.client.set(lockout_key, "1", ex=300)
+                    await self.cache.client.delete(attempts_key)
+                    self.logger.warning("mfa_lockout_triggered", user_id=user_id, attempts=attempts)
             return False
+
+        # Success - clear any failed attempts
+        if self.cache:
+            await self.cache.client.delete(attempts_key)
+
         self.store.set_user_mfa_secret(user_id, cfg.secret, enabled=True)
         if session_id:
             self._mark_session_verified(session_id)
@@ -563,7 +764,8 @@ class AuthService:
         digest = self._pwd_hasher.hash(password)
         return digest, algo
 
-    def _verify_password(self, user_id: str, password: str) -> bool:
+    def verify_password(self, user_id: str, password: str) -> bool:
+        """Verify a user's password against stored hash."""
         record = self.store.get_password_record(user_id)
         if not record:
             return False

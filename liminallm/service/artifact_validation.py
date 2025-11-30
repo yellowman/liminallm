@@ -4,7 +4,6 @@ from typing import Any, Dict
 
 from jsonschema import Draft202012Validator
 
-
 _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
     "workflow": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",

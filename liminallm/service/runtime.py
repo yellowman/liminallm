@@ -2,24 +2,25 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, Union
 
 from liminallm.config import get_settings, reset_settings_cache
-from liminallm.service.config_ops import ConfigOpsService
+from liminallm.logging import get_logger
 from liminallm.service.auth import AuthService
 from liminallm.service.clustering import SemanticClusterer
+from liminallm.service.config_ops import ConfigOpsService
+from liminallm.service.email import EmailService
+from liminallm.service.embeddings import EmbeddingsService
 from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
 from liminallm.service.router import RouterEngine
 from liminallm.service.training import TrainingService
+from liminallm.service.training_worker import TrainingWorker
 from liminallm.service.voice import VoiceService
 from liminallm.service.workflow import WorkflowEngine
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.postgres import PostgresStore
-from liminallm.storage.redis_cache import RedisCache
-from liminallm.service.embeddings import EmbeddingsService
-
-from liminallm.logging import get_logger
+from liminallm.storage.redis_cache import RedisCache, SyncRedisCache
 
 logger = get_logger(__name__)
 
@@ -40,7 +41,11 @@ class Runtime:
         redis_error: Exception | None = None
         if self.settings.redis_url:
             try:
-                cache = RedisCache(self.settings.redis_url)
+                # Use sync Redis client in test mode to avoid event loop issues
+                if self.settings.test_mode:
+                    cache = SyncRedisCache(self.settings.redis_url)
+                else:
+                    cache = RedisCache(self.settings.redis_url)
                 cache.verify_connection()
                 self.cache = cache
             except Exception as exc:
@@ -117,7 +122,13 @@ class Runtime:
         self.workflow = WorkflowEngine(
             self.store, self.llm, self.router, self.rag, cache=self.cache
         )
-        self.voice = VoiceService(self.settings.shared_fs_root)
+        self.voice = VoiceService(
+            self.settings.shared_fs_root,
+            api_key=self.settings.voice_api_key,
+            transcription_model=self.settings.voice_transcription_model,
+            synthesis_model=self.settings.voice_synthesis_model,
+            default_voice=self.settings.voice_default_voice,
+        )
         self.config_ops = ConfigOpsService(
             self.store, self.llm, self.router, self.training
         )
@@ -126,6 +137,23 @@ class Runtime:
             self.cache,
             self.settings,
             mfa_enabled=self.settings.enable_mfa,
+        )
+        self.email = EmailService(
+            smtp_host=self.settings.smtp_host,
+            smtp_port=self.settings.smtp_port,
+            smtp_user=self.settings.smtp_user,
+            smtp_password=self.settings.smtp_password,
+            smtp_use_tls=self.settings.smtp_use_tls,
+            from_email=self.settings.email_from_address,
+            from_name=self.settings.email_from_name,
+            base_url=self.settings.app_base_url,
+        )
+        # Training worker for background job processing
+        self.training_worker = TrainingWorker(
+            store=self.store,
+            training_service=self.training,
+            clusterer=self.clusterer,
+            poll_interval=self.settings.training_worker_poll_interval,
         )
         self._local_idempotency: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         self._local_idempotency_lock = asyncio.Lock()
@@ -145,8 +173,27 @@ def get_runtime() -> Runtime:
 
 def reset_runtime_for_tests() -> Runtime:
     """Reinitialize the runtime singleton for isolated test runs."""
+    import asyncio
 
     global runtime
+
+    # Close existing Redis connections to avoid event loop issues
+    if runtime is not None and runtime.cache is not None:
+        try:
+            # SyncRedisCache uses a sync client internally, close it directly
+            if isinstance(runtime.cache, SyncRedisCache):
+                runtime.cache.client.close()
+            else:
+                # Async RedisCache - try to close properly
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(runtime.cache.close())
+                except RuntimeError:
+                    asyncio.run(runtime.cache.close())
+        except Exception:
+            # Ignore errors during cleanup - connection may already be closed
+            pass
+
     reset_settings_cache()
     settings = get_settings()
     if not settings.test_mode:
@@ -196,12 +243,9 @@ async def _set_cached_idempotency_record(
         }
 
 
-from typing import Union, Tuple as TypingTuple
-
-
 async def check_rate_limit(
     runtime: Runtime, key: str, limit: int, window_seconds: int, *, return_remaining: bool = False
-) -> Union[bool, TypingTuple[bool, int]]:
+) -> Union[bool, Tuple[bool, int]]:
     """Enforce rate limits even when Redis is unavailable.
 
     Per SPEC §18, rate limits use Redis token bucket with configurable defaults.

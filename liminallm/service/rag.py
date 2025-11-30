@@ -9,8 +9,8 @@ from typing import Callable, Dict, List, Optional, Sequence
 from liminallm.logging import get_logger
 from liminallm.service.embeddings import deterministic_embedding
 from liminallm.storage.memory import MemoryStore
-from liminallm.storage.postgres import PostgresStore
 from liminallm.storage.models import KnowledgeChunk
+from liminallm.storage.postgres import PostgresStore
 
 logger = get_logger(__name__)
 
@@ -79,14 +79,91 @@ class RAGService:
         *,
         user_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
+        max_tokens: Optional[int] = None,
+        min_token_count: int = 10,
     ) -> List[KnowledgeChunk]:
+        """Retrieve relevant chunks for a query.
+
+        Args:
+            context_ids: Context IDs to search within
+            query: Search query
+            limit: Maximum number of chunks to return
+            user_id: User ID for access control
+            tenant_id: Tenant ID for multi-tenant filtering
+            max_tokens: Optional maximum total tokens across all returned chunks.
+                       Uses token_count from chunk metadata if available.
+            min_token_count: Minimum tokens per chunk (filters out very short chunks)
+
+        Returns:
+            List of relevant chunks, optionally limited by total token budget
+        """
         if not context_ids:
             return []
 
         normalized_query = query or ""
-        return self._retriever(
-            context_ids, normalized_query, limit, user_id=user_id, tenant_id=tenant_id
+        results = self._retriever(
+            context_ids, normalized_query, limit * 2 if max_tokens else limit,
+            user_id=user_id, tenant_id=tenant_id
         )
+
+        # Filter out very short chunks (likely noise)
+        if min_token_count > 0:
+            results = [
+                chunk for chunk in results
+                if self._get_chunk_token_count(chunk) >= min_token_count
+            ]
+
+        # Apply token budget if specified
+        if max_tokens is not None and max_tokens > 0:
+            results = self._apply_token_budget(results, max_tokens, limit)
+
+        return results[:limit]
+
+    def _get_chunk_token_count(self, chunk: KnowledgeChunk) -> int:
+        """Get token count from chunk metadata, or estimate from content."""
+        if chunk.meta and isinstance(chunk.meta.get("token_count"), int):
+            return chunk.meta["token_count"]
+        # Estimate ~4 chars per token as fallback
+        return len(chunk.content) // 4
+
+    def _apply_token_budget(
+        self,
+        chunks: List[KnowledgeChunk],
+        max_tokens: int,
+        limit: int,
+    ) -> List[KnowledgeChunk]:
+        """Select chunks that fit within the token budget.
+
+        Prioritizes chunks in their existing order (by relevance score)
+        while respecting the total token budget.
+        """
+        selected: List[KnowledgeChunk] = []
+        total_tokens = 0
+
+        for chunk in chunks:
+            if len(selected) >= limit:
+                break
+
+            chunk_tokens = self._get_chunk_token_count(chunk)
+
+            # Check if adding this chunk would exceed budget
+            if total_tokens + chunk_tokens > max_tokens:
+                # If we have no chunks yet, include at least one
+                if not selected:
+                    selected.append(chunk)
+                    total_tokens += chunk_tokens
+                continue
+
+            selected.append(chunk)
+            total_tokens += chunk_tokens
+
+        logger.debug(
+            "rag_token_budget_applied",
+            max_tokens=max_tokens,
+            total_tokens=total_tokens,
+            chunk_count=len(selected),
+        )
+        return selected
 
     def _uses_pgvector(self) -> bool:
         return self.rag_mode in {"pgvector", "pg", "vector"}
@@ -351,7 +428,80 @@ class RAGService:
             context_id, data, chunk_size=chunk_size, source_path=path
         )
 
-    def embed_text(self, text: str) -> List[float]:
-        """Backward-compatible hook: use the deterministic embedding pipeline."""
+    def ingest_path(
+        self,
+        context_id: str,
+        fs_path: str,
+        *,
+        recursive: bool = True,
+        chunk_size: Optional[int] = None,
+        extensions: Optional[List[str]] = None,
+    ) -> int:
+        """Ingest content from a filesystem path (file or directory).
 
-        return self.embed(text)
+        Args:
+            context_id: Knowledge context to add chunks to
+            fs_path: Path to file or directory
+            recursive: Whether to recursively process subdirectories
+            chunk_size: Optional chunk size override
+            extensions: File extensions to include (e.g., ['.txt', '.md', '.py'])
+                       If None, defaults to common text file extensions.
+
+        Returns:
+            Total number of chunks created
+        """
+        path = Path(fs_path)
+
+        # Default extensions for text-like files
+        if extensions is None:
+            extensions = [
+                ".txt", ".md", ".rst", ".py", ".js", ".ts", ".jsx", ".tsx",
+                ".html", ".css", ".json", ".yaml", ".yml", ".xml", ".csv",
+                ".sql", ".sh", ".bash", ".go", ".rs", ".java", ".c", ".cpp",
+                ".h", ".hpp", ".rb", ".php", ".swift", ".kt", ".scala",
+            ]
+
+        total_chunks = 0
+
+        if path.is_file():
+            # Single file
+            if not extensions or path.suffix.lower() in extensions:
+                try:
+                    total_chunks += self.ingest_file(context_id, str(path), chunk_size)
+                except Exception as exc:
+                    logger.warning(
+                        "ingest_path_file_failed",
+                        path=str(path),
+                        error=str(exc),
+                    )
+            return total_chunks
+
+        if not path.is_dir():
+            logger.warning("ingest_path_not_found", path=str(path))
+            return 0
+
+        # Directory - iterate through files
+        pattern = "**/*" if recursive else "*"
+        for file_path in path.glob(pattern):
+            if not file_path.is_file():
+                continue
+            if extensions and file_path.suffix.lower() not in extensions:
+                continue
+            try:
+                total_chunks += self.ingest_file(context_id, str(file_path), chunk_size)
+            except Exception as exc:
+                logger.warning(
+                    "ingest_path_file_failed",
+                    path=str(file_path),
+                    error=str(exc),
+                )
+
+        logger.info(
+            "ingest_path_completed",
+            context_id=context_id,
+            fs_path=fs_path,
+            recursive=recursive,
+            total_chunks=total_chunks,
+        )
+        return total_chunks
+

@@ -6,8 +6,8 @@ and external API modes:
 2. Base model compatibility validation
 3. Deterministic tokenizer fallback (FNV-1a hash)
 
-NOTE: Tests that use LocalJaxLoRABackend require JAX. The entire module
-is skipped when JAX is not installed to prevent CI failures.
+NOTE: Tests that use LocalJaxLoRABackend require JAX and are skipped
+when JAX is not installed. TestValidateAdapterBaseModel runs without JAX.
 """
 
 from __future__ import annotations
@@ -16,13 +16,22 @@ import json
 
 import pytest
 
-# Skip entire module if JAX is not available - LocalJaxLoRABackend requires JAX
-pytest.importorskip("jax", reason="JAX not installed - skipping LocalJaxLoRABackend tests")
+# Import validate_adapter_base_model unconditionally (doesn't require JAX)
+from liminallm.service.model_backend import validate_adapter_base_model
 
-from liminallm.service.model_backend import (
-    LocalJaxLoRABackend,
-    validate_adapter_base_model,
-)
+# Check if JAX is available for LocalJaxLoRABackend tests
+try:
+    import jax
+    HAS_JAX = True
+except ImportError:
+    HAS_JAX = False
+
+# Conditionally import LocalJaxLoRABackend only if JAX is available
+if HAS_JAX:
+    from liminallm.service.model_backend import LocalJaxLoRABackend
+
+# Decorator to skip tests that require JAX
+requires_jax = pytest.mark.skipif(not HAS_JAX, reason="JAX not installed")
 
 
 # ==============================================================================
@@ -161,6 +170,7 @@ class TestValidateAdapterBaseModel:
 # ==============================================================================
 
 
+@requires_jax
 class TestDeterministicTokenHash:
     """Test FNV-1a hash-based tokenization for determinism."""
 
@@ -227,6 +237,7 @@ class TestDeterministicTokenHash:
         assert h == 0x811C9DC5
 
 
+@requires_jax
 class TestTokenizeFallback:
     """Test tokenize fallback behavior."""
 
@@ -274,6 +285,7 @@ class TestTokenizeFallback:
 # ==============================================================================
 
 
+@requires_jax
 class TestWeightedAdapterBlending:
     """Test adapter weight blending per SPEC §5.2."""
 
@@ -499,6 +511,7 @@ class TestWeightedAdapterBlending:
 # ==============================================================================
 
 
+@requires_jax
 class TestDualModeIntegration:
     """Integration tests for dual-mode adapter handling."""
 

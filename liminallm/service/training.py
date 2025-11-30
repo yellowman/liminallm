@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Sequence
 
 from liminallm.config import AdapterMode, get_compatible_adapter_modes
+from liminallm.logging import get_logger
 from liminallm.service.embeddings import deterministic_embedding
 from liminallm.service.fs import PathTraversalError, safe_join
 from liminallm.service.tokenizer_utils import (
@@ -17,8 +18,6 @@ from liminallm.service.tokenizer_utils import (
 )
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import POSITIVE_FEEDBACK_VALUES, Artifact, PreferenceEvent
-
-from liminallm.logging import get_logger
 
 logger = get_logger(__name__)
 

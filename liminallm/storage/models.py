@@ -6,7 +6,6 @@ from datetime import datetime, timedelta
 from ipaddress import IPv4Address, IPv6Address, ip_address
 from typing import Dict, List, Optional
 
-
 POSITIVE_FEEDBACK_VALUES = {"positive", "like"}
 
 
@@ -79,6 +78,7 @@ class Session:
 
 @dataclass
 class UserAuthCredential:
+    """Password credentials for a user (maps to user_auth_credential table)."""
     user_id: str
     password_hash: Optional[str] = None
     password_algo: Optional[str] = None
@@ -88,6 +88,7 @@ class UserAuthCredential:
 
 @dataclass
 class UserAuthProvider:
+    """OAuth/external auth provider link (maps to user_auth_provider table)."""
     id: int
     user_id: str
     provider: str
@@ -97,6 +98,7 @@ class UserAuthProvider:
 
 @dataclass
 class UserSettings:
+    """User preferences and settings (maps to user_settings table)."""
     user_id: str
     locale: Optional[str] = None
     timezone: Optional[str] = None

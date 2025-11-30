@@ -3,9 +3,9 @@ from __future__ import annotations
 from typing import Iterator, List, Optional
 
 from liminallm.service.model_backend import (
-    ApiAdapterBackend,
-    AdapterPlug,
     BUILTIN_ADAPTER_PLUGS,
+    AdapterPlug,
+    ApiAdapterBackend,
     LocalJaxLoRABackend,
     ModelBackend,
 )
@@ -37,6 +37,28 @@ class LLMService:
             fs_root=fs_root,
         )
 
+    def _prepare_generation(
+        self,
+        prompt: str,
+        adapters: List[dict],
+        context_snippets: List[str],
+        history: Optional[List[Message]] = None,
+    ) -> tuple[List[dict], List[dict]]:
+        """Prepare messages and adapters for generation.
+
+        Returns:
+            Tuple of (messages, normalized_adapters) ready for the backend.
+        """
+        normalized_adapters = self._normalize_adapters(adapters)
+        messages = [{"role": "system", "content": "You are a concise assistant."}]
+        messages.extend(self._build_adapter_prompts(normalized_adapters))
+        if history:
+            for msg in history:
+                messages.append({"role": msg.role, "content": msg.content})
+        messages.append({"role": "user", "content": self._format_user(prompt)})
+        messages = self._inject_context(messages, context_snippets)
+        return messages, normalized_adapters
+
     def generate(
         self,
         prompt: str,
@@ -46,15 +68,9 @@ class LLMService:
         *,
         user_id: Optional[str] = None,
     ) -> dict:
-        normalized_adapters = self._normalize_adapters(adapters)
-        messages = [{"role": "system", "content": "You are a concise assistant."}]
-        messages.extend(self._build_adapter_prompts(normalized_adapters))
-        if history:
-            for msg in history:
-                messages.append({"role": msg.role, "content": msg.content})
-
-        messages.append({"role": "user", "content": self._format_user(prompt)})
-        messages = self._inject_context(messages, context_snippets)
+        messages, normalized_adapters = self._prepare_generation(
+            prompt, adapters, context_snippets, history
+        )
         return self.backend.generate(messages, normalized_adapters, user_id=user_id)
 
     def generate_stream(
@@ -73,14 +89,9 @@ class LLMService:
         - {"event": "message_done", "data": {"content": "full_text", "usage": {...}}}
         - {"event": "error", "data": {"code": "...", "message": "..."}}
         """
-        normalized_adapters = self._normalize_adapters(adapters)
-        messages = [{"role": "system", "content": "You are a concise assistant."}]
-        messages.extend(self._build_adapter_prompts(normalized_adapters))
-        if history:
-            for msg in history:
-                messages.append({"role": msg.role, "content": msg.content})
-        messages.append({"role": "user", "content": self._format_user(prompt)})
-        messages = self._inject_context(messages, context_snippets)
+        messages, normalized_adapters = self._prepare_generation(
+            prompt, adapters, context_snippets, history
+        )
         yield from self.backend.generate_stream(messages, normalized_adapters, user_id=user_id)
 
     def _format_user(self, prompt: str) -> str:

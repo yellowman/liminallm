@@ -2,10 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import copy
 import math
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    AsyncIterator,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 from liminallm.logging import get_logger
 from liminallm.service.embeddings import (
@@ -33,6 +44,60 @@ DEFAULT_BACKOFF_MS = (
 MAX_RETRIES_HARD_CAP = 3  # SPEC §18: hard cap at 3 retries
 DEFAULT_WORKFLOW_TIMEOUT_MS = 60000  # 60 seconds total workflow timeout
 MAX_CONTEXT_SNIPPETS = 20
+MAX_WORKFLOW_SNAPSHOTS = 10  # Keep max 10 snapshots for rollback (memory management)
+
+
+@dataclass
+class WorkflowSnapshot:
+    """Snapshot of workflow state for rollback support.
+
+    Captures the complete state before each node execution, allowing
+    rollback to a previous known-good state on failure.
+    """
+    node_id: str
+    vars_scope: Dict[str, Any]
+    workflow_trace: List[Dict[str, Any]]
+    content: str
+    usage: Dict[str, Any]
+    context_snippets: List[str]
+    pending: List[str]
+    visited_count: int
+    timestamp: datetime = field(default_factory=datetime.utcnow)
+
+    @classmethod
+    def capture(
+        cls,
+        node_id: str,
+        vars_scope: Dict[str, Any],
+        workflow_trace: List[Dict[str, Any]],
+        content: str,
+        usage: Dict[str, Any],
+        context_snippets: List[str],
+        pending: List[str],
+        visited_count: int,
+    ) -> "WorkflowSnapshot":
+        """Create a deep copy snapshot of current workflow state."""
+        return cls(
+            node_id=node_id,
+            vars_scope=copy.deepcopy(vars_scope),
+            workflow_trace=copy.deepcopy(workflow_trace),
+            content=content,
+            usage=copy.deepcopy(usage),
+            context_snippets=list(context_snippets),
+            pending=list(pending),
+            visited_count=visited_count,
+        )
+
+
+@dataclass
+class ParallelNodeResult:
+    """Result of parallel node execution with merged outputs."""
+    merged_outputs: Dict[str, Any]  # Outputs namespaced by node ID
+    merged_content: str  # Concatenated content from all nodes
+    merged_usage: Dict[str, Any]  # Summed token counts
+    merged_snippets: List[str]  # Deduplicated context snippets
+    failed_nodes: List[str]  # Node IDs that failed
+    status: str = "ok"  # "ok" if all succeeded, "partial" if some failed, "error" if all failed
 
 
 class WorkflowEngine:
@@ -63,15 +128,52 @@ class WorkflowEngine:
         vars_scope: Dict[str, Any],
         *,
         reason: str = "node_failure",
+        snapshots: Optional[List[WorkflowSnapshot]] = None,
+        target_snapshot_index: int = -1,
     ) -> Optional[dict]:
+        """Rollback workflow state, optionally restoring from a snapshot.
+
+        Args:
+            state_key: Workflow state cache key
+            workflow_trace: Current trace (will be truncated if restoring)
+            vars_scope: Current variables (will be replaced if restoring)
+            reason: Reason for rollback
+            snapshots: List of captured snapshots for restoration
+            target_snapshot_index: Index of snapshot to restore to (-1 = latest)
+
+        Returns:
+            Rollback state dict with restoration details, or None on failure
+        """
+        restored_from = None
+
+        # If snapshots available, restore to specified snapshot
+        if snapshots and len(snapshots) > 0:
+            idx = target_snapshot_index if target_snapshot_index >= 0 else len(snapshots) - 1
+            if idx < len(snapshots):
+                snapshot = snapshots[idx]
+                restored_from = {
+                    "snapshot_node": snapshot.node_id,
+                    "snapshot_time": snapshot.timestamp.isoformat(),
+                    "restored_vars": list(snapshot.vars_scope.keys()),
+                    "restored_trace_length": len(snapshot.workflow_trace),
+                }
+                self.logger.info(
+                    "workflow_rollback_restoring",
+                    from_node=snapshot.node_id,
+                    trace_length=len(snapshot.workflow_trace),
+                )
+
         rollback_state = {
             "status": "rolled_back",
             "reason": reason,
             "timestamp": datetime.utcnow().isoformat(),
             "vars": vars_scope,
             "trace_length": len(workflow_trace),
+            "restored_from": restored_from,
         }
+
         try:
+            # Mark workflow as rolling back in persistent state
             await self._persist_workflow_state(
                 state_key,
                 {
@@ -79,12 +181,211 @@ class WorkflowEngine:
                     "reason": reason,
                     "updated_at": datetime.utcnow().isoformat(),
                     "workflow_trace": workflow_trace,
+                    "restored_from": restored_from,
                 },
             )
+
+            # Clear any workflow-specific cache entries
+            await self._clear_workflow_cache(state_key)
+
         except Exception as exc:
             self.logger.warning("workflow_rollback_mark_failed", error=str(exc))
             return None
+
         return rollback_state
+
+    def _capture_snapshot(
+        self,
+        snapshots: List[WorkflowSnapshot],
+        node_id: str,
+        vars_scope: Dict[str, Any],
+        workflow_trace: List[Dict[str, Any]],
+        content: str,
+        usage: Dict[str, Any],
+        context_snippets: List[str],
+        pending: List[str],
+        visited_count: int,
+    ) -> None:
+        """Capture a snapshot of workflow state before node execution.
+
+        Maintains a bounded list of snapshots (max MAX_WORKFLOW_SNAPSHOTS)
+        by removing oldest snapshots when the limit is exceeded.
+        """
+        snapshot = WorkflowSnapshot.capture(
+            node_id=node_id,
+            vars_scope=vars_scope,
+            workflow_trace=workflow_trace,
+            content=content,
+            usage=usage,
+            context_snippets=context_snippets,
+            pending=pending,
+            visited_count=visited_count,
+        )
+        snapshots.append(snapshot)
+
+        # Keep only the most recent snapshots
+        while len(snapshots) > MAX_WORKFLOW_SNAPSHOTS:
+            snapshots.pop(0)
+
+    def _restore_from_snapshot(
+        self,
+        snapshot: WorkflowSnapshot,
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], str, Dict[str, Any], List[str], List[str], int]:
+        """Restore workflow state from a snapshot.
+
+        Returns:
+            Tuple of (vars_scope, workflow_trace, content, usage, context_snippets, pending, visited_count)
+        """
+        return (
+            copy.deepcopy(snapshot.vars_scope),
+            copy.deepcopy(snapshot.workflow_trace),
+            snapshot.content,
+            copy.deepcopy(snapshot.usage),
+            list(snapshot.context_snippets),
+            list(snapshot.pending),
+            snapshot.visited_count,
+        )
+
+    async def _clear_workflow_cache(self, state_key: str) -> None:
+        """Clear workflow-specific cache entries during rollback."""
+        if not self.cache:
+            return
+        try:
+            # Clear workflow state from cache
+            await self.cache.delete_workflow_state(state_key)
+            self.logger.debug("workflow_cache_cleared", state_key=state_key)
+        except Exception as exc:
+            # Non-fatal - cache clear is best effort
+            self.logger.warning("workflow_cache_clear_failed", error=str(exc))
+
+    async def _execute_parallel_nodes(
+        self,
+        node_ids: List[str],
+        node_map: Dict[str, Dict[str, Any]],
+        *,
+        user_message: str,
+        context_id: Optional[str],
+        conversation_id: Optional[str],
+        adapters: List[dict],
+        history: List[Any],
+        vars_scope: Dict[str, Any],
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+        workflow_start_time: float,
+        workflow_timeout_ms: float,
+    ) -> ParallelNodeResult:
+        """Execute multiple nodes concurrently and merge results.
+
+        Each node gets a copy of vars_scope to prevent conflicts.
+        Results are namespaced by node ID.
+        """
+        if not node_ids:
+            return ParallelNodeResult(
+                merged_outputs={},
+                merged_content="",
+                merged_usage={},
+                merged_snippets=[],
+                failed_nodes=[],
+                status="ok",
+            )
+
+        async def execute_single_node(node_id: str) -> Tuple[str, Dict[str, Any], List[str]]:
+            """Execute a single node with its own vars_scope copy."""
+            node = node_map.get(node_id)
+            if not node:
+                return node_id, {"status": "error", "error": f"Node {node_id} not found"}, []
+
+            # Each parallel node gets its own copy of vars_scope
+            local_vars = copy.deepcopy(vars_scope)
+
+            try:
+                result, _ = await self._execute_node_with_retry(
+                    node,
+                    user_message=user_message,
+                    context_id=context_id,
+                    conversation_id=conversation_id,
+                    adapters=adapters,
+                    history=history,
+                    vars_scope=local_vars,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    workflow_start_time=workflow_start_time,
+                    workflow_timeout_ms=workflow_timeout_ms,
+                )
+                snippets = result.get("context_snippets", []) if isinstance(result, dict) else []
+                return node_id, result, snippets
+            except Exception as exc:
+                self.logger.error("parallel_node_failed", node_id=node_id, error=str(exc))
+                return node_id, {"status": "error", "error": str(exc)}, []
+
+        # Execute all nodes concurrently
+        tasks = [execute_single_node(nid) for nid in node_ids]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        # Merge results
+        merged_outputs: Dict[str, Any] = {}
+        merged_content_parts: List[str] = []
+        merged_usage: Dict[str, Any] = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        all_snippets: List[str] = []
+        failed_nodes: List[str] = []
+
+        for item in results:
+            if isinstance(item, Exception):
+                self.logger.error("parallel_gather_exception", error=str(item))
+                continue
+
+            node_id, result, snippets = item
+
+            if isinstance(result, dict):
+                # Namespace outputs by node ID
+                merged_outputs[node_id] = {
+                    k: v for k, v in result.items()
+                    if k not in {"usage", "context_snippets", "status"}
+                }
+
+                # Check for failure
+                if result.get("status") == "error":
+                    failed_nodes.append(node_id)
+
+                # Merge content
+                content = result.get("content", "")
+                if content:
+                    merged_content_parts.append(f"[{node_id}]\n{content}")
+
+                # Sum usage
+                usage = result.get("usage", {})
+                if isinstance(usage, dict):
+                    for key in ["prompt_tokens", "completion_tokens", "total_tokens"]:
+                        merged_usage[key] += usage.get(key, 0)
+
+                # Collect snippets
+                all_snippets.extend(snippets)
+
+        # Deduplicate snippets
+        seen_snippets: set = set()
+        deduped_snippets: List[str] = []
+        for snippet in all_snippets:
+            normalized = snippet.strip().lower()
+            if normalized not in seen_snippets:
+                seen_snippets.add(normalized)
+                deduped_snippets.append(snippet)
+
+        # Determine overall status
+        if len(failed_nodes) == len(node_ids):
+            status = "error"
+        elif failed_nodes:
+            status = "partial"
+        else:
+            status = "ok"
+
+        return ParallelNodeResult(
+            merged_outputs=merged_outputs,
+            merged_content="\n\n".join(merged_content_parts),
+            merged_usage=merged_usage,
+            merged_snippets=deduped_snippets[:MAX_CONTEXT_SNIPPETS],
+            failed_nodes=failed_nodes,
+            status=status,
+        )
 
     async def run(
         self,
@@ -136,6 +437,9 @@ class WorkflowEngine:
         visited_nodes: Dict[str, int] = {}
         max_visits_per_node = max(2, math.ceil(max_steps / max(1, len(node_map))))
 
+        # Initialize snapshot list for rollback support
+        snapshots: List[WorkflowSnapshot] = []
+
         state_key = f"{conversation_id or 'anon'}:{workflow_id or 'default'}"
         await self._persist_workflow_state(
             state_key,
@@ -184,6 +488,19 @@ class WorkflowEngine:
                 self.logger.warning("workflow_loop_detected", node=node_id)
                 break
 
+            # Capture snapshot before node execution for rollback support
+            self._capture_snapshot(
+                snapshots,
+                node_id,
+                vars_scope,
+                workflow_trace,
+                content,
+                usage,
+                context_snippets,
+                pending,
+                visited,
+            )
+
             # SPEC §9/§18: Execute node with retry and exponential backoff
             result, next_nodes = await self._execute_node_with_retry(
                 node,
@@ -209,7 +526,77 @@ class WorkflowEngine:
                     context_snippets=context_snippets,
                     workflow_trace=workflow_trace,
                     routing_trace=routing_trace,
+                    snapshots=snapshots,
                 )
+
+            # Handle parallel node execution - run child nodes concurrently
+            if result.get("status") == "parallel":
+                parallel_node_ids = result.get("parallel_nodes", [])
+                after_node = result.get("after")
+
+                if parallel_node_ids:
+                    self.logger.info(
+                        "workflow_parallel_start",
+                        node_id=node_id,
+                        parallel_nodes=parallel_node_ids,
+                    )
+                    parallel_result = await self._execute_parallel_nodes(
+                        parallel_node_ids,
+                        node_map,
+                        user_message=user_message,
+                        context_id=context_id,
+                        conversation_id=conversation_id,
+                        adapters=adapters,
+                        history=history,
+                        vars_scope=vars_scope,
+                        user_id=user_id,
+                        tenant_id=tenant_id,
+                        workflow_start_time=workflow_start_time,
+                        workflow_timeout_ms=workflow_timeout_ms,
+                    )
+
+                    # Merge parallel results into workflow state
+                    workflow_trace.append({
+                        "node": node_id,
+                        "status": parallel_result.status,
+                        "parallel_nodes": parallel_node_ids,
+                        "failed_nodes": parallel_result.failed_nodes,
+                    })
+
+                    # Update vars with namespaced parallel outputs
+                    vars_scope.update(parallel_result.merged_outputs)
+
+                    # Update content if parallel nodes produced any
+                    if parallel_result.merged_content:
+                        content = parallel_result.merged_content
+
+                    # Merge usage
+                    usage = self._merge_usage(usage, parallel_result.merged_usage)
+
+                    # Add context snippets
+                    for snippet in parallel_result.merged_snippets:
+                        if snippet not in context_seen and len(context_snippets) < MAX_CONTEXT_SNIPPETS:
+                            context_seen.add(snippet)
+                            context_snippets.append(snippet)
+
+                    # Handle parallel failures
+                    if parallel_result.status == "error":
+                        return await self._handle_node_failure(
+                            state_key,
+                            node_id,
+                            Exception(f"All parallel nodes failed: {parallel_result.failed_nodes}"),
+                            vars_scope=vars_scope,
+                            context_snippets=context_snippets,
+                            workflow_trace=workflow_trace,
+                            routing_trace=routing_trace,
+                            snapshots=snapshots,
+                        )
+
+                # Continue to "after" node if specified
+                if after_node:
+                    pending.insert(0, after_node)
+                continue
+
             workflow_trace.append({"node": node_id, **result})
             if result.get("outputs"):
                 vars_scope.update(result["outputs"])
@@ -235,6 +622,7 @@ class WorkflowEngine:
                     routing_trace=routing_trace,
                     context_snippets=context_snippets,
                     vars_scope=vars_scope,
+                    snapshots=snapshots,
                 )
             if result.get("status") == "end":
                 break
@@ -429,6 +817,67 @@ class WorkflowEngine:
                     }
                     return
 
+                # Handle parallel node execution in streaming mode
+                if result.get("status") == "parallel":
+                    parallel_node_ids = result.get("parallel_nodes", [])
+                    after_node = result.get("after")
+
+                    if parallel_node_ids:
+                        self.logger.info(
+                            "workflow_streaming_parallel_start",
+                            node_id=node_id,
+                            parallel_nodes=parallel_node_ids,
+                        )
+                        parallel_result = await self._execute_parallel_nodes(
+                            parallel_node_ids,
+                            node_map,
+                            user_message=user_message,
+                            context_id=context_id,
+                            conversation_id=conversation_id,
+                            adapters=adapters,
+                            history=history,
+                            vars_scope=vars_scope,
+                            user_id=user_id,
+                            tenant_id=tenant_id,
+                            workflow_start_time=workflow_start_time,
+                            workflow_timeout_ms=workflow_timeout_ms,
+                        )
+
+                        # Record parallel execution in trace
+                        workflow_trace.append({
+                            "node": node_id,
+                            "status": parallel_result.status,
+                            "parallel_nodes": parallel_node_ids,
+                            "failed_nodes": parallel_result.failed_nodes,
+                        })
+                        yield {"event": "trace", "data": {"workflow_trace": workflow_trace[-1]}}
+
+                        # Merge parallel results
+                        vars_scope.update(parallel_result.merged_outputs)
+                        if parallel_result.merged_content:
+                            content = parallel_result.merged_content
+                        usage = self._merge_usage(usage, parallel_result.merged_usage)
+                        for snippet in parallel_result.merged_snippets:
+                            if snippet not in context_seen and len(context_snippets) < MAX_CONTEXT_SNIPPETS:
+                                context_seen.add(snippet)
+                                context_snippets.append(snippet)
+
+                        # Handle parallel failures
+                        if parallel_result.status == "error":
+                            yield {
+                                "event": "error",
+                                "data": {
+                                    "code": "server_error",
+                                    "message": f"All parallel nodes failed: {parallel_result.failed_nodes}",
+                                },
+                            }
+                            return
+
+                    # Continue to "after" node if specified
+                    if after_node:
+                        pending.insert(0, after_node)
+                    continue
+
                 workflow_trace.append({"node": node_id, **result})
                 yield {"event": "trace", "data": {"workflow_trace": workflow_trace[-1]}}
 
@@ -518,8 +967,7 @@ class WorkflowEngine:
                 user_id=user_id,
             )
 
-            # Wrap synchronous iterator for async
-            loop = asyncio.get_event_loop()
+            # Iterate through synchronous stream, yielding control for async
             for event in stream:
                 if cancel_event and cancel_event.is_set():
                     yield {"event": "cancel_ack", "data": {}}
@@ -545,6 +993,7 @@ class WorkflowEngine:
         context_snippets: List[str],
         workflow_trace: List[Dict[str, Any]],
         routing_trace: List[Dict[str, Any]],
+        snapshots: Optional[List[WorkflowSnapshot]] = None,
     ) -> dict:
         self.logger.error("workflow_node_failed", node=node_id, error=str(exc))
         failure_entry = {
@@ -555,7 +1004,7 @@ class WorkflowEngine:
         }
         workflow_trace.append(failure_entry)
         rollback_state = await self._rollback_workflow(
-            state_key, workflow_trace, vars_scope
+            state_key, workflow_trace, vars_scope, snapshots=snapshots
         )
         if rollback_state:
             failure_entry["rollback"] = rollback_state
@@ -589,9 +1038,10 @@ class WorkflowEngine:
         routing_trace: List[Dict[str, Any]],
         context_snippets: List[str],
         vars_scope: Dict[str, Any],
+        snapshots: Optional[List[WorkflowSnapshot]] = None,
     ) -> Dict[str, Any]:
         rollback_state = await self._rollback_workflow(
-            state_key, workflow_trace, vars_scope, reason="tool_error"
+            state_key, workflow_trace, vars_scope, reason="tool_error", snapshots=snapshots
         )
         if rollback_state:
             result["rollback"] = rollback_state
@@ -984,10 +1434,18 @@ class WorkflowEngine:
                     break
             return {"status": "ok"}, [n for n in next_nodes if n]
         if node_type == "parallel":
+            # Return special status to trigger concurrent execution in main loop
             next_nodes = node.get("next", []) or []
             if isinstance(next_nodes, str):
                 next_nodes = [next_nodes]
-            return {"status": "ok"}, [n for n in next_nodes if n]
+            child_nodes = [n for n in next_nodes if n]
+            # After parallel, continue to "after" node if specified
+            after_node = node.get("after")
+            return {
+                "status": "parallel",
+                "parallel_nodes": child_nodes,
+                "after": after_node,
+            }, []
         if node_type == "end":
             return {"status": "end"}, []
 

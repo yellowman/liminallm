@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import threading
 import uuid
 from datetime import datetime
-from pathlib import Path
 from ipaddress import ip_address
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from psycopg import errors
@@ -20,17 +19,24 @@ from liminallm.service.artifact_validation import (
     validate_artifact,
 )
 from liminallm.service.bm25 import (
-    tokenize_text as _tokenize_text,
     compute_bm25_scores as _compute_bm25_scores,
+)
+from liminallm.service.bm25 import (
+    tokenize_text as _tokenize_text,
+)
+from liminallm.storage.common import (
+    compute_text_embedding,
+    get_default_chat_workflow_schema,
+    get_default_tool_specs,
 )
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
+    AdapterRouterState,
     Artifact,
     ArtifactVersion,
     ConfigPatchAudit,
     ContextSource,
     Conversation,
-    AdapterRouterState,
     KnowledgeChunk,
     KnowledgeContext,
     Message,
@@ -40,8 +46,8 @@ from liminallm.storage.models import (
     TrainingJob,
     User,
     UserMFAConfig,
+    UserSettings,
 )
-
 
 _MAX_SESSION_CACHE_SIZE = 10000
 
@@ -238,60 +244,12 @@ class PostgresStore:
             )
 
     def _ensure_default_artifacts(self) -> None:
-        """Seed the default workflow artifact if the database is empty."""
-
+        """Seed default artifacts using common schema definitions."""
         existing = self.list_artifacts()
-        if any(artifact.name == "default_chat_workflow" for artifact in existing):
-            seeded_workflow = True
-        else:
-            seeded_workflow = False
 
-        if not seeded_workflow:
-            default_schema = {
-                "kind": "workflow.chat",
-                "entrypoint": "classify",
-                "nodes": [
-                    {
-                        "id": "classify",
-                        "type": "tool_call",
-                        "tool": "llm.intent_classifier_v1",
-                        "inputs": {"message": "${input.message}"},
-                        "outputs": ["intent"],
-                        "next": "route",
-                    },
-                    {
-                        "id": "route",
-                        "type": "switch",
-                        "branches": [
-                            {"when": "vars.intent == 'qa_with_docs'", "next": "rag"},
-                            {"when": "vars.intent == 'code_edit'", "next": "code"},
-                            {"when": "true", "next": "plain_chat"},
-                        ],
-                    },
-                    {
-                        "id": "rag",
-                        "type": "tool_call",
-                        "tool": "rag.answer_with_context_v1",
-                        "inputs": {"message": "${input.message}"},
-                        "next": "end",
-                    },
-                    {
-                        "id": "code",
-                        "type": "tool_call",
-                        "tool": "agent.code_v1",
-                        "inputs": {"message": "${input.message}"},
-                        "next": "end",
-                    },
-                    {
-                        "id": "plain_chat",
-                        "type": "tool_call",
-                        "tool": "llm.generic",
-                        "inputs": {"message": "${input.message}"},
-                        "next": "end",
-                    },
-                    {"id": "end", "type": "end"},
-                ],
-            }
+        # Seed default chat workflow if not present
+        if not any(artifact.name == "default_chat_workflow" for artifact in existing):
+            default_schema = get_default_chat_workflow_schema()
             self.create_artifact(
                 "workflow",
                 "default_chat_workflow",
@@ -301,31 +259,13 @@ class PostgresStore:
                 change_note="Seeded default workflow",
             )
 
+        # Seed default tool specs if not present
         seeded_tools = {
             art.schema.get("name")
             for art in existing
             if isinstance(art.schema, dict) and art.schema.get("kind") == "tool.spec"
         }
-        default_tools = [
-            {
-                "kind": "tool.spec",
-                "name": "llm.generic",
-                "description": "Plain chat response from the base model.",
-                "inputs": {"message": {"type": "string"}},
-                "handler": "llm.generic",
-            },
-            {
-                "kind": "tool.spec",
-                "name": "rag.answer_with_context_v1",
-                "description": "Retrieval augmented answer with pgvector context.",
-                "inputs": {
-                    "message": {"type": "string"},
-                    "context_id": {"type": "string", "optional": True},
-                },
-                "handler": "rag.answer_with_context_v1",
-            },
-        ]
-        for spec in default_tools:
+        for spec in get_default_tool_specs():
             if spec["name"] in seeded_tools:
                 continue
             self.create_artifact(
@@ -370,7 +310,7 @@ class PostgresStore:
                     "preference message conversation mismatch",
                     {"message_id": message_id, "conversation_id": conversation_id},
                 )
-            embedding = context_embedding or self._text_embedding(
+            embedding = context_embedding or compute_text_embedding(
                 context_text or msg_row.get("content")
             )
             row = conn.execute(
@@ -417,17 +357,7 @@ class PostgresStore:
             meta=meta,
         )
 
-    def _text_embedding(self, text: Optional[str]) -> list[float]:
-        if not text:
-            return []
-        tokens = text.lower().split()
-        dim = 64
-        vec = [0.0] * dim
-        for tok in tokens:
-            h = int(hashlib.sha256(tok.encode()).hexdigest(), 16)
-            vec[h % dim] += 1.0
-        norm = sum(v * v for v in vec) ** 0.5 or 1.0
-        return [v / norm for v in vec]
+    # _text_embedding moved to common.compute_text_embedding
 
     def list_preference_events(
         self,
@@ -1041,6 +971,68 @@ class PostgresStore:
             self.logger.warning("get_user_mfa_secret_failed", error=str(exc))
             return None
         return None
+
+    def get_user_settings(self, user_id: str) -> Optional[UserSettings]:
+        """Get user settings/preferences."""
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM user_settings WHERE user_id = %s", (user_id,)
+                ).fetchone()
+                if not row:
+                    return None
+                return UserSettings(
+                    user_id=str(row["user_id"]),
+                    locale=row.get("locale"),
+                    timezone=row.get("timezone"),
+                    default_voice=row.get("default_voice"),
+                    default_style=row.get("default_style"),
+                    flags=row.get("flags"),
+                )
+        except Exception as exc:
+            self.logger.warning("get_user_settings_failed", error=str(exc))
+            return None
+
+    def set_user_settings(
+        self,
+        user_id: str,
+        *,
+        locale: Optional[str] = None,
+        timezone: Optional[str] = None,
+        default_voice: Optional[str] = None,
+        default_style: Optional[dict] = None,
+        flags: Optional[dict] = None,
+    ) -> UserSettings:
+        """Create or update user settings."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO user_settings (user_id, locale, timezone, default_voice, default_style, flags)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET
+                    locale = COALESCE(EXCLUDED.locale, user_settings.locale),
+                    timezone = COALESCE(EXCLUDED.timezone, user_settings.timezone),
+                    default_voice = COALESCE(EXCLUDED.default_voice, user_settings.default_voice),
+                    default_style = COALESCE(EXCLUDED.default_style, user_settings.default_style),
+                    flags = COALESCE(EXCLUDED.flags, user_settings.flags)
+                """,
+                (
+                    user_id,
+                    locale,
+                    timezone,
+                    default_voice,
+                    json.dumps(default_style) if default_style else None,
+                    json.dumps(flags) if flags else None,
+                ),
+            )
+        return UserSettings(
+            user_id=user_id,
+            locale=locale,
+            timezone=timezone,
+            default_voice=default_voice,
+            default_style=default_style,
+            flags=flags,
+        )
 
     def get_user_by_email(self, email: str) -> Optional[User]:
         with self._connect() as conn:
