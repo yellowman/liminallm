@@ -988,10 +988,12 @@ class MemoryStore:
             return list(msgs)
         return msgs[-limit:]
 
-    def list_conversations(self, user_id: str, limit: int = 20) -> List[Conversation]:
+    def list_conversations(
+        self, user_id: str, limit: int = 20, offset: int = 0
+    ) -> List[Conversation]:
         convs = [c for c in self.conversations.values() if c.user_id == user_id]
         convs.sort(key=lambda c: c.updated_at, reverse=True)
-        return convs[:limit]
+        return convs[offset : offset + limit]
 
     # artifacts
     def list_artifacts(

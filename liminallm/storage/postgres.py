@@ -1585,16 +1585,18 @@ class PostgresStore:
             )
         return messages
 
-    def list_conversations(self, user_id: str, limit: int = 20) -> List[Conversation]:
+    def list_conversations(
+        self, user_id: str, limit: int = 20, offset: int = 0
+    ) -> List[Conversation]:
         with self._connect() as conn:
             rows = conn.execute(
                 """
                 SELECT * FROM conversation
                 WHERE user_id = %s
                 ORDER BY updated_at DESC
-                LIMIT %s
+                LIMIT %s OFFSET %s
                 """,
-                (user_id, limit),
+                (user_id, limit, offset),
             ).fetchall()
         conversations: List[Conversation] = []
         for row in rows:

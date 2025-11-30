@@ -133,6 +133,68 @@ class AuthService:
         self._email_verification_tokens: dict[str, tuple[str, datetime]] = {}
         self._pwd_hasher = PasswordHasher(type=Type.ID)
         self.logger = logger
+        self._last_cleanup = datetime.utcnow()
+
+    def cleanup_expired_states(self) -> int:
+        """Clean up expired OAuth states, MFA challenges, and email verification tokens.
+
+        Should be called periodically (e.g., every few minutes) to prevent memory leaks.
+
+        Returns:
+            Number of expired entries cleaned up
+        """
+        now = datetime.utcnow()
+        cleaned = 0
+
+        # Clean expired OAuth states
+        expired_oauth = [
+            state for state, (_, expires_at, _) in self._oauth_states.items()
+            if expires_at <= now
+        ]
+        for state in expired_oauth:
+            self._oauth_states.pop(state, None)
+            cleaned += 1
+
+        # Clean expired MFA challenges
+        expired_mfa = [
+            user_id for user_id, (_, expires_at) in self._mfa_challenges.items()
+            if expires_at <= now
+        ]
+        for user_id in expired_mfa:
+            self._mfa_challenges.pop(user_id, None)
+            cleaned += 1
+
+        # Clean expired email verification tokens
+        expired_email = [
+            token for token, (_, expires_at) in self._email_verification_tokens.items()
+            if expires_at <= now
+        ]
+        for token in expired_email:
+            self._email_verification_tokens.pop(token, None)
+            cleaned += 1
+
+        if cleaned > 0:
+            self.logger.debug(
+                "auth_state_cleanup", cleaned=cleaned, oauth=len(expired_oauth),
+                mfa=len(expired_mfa), email=len(expired_email)
+            )
+
+        self._last_cleanup = now
+        return cleaned
+
+    def maybe_cleanup(self, interval_minutes: int = 5) -> int:
+        """Run cleanup if interval has elapsed since last cleanup.
+
+        Args:
+            interval_minutes: Minimum time between cleanups
+
+        Returns:
+            Number of entries cleaned, or 0 if cleanup was skipped
+        """
+        now = datetime.utcnow()
+        if (now - self._last_cleanup).total_seconds() >= interval_minutes * 60:
+            return self.cleanup_expired_states()
+        return 0
 
     def _generate_password(self) -> str:
         return base64.urlsafe_b64encode(os.urandom(12)).decode().rstrip("=")
@@ -200,6 +262,9 @@ class AuthService:
         *,
         tenant_id: Optional[str] = None,
     ) -> dict:
+        # Opportunistically clean up expired states to prevent memory leaks
+        self.maybe_cleanup()
+
         if provider not in OAUTH_PROVIDERS:
             raise ValueError(f"Unsupported OAuth provider: {provider}")
 
@@ -538,6 +603,36 @@ class AuthService:
         self.store.revoke_session(session_id)
         if self.cache:
             await self.cache.revoke_session(session_id)
+
+    async def revoke_all_user_sessions(
+        self, user_id: str, except_session_id: Optional[str] = None
+    ) -> int:
+        """Revoke all sessions for a user, optionally keeping one session active.
+
+        Args:
+            user_id: The user whose sessions to revoke
+            except_session_id: Optional session ID to keep active (e.g., current session)
+
+        Returns:
+            Number of sessions revoked
+        """
+        revoked_count = 0
+        if hasattr(self.store, "revoke_user_sessions"):
+            # Use store method if available for better performance
+            try:
+                self.store.revoke_user_sessions(user_id)  # type: ignore[attr-defined]
+                revoked_count = -1  # Unknown count when using bulk method
+            except Exception as exc:
+                self.logger.warning(
+                    "revoke_user_sessions_failed", user_id=user_id, error=str(exc)
+                )
+        # Also clear from cache
+        if self.cache:
+            try:
+                await self.cache.client.delete(f"user_sessions:{user_id}")
+            except Exception:
+                pass
+        return revoked_count
 
     async def resolve_session(
         self,
