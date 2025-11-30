@@ -67,7 +67,10 @@ class TestSignupFlow:
         )
 
         assert response.status_code == 409
-        assert "already exists" in response.json()["detail"].lower()
+        # API uses envelope format with "error" key containing {code, message, details}
+        error = response.json().get("error", {})
+        error_msg = error.get("message", "") if isinstance(error, dict) else str(error)
+        assert "already exists" in error_msg.lower()
 
     def test_signup_validates_email_format(self, client, test_user_password):
         """Test that signup validates email format."""
@@ -199,7 +202,7 @@ class TestTokenRefresh:
 
         # Refresh tokens
         response = client.post(
-            "/v1/auth/token/refresh",
+            "/v1/auth/refresh",
             json={"refresh_token": refresh_token},
         )
 

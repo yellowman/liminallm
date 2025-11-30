@@ -101,11 +101,11 @@ class TestAdminUserManagement:
 
         assert response.status_code in [200, 201]
         data = response.json()
-        assert "user_id" in data["data"]
+        assert "id" in data["data"]
 
     def test_admin_can_update_user_role(self, client, admin_user, regular_user):
         """Test that admin can update user role."""
-        response = client.patch(
+        response = client.post(
             f"/v1/admin/users/{regular_user['user_id']}/role",
             headers=admin_user["headers"],
             json={"role": "admin"},
@@ -159,7 +159,8 @@ class TestAdminInspection:
 
         assert response.status_code == 200
         data = response.json()
-        assert "items" in data["data"]
+        # Response contains details and summary, not items
+        assert "details" in data["data"] or "summary" in data["data"]
 
     def test_regular_user_cannot_list_adapters(self, client, regular_user):
         """Test that regular users cannot list adapters."""
@@ -188,14 +189,18 @@ class TestConfigPatches:
             json={
                 "name": "Patchable Artifact",
                 "type": "workflow",
-                "schema": {"kind": "workflow.chat", "config": {"key": "value"}},
+                "schema": {
+                    "kind": "workflow.chat",
+                    "nodes": [{"id": "start", "type": "llm_call"}],
+                    "config": {"key": "value"},
+                },
             },
         )
         artifact_id = artifact_resp.json()["data"]["id"]
 
         # Propose a patch
         response = client.post(
-            "/v1/config/patches",
+            "/v1/config/propose_patch",
             headers=admin_user["headers"],
             json={
                 "artifact_id": artifact_id,

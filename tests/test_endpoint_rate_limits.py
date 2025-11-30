@@ -135,9 +135,10 @@ class TestRateLimitErrorResponse:
 
     def test_rate_limit_returns_429(self, client, auth_headers):
         """Test that rate limit exceeded returns 429."""
-        with patch("liminallm.service.runtime.check_rate_limit", new_callable=AsyncMock) as mock_check:
-            # Simulate rate limit exceeded
-            mock_check.return_value = False
+        # Patch where check_rate_limit is used, not where it's defined
+        with patch("liminallm.api.routes.check_rate_limit", new_callable=AsyncMock) as mock_check:
+            # Simulate rate limit exceeded - return tuple (allowed=False, remaining=0)
+            mock_check.return_value = (False, 0)
 
             response = client.get("/v1/artifacts", headers=auth_headers)
 
@@ -146,8 +147,8 @@ class TestRateLimitErrorResponse:
 
     def test_rate_limit_error_has_proper_format(self, client, auth_headers):
         """Test that rate limit error has proper JSON format."""
-        with patch("liminallm.service.runtime.check_rate_limit", new_callable=AsyncMock) as mock_check:
-            mock_check.return_value = False
+        with patch("liminallm.api.routes.check_rate_limit", new_callable=AsyncMock) as mock_check:
+            mock_check.return_value = (False, 0)
 
             response = client.get("/v1/artifacts", headers=auth_headers)
 

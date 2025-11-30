@@ -18,7 +18,7 @@ from liminallm.service.workflow import WorkflowEngine
 from liminallm.service.email import EmailService
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.postgres import PostgresStore
-from liminallm.storage.redis_cache import RedisCache
+from liminallm.storage.redis_cache import RedisCache, SyncRedisCache
 from liminallm.service.embeddings import EmbeddingsService
 
 from liminallm.logging import get_logger
@@ -42,7 +42,11 @@ class Runtime:
         redis_error: Exception | None = None
         if self.settings.redis_url:
             try:
-                cache = RedisCache(self.settings.redis_url)
+                # Use sync Redis client in test mode to avoid event loop issues
+                if self.settings.test_mode:
+                    cache = SyncRedisCache(self.settings.redis_url)
+                else:
+                    cache = RedisCache(self.settings.redis_url)
                 cache.verify_connection()
                 self.cache = cache
             except Exception as exc:
@@ -177,14 +181,16 @@ def reset_runtime_for_tests() -> Runtime:
     # Close existing Redis connections to avoid event loop issues
     if runtime is not None and runtime.cache is not None:
         try:
-            # Try to get the running event loop
-            try:
-                loop = asyncio.get_running_loop()
-                # If we're in an async context, create a task
-                loop.create_task(runtime.cache.close())
-            except RuntimeError:
-                # No running loop - create a new one to close connections
-                asyncio.run(runtime.cache.close())
+            # SyncRedisCache uses a sync client internally, close it directly
+            if isinstance(runtime.cache, SyncRedisCache):
+                runtime.cache.client.close()
+            else:
+                # Async RedisCache - try to close properly
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(runtime.cache.close())
+                except RuntimeError:
+                    asyncio.run(runtime.cache.close())
         except Exception:
             # Ignore errors during cleanup - connection may already be closed
             pass

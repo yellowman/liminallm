@@ -42,7 +42,7 @@ class TestConversations:
         response = client.post(
             "/v1/chat",
             headers=auth_headers,
-            json={"content": "Hello, this is a test message"},
+            json={"message": {"content": "Hello, this is a test message"}, "stream": False},
         )
 
         assert response.status_code == 200
@@ -56,7 +56,7 @@ class TestConversations:
         client.post(
             "/v1/chat",
             headers=auth_headers,
-            json={"content": "Test message"},
+            json={"message": {"content": "Test message"}, "stream": False},
         )
 
         # List conversations
@@ -73,7 +73,7 @@ class TestConversations:
         chat_resp = client.post(
             "/v1/chat",
             headers=auth_headers,
-            json={"content": "Test message"},
+            json={"message": {"content": "Test message"}, "stream": False},
         )
         conv_id = chat_resp.json()["data"]["conversation_id"]
 
@@ -93,7 +93,7 @@ class TestMessages:
         chat_resp = client.post(
             "/v1/chat",
             headers=auth_headers,
-            json={"content": "Test message"},
+            json={"message": {"content": "Test message"}, "stream": False},
         )
         conv_id = chat_resp.json()["data"]["conversation_id"]
 
@@ -115,7 +115,7 @@ class TestMessages:
         chat_resp = client.post(
             "/v1/chat",
             headers=auth_headers,
-            json={"content": "First message"},
+            json={"message": {"content": "First message"}, "stream": False},
         )
         conv_id = chat_resp.json()["data"]["conversation_id"]
 
@@ -123,7 +123,7 @@ class TestMessages:
         response = client.post(
             "/v1/chat",
             headers=auth_headers,
-            json={"content": "Second message", "conversation_id": conv_id},
+            json={"message": {"content": "Second message"}, "conversation_id": conv_id, "stream": False},
         )
 
         assert response.status_code == 200
@@ -152,7 +152,7 @@ class TestKnowledgeContexts:
         client.post(
             "/v1/contexts",
             headers=auth_headers,
-            json={"name": "Test Context"},
+            json={"name": "Test Context", "description": "Test description"},
         )
 
         # List contexts
@@ -170,6 +170,7 @@ class TestKnowledgeContexts:
             headers=auth_headers,
             json={
                 "name": "Text Context",
+                "description": "Context with text content",
                 "text": "This is some sample text that will be chunked and embedded.",
             },
         )
@@ -184,6 +185,7 @@ class TestKnowledgeContexts:
             headers=auth_headers,
             json={
                 "name": "Chunk Test Context",
+                "description": "Context for chunk testing",
                 "text": "This is text for chunk testing.",
             },
         )
@@ -211,7 +213,10 @@ class TestArtifacts:
             json={
                 "name": "Test Artifact",
                 "type": "workflow",
-                "schema": {"kind": "workflow.chat", "config": {}},
+                "schema": {
+                    "kind": "workflow.chat",
+                    "nodes": [{"id": "start", "type": "llm_call"}],
+                },
             },
         )
 
@@ -229,7 +234,10 @@ class TestArtifacts:
             json={
                 "name": "Test Artifact",
                 "type": "workflow",
-                "schema": {"kind": "workflow.chat"},
+                "schema": {
+                    "kind": "workflow.chat",
+                    "nodes": [{"id": "start", "type": "llm_call"}],
+                },
             },
         )
 
@@ -249,7 +257,11 @@ class TestArtifacts:
             json={
                 "name": "Test Artifact",
                 "type": "tool",
-                "schema": {"kind": "tool.spec"},
+                "schema": {
+                    "kind": "tool.spec",
+                    "name": "test_tool",
+                    "handler": "test.handler",
+                },
             },
         )
         artifact_id = create_resp.json()["data"]["id"]
@@ -269,7 +281,10 @@ class TestArtifacts:
             json={
                 "name": "Versioned Artifact",
                 "type": "workflow",
-                "schema": {"kind": "workflow.chat"},
+                "schema": {
+                    "kind": "workflow.chat",
+                    "nodes": [{"id": "start", "type": "llm_call"}],
+                },
             },
         )
         artifact_id = create_resp.json()["data"]["id"]
@@ -297,7 +312,11 @@ class TestToolSpecs:
             json={
                 "name": "Test Tool",
                 "type": "tool",
-                "schema": {"kind": "tool.spec", "name": "test_tool"},
+                "schema": {
+                    "kind": "tool.spec",
+                    "name": "test_tool",
+                    "handler": "test.handler",
+                },
             },
         )
 
@@ -321,7 +340,10 @@ class TestWorkflows:
             json={
                 "name": "Test Workflow",
                 "type": "workflow",
-                "schema": {"kind": "workflow.chat"},
+                "schema": {
+                    "kind": "workflow.chat",
+                    "nodes": [{"id": "start", "type": "llm_call"}],
+                },
             },
         )
 
@@ -342,17 +364,20 @@ class TestPreferences:
         chat_resp = client.post(
             "/v1/chat",
             headers=auth_headers,
-            json={"content": "Test message"},
+            json={"message": {"content": "Test message"}, "stream": False},
         )
-        msg_id = chat_resp.json()["data"]["message_id"]
+        data = chat_resp.json()["data"]
+        conv_id = data["conversation_id"]
+        msg_id = data["message_id"]
 
         # Record preference
         response = client.post(
             "/v1/preferences",
             headers=auth_headers,
             json={
+                "conversation_id": conv_id,
                 "message_id": msg_id,
-                "direction": "up",
+                "feedback": "positive",
             },
         )
 
