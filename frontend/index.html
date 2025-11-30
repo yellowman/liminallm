@@ -69,6 +69,38 @@
                 <button type="button" class="link-btn" id="show-signup">Create an account</button>
                 <button type="button" class="link-btn" id="show-reset">Forgot password?</button>
               </div>
+
+              <!-- OAuth Providers -->
+              <div class="oauth-divider">
+                <span>or continue with</span>
+              </div>
+              <div class="oauth-buttons">
+                <button type="button" class="oauth-btn" data-provider="google" id="oauth-google">
+                  <svg viewBox="0 0 24 24" width="18" height="18">
+                    <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+                    <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+                    <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+                    <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+                  </svg>
+                  Google
+                </button>
+                <button type="button" class="oauth-btn" data-provider="github" id="oauth-github">
+                  <svg viewBox="0 0 24 24" width="18" height="18">
+                    <path fill="currentColor" d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0024 12c0-6.63-5.37-12-12-12z"/>
+                  </svg>
+                  GitHub
+                </button>
+                <button type="button" class="oauth-btn" data-provider="microsoft" id="oauth-microsoft">
+                  <svg viewBox="0 0 24 24" width="18" height="18">
+                    <path fill="#F25022" d="M1 1h10v10H1z"/>
+                    <path fill="#00A4EF" d="M13 1h10v10H13z"/>
+                    <path fill="#7FBA00" d="M1 13h10v10H1z"/>
+                    <path fill="#FFB900" d="M13 13h10v10H13z"/>
+                  </svg>
+                  Microsoft
+                </button>
+              </div>
+              <div id="oauth-status" class="small" role="status"></div>
             </div>
 
             <!-- Signup Form -->
@@ -311,6 +343,38 @@
               <h3>Context details</h3>
               <div id="context-details" class="context-details">
                 <div class="empty">Select a context to view details</div>
+              </div>
+
+              <div class="divider"></div>
+
+              <h3>Context Sources</h3>
+              <p class="subtext">Filesystem paths that have been ingested into this context.</p>
+              <div id="context-sources-list" class="context-sources">
+                <div class="empty">Select a context to view sources</div>
+              </div>
+
+              <div id="add-source-section" class="hidden">
+                <div class="divider"></div>
+                <h3>Add Source</h3>
+                <p class="subtext">Add a filesystem path to ingest into this context.</p>
+                <form id="add-source-form">
+                  <div class="input-grid">
+                    <div class="field">
+                      <label for="source-path">Filesystem Path</label>
+                      <input type="text" id="source-path" placeholder="/path/to/documents" required />
+                    </div>
+                    <div class="field">
+                      <label for="source-recursive">
+                        <input type="checkbox" id="source-recursive" checked />
+                        Recursive (include subdirectories)
+                      </label>
+                    </div>
+                  </div>
+                  <div class="pill-row">
+                    <button type="submit" class="primary" id="add-source-btn">Add Source</button>
+                  </div>
+                </form>
+                <div id="add-source-status" class="small" role="status"></div>
               </div>
             </div>
           </section>
@@ -587,6 +651,110 @@
                   <button class="ghost" id="reload-admin-settings-btn">Reload</button>
                 </div>
                 <div id="admin-settings-status" class="small" role="status"></div>
+
+                <!-- Users Management -->
+                <div class="divider"></div>
+                <h3>Users Management</h3>
+                <p class="subtext">Manage system users, roles, and permissions.</p>
+
+                <div class="pill-row mb-12">
+                  <button class="ghost" id="refresh-users-btn">Refresh</button>
+                  <button class="primary" id="show-add-user-btn">Add User</button>
+                </div>
+
+                <div id="add-user-form-section" class="hidden">
+                  <div class="input-grid">
+                    <div class="field">
+                      <label for="new-user-email">Email</label>
+                      <input type="email" id="new-user-email" placeholder="user@example.com" required />
+                    </div>
+                    <div class="field">
+                      <label for="new-user-password">Password</label>
+                      <input type="password" id="new-user-password" placeholder="Strong password" required />
+                    </div>
+                    <div class="field">
+                      <label for="new-user-role">Role</label>
+                      <select id="new-user-role">
+                        <option value="user">User</option>
+                        <option value="admin">Admin</option>
+                      </select>
+                    </div>
+                  </div>
+                  <div class="pill-row">
+                    <button class="primary" id="create-user-btn">Create User</button>
+                    <button class="ghost" id="cancel-add-user-btn">Cancel</button>
+                  </div>
+                  <div id="create-user-status" class="small" role="status"></div>
+                </div>
+
+                <div class="table-wrapper">
+                  <table class="table" id="users-table">
+                    <thead>
+                      <tr>
+                        <th>Email</th>
+                        <th>Role</th>
+                        <th>Tenant</th>
+                        <th>Created</th>
+                        <th>Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody id="users-table-body">
+                      <tr><td colspan="5" class="empty">Loading users...</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+
+                <!-- Adapters List -->
+                <div class="divider"></div>
+                <h3>Adapters</h3>
+                <p class="subtext">Active LoRA adapters in the system.</p>
+
+                <div class="pill-row mb-12">
+                  <button class="ghost" id="refresh-adapters-btn">Refresh</button>
+                </div>
+
+                <div class="table-wrapper">
+                  <table class="table" id="adapters-table">
+                    <thead>
+                      <tr>
+                        <th>ID</th>
+                        <th>User</th>
+                        <th>Cluster</th>
+                        <th>Model</th>
+                        <th>Created</th>
+                      </tr>
+                    </thead>
+                    <tbody id="adapters-table-body">
+                      <tr><td colspan="5" class="empty">Loading adapters...</td></tr>
+                    </tbody>
+                  </table>
+                </div>
+
+                <!-- Storage Objects -->
+                <div class="divider"></div>
+                <h3>Storage Objects</h3>
+                <p class="subtext">Files and objects stored in the system.</p>
+
+                <div class="pill-row mb-12">
+                  <button class="ghost" id="refresh-objects-btn">Refresh</button>
+                </div>
+
+                <div class="table-wrapper">
+                  <table class="table" id="objects-table">
+                    <thead>
+                      <tr>
+                        <th>Key</th>
+                        <th>Bucket</th>
+                        <th>Size</th>
+                        <th>Type</th>
+                        <th>Created</th>
+                      </tr>
+                    </thead>
+                    <tbody id="objects-table-body">
+                      <tr><td colspan="5" class="empty">Loading objects...</td></tr>
+                    </tbody>
+                  </table>
+                </div>
               </div>
             </div>
           </section>

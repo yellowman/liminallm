@@ -576,6 +576,117 @@ const logout = async () => {
 };
 
 // =============================================================================
+// OAuth
+// =============================================================================
+
+const startOAuth = async (provider) => {
+  const oauthStatus = $('oauth-status');
+  const btn = $(`oauth-${provider}`);
+
+  try {
+    if (btn) btn.disabled = true;
+    if (oauthStatus) oauthStatus.textContent = `Connecting to ${provider}...`;
+
+    const tenant = $('tenant')?.value?.trim() || undefined;
+    const redirectUri = window.location.origin + window.location.pathname;
+
+    const envelope = await requestEnvelope(
+      `${apiBase}/auth/oauth/${provider}/start`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          redirect_uri: redirectUri,
+          tenant_id: tenant,
+        }),
+      },
+      `Failed to start ${provider} login`
+    );
+
+    const authUrl = envelope.data?.authorization_url;
+    if (authUrl) {
+      // Store the state for callback verification
+      sessionStorage.setItem('oauth_state', envelope.data?.state || '');
+      sessionStorage.setItem('oauth_provider', provider);
+      // Redirect to OAuth provider
+      window.location.href = authUrl;
+    } else {
+      if (oauthStatus) oauthStatus.textContent = 'No authorization URL returned';
+    }
+  } catch (err) {
+    if (oauthStatus) oauthStatus.textContent = err.message;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+};
+
+const handleOAuthCallback = async () => {
+  // Check if this is an OAuth callback
+  const urlParams = new URLSearchParams(window.location.search);
+  const code = urlParams.get('code');
+  const state = urlParams.get('state');
+  const provider = urlParams.get('provider') || sessionStorage.getItem('oauth_provider');
+
+  if (!code || !state || !provider) {
+    return false;
+  }
+
+  const oauthStatus = $('oauth-status');
+  const storedState = sessionStorage.getItem('oauth_state');
+
+  // Verify state matches
+  if (storedState && state !== storedState) {
+    if (oauthStatus) oauthStatus.textContent = 'OAuth state mismatch. Please try again.';
+    sessionStorage.removeItem('oauth_state');
+    sessionStorage.removeItem('oauth_provider');
+    return true;
+  }
+
+  try {
+    if (oauthStatus) oauthStatus.textContent = 'Completing sign in...';
+
+    const tenant = $('tenant')?.value?.trim() || undefined;
+
+    const envelope = await requestEnvelope(
+      `${apiBase}/auth/oauth/${provider}/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`,
+      {
+        method: 'GET',
+        headers: { 'Content-Type': 'application/json' },
+      },
+      `OAuth callback failed`
+    );
+
+    // Clear OAuth session data
+    sessionStorage.removeItem('oauth_state');
+    sessionStorage.removeItem('oauth_provider');
+
+    // Clear URL params
+    window.history.replaceState({}, document.title, window.location.pathname);
+
+    if (envelope.data?.access_token) {
+      persistAuth(envelope.data);
+      showStatus('Signed in with ' + provider);
+
+      // Load initial data
+      await Promise.all([
+        fetchConversations(),
+        fetchContexts(),
+        fetchArtifacts(),
+        fetchHealth(),
+      ]);
+    } else {
+      if (oauthStatus) oauthStatus.textContent = 'OAuth completed but no token received';
+    }
+  } catch (err) {
+    if (oauthStatus) oauthStatus.textContent = err.message;
+    sessionStorage.removeItem('oauth_state');
+    sessionStorage.removeItem('oauth_provider');
+  }
+
+  return true;
+};
+
+// =============================================================================
 // Signup
 // =============================================================================
 
@@ -1408,6 +1519,118 @@ const selectContext = async (contextId) => {
   } catch (err) {
     details.innerHTML = `<div class="empty">Error loading context: ${escapeHtml(err.message)}</div>`;
   }
+
+  // Also load sources for this context
+  await fetchContextSources(contextId);
+
+  // Show the add source section
+  const addSourceSection = $('add-source-section');
+  if (addSourceSection) addSourceSection.classList.remove('hidden');
+};
+
+// =============================================================================
+// Context Sources
+// =============================================================================
+
+const fetchContextSources = async (contextId) => {
+  const sourcesList = $('context-sources-list');
+  if (!sourcesList) return;
+
+  if (!contextId) {
+    sourcesList.innerHTML = '<div class="empty">Select a context to view sources</div>';
+    return;
+  }
+
+  try {
+    sourcesList.innerHTML = '<div class="empty">Loading sources...</div>';
+
+    const envelope = await requestEnvelope(
+      `${apiBase}/contexts/${contextId}/sources`,
+      { headers: headers() },
+      'Failed to load sources'
+    );
+
+    const sources = envelope.data?.items || [];
+    renderContextSources(sources);
+  } catch (err) {
+    sourcesList.innerHTML = `<div class="empty">Error: ${escapeHtml(err.message)}</div>`;
+  }
+};
+
+const renderContextSources = (sources) => {
+  const sourcesList = $('context-sources-list');
+  if (!sourcesList) return;
+
+  if (!sources.length) {
+    sourcesList.innerHTML = '<div class="empty">No sources added yet</div>';
+    return;
+  }
+
+  sourcesList.innerHTML = sources
+    .map((s) => {
+      const date = s.created_at ? new Date(s.created_at).toLocaleDateString() : '-';
+      return `
+        <div class="source-item">
+          <div class="source-path monospace">${escapeHtml(s.fs_path || s.path || '-')}</div>
+          <div class="source-meta">
+            <span>${s.recursive ? 'Recursive' : 'Single file'}</span>
+            <span>Added ${date}</span>
+          </div>
+        </div>
+      `;
+    })
+    .join('');
+};
+
+const addContextSource = async (event) => {
+  event.preventDefault();
+
+  if (!state.selectedContext) {
+    const statusEl = $('add-source-status');
+    if (statusEl) statusEl.textContent = 'No context selected';
+    return;
+  }
+
+  const pathEl = $('source-path');
+  const recursiveEl = $('source-recursive');
+  const statusEl = $('add-source-status');
+  const submitBtn = $('add-source-btn');
+
+  const fsPath = pathEl?.value?.trim();
+  const recursive = recursiveEl?.checked ?? true;
+
+  if (!fsPath) {
+    if (statusEl) statusEl.textContent = 'Path is required';
+    return;
+  }
+
+  try {
+    toggleButtonBusy(submitBtn, true, 'Adding...');
+    if (statusEl) statusEl.textContent = '';
+
+    await requestEnvelope(
+      `${apiBase}/contexts/${state.selectedContext.id}/sources`,
+      {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ fs_path: fsPath, recursive }),
+      },
+      'Failed to add source'
+    );
+
+    if (statusEl) statusEl.textContent = 'Source added and ingested!';
+    if (pathEl) pathEl.value = '';
+
+    // Reload sources
+    await fetchContextSources(state.selectedContext.id);
+
+    // Also reload the context details to update chunk count
+    await selectContext(state.selectedContext.id);
+  } catch (err) {
+    if (statusEl) statusEl.textContent = err.message;
+  } finally {
+    toggleButtonBusy(submitBtn, false);
+  }
 };
 
 const createContext = async () => {
@@ -2059,7 +2282,262 @@ const renderAdminSettingsSection = () => {
   }
   if (state.role === 'admin') {
     fetchAdminSettings();
+    fetchAdminUsers();
+    fetchAdminAdapters();
+    fetchAdminObjects();
   }
+};
+
+// =============================================================================
+// Admin Users Management
+// =============================================================================
+
+const fetchAdminUsers = async () => {
+  if (state.role !== 'admin') return;
+
+  const tbody = $('users-table-body');
+  if (tbody) tbody.innerHTML = '<tr><td colspan="5" class="empty">Loading users...</td></tr>';
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/admin/users`,
+      { headers: authHeaders() },
+      'Failed to load users'
+    );
+
+    const users = envelope.data?.items || [];
+    renderAdminUsers(users);
+  } catch (err) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="5" class="empty">Error: ${escapeHtml(err.message)}</td></tr>`;
+  }
+};
+
+const renderAdminUsers = (users) => {
+  const tbody = $('users-table-body');
+  if (!tbody) return;
+
+  if (!users.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">No users found</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = users
+    .map((user) => {
+      const created = user.created_at ? new Date(user.created_at).toLocaleDateString() : '-';
+      const isSelf = user.id === state.userId;
+      return `
+        <tr data-user-id="${escapeHtml(user.id)}">
+          <td>${escapeHtml(user.email || '-')}</td>
+          <td>
+            <select class="user-role-select" ${isSelf ? 'disabled title="Cannot change own role"' : ''}>
+              <option value="user" ${user.role === 'user' ? 'selected' : ''}>User</option>
+              <option value="admin" ${user.role === 'admin' ? 'selected' : ''}>Admin</option>
+            </select>
+          </td>
+          <td class="monospace">${escapeHtml(user.tenant_id || 'default')}</td>
+          <td>${escapeHtml(created)}</td>
+          <td>
+            <button class="ghost delete-user-btn" ${isSelf ? 'disabled title="Cannot delete self"' : ''}>Delete</button>
+          </td>
+        </tr>
+      `;
+    })
+    .join('');
+
+  // Add event listeners for role changes
+  tbody.querySelectorAll('.user-role-select').forEach((select) => {
+    select.addEventListener('change', async (e) => {
+      const row = e.target.closest('tr');
+      const userId = row?.dataset.userId;
+      const newRole = e.target.value;
+      if (userId) await changeUserRole(userId, newRole);
+    });
+  });
+
+  // Add event listeners for delete buttons
+  tbody.querySelectorAll('.delete-user-btn').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      const row = e.target.closest('tr');
+      const userId = row?.dataset.userId;
+      if (userId && confirm('Are you sure you want to delete this user?')) {
+        await deleteUser(userId);
+      }
+    });
+  });
+};
+
+const createAdminUser = async () => {
+  const statusEl = $('create-user-status');
+  const email = $('new-user-email')?.value?.trim();
+  const password = $('new-user-password')?.value;
+  const role = $('new-user-role')?.value || 'user';
+
+  if (!email || !password) {
+    if (statusEl) statusEl.textContent = 'Email and password are required';
+    return;
+  }
+
+  try {
+    if (statusEl) statusEl.textContent = 'Creating user...';
+
+    await requestEnvelope(
+      `${apiBase}/admin/users`,
+      {
+        method: 'POST',
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email, password, role }),
+      },
+      'Failed to create user'
+    );
+
+    if (statusEl) statusEl.textContent = 'User created successfully';
+    $('new-user-email').value = '';
+    $('new-user-password').value = '';
+    $('new-user-role').value = 'user';
+    $('add-user-form-section')?.classList.add('hidden');
+
+    fetchAdminUsers();
+  } catch (err) {
+    if (statusEl) statusEl.textContent = `Error: ${err.message}`;
+  }
+};
+
+const changeUserRole = async (userId, newRole) => {
+  try {
+    await requestEnvelope(
+      `${apiBase}/admin/users/${userId}/role`,
+      {
+        method: 'POST',
+        headers: { ...authHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ role: newRole }),
+      },
+      'Failed to change user role'
+    );
+
+    fetchAdminUsers();
+  } catch (err) {
+    alert(`Failed to change role: ${err.message}`);
+    fetchAdminUsers();
+  }
+};
+
+const deleteUser = async (userId) => {
+  try {
+    await requestEnvelope(
+      `${apiBase}/admin/users/${userId}`,
+      { method: 'DELETE', headers: authHeaders() },
+      'Failed to delete user'
+    );
+
+    fetchAdminUsers();
+  } catch (err) {
+    alert(`Failed to delete user: ${err.message}`);
+  }
+};
+
+// =============================================================================
+// Admin Adapters List
+// =============================================================================
+
+const fetchAdminAdapters = async () => {
+  if (state.role !== 'admin') return;
+
+  const tbody = $('adapters-table-body');
+  if (tbody) tbody.innerHTML = '<tr><td colspan="5" class="empty">Loading adapters...</td></tr>';
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/admin/adapters`,
+      { headers: authHeaders() },
+      'Failed to load adapters'
+    );
+
+    const adapters = envelope.data?.items || [];
+    renderAdminAdapters(adapters);
+  } catch (err) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="5" class="empty">Error: ${escapeHtml(err.message)}</td></tr>`;
+  }
+};
+
+const renderAdminAdapters = (adapters) => {
+  const tbody = $('adapters-table-body');
+  if (!tbody) return;
+
+  if (!adapters.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">No adapters found</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = adapters
+    .map((adapter) => {
+      const created = adapter.created_at ? new Date(adapter.created_at).toLocaleDateString() : '-';
+      return `
+        <tr>
+          <td class="monospace">${escapeHtml(adapter.id?.slice(0, 8) || '-')}...</td>
+          <td class="monospace">${escapeHtml(adapter.user_id?.slice(0, 8) || '-')}...</td>
+          <td class="monospace">${escapeHtml(adapter.cluster_id?.slice(0, 8) || '-')}...</td>
+          <td>${escapeHtml(adapter.base_model_id || '-')}</td>
+          <td>${escapeHtml(created)}</td>
+        </tr>
+      `;
+    })
+    .join('');
+};
+
+// =============================================================================
+// Admin Storage Objects
+// =============================================================================
+
+const fetchAdminObjects = async () => {
+  if (state.role !== 'admin') return;
+
+  const tbody = $('objects-table-body');
+  if (tbody) tbody.innerHTML = '<tr><td colspan="5" class="empty">Loading objects...</td></tr>';
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/admin/objects`,
+      { headers: authHeaders() },
+      'Failed to load objects'
+    );
+
+    const objects = envelope.data?.items || [];
+    renderAdminObjects(objects);
+  } catch (err) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="5" class="empty">Error: ${escapeHtml(err.message)}</td></tr>`;
+  }
+};
+
+const renderAdminObjects = (objects) => {
+  const tbody = $('objects-table-body');
+  if (!tbody) return;
+
+  if (!objects.length) {
+    tbody.innerHTML = '<tr><td colspan="5" class="empty">No storage objects found</td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = objects
+    .map((obj) => {
+      const created = obj.created_at ? new Date(obj.created_at).toLocaleDateString() : '-';
+      const sizeDisplay = obj.size_bytes
+        ? obj.size_bytes > 1024 * 1024
+          ? `${(obj.size_bytes / (1024 * 1024)).toFixed(1)} MB`
+          : obj.size_bytes > 1024
+          ? `${(obj.size_bytes / 1024).toFixed(1)} KB`
+          : `${obj.size_bytes} B`
+        : '-';
+      return `
+        <tr>
+          <td class="monospace">${escapeHtml(obj.key || obj.object_key || '-')}</td>
+          <td>${escapeHtml(obj.bucket || obj.bucket_name || 'default')}</td>
+          <td>${escapeHtml(sizeDisplay)}</td>
+          <td>${escapeHtml(obj.content_type || obj.mime_type || '-')}</td>
+          <td>${escapeHtml(created)}</td>
+        </tr>
+      `;
+    })
+    .join('');
 };
 
 // =============================================================================
@@ -2441,6 +2919,11 @@ const initEventListeners = () => {
 
   // Password reset
   $('reset-request-form')?.addEventListener('submit', handleResetRequest);
+
+  // OAuth
+  $('oauth-google')?.addEventListener('click', () => startOAuth('google'));
+  $('oauth-github')?.addEventListener('click', () => startOAuth('github'));
+  $('oauth-microsoft')?.addEventListener('click', () => startOAuth('microsoft'));
   $('reset-confirm-form')?.addEventListener('submit', handleResetConfirm);
 
   // Chat
@@ -2461,6 +2944,7 @@ const initEventListeners = () => {
   // Contexts
   $('create-context-btn')?.addEventListener('click', createContext);
   $('refresh-contexts')?.addEventListener('click', fetchContexts);
+  $('add-source-form')?.addEventListener('submit', addContextSource);
 
   // Artifacts
   $('refresh-artifacts')?.addEventListener('click', fetchArtifacts);
@@ -2485,6 +2969,21 @@ const initEventListeners = () => {
   // Admin settings
   $('save-admin-settings-btn')?.addEventListener('click', saveAdminSettings);
   $('reload-admin-settings-btn')?.addEventListener('click', fetchAdminSettings);
+
+  // Admin users management
+  $('refresh-users-btn')?.addEventListener('click', fetchAdminUsers);
+  $('show-add-user-btn')?.addEventListener('click', () => {
+    $('add-user-form-section')?.classList.remove('hidden');
+  });
+  $('cancel-add-user-btn')?.addEventListener('click', () => {
+    $('add-user-form-section')?.classList.add('hidden');
+    $('create-user-status').textContent = '';
+  });
+  $('create-user-btn')?.addEventListener('click', createAdminUser);
+
+  // Admin adapters and objects
+  $('refresh-adapters-btn')?.addEventListener('click', fetchAdminAdapters);
+  $('refresh-objects-btn')?.addEventListener('click', fetchAdminObjects);
 };
 
 // =============================================================================
@@ -2499,6 +2998,14 @@ const init = async () => {
   updateDraftIndicator();
   renderPreferencePanel();
   renderUploadHint();
+
+  // Handle OAuth callback if present
+  const isOAuthCallback = await handleOAuthCallback();
+  if (isOAuthCallback) {
+    // OAuth callback was handled, UI already updated
+    updateEmptyState();
+    return;
+  }
 
   // Load draft for current conversation
   const messageInput = $('message-input');

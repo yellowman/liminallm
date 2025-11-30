@@ -866,6 +866,40 @@ button.minor:hover {
   color: var(--text-muted);
 }
 
+/* Context sources */
+.context-sources {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.source-item {
+  padding: 12px 14px;
+  background: var(--panel-muted);
+  border-radius: 8px;
+  border-left: 3px solid var(--accent);
+}
+
+.source-path {
+  font-weight: 600;
+  font-size: 13px;
+  word-break: break-all;
+  margin-bottom: 6px;
+}
+
+.source-meta {
+  display: flex;
+  gap: 12px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.source-meta span {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
 /* Artifacts list */
 .artifacts-list .artifact-row {
   cursor: pointer;
@@ -1063,6 +1097,64 @@ button.minor:hover {
 
 .link-btn:hover {
   color: var(--accent-strong);
+}
+
+/* OAuth buttons */
+.oauth-divider {
+  display: flex;
+  align-items: center;
+  margin: 20px 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.oauth-divider::before,
+.oauth-divider::after {
+  content: '';
+  flex: 1;
+  border-top: 1px solid var(--border);
+}
+
+.oauth-divider span {
+  padding: 0 12px;
+}
+
+.oauth-buttons {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.oauth-btn {
+  flex: 1;
+  min-width: 100px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.2s ease;
+}
+
+.oauth-btn:hover {
+  background: var(--panel-muted);
+  border-color: var(--accent);
+}
+
+.oauth-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.oauth-btn svg {
+  flex-shrink: 0;
 }
 
 /* Tools list */
@@ -1372,6 +1464,31 @@ button.minor:hover {
 .form-group .small {
   margin-top: 4px;
   display: block;
+}
+
+/* Admin tables */
+.user-role-select {
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.user-role-select:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.delete-user-btn {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.delete-user-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
 }
 
 /* Responsive */
