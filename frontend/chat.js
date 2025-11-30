@@ -1401,14 +1401,14 @@ const sendMessage = async (event) => {
 
   /**
    * SPEC §18: Streaming WebSocket chat with token events.
-   * Handles events: token, trace, message_done, error, cancel_ack
+   * Handles events: token, trace, message_done, streaming_complete, error, cancel_ack
    */
   const chatViaWebSocketStreaming = async () => {
     const ws = await ensureWebSocket();
     return new Promise((resolve, reject) => {
       let settled = false;
       let streamingMsg = null;
-      let finalData = null;
+      let messageDoneData = null;
 
       const cleanup = () => {
         ws.removeEventListener('message', handleMessage);
@@ -1439,24 +1439,22 @@ const sendMessage = async (event) => {
                 break;
 
               case 'message_done':
-                // Streaming complete
-                settled = true;
-                cleanup();
+                // Streaming visually complete, but wait for streaming_complete for IDs
+                messageDoneData = msg.data || {};
                 if (streamingMsg) {
-                  const adapters = (msg.data?.adapters || []).map(a => a?.name || a?.id || a).filter(Boolean);
+                  const adapters = (messageDoneData.adapters || []).map(a => a?.name || a?.id || a).filter(Boolean);
                   streamingMsg.finalize(adapters.length ? `Adapters: ${adapters.join(', ')}` : '');
                 }
-                resolve(msg.data || {});
+                // Don't resolve yet - wait for streaming_complete with message_id
                 break;
 
               case 'streaming_complete':
                 // Final event with message_id and conversation_id after DB save
-                if (!settled) {
-                  settled = true;
-                  cleanup();
-                  finalData = msg.data || {};
-                  resolve(finalData);
-                }
+                settled = true;
+                cleanup();
+                // Merge with any data from message_done
+                const finalData = { ...messageDoneData, ...(msg.data || {}) };
+                resolve(finalData);
                 break;
 
               case 'error':
@@ -1512,8 +1510,14 @@ const sendMessage = async (event) => {
         if (!settled) {
           settled = true;
           cleanup();
-          if (streamingMsg) streamingMsg.finalize('Connection closed');
-          reject(new Error('Connection closed'));
+          // If we got message_done but not streaming_complete, resolve with what we have
+          if (messageDoneData) {
+            if (streamingMsg) streamingMsg.finalize('');
+            resolve(messageDoneData);
+          } else {
+            if (streamingMsg) streamingMsg.finalize('Connection closed');
+            reject(new Error('Connection closed'));
+          }
         }
       };
 
