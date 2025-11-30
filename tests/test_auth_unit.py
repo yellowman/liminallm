@@ -37,7 +37,7 @@ def memory_store(tmp_path):
 @pytest.fixture
 def auth_service(memory_store, settings):
     """Create auth service for testing."""
-    return AuthService(store=memory_store, settings=settings)
+    return AuthService(store=memory_store, cache=None, settings=settings)
 
 
 @pytest.fixture

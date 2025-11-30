@@ -143,7 +143,7 @@ class TestUserOperations:
 
     def test_update_user_role(self, memory_store, test_user):
         """Test updating user role."""
-        updated = memory_store.update_user(test_user.id, role="admin")
+        updated = memory_store.update_user_role(test_user.id, role="admin")
 
         assert updated is not None
         assert updated.role == "admin"
@@ -219,19 +219,23 @@ class TestContextOperations:
 
     def test_create_context(self, memory_store, test_user):
         """Test context creation."""
-        ctx = memory_store.create_context(
-            test_user.id,
+        ctx = memory_store.upsert_context(
+            owner_user_id=test_user.id,
             name="My Knowledge",
             description="Test context",
         )
 
         assert ctx.id is not None
         assert ctx.name == "My Knowledge"
-        assert ctx.user_id == test_user.id
+        assert ctx.owner_user_id == test_user.id
 
     def test_get_context(self, memory_store, test_user):
         """Test getting context by ID."""
-        ctx = memory_store.create_context(test_user.id, name="Test")
+        ctx = memory_store.upsert_context(
+            owner_user_id=test_user.id,
+            name="Test",
+            description="Test description",
+        )
 
         fetched = memory_store.get_context(ctx.id)
 
@@ -240,8 +244,8 @@ class TestContextOperations:
 
     def test_list_contexts_for_user(self, memory_store, test_user):
         """Test listing user's contexts."""
-        memory_store.create_context(test_user.id, name="Context 1")
-        memory_store.create_context(test_user.id, name="Context 2")
+        memory_store.upsert_context(owner_user_id=test_user.id, name="Context 1", description="Desc 1")
+        memory_store.upsert_context(owner_user_id=test_user.id, name="Context 2", description="Desc 2")
 
         contexts = memory_store.list_contexts(test_user.id)
 
@@ -249,7 +253,7 @@ class TestContextOperations:
 
     def test_delete_context(self, memory_store, test_user):
         """Test deleting context."""
-        ctx = memory_store.create_context(test_user.id, name="To Delete")
+        ctx = memory_store.upsert_context(owner_user_id=test_user.id, name="To Delete", description="Will be deleted")
 
         memory_store.delete_context(ctx.id)
 
@@ -262,10 +266,10 @@ class TestArtifactOperations:
     def test_create_artifact(self, memory_store, test_user):
         """Test artifact creation."""
         artifact = memory_store.create_artifact(
+            type_="workflow",
             name="Test Artifact",
-            artifact_type="workflow",
             schema={"kind": "workflow.chat"},
-            owner_id=test_user.id,
+            owner_user_id=test_user.id,
         )
 
         assert artifact.id is not None
@@ -275,10 +279,10 @@ class TestArtifactOperations:
     def test_get_artifact(self, memory_store, test_user):
         """Test getting artifact by ID."""
         artifact = memory_store.create_artifact(
+            type_="tool",
             name="Test",
-            artifact_type="tool",
             schema={"kind": "tool.spec"},
-            owner_id=test_user.id,
+            owner_user_id=test_user.id,
         )
 
         fetched = memory_store.get_artifact(artifact.id)
@@ -289,16 +293,16 @@ class TestArtifactOperations:
     def test_list_artifacts_by_type(self, memory_store, test_user):
         """Test listing artifacts filtered by type."""
         memory_store.create_artifact(
+            type_="workflow",
             name="Workflow 1",
-            artifact_type="workflow",
             schema={"kind": "workflow.chat"},
-            owner_id=test_user.id,
+            owner_user_id=test_user.id,
         )
         memory_store.create_artifact(
+            type_="tool",
             name="Tool 1",
-            artifact_type="tool",
             schema={"kind": "tool.spec"},
-            owner_id=test_user.id,
+            owner_user_id=test_user.id,
         )
 
         workflows = memory_store.list_artifacts(type_filter="workflow")
@@ -310,10 +314,10 @@ class TestArtifactOperations:
     def test_update_artifact(self, memory_store, test_user):
         """Test updating artifact schema."""
         artifact = memory_store.create_artifact(
+            type_="workflow",
             name="Updateable",
-            artifact_type="workflow",
             schema={"kind": "workflow.chat", "version": 1},
-            owner_id=test_user.id,
+            owner_user_id=test_user.id,
         )
 
         new_schema = {"kind": "workflow.chat", "version": 2}
@@ -324,10 +328,10 @@ class TestArtifactOperations:
     def test_list_artifact_versions(self, memory_store, test_user):
         """Test listing artifact versions."""
         artifact = memory_store.create_artifact(
+            type_="workflow",
             name="Versioned",
-            artifact_type="workflow",
             schema={"version": 1},
-            owner_id=test_user.id,
+            owner_user_id=test_user.id,
         )
         memory_store.update_artifact(artifact.id, {"version": 2})
         memory_store.update_artifact(artifact.id, {"version": 3})

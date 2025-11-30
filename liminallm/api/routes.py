@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path as FilePath
 from typing import Any, Dict, Optional
 from uuid import uuid4
@@ -489,13 +489,17 @@ def _generate_conversation_title(message: str, max_length: int = 50) -> str:
 def _apply_session_cookies(
     response: Response, session: Session, tokens: dict, *, refresh_ttl_minutes: int
 ) -> None:
+    # Convert naive datetime to UTC-aware for cookie expiration
+    expires_at = session.expires_at
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
     response.set_cookie(
         "session_id",
         session.id,
         httponly=True,
         secure=True,
         samesite="lax",
-        expires=session.expires_at,
+        expires=expires_at,
         path="/",
     )
     refresh_token = tokens.get("refresh_token")

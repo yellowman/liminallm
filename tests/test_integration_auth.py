@@ -43,7 +43,7 @@ class TestSignupFlow:
             json={"email": test_user_email, "password": test_user_password},
         )
 
-        assert response.status_code == 200
+        assert response.status_code == 201  # Resource created
         data = response.json()
         assert data["status"] == "ok"
         assert "user_id" in data["data"]
