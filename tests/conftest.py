@@ -11,6 +11,10 @@ os.environ.setdefault("SHARED_FS_ROOT", _test_tmp_dir)
 os.environ.setdefault("TEST_MODE", "true")
 os.environ.setdefault("USE_MEMORY_STORE", "true")
 os.environ.setdefault("ALLOW_REDIS_FALLBACK_DEV", "true")
+os.environ.setdefault("JWT_SECRET", "test-secret-key-for-testing-only-do-not-use-in-production")
+# Disable Redis in tests - use in-memory rate limiting and caching instead
+# This avoids async event loop issues between test runs
+os.environ.setdefault("REDIS_URL", "")
 
 import pytest  # noqa: E402
 from fastapi.dependencies import utils as fastapi_dep_utils  # noqa: E402

@@ -170,8 +170,25 @@ def get_runtime() -> Runtime:
 
 def reset_runtime_for_tests() -> Runtime:
     """Reinitialize the runtime singleton for isolated test runs."""
+    import asyncio
 
     global runtime
+
+    # Close existing Redis connections to avoid event loop issues
+    if runtime is not None and runtime.cache is not None:
+        try:
+            # Try to get the running event loop
+            try:
+                loop = asyncio.get_running_loop()
+                # If we're in an async context, create a task
+                loop.create_task(runtime.cache.close())
+            except RuntimeError:
+                # No running loop - create a new one to close connections
+                asyncio.run(runtime.cache.close())
+        except Exception:
+            # Ignore errors during cleanup - connection may already be closed
+            pass
+
     reset_settings_cache()
     settings = get_settings()
     if not settings.test_mode:

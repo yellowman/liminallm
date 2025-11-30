@@ -211,6 +211,11 @@ class RedisCache:
             f"idemp:{route}:{user_id}:{key}", json.dumps(record), ex=ttl_seconds
         )
 
+    async def close(self) -> None:
+        """Close Redis connection pool. Call when shutting down or resetting runtime."""
+        await self.client.close()
+        await self.client.connection_pool.disconnect()
+
     async def delete_workflow_state(self, state_key: str) -> None:
         """Delete workflow state from cache during rollback or cleanup."""
         await self.client.delete(f"workflow:state:{state_key}")
