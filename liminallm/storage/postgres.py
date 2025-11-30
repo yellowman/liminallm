@@ -1330,13 +1330,23 @@ class PostgresStore:
             conn.execute("DELETE FROM auth_session WHERE id = %s", (session_id,))
         self._evict_session(session_id)
 
-    def revoke_user_sessions(self, user_id: str) -> None:
+    def revoke_user_sessions(
+        self, user_id: str, except_session_id: Optional[str] = None
+    ) -> None:
         with self._connect() as conn:
-            conn.execute("DELETE FROM auth_session WHERE user_id = %s", (user_id,))
+            if except_session_id:
+                conn.execute(
+                    "DELETE FROM auth_session WHERE user_id = %s AND id != %s",
+                    (user_id, except_session_id),
+                )
+            else:
+                conn.execute("DELETE FROM auth_session WHERE user_id = %s", (user_id,))
         # Thread-safe iteration over session cache per SPEC §18
         with self._session_lock:
             stale_ids = [
-                sid for sid, sess in self.sessions.items() if sess.user_id == user_id
+                sid
+                for sid, sess in self.sessions.items()
+                if sess.user_id == user_id and sid != except_session_id
             ]
             for sid in stale_ids:
                 self.sessions.pop(sid, None)

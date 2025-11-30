@@ -502,9 +502,15 @@ class MemoryStore:
             self.sessions.pop(session_id, None)
             self._persist_state()
 
-    def revoke_user_sessions(self, user_id: str) -> None:
+    def revoke_user_sessions(
+        self, user_id: str, except_session_id: Optional[str] = None
+    ) -> None:
         with self._data_lock:
-            stale = [sid for sid, sess in self.sessions.items() if sess.user_id == user_id]
+            stale = [
+                sid
+                for sid, sess in self.sessions.items()
+                if sess.user_id == user_id and sid != except_session_id
+            ]
             for sid in stale:
                 self.sessions.pop(sid, None)
             if stale:
