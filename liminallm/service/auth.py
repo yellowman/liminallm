@@ -777,6 +777,11 @@ class AuthService:
         except (InvalidHash, VerifyMismatchError):
             return False
 
+    def save_password(self, user_id: str, password: str) -> None:
+        """Hash and save a new password for a user."""
+        pwd_hash, algo = self._hash_password(password)
+        self.store.save_password(user_id, pwd_hash, algo)
+
     def _verify_totp(
         self, secret: str, code: str, *, window: int = 1, interval: int = 30
     ) -> bool:
