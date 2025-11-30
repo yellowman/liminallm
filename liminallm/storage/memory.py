@@ -1341,6 +1341,16 @@ class MemoryStore:
             all_sources.extend(sources)
         return all_sources
 
+    def delete_context_source(self, source_id: str) -> bool:
+        """Delete a context source by ID. Returns True if deleted."""
+        for ctx_id, sources in self.context_sources.items():
+            for i, src in enumerate(sources):
+                if src.id == source_id:
+                    del sources[i]
+                    self._persist_state()
+                    return True
+        return False
+
     def add_chunks(self, context_id: str, chunks: Iterable[KnowledgeChunk]) -> None:
         if context_id not in self.contexts:
             raise ConstraintViolation("context not found", {"context_id": context_id})

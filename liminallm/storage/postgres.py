@@ -2341,6 +2341,14 @@ class PostgresStore:
             for row in rows
         ]
 
+    def delete_context_source(self, source_id: str) -> bool:
+        """Delete a context source by ID. Returns True if deleted."""
+        with self._connect() as conn:
+            result = conn.execute(
+                "DELETE FROM context_source WHERE id = %s", (source_id,)
+            )
+            return result.rowcount > 0
+
     def add_chunks(self, context_id: str, chunks: Iterable[KnowledgeChunk]) -> None:
         try:
             with self._connect() as conn:
