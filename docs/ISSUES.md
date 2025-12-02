@@ -1,7 +1,7 @@
 # Codebase Issues and Security Audit
 
 **Last Updated:** 2025-12-02
-**Scope:** Comprehensive review against SPEC.md requirements (3rd pass)
+**Scope:** Comprehensive review against SPEC.md requirements (4th pass)
 
 ---
 
@@ -26,10 +26,18 @@ This document consolidates findings from deep analysis of the liminallm codebase
 - Clusterer and skill discovery
 - Redis usage and memory persistence
 - Database schema
+- Race conditions and concurrency bugs (4th pass)
+- Error handling and partial failures (4th pass)
+- Transaction safety and atomicity (4th pass)
+- Cache invalidation and consistency (4th pass)
+- Resource cleanup and memory management (4th pass)
+- Edge cases handling (4th pass)
+- Pagination and large payload handling (4th pass)
+- State machine consistency (4th pass)
 
-**Critical Issues Found:** 38
-**High Priority Issues:** 23
-**Medium Priority Issues:** 18
+**Critical Issues Found:** 53
+**High Priority Issues:** 35
+**Medium Priority Issues:** 26
 
 ---
 
@@ -589,9 +597,513 @@ Target assistant message included in prompt, violating SFT principles.
 
 ---
 
-## 19. Previously Resolved Issues
+## 19. Race Conditions and Concurrency Bugs (4th Pass)
 
-### 19.1 Session Exception Parameter (FIXED)
+### 19.1 CRITICAL: OAuth State TOCTOU Vulnerability
+
+**Location:** `liminallm/storage/redis_cache.py:374-380`
+
+```python
+async def pop_oauth_state(self, state_key: str) -> Optional[dict]:
+    data = await self.get(f"oauth:{state_key}")  # Read
+    if data:
+        await self.delete(f"oauth:{state_key}")  # Delete
+    return data
+```
+
+**Issue:** Time-of-check-to-time-of-use race condition. Two concurrent callbacks with same state can both pass validation before either deletes. This enables OAuth replay attacks.
+
+**Fix:** Use Redis atomic GETDEL operation or Lua script for atomic get-and-delete.
+
+### 19.2 CRITICAL: MemoryStore Reads Without Lock
+
+**Location:** `liminallm/storage/memory.py:557-565, 1041-1042, 786-787`
+
+Multiple read methods access shared state dictionaries without acquiring `_data_lock`:
+- `get_session()` reads `self._sessions` directly
+- `get_user()` reads `self._users` without lock
+- `list_conversations()` iterates `self._conversations`
+
+**Impact:** Concurrent reads during writes can see partial/inconsistent data.
+
+**Fix:** Wrap all read operations in `async with self._data_lock:` blocks.
+
+### 19.3 CRITICAL: MFA Lockout Check-Then-Act Race
+
+**Location:** `liminallm/service/auth.py:744-763`
+
+```python
+failures = await self.cache.get_mfa_failures(user_id)
+if failures >= self.max_mfa_attempts:
+    # ... lockout logic
+await self.cache.increment_mfa_failures(user_id)
+```
+
+**Issue:** Attacker can flood concurrent TOTP attempts. Each request reads failures=N, all pass check, all increment. Can exceed lockout threshold significantly.
+
+**Fix:** Use atomic Redis INCR with conditional check in Lua script.
+
+### 19.4 CRITICAL: Idempotency Check-Then-Set Race
+
+**Location:** `liminallm/api/routes.py:272-312`
+
+```python
+existing = await store.get_idempotency_record(key)
+if existing:
+    return existing.response
+# ... process request
+await store.set_idempotency_record(key, response)
+```
+
+**Issue:** Two concurrent requests with same idempotency key both see no existing record, both process, potentially creating duplicates.
+
+**Fix:** Use atomic SETNX pattern or database advisory lock.
+
+### 19.5 CRITICAL: Artifact Version Race Condition
+
+**Location:** `liminallm/storage/postgres.py:1814-1818`
+
+```python
+result = await conn.fetchrow(
+    "SELECT COALESCE(MAX(version), 0) + 1 FROM artifact_versions WHERE artifact_id = $1",
+    artifact_id
+)
+next_version = result[0]
+# ... insert with next_version
+```
+
+**Issue:** Two concurrent version creates both get same max, both insert same version number.
+
+**Fix:** Use `SELECT ... FOR UPDATE` or auto-incrementing version column.
+
+### 19.6 HIGH: Workflow Executor Thread Safety
+
+**Location:** `liminallm/service/workflow.py:122, 428-600`
+
+The shared `_executor` ThreadPoolExecutor is accessed by multiple async coroutines without synchronization. Additionally, `workflow_traces` and `context_lists` grow unbounded during execution.
+
+**Impact:** Memory leaks and potential thread contention under high concurrency.
+
+### 19.7 HIGH: Session Token Generation Race
+
+**Location:** `liminallm/service/auth.py:533-563`
+
+Token generation uses `secrets.token_urlsafe()` which is thread-safe, but session creation is not atomic. Two concurrent logins could theoretically create duplicate sessions.
+
+### 19.8 MEDIUM: Router Last-Used State Race
+
+**Location:** `liminallm/service/router.py:81`
+
+`_last_used` dictionary updated without synchronization in async context.
+
+---
+
+## 20. Error Handling and Partial Failures (4th Pass)
+
+### 20.1 CRITICAL: Swallowed Exceptions with Bare Pass
+
+**Location:** Multiple files
+
+```python
+# liminallm/service/workflow.py:1580
+except Exception:
+    pass  # Tool cleanup failures silently ignored
+
+# liminallm/storage/memory.py:1540
+except Exception:
+    pass  # Persistence failures silently lost
+```
+
+**Impact:** Data loss and silent failures make debugging impossible.
+
+**Fix:** Log exceptions at minimum; propagate critical failures.
+
+### 20.2 CRITICAL: Training Job Multi-Step Without Rollback
+
+**Location:** `liminallm/service/training.py:259-380`
+
+Training jobs perform multiple database operations:
+1. Update job status to "running"
+2. Generate dataset
+3. Train model
+4. Save artifacts
+5. Update job status to "completed"
+
+**Issue:** Failure at step 3 or 4 leaves job in "running" state forever with orphaned artifacts.
+
+**Fix:** Implement saga pattern or compensating transactions.
+
+### 20.3 HIGH: Unprotected File Operations
+
+**Location:** `liminallm/service/training.py:684-690`
+
+```python
+os.symlink(source, dest)  # No try/except
+```
+
+Symlink operations can fail (permissions, existing file, invalid path) without error handling.
+
+### 20.4 HIGH: WebSocket Send Without Error Handling
+
+**Location:** `liminallm/api/routes.py:2954-2980`
+
+```python
+await websocket.send_json(event)  # Can raise WebSocketDisconnect
+```
+
+WebSocket send failures not caught individually, can terminate entire stream prematurely.
+
+### 20.5 HIGH: Database Connection Errors Not Retried
+
+**Location:** `liminallm/storage/postgres.py` (throughout)
+
+Database operations fail immediately on connection errors without retry logic.
+
+### 20.6 MEDIUM: Redis GET Returns None vs Missing Key
+
+**Location:** `liminallm/storage/redis_cache.py:102-115`
+
+No distinction between "key exists with None value" and "key does not exist".
+
+---
+
+## 21. Transaction Safety and Atomicity (4th Pass)
+
+### 21.1 CRITICAL: Session Revocation Cache-DB Desync
+
+**Location:** `liminallm/storage/postgres.py:1333-1352`
+
+```python
+async def revoke_all_user_sessions(...):
+    # Delete from database
+    await conn.execute("DELETE FROM sessions WHERE user_id = $1 ...")
+    # Then invalidate cache
+    await self._invalidate_session_cache(user_id)
+```
+
+**Issue:** If cache invalidation fails, DB shows no sessions but cache still has valid session tokens.
+
+**Fix:** Use transaction with cache update in finally block, or two-phase approach.
+
+### 21.2 CRITICAL: Config Patch Apply Not Atomic
+
+**Location:** `liminallm/service/config_ops.py:89-99`
+
+Applying a config patch involves multiple operations (validation, application, status update) without transaction wrapping.
+
+### 21.3 HIGH: Artifact Create With Versions Not Atomic
+
+**Location:** `liminallm/storage/postgres.py:1780-1830`
+
+Creating artifact and first version are separate operations. Failure after artifact create leaves orphan.
+
+### 21.4 HIGH: User Create With Settings Not Atomic
+
+**Location:** `liminallm/storage/postgres.py:188-220`
+
+User and initial settings created separately without transaction.
+
+### 21.5 MEDIUM: Conversation Delete Leaves Orphan Messages
+
+If message deletion fails partway through, conversation deleted but messages remain.
+
+---
+
+## 22. Cache Invalidation and Consistency (4th Pass)
+
+### 22.1 CRITICAL: User Role Changes Not Invalidating Session Cache
+
+**Location:** `liminallm/service/auth.py`, `liminallm/storage/redis_cache.py`
+
+When user role/permissions change, existing cached sessions retain old permissions until TTL expires.
+
+**Impact:** Privilege escalation window - demoted admin retains powers for cache TTL duration.
+
+**Fix:** Invalidate all user sessions on permission change, or include version in session token.
+
+### 22.2 CRITICAL: Missing tenant_id in Cache Keys
+
+**Location:** `liminallm/storage/redis_cache.py:194`, `liminallm/service/router.py:81`
+
+```python
+f"router:last:{user_id}"  # Missing tenant_id
+f"idemp:{key}"            # Missing tenant_id
+```
+
+**Impact:** Cross-tenant cache pollution in multi-tenant deployment.
+
+**Fix:** Include tenant_id in all cache key prefixes.
+
+### 22.3 CRITICAL: Password Reset Wrong Cache Key Format
+
+**Location:** `liminallm/service/auth.py:632`
+
+```python
+f"user_sessions:{user_id}"  # Key pattern never created
+```
+
+**Issue:** Password reset attempts to invalidate sessions using wrong key pattern. Sessions not actually invalidated.
+
+### 22.4 HIGH: Artifact Update Cache Invalidation Missing
+
+**Location:** `liminallm/storage/postgres.py:1850-1890`
+
+Artifact updates don't invalidate any caches. Stale artifact data served until TTL.
+
+### 22.5 HIGH: Rate Limit Counter Not Tenant-Isolated
+
+**Location:** `liminallm/storage/redis_cache.py:42-73`
+
+Rate limit keys don't include tenant_id, allowing cross-tenant rate limit exhaustion.
+
+### 22.6 MEDIUM: Conversation Cache TTL Mismatch
+
+Conversation cached with 5m TTL but messages cached with 1m TTL. Can serve stale message counts.
+
+---
+
+## 23. Resource Cleanup and Memory Management (4th Pass)
+
+### 23.1 CRITICAL: ThreadPoolExecutor Relies on __del__
+
+**Location:** `liminallm/service/workflow.py:1869-1873`
+
+```python
+def __del__(self):
+    if self._executor:
+        self._executor.shutdown(wait=False)
+```
+
+**Issue:** `__del__` not guaranteed to run. Executor threads can leak on ungraceful shutdown.
+
+**Fix:** Implement explicit cleanup method called during app shutdown.
+
+### 23.2 CRITICAL: Unbounded _active_requests Dictionary
+
+**Location:** `liminallm/api/routes.py:112-125`
+
+```python
+_active_requests: Dict[str, RequestState] = {}
+```
+
+**Issue:** Entries added on request start, removed on completion. Network disconnects or crashes leave orphan entries that grow unbounded.
+
+**Fix:** Add TTL-based cleanup or use WeakValueDictionary.
+
+### 23.3 HIGH: WebSocket Listener Not Cleaned Up
+
+**Location:** `liminallm/api/routes.py:2852-3100`
+
+WebSocket handlers don't always clean up listener tasks on disconnect. Task references leak.
+
+### 23.4 HIGH: Workflow Trace Accumulation
+
+**Location:** `liminallm/service/workflow.py:428-600`
+
+```python
+workflow_traces.append(trace)  # Never truncated during execution
+```
+
+Long-running workflows accumulate unbounded trace data in memory.
+
+### 23.5 MEDIUM: Database Connection Pool Not Monitored
+
+No metrics or alerts for connection pool exhaustion. Silent failures under load.
+
+### 23.6 MEDIUM: File Handle Leaks in Training
+
+**Location:** `liminallm/training/dataset.py`
+
+Some file operations don't use context managers, risking handle leaks.
+
+---
+
+## 24. Edge Cases: Null/Empty/Encoding/Timezone (4th Pass)
+
+### 24.1 CRITICAL: Naive vs Aware Datetime Mixing
+
+**Location:** `liminallm/service/auth.py:1016`, `liminallm/storage/postgres.py` (multiple)
+
+```python
+expires_at = datetime.utcnow() + timedelta(...)  # Naive datetime
+```
+
+**Issue:** Mixing naive and timezone-aware datetimes causes comparison errors and incorrect expiry calculations.
+
+**Fix:** Use `datetime.now(timezone.utc)` consistently throughout.
+
+### 24.2 HIGH: Unsafe .get() Without None Handling
+
+**Location:** Multiple files
+
+```python
+value = data.get("field")
+value.strip()  # AttributeError if None
+```
+
+Many `.get()` calls followed by method calls without None checks.
+
+### 24.3 HIGH: Float Conversion Without Error Handling
+
+**Location:** `liminallm/service/router.py:145-160`
+
+```python
+score = float(raw_score)  # Can raise ValueError
+```
+
+Score conversions can fail on invalid input without try/except.
+
+### 24.4 MEDIUM: Empty String vs None Inconsistency
+
+**Location:** `liminallm/storage/memory.py`, `liminallm/storage/postgres.py`
+
+Some methods treat empty string as falsy (skip), others store it. Behavior differs between backends.
+
+### 24.5 MEDIUM: Unicode Normalization Missing
+
+**Location:** `liminallm/service/rag.py:200-250`
+
+Text ingestion doesn't normalize Unicode. Same text with different normalization forms treated as different.
+
+### 24.6 MEDIUM: Locale-Dependent String Operations
+
+**Location:** `liminallm/service/clustering.py:150-180`
+
+`.lower()` and similar operations are locale-dependent, can give inconsistent results.
+
+---
+
+## 25. Pagination and Large Payload Handling (4th Pass)
+
+### 25.1 CRITICAL: list_preference_events No LIMIT Clause
+
+**Location:** `liminallm/storage/postgres.py:370-413`
+
+```python
+SELECT * FROM preference_events WHERE user_id = $1
+```
+
+**Issue:** No LIMIT clause. Users with many events exhaust memory/timeout.
+
+**Fix:** Add mandatory pagination with max page size.
+
+### 25.2 CRITICAL: Chat Loads All Messages Unbounded
+
+**Location:** `liminallm/api/routes.py:1462-1466`
+
+```python
+messages = await store.list_messages(conversation_id)  # All messages
+```
+
+**Issue:** Conversations with thousands of messages loaded entirely into memory.
+
+**Fix:** Implement cursor-based pagination for messages.
+
+### 25.3 CRITICAL: search_chunks Loads All Before Scoring
+
+**Location:** `liminallm/storage/postgres.py:2400-2450`
+
+```python
+# Load all matching chunks
+chunks = await conn.fetch("SELECT * FROM chunks WHERE context_id = $1", ...)
+# Then score in Python
+scored = [(score(c), c) for c in chunks]
+```
+
+**Issue:** Large contexts load all chunks into memory before filtering.
+
+**Fix:** Use database-side scoring and LIMIT.
+
+### 25.4 HIGH: Artifact List No Default Limit
+
+**Location:** `liminallm/storage/postgres.py:1700-1750`
+
+`list_artifacts()` accepts optional limit but defaults to unlimited.
+
+### 25.5 HIGH: Webhook Payload Size Unbounded
+
+**Location:** `liminallm/service/webhooks.py`
+
+Webhook payloads can be arbitrarily large. No truncation before sending.
+
+### 25.6 MEDIUM: Offset Pagination Inefficient for Large Datasets
+
+**Location:** Multiple endpoints
+
+Using `OFFSET` for pagination. Performance degrades linearly with page number.
+
+**Fix:** Implement keyset/cursor pagination.
+
+---
+
+## 26. State Machine Consistency (4th Pass)
+
+### 26.1 CRITICAL: Config Patch Apply Bypasses Approval Check
+
+**Location:** `liminallm/service/config_ops.py:89-99`
+
+```python
+async def apply_patch(self, patch_id: str):
+    patch = await self.store.get_config_patch(patch_id)
+    # BUG: No check that patch.status == "approved"
+    await self._apply_operations(patch.operations)
+    patch.status = "applied"
+```
+
+**Issue:** Anyone can apply a patch regardless of approval status. Skips entire approval workflow.
+
+**Fix:** Add status validation: `if patch.status != "approved": raise ValidationError`
+
+### 26.2 CRITICAL: Training Job Concurrent Processing Race
+
+**Location:** `liminallm/service/training.py:200-260`
+
+```python
+job = await store.get_training_job(job_id)
+if job.status == "queued":
+    job.status = "running"
+    await store.update_training_job(job)
+    # ... process
+```
+
+**Issue:** Two workers can both see status="queued", both set to "running", both process same job.
+
+**Fix:** Use atomic status transition with WHERE clause: `UPDATE ... SET status='running' WHERE status='queued' RETURNING *`
+
+### 26.3 HIGH: No Visibility Transition Guards
+
+**Location:** `liminallm/storage/postgres.py:1850-1890`
+
+Artifact visibility can be changed from any state to any state. No validation of valid transitions (e.g., preventing `global` → `private` once shared).
+
+### 26.4 HIGH: Conversation Status Inconsistent
+
+**Location:** `liminallm/storage/postgres.py:1200-1250`
+
+Conversations have `status` field but no state machine. Can jump between `active`, `archived`, `deleted` arbitrarily.
+
+### 26.5 HIGH: decide_patch Doesn't Check Current Status
+
+**Location:** `liminallm/service/config_ops.py:55-73`
+
+```python
+async def decide_patch(self, patch_id: str, approved: bool):
+    patch = await self.store.get_config_patch(patch_id)
+    # BUG: No check that patch.status == "pending"
+    patch.status = "approved" if approved else "rejected"
+```
+
+**Issue:** Can approve/reject already-applied patches.
+
+### 26.6 MEDIUM: Message Edit Allows Status Change
+
+Messages can be edited to change their status field directly, bypassing any workflow.
+
+---
+
+## 27. Previously Resolved Issues
+
+### 27.1 Session Exception Parameter (FIXED)
 
 **Commit:** 3beddff
 
@@ -601,7 +1113,7 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 
 ## Summary by Severity
 
-### Critical (38 Issues)
+### Critical (53 Issues)
 
 | # | Issue | Location |
 |---|-------|----------|
@@ -638,8 +1150,28 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 | 31 | No deduplication in training dataset | training/dataset.py |
 | 32 | SFT prompt includes target message | training/sft.py |
 | 33 | Frontend expects non-spec streaming_complete | chat.js:1484 |
+| 34 | OAuth state TOCTOU vulnerability | redis_cache.py:374-380 |
+| 35 | MemoryStore reads without lock | memory.py:557-565 |
+| 36 | MFA lockout check-then-act race | auth.py:744-763 |
+| 37 | Idempotency check-then-set race | routes.py:272-312 |
+| 38 | Artifact version race condition | postgres.py:1814-1818 |
+| 39 | Swallowed exceptions with bare pass | workflow.py, memory.py |
+| 40 | Training job multi-step without rollback | training.py:259-380 |
+| 41 | Session revocation cache-DB desync | postgres.py:1333-1352 |
+| 42 | Config patch apply not atomic | config_ops.py:89-99 |
+| 43 | User role changes not invalidating cache | auth.py, redis_cache.py |
+| 44 | Missing tenant_id in cache keys | redis_cache.py:194, router.py:81 |
+| 45 | Password reset wrong cache key format | auth.py:632 |
+| 46 | ThreadPoolExecutor relies on __del__ | workflow.py:1869-1873 |
+| 47 | Unbounded _active_requests dictionary | routes.py:112-125 |
+| 48 | Naive vs aware datetime mixing | auth.py:1016, postgres.py |
+| 49 | list_preference_events no LIMIT | postgres.py:370-413 |
+| 50 | Chat loads all messages unbounded | routes.py:1462-1466 |
+| 51 | search_chunks loads all before scoring | postgres.py:2400-2450 |
+| 52 | Config patch apply bypasses approval | config_ops.py:89-99 |
+| 53 | Training job concurrent processing race | training.py:200-260 |
 
-### High Priority (23 Issues)
+### High Priority (35 Issues)
 
 | # | Issue | Location |
 |---|-------|----------|
@@ -666,8 +1198,20 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 | 21 | WebSocket event name mismatch | chat.js:1484 |
 | 22 | Context window overflow not handled | llm.py |
 | 23 | Password reset cache dependency | auth.py:775-810 |
+| 24 | Workflow executor thread safety | workflow.py:122, 428-600 |
+| 25 | Session token generation race | auth.py:533-563 |
+| 26 | Unprotected file operations | training.py:684-690 |
+| 27 | WebSocket send without error handling | routes.py:2954-2980 |
+| 28 | Database connection errors not retried | postgres.py |
+| 29 | Artifact create with versions not atomic | postgres.py:1780-1830 |
+| 30 | User create with settings not atomic | postgres.py:188-220 |
+| 31 | Artifact update cache invalidation missing | postgres.py:1850-1890 |
+| 32 | Rate limit counter not tenant-isolated | redis_cache.py:42-73 |
+| 33 | WebSocket listener not cleaned up | routes.py:2852-3100 |
+| 34 | Workflow trace accumulation | workflow.py:428-600 |
+| 35 | Unsafe .get() without None handling | Multiple files |
 
-### Medium Priority (18 Issues)
+### Medium Priority (26 Issues)
 
 | # | Issue | Location |
 |---|-------|----------|
@@ -689,6 +1233,14 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 | 16 | RagMode enum missing LOCAL_HYBRID | config.py:37-41 |
 | 17 | Undocumented API endpoints | SPEC.md vs frontend |
 | 18 | Pagination default inconsistency | routes.py:2539 |
+| 19 | Router last-used state race | router.py:81 |
+| 20 | Redis GET None vs missing key | redis_cache.py:102-115 |
+| 21 | Conversation delete leaves orphan messages | postgres.py |
+| 22 | Conversation cache TTL mismatch | redis_cache.py |
+| 23 | Database connection pool not monitored | postgres.py |
+| 24 | File handle leaks in training | training/dataset.py |
+| 25 | Float conversion without error handling | router.py:145-160 |
+| 26 | Empty string vs None inconsistency | memory.py, postgres.py |
 
 ---
 
@@ -703,6 +1255,9 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 5. **Training Pipeline**: Fix SFT to exclude target from prompt; add deduplication
 6. **MFA Lockout**: Add in-memory fallback using _mfa_challenges dict
 7. **Concurrency Caps**: Implement 3 workflow / 2 inference limits with 409 responses
+8. **OAuth TOCTOU**: Use atomic GETDEL for OAuth state validation
+9. **Cache Tenant Isolation**: Add tenant_id prefix to all cache keys
+10. **State Machine Guards**: Add status checks in config_ops apply/decide methods
 
 ### Session Management Actions
 
@@ -710,6 +1265,7 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 2. Add single-session mode enforcement
 3. Add access token denylist on logout
 4. Implement X-Session header for WebSockets
+5. Invalidate sessions on permission/role changes
 
 ### File Service Actions
 
@@ -725,6 +1281,8 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 2. Add missing serialization methods
 3. Add NOT NULL constraints to schema
 4. Add performance indexes
+5. Add MemoryStore read locks for concurrent access safety
+6. Use SELECT FOR UPDATE for version number generation
 
 ### Clustering/Training Actions
 
@@ -733,9 +1291,39 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 3. Implement adapter pruning/merging
 4. Add periodic clustering batch job
 5. Update adapter_router_state after training
+6. Add saga pattern/rollback for multi-step training jobs
+
+### Race Condition Fixes (4th Pass)
+
+1. **Idempotency**: Use SETNX pattern for idempotency records
+2. **Artifact Versions**: Use auto-increment or SELECT FOR UPDATE
+3. **MFA Lockout**: Use atomic INCR with conditional check in Lua
+4. **Training Jobs**: Atomic status transitions with WHERE clause
+
+### Error Handling Improvements (4th Pass)
+
+1. Replace bare `except: pass` with logged exceptions
+2. Add retry logic for transient database errors
+3. Wrap WebSocket sends in try/except
+4. Add file operation error handling in training
+
+### Resource Cleanup Actions (4th Pass)
+
+1. Implement explicit cleanup method for ThreadPoolExecutor
+2. Add TTL-based cleanup for _active_requests dictionary
+3. Clean up WebSocket listener tasks on disconnect
+4. Bound workflow trace accumulation during execution
+
+### Pagination Actions (4th Pass)
+
+1. Add mandatory LIMIT to list_preference_events
+2. Implement cursor-based pagination for messages
+3. Use database-side scoring for chunk search
+4. Add default limits to all list endpoints
 
 ### Documentation Actions
 
 1. Update SPEC.md to document all endpoints used by frontend
 2. Document router "closest" selection algorithm
 3. Document cache requirements for auth features
+4. Document datetime handling (always use timezone-aware)
