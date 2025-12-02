@@ -42,9 +42,10 @@ This document consolidates findings from deep analysis of the liminallm codebase
 - Async/await anti-patterns (5th pass)
 - Frontend-backend contract mismatches (5th pass)
 
-**Critical Issues Found:** 66
+**Critical Issues Found:** 63 (3 reclassified after verification)
 **High Priority Issues:** 52
-**Medium Priority Issues:** 34
+**Medium Priority Issues:** 33 (1 reclassified after verification)
+**False Positives Identified:** 4 (Issues 19.1, 33.2, 33.4, 33.5)
 
 ---
 
@@ -606,34 +607,50 @@ Target assistant message included in prompt, violating SFT principles.
 
 ## 19. Race Conditions and Concurrency Bugs (4th Pass)
 
-### 19.1 CRITICAL: OAuth State TOCTOU Vulnerability
+### 19.1 ~~CRITICAL: OAuth State TOCTOU Vulnerability~~ (FALSE POSITIVE - VERIFIED SAFE)
 
-**Location:** `liminallm/storage/redis_cache.py:374-380`
+**Location:** `liminallm/storage/redis_cache.py:143-189`
+
+**Original Claim:** TOCTOU race condition in OAuth state handling.
+
+**Verification Result:** The actual implementation at lines 143-189 correctly uses atomic operations:
 
 ```python
-async def pop_oauth_state(self, state_key: str) -> Optional[dict]:
-    data = await self.get(f"oauth:{state_key}")  # Read
-    if data:
-        await self.delete(f"oauth:{state_key}")  # Delete
-    return data
+async def pop_oauth_state(self, state: str) -> Optional[tuple[str, datetime, Optional[str]]]:
+    """Atomically get and delete OAuth state to prevent replay attacks."""
+    key = f"auth:oauth:{state}"
+    # Try GETDEL first (Redis 6.2+) for atomic get-and-delete
+    try:
+        cached = await self.client.getdel(key)
+    except AttributeError:
+        # Fallback: use Lua script for atomicity
+        lua_script = """
+        local value = redis.call('GET', KEYS[1])
+        if value then redis.call('DEL', KEYS[1]) end
+        return value
+        """
+        cached = await self.client.eval(lua_script, 1, key)
 ```
 
-**Issue:** Time-of-check-to-time-of-use race condition. Two concurrent callbacks with same state can both pass validation before either deletes. This enables OAuth replay attacks.
+**Status:** No vulnerability exists. Code uses atomic GETDEL or Lua script.
 
-**Fix:** Use Redis atomic GETDEL operation or Lua script for atomic get-and-delete.
+### 19.2 HIGH: MemoryStore Reads Without Lock (PARTIALLY CORRECTED)
 
-### 19.2 CRITICAL: MemoryStore Reads Without Lock
+**Location:** `liminallm/storage/memory.py:557-565, 786-787, 997-1002, 1041-1042`
 
-**Location:** `liminallm/storage/memory.py:557-565, 1041-1042, 786-787`
+**Verification Result:** Some claims were false positives:
+- ~~`get_session()`~~ - DOES use lock (line 487-489) ✓
+- ~~`get_user()`~~ - DOES use lock (line 281-283) ✓
 
-Multiple read methods access shared state dictionaries without acquiring `_data_lock`:
-- `get_session()` reads `self._sessions` directly
-- `get_user()` reads `self._users` without lock
-- `list_conversations()` iterates `self._conversations`
+**Confirmed issues (TRUE POSITIVES):**
+- `get_conversation()` at lines 557-565 - NO lock
+- `get_artifact()` at lines 1041-1042 - NO lock
+- `get_semantic_cluster()` at lines 786-787 - NO lock
+- `list_conversations()` at lines 997-1002 - NO lock
 
-**Impact:** Concurrent reads during writes can see partial/inconsistent data.
+**Impact:** Concurrent reads during writes can see partial/inconsistent data for conversations, artifacts, and clusters.
 
-**Fix:** Wrap all read operations in `async with self._data_lock:` blocks.
+**Fix:** Wrap remaining unprotected read operations in `with self._data_lock:` blocks.
 
 ### 19.3 CRITICAL: MFA Lockout Check-Then-Act Race
 
@@ -1398,13 +1415,15 @@ Backend provides: Citations embedded in `content_struct.segments` as type="citat
 
 **Impact:** Citations never display in UI.
 
-### 33.2 CRITICAL: WebSocket tenant_id From Message Body
+### 33.2 ~~CRITICAL: WebSocket tenant_id From Message Body~~ (FALSE POSITIVE - VERIFIED SAFE)
 
 **Location:** `chat.js:1571` vs `routes.py:2862-2872`
 
-Frontend sends `tenant_id` in WebSocket message body. REST endpoints use `X-Tenant-ID` header.
+**Original Claim:** Backend accepts tenant_id from WebSocket message body.
 
-**Security:** Per CLAUDE.md, tenant_id should be from JWT, not user input.
+**Verification Result:** While frontend DOES send `tenant_id` in the message body, the backend correctly IGNORES it. The backend uses `auth_ctx.tenant_id` derived from the authenticated JWT token (routes.py:2947), not from `init.get("tenant_id")`.
+
+**Status:** Backend implementation follows CLAUDE.md security guideline. Frontend sends unnecessary data that is properly ignored.
 
 ### 33.3 HIGH: Pagination Response Ignored
 
@@ -1414,22 +1433,38 @@ Backend returns `has_next`, `next_page`, `total_count` but frontend ignores pagi
 
 **Impact:** Users can only see first 50 conversations.
 
-### 33.4 HIGH: Admin.js Error Extraction Wrong Path
+### 33.4 ~~HIGH: Admin.js Error Extraction Wrong Path~~ (FALSE POSITIVE - VERIFIED CORRECT)
 
 **Location:** `admin.js:141-147`
 
+**Original Claim:** Error extraction uses wrong path.
+
+**Verification Result:** The actual code handles multiple fallback paths correctly:
+
 ```javascript
-const detail = payload?.detail || payload?.error || payload;
-// Should be: payload?.error?.message
+const extractError = (payload, fallback) => {
+  const detail = payload?.detail || payload?.error || payload;
+  if (typeof detail === 'string') return detail.trim() || fallback;
+  if (detail?.message) return detail.message;
+  if (detail?.error?.message) return detail.error.message;  // Line 145 - handles nested path
+  return fallback;
+};
 ```
 
-**Impact:** Admin console shows raw error objects instead of messages.
+**Status:** Error extraction is properly implemented with multiple fallback paths.
 
-### 33.5 MEDIUM: VoiceSynthesis audio_path Fallback Missing
+### 33.5 ~~MEDIUM: VoiceSynthesis audio_path Fallback Missing~~ (FALSE POSITIVE - VERIFIED CORRECT)
 
 **Location:** `chat.js:2200` vs `routes.py:2827-2852`
 
-Frontend only checks `audio_url`, ignoring `audio_path` fallback. Voice synthesis may fail unnecessarily.
+**Original Claim:** Frontend should fallback to `audio_path` when `audio_url` missing.
+
+**Verification Result:**
+1. Backend ALWAYS returns `audio_url` (relative URL for browser fetch)
+2. `audio_path` is a server filesystem path, NOT usable by browser
+3. Frontend correctly checks `audio_url` and has browser speech synthesis fallback
+
+**Status:** Implementation is correct. Using `audio_path` as fallback would not work since it's a filesystem path.
 
 ---
 
@@ -1445,7 +1480,7 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 
 ## Summary by Severity
 
-### Critical (66 Issues)
+### Critical (63 Issues) - After False Positive Verification
 
 | # | Issue | Location |
 |---|-------|----------|
@@ -1482,8 +1517,8 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 | 31 | No deduplication in training dataset | training/dataset.py |
 | 32 | SFT prompt includes target message | training/sft.py |
 | 33 | Frontend expects non-spec streaming_complete | chat.js:1484 |
-| 34 | OAuth state TOCTOU vulnerability | redis_cache.py:374-380 |
-| 35 | MemoryStore reads without lock | memory.py:557-565 |
+| ~~34~~ | ~~OAuth state TOCTOU vulnerability~~ | **FALSE POSITIVE** - Uses atomic GETDEL/Lua |
+| ~~35~~ | ~~MemoryStore reads without lock~~ | **DOWNGRADED to HIGH** - Only some methods |
 | 36 | MFA lockout check-then-act race | auth.py:744-763 |
 | 37 | Idempotency check-then-set race | routes.py:272-312 |
 | 38 | Artifact version race condition | postgres.py:1814-1818 |
@@ -1510,9 +1545,9 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 | 59 | list_artifacts missing global items | routes.py:1684-1690 |
 | 60 | Blocking tool execution in async context | workflow.py:1110, 1547 |
 | 61 | content_struct.citations field mismatch | chat.js:1415 vs content_struct.py |
-| 62 | WebSocket tenant_id from message body | chat.js:1571 vs routes.py:2862 |
+| ~~62~~ | ~~WebSocket tenant_id from message body~~ | **FALSE POSITIVE** - Backend ignores it |
 
-### High Priority (52 Issues)
+### High Priority (52 Issues) - After False Positive Verification
 
 | # | Issue | Location |
 |---|-------|----------|
@@ -1567,9 +1602,10 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 | 49 | Fire-and-forget cache close task | runtime.py:190 |
 | 50 | Blocking file I/O in async upload | routes.py:2417 |
 | 51 | Pagination response ignored by frontend | chat.js:1016 |
-| 52 | Admin.js error extraction wrong path | admin.js:141-147 |
+| ~~52~~ | ~~Admin.js error extraction wrong path~~ | **FALSE POSITIVE** - Handles multiple paths |
+| 53 | MemoryStore reads without lock (partial) | memory.py:557-565, 786-787, 1041 |
 
-### Medium Priority (34 Issues)
+### Medium Priority (33 Issues) - After False Positive Verification
 
 | # | Issue | Location |
 |---|-------|----------|
@@ -1604,7 +1640,7 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 | 29 | Optional config dependencies not validated | config.py (OAuth, SMTP) |
 | 30 | Chat endpoint minimal logging | routes.py:1336-1468 |
 | 31 | Global training job limit missing | training.py:419-428 |
-| 32 | VoiceSynthesis audio_path fallback missing | chat.js:2200 |
+| ~~32~~ | ~~VoiceSynthesis audio_path fallback missing~~ | **FALSE POSITIVE** - audio_url always provided |
 | 33 | Adapter max policy-based not hardcapped | router.py:404-420 |
 | 34 | Expression length limits missing | workflow.py:1846-1867 |
 
@@ -1621,7 +1657,7 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 5. **Training Pipeline**: Fix SFT to exclude target from prompt; add deduplication
 6. **MFA Lockout**: Add in-memory fallback using _mfa_challenges dict
 7. **Concurrency Caps**: Implement 3 workflow / 2 inference limits with 409 responses
-8. **OAuth TOCTOU**: Use atomic GETDEL for OAuth state validation
+8. ~~**OAuth TOCTOU**: Use atomic GETDEL for OAuth state validation~~ - **FALSE POSITIVE** (already uses atomic ops)
 9. **Cache Tenant Isolation**: Add tenant_id prefix to all cache keys
 10. **State Machine Guards**: Add status checks in config_ops apply/decide methods
 
@@ -1733,6 +1769,6 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 ### Frontend Contract Actions (5th Pass)
 
 1. **Fix Citations**: Extract from content_struct.segments, not top-level citations
-2. **Fix Tenant ID**: Derive from JWT in WebSocket, not message body
+2. ~~**Fix Tenant ID**: Derive from JWT in WebSocket, not message body~~ - **FALSE POSITIVE** (already correct)
 3. **Implement Pagination**: Use has_next/next_page in frontend list views
-4. **Fix Error Extraction**: Use payload.error.message in admin.js
+4. ~~**Fix Error Extraction**: Use payload.error.message in admin.js~~ - **FALSE POSITIVE** (already handles multiple paths)
