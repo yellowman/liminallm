@@ -1,7 +1,7 @@
 # Codebase Issues and Security Audit
 
 **Last Updated:** 2025-12-02
-**Scope:** Comprehensive review against SPEC.md requirements (4th pass)
+**Scope:** Comprehensive review against SPEC.md requirements (5th pass)
 
 ---
 
@@ -34,10 +34,17 @@ This document consolidates findings from deep analysis of the liminallm codebase
 - Edge cases handling (4th pass)
 - Pagination and large payload handling (4th pass)
 - State machine consistency (4th pass)
+- API contract validation (5th pass)
+- Service initialization issues (5th pass)
+- Configuration validation (5th pass)
+- Logging and observability gaps (5th pass)
+- Business logic constraints (5th pass)
+- Async/await anti-patterns (5th pass)
+- Frontend-backend contract mismatches (5th pass)
 
-**Critical Issues Found:** 53
-**High Priority Issues:** 35
-**Medium Priority Issues:** 26
+**Critical Issues Found:** 66
+**High Priority Issues:** 52
+**Medium Priority Issues:** 34
 
 ---
 
@@ -1101,9 +1108,334 @@ Messages can be edited to change their status field directly, bypassing any work
 
 ---
 
-## 27. Previously Resolved Issues
+## 27. API Contract Validation (5th Pass)
 
-### 27.1 Session Exception Parameter (FIXED)
+### 27.1 HIGH: Missing Path Parameter Validators
+
+**Location:** `liminallm/api/routes.py` (multiple endpoints)
+
+Multiple endpoints lack proper `Path(...)` validators on path parameters:
+- `/conversations/{conversation_id}/messages` (line 2441)
+- `/admin/users/{user_id}/role` (line 806)
+- `/tools/{tool_id}/invoke` (line 1937)
+- `/artifacts/{artifact_id}` PATCH (line 2058)
+- `/config/patches/{patch_id}/decide` (line 2169)
+
+**Issue:** No length/type validation on path parameters.
+
+**Fix:** Add `Path(..., max_length=255)` validators.
+
+### 27.2 HIGH: ArtifactRequest.type Claimed Optional But Required
+
+**Location:** `liminallm/api/schemas.py:280-284`
+
+```python
+class ArtifactRequest(_SchemaPayload):
+    type: Optional[str] = None  # Claims optional but actually required
+```
+
+**Issue:** Schema says optional but `routes.py:2020` raises error if missing.
+
+### 27.3 MEDIUM: File Limits Response Missing Extensions
+
+**Location:** `liminallm/api/routes.py:2330-2344`
+
+`/files/limits` returns only `max_upload_bytes` but SPEC §17 mentions "allowed extensions from GET /v1/files/limits".
+
+### 27.4 MEDIUM: Schema Validation Not JSON-Serializable Check
+
+**Location:** `liminallm/api/schemas.py:268-277`
+
+`_SchemaPayload.schema_` field accepts any dict without validating JSON serializability.
+
+---
+
+## 28. Service Initialization Issues (5th Pass)
+
+### 28.1 CRITICAL: Thread-Unsafe Singleton in get_runtime()
+
+**Location:** `liminallm/service/runtime.py:164-171`
+
+```python
+def get_runtime() -> Runtime:
+    global runtime
+    if runtime is None:  # TOCTOU race
+        runtime = Runtime()
+    return runtime
+```
+
+**Issue:** Non-atomic check-then-act without locks. Multiple threads can create multiple Runtime instances.
+
+**Impact:** Duplicate database pools, memory leaks, lost state.
+
+### 28.2 CRITICAL: Asyncio Lock at Module Import Time
+
+**Location:** `liminallm/api/routes.py:113`
+
+```python
+_active_requests_lock = asyncio.Lock()  # Created before event loop exists
+```
+
+**Issue:** Lock created during module import, before any event loop. Can cause "No running event loop" errors.
+
+### 28.3 HIGH: Missing Cleanup Hooks for Services
+
+**Location:** Multiple files
+
+- VoiceService has `close()` (voice.py:262) but never called
+- PostgreSQL connection pool never explicitly closed
+- Redis cache connections not cleaned on shutdown
+
+**Impact:** Resource leaks on shutdown.
+
+### 28.4 HIGH: AuthService Mutable State Not Thread-Safe
+
+**Location:** `liminallm/service/auth.py:128-133`
+
+```python
+self._mfa_challenges: dict[str, tuple[str, datetime]] = {}
+self._oauth_states: dict[str, tuple[str, datetime, Optional[str]]] = {}
+```
+
+**Issue:** Multiple unprotected mutable dictionaries accessed concurrently without locks.
+
+### 28.5 HIGH: Config Validation Deferred to Runtime
+
+**Location:** `liminallm/config.py:385-446`
+
+JWT secret generation happens in field validator at first access, not at startup. File system errors occur at first auth request.
+
+---
+
+## 29. Configuration Validation Issues (5th Pass)
+
+### 29.1 CRITICAL: Sensitive Config in Logs
+
+**Location:** `liminallm/service/runtime.py:71`
+
+```python
+logger.warning("redis_disabled_fallback", redis_url=self.settings.redis_url)
+```
+
+**Issue:** Redis URL (may contain password) logged without masking.
+
+### 29.2 CRITICAL: Undocumented Environment Variables
+
+Multiple env vars read directly via `os.getenv()` but not in Settings class:
+- `LOG_LEVEL`, `LOG_JSON`, `LOG_DEV_MODE` (logging.py:98-100)
+- `BUILD_SHA` (app.py:22)
+- `CORS_ALLOW_ORIGINS` (app.py:55)
+- `ENABLE_HSTS` (app.py:123)
+- `MFA_SECRET_KEY` (memory.py:113)
+
+**Impact:** No centralized config discovery or validation.
+
+### 29.3 HIGH: Missing Integer Range Validators
+
+**Location:** `liminallm/config.py:294-341`
+
+12+ config values (rate limits, TTLs, page sizes) have no min/max bounds:
+- `chat_rate_limit_per_minute` - no bounds
+- `training_worker_poll_interval` - `0` would loop infinitely
+- `smtp_port` - no 1-65535 validation
+
+### 29.4 HIGH: Inconsistent Boolean Parsing
+
+**Location:** Multiple files
+
+Boolean env vars parsed inconsistently:
+- `app.py:72`: `flag.lower() in {"1", "true", "yes", "on"}`
+- Pydantic uses stricter parsing
+
+### 29.5 MEDIUM: Optional Config Dependencies Not Validated
+
+OAuth and SMTP configs are optional individually but should require pairs:
+- `oauth_google_client_id` set but not `oauth_google_client_secret`
+- `smtp_host` set but not `smtp_password`
+
+---
+
+## 30. Logging and Observability Gaps (5th Pass)
+
+### 30.1 HIGH: Missing Per-Node Latency in Workflow Traces
+
+**Location:** `liminallm/service/workflow.py:881-882`
+
+**SPEC §15.2 requires:** "workflow traces: per-node latency, retries, timeout counts"
+
+**Current:** Traces only include node ID and result, not latency metrics.
+
+### 30.2 HIGH: Routing/Workflow Trace Functions Never Called
+
+**Location:** `liminallm/logging.py:117-126`
+
+`log_routing_trace()` and `log_workflow_trace()` defined but never used anywhere in codebase.
+
+### 30.3 HIGH: Missing SPEC §15.2 Metrics
+
+**Location:** `liminallm/app.py:263-320`
+
+`/metrics` endpoint missing:
+- Request latency histograms
+- Tokens in/out per call
+- Adapter usage counts & success_score
+- Preference event rates
+- Training job metrics
+
+### 30.4 HIGH: Silent Exception in Auth Cache Clear
+
+**Location:** `liminallm/service/auth.py:633-634`
+
+```python
+except Exception:
+    pass  # NO LOGGING
+```
+
+**Impact:** Redis failures invisible; debugging impossible.
+
+### 30.5 MEDIUM: Chat Endpoint Minimal Logging
+
+**Location:** `liminallm/api/routes.py:1336-1468`
+
+Only 8 logging statements in 3,146 lines. Chat endpoint has no logging of:
+- Request metadata with correlation IDs
+- Token counts
+- Adapter selection decisions
+
+---
+
+## 31. Business Logic Constraint Violations (5th Pass)
+
+### 31.1 CRITICAL: Global Artifacts Inaccessible to Users
+
+**Location:** `liminallm/api/routes.py:414-422`
+
+`_get_owned_artifact()` blocks access to global artifacts (visibility='global') for non-admin users.
+
+**SPEC §12.2 requires:** Global artifacts accessible to all users.
+
+### 31.2 CRITICAL: list_artifacts Missing Global Items
+
+**Location:** `liminallm/api/routes.py:1684-1690`
+
+Query only returns artifacts owned by user, missing global system artifacts.
+
+**Impact:** Users can't discover default workflows, policies, tool specs.
+
+### 31.3 HIGH: RAG Cannot Access Shared Contexts
+
+**Location:** `liminallm/service/rag.py:210, 229`
+
+RAG filters out all contexts not owned by user, preventing shared knowledge base access.
+
+### 31.4 HIGH: File Size Limits Not Plan-Differentiated
+
+**Location:** `liminallm/api/routes.py:2385-2388`
+
+**SPEC §18 requires:** Free: 25MB/file, Paid: 200MB/file
+
+**Current:** Single global `max_upload_bytes` for all plans.
+
+### 31.5 MEDIUM: Global Training Job Limit Missing
+
+**Location:** `liminallm/service/training.py:419-428`
+
+Per-user cooldown enforced but no global concurrency cap. Could exhaust GPU resources.
+
+---
+
+## 32. Async/Await Anti-Patterns (5th Pass)
+
+### 32.1 CRITICAL: Blocking Tool Execution in Async Context
+
+**Location:** `liminallm/service/workflow.py:1110, 1547`
+
+```python
+async def _execute_node_with_retry(...):
+    result = self._execute_node(...)  # Sync call
+
+def _execute_node(...):
+    return future.result(timeout=timeout)  # BLOCKS event loop
+```
+
+**Issue:** Async function calls sync method that blocks on `future.result()` for up to 5 seconds.
+
+**Impact:** Event loop stalls; WebSocket streaming and concurrent operations freeze.
+
+**Fix:** Use `asyncio.to_thread()` for blocking operations.
+
+### 32.2 HIGH: Fire-and-Forget Cache Close Task
+
+**Location:** `liminallm/service/runtime.py:190`
+
+```python
+loop.create_task(runtime.cache.close())  # Task not stored or awaited
+```
+
+**Issue:** Cache close task may not complete before shutdown.
+
+### 32.3 HIGH: Blocking File I/O in Async Upload
+
+**Location:** `liminallm/api/routes.py:2417`
+
+```python
+async def upload_file(...):
+    dest_path.write_bytes(contents)  # Sync file I/O blocks event loop
+```
+
+**Impact:** Large file uploads block all concurrent requests.
+
+---
+
+## 33. Frontend-Backend Contract Mismatches (5th Pass)
+
+### 33.1 CRITICAL: content_struct.citations Field Mismatch
+
+**Location:** Frontend `chat.js:1415` vs Backend `content_struct.py:55-57`
+
+Frontend expects: `data.content_struct.citations` (top-level array)
+Backend provides: Citations embedded in `content_struct.segments` as type="citation"
+
+**Impact:** Citations never display in UI.
+
+### 33.2 CRITICAL: WebSocket tenant_id From Message Body
+
+**Location:** `chat.js:1571` vs `routes.py:2862-2872`
+
+Frontend sends `tenant_id` in WebSocket message body. REST endpoints use `X-Tenant-ID` header.
+
+**Security:** Per CLAUDE.md, tenant_id should be from JWT, not user input.
+
+### 33.3 HIGH: Pagination Response Ignored
+
+**Location:** `chat.js:1016` vs `routes.py:2525-2562`
+
+Backend returns `has_next`, `next_page`, `total_count` but frontend ignores pagination.
+
+**Impact:** Users can only see first 50 conversations.
+
+### 33.4 HIGH: Admin.js Error Extraction Wrong Path
+
+**Location:** `admin.js:141-147`
+
+```javascript
+const detail = payload?.detail || payload?.error || payload;
+// Should be: payload?.error?.message
+```
+
+**Impact:** Admin console shows raw error objects instead of messages.
+
+### 33.5 MEDIUM: VoiceSynthesis audio_path Fallback Missing
+
+**Location:** `chat.js:2200` vs `routes.py:2827-2852`
+
+Frontend only checks `audio_url`, ignoring `audio_path` fallback. Voice synthesis may fail unnecessarily.
+
+---
+
+## 34. Previously Resolved Issues
+
+### 34.1 Session Exception Parameter (FIXED)
 
 **Commit:** 3beddff
 
@@ -1113,7 +1445,7 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 
 ## Summary by Severity
 
-### Critical (53 Issues)
+### Critical (66 Issues)
 
 | # | Issue | Location |
 |---|-------|----------|
@@ -1170,8 +1502,17 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 | 51 | search_chunks loads all before scoring | postgres.py:2400-2450 |
 | 52 | Config patch apply bypasses approval | config_ops.py:89-99 |
 | 53 | Training job concurrent processing race | training.py:200-260 |
+| 54 | Thread-unsafe singleton get_runtime() | runtime.py:164-171 |
+| 55 | Asyncio Lock at module import time | routes.py:113 |
+| 56 | Sensitive config (redis_url) in logs | runtime.py:71 |
+| 57 | Undocumented environment variables | logging.py, app.py |
+| 58 | Global artifacts inaccessible to users | routes.py:414-422 |
+| 59 | list_artifacts missing global items | routes.py:1684-1690 |
+| 60 | Blocking tool execution in async context | workflow.py:1110, 1547 |
+| 61 | content_struct.citations field mismatch | chat.js:1415 vs content_struct.py |
+| 62 | WebSocket tenant_id from message body | chat.js:1571 vs routes.py:2862 |
 
-### High Priority (35 Issues)
+### High Priority (52 Issues)
 
 | # | Issue | Location |
 |---|-------|----------|
@@ -1210,8 +1551,25 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 | 33 | WebSocket listener not cleaned up | routes.py:2852-3100 |
 | 34 | Workflow trace accumulation | workflow.py:428-600 |
 | 35 | Unsafe .get() without None handling | Multiple files |
+| 36 | Missing Path parameter validators | routes.py (multiple) |
+| 37 | ArtifactRequest.type optional but required | schemas.py:280-284 |
+| 38 | Missing cleanup hooks for services | voice.py, postgres.py |
+| 39 | AuthService mutable state not thread-safe | auth.py:128-133 |
+| 40 | Config validation deferred to runtime | config.py:385-446 |
+| 41 | Missing integer range validators | config.py:294-341 |
+| 42 | Inconsistent boolean parsing | app.py, logging.py |
+| 43 | Missing per-node latency in traces | workflow.py:881-882 |
+| 44 | Routing/workflow trace functions unused | logging.py:117-126 |
+| 45 | Missing SPEC §15.2 metrics | app.py:263-320 |
+| 46 | Silent exception in auth cache clear | auth.py:633-634 |
+| 47 | RAG cannot access shared contexts | rag.py:210, 229 |
+| 48 | File size limits not plan-differentiated | routes.py:2385-2388 |
+| 49 | Fire-and-forget cache close task | runtime.py:190 |
+| 50 | Blocking file I/O in async upload | routes.py:2417 |
+| 51 | Pagination response ignored by frontend | chat.js:1016 |
+| 52 | Admin.js error extraction wrong path | admin.js:141-147 |
 
-### Medium Priority (26 Issues)
+### Medium Priority (34 Issues)
 
 | # | Issue | Location |
 |---|-------|----------|
@@ -1241,6 +1599,14 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 | 24 | File handle leaks in training | training/dataset.py |
 | 25 | Float conversion without error handling | router.py:145-160 |
 | 26 | Empty string vs None inconsistency | memory.py, postgres.py |
+| 27 | File limits response missing extensions | routes.py:2330-2344 |
+| 28 | Schema validation not JSON-serializable | schemas.py:268-277 |
+| 29 | Optional config dependencies not validated | config.py (OAuth, SMTP) |
+| 30 | Chat endpoint minimal logging | routes.py:1336-1468 |
+| 31 | Global training job limit missing | training.py:419-428 |
+| 32 | VoiceSynthesis audio_path fallback missing | chat.js:2200 |
+| 33 | Adapter max policy-based not hardcapped | router.py:404-420 |
+| 34 | Expression length limits missing | workflow.py:1846-1867 |
 
 ---
 
@@ -1327,3 +1693,46 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 2. Document router "closest" selection algorithm
 3. Document cache requirements for auth features
 4. Document datetime handling (always use timezone-aware)
+
+### Service Initialization Actions (5th Pass)
+
+1. **Thread-safe Singleton**: Add threading.Lock to get_runtime()
+2. **Lazy Lock Creation**: Create asyncio.Lock lazily, not at module import
+3. **Shutdown Hooks**: Add explicit cleanup in app lifespan for VoiceService, DB pool, Redis
+4. **AuthService Locks**: Add thread locks to mutable state dictionaries
+5. **Early Config Validation**: Validate JWT secret and paths at startup, not first access
+
+### Configuration Actions (5th Pass)
+
+1. **Centralize Config**: Move all os.getenv() calls to Settings class
+2. **Mask Sensitive Logs**: Filter redis_url and other secrets from log output
+3. **Add Range Validators**: Add min/max bounds to all integer config values
+4. **Consistent Boolean Parsing**: Use Pydantic's built-in boolean parsing everywhere
+5. **Validate Config Pairs**: Ensure OAuth and SMTP configs are all-or-nothing
+
+### Observability Actions (5th Pass)
+
+1. **Per-Node Latency**: Add timing to workflow trace for each node execution
+2. **Enable Trace Logging**: Call log_routing_trace() and log_workflow_trace()
+3. **Add SPEC Metrics**: Implement latency, tokens, adapter usage, preference rate metrics
+4. **Log All Exceptions**: Replace bare `except: pass` with logged exceptions
+
+### Business Logic Actions (5th Pass)
+
+1. **Fix Artifact Visibility**: Allow users to access global artifacts
+2. **Fix list_artifacts**: Include global and shared artifacts in listing
+3. **Fix RAG Context Access**: Allow shared context access per visibility rules
+4. **Plan-Based Limits**: Implement per-plan file size limits (25MB free, 200MB paid)
+
+### Async Pattern Actions (5th Pass)
+
+1. **Async Tool Execution**: Use asyncio.to_thread() for blocking tool invocations
+2. **Await Cache Close**: Store and await cache close task properly
+3. **Async File I/O**: Use asyncio.to_thread() for file writes in upload endpoint
+
+### Frontend Contract Actions (5th Pass)
+
+1. **Fix Citations**: Extract from content_struct.segments, not top-level citations
+2. **Fix Tenant ID**: Derive from JWT in WebSocket, not message body
+3. **Implement Pagination**: Use has_next/next_page in frontend list views
+4. **Fix Error Extraction**: Use payload.error.message in admin.js
