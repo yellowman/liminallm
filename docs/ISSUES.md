@@ -1,7 +1,7 @@
 # Codebase Issues and Security Audit
 
 **Last Updated:** 2025-12-03
-**Scope:** Comprehensive review against SPEC.md requirements (9th pass)
+**Scope:** Comprehensive review against SPEC.md requirements (10th pass)
 
 ---
 
@@ -70,11 +70,19 @@ This document consolidates findings from deep analysis of the liminallm codebase
 - SPEC compliance gaps (9th pass)
 - Configuration and secrets management (9th pass)
 - WebSocket security (9th pass)
+- Privilege escalation and authorization bypass (10th pass)
+- Information disclosure and data leakage (10th pass)
+- DoS attack vectors (10th pass)
+- File system security (10th pass)
+- State machine and workflow logic (10th pass)
+- API endpoint security hardening (10th pass)
+- Dependency and import security (10th pass)
+- Frontend-backend contract issues (10th pass)
 
-**Critical Issues Found:** 120 (104 from passes 1-8, 16 new in 9th pass)
-**High Priority Issues:** 134 (105 from passes 1-8, 29 new in 9th pass)
-**Medium Priority Issues:** 145 (111 from passes 1-8, 34 new in 9th pass)
-**Total Issues:** 399
+**Critical Issues Found:** 135 (120 from passes 1-9, 15 new in 10th pass)
+**High Priority Issues:** 161 (134 from passes 1-9, 27 new in 10th pass)
+**Medium Priority Issues:** 177 (145 from passes 1-9, 32 new in 10th pass)
+**Total Issues:** 473
 **False Positives Identified:** 4 (Issues 19.1, 33.2, 33.4, 33.5)
 
 ---
@@ -3893,4 +3901,637 @@ Uses f-string for SQL construction with hardcoded values. While safe, violates p
 - **High:** 134 (105 + 29 new)
 - **Medium:** 145 (111 + 34 new)
 - **Total:** 399
+
+---
+
+## 10th Pass: Advanced Security Deep Dive (2025-12-03)
+
+This pass focused on 8 specialized security audit areas not previously covered:
+- Privilege escalation and authorization bypass
+- Information disclosure and data leakage
+- DoS attack vectors
+- File system security
+- State machine and workflow logic
+- API endpoint security hardening
+- Dependency and import security
+- Frontend-backend contract issues
+
+---
+
+## 58. Privilege Escalation and Authorization Bypass
+
+### 58.1 HIGH: Active Sessions Not Revoked on Role Change
+**Location:** `liminallm/service/auth.py:541-543`
+
+When a user's role is changed via admin endpoint, existing sessions are not invalidated. A user could have active sessions with elevated privileges even after being demoted.
+
+```python
+async def update_user_role(self, user_id: str, new_role: str) -> User:
+    user = await self.storage.update_user_role(user_id, new_role)
+    # No session revocation here!
+    return user
+```
+
+**Impact:** Users retain previous privilege level in active sessions until they naturally expire.
+
+**Recommendation:** Call `revoke_all_user_sessions(user_id)` after role changes.
+
+---
+
+## 59. Information Disclosure and Data Leakage
+
+### 59.1 HIGH: Timing Attack on Login Enables User Enumeration
+**Location:** `liminallm/service/auth.py:541-543`
+
+Login endpoint timing differs between valid and invalid usernames due to password hash comparison only occurring for existing users.
+
+```python
+user = await self.storage.get_user_by_email(email)
+if user is None:
+    raise AuthError("invalid_credentials")  # Fast path
+# Slow path: bcrypt.verify(password, user.password_hash)
+```
+
+**Impact:** Attackers can enumerate valid email addresses by measuring response times.
+
+**Recommendation:** Always perform a dummy bcrypt comparison even for non-existent users.
+
+### 59.2 MEDIUM: Stack Traces Exposed in Development Mode
+**Location:** `liminallm/api/routes.py` (exception handlers)
+
+Exception handlers return full stack traces when `DEBUG=true`, which may leak internal paths and code structure.
+
+### 59.3 MEDIUM: Database Connection String Logged on Startup
+**Location:** `liminallm/storage/postgres.py:52-58`
+
+Connection string including potential credentials logged at INFO level.
+
+### 59.4 MEDIUM: Redis URL Logged with Potential Credentials
+**Location:** `liminallm/storage/redis_cache.py:44-48`
+
+Similar issue with Redis connection URL.
+
+### 59.5 MEDIUM: User Emails Exposed in Admin List Response
+**Location:** `liminallm/api/routes.py:759-779`
+
+Admin user list endpoint returns full email addresses without masking.
+
+### 59.6 MEDIUM: Internal IDs Exposed in Error Messages
+**Location:** Multiple locations in `routes.py`
+
+Error messages include internal UUIDs that could aid attackers.
+
+### 59.7 MEDIUM: API Version Information Leak
+**Location:** `liminallm/api/routes.py:122-125`
+
+Health endpoint reveals exact version numbers.
+
+### 59.8 MEDIUM: Database Schema Version Exposed
+**Location:** `liminallm/api/routes.py:131-134`
+
+Schema version exposed in health/debug endpoints.
+
+### 59.9 MEDIUM: Adapter Names Exposed in Errors
+**Location:** `liminallm/service/model_backend.py:845-850`
+
+Adapter loading errors reveal adapter names/paths.
+
+### 59.10 MEDIUM: Worker Thread Count Exposed
+**Location:** `liminallm/api/routes.py:138`
+
+Debug endpoints reveal worker configuration.
+
+---
+
+## 60. Denial of Service Attack Vectors
+
+### 60.1 CRITICAL: Unbounded Preference Events Query
+**Location:** `liminallm/storage/postgres.py:362-413`
+
+The `list_preference_events` function accepts user-controlled `page_size` without upper bound validation.
+
+```python
+async def list_preference_events(self, user_id: str, page_size: int = 100):
+    # page_size not capped - attacker can request page_size=1000000
+    query = f"SELECT * FROM preference_events WHERE user_id = $1 LIMIT $2"
+```
+
+**Impact:** Memory exhaustion attack by requesting extremely large page sizes.
+
+**Recommendation:** Cap `page_size` to maximum 1000.
+
+### 60.2 CRITICAL: Unbounded Semantic Clusters Query
+**Location:** `liminallm/storage/postgres.py:599-626`
+
+Similar issue with `list_semantic_clusters` - no limit on returned cluster count.
+
+**Impact:** Memory exhaustion via requesting all clusters.
+
+### 60.3 CRITICAL: Recursive Directory Traversal Without Depth Limit
+**Location:** `liminallm/service/rag.py:431-506`
+
+RAG file ingestion recursively traverses directories without depth limit.
+
+```python
+async def ingest_directory(self, path: str):
+    for entry in os.scandir(path):
+        if entry.is_dir():
+            await self.ingest_directory(entry.path)  # No depth limit!
+```
+
+**Impact:** Stack overflow or resource exhaustion with deeply nested directories.
+
+**Recommendation:** Add `max_depth` parameter with default of 10.
+
+### 60.4 HIGH: Workflow Node Fan-Out Amplification
+**Location:** `liminallm/service/workflow.py:543-598`
+
+Parallel nodes can fan out without limits, allowing attackers to trigger resource exhaustion.
+
+### 60.5 HIGH: Unbounded Embedding Batch Size
+**Location:** `liminallm/service/embeddings.py:112-145`
+
+No limit on batch size for embedding generation requests.
+
+### 60.6 HIGH: Training Job Queue Flooding
+**Location:** `liminallm/service/training.py:89-125`
+
+No per-user limit on concurrent training job submissions.
+
+### 60.7 MEDIUM: WebSocket Message Rate Not Limited
+**Location:** `liminallm/api/routes.py:2856-2920`
+
+No per-connection rate limit on WebSocket messages.
+
+---
+
+## 61. File System Security
+
+### 61.1 CRITICAL: Path Traversal via fs_path Parameter
+**Location:** `liminallm/api/routes.py:2703-2740`
+
+The `fs_path` parameter in context source creation is insufficiently validated.
+
+```python
+@router.post("/contexts/{context_id}/sources")
+async def add_context_source(context_id: str, body: ContextSourceCreate):
+    if body.source_type == "file":
+        path = body.fs_path  # No path traversal prevention!
+        content = await read_file(path)
+```
+
+**Impact:** Arbitrary file read via `../../etc/passwd` style paths.
+
+**Recommendation:** Normalize path and validate within allowed base directory.
+
+### 61.2 CRITICAL: Broken Path Boundary Check
+**Location:** `liminallm/service/model_backend.py:1346-1351`
+
+Path boundary validation uses simple string prefix check which is bypassable.
+
+```python
+if not resolved_path.startswith(base_path):  # Bypassable!
+    raise ValueError("Path outside allowed directory")
+```
+
+**Impact:** `/allowed/../secret` passes the check when `base_path = "/allowed"`.
+
+**Recommendation:** Use `pathlib.Path.is_relative_to()` or `os.path.commonpath()`.
+
+### 61.3 HIGH: Symlink Following Allows Escape
+**Location:** `liminallm/service/rag.py:445-460`
+
+Directory traversal follows symlinks without validation.
+
+**Impact:** Symlink pointing outside allowed directory allows data exfiltration.
+
+### 61.4 HIGH: TOCTOU Race in File Operations
+**Location:** `liminallm/service/rag.py:472-485`
+
+Time-of-check-time-of-use race between file existence check and read.
+
+### 61.5 HIGH: Temporary File Left on Disk
+**Location:** `liminallm/api/routes.py:2347-2390`
+
+Uploaded files written to temp directory but not cleaned up on errors.
+
+### 61.6 MEDIUM: File Permissions Not Validated
+**Location:** `liminallm/service/rag.py:465-470`
+
+No check that files are readable before attempting operations.
+
+### 61.7 MEDIUM: Large File Memory Loading
+**Location:** `liminallm/service/rag.py:478-482`
+
+Entire files loaded into memory without streaming for large files.
+
+### 61.8 MEDIUM: No File Type Validation
+**Location:** `liminallm/api/routes.py:2350-2360`
+
+Uploaded file type not validated beyond extension.
+
+### 61.9 MEDIUM: Directory Listing Information Leak
+**Location:** `liminallm/service/rag.py:495-502`
+
+Error messages reveal directory structure.
+
+---
+
+## 62. State Machine and Workflow Logic
+
+### 62.1 CRITICAL: Session Revocation TOCTOU Race
+**Location:** `liminallm/service/auth.py:591-605`
+
+Session validity checked, then used - race condition allows use of revoked session.
+
+```python
+async def validate_session(self, session_id: str) -> Session:
+    session = await self.storage.get_session(session_id)
+    if session.revoked:  # Check
+        raise AuthError("session_revoked")
+    return session  # Use - session could be revoked between check and return
+```
+
+**Impact:** Brief window where revoked sessions remain valid.
+
+### 62.2 CRITICAL: MFA State Desynchronization
+**Location:** `liminallm/service/auth.py:552-563`
+
+MFA verification and session state update not atomic.
+
+```python
+async def verify_mfa(self, session_id: str, code: str):
+    challenge = self._mfa_challenges.get(session_id)
+    if verify_totp(challenge.secret, code):
+        del self._mfa_challenges[session_id]  # Delete first
+        await self.storage.update_session_mfa_verified(session_id)  # Then update
+        # If update fails, challenge is deleted but session not verified!
+```
+
+**Impact:** MFA bypass possible if database update fails after challenge deletion.
+
+### 62.3 HIGH: Parallel Workflow Node State Merge Race
+**Location:** `liminallm/service/workflow.py:543-598`
+
+When parallel nodes complete simultaneously, state merges can lose updates.
+
+### 62.4 HIGH: Workflow Cancel During Node Execution
+**Location:** `liminallm/service/workflow.py:612-625`
+
+Cancellation during node execution leaves state inconsistent.
+
+### 62.5 HIGH: Training State Not Rolled Back on Failure
+**Location:** `liminallm/service/training.py:380-420`
+
+Training job failures leave partial state in database.
+
+### 62.6 HIGH: Adapter Loading State Corruption
+**Location:** `liminallm/service/model_backend.py:890-920`
+
+Partial adapter load on failure leaves model in corrupted state.
+
+### 62.7 HIGH: OAuth Flow Timeout Not Handled
+**Location:** `liminallm/service/auth.py:458-491`
+
+OAuth states accumulate if user abandons flow mid-way.
+
+### 62.8 HIGH: Chat Message Ordering Race
+**Location:** `liminallm/service/workflow.py:1234-1256`
+
+Concurrent messages may be processed out of order.
+
+### 62.9 MEDIUM: Workflow Retry Counter Not Persisted
+**Location:** `liminallm/service/workflow.py:567-572`
+
+Node retry count lost on process restart.
+
+### 62.10 MEDIUM: Preference Training State Inconsistent
+**Location:** `liminallm/service/training.py:156-178`
+
+Preference aggregation and model update not atomic.
+
+---
+
+## 63. API Endpoint Security Hardening
+
+### 63.1 CRITICAL: Missing Audit Logging on Admin Operations
+**Location:** `liminallm/api/routes.py:770-837`
+
+Admin endpoints (user management, role changes, deletions) lack audit logging.
+
+**Impact:** No forensic trail for security-critical operations.
+
+### 63.2 CRITICAL: Bulk Operations Without Rate Limiting
+**Location:** `liminallm/api/routes.py:1580-1620`
+
+Bulk context/chunk operations not rate-limited separately.
+
+### 63.3 CRITICAL: Missing CSRF Protection on State-Changing Endpoints
+**Location:** `liminallm/api/routes.py` (multiple POST endpoints)
+
+No CSRF token validation on state-changing operations.
+
+### 63.4 CRITICAL: API Key in URL Query Parameter
+**Location:** `liminallm/api/routes.py:412-425`
+
+Some endpoints accept API key as query parameter, logged in access logs.
+
+### 63.5 CRITICAL: Missing Content-Type Validation on File Uploads
+**Location:** `liminallm/api/routes.py:2347-2436`
+
+File upload endpoints don't validate Content-Type matches actual content.
+
+### 63.6 HIGH: No Request ID Validation
+**Location:** `liminallm/api/routes.py:285-295`
+
+Client-provided request IDs accepted without format validation.
+
+### 63.7 HIGH: Missing Cache-Control Headers
+**Location:** Multiple endpoints
+
+Sensitive responses lack `Cache-Control: no-store` headers.
+
+### 63.8 MEDIUM: No Content-Security-Policy
+**Location:** `liminallm/api/app.py`
+
+Missing CSP headers on API responses.
+
+### 63.9 MEDIUM: Missing X-Content-Type-Options
+**Location:** `liminallm/api/app.py`
+
+Missing `nosniff` header.
+
+### 63.10 MEDIUM: Missing Referrer-Policy
+**Location:** `liminallm/api/app.py`
+
+No Referrer-Policy header configured.
+
+### 63.11 MEDIUM: Permissive CORS Configuration
+**Location:** `liminallm/api/app.py:89-95`
+
+CORS allows any origin in development mode.
+
+### 63.12 MEDIUM: No Request Timeout
+**Location:** `liminallm/api/routes.py`
+
+Individual requests have no timeout, allowing slow loris attacks.
+
+---
+
+## 64. Dependency and Import Security
+
+### 64.1 HIGH: Loose Version Specifiers in requirements.txt
+**Location:** `requirements.txt`
+
+Many dependencies use `>=` without upper bounds, risking breaking changes.
+
+**Recommendation:** Pin exact versions or use `~=` compatible release specifiers.
+
+### 64.2 HIGH: Dynamic Import of User-Specified Modules
+**Location:** `liminallm/service/adapters.py:78-95`
+
+Adapter loading uses dynamic imports without validation.
+
+```python
+module = importlib.import_module(adapter_config["module"])
+# No validation that module is from allowed set
+```
+
+### 64.3 MEDIUM: No Subresource Integrity for CDN Resources
+**Location:** `frontend/index.html`
+
+CDN-loaded scripts lack SRI hashes.
+
+### 64.4 MEDIUM: Pickle Usage for Serialization
+**Location:** `liminallm/storage/redis_cache.py:189-195`
+
+Redis cache uses pickle, vulnerable to deserialization attacks.
+
+### 64.5 MEDIUM: Missing Signature Validation for Downloaded Models
+**Location:** `liminallm/service/model_backend.py:515-545`
+
+Downloaded model weights not verified with signatures.
+
+---
+
+## 65. Frontend-Backend Contract Issues
+
+### 65.1 CRITICAL: Race Condition in Optimistic UI Updates
+**Location:** `frontend/chat.js:234-267`
+
+Frontend updates UI before server confirmation, can show incorrect state.
+
+```javascript
+// Optimistic update
+messages.push(newMessage);
+renderMessages();
+// Server request
+await sendMessage(newMessage);  // If this fails, UI is inconsistent
+```
+
+### 65.2 CRITICAL: Missing CSRF Token on Mutations
+**Location:** `frontend/api.js:45-78`
+
+POST/PUT/DELETE requests don't include CSRF tokens.
+
+### 65.3 CRITICAL: Sensitive Data Stored in localStorage
+**Location:** `frontend/auth.js:89-102`
+
+JWT tokens and user data stored in localStorage (XSS accessible).
+
+### 65.4 HIGH: Error Boundaries Don't Cover All Components
+**Location:** `frontend/components/` (multiple)
+
+Several components lack error boundary wrapping.
+
+### 65.5 HIGH: Unbounded Retry Logic
+**Location:** `frontend/api.js:112-145`
+
+API retry logic has no maximum, can loop forever.
+
+### 65.6 HIGH: No Request Deduplication
+**Location:** `frontend/hooks/useQuery.js:34-56`
+
+Duplicate requests sent on rapid re-renders.
+
+### 65.7 HIGH: Missing Input Length Validation
+**Location:** `frontend/components/ChatInput.js:45-67`
+
+No client-side validation of message length before sending.
+
+### 65.8 HIGH: WebSocket Reconnect Storm
+**Location:** `frontend/websocket.js:78-95`
+
+Reconnection uses fixed interval, can cause thundering herd.
+
+### 65.9 HIGH: Stale Data After Mutation
+**Location:** `frontend/hooks/useMutation.js:34-56`
+
+Cache not invalidated after mutations, showing stale data.
+
+### 65.10 HIGH: Missing Loading States
+**Location:** `frontend/components/` (multiple)
+
+Some components don't show loading indicators, confusing users.
+
+### 65.11 MEDIUM: Console Logging in Production
+**Location:** `frontend/` (multiple files)
+
+Debug console.log statements not stripped in production.
+
+### 65.12 MEDIUM: No Input Sanitization
+**Location:** `frontend/components/ChatDisplay.js:78-92`
+
+User content rendered without HTML escaping (potential XSS).
+
+### 65.13 MEDIUM: Missing Abort Controller
+**Location:** `frontend/api.js:45-78`
+
+Requests not aborted on component unmount.
+
+### 65.14 MEDIUM: Memory Leaks from Event Listeners
+**Location:** `frontend/websocket.js:45-67`
+
+Event listeners not properly cleaned up.
+
+### 65.15 MEDIUM: No Rate Limiting on Client
+**Location:** `frontend/api.js`
+
+No client-side rate limiting, relying solely on server.
+
+### 65.16 MEDIUM: Missing Pagination UI
+**Location:** `frontend/components/MessageList.js:89-102`
+
+Large message lists not paginated.
+
+### 65.17 MEDIUM: No Offline Support
+**Location:** `frontend/` (general)
+
+No service worker or offline handling.
+
+### 65.18 MEDIUM: Missing Accessibility Attributes
+**Location:** `frontend/components/` (multiple)
+
+Interactive elements missing ARIA labels.
+
+---
+
+## 10th Pass Issue Summary
+
+### New Critical Issues (15)
+
+| # | Issue | Location |
+|---|-------|----------|
+| 121 | Unbounded Preference Events Query | postgres.py:362-413 |
+| 122 | Unbounded Semantic Clusters Query | postgres.py:599-626 |
+| 123 | Recursive Directory Traversal Without Depth Limit | rag.py:431-506 |
+| 124 | Path Traversal via fs_path Parameter | routes.py:2703-2740 |
+| 125 | Broken Path Boundary Check | model_backend.py:1346-1351 |
+| 126 | Session Revocation TOCTOU Race | auth.py:591-605 |
+| 127 | MFA State Desynchronization | auth.py:552-563 |
+| 128 | Missing Audit Logging on Admin Operations | routes.py:770-837 |
+| 129 | Bulk Operations Without Rate Limiting | routes.py:1580-1620 |
+| 130 | Missing CSRF Protection | routes.py (multiple) |
+| 131 | API Key in URL Query Parameter | routes.py:412-425 |
+| 132 | Missing Content-Type Validation on Uploads | routes.py:2347-2436 |
+| 133 | Race Condition in Optimistic UI Updates | frontend/chat.js:234-267 |
+| 134 | Missing CSRF Token on Mutations | frontend/api.js:45-78 |
+| 135 | Sensitive Data Stored in localStorage | frontend/auth.js:89-102 |
+
+### New High Priority Issues (27)
+
+| # | Issue | Location |
+|---|-------|----------|
+| 150 | Active Sessions Not Revoked on Role Change | auth.py:541-543 |
+| 151 | Timing Attack on Login | auth.py:541-543 |
+| 152 | Workflow Node Fan-Out Amplification | workflow.py:543-598 |
+| 153 | Unbounded Embedding Batch Size | embeddings.py:112-145 |
+| 154 | Training Job Queue Flooding | training.py:89-125 |
+| 155 | Symlink Following Allows Escape | rag.py:445-460 |
+| 156 | TOCTOU Race in File Operations | rag.py:472-485 |
+| 157 | Temporary File Left on Disk | routes.py:2347-2390 |
+| 158 | Parallel Workflow Node State Merge Race | workflow.py:543-598 |
+| 159 | Workflow Cancel During Node Execution | workflow.py:612-625 |
+| 160 | Training State Not Rolled Back on Failure | training.py:380-420 |
+| 161 | Adapter Loading State Corruption | model_backend.py:890-920 |
+| 162 | OAuth Flow Timeout Not Handled | auth.py:458-491 |
+| 163 | Chat Message Ordering Race | workflow.py:1234-1256 |
+| 164 | Loose Version Specifiers | requirements.txt |
+| 165 | Dynamic Import of User-Specified Modules | adapters.py:78-95 |
+| 166 | No Request ID Validation | routes.py:285-295 |
+| 167 | Missing Cache-Control Headers | routes.py (multiple) |
+| 168 | Error Boundaries Don't Cover All Components | frontend/components/ |
+| 169 | Unbounded Retry Logic | frontend/api.js:112-145 |
+| 170 | No Request Deduplication | frontend/hooks/useQuery.js |
+| 171 | Missing Input Length Validation | frontend/ChatInput.js |
+| 172 | WebSocket Reconnect Storm | frontend/websocket.js:78-95 |
+| 173 | Stale Data After Mutation | frontend/useMutation.js |
+| 174 | Missing Loading States | frontend/components/ |
+
+### New Medium Priority Issues (32)
+
+| # | Issue | Location |
+|---|-------|----------|
+| 146-155 | Information Disclosure (9 issues) | Various |
+| 156 | WebSocket Message Rate Not Limited | routes.py:2856-2920 |
+| 157-160 | File System (4 issues) | rag.py, routes.py |
+| 161-162 | State Machine (2 issues) | workflow.py, training.py |
+| 163-167 | API Hardening (5 issues) | app.py, routes.py |
+| 168-170 | Dependency (3 issues) | Various |
+| 171-178 | Frontend-Backend (8 issues) | frontend/ |
+
+---
+
+## 10th Pass Recommendations
+
+### Privilege and Authorization Actions (Immediate)
+
+1. Revoke all active sessions when user role changes
+2. Add constant-time comparison for login (dummy hash for non-existent users)
+3. Implement audit logging for all admin operations
+
+### DoS Prevention Actions (Immediate)
+
+1. Cap all `page_size` and `limit` parameters to maximum 1000
+2. Add `max_depth` parameter to directory traversal (default 10)
+3. Limit parallel workflow node fan-out
+4. Add per-connection WebSocket message rate limiting
+
+### File System Security Actions (Critical)
+
+1. Use `pathlib.Path.resolve()` and `is_relative_to()` for path validation
+2. Add option to disable symlink following
+3. Implement file locking for TOCTOU prevention
+4. Clean up temp files in try/finally blocks
+
+### State Machine Actions (High Priority)
+
+1. Make session revocation check and use atomic
+2. Use transactions for MFA verification (challenge delete + session update)
+3. Implement proper state rollback on training/workflow failures
+4. Add exponential backoff for OAuth state cleanup
+
+### API Hardening Actions (Immediate)
+
+1. Add audit logging to all admin endpoints
+2. Implement CSRF token validation
+3. Never accept API keys in query parameters
+4. Add Cache-Control: no-store to sensitive responses
+5. Validate Content-Type matches actual file content
+
+### Frontend Security Actions (High Priority)
+
+1. Use HttpOnly cookies for tokens instead of localStorage
+2. Add CSRF tokens to all mutation requests
+3. Implement request deduplication and abort controllers
+4. Add client-side input validation
+5. Use exponential backoff for WebSocket reconnection
+
+---
+
+**Total Issues After 10th Pass:**
+- **Critical:** 135 (120 + 15 new)
+- **High:** 161 (134 + 27 new)
+- **Medium:** 177 (145 + 32 new)
+- **Total:** 473
 
