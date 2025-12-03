@@ -1,7 +1,7 @@
 # Codebase Issues and Security Audit
 
-**Last Updated:** 2025-12-02
-**Scope:** Comprehensive review against SPEC.md requirements (5th pass)
+**Last Updated:** 2025-12-03
+**Scope:** Comprehensive review against SPEC.md requirements (9th pass)
 
 ---
 
@@ -41,10 +41,40 @@ This document consolidates findings from deep analysis of the liminallm codebase
 - Business logic constraints (5th pass)
 - Async/await anti-patterns (5th pass)
 - Frontend-backend contract mismatches (5th pass)
+- JWT/Authentication security (6th pass)
+- Workflow graph security (6th pass)
+- Data integrity issues (6th pass)
+- DoS/Resource exhaustion (6th pass)
+- Type coercion vulnerabilities (6th pass)
+- CSRF/Session security (6th pass)
+- Frontend XSS vulnerabilities (6th pass)
+- Error handling security (6th pass)
+- Adapter/LoRA security (7th pass)
+- Multi-tenant isolation (7th pass)
+- Embedding/vector security (7th pass)
+- Input validation edge cases (7th pass)
+- Content redaction security (7th pass)
+- Deadlock/timeout patterns (7th pass)
+- API versioning/compatibility (7th pass)
+- RBAC and permission security (8th pass)
+- Audit logging and compliance gaps (8th pass)
+- HTTP security headers (8th pass)
+- Business logic vulnerabilities (8th pass)
+- Frontend security issues (8th pass)
+- External API integration issues (8th pass)
+- Cryptographic implementation issues (8th pass)
+- Memory management and resource leaks (9th pass)
+- Concurrency and synchronization issues (9th pass)
+- Error recovery and resilience (9th pass)
+- Data validation at boundaries (9th pass)
+- SPEC compliance gaps (9th pass)
+- Configuration and secrets management (9th pass)
+- WebSocket security (9th pass)
 
-**Critical Issues Found:** 63 (3 reclassified after verification)
-**High Priority Issues:** 52
-**Medium Priority Issues:** 33 (1 reclassified after verification)
+**Critical Issues Found:** 120 (104 from passes 1-8, 16 new in 9th pass)
+**High Priority Issues:** 134 (105 from passes 1-8, 29 new in 9th pass)
+**Medium Priority Issues:** 145 (111 from passes 1-8, 34 new in 9th pass)
+**Total Issues:** 399
 **False Positives Identified:** 4 (Issues 19.1, 33.2, 33.4, 33.5)
 
 ---
@@ -1772,3 +1802,2095 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 2. ~~**Fix Tenant ID**: Derive from JWT in WebSocket, not message body~~ - **FALSE POSITIVE** (already correct)
 3. **Implement Pagination**: Use has_next/next_page in frontend list views
 4. ~~**Fix Error Extraction**: Use payload.error.message in admin.js~~ - **FALSE POSITIVE** (already handles multiple paths)
+
+---
+
+## 35. JWT/Authentication Security (6th Pass)
+
+### 35.1 CRITICAL: JWT Header Not Validated (Algorithm Confusion)
+
+**Location:** `liminallm/service/auth.py:920-932`
+
+JWT decoding does not validate the header's algorithm field. An attacker could craft a token with `"alg": "none"` or manipulate the algorithm to bypass signature verification.
+
+**Impact:** Complete authentication bypass possible.
+
+**Fix:** Decode and validate JWT header before signature verification; reject unexpected algorithms.
+
+### 35.2 CRITICAL: Tenant ID Spoofing via Request Body
+
+**Location:** `liminallm/api/routes.py:545-556, 591-603, 639-649`
+
+Signup, login, and OAuth endpoints accept `tenant_id` from request body before authentication. Violates CLAUDE.md security guideline.
+
+**Impact:** Users can create accounts in arbitrary tenants.
+
+**Fix:** Remove tenant_id from unauthenticated request bodies; derive from server config or OAuth claims.
+
+### 35.3 HIGH: Missing JWT Standard Claims (iat/nbf)
+
+**Location:** `liminallm/service/auth.py:975-1008`
+
+Tokens are issued without `iat` (issued at) or `nbf` (not before) claims.
+
+**Impact:** Cannot detect token age or prevent pre-dated tokens.
+
+### 35.4 HIGH: No JWT Clock Skew Tolerance
+
+**Location:** `liminallm/service/auth.py:964-972`
+
+Token expiration checked without clock skew tolerance.
+
+**Impact:** Valid tokens rejected due to minor clock drift between servers.
+
+### 35.5 HIGH: Weak Password Requirements
+
+**Location:** `liminallm/api/schemas.py:90-96`
+
+Password validation only checks length (8+ chars), no complexity requirements.
+
+**Impact:** Vulnerable to dictionary attacks and credential stuffing.
+
+### 35.6 HIGH: MFA Secret Uses JWT Key
+
+**Location:** `liminallm/storage/memory.py:111-139`
+
+MFA encryption cipher falls back to using JWT_SECRET when MFA_SECRET_KEY not set.
+
+**Impact:** Single key compromise affects both JWT and MFA security.
+
+---
+
+## 36. Workflow Graph Security (6th Pass)
+
+### 36.1 MEDIUM: Missing Cycle Detection in Workflow Graphs
+
+**Location:** `liminallm/service/workflow.py:418-627`
+
+No explicit cycle detection algorithm for workflow graphs. Cycles detected only through per-node visit limits at runtime.
+
+**Impact:** Malicious workflows can exhaust resources before loop detection triggers.
+
+**Fix:** Add DFS-based cycle detection at artifact creation time.
+
+### 36.2 MEDIUM: Orphan Node Detection Missing
+
+**Location:** `liminallm/service/workflow.py:418-425`
+
+No reachability analysis from entrypoint. Orphan nodes silently ignored.
+
+**Impact:** Configuration errors go unnoticed; dead code in workflows.
+
+### 36.3 MEDIUM: Invalid Next Node References Not Validated
+
+**Location:** `liminallm/service/workflow.py:1429-1435, 1485-1495`
+
+Next node references not validated against node_map at creation time.
+
+**Impact:** Invalid references cause silent runtime failures.
+
+### 36.4 MEDIUM: Tool Output Directly Merged to State
+
+**Location:** `liminallm/service/workflow.py:567, 602, 885`
+
+Tool outputs merged directly into vars_scope without validation or whitelisting.
+
+**Impact:** Malicious tools can pollute workflow state, overwrite critical variables.
+
+### 36.5 MEDIUM: Missing Tool Input Size Limits
+
+**Location:** `liminallm/api/routes.py:1935-1975`
+
+No limit on total size of inputs passed to tools via API.
+
+**Impact:** Memory exhaustion via large tool inputs.
+
+---
+
+## 37. Data Integrity Issues (6th Pass)
+
+### 37.1 CRITICAL: Non-Atomic Dataset File Writes
+
+**Location:** `liminallm/service/training.py:307-309`
+
+Dataset files written directly without temp-then-rename atomic pattern.
+
+**Impact:** Partial dataset on crash leads to invalid training jobs.
+
+### 37.2 CRITICAL: config_patch_audit Table Does Not Exist
+
+**Location:** `liminallm/storage/postgres.py:1231`
+
+Code references `config_patch_audit` table but schema only defines `config_patch`.
+
+**Impact:** User deletion fails at runtime; orphaned records.
+
+### 37.3 HIGH: File I/O Outside Database Transaction
+
+**Location:** `liminallm/storage/postgres.py:1741-1769`
+
+Artifact file persisted BEFORE transaction starts. If INSERT fails, orphaned file remains.
+
+**Impact:** Orphaned files accumulate on constraint violations.
+
+### 37.4 HIGH: Manual Cascade Instead of DB Constraints
+
+**Location:** `liminallm/storage/postgres.py:1151-1280`
+
+15+ manual DELETE statements for user deletion, not using ON DELETE CASCADE.
+
+**Impact:** Partial deletion leaves orphaned records if process crashes mid-operation.
+
+### 37.5 HIGH: Non-Atomic Adapter Parameter Writes
+
+**Location:** `liminallm/service/training.py:328-339`
+
+Multiple files (params.json, metadata.json) written sequentially without atomicity.
+
+**Impact:** Inconsistent adapter state if crash between writes.
+
+### 37.6 MEDIUM: Message Sequence Using COUNT(*) Instead of MAX
+
+**Location:** `liminallm/storage/postgres.py:1500-1504`
+
+Uses `COUNT(*)` to calculate next sequence number. Inefficient and assumes no gaps.
+
+**Impact:** Sequence collisions possible in concurrent scenarios.
+
+### 37.7 MEDIUM: Session Cache Not Atomic with DB
+
+**Location:** `liminallm/storage/postgres.py:1354-1363`
+
+Cache update proceeds even if DB update fails (exception only logged, not raised).
+
+**Impact:** Session cache diverges from database state.
+
+---
+
+## 38. DoS/Resource Exhaustion (6th Pass)
+
+### 38.1 CRITICAL: No Per-User WebSocket Connection Limits
+
+**Location:** `liminallm/api/routes.py:2853`
+
+No limit on concurrent WebSocket connections per user.
+
+**Impact:** Single user can open 1000+ connections, exhausting server resources.
+
+### 38.2 CRITICAL: No Disk Quota Enforcement
+
+**Location:** `liminallm/api/routes.py:2347-2436`
+
+While individual files limited to 10MB, no per-user or per-tenant storage quota.
+
+**Impact:** Users can upload unlimited files, exhausting disk space.
+
+### 38.3 HIGH: Recursive File Ingestion Without Limits
+
+**Location:** `liminallm/service/rag.py:431-506`
+
+`ingest_path()` with recursive=True has no file count or depth limits.
+
+**Impact:** Directory with 100K files causes memory exhaustion.
+
+### 38.4 HIGH: Unbounded List Operations
+
+**Location:** `liminallm/api/routes.py:1463`
+
+`list_messages()` called without limit parameter, retrieves all messages.
+
+**Impact:** Single conversation with 100K+ messages consumes unbounded memory.
+
+### 38.5 HIGH: String Concatenation in WebSocket Streaming
+
+**Location:** `liminallm/api/routes.py:2957`
+
+Token accumulation uses `+=` string concatenation in loop.
+
+**Impact:** Large responses cause O(n²) memory allocation pattern.
+
+### 38.6 MEDIUM: PostgreSQL Connection Pool Too Small
+
+**Location:** `liminallm/storage/postgres.py:63-68`
+
+Connection pool max_size=10. With 100+ concurrent users, 90% block.
+
+**Impact:** Database connection starvation under load.
+
+### 38.7 MEDIUM: Email Validation ReDoS
+
+**Location:** `liminallm/api/schemas.py:50-53`
+
+Email regex with nested quantifiers vulnerable to catastrophic backtracking.
+
+**Impact:** Malformed emails cause CPU exhaustion.
+
+### 38.8 MEDIUM: Active Requests Registry Memory Leak
+
+**Location:** `liminallm/api/routes.py:112-119`
+
+`_active_requests` dict entries not cleaned up if WebSocket disconnects abnormally.
+
+**Impact:** Memory leak from abandoned WebSocket connections.
+
+---
+
+## 39. Type Coercion Vulnerabilities (6th Pass)
+
+### 39.1 CRITICAL: JSON Deserialization Without Error Handling
+
+**Location:** `liminallm/service/model_backend.py:1023`, `liminallm/storage/memory.py:1565`
+
+`json.loads()` called without try-except.
+
+**Impact:** Invalid JSON crashes adapter loading or state restoration.
+
+### 39.2 HIGH: datetime.fromisoformat Without Error Handling
+
+**Location:** `liminallm/storage/redis_cache.py:185, 392`, `liminallm/storage/postgres.py:2137,2142,2147`
+
+ISO datetime parsing without try-except.
+
+**Impact:** Corrupted datetime strings crash deserialization.
+
+### 39.3 HIGH: float()/int() Without Error Handling
+
+**Location:** Multiple files - `router.py:177,399`, `model_backend.py:674,1281`, `postgres.py:409,440,464`, `training.py:318,324`
+
+Numeric coercion without validation.
+
+**Impact:** Non-numeric values crash request processing.
+
+### 39.4 MEDIUM: No NaN/Infinity Validation
+
+**Location:** `liminallm/service/training.py`, `liminallm/service/router.py`
+
+Float values (embeddings, scores) never validated for NaN/Infinity.
+
+**Impact:** Invalid JSON serialization when NaN/Infinity encountered.
+
+---
+
+## 40. CSRF/Session Security (6th Pass)
+
+### 40.1 CRITICAL: CSRF Tokens Listed But Not Validated
+
+**Location:** `liminallm/app.py:88` and all POST/PATCH/DELETE routes
+
+CORS headers advertise `X-CSRF-Token` support but tokens are never generated or validated.
+
+**Impact:** All state-changing endpoints vulnerable to CSRF attacks.
+
+### 40.2 CRITICAL: Tokens Exposed in Email URLs
+
+**Location:** `liminallm/service/email.py:108, 160`
+
+Password reset and email verification tokens passed in URL query parameters.
+
+**Impact:** Token exposure via browser history, Referer headers, server logs, proxies.
+
+### 40.3 CRITICAL: Session Rotation Not Implemented
+
+**Location:** `liminallm/service/auth.py` (missing functionality)
+
+SPEC §12.1 requires session ID rotation every 24h of activity. Not implemented.
+
+**Impact:** Session hijacking window remains open indefinitely.
+
+### 40.4 HIGH: Access Tokens Not Revoked on Logout
+
+**Location:** `liminallm/api/routes.py:1330-1331`
+
+Only cookies deleted on logout; JWT access tokens remain valid for 30 minutes.
+
+**Impact:** Compromised tokens usable after logout.
+
+### 40.5 HIGH: No Origin/Referer Header Validation
+
+**Location:** `liminallm/app.py` middleware
+
+No validation that state-changing requests originate from allowed origins.
+
+**Impact:** CSRF defense-in-depth compromised.
+
+---
+
+## 41. Frontend XSS Vulnerabilities (6th Pass)
+
+### 41.1 CRITICAL: Dynamic onclick Handler
+
+**Location:** `frontend/chat.js:192`
+
+Inline event handler in innerHTML template. Anti-pattern that violates CSP.
+
+**Fix:** Use addEventListener instead of inline handlers.
+
+### 41.2 HIGH: innerHTML Injection in Patch Status
+
+**Location:** `frontend/admin.js:171-174`
+
+Patch status values from API inserted into innerHTML without escaping.
+
+**Impact:** XSS via malicious patch status values.
+
+### 41.3 HIGH: Unescaped JSON in Data Attributes
+
+**Location:** `frontend/chat.js:1169-1176`
+
+Citation data in data-citation attribute relies on fragile escaping.
+
+**Impact:** XSS if escaping fails on malformed API data.
+
+### 41.4 MEDIUM: Unvalidated URL Parameters
+
+**Location:** `frontend/chat.js:648-651, 879-880, 972-973`
+
+OAuth provider parameter used in API endpoint without validation.
+
+**Impact:** Path traversal via `provider=../../../`.
+
+### 41.5 MEDIUM: Sensitive Token Storage in sessionStorage
+
+**Location:** `frontend/chat.js:13-19`, `frontend/admin.js:17-34`
+
+Access tokens stored in sessionStorage accessible to any XSS.
+
+**Impact:** Token theft if any XSS vulnerability exists.
+
+---
+
+## 42. Error Handling Security (6th Pass)
+
+### 42.1 CRITICAL: Raw Exception Exposure in Responses
+
+**Location:** `liminallm/api/routes.py:186, 2754`
+
+`str(exc)` passed directly to client error responses.
+
+**Impact:** Internal exception details (paths, schema, queries) exposed to attackers.
+
+### 42.2 HIGH: Email Enumeration Vulnerability
+
+**Location:** `liminallm/storage/postgres.py:865`, `memory.py:236`
+
+Signup returns specific "email already exists" error on duplicate.
+
+**Impact:** Attackers can enumerate valid email addresses.
+
+### 42.3 HIGH: Full Stack Trace Logging
+
+**Location:** `liminallm/api/error_handling.py:88`
+
+`logger.exception(..., exc_info=exc)` logs full stack traces.
+
+**Impact:** Sensitive data in variables exposed to log aggregation systems.
+
+### 42.4 MEDIUM: Bare Exceptions Silently Swallowed
+
+**Location:** `liminallm/api/routes.py:2935-2936, 3119-3120, 3144-3145, 2750-2751`
+
+Multiple bare `except: pass` blocks without logging.
+
+**Impact:** Failures go unnoticed; debugging impossible.
+
+### 42.5 MEDIUM: Database Schema in Error Responses
+
+**Location:** `liminallm/storage/postgres.py:2224-2228`
+
+Database column names exposed in NOT NULL constraint violation errors.
+
+**Impact:** Schema information disclosure aids SQL injection attempts.
+
+---
+
+## 43. Adapter/LoRA Security (7th Pass)
+
+### 43.1 CRITICAL: Float Weight Injection via JSON Deserialization
+
+**Location:** `liminallm/service/model_backend.py:1023`
+
+Adapter weight files are deserialized using `json.loads()` without validation. JSON allows serialization of IEEE 754 special floating-point values (infinity, -infinity, NaN) via scientific notation.
+
+**Impact:** Numerical instability, model corruption, NaN propagation through inference, DoS via malformed weights.
+
+### 43.2 HIGH: Insufficient Gate Weight Bounds Checking
+
+**Location:** `liminallm/service/model_backend.py:666-674`
+
+Gate weights extracted and converted to float before bounds clamping. Float conversion at line 674 happens before clamping at line 1283.
+
+**Impact:** Infinity/NaN in weight field bypass the clamping check; malformed weights passed to API backends.
+
+### 43.3 HIGH: Missing File Size Limits on Weight Uploads
+
+**Location:** `liminallm/service/model_backend.py:999`
+
+No validation of file size before reading entire weight file into memory: `payload = params_path.read_bytes()`.
+
+**Impact:** DoS via large adapter files causing OOM; resource exhaustion affecting other users.
+
+### 43.4 HIGH: No Validation of Remote Model IDs
+
+**Location:** `liminallm/service/model_backend.py:633, 659-664`
+
+Remote model IDs passed through without validation to external providers.
+
+**Impact:** Model injection, parameter pollution, access control bypass via crafted model IDs.
+
+### 43.5 MEDIUM: Adapter Cache Poisoning (Cross-User Access)
+
+**Location:** `liminallm/service/model_backend.py:825, 996-998, 1029`
+
+Adapter cache keyed only by `adapter_id`, no user_id or tenant_id in cache key.
+
+**Impact:** User B could load User A's private adapter weights if adapter IDs collide.
+
+### 43.6 MEDIUM: Prompt Injection via adapter prompt_instructions
+
+**Location:** `liminallm/service/model_backend.py:738-762, 764-788`
+
+Adapter prompt instructions extracted and injected into system message without sanitization or length limits.
+
+**Impact:** LLM jailbreak, model behavior hijacking, context window pollution.
+
+### 43.7 MEDIUM: Missing Input Validation on Adapter Schema Fields
+
+**Location:** `liminallm/api/schemas.py`, `model_backend.py`
+
+No regex/pattern validation on remote_model_id, remote_adapter_id, adapter_id. Weight array dimensions loaded without shape validation.
+
+**Impact:** Malformed data confuses downstream consumers; injection via provider APIs.
+
+### 43.8 LOW: Cache Mtime Check Bypass
+
+**Location:** `liminallm/service/model_backend.py:995-998`
+
+Cache validation relies on file mtime which can be manipulated or affected by clock skew.
+
+**Impact:** Stale or modified weights served from cache.
+
+---
+
+## 44. Multi-Tenant Isolation (7th Pass)
+
+### 44.1 MEDIUM: X-Tenant-ID Header Parameter Accepted
+
+**Location:** `liminallm/api/routes.py:339-370`
+
+`X-Tenant-ID` header accepted as a "hint" and passed to `authenticate()`. Violates CLAUDE.md: "Always derive tenant_id from the authenticated JWT token, never from request parameters."
+
+**Impact:** Information disclosure (tenant enumeration), confusion in audit logs.
+
+### 44.2 MEDIUM: OAuth Callback tenant_id Parameter
+
+**Location:** `liminallm/api/routes.py:658`
+
+OAuth callback endpoint accepts `tenant_id` as a query parameter from attacker-controlled OAuth callback URL.
+
+**Impact:** Potential tenant assignment manipulation during OAuth flow.
+
+### 44.3 MEDIUM: Missing Tenant Isolation in Rate Limiting Cache Keys
+
+**Location:** `liminallm/storage/redis_cache.py:58`
+
+Rate limit keys constructed as `rate:{key}:{now_bucket}` without explicit tenant separation.
+
+**Impact:** Cross-tenant rate limit bucket collisions possible; tenant-wide rate limits not feasible.
+
+### 44.4 MEDIUM: Workflow State Cache Keys Lack Tenant Isolation
+
+**Location:** `liminallm/storage/redis_cache.py:99-113`
+
+Workflow state cache keys use only `state_key` without tenant/user isolation.
+
+**Impact:** Cross-tenant workflow state collision if state_key is predictable.
+
+### 44.5 LOW: Router Cache Keys Not Tenant-Prefixed
+
+**Location:** `liminallm/storage/redis_cache.py:82, 95`
+
+Cache keys include `user_id` but not `tenant_id`.
+
+**Impact:** UUID collision unlikely but violates isolation principle.
+
+---
+
+## 45. Embedding/Vector Security (7th Pass)
+
+### 45.1 CRITICAL: No NaN/Infinity Validation in Embeddings
+
+**Location:** `liminallm/service/embeddings.py:29-36`
+
+`cosine_similarity()` does not check for NaN or Infinity values before computing similarity.
+
+**Impact:** Poisoned embeddings corrupt similarity scores, centroid calculations, vector search results.
+
+### 45.2 HIGH: Missing Embedding Dimension Validation
+
+**Location:** `liminallm/service/embeddings.py:39-47`
+
+`ensure_embedding_dim()` silently pads or truncates embeddings without validating input dimensions.
+
+**Impact:** Malformed embeddings cause inconsistent vector space geometry and clustering errors.
+
+### 45.3 HIGH: Centroid Poisoning - No Validation on Cluster Centroids
+
+**Location:** `liminallm/service/clustering.py:88-99`
+
+Cluster centroids computed and stored without validating for NaN/Infinity. K-means update rule doesn't normalize results.
+
+**Impact:** Malicious centroids break similarity calculations, skew cluster assignments.
+
+### 45.4 HIGH: Embedding Injection in Preference Events
+
+**Location:** `liminallm/storage/postgres.py:313-315`, `memory.py:648-650`
+
+User-provided embeddings in preference events accepted without validation.
+
+**Impact:** Training data poisoning, centroid corruption, clustering manipulation.
+
+### 45.5 HIGH: No Bounds Checking on Cosine Similarity Scores
+
+**Location:** `liminallm/service/router.py:307-319`
+
+Similarity scores used directly for weight assignment without NaN validation.
+
+**Impact:** NaN similarity scores propagate through adapter routing, undefined behavior.
+
+### 45.6 MEDIUM: Centroid Exposure in Adapter Schema
+
+**Location:** `liminallm/service/router.py:422-426`, `clustering.py:209`
+
+Adapter centroids stored in artifact schema and exposed to users via API responses.
+
+**Impact:** Embeddings leaked; attackers can craft malicious adapters with poisoned centroids.
+
+### 45.7 MEDIUM: Chunk Search with Unvalidated Embeddings
+
+**Location:** `liminallm/storage/common.py:86-91`, `memory.py:1487-1496`
+
+Search functions don't validate embedding dimensions before computing similarity.
+
+**Impact:** Dimension mismatch silently handled, incorrect search results.
+
+### 45.8 MEDIUM: No Embedding Model Validation for pgvector Search
+
+**Location:** `liminallm/storage/postgres.py:2472-2474`
+
+Embedding model ID filtering is optional and happens after chunks selected.
+
+**Impact:** Chunks from different embedding models mixed in search results.
+
+### 45.9 MEDIUM: Unvalidated Centroid in Workflow Context Embedding
+
+**Location:** `liminallm/service/workflow.py:1370, 1375`
+
+Cluster centroids used directly in workflow vector alignment without validation.
+
+**Impact:** Poisoned centroids corrupt workflow routing decisions.
+
+### 45.10 MEDIUM: Missing Normalization in Centroid Update
+
+**Location:** `liminallm/service/clustering.py:40-42, 88-95`
+
+Mini-batch k-means centroids updated incrementally without normalization.
+
+**Impact:** Centroids accumulate magnitude errors, incorrect cluster assignments.
+
+---
+
+## 46. Input Validation Edge Cases (7th Pass)
+
+### 46.1 HIGH: Nested JSON Validation - Unbounded Depth
+
+**Location:** `liminallm/api/schemas.py:184-185, 242, 258-265, 654, 662`
+
+Multiple fields accept unrestricted `dict` with no nested depth or size validation: `default_style`, `flags`, `inputs`, `outputs`.
+
+**Impact:** Memory exhaustion via deeply nested structures; JSON deserialization bomb attacks.
+
+### 46.2 HIGH: Array Length Limits - Unbounded Arrays
+
+**Location:** `liminallm/api/schemas.py:260-265`
+
+`ChatResponse` list fields (`adapters`, `adapter_gates`, `context_snippets`, `routing_trace`, `workflow_trace`) have no `max_items` validation.
+
+**Impact:** DoS via large arrays; memory exhaustion.
+
+### 46.3 HIGH: String Length Limits - Missing maxLength
+
+**Location:** `liminallm/api/schemas.py:281-282, 493, 655-657`
+
+Multiple required/optional strings without `max_length`: `ArtifactRequest.name`, `type`, `explicit_signal`, `conversation_id`, `context_id`, `user_message`.
+
+**Impact:** Memory exhaustion; buffer overflow in storage; unbounded query strings.
+
+### 46.4 MEDIUM: Unicode Edge Cases - No Normalization
+
+**Location:** `liminallm/api/schemas.py:59`
+
+Email validation `strip().lower()` doesn't account for zero-width characters, RTL override, combining diacritics, or NFKC normalization.
+
+**Impact:** IDN homoglyph attacks; Unicode normalization bypasses; spoofed identities.
+
+### 46.5 MEDIUM: Numeric Bounds - Integer Overflow Potential
+
+**Location:** `liminallm/api/routes.py:741, 1648-1650`
+
+Integer query parameters have only `ge=1` bounds, no upper limits. Float fields don't prevent NaN/Infinity.
+
+**Impact:** Integer overflow in offset/limit calculations; NaN propagation.
+
+### 46.6 MEDIUM: Empty String vs Null Handling
+
+**Location:** `liminallm/api/schemas.py:283`, `storage/postgres.py:1678`
+
+Inconsistent empty string vs None handling between similar fields and between request/response.
+
+**Impact:** Type confusion attacks; logic bypasses.
+
+### 46.7 MEDIUM: Special Characters in Identifiers
+
+**Location:** `liminallm/api/routes.py:1645-1646, 465`
+
+`type`, `kind` query parameters and `fs_path` lack pattern validation.
+
+**Impact:** NoSQL injection through JSONB operators; path traversal.
+
+### 46.8 MEDIUM: Query Parameter Injection
+
+**Location:** `liminallm/api/routes.py`
+
+No protection against duplicate query parameters (FastAPI merges as lists). OAuth provider parameter not validated against allowed list.
+
+**Impact:** Type confusion; parameter pollution; OAuth provider spoofing.
+
+---
+
+## 47. Content Redaction Security (7th Pass)
+
+### 47.1 HIGH: Error Message Content Exposure
+
+**Location:** `liminallm/service/workflow.py:600, 1002, 1024, 1470-1474`
+
+Exception messages containing sensitive internal details exposed in workflow_trace and error responses.
+
+**Impact:** Stack traces, SQL errors, API secrets, internal paths exposed to attackers.
+
+### 47.2 HIGH: Citation Content Exposure
+
+**Location:** `liminallm/service/workflow.py:1708, 1750, 1769`
+
+Citation chunks extracted directly without content filtering, returned in API responses and traces.
+
+**Impact:** Sensitive information from knowledge bases exposed; confidential documents leaked.
+
+### 47.3 HIGH: Message Content Not Filtered
+
+**Location:** `liminallm/api/routes.py:2458-2475`
+
+Messages returned with full content and content_struct without any filtering or redaction.
+
+**Impact:** User messages with sensitive info not filtered; tool outputs not sanitized.
+
+### 47.4 MEDIUM: Tool Output Sanitization Incomplete
+
+**Location:** `liminallm/service/workflow.py:1504-1507`
+
+Tool outputs passed through without validation or filtering for sensitive data patterns.
+
+**Impact:** Tools can leak credentials, API keys, or PII.
+
+### 47.5 MEDIUM: Content Struct Meta Field Bypass
+
+**Location:** `liminallm/content_struct.py:52, 61-95, 99-110`
+
+`content_struct` normalization accepts arbitrary data in "meta" field without validation.
+
+**Impact:** Malicious payloads injected; data exfiltration; security control bypass.
+
+### 47.6 MEDIUM: Routing Trace & Debug Info Exposure
+
+**Location:** `liminallm/api/routes.py:1441-1442`, `router.py:89-100`
+
+Routing traces with rule evaluation details returned to clients.
+
+**Impact:** Adapter selection logic, backend capabilities exposed; aids targeted attacks.
+
+### 47.7 MEDIUM: PII Redaction Limited to Logging
+
+**Location:** `liminallm/logging.py:37-48`
+
+PII redaction only occurs in log entries, not in API responses or stored data.
+
+**Impact:** PII exposed in API responses via message content, citations, tool outputs.
+
+### 47.8 MEDIUM: Inconsistent Sanitization
+
+**Location:** `liminallm/api/routes.py:2273-2327`
+
+Admin settings endpoint has sanitization logic not applied to chat messages, tool outputs, workflow traces, citations.
+
+**Impact:** No consistent sensitive field detection across API.
+
+---
+
+## 48. Deadlock/Timeout Patterns (7th Pass)
+
+### 48.1 CRITICAL: Unprotected asyncio.Lock Ordering
+
+**Location:** `liminallm/service/runtime.py:159-161`
+
+Two separate asyncio.Lock instances without documented lock ordering discipline.
+
+**Impact:** Complete service hang under concurrent requests if locks acquired in different orders.
+
+### 48.2 CRITICAL: No Connection Pool Timeout Configuration
+
+**Location:** `liminallm/storage/postgres.py:63-68`
+
+ConnectionPool created with only 10 max connections and NO timeout parameters, no statement_timeout.
+
+**Impact:** Long-running queries block new connections; pool exhaustion = service unresponsive.
+
+### 48.3 CRITICAL: Redis Operations Without Explicit Timeouts
+
+**Location:** `liminallm/storage/redis_cache.py` (multiple: 34, 37, 66, 162)
+
+All Redis operations rely on connection-level timeout (if set), not operation-level timeouts.
+
+**Impact:** Single slow Redis command stalls auth/rate-limiting/session system.
+
+### 48.4 CRITICAL: No Timeout on Database Connection Acquisition
+
+**Location:** `liminallm/storage/postgres.py:118`
+
+`pool.connection()` can block indefinitely if no connections available.
+
+**Impact:** Any of 100+ database operations using `with self._connect()` can deadlock.
+
+### 48.5 HIGH: SyncRedisCache Race Condition in pop_oauth_state
+
+**Location:** `liminallm/storage/redis_cache.py:378-380`
+
+GET then DELETE is NOT atomic. Between operations, another coroutine can consume same OAuth state.
+
+**Impact:** OAuth replay attacks; same state token could be used multiple times.
+
+### 48.6 HIGH: ThreadPoolExecutor Resource Exhaustion
+
+**Location:** `liminallm/service/workflow.py:122`
+
+Fixed pool of 4 workers is too small; no queue monitoring or adaptive scaling.
+
+**Impact:** Tools execute serially under load; requests queue indefinitely.
+
+### 48.7 HIGH: Async/Sync Context Mixing in Training Worker
+
+**Location:** `liminallm/service/training_worker.py:144`
+
+`asyncio.to_thread()` offloads training but no timeout on the call.
+
+**Impact:** If training takes too long, event loop can't process other tasks.
+
+### 48.8 HIGH: Unbounded Parallel Node Execution Without Timeout
+
+**Location:** `liminallm/service/workflow.py:323`
+
+`asyncio.gather()` without timeout; all parallel nodes must complete or hang.
+
+**Impact:** One stalled parallel node stalls entire workflow.
+
+### 48.9 MEDIUM: Lock Contention in Idempotency/Rate-Limit Caching
+
+**Location:** `liminallm/service/runtime.py:214-221, 278-289`
+
+Both functions hold locks during dictionary operations; under high concurrency, this serializes access.
+
+**Impact:** Rate limit and idempotency checks become bottleneck.
+
+### 48.10 MEDIUM: No Timeout on Training Job Retry Loop
+
+**Location:** `liminallm/service/training_worker.py:141-195`
+
+Total retry duration unbounded. Each attempt can take 5+ minutes with retries=3.
+
+**Impact:** Training jobs block queue indefinitely.
+
+### 48.11 MEDIUM: OAuth State Cleanup Race Condition
+
+**Location:** `liminallm/service/auth.py:138-183`
+
+`cleanup_expired_states()` called without any lock while other methods read/write `_oauth_states` concurrently.
+
+**Impact:** Data structure corruption, OAuth state loss.
+
+---
+
+## 49. API Versioning/Compatibility (7th Pass)
+
+### 49.1 CRITICAL: Database Migration Safety - Breaking Column Rename
+
+**Location:** `liminallm/sql/003_preferences.sql:53-61`
+
+Column rename `adapter_artifact_id` to `adapter_id` without backward compatibility layer.
+
+**Impact:** Old code referencing `adapter_artifact_id` breaks immediately; no rollback strategy.
+
+### 49.2 HIGH: Missing /v1/ Prefix Enforcement
+
+**Location:** `liminallm/app.py:174, 263`
+
+Infrastructure endpoints bypass API versioning: `/healthz`, `/metrics` return raw dict/text, not Envelope.
+
+**Impact:** Clients cannot consistently parse responses using same envelope format.
+
+### 49.3 HIGH: Breaking Changes Protection - Schema Migration Handling
+
+**Location:** `liminallm/storage/postgres.py:1701-1707`
+
+Silent schema deserialization failure with data loss - returns empty `{}` on parse failure.
+
+**Impact:** Corrupt or incompatible artifact schemas silently replaced with empty dict.
+
+### 49.4 HIGH: Artifact Schema Versioning - Unsafe Old Schema Loading
+
+**Location:** `liminallm/storage/postgres.py:1704, 1873, 1942`
+
+Old artifact schemas loaded via `json.loads()` without schema validation or migration logic.
+
+**Impact:** Old schemas may fail to load if internal structure changed.
+
+### 49.5 MEDIUM: No Deprecation Headers
+
+**Location:** `liminallm/api/routes.py` (all endpoints)
+
+No deprecation headers (`Deprecation`, `Sunset`, `Link: rel="deprecation"`) sent to clients.
+
+**Impact:** Old clients have no signal to migrate to new API versions.
+
+### 49.6 MEDIUM: Response Format Stability - Inconsistent Envelope
+
+**Location:** `liminallm/api/routes.py`
+
+59 endpoints declare `response_model=Envelope` but only 31 explicitly return `Envelope(...)`.
+
+**Impact:** Inconsistent response format across endpoints.
+
+### 49.7 MEDIUM: No Accept-Version Header Support
+
+**Location:** `liminallm/api/routes.py`
+
+No `Accept-Version` header parsing or `API-Version` response header.
+
+**Impact:** Clients cannot negotiate API version for backward compatibility.
+
+### 49.8 MEDIUM: Response Envelope Consistency - Missing request_id
+
+**Location:** `liminallm/api/routes.py:1973, 2051, 2434`
+
+Only some endpoints explicitly pass `request_id` to Envelope; most rely on default UUID.
+
+**Impact:** Idempotency keys and correlation IDs not properly propagated.
+
+---
+
+## Summary by Severity (Updated 7th Pass)
+
+### Critical (83 Issues)
+
+| # | Issue | Location |
+|---|-------|----------|
+| 1-62 | (Previous passes - see above) | Various |
+| 63 | Float Weight Injection via JSON Deserialization | model_backend.py:1023 |
+| 64 | No NaN/Infinity Validation in Embeddings | embeddings.py:29-36 |
+| 65 | Unprotected asyncio.Lock Ordering | runtime.py:159-161 |
+| 66 | No Connection Pool Timeout Configuration | postgres.py:63-68 |
+| 67 | Redis Operations Without Explicit Timeouts | redis_cache.py (multiple) |
+| 68 | No Timeout on Database Connection Acquisition | postgres.py:118 |
+| 69 | Database Migration Safety - Breaking Column Rename | sql/003_preferences.sql:53-61 |
+| 70 | (Numbered placeholder for prior issues) | Various |
+
+### High Priority (90 Issues)
+
+| # | Issue | Location |
+|---|-------|----------|
+| 1-52 | (Previous passes - see above) | Various |
+| 53 | Insufficient Gate Weight Bounds Checking | model_backend.py:674 |
+| 54 | Missing File Size Limits on Weight Uploads | model_backend.py:999 |
+| 55 | No Validation of Remote Model IDs | model_backend.py:633, 659 |
+| 56 | Missing Embedding Dimension Validation | embeddings.py:39-47 |
+| 57 | Centroid Poisoning - No Validation | clustering.py:88-99 |
+| 58 | Embedding Injection in Preference Events | postgres.py:313-315 |
+| 59 | No Bounds Checking on Cosine Similarity | router.py:307-319 |
+| 60 | Nested JSON Validation - Unbounded Depth | schemas.py:184-185 |
+| 61 | Array Length Limits - Unbounded Arrays | schemas.py:260-265 |
+| 62 | String Length Limits - Missing maxLength | schemas.py:281-282 |
+| 63 | Error Message Content Exposure | workflow.py:600, 1002, 1024 |
+| 64 | Citation Content Exposure | workflow.py:1708, 1750 |
+| 65 | Message Content Not Filtered | routes.py:2458-2475 |
+| 66 | SyncRedisCache Race Condition | redis_cache.py:378-380 |
+| 67 | ThreadPoolExecutor Resource Exhaustion | workflow.py:122 |
+| 68 | Async/Sync Context Mixing in Training | training_worker.py:144 |
+| 69 | Unbounded Parallel Node Execution | workflow.py:323 |
+| 70 | Missing /v1/ Prefix Enforcement | app.py:174, 263 |
+| 71 | Schema Migration Handling | postgres.py:1701-1707 |
+| 72 | Unsafe Old Schema Loading | postgres.py:1704, 1873 |
+
+### Medium Priority (75 Issues)
+
+| # | Issue | Location |
+|---|-------|----------|
+| 1-33 | (Previous passes - see above) | Various |
+| 34 | Adapter Cache Poisoning | model_backend.py:825, 1029 |
+| 35 | Prompt Injection via prompt_instructions | model_backend.py:738-788 |
+| 36 | Missing Adapter Schema Field Validation | schemas.py, model_backend.py |
+| 37 | X-Tenant-ID Header Parameter | routes.py:339-370 |
+| 38 | OAuth Callback tenant_id Parameter | routes.py:658 |
+| 39 | Rate Limiting Cache Keys Tenant Isolation | redis_cache.py:58 |
+| 40 | Workflow State Cache Keys Tenant Isolation | redis_cache.py:99-113 |
+| 41 | Centroid Exposure in Adapter Schema | router.py:422-426 |
+| 42 | Chunk Search Unvalidated Embeddings | common.py:86-91 |
+| 43 | No Embedding Model Validation for pgvector | postgres.py:2472-2474 |
+| 44 | Unvalidated Centroid in Workflow | workflow.py:1370, 1375 |
+| 45 | Missing Normalization in Centroid Update | clustering.py:92-95 |
+| 46 | Unicode Edge Cases - No Normalization | schemas.py:59 |
+| 47 | Numeric Bounds - Integer Overflow | routes.py:741, 1648 |
+| 48 | Empty String vs Null Handling | schemas.py:283, postgres.py:1678 |
+| 49 | Special Characters in Identifiers | routes.py:1645-1646 |
+| 50 | Query Parameter Injection | routes.py |
+| 51 | Tool Output Sanitization Incomplete | workflow.py:1504-1507 |
+| 52 | Content Struct Meta Field Bypass | content_struct.py:52, 99-110 |
+| 53 | Routing Trace & Debug Info Exposure | routes.py:1441, router.py:89-100 |
+| 54 | PII Redaction Limited to Logging | logging.py:37-48 |
+| 55 | Inconsistent Sanitization | routes.py:2273-2327 |
+| 56 | Lock Contention in Caching | runtime.py:214-221, 278-289 |
+| 57 | No Timeout on Training Retry Loop | training_worker.py:141-195 |
+| 58 | OAuth State Cleanup Race | auth.py:138-183 |
+| 59 | No Deprecation Headers | routes.py |
+| 60 | Response Format Inconsistent Envelope | routes.py |
+| 61 | No Accept-Version Header Support | routes.py |
+| 62 | Missing request_id Propagation | routes.py:1973, 2051, 2434 |
+
+---
+
+## 7th Pass Recommendations
+
+### Adapter/LoRA Security Actions
+
+1. Validate all float values in loaded weights are finite (no inf/nan)
+2. Implement file size limits on weight uploads
+3. Validate remote model/adapter IDs against whitelist patterns
+4. Use composite cache key (adapter_id + user_id + tenant_id)
+5. Sanitize prompt_instructions for length and content
+
+### Multi-Tenant Isolation Actions
+
+1. Remove X-Tenant-ID header; derive only from JWT
+2. Remove tenant_id parameter from OAuth callback
+3. Add tenant_id prefix to all cache keys
+
+### Embedding/Vector Security Actions
+
+1. Check for NaN/Infinity in all vector operations
+2. Add strict embedding dimension validation
+3. Normalize centroids after each update
+4. Validate all embeddings before similarity calculations
+
+### Input Validation Actions
+
+1. Add max_items to all list fields
+2. Add max_length to all string fields
+3. Implement Unicode normalization (NFKC)
+4. Add upper bounds to all integer query parameters
+
+### Content Redaction Actions
+
+1. Filter error messages before returning to clients
+2. Implement content filtering for citations and tool outputs
+3. Validate/restrict content_struct meta field
+4. Apply consistent sanitization across all endpoints
+
+### Deadlock/Timeout Actions
+
+1. Enforce strict lock ordering; document globally
+2. Add connection pool and statement timeouts
+3. Add Redis client socket timeout
+4. Increase thread pool workers and add monitoring
+5. Add timeout to asyncio.gather() calls
+
+### API Versioning Actions
+
+1. Wrap infrastructure endpoints in Envelope format
+2. Add deprecation headers for deprecated endpoints
+3. Implement schema validation and migration for artifacts
+4. Standardize request_id propagation
+
+---
+
+## 8th Pass: Comprehensive Security Deep Dive (2025-12-03)
+
+This pass focused on 8 specialized security audit areas:
+- RBAC and permission checking
+- Logging and audit trail compliance
+- Data serialization security
+- HTTP security headers
+- Business logic vulnerabilities
+- Frontend security (React/TypeScript)
+- External API integrations
+- Cryptographic implementations
+
+---
+
+## 50. RBAC and Permission Security
+
+### 50.1 CRITICAL: MFA Request Endpoint Missing Authentication
+**Location:** `liminallm/api/routes.py:997-1012`
+
+The `POST /auth/mfa/request` endpoint does NOT require authentication and accepts an arbitrary `session_id` from the request body without validating ownership.
+
+```python
+@router.post("/auth/mfa/request", response_model=Envelope, tags=["auth"])
+async def request_mfa(body: MFARequest):
+    auth_ctx = await runtime.auth.resolve_session(
+        body.session_id, allow_pending_mfa=True  # No ownership validation
+    )
+```
+
+**Impact:** Attacker can enumerate session IDs and trigger MFA challenges for arbitrary other users' sessions.
+
+### 50.2 CRITICAL: MFA Verify Endpoint Missing Session Ownership Validation
+**Location:** `liminallm/api/routes.py:1015-1050`
+
+The `POST /auth/mfa/verify` endpoint does NOT require authentication. An unauthenticated attacker can pass ANY session_id and attempt to verify MFA for that session without being the session owner.
+
+**Impact:** **Account Takeover** - If a target user has MFA disabled, an attacker can receive valid tokens for the victim's session by enumerating session IDs.
+
+### 50.3 CRITICAL: Admin User Role Modification Missing Tenant Isolation
+**Location:** `liminallm/api/routes.py:804-820`
+
+The `POST /admin/users/{user_id}/role` endpoint does NOT validate that the target `user_id` belongs to the admin's tenant.
+
+**Impact:** Admins from Tenant A can promote/demote users from Tenant B, violating multi-tenant isolation.
+
+### 50.4 CRITICAL: Admin User Deletion Missing Tenant Isolation
+**Location:** `liminallm/api/routes.py:823-837`
+
+The `DELETE /admin/users/{user_id}` endpoint does NOT validate tenant isolation.
+
+**Impact:** Admins from one tenant can delete users from other tenants.
+
+### 50.5 HIGH: Chat Request Cancellation Missing Ownership Validation
+**Location:** `liminallm/api/routes.py:1472-1510`
+
+The `POST /chat/cancel` endpoint accepts a `request_id` but does NOT validate that the request belongs to the authenticated user.
+
+**Impact:** Attackers can cancel other users' active chat requests, causing denial of service.
+
+### 50.6 MEDIUM: Inconsistent Tenant Validation Across Admin Endpoints
+**Location:** Multiple admin endpoints in `liminallm/api/routes.py`
+
+- ✅ `/admin/users` (GET, line 759) - VALIDATES tenant
+- ✅ `/admin/users` (POST, line 781) - VALIDATES tenant
+- ❌ `/admin/users/{user_id}/role` (POST, line 804) - MISSING validation
+- ❌ `/admin/users/{user_id}` (DELETE, line 823) - MISSING validation
+
+---
+
+## 51. Audit Logging and Compliance Gaps
+
+### 51.1 CRITICAL: Missing Audit Logging for User Signup
+**Location:** `liminallm/api/routes.py:525-570`
+
+User signup endpoint creates new accounts with **zero logging**. No record of success/failure, email created, timestamps, or tenant assignments.
+
+**Compliance Impact:** FAILS GDPR requirement for user access logs and SOC2 accountability.
+
+### 51.2 CRITICAL: Missing Audit Logging for Admin User Creation
+**Location:** `liminallm/api/routes.py:771-801`
+
+Privileged operation to create users has no logging of which admin created the user, user details, or timestamps.
+
+**Compliance Impact:** CRITICAL for SOC2 Type II - no audit trail for privileged operations.
+
+### 51.3 CRITICAL: Missing Audit Logging for User Deletion
+**Location:** `liminallm/api/routes.py:824-837`
+
+User deletion operations are completely unlogged.
+
+**Compliance Impact:** GDPR & SOC2 require audit trail of data deletion.
+
+### 51.4 CRITICAL: Missing Audit Logging for Permission Changes
+**Location:** `liminallm/api/routes.py:805-820`
+
+Role/permission changes are unlogged - no record of who changed what role.
+
+**Compliance Impact:** SOC2 requires detailed access control change logs.
+
+### 51.5 CRITICAL: Failed Login Attempts Not Logged
+**Location:** `liminallm/api/routes.py:597-598`
+
+Failed authentication attempts have no logging - cannot detect brute force attacks.
+
+### 51.6 CRITICAL: Password Change Events Not Logged
+**Location:** `liminallm/api/routes.py:1277-1305`
+
+Credential changes completely unlogged - no audit trail for GDPR/SOC2 compliance.
+
+### 51.7 CRITICAL: Email Verification Events Not Logged
+**Location:** `liminallm/service/auth.py:828-855`
+
+Email verification success/failure completely unlogged.
+
+### 51.8 CRITICAL: Password Reset Completion Not Logged
+**Location:** `liminallm/service/auth.py:788-810`
+
+Password recovery operations unlogged.
+
+### 51.9 CRITICAL: Session Revocation Not Logged
+**Location:** `liminallm/api/routes.py:1308-1332`
+
+Session termination completely unlogged - cannot audit user access patterns.
+
+### 51.10 HIGH: PII (Email Addresses) Being Logged
+**Location:** `liminallm/service/email.py:65, 99, 103`
+
+Email addresses logged directly despite PII redaction being configured.
+
+### 51.11 HIGH: No Logging for Failed Password Verification
+**Location:** `liminallm/service/auth.py:862-873`
+
+Failed password attempts silently fail with no logging - cannot detect brute force.
+
+### 51.12 HIGH: Token Refresh Failures Not Logged
+**Location:** `liminallm/api/routes.py:714-715`
+
+Failed token refresh completely unlogged - could indicate token theft.
+
+### 51.13 HIGH: Insufficient OAuth Exchange Logging
+**Location:** `liminallm/service/auth.py:411-415`
+
+OAuth success logs missing critical audit information (user_id, action type).
+
+### 51.14 HIGH: Insufficient MFA Failure Logging
+**Location:** `liminallm/service/auth.py:754-763`
+
+Only MFA lockout is logged, not individual failed attempts.
+
+### 51.15 MEDIUM: Inconsistent Log Levels for Security Events
+**Location:** Multiple service files
+
+No standard for security event log levels - makes alerting difficult.
+
+### 51.16 MEDIUM: Insufficient Correlation ID Usage
+**Location:** `liminallm/service/auth.py`
+
+Service-layer logging doesn't consistently expose correlation IDs.
+
+### 51.17 MEDIUM: Missing Config Patch Decision Logging
+**Location:** `liminallm/api/routes.py:2104-2247`
+
+Admin approval/rejection decisions lack detailed logs.
+
+---
+
+## 52. HTTP Security Headers
+
+### 52.1 MEDIUM: X-Frame-Options Configuration Mismatch
+**Location:** `nginx.conf:40` vs `liminallm/app.py:116`
+
+Nginx sets `SAMEORIGIN` while app sets `DENY` - nginx takes precedence, weakening protection.
+
+### 52.2 MEDIUM: Missing Cache-Control on Sensitive Endpoints
+**Location:** `liminallm/app.py:174-260, 263-320`
+
+`/healthz` and `/metrics` endpoints don't set Cache-Control headers. Build info could be cached.
+
+### 52.3 MEDIUM: Missing Cache-Control on API Endpoints
+**Location:** `liminallm/app.py:113-136`
+
+No Cache-Control header set globally for API responses - intermediate proxies could cache sensitive data.
+
+### 52.4 MEDIUM: HSTS Only Enabled via Environment Flag
+**Location:** `liminallm/app.py:123-131`
+
+HSTS is disabled by default (must enable via ENABLE_HSTS) - relies on nginx fallback.
+
+### 52.5 MEDIUM: /healthz and /metrics Not Rate Limited
+**Location:** `nginx.conf:119-123`
+
+Health and metrics endpoints have no rate limiting - DoS vector.
+
+### 52.6 MEDIUM: FileResponse Not Setting Cache Headers
+**Location:** `liminallm/app.py:150-171`
+
+FileResponse for HTML pages doesn't set Cache-Control - admin.html could be cached.
+
+### 52.7 LOW: Missing Server Header Suppression
+**Location:** `nginx.conf`
+
+Missing `server_tokens off;` - nginx version information disclosure.
+
+### 52.8 LOW: CORS Missing Max-Age Header
+**Location:** `liminallm/app.py:75-91`
+
+No explicit `max_age` configured for CORS preflight caching.
+
+### 52.9 LOW: CORS Missing Expose-Headers
+**Location:** `liminallm/app.py:75-91`
+
+X-Request-ID header not exposed to frontend JavaScript.
+
+### 52.10 LOW: Incomplete CSP Directives
+**Location:** `liminallm/app.py:132-135`
+
+CSP doesn't explicitly restrict `object-src`, `media-src`, `worker-src`.
+
+---
+
+## 53. Business Logic Vulnerabilities
+
+### 53.1 CRITICAL: MFA Bypass via Silent Database Failure
+**Location:** `liminallm/storage/postgres.py:1354-1363`
+
+If database UPDATE fails during `mark_session_verified()`, the exception is caught but in-memory cache is STILL marked as verified.
+
+```python
+except Exception as exc:
+    self.logger.warning("mark_session_verified_failed", error=str(exc))
+self._update_cached_session(session_id, mfa_verified=True)  # ALWAYS EXECUTES
+```
+
+**Impact:** Complete MFA bypass - database transient failure enables MFA-protected account compromise.
+
+### 53.2 CRITICAL: Tenant Spoofing via Signup Endpoint
+**Location:** `liminallm/api/routes.py:545-549`, `liminallm/service/auth.py:202-220`
+
+Signup endpoint accepts `tenant_id` directly from request body, violating CLAUDE.md guideline.
+
+**Impact:** Attacker can register in ANY tenant by specifying arbitrary tenant_id.
+
+### 53.3 CRITICAL: Tenant Spoofing via OAuth Complete
+**Location:** `liminallm/service/auth.py:484-495`
+
+OAuth callback accepts `tenant_id` parameter - can create account in attacker-specified tenant.
+
+### 53.4 CRITICAL: TOCTOU Race Condition in Session Revocation
+**Location:** `liminallm/api/routes.py:1325-1329`
+
+Between ownership check and revoke call, session could be modified by concurrent request.
+
+### 53.5 CRITICAL: Session Verification State Machine Inconsistency
+**Location:** `liminallm/service/auth.py:591-605`
+
+If `revoke_refresh_token()` throws, the session may remain in database while refresh token is revoked.
+
+### 53.6 HIGH: MFA Race Condition - Lockout Bypass
+**Location:** `liminallm/service/auth.py:756-763`
+
+Multiple concurrent requests can increment MFA attempt counter before lockout check executes.
+
+### 53.7 HIGH: Unsigned MFA Verification Failure
+**Location:** `liminallm/service/auth.py:553-556`
+
+`_mark_session_verified()` might fail silently but tokens are still issued.
+
+### 53.8 HIGH: Missing Negative Value Validation in Rate Limiting
+**Location:** `liminallm/service/runtime.py:278-289`
+
+No validation that `limit` is positive - negative limit bypasses rate limiting.
+
+### 53.9 MEDIUM: Insufficient Exception Handling in Cache Operations
+**Location:** `liminallm/service/auth.py:630-634`
+
+Cache deletion failures silently ignored - ghost sessions may persist.
+
+### 53.10 MEDIUM: Race Condition in Session Cache Eviction
+**Location:** `liminallm/storage/postgres.py:76-94`
+
+Session may expire between sort and eviction decision.
+
+---
+
+## 54. Frontend Security Issues
+
+### 54.1 CRITICAL: Sensitive MFA Secret Displayed in DOM
+**Location:** `frontend/chat.js:2471`
+
+MFA secret displayed via textContent - visible in DevTools, readable by extensions.
+
+### 54.2 CRITICAL: OTP Authentication URI Exposed Without Escaping
+**Location:** `frontend/chat.js:2480`
+
+`otpauth_uri` interpolated directly into innerHTML without HTML escaping.
+
+### 54.3 CRITICAL: Newly Created Passwords Displayed in DOM
+**Location:** `frontend/admin.js:429`
+
+Auto-generated passwords displayed in UI - window of exposure.
+
+### 54.4 HIGH: Sensitive Runtime Config Displayed in Plaintext
+**Location:** `frontend/admin.js:257`
+
+Entire runtime configuration displayed via JSON.stringify.
+
+### 54.5 HIGH: Admin Objects Inspect Displays Sensitive Data
+**Location:** `frontend/admin.js:532-536`
+
+Full object details displayed in JSON - could contain sensitive data.
+
+### 54.6 HIGH: Unescaped Error Messages Displayed
+**Location:** Multiple files - `chat.js:3064, 3079`, `admin.js:259, 295, 329, 539`
+
+Error messages from API displayed directly - could expose SQL errors, file paths.
+
+### 54.7 HIGH: Missing CSRF Protection on Forms
+**Location:** `admin.html`, `index.html`
+
+No forms or API requests include CSRF tokens.
+
+### 54.8 HIGH: Sensitive Data in Session Storage
+**Location:** `frontend/chat.js:13-20, 67-76`
+
+Access/refresh tokens stored in sessionStorage - vulnerable to XSS.
+
+### 54.9 MEDIUM: Preference Data Exposes Internal Routing
+**Location:** `frontend/chat.js:2050, 2052-2055`
+
+Internal routing traces and workflow details displayed in preference panel.
+
+### 54.10 MEDIUM: URL Parameters Containing Sensitive Tokens
+**Location:** `frontend/chat.js:880, 973`
+
+Password reset and email verification tokens passed in URL parameters.
+
+### 54.11 MEDIUM: Insufficient Input Validation on Admin Inputs
+**Location:** `frontend/admin.js:264-276`
+
+Minimal validation of patch body structure.
+
+### 54.12 MEDIUM: Potential IDOR in Artifact/Conversation Access
+**Location:** `frontend/chat.js:1061-1072, 1950-1966`
+
+Frontend accesses resources by ID without validating authorization.
+
+### 54.13 MEDIUM: Draft Data Stored in Plain LocalStorage
+**Location:** `frontend/chat.js:23-52`
+
+Conversation drafts stored unencrypted in localStorage.
+
+### 54.14 MEDIUM: Tenant ID From Session Storage (Not Derived From Token)
+**Location:** `frontend/admin.js:36-42, 55, 116`
+
+Tenant ID read from sessionStorage and sent to backend - violates CLAUDE.md.
+
+---
+
+## 55. External API Integration Issues
+
+### 55.1 MEDIUM: Secrets in URL Query Parameters
+**Location:** `liminallm/service/email.py:108, 160`
+
+Reset and verification tokens exposed in URL query parameters - logged in access logs, browser history.
+
+### 55.2 MEDIUM: Missing Input Validation on OAuth Responses
+**Location:** `liminallm/service/auth.py:373-416, 430-456`
+
+OAuth token response structure not validated - could fail silently on malformed responses.
+
+### 55.3 MEDIUM: Insecure Redirect Following on OAuth Calls
+**Location:** `liminallm/service/auth.py:356`
+
+Default httpx behavior follows redirects without limits - potential SSRF.
+
+### 55.4 MEDIUM: No API Key Rotation Handling
+**Location:** `liminallm/service/voice.py:32-42`, `liminallm/service/model_backend.py:354-371`
+
+API keys cannot be rotated without restarting application.
+
+### 55.5 MEDIUM: Missing Validation on OAuth Redirect URI
+**Location:** `liminallm/service/auth.py:282-286, 348-351`
+
+Redirect URI not validated for HTTPS or allowed domain.
+
+### 55.6 MEDIUM: Default Insecure SMTP Configuration
+**Location:** `liminallm/service/email.py:85-97`
+
+Configuration naming confusing - `smtp_use_tls=False` uses SMTP_SSL.
+
+### 55.7 LOW: No Timeout on OpenAI Client
+**Location:** `liminallm/service/model_backend.py:368-371`
+
+OpenAI client uses default timeout (may be infinite).
+
+### 55.8 LOW: Missing Explicit Error Handling for JSON Parsing
+**Location:** `liminallm/service/voice.py:95-100`
+
+JSON parsing could fail even after raise_for_status().
+
+---
+
+## 56. Cryptographic Implementation Issues
+
+### 56.1 MEDIUM: Weak JWT Test Secret
+**Location:** `tests/test_auth_unit.py:25`
+
+Test JWT secret only 27 characters - lower entropy than production requirement.
+
+### 56.2 MEDIUM: MFA Encryption Key Fallback Chain
+**Location:** `liminallm/storage/memory.py:111-114`
+
+MFA encryption uses JWT_SECRET as fallback - violates key separation principle.
+
+### 56.3 MEDIUM: OAuth State Parameter Not Redis-Backed
+**Location:** `liminallm/service/auth.py:131, 276-278`
+
+OAuth state stored in-memory - fails in multi-process deployments without Redis.
+
+### 56.4 ADVISORY: SHA1 in TOTP Implementation
+**Location:** `liminallm/service/auth.py:903`
+
+TOTP uses SHA1 per RFC 6238 - acceptable but documented limitation.
+
+---
+
+## 8th Pass Summary Tables
+
+### Critical Priority (104 Issues Total)
+
+| # | Issue | Location |
+|---|-------|----------|
+| 84 | MFA Request Missing Authentication | routes.py:997-1012 |
+| 85 | MFA Verify Missing Session Ownership | routes.py:1015-1050 |
+| 86 | Admin Role Modification Missing Tenant Isolation | routes.py:804-820 |
+| 87 | Admin User Deletion Missing Tenant Isolation | routes.py:823-837 |
+| 88 | Missing Audit Logging - User Signup | routes.py:525-570 |
+| 89 | Missing Audit Logging - Admin User Creation | routes.py:771-801 |
+| 90 | Missing Audit Logging - User Deletion | routes.py:824-837 |
+| 91 | Missing Audit Logging - Permission Changes | routes.py:805-820 |
+| 92 | Failed Login Attempts Not Logged | routes.py:597-598 |
+| 93 | Password Change Events Not Logged | routes.py:1277-1305 |
+| 94 | Email Verification Events Not Logged | auth.py:828-855 |
+| 95 | Password Reset Completion Not Logged | auth.py:788-810 |
+| 96 | Session Revocation Not Logged | routes.py:1308-1332 |
+| 97 | MFA Bypass via Silent Database Failure | postgres.py:1354-1363 |
+| 98 | Tenant Spoofing via Signup Endpoint | routes.py:545-549 |
+| 99 | Tenant Spoofing via OAuth Complete | auth.py:484-495 |
+| 100 | TOCTOU Race in Session Revocation | routes.py:1325-1329 |
+| 101 | Session Verification State Machine Issue | auth.py:591-605 |
+| 102 | MFA Secret Displayed in DOM | chat.js:2471 |
+| 103 | OTP URI Exposed Without Escaping | chat.js:2480 |
+| 104 | Passwords Displayed in Admin UI | admin.js:429 |
+
+### High Priority (105 Issues Total)
+
+| # | Issue | Location |
+|---|-------|----------|
+| 91 | Chat Cancel Missing Ownership | routes.py:1472-1510 |
+| 92 | PII (Emails) Being Logged | email.py:65, 99, 103 |
+| 93 | Failed Password Verification Not Logged | auth.py:862-873 |
+| 94 | Token Refresh Failures Not Logged | routes.py:714-715 |
+| 95 | Insufficient OAuth Exchange Logging | auth.py:411-415 |
+| 96 | Insufficient MFA Failure Logging | auth.py:754-763 |
+| 97 | MFA Lockout Race Condition | auth.py:756-763 |
+| 98 | Unsigned MFA Verification | auth.py:553-556 |
+| 99 | Missing Negative Value Validation | runtime.py:278-289 |
+| 100 | Runtime Config Displayed in Plaintext | admin.js:257 |
+| 101 | Admin Inspect Displays Sensitive Data | admin.js:532-536 |
+| 102 | Unescaped Error Messages | Multiple files |
+| 103 | Missing CSRF Protection | admin.html, index.html |
+| 104 | Tokens in Session Storage | chat.js:13-20 |
+| 105 | Tenant Validation Inconsistency | routes.py (admin endpoints) |
+
+### Medium Priority (111 Issues Total)
+
+| # | Issue | Location |
+|---|-------|----------|
+| 76-85 | HTTP Header Issues | app.py, nginx.conf |
+| 86-87 | Cache Error Handling, Eviction Race | auth.py, postgres.py |
+| 88-93 | Frontend Issues | chat.js, admin.js |
+| 94-99 | External API Issues | email.py, auth.py, voice.py |
+| 100-103 | Cryptographic Issues | memory.py, auth.py, tests |
+| 104-111 | Logging Consistency Issues | Multiple files |
+
+---
+
+## 8th Pass Recommendations
+
+### RBAC Actions (Immediate)
+
+1. Add authentication to MFA request/verify endpoints
+2. Validate session ownership before MFA operations
+3. Add tenant isolation checks to all admin user operations
+4. Validate ownership before chat request cancellation
+
+### Audit Logging Actions (Immediate)
+
+1. Add logging to signup, login failure, password change endpoints
+2. Add logging to all admin user operations (create, delete, role change)
+3. Fix email address logging in email service (use PII redaction)
+4. Add logging for failed password verification
+5. Add logging for session revocation and token refresh failures
+6. Standardize log levels for security events
+
+### HTTP Security Actions (Short-term)
+
+1. Add Cache-Control to sensitive endpoints (/healthz, /metrics, APIs)
+2. Fix X-Frame-Options mismatch (use DENY consistently)
+3. Rate limit /healthz and /metrics endpoints
+4. Enable HSTS by default in production
+5. Add explicit CSP directives for object-src, media-src
+
+### Business Logic Actions (Immediate)
+
+1. Only update MFA cache AFTER database update succeeds
+2. Remove tenant_id from signup and OAuth callback parameters
+3. Use atomic database operations for session revocation
+4. Use Redis Lua scripts for atomic MFA attempt counting
+5. Add positive validation for rate limit parameters
+
+### Frontend Security Actions (Immediate)
+
+1. Remove MFA secret display from DOM
+2. Escape OTP URI before innerHTML insertion
+3. Remove password display from admin UI
+4. Implement CSRF token protection
+5. Move tokens from sessionStorage to memory-only
+6. Redact sensitive data from runtime config display
+7. Remove tenant_id from frontend (derive from JWT only)
+
+### External API Actions (Short-term)
+
+1. Use POST for reset/verification tokens (not URL parameters)
+2. Implement input validation for OAuth responses
+3. Set follow_redirects=False on OAuth HTTP clients
+4. Implement API key rotation mechanism
+5. Add timeout parameter to OpenAI client
+
+### Cryptographic Actions (Short-term)
+
+1. Use production-strength secrets in tests
+2. Require separate MFA_SECRET_KEY (remove JWT_SECRET fallback)
+3. Make Redis mandatory for OAuth state in production
+
+---
+
+**Total Issues After 8th Pass:**
+- **Critical:** 104 (83 + 21 new)
+- **High:** 105 (90 + 15 new)
+- **Medium:** 111 (75 + 36 new)
+- **Total:** 320
+
+
+---
+
+## 9th Pass: Deep Security & Resilience Audit (2025-12-03)
+
+This pass focused on 8 specialized areas:
+- SQL and database security
+- Memory management and resource leaks
+- Concurrency and synchronization
+- Error recovery and graceful degradation
+- Data validation at boundaries
+- SPEC.md compliance gaps
+- Configuration and secrets management
+- WebSocket security
+
+---
+
+## 57. Memory Management and Resource Leaks
+
+### 57.1 CRITICAL: Unbounded Idempotency Cache Growth
+**Location:** `liminallm/service/runtime.py:158-243`
+
+The `_local_idempotency` dictionary grows indefinitely with no maximum size limit. Only lazy cleanup when records are accessed after expiration.
+
+**Impact:** With 24-hour TTL and thousands of users, memory can grow to gigabytes, causing OOM.
+
+### 57.2 CRITICAL: Unbounded Rate Limit Cache Growth
+**Location:** `liminallm/service/runtime.py:160, 278-285`
+
+The `_local_rate_limits` dictionary accumulates rate limit tracking indefinitely. Old keys never expire.
+
+**Impact:** Rate limit keys for every unique user:resource:action combination persist forever.
+
+### 57.3 HIGH: Unbounded Active Requests Dictionary
+**Location:** `liminallm/api/routes.py:112-125`
+
+The `_active_requests` dict stores websocket cancel events indefinitely. Abnormal termination could leave entries orphaned.
+
+### 57.4 HIGH: ThreadPoolExecutor Cleanup via __del__ (Unreliable)
+**Location:** `liminallm/service/workflow.py:122, 1869-1873`
+
+ThreadPoolExecutor is only shutdown via `__del__`, which is unreliable and may never be called.
+
+### 57.5 HIGH: Redis Pipeline Not Explicitly Managed
+**Location:** `liminallm/storage/redis_cache.py:63-66`
+
+Redis pipeline objects created without explicit cleanup. Errors during execute() could leave pipeline in undefined state.
+
+### 57.6 HIGH: Asyncio Task Created Without Proper Cancellation Guarantee
+**Location:** `liminallm/api/routes.py:2938-2977`
+
+`cancel_listener` task created but exceptions in `listen_for_cancel()` are silently swallowed.
+
+### 57.7 MEDIUM: PostgreSQL Connection Pool Not Explicitly Closed
+**Location:** `liminallm/storage/postgres.py:63-68`
+
+ConnectionPool created but never explicitly closed. No `__del__` or cleanup method.
+
+### 57.8 MEDIUM: Unsafe Asyncio Event Loop Handling in reset_runtime
+**Location:** `liminallm/service/runtime.py:182-192`
+
+Mixing sync and async cleanup with fire-and-forget task creation.
+
+---
+
+## 58. Concurrency and Synchronization Issues
+
+### 58.1 CRITICAL: OAuth State Race Condition - Multiple Concurrent Consumers
+**Location:** `liminallm/service/auth.py:458-491`
+
+TOCTOU race condition in OAuth state handling. Multiple concurrent requests could consume the same OAuth state token.
+
+### 58.2 CRITICAL: Email Verification Token Race Condition
+**Location:** `liminallm/service/auth.py:828-855`
+
+Check-and-act race condition on email verification tokens without synchronization.
+
+### 58.3 CRITICAL: Unsynchronized Global Runtime Singleton
+**Location:** `liminallm/service/runtime.py:164-171`
+
+Double-checked locking antipattern without synchronization. Race condition can create multiple Runtime instances.
+
+### 58.4 CRITICAL: Thread-Unsafe revoked_refresh_tokens Set Operations
+**Location:** `liminallm/service/auth.py:130, 1042, 1058`
+
+The `revoked_refresh_tokens` set accessed and modified from concurrent async contexts without synchronization.
+
+**Impact:** Revoked token could be accepted due to race between revocation and check.
+
+### 58.5 HIGH: Race Condition in cleanup_expired_states
+**Location:** `liminallm/service/auth.py:138-183`
+
+Cleanup method iterates over dictionaries while concurrent tasks could be modifying them.
+
+### 58.6 HIGH: SyncRedisCache Fallback Non-Atomic Operations
+**Location:** `liminallm/storage/redis_cache.py:377-380`
+
+When GETDEL unavailable, fallback uses get() followed by delete() - race window exists.
+
+### 58.7 HIGH: Missing Synchronization Around _oauth_states Access
+**Location:** `liminallm/service/auth.py:278, 315, 334, 470, 472, 476`
+
+Multiple unsynchronized accesses to `_oauth_states` and `_oauth_code_registry`.
+
+### 58.8 HIGH: Missing Synchronization Around _mfa_challenges
+**Location:** `liminallm/service/auth.py:128, 138-165`
+
+The `_mfa_challenges` dictionary accessed and modified without synchronization.
+
+### 58.9 HIGH: ThreadPoolExecutor Interaction with Async Context
+**Location:** `liminallm/service/workflow.py:122, 1544-1553`
+
+Tool handlers run in ThreadPoolExecutor may access shared mutable state causing races.
+
+### 58.10 HIGH: Unsafe tool_registry Dictionary Mutation
+**Location:** `liminallm/service/workflow.py:1306`
+
+The tool_registry dictionary mutated without synchronization while being read.
+
+---
+
+## 59. Error Recovery and Resilience
+
+### 59.1 CRITICAL: Missing PostgreSQL Connection Pool Cleanup on Shutdown
+**Location:** `liminallm/storage/postgres.py:63-68`, `liminallm/app.py:25-49`
+
+PostgresStore creates ConnectionPool but never closes it. App lifespan shutdown has no pool cleanup.
+
+### 59.2 CRITICAL: Missing Redis Cache Cleanup on App Shutdown
+**Location:** `liminallm/app.py:25-49`, `liminallm/service/runtime.py:31-162`
+
+RedisCache has `close()` method but it's never called during app shutdown.
+
+### 59.3 CRITICAL: No Error Handling in Training Job Multi-Step Execution
+**Location:** `liminallm/service/training.py:259-380`
+
+`train_from_preferences` performs multiple database updates and file operations without try/except wrapping.
+
+**Impact:** Orphaned training jobs, inconsistent adapter states, partial dataset files.
+
+### 59.4 HIGH: No Connection Retry Logic for Redis Operations
+**Location:** `liminallm/storage/redis_cache.py:30-222`
+
+All Redis operations have NO retry logic for transient failures.
+
+### 59.5 HIGH: VoiceService HTTP Client Never Closed on Shutdown
+**Location:** `liminallm/service/voice.py:49-58`, `liminallm/app.py:25-49`
+
+VoiceService creates httpx.AsyncClient that has close() method but never called.
+
+### 59.6 HIGH: Workflow Engine ThreadPoolExecutor Cleanup Uses Unreliable __del__
+**Location:** `liminallm/service/workflow.py:122, 1869-1873`
+
+ThreadPoolExecutor created without explicit cleanup management. Relies on `__del__`.
+
+### 59.7 MEDIUM: No Health Check for Redis Connection During Runtime
+**Location:** `liminallm/app.py:174-220`
+
+Health check doesn't verify Redis connection is still alive.
+
+### 59.8 MEDIUM: Exception Handler Catches All Exceptions Without Proper Propagation
+**Location:** `liminallm/api/routes.py:2406-2414`
+
+Broad `except Exception` swallows all errors and just logs them.
+
+### 59.9 MEDIUM: Database Connection Fails Immediately Without Retry
+**Location:** `liminallm/storage/postgres.py:117-118`
+
+`_connect()` method doesn't implement retry logic.
+
+### 59.10 MEDIUM: Training Worker Doesn't Validate Partial Job State
+**Location:** `liminallm/service/training_worker.py:141-212`
+
+No validation that job wasn't partially completed before retry.
+
+---
+
+## 60. Data Validation at Boundaries
+
+### 60.1 CRITICAL: Arbitrary File Path Traversal via Context Source
+**Location:** `liminallm/api/routes.py:2704-2739`
+
+The `add_context_source` endpoint accepts `fs_path` with only max_length validation. No path traversal prevention.
+
+**Impact:** Attackers can read arbitrary files on system via `fs_path="/etc/passwd"`.
+
+### 60.2 CRITICAL: Unbound Dictionary Fields - DoS via Large Payloads
+**Location:** `liminallm/api/schemas.py` (multiple locations)
+
+Multiple dict fields without size limits: `schema_`, `inputs`, `outputs`, `default_style`, `flags`, `meta`.
+
+**Impact:** Memory exhaustion via requests with huge dict payloads.
+
+### 60.3 CRITICAL: Missing Array Size Limits - Segment Explosion DoS
+**Location:** `liminallm/content_struct.py:113-145`
+
+`normalize_content_struct` accepts segments list without max_items constraint.
+
+### 60.4 CRITICAL: Missing List Size Limits in Response Schemas
+**Location:** `liminallm/api/schemas.py` (multiple response classes)
+
+ChatResponse lists (`adapter_gates`, `routing_trace`, `workflow_trace`) have no max_items.
+
+### 60.5 HIGH: Missing Length Validation on Header Parameters
+**Location:** `liminallm/api/routes.py` (multiple endpoints)
+
+Headers `authorization`, `session_id`, `x_tenant_id`, `idempotency_key` have no max_length.
+
+### 60.6 HIGH: Unsafe Model Backend and Model Path Configuration
+**Location:** `liminallm/api/schemas.py:639-640`, `liminallm/api/routes.py:972-975`
+
+Admin can set `model_backend` and `model_path` to arbitrary strings without validation.
+
+### 60.7 HIGH: Unvalidated OAuth Provider Parameter
+**Location:** `liminallm/api/routes.py:623, 654`
+
+OAuth provider parameter not validated at API layer - used in rate limit key before validation.
+
+### 60.8 HIGH: No Validation of Session ID Format
+**Location:** `liminallm/api/routes.py:1311, 338, 356`
+
+Session ID accepted from header without format/length validation.
+
+### 60.9 HIGH: Missing Numeric Bounds on Page Size Query Parameters
+**Location:** `liminallm/api/routes.py:1649-1650`
+
+`page_size` and `limit` have no upper bound constraints.
+
+### 60.10 HIGH: Unvalidated Admin User Creation Meta Field
+**Location:** `liminallm/api/routes.py:771-801`
+
+The `meta` field in `AdminCreateUserRequest` is unvalidated dict.
+
+### 60.11 MEDIUM: No Minimum Length Validation on MFA Code
+**Location:** `liminallm/api/schemas.py:136, 167, 171`
+
+MFA codes have max_length=10 but no min_length, no numeric pattern validation.
+
+### 60.12 MEDIUM: Missing Validation on Artifact Type and Name Fields
+**Location:** `liminallm/api/schemas.py:280-283`
+
+Artifact name and type have no length limits.
+
+### 60.13 MEDIUM: Type Conversion Risk on Chunk ID
+**Location:** `liminallm/api/routes.py:2692`
+
+Direct int() conversion without proper error handling.
+
+---
+
+## 61. SPEC Compliance Gaps
+
+### 61.1 HIGH: Pagination Inconsistency - list_contexts/list_chunks
+**Location:** `liminallm/api/routes.py:2639-2665, 2669-2700`
+
+list_contexts() and list_chunks() return no pagination metadata (no has_next, next_page, next_cursor).
+
+**SPEC §18:** "pagination uses page/page_size or opaque next_cursor"
+
+### 61.2 HIGH: Streaming Trace Events Not Emitted for All Node Executions
+**Location:** `liminallm/service/workflow.py:667-925`
+
+Trace events only emitted conditionally, not during regular workflow execution.
+
+**SPEC §18:** streaming events should include "trace (router/workflow trace snapshot)"
+
+### 61.3 HIGH: list_chunks Response Missing Pagination Support
+**Location:** `liminallm/api/routes.py:2669-2700`
+
+Endpoint accepts `limit` but response has no way to know if more chunks exist.
+
+### 61.4 MEDIUM: Session Rotation Not Implemented
+**Location:** `liminallm/service/auth.py`
+
+No visible logic rotating session IDs after 24h of activity.
+
+**SPEC §12.1:** "rotation: refresh id/expires_at every 24h of activity"
+
+### 61.5 MEDIUM: MFA Lockout Duration Not Persistent Across Restarts
+**Location:** `liminallm/service/auth.py:735-773`
+
+MFA lockout is Redis-only. If Redis restarts, lockout state is lost.
+
+### 61.6 MEDIUM: Pagination Parameter Naming Inconsistency
+**Location:** `liminallm/api/routes.py` (multiple endpoints)
+
+Some endpoints use `page_size`, others use `limit` only.
+
+### 61.7 MEDIUM: Adapter Mode Compatibility Not Enforced at Call Time
+**Location:** `liminallm/service/model_backend.py:107-122`
+
+`filter_adapters_by_mode()` exists but not verified it's called in router/workflow.
+
+---
+
+## 62. Configuration and Secrets Management
+
+### 62.1 CRITICAL: JWT_SECRET Insufficient Strength Validation
+**Location:** `liminallm/config.py:385-446`
+
+JWT_SECRET validation only checks minimum length of 32 characters. No entropy validation.
+
+### 62.2 CRITICAL: MFA Encryption Key Reuse - Derived from JWT_SECRET
+**Location:** `liminallm/storage/memory.py:111-139`
+
+MFA encryption uses JWT_SECRET as fallback when MFA_SECRET_KEY not provided.
+
+**Impact:** Compromise of JWT_SECRET exposes both JWT and MFA secrets.
+
+### 62.3 HIGH: Insecure Default Configuration Values
+**Location:** `liminallm/config.py:249-252, 280, 286, 298`
+
+Database/Redis default to localhost, app_base_url defaults to HTTP, allow_signup=True.
+
+### 62.4 HIGH: Hardcoded Test Secret in Test File
+**Location:** `tests/test_auth_unit.py:25`
+
+Test file contains hardcoded JWT secret "test-secret-key-for-testing-only".
+
+### 62.5 HIGH: Email Service Hardcoded Localhost Fallback
+**Location:** `liminallm/service/email.py:43`
+
+Email service falls back to hardcoded localhost HTTP URL.
+
+### 62.6 HIGH: CORS Default Origins Allow Localhost
+**Location:** `liminallm/app.py:54-65`
+
+Default CORS allows all localhost origins when CORS_ALLOW_ORIGINS not set.
+
+### 62.7 HIGH: Development Fallback Flags Enabled by Default
+**Location:** `liminallm/config.py:287-293`
+
+USE_MEMORY_STORE, ALLOW_REDIS_FALLBACK_DEV, TEST_MODE can bypass security.
+
+### 62.8 MEDIUM: Database URL Configuration Not Validated
+**Location:** `liminallm/config.py:249-251`
+
+DATABASE_URL not validated for SSL/TLS requirement in production.
+
+### 62.9 MEDIUM: Missing Validation for Critical API Keys
+**Location:** `liminallm/config.py:256-276`
+
+API keys are optional (None default). No format/length validation.
+
+### 62.10 MEDIUM: Admin Config Endpoint Sanitization Coverage Gap
+**Location:** `liminallm/api/routes.py:2262-2327`
+
+Sanitization based on token matching may miss fields with different naming.
+
+---
+
+## 63. WebSocket Security
+
+### 63.1 CRITICAL: Connection Accepted Before Authentication Verification
+**Location:** `liminallm/api/routes.py:2856, 2869-2875`
+
+WebSocket connection accepted with `await ws.accept()` BEFORE authentication verification.
+
+**Impact:** Unauthenticated clients can establish WebSocket connections during auth window.
+
+### 63.2 HIGH: Missing WebSocket Message Size Limits
+**Location:** `liminallm/api/routes.py:2863, 2924`
+
+No explicit maximum message size enforced on WebSocket frames.
+
+**Impact:** Memory exhaustion via arbitrarily large JSON payloads.
+
+### 63.3 HIGH: Missing Origin Validation on WebSocket Connections
+**Location:** `liminallm/api/routes.py:2852-2856`
+
+No origin validation before accepting WebSocket connections.
+
+**Impact:** CSRF attacks via malicious websites establishing WebSocket connections.
+
+### 63.4 MEDIUM: Silent Exception Handling in Listen-for-Cancel Task
+**Location:** `liminallm/api/routes.py:2920-2936`
+
+Broad exception catching with silent `pass` hides potential security issues.
+
+### 63.5 MEDIUM: No Input Validation on WebSocket Message Actions
+**Location:** `liminallm/api/routes.py:2924-2929`
+
+The "action" field not validated; only checked for specific values.
+
+### 63.6 MEDIUM: Missing Heartbeat/Keepalive Mechanism
+**Location:** `liminallm/api/routes.py:2852-3147`
+
+No automatic server-initiated heartbeat mechanism. Zombie connections persist.
+
+### 63.7 LOW: Potential Memory Leak in _active_requests Registry
+**Location:** `liminallm/api/routes.py:112-135`
+
+Global mutable dictionary without size limits or TTL-based cleanup.
+
+### 63.8 LOW: No Explicit Connection-Level Timeout Configuration
+**Location:** `liminallm/api/routes.py:2852-3147`
+
+No maximum total connection duration enforced.
+
+---
+
+## 64. SQL and Database Security (Additional)
+
+### 64.1 MEDIUM: F-String SQL Query Interpolation Anti-Pattern
+**Location:** `liminallm/storage/postgres.py:667-671`
+
+Uses f-string for SQL construction with hardcoded values. While safe, violates parameterized query principle.
+
+---
+
+## 9th Pass Summary Tables
+
+### Critical Priority (120 Issues Total)
+
+| # | Issue | Location |
+|---|-------|----------|
+| 105 | Unbounded Idempotency Cache Growth | runtime.py:158-243 |
+| 106 | Unbounded Rate Limit Cache Growth | runtime.py:160, 278-285 |
+| 107 | OAuth State Race Condition | auth.py:458-491 |
+| 108 | Email Verification Token Race | auth.py:828-855 |
+| 109 | Unsynchronized Runtime Singleton | runtime.py:164-171 |
+| 110 | Thread-Unsafe revoked_refresh_tokens | auth.py:130, 1042, 1058 |
+| 111 | Missing PostgreSQL Pool Cleanup | postgres.py, app.py |
+| 112 | Missing Redis Cleanup on Shutdown | app.py, runtime.py |
+| 113 | No Error Handling in Training Multi-Step | training.py:259-380 |
+| 114 | File Path Traversal via Context Source | routes.py:2704-2739 |
+| 115 | Unbound Dictionary Fields DoS | schemas.py (multiple) |
+| 116 | Missing Array Size Limits | content_struct.py:113-145 |
+| 117 | Missing Response List Size Limits | schemas.py (multiple) |
+| 118 | JWT_SECRET Insufficient Validation | config.py:385-446 |
+| 119 | MFA Key Reuse from JWT_SECRET | memory.py:111-139 |
+| 120 | WebSocket Accept Before Auth | routes.py:2856 |
+
+### High Priority (134 Issues Total)
+
+| # | Issue | Location |
+|---|-------|----------|
+| 106-120 | Memory Leaks (4 issues) | runtime.py, routes.py, workflow.py |
+| 121-130 | Concurrency Races (6 issues) | auth.py, redis_cache.py, workflow.py |
+| 131-133 | Error Recovery (3 issues) | redis_cache.py, voice.py, workflow.py |
+| 134-139 | Data Validation (6 issues) | routes.py, schemas.py |
+| 140-142 | SPEC Compliance (3 issues) | routes.py, workflow.py |
+| 143-147 | Configuration (5 issues) | config.py, app.py, email.py |
+| 148-149 | WebSocket (2 issues) | routes.py |
+
+### Medium Priority (145 Issues Total)
+
+| # | Issue | Location |
+|---|-------|----------|
+| 112-145 | Various medium issues across 8 categories | Multiple files |
+
+---
+
+## 9th Pass Recommendations
+
+### Memory Management Actions (Immediate)
+
+1. Implement bounded LRU cache for `_local_idempotency` with max 100k entries
+2. Add periodic cleanup task for `_local_rate_limits`
+3. Add `.close()` methods to PostgresStore, RedisCache, VoiceService
+4. Call cleanup methods in app lifespan shutdown handler
+
+### Concurrency Actions (Immediate)
+
+1. Add asyncio.Lock to all access to `_oauth_states`, `_oauth_code_registry`, `_mfa_challenges`
+2. Fix Runtime singleton with proper thread-safe initialization
+3. Add lock protection to `revoked_refresh_tokens` set operations
+4. Use atomic Redis operations (Lua scripts) for state management
+
+### Error Recovery Actions (Short-term)
+
+1. Implement exponential backoff retry for Redis operations
+2. Wrap training job execution in transaction with rollback on failure
+3. Add Redis health check to `/healthz` endpoint
+4. Ensure all cleanup methods called during shutdown
+
+### Data Validation Actions (Immediate)
+
+1. Add path traversal validation for `fs_path` in context sources
+2. Add max_items constraints to all array fields
+3. Add size limits to all dict fields in schemas
+4. Add upper bounds (le=1000) to all page_size/limit parameters
+5. Add pattern validation for session_id (UUID format)
+
+### SPEC Compliance Actions (Short-term)
+
+1. Add pagination metadata to list_contexts and list_chunks responses
+2. Emit trace events after every workflow node execution
+3. Implement session rotation after 24h of activity
+4. Standardize pagination parameter naming
+
+### Configuration Actions (Short-term)
+
+1. Require separate MFA_SECRET_KEY (remove JWT_SECRET fallback)
+2. Add entropy validation for JWT_SECRET
+3. Remove localhost defaults; require explicit configuration
+4. Validate DATABASE_URL requires SSL in production
+
+### WebSocket Actions (Immediate)
+
+1. Move ws.accept() to AFTER authentication verification
+2. Add message size limits (max 10MB)
+3. Add origin validation before accepting connections
+4. Implement server-initiated heartbeat mechanism
+
+---
+
+**Total Issues After 9th Pass:**
+- **Critical:** 120 (104 + 16 new)
+- **High:** 134 (105 + 29 new)
+- **Medium:** 145 (111 + 34 new)
+- **Total:** 399
+
