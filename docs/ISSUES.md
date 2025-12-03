@@ -1,7 +1,7 @@
 # Codebase Issues and Security Audit
 
 **Last Updated:** 2025-12-03
-**Scope:** Comprehensive review against SPEC.md requirements (7th pass)
+**Scope:** Comprehensive review against SPEC.md requirements (8th pass)
 
 ---
 
@@ -56,11 +56,18 @@ This document consolidates findings from deep analysis of the liminallm codebase
 - Content redaction security (7th pass)
 - Deadlock/timeout patterns (7th pass)
 - API versioning/compatibility (7th pass)
+- RBAC and permission security (8th pass)
+- Audit logging and compliance gaps (8th pass)
+- HTTP security headers (8th pass)
+- Business logic vulnerabilities (8th pass)
+- Frontend security issues (8th pass)
+- External API integration issues (8th pass)
+- Cryptographic implementation issues (8th pass)
 
-**Critical Issues Found:** 83 (75 from passes 1-6, 8 new in 7th pass)
-**High Priority Issues:** 90 (70 from passes 1-6, 20 new in 7th pass)
-**Medium Priority Issues:** 75 (48 from passes 1-6, 27 new in 7th pass)
-**Total Issues:** 248
+**Critical Issues Found:** 104 (83 from passes 1-7, 21 new in 8th pass)
+**High Priority Issues:** 105 (90 from passes 1-7, 15 new in 8th pass)
+**Medium Priority Issues:** 111 (75 from passes 1-7, 36 new in 8th pass)
+**Total Issues:** 320
 **False Positives Identified:** 4 (Issues 19.1, 33.2, 33.4, 33.5)
 
 ---
@@ -2811,3 +2818,559 @@ Only some endpoints explicitly pass `request_id` to Envelope; most rely on defau
 2. Add deprecation headers for deprecated endpoints
 3. Implement schema validation and migration for artifacts
 4. Standardize request_id propagation
+
+---
+
+## 8th Pass: Comprehensive Security Deep Dive (2025-12-03)
+
+This pass focused on 8 specialized security audit areas:
+- RBAC and permission checking
+- Logging and audit trail compliance
+- Data serialization security
+- HTTP security headers
+- Business logic vulnerabilities
+- Frontend security (React/TypeScript)
+- External API integrations
+- Cryptographic implementations
+
+---
+
+## 50. RBAC and Permission Security
+
+### 50.1 CRITICAL: MFA Request Endpoint Missing Authentication
+**Location:** `liminallm/api/routes.py:997-1012`
+
+The `POST /auth/mfa/request` endpoint does NOT require authentication and accepts an arbitrary `session_id` from the request body without validating ownership.
+
+```python
+@router.post("/auth/mfa/request", response_model=Envelope, tags=["auth"])
+async def request_mfa(body: MFARequest):
+    auth_ctx = await runtime.auth.resolve_session(
+        body.session_id, allow_pending_mfa=True  # No ownership validation
+    )
+```
+
+**Impact:** Attacker can enumerate session IDs and trigger MFA challenges for arbitrary other users' sessions.
+
+### 50.2 CRITICAL: MFA Verify Endpoint Missing Session Ownership Validation
+**Location:** `liminallm/api/routes.py:1015-1050`
+
+The `POST /auth/mfa/verify` endpoint does NOT require authentication. An unauthenticated attacker can pass ANY session_id and attempt to verify MFA for that session without being the session owner.
+
+**Impact:** **Account Takeover** - If a target user has MFA disabled, an attacker can receive valid tokens for the victim's session by enumerating session IDs.
+
+### 50.3 CRITICAL: Admin User Role Modification Missing Tenant Isolation
+**Location:** `liminallm/api/routes.py:804-820`
+
+The `POST /admin/users/{user_id}/role` endpoint does NOT validate that the target `user_id` belongs to the admin's tenant.
+
+**Impact:** Admins from Tenant A can promote/demote users from Tenant B, violating multi-tenant isolation.
+
+### 50.4 CRITICAL: Admin User Deletion Missing Tenant Isolation
+**Location:** `liminallm/api/routes.py:823-837`
+
+The `DELETE /admin/users/{user_id}` endpoint does NOT validate tenant isolation.
+
+**Impact:** Admins from one tenant can delete users from other tenants.
+
+### 50.5 HIGH: Chat Request Cancellation Missing Ownership Validation
+**Location:** `liminallm/api/routes.py:1472-1510`
+
+The `POST /chat/cancel` endpoint accepts a `request_id` but does NOT validate that the request belongs to the authenticated user.
+
+**Impact:** Attackers can cancel other users' active chat requests, causing denial of service.
+
+### 50.6 MEDIUM: Inconsistent Tenant Validation Across Admin Endpoints
+**Location:** Multiple admin endpoints in `liminallm/api/routes.py`
+
+- ✅ `/admin/users` (GET, line 759) - VALIDATES tenant
+- ✅ `/admin/users` (POST, line 781) - VALIDATES tenant
+- ❌ `/admin/users/{user_id}/role` (POST, line 804) - MISSING validation
+- ❌ `/admin/users/{user_id}` (DELETE, line 823) - MISSING validation
+
+---
+
+## 51. Audit Logging and Compliance Gaps
+
+### 51.1 CRITICAL: Missing Audit Logging for User Signup
+**Location:** `liminallm/api/routes.py:525-570`
+
+User signup endpoint creates new accounts with **zero logging**. No record of success/failure, email created, timestamps, or tenant assignments.
+
+**Compliance Impact:** FAILS GDPR requirement for user access logs and SOC2 accountability.
+
+### 51.2 CRITICAL: Missing Audit Logging for Admin User Creation
+**Location:** `liminallm/api/routes.py:771-801`
+
+Privileged operation to create users has no logging of which admin created the user, user details, or timestamps.
+
+**Compliance Impact:** CRITICAL for SOC2 Type II - no audit trail for privileged operations.
+
+### 51.3 CRITICAL: Missing Audit Logging for User Deletion
+**Location:** `liminallm/api/routes.py:824-837`
+
+User deletion operations are completely unlogged.
+
+**Compliance Impact:** GDPR & SOC2 require audit trail of data deletion.
+
+### 51.4 CRITICAL: Missing Audit Logging for Permission Changes
+**Location:** `liminallm/api/routes.py:805-820`
+
+Role/permission changes are unlogged - no record of who changed what role.
+
+**Compliance Impact:** SOC2 requires detailed access control change logs.
+
+### 51.5 CRITICAL: Failed Login Attempts Not Logged
+**Location:** `liminallm/api/routes.py:597-598`
+
+Failed authentication attempts have no logging - cannot detect brute force attacks.
+
+### 51.6 CRITICAL: Password Change Events Not Logged
+**Location:** `liminallm/api/routes.py:1277-1305`
+
+Credential changes completely unlogged - no audit trail for GDPR/SOC2 compliance.
+
+### 51.7 CRITICAL: Email Verification Events Not Logged
+**Location:** `liminallm/service/auth.py:828-855`
+
+Email verification success/failure completely unlogged.
+
+### 51.8 CRITICAL: Password Reset Completion Not Logged
+**Location:** `liminallm/service/auth.py:788-810`
+
+Password recovery operations unlogged.
+
+### 51.9 CRITICAL: Session Revocation Not Logged
+**Location:** `liminallm/api/routes.py:1308-1332`
+
+Session termination completely unlogged - cannot audit user access patterns.
+
+### 51.10 HIGH: PII (Email Addresses) Being Logged
+**Location:** `liminallm/service/email.py:65, 99, 103`
+
+Email addresses logged directly despite PII redaction being configured.
+
+### 51.11 HIGH: No Logging for Failed Password Verification
+**Location:** `liminallm/service/auth.py:862-873`
+
+Failed password attempts silently fail with no logging - cannot detect brute force.
+
+### 51.12 HIGH: Token Refresh Failures Not Logged
+**Location:** `liminallm/api/routes.py:714-715`
+
+Failed token refresh completely unlogged - could indicate token theft.
+
+### 51.13 HIGH: Insufficient OAuth Exchange Logging
+**Location:** `liminallm/service/auth.py:411-415`
+
+OAuth success logs missing critical audit information (user_id, action type).
+
+### 51.14 HIGH: Insufficient MFA Failure Logging
+**Location:** `liminallm/service/auth.py:754-763`
+
+Only MFA lockout is logged, not individual failed attempts.
+
+### 51.15 MEDIUM: Inconsistent Log Levels for Security Events
+**Location:** Multiple service files
+
+No standard for security event log levels - makes alerting difficult.
+
+### 51.16 MEDIUM: Insufficient Correlation ID Usage
+**Location:** `liminallm/service/auth.py`
+
+Service-layer logging doesn't consistently expose correlation IDs.
+
+### 51.17 MEDIUM: Missing Config Patch Decision Logging
+**Location:** `liminallm/api/routes.py:2104-2247`
+
+Admin approval/rejection decisions lack detailed logs.
+
+---
+
+## 52. HTTP Security Headers
+
+### 52.1 MEDIUM: X-Frame-Options Configuration Mismatch
+**Location:** `nginx.conf:40` vs `liminallm/app.py:116`
+
+Nginx sets `SAMEORIGIN` while app sets `DENY` - nginx takes precedence, weakening protection.
+
+### 52.2 MEDIUM: Missing Cache-Control on Sensitive Endpoints
+**Location:** `liminallm/app.py:174-260, 263-320`
+
+`/healthz` and `/metrics` endpoints don't set Cache-Control headers. Build info could be cached.
+
+### 52.3 MEDIUM: Missing Cache-Control on API Endpoints
+**Location:** `liminallm/app.py:113-136`
+
+No Cache-Control header set globally for API responses - intermediate proxies could cache sensitive data.
+
+### 52.4 MEDIUM: HSTS Only Enabled via Environment Flag
+**Location:** `liminallm/app.py:123-131`
+
+HSTS is disabled by default (must enable via ENABLE_HSTS) - relies on nginx fallback.
+
+### 52.5 MEDIUM: /healthz and /metrics Not Rate Limited
+**Location:** `nginx.conf:119-123`
+
+Health and metrics endpoints have no rate limiting - DoS vector.
+
+### 52.6 MEDIUM: FileResponse Not Setting Cache Headers
+**Location:** `liminallm/app.py:150-171`
+
+FileResponse for HTML pages doesn't set Cache-Control - admin.html could be cached.
+
+### 52.7 LOW: Missing Server Header Suppression
+**Location:** `nginx.conf`
+
+Missing `server_tokens off;` - nginx version information disclosure.
+
+### 52.8 LOW: CORS Missing Max-Age Header
+**Location:** `liminallm/app.py:75-91`
+
+No explicit `max_age` configured for CORS preflight caching.
+
+### 52.9 LOW: CORS Missing Expose-Headers
+**Location:** `liminallm/app.py:75-91`
+
+X-Request-ID header not exposed to frontend JavaScript.
+
+### 52.10 LOW: Incomplete CSP Directives
+**Location:** `liminallm/app.py:132-135`
+
+CSP doesn't explicitly restrict `object-src`, `media-src`, `worker-src`.
+
+---
+
+## 53. Business Logic Vulnerabilities
+
+### 53.1 CRITICAL: MFA Bypass via Silent Database Failure
+**Location:** `liminallm/storage/postgres.py:1354-1363`
+
+If database UPDATE fails during `mark_session_verified()`, the exception is caught but in-memory cache is STILL marked as verified.
+
+```python
+except Exception as exc:
+    self.logger.warning("mark_session_verified_failed", error=str(exc))
+self._update_cached_session(session_id, mfa_verified=True)  # ALWAYS EXECUTES
+```
+
+**Impact:** Complete MFA bypass - database transient failure enables MFA-protected account compromise.
+
+### 53.2 CRITICAL: Tenant Spoofing via Signup Endpoint
+**Location:** `liminallm/api/routes.py:545-549`, `liminallm/service/auth.py:202-220`
+
+Signup endpoint accepts `tenant_id` directly from request body, violating CLAUDE.md guideline.
+
+**Impact:** Attacker can register in ANY tenant by specifying arbitrary tenant_id.
+
+### 53.3 CRITICAL: Tenant Spoofing via OAuth Complete
+**Location:** `liminallm/service/auth.py:484-495`
+
+OAuth callback accepts `tenant_id` parameter - can create account in attacker-specified tenant.
+
+### 53.4 CRITICAL: TOCTOU Race Condition in Session Revocation
+**Location:** `liminallm/api/routes.py:1325-1329`
+
+Between ownership check and revoke call, session could be modified by concurrent request.
+
+### 53.5 CRITICAL: Session Verification State Machine Inconsistency
+**Location:** `liminallm/service/auth.py:591-605`
+
+If `revoke_refresh_token()` throws, the session may remain in database while refresh token is revoked.
+
+### 53.6 HIGH: MFA Race Condition - Lockout Bypass
+**Location:** `liminallm/service/auth.py:756-763`
+
+Multiple concurrent requests can increment MFA attempt counter before lockout check executes.
+
+### 53.7 HIGH: Unsigned MFA Verification Failure
+**Location:** `liminallm/service/auth.py:553-556`
+
+`_mark_session_verified()` might fail silently but tokens are still issued.
+
+### 53.8 HIGH: Missing Negative Value Validation in Rate Limiting
+**Location:** `liminallm/service/runtime.py:278-289`
+
+No validation that `limit` is positive - negative limit bypasses rate limiting.
+
+### 53.9 MEDIUM: Insufficient Exception Handling in Cache Operations
+**Location:** `liminallm/service/auth.py:630-634`
+
+Cache deletion failures silently ignored - ghost sessions may persist.
+
+### 53.10 MEDIUM: Race Condition in Session Cache Eviction
+**Location:** `liminallm/storage/postgres.py:76-94`
+
+Session may expire between sort and eviction decision.
+
+---
+
+## 54. Frontend Security Issues
+
+### 54.1 CRITICAL: Sensitive MFA Secret Displayed in DOM
+**Location:** `frontend/chat.js:2471`
+
+MFA secret displayed via textContent - visible in DevTools, readable by extensions.
+
+### 54.2 CRITICAL: OTP Authentication URI Exposed Without Escaping
+**Location:** `frontend/chat.js:2480`
+
+`otpauth_uri` interpolated directly into innerHTML without HTML escaping.
+
+### 54.3 CRITICAL: Newly Created Passwords Displayed in DOM
+**Location:** `frontend/admin.js:429`
+
+Auto-generated passwords displayed in UI - window of exposure.
+
+### 54.4 HIGH: Sensitive Runtime Config Displayed in Plaintext
+**Location:** `frontend/admin.js:257`
+
+Entire runtime configuration displayed via JSON.stringify.
+
+### 54.5 HIGH: Admin Objects Inspect Displays Sensitive Data
+**Location:** `frontend/admin.js:532-536`
+
+Full object details displayed in JSON - could contain sensitive data.
+
+### 54.6 HIGH: Unescaped Error Messages Displayed
+**Location:** Multiple files - `chat.js:3064, 3079`, `admin.js:259, 295, 329, 539`
+
+Error messages from API displayed directly - could expose SQL errors, file paths.
+
+### 54.7 HIGH: Missing CSRF Protection on Forms
+**Location:** `admin.html`, `index.html`
+
+No forms or API requests include CSRF tokens.
+
+### 54.8 HIGH: Sensitive Data in Session Storage
+**Location:** `frontend/chat.js:13-20, 67-76`
+
+Access/refresh tokens stored in sessionStorage - vulnerable to XSS.
+
+### 54.9 MEDIUM: Preference Data Exposes Internal Routing
+**Location:** `frontend/chat.js:2050, 2052-2055`
+
+Internal routing traces and workflow details displayed in preference panel.
+
+### 54.10 MEDIUM: URL Parameters Containing Sensitive Tokens
+**Location:** `frontend/chat.js:880, 973`
+
+Password reset and email verification tokens passed in URL parameters.
+
+### 54.11 MEDIUM: Insufficient Input Validation on Admin Inputs
+**Location:** `frontend/admin.js:264-276`
+
+Minimal validation of patch body structure.
+
+### 54.12 MEDIUM: Potential IDOR in Artifact/Conversation Access
+**Location:** `frontend/chat.js:1061-1072, 1950-1966`
+
+Frontend accesses resources by ID without validating authorization.
+
+### 54.13 MEDIUM: Draft Data Stored in Plain LocalStorage
+**Location:** `frontend/chat.js:23-52`
+
+Conversation drafts stored unencrypted in localStorage.
+
+### 54.14 MEDIUM: Tenant ID From Session Storage (Not Derived From Token)
+**Location:** `frontend/admin.js:36-42, 55, 116`
+
+Tenant ID read from sessionStorage and sent to backend - violates CLAUDE.md.
+
+---
+
+## 55. External API Integration Issues
+
+### 55.1 MEDIUM: Secrets in URL Query Parameters
+**Location:** `liminallm/service/email.py:108, 160`
+
+Reset and verification tokens exposed in URL query parameters - logged in access logs, browser history.
+
+### 55.2 MEDIUM: Missing Input Validation on OAuth Responses
+**Location:** `liminallm/service/auth.py:373-416, 430-456`
+
+OAuth token response structure not validated - could fail silently on malformed responses.
+
+### 55.3 MEDIUM: Insecure Redirect Following on OAuth Calls
+**Location:** `liminallm/service/auth.py:356`
+
+Default httpx behavior follows redirects without limits - potential SSRF.
+
+### 55.4 MEDIUM: No API Key Rotation Handling
+**Location:** `liminallm/service/voice.py:32-42`, `liminallm/service/model_backend.py:354-371`
+
+API keys cannot be rotated without restarting application.
+
+### 55.5 MEDIUM: Missing Validation on OAuth Redirect URI
+**Location:** `liminallm/service/auth.py:282-286, 348-351`
+
+Redirect URI not validated for HTTPS or allowed domain.
+
+### 55.6 MEDIUM: Default Insecure SMTP Configuration
+**Location:** `liminallm/service/email.py:85-97`
+
+Configuration naming confusing - `smtp_use_tls=False` uses SMTP_SSL.
+
+### 55.7 LOW: No Timeout on OpenAI Client
+**Location:** `liminallm/service/model_backend.py:368-371`
+
+OpenAI client uses default timeout (may be infinite).
+
+### 55.8 LOW: Missing Explicit Error Handling for JSON Parsing
+**Location:** `liminallm/service/voice.py:95-100`
+
+JSON parsing could fail even after raise_for_status().
+
+---
+
+## 56. Cryptographic Implementation Issues
+
+### 56.1 MEDIUM: Weak JWT Test Secret
+**Location:** `tests/test_auth_unit.py:25`
+
+Test JWT secret only 27 characters - lower entropy than production requirement.
+
+### 56.2 MEDIUM: MFA Encryption Key Fallback Chain
+**Location:** `liminallm/storage/memory.py:111-114`
+
+MFA encryption uses JWT_SECRET as fallback - violates key separation principle.
+
+### 56.3 MEDIUM: OAuth State Parameter Not Redis-Backed
+**Location:** `liminallm/service/auth.py:131, 276-278`
+
+OAuth state stored in-memory - fails in multi-process deployments without Redis.
+
+### 56.4 ADVISORY: SHA1 in TOTP Implementation
+**Location:** `liminallm/service/auth.py:903`
+
+TOTP uses SHA1 per RFC 6238 - acceptable but documented limitation.
+
+---
+
+## 8th Pass Summary Tables
+
+### Critical Priority (104 Issues Total)
+
+| # | Issue | Location |
+|---|-------|----------|
+| 84 | MFA Request Missing Authentication | routes.py:997-1012 |
+| 85 | MFA Verify Missing Session Ownership | routes.py:1015-1050 |
+| 86 | Admin Role Modification Missing Tenant Isolation | routes.py:804-820 |
+| 87 | Admin User Deletion Missing Tenant Isolation | routes.py:823-837 |
+| 88 | Missing Audit Logging - User Signup | routes.py:525-570 |
+| 89 | Missing Audit Logging - Admin User Creation | routes.py:771-801 |
+| 90 | Missing Audit Logging - User Deletion | routes.py:824-837 |
+| 91 | Missing Audit Logging - Permission Changes | routes.py:805-820 |
+| 92 | Failed Login Attempts Not Logged | routes.py:597-598 |
+| 93 | Password Change Events Not Logged | routes.py:1277-1305 |
+| 94 | Email Verification Events Not Logged | auth.py:828-855 |
+| 95 | Password Reset Completion Not Logged | auth.py:788-810 |
+| 96 | Session Revocation Not Logged | routes.py:1308-1332 |
+| 97 | MFA Bypass via Silent Database Failure | postgres.py:1354-1363 |
+| 98 | Tenant Spoofing via Signup Endpoint | routes.py:545-549 |
+| 99 | Tenant Spoofing via OAuth Complete | auth.py:484-495 |
+| 100 | TOCTOU Race in Session Revocation | routes.py:1325-1329 |
+| 101 | Session Verification State Machine Issue | auth.py:591-605 |
+| 102 | MFA Secret Displayed in DOM | chat.js:2471 |
+| 103 | OTP URI Exposed Without Escaping | chat.js:2480 |
+| 104 | Passwords Displayed in Admin UI | admin.js:429 |
+
+### High Priority (105 Issues Total)
+
+| # | Issue | Location |
+|---|-------|----------|
+| 91 | Chat Cancel Missing Ownership | routes.py:1472-1510 |
+| 92 | PII (Emails) Being Logged | email.py:65, 99, 103 |
+| 93 | Failed Password Verification Not Logged | auth.py:862-873 |
+| 94 | Token Refresh Failures Not Logged | routes.py:714-715 |
+| 95 | Insufficient OAuth Exchange Logging | auth.py:411-415 |
+| 96 | Insufficient MFA Failure Logging | auth.py:754-763 |
+| 97 | MFA Lockout Race Condition | auth.py:756-763 |
+| 98 | Unsigned MFA Verification | auth.py:553-556 |
+| 99 | Missing Negative Value Validation | runtime.py:278-289 |
+| 100 | Runtime Config Displayed in Plaintext | admin.js:257 |
+| 101 | Admin Inspect Displays Sensitive Data | admin.js:532-536 |
+| 102 | Unescaped Error Messages | Multiple files |
+| 103 | Missing CSRF Protection | admin.html, index.html |
+| 104 | Tokens in Session Storage | chat.js:13-20 |
+| 105 | Tenant Validation Inconsistency | routes.py (admin endpoints) |
+
+### Medium Priority (111 Issues Total)
+
+| # | Issue | Location |
+|---|-------|----------|
+| 76-85 | HTTP Header Issues | app.py, nginx.conf |
+| 86-87 | Cache Error Handling, Eviction Race | auth.py, postgres.py |
+| 88-93 | Frontend Issues | chat.js, admin.js |
+| 94-99 | External API Issues | email.py, auth.py, voice.py |
+| 100-103 | Cryptographic Issues | memory.py, auth.py, tests |
+| 104-111 | Logging Consistency Issues | Multiple files |
+
+---
+
+## 8th Pass Recommendations
+
+### RBAC Actions (Immediate)
+
+1. Add authentication to MFA request/verify endpoints
+2. Validate session ownership before MFA operations
+3. Add tenant isolation checks to all admin user operations
+4. Validate ownership before chat request cancellation
+
+### Audit Logging Actions (Immediate)
+
+1. Add logging to signup, login failure, password change endpoints
+2. Add logging to all admin user operations (create, delete, role change)
+3. Fix email address logging in email service (use PII redaction)
+4. Add logging for failed password verification
+5. Add logging for session revocation and token refresh failures
+6. Standardize log levels for security events
+
+### HTTP Security Actions (Short-term)
+
+1. Add Cache-Control to sensitive endpoints (/healthz, /metrics, APIs)
+2. Fix X-Frame-Options mismatch (use DENY consistently)
+3. Rate limit /healthz and /metrics endpoints
+4. Enable HSTS by default in production
+5. Add explicit CSP directives for object-src, media-src
+
+### Business Logic Actions (Immediate)
+
+1. Only update MFA cache AFTER database update succeeds
+2. Remove tenant_id from signup and OAuth callback parameters
+3. Use atomic database operations for session revocation
+4. Use Redis Lua scripts for atomic MFA attempt counting
+5. Add positive validation for rate limit parameters
+
+### Frontend Security Actions (Immediate)
+
+1. Remove MFA secret display from DOM
+2. Escape OTP URI before innerHTML insertion
+3. Remove password display from admin UI
+4. Implement CSRF token protection
+5. Move tokens from sessionStorage to memory-only
+6. Redact sensitive data from runtime config display
+7. Remove tenant_id from frontend (derive from JWT only)
+
+### External API Actions (Short-term)
+
+1. Use POST for reset/verification tokens (not URL parameters)
+2. Implement input validation for OAuth responses
+3. Set follow_redirects=False on OAuth HTTP clients
+4. Implement API key rotation mechanism
+5. Add timeout parameter to OpenAI client
+
+### Cryptographic Actions (Short-term)
+
+1. Use production-strength secrets in tests
+2. Require separate MFA_SECRET_KEY (remove JWT_SECRET fallback)
+3. Make Redis mandatory for OAuth state in production
+
+---
+
+**Total Issues After 8th Pass:**
+- **Critical:** 104 (83 + 21 new)
+- **High:** 105 (90 + 15 new)
+- **Medium:** 111 (75 + 36 new)
+- **Total:** 320
+
