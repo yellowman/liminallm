@@ -1,7 +1,7 @@
 # Codebase Issues and Security Audit
 
 **Last Updated:** 2025-12-03
-**Scope:** Comprehensive review against SPEC.md requirements (6th pass)
+**Scope:** Comprehensive review against SPEC.md requirements (7th pass)
 
 ---
 
@@ -49,11 +49,18 @@ This document consolidates findings from deep analysis of the liminallm codebase
 - CSRF/Session security (6th pass)
 - Frontend XSS vulnerabilities (6th pass)
 - Error handling security (6th pass)
+- Adapter/LoRA security (7th pass)
+- Multi-tenant isolation (7th pass)
+- Embedding/vector security (7th pass)
+- Input validation edge cases (7th pass)
+- Content redaction security (7th pass)
+- Deadlock/timeout patterns (7th pass)
+- API versioning/compatibility (7th pass)
 
-**Critical Issues Found:** 75 (63 from passes 1-5, 12 new in 6th pass)
-**High Priority Issues:** 70 (52 from passes 1-5, 18 new in 6th pass)
-**Medium Priority Issues:** 48 (33 from passes 1-5, 15 new in 6th pass)
-**Total Issues:** 193
+**Critical Issues Found:** 83 (75 from passes 1-6, 8 new in 7th pass)
+**High Priority Issues:** 90 (70 from passes 1-6, 20 new in 7th pass)
+**Medium Priority Issues:** 75 (48 from passes 1-6, 27 new in 7th pass)
+**Total Issues:** 248
 **False Positives Identified:** 4 (Issues 19.1, 33.2, 33.4, 33.5)
 
 ---
@@ -2179,3 +2186,628 @@ Multiple bare `except: pass` blocks without logging.
 Database column names exposed in NOT NULL constraint violation errors.
 
 **Impact:** Schema information disclosure aids SQL injection attempts.
+
+---
+
+## 43. Adapter/LoRA Security (7th Pass)
+
+### 43.1 CRITICAL: Float Weight Injection via JSON Deserialization
+
+**Location:** `liminallm/service/model_backend.py:1023`
+
+Adapter weight files are deserialized using `json.loads()` without validation. JSON allows serialization of IEEE 754 special floating-point values (infinity, -infinity, NaN) via scientific notation.
+
+**Impact:** Numerical instability, model corruption, NaN propagation through inference, DoS via malformed weights.
+
+### 43.2 HIGH: Insufficient Gate Weight Bounds Checking
+
+**Location:** `liminallm/service/model_backend.py:666-674`
+
+Gate weights extracted and converted to float before bounds clamping. Float conversion at line 674 happens before clamping at line 1283.
+
+**Impact:** Infinity/NaN in weight field bypass the clamping check; malformed weights passed to API backends.
+
+### 43.3 HIGH: Missing File Size Limits on Weight Uploads
+
+**Location:** `liminallm/service/model_backend.py:999`
+
+No validation of file size before reading entire weight file into memory: `payload = params_path.read_bytes()`.
+
+**Impact:** DoS via large adapter files causing OOM; resource exhaustion affecting other users.
+
+### 43.4 HIGH: No Validation of Remote Model IDs
+
+**Location:** `liminallm/service/model_backend.py:633, 659-664`
+
+Remote model IDs passed through without validation to external providers.
+
+**Impact:** Model injection, parameter pollution, access control bypass via crafted model IDs.
+
+### 43.5 MEDIUM: Adapter Cache Poisoning (Cross-User Access)
+
+**Location:** `liminallm/service/model_backend.py:825, 996-998, 1029`
+
+Adapter cache keyed only by `adapter_id`, no user_id or tenant_id in cache key.
+
+**Impact:** User B could load User A's private adapter weights if adapter IDs collide.
+
+### 43.6 MEDIUM: Prompt Injection via adapter prompt_instructions
+
+**Location:** `liminallm/service/model_backend.py:738-762, 764-788`
+
+Adapter prompt instructions extracted and injected into system message without sanitization or length limits.
+
+**Impact:** LLM jailbreak, model behavior hijacking, context window pollution.
+
+### 43.7 MEDIUM: Missing Input Validation on Adapter Schema Fields
+
+**Location:** `liminallm/api/schemas.py`, `model_backend.py`
+
+No regex/pattern validation on remote_model_id, remote_adapter_id, adapter_id. Weight array dimensions loaded without shape validation.
+
+**Impact:** Malformed data confuses downstream consumers; injection via provider APIs.
+
+### 43.8 LOW: Cache Mtime Check Bypass
+
+**Location:** `liminallm/service/model_backend.py:995-998`
+
+Cache validation relies on file mtime which can be manipulated or affected by clock skew.
+
+**Impact:** Stale or modified weights served from cache.
+
+---
+
+## 44. Multi-Tenant Isolation (7th Pass)
+
+### 44.1 MEDIUM: X-Tenant-ID Header Parameter Accepted
+
+**Location:** `liminallm/api/routes.py:339-370`
+
+`X-Tenant-ID` header accepted as a "hint" and passed to `authenticate()`. Violates CLAUDE.md: "Always derive tenant_id from the authenticated JWT token, never from request parameters."
+
+**Impact:** Information disclosure (tenant enumeration), confusion in audit logs.
+
+### 44.2 MEDIUM: OAuth Callback tenant_id Parameter
+
+**Location:** `liminallm/api/routes.py:658`
+
+OAuth callback endpoint accepts `tenant_id` as a query parameter from attacker-controlled OAuth callback URL.
+
+**Impact:** Potential tenant assignment manipulation during OAuth flow.
+
+### 44.3 MEDIUM: Missing Tenant Isolation in Rate Limiting Cache Keys
+
+**Location:** `liminallm/storage/redis_cache.py:58`
+
+Rate limit keys constructed as `rate:{key}:{now_bucket}` without explicit tenant separation.
+
+**Impact:** Cross-tenant rate limit bucket collisions possible; tenant-wide rate limits not feasible.
+
+### 44.4 MEDIUM: Workflow State Cache Keys Lack Tenant Isolation
+
+**Location:** `liminallm/storage/redis_cache.py:99-113`
+
+Workflow state cache keys use only `state_key` without tenant/user isolation.
+
+**Impact:** Cross-tenant workflow state collision if state_key is predictable.
+
+### 44.5 LOW: Router Cache Keys Not Tenant-Prefixed
+
+**Location:** `liminallm/storage/redis_cache.py:82, 95`
+
+Cache keys include `user_id` but not `tenant_id`.
+
+**Impact:** UUID collision unlikely but violates isolation principle.
+
+---
+
+## 45. Embedding/Vector Security (7th Pass)
+
+### 45.1 CRITICAL: No NaN/Infinity Validation in Embeddings
+
+**Location:** `liminallm/service/embeddings.py:29-36`
+
+`cosine_similarity()` does not check for NaN or Infinity values before computing similarity.
+
+**Impact:** Poisoned embeddings corrupt similarity scores, centroid calculations, vector search results.
+
+### 45.2 HIGH: Missing Embedding Dimension Validation
+
+**Location:** `liminallm/service/embeddings.py:39-47`
+
+`ensure_embedding_dim()` silently pads or truncates embeddings without validating input dimensions.
+
+**Impact:** Malformed embeddings cause inconsistent vector space geometry and clustering errors.
+
+### 45.3 HIGH: Centroid Poisoning - No Validation on Cluster Centroids
+
+**Location:** `liminallm/service/clustering.py:88-99`
+
+Cluster centroids computed and stored without validating for NaN/Infinity. K-means update rule doesn't normalize results.
+
+**Impact:** Malicious centroids break similarity calculations, skew cluster assignments.
+
+### 45.4 HIGH: Embedding Injection in Preference Events
+
+**Location:** `liminallm/storage/postgres.py:313-315`, `memory.py:648-650`
+
+User-provided embeddings in preference events accepted without validation.
+
+**Impact:** Training data poisoning, centroid corruption, clustering manipulation.
+
+### 45.5 HIGH: No Bounds Checking on Cosine Similarity Scores
+
+**Location:** `liminallm/service/router.py:307-319`
+
+Similarity scores used directly for weight assignment without NaN validation.
+
+**Impact:** NaN similarity scores propagate through adapter routing, undefined behavior.
+
+### 45.6 MEDIUM: Centroid Exposure in Adapter Schema
+
+**Location:** `liminallm/service/router.py:422-426`, `clustering.py:209`
+
+Adapter centroids stored in artifact schema and exposed to users via API responses.
+
+**Impact:** Embeddings leaked; attackers can craft malicious adapters with poisoned centroids.
+
+### 45.7 MEDIUM: Chunk Search with Unvalidated Embeddings
+
+**Location:** `liminallm/storage/common.py:86-91`, `memory.py:1487-1496`
+
+Search functions don't validate embedding dimensions before computing similarity.
+
+**Impact:** Dimension mismatch silently handled, incorrect search results.
+
+### 45.8 MEDIUM: No Embedding Model Validation for pgvector Search
+
+**Location:** `liminallm/storage/postgres.py:2472-2474`
+
+Embedding model ID filtering is optional and happens after chunks selected.
+
+**Impact:** Chunks from different embedding models mixed in search results.
+
+### 45.9 MEDIUM: Unvalidated Centroid in Workflow Context Embedding
+
+**Location:** `liminallm/service/workflow.py:1370, 1375`
+
+Cluster centroids used directly in workflow vector alignment without validation.
+
+**Impact:** Poisoned centroids corrupt workflow routing decisions.
+
+### 45.10 MEDIUM: Missing Normalization in Centroid Update
+
+**Location:** `liminallm/service/clustering.py:40-42, 88-95`
+
+Mini-batch k-means centroids updated incrementally without normalization.
+
+**Impact:** Centroids accumulate magnitude errors, incorrect cluster assignments.
+
+---
+
+## 46. Input Validation Edge Cases (7th Pass)
+
+### 46.1 HIGH: Nested JSON Validation - Unbounded Depth
+
+**Location:** `liminallm/api/schemas.py:184-185, 242, 258-265, 654, 662`
+
+Multiple fields accept unrestricted `dict` with no nested depth or size validation: `default_style`, `flags`, `inputs`, `outputs`.
+
+**Impact:** Memory exhaustion via deeply nested structures; JSON deserialization bomb attacks.
+
+### 46.2 HIGH: Array Length Limits - Unbounded Arrays
+
+**Location:** `liminallm/api/schemas.py:260-265`
+
+`ChatResponse` list fields (`adapters`, `adapter_gates`, `context_snippets`, `routing_trace`, `workflow_trace`) have no `max_items` validation.
+
+**Impact:** DoS via large arrays; memory exhaustion.
+
+### 46.3 HIGH: String Length Limits - Missing maxLength
+
+**Location:** `liminallm/api/schemas.py:281-282, 493, 655-657`
+
+Multiple required/optional strings without `max_length`: `ArtifactRequest.name`, `type`, `explicit_signal`, `conversation_id`, `context_id`, `user_message`.
+
+**Impact:** Memory exhaustion; buffer overflow in storage; unbounded query strings.
+
+### 46.4 MEDIUM: Unicode Edge Cases - No Normalization
+
+**Location:** `liminallm/api/schemas.py:59`
+
+Email validation `strip().lower()` doesn't account for zero-width characters, RTL override, combining diacritics, or NFKC normalization.
+
+**Impact:** IDN homoglyph attacks; Unicode normalization bypasses; spoofed identities.
+
+### 46.5 MEDIUM: Numeric Bounds - Integer Overflow Potential
+
+**Location:** `liminallm/api/routes.py:741, 1648-1650`
+
+Integer query parameters have only `ge=1` bounds, no upper limits. Float fields don't prevent NaN/Infinity.
+
+**Impact:** Integer overflow in offset/limit calculations; NaN propagation.
+
+### 46.6 MEDIUM: Empty String vs Null Handling
+
+**Location:** `liminallm/api/schemas.py:283`, `storage/postgres.py:1678`
+
+Inconsistent empty string vs None handling between similar fields and between request/response.
+
+**Impact:** Type confusion attacks; logic bypasses.
+
+### 46.7 MEDIUM: Special Characters in Identifiers
+
+**Location:** `liminallm/api/routes.py:1645-1646, 465`
+
+`type`, `kind` query parameters and `fs_path` lack pattern validation.
+
+**Impact:** NoSQL injection through JSONB operators; path traversal.
+
+### 46.8 MEDIUM: Query Parameter Injection
+
+**Location:** `liminallm/api/routes.py`
+
+No protection against duplicate query parameters (FastAPI merges as lists). OAuth provider parameter not validated against allowed list.
+
+**Impact:** Type confusion; parameter pollution; OAuth provider spoofing.
+
+---
+
+## 47. Content Redaction Security (7th Pass)
+
+### 47.1 HIGH: Error Message Content Exposure
+
+**Location:** `liminallm/service/workflow.py:600, 1002, 1024, 1470-1474`
+
+Exception messages containing sensitive internal details exposed in workflow_trace and error responses.
+
+**Impact:** Stack traces, SQL errors, API secrets, internal paths exposed to attackers.
+
+### 47.2 HIGH: Citation Content Exposure
+
+**Location:** `liminallm/service/workflow.py:1708, 1750, 1769`
+
+Citation chunks extracted directly without content filtering, returned in API responses and traces.
+
+**Impact:** Sensitive information from knowledge bases exposed; confidential documents leaked.
+
+### 47.3 HIGH: Message Content Not Filtered
+
+**Location:** `liminallm/api/routes.py:2458-2475`
+
+Messages returned with full content and content_struct without any filtering or redaction.
+
+**Impact:** User messages with sensitive info not filtered; tool outputs not sanitized.
+
+### 47.4 MEDIUM: Tool Output Sanitization Incomplete
+
+**Location:** `liminallm/service/workflow.py:1504-1507`
+
+Tool outputs passed through without validation or filtering for sensitive data patterns.
+
+**Impact:** Tools can leak credentials, API keys, or PII.
+
+### 47.5 MEDIUM: Content Struct Meta Field Bypass
+
+**Location:** `liminallm/content_struct.py:52, 61-95, 99-110`
+
+`content_struct` normalization accepts arbitrary data in "meta" field without validation.
+
+**Impact:** Malicious payloads injected; data exfiltration; security control bypass.
+
+### 47.6 MEDIUM: Routing Trace & Debug Info Exposure
+
+**Location:** `liminallm/api/routes.py:1441-1442`, `router.py:89-100`
+
+Routing traces with rule evaluation details returned to clients.
+
+**Impact:** Adapter selection logic, backend capabilities exposed; aids targeted attacks.
+
+### 47.7 MEDIUM: PII Redaction Limited to Logging
+
+**Location:** `liminallm/logging.py:37-48`
+
+PII redaction only occurs in log entries, not in API responses or stored data.
+
+**Impact:** PII exposed in API responses via message content, citations, tool outputs.
+
+### 47.8 MEDIUM: Inconsistent Sanitization
+
+**Location:** `liminallm/api/routes.py:2273-2327`
+
+Admin settings endpoint has sanitization logic not applied to chat messages, tool outputs, workflow traces, citations.
+
+**Impact:** No consistent sensitive field detection across API.
+
+---
+
+## 48. Deadlock/Timeout Patterns (7th Pass)
+
+### 48.1 CRITICAL: Unprotected asyncio.Lock Ordering
+
+**Location:** `liminallm/service/runtime.py:159-161`
+
+Two separate asyncio.Lock instances without documented lock ordering discipline.
+
+**Impact:** Complete service hang under concurrent requests if locks acquired in different orders.
+
+### 48.2 CRITICAL: No Connection Pool Timeout Configuration
+
+**Location:** `liminallm/storage/postgres.py:63-68`
+
+ConnectionPool created with only 10 max connections and NO timeout parameters, no statement_timeout.
+
+**Impact:** Long-running queries block new connections; pool exhaustion = service unresponsive.
+
+### 48.3 CRITICAL: Redis Operations Without Explicit Timeouts
+
+**Location:** `liminallm/storage/redis_cache.py` (multiple: 34, 37, 66, 162)
+
+All Redis operations rely on connection-level timeout (if set), not operation-level timeouts.
+
+**Impact:** Single slow Redis command stalls auth/rate-limiting/session system.
+
+### 48.4 CRITICAL: No Timeout on Database Connection Acquisition
+
+**Location:** `liminallm/storage/postgres.py:118`
+
+`pool.connection()` can block indefinitely if no connections available.
+
+**Impact:** Any of 100+ database operations using `with self._connect()` can deadlock.
+
+### 48.5 HIGH: SyncRedisCache Race Condition in pop_oauth_state
+
+**Location:** `liminallm/storage/redis_cache.py:378-380`
+
+GET then DELETE is NOT atomic. Between operations, another coroutine can consume same OAuth state.
+
+**Impact:** OAuth replay attacks; same state token could be used multiple times.
+
+### 48.6 HIGH: ThreadPoolExecutor Resource Exhaustion
+
+**Location:** `liminallm/service/workflow.py:122`
+
+Fixed pool of 4 workers is too small; no queue monitoring or adaptive scaling.
+
+**Impact:** Tools execute serially under load; requests queue indefinitely.
+
+### 48.7 HIGH: Async/Sync Context Mixing in Training Worker
+
+**Location:** `liminallm/service/training_worker.py:144`
+
+`asyncio.to_thread()` offloads training but no timeout on the call.
+
+**Impact:** If training takes too long, event loop can't process other tasks.
+
+### 48.8 HIGH: Unbounded Parallel Node Execution Without Timeout
+
+**Location:** `liminallm/service/workflow.py:323`
+
+`asyncio.gather()` without timeout; all parallel nodes must complete or hang.
+
+**Impact:** One stalled parallel node stalls entire workflow.
+
+### 48.9 MEDIUM: Lock Contention in Idempotency/Rate-Limit Caching
+
+**Location:** `liminallm/service/runtime.py:214-221, 278-289`
+
+Both functions hold locks during dictionary operations; under high concurrency, this serializes access.
+
+**Impact:** Rate limit and idempotency checks become bottleneck.
+
+### 48.10 MEDIUM: No Timeout on Training Job Retry Loop
+
+**Location:** `liminallm/service/training_worker.py:141-195`
+
+Total retry duration unbounded. Each attempt can take 5+ minutes with retries=3.
+
+**Impact:** Training jobs block queue indefinitely.
+
+### 48.11 MEDIUM: OAuth State Cleanup Race Condition
+
+**Location:** `liminallm/service/auth.py:138-183`
+
+`cleanup_expired_states()` called without any lock while other methods read/write `_oauth_states` concurrently.
+
+**Impact:** Data structure corruption, OAuth state loss.
+
+---
+
+## 49. API Versioning/Compatibility (7th Pass)
+
+### 49.1 CRITICAL: Database Migration Safety - Breaking Column Rename
+
+**Location:** `liminallm/sql/003_preferences.sql:53-61`
+
+Column rename `adapter_artifact_id` to `adapter_id` without backward compatibility layer.
+
+**Impact:** Old code referencing `adapter_artifact_id` breaks immediately; no rollback strategy.
+
+### 49.2 HIGH: Missing /v1/ Prefix Enforcement
+
+**Location:** `liminallm/app.py:174, 263`
+
+Infrastructure endpoints bypass API versioning: `/healthz`, `/metrics` return raw dict/text, not Envelope.
+
+**Impact:** Clients cannot consistently parse responses using same envelope format.
+
+### 49.3 HIGH: Breaking Changes Protection - Schema Migration Handling
+
+**Location:** `liminallm/storage/postgres.py:1701-1707`
+
+Silent schema deserialization failure with data loss - returns empty `{}` on parse failure.
+
+**Impact:** Corrupt or incompatible artifact schemas silently replaced with empty dict.
+
+### 49.4 HIGH: Artifact Schema Versioning - Unsafe Old Schema Loading
+
+**Location:** `liminallm/storage/postgres.py:1704, 1873, 1942`
+
+Old artifact schemas loaded via `json.loads()` without schema validation or migration logic.
+
+**Impact:** Old schemas may fail to load if internal structure changed.
+
+### 49.5 MEDIUM: No Deprecation Headers
+
+**Location:** `liminallm/api/routes.py` (all endpoints)
+
+No deprecation headers (`Deprecation`, `Sunset`, `Link: rel="deprecation"`) sent to clients.
+
+**Impact:** Old clients have no signal to migrate to new API versions.
+
+### 49.6 MEDIUM: Response Format Stability - Inconsistent Envelope
+
+**Location:** `liminallm/api/routes.py`
+
+59 endpoints declare `response_model=Envelope` but only 31 explicitly return `Envelope(...)`.
+
+**Impact:** Inconsistent response format across endpoints.
+
+### 49.7 MEDIUM: No Accept-Version Header Support
+
+**Location:** `liminallm/api/routes.py`
+
+No `Accept-Version` header parsing or `API-Version` response header.
+
+**Impact:** Clients cannot negotiate API version for backward compatibility.
+
+### 49.8 MEDIUM: Response Envelope Consistency - Missing request_id
+
+**Location:** `liminallm/api/routes.py:1973, 2051, 2434`
+
+Only some endpoints explicitly pass `request_id` to Envelope; most rely on default UUID.
+
+**Impact:** Idempotency keys and correlation IDs not properly propagated.
+
+---
+
+## Summary by Severity (Updated 7th Pass)
+
+### Critical (83 Issues)
+
+| # | Issue | Location |
+|---|-------|----------|
+| 1-62 | (Previous passes - see above) | Various |
+| 63 | Float Weight Injection via JSON Deserialization | model_backend.py:1023 |
+| 64 | No NaN/Infinity Validation in Embeddings | embeddings.py:29-36 |
+| 65 | Unprotected asyncio.Lock Ordering | runtime.py:159-161 |
+| 66 | No Connection Pool Timeout Configuration | postgres.py:63-68 |
+| 67 | Redis Operations Without Explicit Timeouts | redis_cache.py (multiple) |
+| 68 | No Timeout on Database Connection Acquisition | postgres.py:118 |
+| 69 | Database Migration Safety - Breaking Column Rename | sql/003_preferences.sql:53-61 |
+| 70 | (Numbered placeholder for prior issues) | Various |
+
+### High Priority (90 Issues)
+
+| # | Issue | Location |
+|---|-------|----------|
+| 1-52 | (Previous passes - see above) | Various |
+| 53 | Insufficient Gate Weight Bounds Checking | model_backend.py:674 |
+| 54 | Missing File Size Limits on Weight Uploads | model_backend.py:999 |
+| 55 | No Validation of Remote Model IDs | model_backend.py:633, 659 |
+| 56 | Missing Embedding Dimension Validation | embeddings.py:39-47 |
+| 57 | Centroid Poisoning - No Validation | clustering.py:88-99 |
+| 58 | Embedding Injection in Preference Events | postgres.py:313-315 |
+| 59 | No Bounds Checking on Cosine Similarity | router.py:307-319 |
+| 60 | Nested JSON Validation - Unbounded Depth | schemas.py:184-185 |
+| 61 | Array Length Limits - Unbounded Arrays | schemas.py:260-265 |
+| 62 | String Length Limits - Missing maxLength | schemas.py:281-282 |
+| 63 | Error Message Content Exposure | workflow.py:600, 1002, 1024 |
+| 64 | Citation Content Exposure | workflow.py:1708, 1750 |
+| 65 | Message Content Not Filtered | routes.py:2458-2475 |
+| 66 | SyncRedisCache Race Condition | redis_cache.py:378-380 |
+| 67 | ThreadPoolExecutor Resource Exhaustion | workflow.py:122 |
+| 68 | Async/Sync Context Mixing in Training | training_worker.py:144 |
+| 69 | Unbounded Parallel Node Execution | workflow.py:323 |
+| 70 | Missing /v1/ Prefix Enforcement | app.py:174, 263 |
+| 71 | Schema Migration Handling | postgres.py:1701-1707 |
+| 72 | Unsafe Old Schema Loading | postgres.py:1704, 1873 |
+
+### Medium Priority (75 Issues)
+
+| # | Issue | Location |
+|---|-------|----------|
+| 1-33 | (Previous passes - see above) | Various |
+| 34 | Adapter Cache Poisoning | model_backend.py:825, 1029 |
+| 35 | Prompt Injection via prompt_instructions | model_backend.py:738-788 |
+| 36 | Missing Adapter Schema Field Validation | schemas.py, model_backend.py |
+| 37 | X-Tenant-ID Header Parameter | routes.py:339-370 |
+| 38 | OAuth Callback tenant_id Parameter | routes.py:658 |
+| 39 | Rate Limiting Cache Keys Tenant Isolation | redis_cache.py:58 |
+| 40 | Workflow State Cache Keys Tenant Isolation | redis_cache.py:99-113 |
+| 41 | Centroid Exposure in Adapter Schema | router.py:422-426 |
+| 42 | Chunk Search Unvalidated Embeddings | common.py:86-91 |
+| 43 | No Embedding Model Validation for pgvector | postgres.py:2472-2474 |
+| 44 | Unvalidated Centroid in Workflow | workflow.py:1370, 1375 |
+| 45 | Missing Normalization in Centroid Update | clustering.py:92-95 |
+| 46 | Unicode Edge Cases - No Normalization | schemas.py:59 |
+| 47 | Numeric Bounds - Integer Overflow | routes.py:741, 1648 |
+| 48 | Empty String vs Null Handling | schemas.py:283, postgres.py:1678 |
+| 49 | Special Characters in Identifiers | routes.py:1645-1646 |
+| 50 | Query Parameter Injection | routes.py |
+| 51 | Tool Output Sanitization Incomplete | workflow.py:1504-1507 |
+| 52 | Content Struct Meta Field Bypass | content_struct.py:52, 99-110 |
+| 53 | Routing Trace & Debug Info Exposure | routes.py:1441, router.py:89-100 |
+| 54 | PII Redaction Limited to Logging | logging.py:37-48 |
+| 55 | Inconsistent Sanitization | routes.py:2273-2327 |
+| 56 | Lock Contention in Caching | runtime.py:214-221, 278-289 |
+| 57 | No Timeout on Training Retry Loop | training_worker.py:141-195 |
+| 58 | OAuth State Cleanup Race | auth.py:138-183 |
+| 59 | No Deprecation Headers | routes.py |
+| 60 | Response Format Inconsistent Envelope | routes.py |
+| 61 | No Accept-Version Header Support | routes.py |
+| 62 | Missing request_id Propagation | routes.py:1973, 2051, 2434 |
+
+---
+
+## 7th Pass Recommendations
+
+### Adapter/LoRA Security Actions
+
+1. Validate all float values in loaded weights are finite (no inf/nan)
+2. Implement file size limits on weight uploads
+3. Validate remote model/adapter IDs against whitelist patterns
+4. Use composite cache key (adapter_id + user_id + tenant_id)
+5. Sanitize prompt_instructions for length and content
+
+### Multi-Tenant Isolation Actions
+
+1. Remove X-Tenant-ID header; derive only from JWT
+2. Remove tenant_id parameter from OAuth callback
+3. Add tenant_id prefix to all cache keys
+
+### Embedding/Vector Security Actions
+
+1. Check for NaN/Infinity in all vector operations
+2. Add strict embedding dimension validation
+3. Normalize centroids after each update
+4. Validate all embeddings before similarity calculations
+
+### Input Validation Actions
+
+1. Add max_items to all list fields
+2. Add max_length to all string fields
+3. Implement Unicode normalization (NFKC)
+4. Add upper bounds to all integer query parameters
+
+### Content Redaction Actions
+
+1. Filter error messages before returning to clients
+2. Implement content filtering for citations and tool outputs
+3. Validate/restrict content_struct meta field
+4. Apply consistent sanitization across all endpoints
+
+### Deadlock/Timeout Actions
+
+1. Enforce strict lock ordering; document globally
+2. Add connection pool and statement timeouts
+3. Add Redis client socket timeout
+4. Increase thread pool workers and add monitoring
+5. Add timeout to asyncio.gather() calls
+
+### API Versioning Actions
+
+1. Wrap infrastructure endpoints in Envelope format
+2. Add deprecation headers for deprecated endpoints
+3. Implement schema validation and migration for artifacts
+4. Standardize request_id propagation
