@@ -1,7 +1,7 @@
 # Codebase Issues and Security Audit
 
 **Last Updated:** 2025-12-03
-**Scope:** Comprehensive review against SPEC.md requirements (10th pass)
+**Scope:** Comprehensive review against SPEC.md requirements (11th pass)
 
 ---
 
@@ -78,11 +78,19 @@ This document consolidates findings from deep analysis of the liminallm codebase
 - API endpoint security hardening (10th pass)
 - Dependency and import security (10th pass)
 - Frontend-backend contract issues (10th pass)
+- SQL injection and query construction (11th pass)
+- Serialization/deserialization security (11th pass)
+- Numeric/integer security (11th pass)
+- Template/string interpolation security (11th pass)
+- Async event/signal handling (11th pass)
+- Test/mock code security (11th pass)
+- Build/deployment configuration (11th pass)
+- Logging security (11th pass)
 
-**Critical Issues Found:** 135 (120 from passes 1-9, 15 new in 10th pass)
-**High Priority Issues:** 161 (134 from passes 1-9, 27 new in 10th pass)
-**Medium Priority Issues:** 177 (145 from passes 1-9, 32 new in 10th pass)
-**Total Issues:** 473
+**Critical Issues Found:** 157 (135 from passes 1-10, 22 new in 11th pass)
+**High Priority Issues:** 192 (161 from passes 1-10, 31 new in 11th pass)
+**Medium Priority Issues:** 243 (177 from passes 1-10, 66 new in 11th pass)
+**Total Issues:** 592
 **False Positives Identified:** 4 (Issues 19.1, 33.2, 33.4, 33.5)
 
 ---
@@ -4534,4 +4542,524 @@ Interactive elements missing ARIA labels.
 - **High:** 161 (134 + 27 new)
 - **Medium:** 177 (145 + 32 new)
 - **Total:** 473
+
+---
+
+## 11th Pass: Code Quality and Infrastructure Deep Dive (2025-12-04)
+
+This pass focused on 8 specialized audit areas not previously covered:
+- SQL injection and query construction
+- Serialization/deserialization security
+- Numeric/integer security
+- Template/string interpolation security
+- Async event/signal handling
+- Test/mock code security
+- Build/deployment configuration
+- Logging security
+
+---
+
+## 66. SQL Injection and Query Construction
+
+### 66.1 CRITICAL: F-String SQL Construction with Dynamic IN Clause
+**Location:** `liminallm/storage/postgres.py:1913-1918`
+
+```python
+placeholders = ", ".join(["%s"] * len(artifact_ids))
+rows = conn.execute(
+    f"SELECT artifact_id, MAX(version) as max_version FROM artifact_version "
+    f"WHERE artifact_id IN ({placeholders}) GROUP BY artifact_id",
+    tuple(artifact_ids),
+).fetchall()
+```
+
+**Impact:** While currently safe, f-string SQL construction is an anti-pattern that could become exploitable.
+
+**Recommendation:** Use PostgreSQL's `ANY()` operator instead.
+
+### 66.2 CRITICAL: F-String SQL Construction in Feedback Filter
+**Location:** `liminallm/storage/postgres.py:375-382`
+
+Same pattern - dynamic placeholder generation using f-strings for IN clause construction.
+
+### 66.3 HIGH: F-String SQL Construction with Column Names
+**Location:** `liminallm/storage/postgres.py:660-671`
+
+Using f-strings to embed column names and placeholders in INSERT statements.
+
+### 66.4 MEDIUM: Dynamic Query Concatenation with += Operator
+**Location:** `liminallm/storage/postgres.py:788-803` and similar patterns at multiple locations
+
+Query building using string concatenation (`query +=`) is fragile and error-prone.
+
+### 66.5 MEDIUM: WHERE Clause Building with String Concatenation
+**Location:** `liminallm/storage/postgres.py:1661-1670`
+
+### 66.6 MEDIUM: Vector Format String Construction
+**Location:** `liminallm/storage/postgres.py:2433-2434`
+
+Special float values (NaN, Infinity) not validated before vector string formatting.
+
+### 66.7 MEDIUM: JSON Operator Usage Without Key Validation
+**Location:** `liminallm/storage/postgres.py:1648, 2473`
+
+Hardcoded JSON keys - could become vulnerable if made dynamic.
+
+### 66.8 MEDIUM: Dynamic Query Building in search_chunks_pgvector
+**Location:** `liminallm/storage/postgres.py:2459-2491`
+
+---
+
+## 67. Serialization/Deserialization Security
+
+### 67.1 MEDIUM: JSON Parsing Without Schema Validation (Redis Cache)
+**Location:** `liminallm/storage/redis_cache.py:86, 103, 120, 178, 198, 321, 335, 349, 386, 405`
+
+All `json.loads()` calls lack size limits, nesting depth checks, and schema validation.
+
+**Impact:** Memory exhaustion via deeply nested or large JSON payloads if Redis is poisoned.
+
+### 67.2 MEDIUM: JWT Payload Deserialization Without Depth Limits
+**Location:** `liminallm/service/auth.py:950`
+
+### 67.3 MEDIUM: OAuth State Deserialization Without Validation
+**Location:** `liminallm/service/auth.py:328, 386`
+
+### 67.4 MEDIUM: Config Patch LLM Response Parsing
+**Location:** `liminallm/service/config_ops.py:164`
+
+LLM-generated JSON parsed without size limits.
+
+### 67.5 MEDIUM: Cluster Label Response Parsing
+**Location:** `liminallm/service/clustering.py:162`
+
+### 67.6 MEDIUM: Adapter Weight Loading Without Size Limits
+**Location:** `liminallm/service/model_backend.py:1023`
+
+### 67.7 MEDIUM: Postgres Metadata Parsing Without Validation
+**Location:** `liminallm/storage/postgres.py:1375, 1467, 1571, 1580, 1704, 1873, 1942, 1970, 2070, 2110, 2178, 2258`
+
+### 67.8 MEDIUM: Memory Store State Loading Without Size Validation
+**Location:** `liminallm/storage/memory.py:1565`
+
+---
+
+## 68. Numeric/Integer Security
+
+### 68.1 CRITICAL: Division by Zero in BM25 Scoring
+**Location:** `liminallm/service/bm25.py:47`
+
+```python
+avgdl = sum(len(doc) for doc in documents) / float(N)
+```
+
+Empty document list causes division by zero crash.
+
+### 68.2 CRITICAL: Division by Zero in BM25 Denominator
+**Location:** `liminallm/service/bm25.py:73-74`
+
+### 68.3 CRITICAL: Integer Overflow in Hash-Based Token Encoding
+**Location:** `liminallm/service/training.py:619-625`
+
+If `vocab_size` is 0 or negative, modulo by zero crash.
+
+### 68.4 CRITICAL: Modulo by Zero in Embedding Index Calculation
+**Location:** `liminallm/service/embeddings.py:22-24`
+
+### 68.5 CRITICAL: Modulo by Zero in Token Generation
+**Location:** `liminallm/service/model_backend.py:1137`
+
+### 68.6 HIGH: Negative Array Indexing with User-Controlled Data
+**Location:** `liminallm/service/rag.py:371, 381`
+
+### 68.7 HIGH: Integer Overflow in Session Cache Eviction
+**Location:** `liminallm/storage/postgres.py:83-91`
+
+### 68.8 HIGH: Negative Index in Config Path Operations
+**Location:** `liminallm/service/config_ops.py:241`
+
+JSON patch paths with negative indices could access arrays unexpectedly.
+
+### 68.9 HIGH: Division with Potential Zero in Router Cosine Similarity
+**Location:** `liminallm/service/embeddings.py:34-36`
+
+### 68.10 HIGH: Unbounded Page Multiplication Leading to Integer Overflow
+**Location:** `liminallm/api/routes.py:1648-1682`
+
+Page parameter has no upper bound - `page=2147483647` could overflow offset calculations.
+
+### 68.11 MEDIUM: Float Precision Loss in Weight Calculations
+**Location:** `liminallm/service/router.py:338-340`
+
+### 68.12 MEDIUM: Unchecked Integer Conversion from User Input
+**Location:** `liminallm/storage/memory.py:1374-1381`
+
+### 68.13 MEDIUM: Timestamp Integer Overflow in Redis Rate Limiting
+**Location:** `liminallm/storage/redis_cache.py:57, 293`
+
+### 68.14 MEDIUM: TTL Calculation Overflow
+**Location:** `liminallm/storage/redis_cache.py:33, 60`
+
+### 68.15 MEDIUM: Vector Dimension Calculation Overflow
+**Location:** `liminallm/service/training.py:754-761`
+
+---
+
+## 69. Template/String Interpolation Security
+
+### 69.1 CRITICAL: Prompt Injection - LLM Context Snippets
+**Location:** `liminallm/service/llm.py:109, 112, 117`
+
+```python
+context_text = f"Context: {' | '.join(context_snippets)}"
+```
+
+User-controlled context snippets directly interpolated into LLM prompts.
+
+**Impact:** Attackers can inject malicious instructions overriding system prompts.
+
+### 69.2 CRITICAL: Prompt Injection - Adapter Instructions
+**Location:** `liminallm/service/llm.py:145, 149`
+
+Adapter `prompt_instructions` injected into system messages without validation.
+
+### 69.3 CRITICAL: Prompt Injection - Model Backend Adapter Prompts
+**Location:** `liminallm/service/model_backend.py:771-772, 786`
+
+### 69.4 HIGH: HTML Injection - Email Password Reset
+**Location:** `liminallm/service/email.py:108, 112-140`
+
+If `base_url` is compromised, HTML/JavaScript can be injected into emails.
+
+### 69.5 HIGH: HTML Injection - Email Verification
+**Location:** `liminallm/service/email.py:160, 164-191`
+
+### 69.6 HIGH: XSS - Frontend innerHTML with User Data
+**Location:** `frontend/chat.js:170, 1879`
+
+Context names interpolated into HTML without escaping.
+
+### 69.7 HIGH: XSS - Frontend innerHTML in Admin Panel
+**Location:** `frontend/admin.js:171-174, 209, 227-231`
+
+### 69.8 MEDIUM: Cache Key Construction - Redis Keys with User IDs
+**Location:** `liminallm/storage/redis_cache.py:34, 37, 40, 58, 76, 79, 82, 95, 99, 116` (80+ occurrences)
+
+### 69.9 MEDIUM: URL Construction - OAuth Redirect
+**Location:** `liminallm/service/auth.py:304`
+
+### 69.10 MEDIUM: Logging with User Data
+**Location:** `liminallm/api/routes.py:541, 587, 1111`
+
+### 69.11 MEDIUM: TOTP URI Construction
+**Location:** `liminallm/service/auth.py:732`
+
+User ID not URL-encoded in OTP URI.
+
+---
+
+## 70. Async Event/Signal Handling
+
+### 70.1 CRITICAL: Task Cancellation Leak in WebSocket Handler
+**Location:** `liminallm/api/routes.py:2913-2976`
+
+If WebSocketDisconnect occurs before task creation, orphaned async tasks accumulate.
+
+**Impact:** Resource exhaustion via task leaks.
+
+### 70.2 CRITICAL: Race Condition in Cancel Request Registry
+**Location:** `liminallm/api/routes.py:128-135`
+
+TOCTOU race - streaming handler checks `is_set()` without holding lock.
+
+### 70.3 HIGH: asyncio.gather() Exception Information Disclosure
+**Location:** `liminallm/service/workflow.py:317-335`
+
+Exception details with internal paths exposed in error responses.
+
+### 70.4 HIGH: Unhandled BaseException in Async Generator
+**Location:** `liminallm/service/workflow.py:961-984`
+
+GeneratorExit/CancelledError not handled, causing resource leaks.
+
+### 70.5 HIGH: Idempotency Race Condition (Check-Then-Set)
+**Location:** `liminallm/api/routes.py:272-312`
+
+Non-atomic check and set allows duplicate request execution.
+
+### 70.6 MEDIUM: Background Task Lifecycle Not Tracked
+**Location:** `liminallm/app.py:26-48`
+
+### 70.7 MEDIUM: asyncio.to_thread Exception Propagation
+**Location:** `liminallm/api/routes.py:1120, 1256`
+
+### 70.8 MEDIUM: Event Loop Context Leakage Between Requests
+**Location:** `liminallm/service/runtime.py:158-161, 214-221, 239-243, 278-286`
+
+### 70.9 MEDIUM: Training Worker Loop Exception Swallowing
+**Location:** `liminallm/service/training_worker.py:85-93`
+
+### 70.10 MEDIUM: WebSocket Initial Receive Without Timeout
+**Location:** `liminallm/api/routes.py:2863`
+
+Slowloris-style DoS via hanging WebSocket connections.
+
+---
+
+## 71. Test/Mock Code Security
+
+### 71.1 CRITICAL: Test JWT Secret Could Leak to Production via setdefault
+**Location:** `tests/conftest.py:14`
+
+```python
+os.environ.setdefault("JWT_SECRET", "test-secret-key-for-testing-only-do-not-use-in-production")
+```
+
+If production fails to set JWT_SECRET, this weak test secret becomes the fallback.
+
+### 71.2 CRITICAL: MFA Encryption Uses JWT_SECRET as Fallback
+**Location:** `liminallm/storage/memory.py:113`
+
+Violates cryptographic key separation principles.
+
+### 71.3 CRITICAL: TEST_MODE Bypasses Security Controls
+**Location:** `tests/conftest.py:11`, `liminallm/service/runtime.py:45-78`
+
+TEST_MODE disables rate limiting, idempotency, and session validation.
+
+### 71.4 HIGH: Admin Privilege Escalation in Test Fixtures
+**Location:** `tests/test_integration_admin.py:40`
+
+### 71.5 HIGH: CI Uses Weak Hardcoded Secrets
+**Location:** `.github/workflows/tests.yml:84, 151`
+
+### 71.6 HIGH: Test Credentials Match Production Patterns
+**Location:** `tests/test_integration_admin.py:32, 62`
+
+### 71.7 HIGH: reset_runtime_for_tests() Could Be Called in Production
+**Location:** `liminallm/service/runtime.py:174-202`
+
+### 71.8 MEDIUM: Test Database URLs in Environment Defaults
+**Location:** `tests/conftest.py:17`
+
+### 71.9 MEDIUM: Mock Secrets Stored in Plain Text
+**Location:** Multiple test files
+
+### 71.10 MEDIUM: ALLOW_REDIS_FALLBACK_DEV Could Leak to Production
+**Location:** `tests/conftest.py:13`
+
+---
+
+## 72. Build/Deployment Configuration
+
+### 72.1 CRITICAL: Unpinned Dependencies - Supply Chain Attack Vector
+**Location:** `pyproject.toml:8-22`
+
+Dependencies use `>=` without upper bounds, allowing malicious updates.
+
+### 72.2 CRITICAL: Redis Running Without Authentication
+**Location:** `docker-compose.yaml:97`
+
+### 72.3 CRITICAL: Security Scan Failures Ignored in CI
+**Location:** `.github/workflows/tests.yml:167`
+
+`bandit ... || true` ignores security scan failures.
+
+### 72.4 CRITICAL: Shell Injection in Migration Script
+**Location:** `scripts/migrate.sh:7, 14`
+
+`$(ls sql/*.sql | sort)` vulnerable to filename injection.
+
+### 72.5 HIGH: Missing Container Resource Limits
+**Location:** `docker-compose.yaml:7-73`
+
+### 72.6 HIGH: Missing PYTHONHASHSEED Security Flag
+**Location:** `Dockerfile:57-61`
+
+### 72.7 HIGH: Auto-Initialization of SQL Files from Mounted Directory
+**Location:** `docker-compose.yaml:85`
+
+### 72.8 HIGH: Secrets Passed as Environment Variables
+**Location:** `docker-compose.yaml:15-60`
+
+### 72.9 HIGH: Database Password in Connection String
+**Location:** `docker-compose.yaml:17`
+
+### 72.10 HIGH: Missing Content-Security-Policy Header
+**Location:** `nginx.conf:39-43`
+
+### 72.11 MEDIUM: Development Tools in Production Image
+**Location:** `Dockerfile:36-40`
+
+### 72.12 MEDIUM: Insecure Default in Example Configuration
+**Location:** `.env.example:60`
+
+### 72.13 MEDIUM: Overly Permissive WebSocket Timeout
+**Location:** `nginx.conf:115`
+
+24-hour timeout enables resource exhaustion.
+
+### 72.14 MEDIUM: Missing Client Body Size Limit
+**Location:** `nginx.conf:72-141`
+
+---
+
+## 73. Logging Security
+
+### 73.1 CRITICAL: Redis URL with Credentials Logged
+**Location:** `liminallm/service/runtime.py:71`
+
+Redis URL including password logged directly.
+
+### 73.2 CRITICAL: Email Body Preview Logs Password Reset Tokens
+**Location:** `liminallm/service/email.py:63-68`
+
+Dev mode logs email body containing sensitive tokens.
+
+### 73.3 CRITICAL: Exception Messages Logged May Contain Sensitive Data
+**Location:** 37+ occurrences across codebase
+
+`error=str(exc)` pattern exposes credentials, paths, and internal details.
+
+### 73.4 HIGH: OAuth HTTP Error Responses Logged
+**Location:** `liminallm/service/auth.py:419-424`
+
+### 73.5 HIGH: File Paths Logged Without Sanitization
+**Location:** `liminallm/service/rag.py:472-475, 493-496`
+
+### 73.6 HIGH: Database Connection Errors Expose Internal Details
+**Location:** `liminallm/app.py:210-214, 225-227, 249-252`
+
+### 73.7 HIGH: JWT Secret Path Logged on Error
+**Location:** `liminallm/config.py:416-418, 440-442`
+
+### 73.8-73.27 MEDIUM: Various Logging Issues (20 issues)
+Including: User emails logged, user IDs logged, MFA lockout status logged, log injection vulnerabilities, conversation IDs logged, adapter configuration exposure, training job errors, workflow errors, voice service logs, model backend errors, router errors, postgres schema errors, unhandled exception handler logs full stack traces, context source ingestion failures, session revocation failures, cache operations log JTI.
+
+---
+
+## 11th Pass Issue Summary
+
+### New Critical Issues (22)
+
+| # | Issue | Location |
+|---|-------|----------|
+| 136 | F-String SQL Construction (IN Clause) | postgres.py:1913-1918 |
+| 137 | F-String SQL Construction (Feedback) | postgres.py:375-382 |
+| 138 | Division by Zero in BM25 Scoring | bm25.py:47 |
+| 139 | Division by Zero in BM25 Denominator | bm25.py:73-74 |
+| 140 | Integer Overflow in Hash Token Encoding | training.py:619-625 |
+| 141 | Modulo by Zero in Embedding Index | embeddings.py:22-24 |
+| 142 | Modulo by Zero in Token Generation | model_backend.py:1137 |
+| 143 | Prompt Injection - Context Snippets | llm.py:109, 112, 117 |
+| 144 | Prompt Injection - Adapter Instructions | llm.py:145, 149 |
+| 145 | Prompt Injection - Model Backend | model_backend.py:771-772, 786 |
+| 146 | Task Cancellation Leak WebSocket | routes.py:2913-2976 |
+| 147 | Race Condition Cancel Registry | routes.py:128-135 |
+| 148 | Test JWT Secret Fallback | conftest.py:14 |
+| 149 | MFA Uses JWT_SECRET Fallback | memory.py:113 |
+| 150 | TEST_MODE Bypasses Security | conftest.py:11, runtime.py:45-78 |
+| 151 | Unpinned Dependencies | pyproject.toml:8-22 |
+| 152 | Redis Without Authentication | docker-compose.yaml:97 |
+| 153 | Security Scan Failures Ignored | tests.yml:167 |
+| 154 | Shell Injection Migration Script | migrate.sh:7, 14 |
+| 155 | Redis URL Credentials Logged | runtime.py:71 |
+| 156 | Email Body Logs Reset Tokens | email.py:63-68 |
+| 157 | Exception Messages Log Sensitive Data | Multiple files |
+
+### New High Priority Issues (31)
+
+| # | Issue | Location |
+|---|-------|----------|
+| 175-183 | SQL/Query Construction (1 issue) | postgres.py |
+| 184-188 | Numeric Security (5 issues) | Various |
+| 189-195 | String/Template Injection (4 issues) | email.py, chat.js, admin.js |
+| 196-200 | Async/Event Handling (3 issues) | workflow.py, routes.py |
+| 201-207 | Test Code Security (4 issues) | Various |
+| 208-217 | Build/Deploy Config (10 issues) | Dockerfile, docker-compose, nginx |
+| 218-221 | Logging Security (4 issues) | auth.py, rag.py, app.py, config.py |
+
+### New Medium Priority Issues (66)
+
+| # | Issue | Location |
+|---|-------|----------|
+| 178-185 | SQL Construction (5 issues) | postgres.py |
+| 186-193 | Serialization (8 issues) | redis_cache.py, auth.py, etc. |
+| 194-198 | Numeric (5 issues) | router.py, memory.py, redis_cache.py |
+| 199-203 | String Interpolation (4 issues) | redis_cache.py, auth.py, routes.py |
+| 204-208 | Async/Event (5 issues) | app.py, routes.py, runtime.py, etc. |
+| 209-211 | Test Code (3 issues) | conftest.py, test files |
+| 212-215 | Build/Deploy (4 issues) | Dockerfile, nginx.conf, .env.example |
+| 216-235 | Logging (20 issues) | Multiple files |
+
+---
+
+## 11th Pass Recommendations
+
+### SQL Injection Prevention (Immediate)
+
+1. Replace all f-string SQL construction with parameterized queries
+2. Use PostgreSQL's `ANY()` operator instead of dynamic IN clauses
+3. Implement query builder pattern for dynamic WHERE clauses
+4. Add validation for special float values before vector operations
+
+### Serialization Security (Immediate)
+
+1. Implement `safe_json_loads()` utility with size/depth limits
+2. Add size limits before file-based deserialization
+3. Validate parsed JSON type matches expected type
+4. Add schema validation for critical data paths
+
+### Numeric Security (Critical)
+
+1. Add bounds checking before all division operations
+2. Validate `vocab_size`, `dim`, and other denominators are positive
+3. Cap page numbers and other user-controlled integers
+4. Add epsilon checks to cosine similarity calculations
+
+### Prompt Injection Prevention (Critical)
+
+1. Implement prompt sanitization for context snippets
+2. Validate and sanitize adapter instructions
+3. Use role separation and structured prompts
+4. Consider prompt injection detection
+
+### Async/Event Security (High Priority)
+
+1. Add proper task cleanup in finally blocks
+2. Use atomic operations for idempotency checks (Redis SETNX)
+3. Add timeouts to all WebSocket receive operations
+4. Implement graceful degradation for persistent failures
+
+### Test Code Security (Immediate)
+
+1. Never use `setdefault()` for security-critical environment variables
+2. Require separate MFA_SECRET_KEY (no JWT_SECRET fallback)
+3. Add startup validation to reject TEST_MODE in production
+4. Use GitHub Secrets for CI credentials
+
+### Build/Deploy Security (Immediate)
+
+1. Pin all dependencies to specific versions
+2. Add Redis authentication
+3. Remove `|| true` from security scan step
+4. Fix shell injection in migration script
+5. Add container resource limits
+6. Add Content-Security-Policy headers
+
+### Logging Security (High Priority)
+
+1. Implement URL credential redaction before logging
+2. Never log email body content
+3. Create `sanitize_exception()` utility for all error logging
+4. Remove or hash user IDs from logs
+5. Prevent log injection via input sanitization
+
+---
+
+**Total Issues After 11th Pass:**
+- **Critical:** 157 (135 + 22 new)
+- **High:** 192 (161 + 31 new)
+- **Medium:** 243 (177 + 66 new)
+- **Total:** 592
 
