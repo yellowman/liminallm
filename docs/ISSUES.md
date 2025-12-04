@@ -99,8 +99,10 @@ This document consolidates findings from deep analysis of the liminallm codebase
 **High Priority Issues:** 223 (192 from passes 1-11, 31 new in 12th pass)
 **Medium Priority Issues:** 282 (243 from passes 1-11, 39 new in 12th pass)
 **Total Issues:** 681
-**False Positives Identified:** 24 (verified via code examination)
-**Effective Issues:** 657 (681 - 24 false positives)
+**False Positives Identified:** 35 (verified via code examination)
+**Effective Issues:** 646 (681 - 35 false positives)
+
+*Note: False positives include 8 SQL injection issues (section 66) where pattern matching flagged f-strings but all user data is properly parameterized via `%s` placeholders.*
 
 ---
 
@@ -5978,13 +5980,52 @@ Comprehensive code examination identified 24 false positives. These issues were 
 | 81.3 | Conversation History Not Deleted | CRITICAL | Explicitly deleted at postgres.py:1207-1211 |
 | 81.11 | Session Tokens Not Invalidated on Deletion | MEDIUM | Sessions deleted at postgres.py:1259 + cache cleared |
 
-### Impact on Totals
+### Structural False Positives (Pattern-Based)
 
-After removing false positives:
+These issues were flagged by pattern matching but the codebase uses safe patterns throughout:
+
+#### SQL Injection Issues (Section 66) - ALL FALSE POSITIVES
+
+The codebase consistently uses parameterized queries. F-strings are ONLY used for:
+- Table/column names (hardcoded, not user input)
+- Generating `%s` placeholder strings
+- SQL keywords and operators
+
+All user data goes through `%s` parameterization via `conn.execute(query, params)`.
+
+| Issue | Title | Why False Positive |
+|-------|-------|-------------------|
+| 66.1 | F-String SQL IN Clause | `placeholders = ", ".join(["%s"] * len(ids))` - only generates placeholder string |
+| 66.2 | F-String SQL Feedback Filter | Same pattern - user values go through `params.extend()` |
+| 66.3 | F-String SQL Column Names | Columns are hardcoded string literals, not user input |
+| 66.4 | Query Building with += | Appends hardcoded `" AND column = %s"`, values in params list |
+| 66.5 | WHERE Clause Concatenation | Only joins hardcoded clauses like `"visibility = %s"` |
+| 66.6 | Vector Format String | Formats `Sequence[float]` to `[0.123,...]` - numeric only |
+| 66.7 | JSON Operator Usage | JSON keys hardcoded (`'kind'`), only values use `%s` |
+| 66.8 | Dynamic Query Building | All where clauses hardcoded with `%s`, user data in params |
+
+**Evidence:** 80+ `conn.execute()` calls follow the safe pattern consistently.
+
+#### Rate Limiting Issues - Additional False Positives
+
+| Issue | Title | Evidence |
+|-------|-------|----------|
+| 77.5 | WebSocket Rate Limit Gap | Rate limiting at routes.py:2884-2888 after auth |
+| 77.6 | Admin Routes No Rate Limit | ALL 8 admin endpoints have rate limiting (lines 750, 775, 811, 828, 843, 888, 915, 954) |
+
+#### Resource Cleanup Issues - Additional False Positives
+
+| Issue | Title | Evidence |
+|-------|-------|----------|
+| 23.2 | Unbounded _active_requests | Cleanup in finally block at routes.py:2976-2977 + WebSocketDisconnect handler |
+
+### Updated Impact on Totals
+
+After removing all false positives (24 individual + 8 SQL structural + 3 additional):
 - **Critical Issues:** 168 (was 176, -8 false positives)
-- **High Issues:** 213 (was 223, -10 false positives)
+- **High Issues:** 203 (was 223, -20 false positives including SQL injection)
 - **Medium Issues:** 276 (was 282, -6 false positives)
-- **Effective Total:** 657 issues
+- **Effective Total:** 647 issues (681 - 34 false positives)
 
 ### Verification Methodology
 
