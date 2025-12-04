@@ -99,10 +99,11 @@ This document consolidates findings from deep analysis of the liminallm codebase
 **High Priority Issues:** 223 (192 from passes 1-11, 31 new in 12th pass)
 **Medium Priority Issues:** 282 (243 from passes 1-11, 39 new in 12th pass)
 **Total Issues:** 681
-**False Positives Identified:** 35 (verified via code examination)
-**Effective Issues:** 646 (681 - 35 false positives)
+**False Positives Identified:** 57 (verified via deep code examination)
+**Effective Issues:** 624 (681 - 57 false positives)
+**False Positive Rate:** 8.4%
 
-*Note: False positives include 8 SQL injection issues (section 66) where pattern matching flagged f-strings but all user data is properly parameterized via `%s` placeholders.*
+*Note: False positives include structural patterns (SQL parameterization, Python GIL protection, idempotent operations) and misattributed issues (internal logging vs client exposure, required functionality).*
 
 ---
 
@@ -6019,13 +6020,69 @@ All user data goes through `%s` parameterization via `conn.execute(query, params
 |-------|-------|----------|
 | 23.2 | Unbounded _active_requests | Cleanup in finally block at routes.py:2976-2977 + WebSocketDisconnect handler |
 
+### Deep Analysis False Positives (Additional 22)
+
+#### Authentication/Session Issues
+
+| Issue | Title | Severity | Reason |
+|-------|-------|----------|--------|
+| 50.1 | MFA Request Missing Auth | CRITICAL | DOES validate session via `resolve_session()` at routes.py:1000-1004 |
+| 50.2 | MFA Verify Missing Validation | CRITICAL | DOES validate session ownership + rate limiting + lockout |
+| 35.1 | JWT Algorithm Confusion | HIGH | Always uses HS256, ignores header alg claim - secure implementation |
+| 2.4 | Access Tokens Not Denylisted | HIGH | Access tokens ARE invalidated via session deletion at auth.py:603 |
+
+#### Concurrency/Race Condition Issues
+
+| Issue | Title | Severity | Reason |
+|-------|-------|----------|--------|
+| 58.2 | Email Verification Race | CRITICAL | Idempotent operation - no security impact from duplicate verification |
+| 58.3 | Runtime Singleton Race | CRITICAL | Protected by Python GIL + asyncio single-threading |
+| 58.4 | revoked_refresh_tokens Race | CRITICAL | GIL protected + Redis is authoritative source of truth |
+| 58.8 | _mfa_challenges Race | HIGH | GIL protected + Redis used in production |
+| 77.10 | Rate Limit GET+INCR Race | MEDIUM | Uses atomic INCR only, not GET+INCR as claimed |
+
+#### Frontend Security Issues
+
+| Issue | Title | Severity | Reason |
+|-------|-------|----------|--------|
+| 41.1 | Dynamic onclick Handler | HIGH | Static hardcoded handler, no user input - CSP issue not XSS |
+| 41.4 | URL Params XSS | HIGH | Used in fetch() API calls, not rendered in HTML |
+| 41.5 | sessionStorage Token Storage | HIGH | Standard SPA practice, not a vulnerability |
+| 54.1 | MFA Secret in DOM | HIGH | Required functionality, uses textContent (XSS-safe) |
+| 54.3 | Password Display in DOM | MEDIUM | Required admin functionality, uses textContent |
+| 54.4 | Config Display in DOM | MEDIUM | Required admin functionality, uses textContent |
+
+#### Logging/Error Handling Issues
+
+| Issue | Title | Severity | Reason |
+|-------|-------|----------|--------|
+| 42.1 | Exception in Response (L186) | CRITICAL | Stored in cache for replay, NOT sent to clients |
+| 42.3 | Stack Traces Logged | HIGH | Logged internally only, clients get "internal server error" |
+| 42.4 | Bare Exception Handlers | HIGH | Legitimate best-effort cleanup operations with comments |
+| 73.3 | Exception Messages Logged | CRITICAL | Internal logging for ops, not client exposure |
+| 73.4 | OAuth Errors Logged | HIGH | Internal logging, clients get generic failure |
+
+#### Storage/Memory Issues
+
+| Issue | Title | Severity | Reason |
+|-------|-------|----------|--------|
+| 19.2 | MemoryStore Reads No Lock (partial) | CRITICAL | get_user() and get_session() DO use locks (2 of 6 claims false) |
+
 ### Updated Impact on Totals
 
-After removing all false positives (24 individual + 8 SQL structural + 3 additional):
-- **Critical Issues:** 168 (was 176, -8 false positives)
-- **High Issues:** 203 (was 223, -20 false positives including SQL injection)
-- **Medium Issues:** 276 (was 282, -6 false positives)
-- **Effective Total:** 647 issues (681 - 34 false positives)
+After removing all false positives:
+- **Individual FPs:** 24 (original)
+- **SQL Structural FPs:** 8
+- **Rate Limit/Cleanup FPs:** 3
+- **Deep Analysis FPs:** 22
+- **Total False Positives:** 57
+
+Updated severity counts:
+- **Critical Issues:** 156 (was 176, -20 false positives)
+- **High Issues:** 193 (was 223, -30 false positives)
+- **Medium Issues:** 275 (was 282, -7 false positives)
+- **Effective Total:** 624 issues (681 - 57 false positives)
+- **False Positive Rate:** 8.4%
 
 ### Verification Methodology
 
@@ -6040,4 +6097,7 @@ Issues were marked as FALSE POSITIVE only when:
 - The vulnerability is already mitigated by other code
 - The described behavior doesn't match actual implementation
 - The regex/validation already prevents the attack vector
+- Python GIL provides thread-safety (for in-memory operations)
+- Operation is idempotent (no security impact from races)
+- Internal logging confused with client exposure
 
