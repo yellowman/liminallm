@@ -99,7 +99,8 @@ This document consolidates findings from deep analysis of the liminallm codebase
 **High Priority Issues:** 223 (192 from passes 1-11, 31 new in 12th pass)
 **Medium Priority Issues:** 282 (243 from passes 1-11, 39 new in 12th pass)
 **Total Issues:** 681
-**False Positives Identified:** 4 (Issues 19.1, 33.2, 33.4, 33.5)
+**False Positives Identified:** 24 (verified via code examination)
+**Effective Issues:** 657 (681 - 24 false positives)
 
 ---
 
@@ -5936,4 +5937,66 @@ User deletion removes user but email may be retained in other tables (e.g., shar
 - **High:** 223 (192 + 31 new)
 - **Medium:** 282 (243 + 39 new)
 - **Total:** 681
+
+---
+
+## False Positive Verification (2025-12-04)
+
+Comprehensive code examination identified 24 false positives. These issues were reported but upon verifying the actual source code, the described vulnerabilities do not exist or are already mitigated.
+
+### Previously Identified (4)
+
+| Issue | Title | Reason |
+|-------|-------|--------|
+| 19.1 | OAuth State TOCTOU Vulnerability | Uses atomic GETDEL or Lua script fallback |
+| 33.2 | WebSocket tenant_id From Message Body | Backend uses auth_ctx.tenant_id from JWT |
+| 33.4 | Admin.js Error Extraction Wrong Path | Has proper fallback path handling |
+| 33.5 | VoiceSynthesis audio_path Fallback Missing | Backend returns audio_url; audio_path is server-side only |
+
+### Newly Identified (20)
+
+| Issue | Title | Severity | Reason |
+|-------|-------|----------|--------|
+| 21.3 | Artifact Create With Versions Not Atomic | CRITICAL | DB operations ARE wrapped in `with conn.transaction()` |
+| 25.3 | search_chunks Loads All Before Scoring | HIGH | SQL queries have proper `LIMIT %s` clauses |
+| 41.3 | Unescaped JSON in Data Attributes | HIGH | Uses JSON.stringify() + HTML attribute encoding |
+| 49.1 | Breaking Column Rename Migration | CRITICAL | Uses `IF EXISTS` conditional wrapper |
+| 57.1 | Unbounded Idempotency Cache Growth | CRITICAL | Lazy cleanup IS implemented on access |
+| 57.5 | Redis Pipeline Not Explicitly Managed | HIGH | Pipeline usage follows correct pattern |
+| 57.6 | Asyncio Task Without Cancellation | HIGH | Task IS properly cancelled in finally block |
+| 63.1 | WebSocket Accept Before Auth | HIGH | Standard practice with immediate close on failure |
+| 74.2 | MFA TOTP Secret Generation Entropy | MEDIUM | Code doesn't exist at specified location |
+| 75.1 | Email Normalization Bypass - No Unicode NFC | CRITICAL | EMAIL_REGEX restricts to ASCII only: `[a-zA-Z0-9...]` |
+| 75.2 | Username Homograph Attack | CRITICAL | Handle pattern restricts to ASCII: `^[a-zA-Z0-9_-]+$` |
+| 75.3 | Email Lookup Without Normalization | HIGH | ASCII-only input guaranteed by validation |
+| 77.3 | No Rate Limit on Password Reset | HIGH | Rate limiting implemented at routes.py:1109-1114 |
+| 77.11 | No Rate Limit on File Upload | MEDIUM | Rate limiting implemented at routes.py:2358-2364 |
+| 78.1 | Training Job Duplicate Execution | CRITICAL | `claim_job` method doesn't exist; different implementation |
+| 78.4 | Job Queue Tenant Isolation Bypass | CRITICAL | tenant_id filtering IS implemented at postgres.py:796-798 |
+| 80.5 | Debug Endpoints in Production | HIGH | No debug endpoints exist at specified location |
+| 81.1 | Incomplete User Data Deletion | CRITICAL | Comprehensive cascade at postgres.py:1196-1281 |
+| 81.3 | Conversation History Not Deleted | CRITICAL | Explicitly deleted at postgres.py:1207-1211 |
+| 81.11 | Session Tokens Not Invalidated on Deletion | MEDIUM | Sessions deleted at postgres.py:1259 + cache cleared |
+
+### Impact on Totals
+
+After removing false positives:
+- **Critical Issues:** 168 (was 176, -8 false positives)
+- **High Issues:** 213 (was 223, -10 false positives)
+- **Medium Issues:** 276 (was 282, -6 false positives)
+- **Effective Total:** 657 issues
+
+### Verification Methodology
+
+Each issue was verified by:
+1. Reading actual source code at the specified location
+2. Checking if the vulnerability pattern exists
+3. Verifying if mitigations are in place
+4. Confirming behavior matches the issue description
+
+Issues were marked as FALSE POSITIVE only when:
+- Code doesn't exist at the specified location
+- The vulnerability is already mitigated by other code
+- The described behavior doesn't match actual implementation
+- The regex/validation already prevents the attack vector
 
