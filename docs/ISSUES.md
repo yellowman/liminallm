@@ -99,10 +99,10 @@ This document consolidates findings from deep analysis of the liminallm codebase
 **High Priority Issues:** 223 (192 from passes 1-11, 31 new in 12th pass)
 **Medium Priority Issues:** 282 (243 from passes 1-11, 39 new in 12th pass)
 **Total Issues:** 681
-**False Positives Identified:** 111 (verified via comprehensive code examination)
+**False Positives Identified:** 116 (verified via comprehensive code examination)
 **Issues Fixed:** 8 (frontend security, validation, and compatibility fixes)
-**Effective Issues:** 562 (681 - 111 false positives - 8 fixed)
-**False Positive Rate:** 16.3%
+**Effective Issues:** 557 (681 - 116 false positives - 8 fixed)
+**False Positive Rate:** 17.0%
 
 *Note: False positives include structural patterns (SQL parameterization, Python GIL, timeouts), development/test code, standard industry practices (Docker isolation, env vars), required functionality (MFA secret display, admin password display), misattributed issues (internal logging), and references to non-existent files (React-specific issues on vanilla JS codebase).*
 
@@ -3238,30 +3238,70 @@ No forms or API requests include CSRF tokens.
 
 Access/refresh tokens stored in sessionStorage - vulnerable to XSS.
 
-### 54.9 MEDIUM: Preference Data Exposes Internal Routing
-**Location:** `frontend/chat.js:2050, 2052-2055`
+### 54.9 ~~MEDIUM: Preference Data Exposes Internal Routing~~ (FALSE POSITIVE - INTENTIONAL FUNCTIONALITY)
+**Location:** `frontend/chat.js:2087-2120`
 
-Internal routing traces and workflow details displayed in preference panel.
+**Original Claim:** Internal routing traces and workflow details displayed in preference panel.
 
-### 54.10 MEDIUM: URL Parameters Containing Sensitive Tokens
-**Location:** `frontend/chat.js:880, 973`
+**Verification Result:** Per SPEC §0.2.4 "continuous personalization", the system is designed for "preference events → adapter training jobs → LoRA weight updates → router state updates". The routing/workflow traces displayed in the preference panel:
+1. Help users understand why they received specific responses
+2. Enable informed preference feedback (thumbs up/down)
+3. Are user-specific (users only see their own data)
+4. Support the core personalization feedback loop
 
-Password reset and email verification tokens passed in URL parameters.
+**Status:** Intentional functionality per SPEC design principles. Not a vulnerability.
 
-### 54.11 MEDIUM: Insufficient Input Validation on Admin Inputs
-**Location:** `frontend/admin.js:264-276`
+### 54.10 ~~MEDIUM: URL Parameters Containing Sensitive Tokens~~ (FALSE POSITIVE - PROPERLY HANDLED)
+**Location:** `frontend/chat.js:913-921, 1006-1014`
 
-Minimal validation of patch body structure.
+**Original Claim:** Password reset and email verification tokens passed in URL parameters.
 
-### 54.12 MEDIUM: Potential IDOR in Artifact/Conversation Access
+**Verification Result:** While tokens DO arrive via URL (from email links - industry standard), the code immediately clears them:
+- Line 921: `window.history.replaceState({}, document.title, window.location.pathname)` - clears reset token from URL/history
+- Line 1014: Same for verify token - immediately cleared
+- Tokens stored temporarily in memory, not localStorage
+- Used once for API call, then discarded
+
+**Status:** Implementation follows security best practices. Tokens are properly sanitized from browser history.
+
+### 54.11 ~~MEDIUM: Insufficient Input Validation on Admin Inputs~~ (FALSE POSITIVE - VALIDATION EXISTS)
+**Location:** `frontend/admin.js:274-288`
+
+**Original Claim:** Minimal validation of patch body structure.
+
+**Verification Result:** The code validates:
+1. Required fields check: `if (!artifact || !body)` (line 278)
+2. JSON structure validation: `try { parsed = JSON.parse(body) } catch` (lines 282-287)
+3. Backend performs additional schema validation per ConfigOps pipeline (SPEC §0.2.3)
+
+**Status:** Frontend validation is appropriate. Backend is the authoritative validation layer.
+
+### 54.12 ~~MEDIUM: Potential IDOR in Artifact/Conversation Access~~ (FALSE POSITIVE - BACKEND CONCERN)
 **Location:** `frontend/chat.js:1061-1072, 1950-1966`
 
-Frontend accesses resources by ID without validating authorization.
+**Original Claim:** Frontend accesses resources by ID without validating authorization.
 
-### 54.13 MEDIUM: Draft Data Stored in Plain LocalStorage
+**Verification Result:** Frontend CANNOT validate authorization - it doesn't have access to the authorization database. The correct security model is:
+1. Frontend sends requests with resource IDs
+2. Backend validates authorization via `auth_ctx.user_id` and `auth_ctx.tenant_id` from JWT
+3. Backend returns 403 if unauthorized
+
+This is the standard security model. Frontend authorization would be bypassable anyway.
+
+**Status:** Backend authorization is the correct layer for IDOR prevention.
+
+### 54.13 ~~MEDIUM: Draft Data Stored in Plain LocalStorage~~ (FALSE POSITIVE - NON-SENSITIVE DATA)
 **Location:** `frontend/chat.js:23-52`
 
-Conversation drafts stored unencrypted in localStorage.
+**Original Claim:** Conversation drafts stored unencrypted in localStorage.
+
+**Verification Result:** Per code comment "LocalStorage for drafts (offline-safe per SPEC §17)", drafts contain ONLY:
+- User's own message text (what they're typing)
+- Timestamp
+
+NO sensitive data: no tokens, no credentials, no PII. The user's own draft message text is not a security concern - they're actively composing it.
+
+**Status:** Standard SPA practice. Draft text is not sensitive data.
 
 ### 54.14 ~~MEDIUM: Tenant ID From Session Storage (Not Derived From Token)~~ (FALSE POSITIVE - BACKEND SECURE)
 **Location:** `frontend/admin.js:36-42, 55, 116`
