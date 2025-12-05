@@ -13,6 +13,7 @@ const createdPasswordEl = document.getElementById('created-user-password');
 const runtimeConfigEl = document.getElementById('runtime-config');
 const decisionStatusInput = document.getElementById('decision-status');
 const patchStatusOptions = document.getElementById('patch-status-options');
+const settingsFeedbackEl = document.getElementById('settings-feedback');
 
 const sessionStorageKey = (key) => `liminal.${key}`;
 const readSession = (key) => sessionStorage.getItem(sessionStorageKey(key));
@@ -551,6 +552,69 @@ const runInspect = async () => {
   }
 };
 
+const showSettingsFeedback = (msg) => {
+  if (!settingsFeedbackEl) return;
+  settingsFeedbackEl.textContent = msg;
+  settingsFeedbackEl.style.display = msg ? 'block' : 'none';
+};
+
+const fetchSystemSettings = async () => {
+  showSettingsFeedback('Loading settings...');
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/admin/settings`,
+      { headers: headers() },
+      'Unable to load system settings'
+    );
+    const s = envelope.data || {};
+    const setVal = (id, val) => {
+      const el = document.getElementById(id);
+      if (el && val !== undefined) el.value = val;
+    };
+    setVal('setting-session-rotation-hours', s.session_rotation_hours);
+    setVal('setting-session-rotation-grace', s.session_rotation_grace_seconds);
+    setVal('setting-max-concurrent-workflows', s.max_concurrent_workflows);
+    setVal('setting-max-concurrent-inference', s.max_concurrent_inference);
+    setVal('setting-rate-limit-free', s.rate_limit_multiplier_free);
+    setVal('setting-rate-limit-paid', s.rate_limit_multiplier_paid);
+    setVal('setting-rate-limit-enterprise', s.rate_limit_multiplier_enterprise);
+    showSettingsFeedback('Settings loaded');
+  } catch (err) {
+    showSettingsFeedback(err.message);
+  }
+};
+
+const saveSystemSettings = async () => {
+  const getVal = (id, parser) => {
+    const el = document.getElementById(id);
+    return el ? parser(el.value) : undefined;
+  };
+  const settings = {
+    session_rotation_hours: getVal('setting-session-rotation-hours', Number),
+    session_rotation_grace_seconds: getVal('setting-session-rotation-grace', Number),
+    max_concurrent_workflows: getVal('setting-max-concurrent-workflows', Number),
+    max_concurrent_inference: getVal('setting-max-concurrent-inference', Number),
+    rate_limit_multiplier_free: getVal('setting-rate-limit-free', parseFloat),
+    rate_limit_multiplier_paid: getVal('setting-rate-limit-paid', parseFloat),
+    rate_limit_multiplier_enterprise: getVal('setting-rate-limit-enterprise', parseFloat),
+  };
+  showSettingsFeedback('Saving...');
+  try {
+    await requestEnvelope(
+      `${apiBase}/admin/settings`,
+      {
+        method: 'PUT',
+        headers: headers(),
+        body: JSON.stringify(settings),
+      },
+      'Unable to save settings'
+    );
+    showSettingsFeedback('Settings saved');
+  } catch (err) {
+    showSettingsFeedback(err.message);
+  }
+};
+
 const logout = async () => {
   const tryRevoke = async () => {
     try {
@@ -608,12 +672,17 @@ const runInspectBtn = document.getElementById('run-inspect');
 if (runInspectBtn) runInspectBtn.addEventListener('click', runInspect);
 const refreshConfigBtn = document.getElementById('refresh-config');
 if (refreshConfigBtn) refreshConfigBtn.addEventListener('click', fetchRuntimeConfig);
+const refreshSettingsBtn = document.getElementById('refresh-settings');
+if (refreshSettingsBtn) refreshSettingsBtn.addEventListener('click', fetchSystemSettings);
+const saveSettingsBtn = document.getElementById('save-settings');
+if (saveSettingsBtn) saveSettingsBtn.addEventListener('click', saveSystemSettings);
 
 // Bootstrap existing session
 if (state.accessToken) {
   if (gatekeep()) {
     fetchPatches();
     fetchRuntimeConfig();
+    fetchSystemSettings();
     fetchUsers();
     fetchAdapters();
   }

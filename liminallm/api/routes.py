@@ -239,6 +239,29 @@ class RateLimitInfo:
         response.headers["X-RateLimit-Reset"] = str(self.reset_seconds)
 
 
+def _get_system_settings(runtime) -> dict:
+    """Get admin-managed system settings from database.
+
+    Returns merged settings with defaults for any missing values.
+    """
+    if hasattr(runtime.store, "get_system_settings"):
+        db_settings = runtime.store.get_system_settings()
+    else:
+        db_settings = {}
+
+    # Defaults for any missing settings
+    defaults = {
+        "session_rotation_hours": 24,
+        "session_rotation_grace_seconds": 300,
+        "max_concurrent_workflows": 3,
+        "max_concurrent_inference": 2,
+        "rate_limit_multiplier_free": 1.0,
+        "rate_limit_multiplier_paid": 2.0,
+        "rate_limit_multiplier_enterprise": 5.0,
+    }
+    return {**defaults, **db_settings}
+
+
 def _get_plan_rate_multiplier(runtime, plan_tier: str) -> float:
     """Get rate limit multiplier for a user's plan tier (SPEC §18).
 
@@ -249,10 +272,11 @@ def _get_plan_rate_multiplier(runtime, plan_tier: str) -> float:
     Returns:
         Multiplier to apply to base rate limits
     """
+    sys_settings = _get_system_settings(runtime)
     multipliers = {
-        "free": runtime.settings.rate_limit_multiplier_free,
-        "paid": runtime.settings.rate_limit_multiplier_paid,
-        "enterprise": runtime.settings.rate_limit_multiplier_enterprise,
+        "free": sys_settings.get("rate_limit_multiplier_free", 1.0),
+        "paid": sys_settings.get("rate_limit_multiplier_paid", 2.0),
+        "enterprise": sys_settings.get("rate_limit_multiplier_enterprise", 5.0),
     }
     return multipliers.get(plan_tier, 1.0)
 
@@ -334,15 +358,17 @@ async def _acquire_workflow_slot(runtime, user_id: str) -> bool:
         # Without Redis, we can't track concurrency - allow the request
         return True
 
+    sys_settings = _get_system_settings(runtime)
+    max_workflows = sys_settings.get("max_concurrent_workflows", 3)
     acquired, current = await runtime.cache.acquire_concurrency_slot(
         "workflow",
         user_id,
-        runtime.settings.max_concurrent_workflows,
+        max_workflows,
     )
     if not acquired:
         raise _http_error(
             "busy",
-            f"concurrent workflow limit ({runtime.settings.max_concurrent_workflows}) exceeded",
+            f"concurrent workflow limit ({max_workflows}) exceeded",
             status_code=409,
         )
     return True
@@ -370,15 +396,17 @@ async def _acquire_inference_slot(runtime, user_id: str) -> bool:
     if not runtime.cache:
         return True
 
+    sys_settings = _get_system_settings(runtime)
+    max_inference = sys_settings.get("max_concurrent_inference", 2)
     acquired, current = await runtime.cache.acquire_concurrency_slot(
         "inference",
         user_id,
-        runtime.settings.max_concurrent_inference,
+        max_inference,
     )
     if not acquired:
         raise _http_error(
             "busy",
-            f"concurrent inference limit ({runtime.settings.max_concurrent_inference}) exceeded",
+            f"concurrent inference limit ({max_inference}) exceeded",
             status_code=409,
         )
     return True
@@ -2464,6 +2492,123 @@ async def get_config(principal: AuthContext = Depends(get_admin_user)):
     )
 
 
+@router.get("/admin/settings", response_model=Envelope, tags=["admin"])
+async def get_system_settings(principal: AuthContext = Depends(get_admin_user)):
+    """Get admin-managed system settings.
+
+    Returns settings for session rotation, concurrency caps, and rate limit
+    multipliers that can be modified via the admin UI.
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"admin:read:{principal.user_id}",
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
+    )
+    settings = (
+        runtime.store.get_system_settings()
+        if hasattr(runtime.store, "get_system_settings")
+        else {}
+    )
+    return Envelope(status="ok", data=settings)
+
+
+@router.put("/admin/settings", response_model=Envelope, tags=["admin"])
+async def update_system_settings(
+    body: dict,
+    principal: AuthContext = Depends(get_admin_user),
+):
+    """Update admin-managed system settings.
+
+    Allows admins to modify session rotation, concurrency caps, and rate limit
+    multipliers without restarting the application.
+
+    Supported settings:
+    - session_rotation_hours: Hours before session rotation (default: 24)
+    - session_rotation_grace_seconds: Grace period for old session ID (default: 300)
+    - max_concurrent_workflows: Max workflows per user (default: 3)
+    - max_concurrent_inference: Max inference per user (default: 2)
+    - rate_limit_multiplier_free: Rate limit multiplier for free tier (default: 1.0)
+    - rate_limit_multiplier_paid: Rate limit multiplier for paid tier (default: 2.0)
+    - rate_limit_multiplier_enterprise: Rate limit multiplier for enterprise (default: 5.0)
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"admin:write:{principal.user_id}",
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
+    )
+
+    # Validate settings
+    allowed_keys = {
+        "session_rotation_hours",
+        "session_rotation_grace_seconds",
+        "max_concurrent_workflows",
+        "max_concurrent_inference",
+        "rate_limit_multiplier_free",
+        "rate_limit_multiplier_paid",
+        "rate_limit_multiplier_enterprise",
+    }
+    invalid_keys = set(body.keys()) - allowed_keys
+    if invalid_keys:
+        raise _http_error(
+            "validation_error",
+            f"Invalid settings keys: {', '.join(invalid_keys)}",
+            status_code=400,
+        )
+
+    # Type validation
+    int_keys = {
+        "session_rotation_hours",
+        "session_rotation_grace_seconds",
+        "max_concurrent_workflows",
+        "max_concurrent_inference",
+    }
+    float_keys = {
+        "rate_limit_multiplier_free",
+        "rate_limit_multiplier_paid",
+        "rate_limit_multiplier_enterprise",
+    }
+    for key, value in body.items():
+        if key in int_keys and not isinstance(value, int):
+            raise _http_error(
+                "validation_error",
+                f"{key} must be an integer",
+                status_code=400,
+            )
+        if key in float_keys and not isinstance(value, (int, float)):
+            raise _http_error(
+                "validation_error",
+                f"{key} must be a number",
+                status_code=400,
+            )
+        # Validate positive values
+        if isinstance(value, (int, float)) and value <= 0:
+            raise _http_error(
+                "validation_error",
+                f"{key} must be positive",
+                status_code=400,
+            )
+
+    if hasattr(runtime.store, "set_system_settings"):
+        updated = runtime.store.set_system_settings(body)
+    else:
+        raise _http_error(
+            "not_implemented",
+            "System settings not supported with this storage backend",
+            status_code=501,
+        )
+
+    logger.info(
+        "system_settings_updated",
+        admin_user_id=principal.user_id,
+        updated_keys=list(body.keys()),
+    )
+    return Envelope(status="ok", data=updated)
+
+
 @router.get("/files/limits", response_model=Envelope, tags=["files"])
 async def get_file_limits(principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
@@ -3037,17 +3182,19 @@ async def websocket_chat(ws: WebSocket):
         # SPEC §18: Concurrency cap - max 3 concurrent workflows per user
         # Check if we can acquire a slot; if not, close with 409-equivalent code
         if runtime.cache:
+            sys_settings = _get_system_settings(runtime)
+            max_workflows = sys_settings.get("max_concurrent_workflows", 3)
             acquired, _ = await runtime.cache.acquire_concurrency_slot(
                 "workflow",
                 user_id,
-                runtime.settings.max_concurrent_workflows,
+                max_workflows,
             )
             if not acquired:
                 await ws.send_json({
                     "event": "error",
                     "data": {
                         "error": "busy",
-                        "message": f"concurrent workflow limit ({runtime.settings.max_concurrent_workflows}) exceeded",
+                        "message": f"concurrent workflow limit ({max_workflows}) exceeded",
                     },
                     "request_id": request_id,
                 })

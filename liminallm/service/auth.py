@@ -199,6 +199,21 @@ class AuthService:
     def _generate_password(self) -> str:
         return base64.urlsafe_b64encode(os.urandom(12)).decode().rstrip("=")
 
+    def _get_system_settings(self) -> dict:
+        """Get admin-managed system settings from database.
+
+        Returns merged settings with defaults for any missing values.
+        """
+        if hasattr(self.store, "get_system_settings"):
+            db_settings = self.store.get_system_settings()
+        else:
+            db_settings = {}
+        defaults = {
+            "session_rotation_hours": 24,
+            "session_rotation_grace_seconds": 300,
+        }
+        return {**defaults, **db_settings}
+
     async def signup(
         self,
         email: str,
@@ -738,7 +753,9 @@ class AuthService:
             await self.cache.update_session_activity(sess.id)
             return None
 
-        rotation_threshold = timedelta(hours=self.settings.session_rotation_hours)
+        sys_settings = self._get_system_settings()
+        rotation_hours = sys_settings.get("session_rotation_hours", 24)
+        rotation_threshold = timedelta(hours=rotation_hours)
         if datetime.utcnow() - last_activity < rotation_threshold:
             return None
 
@@ -765,10 +782,11 @@ class AuthService:
             new_session.mfa_verified = True
 
         # Set up grace period mapping
+        grace_seconds = sys_settings.get("session_rotation_grace_seconds", 300)
         await self.cache.set_session_rotation_grace(
             sess.id,
             new_session.id,
-            self.settings.session_rotation_grace_seconds,
+            grace_seconds,
         )
 
         # Revoke old session

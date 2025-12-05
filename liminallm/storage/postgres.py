@@ -2197,6 +2197,60 @@ class PostgresStore:
         self._set_runtime_config(merged)
         return merged
 
+    def get_system_settings(self) -> dict:
+        """Get admin-managed system settings from database.
+
+        Returns settings for session rotation, concurrency caps, and rate limit
+        multipliers. These are managed via the admin UI instead of env vars.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT config FROM instance_config WHERE name = %s",
+                ("system_settings",)
+            ).fetchone()
+        if not row:
+            # Return defaults if no settings in database
+            return {
+                "session_rotation_hours": 24,
+                "session_rotation_grace_seconds": 300,
+                "max_concurrent_workflows": 3,
+                "max_concurrent_inference": 2,
+                "rate_limit_multiplier_free": 1.0,
+                "rate_limit_multiplier_paid": 2.0,
+                "rate_limit_multiplier_enterprise": 5.0,
+            }
+        raw_config = row.get("config")
+        if isinstance(raw_config, str):
+            try:
+                return json.loads(raw_config)
+            except Exception as exc:
+                self.logger.warning("system_settings_parse_failed", error=str(exc))
+                return {}
+        if isinstance(raw_config, dict):
+            return raw_config
+        return {}
+
+    def set_system_settings(self, settings: dict) -> dict:
+        """Update admin-managed system settings.
+
+        Merges provided settings with existing settings and persists to database.
+        Returns the updated full settings.
+        """
+        existing = self.get_system_settings()
+        merged = {**existing, **settings}
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO instance_config (name, config, created_at, updated_at)
+                VALUES (%s, %s, now(), now())
+                ON CONFLICT (name) DO UPDATE SET
+                    config = EXCLUDED.config,
+                    updated_at = now()
+                """,
+                ("system_settings", json.dumps(merged)),
+            )
+        return merged
+
     # knowledge
     def upsert_context(
         self,

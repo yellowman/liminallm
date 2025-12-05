@@ -1245,6 +1245,34 @@ class MemoryStore:
         self._persist_state()
         return dict(self.runtime_config)
 
+    def get_system_settings(self) -> dict:
+        """Get admin-managed system settings.
+
+        Returns settings for session rotation, concurrency caps, and rate limit
+        multipliers. These are managed via the admin UI instead of env vars.
+        """
+        return self.runtime_config.get("system_settings", {
+            "session_rotation_hours": 24,
+            "session_rotation_grace_seconds": 300,
+            "max_concurrent_workflows": 3,
+            "max_concurrent_inference": 2,
+            "rate_limit_multiplier_free": 1.0,
+            "rate_limit_multiplier_paid": 2.0,
+            "rate_limit_multiplier_enterprise": 5.0,
+        })
+
+    def set_system_settings(self, settings: dict) -> dict:
+        """Update admin-managed system settings.
+
+        Merges provided settings with existing settings and persists.
+        Returns the updated full settings.
+        """
+        existing = self.get_system_settings()
+        merged = {**existing, **settings}
+        self.runtime_config["system_settings"] = merged
+        self._persist_state()
+        return merged
+
     def get_latest_workflow(self, workflow_id: str) -> Optional[dict]:
         versions = self.artifact_versions.get(workflow_id)
         if not versions:

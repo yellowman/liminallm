@@ -91,6 +91,47 @@
           <div class="divider"></div>
 
           <div class="section-header">
+            <h3>System Settings</h3>
+            <button class="minor" id="refresh-settings">Refresh</button>
+          </div>
+          <div class="subtext">Adjust runtime behavior without code changes. Settings are stored in the database.</div>
+
+          <div class="stack">
+            <div class="field">
+              <label for="setting-session-rotation-hours">Session rotation hours</label>
+              <input type="number" id="setting-session-rotation-hours" min="1" max="720" value="24" />
+            </div>
+            <div class="field">
+              <label for="setting-session-rotation-grace">Session rotation grace (seconds)</label>
+              <input type="number" id="setting-session-rotation-grace" min="0" max="3600" value="300" />
+            </div>
+            <div class="field">
+              <label for="setting-max-concurrent-workflows">Max concurrent workflows per user</label>
+              <input type="number" id="setting-max-concurrent-workflows" min="1" max="20" value="3" />
+            </div>
+            <div class="field">
+              <label for="setting-max-concurrent-inference">Max concurrent inference per user</label>
+              <input type="number" id="setting-max-concurrent-inference" min="1" max="20" value="2" />
+            </div>
+            <div class="field">
+              <label for="setting-rate-limit-free">Rate limit multiplier (free tier)</label>
+              <input type="number" id="setting-rate-limit-free" min="0.1" max="10" step="0.1" value="1.0" />
+            </div>
+            <div class="field">
+              <label for="setting-rate-limit-paid">Rate limit multiplier (paid tier)</label>
+              <input type="number" id="setting-rate-limit-paid" min="0.1" max="10" step="0.1" value="2.0" />
+            </div>
+            <div class="field">
+              <label for="setting-rate-limit-enterprise">Rate limit multiplier (enterprise tier)</label>
+              <input type="number" id="setting-rate-limit-enterprise" min="0.1" max="10" step="0.1" value="5.0" />
+            </div>
+            <button class="primary" id="save-settings">Save settings</button>
+          </div>
+          <div id="settings-feedback" role="status" class="subtext"></div>
+
+          <div class="divider"></div>
+
+          <div class="section-header">
             <h3>Runtime config</h3>
             <button class="minor" id="refresh-config">Refresh config</button>
           </div>
