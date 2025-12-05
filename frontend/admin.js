@@ -598,6 +598,19 @@ const fetchSystemSettings = async () => {
     setVal('setting-conversations-limit', s.default_conversations_limit);
     setVal('setting-max-upload', s.max_upload_bytes);
     setVal('setting-rag-chunk', s.rag_chunk_size);
+    // Token TTL
+    setVal('setting-access-ttl', s.access_token_ttl_minutes);
+    setVal('setting-refresh-ttl', s.refresh_token_ttl_minutes);
+    // Feature Flags (checkboxes)
+    const setChecked = (id, val) => {
+      const el = document.getElementById(id);
+      if (el && val !== undefined) el.checked = val;
+    };
+    setChecked('setting-enable-mfa', s.enable_mfa);
+    setChecked('setting-allow-signup', s.allow_signup);
+    // Training Worker
+    setChecked('setting-training-enabled', s.training_worker_enabled);
+    setVal('setting-training-poll', s.training_worker_poll_interval);
     showSettingsFeedback('Settings loaded');
   } catch (err) {
     showSettingsFeedback(err.message);
@@ -608,6 +621,10 @@ const saveSystemSettings = async () => {
   const getVal = (id, parser) => {
     const el = document.getElementById(id);
     return el ? parser(el.value) : undefined;
+  };
+  const getChecked = (id) => {
+    const el = document.getElementById(id);
+    return el ? el.checked : undefined;
   };
   const settings = {
     // Session & Concurrency
@@ -637,6 +654,15 @@ const saveSystemSettings = async () => {
     default_conversations_limit: getVal('setting-conversations-limit', Number),
     max_upload_bytes: getVal('setting-max-upload', Number),
     rag_chunk_size: getVal('setting-rag-chunk', Number),
+    // Token TTL
+    access_token_ttl_minutes: getVal('setting-access-ttl', Number),
+    refresh_token_ttl_minutes: getVal('setting-refresh-ttl', Number),
+    // Feature Flags
+    enable_mfa: getChecked('setting-enable-mfa'),
+    allow_signup: getChecked('setting-allow-signup'),
+    // Training Worker
+    training_worker_enabled: getChecked('setting-training-enabled'),
+    training_worker_poll_interval: getVal('setting-training-poll', Number),
   };
   showSettingsFeedback('Saving...');
   try {

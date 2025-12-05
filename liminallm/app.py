@@ -30,7 +30,12 @@ async def lifespan(app: FastAPI):
 
     try:
         runtime = get_runtime()
-        if runtime.settings.training_worker_enabled:
+        # Check training_worker_enabled from DB settings (falls back to env var)
+        training_worker_enabled = runtime.settings.training_worker_enabled
+        if hasattr(runtime.store, "get_system_settings"):
+            sys_settings = runtime.store.get_system_settings() or {}
+            training_worker_enabled = sys_settings.get("training_worker_enabled", training_worker_enabled)
+        if training_worker_enabled:
             await runtime.training_worker.start()
             logger.info("training_worker_started_on_startup")
     except Exception as exc:

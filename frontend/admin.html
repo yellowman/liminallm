@@ -197,6 +197,33 @@
               <input type="number" id="setting-rag-chunk" min="64" max="4000" value="400" />
             </div>
 
+            <h4>Token TTL</h4>
+            <div class="field">
+              <label for="setting-access-ttl">Access token TTL (minutes)</label>
+              <input type="number" id="setting-access-ttl" min="1" max="1440" value="30" />
+            </div>
+            <div class="field">
+              <label for="setting-refresh-ttl">Refresh token TTL (minutes)</label>
+              <input type="number" id="setting-refresh-ttl" min="60" max="43200" value="1440" />
+            </div>
+
+            <h4>Feature Flags</h4>
+            <div class="field checkbox">
+              <label><input type="checkbox" id="setting-enable-mfa" checked /> Enable MFA</label>
+            </div>
+            <div class="field checkbox">
+              <label><input type="checkbox" id="setting-allow-signup" checked /> Allow signup</label>
+            </div>
+
+            <h4>Training Worker</h4>
+            <div class="field checkbox">
+              <label><input type="checkbox" id="setting-training-enabled" checked /> Training worker enabled</label>
+            </div>
+            <div class="field">
+              <label for="setting-training-poll">Training poll interval (seconds)</label>
+              <input type="number" id="setting-training-poll" min="10" max="3600" value="60" />
+            </div>
+
             <button class="primary" id="save-settings">Save settings</button>
           </div>
           <div id="settings-feedback" role="status" class="subtext"></div>

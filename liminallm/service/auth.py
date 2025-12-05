@@ -211,6 +211,8 @@ class AuthService:
         defaults = {
             "session_rotation_hours": 24,
             "session_rotation_grace_seconds": 300,
+            "access_token_ttl_minutes": 30,
+            "refresh_token_ttl_minutes": 1440,
         }
         return {**defaults, **db_settings}
 
@@ -1093,14 +1095,15 @@ class AuthService:
 
     def _issue_tokens(self, user: User, session: Session) -> dict[str, str]:
         now = datetime.utcnow()
+        sys_settings = self._get_system_settings()
         access_exp = int(
             (
-                now + timedelta(minutes=self.settings.access_token_ttl_minutes)
+                now + timedelta(minutes=sys_settings.get("access_token_ttl_minutes", 30))
             ).timestamp()
         )
         refresh_exp = int(
             (
-                now + timedelta(minutes=self.settings.refresh_token_ttl_minutes)
+                now + timedelta(minutes=sys_settings.get("refresh_token_ttl_minutes", 1440))
             ).timestamp()
         )
         refresh_jti = str(uuid.uuid4())
@@ -1163,7 +1166,8 @@ class AuthService:
         if isinstance(exp, (int, float)):
             ttl = max(int(exp - datetime.utcnow().timestamp()), 0)
         if ttl is None:
-            ttl = max(int(self.settings.refresh_token_ttl_minutes * 60), 0)
+            sys_settings = self._get_system_settings()
+            ttl = max(int(sys_settings.get("refresh_token_ttl_minutes", 1440) * 60), 0)
         if self.cache:
             try:
                 await self.cache.mark_refresh_revoked(jti, ttl)

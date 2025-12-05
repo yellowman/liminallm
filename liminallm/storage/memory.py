@@ -1275,6 +1275,12 @@ class MemoryStore:
             "default_conversations_limit": 50,
             "max_upload_bytes": 10485760,
             "rag_chunk_size": 400,
+            "access_token_ttl_minutes": 30,
+            "refresh_token_ttl_minutes": 1440,
+            "enable_mfa": True,
+            "allow_signup": True,
+            "training_worker_enabled": True,
+            "training_worker_poll_interval": 60,
         })
 
     def set_system_settings(self, settings: dict) -> dict:

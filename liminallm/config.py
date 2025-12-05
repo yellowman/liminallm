@@ -283,7 +283,11 @@ class Settings(BaseModel):
         "DEFAULT_ADAPTER_MODE",
         description="Default mode for new adapters: local, remote, prompt, or hybrid",
     )
-    allow_signup: bool = env_field(True, "ALLOW_SIGNUP")
+    allow_signup: bool = env_field(
+        True,
+        "ALLOW_SIGNUP",
+        description="Allow new user signups (overridable via admin UI)",
+    )
     use_memory_store: bool = env_field(False, "USE_MEMORY_STORE")
     allow_redis_fallback_dev: bool = env_field(False, "ALLOW_REDIS_FALLBACK_DEV")
     test_mode: bool = env_field(
@@ -291,18 +295,31 @@ class Settings(BaseModel):
         "TEST_MODE",
         description="Toggle deterministic testing behaviors; required for CI pathways described in SPEC §14.",
     )
-    enable_mfa: bool = env_field(True, "ENABLE_MFA")
+    enable_mfa: bool = env_field(
+        True,
+        "ENABLE_MFA",
+        description="Enable multi-factor authentication (overridable via admin UI)",
+    )
     jwt_secret: str = env_field(None, "JWT_SECRET")
     jwt_issuer: str = env_field("liminallm", "JWT_ISSUER")
     jwt_audience: str = env_field("liminal-clients", "JWT_AUDIENCE")
-    access_token_ttl_minutes: int = env_field(30, "ACCESS_TOKEN_TTL_MINUTES")
-    refresh_token_ttl_minutes: int = env_field(24 * 60, "REFRESH_TOKEN_TTL_MINUTES")
+    access_token_ttl_minutes: int = env_field(
+        30,
+        "ACCESS_TOKEN_TTL_MINUTES",
+        description="Access token TTL in minutes (overridable via admin UI)",
+    )
+    refresh_token_ttl_minutes: int = env_field(
+        24 * 60,
+        "REFRESH_TOKEN_TTL_MINUTES",
+        description="Refresh token TTL in minutes (overridable via admin UI)",
+    )
     default_tenant_id: str = env_field("public", "DEFAULT_TENANT_ID")
     rag_mode: RagMode = env_field(RagMode.PGVECTOR, "RAG_MODE")
     embedding_model_id: str = env_field("text-embedding", "EMBEDDING_MODEL_ID")
 
     # NOTE: The following operational settings have been moved to database-managed
-    # system settings (accessible via admin UI at /admin.html and API at /v1/admin/settings):
+    # system settings (accessible via admin UI at /admin.html and API at /v1/admin/settings).
+    # Env var values serve as fallbacks when database settings are not present.
     #
     # Session & Concurrency:
     # - session_rotation_hours, session_rotation_grace_seconds
@@ -320,17 +337,26 @@ class Settings(BaseModel):
     # Pagination & Files:
     # - default_page_size, max_page_size, default_conversations_limit
     # - max_upload_bytes, rag_chunk_size
+    #
+    # Token TTL:
+    # - access_token_ttl_minutes, refresh_token_ttl_minutes
+    #
+    # Feature Flags:
+    # - enable_mfa, allow_signup
+    #
+    # Training Worker:
+    # - training_worker_enabled, training_worker_poll_interval
 
-    # Training worker settings
+    # Training worker settings (env vars are fallbacks - prefer admin UI)
     training_worker_enabled: bool = env_field(
         True,
         "TRAINING_WORKER_ENABLED",
-        description="Enable background training job worker",
+        description="Enable background training job worker (overridable via admin UI)",
     )
     training_worker_poll_interval: int = env_field(
         60,
         "TRAINING_WORKER_POLL_INTERVAL",
-        description="Training worker poll interval in seconds",
+        description="Training worker poll interval in seconds (overridable via admin UI)",
     )
 
     model_config = ConfigDict(extra="ignore")

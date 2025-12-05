@@ -274,6 +274,12 @@ def _get_system_settings(runtime) -> dict:
         "default_conversations_limit": 50,
         "max_upload_bytes": 10485760,
         "rag_chunk_size": 400,
+        "access_token_ttl_minutes": 30,
+        "refresh_token_ttl_minutes": 1440,
+        "enable_mfa": True,
+        "allow_signup": True,
+        "training_worker_enabled": True,
+        "training_worker_poll_interval": 60,
     }
     return {**defaults, **db_settings}
 
@@ -672,7 +678,7 @@ def _generate_conversation_title(message: str, max_length: int = 50) -> str:
 
 
 def _apply_session_cookies(
-    response: Response, session: Session, tokens: dict, *, refresh_ttl_minutes: int
+    response: Response, session: Session, tokens: dict, *, refresh_ttl_minutes: Optional[int] = None
 ) -> None:
     # Convert naive datetime to UTC-aware for cookie expiration
     expires_at = session.expires_at
@@ -689,6 +695,11 @@ def _apply_session_cookies(
     )
     refresh_token = tokens.get("refresh_token")
     if refresh_token:
+        # Get refresh TTL from database settings if not provided
+        if refresh_ttl_minutes is None:
+            runtime = get_runtime()
+            sys_settings = _get_system_settings(runtime)
+            refresh_ttl_minutes = sys_settings.get("refresh_token_ttl_minutes", 1440)
         response.set_cookie(
             "refresh_token",
             refresh_token,
@@ -711,10 +722,10 @@ async def signup(body: SignupRequest, response: Response):
         403: If signup is disabled in settings
         429: If rate limit exceeded for this email
     """
-    settings = get_settings()
-    if not settings.allow_signup:
-        raise _http_error("forbidden", "signup disabled", status_code=403)
     runtime = get_runtime()
+    sys_settings = _get_system_settings(runtime)
+    if not sys_settings.get("allow_signup", True):
+        raise _http_error("forbidden", "signup disabled", status_code=403)
     await _enforce_rate_limit(
         runtime,
         f"signup:{body.email.lower()}",
@@ -731,8 +742,7 @@ async def signup(body: SignupRequest, response: Response):
         response,
         session,
         tokens,
-        refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes,
-    )
+            )
     return Envelope(
         status="ok",
         data=AuthResponse(
@@ -779,8 +789,7 @@ async def login(body: LoginRequest, response: Response):
         response,
         session,
         tokens,
-        refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes,
-    )
+            )
     return Envelope(
         status="ok",
         data=AuthResponse(
@@ -858,8 +867,7 @@ async def oauth_callback(
         response,
         session,
         tokens,
-        refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes,
-    )
+            )
     return Envelope(
         status="ok",
         data=AuthResponse(
@@ -896,8 +904,7 @@ async def refresh_tokens(
         response,
         session,
         tokens,
-        refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes,
-    )
+            )
     return Envelope(
         status="ok",
         data=AuthResponse(
@@ -1230,8 +1237,7 @@ async def verify_mfa(body: MFAVerifyRequest, response: Response):
             response,
             session,
             tokens,
-            refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes,
-        )
+                    )
     return Envelope(status="ok", data=resp)
 
 
@@ -2565,6 +2571,9 @@ async def update_system_settings(
       read_rate_limit_per_minute (120)
     - Pagination: default_page_size (100), max_page_size (500), default_conversations_limit (50)
     - Files: max_upload_bytes (10485760), rag_chunk_size (400)
+    - Token TTL: access_token_ttl_minutes (30), refresh_token_ttl_minutes (1440)
+    - Feature flags: enable_mfa (true), allow_signup (true)
+    - Training worker: training_worker_enabled (true), training_worker_poll_interval (60)
     """
     runtime = get_runtime()
     sys_settings = _get_system_settings(runtime)
@@ -2600,6 +2609,12 @@ async def update_system_settings(
         "default_conversations_limit",
         "max_upload_bytes",
         "rag_chunk_size",
+        "access_token_ttl_minutes",
+        "refresh_token_ttl_minutes",
+        "enable_mfa",
+        "allow_signup",
+        "training_worker_enabled",
+        "training_worker_poll_interval",
     }
     invalid_keys = set(body.keys()) - allowed_keys
     if invalid_keys:
@@ -2631,11 +2646,19 @@ async def update_system_settings(
         "default_conversations_limit",
         "max_upload_bytes",
         "rag_chunk_size",
+        "access_token_ttl_minutes",
+        "refresh_token_ttl_minutes",
+        "training_worker_poll_interval",
     }
     float_keys = {
         "rate_limit_multiplier_free",
         "rate_limit_multiplier_paid",
         "rate_limit_multiplier_enterprise",
+    }
+    bool_keys = {
+        "enable_mfa",
+        "allow_signup",
+        "training_worker_enabled",
     }
     for key, value in body.items():
         if key in int_keys and not isinstance(value, int):
@@ -2650,8 +2673,20 @@ async def update_system_settings(
                 f"{key} must be a number",
                 status_code=400,
             )
-        # Validate positive values
-        if isinstance(value, (int, float)) and value <= 0:
+        if key in bool_keys and not isinstance(value, bool):
+            raise _http_error(
+                "validation_error",
+                f"{key} must be a boolean",
+                status_code=400,
+            )
+        # Validate positive values for numeric settings
+        if key in int_keys and isinstance(value, int) and value <= 0:
+            raise _http_error(
+                "validation_error",
+                f"{key} must be positive",
+                status_code=400,
+            )
+        if key in float_keys and isinstance(value, (int, float)) and value <= 0:
             raise _http_error(
                 "validation_error",
                 f"{key} must be positive",

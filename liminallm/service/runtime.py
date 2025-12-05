@@ -132,11 +132,16 @@ class Runtime:
         self.config_ops = ConfigOpsService(
             self.store, self.llm, self.router, self.training
         )
+        # Get MFA setting from DB (falls back to env var if not in DB)
+        mfa_enabled = self.settings.enable_mfa
+        if hasattr(self.store, "get_system_settings"):
+            sys_settings = self.store.get_system_settings() or {}
+            mfa_enabled = sys_settings.get("enable_mfa", mfa_enabled)
         self.auth = AuthService(
             self.store,
             self.cache,
             self.settings,
-            mfa_enabled=self.settings.enable_mfa,
+            mfa_enabled=mfa_enabled,
         )
         self.email = EmailService(
             smtp_host=self.settings.smtp_host,
@@ -149,11 +154,16 @@ class Runtime:
             base_url=self.settings.app_base_url,
         )
         # Training worker for background job processing
+        # Get poll interval from DB (falls back to env var if not in DB)
+        poll_interval = self.settings.training_worker_poll_interval
+        if hasattr(self.store, "get_system_settings"):
+            sys_settings = self.store.get_system_settings() or {}
+            poll_interval = sys_settings.get("training_worker_poll_interval", poll_interval)
         self.training_worker = TrainingWorker(
             store=self.store,
             training_service=self.training,
             clusterer=self.clusterer,
-            poll_interval=self.settings.training_worker_poll_interval,
+            poll_interval=poll_interval,
         )
         self._local_idempotency: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         self._local_idempotency_lock = asyncio.Lock()
