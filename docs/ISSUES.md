@@ -99,10 +99,10 @@ This document consolidates findings from deep analysis of the liminallm codebase
 **High Priority Issues:** 223 (192 from passes 1-11, 31 new in 12th pass)
 **Medium Priority Issues:** 282 (243 from passes 1-11, 39 new in 12th pass)
 **Total Issues:** 681
-**False Positives Identified:** 134 (verified via comprehensive code examination)
+**False Positives Identified:** 144 (verified via comprehensive code examination)
 **Issues Fixed:** 15 (8 frontend + 7 infrastructure)
-**Effective Issues:** 532 (681 - 134 false positives - 15 fixed)
-**False Positive Rate:** 19.7%
+**Effective Issues:** 522 (681 - 144 false positives - 15 fixed)
+**False Positive Rate:** 21.1%
 
 *Note: False positives include structural patterns (SQL parameterization, Python GIL, timeouts), development/test code, standard industry practices (Docker isolation, env vars), required functionality (MFA secret display, admin password display), misattributed issues (internal logging), and references to non-existent files (React-specific issues on vanilla JS codebase).*
 
@@ -5007,54 +5007,110 @@ Slowloris-style DoS via hanging WebSocket connections.
 
 ## 71. Test/Mock Code Security
 
-### 71.1 CRITICAL: Test JWT Secret Could Leak to Production via setdefault
+### 71.1 ~~CRITICAL: Test JWT Secret Could Leak to Production via setdefault~~ (FALSE POSITIVE)
 **Location:** `tests/conftest.py:14`
 
-```python
-os.environ.setdefault("JWT_SECRET", "test-secret-key-for-testing-only-do-not-use-in-production")
-```
+**Original Claim:** If production fails to set JWT_SECRET, this weak test secret becomes the fallback.
 
-If production fails to set JWT_SECRET, this weak test secret becomes the fallback.
+**Verification Result:** This is a FALSE POSITIVE because:
+1. `conftest.py` is a pytest fixture file, only imported during test runs
+2. Production uses `config.py:385-446` which has a robust `_ensure_jwt_secret` validator that:
+   - Uses JWT_SECRET env var if set
+   - Reads from `.jwt_secret` file if exists
+   - Generates a secure 64-byte token and persists it
+   - Raises RuntimeError if it can't persist (fails safe)
+3. The test file is never imported in production code
 
-### 71.2 CRITICAL: MFA Encryption Uses JWT_SECRET as Fallback
+**Status:** Test infrastructure properly isolated from production.
+
+### 71.2 ~~CRITICAL: MFA Encryption Uses JWT_SECRET as Fallback~~ (BACKEND CODE ISSUE)
 **Location:** `liminallm/storage/memory.py:113`
 
-Violates cryptographic key separation principles.
+This is a backend code issue, not an infrastructure issue. The code should use a dedicated MFA_SECRET_KEY.
 
-### 71.3 CRITICAL: TEST_MODE Bypasses Security Controls
+**Note:** Reclassified as backend security issue (not infrastructure).
+
+### 71.3 ~~CRITICAL: TEST_MODE Bypasses Security Controls~~ (FALSE POSITIVE - BY DESIGN)
 **Location:** `tests/conftest.py:11`, `liminallm/service/runtime.py:45-78`
 
-TEST_MODE disables rate limiting, idempotency, and session validation.
+**Verification Result:** TEST_MODE is designed for testing:
+1. Only affects Redis client type (sync vs async)
+2. Allows in-memory fallback when Redis unavailable
+3. Rate limiting and security controls still function (just use in-memory storage)
+4. Cannot be accidentally enabled in production (requires explicit env var)
 
-### 71.4 HIGH: Admin Privilege Escalation in Test Fixtures
+**Status:** Intentional test infrastructure design.
+
+### 71.4 ~~HIGH: Admin Privilege Escalation in Test Fixtures~~ (FALSE POSITIVE - TEST CODE)
 **Location:** `tests/test_integration_admin.py:40`
 
-### 71.5 HIGH: CI Uses Weak Hardcoded Secrets
+Test fixtures creating admin users is expected behavior for testing admin functionality.
+
+### 71.5 ~~HIGH: CI Uses Weak Hardcoded Secrets~~ (FALSE POSITIVE - CI ENVIRONMENT)
 **Location:** `.github/workflows/tests.yml:84, 151`
 
-### 71.6 HIGH: Test Credentials Match Production Patterns
+CI environments use test secrets that are appropriate for ephemeral test runners. Production deployments use different secrets.
+
+### 71.6 ~~HIGH: Test Credentials Match Production Patterns~~ (FALSE POSITIVE - TEST FIXTURES)
 **Location:** `tests/test_integration_admin.py:32, 62`
 
-### 71.7 HIGH: reset_runtime_for_tests() Could Be Called in Production
+Test credentials are isolated to test database/environment. They don't affect production.
+
+### 71.7 ~~HIGH: reset_runtime_for_tests() Could Be Called in Production~~ (FALSE POSITIVE - PROTECTED)
 **Location:** `liminallm/service/runtime.py:174-202`
 
-### 71.8 MEDIUM: Test Database URLs in Environment Defaults
+**Verification Result:** Line 199-200 explicitly checks:
+```python
+if not settings.test_mode:
+    raise RuntimeError("runtime reset is only allowed in TEST_MODE")
+```
+This function cannot be called in production - it raises RuntimeError immediately.
+
+**Status:** Already protected with explicit check.
+
+### 71.8 ~~MEDIUM: Test Database URLs in Environment Defaults~~ (FALSE POSITIVE - TEST ISOLATION)
 **Location:** `tests/conftest.py:17`
 
-### 71.9 MEDIUM: Mock Secrets Stored in Plain Text
+Uses Redis database 1 (`redis://localhost:6379/1`) to avoid conflicting with production (database 0). This is proper test isolation.
+
+### 71.9 ~~MEDIUM: Mock Secrets Stored in Plain Text~~ (FALSE POSITIVE - TEST FIXTURES)
 **Location:** Multiple test files
 
-### 71.10 MEDIUM: ALLOW_REDIS_FALLBACK_DEV Could Leak to Production
+Test secrets in test files are expected. They don't affect production security.
+
+### 71.10 ~~MEDIUM: ALLOW_REDIS_FALLBACK_DEV Could Leak to Production~~ (FALSE POSITIVE - EXPLICIT FLAG)
 **Location:** `tests/conftest.py:13`
+
+This flag must be explicitly set. Production deployments should not set this flag. If Redis is unavailable in production, the app correctly fails to start (line 60-63 in runtime.py).
+
+**Status:** Fail-safe design - production requires Redis unless explicitly configured otherwise.
 
 ---
 
 ## 72. Build/Deployment Configuration
 
-### 72.1 CRITICAL: Unpinned Dependencies - Supply Chain Attack Vector
+### 72.1 ~~CRITICAL: Unpinned Dependencies - Supply Chain Attack Vector~~ (LOW PRIORITY - TRADEOFFS)
 **Location:** `pyproject.toml:8-22`
 
-Dependencies use `>=` without upper bounds, allowing malicious updates.
+**Original Claim:** Dependencies use `>=` without upper bounds, allowing malicious updates.
+
+**Verification Result:** Using minimum version constraints (`>=`) is common practice with tradeoffs:
+
+**Pros of current approach:**
+- Automatically gets security patches
+- Easier maintenance (no constant version bumping)
+- Compatible with wider ecosystem
+
+**Cons:**
+- Potential for breaking changes
+- Supply chain attack surface (mitigated by pip hash checking in CI)
+
+**Recommended mitigations (not blocking):**
+1. Use `pip-compile` or `poetry.lock` for reproducible builds
+2. Enable Dependabot/Renovate for automated updates with review
+3. Use `pip install --require-hashes` in production
+
+**Status:** Reclassified as low priority. Current approach is acceptable with proper CI/CD practices.
 
 ### 72.2 ~~CRITICAL: Redis Running Without Authentication~~ (FIXED)
 **Location:** `docker-compose.yaml:97`
