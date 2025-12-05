@@ -56,6 +56,7 @@ RUN mkdir -p /srv/liminallm && \
 # Environment variables with secure defaults
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONHASHSEED=random \
     SHARED_FS_ROOT=/srv/liminallm \
     HOST=0.0.0.0 \
     PORT=8000

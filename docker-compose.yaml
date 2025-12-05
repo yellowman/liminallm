@@ -15,8 +15,8 @@ services:
     environment:
       # Database
       DATABASE_URL: postgres://liminallm:${POSTGRES_PASSWORD}@postgres:5432/liminallm
-      # Redis
-      REDIS_URL: redis://redis:6379/0
+      # Redis (with authentication)
+      REDIS_URL: redis://:${REDIS_PASSWORD:-changeme}@redis:6379/0
       # Storage
       SHARED_FS_ROOT: /srv/liminallm
       # Model configuration
@@ -71,6 +71,14 @@ services:
       timeout: 10s
       retries: 3
       start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
 
   postgres:
     image: pgvector/pgvector:pg16
@@ -89,19 +97,37 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
 
   redis:
     image: redis:7-alpine
     container_name: liminallm-redis
     restart: unless-stopped
-    command: redis-server --appendonly yes
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-changeme}
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-changeme}
     volumes:
       - redis-data:/data
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-changeme}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+        reservations:
+          cpus: '0.1'
+          memory: 64M
 
   # Optional: Nginx reverse proxy for production
   nginx:
