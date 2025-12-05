@@ -99,10 +99,10 @@ This document consolidates findings from deep analysis of the liminallm codebase
 **High Priority Issues:** 223 (192 from passes 1-11, 31 new in 12th pass)
 **Medium Priority Issues:** 282 (243 from passes 1-11, 39 new in 12th pass)
 **Total Issues:** 681
-**False Positives Identified:** 109 (verified via comprehensive code examination)
+**False Positives Identified:** 111 (verified via comprehensive code examination)
 **Issues Fixed:** 8 (frontend security, validation, and compatibility fixes)
-**Effective Issues:** 564 (681 - 109 false positives - 8 fixed)
-**False Positive Rate:** 16.0%
+**Effective Issues:** 562 (681 - 111 false positives - 8 fixed)
+**False Positive Rate:** 16.3%
 
 *Note: False positives include structural patterns (SQL parameterization, Python GIL, timeouts), development/test code, standard industry practices (Docker isolation, env vars), required functionality (MFA secret display, admin password display), misattributed issues (internal logging), and references to non-existent files (React-specific issues on vanilla JS codebase).*
 
@@ -3215,10 +3215,18 @@ Entire runtime configuration displayed via JSON.stringify.
 
 Full object details displayed in JSON - could contain sensitive data.
 
-### 54.6 HIGH: Unescaped Error Messages Displayed
+### 54.6 ~~HIGH: Unescaped Error Messages Displayed~~ (FALSE POSITIVE - VERIFIED SAFE)
 **Location:** Multiple files - `chat.js:3064, 3079`, `admin.js:259, 295, 329, 539`
 
-Error messages from API displayed directly - could expose SQL errors, file paths.
+**Original Claim:** Error messages from API displayed directly - could expose SQL errors, file paths.
+
+**Verification Result:** All error displays use either:
+1. `textContent` property (e.g., `showError()` uses `errorEl.textContent = msg`) - automatically escapes HTML
+2. `escapeHtml()` wrapper (e.g., `innerHTML = \`Error: ${escapeHtml(err.message)}\``)
+
+The cited line numbers (259, 295, 329, 539 in admin.js) are not error displays - they're API call configurations. All actual error handling is properly escaped.
+
+**Status:** No XSS vulnerability. Error messages are safely displayed.
 
 ### 54.7 HIGH: Missing CSRF Protection on Forms
 **Location:** `admin.html`, `index.html`
@@ -3255,10 +3263,14 @@ Frontend accesses resources by ID without validating authorization.
 
 Conversation drafts stored unencrypted in localStorage.
 
-### 54.14 MEDIUM: Tenant ID From Session Storage (Not Derived From Token)
+### 54.14 ~~MEDIUM: Tenant ID From Session Storage (Not Derived From Token)~~ (FALSE POSITIVE - BACKEND SECURE)
 **Location:** `frontend/admin.js:36-42, 55, 116`
 
-Tenant ID read from sessionStorage and sent to backend - violates CLAUDE.md.
+**Original Claim:** Tenant ID read from sessionStorage and sent to backend - violates CLAUDE.md.
+
+**Verification Result:** CLAUDE.md guideline states backend must derive tenant_id from JWT, not that frontend can't send it. Per Issue 33.2 verification, backend correctly IGNORES any frontend-provided tenant_id and uses `auth_ctx.tenant_id` derived from the authenticated JWT token (routes.py:2947).
+
+**Status:** Backend follows CLAUDE.md security guideline. Frontend sends harmless hint that is properly ignored.
 
 ---
 
