@@ -189,11 +189,16 @@ const createCitationModal = () => {
     <div class="modal-content">
       <div class="modal-header">
         <h3 id="citation-modal-title">Citation</h3>
-        <button class="modal-close" onclick="document.getElementById('citation-modal').classList.remove('active')">&times;</button>
+        <button class="modal-close" aria-label="Close">&times;</button>
       </div>
       <div id="citation-modal-content" class="modal-body"></div>
     </div>
   `;
+  // Use addEventListener instead of inline onclick for CSP compliance
+  const closeBtn = modal.querySelector('.modal-close');
+  if (closeBtn) {
+    closeBtn.addEventListener('click', () => modal.classList.remove('active'));
+  }
   document.body.appendChild(modal);
 };
 
@@ -1157,6 +1162,7 @@ const renderMessage = (m) => {
   if (m.model) metaBits.push(escapeHtml(m.model));
 
   // Render citations as clickable links per SPEC §17
+  // Note: Uses event delegation via messagesEl click handler (see initEventListeners)
   let citationsHtml = '';
   const citations = m.content_struct?.citations || [];
   if (citations.length) {
@@ -1173,7 +1179,7 @@ const renderMessage = (m) => {
             context_id: c.context_id || '',
             chunk_index: c.chunk_index,
           }).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
-          return `<span class="citation-link" title="${path}" data-citation="${snippetData}" onclick="showCitationModal(this)">${escapeHtml(label)}</span>`;
+          return `<span class="citation-link" title="${path}" data-citation="${snippetData}" tabindex="0" role="button">${escapeHtml(label)}</span>`;
         }).join('')}
       </div>
     `;
@@ -1387,6 +1393,9 @@ const ensureWebSocket = () =>
     socket.addEventListener('error', handleError);
   });
 
+// Maximum message length (characters) - approximately 2k tokens per SPEC §18
+const MAX_MESSAGE_LENGTH = 8000;
+
 const sendMessage = async (event) => {
   event.preventDefault();
   const messageInput = $('message-input');
@@ -1394,6 +1403,12 @@ const sendMessage = async (event) => {
   if (!content) return;
   if (!state.accessToken) {
     showStatus('Sign in to chat.', true);
+    return;
+  }
+
+  // Client-side length validation per Issue 65.7
+  if (content.length > MAX_MESSAGE_LENGTH) {
+    showStatus(`Message too long (${content.length} chars). Maximum is ${MAX_MESSAGE_LENGTH} characters.`, true);
     return;
   }
 
@@ -2167,9 +2182,17 @@ const transcribeAudio = async (audioBlob) => {
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${state.accessToken}`,
+        ...authHeaders(),
       },
       body: formData,
     });
+
+    if (!response.ok) {
+      const errorText = await response.text().catch(() => 'Unknown error');
+      console.error('Transcription failed:', response.status, errorText);
+      showStatus('Voice transcription failed. Please try again.', true);
+      return;
+    }
 
     const envelope = await response.json();
     if (envelope.status === 'ok' && envelope.data?.transcript) {
@@ -2180,10 +2203,13 @@ const transcribeAudio = async (audioBlob) => {
         messageInput.focus();
       }
     } else {
+      const errorMsg = extractError(envelope, 'Transcription failed');
       console.error('Transcription failed:', envelope);
+      showStatus(errorMsg, true);
     }
   } catch (err) {
     console.error('Transcription error:', err);
+    showStatus('Voice transcription error. Please try again.', true);
   }
 };
 
@@ -2196,10 +2222,15 @@ const speakText = async (text) => {
     currentAudio = null;
   }
 
-  if (!state.accessToken) {
-    // Fall back to browser speech synthesis
+  // Helper for browser fallback
+  const speakWithBrowser = () => {
     const utterance = new SpeechSynthesisUtterance(text);
     window.speechSynthesis.speak(utterance);
+  };
+
+  if (!state.accessToken) {
+    // Fall back to browser speech synthesis
+    speakWithBrowser();
     return;
   }
 
@@ -2209,11 +2240,17 @@ const speakText = async (text) => {
     const response = await fetch(`${apiBase}/voice/synthesize`, {
       method: 'POST',
       headers: {
-        'Authorization': `Bearer ${state.accessToken}`,
-        'Content-Type': 'application/json',
+        ...headers(),
       },
       body: JSON.stringify({ text }),
     });
+
+    if (!response.ok) {
+      console.warn('Voice synthesis API failed, using browser fallback');
+      if (voiceOutputBtn) voiceOutputBtn.classList.remove('playing');
+      speakWithBrowser();
+      return;
+    }
 
     const envelope = await response.json();
     if (envelope.status === 'ok' && envelope.data?.audio_url) {
@@ -2224,22 +2261,19 @@ const speakText = async (text) => {
       currentAudio.onerror = () => {
         if (voiceOutputBtn) voiceOutputBtn.classList.remove('playing');
         // Fall back to browser speech synthesis
-        const utterance = new SpeechSynthesisUtterance(text);
-        window.speechSynthesis.speak(utterance);
+        speakWithBrowser();
       };
       currentAudio.play();
     } else {
       // Fall back to browser speech synthesis
       if (voiceOutputBtn) voiceOutputBtn.classList.remove('playing');
-      const utterance = new SpeechSynthesisUtterance(text);
-      window.speechSynthesis.speak(utterance);
+      speakWithBrowser();
     }
   } catch (err) {
     console.error('Speech synthesis error:', err);
     if (voiceOutputBtn) voiceOutputBtn.classList.remove('playing');
     // Fall back to browser speech synthesis
-    const utterance = new SpeechSynthesisUtterance(text);
-    window.speechSynthesis.speak(utterance);
+    speakWithBrowser();
   }
 };
 
@@ -2473,13 +2507,18 @@ const startMfaSetup = async () => {
     // Generate QR code using a simple text display (or use qrcode library if available)
     const qrContainer = $('mfa-qr-code');
     if (qrContainer) {
-      // Create a simple link to the otpauth URI that mobile apps can scan
-      qrContainer.innerHTML = `
-        <div class="qr-placeholder">
-          <p>Open your authenticator app and add a new account using this URI:</p>
-          <code style="word-break: break-all; font-size: 0.75rem;">${otpauth_uri || 'N/A'}</code>
-        </div>
-      `;
+      // Create QR placeholder with properly escaped URI to prevent XSS
+      const placeholder = document.createElement('div');
+      placeholder.className = 'qr-placeholder';
+      const instructions = document.createElement('p');
+      instructions.textContent = 'Open your authenticator app and add a new account using this URI:';
+      const uriCode = document.createElement('code');
+      uriCode.style.cssText = 'word-break: break-all; font-size: 0.75rem;';
+      uriCode.textContent = otpauth_uri || 'N/A';
+      placeholder.appendChild(instructions);
+      placeholder.appendChild(uriCode);
+      qrContainer.innerHTML = '';
+      qrContainer.appendChild(placeholder);
     }
 
     setMfaSetupStatus('Enter the 6-digit code from your authenticator app');
@@ -3699,10 +3738,26 @@ const renderInsights = (data) => {
 let draftSaveTimeout = null;
 
 const handleMessageInputChange = () => {
+  const messageInput = $('message-input');
+  const text = messageInput?.value || '';
+  const charCount = text.length;
+
+  // Update character count indicator if it exists
+  const charIndicator = $('char-count-indicator');
+  if (charIndicator) {
+    if (charCount > MAX_MESSAGE_LENGTH * 0.8) {
+      // Show warning when approaching limit
+      charIndicator.textContent = `${charCount}/${MAX_MESSAGE_LENGTH}`;
+      charIndicator.className = charCount > MAX_MESSAGE_LENGTH ? 'char-count error' : 'char-count warning';
+      charIndicator.style.display = 'block';
+    } else {
+      charIndicator.style.display = 'none';
+    }
+  }
+
+  // Debounced draft save
   clearTimeout(draftSaveTimeout);
   draftSaveTimeout = setTimeout(() => {
-    const messageInput = $('message-input');
-    const text = messageInput?.value || '';
     saveDraft(state.conversationId, text);
   }, 1000);
 };
@@ -3749,6 +3804,26 @@ const initEventListeners = () => {
   $('stop-stream-btn')?.addEventListener('click', cancelStreaming);
   $('new-conversation-btn')?.addEventListener('click', newConversation);
   $('refresh-conversations')?.addEventListener('click', fetchConversations);
+
+  // Citation click delegation (CSP-compliant instead of inline onclick)
+  if (messagesEl) {
+    messagesEl.addEventListener('click', (e) => {
+      const citationLink = e.target.closest('.citation-link');
+      if (citationLink) {
+        showCitationModal(citationLink);
+      }
+    });
+    // Support keyboard activation for accessibility
+    messagesEl.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        const citationLink = e.target.closest('.citation-link');
+        if (citationLink) {
+          e.preventDefault();
+          showCitationModal(citationLink);
+        }
+      }
+    });
+  }
 
   // Conversation search (debounced to avoid excessive re-renders)
   conversationSearchEl?.addEventListener('input', debounce(renderConversationList, 150));
