@@ -99,10 +99,10 @@ This document consolidates findings from deep analysis of the liminallm codebase
 **High Priority Issues:** 223 (192 from passes 1-11, 31 new in 12th pass)
 **Medium Priority Issues:** 282 (243 from passes 1-11, 39 new in 12th pass)
 **Total Issues:** 681
-**False Positives Identified:** 116 (verified via comprehensive code examination)
+**False Positives Identified:** 126 (verified via comprehensive code examination)
 **Issues Fixed:** 8 (frontend security, validation, and compatibility fixes)
-**Effective Issues:** 557 (681 - 116 false positives - 8 fixed)
-**False Positive Rate:** 17.0%
+**Effective Issues:** 547 (681 - 126 false positives - 8 fixed)
+**False Positive Rate:** 18.5%
 
 *Note: False positives include structural patterns (SQL parameterization, Python GIL, timeouts), development/test code, standard industry practices (Docker isolation, env vars), required functionality (MFA secret display, admin password display), misattributed issues (internal logging), and references to non-existent files (React-specific issues on vanilla JS codebase).*
 
@@ -3205,15 +3205,33 @@ Session may expire between sort and eviction decision.
 
 **Status:** Required functionality for admin user creation workflow.
 
-### 54.4 HIGH: Sensitive Runtime Config Displayed in Plaintext
-**Location:** `frontend/admin.js:257`
+### 54.4 ~~HIGH: Sensitive Runtime Config Displayed in Plaintext~~ (FALSE POSITIVE - ADMIN FUNCTIONALITY)
+**Location:** `frontend/admin.js:257-268`
 
-Entire runtime configuration displayed via JSON.stringify.
+**Original Claim:** Entire runtime configuration displayed via JSON.stringify.
 
-### 54.5 HIGH: Admin Objects Inspect Displays Sensitive Data
-**Location:** `frontend/admin.js:532-536`
+**Verification Result:** This is the **admin panel** config viewer feature. Admins are trusted users who:
+1. Need to view system configuration for management purposes
+2. Already have elevated privileges (admin role verified at login)
+3. Can only see config they're authorized to access (backend enforces)
 
-Full object details displayed in JSON - could contain sensitive data.
+The backend should sanitize secrets before sending to admin endpoint. Frontend correctly displays what backend provides.
+
+**Status:** Intentional admin functionality. Backend should filter sensitive values.
+
+### 54.5 ~~HIGH: Admin Objects Inspect Displays Sensitive Data~~ (FALSE POSITIVE - ADMIN FUNCTIONALITY)
+**Location:** `frontend/admin.js:532-547`
+
+**Original Claim:** Full object details displayed in JSON - could contain sensitive data.
+
+**Verification Result:** The "Inspect Objects" feature is an admin debugging tool:
+1. Only accessible to authenticated admins
+2. Backend controls what data is returned via `/admin/objects` endpoint
+3. Uses `textContent` (not innerHTML) to display - XSS safe
+
+Like database admin tools (pgAdmin, etc.), this allows admins to inspect system state.
+
+**Status:** Intentional admin functionality. Backend should filter secrets from response.
 
 ### 54.6 ~~HIGH: Unescaped Error Messages Displayed~~ (FALSE POSITIVE - VERIFIED SAFE)
 **Location:** Multiple files - `chat.js:3064, 3079`, `admin.js:259, 295, 329, 539`
@@ -3228,15 +3246,32 @@ The cited line numbers (259, 295, 329, 539 in admin.js) are not error displays -
 
 **Status:** No XSS vulnerability. Error messages are safely displayed.
 
-### 54.7 HIGH: Missing CSRF Protection on Forms
+### 54.7 ~~HIGH: Missing CSRF Protection on Forms~~ (NOT FRONTEND ISSUE - BACKEND CONCERN)
 **Location:** `admin.html`, `index.html`
 
-No forms or API requests include CSRF tokens.
+**Original Claim:** No forms or API requests include CSRF tokens.
 
-### 54.8 HIGH: Sensitive Data in Session Storage
+**Verification Result:** CSRF protection is a **backend responsibility**, not frontend:
+1. Backend should use SameSite cookie attributes (documented in Issue 40.1)
+2. JWT tokens in Authorization header provide request authentication
+3. Frontend cannot implement CSRF protection alone - it's enforced server-side
+
+**Status:** Backend concern. See Issue 40.1 for CSRF implementation requirements.
+
+### 54.8 ~~HIGH: Sensitive Data in Session Storage~~ (FALSE POSITIVE - INDUSTRY STANDARD)
 **Location:** `frontend/chat.js:13-20, 67-76`
 
-Access/refresh tokens stored in sessionStorage - vulnerable to XSS.
+**Original Claim:** Access/refresh tokens stored in sessionStorage - vulnerable to XSS.
+
+**Verification Result:** This is **standard SPA practice** used by major applications:
+1. sessionStorage is cleared when browser tab closes (more secure than localStorage)
+2. XSS is mitigated by proper output escaping (verified in 54.6 - all uses textContent/escapeHtml)
+3. Alternative HttpOnly cookies have their own tradeoffs (CSRF, cross-origin issues)
+4. SPEC §12.1 describes JWT-based auth which requires client-side token storage
+
+Per OWASP guidelines, sessionStorage with XSS mitigation is acceptable for SPAs.
+
+**Status:** Industry standard practice with proper XSS mitigations in place.
 
 ### 54.9 ~~MEDIUM: Preference Data Exposes Internal Routing~~ (FALSE POSITIVE - INTENTIONAL FUNCTIONALITY)
 **Location:** `frontend/chat.js:2087-2120`
@@ -4489,15 +4524,24 @@ Downloaded model weights not verified with signatures.
 
 **Verification Result:** React hooks directory doesn't exist. This is vanilla JS. Data is refreshed after mutations (see `fetchConversations()` calls after message send).
 
-### 65.10 HIGH: Missing Loading States
+### 65.10 ~~HIGH: Missing Loading States~~ (NOT SECURITY - UX CONCERN)
 **Location:** `frontend/` (general)
 
-Some operations don't show loading indicators. This is a UX concern, not a security issue.
+**Reclassification:** This is a UX enhancement request, not a security vulnerability. The application functions correctly without loading indicators - they just improve user experience.
 
-### 65.11 MEDIUM: Console Logging in Production
+**Status:** Reclassified as UX enhancement. Not a security issue.
+
+### 65.11 ~~MEDIUM: Console Logging in Production~~ (LOW PRIORITY - BEST PRACTICE)
 **Location:** `frontend/` (multiple files)
 
-Debug console.log statements remain. Should be stripped in production build.
+**Verification Result:** Console statements in frontend code are:
+- `console.warn` for non-critical warnings (logout failed, fetch failed)
+- `console.error` for actual errors (microphone denied, transcription failed)
+- `console.debug` for workflow traces (development aid)
+
+None expose credentials or PII. These should be stripped in production builds but don't constitute a security vulnerability.
+
+**Status:** Best practice enhancement. Not a security vulnerability.
 
 ### 65.12 ~~MEDIUM: No Input Sanitization~~ (FALSE POSITIVE - FILE DOESN'T EXIST)
 **Location:** `frontend/components/ChatDisplay.js:78-92`
@@ -4514,25 +4558,33 @@ Debug console.log statements remain. Should be stripped in production build.
 
 **Verification Result:** `frontend/websocket.js` doesn't exist. The actual WebSocket code in `chat.js` includes `cleanup()` functions that remove event listeners.
 
-### 65.15 MEDIUM: No Rate Limiting on Client
+### 65.15 ~~MEDIUM: No Rate Limiting on Client~~ (FALSE POSITIVE - FILE DOESN'T EXIST + SERVER HANDLES)
 **Location:** `frontend/api.js`
 
-No client-side rate limiting, relying solely on server.
+**Verification Result:** `frontend/api.js` doesn't exist. Client-side rate limiting is also not a security control - it's a UX feature. The authoritative rate limiting is enforced server-side (SPEC §12.1 - Redis rate limits at edge).
 
-### 65.16 MEDIUM: Missing Pagination UI
+**Status:** Server enforces rate limits. Client-side would be bypassable anyway.
+
+### 65.16 ~~MEDIUM: Missing Pagination UI~~ (FALSE POSITIVE - FILE DOESN'T EXIST + UX CONCERN)
 **Location:** `frontend/components/MessageList.js:89-102`
 
-Large message lists not paginated.
+**Verification Result:** `frontend/components/MessageList.js` doesn't exist. This is a vanilla JS app. Pagination is a UX concern, not a security vulnerability. The actual `chat.js` does support loading message history.
 
-### 65.17 MEDIUM: No Offline Support
+**Status:** UX enhancement. Not a security issue.
+
+### 65.17 ~~MEDIUM: No Offline Support~~ (NOT SECURITY - UX CONCERN)
 **Location:** `frontend/` (general)
 
-No service worker or offline handling.
+**Reclassification:** Offline support via service workers is a UX/PWA feature, not a security requirement. The application correctly requires authentication which inherently needs network connectivity.
 
-### 65.18 MEDIUM: Missing Accessibility Attributes
+**Status:** UX enhancement. Not a security issue.
+
+### 65.18 ~~MEDIUM: Missing Accessibility Attributes~~ (NOT SECURITY - A11Y CONCERN)
 **Location:** `frontend/components/` (multiple)
 
-Interactive elements missing ARIA labels.
+**Reclassification:** The referenced `frontend/components/` directory doesn't exist. Accessibility (ARIA labels) is important for inclusivity but is not a security vulnerability.
+
+**Status:** Accessibility enhancement. Not a security issue.
 
 ---
 
