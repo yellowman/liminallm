@@ -143,14 +143,39 @@ class Runtime:
             self.settings,
             mfa_enabled=mfa_enabled,
         )
+        # Get SMTP settings from DB (falls back to env vars if not in DB)
+        smtp_host = self.settings.smtp_host
+        smtp_port = self.settings.smtp_port
+        smtp_user = self.settings.smtp_user
+        smtp_password = self.settings.smtp_password
+        smtp_use_tls = self.settings.smtp_use_tls
+        email_from_address = self.settings.email_from_address
+        email_from_name = self.settings.email_from_name
+        if hasattr(self.store, "get_system_settings"):
+            sys_settings = self.store.get_system_settings() or {}
+            # Only use DB values if they are non-empty (allows env var fallback)
+            if sys_settings.get("smtp_host"):
+                smtp_host = sys_settings["smtp_host"]
+            if sys_settings.get("smtp_port"):
+                smtp_port = sys_settings["smtp_port"]
+            if sys_settings.get("smtp_user"):
+                smtp_user = sys_settings["smtp_user"]
+            if sys_settings.get("smtp_password"):
+                smtp_password = sys_settings["smtp_password"]
+            if "smtp_use_tls" in sys_settings:
+                smtp_use_tls = sys_settings["smtp_use_tls"]
+            if sys_settings.get("email_from_address"):
+                email_from_address = sys_settings["email_from_address"]
+            if sys_settings.get("email_from_name"):
+                email_from_name = sys_settings["email_from_name"]
         self.email = EmailService(
-            smtp_host=self.settings.smtp_host,
-            smtp_port=self.settings.smtp_port,
-            smtp_user=self.settings.smtp_user,
-            smtp_password=self.settings.smtp_password,
-            smtp_use_tls=self.settings.smtp_use_tls,
-            from_email=self.settings.email_from_address,
-            from_name=self.settings.email_from_name,
+            smtp_host=smtp_host,
+            smtp_port=smtp_port,
+            smtp_user=smtp_user,
+            smtp_password=smtp_password,
+            smtp_use_tls=smtp_use_tls,
+            from_email=email_from_address,
+            from_name=email_from_name,
             base_url=self.settings.app_base_url,
         )
         # Training worker for background job processing

@@ -280,6 +280,13 @@ def _get_system_settings(runtime) -> dict:
         "allow_signup": True,
         "training_worker_enabled": True,
         "training_worker_poll_interval": 60,
+        "smtp_host": "",
+        "smtp_port": 587,
+        "smtp_user": "",
+        "smtp_password": "",
+        "smtp_use_tls": True,
+        "email_from_address": "",
+        "email_from_name": "LiminalLM",
     }
     return {**defaults, **db_settings}
 
@@ -630,22 +637,15 @@ def _get_artifact_kind(schema: Any) -> Optional[str]:
 
 
 def _get_pagination_settings(runtime) -> dict:
-    """Get pagination settings from runtime config with fallback to env settings.
+    """Get pagination settings from database-managed system settings.
 
     Returns dict with: default_page_size, max_page_size, default_conversations_limit
     """
-    settings = get_settings()
-    runtime_config = (
-        runtime.store.get_runtime_config()
-        if hasattr(runtime.store, "get_runtime_config")
-        else {}
-    )
+    sys_settings = _get_system_settings(runtime)
     return {
-        "default_page_size": runtime_config.get("default_page_size", settings.default_page_size),
-        "max_page_size": runtime_config.get("max_page_size", settings.max_page_size),
-        "default_conversations_limit": runtime_config.get(
-            "default_conversations_limit", settings.default_conversations_limit
-        ),
+        "default_page_size": sys_settings.get("default_page_size", 100),
+        "max_page_size": sys_settings.get("max_page_size", 500),
+        "default_conversations_limit": sys_settings.get("default_conversations_limit", 50),
     }
 
 
@@ -2574,6 +2574,8 @@ async def update_system_settings(
     - Token TTL: access_token_ttl_minutes (30), refresh_token_ttl_minutes (1440)
     - Feature flags: enable_mfa (true), allow_signup (true)
     - Training worker: training_worker_enabled (true), training_worker_poll_interval (60)
+    - SMTP: smtp_host, smtp_port (587), smtp_user, smtp_password, smtp_use_tls (true),
+      email_from_address, email_from_name ("LiminalLM")
     """
     runtime = get_runtime()
     sys_settings = _get_system_settings(runtime)
@@ -2615,6 +2617,13 @@ async def update_system_settings(
         "allow_signup",
         "training_worker_enabled",
         "training_worker_poll_interval",
+        "smtp_host",
+        "smtp_port",
+        "smtp_user",
+        "smtp_password",
+        "smtp_use_tls",
+        "email_from_address",
+        "email_from_name",
     }
     invalid_keys = set(body.keys()) - allowed_keys
     if invalid_keys:
@@ -2649,6 +2658,7 @@ async def update_system_settings(
         "access_token_ttl_minutes",
         "refresh_token_ttl_minutes",
         "training_worker_poll_interval",
+        "smtp_port",
     }
     float_keys = {
         "rate_limit_multiplier_free",
@@ -2659,6 +2669,14 @@ async def update_system_settings(
         "enable_mfa",
         "allow_signup",
         "training_worker_enabled",
+        "smtp_use_tls",
+    }
+    string_keys = {
+        "smtp_host",
+        "smtp_user",
+        "smtp_password",
+        "email_from_address",
+        "email_from_name",
     }
     for key, value in body.items():
         if key in int_keys and not isinstance(value, int):
@@ -2677,6 +2695,12 @@ async def update_system_settings(
             raise _http_error(
                 "validation_error",
                 f"{key} must be a boolean",
+                status_code=400,
+            )
+        if key in string_keys and not isinstance(value, str):
+            raise _http_error(
+                "validation_error",
+                f"{key} must be a string",
                 status_code=400,
             )
         # Validate positive values for numeric settings

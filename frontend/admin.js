@@ -611,6 +611,14 @@ const fetchSystemSettings = async () => {
     // Training Worker
     setChecked('setting-training-enabled', s.training_worker_enabled);
     setVal('setting-training-poll', s.training_worker_poll_interval);
+    // SMTP / Email
+    setVal('setting-smtp-host', s.smtp_host);
+    setVal('setting-smtp-port', s.smtp_port);
+    setVal('setting-smtp-user', s.smtp_user);
+    // Don't display password - leave field empty for security
+    setChecked('setting-smtp-tls', s.smtp_use_tls);
+    setVal('setting-email-from', s.email_from_address);
+    setVal('setting-email-name', s.email_from_name);
     showSettingsFeedback('Settings loaded');
   } catch (err) {
     showSettingsFeedback(err.message);
@@ -663,7 +671,19 @@ const saveSystemSettings = async () => {
     // Training Worker
     training_worker_enabled: getChecked('setting-training-enabled'),
     training_worker_poll_interval: getVal('setting-training-poll', Number),
+    // SMTP / Email
+    smtp_host: getVal('setting-smtp-host', String),
+    smtp_port: getVal('setting-smtp-port', Number),
+    smtp_user: getVal('setting-smtp-user', String),
+    smtp_use_tls: getChecked('setting-smtp-tls'),
+    email_from_address: getVal('setting-email-from', String),
+    email_from_name: getVal('setting-email-name', String),
   };
+  // Only include password if it was entered (non-empty)
+  const smtpPassword = document.getElementById('setting-smtp-password')?.value;
+  if (smtpPassword) {
+    settings.smtp_password = smtpPassword;
+  }
   showSettingsFeedback('Saving...');
   try {
     await requestEnvelope(

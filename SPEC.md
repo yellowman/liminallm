@@ -1693,10 +1693,11 @@ the following are treated as constants the kernel must honor; LLM edits happen o
     - token TTL: `access_token_ttl_minutes`, `refresh_token_ttl_minutes`
     - feature flags: `enable_mfa`, `allow_signup`
     - training worker: `training_worker_enabled`, `training_worker_poll_interval`
-    - SMTP operational settings (non-secret): `smtp_host`, `smtp_port`, `smtp_use_tls`, `email_from_address`, `email_from_name`
-  - **environment-only settings** (secrets or infrastructure decisions):
+    - SMTP (all settings including secrets): `smtp_host`, `smtp_port`, `smtp_user`, `smtp_password`, `smtp_use_tls`, `email_from_address`, `email_from_name`
+  - **environment-only settings** (infrastructure decisions or bootstrap secrets):
     - database connection: `DATABASE_URL`, `REDIS_URL`
-    - secrets: `JWT_SECRET`, `SMTP_PASSWORD`, `SMTP_USER`, OAuth `client_secret` values
+    - bootstrap secrets: `JWT_SECRET` (required before DB available)
+    - OAuth secrets: `client_secret` values (optional, can be moved to DB with encryption if needed)
     - storage mode: `USE_MEMORY_STORE` (required before DB connection)
     - test harness: `TEST_MODE`
   - **admin UI** at `/admin.html` provides grouped controls for all database-managed settings; changes take effect immediately without server restart.

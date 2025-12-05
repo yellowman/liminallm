@@ -224,6 +224,35 @@
               <input type="number" id="setting-training-poll" min="10" max="3600" value="60" />
             </div>
 
+            <h4>SMTP / Email</h4>
+            <div class="field">
+              <label for="setting-smtp-host">SMTP host</label>
+              <input type="text" id="setting-smtp-host" placeholder="smtp.example.com" />
+            </div>
+            <div class="field">
+              <label for="setting-smtp-port">SMTP port</label>
+              <input type="number" id="setting-smtp-port" min="1" max="65535" value="587" />
+            </div>
+            <div class="field">
+              <label for="setting-smtp-user">SMTP user</label>
+              <input type="text" id="setting-smtp-user" placeholder="user@example.com" />
+            </div>
+            <div class="field">
+              <label for="setting-smtp-password">SMTP password</label>
+              <input type="password" id="setting-smtp-password" placeholder="********" />
+            </div>
+            <div class="field checkbox">
+              <label><input type="checkbox" id="setting-smtp-tls" checked /> Use TLS</label>
+            </div>
+            <div class="field">
+              <label for="setting-email-from">From email address</label>
+              <input type="email" id="setting-email-from" placeholder="noreply@example.com" />
+            </div>
+            <div class="field">
+              <label for="setting-email-name">From name</label>
+              <input type="text" id="setting-email-name" value="LiminalLM" />
+            </div>
+
             <button class="primary" id="save-settings">Save settings</button>
           </div>
           <div id="settings-feedback" role="status" class="subtext"></div>

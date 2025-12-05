@@ -269,14 +269,28 @@ class Settings(BaseModel):
     oauth_microsoft_client_id: str | None = env_field(None, "OAUTH_MICROSOFT_CLIENT_ID")
     oauth_microsoft_client_secret: str | None = env_field(None, "OAUTH_MICROSOFT_CLIENT_SECRET")
     oauth_redirect_uri: str | None = env_field(None, "OAUTH_REDIRECT_URI")
-    # Email service settings
-    smtp_host: str | None = env_field(None, "SMTP_HOST")
-    smtp_port: int = env_field(587, "SMTP_PORT")
-    smtp_user: str | None = env_field(None, "SMTP_USER")
-    smtp_password: str | None = env_field(None, "SMTP_PASSWORD")
-    smtp_use_tls: bool = env_field(True, "SMTP_USE_TLS")
-    email_from_address: str | None = env_field(None, "EMAIL_FROM_ADDRESS")
-    email_from_name: str = env_field("LiminalLM", "EMAIL_FROM_NAME")
+    # Email service settings (env vars are fallbacks - prefer admin UI)
+    smtp_host: str | None = env_field(
+        None, "SMTP_HOST", description="SMTP server host (overridable via admin UI)"
+    )
+    smtp_port: int = env_field(
+        587, "SMTP_PORT", description="SMTP server port (overridable via admin UI)"
+    )
+    smtp_user: str | None = env_field(
+        None, "SMTP_USER", description="SMTP username (overridable via admin UI)"
+    )
+    smtp_password: str | None = env_field(
+        None, "SMTP_PASSWORD", description="SMTP password (overridable via admin UI)"
+    )
+    smtp_use_tls: bool = env_field(
+        True, "SMTP_USE_TLS", description="Use TLS for SMTP (overridable via admin UI)"
+    )
+    email_from_address: str | None = env_field(
+        None, "EMAIL_FROM_ADDRESS", description="Email from address (overridable via admin UI)"
+    )
+    email_from_name: str = env_field(
+        "LiminalLM", "EMAIL_FROM_NAME", description="Email from name (overridable via admin UI)"
+    )
     app_base_url: str = env_field("http://localhost:8000", "APP_BASE_URL")
     default_adapter_mode: AdapterMode = env_field(
         AdapterMode.HYBRID,
@@ -346,6 +360,10 @@ class Settings(BaseModel):
     #
     # Training Worker:
     # - training_worker_enabled, training_worker_poll_interval
+    #
+    # SMTP / Email (all settings including secrets):
+    # - smtp_host, smtp_port, smtp_user, smtp_password, smtp_use_tls
+    # - email_from_address, email_from_name
 
     # Training worker settings (env vars are fallbacks - prefer admin UI)
     training_worker_enabled: bool = env_field(

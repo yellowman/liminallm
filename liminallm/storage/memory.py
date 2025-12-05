@@ -1281,6 +1281,13 @@ class MemoryStore:
             "allow_signup": True,
             "training_worker_enabled": True,
             "training_worker_poll_interval": 60,
+            "smtp_host": "",
+            "smtp_port": 587,
+            "smtp_user": "",
+            "smtp_password": "",
+            "smtp_use_tls": True,
+            "email_from_address": "",
+            "email_from_name": "LiminalLM",
         })
 
     def set_system_settings(self, settings: dict) -> dict:

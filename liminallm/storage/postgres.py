@@ -2240,6 +2240,13 @@ class PostgresStore:
                 "allow_signup": True,
                 "training_worker_enabled": True,
                 "training_worker_poll_interval": 60,
+                "smtp_host": "",
+                "smtp_port": 587,
+                "smtp_user": "",
+                "smtp_password": "",
+                "smtp_use_tls": True,
+                "email_from_address": "",
+                "email_from_name": "LiminalLM",
             }
         raw_config = row.get("config")
         if isinstance(raw_config, str):

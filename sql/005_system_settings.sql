@@ -34,7 +34,14 @@ VALUES (
     "enable_mfa": true,
     "allow_signup": true,
     "training_worker_enabled": true,
-    "training_worker_poll_interval": 60
+    "training_worker_poll_interval": 60,
+    "smtp_host": "",
+    "smtp_port": 587,
+    "smtp_user": "",
+    "smtp_password": "",
+    "smtp_use_tls": true,
+    "email_from_address": "",
+    "email_from_name": "LiminalLM"
   }'::jsonb,
   now(),
   now()
