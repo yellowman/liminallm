@@ -1683,3 +1683,21 @@ the following are treated as constants the kernel must honor; LLM edits happen o
 - **migrations & seeding**
   - `scripts/migrate.sh` is the only required tool; it applies ordered `sql/*.sql` files and optional `sql/seed/*.sql` that upsert default artifacts (workflow, routing policy, base tool specs); rerunning is safe due to `IF NOT EXISTS` and deterministic upserts.
   - CI runs migrations on a fresh DB to validate schema; production runs migrations during maintenance windows with `DATABASE_URL` from environment and fails fast on checksum mismatch.
+
+- **configuration management (database-driven)**
+  - **principle**: most operational settings MUST be database-managed and editable via admin/instance-admin UI (`/admin.html`, `GET/PUT /v1/admin/settings`); environment variables serve only as bootstrap defaults or for infrastructure/secrets that cannot safely reside in the database.
+  - **database-managed settings** (modifiable at runtime without restart):
+    - session & concurrency: `session_rotation_hours`, `session_rotation_grace_seconds`, `max_concurrent_workflows`, `max_concurrent_inference`
+    - rate limits: `chat_rate_limit_per_minute`, `login_rate_limit_per_minute`, `signup_rate_limit_per_minute`, `reset_rate_limit_per_minute`, `mfa_rate_limit_per_minute`, `admin_rate_limit_per_minute`, `files_upload_rate_limit_per_minute`, `configops_rate_limit_per_hour`, `read_rate_limit_per_minute` and their window/multiplier variants
+    - pagination & files: `default_page_size`, `max_page_size`, `default_conversations_limit`, `max_upload_bytes`, `rag_chunk_size`
+    - token TTL: `access_token_ttl_minutes`, `refresh_token_ttl_minutes`
+    - feature flags: `enable_mfa`, `allow_signup`
+    - training worker: `training_worker_enabled`, `training_worker_poll_interval`
+    - SMTP operational settings (non-secret): `smtp_host`, `smtp_port`, `smtp_use_tls`, `email_from_address`, `email_from_name`
+  - **environment-only settings** (secrets or infrastructure decisions):
+    - database connection: `DATABASE_URL`, `REDIS_URL`
+    - secrets: `JWT_SECRET`, `SMTP_PASSWORD`, `SMTP_USER`, OAuth `client_secret` values
+    - storage mode: `USE_MEMORY_STORE` (required before DB connection)
+    - test harness: `TEST_MODE`
+  - **admin UI** at `/admin.html` provides grouped controls for all database-managed settings; changes take effect immediately without server restart.
+  - **API**: `GET /v1/admin/settings` returns current values merged with defaults; `PUT /v1/admin/settings` validates types (int/float/bool) and persists to `instance_config` table; requires admin role.
