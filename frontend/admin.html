@@ -97,6 +97,7 @@
           <div class="subtext">Adjust runtime behavior without code changes. Settings are stored in the database.</div>
 
           <div class="stack">
+            <h4>Session &amp; Concurrency</h4>
             <div class="field">
               <label for="setting-session-rotation-hours">Session rotation hours</label>
               <input type="number" id="setting-session-rotation-hours" min="1" max="720" value="24" />
@@ -113,18 +114,89 @@
               <label for="setting-max-concurrent-inference">Max concurrent inference per user</label>
               <input type="number" id="setting-max-concurrent-inference" min="1" max="20" value="2" />
             </div>
+
+            <h4>Plan Rate Multipliers</h4>
             <div class="field">
-              <label for="setting-rate-limit-free">Rate limit multiplier (free tier)</label>
+              <label for="setting-rate-limit-free">Free tier multiplier</label>
               <input type="number" id="setting-rate-limit-free" min="0.1" max="10" step="0.1" value="1.0" />
             </div>
             <div class="field">
-              <label for="setting-rate-limit-paid">Rate limit multiplier (paid tier)</label>
+              <label for="setting-rate-limit-paid">Paid tier multiplier</label>
               <input type="number" id="setting-rate-limit-paid" min="0.1" max="10" step="0.1" value="2.0" />
             </div>
             <div class="field">
-              <label for="setting-rate-limit-enterprise">Rate limit multiplier (enterprise tier)</label>
+              <label for="setting-rate-limit-enterprise">Enterprise tier multiplier</label>
               <input type="number" id="setting-rate-limit-enterprise" min="0.1" max="10" step="0.1" value="5.0" />
             </div>
+
+            <h4>Rate Limits</h4>
+            <div class="field">
+              <label for="setting-chat-rate">Chat rate limit (per minute)</label>
+              <input type="number" id="setting-chat-rate" min="1" max="1000" value="60" />
+            </div>
+            <div class="field">
+              <label for="setting-chat-window">Chat rate window (seconds)</label>
+              <input type="number" id="setting-chat-window" min="1" max="3600" value="60" />
+            </div>
+            <div class="field">
+              <label for="setting-login-rate">Login rate limit (per minute)</label>
+              <input type="number" id="setting-login-rate" min="1" max="100" value="10" />
+            </div>
+            <div class="field">
+              <label for="setting-signup-rate">Signup rate limit (per minute)</label>
+              <input type="number" id="setting-signup-rate" min="1" max="100" value="5" />
+            </div>
+            <div class="field">
+              <label for="setting-reset-rate">Reset rate limit (per minute)</label>
+              <input type="number" id="setting-reset-rate" min="1" max="100" value="5" />
+            </div>
+            <div class="field">
+              <label for="setting-mfa-rate">MFA rate limit (per minute)</label>
+              <input type="number" id="setting-mfa-rate" min="1" max="100" value="5" />
+            </div>
+            <div class="field">
+              <label for="setting-admin-rate">Admin rate limit (per minute)</label>
+              <input type="number" id="setting-admin-rate" min="1" max="100" value="30" />
+            </div>
+            <div class="field">
+              <label for="setting-admin-window">Admin rate window (seconds)</label>
+              <input type="number" id="setting-admin-window" min="1" max="3600" value="60" />
+            </div>
+            <div class="field">
+              <label for="setting-files-rate">Files upload rate (per minute)</label>
+              <input type="number" id="setting-files-rate" min="1" max="100" value="10" />
+            </div>
+            <div class="field">
+              <label for="setting-configops-rate">Config ops rate (per hour)</label>
+              <input type="number" id="setting-configops-rate" min="1" max="1000" value="30" />
+            </div>
+            <div class="field">
+              <label for="setting-read-rate">Read rate limit (per minute)</label>
+              <input type="number" id="setting-read-rate" min="1" max="1000" value="120" />
+            </div>
+
+            <h4>Pagination &amp; Files</h4>
+            <div class="field">
+              <label for="setting-page-size">Default page size</label>
+              <input type="number" id="setting-page-size" min="1" max="500" value="100" />
+            </div>
+            <div class="field">
+              <label for="setting-max-page">Max page size</label>
+              <input type="number" id="setting-max-page" min="1" max="1000" value="500" />
+            </div>
+            <div class="field">
+              <label for="setting-conversations-limit">Default conversations limit</label>
+              <input type="number" id="setting-conversations-limit" min="1" max="500" value="50" />
+            </div>
+            <div class="field">
+              <label for="setting-max-upload">Max upload bytes</label>
+              <input type="number" id="setting-max-upload" min="1" max="104857600" value="10485760" />
+            </div>
+            <div class="field">
+              <label for="setting-rag-chunk">RAG chunk size</label>
+              <input type="number" id="setting-rag-chunk" min="64" max="4000" value="400" />
+            </div>
+
             <button class="primary" id="save-settings">Save settings</button>
           </div>
           <div id="settings-feedback" role="status" class="subtext"></div>

@@ -1248,8 +1248,8 @@ class MemoryStore:
     def get_system_settings(self) -> dict:
         """Get admin-managed system settings.
 
-        Returns settings for session rotation, concurrency caps, and rate limit
-        multipliers. These are managed via the admin UI instead of env vars.
+        Returns settings for session rotation, concurrency caps, rate limits,
+        and other operational parameters. Managed via admin UI instead of env vars.
         """
         return self.runtime_config.get("system_settings", {
             "session_rotation_hours": 24,
@@ -1259,6 +1259,22 @@ class MemoryStore:
             "rate_limit_multiplier_free": 1.0,
             "rate_limit_multiplier_paid": 2.0,
             "rate_limit_multiplier_enterprise": 5.0,
+            "chat_rate_limit_per_minute": 60,
+            "chat_rate_limit_window_seconds": 60,
+            "login_rate_limit_per_minute": 10,
+            "signup_rate_limit_per_minute": 5,
+            "reset_rate_limit_per_minute": 5,
+            "mfa_rate_limit_per_minute": 5,
+            "admin_rate_limit_per_minute": 30,
+            "admin_rate_limit_window_seconds": 60,
+            "files_upload_rate_limit_per_minute": 10,
+            "configops_rate_limit_per_hour": 30,
+            "read_rate_limit_per_minute": 120,
+            "default_page_size": 100,
+            "max_page_size": 500,
+            "default_conversations_limit": 50,
+            "max_upload_bytes": 10485760,
+            "rag_chunk_size": 400,
         })
 
     def set_system_settings(self, settings: dict) -> dict:

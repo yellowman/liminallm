@@ -291,10 +291,6 @@ class Settings(BaseModel):
         "TEST_MODE",
         description="Toggle deterministic testing behaviors; required for CI pathways described in SPEC §14.",
     )
-    chat_rate_limit_per_minute: int = env_field(60, "CHAT_RATE_LIMIT_PER_MINUTE")
-    chat_rate_limit_window_seconds: int = env_field(
-        60, "CHAT_RATE_LIMIT_WINDOW_SECONDS"
-    )
     enable_mfa: bool = env_field(True, "ENABLE_MFA")
     jwt_secret: str = env_field(None, "JWT_SECRET")
     jwt_issuer: str = env_field("liminallm", "JWT_ISSUER")
@@ -302,31 +298,28 @@ class Settings(BaseModel):
     access_token_ttl_minutes: int = env_field(30, "ACCESS_TOKEN_TTL_MINUTES")
     refresh_token_ttl_minutes: int = env_field(24 * 60, "REFRESH_TOKEN_TTL_MINUTES")
     default_tenant_id: str = env_field("public", "DEFAULT_TENANT_ID")
-    rag_chunk_size: int = env_field(400, "RAG_CHUNK_SIZE")
     rag_mode: RagMode = env_field(RagMode.PGVECTOR, "RAG_MODE")
     embedding_model_id: str = env_field("text-embedding", "EMBEDDING_MODEL_ID")
-    max_upload_bytes: int = env_field(10 * 1024 * 1024, "MAX_UPLOAD_BYTES")
-    login_rate_limit_per_minute: int = env_field(10, "LOGIN_RATE_LIMIT_PER_MINUTE")
-    signup_rate_limit_per_minute: int = env_field(5, "SIGNUP_RATE_LIMIT_PER_MINUTE")
-    reset_rate_limit_per_minute: int = env_field(5, "RESET_RATE_LIMIT_PER_MINUTE")
-    mfa_rate_limit_per_minute: int = env_field(5, "MFA_RATE_LIMIT_PER_MINUTE")
-    admin_rate_limit_per_minute: int = env_field(30, "ADMIN_RATE_LIMIT_PER_MINUTE")
-    admin_rate_limit_window_seconds: int = env_field(
-        60, "ADMIN_RATE_LIMIT_WINDOW_SECONDS"
-    )
-    files_upload_rate_limit_per_minute: int = env_field(
-        10, "FILES_UPLOAD_RATE_LIMIT_PER_MINUTE"
-    )
-    configops_rate_limit_per_hour: int = env_field(30, "CONFIGOPS_RATE_LIMIT_PER_HOUR")
-    read_rate_limit_per_minute: int = env_field(120, "READ_RATE_LIMIT_PER_MINUTE")
 
-    # NOTE: The following settings have been moved to database-managed system settings
-    # (accessible via admin UI at /admin.html and API at /v1/admin/settings):
-    # - max_concurrent_workflows: Concurrency cap for workflows per user (SPEC §18)
-    # - max_concurrent_inference: Concurrency cap for inference per user (SPEC §18)
-    # - session_rotation_hours: Session rotation interval (SPEC §12.1)
-    # - session_rotation_grace_seconds: Grace period for old session IDs
-    # - rate_limit_multiplier_free/paid/enterprise: Per-plan rate limit multipliers (SPEC §18)
+    # NOTE: The following operational settings have been moved to database-managed
+    # system settings (accessible via admin UI at /admin.html and API at /v1/admin/settings):
+    #
+    # Session & Concurrency:
+    # - session_rotation_hours, session_rotation_grace_seconds
+    # - max_concurrent_workflows, max_concurrent_inference
+    #
+    # Rate Limits:
+    # - chat_rate_limit_per_minute, chat_rate_limit_window_seconds
+    # - login_rate_limit_per_minute, signup_rate_limit_per_minute
+    # - reset_rate_limit_per_minute, mfa_rate_limit_per_minute
+    # - admin_rate_limit_per_minute, admin_rate_limit_window_seconds
+    # - files_upload_rate_limit_per_minute, configops_rate_limit_per_hour
+    # - read_rate_limit_per_minute
+    # - rate_limit_multiplier_free/paid/enterprise
+    #
+    # Pagination & Files:
+    # - default_page_size, max_page_size, default_conversations_limit
+    # - max_upload_bytes, rag_chunk_size
 
     # Training worker settings
     training_worker_enabled: bool = env_field(
@@ -338,23 +331,6 @@ class Settings(BaseModel):
         60,
         "TRAINING_WORKER_POLL_INTERVAL",
         description="Training worker poll interval in seconds",
-    )
-
-    # Pagination defaults per SPEC §18
-    default_page_size: int = env_field(
-        100,
-        "DEFAULT_PAGE_SIZE",
-        description="Default page size for list endpoints (SPEC §18)",
-    )
-    max_page_size: int = env_field(
-        500,
-        "MAX_PAGE_SIZE",
-        description="Maximum page size for list endpoints (SPEC §18)",
-    )
-    default_conversations_limit: int = env_field(
-        50,
-        "DEFAULT_CONVERSATIONS_LIMIT",
-        description="Default limit for conversation list",
     )
 
     model_config = ConfigDict(extra="ignore")

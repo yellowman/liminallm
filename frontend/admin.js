@@ -571,13 +571,33 @@ const fetchSystemSettings = async () => {
       const el = document.getElementById(id);
       if (el && val !== undefined) el.value = val;
     };
+    // Session & Concurrency
     setVal('setting-session-rotation-hours', s.session_rotation_hours);
     setVal('setting-session-rotation-grace', s.session_rotation_grace_seconds);
     setVal('setting-max-concurrent-workflows', s.max_concurrent_workflows);
     setVal('setting-max-concurrent-inference', s.max_concurrent_inference);
+    // Plan multipliers
     setVal('setting-rate-limit-free', s.rate_limit_multiplier_free);
     setVal('setting-rate-limit-paid', s.rate_limit_multiplier_paid);
     setVal('setting-rate-limit-enterprise', s.rate_limit_multiplier_enterprise);
+    // Rate limits
+    setVal('setting-chat-rate', s.chat_rate_limit_per_minute);
+    setVal('setting-chat-window', s.chat_rate_limit_window_seconds);
+    setVal('setting-login-rate', s.login_rate_limit_per_minute);
+    setVal('setting-signup-rate', s.signup_rate_limit_per_minute);
+    setVal('setting-reset-rate', s.reset_rate_limit_per_minute);
+    setVal('setting-mfa-rate', s.mfa_rate_limit_per_minute);
+    setVal('setting-admin-rate', s.admin_rate_limit_per_minute);
+    setVal('setting-admin-window', s.admin_rate_limit_window_seconds);
+    setVal('setting-files-rate', s.files_upload_rate_limit_per_minute);
+    setVal('setting-configops-rate', s.configops_rate_limit_per_hour);
+    setVal('setting-read-rate', s.read_rate_limit_per_minute);
+    // Pagination & Files
+    setVal('setting-page-size', s.default_page_size);
+    setVal('setting-max-page', s.max_page_size);
+    setVal('setting-conversations-limit', s.default_conversations_limit);
+    setVal('setting-max-upload', s.max_upload_bytes);
+    setVal('setting-rag-chunk', s.rag_chunk_size);
     showSettingsFeedback('Settings loaded');
   } catch (err) {
     showSettingsFeedback(err.message);
@@ -590,13 +610,33 @@ const saveSystemSettings = async () => {
     return el ? parser(el.value) : undefined;
   };
   const settings = {
+    // Session & Concurrency
     session_rotation_hours: getVal('setting-session-rotation-hours', Number),
     session_rotation_grace_seconds: getVal('setting-session-rotation-grace', Number),
     max_concurrent_workflows: getVal('setting-max-concurrent-workflows', Number),
     max_concurrent_inference: getVal('setting-max-concurrent-inference', Number),
+    // Plan multipliers
     rate_limit_multiplier_free: getVal('setting-rate-limit-free', parseFloat),
     rate_limit_multiplier_paid: getVal('setting-rate-limit-paid', parseFloat),
     rate_limit_multiplier_enterprise: getVal('setting-rate-limit-enterprise', parseFloat),
+    // Rate limits
+    chat_rate_limit_per_minute: getVal('setting-chat-rate', Number),
+    chat_rate_limit_window_seconds: getVal('setting-chat-window', Number),
+    login_rate_limit_per_minute: getVal('setting-login-rate', Number),
+    signup_rate_limit_per_minute: getVal('setting-signup-rate', Number),
+    reset_rate_limit_per_minute: getVal('setting-reset-rate', Number),
+    mfa_rate_limit_per_minute: getVal('setting-mfa-rate', Number),
+    admin_rate_limit_per_minute: getVal('setting-admin-rate', Number),
+    admin_rate_limit_window_seconds: getVal('setting-admin-window', Number),
+    files_upload_rate_limit_per_minute: getVal('setting-files-rate', Number),
+    configops_rate_limit_per_hour: getVal('setting-configops-rate', Number),
+    read_rate_limit_per_minute: getVal('setting-read-rate', Number),
+    // Pagination & Files
+    default_page_size: getVal('setting-page-size', Number),
+    max_page_size: getVal('setting-max-page', Number),
+    default_conversations_limit: getVal('setting-conversations-limit', Number),
+    max_upload_bytes: getVal('setting-max-upload', Number),
+    rag_chunk_size: getVal('setting-rag-chunk', Number),
   };
   showSettingsFeedback('Saving...');
   try {
