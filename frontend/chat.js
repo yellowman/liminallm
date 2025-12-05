@@ -607,6 +607,14 @@ const logout = async () => {
 // OAuth
 // =============================================================================
 
+// Allowed OAuth providers (prevents path traversal via malicious provider values)
+const ALLOWED_OAUTH_PROVIDERS = new Set(['google', 'github', 'microsoft']);
+
+const validateOAuthProvider = (provider) => {
+  if (!provider || typeof provider !== 'string') return false;
+  return ALLOWED_OAUTH_PROVIDERS.has(provider.toLowerCase());
+};
+
 const startOAuth = async (provider) => {
   const oauthStatus = $('oauth-status');
   const btn = $(`oauth-${provider}`);
@@ -660,6 +668,17 @@ const handleOAuthCallback = async () => {
   }
 
   const oauthStatus = $('oauth-status');
+
+  // Validate provider to prevent path traversal attacks (Issue 41.4)
+  if (!validateOAuthProvider(provider)) {
+    if (oauthStatus) oauthStatus.textContent = 'Invalid OAuth provider.';
+    sessionStorage.removeItem('oauth_state');
+    sessionStorage.removeItem('oauth_provider');
+    // Clear URL params
+    window.history.replaceState({}, document.title, window.location.pathname);
+    return true;
+  }
+
   const storedState = sessionStorage.getItem('oauth_state');
 
   // Verify state matches
@@ -1163,8 +1182,22 @@ const renderMessage = (m) => {
 
   // Render citations as clickable links per SPEC §17
   // Note: Uses event delegation via messagesEl click handler (see initEventListeners)
+  // Citations can be at content_struct.citations OR extracted from content_struct.segments
   let citationsHtml = '';
-  const citations = m.content_struct?.citations || [];
+  let citations = m.content_struct?.citations || [];
+  // Fallback: extract citations from segments if not at top level
+  if (!citations.length && m.content_struct?.segments) {
+    citations = m.content_struct.segments
+      .filter(seg => seg.type === 'citation')
+      .map(seg => ({
+        source_path: seg.source_id || seg.locator || '',
+        chunk_id: seg.chunk_id || '',
+        content: seg.text || '',
+        context_id: seg.context_id || '',
+        chunk_index: seg.chunk_index,
+        score: seg.score,
+      }));
+  }
   if (citations.length) {
     citationsHtml = `
       <div class="citations-row">

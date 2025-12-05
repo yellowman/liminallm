@@ -168,9 +168,10 @@ const requestEnvelope = async (url, options, fallbackMessage) => {
 const setPatchStatusOptions = (statuses = []) => {
   knownPatchStatuses = new Set([...defaultPatchStatuses, ...statuses.map((s) => (s || '').toLowerCase())]);
   if (!patchStatusOptions) return;
+  // Escape status values to prevent XSS via malicious API data (Issue 69.7)
   patchStatusOptions.innerHTML = Array.from(knownPatchStatuses)
     .sort()
-    .map((status) => `<option value="${status}"></option>`)
+    .map((status) => `<option value="${escapeHtml(status)}">${escapeHtml(status)}</option>`)
     .join('');
 };
 

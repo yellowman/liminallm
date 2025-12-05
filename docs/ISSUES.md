@@ -100,17 +100,20 @@ This document consolidates findings from deep analysis of the liminallm codebase
 **Medium Priority Issues:** 282 (243 from passes 1-11, 39 new in 12th pass)
 **Total Issues:** 681
 **False Positives Identified:** 109 (verified via comprehensive code examination)
-**Issues Fixed:** 4 (frontend security and validation fixes)
-**Effective Issues:** 568 (681 - 109 false positives - 4 fixed)
+**Issues Fixed:** 7 (frontend security, validation, and compatibility fixes)
+**Effective Issues:** 565 (681 - 109 false positives - 7 fixed)
 **False Positive Rate:** 16.0%
 
 *Note: False positives include structural patterns (SQL parameterization, Python GIL, timeouts), development/test code, standard industry practices (Docker isolation, env vars), required functionality (MFA secret display, admin password display), misattributed issues (internal logging), and references to non-existent files (React-specific issues on vanilla JS codebase).*
 
 **Frontend Fixes Applied:**
 - 13.3: Voice endpoint error handling improved
+- 33.1: Citation extraction now supports both top-level and segment-embedded citations
 - 41.1: Inline onclick handlers replaced with event delegation (CSP compliance)
+- 41.4: OAuth provider validation added to prevent path traversal
 - 54.2: XSS vulnerability in MFA otpauth_uri fixed
 - 65.7: Input length validation added to chat messages
+- 69.7: Admin panel status values now properly escaped
 
 ---
 
@@ -1478,14 +1481,17 @@ async def upload_file(...):
 
 ## 33. Frontend-Backend Contract Mismatches (5th Pass)
 
-### 33.1 CRITICAL: content_struct.citations Field Mismatch
+### 33.1 ~~CRITICAL: content_struct.citations Field Mismatch~~ (FIXED)
 
-**Location:** Frontend `chat.js:1415` vs Backend `content_struct.py:55-57`
+**Location:** Frontend `chat.js:1164-1181`
 
-Frontend expects: `data.content_struct.citations` (top-level array)
-Backend provides: Citations embedded in `content_struct.segments` as type="citation"
+**Original Issue:** Frontend expected `content_struct.citations` but backend provides citations in `content_struct.segments`.
 
-**Impact:** Citations never display in UI.
+**Fix Applied:** Frontend now supports both formats:
+1. Top-level `content_struct.citations` array (if present)
+2. Extraction from `content_struct.segments` where `type="citation"` (fallback)
+
+The fix maps segment fields to the expected citation structure (`source_path`, `chunk_id`, `content`, etc.).
 
 ### 33.2 ~~CRITICAL: WebSocket tenant_id From Message Body~~ (FALSE POSITIVE - VERIFIED SAFE)
 
@@ -2194,15 +2200,17 @@ This is the correct escaping for double-quoted HTML attributes. JSON.stringify h
 
 **Status:** Escaping is correct and robust.
 
-### 41.4 MEDIUM: Unvalidated URL Parameters
+### 41.4 ~~MEDIUM: Unvalidated URL Parameters~~ (FIXED)
 
-**Location:** `frontend/chat.js:648-651, 879-880, 972-973`
+**Location:** `frontend/chat.js:610-616, 672-680`
 
-OAuth provider parameter used in API endpoint without validation.
+**Original Issue:** OAuth provider parameter from URL used without validation.
 
-**Impact:** Path traversal via `provider=../../../`.
-
-**Note:** This is mitigated by backend URL routing which only matches defined routes. Recommend adding client-side validation as defense-in-depth.
+**Fix Applied:**
+- Added `ALLOWED_OAUTH_PROVIDERS` constant with whitelist (`google`, `github`, `microsoft`)
+- Added `validateOAuthProvider()` function for validation
+- `handleOAuthCallback()` now validates provider before API call
+- Invalid providers trigger error message and clear OAuth state
 
 ### 41.5 MEDIUM: Sensitive Token Storage in sessionStorage
 
@@ -4785,13 +4793,29 @@ If `base_url` is compromised, HTML/JavaScript can be injected into emails.
 ### 69.5 HIGH: HTML Injection - Email Verification
 **Location:** `liminallm/service/email.py:160, 164-191`
 
-### 69.6 HIGH: XSS - Frontend innerHTML with User Data
+### 69.6 ~~HIGH: XSS - Frontend innerHTML with User Data~~ (FALSE POSITIVE)
 **Location:** `frontend/chat.js:170, 1879`
 
-Context names interpolated into HTML without escaping.
+**Original Claim:** Context names interpolated into HTML without escaping.
 
-### 69.7 HIGH: XSS - Frontend innerHTML in Admin Panel
-**Location:** `frontend/admin.js:171-174, 209, 227-231`
+**Verification Result:**
+- Line 170: `content.innerHTML = html` - All data IS escaped via `escapeHtml()` calls (lines 156-165)
+- Line 1879: Just clears a form field (`nameEl.value = ''`), no user data involved
+- Line 1897: Context select uses `escapeHtml(ctx.id)` and `escapeHtml(ctx.name)`
+
+**Status:** All user data is properly escaped. No vulnerability.
+
+### 69.7 ~~HIGH: XSS - Frontend innerHTML in Admin Panel~~ (FIXED)
+**Location:** `frontend/admin.js:168-175`
+
+**Original Issue:** Status values in `<option>` elements not escaped.
+
+**Fix Applied:** `setPatchStatusOptions()` now escapes status values:
+```javascript
+`<option value="${escapeHtml(status)}">${escapeHtml(status)}</option>`
+```
+
+**Note:** Lines 209, 227-231 already use `escapeHtml()` for all dynamic data in the patch table.
 
 ### 69.8 MEDIUM: Cache Key Construction - Redis Keys with User IDs
 **Location:** `liminallm/storage/redis_cache.py:34, 37, 40, 58, 76, 79, 82, 95, 99, 116` (80+ occurrences)
