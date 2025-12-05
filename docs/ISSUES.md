@@ -100,8 +100,8 @@ This document consolidates findings from deep analysis of the liminallm codebase
 **Medium Priority Issues:** 282 (243 from passes 1-11, 39 new in 12th pass)
 **Total Issues:** 681
 **False Positives Identified:** 109 (verified via comprehensive code examination)
-**Issues Fixed:** 7 (frontend security, validation, and compatibility fixes)
-**Effective Issues:** 565 (681 - 109 false positives - 7 fixed)
+**Issues Fixed:** 8 (frontend security, validation, and compatibility fixes)
+**Effective Issues:** 564 (681 - 109 false positives - 8 fixed)
 **False Positive Rate:** 16.0%
 
 *Note: False positives include structural patterns (SQL parameterization, Python GIL, timeouts), development/test code, standard industry practices (Docker isolation, env vars), required functionality (MFA secret display, admin password display), misattributed issues (internal logging), and references to non-existent files (React-specific issues on vanilla JS codebase).*
@@ -114,6 +114,7 @@ This document consolidates findings from deep analysis of the liminallm codebase
 - 54.2: XSS vulnerability in MFA otpauth_uri fixed
 - 65.7: Input length validation added to chat messages
 - 69.7: Admin panel status values now properly escaped
+- 74.1: Cryptographically secure idempotency key generation using crypto.getRandomValues() fallback
 
 ---
 
@@ -5156,21 +5157,30 @@ This pass focused on 8 specialized areas:
 
 ## 74. Cryptographic Randomness and Entropy
 
-### 74.1 HIGH: Frontend Math.random() Fallback for Idempotency Keys
-**Location:** `frontend/chat.js:204`, `frontend/admin.js:49`
+### 74.1 ~~HIGH: Frontend Math.random() Fallback for Idempotency Keys~~ (FIXED)
+**Location:** `frontend/chat.js:207-220`, `frontend/admin.js:47-60`
 
+**Original Issue:** Math.random() fallback for idempotency keys is not cryptographically secure. Predictable keys could enable replay attacks in older browsers.
+
+**Fix Applied:** Added `crypto.getRandomValues()` as intermediate fallback before `Math.random()`:
 ```javascript
-function generateIdempotencyKey() {
-    if (window.crypto && window.crypto.randomUUID) {
-        return window.crypto.randomUUID();
-    }
-    return 'idem-' + Math.random().toString(36).substring(2);
-}
+const randomIdempotencyKey = () => {
+  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  // Fallback using crypto.getRandomValues() - cryptographically secure, broader browser support
+  if (window.crypto?.getRandomValues) {
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // UUID v4 version
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // UUID v4 variant
+    const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+  }
+  // Ultimate fallback for ancient browsers without crypto support
+  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+};
 ```
 
-Math.random() is not cryptographically secure. Predictable idempotency keys enable replay attacks in older browsers.
-
-**Impact:** Attackers can predict idempotency keys and replay requests.
+**Why this works:** `crypto.getRandomValues()` is cryptographically secure and has broad browser support (IE11+, all modern browsers). The `randomUUID()` API is newer (Chrome 92+), so this fallback covers the gap. Only extremely old browsers without any crypto support fall through to Math.random().
 
 ### 74.2 MEDIUM: MFA TOTP Secret Generation Entropy
 **Location:** `liminallm/service/auth.py:892-898`

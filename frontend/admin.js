@@ -46,6 +46,16 @@ let knownPatchStatuses = new Set(defaultPatchStatuses);
 
 const randomIdempotencyKey = () => {
   if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  // Fallback using crypto.getRandomValues() - cryptographically secure, broader browser support
+  if (window.crypto?.getRandomValues) {
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // UUID v4 version
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // UUID v4 variant
+    const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+  }
+  // Ultimate fallback for ancient browsers without crypto support
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 };
 
