@@ -221,6 +221,101 @@ class RedisCache:
         """Delete workflow state from cache during rollback or cleanup."""
         await self.client.delete(f"workflow:state:{state_key}")
 
+    # =========================================================================
+    # Concurrency Caps (SPEC §18)
+    # =========================================================================
+
+    async def acquire_concurrency_slot(
+        self, slot_type: str, user_id: str, max_slots: int, ttl_seconds: int = 3600
+    ) -> tuple[bool, int]:
+        """Atomically acquire a concurrency slot for a user.
+
+        Args:
+            slot_type: Type of slot (e.g., "workflow", "inference")
+            user_id: User ID
+            max_slots: Maximum concurrent slots allowed
+            ttl_seconds: TTL for slot keys (safety cleanup)
+
+        Returns:
+            Tuple of (acquired: bool, current_count: int)
+        """
+        key = f"concurrency:{slot_type}:{user_id}"
+        # Use Lua script for atomic check-and-increment
+        lua_script = """
+        local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+        local max_allowed = tonumber(ARGV[1])
+        local ttl = tonumber(ARGV[2])
+        if current < max_allowed then
+            redis.call('INCR', KEYS[1])
+            redis.call('EXPIRE', KEYS[1], ttl)
+            return {1, current + 1}
+        end
+        return {0, current}
+        """
+        result = await self.client.eval(lua_script, 1, key, max_slots, ttl_seconds)
+        return (bool(result[0]), int(result[1]))
+
+    async def release_concurrency_slot(self, slot_type: str, user_id: str) -> int:
+        """Release a concurrency slot for a user.
+
+        Args:
+            slot_type: Type of slot (e.g., "workflow", "inference")
+            user_id: User ID
+
+        Returns:
+            Current count after release
+        """
+        key = f"concurrency:{slot_type}:{user_id}"
+        # Use Lua script to ensure we don't go below 0
+        lua_script = """
+        local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+        if current > 0 then
+            return redis.call('DECR', KEYS[1])
+        end
+        return 0
+        """
+        result = await self.client.eval(lua_script, 1, key)
+        return int(result)
+
+    async def get_concurrency_count(self, slot_type: str, user_id: str) -> int:
+        """Get current concurrency count for a user."""
+        key = f"concurrency:{slot_type}:{user_id}"
+        count = await self.client.get(key)
+        return int(count) if count else 0
+
+    # =========================================================================
+    # Session Activity Tracking (SPEC §12.1)
+    # =========================================================================
+
+    async def update_session_activity(self, session_id: str, ttl_seconds: int = 86400) -> None:
+        """Update session last activity timestamp."""
+        key = f"session:activity:{session_id}"
+        now = datetime.utcnow().isoformat()
+        await self.client.set(key, now, ex=ttl_seconds)
+
+    async def get_session_activity(self, session_id: str) -> Optional[datetime]:
+        """Get session last activity timestamp."""
+        key = f"session:activity:{session_id}"
+        value = await self.client.get(key)
+        if value:
+            try:
+                return datetime.fromisoformat(value)
+            except (ValueError, TypeError):
+                return None
+        return None
+
+    async def set_session_rotation_grace(
+        self, old_session_id: str, new_session_id: str, grace_seconds: int = 300
+    ) -> None:
+        """Store mapping from old to new session ID during grace period."""
+        key = f"session:rotation:{old_session_id}"
+        await self.client.set(key, new_session_id, ex=grace_seconds)
+
+    async def get_rotated_session(self, old_session_id: str) -> Optional[str]:
+        """Get new session ID if old session was rotated."""
+        key = f"session:rotation:{old_session_id}"
+        return await self.client.get(key)
+
 
 class _SyncClientAdapter:
     """Adapter that wraps a sync Redis client with async method signatures.
@@ -423,3 +518,78 @@ class SyncRedisCache:
     async def delete_workflow_state(self, state_key: str) -> None:
         """Delete workflow state from cache."""
         self._sync_client.delete(f"workflow:state:{state_key}")
+
+    # =========================================================================
+    # Concurrency Caps (SPEC §18)
+    # =========================================================================
+
+    async def acquire_concurrency_slot(
+        self, slot_type: str, user_id: str, max_slots: int, ttl_seconds: int = 3600
+    ) -> tuple[bool, int]:
+        """Atomically acquire a concurrency slot for a user."""
+        key = f"concurrency:{slot_type}:{user_id}"
+        lua_script = """
+        local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+        local max_allowed = tonumber(ARGV[1])
+        local ttl = tonumber(ARGV[2])
+        if current < max_allowed then
+            redis.call('INCR', KEYS[1])
+            redis.call('EXPIRE', KEYS[1], ttl)
+            return {1, current + 1}
+        end
+        return {0, current}
+        """
+        result = self._sync_client.eval(lua_script, 1, key, max_slots, ttl_seconds)
+        return (bool(result[0]), int(result[1]))
+
+    async def release_concurrency_slot(self, slot_type: str, user_id: str) -> int:
+        """Release a concurrency slot for a user."""
+        key = f"concurrency:{slot_type}:{user_id}"
+        lua_script = """
+        local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+        if current > 0 then
+            return redis.call('DECR', KEYS[1])
+        end
+        return 0
+        """
+        result = self._sync_client.eval(lua_script, 1, key)
+        return int(result)
+
+    async def get_concurrency_count(self, slot_type: str, user_id: str) -> int:
+        """Get current concurrency count for a user."""
+        key = f"concurrency:{slot_type}:{user_id}"
+        count = self._sync_client.get(key)
+        return int(count) if count else 0
+
+    # =========================================================================
+    # Session Activity Tracking (SPEC §12.1)
+    # =========================================================================
+
+    async def update_session_activity(self, session_id: str, ttl_seconds: int = 86400) -> None:
+        """Update session last activity timestamp."""
+        key = f"session:activity:{session_id}"
+        now = datetime.utcnow().isoformat()
+        self._sync_client.set(key, now, ex=ttl_seconds)
+
+    async def get_session_activity(self, session_id: str) -> Optional[datetime]:
+        """Get session last activity timestamp."""
+        key = f"session:activity:{session_id}"
+        value = self._sync_client.get(key)
+        if value:
+            try:
+                return datetime.fromisoformat(value)
+            except (ValueError, TypeError):
+                return None
+        return None
+
+    async def set_session_rotation_grace(
+        self, old_session_id: str, new_session_id: str, grace_seconds: int = 300
+    ) -> None:
+        """Store mapping from old to new session ID during grace period."""
+        key = f"session:rotation:{old_session_id}"
+        self._sync_client.set(key, new_session_id, ex=grace_seconds)
+
+    async def get_rotated_session(self, old_session_id: str) -> Optional[str]:
+        """Get new session ID if old session was rotated."""
+        key = f"session:rotation:{old_session_id}"
+        return self._sync_client.get(key)

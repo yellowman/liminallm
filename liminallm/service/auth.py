@@ -537,16 +537,33 @@ class AuthService:
         mfa_code: Optional[str] = None,
         *,
         tenant_id: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        ip_addr: Optional[str] = None,
     ) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
         user = self.store.get_user_by_email(email)
         if not user or not self.verify_password(user.id, password):
             return None, None, {}
         if tenant_id and tenant_id != user.tenant_id:
             return None, None, {}
+
+        # SPEC §18: Single-session mode - invalidate prior sessions if enabled
+        user_meta = user.meta or {}
+        if user_meta.get("single_session"):
+            self.logger.info(
+                "single_session_mode_active",
+                user_id=user.id,
+                action="revoking_prior_sessions",
+            )
+            await self.revoke_all_user_sessions(user.id)
+
         mfa_cfg = self.store.get_user_mfa_secret(user.id) if self.mfa_enabled else None
         require_mfa = bool(self.mfa_enabled and mfa_cfg and mfa_cfg.enabled)
         session = self.store.create_session(
-            user.id, mfa_required=require_mfa, tenant_id=user.tenant_id
+            user.id,
+            mfa_required=require_mfa,
+            tenant_id=user.tenant_id,
+            user_agent=user_agent,
+            ip_addr=ip_addr,
         )
         tokens: dict[str, str] = {}
         if require_mfa and mfa_cfg:
@@ -560,6 +577,8 @@ class AuthService:
             tokens = self._issue_tokens(user, session)
         if self.cache and (not require_mfa or session.mfa_verified):
             await self.cache.cache_session(session.id, user.id, session.expires_at)
+            # Initialize session activity tracking
+            await self.cache.update_session_activity(session.id)
         return user, session, tokens
 
     async def refresh_tokens(
@@ -644,12 +663,25 @@ class AuthService:
     ) -> Optional[AuthContext]:
         if not session_id:
             return None
-        sess = self.store.get_session(session_id)
+
+        # SPEC §12.1: Check if this is a rotated session (grace period)
+        actual_session_id = session_id
+        if self.cache:
+            rotated_to = await self.cache.get_rotated_session(session_id)
+            if rotated_to:
+                actual_session_id = rotated_to
+                self.logger.debug(
+                    "session_rotation_grace",
+                    old_session=session_id,
+                    new_session=rotated_to,
+                )
+
+        sess = self.store.get_session(actual_session_id)
         if not sess and self.cache:
-            cached_user = await self.cache.get_session_user(session_id)
+            cached_user = await self.cache.get_session_user(actual_session_id)
             if not cached_user:
                 return None
-            sess = self.store.get_session(session_id)
+            sess = self.store.get_session(actual_session_id)
         if not sess:
             return None
         if sess.expires_at <= datetime.utcnow():
@@ -661,13 +693,24 @@ class AuthService:
             return None
         if required_role and not self._role_allows(user.role, required_role):
             return None
+
+        # SPEC §12.1: Session rotation after 24h of activity
+        final_session = sess
+        if self.cache:
+            rotated_session = await self._maybe_rotate_session(sess, user)
+            if rotated_session:
+                final_session = rotated_session
+
         if self.cache and (
-            not sess.mfa_required or sess.mfa_verified or not self.mfa_enabled
+            not final_session.mfa_required or final_session.mfa_verified or not self.mfa_enabled
         ):
-            await self.cache.cache_session(sess.id, sess.user_id, sess.expires_at)
+            await self.cache.cache_session(final_session.id, final_session.user_id, final_session.expires_at)
+            # Update activity timestamp on each session use
+            await self.cache.update_session_activity(final_session.id)
+
         if (
-            sess.mfa_required
-            and not sess.mfa_verified
+            final_session.mfa_required
+            and not final_session.mfa_verified
             and self.mfa_enabled
             and not allow_pending_mfa
         ):
@@ -676,8 +719,66 @@ class AuthService:
             user_id=user.id,
             role=user.role,
             tenant_id=user.tenant_id,
-            session_id=sess.id,
+            session_id=final_session.id,
         )
+
+    async def _maybe_rotate_session(
+        self, sess: Session, user: User
+    ) -> Optional[Session]:
+        """Rotate session if 24h of activity has passed (SPEC §12.1).
+
+        Returns the new session if rotated, None otherwise.
+        """
+        if not self.cache:
+            return None
+
+        last_activity = await self.cache.get_session_activity(sess.id)
+        if not last_activity:
+            # No activity record - initialize it
+            await self.cache.update_session_activity(sess.id)
+            return None
+
+        rotation_threshold = timedelta(hours=self.settings.session_rotation_hours)
+        if datetime.utcnow() - last_activity < rotation_threshold:
+            return None
+
+        # Time to rotate - create new session
+        self.logger.info(
+            "session_rotation",
+            old_session=sess.id,
+            user_id=sess.user_id,
+            last_activity=last_activity.isoformat(),
+        )
+
+        new_session = self.store.create_session(
+            sess.user_id,
+            mfa_required=sess.mfa_required,
+            tenant_id=sess.tenant_id,
+            user_agent=sess.user_agent,
+            ip_addr=str(sess.ip_addr) if sess.ip_addr else None,
+            meta=sess.meta,
+        )
+
+        # Mark new session as MFA verified if old one was
+        if sess.mfa_verified:
+            self._mark_session_verified(new_session.id)
+            new_session.mfa_verified = True
+
+        # Set up grace period mapping
+        await self.cache.set_session_rotation_grace(
+            sess.id,
+            new_session.id,
+            self.settings.session_rotation_grace_seconds,
+        )
+
+        # Revoke old session
+        self.store.revoke_session(sess.id)
+        await self.cache.revoke_session(sess.id)
+
+        # Initialize activity for new session
+        await self.cache.update_session_activity(new_session.id)
+
+        return new_session
 
     async def authenticate(
         self,

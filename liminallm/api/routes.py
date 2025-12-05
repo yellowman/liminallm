@@ -239,6 +239,24 @@ class RateLimitInfo:
         response.headers["X-RateLimit-Reset"] = str(self.reset_seconds)
 
 
+def _get_plan_rate_multiplier(runtime, plan_tier: str) -> float:
+    """Get rate limit multiplier for a user's plan tier (SPEC §18).
+
+    Args:
+        runtime: Application runtime context
+        plan_tier: User's plan tier (free, paid, enterprise)
+
+    Returns:
+        Multiplier to apply to base rate limits
+    """
+    multipliers = {
+        "free": runtime.settings.rate_limit_multiplier_free,
+        "paid": runtime.settings.rate_limit_multiplier_paid,
+        "enterprise": runtime.settings.rate_limit_multiplier_enterprise,
+    }
+    return multipliers.get(plan_tier, 1.0)
+
+
 async def _enforce_rate_limit(
     runtime, key: str, limit: int, window_seconds: int, *, response: Optional[Response] = None
 ) -> RateLimitInfo:
@@ -267,6 +285,109 @@ async def _enforce_rate_limit(
         raise _http_error("rate_limited", "rate limit exceeded", status_code=429)
 
     return info
+
+
+async def _enforce_rate_limit_per_plan(
+    runtime,
+    key: str,
+    base_limit: int,
+    window_seconds: int,
+    plan_tier: str,
+    *,
+    response: Optional[Response] = None,
+) -> RateLimitInfo:
+    """Enforce rate limit adjusted for user's plan tier (SPEC §18).
+
+    Args:
+        runtime: Application runtime context
+        key: Rate limit key (e.g., "chat:{user_id}")
+        base_limit: Base rate limit (will be multiplied by plan tier)
+        window_seconds: Rate limit window in seconds
+        plan_tier: User's plan tier for multiplier lookup
+        response: Optional response to add rate limit headers to
+
+    Returns:
+        RateLimitInfo with current rate limit state
+
+    Raises:
+        HTTPException with 429 if rate limit exceeded
+    """
+    multiplier = _get_plan_rate_multiplier(runtime, plan_tier)
+    adjusted_limit = int(base_limit * multiplier)
+    return await _enforce_rate_limit(runtime, key, adjusted_limit, window_seconds, response=response)
+
+
+async def _acquire_workflow_slot(runtime, user_id: str) -> bool:
+    """Acquire a workflow concurrency slot (SPEC §18: max 3 per user).
+
+    Args:
+        runtime: Application runtime context
+        user_id: User ID
+
+    Returns:
+        True if slot acquired, raises 409 if at capacity
+
+    Raises:
+        HTTPException with 409 if concurrency cap exceeded
+    """
+    if not runtime.cache:
+        # Without Redis, we can't track concurrency - allow the request
+        return True
+
+    acquired, current = await runtime.cache.acquire_concurrency_slot(
+        "workflow",
+        user_id,
+        runtime.settings.max_concurrent_workflows,
+    )
+    if not acquired:
+        raise _http_error(
+            "busy",
+            f"concurrent workflow limit ({runtime.settings.max_concurrent_workflows}) exceeded",
+            status_code=409,
+        )
+    return True
+
+
+async def _release_workflow_slot(runtime, user_id: str) -> None:
+    """Release a workflow concurrency slot."""
+    if runtime.cache:
+        await runtime.cache.release_concurrency_slot("workflow", user_id)
+
+
+async def _acquire_inference_slot(runtime, user_id: str) -> bool:
+    """Acquire an inference concurrency slot (SPEC §18: max 2 per user).
+
+    Args:
+        runtime: Application runtime context
+        user_id: User ID
+
+    Returns:
+        True if slot acquired, raises 409 if at capacity
+
+    Raises:
+        HTTPException with 409 if concurrency cap exceeded
+    """
+    if not runtime.cache:
+        return True
+
+    acquired, current = await runtime.cache.acquire_concurrency_slot(
+        "inference",
+        user_id,
+        runtime.settings.max_concurrent_inference,
+    )
+    if not acquired:
+        raise _http_error(
+            "busy",
+            f"concurrent inference limit ({runtime.settings.max_concurrent_inference}) exceeded",
+            status_code=409,
+        )
+    return True
+
+
+async def _release_inference_slot(runtime, user_id: str) -> None:
+    """Release an inference concurrency slot."""
+    if runtime.cache:
+        await runtime.cache.release_concurrency_slot("inference", user_id)
 
 
 async def _resolve_idempotency(
@@ -1347,125 +1468,141 @@ async def chat(
     Raises:
         401: If authentication fails
         404: If conversation or context not found
+        409: If concurrent workflow limit exceeded (SPEC §18)
         429: If rate limit exceeded
     """
     runtime = get_runtime()
     user_id = principal.user_id
+
+    # Get user's plan tier for per-plan rate limits (SPEC §18)
+    user = runtime.store.get_user(user_id)
+    plan_tier = user.plan_tier if user else "free"
+
     # SPEC §18: Accept Idempotency-Key when provided (optional)
     async with IdempotencyGuard(
         "chat", user_id, idempotency_key, require=False
     ) as idem:
         if idem.cached:
             return idem.cached
-        await _enforce_rate_limit(
+
+        # SPEC §18: Per-plan adjustable rate limits
+        await _enforce_rate_limit_per_plan(
             runtime,
             f"chat:{user_id}",
             runtime.settings.chat_rate_limit_per_minute,
             runtime.settings.chat_rate_limit_window_seconds,
+            plan_tier,
         )
-        conversation: Conversation | None = None
-        context_id = body.context_id
-        validated_context_id: str | None = None
-        if body.conversation_id:
-            conversation = _get_owned_conversation(
-                runtime, body.conversation_id, principal
-            )
-        else:
-            if context_id:
-                _get_owned_context(runtime, context_id, principal)
-                validated_context_id = context_id
-            # Generate title from first message for new conversations
-            auto_title = _generate_conversation_title(body.message.content)
-            conversation = runtime.store.create_conversation(
-                user_id=user_id, active_context_id=body.context_id, title=auto_title
-            )
-        conversation_id = conversation.id
-        context_id = context_id or conversation.active_context_id
-        if context_id and context_id != validated_context_id:
-            _get_owned_context(runtime, context_id, principal)
-        user_content = body.message.content
-        voice_meta: dict = {}
-        if body.message.mode == "voice":
-            try:
-                audio_bytes = base64.b64decode(body.message.content)
-            except Exception as exc:
-                raise _http_error(
-                    "bad_request",
-                    "invalid base64-encoded audio payload",
-                    status_code=400,
-                ) from exc
-            transcript = await runtime.voice.transcribe(audio_bytes, user_id=user_id) or {}
-            user_content = transcript.get("transcript") or transcript.get("text")
-            if not user_content:
-                raise _http_error(
-                    "bad_request", "unable to transcribe audio", status_code=400
+
+        # SPEC §18: Concurrency cap - max 3 concurrent workflows per user
+        await _acquire_workflow_slot(runtime, user_id)
+        try:
+            conversation: Conversation | None = None
+            context_id = body.context_id
+            validated_context_id: str | None = None
+            if body.conversation_id:
+                conversation = _get_owned_conversation(
+                    runtime, body.conversation_id, principal
                 )
-            voice_meta = {"mode": "voice", "transcript": transcript}
-        user_content_struct = normalize_content_struct(
-            body.message.content_struct, user_content
-        )
-        runtime.store.append_message(
-            conversation_id,
-            sender="user",
-            role="user",
-            content=user_content,
-            meta=voice_meta or None,
-            content_struct=user_content_struct,
-        )
-        orchestration = await runtime.workflow.run(
-            body.workflow_id,
-            conversation_id,
-            user_content,
-            context_id,
-            user_id,
-            tenant_id=principal.tenant_id,
-        )
-        orchestration_dict: dict[str, Any] = (
-            orchestration if isinstance(orchestration, dict) else {}
-        )
-        adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
-        assistant_content_struct = normalize_content_struct(
-            orchestration_dict.get("content_struct"),
-            orchestration_dict.get("content"),
-        )
-        assistant_content = orchestration_dict.get("content", "No response generated.")
-        assistant_msg = runtime.store.append_message(
-            conversation_id,
-            sender="assistant",
-            role="assistant",
-            content=assistant_content,
-            content_struct=assistant_content_struct,
-            meta={
-                "adapters": orchestration_dict.get("adapters", []),
-                "adapter_gates": orchestration_dict.get("adapter_gates", []),
-                "routing_trace": orchestration_dict.get("routing_trace", []),
-                "workflow_trace": orchestration_dict.get("workflow_trace", []),
-                "usage": orchestration_dict.get("usage", {}),
-            },
-        )
-        resp = ChatResponse(
-            message_id=assistant_msg.id,
-            conversation_id=conversation_id,
-            content=assistant_msg.content,
-            content_struct=assistant_msg.content_struct,
-            workflow_id=body.workflow_id,
-            adapters=adapter_names,
-            adapter_gates=orchestration_dict.get("adapter_gates", []),
-            usage=orchestration_dict.get("usage", {}),
-            context_snippets=orchestration_dict.get("context_snippets", []),
-            routing_trace=orchestration_dict.get("routing_trace", []),
-            workflow_trace=orchestration_dict.get("workflow_trace", []),
-        )
-        envelope = Envelope(
-            status="ok", data=resp.model_dump(), request_id=idem.request_id
-        )
-        if runtime.cache:
-            history = runtime.store.list_messages(
-                conversation_id, user_id=principal.user_id
+            else:
+                if context_id:
+                    _get_owned_context(runtime, context_id, principal)
+                    validated_context_id = context_id
+                # Generate title from first message for new conversations
+                auto_title = _generate_conversation_title(body.message.content)
+                conversation = runtime.store.create_conversation(
+                    user_id=user_id, active_context_id=body.context_id, title=auto_title
+                )
+            conversation_id = conversation.id
+            context_id = context_id or conversation.active_context_id
+            if context_id and context_id != validated_context_id:
+                _get_owned_context(runtime, context_id, principal)
+            user_content = body.message.content
+            voice_meta: dict = {}
+            if body.message.mode == "voice":
+                try:
+                    audio_bytes = base64.b64decode(body.message.content)
+                except Exception as exc:
+                    raise _http_error(
+                        "bad_request",
+                        "invalid base64-encoded audio payload",
+                        status_code=400,
+                    ) from exc
+                transcript = await runtime.voice.transcribe(audio_bytes, user_id=user_id) or {}
+                user_content = transcript.get("transcript") or transcript.get("text")
+                if not user_content:
+                    raise _http_error(
+                        "bad_request", "unable to transcribe audio", status_code=400
+                    )
+                voice_meta = {"mode": "voice", "transcript": transcript}
+            user_content_struct = normalize_content_struct(
+                body.message.content_struct, user_content
             )
-            await runtime.workflow.cache_conversation_state(conversation_id, history)
-        await idem.store_result(envelope)
-        return envelope
+            runtime.store.append_message(
+                conversation_id,
+                sender="user",
+                role="user",
+                content=user_content,
+                meta=voice_meta or None,
+                content_struct=user_content_struct,
+            )
+            orchestration = await runtime.workflow.run(
+                body.workflow_id,
+                conversation_id,
+                user_content,
+                context_id,
+                user_id,
+                tenant_id=principal.tenant_id,
+            )
+            orchestration_dict: dict[str, Any] = (
+                orchestration if isinstance(orchestration, dict) else {}
+            )
+            adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
+            assistant_content_struct = normalize_content_struct(
+                orchestration_dict.get("content_struct"),
+                orchestration_dict.get("content"),
+            )
+            assistant_content = orchestration_dict.get("content", "No response generated.")
+            assistant_msg = runtime.store.append_message(
+                conversation_id,
+                sender="assistant",
+                role="assistant",
+                content=assistant_content,
+                content_struct=assistant_content_struct,
+                meta={
+                    "adapters": orchestration_dict.get("adapters", []),
+                    "adapter_gates": orchestration_dict.get("adapter_gates", []),
+                    "routing_trace": orchestration_dict.get("routing_trace", []),
+                    "workflow_trace": orchestration_dict.get("workflow_trace", []),
+                    "usage": orchestration_dict.get("usage", {}),
+                },
+            )
+            resp = ChatResponse(
+                message_id=assistant_msg.id,
+                conversation_id=conversation_id,
+                content=assistant_msg.content,
+                content_struct=assistant_msg.content_struct,
+                workflow_id=body.workflow_id,
+                adapters=adapter_names,
+                adapter_gates=orchestration_dict.get("adapter_gates", []),
+                usage=orchestration_dict.get("usage", {}),
+                context_snippets=orchestration_dict.get("context_snippets", []),
+                routing_trace=orchestration_dict.get("routing_trace", []),
+                workflow_trace=orchestration_dict.get("workflow_trace", []),
+            )
+            envelope = Envelope(
+                status="ok", data=resp.model_dump(), request_id=idem.request_id
+            )
+            if runtime.cache:
+                history = runtime.store.list_messages(
+                    conversation_id, user_id=principal.user_id
+                )
+                await runtime.workflow.cache_conversation_state(conversation_id, history)
+            await idem.store_result(envelope)
+            return envelope
+        finally:
+            # Always release workflow slot, even on error
+            await _release_workflow_slot(runtime, user_id)
     # Exceptions bubble through the guard which records failed states
 
 
@@ -2859,6 +2996,7 @@ async def websocket_chat(ws: WebSocket):
     # Generate request_id immediately to ensure traceability even on early errors
     request_id: str = str(uuid4())
     convo_id: Optional[str] = None
+    workflow_slot_acquired: bool = False
     try:
         init = await ws.receive_json()
         idempotency_key = init.get("idempotency_key")
@@ -2874,6 +3012,11 @@ async def websocket_chat(ws: WebSocket):
             await ws.close(code=4401)
             return
         user_id = auth_ctx.user_id
+
+        # Get user's plan tier for per-plan rate limits (SPEC §18)
+        user = runtime.store.get_user(user_id)
+        plan_tier = user.plan_tier if user else "free"
+
         # SPEC §18: Accept Idempotency-Key when provided (optional)
         request_id, cached = await _resolve_idempotency(
             "chat:ws", user_id, idempotency_key, require=False, request_id=request_id
@@ -2881,12 +3024,37 @@ async def websocket_chat(ws: WebSocket):
         if cached:
             await ws.send_json(cached.model_dump())
             return
-        await _enforce_rate_limit(
+
+        # SPEC §18: Per-plan adjustable rate limits
+        await _enforce_rate_limit_per_plan(
             runtime,
             f"chat:{user_id}",
             runtime.settings.chat_rate_limit_per_minute,
             runtime.settings.chat_rate_limit_window_seconds,
+            plan_tier,
         )
+
+        # SPEC §18: Concurrency cap - max 3 concurrent workflows per user
+        # Check if we can acquire a slot; if not, close with 409-equivalent code
+        if runtime.cache:
+            acquired, _ = await runtime.cache.acquire_concurrency_slot(
+                "workflow",
+                user_id,
+                runtime.settings.max_concurrent_workflows,
+            )
+            if not acquired:
+                await ws.send_json({
+                    "event": "error",
+                    "data": {
+                        "error": "busy",
+                        "message": f"concurrent workflow limit ({runtime.settings.max_concurrent_workflows}) exceeded",
+                    },
+                    "request_id": request_id,
+                })
+                await ws.close(code=4409)  # Custom code for "busy"
+                return
+            workflow_slot_acquired = True
+
         convo_id = init.get("conversation_id")
         if convo_id:
             conversation = _get_owned_conversation(runtime, convo_id, auth_ctx)
@@ -3144,3 +3312,7 @@ async def websocket_chat(ws: WebSocket):
         except Exception:
             pass  # Connection may already be closed
         await ws.close(code=1011)
+    finally:
+        # Always release workflow slot, even on error
+        if workflow_slot_acquired and user_id and runtime.cache:
+            await runtime.cache.release_concurrency_slot("workflow", user_id)

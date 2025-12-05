@@ -320,6 +320,48 @@ class Settings(BaseModel):
     configops_rate_limit_per_hour: int = env_field(30, "CONFIGOPS_RATE_LIMIT_PER_HOUR")
     read_rate_limit_per_minute: int = env_field(120, "READ_RATE_LIMIT_PER_MINUTE")
 
+    # Concurrency caps (SPEC §18)
+    max_concurrent_workflows: int = env_field(
+        3,
+        "MAX_CONCURRENT_WORKFLOWS",
+        description="Maximum concurrent workflows per user (SPEC §18: max 3)",
+    )
+    max_concurrent_inference: int = env_field(
+        2,
+        "MAX_CONCURRENT_INFERENCE",
+        description="Maximum concurrent inference decodes per user (SPEC §18: max 2)",
+    )
+
+    # Session rotation (SPEC §12.1)
+    session_rotation_hours: int = env_field(
+        24,
+        "SESSION_ROTATION_HOURS",
+        description="Rotate session ID after this many hours of activity (SPEC §12.1: 24h)",
+    )
+    session_rotation_grace_seconds: int = env_field(
+        300,
+        "SESSION_ROTATION_GRACE_SECONDS",
+        description="Grace period for old session ID after rotation (5 minutes)",
+    )
+
+    # Per-plan rate limit multipliers (SPEC §18: "adjustable per plan")
+    # These multiply the base rate limits for each plan tier
+    rate_limit_multiplier_free: float = env_field(
+        1.0,
+        "RATE_LIMIT_MULTIPLIER_FREE",
+        description="Rate limit multiplier for free tier",
+    )
+    rate_limit_multiplier_paid: float = env_field(
+        2.0,
+        "RATE_LIMIT_MULTIPLIER_PAID",
+        description="Rate limit multiplier for paid tier",
+    )
+    rate_limit_multiplier_enterprise: float = env_field(
+        5.0,
+        "RATE_LIMIT_MULTIPLIER_ENTERPRISE",
+        description="Rate limit multiplier for enterprise tier",
+    )
+
     # Training worker settings
     training_worker_enabled: bool = env_field(
         True,

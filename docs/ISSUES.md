@@ -102,8 +102,8 @@ This document consolidates findings from deep analysis of the liminallm codebase
 **False Positives Identified:** 144 (verified via comprehensive code examination)
 **Design Variances:** 1 (X-Session WebSocket auth via JSON body - valid implementation)
 **Future Features Deferred:** 1 (Adapter pruning/merging - optimization feature)
-**Issues Fixed:** 15 (8 frontend + 7 infrastructure)
-**Effective Issues:** 520 (681 - 144 false positives - 2 variances/deferred - 15 fixed)
+**Issues Fixed:** 19 (8 frontend + 7 infrastructure + 4 NOT IMPLEMENTED)
+**Effective Issues:** 516 (681 - 144 false positives - 2 variances/deferred - 19 fixed)
 **False Positive Rate:** 21.1%
 
 *Note: False positives include structural patterns (SQL parameterization, Python GIL, timeouts), development/test code, standard industry practices (Docker isolation, env vars), required functionality (MFA secret display, admin password display), misattributed issues (internal logging), and references to non-existent files (React-specific issues on vanilla JS codebase).*
@@ -126,6 +126,12 @@ This document consolidates findings from deep analysis of the liminallm codebase
 - 72.10: Content-Security-Policy header added to nginx
 - 72.13: WebSocket timeout reduced from 24h to 1h
 - 72.14: Client body size limit (50MB) added to nginx
+
+**NOT IMPLEMENTED Features Now Implemented:**
+- 2.1: Session rotation after 24h of activity (SPEC §12.1) with grace period
+- 2.2: Single-session mode (`meta.single_session=true` revokes prior sessions on login)
+- 3.1: Concurrency caps (max 3 workflows, 2 inference per user) with 409 responses
+- 3.2: Per-plan adjustable rate limits (free: 1x, paid: 2x, enterprise: 5x multipliers)
 
 ---
 
@@ -188,25 +194,33 @@ The PATCH endpoint accepts a flat object instead of RFC 6902 JSON Patch operatio
 
 ## 2. Session Management
 
-### 2.1 CRITICAL: Session Rotation (24h Activity) NOT IMPLEMENTED
+### 2.1 ~~CRITICAL~~ FIXED: Session Rotation (24h Activity)
 
-**Location:** `liminallm/service/auth.py:533-563`
+**Status:** ✅ IMPLEMENTED
+
+**Location:** `liminallm/service/auth.py:725-781`
 
 **SPEC §12.1 requires:** "refresh `id`/`expires_at` every 24h of activity; invalidate old session id after grace period"
 
-**Current:** Sessions created with static 24h TTL, never rotated. No grace period logic exists.
+**Implementation:**
+- Added `_maybe_rotate_session()` method that checks activity timestamp and rotates session after 24h
+- Session activity tracked in Redis via `update_session_activity()` / `get_session_activity()`
+- Grace period mapping via `set_session_rotation_grace()` allows old session IDs to resolve to new ones
+- Configurable via `SESSION_ROTATION_HOURS` (default 24h) and `SESSION_ROTATION_GRACE_SECONDS` (default 5min)
+- Old session properly revoked after rotation
 
-**Impact:** Sessions tied to initial creation time, not activity. User could be active for days but logged out.
+### 2.2 ~~CRITICAL~~ FIXED: Single-Session Mode
 
-### 2.2 CRITICAL: Single-Session Mode NOT IMPLEMENTED
+**Status:** ✅ IMPLEMENTED
 
-**Location:** `liminallm/service/auth.py:533-563`
+**Location:** `liminallm/service/auth.py:549-557`
 
 **SPEC §18 requires:** "login from new device invalidates prior refresh tokens if `meta.single_session=true`"
 
-**Current:** No check for `meta.single_session` flag, no device detection logic.
-
-**Impact:** Users cannot enforce "only one device" security policy.
+**Implementation:**
+- Login method now checks `user.meta.single_session` flag
+- If True, calls `revoke_all_user_sessions()` before creating new session
+- Logs the action for audit trail
 
 ### 2.3 ~~CRITICAL~~ DESIGN VARIANCE: X-Session Header for WebSockets
 
@@ -245,24 +259,41 @@ Only refresh tokens are revoked on logout. Access tokens remain valid for full 3
 
 ## 3. Rate Limiting and Concurrency
 
-### 3.1 CRITICAL: Concurrency Caps NOT IMPLEMENTED
+### 3.1 ~~CRITICAL~~ FIXED: Concurrency Caps
 
-**Location:** Multiple files (search shows no implementation)
+**Status:** ✅ IMPLEMENTED
+
+**Location:** `liminallm/storage/redis_cache.py:228-284`, `liminallm/api/routes.py:320-390`
 
 **SPEC §18 requires:**
 - Max 3 concurrent workflows per user
 - Max 2 concurrent inference decodes per user
 - Return 409 "busy" when cap exceeded
 
-**Current:** No tracking of active workflows/inference per user. No 409 responses.
+**Implementation:**
+- Added `acquire_concurrency_slot()` and `release_concurrency_slot()` to RedisCache using atomic Lua scripts
+- Added `_acquire_workflow_slot()` / `_release_workflow_slot()` helper functions in routes.py
+- Chat endpoint (`POST /chat`) acquires slot before workflow.run(), releases in finally block
+- WebSocket endpoint acquires slot with proper cleanup on error/disconnect
+- Returns 409 with "busy" error code when cap exceeded
+- Configurable via `MAX_CONCURRENT_WORKFLOWS` (default 3) and `MAX_CONCURRENT_INFERENCE` (default 2)
 
-### 3.2 CRITICAL: Per-Plan Adjustable Limits NOT IMPLEMENTED
+### 3.2 ~~CRITICAL~~ FIXED: Per-Plan Adjustable Limits
 
-**Location:** `liminallm/config.py`, `liminallm/api/routes.py`
+**Status:** ✅ IMPLEMENTED
+
+**Location:** `liminallm/config.py:347-363`, `liminallm/api/routes.py:242-317`
 
 **SPEC §18 requires:** Rate limits "adjustable per plan"
 
-**Current:** Limits are global constants. User `plan_tier` field exists but never used for rate limit calculation.
+**Implementation:**
+- Added plan-based rate limit multipliers in config.py:
+  - `RATE_LIMIT_MULTIPLIER_FREE` (default 1.0)
+  - `RATE_LIMIT_MULTIPLIER_PAID` (default 2.0)
+  - `RATE_LIMIT_MULTIPLIER_ENTERPRISE` (default 5.0)
+- Added `_get_plan_rate_multiplier()` and `_enforce_rate_limit_per_plan()` helper functions
+- Chat endpoints now look up user's `plan_tier` and apply multiplier to base rate limits
+- Both REST and WebSocket endpoints use per-plan rate limiting
 
 ### 3.3 MEDIUM: Token Bucket Is Fixed-Window Counter
 
@@ -1602,11 +1633,11 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 | 4 | OAuth tenant_id from user input | routes.py:640,674 |
 | 5 | Visibility filter broken for global artifacts | routes.py:1684-1691 |
 | 6 | PATCH /artifacts not RFC 6902 compliant | routes.py:1720-1745 |
-| 7 | Session rotation (24h activity) NOT IMPLEMENTED | auth.py:533-563 |
-| 8 | Single-session mode NOT IMPLEMENTED | auth.py:533-563 |
+| 7 | ~~Session rotation (24h activity)~~ ✅ FIXED | auth.py:725-781 |
+| 8 | ~~Single-session mode~~ ✅ FIXED | auth.py:549-557 |
 | 9 | ~~X-Session header for WebSockets~~ ✅ DESIGN VARIANCE | routes.py:2853-2875 |
-| 10 | Concurrency caps NOT IMPLEMENTED | Multiple |
-| 11 | Per-plan rate limits NOT IMPLEMENTED | config.py, routes.py |
+| 10 | ~~Concurrency caps~~ ✅ FIXED | redis_cache.py, routes.py |
+| 11 | ~~Per-plan rate limits~~ ✅ FIXED | config.py, routes.py |
 | 12 | No file download endpoint | routes.py |
 | 13 | No signed URLs (10m expiry) | N/A |
 | 14 | Per-plan file size caps not enforced | routes.py:2385-2388 |
