@@ -239,13 +239,17 @@ The PATCH endpoint accepts a flat object instead of RFC 6902 JSON Patch operatio
 - Both `session_id` and `access_token` (Bearer) are accepted per SPEC requirement
 - This approach is standard practice for WebSocket authentication
 
-### 2.4 HIGH: Access Tokens Not Denylisted on Logout
+### 2.4 ~~HIGH: Access Tokens Not Denylisted on Logout~~ FIXED
 
-**Location:** `liminallm/service/auth.py:591-605`
+**Status:** ✅ IMPLEMENTED
 
-Only refresh tokens are revoked on logout. Access tokens remain valid for full 30 minutes.
+**Location:** `liminallm/service/auth.py`
 
-**Impact:** Compromised access tokens remain valid even after logout.
+**Fix Applied:**
+- revoke_session() now denylists access tokens via cache.denylist_access_token()
+- Access tokens include JTI for denylist support
+- validate_access_token() checks denylist before validating
+- Per SPEC §12.1: "add JWT to short-lived denylist if JWTs used"
 
 ### 2.5 MEDIUM: Session Expiry Not Differentiated by Device
 
@@ -346,11 +350,15 @@ Only refresh tokens are revoked on logout. Access tokens remain valid for full 3
 - `/files/upload` now enforces plan-specific limits
 - `/files/limits` returns plan-specific max_upload_bytes
 
-### 4.4 HIGH: Content-Disposition Header Missing
+### 4.4 ~~HIGH: Content-Disposition Header Missing~~ FIXED
+
+**Status:** ✅ IMPLEMENTED
 
 **SPEC §18 requires:** "content-disposition set to prevent inline execution"
 
-**Current:** No Content-Disposition header implementation for downloads.
+**Fix Applied:**
+- GET /files/download sets `Content-Disposition: attachment; filename="{path}"`
+- Prevents inline execution of downloaded files in browser
 
 ### 4.5 HIGH: MIME Type Validation Absent
 
@@ -374,21 +382,28 @@ Only refresh tokens are revoked on logout. Access tokens remain valid for full 3
 
 ## 5. WebSocket Protocol Compliance
 
-### 5.1 CRITICAL: Missing request_id in Stream Events
+### 5.1 ~~CRITICAL: Missing request_id in Stream Events~~ FIXED
 
-**Location:** `liminallm/api/routes.py:2954`
+**Status:** ✅ IMPLEMENTED
+
+**Location:** `liminallm/api/routes.py`
 
 **SPEC §18 requires:** "stream events carry `{ event, data, request_id }`"
 
-**Current:** Events sent without `request_id`: `{"event": event_type, "data": event_data}`
+**Fix Applied:**
+- All WebSocket stream events now include request_id
+- Events use format: `{"event": event_type, "data": event_data, "request_id": request_id}`
 
-### 5.2 HIGH: No Per-User Connection Limits
+### 5.2 ~~HIGH: No Per-User Connection Limits~~ FIXED
 
-**Location:** `liminallm/api/routes.py:2852`
+**Status:** ✅ IMPLEMENTED
 
-No connection limit enforcement found. Single user could create unlimited concurrent WebSocket connections.
+**Location:** `liminallm/api/routes.py`
 
-**Impact:** DoS vulnerability - user can exhaust server resources.
+**Fix Applied:**
+- Added `max_websocket_connections_per_user` setting (default: 5)
+- WebSocket endpoint enforces limit before accepting connection
+- Returns error code "connection_limit" when exceeded
 
 ### 5.3 MEDIUM: No Mixed Transport Rejection
 
