@@ -802,17 +802,29 @@ Configuration parameter referenced in routes.py does not exist.
 
 ## 18. Training Pipeline
 
-### 18.1 CRITICAL: No Deduplication in Dataset Generation
+### 18.1 ~~CRITICAL: No Deduplication in Dataset Generation~~ FIXED
 
-**Location:** `liminallm/training/dataset.py`
+**Status:** ✅ IMPLEMENTED
 
-Multiple identical prompt-response pairs can appear in training data.
+**Location:** `liminallm/service/training.py:_build_examples`
 
-### 18.2 CRITICAL: SFT Prompt Includes Target Message
+**SPEC §18 requires:** "dedupe by `(conversation_id, message_id)`"
 
-**Location:** `liminallm/training/sft.py`
+**Fix Applied:**
+- Added `seen` set to track (conversation_id, message_id) pairs
+- Skip events that have already been processed
+- Prevents duplicate prompt-response pairs in training data
 
-Target assistant message included in prompt, violating SFT principles.
+### 18.2 ~~CRITICAL: SFT Prompt Includes Target Message~~ FIXED
+
+**Status:** ✅ IMPLEMENTED
+
+**Location:** `liminallm/service/training.py:_build_examples`
+
+**Fix Applied:**
+- Target message (message_id match) is now excluded from prompt_chunks
+- Target text extracted for training target, but not included in prompt
+- Properly follows SFT principle: prompt should not contain the answer
 
 ---
 

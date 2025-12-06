@@ -559,7 +559,13 @@ class TrainingService:
         return {"status": "unavailable"}
 
     def _build_examples(self, events: Iterable[PreferenceEvent]) -> Iterable[dict]:
+        # Issue 18.1: Dedupe by (conversation_id, message_id) per SPEC §18
+        seen: set[tuple[str, str]] = set()
         for event in events:
+            key = (event.conversation_id or "", event.message_id or "")
+            if key in seen:
+                continue
+            seen.add(key)
             messages = self.store.list_messages(
                 event.conversation_id, limit=200, user_id=event.user_id
             )
@@ -568,10 +574,14 @@ class TrainingService:
             cluster_id = event.cluster_id or self._bucket_embedding(
                 event.context_embedding, event.user_id
             )
+            # Issue 18.2: Exclude target message from prompt (SFT principle)
             for msg in messages:
+                if msg.id == event.message_id:
+                    # This is the target message - extract for training target, not prompt
+                    if not target_text:
+                        target_text = msg.content
+                    continue  # Don't include target in prompt
                 prompt_chunks.append(f"{msg.role.upper()}: {msg.content}")
-                if msg.id == event.message_id and not target_text:
-                    target_text = msg.content
             if event.context_text:
                 prompt_chunks.append(f"CONTEXT_SNIPPET: {event.context_text}")
             if not target_text:
