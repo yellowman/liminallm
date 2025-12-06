@@ -528,13 +528,18 @@ The PATCH endpoint accepts a flat object instead of RFC 6902 JSON Patch operatio
 
 **Current:** No `update_adapter_router_state()` method exists in either storage backend.
 
-### 7.3 HIGH: Missing explicit_signal Validation
+### 7.3 ~~HIGH: Missing explicit_signal Validation~~ FIXED
 
-**Location:** `liminallm/api/schemas.py:489-500`
+**Status:** ✅ IMPLEMENTED
+
+**Location:** `liminallm/api/schemas.py`
 
 **SPEC §2.6 specifies:** `explicit_signal` should be: 'like','dislike','always','never'
 
-**Current:** Field accepts any string, no enum validation.
+**Fix Applied:**
+- Added `_VALID_EXPLICIT_SIGNALS` constant with allowed values
+- Added `@field_validator("explicit_signal")` to validate signal values
+- Invalid signals raise validation error with list of valid options
 
 ### 7.4 MEDIUM: Score Normalization Missing
 
@@ -695,11 +700,15 @@ MFA challenges dictionary is used for in-memory challenge tracking. Additionally
 
 ## 12. Workflow Engine
 
-### 12.1 HIGH: Per-Node Timeout Default Incorrect
+### 12.1 ~~HIGH: Per-Node Timeout Default Incorrect~~ FIXED
 
-**Location:** `liminallm/service/workflow.py:1525`
+**Status:** ✅ IMPLEMENTED
 
-`DEFAULT_NODE_TIMEOUT_MS = 15000` defined but hardcoded `timeout = 5` used instead.
+**Location:** `liminallm/service/workflow.py`
+
+**Fix Applied:**
+- Changed default timeout from 5 to 15 seconds per SPEC
+- Now uses `DEFAULT_NODE_TIMEOUT_MS` constant (15000ms)
 
 ### 12.2 MEDIUM: Retry Backoff Not Cancellable
 
