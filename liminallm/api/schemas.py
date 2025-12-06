@@ -332,6 +332,17 @@ class ConfigPatchAuditResponse(BaseModel):
     meta: Optional[dict] = None
 
 
+# SPEC §2.6: explicit_signal allowed values ('like','dislike','always','never', etc.)
+# Extended with practical UI values (thumbs_up/thumbs_down) and routing signals
+_VALID_EXPLICIT_SIGNALS = frozenset({
+    # SPEC §2.6 core values
+    "like", "dislike", "always", "never",
+    # UI-friendly aliases
+    "thumbs_up", "thumbs_down",
+    # Routing and system signals
+    "routing_feedback", "correction", "edit",
+})
+
 _JSON_PATCH_OPS = frozenset({"add", "remove", "replace", "move", "copy", "test"})
 
 
@@ -490,7 +501,7 @@ class PreferenceEventRequest(BaseModel):
     conversation_id: str
     message_id: str
     feedback: str = Field(..., pattern="^(positive|negative|neutral|like|dislike)$")
-    explicit_signal: Optional[str] = None
+    explicit_signal: Optional[str] = Field(default=None, max_length=64)
     score: Optional[float] = Field(default=None, ge=-1.0, le=1.0)  # SPEC §2.6 bounds
     context_text: Optional[str] = None
     corrected_text: Optional[str] = None
@@ -498,6 +509,18 @@ class PreferenceEventRequest(BaseModel):
     routing_trace: Optional[List[dict]] = None
     adapter_gates: Optional[List[dict]] = None
     notes: Optional[str] = Field(default=None, max_length=2000)
+
+    @field_validator("explicit_signal")
+    @classmethod
+    def _validate_explicit_signal(cls, value: Optional[str]) -> Optional[str]:
+        """Validate explicit_signal per SPEC §2.6."""
+        if value is None:
+            return None
+        if value not in _VALID_EXPLICIT_SIGNALS:
+            raise ValueError(
+                f"Invalid explicit_signal '{value}'. Must be one of: {', '.join(sorted(_VALID_EXPLICIT_SIGNALS))}"
+            )
+        return value
 
 
 class PreferenceEventResponse(BaseModel):

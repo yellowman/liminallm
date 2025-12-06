@@ -1601,7 +1601,7 @@ async def chat(
                     audio_bytes = base64.b64decode(body.message.content)
                 except Exception as exc:
                     raise _http_error(
-                        "bad_request",
+                        "validation_error",
                         "invalid base64-encoded audio payload",
                         status_code=400,
                     ) from exc
@@ -1609,7 +1609,7 @@ async def chat(
                 user_content = transcript.get("transcript") or transcript.get("text")
                 if not user_content:
                     raise _http_error(
-                        "bad_request", "unable to transcribe audio", status_code=400
+                        "validation_error", "unable to transcribe audio", status_code=400
                     )
                 voice_meta = {"mode": "voice", "transcript": transcript}
             user_content_struct = normalize_content_struct(
@@ -2995,7 +2995,7 @@ async def create_conversation(
                 active_context_id=conversation.active_context_id,
             ),
         )
-        idem.result = response
+        await idem.store_result(response)
         return response
 
 
@@ -3436,7 +3436,7 @@ async def websocket_chat(ws: WebSocket):
                                 cancel_event.set()
                                 return
                             elif msg.get("action") == "ping":
-                                await ws.send_json({"event": "pong", "data": None})
+                                await ws.send_json({"event": "pong", "data": None, "request_id": request_id})
                         except asyncio.TimeoutError:
                             continue
                         except WebSocketDisconnect:
@@ -3460,8 +3460,8 @@ async def websocket_chat(ws: WebSocket):
                     event_type = event.get("event")
                     event_data = event.get("data")
 
-                    # SPEC §18: WebSockets wrap as {"event": "token", "data": "..."}
-                    await ws.send_json({"event": event_type, "data": event_data})
+                    # SPEC §18: WebSockets wrap as {"event": "token", "data": "...", "request_id": "..."}
+                    await ws.send_json({"event": event_type, "data": event_data, "request_id": request_id})
 
                     if event_type == "token":
                         full_content += event_data if isinstance(event_data, str) else ""
@@ -3528,8 +3528,9 @@ async def websocket_chat(ws: WebSocket):
             await _store_idempotency_result("chat:ws", user_id, idempotency_key, envelope)
 
             # Send final event with message_id and conversation_id to client
+            # SPEC §18: Valid events are token, message_done, error, cancel_ack, trace
             await ws.send_json({
-                "event": "streaming_complete",
+                "event": "message_done",
                 "data": {
                     "message_id": assistant_msg.id,
                     "conversation_id": convo_id,
@@ -3539,7 +3540,8 @@ async def websocket_chat(ws: WebSocket):
                     "context_snippets": orchestration_dict.get("context_snippets", []),
                     "routing_trace": orchestration_dict.get("routing_trace", []),
                     "workflow_trace": orchestration_dict.get("workflow_trace", []),
-                }
+                },
+                "request_id": request_id,
             })
 
         else:
@@ -3621,7 +3623,7 @@ async def websocket_chat(ws: WebSocket):
         )
         error_env = Envelope(
             status="error",
-            error={"code": "invalid_json", "message": "Invalid JSON in request"},
+            error={"code": "validation_error", "message": "Invalid JSON in request"},
             request_id=request_id,
         )
         try:
