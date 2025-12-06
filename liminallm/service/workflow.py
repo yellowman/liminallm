@@ -301,6 +301,7 @@ class WorkflowEngine:
         tenant_id: Optional[str],
         workflow_start_time: float,
         workflow_timeout_ms: float,
+        cancel_event: Optional[asyncio.Event] = None,
     ) -> ParallelNodeResult:
         """Execute multiple nodes concurrently and merge results.
 
@@ -339,6 +340,7 @@ class WorkflowEngine:
                     tenant_id=tenant_id,
                     workflow_start_time=workflow_start_time,
                     workflow_timeout_ms=workflow_timeout_ms,
+                    cancel_event=cancel_event,
                 )
                 snippets = result.get("context_snippets", []) if isinstance(result, dict) else []
                 return node_id, result, snippets
@@ -860,6 +862,7 @@ class WorkflowEngine:
                     tenant_id=tenant_id,
                     workflow_start_time=workflow_start_time,
                     workflow_timeout_ms=workflow_timeout_ms,
+                    cancel_event=cancel_event,
                 )
 
                 if result.get("status") == "error" and result.get("retries_exhausted"):
@@ -894,6 +897,7 @@ class WorkflowEngine:
                             tenant_id=tenant_id,
                             workflow_start_time=workflow_start_time,
                             workflow_timeout_ms=workflow_timeout_ms,
+                            cancel_event=cancel_event,
                         )
 
                         # Record parallel execution in trace
@@ -1129,6 +1133,7 @@ class WorkflowEngine:
         tenant_id: Optional[str],
         workflow_start_time: float,
         workflow_timeout_ms: float,
+        cancel_event: Optional[asyncio.Event] = None,
     ) -> Tuple[Dict[str, Any], List[str]]:
         """Execute a node with SPEC §9/§18 exponential backoff retry logic.
 
@@ -1159,19 +1164,23 @@ class WorkflowEngine:
                         "attempts": attempt,
                     },
                     [],
-                )
+            )
 
             try:
-                result, next_nodes = await self._execute_node(
-                    node,
-                    user_message=user_message,
-                    context_id=context_id,
-                    conversation_id=conversation_id,
-                    adapters=adapters,
-                    history=history,
-                    vars_scope=vars_scope,
-                    user_id=user_id,
-                    tenant_id=tenant_id,
+                node_timeout_ms = node.get("timeout_ms", DEFAULT_NODE_TIMEOUT_MS)
+                result, next_nodes = await asyncio.wait_for(
+                    self._execute_node(
+                        node,
+                        user_message=user_message,
+                        context_id=context_id,
+                        conversation_id=conversation_id,
+                        adapters=adapters,
+                        history=history,
+                        vars_scope=vars_scope,
+                        user_id=user_id,
+                        tenant_id=tenant_id,
+                    ),
+                    timeout=node_timeout_ms / 1000.0,
                 )
 
                 # If node executed successfully or has an on_error handler, return
@@ -1184,6 +1193,21 @@ class WorkflowEngine:
                 last_error = Exception(
                     result.get("error", "node returned error status")
                 )
+
+            except asyncio.TimeoutError:
+                last_error = asyncio.TimeoutError("node_timeout")
+                self.logger.warning(
+                    "workflow_node_timeout",
+                    node=node_id,
+                    attempt=attempt + 1,
+                    timeout_ms=node_timeout_ms,
+                )
+                result = {
+                    "status": "error",
+                    "error": "node_timeout",
+                    "timeout_ms": node_timeout_ms,
+                }
+                next_nodes = []
 
             except Exception as exc:
                 last_error = exc
@@ -1214,7 +1238,32 @@ class WorkflowEngine:
                         attempt=attempt,
                         backoff_ms=sleep_ms,
                     )
-                    await asyncio.sleep(sleep_ms / 1000.0)
+                    if cancel_event and cancel_event.is_set():
+                        return (
+                            {
+                                "status": "error",
+                                "error": "workflow_cancelled",
+                                "cancelled": True,
+                            },
+                            [],
+                        )
+                    if cancel_event:
+                        try:
+                            await asyncio.wait_for(
+                                cancel_event.wait(), timeout=sleep_ms / 1000.0
+                            )
+                            return (
+                                {
+                                    "status": "error",
+                                    "error": "workflow_cancelled",
+                                    "cancelled": True,
+                                },
+                                [],
+                            )
+                        except asyncio.TimeoutError:
+                            pass
+                    else:
+                        await asyncio.sleep(sleep_ms / 1000.0)
 
         # All retries exhausted
         self.logger.error(

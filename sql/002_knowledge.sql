@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS knowledge_chunk (
 CREATE INDEX IF NOT EXISTS knowledge_chunk_context_idx ON knowledge_chunk (context_id);
 CREATE INDEX IF NOT EXISTS knowledge_chunk_embedding_idx ON knowledge_chunk
 USING ivfflat (embedding) WITH (lists = 100);
+CREATE INDEX IF NOT EXISTS knowledge_chunk_fs_path_idx ON knowledge_chunk (fs_path);
+CREATE INDEX IF NOT EXISTS knowledge_chunk_context_chunk_idx ON knowledge_chunk (context_id, chunk_index);
 
 -- Add FK constraint for conversation.active_context_id now that knowledge_context exists
 DO $$

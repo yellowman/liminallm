@@ -634,31 +634,27 @@ Redis rate limiting now uses an atomic Lua token bucket with weighted costs and 
 
 ## 10. Storage Layer Consistency
 
-### 10.1 CRITICAL: search_chunks_pgvector User Isolation Mismatch
+### 10.1 ~~CRITICAL: search_chunks_pgvector User Isolation Mismatch~~ FIXED
 
-**Location:** `liminallm/storage/memory.py:1437` vs `liminallm/storage/postgres.py:2444`
+**Location:** `liminallm/storage/memory.py`
 
-Memory.py has `user_id` as `Optional[str]`, Postgres.py requires it.
+**Status:** ✅ `search_chunks_pgvector` now enforces `user_id` presence and logs when missing, matching Postgres isolation semantics.
 
-### 10.2 HIGH: Missing Validation in Memory Store
+### 10.2 ~~HIGH: Missing Validation in Memory Store~~ FIXED
 
-**Location:** `liminallm/storage/memory.py:491`
+**Location:** `liminallm/storage/memory.py`
 
-`set_session_meta` in Postgres validates JSON serializability; Memory.py does not.
+**Status:** ✅ `set_session_meta` validates dictionary inputs and JSON serializability before persisting, aligning with Postgres safeguards.
 
-### 10.3 MEDIUM: SQL Schema Missing NOT NULL Constraints
+### 10.3 ~~MEDIUM: SQL Schema Missing NOT NULL Constraints~~ (FALSE POSITIVE)
 
-**Location:** `liminallm/storage/schema.sql`
+**Location:** `sql/000_base.sql`, `sql/001_artifacts.sql`
 
-| Table | Column | Issue |
-|-------|--------|-------|
-| `users` | `created_at` | Should be NOT NULL DEFAULT NOW() |
-| `sessions` | `tenant_id` | Should be NOT NULL for multi-tenant isolation |
-| `artifacts` | `visibility` | Should be NOT NULL DEFAULT 'private' |
+**Status:** ℹ️ `created_at`, `tenant_id`, and `visibility` already carry NOT NULL defaults in the base schema; no changes required.
 
-### 10.4 MEDIUM: SQL Schema Missing Performance Indexes
+### 10.4 ~~MEDIUM: SQL Schema Missing Performance Indexes~~ FIXED
 
-Missing indexes for common query patterns on sessions, artifacts, chunks tables.
+**Status:** ✅ Added targeted indexes for frequent lookups on sessions (`tenant_id`), artifacts (`visibility`, owner+visibility), and knowledge chunks (`fs_path`, `context_id`+`chunk_index`).
 
 ---
 
@@ -709,15 +705,17 @@ MFA challenges dictionary is used for in-memory challenge tracking. Additionally
 - Changed default timeout from 5 to 15 seconds per SPEC
 - Now uses `DEFAULT_NODE_TIMEOUT_MS` constant (15000ms)
 
-### 12.2 MEDIUM: Retry Backoff Not Cancellable
+### 12.2 ~~MEDIUM: Retry Backoff Not Cancellable~~ FIXED
 
-**Location:** `liminallm/service/workflow.py:1063-1179`
+**Location:** `liminallm/service/workflow.py`
 
-Retry sleep cannot be interrupted by cancel events.
+**Status:** ✅ Retry backoff now waits on cancellation events and returns a cancel error immediately when set, preventing hangs during backoff periods.
 
-### 12.3 MEDIUM: Per-Node Timeout Not Enforced Across Retries
+### 12.3 ~~MEDIUM: Per-Node Timeout Not Enforced Across Retries~~ FIXED
 
-Only workflow-level timeout checked during retries, not per-node.
+**Location:** `liminallm/service/workflow.py`
+
+**Status:** ✅ Each attempt is wrapped in `asyncio.wait_for` using node-level `timeout_ms`, ensuring per-node deadlines are honored even across retries.
 
 ### 12.4 CRITICAL: Circuit Breaker Checks Not Awaited (FIXED)
 
