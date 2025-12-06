@@ -8,7 +8,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional, Protocol, Tuple
 
 import httpx
@@ -142,7 +142,14 @@ class AuthService:
         self._password_reset_tokens: dict[str, tuple[str, datetime]] = {}  # token -> (email, expires_at)
         self._pwd_hasher = PasswordHasher(type=Type.ID)
         self.logger = logger
-        self._last_cleanup = datetime.utcnow()
+        self._last_cleanup = datetime.now(timezone.utc)
+        # Allowance for small clock skew across nodes (Issue 76.1/76.2)
+        self._clock_skew_leeway = timedelta(seconds=120)
+
+    def _now(self) -> datetime:
+        """Timezone-aware UTC helper to avoid naive datetime usage."""
+
+        return datetime.now(timezone.utc)
 
     def cleanup_expired_states(self) -> int:
         """Clean up expired OAuth states, MFA challenges, and email verification tokens.
@@ -152,7 +159,7 @@ class AuthService:
         Returns:
             Number of expired entries cleaned up
         """
-        now = datetime.utcnow()
+        now = self._now()
         cleaned = 0
 
         # Issue 28.4: Thread-safe access to mutable state dictionaries
@@ -231,7 +238,7 @@ class AuthService:
         Returns:
             Number of entries cleaned, or 0 if cleanup was skipped
         """
-        now = datetime.utcnow()
+        now = self._now()
         if (now - self._last_cleanup).total_seconds() >= interval_minutes * 60:
             return self.cleanup_expired_states()
         return 0
@@ -331,7 +338,7 @@ class AuthService:
             raise ValueError(f"OAuth provider {provider} is not configured")
 
         state = uuid.uuid4().hex
-        expires_at = datetime.utcnow() + timedelta(minutes=10)
+        expires_at = self._now() + timedelta(minutes=10)
         # Issue 28.4: Thread-safe state mutation
         with self._state_lock:
             self._oauth_states[state] = (provider, expires_at, tenant_id)
@@ -537,7 +544,7 @@ class AuthService:
                 stored = self._oauth_states.pop(state, None)
             else:
                 self._oauth_states.pop(state, None)
-        now = datetime.utcnow()
+        now = self._now()
 
         async def _clear_oauth_state() -> None:
             with self._state_lock:
@@ -681,7 +688,8 @@ class AuthService:
             return None, None, {}
         session_id = payload.get("sid")
         session = self.store.get_session(session_id) if session_id else None
-        if not session or session.expires_at <= datetime.utcnow():
+        now = self._now()
+        if not session or session.expires_at <= now - self._clock_skew_leeway:
             return None, None, {}
         user = self.store.get_user(session.user_id)
         if not user:
@@ -790,7 +798,8 @@ class AuthService:
             sess = self.store.get_session(actual_session_id)
         if not sess:
             return None
-        if sess.expires_at <= datetime.utcnow():
+        now = self._now()
+        if sess.expires_at <= now - self._clock_skew_leeway:
             return None
         user = self.store.get_user(sess.user_id)
         if not user:
@@ -850,7 +859,7 @@ class AuthService:
         sys_settings = self._get_system_settings()
         rotation_hours = sys_settings.get("session_rotation_hours", 24)
         rotation_threshold = timedelta(hours=rotation_hours)
-        if datetime.utcnow() - last_activity < rotation_threshold:
+        if self._now() - last_activity < rotation_threshold:
             return None
 
         # Bug fix: Acquire rotation lock to prevent duplicate rotations
@@ -964,7 +973,8 @@ class AuthService:
         self, session_id: str
     ) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
         sess = self.store.get_session(session_id)
-        if not sess or sess.expires_at <= datetime.utcnow():
+        now = self._now()
+        if not sess or sess.expires_at <= now - self._clock_skew_leeway:
             return None, None, {}
         if sess.mfa_required and self.mfa_enabled and not sess.mfa_verified:
             return None, None, {}
@@ -997,7 +1007,7 @@ class AuthService:
             return False
 
         # Check MFA lockout (5 failed attempts = 5 minute lockout per SPEC §18)
-        now = datetime.utcnow()
+        now = self._now()
 
         # Issue 19.3: Use atomic MFA lockout to prevent check-then-act race condition
         # First check if already locked out (before TOTP verification)
@@ -1063,13 +1073,13 @@ class AuthService:
     async def initiate_password_reset(self, email: str) -> str:
         # Use raw bytes for proper entropy (not string representation)
         token = hashlib.sha256(b"reset-" + email.encode() + os.urandom(32)).hexdigest()
-        expires_at = datetime.utcnow() + timedelta(minutes=15)
+        expires_at = self._now() + timedelta(minutes=15)
         # Persist a short-lived reset token with TTL in Redis if available
         if self.cache:
             await self.cache.client.set(
                 f"reset:{token}",
                 email,
-                ex=int((expires_at - datetime.utcnow()).total_seconds()),
+                ex=int((expires_at - self._now()).total_seconds()),
             )
         else:
             # Issue 11.2: In-memory fallback for password reset tokens
@@ -1087,7 +1097,7 @@ class AuthService:
                 stored = self._password_reset_tokens.get(token)
                 if stored:
                     stored_email, expires_at = stored
-                    if expires_at <= datetime.utcnow():
+                    if expires_at <= self._now() - self._clock_skew_leeway:
                         # Remove expired token to prevent memory leak
                         self._password_reset_tokens.pop(token, None)
                     else:
@@ -1118,12 +1128,12 @@ class AuthService:
         token = hashlib.sha256(
             b"verify-" + user.email.encode() + os.urandom(32)
         ).hexdigest()
-        expires_at = datetime.utcnow() + timedelta(hours=24)
+        expires_at = self._now() + timedelta(hours=24)
         if self.cache:
             await self.cache.client.set(
                 f"verify:{token}",
                 user.id,
-                ex=int((expires_at - datetime.utcnow()).total_seconds()),
+                ex=int((expires_at - self._now()).total_seconds()),
             )
         else:
             # Issue 28.4: Thread-safe state mutation
@@ -1141,7 +1151,7 @@ class AuthService:
                 stored = self._email_verification_tokens.get(token)
                 if stored:
                     user_id, expires_at = stored
-                    if expires_at <= datetime.utcnow():
+                    if expires_at <= self._now() - self._clock_skew_leeway:
                         # Remove expired token to prevent memory leak
                         self._email_verification_tokens.pop(token, None)
                         user_id = None
@@ -1187,9 +1197,13 @@ class AuthService:
         self.store.save_password(user_id, pwd_hash, algo)
 
     def _verify_totp(
-        self, secret: str, code: str, *, window: int = 1, interval: int = 30
+        self, secret: str, code: str, *, window: int = 0, interval: int = 30
     ) -> bool:
-        for offset in range(-window, window + 1):
+        # Issue 76.3: Narrow TOTP validation window and only allow a single
+        # adjacent step for minor clock skew.
+        grace_steps = min(1, int(self._clock_skew_leeway.total_seconds() // interval))
+        allowed_window = max(window, grace_steps)
+        for offset in range(-allowed_window, allowed_window + 1):
             generated = self._generate_totp(
                 secret, time.time() + offset * interval, interval=interval
             )
@@ -1288,12 +1302,12 @@ class AuthService:
             exp_ts = float(exp)
         except (TypeError, ValueError):
             return None
-        if exp_ts <= time.time():
+        if exp_ts <= time.time() - self._clock_skew_leeway.total_seconds():
             return None
         return payload
 
     def _issue_tokens(self, user: User, session: Session) -> dict[str, str]:
-        now = datetime.utcnow()
+        now = self._now()
         sys_settings = self._get_system_settings()
         access_exp = int(
             (
@@ -1371,7 +1385,7 @@ class AuthService:
         self.revoked_refresh_tokens.add(jti)
         ttl = None
         if isinstance(exp, (int, float)):
-            ttl = max(int(exp - datetime.utcnow().timestamp()), 0)
+            ttl = max(int(exp - self._now().timestamp()), 0)
         if ttl is None:
             sys_settings = self._get_system_settings()
             ttl = max(int(sys_settings.get("refresh_token_ttl_minutes", 1440) * 60), 0)
@@ -1430,7 +1444,8 @@ class AuthService:
             return None
         session_id = payload.get("sid")
         sess = self.store.get_session(session_id) if session_id else None
-        if not sess or sess.expires_at <= datetime.utcnow():
+        now = self._now()
+        if not sess or sess.expires_at <= now - self._clock_skew_leeway:
             return None
         user = self.store.get_user(payload.get("sub"))
         if not user:

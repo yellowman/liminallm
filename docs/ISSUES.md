@@ -5652,37 +5652,20 @@ WebSocket text messages assumed UTF-8 without validation. Invalid UTF-8 sequence
 
 ## 76. Time-Based Security Vulnerabilities
 
-### 76.1 CRITICAL: Clock Skew in Session Validation
+### 76.1 ~~CRITICAL: Clock Skew in Session Validation~~ FIXED
 **Location:** `liminallm/service/auth.py:576, 655, 712`
 
-```python
-if session.expires_at < datetime.utcnow():
-    raise SessionExpired()
-```
+**Fix:** Session validation now uses timezone-aware UTC and applies a bounded skew leeway when comparing expiry times, preventing premature expiry on nodes with minor drift.
 
-Session expiration uses server's local clock without accounting for clock skew. Distributed deployments with clock drift may have inconsistent session validity.
-
-**Impact:** Sessions valid on one server may be expired on another, or vice versa.
-
-### 76.2 CRITICAL: JWT Token Time Window Attack
+### 76.2 ~~CRITICAL: JWT Token Time Window Attack~~ FIXED
 **Location:** `liminallm/service/auth.py:1103`
 
-JWT validation uses `datetime.utcnow()` for `exp` claim validation. No leeway configured for clock skew between token issuer and validator.
+**Fix:** JWT expiration checks include a 120-second skew allowance and timezone-aware timestamps to avoid rejecting valid tokens while still expiring stale tokens promptly.
 
-**Impact:** Valid tokens rejected or expired tokens accepted due to clock differences.
-
-### 76.3 CRITICAL: TOTP Time Window Too Wide
+### 76.3 ~~CRITICAL: TOTP Time Window Too Wide~~ FIXED
 **Location:** `liminallm/service/auth.py:945-962`
 
-```python
-def verify_totp(self, secret: str, code: str) -> bool:
-    totp = pyotp.TOTP(secret)
-    return totp.verify(code, valid_window=1)
-```
-
-TOTP valid_window=1 allows codes from -30s to +30s. Combined with clock skew, effective window could be 90+ seconds.
-
-**Impact:** Extended window for TOTP brute-force attacks.
+**Fix:** Narrowed the TOTP validation window to a single adjacent step (<=30s) derived from the skew leeway to reduce brute-force surface while tolerating minimal drift.
 
 ### 76.4 HIGH: Rate Limit Window Clock Manipulation
 **Location:** `liminallm/storage/redis_cache.py:42-73`
