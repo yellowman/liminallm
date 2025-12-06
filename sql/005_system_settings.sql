@@ -41,7 +41,20 @@ VALUES (
     "smtp_password": "",
     "smtp_use_tls": true,
     "email_from_address": "",
-    "email_from_name": "LiminalLM"
+    "email_from_name": "LiminalLM",
+    "oauth_redirect_uri": "",
+    "app_base_url": "http://localhost:8000",
+    "voice_transcription_model": "whisper-1",
+    "voice_synthesis_model": "tts-1",
+    "voice_default_voice": "alloy",
+    "rag_mode": "pgvector",
+    "embedding_model_id": "text-embedding",
+    "default_tenant_id": "public",
+    "jwt_issuer": "liminallm",
+    "jwt_audience": "liminal-clients",
+    "model_path": "gpt-4o-mini",
+    "model_backend": "openai",
+    "default_adapter_mode": "hybrid"
   }'::jsonb,
   now(),
   now()

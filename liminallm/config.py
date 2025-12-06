@@ -251,16 +251,29 @@ class Settings(BaseModel):
     )
     redis_url: str = env_field("redis://localhost:6379/0", "REDIS_URL")
     shared_fs_root: str = env_field("/srv/liminallm", "SHARED_FS_ROOT")
-    model_path: str = env_field("gpt-4o-mini", "MODEL_PATH")
-    model_backend: ModelBackend | None = env_field(ModelBackend.OPENAI, "MODEL_BACKEND")
+    model_path: str = env_field(
+        "gpt-4o-mini", "MODEL_PATH", description="Model path (overridable via admin UI)"
+    )
+    model_backend: ModelBackend | None = env_field(
+        ModelBackend.OPENAI, "MODEL_BACKEND", description="Model backend (overridable via admin UI)"
+    )
     adapter_openai_api_key: str | None = env_field(None, "OPENAI_ADAPTER_API_KEY")
     adapter_openai_base_url: str | None = env_field(None, "OPENAI_ADAPTER_BASE_URL")
     adapter_server_model: str | None = env_field(None, "ADAPTER_SERVER_MODEL")
     # Voice service settings
     voice_api_key: str | None = env_field(None, "VOICE_API_KEY")
-    voice_transcription_model: str = env_field("whisper-1", "VOICE_TRANSCRIPTION_MODEL")
-    voice_synthesis_model: str = env_field("tts-1", "VOICE_SYNTHESIS_MODEL")
-    voice_default_voice: str = env_field("alloy", "VOICE_DEFAULT_VOICE")
+    voice_transcription_model: str = env_field(
+        "whisper-1", "VOICE_TRANSCRIPTION_MODEL",
+        description="Transcription model (overridable via admin UI)"
+    )
+    voice_synthesis_model: str = env_field(
+        "tts-1", "VOICE_SYNTHESIS_MODEL",
+        description="Synthesis model (overridable via admin UI)"
+    )
+    voice_default_voice: str = env_field(
+        "alloy", "VOICE_DEFAULT_VOICE",
+        description="Default voice (overridable via admin UI)"
+    )
     # OAuth settings
     oauth_google_client_id: str | None = env_field(None, "OAUTH_GOOGLE_CLIENT_ID")
     oauth_google_client_secret: str | None = env_field(None, "OAUTH_GOOGLE_CLIENT_SECRET")
@@ -268,7 +281,9 @@ class Settings(BaseModel):
     oauth_github_client_secret: str | None = env_field(None, "OAUTH_GITHUB_CLIENT_SECRET")
     oauth_microsoft_client_id: str | None = env_field(None, "OAUTH_MICROSOFT_CLIENT_ID")
     oauth_microsoft_client_secret: str | None = env_field(None, "OAUTH_MICROSOFT_CLIENT_SECRET")
-    oauth_redirect_uri: str | None = env_field(None, "OAUTH_REDIRECT_URI")
+    oauth_redirect_uri: str | None = env_field(
+        None, "OAUTH_REDIRECT_URI", description="OAuth redirect URI (overridable via admin UI)"
+    )
     # Email service settings (env vars are fallbacks - prefer admin UI)
     smtp_host: str | None = env_field(
         None, "SMTP_HOST", description="SMTP server host (overridable via admin UI)"
@@ -291,11 +306,14 @@ class Settings(BaseModel):
     email_from_name: str = env_field(
         "LiminalLM", "EMAIL_FROM_NAME", description="Email from name (overridable via admin UI)"
     )
-    app_base_url: str = env_field("http://localhost:8000", "APP_BASE_URL")
+    app_base_url: str = env_field(
+        "http://localhost:8000", "APP_BASE_URL",
+        description="Application base URL (overridable via admin UI)"
+    )
     default_adapter_mode: AdapterMode = env_field(
         AdapterMode.HYBRID,
         "DEFAULT_ADAPTER_MODE",
-        description="Default mode for new adapters: local, remote, prompt, or hybrid",
+        description="Default mode for new adapters: local, remote, prompt, or hybrid (overridable via admin UI)",
     )
     allow_signup: bool = env_field(
         True,
@@ -315,8 +333,14 @@ class Settings(BaseModel):
         description="Enable multi-factor authentication (overridable via admin UI)",
     )
     jwt_secret: str = env_field(None, "JWT_SECRET")
-    jwt_issuer: str = env_field("liminallm", "JWT_ISSUER")
-    jwt_audience: str = env_field("liminal-clients", "JWT_AUDIENCE")
+    jwt_issuer: str = env_field(
+        "liminallm", "JWT_ISSUER",
+        description="JWT issuer (overridable via admin UI)"
+    )
+    jwt_audience: str = env_field(
+        "liminal-clients", "JWT_AUDIENCE",
+        description="JWT audience (overridable via admin UI)"
+    )
     access_token_ttl_minutes: int = env_field(
         30,
         "ACCESS_TOKEN_TTL_MINUTES",
@@ -327,9 +351,18 @@ class Settings(BaseModel):
         "REFRESH_TOKEN_TTL_MINUTES",
         description="Refresh token TTL in minutes (overridable via admin UI)",
     )
-    default_tenant_id: str = env_field("public", "DEFAULT_TENANT_ID")
-    rag_mode: RagMode = env_field(RagMode.PGVECTOR, "RAG_MODE")
-    embedding_model_id: str = env_field("text-embedding", "EMBEDDING_MODEL_ID")
+    default_tenant_id: str = env_field(
+        "public", "DEFAULT_TENANT_ID",
+        description="Default tenant ID (overridable via admin UI)"
+    )
+    rag_mode: RagMode = env_field(
+        RagMode.PGVECTOR, "RAG_MODE",
+        description="RAG mode: pgvector or memory (overridable via admin UI)"
+    )
+    embedding_model_id: str = env_field(
+        "text-embedding", "EMBEDDING_MODEL_ID",
+        description="Embedding model ID (overridable via admin UI)"
+    )
 
     # NOTE: The following operational settings have been moved to database-managed
     # system settings (accessible via admin UI at /admin.html and API at /v1/admin/settings).
@@ -364,6 +397,18 @@ class Settings(BaseModel):
     # SMTP / Email (all settings including secrets):
     # - smtp_host, smtp_port, smtp_user, smtp_password, smtp_use_tls
     # - email_from_address, email_from_name
+    #
+    # URL Settings:
+    # - oauth_redirect_uri, app_base_url
+    #
+    # Voice Settings:
+    # - voice_transcription_model, voice_synthesis_model, voice_default_voice
+    #
+    # Model Settings:
+    # - model_path, model_backend, default_adapter_mode, rag_mode, embedding_model_id
+    #
+    # Tenant & JWT Settings:
+    # - default_tenant_id, jwt_issuer, jwt_audience
 
     # Training worker settings (env vars are fallbacks - prefer admin UI)
     training_worker_enabled: bool = env_field(

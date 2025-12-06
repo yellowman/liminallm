@@ -287,6 +287,19 @@ def _get_system_settings(runtime) -> dict:
         "smtp_use_tls": True,
         "email_from_address": "",
         "email_from_name": "LiminalLM",
+        "oauth_redirect_uri": "",
+        "app_base_url": "http://localhost:8000",
+        "voice_transcription_model": "whisper-1",
+        "voice_synthesis_model": "tts-1",
+        "voice_default_voice": "alloy",
+        "rag_mode": "pgvector",
+        "embedding_model_id": "text-embedding",
+        "default_tenant_id": "public",
+        "jwt_issuer": "liminallm",
+        "jwt_audience": "liminal-clients",
+        "model_path": "gpt-4o-mini",
+        "model_backend": "openai",
+        "default_adapter_mode": "hybrid",
     }
     return {**defaults, **db_settings}
 
@@ -2576,6 +2589,13 @@ async def update_system_settings(
     - Training worker: training_worker_enabled (true), training_worker_poll_interval (60)
     - SMTP: smtp_host, smtp_port (587), smtp_user, smtp_password, smtp_use_tls (true),
       email_from_address, email_from_name ("LiminalLM")
+    - URL settings: oauth_redirect_uri, app_base_url ("http://localhost:8000")
+    - Voice: voice_transcription_model ("whisper-1"), voice_synthesis_model ("tts-1"),
+      voice_default_voice ("alloy" - one of: alloy, echo, fable, onyx, nova, shimmer)
+    - Model: rag_mode ("pgvector" or "memory"), embedding_model_id ("text-embedding"),
+      model_path ("gpt-4o-mini"), model_backend (openai, azure, together, etc.),
+      default_adapter_mode ("hybrid" - one of: local, remote, prompt, hybrid)
+    - Tenant: default_tenant_id ("public"), jwt_issuer ("liminallm"), jwt_audience ("liminal-clients")
     """
     runtime = get_runtime()
     sys_settings = _get_system_settings(runtime)
@@ -2624,6 +2644,19 @@ async def update_system_settings(
         "smtp_use_tls",
         "email_from_address",
         "email_from_name",
+        "oauth_redirect_uri",
+        "app_base_url",
+        "voice_transcription_model",
+        "voice_synthesis_model",
+        "voice_default_voice",
+        "rag_mode",
+        "embedding_model_id",
+        "default_tenant_id",
+        "jwt_issuer",
+        "jwt_audience",
+        "model_path",
+        "model_backend",
+        "default_adapter_mode",
     }
     invalid_keys = set(body.keys()) - allowed_keys
     if invalid_keys:
@@ -2677,6 +2710,30 @@ async def update_system_settings(
         "smtp_password",
         "email_from_address",
         "email_from_name",
+        "oauth_redirect_uri",
+        "app_base_url",
+        "voice_transcription_model",
+        "voice_synthesis_model",
+        "voice_default_voice",
+        "rag_mode",
+        "embedding_model_id",
+        "default_tenant_id",
+        "jwt_issuer",
+        "jwt_audience",
+        "model_path",
+        "model_backend",
+        "default_adapter_mode",
+    }
+    # Enum validation for settings with known valid values
+    enum_values = {
+        "voice_default_voice": {"alloy", "echo", "fable", "onyx", "nova", "shimmer"},
+        "rag_mode": {"pgvector", "memory"},
+        "model_backend": {
+            "openai", "azure", "azure_openai", "vertex", "gemini", "google",
+            "bedrock", "together", "together.ai", "lorax", "adapter_server",
+            "sagemaker", "aws_sagemaker",
+        },
+        "default_adapter_mode": {"local", "remote", "prompt", "hybrid"},
     }
     for key, value in body.items():
         if key in int_keys and not isinstance(value, int):
@@ -2714,6 +2771,13 @@ async def update_system_settings(
             raise _http_error(
                 "validation_error",
                 f"{key} must be positive",
+                status_code=400,
+            )
+        # Validate enum values
+        if key in enum_values and value not in enum_values[key]:
+            raise _http_error(
+                "validation_error",
+                f"{key} must be one of: {', '.join(sorted(enum_values[key]))}",
                 status_code=400,
             )
 

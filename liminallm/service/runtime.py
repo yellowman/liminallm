@@ -76,16 +76,38 @@ class Runtime:
                 ),
                 mode=fallback_mode,
             )
-        # Compute backend_mode before creating services that need it
-        runtime_config = {}
-        db_backend_mode = None
-        if hasattr(self.store, "get_runtime_config"):
-            runtime_config = self.store.get_runtime_config() or {}
-            db_backend_mode = runtime_config.get("model_backend")
+        # Get system settings from DB early (falls back to env vars if not in DB)
+        sys_settings = {}
+        if hasattr(self.store, "get_system_settings"):
+            sys_settings = self.store.get_system_settings() or {}
+
+        # Resolve model settings from DB with env var fallback
         resolved_base_model = (
-            runtime_config.get("model_path") or self.settings.model_path
+            sys_settings.get("model_path") or self.settings.model_path
         )
-        backend_mode = db_backend_mode or self.settings.model_backend
+        backend_mode = sys_settings.get("model_backend") or self.settings.model_backend
+        default_adapter_mode = (
+            sys_settings.get("default_adapter_mode") or self.settings.default_adapter_mode
+        )
+
+        # Resolve other settings from DB with env var fallback
+        rag_mode = sys_settings.get("rag_mode") or self.settings.rag_mode
+        embedding_model_id = (
+            sys_settings.get("embedding_model_id") or self.settings.embedding_model_id
+        )
+        voice_transcription_model = (
+            sys_settings.get("voice_transcription_model")
+            or self.settings.voice_transcription_model
+        )
+        voice_synthesis_model = (
+            sys_settings.get("voice_synthesis_model")
+            or self.settings.voice_synthesis_model
+        )
+        voice_default_voice = (
+            sys_settings.get("voice_default_voice") or self.settings.voice_default_voice
+        )
+        app_base_url = sys_settings.get("app_base_url") or self.settings.app_base_url
+
         self.router = RouterEngine(cache=self.cache, backend_mode=backend_mode)
         adapter_configs = {
             "openai": {
@@ -94,7 +116,7 @@ class Runtime:
                 "adapter_server_model": self.settings.adapter_server_model,
             }
         }
-        self.embeddings = EmbeddingsService(self.settings.embedding_model_id)
+        self.embeddings = EmbeddingsService(embedding_model_id)
         self.llm = LLMService(
             base_model=resolved_base_model,
             backend_mode=backend_mode,
@@ -107,15 +129,15 @@ class Runtime:
         self.rag = RAGService(
             self.store,
             default_chunk_size=self.settings.rag_chunk_size,
-            rag_mode=self.settings.rag_mode,
+            rag_mode=rag_mode,
             embed=self.embeddings.embed,
-            embedding_model_id=self.settings.embedding_model_id,
+            embedding_model_id=embedding_model_id,
         )
         self.training = TrainingService(
             self.store,
             self.settings.shared_fs_root,
             runtime_base_model=resolved_base_model,
-            default_adapter_mode=self.settings.default_adapter_mode,
+            default_adapter_mode=default_adapter_mode,
             backend_mode=backend_mode,
         )
         self.clusterer = SemanticClusterer(self.store, self.llm, self.training)
@@ -125,49 +147,33 @@ class Runtime:
         self.voice = VoiceService(
             self.settings.shared_fs_root,
             api_key=self.settings.voice_api_key,
-            transcription_model=self.settings.voice_transcription_model,
-            synthesis_model=self.settings.voice_synthesis_model,
-            default_voice=self.settings.voice_default_voice,
+            transcription_model=voice_transcription_model,
+            synthesis_model=voice_synthesis_model,
+            default_voice=voice_default_voice,
         )
         self.config_ops = ConfigOpsService(
             self.store, self.llm, self.router, self.training
         )
-        # Get MFA setting from DB (falls back to env var if not in DB)
-        mfa_enabled = self.settings.enable_mfa
-        if hasattr(self.store, "get_system_settings"):
-            sys_settings = self.store.get_system_settings() or {}
-            mfa_enabled = sys_settings.get("enable_mfa", mfa_enabled)
+        # Use MFA setting from sys_settings (already fetched above)
+        mfa_enabled = sys_settings.get("enable_mfa", self.settings.enable_mfa)
         self.auth = AuthService(
             self.store,
             self.cache,
             self.settings,
             mfa_enabled=mfa_enabled,
         )
-        # Get SMTP settings from DB (falls back to env vars if not in DB)
-        smtp_host = self.settings.smtp_host
-        smtp_port = self.settings.smtp_port
-        smtp_user = self.settings.smtp_user
-        smtp_password = self.settings.smtp_password
-        smtp_use_tls = self.settings.smtp_use_tls
-        email_from_address = self.settings.email_from_address
-        email_from_name = self.settings.email_from_name
-        if hasattr(self.store, "get_system_settings"):
-            sys_settings = self.store.get_system_settings() or {}
-            # Only use DB values if they are non-empty (allows env var fallback)
-            if sys_settings.get("smtp_host"):
-                smtp_host = sys_settings["smtp_host"]
-            if sys_settings.get("smtp_port"):
-                smtp_port = sys_settings["smtp_port"]
-            if sys_settings.get("smtp_user"):
-                smtp_user = sys_settings["smtp_user"]
-            if sys_settings.get("smtp_password"):
-                smtp_password = sys_settings["smtp_password"]
-            if "smtp_use_tls" in sys_settings:
-                smtp_use_tls = sys_settings["smtp_use_tls"]
-            if sys_settings.get("email_from_address"):
-                email_from_address = sys_settings["email_from_address"]
-            if sys_settings.get("email_from_name"):
-                email_from_name = sys_settings["email_from_name"]
+        # Get SMTP settings from sys_settings (falls back to env vars if not in DB)
+        smtp_host = sys_settings.get("smtp_host") or self.settings.smtp_host
+        smtp_port = sys_settings.get("smtp_port") or self.settings.smtp_port
+        smtp_user = sys_settings.get("smtp_user") or self.settings.smtp_user
+        smtp_password = sys_settings.get("smtp_password") or self.settings.smtp_password
+        smtp_use_tls = sys_settings.get("smtp_use_tls", self.settings.smtp_use_tls)
+        email_from_address = (
+            sys_settings.get("email_from_address") or self.settings.email_from_address
+        )
+        email_from_name = (
+            sys_settings.get("email_from_name") or self.settings.email_from_name
+        )
         self.email = EmailService(
             smtp_host=smtp_host,
             smtp_port=smtp_port,
@@ -176,14 +182,12 @@ class Runtime:
             smtp_use_tls=smtp_use_tls,
             from_email=email_from_address,
             from_name=email_from_name,
-            base_url=self.settings.app_base_url,
+            base_url=app_base_url,
         )
         # Training worker for background job processing
-        # Get poll interval from DB (falls back to env var if not in DB)
-        poll_interval = self.settings.training_worker_poll_interval
-        if hasattr(self.store, "get_system_settings"):
-            sys_settings = self.store.get_system_settings() or {}
-            poll_interval = sys_settings.get("training_worker_poll_interval", poll_interval)
+        poll_interval = sys_settings.get(
+            "training_worker_poll_interval", self.settings.training_worker_poll_interval
+        )
         self.training_worker = TrainingWorker(
             store=self.store,
             training_service=self.training,

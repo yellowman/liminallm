@@ -253,6 +253,95 @@
               <input type="text" id="setting-email-name" value="LiminalLM" />
             </div>
 
+            <h4>URL Settings</h4>
+            <div class="field">
+              <label for="setting-oauth-redirect">OAuth redirect URI</label>
+              <input type="url" id="setting-oauth-redirect" placeholder="https://example.com/auth/callback" />
+            </div>
+            <div class="field">
+              <label for="setting-app-base-url">Application base URL</label>
+              <input type="url" id="setting-app-base-url" value="http://localhost:8000" />
+            </div>
+
+            <h4>Voice Settings</h4>
+            <div class="field">
+              <label for="setting-voice-transcription">Transcription model</label>
+              <input type="text" id="setting-voice-transcription" value="whisper-1" />
+            </div>
+            <div class="field">
+              <label for="setting-voice-synthesis">Synthesis model</label>
+              <input type="text" id="setting-voice-synthesis" value="tts-1" />
+            </div>
+            <div class="field">
+              <label for="setting-voice-default">Default voice</label>
+              <select id="setting-voice-default">
+                <option value="alloy" selected>alloy</option>
+                <option value="echo">echo</option>
+                <option value="fable">fable</option>
+                <option value="onyx">onyx</option>
+                <option value="nova">nova</option>
+                <option value="shimmer">shimmer</option>
+              </select>
+            </div>
+
+            <h4>Model Settings</h4>
+            <div class="field">
+              <label for="setting-model-path">Model path</label>
+              <input type="text" id="setting-model-path" value="gpt-4o-mini" placeholder="gpt-4o-mini" />
+            </div>
+            <div class="field">
+              <label for="setting-model-backend">Model backend</label>
+              <select id="setting-model-backend">
+                <option value="openai" selected>openai</option>
+                <option value="azure">azure</option>
+                <option value="azure_openai">azure_openai</option>
+                <option value="vertex">vertex</option>
+                <option value="gemini">gemini</option>
+                <option value="google">google</option>
+                <option value="bedrock">bedrock</option>
+                <option value="together">together</option>
+                <option value="together.ai">together.ai</option>
+                <option value="lorax">lorax</option>
+                <option value="adapter_server">adapter_server</option>
+                <option value="sagemaker">sagemaker</option>
+                <option value="aws_sagemaker">aws_sagemaker</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="setting-adapter-mode">Default adapter mode</label>
+              <select id="setting-adapter-mode">
+                <option value="local">local</option>
+                <option value="remote">remote</option>
+                <option value="prompt">prompt</option>
+                <option value="hybrid" selected>hybrid</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="setting-rag-mode">RAG mode</label>
+              <select id="setting-rag-mode">
+                <option value="pgvector" selected>pgvector</option>
+                <option value="memory">memory</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="setting-embedding-model">Embedding model ID</label>
+              <input type="text" id="setting-embedding-model" value="text-embedding" />
+            </div>
+
+            <h4>Tenant & JWT Settings</h4>
+            <div class="field">
+              <label for="setting-default-tenant">Default tenant ID</label>
+              <input type="text" id="setting-default-tenant" value="public" />
+            </div>
+            <div class="field">
+              <label for="setting-jwt-issuer">JWT issuer</label>
+              <input type="text" id="setting-jwt-issuer" value="liminallm" />
+            </div>
+            <div class="field">
+              <label for="setting-jwt-audience">JWT audience</label>
+              <input type="text" id="setting-jwt-audience" value="liminal-clients" />
+            </div>
+
             <button class="primary" id="save-settings">Save settings</button>
           </div>
           <div id="settings-feedback" role="status" class="subtext"></div>

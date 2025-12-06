@@ -619,6 +619,23 @@ const fetchSystemSettings = async () => {
     setChecked('setting-smtp-tls', s.smtp_use_tls);
     setVal('setting-email-from', s.email_from_address);
     setVal('setting-email-name', s.email_from_name);
+    // URL Settings
+    setVal('setting-oauth-redirect', s.oauth_redirect_uri);
+    setVal('setting-app-base-url', s.app_base_url);
+    // Voice Settings
+    setVal('setting-voice-transcription', s.voice_transcription_model);
+    setVal('setting-voice-synthesis', s.voice_synthesis_model);
+    setVal('setting-voice-default', s.voice_default_voice);
+    // Model Settings
+    setVal('setting-model-path', s.model_path);
+    setVal('setting-model-backend', s.model_backend);
+    setVal('setting-adapter-mode', s.default_adapter_mode);
+    setVal('setting-rag-mode', s.rag_mode);
+    setVal('setting-embedding-model', s.embedding_model_id);
+    // Tenant & JWT Settings
+    setVal('setting-default-tenant', s.default_tenant_id);
+    setVal('setting-jwt-issuer', s.jwt_issuer);
+    setVal('setting-jwt-audience', s.jwt_audience);
     showSettingsFeedback('Settings loaded');
   } catch (err) {
     showSettingsFeedback(err.message);
@@ -678,6 +695,23 @@ const saveSystemSettings = async () => {
     smtp_use_tls: getChecked('setting-smtp-tls'),
     email_from_address: getVal('setting-email-from', String),
     email_from_name: getVal('setting-email-name', String),
+    // URL Settings
+    oauth_redirect_uri: getVal('setting-oauth-redirect', String),
+    app_base_url: getVal('setting-app-base-url', String),
+    // Voice Settings
+    voice_transcription_model: getVal('setting-voice-transcription', String),
+    voice_synthesis_model: getVal('setting-voice-synthesis', String),
+    voice_default_voice: getVal('setting-voice-default', String),
+    // Model Settings
+    model_path: getVal('setting-model-path', String),
+    model_backend: getVal('setting-model-backend', String),
+    default_adapter_mode: getVal('setting-adapter-mode', String),
+    rag_mode: getVal('setting-rag-mode', String),
+    embedding_model_id: getVal('setting-embedding-model', String),
+    // Tenant & JWT Settings
+    default_tenant_id: getVal('setting-default-tenant', String),
+    jwt_issuer: getVal('setting-jwt-issuer', String),
+    jwt_audience: getVal('setting-jwt-audience', String),
   };
   // Only include password if it was entered (non-empty)
   const smtpPassword = document.getElementById('setting-smtp-password')?.value;
