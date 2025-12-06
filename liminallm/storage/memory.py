@@ -674,6 +674,7 @@ class MemoryStore:
         cluster_id: Optional[str] = None,
         *,
         tenant_id: Optional[str] = None,
+        limit: int = 1000,
     ) -> List[PreferenceEvent]:
         events = list(self.preference_events.values())
         if tenant_id:
@@ -690,7 +691,8 @@ class MemoryStore:
             events = [e for e in events if e.feedback in feedback_values]
         if cluster_id:
             events = [e for e in events if e.cluster_id == cluster_id]
-        return sorted(events, key=lambda e: e.created_at)
+        # Apply limit to prevent unbounded results
+        return sorted(events, key=lambda e: e.created_at)[:limit]
 
     def get_preference_event(self, event_id: str) -> Optional[PreferenceEvent]:
         with self._data_lock:
@@ -1621,6 +1623,13 @@ class MemoryStore:
             "mfa_secrets": [
                 self._serialize_mfa_config(cfg) for cfg in self.mfa_secrets.values()
             ],
+            "user_settings": [
+                self._serialize_user_settings(s) for s in self.user_settings.values()
+            ],
+            "adapter_router_state": [
+                self._serialize_adapter_router_state(s)
+                for s in self.adapter_router_state.values()
+            ],
         }
         path = self._state_path()
         try:
@@ -1712,6 +1721,14 @@ class MemoryStore:
         self.mfa_secrets = {
             cfg["user_id"]: self._deserialize_mfa_config(cfg)
             for cfg in data.get("mfa_secrets", [])
+        }
+        self.user_settings = {
+            s["user_id"]: self._deserialize_user_settings(s)
+            for s in data.get("user_settings", [])
+        }
+        self.adapter_router_state = {
+            s["artifact_id"]: self._deserialize_adapter_router_state(s)
+            for s in data.get("adapter_router_state", [])
         }
         return True
 
@@ -2136,5 +2153,53 @@ class MemoryStore:
             created_at=self._deserialize_datetime(
                 data.get("created_at", datetime.utcnow().isoformat())
             ),
+            meta=data.get("meta"),
+        )
+
+    def _serialize_user_settings(self, settings: UserSettings) -> dict:
+        """Serialize UserSettings for persistence."""
+        return {
+            "user_id": settings.user_id,
+            "locale": settings.locale,
+            "timezone": settings.timezone,
+            "default_voice": settings.default_voice,
+            "default_style": settings.default_style,
+            "flags": settings.flags,
+        }
+
+    def _deserialize_user_settings(self, data: dict) -> UserSettings:
+        """Deserialize UserSettings from persistence."""
+        return UserSettings(
+            user_id=data["user_id"],
+            locale=data.get("locale"),
+            timezone=data.get("timezone"),
+            default_voice=data.get("default_voice"),
+            default_style=data.get("default_style"),
+            flags=data.get("flags"),
+        )
+
+    def _serialize_adapter_router_state(self, state: AdapterRouterState) -> dict:
+        """Serialize AdapterRouterState for persistence."""
+        return {
+            "artifact_id": state.artifact_id,
+            "base_model": state.base_model,
+            "centroid_vec": state.centroid_vec,
+            "usage_count": state.usage_count,
+            "success_score": state.success_score,
+            "last_used_at": self._serialize_datetime(state.last_used_at) if state.last_used_at else None,
+            "last_trained_at": self._serialize_datetime(state.last_trained_at) if state.last_trained_at else None,
+            "meta": state.meta,
+        }
+
+    def _deserialize_adapter_router_state(self, data: dict) -> AdapterRouterState:
+        """Deserialize AdapterRouterState from persistence."""
+        return AdapterRouterState(
+            artifact_id=data["artifact_id"],
+            base_model=data.get("base_model"),
+            centroid_vec=data.get("centroid_vec"),
+            usage_count=data.get("usage_count", 0),
+            success_score=data.get("success_score", 0.0),
+            last_used_at=self._deserialize_datetime(data["last_used_at"]) if data.get("last_used_at") else None,
+            last_trained_at=self._deserialize_datetime(data["last_trained_at"]) if data.get("last_trained_at") else None,
             meta=data.get("meta"),
         )

@@ -396,6 +396,7 @@ class PostgresStore:
         cluster_id: str | None = None,
         *,
         tenant_id: str | None = None,
+        limit: int = 1000,
     ) -> list[PreferenceEvent]:
         clauses = []
         params: list[Any] = []
@@ -419,7 +420,9 @@ class PostgresStore:
         query = "SELECT * FROM preference_event"
         if clauses:
             query = " ".join([query, "WHERE", " AND ".join(clauses)])
-        query = " ".join([query, "ORDER BY created_at"])
+        # SPEC compliance: Always apply LIMIT to prevent unbounded queries
+        query = " ".join([query, "ORDER BY created_at LIMIT %s"])
+        params.append(limit)
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [
