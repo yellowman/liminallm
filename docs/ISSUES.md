@@ -716,6 +716,15 @@ Retry sleep cannot be interrupted by cancel events.
 
 Only workflow-level timeout checked during retries, not per-node.
 
+### 12.4 CRITICAL: Circuit Breaker Checks Not Awaited (FIXED)
+
+**Location:** `liminallm/service/workflow.py:1454-1655`
+
+**Issue:** `_execute_node` was synchronous yet performed `await` calls, producing a SyntaxError and silently skipping SPEC §18 circuit-breaker checks when invoking tools.
+
+**Fix Applied:**
+- Converted `_execute_node` to `async` and awaited it from `_execute_node_with_retry`, restoring the circuit-breaker gating and removing the SyntaxError that blocked compilation.
+
 ---
 
 ## 13. Frontend API Usage
@@ -734,7 +743,7 @@ Only workflow-level timeout checked during retries, not per-node.
 
 **Original Claim:** Multiple POST endpoints lack Idempotency-Key headers.
 
-**Verification Result:** Both `chat.js:296` and `admin.js:52-58` include `headers()` function that adds `Idempotency-Key` to all requests using `randomIdempotencyKey()`. All API calls use these headers.
+**Verification Result:** Both `chat.js:296` and `admin.js:52-58` include `headers()` function that adds `Idempotency-Key` to all requests using `randomIdempotencyKey()`. All API calls use these headers. Cross-check of other helpers (upload formData calls, admin object/patch fetchers, and authHeaders-only paths) confirmed they also route through the same Idempotency-Key generation helpers, so no alternate code paths omit the header.
 
 **Status:** Idempotency keys are already implemented.
 

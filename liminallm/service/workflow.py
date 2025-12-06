@@ -1147,7 +1147,7 @@ class WorkflowEngine:
                 )
 
             try:
-                result, next_nodes = self._execute_node(
+                result, next_nodes = await self._execute_node(
                     node,
                     user_message=user_message,
                     context_id=context_id,
@@ -1451,7 +1451,7 @@ class WorkflowEngine:
             ensure_embedding_dim(b, dim=EMBEDDING_DIM),
         )
 
-    def _execute_node(
+    async def _execute_node(
         self,
         node: Dict[str, Any],
         *,
