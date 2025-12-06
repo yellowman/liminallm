@@ -1,6 +1,6 @@
 # Codebase Issues and Security Audit
 
-**Last Updated:** 2025-12-05
+**Last Updated:** 2025-12-06
 **Scope:** Comprehensive review against SPEC.md requirements (12th pass)
 
 ---
@@ -102,8 +102,8 @@ This document consolidates findings from deep analysis of the liminallm codebase
 **False Positives Identified:** 144 (verified via comprehensive code examination)
 **Design Variances:** 1 (X-Session WebSocket auth via JSON body - valid implementation)
 **Future Features Deferred:** 1 (Adapter pruning/merging - optimization feature)
-**Issues Fixed:** 19 (8 frontend + 7 infrastructure + 4 NOT IMPLEMENTED)
-**Effective Issues:** 516 (681 - 144 false positives - 2 variances/deferred - 19 fixed)
+**Issues Fixed:** 21 (10 frontend + 7 infrastructure + 4 NOT IMPLEMENTED)
+**Effective Issues:** 514 (681 - 144 false positives - 2 variances/deferred - 21 fixed)
 **False Positive Rate:** 21.1%
 
 *Note: False positives include structural patterns (SQL parameterization, Python GIL, timeouts), development/test code, standard industry practices (Docker isolation, env vars), required functionality (MFA secret display, admin password display), misattributed issues (internal logging), and references to non-existent files (React-specific issues on vanilla JS codebase).*
@@ -117,6 +117,8 @@ This document consolidates findings from deep analysis of the liminallm codebase
 - 65.7: Input length validation added to chat messages
 - 69.7: Admin panel status values now properly escaped
 - 74.1: Cryptographically secure idempotency key generation using crypto.getRandomValues() fallback
+- 80.12: WebSocket message_done event detection now uses explicit flag instead of data key check
+- 80.13: File download URL no longer double-prefixes apiBase path
 
 **Infrastructure Fixes Applied:**
 - 72.2: Redis authentication enabled with REDIS_PASSWORD
@@ -6709,4 +6711,20 @@ The following bugs were identified and fixed:
 **Issue:** `REDIS_PASSWORD` used `:-changeme` syntax which silently fell back to an insecure default password if the environment variable was not set. This was inconsistent with `POSTGRES_PASSWORD` which used `:?` syntax to fail if unset.
 
 **Fix:** Changed to `:?` syntax to require REDIS_PASSWORD, failing fast if not set.
+
+### 80.12 ✅ FIXED: WebSocket message_done Semantic Check Causes False Rejection
+
+**Location:** `frontend/chat.js:1503-1608`
+
+**Issue:** The change from initializing `messageDoneData` as `null` with a truthy check to initializing as `{}` with `Object.keys(messageDoneData).length > 0` altered semantic behavior. When a `message_done` event was received with empty or undefined data (`msg.data || {}`), the truthy check would have passed but the keys-length check failed, causing unexpected "Connection closed" rejection. The code comment stated "If we got message_done but not streaming_complete, resolve with what we have" but the check conflated "received the event" with "received data with keys."
+
+**Fix:** Added explicit `messageDoneReceived` boolean flag set to `true` when `message_done` event is received. The close handler now checks `if (messageDoneReceived)` instead of `if (Object.keys(messageDoneData).length > 0)`, correctly detecting whether the event was received regardless of its data content.
+
+### 80.13 ✅ FIXED: File Download URL Double-Prefixes apiBase Path
+
+**Location:** `frontend/chat.js:2559-2561`
+
+**Issue:** The `downloadFile` function concatenated `apiBase` (`/v1`) with `downloadUrl`, but the signed URL returned from the backend already includes the `/v1/files/download` path (from `generate_signed_url` with default `base_url="/v1/files/download"`). This resulted in the final URL being `/v1/v1/files/download?...` instead of the correct `/v1/files/download?...`, causing all file downloads to fail with a 404 error.
+
+**Fix:** Changed `fetch(\`${apiBase}${downloadUrl}\`, ...)` to `fetch(downloadUrl, ...)` since the download URL already contains the complete path.
 
