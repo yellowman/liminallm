@@ -102,8 +102,8 @@ This document consolidates findings from deep analysis of the liminallm codebase
 **False Positives Identified:** 144 (verified via comprehensive code examination)
 **Design Variances:** 1 (X-Session WebSocket auth via JSON body - valid implementation)
 **Future Features Deferred:** 1 (Adapter pruning/merging - optimization feature)
-**Issues Fixed:** 21 (10 frontend + 7 infrastructure + 4 NOT IMPLEMENTED)
-**Effective Issues:** 514 (681 - 144 false positives - 2 variances/deferred - 21 fixed)
+**Issues Fixed:** 22 (10 frontend + 1 backend + 7 infrastructure + 4 NOT IMPLEMENTED)
+**Effective Issues:** 513 (681 - 144 false positives - 2 variances/deferred - 22 fixed)
 **False Positive Rate:** 21.1%
 
 *Note: False positives include structural patterns (SQL parameterization, Python GIL, timeouts), development/test code, standard industry practices (Docker isolation, env vars), required functionality (MFA secret display, admin password display), misattributed issues (internal logging), and references to non-existent files (React-specific issues on vanilla JS codebase).*
@@ -119,6 +119,9 @@ This document consolidates findings from deep analysis of the liminallm codebase
 - 74.1: Cryptographically secure idempotency key generation using crypto.getRandomValues() fallback
 - 80.12: WebSocket message_done event detection now uses explicit flag instead of data key check
 - 80.13: File download URL no longer double-prefixes apiBase path
+
+**Backend Fixes Applied:**
+- 80.14: Circuit breaker no longer double-counts failures for tool exceptions
 
 **Infrastructure Fixes Applied:**
 - 72.2: Redis authentication enabled with REDIS_PASSWORD
@@ -6727,4 +6730,12 @@ The following bugs were identified and fixed:
 **Issue:** The `downloadFile` function concatenated `apiBase` (`/v1`) with `downloadUrl`, but the signed URL returned from the backend already includes the `/v1/files/download` path (from `generate_signed_url` with default `base_url="/v1/files/download"`). This resulted in the final URL being `/v1/v1/files/download?...` instead of the correct `/v1/files/download?...`, causing all file downloads to fail with a 404 error.
 
 **Fix:** Changed `fetch(\`${apiBase}${downloadUrl}\`, ...)` to `fetch(downloadUrl, ...)` since the download URL already contains the complete path.
+
+### 80.14 ✅ FIXED: Circuit Breaker Double-Counts Tool Failures
+
+**Location:** `liminallm/service/workflow.py:1532-1569`
+
+**Issue:** When `_invoke_tool` raised an exception, the code recorded a failure via `record_tool_failure` in the except block (lines 1535-1545) and set `tool_result` with `status: "error"`. Immediately after the try/except, the code at lines 1551-1562 checked if `tool_result.get("status") == "error"` and recorded another failure. This caused exceptions to be double-counted, potentially tripping the circuit breaker at half the intended threshold (after ~2.5 failures instead of 5).
+
+**Fix:** Added `_failure_recorded: True` flag to the error result created in the except block. The subsequent failure recording check now includes `and not tool_result.get("_failure_recorded")` to skip already-recorded failures. The internal flag is excluded from outputs.
 
