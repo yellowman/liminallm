@@ -49,8 +49,12 @@ async def lifespan(app: FastAPI):
         if runtime.training_worker:
             await runtime.training_worker.stop()
             logger.info("training_worker_stopped_on_shutdown")
+        # Issue 23.1: Explicitly shutdown workflow engine's executor
+        if runtime.workflow:
+            runtime.workflow.shutdown(wait=True)
+            logger.info("workflow_engine_shutdown_on_exit")
     except Exception as exc:
-        logger.error("shutdown_training_worker_failed", error=str(exc))
+        logger.error("shutdown_failed", error=str(exc))
 
 
 app = FastAPI(title="LiminalLM Kernel", version=__version__, lifespan=lifespan)

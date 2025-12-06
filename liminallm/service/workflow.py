@@ -128,6 +128,26 @@ class WorkflowEngine:
         # Issue 48.6: Configurable worker pool with bounds
         workers = min(max(1, tool_workers), self.MAX_TOOL_WORKERS)
         self._tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+        self._executor_shutdown = False
+
+    def shutdown(self, wait: bool = True) -> None:
+        """Explicitly shutdown the executor. Call during app shutdown.
+
+        Issue 23.1: Provides explicit cleanup instead of relying on __del__.
+        This should be called during application shutdown to ensure proper cleanup
+        of ThreadPoolExecutor resources.
+
+        Args:
+            wait: If True, wait for pending futures to complete. If False, cancel them.
+        """
+        if self._executor_shutdown:
+            return
+        self._executor_shutdown = True
+        try:
+            self._tool_executor.shutdown(wait=wait, cancel_futures=not wait)
+            self.logger.info("workflow_executor_shutdown", wait=wait)
+        except Exception as exc:
+            self.logger.warning("workflow_executor_shutdown_error", error=str(exc))
 
     async def _rollback_workflow(
         self,
@@ -1937,7 +1957,6 @@ class WorkflowEngine:
             return False
 
     def __del__(self) -> None:
-        try:
-            self._tool_executor.shutdown(wait=False, cancel_futures=True)
-        except Exception:
-            pass
+        """Fallback cleanup if shutdown() was not called explicitly."""
+        # Issue 23.1: Call shutdown method for proper cleanup
+        self.shutdown(wait=False)

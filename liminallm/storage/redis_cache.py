@@ -264,9 +264,11 @@ class RedisCache:
         return data.get("provider"), expires_at, data.get("tenant_id")
 
     async def get_idempotency_record(
-        self, route: str, user_id: str, key: str
+        self, route: str, user_id: str, key: str, *, tenant_id: Optional[str] = None
     ) -> Optional[dict]:
-        cached = await self.client.get(f"idemp:{route}:{user_id}:{key}")
+        # Issue 22.2: Include tenant_id in cache key for multi-tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        cached = await self.client.get(f"idemp:{tenant_prefix}{route}:{user_id}:{key}")
         if not cached:
             return None
         try:
@@ -282,9 +284,13 @@ class RedisCache:
         key: str,
         record: dict,
         ttl_seconds: int = 60 * 60 * 24,
+        *,
+        tenant_id: Optional[str] = None,
     ) -> None:
+        # Issue 22.2: Include tenant_id in cache key for multi-tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
         await self.client.set(
-            f"idemp:{route}:{user_id}:{key}", json.dumps(record), ex=ttl_seconds
+            f"idemp:{tenant_prefix}{route}:{user_id}:{key}", json.dumps(record), ex=ttl_seconds
         )
 
     async def acquire_idempotency_slot(
@@ -294,6 +300,8 @@ class RedisCache:
         key: str,
         record: dict,
         ttl_seconds: int = 60 * 60 * 24,
+        *,
+        tenant_id: Optional[str] = None,
     ) -> tuple[bool, Optional[dict]]:
         """Atomically acquire an idempotency slot using SETNX pattern (Issue 19.4).
 
@@ -303,13 +311,16 @@ class RedisCache:
             key: Idempotency key
             record: Record to set if slot acquired (typically status=in_progress)
             ttl_seconds: TTL for the record
+            tenant_id: Optional tenant ID for multi-tenant isolation (Issue 22.2)
 
         Returns:
             Tuple of (acquired: bool, existing_record: Optional[dict])
             - If acquired=True, the slot was successfully claimed
             - If acquired=False, existing_record contains the current record
         """
-        cache_key = f"idemp:{route}:{user_id}:{key}"
+        # Issue 22.2: Include tenant_id in cache key for multi-tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        cache_key = f"idemp:{tenant_prefix}{route}:{user_id}:{key}"
         # Use SET NX (set if not exists) for atomic acquisition
         acquired = await self.client.set(
             cache_key, json.dumps(record), ex=ttl_seconds, nx=True
@@ -878,9 +889,11 @@ class SyncRedisCache:
         return data.get("provider"), expires_at, data.get("tenant_id")
 
     async def get_idempotency_record(
-        self, route: str, user_id: str, key: str
+        self, route: str, user_id: str, key: str, *, tenant_id: Optional[str] = None
     ) -> Optional[dict]:
-        cached = self._sync_client.get(f"idemp:{route}:{user_id}:{key}")
+        # Issue 22.2: Include tenant_id in cache key for multi-tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        cached = self._sync_client.get(f"idemp:{tenant_prefix}{route}:{user_id}:{key}")
         if not cached:
             return None
         try:
@@ -895,8 +908,12 @@ class SyncRedisCache:
         key: str,
         record: dict,
         ttl_seconds: int = 60 * 60 * 24,
+        *,
+        tenant_id: Optional[str] = None,
     ) -> None:
-        self._sync_client.set(f"idemp:{route}:{user_id}:{key}", json.dumps(record), ex=ttl_seconds)
+        # Issue 22.2: Include tenant_id in cache key for multi-tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        self._sync_client.set(f"idemp:{tenant_prefix}{route}:{user_id}:{key}", json.dumps(record), ex=ttl_seconds)
 
     async def acquire_idempotency_slot(
         self,
@@ -905,9 +922,13 @@ class SyncRedisCache:
         key: str,
         record: dict,
         ttl_seconds: int = 60 * 60 * 24,
+        *,
+        tenant_id: Optional[str] = None,
     ) -> tuple[bool, Optional[dict]]:
         """Atomically acquire an idempotency slot using SETNX (sync version)."""
-        cache_key = f"idemp:{route}:{user_id}:{key}"
+        # Issue 22.2: Include tenant_id in cache key for multi-tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        cache_key = f"idemp:{tenant_prefix}{route}:{user_id}:{key}"
         acquired = self._sync_client.set(cache_key, json.dumps(record), ex=ttl_seconds, nx=True)
         if acquired:
             return (True, None)

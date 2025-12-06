@@ -792,11 +792,13 @@ No validation that adapter exists, is compatible, or user has permission.
 
 ## 17. Config Operations
 
-### 17.1 CRITICAL: Missing write_rate_limit_per_minute Config
+### 17.1 ~~CRITICAL: Missing write_rate_limit_per_minute Config~~ FIXED
 
-**Location:** `liminallm/config.py`
+**Status:** ✅ VERIFIED_FIXED
 
-Configuration parameter referenced in routes.py does not exist.
+**Location:** `liminallm/api/routes.py:361`
+
+The `write_rate_limit_per_minute` setting exists in the defaults dict at line 361 and is properly used via `_get_rate_limit(runtime, "write_rate_limit_per_minute")`.
 
 ---
 
@@ -1058,28 +1060,28 @@ If message deletion fails partway through, conversation deleted but messages rem
 
 ## 22. Cache Invalidation and Consistency (4th Pass)
 
-### 22.1 CRITICAL: User Role Changes Not Invalidating Session Cache
+### 22.1 ~~CRITICAL: User Role Changes Not Invalidating Session Cache~~ FIXED
 
-**Location:** `liminallm/service/auth.py`, `liminallm/storage/redis_cache.py`
+**Status:** ✅ VERIFIED_FIXED
 
-When user role/permissions change, existing cached sessions retain old permissions until TTL expires.
+**Location:** `liminallm/service/auth.py:594-617`
 
-**Impact:** Privilege escalation window - demoted admin retains powers for cache TTL duration.
+**Fix Applied:**
+- `set_user_role()` method calls `revoke_all_user_sessions()` after role update
+- `revoke_user_sessions()` implemented in both RedisCache and SyncRedisCache
+- Sessions tracked in user session sets (`auth:user_sessions:{user_id}`) for bulk revocation
 
-**Fix:** Invalidate all user sessions on permission change, or include version in session token.
+### 22.2 ~~CRITICAL: Missing tenant_id in Cache Keys~~ FIXED
 
-### 22.2 CRITICAL: Missing tenant_id in Cache Keys
+**Status:** ✅ IMPLEMENTED
 
-**Location:** `liminallm/storage/redis_cache.py:194`, `liminallm/service/router.py:81`
+**Location:** `liminallm/storage/redis_cache.py`, `liminallm/service/runtime.py`
 
-```python
-f"router:last:{user_id}"  # Missing tenant_id
-f"idemp:{key}"            # Missing tenant_id
-```
-
-**Impact:** Cross-tenant cache pollution in multi-tenant deployment.
-
-**Fix:** Include tenant_id in all cache key prefixes.
+**Fix Applied:**
+- Added `tenant_id` parameter to all idempotency cache methods
+- Cache keys now include tenant prefix: `f"idemp:{tenant_prefix}{route}:{user_id}:{key}"`
+- Router cache already had tenant_id support: `f"router:last:{tenant_prefix}{user_id}:{ctx_hash}"`
+- In-memory fallback also includes tenant_id in cache keys
 
 ### 22.3 CRITICAL: Password Reset Wrong Cache Key Format
 
@@ -1111,31 +1113,29 @@ Conversation cached with 5m TTL but messages cached with 1m TTL. Can serve stale
 
 ## 23. Resource Cleanup and Memory Management (4th Pass)
 
-### 23.1 CRITICAL: ThreadPoolExecutor Relies on __del__
+### 23.1 ~~CRITICAL: ThreadPoolExecutor Relies on __del__~~ FIXED
 
-**Location:** `liminallm/service/workflow.py:1869-1873`
+**Status:** ✅ IMPLEMENTED
 
-```python
-def __del__(self):
-    if self._executor:
-        self._executor.shutdown(wait=False)
-```
+**Location:** `liminallm/service/workflow.py:133-150`, `liminallm/app.py:52-55`
 
-**Issue:** `__del__` not guaranteed to run. Executor threads can leak on ungraceful shutdown.
+**Fix Applied:**
+- Added explicit `shutdown(wait: bool)` method to WorkflowEngine
+- `_executor_shutdown` flag prevents double-shutdown
+- App lifespan shutdown calls `runtime.workflow.shutdown(wait=True)`
+- `__del__` now calls `shutdown(wait=False)` as fallback
 
-**Fix:** Implement explicit cleanup method called during app shutdown.
+### 23.2 ~~CRITICAL: Unbounded _active_requests Dictionary~~ FIXED
 
-### 23.2 CRITICAL: Unbounded _active_requests Dictionary
+**Status:** ✅ VERIFIED_FIXED
 
-**Location:** `liminallm/api/routes.py:112-125`
+**Location:** `liminallm/api/routes.py:122-174`
 
-```python
-_active_requests: Dict[str, RequestState] = {}
-```
-
-**Issue:** Entries added on request start, removed on completion. Network disconnects or crashes leave orphan entries that grow unbounded.
-
-**Fix:** Add TTL-based cleanup or use WeakValueDictionary.
+**Fix Applied:**
+- Added timestamp tracking: `_active_requests: Dict[str, tuple[asyncio.Event, datetime, str]]`
+- `_ACTIVE_REQUEST_TTL_SECONDS = 30 * 60` - Max age for stale entries
+- `_cleanup_stale_active_requests()` runs periodically during register/unregister
+- Stale entries automatically removed and cancelled
 
 ### 23.3 HIGH: WebSocket Listener Not Cleaned Up
 
@@ -2242,13 +2242,15 @@ Email regex with nested quantifiers vulnerable to catastrophic backtracking.
 
 ## 39. Type Coercion Vulnerabilities (6th Pass)
 
-### 39.1 CRITICAL: JSON Deserialization Without Error Handling
+### 39.1 ~~CRITICAL: JSON Deserialization Without Error Handling~~ FIXED
 
-**Location:** `liminallm/service/model_backend.py:1023`, `liminallm/storage/memory.py:1565`
+**Status:** ✅ VERIFIED_FIXED
 
-`json.loads()` called without try-except.
+**Location:** `liminallm/service/model_backend.py:1023-1028`, `liminallm/storage/memory.py:1693-1698`
 
-**Impact:** Invalid JSON crashes adapter loading or state restoration.
+**Fix Applied:**
+- `model_backend.py`: `json.loads()` wrapped in try-except with `json.JSONDecodeError, UnicodeDecodeError` handling
+- `memory.py`: State loading has try-except for `json.JSONDecodeError` with graceful error logging
 
 ### 39.2 HIGH: datetime.fromisoformat Without Error Handling
 
@@ -2544,13 +2546,20 @@ Cache keys include `user_id` but not `tenant_id`.
 
 ## 45. Embedding/Vector Security (7th Pass)
 
-### 45.1 CRITICAL: No NaN/Infinity Validation in Embeddings
+### 45.1 ~~CRITICAL: No NaN/Infinity Validation in Embeddings~~ FIXED
 
-**Location:** `liminallm/service/embeddings.py:29-36`
+**Status:** ✅ VERIFIED_FIXED
 
-`cosine_similarity()` does not check for NaN or Infinity values before computing similarity.
+**Location:** `liminallm/service/embeddings.py:11-50, 89-129`
 
-**Impact:** Poisoned embeddings corrupt similarity scores, centroid calculations, vector search results.
+**Fix Applied:**
+- `validate_embedding()` function raises ValueError for NaN/Infinity
+- `sanitize_embedding()` function replaces NaN/Infinity with safe values
+- `cosine_similarity()` has `validate` parameter that checks for NaN/Infinity (lines 107-114)
+- Result clamped to [-1, 1] and validated (lines 122-129)
+- `ensure_embedding_dim()` sanitizes NaN/Infinity during padding
+- `normalize_vector()` sanitizes before computing magnitude
+- `validate_centroid()` validates and normalizes cluster centroids
 
 ### 45.2 HIGH: Missing Embedding Dimension Validation
 
