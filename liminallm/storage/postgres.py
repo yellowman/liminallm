@@ -786,6 +786,51 @@ class PostgresStore:
             meta=row.get("meta"),
         )
 
+    def claim_training_job(self, job_id: str) -> TrainingJob | None:
+        """Atomically claim a training job for processing (Issue 26.2).
+
+        Only claims the job if its status is 'queued'. This prevents race
+        conditions where multiple workers could claim the same job.
+
+        Args:
+            job_id: The job to claim
+
+        Returns:
+            The claimed TrainingJob with status='running' if successful, None if
+            the job doesn't exist or was already claimed by another worker.
+        """
+        now = datetime.utcnow()
+        with self._connect() as conn:
+            # Atomic conditional update - only succeeds if status is still 'queued'
+            row = conn.execute(
+                """
+                UPDATE training_job
+                SET status = 'running', updated_at = %s
+                WHERE id = %s AND status = 'queued'
+                RETURNING *
+                """,
+                (now, job_id),
+            ).fetchone()
+        if not row:
+            # Either job doesn't exist or already claimed
+            return None
+        return TrainingJob(
+            id=str(row["id"]),
+            user_id=str(row["user_id"]),
+            adapter_id=self._require_training_adapter_id(
+                row.get("adapter_id"), row.get("id")
+            ),
+            status="running",
+            num_events=row.get("num_events"),
+            created_at=row.get("created_at", now),
+            updated_at=now,
+            loss=row.get("loss"),
+            preference_event_ids=row.get("preference_event_ids") or [],
+            dataset_path=row.get("dataset_path"),
+            new_version=row.get("new_version"),
+            meta=row.get("meta"),
+        )
+
     def get_training_job(self, job_id: str) -> TrainingJob | None:
         with self._connect() as conn:
             row = conn.execute(

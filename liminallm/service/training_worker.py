@@ -143,15 +143,25 @@ class TrainingWorker:
         user_id = job.user_id
         adapter_id = job.adapter_id
 
+        # Issue 26.2: Atomically claim the job to prevent duplicate processing
+        # Use claim_training_job if available (PostgresStore), fallback to update
+        claim_fn = getattr(self.store, "claim_training_job", None)
+        if callable(claim_fn):
+            claimed_job = claim_fn(job_id)
+            if not claimed_job:
+                # Job already claimed by another worker or doesn't exist
+                logger.info("training_job_already_claimed", job_id=job_id)
+                return
+        else:
+            # Fallback for MemoryStore - use regular update (less safe)
+            self.store.update_training_job(job_id, status="running")
+
         logger.info(
             "training_job_starting",
             job_id=job_id,
             user_id=user_id,
             adapter_id=adapter_id,
         )
-
-        # Mark job as running
-        self.store.update_training_job(job_id, status="running")
 
         attempt = 0
         last_error: Optional[str] = None
