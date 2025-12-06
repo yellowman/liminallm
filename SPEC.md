@@ -1695,8 +1695,8 @@ the following are treated as constants the kernel must honor; LLM edits happen o
     - training worker: `training_worker_enabled`, `training_worker_poll_interval`
     - SMTP (all settings including secrets): `smtp_host`, `smtp_port`, `smtp_user`, `smtp_password`, `smtp_use_tls`, `email_from_address`, `email_from_name`
     - URL settings: `oauth_redirect_uri`, `app_base_url`
-    - voice settings: `voice_transcription_model`, `voice_synthesis_model`, `voice_default_voice` (enum: alloy, echo, fable, onyx, nova, shimmer)
-    - model settings: `model_path`, `model_backend` (enum: openai, azure, together, lorax, etc.), `default_adapter_mode` (enum: local, remote, prompt, hybrid), `rag_mode` (enum: pgvector, memory), `embedding_model_id`
+    - voice settings: `voice_transcription_model` (enum: whisper-1), `voice_synthesis_model` (enum: tts-1, tts-1-hd), `voice_default_voice` (enum: alloy, echo, fable, onyx, nova, shimmer)
+    - model settings: `model_path` (with common suggestions), `model_backend` (enum: openai, azure, together, lorax, etc.), `default_adapter_mode` (enum: local, remote, prompt, hybrid), `rag_mode` (enum: pgvector, memory), `embedding_model_id` (enum: text-embedding, text-embedding-3-small, text-embedding-3-large, text-embedding-ada-002)
     - tenant & JWT: `default_tenant_id`, `jwt_issuer`, `jwt_audience`
   - **environment-only settings** (infrastructure decisions or bootstrap secrets):
     - database connection: `DATABASE_URL`, `REDIS_URL`

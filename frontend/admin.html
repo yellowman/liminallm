@@ -266,11 +266,16 @@
             <h4>Voice Settings</h4>
             <div class="field">
               <label for="setting-voice-transcription">Transcription model</label>
-              <input type="text" id="setting-voice-transcription" value="whisper-1" />
+              <select id="setting-voice-transcription">
+                <option value="whisper-1" selected>whisper-1</option>
+              </select>
             </div>
             <div class="field">
               <label for="setting-voice-synthesis">Synthesis model</label>
-              <input type="text" id="setting-voice-synthesis" value="tts-1" />
+              <select id="setting-voice-synthesis">
+                <option value="tts-1" selected>tts-1</option>
+                <option value="tts-1-hd">tts-1-hd</option>
+              </select>
             </div>
             <div class="field">
               <label for="setting-voice-default">Default voice</label>
@@ -287,7 +292,22 @@
             <h4>Model Settings</h4>
             <div class="field">
               <label for="setting-model-path">Model path</label>
-              <input type="text" id="setting-model-path" value="gpt-4o-mini" placeholder="gpt-4o-mini" />
+              <input type="text" id="setting-model-path" value="gpt-4o-mini" list="model-path-options" />
+              <datalist id="model-path-options">
+                <option value="gpt-4o">
+                <option value="gpt-4o-mini">
+                <option value="gpt-4-turbo">
+                <option value="gpt-4">
+                <option value="gpt-3.5-turbo">
+                <option value="claude-3-5-sonnet-20241022">
+                <option value="claude-3-5-haiku-20241022">
+                <option value="claude-3-opus-20240229">
+                <option value="gemini-1.5-pro">
+                <option value="gemini-1.5-flash">
+                <option value="meta-llama/Llama-3.1-70B-Instruct">
+                <option value="meta-llama/Llama-3.1-8B-Instruct">
+                <option value="mistralai/Mixtral-8x7B-Instruct-v0.1">
+              </datalist>
             </div>
             <div class="field">
               <label for="setting-model-backend">Model backend</label>
@@ -325,7 +345,12 @@
             </div>
             <div class="field">
               <label for="setting-embedding-model">Embedding model ID</label>
-              <input type="text" id="setting-embedding-model" value="text-embedding" />
+              <select id="setting-embedding-model">
+                <option value="text-embedding-3-small">text-embedding-3-small</option>
+                <option value="text-embedding-3-large">text-embedding-3-large</option>
+                <option value="text-embedding-ada-002">text-embedding-ada-002</option>
+                <option value="text-embedding" selected>text-embedding (local)</option>
+              </select>
             </div>
 
             <h4>Tenant & JWT Settings</h4>

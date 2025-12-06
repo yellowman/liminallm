@@ -2590,11 +2590,11 @@ async def update_system_settings(
     - SMTP: smtp_host, smtp_port (587), smtp_user, smtp_password, smtp_use_tls (true),
       email_from_address, email_from_name ("LiminalLM")
     - URL settings: oauth_redirect_uri, app_base_url ("http://localhost:8000")
-    - Voice: voice_transcription_model ("whisper-1"), voice_synthesis_model ("tts-1"),
-      voice_default_voice ("alloy" - one of: alloy, echo, fable, onyx, nova, shimmer)
-    - Model: rag_mode ("pgvector" or "memory"), embedding_model_id ("text-embedding"),
-      model_path ("gpt-4o-mini"), model_backend (openai, azure, together, etc.),
-      default_adapter_mode ("hybrid" - one of: local, remote, prompt, hybrid)
+    - Voice: voice_transcription_model (whisper-1), voice_synthesis_model (tts-1, tts-1-hd),
+      voice_default_voice (alloy, echo, fable, onyx, nova, shimmer)
+    - Model: rag_mode (pgvector, memory), embedding_model_id (text-embedding, text-embedding-3-small,
+      text-embedding-3-large, text-embedding-ada-002), model_path ("gpt-4o-mini" with suggestions),
+      model_backend (openai, azure, together, etc.), default_adapter_mode (local, remote, prompt, hybrid)
     - Tenant: default_tenant_id ("public"), jwt_issuer ("liminallm"), jwt_audience ("liminal-clients")
     """
     runtime = get_runtime()
@@ -2726,6 +2726,8 @@ async def update_system_settings(
     }
     # Enum validation for settings with known valid values
     enum_values = {
+        "voice_transcription_model": {"whisper-1"},
+        "voice_synthesis_model": {"tts-1", "tts-1-hd"},
         "voice_default_voice": {"alloy", "echo", "fable", "onyx", "nova", "shimmer"},
         "rag_mode": {"pgvector", "memory"},
         "model_backend": {
@@ -2734,6 +2736,10 @@ async def update_system_settings(
             "sagemaker", "aws_sagemaker",
         },
         "default_adapter_mode": {"local", "remote", "prompt", "hybrid"},
+        "embedding_model_id": {
+            "text-embedding", "text-embedding-3-small", "text-embedding-3-large",
+            "text-embedding-ada-002",
+        },
     }
     for key, value in body.items():
         if key in int_keys and not isinstance(value, int):
