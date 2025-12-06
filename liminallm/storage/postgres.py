@@ -71,13 +71,26 @@ class PostgresStore:
             raise
 
         try:
+            # Issue 48.2: Add connection pool timeout configuration
+            # timeout: max seconds to wait for a connection from the pool
+            # max_waiting: max requests that can wait for a connection
+            # reconnect_timeout: seconds to wait before reconnecting failed connection
             self.pool = ConnectionPool(
                 self.dsn,
                 min_size=2,
                 max_size=10,
+                timeout=30.0,  # Don't wait more than 30s for a connection
+                max_waiting=100,  # Limit waiting queue to prevent unbounded growth
+                reconnect_timeout=5.0,  # Quick reconnection on failure
                 kwargs={"row_factory": dict_row, "autocommit": False},
             )
-            self.logger.info("postgres_pool_created", min_size=2, max_size=10)
+            self.logger.info(
+                "postgres_pool_created",
+                min_size=2,
+                max_size=10,
+                timeout=30.0,
+                max_waiting=100,
+            )
         except Exception as exc:
             self.logger.error(
                 "postgres_pool_creation_failed",
