@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -225,6 +226,9 @@ async def serve_admin() -> FileResponse:
     return FileResponse(admin)
 
 
+HEALTH_CHECK_TIMEOUT_SECONDS = 3
+
+
 @app.get("/healthz")
 async def health() -> Dict[str, Any]:
     """Health check endpoint per SPEC §18.
@@ -247,63 +251,62 @@ async def health() -> Dict[str, Any]:
         "build": __build__,
     }
 
+    async def _run_bounded(label: str, func) -> bool:
+        try:
+            await asyncio.wait_for(asyncio.to_thread(func), HEALTH_CHECK_TIMEOUT_SECONDS)
+            return True
+        except asyncio.TimeoutError:
+            logger.error(
+                "health_check_timeout", component=label, timeout=HEALTH_CHECK_TIMEOUT_SECONDS
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging path
+            logger.error(f"health_check_{label}_failed", error=str(exc))
+        return False
+
     # Database check
-    try:
-        runtime = get_runtime()
-        if hasattr(runtime.store, "verify_connection"):
-            runtime.store.verify_connection()
-            checks["database"] = {"status": "healthy"}
-        elif hasattr(runtime.store, "_connect"):
-            # Postgres store - try a simple query
+    runtime = get_runtime()
+    if hasattr(runtime.store, "verify_connection"):
+        db_ok = await _run_bounded("database", runtime.store.verify_connection)
+    elif hasattr(runtime.store, "_connect"):
+        def _db_probe() -> None:
             with runtime.store._connect() as conn:
                 conn.execute("SELECT 1").fetchone()
-            checks["database"] = {"status": "healthy"}
-        else:
-            # Memory store - always healthy if runtime exists
-            checks["database"] = {"status": "healthy", "type": "memory"}
-    except Exception as exc:
-        logger.error("health_check_database_failed", error=str(exc))
-        # SECURITY: Don't expose internal error details in response
-        checks["database"] = {"status": "unhealthy"}
-        overall_healthy = False
+
+        db_ok = await _run_bounded("database", _db_probe)
+    else:
+        db_ok = True
+        checks["database"] = {"status": "healthy", "type": "memory"}
+
+    if not checks.get("database"):
+        checks["database"] = {"status": "healthy" if db_ok else "unhealthy"}
+    overall_healthy = overall_healthy and db_ok
 
     # Redis check (if configured)
-    try:
-        runtime = get_runtime()
-        if hasattr(runtime, "cache") and runtime.cache is not None:
-            runtime.cache.verify_connection()
-            checks["redis"] = {"status": "healthy"}
-        else:
-            checks["redis"] = {"status": "not_configured"}
-    except Exception as exc:
-        logger.error("health_check_redis_failed", error=str(exc))
-        # SECURITY: Don't expose internal error details in response
-        checks["redis"] = {"status": "unhealthy", "degraded": True}
+    if hasattr(runtime, "cache") and runtime.cache is not None:
+        redis_ok = await _run_bounded("redis", runtime.cache.verify_connection)
+        checks["redis"] = {"status": "healthy" if redis_ok else "unhealthy", "degraded": not redis_ok}
+        overall_healthy = overall_healthy and redis_ok
+    else:
+        checks["redis"] = {"status": "not_configured"}
 
     # Filesystem check
-    try:
-        runtime = get_runtime()
-        fs_root = getattr(runtime.store, "fs_root", None)
-        if fs_root:
-            fs_path = Path(fs_root)
-            if fs_path.exists() and fs_path.is_dir():
-                # Try to write/read a health check file
-                health_file = fs_path / ".health_check"
-                health_file.write_text(datetime.utcnow().isoformat())
-                health_file.read_text()
-                health_file.unlink(missing_ok=True)
-                # SECURITY: Don't expose filesystem paths in response
-                checks["filesystem"] = {"status": "healthy"}
-            else:
-                checks["filesystem"] = {"status": "unhealthy"}
-                overall_healthy = False
-        else:
-            checks["filesystem"] = {"status": "not_configured"}
-    except Exception as exc:
-        logger.error("health_check_filesystem_failed", error=str(exc))
-        # SECURITY: Don't expose internal error details in response
-        checks["filesystem"] = {"status": "unhealthy"}
-        overall_healthy = False
+    fs_root = getattr(runtime.store, "fs_root", None)
+    if fs_root:
+        fs_path = Path(fs_root)
+
+        def _fs_probe() -> None:
+            if not fs_path.exists() or not fs_path.is_dir():
+                raise FileNotFoundError(fs_path)
+            health_file = fs_path / ".health_check"
+            health_file.write_text(datetime.utcnow().isoformat())
+            health_file.read_text()
+            health_file.unlink(missing_ok=True)
+
+        fs_ok = await _run_bounded("filesystem", _fs_probe)
+        checks["filesystem"] = {"status": "healthy" if fs_ok else "unhealthy"}
+        overall_healthy = overall_healthy and fs_ok
+    else:
+        checks["filesystem"] = {"status": "not_configured"}
 
     status = "healthy" if overall_healthy else "unhealthy"
     return {

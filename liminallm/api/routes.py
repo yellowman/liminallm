@@ -1835,118 +1835,123 @@ async def chat(
             plan_tier,
         )
 
-        # SPEC §18: Concurrency cap - max 3 concurrent workflows per user
-        await _acquire_workflow_slot(runtime, user_id)
+        # SPEC §18: Concurrency caps - limit decode pressure per user
+        await _acquire_inference_slot(runtime, user_id)
         try:
-            conversation: Conversation | None = None
-            context_id = body.context_id
-            validated_context_id: str | None = None
-            if body.conversation_id:
-                conversation = _get_owned_conversation(
-                    runtime, body.conversation_id, principal
-                )
-            else:
-                if context_id:
-                    _get_owned_context(runtime, context_id, principal)
-                    validated_context_id = context_id
-                # Generate title from first message for new conversations
-                auto_title = _generate_conversation_title(body.message.content)
-                conversation = runtime.store.create_conversation(
-                    user_id=user_id, active_context_id=body.context_id, title=auto_title
-                )
-            conversation_id = conversation.id
-            context_id = context_id or conversation.active_context_id
-            if context_id and context_id != validated_context_id:
-                _get_owned_context(runtime, context_id, principal)
-            user_content = body.message.content
-            voice_meta: dict = {}
-            if body.message.mode == "voice":
-                try:
-                    audio_bytes = base64.b64decode(body.message.content)
-                except Exception as exc:
-                    raise _http_error(
-                        "validation_error",
-                        "invalid base64-encoded audio payload",
-                        status_code=400,
-                    ) from exc
-                transcript = await runtime.voice.transcribe(audio_bytes, user_id=user_id) or {}
-                user_content = transcript.get("transcript") or transcript.get("text")
-                if not user_content:
-                    raise _http_error(
-                        "validation_error", "unable to transcribe audio", status_code=400
+            await _acquire_workflow_slot(runtime, user_id)
+            try:
+                conversation: Conversation | None = None
+                context_id = body.context_id
+                validated_context_id: str | None = None
+                if body.conversation_id:
+                    conversation = _get_owned_conversation(
+                        runtime, body.conversation_id, principal
                     )
-                voice_meta = {"mode": "voice", "transcript": transcript}
-            user_content_struct = normalize_content_struct(
-                body.message.content_struct, user_content
-            )
-            runtime.store.append_message(
-                conversation_id,
-                sender="user",
-                role="user",
-                content=user_content,
-                meta=voice_meta or None,
-                content_struct=user_content_struct,
-            )
-            orchestration = await runtime.workflow.run(
-                body.workflow_id,
-                conversation_id,
-                user_content,
-                context_id,
-                user_id,
-                tenant_id=principal.tenant_id,
-            )
-            orchestration_dict: dict[str, Any] = (
-                orchestration if isinstance(orchestration, dict) else {}
-            )
-            adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
-            assistant_content_struct = normalize_content_struct(
-                orchestration_dict.get("content_struct"),
-                orchestration_dict.get("content"),
-            )
-            assistant_content = orchestration_dict.get("content", "No response generated.")
-            assistant_msg = runtime.store.append_message(
-                conversation_id,
-                sender="assistant",
-                role="assistant",
-                content=assistant_content,
-                content_struct=assistant_content_struct,
-                meta={
-                    "adapters": orchestration_dict.get("adapters", []),
-                    "adapter_gates": orchestration_dict.get("adapter_gates", []),
-                    "routing_trace": orchestration_dict.get("routing_trace", []),
-                    "workflow_trace": orchestration_dict.get("workflow_trace", []),
-                    "usage": orchestration_dict.get("usage", {}),
-                },
-            )
-            resp = ChatResponse(
-                message_id=assistant_msg.id,
-                conversation_id=conversation_id,
-                content=assistant_msg.content,
-                content_struct=assistant_msg.content_struct,
-                workflow_id=body.workflow_id,
-                adapters=adapter_names,
-                adapter_gates=orchestration_dict.get("adapter_gates", []),
-                usage=orchestration_dict.get("usage", {}),
-                context_snippets=orchestration_dict.get("context_snippets", []),
-                routing_trace=orchestration_dict.get("routing_trace", []),
-                workflow_trace=orchestration_dict.get("workflow_trace", []),
-            )
-            envelope = Envelope(
-                status="ok", data=resp.model_dump(), request_id=idem.request_id
-            )
-            if runtime.cache:
-                # Issue 38.4: Add limit to prevent unbounded memory usage
-                # Use reasonable limit for conversation context caching
-                paging = _get_pagination_settings(runtime)
-                history = runtime.store.list_messages(
-                    conversation_id, limit=paging["max_page_size"], user_id=principal.user_id
+                else:
+                    if context_id:
+                        _get_owned_context(runtime, context_id, principal)
+                        validated_context_id = context_id
+                    # Generate title from first message for new conversations
+                    auto_title = _generate_conversation_title(body.message.content)
+                    conversation = runtime.store.create_conversation(
+                        user_id=user_id, active_context_id=body.context_id, title=auto_title
+                    )
+                conversation_id = conversation.id
+                context_id = context_id or conversation.active_context_id
+                if context_id and context_id != validated_context_id:
+                    _get_owned_context(runtime, context_id, principal)
+                user_content = body.message.content
+                voice_meta: dict = {}
+                if body.message.mode == "voice":
+                    try:
+                        audio_bytes = base64.b64decode(body.message.content)
+                    except Exception as exc:
+                        raise _http_error(
+                            "validation_error",
+                            "invalid base64-encoded audio payload",
+                            status_code=400,
+                        ) from exc
+                    transcript = await runtime.voice.transcribe(audio_bytes, user_id=user_id) or {}
+                    user_content = transcript.get("transcript") or transcript.get("text")
+                    if not user_content:
+                        raise _http_error(
+                            "validation_error", "unable to transcribe audio", status_code=400
+                        )
+                    voice_meta = {"mode": "voice", "transcript": transcript}
+                user_content_struct = normalize_content_struct(
+                    body.message.content_struct, user_content
                 )
-                await runtime.workflow.cache_conversation_state(conversation_id, history)
-            await idem.store_result(envelope)
-            return envelope
+                runtime.store.append_message(
+                    conversation_id,
+                    sender="user",
+                    role="user",
+                    content=user_content,
+                    meta=voice_meta or None,
+                    content_struct=user_content_struct,
+                )
+                orchestration = await runtime.workflow.run(
+                    body.workflow_id,
+                    conversation_id,
+                    user_content,
+                    context_id,
+                    user_id,
+                    tenant_id=principal.tenant_id,
+                )
+                orchestration_dict: dict[str, Any] = (
+                    orchestration if isinstance(orchestration, dict) else {}
+                )
+                adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
+                assistant_content_struct = normalize_content_struct(
+                    orchestration_dict.get("content_struct"),
+                    orchestration_dict.get("content"),
+                )
+                assistant_content = orchestration_dict.get("content", "No response generated.")
+                assistant_msg = runtime.store.append_message(
+                    conversation_id,
+                    sender="assistant",
+                    role="assistant",
+                    content=assistant_content,
+                    content_struct=assistant_content_struct,
+                    meta={
+                        "adapters": orchestration_dict.get("adapters", []),
+                        "adapter_gates": orchestration_dict.get("adapter_gates", []),
+                        "routing_trace": orchestration_dict.get("routing_trace", []),
+                        "workflow_trace": orchestration_dict.get("workflow_trace", []),
+                        "usage": orchestration_dict.get("usage", {}),
+                    },
+                )
+                resp = ChatResponse(
+                    message_id=assistant_msg.id,
+                    conversation_id=conversation_id,
+                    content=assistant_msg.content,
+                    content_struct=assistant_msg.content_struct,
+                    workflow_id=body.workflow_id,
+                    adapters=adapter_names,
+                    adapter_gates=orchestration_dict.get("adapter_gates", []),
+                    usage=orchestration_dict.get("usage", {}),
+                    context_snippets=orchestration_dict.get("context_snippets", []),
+                    routing_trace=orchestration_dict.get("routing_trace", []),
+                    workflow_trace=orchestration_dict.get("workflow_trace", []),
+                )
+                envelope = Envelope(
+                    status="ok", data=resp.model_dump(), request_id=idem.request_id
+                )
+                if runtime.cache:
+                    # Issue 38.4: Add limit to prevent unbounded memory usage
+                    # Use reasonable limit for conversation context caching
+                    paging = _get_pagination_settings(runtime)
+                    history = runtime.store.list_messages(
+                        conversation_id, limit=paging["max_page_size"], user_id=principal.user_id
+                    )
+                    await runtime.workflow.cache_conversation_state(conversation_id, history)
+                await idem.store_result(envelope)
+                return envelope
+            finally:
+                # Always release workflow slot, even on error
+                await _release_workflow_slot(runtime, user_id)
         finally:
-            # Always release workflow slot, even on error
-            await _release_workflow_slot(runtime, user_id)
+            # SPEC §18: Ensure inference slots are returned promptly
+            await _release_inference_slot(runtime, user_id)
     # Exceptions bubble through the guard which records failed states
 
 

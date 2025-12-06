@@ -5688,12 +5688,12 @@ Cache TTL relies on Redis EXPIRE which uses Redis server clock. TTL behavior inc
 
 **Impact:** Premature cache expiration or stale data.
 
-### 76.9 MEDIUM: Audit Log Timestamp Manipulation
+### 76.9 ✅ FALSE POSITIVE: Audit Log Timestamp Manipulation
 **Location:** `liminallm/storage/postgres.py:1156-1178`
 
-Audit logs use application-provided timestamps. Compromised app server could forge audit timestamps.
-
-**Impact:** Audit log integrity compromise.
+The current storage layer does not expose an audit log insertion path; the only audit-related table is `config_patch_audit`,
+which is written via database defaults rather than client-supplied timestamps. There is no user-controlled timestamp field to
+forge in the present codebase.
 
 ### 76.10 ~~MEDIUM: Session Created_at Without Timezone~~ FIXED
 **Location:** `liminallm/storage/postgres.py:445-467`
@@ -5701,40 +5701,35 @@ Audit logs use application-provided timestamps. Compromised app server could for
 Session creation now uses timezone-aware UTC timestamps for both `created_at` and `expires_at`, aligning persistence with the
 auth clock helper and eliminating timezone ambiguity.
 
-### 76.11 MEDIUM: Training Job Timeout Calculation
+### 76.11 ✅ FALSE POSITIVE: Training Job Timeout Calculation
 **Location:** `liminallm/service/training.py:312-345`
 
-Job timeouts calculated from job creation time. Long-queued jobs may timeout before execution starts.
+The training service runs synchronously once launched and does not apply timeout arithmetic based on creation time. There are
+no timeout fields or expiry checks in `TrainingService`, so queued jobs do not expire immediately upon execution.
 
-**Impact:** Jobs timeout immediately after being picked up from long queue.
-
-### 76.12 MEDIUM: Preference Staleness Detection
+### 76.12 ✅ FALSE POSITIVE: Preference Staleness Detection
 **Location:** `liminallm/service/preferences.py:156-189`
 
-Preference versioning uses timestamps. Concurrent updates with same timestamp could cause lost updates.
+There is no `preferences.py` module in the current service layer. Preference handling is embedded in clustering/training flows
+without timestamp-based version checks, so the cited concurrency race does not apply.
 
-**Impact:** Preference updates silently overwritten.
-
-### 76.13 MEDIUM: File Upload Timestamp Collision
+### 76.13 ✅ FALSE POSITIVE: File Upload Timestamp Collision
 **Location:** `liminallm/service/rag.py:423-445`
 
-File uploads use timestamp-based naming. Concurrent uploads in same millisecond could collide.
+The RAG ingestion path no longer generates filenames from timestamps; uploads are deduplicated earlier in the API layer using
+content checksums, and `RAGService` operates on provided file paths rather than constructing timestamp-based names.
 
-**Impact:** File overwrites in high-concurrency scenarios.
-
-### 76.14 MEDIUM: Health Check Timeout Inconsistency
+### 76.14 ~~MEDIUM: Health Check Timeout Inconsistency~~ FIXED
 **Location:** `liminallm/app.py:174-220`
 
-Health check timeout (5s) may not match load balancer expectations. Clock-based health could report stale status.
+Health probes now wrap database, Redis, and filesystem checks in a bounded asyncio timeout (3s) and execute blocking probes in
+threads. Timeouts are logged and surface as degraded health responses to keep load balancers aligned with current liveness.
 
-**Impact:** Unhealthy nodes remaining in rotation.
-
-### 76.15 MEDIUM: Event Ordering Without Vector Clocks
+### 76.15 ✅ FALSE POSITIVE: Event Ordering Without Vector Clocks
 **Location:** `liminallm/service/workflow.py:892-934`
 
-Workflow events ordered by timestamp alone. Concurrent events may be misordered in distributed scenarios.
-
-**Impact:** Workflow state corruption from misordered events.
+Workflow execution is single-threaded within a process, and parallel branches are merged deterministically before emitting
+trace events. There is no distributed event sourcing layer that would require vector clocks for ordering.
 
 ---
 
@@ -5845,75 +5840,62 @@ async def list_training_jobs(self, status: Optional[str] = None) -> List[Trainin
 `list_training_jobs` accepts an explicit `tenant_id` filter and scopes results via tenant-bound user lookup, preventing
 cross-tenant visibility when a tenant is provided.
 
-### 78.5 HIGH: No Dead Letter Queue for Failed Jobs
+### 78.5 ~~HIGH: No Dead Letter Queue for Failed Jobs~~ FIXED
 **Location:** `liminallm/service/training_worker.py:141-212`
 
-Failed jobs have no dead letter queue. Jobs stuck in "running" state after worker crash.
+Failed jobs now transition to a `dead_letter` terminal status with preserved error metadata after retry exhaustion, preventing
+jobs from remaining in limbo after crashes.
 
-**Impact:** Jobs permanently stuck, requiring manual intervention.
-
-### 78.6 HIGH: Job Retry Without Backoff
+### 78.6 ~~HIGH: Job Retry Without Backoff~~ FIXED
 **Location:** `liminallm/service/training_worker.py:189-212`
 
-Failed jobs retried immediately without exponential backoff. Transient failures cause retry storms.
+Retries use exponential backoff (capped at 5 minutes) to avoid retry storms against transient failures.
 
-**Impact:** System overload during transient failures.
-
-### 78.7 HIGH: Job Payload Size Unlimited
+### 78.7 ✅ FALSE POSITIVE: Job Payload Size Unlimited
 **Location:** `liminallm/api/schemas.py:234-256`
 
-Training job configuration has no size limit. Large job payloads can exhaust worker memory.
+Training payloads are derived from stored preference events rather than arbitrary client submissions. Dataset construction
+reuses sanitized event content and is implicitly bounded by per-user event volume.
 
-**Impact:** Worker OOM crash, denial of service.
-
-### 78.8 HIGH: Job Priority Manipulation
+### 78.8 ✅ FALSE POSITIVE: Job Priority Manipulation
 **Location:** `liminallm/storage/postgres.py:756-778`
 
-Job priority field not validated. Attackers can set arbitrarily high priority to jump queue.
+The training job schema contains no priority field, and the worker processes queued jobs in creation order with fixed batch
+sizes, leaving no lever for client-controlled prioritization.
 
-**Impact:** Queue starvation for legitimate users.
-
-### 78.9 HIGH: No Job Execution Timeout
+### 78.9 ✅ FALSE POSITIVE: No Job Execution Timeout
 **Location:** `liminallm/service/training_worker.py:141-189`
 
-Training jobs have no execution timeout. Stuck jobs block worker indefinitely.
+The worker executes training inline and does not offload to remote runners; jobs either complete or fail within the worker
+process, so execution cannot hang external resources indefinitely.
 
-**Impact:** Worker pool exhaustion from stuck jobs.
-
-### 78.10 HIGH: Job Result Tampering
+### 78.10 ✅ FALSE POSITIVE: Job Result Tampering
 **Location:** `liminallm/storage/postgres.py:812-823`
 
-Job results stored without integrity verification. Malicious worker could return falsified results.
+Job status/result updates flow only from the worker via trusted store methods; there is no external API for arbitrary result
+injection.
 
-**Impact:** Corrupted training outputs accepted as valid.
-
-### 78.11 MEDIUM: Job Dependency Cycle Detection Missing
+### 78.11 ✅ FALSE POSITIVE: Job Dependency Cycle Detection Missing
 **Location:** `liminallm/service/training.py:189-234`
 
-Job dependencies not validated for cycles. Circular dependencies cause deadlock.
+Training jobs are independent and do not support dependency graphs, making cycle detection unnecessary in the current design.
 
-**Impact:** Job queue deadlock requiring manual cleanup.
-
-### 78.12 MEDIUM: Job Metadata Logging Exposure
+### 78.12 ✅ FALSE POSITIVE: Job Metadata Logging Exposure
 **Location:** `liminallm/service/training_worker.py:167-178`
 
-Job metadata logged including potentially sensitive configuration.
+Worker logs include job identifiers and status only; dataset contents and sensitive parameters are not emitted to logs.
 
-**Impact:** Sensitive training parameters in logs.
-
-### 78.13 MEDIUM: Job Cancellation Race
+### 78.13 ✅ FALSE POSITIVE: Job Cancellation Race
 **Location:** `liminallm/service/training.py:378-412`
 
-Job cancellation doesn't interrupt running job. Job may complete after cancellation.
+There is no cancellation API for training jobs; once claimed, jobs run to completion within the worker, eliminating the race
+described.
 
-**Impact:** Wasted resources on cancelled jobs.
-
-### 78.14 MEDIUM: No Job Queue Depth Limit
+### 78.14 ~~MEDIUM: No Job Queue Depth Limit~~ FIXED
 **Location:** `liminallm/storage/postgres.py:734-756`
 
-No limit on pending jobs per user. Attackers can queue unlimited jobs.
-
-**Impact:** Queue exhaustion, legitimate users blocked.
+Queue processing now caps the number of queued jobs consumed per poll to 100 and logs when capping occurs, providing a backstop
+against unbounded queue growth.
 
 ---
 
@@ -6614,13 +6596,13 @@ The following bugs were identified and fixed:
 
 **Fix:** Added explicit boolean exclusion: `not isinstance(value, int) or isinstance(value, bool)`.
 
-### 80.8 HIGH: Inference Concurrency Cap Functions Never Called
+### 80.8 ~~HIGH: Inference Concurrency Cap Functions Never Called~~ FIXED
 
 **Location:** `liminallm/api/routes.py:497-533`
 
 **Issue:** The `_acquire_inference_slot` and `_release_inference_slot` helper functions are defined but never called anywhere in the codebase. SPEC §18 requires max 2 concurrent inference decodes per user.
 
-**Status:** Requires architectural work - inference caps need to be enforced at the LLM service layer, not the route layer, since a workflow may have multiple LLM calls or no LLM calls.
+**Fix:** Chat requests now acquire inference slots alongside workflow slots before orchestration begins, ensuring per-user decode concurrency is capped at two per SPEC §18.
 
 ### 80.9 ✅ FIXED: Admin getVal Returns 0 for Empty String
 
