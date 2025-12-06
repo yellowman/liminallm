@@ -58,20 +58,50 @@ class PostgresStore:
     def __init__(self, dsn: str, fs_root: str) -> None:
         self.dsn = dsn
         self.fs_root = Path(fs_root)
-        self.fs_root.mkdir(parents=True, exist_ok=True)
         self.logger = get_logger(__name__)
-        self.pool = ConnectionPool(
-            self.dsn,
-            min_size=2,
-            max_size=10,
-            kwargs={"row_factory": dict_row, "autocommit": False},
-        )
+
+        try:
+            self.fs_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.logger.error(
+                "postgres_store_fs_root_error",
+                fs_root=fs_root,
+                error=str(exc),
+            )
+            raise
+
+        try:
+            self.pool = ConnectionPool(
+                self.dsn,
+                min_size=2,
+                max_size=10,
+                kwargs={"row_factory": dict_row, "autocommit": False},
+            )
+            self.logger.info("postgres_pool_created", min_size=2, max_size=10)
+        except Exception as exc:
+            self.logger.error(
+                "postgres_pool_creation_failed",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
+
         self.sessions: dict[str, Session] = {}
         self._session_lock = threading.Lock()
-        self._ensure_runtime_config_table()
-        self._verify_required_schema()
-        self._load_training_state()
-        self._ensure_default_artifacts()
+
+        try:
+            self._ensure_runtime_config_table()
+            self._verify_required_schema()
+            self._load_training_state()
+            self._ensure_default_artifacts()
+            self.logger.info("postgres_store_initialized")
+        except Exception as exc:
+            self.logger.error(
+                "postgres_store_init_failed",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
 
     def _cache_session(self, session: Session) -> Session:
         """Store session in the in-memory cache and return it.

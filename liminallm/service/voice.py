@@ -119,15 +119,45 @@ class VoiceService:
             }
 
         except httpx.HTTPStatusError as e:
+            # Extract error details from response if available
+            error_body = None
+            try:
+                error_body = e.response.json()
+            except Exception:
+                pass
             logger.error(
                 "voice_transcribe_api_error",
                 user_id=user_id,
                 status_code=e.response.status_code,
                 error=str(e),
+                error_body=error_body,
+                model=self.transcription_model,
             )
             raise ValueError(f"Transcription failed: {e.response.status_code}") from e
+        except httpx.TimeoutException as e:
+            logger.error(
+                "voice_transcribe_timeout",
+                user_id=user_id,
+                audio_size=len(audio_bytes),
+                model=self.transcription_model,
+                error=str(e),
+            )
+            raise ValueError("Transcription timed out") from e
+        except httpx.ConnectError as e:
+            logger.error(
+                "voice_transcribe_connect_error",
+                user_id=user_id,
+                api_base=self.OPENAI_API_BASE,
+                error=str(e),
+            )
+            raise ValueError("Failed to connect to transcription service") from e
         except Exception as e:
-            logger.error("voice_transcribe_error", user_id=user_id, error=str(e))
+            logger.error(
+                "voice_transcribe_error",
+                user_id=user_id,
+                error_type=type(e).__name__,
+                error=str(e),
+            )
             raise ValueError(f"Transcription failed: {str(e)}") from e
 
     async def synthesize(
@@ -200,15 +230,54 @@ class VoiceService:
             }
 
         except httpx.HTTPStatusError as e:
+            error_body = None
+            try:
+                error_body = e.response.json()
+            except Exception:
+                pass
             logger.error(
                 "voice_synthesize_api_error",
                 user_id=user_id,
                 status_code=e.response.status_code,
                 error=str(e),
+                error_body=error_body,
+                model=self.synthesis_model,
+                voice=voice,
             )
             raise ValueError(f"Synthesis failed: {e.response.status_code}") from e
+        except httpx.TimeoutException as e:
+            logger.error(
+                "voice_synthesize_timeout",
+                user_id=user_id,
+                text_length=len(text),
+                model=self.synthesis_model,
+                voice=voice,
+                error=str(e),
+            )
+            raise ValueError("Synthesis timed out") from e
+        except httpx.ConnectError as e:
+            logger.error(
+                "voice_synthesize_connect_error",
+                user_id=user_id,
+                api_base=self.OPENAI_API_BASE,
+                error=str(e),
+            )
+            raise ValueError("Failed to connect to synthesis service") from e
+        except OSError as e:
+            logger.error(
+                "voice_synthesize_file_error",
+                user_id=user_id,
+                fs_root=str(self.fs_root),
+                error=str(e),
+            )
+            raise ValueError(f"Failed to store audio file: {str(e)}") from e
         except Exception as e:
-            logger.error("voice_synthesize_error", user_id=user_id, error=str(e))
+            logger.error(
+                "voice_synthesize_error",
+                user_id=user_id,
+                error_type=type(e).__name__,
+                error=str(e),
+            )
             raise ValueError(f"Synthesis failed: {str(e)}") from e
 
     def _placeholder_transcribe(

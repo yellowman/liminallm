@@ -46,25 +46,56 @@ def register_exception_handlers(app: FastAPI) -> None:
     """Install consistent exception handlers for domain and storage errors per SPEC §18."""
 
     @app.exception_handler(ConstraintViolation)
-    async def handle_constraint_violation(request, exc: ConstraintViolation):  # type: ignore[unused-argument]
+    async def handle_constraint_violation(request: Request, exc: ConstraintViolation):
+        logger.warning(
+            "constraint_violation",
+            path=request.url.path,
+            method=request.method,
+            message=exc.message,
+            detail=exc.detail,
+        )
         return _error_response(409, exc.message, exc.detail, code="conflict")
 
     @app.exception_handler(ServiceError)
-    async def handle_service_error(request, exc: ServiceError):  # type: ignore[unused-argument]
+    async def handle_service_error(request: Request, exc: ServiceError):
         # Use the error_code from the exception for SPEC §18 compliance
         error_code = getattr(exc, "error_code", None)
+        log_fn = logger.error if exc.status_code >= 500 else logger.warning
+        log_fn(
+            "service_error",
+            path=request.url.path,
+            method=request.method,
+            status_code=exc.status_code,
+            error_code=error_code,
+            message=exc.message,
+            detail=exc.detail,
+        )
         return _error_response(exc.status_code, exc.message, exc.detail, code=error_code)
 
     @app.exception_handler(ArtifactValidationError)
-    async def handle_validation_error(request, exc: ArtifactValidationError):  # type: ignore[unused-argument]
+    async def handle_validation_error(request: Request, exc: ArtifactValidationError):
+        logger.warning(
+            "artifact_validation_error",
+            path=request.url.path,
+            method=request.method,
+            error=str(exc),
+            validation_errors=exc.errors,
+        )
         return _error_response(400, str(exc), exc.errors, code="validation_error")
 
     @app.exception_handler(PathTraversalError)
-    async def handle_path_traversal_error(request, exc: PathTraversalError):  # type: ignore[unused-argument]
+    async def handle_path_traversal_error(request: Request, exc: PathTraversalError):
+        logger.warning(
+            "path_traversal_attempt",
+            path=request.url.path,
+            method=request.method,
+            error=str(exc),
+            client_ip=request.client.host if request.client else None,
+        )
         return _error_response(400, str(exc), code="validation_error")
 
     @app.exception_handler(HTTPException)
-    async def handle_http_exception(request: Request, exc: HTTPException):  # type: ignore[unused-argument]
+    async def handle_http_exception(request: Request, exc: HTTPException):
         # Handle SPEC §18 compliant error envelope from _http_error()
         if isinstance(exc.detail, dict) and "error" in exc.detail:
             error_obj = exc.detail["error"]
@@ -72,6 +103,25 @@ def register_exception_handlers(app: FastAPI) -> None:
                 message = error_obj.get("message", "http error")
                 code = error_obj.get("code")
                 details = error_obj.get("details")
+                # Log 4xx as warning, 5xx as error
+                if exc.status_code >= 500:
+                    logger.error(
+                        "http_error",
+                        path=request.url.path,
+                        method=request.method,
+                        status_code=exc.status_code,
+                        error_code=code,
+                        message=message,
+                    )
+                elif exc.status_code >= 400:
+                    logger.warning(
+                        "http_client_error",
+                        path=request.url.path,
+                        method=request.method,
+                        status_code=exc.status_code,
+                        error_code=code,
+                        message=message,
+                    )
                 return _error_response(exc.status_code, message, details, code=code)
         # Fallback for plain HTTPException or non-conforming detail
         detail = exc.detail if isinstance(exc.detail, dict) else {"detail": exc.detail}
@@ -81,9 +131,24 @@ def register_exception_handlers(app: FastAPI) -> None:
             else str(exc.detail)
         )
         details = detail if isinstance(detail, dict) else None
+        if exc.status_code >= 500:
+            logger.error(
+                "http_error_fallback",
+                path=request.url.path,
+                method=request.method,
+                status_code=exc.status_code,
+                message=message,
+            )
         return _error_response(exc.status_code, message, details)
 
     @app.exception_handler(Exception)
-    async def handle_uncaught(request: Request, exc: Exception):  # type: ignore[unused-argument]
-        logger.exception("unhandled_exception", exc_info=exc)
+    async def handle_uncaught(request: Request, exc: Exception):
+        logger.exception(
+            "unhandled_exception",
+            exc_info=exc,
+            path=request.url.path,
+            method=request.method,
+            error_type=type(exc).__name__,
+            error=str(exc),
+        )
         return _error_response(500, "internal server error", code="server_error")

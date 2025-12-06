@@ -30,13 +30,33 @@ class Runtime:
 
     def __init__(self):
         self.settings = get_settings()
-        self.store = (
-            MemoryStore(fs_root=self.settings.shared_fs_root)
-            if self.settings.use_memory_store
-            else PostgresStore(
-                self.settings.database_url, fs_root=self.settings.shared_fs_root
-            )
+        logger.info(
+            "runtime_init_started",
+            use_memory_store=self.settings.use_memory_store,
+            test_mode=self.settings.test_mode,
         )
+
+        try:
+            self.store = (
+                MemoryStore(fs_root=self.settings.shared_fs_root)
+                if self.settings.use_memory_store
+                else PostgresStore(
+                    self.settings.database_url, fs_root=self.settings.shared_fs_root
+                )
+            )
+            logger.info(
+                "runtime_store_initialized",
+                store_type="memory" if self.settings.use_memory_store else "postgres",
+            )
+        except Exception as exc:
+            logger.error(
+                "runtime_store_init_failed",
+                store_type="memory" if self.settings.use_memory_store else "postgres",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
+
         self.cache = None
         redis_error: Exception | None = None
         if self.settings.redis_url:
@@ -198,6 +218,19 @@ class Runtime:
         self._local_idempotency_lock = asyncio.Lock()
         self._local_rate_limits: Dict[str, Tuple[datetime, int]] = {}
         self._local_rate_limit_lock = asyncio.Lock()
+
+        # Log successful initialization with summary
+        logger.info(
+            "runtime_initialized",
+            model_path=resolved_base_model,
+            model_backend=str(backend_mode),
+            rag_mode=str(rag_mode),
+            adapter_mode=str(default_adapter_mode),
+            redis_enabled=self.cache is not None,
+            email_configured=self.email.is_configured,
+            voice_configured=self.voice.is_configured,
+            mfa_enabled=mfa_enabled,
+        )
 
 
 runtime: Runtime | None = None

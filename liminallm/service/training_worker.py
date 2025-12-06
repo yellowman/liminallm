@@ -84,11 +84,29 @@ class TrainingWorker:
 
     async def _run_loop(self) -> None:
         """Main worker loop."""
+        consecutive_errors = 0
         while self._running:
             try:
                 await self._process_queued_jobs()
+                consecutive_errors = 0
             except Exception as exc:
-                logger.error("training_worker_loop_error", error=str(exc))
+                consecutive_errors += 1
+                logger.error(
+                    "training_worker_loop_error",
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    consecutive_errors=consecutive_errors,
+                )
+                # Exponential backoff on repeated errors
+                if consecutive_errors > 3:
+                    backoff = min(300, self.poll_interval * (2 ** (consecutive_errors - 3)))
+                    logger.warning(
+                        "training_worker_backoff",
+                        backoff_seconds=backoff,
+                        consecutive_errors=consecutive_errors,
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
 
             await asyncio.sleep(self.poll_interval)
 
@@ -187,11 +205,21 @@ class TrainingWorker:
                 logger.warning(
                     "training_job_attempt_failed",
                     job_id=job_id,
+                    user_id=user_id,
+                    adapter_id=adapter_id,
                     attempt=attempt,
+                    max_retries=self.max_retries,
+                    error_type=type(exc).__name__,
                     error=last_error,
                 )
 
                 if attempt < self.max_retries:
+                    logger.debug(
+                        "training_job_retry_wait",
+                        job_id=job_id,
+                        retry_delay=self.retry_delay,
+                        next_attempt=attempt + 1,
+                    )
                     await asyncio.sleep(self.retry_delay)
 
         # All retries exhausted
