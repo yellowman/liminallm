@@ -483,19 +483,30 @@ The PATCH endpoint accepts a flat object instead of RFC 6902 JSON Patch operatio
 
 **Current:** No content type tracking or sanitization.
 
-### 6.8 HIGH: No Privileged Tool Access Controls
+### 6.8 ~~HIGH: No Privileged Tool Access Controls~~ FIXED
+
+**Status:** ✅ IMPLEMENTED
 
 **SPEC §18 requires:** "privileged tools require admin-owned artifacts"
 
-**Current:** No privilege levels. Any authenticated user can invoke any tool.
+**Fix Applied:**
+- Added `PrivilegedToolError` exception class
+- Added `check_privileged_access()` function in sandbox.py
+- Privileged tools require admin role to invoke
+- `PRIVILEGED_SANDBOX_CONFIG` provides higher resource limits for admin tools
 
-### 6.9 MEDIUM: Per-Node Timeout Hardcap Not Enforced
+### 6.9 ~~MEDIUM: Per-Node Timeout Hardcap Not Enforced~~ FIXED
 
-**Location:** `liminallm/service/workflow.py:1522-1525`
+**Status:** ✅ IMPLEMENTED
+
+**Location:** `liminallm/service/workflow.py`
 
 **SPEC §18 requires:** "per-node timeout default 15s, hard cap 60s"
 
-**Current:** No hardcap validation. Tool specs can set arbitrary timeout_seconds.
+**Fix Applied:**
+- Added `MAX_NODE_TIMEOUT_SECONDS = 60` constant
+- Tool timeout is clamped: `min(raw_timeout, MAX_NODE_TIMEOUT_SECONDS)`
+- Default timeout changed to 15s to match SPEC
 
 ---
 

@@ -37,6 +37,7 @@ from liminallm.storage.redis_cache import RedisCache
 
 # SPEC §9/§18: Default retry and timeout settings
 DEFAULT_NODE_TIMEOUT_MS = 15000  # 15 seconds per node
+MAX_NODE_TIMEOUT_SECONDS = 60  # SPEC §18: per-node timeout hard cap 60s
 DEFAULT_NODE_MAX_RETRIES = 2  # Up to 2 retries (3 total attempts), hard cap at 3
 DEFAULT_BACKOFF_MS = (
     1000  # Initial backoff 1s, quadruples each retry (1s, 4s per SPEC §18)
@@ -1589,7 +1590,9 @@ class WorkflowEngine:
     ) -> Dict[str, Any]:
         tool_name = tool or "llm.generic"
         tool_spec = self.tool_registry.get(tool_name)
-        timeout = tool_spec.get("timeout_seconds", 5) if tool_spec else 5
+        # Issue 6.9: Apply hardcap per SPEC §18 (default 15s, hard cap 60s)
+        raw_timeout = tool_spec.get("timeout_seconds", 15) if tool_spec else 15
+        timeout = min(raw_timeout, MAX_NODE_TIMEOUT_SECONDS)
         handler = self._builtin_tool_handlers().get(tool_name)
         if tool_spec and not handler:
             handler = self._builtin_tool_handlers().get(tool_spec.get("handler"))
