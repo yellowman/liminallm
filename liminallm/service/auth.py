@@ -823,6 +823,9 @@ class AuthService:
         """Rotate session if 24h of activity has passed (SPEC §12.1).
 
         Returns the new session if rotated, None otherwise.
+
+        Bug fix: Uses Redis SETNX lock to prevent race condition where concurrent
+        requests with the same session could both trigger rotation.
         """
         if not self.cache:
             return None
@@ -839,44 +842,68 @@ class AuthService:
         if datetime.utcnow() - last_activity < rotation_threshold:
             return None
 
-        # Time to rotate - create new session
-        self.logger.info(
-            "session_rotation",
-            old_session=sess.id,
-            user_id=sess.user_id,
-            last_activity=last_activity.isoformat(),
-        )
+        # Bug fix: Acquire rotation lock to prevent duplicate rotations
+        lock_key = f"session:rotation_lock:{sess.id}"
+        acquired = await self.cache.client.set(lock_key, "1", nx=True, ex=30)
+        if not acquired:
+            # Another request is already rotating this session
+            return None
 
-        new_session = self.store.create_session(
-            sess.user_id,
-            mfa_required=sess.mfa_required,
-            tenant_id=sess.tenant_id,
-            user_agent=sess.user_agent,
-            ip_addr=str(sess.ip_addr) if sess.ip_addr else None,
-            meta=sess.meta,
-        )
+        try:
+            # Double-check the session hasn't been rotated while waiting
+            rotated_to = await self.cache.get_rotated_session(sess.id)
+            if rotated_to:
+                # Session was already rotated by another request
+                return None
 
-        # Mark new session as MFA verified if old one was
-        if sess.mfa_verified:
-            self._mark_session_verified(new_session.id)
-            new_session.mfa_verified = True
+            # Time to rotate - create new session
+            self.logger.info(
+                "session_rotation",
+                old_session=sess.id,
+                user_id=sess.user_id,
+                last_activity=last_activity.isoformat(),
+            )
 
-        # Set up grace period mapping
-        grace_seconds = sys_settings.get("session_rotation_grace_seconds", 300)
-        await self.cache.set_session_rotation_grace(
-            sess.id,
-            new_session.id,
-            grace_seconds,
-        )
+            # Bug fix: Don't copy refresh_jti/refresh_exp from old session meta
+            # to prevent the new session from referencing the wrong refresh token
+            new_meta = None
+            if sess.meta:
+                new_meta = {k: v for k, v in sess.meta.items()
+                           if k not in ("refresh_jti", "refresh_exp")}
 
-        # Revoke old session
-        self.store.revoke_session(sess.id)
-        await self.cache.revoke_session(sess.id)
+            new_session = self.store.create_session(
+                sess.user_id,
+                mfa_required=sess.mfa_required,
+                tenant_id=sess.tenant_id,
+                user_agent=sess.user_agent,
+                ip_addr=str(sess.ip_addr) if sess.ip_addr else None,
+                meta=new_meta,
+            )
 
-        # Initialize activity for new session
-        await self.cache.update_session_activity(new_session.id)
+            # Mark new session as MFA verified if old one was
+            if sess.mfa_verified:
+                self._mark_session_verified(new_session.id)
+                new_session.mfa_verified = True
 
-        return new_session
+            # Set up grace period mapping
+            grace_seconds = sys_settings.get("session_rotation_grace_seconds", 300)
+            await self.cache.set_session_rotation_grace(
+                sess.id,
+                new_session.id,
+                grace_seconds,
+            )
+
+            # Revoke old session
+            self.store.revoke_session(sess.id)
+            await self.cache.revoke_session(sess.id)
+
+            # Initialize activity for new session
+            await self.cache.update_session_activity(new_session.id)
+
+            return new_session
+        finally:
+            # Release the lock
+            await self.cache.client.delete(lock_key)
 
     async def authenticate(
         self,

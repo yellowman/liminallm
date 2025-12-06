@@ -6515,3 +6515,97 @@ Issues were marked as FALSE POSITIVE only when:
 - Test/development code not applicable to production
 - Standard industry practices (Docker isolation, env vars, etc.)
 
+---
+
+## 80. Bug Fixes Applied (December 2024)
+
+The following bugs were identified and fixed:
+
+### 80.1 ✅ FIXED: Double HTML Escaping in Citation Display
+
+**Location:** `frontend/chat.js:1213-1225`
+
+**Issue:** The `path` variable was HTML-escaped at line 1214, then `label` was derived from `path` at line 1216. When `escapeHtml(label)` was called at line 1225, it double-escaped the already-escaped content. For example, a file named "A&B.txt" would display as "A&amp;amp;B.txt".
+
+**Fix:** Removed the first `escapeHtml` call on line 1214 and kept only the output escaping at line 1225-1226.
+
+### 80.2 ✅ FIXED: Duplicate Authorization Header in Voice Transcription
+
+**Location:** `frontend/chat.js:2225-2229`
+
+**Issue:** The voice transcription fetch request set the `Authorization` header explicitly on line 2227 and then spread `...authHeaders()` on line 2228, which also includes an `Authorization` header. This created redundant code.
+
+**Fix:** Removed the explicit `Authorization` header line, using only `authHeaders()` for consistency.
+
+### 80.3 ✅ FIXED: Login Route Missing user_agent and ip_addr Parameters
+
+**Location:** `liminallm/api/routes.py:846-874`, `liminallm/service/auth.py:611-619`
+
+**Issue:** The `login` method signature accepted `user_agent` and `ip_addr` parameters for session metadata, but the login API route didn't extract these from the request and pass them. Sessions created during login had `None` for these fields.
+
+**Fix:** Added `request: Request` parameter to login route and extracted user_agent from headers and ip_addr from request.client.
+
+### 80.4 ✅ FIXED: Shell Command Sorting Bug in migrate.sh
+
+**Location:** `scripts/migrate.sh:19-21, 34-36`
+
+**Issue:** `IFS=$'\n' sorted_files=($(sort <<<"${sql_files[*]}"))` had a bug where `${sql_files[*]}` expanded with space as the separator, causing `sort` to receive all filenames as a single line. Migration would fail when multiple SQL files existed.
+
+**Fix:** Changed to `mapfile -t sorted_files < <(printf '%s\n' "${sql_files[@]}" | sort)` which properly puts each file on its own line.
+
+### 80.5 ✅ FIXED: Session Rotation Race Condition
+
+**Location:** `liminallm/service/auth.py:820-906`
+
+**Issue:** The `_maybe_rotate_session` method lacked atomic locking, allowing concurrent requests with the same session to both trigger rotation. This could result in multiple new sessions being created.
+
+**Fix:** Added Redis SETNX lock with 30-second TTL around the rotation check-and-execute logic to prevent duplicate rotations.
+
+### 80.6 ✅ FIXED: Session Rotation Inherits Old Refresh Token
+
+**Location:** `liminallm/service/auth.py:867-872`
+
+**Issue:** When creating a rotated session, `meta=sess.meta` copied the old session's metadata including `refresh_jti` and `refresh_exp`. This meant the new session inherited a reference to the OLD refresh token.
+
+**Fix:** Added filtering to exclude `refresh_jti` and `refresh_exp` from the new session's meta.
+
+### 80.7 ✅ FIXED: Boolean Passes isinstance(value, int) Check
+
+**Location:** `liminallm/api/routes.py:2961-2974`
+
+**Issue:** The type validation for integer settings used `isinstance(value, int)`, but in Python, `bool` is a subclass of `int`, so `isinstance(True, int)` returns `True`. Boolean values would incorrectly pass validation for integer settings.
+
+**Fix:** Added explicit boolean exclusion: `not isinstance(value, int) or isinstance(value, bool)`.
+
+### 80.8 HIGH: Inference Concurrency Cap Functions Never Called
+
+**Location:** `liminallm/api/routes.py:497-533`
+
+**Issue:** The `_acquire_inference_slot` and `_release_inference_slot` helper functions are defined but never called anywhere in the codebase. SPEC §18 requires max 2 concurrent inference decodes per user.
+
+**Status:** Requires architectural work - inference caps need to be enforced at the LLM service layer, not the route layer, since a workflow may have multiple LLM calls or no LLM calls.
+
+### 80.9 ✅ FIXED: Admin getVal Returns 0 for Empty String
+
+**Location:** `frontend/admin.js:645-651`
+
+**Issue:** The `getVal` helper used `Number(el.value)` for parsing numeric inputs. When a user cleared an input field, `el.value` was an empty string, and `Number('')` returns `0` rather than `undefined`. This could set invalid values like `smtp_port: 0`.
+
+**Fix:** Added explicit empty string check before parsing.
+
+### 80.10 ✅ FIXED: Admin setVal Doesn't Handle null Values
+
+**Location:** `frontend/admin.js:569-573`
+
+**Issue:** The `setVal` function checked `val !== undefined` before setting the input value, but didn't check for `null`. If the backend returned `null` for a setting, `el.value = null` converted it to the literal string `"null"`.
+
+**Fix:** Changed to `val != null` which catches both null and undefined.
+
+### 80.11 ✅ FIXED: REDIS_PASSWORD Uses Insecure Default
+
+**Location:** `docker-compose.yaml:112-119`
+
+**Issue:** `REDIS_PASSWORD` used `:-changeme` syntax which silently fell back to an insecure default password if the environment variable was not set. This was inconsistent with `POSTGRES_PASSWORD` which used `:?` syntax to fail if unset.
+
+**Fix:** Changed to `:?` syntax to require REDIS_PASSWORD, failing fast if not set.
+

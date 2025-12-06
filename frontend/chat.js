@@ -1212,7 +1212,8 @@ const renderMessage = (m) => {
     citationsHtml = `
       <div class="citations-row">
         ${citations.map((c, i) => {
-          const path = escapeHtml(c.source_path || c.chunk_id || `Citation ${i + 1}`);
+          // Bug fix: Don't escape path here - only escape at output to prevent double-escaping
+          const path = c.source_path || c.chunk_id || `Citation ${i + 1}`;
           const label = path.split('/').pop() || path;
           // JSON.stringify escapes internal quotes; only need & and " for double-quoted attr
           const snippetData = JSON.stringify({
@@ -1222,7 +1223,7 @@ const renderMessage = (m) => {
             context_id: c.context_id || '',
             chunk_index: c.chunk_index,
           }).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
-          return `<span class="citation-link" title="${path}" data-citation="${snippetData}" tabindex="0" role="button">${escapeHtml(label)}</span>`;
+          return `<span class="citation-link" title="${escapeHtml(path)}" data-citation="${snippetData}" tabindex="0" role="button">${escapeHtml(label)}</span>`;
         }).join('')}
       </div>
     `;
@@ -2221,12 +2222,10 @@ const transcribeAudio = async (audioBlob) => {
     const formData = new FormData();
     formData.append('file', audioBlob, 'recording.webm');
 
+    // Bug fix: Use authHeaders() consistently - don't duplicate Authorization header
     const response = await fetch(`${apiBase}/voice/transcribe`, {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${state.accessToken}`,
-        ...authHeaders(),
-      },
+      headers: authHeaders(),
       body: formData,
     });
 

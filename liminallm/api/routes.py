@@ -844,7 +844,7 @@ async def signup(body: SignupRequest, response: Response):
 
 
 @router.post("/auth/login", response_model=Envelope, tags=["auth"])
-async def login(body: LoginRequest, response: Response):
+async def login(body: LoginRequest, request: Request, response: Response):
     """Authenticate user with email and password.
 
     Validates credentials and returns session tokens with authentication cookies.
@@ -861,11 +861,16 @@ async def login(body: LoginRequest, response: Response):
         _get_rate_limit(runtime, "login_rate_limit_per_minute"),
         60,
     )
+    # Bug fix: Pass user_agent and ip_addr for session metadata
+    user_agent = request.headers.get("user-agent")
+    ip_addr = request.client.host if request.client else None
     user, session, tokens = await runtime.auth.login(
         email=body.email,
         password=body.password,
         mfa_code=body.mfa_code,
         tenant_id=body.tenant_id,
+        user_agent=user_agent,
+        ip_addr=ip_addr,
     )
     if not user or not session:
         raise _http_error("unauthorized", "invalid credentials", status_code=401)
@@ -2954,13 +2959,15 @@ async def update_system_settings(
         },
     }
     for key, value in body.items():
-        if key in int_keys and not isinstance(value, int):
+        # Bug fix: bool is a subclass of int in Python, so explicitly exclude booleans
+        if key in int_keys and (not isinstance(value, int) or isinstance(value, bool)):
             raise _http_error(
                 "validation_error",
                 f"{key} must be an integer",
                 status_code=400,
             )
-        if key in float_keys and not isinstance(value, (int, float)):
+        # Bug fix: Also exclude booleans from float check
+        if key in float_keys and (not isinstance(value, (int, float)) or isinstance(value, bool)):
             raise _http_error(
                 "validation_error",
                 f"{key} must be a number",

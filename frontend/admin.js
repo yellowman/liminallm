@@ -567,9 +567,10 @@ const fetchSystemSettings = async () => {
       'Unable to load system settings'
     );
     const s = envelope.data || {};
+    // Bug fix: Check for both null and undefined using val != null
     const setVal = (id, val) => {
       const el = document.getElementById(id);
-      if (el && val !== undefined) el.value = val;
+      if (el && val != null) el.value = val;
     };
     // Session & Concurrency
     setVal('setting-session-rotation-hours', s.session_rotation_hours);
@@ -643,9 +644,11 @@ const fetchSystemSettings = async () => {
 };
 
 const saveSystemSettings = async () => {
+  // Bug fix: Handle empty strings before parsing to avoid Number('') returning 0
   const getVal = (id, parser) => {
     const el = document.getElementById(id);
-    return el ? parser(el.value) : undefined;
+    if (!el || el.value === '') return undefined;
+    return parser(el.value);
   };
   const getChecked = (id) => {
     const el = document.getElementById(id);
