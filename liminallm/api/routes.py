@@ -4092,6 +4092,19 @@ async def websocket_chat(ws: WebSocket):
         request_id = init.get("request_id") or request_id
         session_id = init.get("session_id")
         access_token = init.get("access_token")
+        if session_id and access_token:
+            await ws.send_json(
+                {
+                    "event": "error",
+                    "data": {
+                        "error": "fresh_session_required",
+                        "message": "provide a single authentication method (refresh session before switching transports)",
+                    },
+                    "request_id": request_id,
+                }
+            )
+            await ws.close(code=4401)
+            return
         auth_ctx = await runtime.auth.authenticate(
             f"Bearer {access_token}" if access_token else None,
             session_id,

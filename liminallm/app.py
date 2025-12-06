@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import os
 import asyncio
+import contextlib
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -23,9 +24,13 @@ __version__ = "0.1.0"
 __build__ = os.getenv("BUILD_SHA", "dev")
 
 
+_cleanup_task: asyncio.Task | None = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events."""
+    global _cleanup_task
     # Startup
     from liminallm.service.runtime import get_runtime
 
@@ -39,6 +44,14 @@ async def lifespan(app: FastAPI):
         if training_worker_enabled:
             await runtime.training_worker.start()
             logger.info("training_worker_started_on_startup")
+        # Issue 4.6: Schedule cleanup of per-user tmp scratch directories
+        _cleanup_task = asyncio.create_task(
+            _run_tmp_cleanup(
+                Path(runtime.settings.shared_fs_root),
+                runtime.settings.tmp_cleanup_interval_seconds,
+                runtime.settings.tmp_max_age_hours,
+            )
+        )
     except Exception as exc:
         logger.error("startup_training_worker_failed", error=str(exc))
 
@@ -47,6 +60,10 @@ async def lifespan(app: FastAPI):
     # Shutdown
     try:
         runtime = get_runtime()
+        if _cleanup_task:
+            _cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await _cleanup_task
         if runtime.training_worker:
             await runtime.training_worker.stop()
             logger.info("training_worker_stopped_on_shutdown")
@@ -424,6 +441,64 @@ async def metrics() -> Response:
         logger.error("metrics_collection_failed", error=str(exc))
 
     return Response(content="\n".join(lines) + "\n", media_type="text/plain")
+
+
+def _sweep_tmp_dirs(shared_root: Path, max_age_hours: int) -> None:
+    """Remove stale files from per-user tmp scratch directories.
+
+    SPEC §18 requires per-user scratch cleanup on a daily cadence. This helper
+    runs in a thread to avoid blocking the event loop.
+    """
+
+    cutoff_ts = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).timestamp()
+    user_root = shared_root / "users"
+    if not user_root.exists():
+        return
+
+    for user_dir in user_root.iterdir():
+        tmp_dir = user_dir / "tmp"
+        if not tmp_dir.exists():
+            continue
+        # Delete stale files and then prune empty directories depth-first
+        for path in sorted(tmp_dir.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            if path.is_file() and stat.st_mtime < cutoff_ts:
+                path.unlink(missing_ok=True)
+        # Remove empty directories after file cleanup
+        for path in sorted(tmp_dir.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+            if path.is_dir():
+                try:
+                    next(path.iterdir())
+                except (OSError, StopIteration):
+                    with contextlib.suppress(OSError):
+                        path.rmdir()
+        try:
+            next(tmp_dir.iterdir())
+        except (OSError, StopIteration):
+            with contextlib.suppress(OSError):
+                tmp_dir.rmdir()
+
+
+async def _run_tmp_cleanup(
+    shared_root: Path, interval_seconds: int, max_age_hours: int
+) -> None:
+    """Background loop to periodically clean tmp scratch directories."""
+
+    interval = max(interval_seconds, 300)
+    try:
+        while True:
+            try:
+                await asyncio.to_thread(_sweep_tmp_dirs, shared_root, max_age_hours)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover - best-effort cleanup
+                logger.warning("tmp_cleanup_failed", error=str(exc))
+            await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        logger.info("tmp_cleanup_task_cancelled")
 
 
 def create_app() -> FastAPI:

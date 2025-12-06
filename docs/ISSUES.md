@@ -373,11 +373,11 @@ Redis rate limiting now uses an atomic Lua token bucket with weighted costs and 
 
 **Fix Applied:** Uploads now require a recognized MIME type (rejecting unknown or `application/octet-stream`) before proceeding.
 
-### 4.6 MEDIUM: Temp File Cleanup Not Scheduled
+### 4.6 ~~MEDIUM: Temp File Cleanup Not Scheduled~~ FIXED
 
 **SPEC §18 requires:** "per-user scratch /users/{id}/tmp auto-cleans daily"
 
-**Current:** No cleanup scheduler exists.
+**Fix Applied:** Added a background tmp cleanup loop during app startup that sweeps `/users/{id}/tmp` under `shared_fs_root` on a configurable interval (default daily) and deletes entries older than 24h, pruning empty directories afterward.
 
 ### 4.7 ~~MEDIUM: File Checksum Validation Absent~~ FIXED
 
@@ -412,11 +412,11 @@ Redis rate limiting now uses an atomic Lua token bucket with weighted costs and 
 - WebSocket endpoint enforces limit before accepting connection
 - Returns error code "connection_limit" when exceeded
 
-### 5.3 MEDIUM: No Mixed Transport Rejection
+### 5.3 ~~MEDIUM: No Mixed Transport Rejection~~ FIXED
 
 **SPEC §12.1 requires:** "reject mixed transports without fresh session"
 
-**Current:** No validation that session is "fresh" for WebSocket use.
+**Fix Applied:** WebSocket handshakes now reject requests that provide both `session_id` and `access_token`, emitting a `fresh_session_required` error and requiring clients to use a single, current transport credential.
 
 ### 5.4 ~~MEDIUM: Error Events Lack Details Field~~ FIXED
 
@@ -5767,7 +5767,7 @@ trace events. There is no distributed event sourcing layer that would require ve
 
 **Note:** Admin endpoints already enforce rate limits; no code changes required.
 
-### 77.7 MEDIUM: Local Rate Limit Cache Inconsistency
+### 77.7 ~~MEDIUM: Local Rate Limit Cache Inconsistency~~ FIXED
 **Location:** `liminallm/service/runtime.py:160, 278-285`
 
 **Fix:** Token-bucket limits are now centralized via Redis Lua script; the local cache remains a single-node degraded fallback per SPEC guidance.
