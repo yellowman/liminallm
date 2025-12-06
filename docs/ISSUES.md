@@ -332,13 +332,19 @@ Only refresh tokens are revoked on logout. Access tokens remain valid for full 3
 - Default 10-minute (600 second) expiry
 - Content-Disposition header set to 'attachment' to prevent inline execution
 
-### 4.3 CRITICAL: Per-Plan Size Caps Not Enforced
+### 4.3 ~~CRITICAL: Per-Plan Size Caps Not Enforced~~ FIXED
 
-**Location:** `liminallm/api/routes.py:2385-2388`
+**Status:** ✅ IMPLEMENTED
+
+**Location:** `liminallm/api/routes.py`
 
 **SPEC §18 requires:** "free: 25MB/file, paid: 200MB/file"
 
-**Current:** Single global `max_upload_bytes` (10MB default). AuthContext doesn't include `plan_tier`.
+**Fix Applied:**
+- Added `_get_plan_upload_limit()` helper function with per-plan limits
+- free: 25MB, paid: 200MB, enterprise: 200MB
+- `/files/upload` now enforces plan-specific limits
+- `/files/limits` returns plan-specific max_upload_bytes
 
 ### 4.4 HIGH: Content-Disposition Header Missing
 
@@ -628,23 +634,36 @@ Missing indexes for common query patterns on sessions, artifacts, chunks tables.
 
 ## 11. Authentication Service Security
 
-### 11.1 CRITICAL: MFA Lockout Only Works With Cache
+### 11.1 ~~CRITICAL: MFA Lockout Only Works With Cache~~ FIXED
 
-**Location:** `liminallm/service/auth.py:748-773`
+**Status:** ✅ IMPLEMENTED
 
-MFA lockout logic entirely gated on cache availability. Without Redis, unlimited TOTP brute-force possible.
+**Location:** `liminallm/service/auth.py`
 
-### 11.2 HIGH: Password Reset Non-Functional Without Cache
+**Fix Applied:**
+- Added `_mfa_attempts` dict for tracking failed attempts in-memory
+- Added `_mfa_lockouts` dict for in-memory lockout tracking
+- MFA lockout now works without Redis via in-memory fallback
 
-**Location:** `liminallm/service/auth.py:775-810`
+### 11.2 ~~HIGH: Password Reset Non-Functional Without Cache~~ FIXED
 
-Password reset tokens only stored if cache exists.
+**Status:** ✅ IMPLEMENTED
 
-### 11.3 MEDIUM: Unused _mfa_challenges Dictionary
+**Location:** `liminallm/service/auth.py`
 
-**Location:** `liminallm/service/auth.py:128`
+**Fix Applied:**
+- Added `_password_reset_tokens` dict for in-memory token storage
+- initiate_password_reset() stores tokens in memory when Redis unavailable
+- complete_password_reset() checks in-memory tokens as fallback
+- Tokens cleaned up by cleanup_expired_states()
 
-Should be used as in-memory fallback for MFA lockout tracking.
+### 11.3 ~~MEDIUM: Unused _mfa_challenges Dictionary~~ FIXED
+
+**Status:** ✅ USED
+
+**Location:** `liminallm/service/auth.py`
+
+MFA challenges dictionary is used for in-memory challenge tracking. Additionally, `_mfa_attempts` and `_mfa_lockouts` added for MFA rate limiting.
 
 ---
 
