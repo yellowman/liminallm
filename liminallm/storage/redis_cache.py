@@ -11,9 +11,18 @@ from redis import Redis
 class RedisCache:
     """Thin Redis wrapper for sessions and rate limits."""
 
-    def __init__(self, redis_url: str):
+    # Issue 48.3: Default operation timeout for Redis commands
+    DEFAULT_OPERATION_TIMEOUT = 5.0  # 5 seconds
+
+    def __init__(self, redis_url: str, *, socket_timeout: float = 5.0):
         self.redis_url = redis_url
-        self.client = aioredis.from_url(redis_url, decode_responses=True)
+        # Issue 48.3: Configure connection with explicit timeouts
+        self.client = aioredis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_timeout=socket_timeout,
+            socket_connect_timeout=socket_timeout,
+        )
 
     def verify_connection(self) -> None:
         """Assert Redis connectivity before enabling dependent features."""
@@ -73,7 +82,8 @@ class RedisCache:
         return revoked
 
     async def check_rate_limit(
-        self, key: str, limit: int, window_seconds: int, *, return_remaining: bool = False
+        self, key: str, limit: int, window_seconds: int, *, return_remaining: bool = False,
+        tenant_id: Optional[str] = None
     ) -> Union[bool, Tuple[bool, int]]:
         """Check rate limit using Redis token bucket with atomic operations.
 
@@ -82,13 +92,16 @@ class RedisCache:
             limit: Maximum requests per window
             window_seconds: Window duration in seconds
             return_remaining: If True, return (allowed, remaining) tuple
+            tenant_id: Optional tenant ID for isolation (Issue 44.3)
 
         Returns:
             bool if return_remaining is False, else (allowed, remaining) tuple
         """
         now = datetime.utcnow()
         now_bucket = int(now.timestamp() // window_seconds)
-        redis_key = f"rate:{key}:{now_bucket}"
+        # Issue 44.3: Include tenant_id in cache key for tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        redis_key = f"rate:{tenant_prefix}{key}:{now_bucket}"
         bucket_end = (now_bucket + 1) * window_seconds
         ttl = max(1, int(bucket_end - now.timestamp()))
 
@@ -124,8 +137,12 @@ class RedisCache:
         """Check if access token JTI is in denylist."""
         return bool(await self.client.exists(f"auth:access:denylist:{jti}"))
 
-    async def get_router_cache(self, user_id: str, ctx_hash: str) -> Optional[dict]:
-        cached = await self.client.get(f"router:last:{user_id}:{ctx_hash}")
+    async def get_router_cache(
+        self, user_id: str, ctx_hash: str, *, tenant_id: Optional[str] = None
+    ) -> Optional[dict]:
+        # Issue 44.5: Include tenant_id in cache key for tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        cached = await self.client.get(f"router:last:{tenant_prefix}{user_id}:{ctx_hash}")
         if not cached:
             return None
         try:
@@ -135,14 +152,21 @@ class RedisCache:
             return None
 
     async def set_router_cache(
-        self, user_id: str, ctx_hash: str, payload: dict, ttl_seconds: int = 300
+        self, user_id: str, ctx_hash: str, payload: dict, ttl_seconds: int = 300,
+        *, tenant_id: Optional[str] = None
     ) -> None:
+        # Issue 44.5: Include tenant_id in cache key for tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
         await self.client.set(
-            f"router:last:{user_id}:{ctx_hash}", json.dumps(payload), ex=ttl_seconds
+            f"router:last:{tenant_prefix}{user_id}:{ctx_hash}", json.dumps(payload), ex=ttl_seconds
         )
 
-    async def get_workflow_state(self, state_key: str) -> Optional[dict]:
-        cached = await self.client.get(f"workflow:state:{state_key}")
+    async def get_workflow_state(
+        self, state_key: str, *, tenant_id: Optional[str] = None
+    ) -> Optional[dict]:
+        # Issue 44.4: Include tenant_id in cache key for tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        cached = await self.client.get(f"workflow:state:{tenant_prefix}{state_key}")
         if not cached:
             return None
         try:
@@ -152,10 +176,13 @@ class RedisCache:
             return None
 
     async def set_workflow_state(
-        self, state_key: str, state: dict, ttl_seconds: int = 1800
+        self, state_key: str, state: dict, ttl_seconds: int = 1800,
+        *, tenant_id: Optional[str] = None
     ) -> None:
+        # Issue 44.4: Include tenant_id in cache key for tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
         await self.client.set(
-            f"workflow:state:{state_key}", json.dumps(state), ex=ttl_seconds
+            f"workflow:state:{tenant_prefix}{state_key}", json.dumps(state), ex=ttl_seconds
         )
 
     async def get_conversation_summary(self, conversation_id: str) -> Optional[dict]:
@@ -303,16 +330,21 @@ class RedisCache:
         await self.client.close()
         await self.client.connection_pool.disconnect()
 
-    async def delete_workflow_state(self, state_key: str) -> None:
+    async def delete_workflow_state(
+        self, state_key: str, *, tenant_id: Optional[str] = None
+    ) -> None:
         """Delete workflow state from cache during rollback or cleanup."""
-        await self.client.delete(f"workflow:state:{state_key}")
+        # Issue 44.4: Include tenant_id in cache key for tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        await self.client.delete(f"workflow:state:{tenant_prefix}{state_key}")
 
     # =========================================================================
     # Concurrency Caps (SPEC §18)
     # =========================================================================
 
     async def acquire_concurrency_slot(
-        self, slot_type: str, user_id: str, max_slots: int, ttl_seconds: int = 3600
+        self, slot_type: str, user_id: str, max_slots: int, ttl_seconds: int = 3600,
+        *, tenant_id: Optional[str] = None
     ) -> tuple[bool, int]:
         """Atomically acquire a concurrency slot for a user.
 
@@ -321,11 +353,14 @@ class RedisCache:
             user_id: User ID
             max_slots: Maximum concurrent slots allowed
             ttl_seconds: TTL for slot keys (safety cleanup)
+            tenant_id: Optional tenant ID for isolation (Issue 44.3)
 
         Returns:
             Tuple of (acquired: bool, current_count: int)
         """
-        key = f"concurrency:{slot_type}:{user_id}"
+        # Issue 44.3: Include tenant_id in concurrency key for tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        key = f"concurrency:{tenant_prefix}{slot_type}:{user_id}"
         # Use Lua script for atomic check-and-increment
         lua_script = """
         local current = tonumber(redis.call('GET', KEYS[1]) or '0')
@@ -341,17 +376,22 @@ class RedisCache:
         result = await self.client.eval(lua_script, 1, key, max_slots, ttl_seconds)
         return (bool(result[0]), int(result[1]))
 
-    async def release_concurrency_slot(self, slot_type: str, user_id: str) -> int:
+    async def release_concurrency_slot(
+        self, slot_type: str, user_id: str, *, tenant_id: Optional[str] = None
+    ) -> int:
         """Release a concurrency slot for a user.
 
         Args:
             slot_type: Type of slot (e.g., "workflow", "inference")
             user_id: User ID
+            tenant_id: Optional tenant ID for isolation (Issue 44.3)
 
         Returns:
             Current count after release
         """
-        key = f"concurrency:{slot_type}:{user_id}"
+        # Issue 44.3: Include tenant_id in concurrency key for tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        key = f"concurrency:{tenant_prefix}{slot_type}:{user_id}"
         # Use Lua script to ensure we don't go below 0
         lua_script = """
         local current = tonumber(redis.call('GET', KEYS[1]) or '0')
@@ -363,9 +403,13 @@ class RedisCache:
         result = await self.client.eval(lua_script, 1, key)
         return int(result)
 
-    async def get_concurrency_count(self, slot_type: str, user_id: str) -> int:
+    async def get_concurrency_count(
+        self, slot_type: str, user_id: str, *, tenant_id: Optional[str] = None
+    ) -> int:
         """Get current concurrency count for a user."""
-        key = f"concurrency:{slot_type}:{user_id}"
+        # Issue 44.3: Include tenant_id in concurrency key for tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        key = f"concurrency:{tenant_prefix}{slot_type}:{user_id}"
         count = await self.client.get(key)
         return int(count) if count else 0
 
@@ -509,9 +553,18 @@ class SyncRedisCache:
     operations and return the results.
     """
 
-    def __init__(self, redis_url: str):
+    # Issue 48.3: Default operation timeout for Redis commands
+    DEFAULT_OPERATION_TIMEOUT = 5.0  # 5 seconds
+
+    def __init__(self, redis_url: str, *, socket_timeout: float = 5.0):
         self.redis_url = redis_url
-        self._sync_client = Redis.from_url(redis_url, decode_responses=True)
+        # Issue 48.3: Configure connection with explicit timeouts
+        self._sync_client = Redis.from_url(
+            redis_url,
+            decode_responses=True,
+            socket_timeout=socket_timeout,
+            socket_connect_timeout=socket_timeout,
+        )
         # Wrap sync client with async-compatible adapter for direct client access
         self.client = _SyncClientAdapter(self._sync_client)
 
@@ -557,11 +610,14 @@ class SyncRedisCache:
         return revoked
 
     async def check_rate_limit(
-        self, key: str, limit: int, window_seconds: int, *, return_remaining: bool = False
+        self, key: str, limit: int, window_seconds: int, *, return_remaining: bool = False,
+        tenant_id: Optional[str] = None
     ) -> Union[bool, Tuple[bool, int]]:
         now = datetime.utcnow()
         now_bucket = int(now.timestamp() // window_seconds)
-        redis_key = f"rate:{key}:{now_bucket}"
+        # Issue 44.3: Include tenant_id in cache key for tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        redis_key = f"rate:{tenant_prefix}{key}:{now_bucket}"
         bucket_end = (now_bucket + 1) * window_seconds
         ttl = max(1, int(bucket_end - now.timestamp()))
 
@@ -593,8 +649,12 @@ class SyncRedisCache:
         """Check if access token JTI is in denylist."""
         return bool(self._sync_client.exists(f"auth:access:denylist:{jti}"))
 
-    async def get_router_cache(self, user_id: str, ctx_hash: str) -> Optional[dict]:
-        cached = self._sync_client.get(f"router:last:{user_id}:{ctx_hash}")
+    async def get_router_cache(
+        self, user_id: str, ctx_hash: str, *, tenant_id: Optional[str] = None
+    ) -> Optional[dict]:
+        # Issue 44.5: Include tenant_id in cache key for tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        cached = self._sync_client.get(f"router:last:{tenant_prefix}{user_id}:{ctx_hash}")
         if not cached:
             return None
         try:
@@ -603,12 +663,19 @@ class SyncRedisCache:
             return None
 
     async def set_router_cache(
-        self, user_id: str, ctx_hash: str, payload: dict, ttl_seconds: int = 300
+        self, user_id: str, ctx_hash: str, payload: dict, ttl_seconds: int = 300,
+        *, tenant_id: Optional[str] = None
     ) -> None:
-        self._sync_client.set(f"router:last:{user_id}:{ctx_hash}", json.dumps(payload), ex=ttl_seconds)
+        # Issue 44.5: Include tenant_id in cache key for tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        self._sync_client.set(f"router:last:{tenant_prefix}{user_id}:{ctx_hash}", json.dumps(payload), ex=ttl_seconds)
 
-    async def get_workflow_state(self, state_key: str) -> Optional[dict]:
-        cached = self._sync_client.get(f"workflow:state:{state_key}")
+    async def get_workflow_state(
+        self, state_key: str, *, tenant_id: Optional[str] = None
+    ) -> Optional[dict]:
+        # Issue 44.4: Include tenant_id in cache key for tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        cached = self._sync_client.get(f"workflow:state:{tenant_prefix}{state_key}")
         if not cached:
             return None
         try:
@@ -617,9 +684,12 @@ class SyncRedisCache:
             return None
 
     async def set_workflow_state(
-        self, state_key: str, state: dict, ttl_seconds: int = 1800
+        self, state_key: str, state: dict, ttl_seconds: int = 1800,
+        *, tenant_id: Optional[str] = None
     ) -> None:
-        self._sync_client.set(f"workflow:state:{state_key}", json.dumps(state), ex=ttl_seconds)
+        # Issue 44.4: Include tenant_id in cache key for tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        self._sync_client.set(f"workflow:state:{tenant_prefix}{state_key}", json.dumps(state), ex=ttl_seconds)
 
     async def get_conversation_summary(self, conversation_id: str) -> Optional[dict]:
         cached = self._sync_client.get(f"chat:summary:{conversation_id}")
@@ -723,19 +793,26 @@ class SyncRedisCache:
         """Close Redis connection."""
         self._sync_client.close()
 
-    async def delete_workflow_state(self, state_key: str) -> None:
+    async def delete_workflow_state(
+        self, state_key: str, *, tenant_id: Optional[str] = None
+    ) -> None:
         """Delete workflow state from cache."""
-        self._sync_client.delete(f"workflow:state:{state_key}")
+        # Issue 44.4: Include tenant_id in cache key for tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        self._sync_client.delete(f"workflow:state:{tenant_prefix}{state_key}")
 
     # =========================================================================
     # Concurrency Caps (SPEC §18)
     # =========================================================================
 
     async def acquire_concurrency_slot(
-        self, slot_type: str, user_id: str, max_slots: int, ttl_seconds: int = 3600
+        self, slot_type: str, user_id: str, max_slots: int, ttl_seconds: int = 3600,
+        *, tenant_id: Optional[str] = None
     ) -> tuple[bool, int]:
         """Atomically acquire a concurrency slot for a user."""
-        key = f"concurrency:{slot_type}:{user_id}"
+        # Issue 44.3: Include tenant_id in concurrency key for tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        key = f"concurrency:{tenant_prefix}{slot_type}:{user_id}"
         lua_script = """
         local current = tonumber(redis.call('GET', KEYS[1]) or '0')
         local max_allowed = tonumber(ARGV[1])
@@ -750,9 +827,13 @@ class SyncRedisCache:
         result = self._sync_client.eval(lua_script, 1, key, max_slots, ttl_seconds)
         return (bool(result[0]), int(result[1]))
 
-    async def release_concurrency_slot(self, slot_type: str, user_id: str) -> int:
+    async def release_concurrency_slot(
+        self, slot_type: str, user_id: str, *, tenant_id: Optional[str] = None
+    ) -> int:
         """Release a concurrency slot for a user."""
-        key = f"concurrency:{slot_type}:{user_id}"
+        # Issue 44.3: Include tenant_id in concurrency key for tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        key = f"concurrency:{tenant_prefix}{slot_type}:{user_id}"
         lua_script = """
         local current = tonumber(redis.call('GET', KEYS[1]) or '0')
         if current > 0 then
@@ -763,9 +844,13 @@ class SyncRedisCache:
         result = self._sync_client.eval(lua_script, 1, key)
         return int(result)
 
-    async def get_concurrency_count(self, slot_type: str, user_id: str) -> int:
+    async def get_concurrency_count(
+        self, slot_type: str, user_id: str, *, tenant_id: Optional[str] = None
+    ) -> int:
         """Get current concurrency count for a user."""
-        key = f"concurrency:{slot_type}:{user_id}"
+        # Issue 44.3: Include tenant_id in concurrency key for tenant isolation
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        key = f"concurrency:{tenant_prefix}{slot_type}:{user_id}"
         count = self._sync_client.get(key)
         return int(count) if count else 0
 

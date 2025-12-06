@@ -103,6 +103,10 @@ class ParallelNodeResult:
 class WorkflowEngine:
     """Executes workflow.chat graphs using a small tool registry."""
 
+    # Issue 48.6: Increase ThreadPoolExecutor workers and add scaling config
+    DEFAULT_TOOL_WORKERS = 8  # Up from 4 to handle concurrent tool calls
+    MAX_TOOL_WORKERS = 16  # Hard cap to prevent resource exhaustion
+
     def __init__(
         self,
         store: PostgresStore | MemoryStore,
@@ -111,6 +115,7 @@ class WorkflowEngine:
         rag: RAGService,
         *,
         cache: Optional[RedisCache] = None,
+        tool_workers: int = DEFAULT_TOOL_WORKERS,
     ) -> None:
         self.store = store
         self.llm = llm
@@ -119,7 +124,9 @@ class WorkflowEngine:
         self.logger = get_logger(__name__)
         self.tool_registry = self._build_tool_registry()
         self.cache = cache
-        self._tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+        # Issue 48.6: Configurable worker pool with bounds
+        workers = min(max(1, tool_workers), self.MAX_TOOL_WORKERS)
+        self._tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
 
     async def _rollback_workflow(
         self,

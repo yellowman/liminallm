@@ -124,3 +124,140 @@ def log_workflow_trace(trace: list, logger: Optional[Any] = None) -> None:
     """Log workflow trace per SPEC §15.2: nodes executed, errors."""
     log = logger or get_logger("workflow")
     log.info("workflow_trace", trace=trace)
+
+
+# Issue 47.1-47.8: Content sanitization for API responses
+# Patterns that indicate sensitive information in error messages
+_SENSITIVE_ERROR_PATTERNS = [
+    # Database/SQL related
+    r'(?i)(sql|query|select|insert|update|delete|where|from|join)\s+.{0,50}',
+    r'(?i)database\s+error',
+    r'(?i)connection\s+.*\s+(failed|refused|timeout)',
+    # Path/file related
+    r'(?i)/(?:home|var|etc|usr|opt|tmp)/[^\s]+',
+    r'(?i)[a-z]:\\[^\s]+',
+    # Credential patterns
+    r'(?i)(password|secret|token|key|credential|api.?key)\s*[:=]\s*[^\s]+',
+    # Stack traces
+    r'(?i)traceback\s*\(most recent call last\)',
+    r'(?i)at\s+\S+\.\S+\(\S+:\d+\)',
+    # Internal function names that might leak implementation
+    r'(?i)_internal_|_private_|__[a-z]+__',
+]
+
+# Compiled patterns for performance
+import re
+_SENSITIVE_PATTERNS_COMPILED = [re.compile(p) for p in _SENSITIVE_ERROR_PATTERNS]
+
+# Keys that should be redacted in response data
+_SENSITIVE_RESPONSE_KEYS = frozenset({
+    'password', 'secret', 'token', 'api_key', 'apikey', 'api-key',
+    'authorization', 'auth', 'credentials', 'private_key', 'privatekey',
+    'ssn', 'social_security', 'credit_card', 'creditcard', 'cvv',
+    'secret_key', 'secretkey', 'access_key', 'accesskey',
+})
+
+
+def sanitize_error_message(error: str, *, replacement: str = "[redacted]") -> str:
+    """Sanitize error message for API responses (Issue 47.1).
+
+    Removes sensitive information like:
+    - SQL queries and database errors
+    - File paths and internal paths
+    - Credentials and secrets
+    - Stack traces
+
+    Args:
+        error: Original error message
+        replacement: String to replace sensitive content with
+
+    Returns:
+        Sanitized error message safe for API responses
+    """
+    if not error or not isinstance(error, str):
+        return "An error occurred"
+
+    result = error
+    for pattern in _SENSITIVE_PATTERNS_COMPILED:
+        result = pattern.sub(replacement, result)
+
+    # Limit length to prevent excessive error messages
+    if len(result) > 500:
+        result = result[:497] + "..."
+
+    return result
+
+
+def sanitize_response_data(data: Any, *, depth: int = 0, max_depth: int = 20) -> Any:
+    """Sanitize response data by redacting sensitive keys (Issue 47.7).
+
+    Args:
+        data: Data to sanitize (dict, list, or primitive)
+        depth: Current recursion depth
+        max_depth: Maximum recursion depth
+
+    Returns:
+        Sanitized data with sensitive values redacted
+    """
+    if depth > max_depth:
+        return "[max depth exceeded]"
+
+    if isinstance(data, dict):
+        result = {}
+        for key, value in data.items():
+            lower_key = key.lower().replace('-', '_').replace(' ', '_')
+            if any(sensitive in lower_key for sensitive in _SENSITIVE_RESPONSE_KEYS):
+                # Redact sensitive values but preserve type hint
+                if isinstance(value, str):
+                    result[key] = "[REDACTED]"
+                elif isinstance(value, (int, float)):
+                    result[key] = 0
+                elif isinstance(value, bool):
+                    result[key] = False
+                else:
+                    result[key] = "[REDACTED]"
+            else:
+                result[key] = sanitize_response_data(value, depth=depth + 1, max_depth=max_depth)
+        return result
+    elif isinstance(data, list):
+        return [sanitize_response_data(item, depth=depth + 1, max_depth=max_depth) for item in data]
+    else:
+        return data
+
+
+def sanitize_workflow_trace(trace: list) -> list:
+    """Sanitize workflow trace for API responses (Issue 47.6).
+
+    Removes internal details like:
+    - Detailed error messages with stack traces
+    - Internal node configuration
+    - Debugging information
+
+    Args:
+        trace: Raw workflow trace
+
+    Returns:
+        Sanitized trace safe for API responses
+    """
+    sanitized = []
+    for entry in trace:
+        if not isinstance(entry, dict):
+            continue
+
+        safe_entry = {
+            "node_id": entry.get("node_id"),
+            "status": entry.get("status"),
+            "duration_ms": entry.get("duration_ms"),
+        }
+
+        # Include error message only if sanitized
+        if "error" in entry:
+            safe_entry["error"] = sanitize_error_message(str(entry.get("error", "")))
+
+        # Include output keys but not values (for debugging without data exposure)
+        if "output" in entry and isinstance(entry["output"], dict):
+            safe_entry["output_keys"] = list(entry["output"].keys())
+
+        sanitized.append(safe_entry)
+
+    return sanitized

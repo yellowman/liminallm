@@ -7,7 +7,12 @@ import random
 from datetime import datetime
 from typing import Dict, Iterable, List, Sequence, Tuple
 
-from liminallm.service.embeddings import cosine_similarity, pad_vectors
+from liminallm.service.embeddings import (
+    cosine_similarity,
+    normalize_vector,
+    pad_vectors,
+    sanitize_embedding,
+)
 from liminallm.storage.models import (
     POSITIVE_FEEDBACK_VALUES,
     PreferenceEvent,
@@ -75,7 +80,9 @@ class SemanticClusterer:
         if not embeddings or k <= 0:
             return [], []
         k = min(k, len(embeddings))
-        centroids = [list(vec) for vec in random.sample(list(embeddings), k)]
+
+        # Issue 45.3: Sanitize initial centroids
+        centroids = [sanitize_embedding(vec) for vec in random.sample(list(embeddings), k)]
         if not centroids:
             return [], []
         assignments = [0 for _ in embeddings]
@@ -90,9 +97,15 @@ class SemanticClusterer:
                 assignments[idx] = best
                 # simple centroid update
                 lr = 0.2
-                centroids[best] = [
+                updated = [
                     c + lr * (v - c) for c, v in zip(centroids[best], vec)
                 ]
+                # Issue 45.10: Normalize centroid after update to prevent magnitude drift
+                centroids[best] = normalize_vector(updated)
+
+        # Final normalization pass on all centroids (Issue 45.10)
+        centroids = [normalize_vector(c) for c in centroids]
+
         # final assignment
         for idx, vec in enumerate(embeddings):
             sims = [cosine_similarity(vec, c) for c in centroids]

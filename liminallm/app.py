@@ -141,6 +141,43 @@ async def add_security_headers(request, call_next):
     return response
 
 
+# Issue 49.5, 49.7: API versioning middleware
+# Deprecated endpoints that will be removed in future versions
+_DEPRECATED_ENDPOINTS = {
+    # "/v1/old-endpoint": {"sunset": "2025-06-01", "replacement": "/v1/new-endpoint"},
+}
+
+
+@app.middleware("http")
+async def add_api_version_headers(request, call_next):
+    """Add API version and deprecation headers (Issue 49.5, 49.7).
+
+    Adds:
+    - API-Version: Current API version
+    - Deprecation: If endpoint is deprecated
+    - Sunset: Date when deprecated endpoint will be removed
+    - Link: Link to documentation for deprecated endpoints
+    """
+    response = await call_next(request)
+
+    # Issue 49.7: Always include API version header
+    response.headers.setdefault("API-Version", __version__)
+
+    # Issue 49.5: Check for deprecated endpoints
+    path = request.url.path
+    if path in _DEPRECATED_ENDPOINTS:
+        deprecation_info = _DEPRECATED_ENDPOINTS[path]
+        response.headers["Deprecation"] = "true"
+        if "sunset" in deprecation_info:
+            response.headers["Sunset"] = deprecation_info["sunset"]
+        if "replacement" in deprecation_info:
+            response.headers["Link"] = (
+                f'<{deprecation_info["replacement"]}>; rel="successor-version"'
+            )
+
+    return response
+
+
 register_exception_handlers(app)
 app.include_router(router)
 
