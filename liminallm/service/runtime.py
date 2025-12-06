@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple, Union
+from urllib.parse import urlparse, urlunparse
 
 from liminallm.config import get_settings, reset_settings_cache
 from liminallm.logging import get_logger
@@ -23,6 +25,39 @@ from liminallm.storage.postgres import PostgresStore
 from liminallm.storage.redis_cache import RedisCache, SyncRedisCache
 
 logger = get_logger(__name__)
+
+
+def _mask_url_password(url: Optional[str]) -> Optional[str]:
+    """Mask password in URL for safe logging (Issue 29.1).
+
+    Replaces password component with '***' to prevent sensitive data leakage in logs.
+    Example: redis://:mypassword@localhost:6379 -> redis://:***@localhost:6379
+    """
+    if not url:
+        return url
+    try:
+        parsed = urlparse(url)
+        if parsed.password:
+            # Reconstruct URL with masked password
+            netloc = parsed.hostname or ""
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            if parsed.username:
+                netloc = f"{parsed.username}:***@{netloc}"
+            elif parsed.password:
+                netloc = f":***@{netloc}"
+            return urlunparse((
+                parsed.scheme,
+                netloc,
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment,
+            ))
+        return url
+    except Exception:
+        # If parsing fails, return masked placeholder
+        return "***url_parse_error***"
 
 
 class Runtime:
@@ -88,7 +123,8 @@ class Runtime:
 
             logger.warning(
                 "redis_disabled_fallback",
-                redis_url=self.settings.redis_url,
+                # Issue 29.1: Mask password in URL for safe logging
+                redis_url=_mask_url_password(self.settings.redis_url),
                 error=str(redis_error) if redis_error else "redis_url_missing",
                 message=(
                     f"Running without Redis under {fallback_mode}; rate limits, idempotency durability, and "
@@ -234,44 +270,61 @@ class Runtime:
 
 
 runtime: Runtime | None = None
+# Issue 28.1: Thread-safe singleton pattern using a lock
+_runtime_lock = threading.Lock()
 
 
 def get_runtime() -> Runtime:
+    """Get or create the Runtime singleton in a thread-safe manner.
+
+    Uses double-checked locking pattern for efficiency:
+    - First check without lock (fast path for existing runtime)
+    - Second check with lock to prevent race condition during creation
+    """
     global runtime
-    if runtime is None:
-        runtime = Runtime()
-    return runtime
+    # Fast path: runtime already exists
+    if runtime is not None:
+        return runtime
+    # Slow path: acquire lock and double-check before creating
+    with _runtime_lock:
+        if runtime is None:
+            runtime = Runtime()
+        return runtime
 
 
 def reset_runtime_for_tests() -> Runtime:
-    """Reinitialize the runtime singleton for isolated test runs."""
+    """Reinitialize the runtime singleton for isolated test runs.
+
+    Uses the same thread lock as get_runtime for safety (Issue 28.1).
+    """
     import asyncio
 
     global runtime
 
-    # Close existing Redis connections to avoid event loop issues
-    if runtime is not None and runtime.cache is not None:
-        try:
-            # SyncRedisCache uses a sync client internally, close it directly
-            if isinstance(runtime.cache, SyncRedisCache):
-                runtime.cache.client.close()
-            else:
-                # Async RedisCache - try to close properly
-                try:
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(runtime.cache.close())
-                except RuntimeError:
-                    asyncio.run(runtime.cache.close())
-        except Exception:
-            # Ignore errors during cleanup - connection may already be closed
-            pass
+    with _runtime_lock:
+        # Close existing Redis connections to avoid event loop issues
+        if runtime is not None and runtime.cache is not None:
+            try:
+                # SyncRedisCache uses a sync client internally, close it directly
+                if isinstance(runtime.cache, SyncRedisCache):
+                    runtime.cache.client.close()
+                else:
+                    # Async RedisCache - try to close properly
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(runtime.cache.close())
+                    except RuntimeError:
+                        asyncio.run(runtime.cache.close())
+            except Exception:
+                # Ignore errors during cleanup - connection may already be closed
+                pass
 
-    reset_settings_cache()
-    settings = get_settings()
-    if not settings.test_mode:
-        raise RuntimeError("runtime reset is only allowed in TEST_MODE")
-    runtime = Runtime()
-    return runtime
+        reset_settings_cache()
+        settings = get_settings()
+        if not settings.test_mode:
+            raise RuntimeError("runtime reset is only allowed in TEST_MODE")
+        runtime = Runtime()
+        return runtime
 
 
 IDEMPOTENCY_TTL_SECONDS = 60 * 60 * 24

@@ -926,14 +926,12 @@ class AuthService:
             return False
 
         # Check MFA lockout (5 failed attempts = 5 minute lockout per SPEC §18)
-        lockout_key = f"mfa:lockout:{user_id}"
-        attempts_key = f"mfa:attempts:{user_id}"
         now = datetime.utcnow()
 
-        # Check lockout - use Redis if available, otherwise in-memory (Issue 11.1)
+        # Issue 19.3: Use atomic MFA lockout to prevent check-then-act race condition
+        # First check if already locked out (before TOTP verification)
         if self.cache:
-            locked = await self.cache.client.get(lockout_key)
-            if locked:
+            if await self.cache.check_mfa_lockout(user_id):
                 self.logger.warning("mfa_locked_out", user_id=user_id)
                 return False
         else:
@@ -947,14 +945,13 @@ class AuthService:
                 self._mfa_lockouts.pop(user_id, None)
 
         if not self._verify_totp(cfg.secret, code):
-            # Track failed attempt
+            # Issue 19.3: Use atomic operation to track failed attempt and check lockout
             if self.cache:
-                attempts = await self.cache.client.incr(attempts_key)
-                await self.cache.client.expire(attempts_key, 300)  # 5 minute window
-                if attempts >= 5:
-                    # Lock out for 5 minutes
-                    await self.cache.client.set(lockout_key, "1", ex=300)
-                    await self.cache.client.delete(attempts_key)
+                is_locked, attempts = await self.cache.atomic_mfa_attempt(
+                    user_id, max_attempts=5, lockout_seconds=300
+                )
+                if is_locked and attempts >= 0:
+                    # Just triggered lockout (attempts >= 0 means we just incremented)
                     self.logger.warning("mfa_lockout_triggered", user_id=user_id, attempts=attempts)
             else:
                 # In-memory fallback for attempt tracking (Issue 11.1)
@@ -977,7 +974,7 @@ class AuthService:
 
         # Success - clear any failed attempts
         if self.cache:
-            await self.cache.client.delete(attempts_key)
+            await self.cache.clear_mfa_attempts(user_id)
         else:
             # In-memory fallback - clear attempts on success
             self._mfa_attempts.pop(user_id, None)

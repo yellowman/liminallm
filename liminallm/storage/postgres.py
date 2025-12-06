@@ -1879,8 +1879,11 @@ class PostgresStore:
             self.logger.warning("artifact_validation_failed", errors=exc.errors)
             raise
         with self._connect() as conn, conn.transaction():
+            # Issue 19.5: Use SELECT ... FOR UPDATE to prevent race condition
+            # This locks the artifact row until the transaction completes,
+            # preventing concurrent version inserts from calculating the same next_version
             row = conn.execute(
-                "SELECT * FROM artifact WHERE id = %s", (artifact_id,)
+                "SELECT * FROM artifact WHERE id = %s FOR UPDATE", (artifact_id,)
             ).fetchone()
             if not row:
                 return None

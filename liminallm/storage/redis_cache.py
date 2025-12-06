@@ -400,6 +400,70 @@ class RedisCache:
         key = f"session:rotation:{old_session_id}"
         return await self.client.get(key)
 
+    # =========================================================================
+    # MFA Lockout Tracking (Issue 19.3 - Atomic operations)
+    # =========================================================================
+
+    async def check_mfa_lockout(self, user_id: str) -> bool:
+        """Check if user is locked out from MFA attempts.
+
+        Returns:
+            True if user is locked out, False otherwise
+        """
+        key = f"mfa:lockout:{user_id}"
+        return bool(await self.client.exists(key))
+
+    async def atomic_mfa_attempt(
+        self, user_id: str, max_attempts: int = 5, lockout_seconds: int = 300
+    ) -> tuple[bool, int]:
+        """Atomically record a failed MFA attempt and check/trigger lockout.
+
+        This uses a Lua script to ensure atomicity and prevent the race condition
+        where multiple concurrent failed attempts could each pass the lockout
+        check before any increment the counter.
+
+        Args:
+            user_id: User ID to track
+            max_attempts: Maximum failed attempts before lockout
+            lockout_seconds: Duration of lockout in seconds
+
+        Returns:
+            Tuple of (is_now_locked_out: bool, current_attempts: int)
+        """
+        lockout_key = f"mfa:lockout:{user_id}"
+        attempts_key = f"mfa:attempts:{user_id}"
+
+        # Lua script for atomic check-and-increment with lockout trigger
+        lua_script = """
+        -- Check if already locked out
+        if redis.call('EXISTS', KEYS[1]) == 1 then
+            return {1, -1}  -- Already locked out
+        end
+
+        -- Increment attempt counter
+        local attempts = redis.call('INCR', KEYS[2])
+        redis.call('EXPIRE', KEYS[2], ARGV[2])
+
+        -- Check if we should trigger lockout
+        local max_attempts = tonumber(ARGV[1])
+        if attempts >= max_attempts then
+            redis.call('SET', KEYS[1], '1', 'EX', ARGV[2])
+            redis.call('DEL', KEYS[2])
+            return {1, attempts}  -- Now locked out
+        end
+
+        return {0, attempts}  -- Not locked out
+        """
+        result = await self.client.eval(
+            lua_script, 2, lockout_key, attempts_key, max_attempts, lockout_seconds
+        )
+        return (bool(result[0]), int(result[1]))
+
+    async def clear_mfa_attempts(self, user_id: str) -> None:
+        """Clear MFA attempt counter on successful verification."""
+        attempts_key = f"mfa:attempts:{user_id}"
+        await self.client.delete(attempts_key)
+
 
 class _SyncClientAdapter:
     """Adapter that wraps a sync Redis client with async method signatures.
@@ -733,3 +797,41 @@ class SyncRedisCache:
         """Get new session ID if old session was rotated."""
         key = f"session:rotation:{old_session_id}"
         return self._sync_client.get(key)
+
+    # =========================================================================
+    # MFA Lockout Tracking (Issue 19.3 - Atomic operations)
+    # =========================================================================
+
+    async def check_mfa_lockout(self, user_id: str) -> bool:
+        """Check if user is locked out from MFA attempts."""
+        key = f"mfa:lockout:{user_id}"
+        return bool(self._sync_client.exists(key))
+
+    async def atomic_mfa_attempt(
+        self, user_id: str, max_attempts: int = 5, lockout_seconds: int = 300
+    ) -> tuple[bool, int]:
+        """Atomically record a failed MFA attempt and check/trigger lockout (sync version)."""
+        lockout_key = f"mfa:lockout:{user_id}"
+        attempts_key = f"mfa:attempts:{user_id}"
+
+        lua_script = """
+        if redis.call('EXISTS', KEYS[1]) == 1 then
+            return {1, -1}
+        end
+        local attempts = redis.call('INCR', KEYS[2])
+        redis.call('EXPIRE', KEYS[2], ARGV[2])
+        local max_attempts = tonumber(ARGV[1])
+        if attempts >= max_attempts then
+            redis.call('SET', KEYS[1], '1', 'EX', ARGV[2])
+            redis.call('DEL', KEYS[2])
+            return {1, attempts}
+        end
+        return {0, attempts}
+        """
+        result = self._sync_client.eval(lua_script, 2, lockout_key, attempts_key, max_attempts, lockout_seconds)
+        return (bool(result[0]), int(result[1]))
+
+    async def clear_mfa_attempts(self, user_id: str) -> None:
+        """Clear MFA attempt counter on successful verification."""
+        attempts_key = f"mfa:attempts:{user_id}"
+        self._sync_client.delete(attempts_key)
