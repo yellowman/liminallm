@@ -1107,6 +1107,15 @@ async def admin_create_user(
         is_active=body.is_active,
         meta=body.meta,
     )
+    # Issue 51.2: Audit logging for admin user creation (GDPR/SOC2 compliance)
+    logger.info(
+        "admin_user_created",
+        admin_id=principal.user_id,
+        created_user_id=user.id,
+        created_email=user.email,
+        created_role=user.role,
+        tenant_id=target_tenant,
+    )
     return Envelope(
         status="ok",
         data=AdminCreateUserResponse(
@@ -1137,9 +1146,19 @@ async def admin_set_role(
             "forbidden", "cannot modify users in other tenant", status_code=403
         )
     # Issue 22.1: set_user_role is now async to revoke sessions on role change
+    old_role = target_user.role
     user = await runtime.auth.set_user_role(user_id, body.role)
     if not user:
         raise NotFoundError("user not found", detail={"user_id": user_id})
+    # Issue 51.4: Audit logging for permission changes (SOC2 compliance)
+    logger.info(
+        "admin_role_changed",
+        admin_id=principal.user_id,
+        target_user_id=user_id,
+        old_role=old_role,
+        new_role=body.role,
+        tenant_id=principal.tenant_id,
+    )
     return Envelope(status="ok", data=_user_to_response(user))
 
 
@@ -1162,9 +1181,18 @@ async def admin_delete_user(
         raise _http_error(
             "forbidden", "cannot delete users in other tenant", status_code=403
         )
+    target_email = target_user.email  # Capture before deletion
     removed = runtime.auth.delete_user(user_id)
     if not removed:
         raise NotFoundError("user not found", detail={"user_id": user_id})
+    # Issue 51.3: Audit logging for user deletion (GDPR/SOC2 compliance)
+    logger.info(
+        "admin_user_deleted",
+        admin_id=principal.user_id,
+        deleted_user_id=user_id,
+        deleted_email=target_email,
+        tenant_id=principal.tenant_id,
+    )
     return Envelope(status="ok", data={"deleted": True, "user_id": user_id})
 
 
@@ -1673,6 +1701,12 @@ async def change_password(
         principal.user_id, except_session_id=principal.session_id
     )
 
+    # Issue 51.6: Audit logging for password change (GDPR/SOC2 compliance)
+    logger.info(
+        "user_password_changed",
+        user_id=principal.user_id,
+        session_id=principal.session_id,
+    )
     return Envelope(status="ok", data={"status": "changed"})
 
 
@@ -1698,6 +1732,12 @@ async def logout(
                 raise _http_error("forbidden", "cannot revoke other user sessions", status_code=403)
         if target_session:
             await runtime.auth.revoke(target_session)
+            # Issue 51.9: Audit logging for session revocation (SOC2 compliance)
+            logger.info(
+                "session_revoked",
+                user_id=ctx.user_id,
+                session_id=target_session,
+            )
     response.delete_cookie("session_id", path="/", secure=True, samesite="lax")
     response.delete_cookie("refresh_token", path="/", secure=True, samesite="lax")
     return Envelope(status="ok", data={"message": "session revoked"})
