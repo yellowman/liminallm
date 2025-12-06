@@ -2429,9 +2429,191 @@ const handleFileUpload = async (event) => {
 
     // Refresh contexts if uploaded to one
     if (contextId) await fetchContexts();
+    // Refresh file list after upload
+    await fetchUserFiles();
   } catch (err) {
     setUploadStatus(err.message, true);
   }
+};
+
+// =============================================================================
+// File Browser (SPEC §13.3, §18)
+// =============================================================================
+
+const filesListEl = $('files-list');
+const filesEmptyEl = $('files-empty');
+const filesPaginationEl = $('files-pagination');
+const refreshFilesBtn = $('refresh-files-btn');
+const filesSectionToggle = $('files-section-toggle');
+
+let filesOffset = 0;
+const FILES_LIMIT = 20;
+
+const fetchUserFiles = async () => {
+  if (!state.accessToken) {
+    if (filesListEl) filesListEl.innerHTML = '';
+    if (filesEmptyEl) filesEmptyEl.style.display = 'block';
+    if (filesPaginationEl) filesPaginationEl.innerHTML = '';
+    return;
+  }
+
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/files?limit=${FILES_LIMIT}&offset=${filesOffset}`,
+      { headers: headers() },
+      'Failed to load files'
+    );
+
+    const data = envelope.data || {};
+    const files = data.files || [];
+    const total = data.total || 0;
+    const hasNext = data.has_next || false;
+
+    renderFilesList(files, total, hasNext);
+  } catch (err) {
+    console.error('Failed to fetch files:', err);
+    if (filesListEl) filesListEl.innerHTML = '<div class="small" style="color: #b00020;">Failed to load files</div>';
+  }
+};
+
+const renderFilesList = (files, total, hasNext) => {
+  if (!filesListEl) return;
+
+  if (files.length === 0) {
+    filesListEl.innerHTML = '';
+    if (filesEmptyEl) filesEmptyEl.style.display = 'block';
+    if (filesPaginationEl) filesPaginationEl.innerHTML = '';
+    return;
+  }
+
+  if (filesEmptyEl) filesEmptyEl.style.display = 'none';
+
+  filesListEl.innerHTML = files.map(file => `
+    <div class="file-item" data-filename="${escapeHtml(file.name)}">
+      <div class="file-info">
+        <div class="file-name" title="${escapeHtml(file.name)}">${escapeHtml(file.name)}</div>
+        <div class="file-meta">${formatBytes(file.size)} · ${formatRelativeTime(file.modified_at)}</div>
+      </div>
+      <div class="file-actions">
+        <button type="button" class="download-btn" data-action="download">Download</button>
+        <button type="button" class="delete-btn" data-action="delete">Delete</button>
+      </div>
+    </div>
+  `).join('');
+
+  // Render pagination
+  if (filesPaginationEl) {
+    const hasPrev = filesOffset > 0;
+    filesPaginationEl.innerHTML = `
+      <button type="button" class="minor" ${!hasPrev ? 'disabled' : ''} data-action="prev">Previous</button>
+      <span class="small">${filesOffset + 1}-${Math.min(filesOffset + files.length, total)} of ${total}</span>
+      <button type="button" class="minor" ${!hasNext ? 'disabled' : ''} data-action="next">Next</button>
+    `;
+  }
+};
+
+const handleFileAction = async (event) => {
+  const target = event.target;
+  const action = target.dataset?.action;
+  if (!action) return;
+
+  if (action === 'prev') {
+    filesOffset = Math.max(0, filesOffset - FILES_LIMIT);
+    await fetchUserFiles();
+    return;
+  }
+
+  if (action === 'next') {
+    filesOffset += FILES_LIMIT;
+    await fetchUserFiles();
+    return;
+  }
+
+  const fileItem = target.closest('.file-item');
+  if (!fileItem) return;
+  const filename = fileItem.dataset.filename;
+  if (!filename) return;
+
+  if (action === 'download') {
+    await downloadFile(filename);
+  } else if (action === 'delete') {
+    await deleteFile(filename);
+  }
+};
+
+const downloadFile = async (filename) => {
+  if (!state.accessToken) return;
+
+  try {
+    // Get signed download URL
+    const envelope = await requestEnvelope(
+      `${apiBase}/files/${encodeURIComponent(filename)}/url`,
+      { headers: headers() },
+      'Failed to get download URL'
+    );
+
+    const downloadUrl = envelope.data?.download_url;
+    if (!downloadUrl) throw new Error('No download URL returned');
+
+    // Fetch the file using the signed URL
+    const response = await fetch(`${apiBase}${downloadUrl}`, {
+      headers: headers(),
+    });
+
+    if (!response.ok) throw new Error('Download failed');
+
+    // Create blob and trigger download
+    const blob = await response.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    window.URL.revokeObjectURL(url);
+    a.remove();
+  } catch (err) {
+    console.error('Download failed:', err);
+    alert(`Failed to download file: ${err.message}`);
+  }
+};
+
+const deleteFile = async (filename) => {
+  if (!state.accessToken) return;
+  if (!confirm(`Delete "${filename}"? This cannot be undone.`)) return;
+
+  try {
+    await requestEnvelope(
+      `${apiBase}/files/${encodeURIComponent(filename)}`,
+      {
+        method: 'DELETE',
+        headers: headers(),
+      },
+      'Failed to delete file'
+    );
+
+    // Refresh the file list
+    await fetchUserFiles();
+  } catch (err) {
+    console.error('Delete failed:', err);
+    alert(`Failed to delete file: ${err.message}`);
+  }
+};
+
+const formatRelativeTime = (isoString) => {
+  if (!isoString) return '';
+  const date = new Date(isoString);
+  const now = new Date();
+  const diffMs = now - date;
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMs / 3600000);
+  const diffDays = Math.floor(diffMs / 86400000);
+
+  if (diffMins < 1) return 'just now';
+  if (diffMins < 60) return `${diffMins}m ago`;
+  if (diffHours < 24) return `${diffHours}h ago`;
+  if (diffDays < 7) return `${diffDays}d ago`;
+  return date.toLocaleDateString();
 };
 
 // =============================================================================
@@ -3894,6 +4076,23 @@ const initEventListeners = () => {
   // File upload
   if (fileUploadInput) fileUploadInput.addEventListener('change', renderUploadHint);
   if (fileUploadButton) fileUploadButton.addEventListener('click', handleFileUpload);
+
+  // File browser
+  if (refreshFilesBtn) refreshFilesBtn.addEventListener('click', fetchUserFiles);
+  if (filesListEl) filesListEl.addEventListener('click', handleFileAction);
+  if (filesPaginationEl) filesPaginationEl.addEventListener('click', handleFileAction);
+  if (filesSectionToggle) {
+    filesSectionToggle.addEventListener('click', () => {
+      const section = $('files-section');
+      if (section) {
+        section.classList.toggle('collapsed');
+        // Fetch files when section is expanded
+        if (!section.classList.contains('collapsed')) {
+          fetchUserFiles();
+        }
+      }
+    });
+  }
 
   // Settings
   $('clear-drafts-btn')?.addEventListener('click', handleClearDrafts);
