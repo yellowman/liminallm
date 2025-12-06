@@ -510,6 +510,136 @@ class RedisCache:
         attempts_key = f"mfa:attempts:{user_id}"
         await self.client.delete(attempts_key)
 
+    # =========================================================================
+    # Circuit Breaker (SPEC §18)
+    # =========================================================================
+
+    async def check_circuit_breaker(
+        self,
+        tool_id: str,
+        *,
+        failure_threshold: int = 5,
+        window_seconds: int = 60,
+        cooldown_seconds: int = 60,
+        tenant_id: Optional[str] = None,
+    ) -> tuple[bool, int]:
+        """Check if circuit breaker is open for a tool.
+
+        SPEC §18: Circuit breaker opens for a tool after 5 failures in 1 minute.
+
+        Args:
+            tool_id: Tool identifier
+            failure_threshold: Number of failures to trip breaker (default: 5)
+            window_seconds: Time window for failure counting (default: 60)
+            cooldown_seconds: How long breaker stays open (default: 60)
+            tenant_id: Optional tenant ID for isolation
+
+        Returns:
+            Tuple of (is_open: bool, failure_count: int)
+            - is_open=True means the circuit is open and tool should not be called
+            - failure_count is the current failure count in the window
+        """
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        open_key = f"circuit:{tenant_prefix}{tool_id}:open"
+        failures_key = f"circuit:{tenant_prefix}{tool_id}:failures"
+
+        # Check if circuit is open (tripped)
+        is_open = await self.client.exists(open_key)
+        if is_open:
+            return (True, -1)
+
+        # Get current failure count
+        failures_raw = await self.client.get(failures_key)
+        failure_count = int(failures_raw) if failures_raw else 0
+
+        return (False, failure_count)
+
+    async def record_tool_failure(
+        self,
+        tool_id: str,
+        *,
+        failure_threshold: int = 5,
+        window_seconds: int = 60,
+        cooldown_seconds: int = 60,
+        tenant_id: Optional[str] = None,
+    ) -> tuple[bool, int]:
+        """Record a tool failure and potentially trip the circuit breaker.
+
+        SPEC §18: Circuit breaker opens for a tool after 5 failures in 1 minute.
+
+        Uses atomic Lua script to prevent race conditions.
+
+        Args:
+            tool_id: Tool identifier
+            failure_threshold: Number of failures to trip breaker (default: 5)
+            window_seconds: Time window for failure counting (default: 60)
+            cooldown_seconds: How long breaker stays open (default: 60)
+            tenant_id: Optional tenant ID for isolation
+
+        Returns:
+            Tuple of (circuit_tripped: bool, failure_count: int)
+        """
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        open_key = f"circuit:{tenant_prefix}{tool_id}:open"
+        failures_key = f"circuit:{tenant_prefix}{tool_id}:failures"
+
+        # Lua script for atomic failure recording and circuit tripping
+        lua_script = """
+        -- Check if circuit is already open
+        if redis.call('EXISTS', KEYS[1]) == 1 then
+            return {1, -1}  -- Already open
+        end
+
+        -- Increment failure counter
+        local failures = redis.call('INCR', KEYS[2])
+        redis.call('EXPIRE', KEYS[2], ARGV[1])
+
+        -- Check if we should trip the circuit
+        local threshold = tonumber(ARGV[2])
+        if failures >= threshold then
+            redis.call('SET', KEYS[1], '1', 'EX', ARGV[3])
+            redis.call('DEL', KEYS[2])  -- Clear failures counter
+            return {1, failures}  -- Circuit tripped
+        end
+
+        return {0, failures}  -- Not tripped
+        """
+        result = await self.client.eval(
+            lua_script, 2, open_key, failures_key,
+            window_seconds, failure_threshold, cooldown_seconds
+        )
+        return (bool(result[0]), int(result[1]))
+
+    async def record_tool_success(
+        self,
+        tool_id: str,
+        *,
+        tenant_id: Optional[str] = None,
+    ) -> None:
+        """Record a successful tool execution, resetting failure count.
+
+        This implements the "half-open" behavior where a success resets the
+        failure counter, allowing the circuit to eventually close.
+        """
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        failures_key = f"circuit:{tenant_prefix}{tool_id}:failures"
+        await self.client.delete(failures_key)
+
+    async def reset_circuit_breaker(
+        self,
+        tool_id: str,
+        *,
+        tenant_id: Optional[str] = None,
+    ) -> None:
+        """Manually reset a circuit breaker (admin action)."""
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        open_key = f"circuit:{tenant_prefix}{tool_id}:open"
+        failures_key = f"circuit:{tenant_prefix}{tool_id}:failures"
+        pipe = self.client.pipeline()
+        pipe.delete(open_key)
+        pipe.delete(failures_key)
+        await pipe.execute()
+
 
 class _SyncClientAdapter:
     """Adapter that wraps a sync Redis client with async method signatures.

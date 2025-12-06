@@ -1460,6 +1460,38 @@ class WorkflowEngine:
         inputs = self._resolve_inputs(node.get("inputs", {}), user_message, vars_scope)
         if "message" not in inputs and user_message:
             inputs["message"] = user_message
+
+        # SPEC §18: Check circuit breaker before invoking tool
+        if self.cache and tool_name:
+            is_open, _ = await self.cache.check_circuit_breaker(
+                tool_name, tenant_id=tenant_id
+            )
+            if is_open:
+                self.logger.warning("tool_circuit_open", tool=tool_name, tenant_id=tenant_id)
+                tool_result = {
+                    "status": "error",
+                    "content": "tool temporarily unavailable (circuit breaker open)",
+                    "error": "circuit_breaker_open",
+                }
+                outputs = {}
+                next_nodes = node.get("next")
+                if isinstance(next_nodes, str):
+                    next_nodes_list = [next_nodes]
+                elif isinstance(next_nodes, list):
+                    next_nodes_list = [n for n in next_nodes if n]
+                else:
+                    next_nodes_list = []
+                result_payload = {
+                    "node_id": node_id,
+                    "status": tool_result.get("status", "done"),
+                    "outputs": outputs,
+                }
+                if isinstance(tool_result, dict):
+                    for k in ("content", "usage", "context_snippets"):
+                        if k in tool_result:
+                            result_payload[k] = tool_result[k]
+                return result_payload, next_nodes_list
+
         try:
             tool_result = self._invoke_tool(
                 tool_name,
@@ -1472,13 +1504,41 @@ class WorkflowEngine:
                 user_id=user_id,
                 tenant_id=tenant_id,
             )
+            # SPEC §18: Record success to reset failure counter
+            if self.cache and tool_name:
+                if isinstance(tool_result, dict) and tool_result.get("status") != "error":
+                    await self.cache.record_tool_success(tool_name, tenant_id=tenant_id)
         except Exception as exc:
             self.logger.error("tool_invoke_failed", tool=tool_name, error=str(exc))
+            # SPEC §18: Record failure for circuit breaker
+            if self.cache and tool_name:
+                tripped, failures = await self.cache.record_tool_failure(
+                    tool_name, tenant_id=tenant_id
+                )
+                if tripped:
+                    self.logger.warning(
+                        "tool_circuit_tripped",
+                        tool=tool_name,
+                        failures=failures,
+                        tenant_id=tenant_id,
+                    )
             tool_result = {
                 "status": "error",
                 "content": "tool execution failed",
                 "error": str(exc),
             }
+        # Record failure for error results from _invoke_tool
+        if self.cache and tool_name and isinstance(tool_result, dict) and tool_result.get("status") == "error":
+            tripped, failures = await self.cache.record_tool_failure(
+                tool_name, tenant_id=tenant_id
+            )
+            if tripped:
+                self.logger.warning(
+                    "tool_circuit_tripped",
+                    tool=tool_name,
+                    failures=failures,
+                    tenant_id=tenant_id,
+                )
         outputs = {}
         for key in node.get("outputs", []) or []:
             if isinstance(tool_result, dict) and key in tool_result:

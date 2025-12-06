@@ -8,6 +8,8 @@ from pathlib import Path as FilePath
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
+import mimetypes
+
 from fastapi import (
     APIRouter,
     Depends,
@@ -22,6 +24,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from fastapi.responses import FileResponse
 
 from liminallm.api.schemas import (
     AdminCreateUserRequest,
@@ -94,7 +97,12 @@ from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service.auth import AuthContext
 from liminallm.service.errors import BadRequestError, NotFoundError
-from liminallm.service.fs import safe_join, PathTraversalError
+from liminallm.service.fs import (
+    safe_join,
+    PathTraversalError,
+    generate_signed_url,
+    validate_signed_url,
+)
 from liminallm.service.runtime import (
     IDEMPOTENCY_TTL_SECONDS,
     _acquire_idempotency_slot,
@@ -3281,6 +3289,223 @@ async def upload_file(
         envelope = Envelope(status="ok", data=resp, request_id=idem.request_id)
         await idem.store_result(envelope)
         return envelope
+
+
+# =========================================================================
+# File Download Endpoints (SPEC §13.3, §18)
+# =========================================================================
+
+
+@router.get("/files", response_model=Envelope, tags=["files"])
+async def list_files(
+    limit: Optional[int] = Query(None, ge=1, le=100, description="Maximum files to return"),
+    offset: Optional[int] = Query(0, ge=0, description="Offset for pagination"),
+    principal: AuthContext = Depends(get_user),
+):
+    """List user's uploaded files with pagination.
+
+    SPEC §13.3: GET /v1/files - list user files (paginated)
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        60,
+    )
+    # Get user's file directory
+    files_dir = (
+        FilePath(runtime.settings.shared_fs_root)
+        / "users"
+        / principal.user_id
+        / "files"
+    )
+
+    if not files_dir.exists():
+        return Envelope(
+            status="ok",
+            data={"files": [], "total": 0, "limit": limit or 50, "offset": offset},
+        )
+
+    # List files with pagination
+    all_files = []
+    try:
+        for f in files_dir.iterdir():
+            if f.is_file():
+                stat = f.stat()
+                all_files.append({
+                    "name": f.name,
+                    "size": stat.st_size,
+                    "created_at": datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc).isoformat(),
+                    "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                })
+    except PermissionError:
+        logger.warning("files_list_permission_denied", user_id=principal.user_id)
+        return Envelope(status="ok", data={"files": [], "total": 0, "limit": limit or 50, "offset": offset})
+
+    # Sort by modified_at descending
+    all_files.sort(key=lambda x: x["modified_at"], reverse=True)
+
+    # Apply pagination
+    resolved_limit = limit or 50
+    paginated = all_files[offset:offset + resolved_limit]
+
+    return Envelope(
+        status="ok",
+        data={
+            "files": paginated,
+            "total": len(all_files),
+            "limit": resolved_limit,
+            "offset": offset,
+            "has_next": offset + resolved_limit < len(all_files),
+        },
+    )
+
+
+@router.get("/files/{filename}/url", response_model=Envelope, tags=["files"])
+async def get_file_download_url(
+    filename: str = Path(..., max_length=255, description="File name to download"),
+    principal: AuthContext = Depends(get_user),
+):
+    """Get a signed download URL for a file.
+
+    SPEC §18: Downloads use signed URLs with 10m expiry and content-disposition
+    set to prevent inline execution.
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        60,
+    )
+
+    # Verify file exists
+    files_dir = (
+        FilePath(runtime.settings.shared_fs_root)
+        / "users"
+        / principal.user_id
+        / "files"
+    )
+    try:
+        file_path = safe_join(files_dir, filename)
+    except PathTraversalError:
+        raise _http_error("validation_error", "invalid filename", status_code=400)
+
+    if not file_path.exists() or not file_path.is_file():
+        raise _http_error("not_found", "file not found", status_code=404)
+
+    # Generate signed URL with 10-minute expiry
+    signed_url = generate_signed_url(
+        file_path=filename,
+        user_id=principal.user_id,
+        secret_key=runtime.settings.jwt_secret,
+        expiry_seconds=600,  # SPEC §18: 10 minute expiry
+    )
+
+    return Envelope(
+        status="ok",
+        data={
+            "download_url": signed_url,
+            "expires_in": 600,
+            "filename": filename,
+        },
+    )
+
+
+@router.get("/files/download", tags=["files"])
+async def download_file(
+    path: str = Query(..., max_length=255, description="File path"),
+    expires: str = Query(..., description="Expiry timestamp"),
+    sig: str = Query(..., max_length=128, description="URL signature"),
+    principal: AuthContext = Depends(get_user),
+):
+    """Download a file using a signed URL.
+
+    SPEC §18: Downloads use signed URLs with 10m expiry and content-disposition
+    set to prevent inline execution.
+    """
+    runtime = get_runtime()
+
+    # Validate signed URL
+    is_valid, error_msg = validate_signed_url(
+        path=path,
+        expires=expires,
+        signature=sig,
+        user_id=principal.user_id,
+        secret_key=runtime.settings.jwt_secret,
+    )
+
+    if not is_valid:
+        raise _http_error("unauthorized", error_msg or "invalid signature", status_code=401)
+
+    # Build file path and validate
+    files_dir = (
+        FilePath(runtime.settings.shared_fs_root)
+        / "users"
+        / principal.user_id
+        / "files"
+    )
+    try:
+        file_path = safe_join(files_dir, path)
+    except PathTraversalError:
+        raise _http_error("validation_error", "invalid file path", status_code=400)
+
+    if not file_path.exists() or not file_path.is_file():
+        raise _http_error("not_found", "file not found", status_code=404)
+
+    # Determine content type
+    content_type, _ = mimetypes.guess_type(str(file_path))
+    if not content_type:
+        content_type = "application/octet-stream"
+
+    # SPEC §18: content-disposition set to prevent inline execution
+    # Use 'attachment' to force download rather than inline display
+    return FileResponse(
+        path=str(file_path),
+        filename=path,
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{path}"',
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, no-cache, no-store, must-revalidate",
+        },
+    )
+
+
+@router.delete("/files/{filename}", response_model=Envelope, tags=["files"])
+async def delete_file(
+    filename: str = Path(..., max_length=255, description="File name to delete"),
+    principal: AuthContext = Depends(get_user),
+):
+    """Delete a user's file."""
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"write:{principal.user_id}",
+        _get_rate_limit(runtime, "write_rate_limit_per_minute"),
+        60,
+    )
+
+    files_dir = (
+        FilePath(runtime.settings.shared_fs_root)
+        / "users"
+        / principal.user_id
+        / "files"
+    )
+    try:
+        file_path = safe_join(files_dir, filename)
+    except PathTraversalError:
+        raise _http_error("validation_error", "invalid filename", status_code=400)
+
+    if not file_path.exists() or not file_path.is_file():
+        raise _http_error("not_found", "file not found", status_code=404)
+
+    # Delete file
+    await asyncio.to_thread(file_path.unlink)
+
+    logger.info("file_deleted", user_id=principal.user_id, filename=filename)
+    return Envelope(status="ok", data={"deleted": filename})
 
 
 @router.get("/conversations/{conversation_id}/messages", response_model=Envelope, tags=["conversations"])
