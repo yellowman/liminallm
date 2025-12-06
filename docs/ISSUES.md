@@ -102,8 +102,8 @@ This document consolidates findings from deep analysis of the liminallm codebase
 **False Positives Identified:** 144 (verified via comprehensive code examination)
 **Design Variances:** 1 (X-Session WebSocket auth via JSON body - valid implementation)
 **Future Features Deferred:** 1 (Adapter pruning/merging - optimization feature)
-**Issues Fixed:** 30 (10 frontend + 1 backend + 7 infrastructure + 4 NOT IMPLEMENTED + 8 previously unrecorded)
-**Effective Issues:** 505 (681 - 144 false positives - 2 variances/deferred - 30 fixed)
+**Issues Fixed:** 32 (10 frontend + 1 backend + 7 infrastructure + 4 NOT IMPLEMENTED + 10 previously unrecorded)
+**Effective Issues:** 503 (681 - 144 false positives - 2 variances/deferred - 32 fixed)
 **False Positive Rate:** 21.1%
 
 *Note: False positives include structural patterns (SQL parameterization, Python GIL, timeouts), development/test code, standard industry practices (Docker isolation, env vars), required functionality (MFA secret display, admin password display), misattributed issues (internal logging), and references to non-existent files (React-specific issues on vanilla JS codebase).*
@@ -132,6 +132,8 @@ This document consolidates findings from deep analysis of the liminallm codebase
 - 14.1: Path traversal vulnerability in ingest_path fixed with safe_join validation
 - 22.5: Rate limit counters now include tenant_id for proper isolation
 - 25.1: list_preference_events now has LIMIT clause (default 1000)
+- 63.9: X-Content-Type-Options header now set
+- 63.10: Referrer-Policy header now set
 
 **Infrastructure Fixes Applied:**
 - 72.2: Redis authentication enabled with REDIS_PASSWORD
@@ -4579,15 +4581,15 @@ Sensitive responses lack `Cache-Control: no-store` headers.
 
 Missing CSP headers on API responses.
 
-### 63.9 MEDIUM: Missing X-Content-Type-Options
-**Location:** `liminallm/api/app.py`
+### 63.9 ~~MEDIUM: Missing X-Content-Type-Options~~ FIXED
+**Location:** `liminallm/app.py:117`
 
-Missing `nosniff` header.
+**Status:** ✅ Header now set: `response.headers.setdefault("X-Content-Type-Options", "nosniff")`
 
-### 63.10 MEDIUM: Missing Referrer-Policy
-**Location:** `liminallm/api/app.py`
+### 63.10 ~~MEDIUM: Missing Referrer-Policy~~ FIXED
+**Location:** `liminallm/app.py:119`
 
-No Referrer-Policy header configured.
+**Status:** ✅ Header now set: `response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")`
 
 ### 63.11 MEDIUM: Permissive CORS Configuration
 **Location:** `liminallm/api/app.py:89-95`
