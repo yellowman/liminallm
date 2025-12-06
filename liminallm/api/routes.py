@@ -414,6 +414,26 @@ def _get_plan_rate_multiplier(runtime, plan_tier: str) -> float:
     return multipliers.get(plan_tier, 1.0)
 
 
+def _get_plan_upload_limit(runtime, plan_tier: str) -> int:
+    """Get per-plan file upload size limit (SPEC §18).
+
+    Args:
+        runtime: Application runtime context
+        plan_tier: User's plan tier (free, paid, enterprise)
+
+    Returns:
+        Maximum upload size in bytes for the user's plan
+    """
+    # SPEC §18: "free: 25MB/file, paid: 200MB/file"
+    # Enterprise gets same as paid by default
+    limits = {
+        "free": 25 * 1024 * 1024,        # 25MB
+        "paid": 200 * 1024 * 1024,       # 200MB
+        "enterprise": 200 * 1024 * 1024, # 200MB
+    }
+    return limits.get(plan_tier, limits["free"])
+
+
 def _get_rate_limit(runtime, key: str) -> int:
     """Get rate limit value from database settings.
 
@@ -3190,10 +3210,14 @@ async def get_file_limits(principal: AuthContext = Depends(get_user)):
         _get_rate_limit(runtime, "read_rate_limit_per_minute"),
         60,
     )
+    # Issue 4.3: Return per-plan upload limits (SPEC §18)
+    user = runtime.store.get_user(principal.user_id)
+    plan_tier = user.plan_tier if user else "free"
     return Envelope(
         status="ok",
         data={
-            "max_upload_bytes": _get_rate_limit(runtime, "max_upload_bytes"),
+            "max_upload_bytes": _get_plan_upload_limit(runtime, plan_tier),
+            "plan_tier": plan_tier,
         },
     )
 
@@ -3236,10 +3260,13 @@ async def upload_file(
             / principal.user_id
             / "files"
         )
-        max_bytes = max(1, _get_rate_limit(runtime, "max_upload_bytes"))
+        # Issue 4.3: Enforce per-plan file size limits (SPEC §18)
+        user = runtime.store.get_user(principal.user_id)
+        plan_tier = user.plan_tier if user else "free"
+        max_bytes = max(1, _get_plan_upload_limit(runtime, plan_tier))
         contents = await file.read(max_bytes + 1)
         if len(contents) > max_bytes:
-            raise _http_error("validation_error", "file too large", status_code=413)
+            raise _http_error("validation_error", f"file too large (max {max_bytes // 1024 // 1024}MB for {plan_tier} plan)", status_code=413)
         dest_path = safe_join(dest_dir, safe_filename)
         resolved_dest = dest_path.resolve()
         if (

@@ -138,6 +138,8 @@ class AuthService:
         self._oauth_states: dict[str, tuple[str, datetime, Optional[str]]] = {}
         self._oauth_code_registry: dict[tuple[str, str], dict] = {}
         self._email_verification_tokens: dict[str, tuple[str, datetime]] = {}
+        # Issue 11.2: In-memory fallback for password reset tokens when Redis unavailable
+        self._password_reset_tokens: dict[str, tuple[str, datetime]] = {}  # token -> (email, expires_at)
         self._pwd_hasher = PasswordHasher(type=Type.ID)
         self.logger = logger
         self._last_cleanup = datetime.utcnow()
@@ -182,6 +184,15 @@ class AuthService:
                 self._email_verification_tokens.pop(token, None)
                 cleaned += 1
 
+            # Clean expired password reset tokens (Issue 11.2)
+            expired_reset = [
+                token for token, (_, expires_at) in self._password_reset_tokens.items()
+                if expires_at <= now
+            ]
+            for token in expired_reset:
+                self._password_reset_tokens.pop(token, None)
+                cleaned += 1
+
             # Clean expired MFA lockouts (Issue 11.1)
             expired_lockouts = [
                 user_id for user_id, locked_until in self._mfa_lockouts.items()
@@ -204,7 +215,7 @@ class AuthService:
         if cleaned > 0:
             self.logger.debug(
                 "auth_state_cleanup", cleaned=cleaned, oauth=len(expired_oauth),
-                mfa=len(expired_mfa), email=len(expired_email),
+                mfa=len(expired_mfa), email=len(expired_email), reset=len(expired_reset),
                 mfa_lockouts=len(expired_lockouts), mfa_attempts=len(expired_attempts)
             )
 
@@ -1052,20 +1063,36 @@ class AuthService:
     async def initiate_password_reset(self, email: str) -> str:
         # Use raw bytes for proper entropy (not string representation)
         token = hashlib.sha256(b"reset-" + email.encode() + os.urandom(32)).hexdigest()
+        expires_at = datetime.utcnow() + timedelta(minutes=15)
         # Persist a short-lived reset token with TTL in Redis if available
         if self.cache:
-            expires_at = datetime.utcnow() + timedelta(minutes=15)
             await self.cache.client.set(
                 f"reset:{token}",
                 email,
                 ex=int((expires_at - datetime.utcnow()).total_seconds()),
             )
+        else:
+            # Issue 11.2: In-memory fallback for password reset tokens
+            with self._state_lock:
+                self._password_reset_tokens[token] = (email, expires_at)
         return token
 
     async def complete_password_reset(self, token: str, new_password: str) -> bool:
         email = None
         if self.cache:
             email = await self.cache.client.get(f"reset:{token}")
+        else:
+            # Issue 11.2: In-memory fallback for password reset tokens
+            with self._state_lock:
+                stored = self._password_reset_tokens.get(token)
+                if stored:
+                    stored_email, expires_at = stored
+                    if expires_at <= datetime.utcnow():
+                        # Remove expired token to prevent memory leak
+                        self._password_reset_tokens.pop(token, None)
+                    else:
+                        email = stored_email
+                        self._password_reset_tokens.pop(token, None)
         if not email:
             return False
         if isinstance(email, bytes):
