@@ -1218,6 +1218,17 @@ class AuthService:
             header_b64, payload_b64, sig_b64 = token.split(".")
         except ValueError:
             return None
+
+        # Issue 35.1: Validate header algorithm to prevent algorithm confusion attacks
+        try:
+            header = json.loads(self._decode_segment(header_b64))
+            if header.get("alg") != "HS256":
+                logger.warning("jwt_invalid_algorithm", alg=header.get("alg"))
+                return None
+        except Exception:
+            logger.warning("jwt_header_decode_failed")
+            return None
+
         signing_input = f"{header_b64}.{payload_b64}"
         expected_sig = self._encode_segment(
             hmac.new(
