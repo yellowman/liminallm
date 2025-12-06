@@ -125,6 +125,10 @@ class AuthService:
         self.store: AuthStore = store
         self.cache = cache
         self.settings = settings
+        # Issue 28.4: Thread-safe lock for mutable state dictionaries
+        # Protects all in-memory fallback state from concurrent access
+        import threading
+        self._state_lock = threading.Lock()
         self._mfa_challenges: dict[str, tuple[str, datetime]] = {}
         # Issue 11.1: In-memory fallback for MFA lockout when Redis unavailable
         self._mfa_attempts: dict[str, tuple[int, datetime]] = {}  # user_id -> (count, window_start)
@@ -134,6 +138,8 @@ class AuthService:
         self._oauth_states: dict[str, tuple[str, datetime, Optional[str]]] = {}
         self._oauth_code_registry: dict[tuple[str, str], dict] = {}
         self._email_verification_tokens: dict[str, tuple[str, datetime]] = {}
+        # Issue 11.2: In-memory fallback for password reset tokens when Redis unavailable
+        self._password_reset_tokens: dict[str, tuple[str, datetime]] = {}  # token -> (email, expires_at)
         self._pwd_hasher = PasswordHasher(type=Type.ID)
         self.logger = logger
         self._last_cleanup = datetime.utcnow()
@@ -149,56 +155,67 @@ class AuthService:
         now = datetime.utcnow()
         cleaned = 0
 
-        # Clean expired OAuth states
-        expired_oauth = [
-            state for state, (_, expires_at, _) in self._oauth_states.items()
-            if expires_at <= now
-        ]
-        for state in expired_oauth:
-            self._oauth_states.pop(state, None)
-            cleaned += 1
+        # Issue 28.4: Thread-safe access to mutable state dictionaries
+        with self._state_lock:
+            # Clean expired OAuth states
+            expired_oauth = [
+                state for state, (_, expires_at, _) in self._oauth_states.items()
+                if expires_at <= now
+            ]
+            for state in expired_oauth:
+                self._oauth_states.pop(state, None)
+                cleaned += 1
 
-        # Clean expired MFA challenges
-        expired_mfa = [
-            user_id for user_id, (_, expires_at) in self._mfa_challenges.items()
-            if expires_at <= now
-        ]
-        for user_id in expired_mfa:
-            self._mfa_challenges.pop(user_id, None)
-            cleaned += 1
+            # Clean expired MFA challenges
+            expired_mfa = [
+                user_id for user_id, (_, expires_at) in self._mfa_challenges.items()
+                if expires_at <= now
+            ]
+            for user_id in expired_mfa:
+                self._mfa_challenges.pop(user_id, None)
+                cleaned += 1
 
-        # Clean expired email verification tokens
-        expired_email = [
-            token for token, (_, expires_at) in self._email_verification_tokens.items()
-            if expires_at <= now
-        ]
-        for token in expired_email:
-            self._email_verification_tokens.pop(token, None)
-            cleaned += 1
+            # Clean expired email verification tokens
+            expired_email = [
+                token for token, (_, expires_at) in self._email_verification_tokens.items()
+                if expires_at <= now
+            ]
+            for token in expired_email:
+                self._email_verification_tokens.pop(token, None)
+                cleaned += 1
 
-        # Clean expired MFA lockouts (Issue 11.1)
-        expired_lockouts = [
-            user_id for user_id, locked_until in self._mfa_lockouts.items()
-            if locked_until <= now
-        ]
-        for user_id in expired_lockouts:
-            self._mfa_lockouts.pop(user_id, None)
-            cleaned += 1
+            # Clean expired password reset tokens (Issue 11.2)
+            expired_reset = [
+                token for token, (_, expires_at) in self._password_reset_tokens.items()
+                if expires_at <= now
+            ]
+            for token in expired_reset:
+                self._password_reset_tokens.pop(token, None)
+                cleaned += 1
 
-        # Clean expired MFA attempts (5-minute window)
-        window_threshold = now - timedelta(minutes=5)
-        expired_attempts = [
-            user_id for user_id, (_, window_start) in self._mfa_attempts.items()
-            if window_start <= window_threshold
-        ]
-        for user_id in expired_attempts:
-            self._mfa_attempts.pop(user_id, None)
-            cleaned += 1
+            # Clean expired MFA lockouts (Issue 11.1)
+            expired_lockouts = [
+                user_id for user_id, locked_until in self._mfa_lockouts.items()
+                if locked_until <= now
+            ]
+            for user_id in expired_lockouts:
+                self._mfa_lockouts.pop(user_id, None)
+                cleaned += 1
+
+            # Clean expired MFA attempts (5-minute window)
+            window_threshold = now - timedelta(minutes=5)
+            expired_attempts = [
+                user_id for user_id, (_, window_start) in self._mfa_attempts.items()
+                if window_start <= window_threshold
+            ]
+            for user_id in expired_attempts:
+                self._mfa_attempts.pop(user_id, None)
+                cleaned += 1
 
         if cleaned > 0:
             self.logger.debug(
                 "auth_state_cleanup", cleaned=cleaned, oauth=len(expired_oauth),
-                mfa=len(expired_mfa), email=len(expired_email),
+                mfa=len(expired_mfa), email=len(expired_email), reset=len(expired_reset),
                 mfa_lockouts=len(expired_lockouts), mfa_attempts=len(expired_attempts)
             )
 
@@ -315,7 +332,9 @@ class AuthService:
 
         state = uuid.uuid4().hex
         expires_at = datetime.utcnow() + timedelta(minutes=10)
-        self._oauth_states[state] = (provider, expires_at, tenant_id)
+        # Issue 28.4: Thread-safe state mutation
+        with self._state_lock:
+            self._oauth_states[state] = (provider, expires_at, tenant_id)
         if self.cache:
             await self.cache.set_oauth_state(state, provider, expires_at, tenant_id)
 
@@ -512,14 +531,17 @@ class AuthService:
                 cache_state_used = stored is not None
             except Exception as exc:
                 self.logger.warning("pop_oauth_state_failed", error=str(exc))
-        if stored is None:
-            stored = self._oauth_states.pop(state, None)
-        else:
-            self._oauth_states.pop(state, None)
+        # Issue 28.4: Thread-safe state mutation
+        with self._state_lock:
+            if stored is None:
+                stored = self._oauth_states.pop(state, None)
+            else:
+                self._oauth_states.pop(state, None)
         now = datetime.utcnow()
 
         async def _clear_oauth_state() -> None:
-            self._oauth_states.pop(state, None)
+            with self._state_lock:
+                self._oauth_states.pop(state, None)
             if self.cache and not cache_state_used:
                 await self.cache.pop_oauth_state(state)
 
@@ -569,8 +591,30 @@ class AuthService:
     ) -> list[User]:
         return self.store.list_users(tenant_id=tenant_id, limit=limit)
 
-    def set_user_role(self, user_id: str, role: str) -> Optional[User]:
-        return self.store.update_user_role(user_id, role)
+    async def set_user_role(self, user_id: str, role: str) -> Optional[User]:
+        """Update user role and invalidate all existing sessions.
+
+        Issue 22.1: When role changes, existing sessions must be invalidated
+        to prevent users from retaining previous privilege levels.
+        """
+        user = self.store.update_user_role(user_id, role)
+        if user:
+            # Revoke all sessions for this user to enforce new role
+            try:
+                await self.revoke_all_user_sessions(user_id)
+                self.logger.info(
+                    "user_role_updated_sessions_revoked",
+                    user_id=user_id,
+                    new_role=role,
+                )
+            except Exception as exc:
+                # Log but don't fail role update if session revocation fails
+                self.logger.warning(
+                    "user_role_session_revocation_failed",
+                    user_id=user_id,
+                    error=str(exc),
+                )
+        return user
 
     def delete_user(self, user_id: str) -> bool:
         return bool(self.store.delete_user(user_id))
@@ -790,6 +834,9 @@ class AuthService:
         """Rotate session if 24h of activity has passed (SPEC §12.1).
 
         Returns the new session if rotated, None otherwise.
+
+        Bug fix: Uses Redis SETNX lock to prevent race condition where concurrent
+        requests with the same session could both trigger rotation.
         """
         if not self.cache:
             return None
@@ -806,44 +853,68 @@ class AuthService:
         if datetime.utcnow() - last_activity < rotation_threshold:
             return None
 
-        # Time to rotate - create new session
-        self.logger.info(
-            "session_rotation",
-            old_session=sess.id,
-            user_id=sess.user_id,
-            last_activity=last_activity.isoformat(),
-        )
+        # Bug fix: Acquire rotation lock to prevent duplicate rotations
+        lock_key = f"session:rotation_lock:{sess.id}"
+        acquired = await self.cache.client.set(lock_key, "1", nx=True, ex=30)
+        if not acquired:
+            # Another request is already rotating this session
+            return None
 
-        new_session = self.store.create_session(
-            sess.user_id,
-            mfa_required=sess.mfa_required,
-            tenant_id=sess.tenant_id,
-            user_agent=sess.user_agent,
-            ip_addr=str(sess.ip_addr) if sess.ip_addr else None,
-            meta=sess.meta,
-        )
+        try:
+            # Double-check the session hasn't been rotated while waiting
+            rotated_to = await self.cache.get_rotated_session(sess.id)
+            if rotated_to:
+                # Session was already rotated by another request
+                return None
 
-        # Mark new session as MFA verified if old one was
-        if sess.mfa_verified:
-            self._mark_session_verified(new_session.id)
-            new_session.mfa_verified = True
+            # Time to rotate - create new session
+            self.logger.info(
+                "session_rotation",
+                old_session=sess.id,
+                user_id=sess.user_id,
+                last_activity=last_activity.isoformat(),
+            )
 
-        # Set up grace period mapping
-        grace_seconds = sys_settings.get("session_rotation_grace_seconds", 300)
-        await self.cache.set_session_rotation_grace(
-            sess.id,
-            new_session.id,
-            grace_seconds,
-        )
+            # Bug fix: Don't copy refresh_jti/refresh_exp from old session meta
+            # to prevent the new session from referencing the wrong refresh token
+            new_meta = None
+            if sess.meta:
+                new_meta = {k: v for k, v in sess.meta.items()
+                           if k not in ("refresh_jti", "refresh_exp")}
 
-        # Revoke old session
-        self.store.revoke_session(sess.id)
-        await self.cache.revoke_session(sess.id)
+            new_session = self.store.create_session(
+                sess.user_id,
+                mfa_required=sess.mfa_required,
+                tenant_id=sess.tenant_id,
+                user_agent=sess.user_agent,
+                ip_addr=str(sess.ip_addr) if sess.ip_addr else None,
+                meta=new_meta,
+            )
 
-        # Initialize activity for new session
-        await self.cache.update_session_activity(new_session.id)
+            # Mark new session as MFA verified if old one was
+            if sess.mfa_verified:
+                self._mark_session_verified(new_session.id)
+                new_session.mfa_verified = True
 
-        return new_session
+            # Set up grace period mapping
+            grace_seconds = sys_settings.get("session_rotation_grace_seconds", 300)
+            await self.cache.set_session_rotation_grace(
+                sess.id,
+                new_session.id,
+                grace_seconds,
+            )
+
+            # Revoke old session
+            self.store.revoke_session(sess.id)
+            await self.cache.revoke_session(sess.id)
+
+            # Initialize activity for new session
+            await self.cache.update_session_activity(new_session.id)
+
+            return new_session
+        finally:
+            # Release the lock
+            await self.cache.client.delete(lock_key)
 
     async def authenticate(
         self,
@@ -936,13 +1007,15 @@ class AuthService:
                 return False
         else:
             # In-memory fallback for lockout check
-            locked_until = self._mfa_lockouts.get(user_id)
-            if locked_until and locked_until > now:
-                self.logger.warning("mfa_locked_out", user_id=user_id)
-                return False
-            elif locked_until:
-                # Expired lockout, clean up
-                self._mfa_lockouts.pop(user_id, None)
+            # Issue 28.4: Thread-safe state access
+            with self._state_lock:
+                locked_until = self._mfa_lockouts.get(user_id)
+                if locked_until and locked_until > now:
+                    self.logger.warning("mfa_locked_out", user_id=user_id)
+                    return False
+                elif locked_until:
+                    # Expired lockout, clean up
+                    self._mfa_lockouts.pop(user_id, None)
 
         if not self._verify_totp(cfg.secret, code):
             # Issue 19.3: Use atomic operation to track failed attempt and check lockout
@@ -955,21 +1028,23 @@ class AuthService:
                     self.logger.warning("mfa_lockout_triggered", user_id=user_id, attempts=attempts)
             else:
                 # In-memory fallback for attempt tracking (Issue 11.1)
-                current = self._mfa_attempts.get(user_id)
-                window_start = now
-                attempts = 1
-                if current:
-                    count, prev_window_start = current
-                    # If within 5-minute window, increment; otherwise reset
-                    if now - prev_window_start < timedelta(minutes=5):
-                        attempts = count + 1
-                        window_start = prev_window_start
-                self._mfa_attempts[user_id] = (attempts, window_start)
-                if attempts >= 5:
-                    # Lock out for 5 minutes
-                    self._mfa_lockouts[user_id] = now + timedelta(minutes=5)
-                    self._mfa_attempts.pop(user_id, None)
-                    self.logger.warning("mfa_lockout_triggered", user_id=user_id, attempts=attempts)
+                # Issue 28.4: Thread-safe state access
+                with self._state_lock:
+                    current = self._mfa_attempts.get(user_id)
+                    window_start = now
+                    attempts = 1
+                    if current:
+                        count, prev_window_start = current
+                        # If within 5-minute window, increment; otherwise reset
+                        if now - prev_window_start < timedelta(minutes=5):
+                            attempts = count + 1
+                            window_start = prev_window_start
+                    self._mfa_attempts[user_id] = (attempts, window_start)
+                    if attempts >= 5:
+                        # Lock out for 5 minutes
+                        self._mfa_lockouts[user_id] = now + timedelta(minutes=5)
+                        self._mfa_attempts.pop(user_id, None)
+                        self.logger.warning("mfa_lockout_triggered", user_id=user_id, attempts=attempts)
             return False
 
         # Success - clear any failed attempts
@@ -977,7 +1052,8 @@ class AuthService:
             await self.cache.clear_mfa_attempts(user_id)
         else:
             # In-memory fallback - clear attempts on success
-            self._mfa_attempts.pop(user_id, None)
+            with self._state_lock:
+                self._mfa_attempts.pop(user_id, None)
 
         self.store.set_user_mfa_secret(user_id, cfg.secret, enabled=True)
         if session_id:
@@ -987,20 +1063,36 @@ class AuthService:
     async def initiate_password_reset(self, email: str) -> str:
         # Use raw bytes for proper entropy (not string representation)
         token = hashlib.sha256(b"reset-" + email.encode() + os.urandom(32)).hexdigest()
+        expires_at = datetime.utcnow() + timedelta(minutes=15)
         # Persist a short-lived reset token with TTL in Redis if available
         if self.cache:
-            expires_at = datetime.utcnow() + timedelta(minutes=15)
             await self.cache.client.set(
                 f"reset:{token}",
                 email,
                 ex=int((expires_at - datetime.utcnow()).total_seconds()),
             )
+        else:
+            # Issue 11.2: In-memory fallback for password reset tokens
+            with self._state_lock:
+                self._password_reset_tokens[token] = (email, expires_at)
         return token
 
     async def complete_password_reset(self, token: str, new_password: str) -> bool:
         email = None
         if self.cache:
             email = await self.cache.client.get(f"reset:{token}")
+        else:
+            # Issue 11.2: In-memory fallback for password reset tokens
+            with self._state_lock:
+                stored = self._password_reset_tokens.get(token)
+                if stored:
+                    stored_email, expires_at = stored
+                    if expires_at <= datetime.utcnow():
+                        # Remove expired token to prevent memory leak
+                        self._password_reset_tokens.pop(token, None)
+                    else:
+                        email = stored_email
+                        self._password_reset_tokens.pop(token, None)
         if not email:
             return False
         if isinstance(email, bytes):
@@ -1034,7 +1126,9 @@ class AuthService:
                 ex=int((expires_at - datetime.utcnow()).total_seconds()),
             )
         else:
-            self._email_verification_tokens[token] = (user.id, expires_at)
+            # Issue 28.4: Thread-safe state mutation
+            with self._state_lock:
+                self._email_verification_tokens[token] = (user.id, expires_at)
         return token
 
     async def complete_email_verification(self, token: str) -> bool:
@@ -1042,15 +1136,17 @@ class AuthService:
         if self.cache:
             user_id = await self.cache.client.get(f"verify:{token}")
         else:
-            stored = self._email_verification_tokens.get(token)
-            if stored:
-                user_id, expires_at = stored
-                if expires_at <= datetime.utcnow():
-                    # Remove expired token to prevent memory leak
-                    self._email_verification_tokens.pop(token, None)
-                    user_id = None
-                else:
-                    self._email_verification_tokens.pop(token, None)
+            # Issue 28.4: Thread-safe state access
+            with self._state_lock:
+                stored = self._email_verification_tokens.get(token)
+                if stored:
+                    user_id, expires_at = stored
+                    if expires_at <= datetime.utcnow():
+                        # Remove expired token to prevent memory leak
+                        self._email_verification_tokens.pop(token, None)
+                        user_id = None
+                    else:
+                        self._email_verification_tokens.pop(token, None)
         if isinstance(user_id, bytes):
             user_id = user_id.decode()
         if not user_id:
@@ -1063,7 +1159,8 @@ class AuthService:
         if self.cache:
             await self.cache.client.delete(f"verify:{token}")
         else:
-            self._email_verification_tokens.pop(token, None)
+            with self._state_lock:
+                self._email_verification_tokens.pop(token, None)
         return True
 
     def _hash_password(self, password: str) -> Tuple[str, str]:
@@ -1148,6 +1245,17 @@ class AuthService:
             header_b64, payload_b64, sig_b64 = token.split(".")
         except ValueError:
             return None
+
+        # Issue 35.1: Validate header algorithm to prevent algorithm confusion attacks
+        try:
+            header = json.loads(self._decode_segment(header_b64))
+            if header.get("alg") != "HS256":
+                logger.warning("jwt_invalid_algorithm", alg=header.get("alg"))
+                return None
+        except Exception:
+            logger.warning("jwt_header_decode_failed")
+            return None
+
         signing_input = f"{header_b64}.{payload_b64}"
         expected_sig = self._encode_segment(
             hmac.new(

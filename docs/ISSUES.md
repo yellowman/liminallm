@@ -239,13 +239,17 @@ The PATCH endpoint accepts a flat object instead of RFC 6902 JSON Patch operatio
 - Both `session_id` and `access_token` (Bearer) are accepted per SPEC requirement
 - This approach is standard practice for WebSocket authentication
 
-### 2.4 HIGH: Access Tokens Not Denylisted on Logout
+### 2.4 ~~HIGH: Access Tokens Not Denylisted on Logout~~ FIXED
 
-**Location:** `liminallm/service/auth.py:591-605`
+**Status:** ✅ IMPLEMENTED
 
-Only refresh tokens are revoked on logout. Access tokens remain valid for full 30 minutes.
+**Location:** `liminallm/service/auth.py`
 
-**Impact:** Compromised access tokens remain valid even after logout.
+**Fix Applied:**
+- revoke_session() now denylists access tokens via cache.denylist_access_token()
+- Access tokens include JTI for denylist support
+- validate_access_token() checks denylist before validating
+- Per SPEC §12.1: "add JWT to short-lived denylist if JWTs used"
 
 ### 2.5 MEDIUM: Session Expiry Not Differentiated by Device
 
@@ -307,36 +311,54 @@ Only refresh tokens are revoked on logout. Access tokens remain valid for full 3
 
 ## 4. File Upload/Download Security
 
-### 4.1 CRITICAL: No File Download Endpoint
+### 4.1 ~~CRITICAL: No File Download Endpoint~~ FIXED
 
 **Location:** `liminallm/api/routes.py`
 
 **SPEC §13.3 requires:** "GET /v1/files — list user files (paginated)"
 **SPEC §12.2 requires:** "signed download URLs for browser fetch"
 
-**Current:** Only `GET /files/limits` and `POST /files/upload` exist. No download capability.
+**Fix Applied:**
+- Added GET /files - list user files with pagination
+- Added GET /files/{filename}/url - get signed download URL
+- Added GET /files/download - download file with validated signature
+- Added DELETE /files/{filename} - delete user file
 
-### 4.2 CRITICAL: No Signed URLs (10-Minute Expiry)
+### 4.2 ~~CRITICAL: No Signed URLs (10-Minute Expiry)~~ FIXED
 
-**Location:** N/A (not implemented)
+**Location:** `liminallm/service/fs.py`
 
 **SPEC §18 requires:** "downloads use signed URLs with 10m expiry and content-disposition set to prevent inline execution"
 
-**Current:** No signed URL generation mechanism exists.
+**Fix Applied:**
+- Implemented `generate_signed_url()` with HMAC-SHA256 signatures
+- Implemented `validate_signed_url()` with constant-time comparison
+- Default 10-minute (600 second) expiry
+- Content-Disposition header set to 'attachment' to prevent inline execution
 
-### 4.3 CRITICAL: Per-Plan Size Caps Not Enforced
+### 4.3 ~~CRITICAL: Per-Plan Size Caps Not Enforced~~ FIXED
 
-**Location:** `liminallm/api/routes.py:2385-2388`
+**Status:** ✅ IMPLEMENTED
+
+**Location:** `liminallm/api/routes.py`
 
 **SPEC §18 requires:** "free: 25MB/file, paid: 200MB/file"
 
-**Current:** Single global `max_upload_bytes` (10MB default). AuthContext doesn't include `plan_tier`.
+**Fix Applied:**
+- Added `_get_plan_upload_limit()` helper function with per-plan limits
+- free: 25MB, paid: 200MB, enterprise: 200MB
+- `/files/upload` now enforces plan-specific limits
+- `/files/limits` returns plan-specific max_upload_bytes
 
-### 4.4 HIGH: Content-Disposition Header Missing
+### 4.4 ~~HIGH: Content-Disposition Header Missing~~ FIXED
+
+**Status:** ✅ IMPLEMENTED
 
 **SPEC §18 requires:** "content-disposition set to prevent inline execution"
 
-**Current:** No Content-Disposition header implementation for downloads.
+**Fix Applied:**
+- GET /files/download sets `Content-Disposition: attachment; filename="{path}"`
+- Prevents inline execution of downloaded files in browser
 
 ### 4.5 HIGH: MIME Type Validation Absent
 
@@ -360,21 +382,28 @@ Only refresh tokens are revoked on logout. Access tokens remain valid for full 3
 
 ## 5. WebSocket Protocol Compliance
 
-### 5.1 CRITICAL: Missing request_id in Stream Events
+### 5.1 ~~CRITICAL: Missing request_id in Stream Events~~ FIXED
 
-**Location:** `liminallm/api/routes.py:2954`
+**Status:** ✅ IMPLEMENTED
+
+**Location:** `liminallm/api/routes.py`
 
 **SPEC §18 requires:** "stream events carry `{ event, data, request_id }`"
 
-**Current:** Events sent without `request_id`: `{"event": event_type, "data": event_data}`
+**Fix Applied:**
+- All WebSocket stream events now include request_id
+- Events use format: `{"event": event_type, "data": event_data, "request_id": request_id}`
 
-### 5.2 HIGH: No Per-User Connection Limits
+### 5.2 ~~HIGH: No Per-User Connection Limits~~ FIXED
 
-**Location:** `liminallm/api/routes.py:2852`
+**Status:** ✅ IMPLEMENTED
 
-No connection limit enforcement found. Single user could create unlimited concurrent WebSocket connections.
+**Location:** `liminallm/api/routes.py`
 
-**Impact:** DoS vulnerability - user can exhaust server resources.
+**Fix Applied:**
+- Added `max_websocket_connections_per_user` setting (default: 5)
+- WebSocket endpoint enforces limit before accepting connection
+- Returns error code "connection_limit" when exceeded
 
 ### 5.3 MEDIUM: No Mixed Transport Rejection
 
@@ -394,25 +423,39 @@ No connection limit enforcement found. Single user could create unlimited concur
 
 ## 6. Tool Sandboxing and Circuit Breakers
 
-### 6.1 CRITICAL: No Circuit Breaker Implementation
+### 6.1 ~~CRITICAL: No Circuit Breaker Implementation~~ FIXED
 
 **SPEC §18 requires:** "circuit breaker opens for a tool after 5 failures in 1 minute"
 
-**Current:** No circuit breaker found anywhere in codebase.
+**Fix Applied:**
+- Added `check_circuit_breaker()` to redis_cache.py
+- Added `record_tool_failure()` with atomic Lua script
+- Added `record_tool_success()` to reset failure counter
+- Circuit opens after 5 failures in 1 minute (configurable)
+- Integrated circuit breaker checks in workflow.py `_execute_node()`
 
-### 6.2 CRITICAL: No Tool Worker Cgroup Limits
+### 6.2 ~~CRITICAL: No Tool Worker Cgroup Limits~~ FIXED
 
-**Location:** `liminallm/service/workflow.py:1510-1554`
+**Location:** `liminallm/service/sandbox.py`
 
 **SPEC §18 requires:** "Tool workers run under a fixed UID with cgroup limits (CPU shares, memory hard cap)"
 
-**Current:** Tools execute in same process as FastAPI app with no isolation.
+**Fix Applied:**
+- Added `SandboxConfig` with resource limits (CPU, memory, file size)
+- Added `apply_resource_limits()` using Python's resource module
+- Added `setup_cgroup()` and `add_to_cgroup()` for cgroup v2 integration
+- Limits: 512MB memory, 30s CPU, 100MB file size by default
+- Privileged tools get higher limits (1024MB, 120s)
 
-### 6.3 CRITICAL: No Filesystem Isolation for Tools
+### 6.3 ~~CRITICAL: No Filesystem Isolation for Tools~~ FIXED
 
 **SPEC §18 requires:** "no filesystem access except tmp scratch"
 
-**Current:** Tools have full access to application filesystem.
+**Fix Applied:**
+- Added `validate_path_access()` that restricts file access to scratch directory
+- Added `SandboxedFileHandle` for safe file operations
+- Added `sandbox_open()` as a drop-in replacement for built-in open()
+- Scratch directory defaults to `/tmp/liminallm_sandbox`
 
 ### 6.4 CRITICAL: No Allowlisted External Fetch Proxy
 
@@ -440,19 +483,30 @@ No connection limit enforcement found. Single user could create unlimited concur
 
 **Current:** No content type tracking or sanitization.
 
-### 6.8 HIGH: No Privileged Tool Access Controls
+### 6.8 ~~HIGH: No Privileged Tool Access Controls~~ FIXED
+
+**Status:** ✅ IMPLEMENTED
 
 **SPEC §18 requires:** "privileged tools require admin-owned artifacts"
 
-**Current:** No privilege levels. Any authenticated user can invoke any tool.
+**Fix Applied:**
+- Added `PrivilegedToolError` exception class
+- Added `check_privileged_access()` function in sandbox.py
+- Privileged tools require admin role to invoke
+- `PRIVILEGED_SANDBOX_CONFIG` provides higher resource limits for admin tools
 
-### 6.9 MEDIUM: Per-Node Timeout Hardcap Not Enforced
+### 6.9 ~~MEDIUM: Per-Node Timeout Hardcap Not Enforced~~ FIXED
 
-**Location:** `liminallm/service/workflow.py:1522-1525`
+**Status:** ✅ IMPLEMENTED
+
+**Location:** `liminallm/service/workflow.py`
 
 **SPEC §18 requires:** "per-node timeout default 15s, hard cap 60s"
 
-**Current:** No hardcap validation. Tool specs can set arbitrary timeout_seconds.
+**Fix Applied:**
+- Added `MAX_NODE_TIMEOUT_SECONDS = 60` constant
+- Tool timeout is clamped: `min(raw_timeout, MAX_NODE_TIMEOUT_SECONDS)`
+- Default timeout changed to 15s to match SPEC
 
 ---
 
@@ -474,13 +528,18 @@ No connection limit enforcement found. Single user could create unlimited concur
 
 **Current:** No `update_adapter_router_state()` method exists in either storage backend.
 
-### 7.3 HIGH: Missing explicit_signal Validation
+### 7.3 ~~HIGH: Missing explicit_signal Validation~~ FIXED
 
-**Location:** `liminallm/api/schemas.py:489-500`
+**Status:** ✅ IMPLEMENTED
+
+**Location:** `liminallm/api/schemas.py`
 
 **SPEC §2.6 specifies:** `explicit_signal` should be: 'like','dislike','always','never'
 
-**Current:** Field accepts any string, no enum validation.
+**Fix Applied:**
+- Added `_VALID_EXPLICIT_SIGNALS` constant with allowed values
+- Added `@field_validator("explicit_signal")` to validate signal values
+- Invalid signals raise validation error with list of valid options
 
 ### 7.4 MEDIUM: Score Normalization Missing
 
@@ -606,33 +665,50 @@ Missing indexes for common query patterns on sessions, artifacts, chunks tables.
 
 ## 11. Authentication Service Security
 
-### 11.1 CRITICAL: MFA Lockout Only Works With Cache
+### 11.1 ~~CRITICAL: MFA Lockout Only Works With Cache~~ FIXED
 
-**Location:** `liminallm/service/auth.py:748-773`
+**Status:** ✅ IMPLEMENTED
 
-MFA lockout logic entirely gated on cache availability. Without Redis, unlimited TOTP brute-force possible.
+**Location:** `liminallm/service/auth.py`
 
-### 11.2 HIGH: Password Reset Non-Functional Without Cache
+**Fix Applied:**
+- Added `_mfa_attempts` dict for tracking failed attempts in-memory
+- Added `_mfa_lockouts` dict for in-memory lockout tracking
+- MFA lockout now works without Redis via in-memory fallback
 
-**Location:** `liminallm/service/auth.py:775-810`
+### 11.2 ~~HIGH: Password Reset Non-Functional Without Cache~~ FIXED
 
-Password reset tokens only stored if cache exists.
+**Status:** ✅ IMPLEMENTED
 
-### 11.3 MEDIUM: Unused _mfa_challenges Dictionary
+**Location:** `liminallm/service/auth.py`
 
-**Location:** `liminallm/service/auth.py:128`
+**Fix Applied:**
+- Added `_password_reset_tokens` dict for in-memory token storage
+- initiate_password_reset() stores tokens in memory when Redis unavailable
+- complete_password_reset() checks in-memory tokens as fallback
+- Tokens cleaned up by cleanup_expired_states()
 
-Should be used as in-memory fallback for MFA lockout tracking.
+### 11.3 ~~MEDIUM: Unused _mfa_challenges Dictionary~~ FIXED
+
+**Status:** ✅ USED
+
+**Location:** `liminallm/service/auth.py`
+
+MFA challenges dictionary is used for in-memory challenge tracking. Additionally, `_mfa_attempts` and `_mfa_lockouts` added for MFA rate limiting.
 
 ---
 
 ## 12. Workflow Engine
 
-### 12.1 HIGH: Per-Node Timeout Default Incorrect
+### 12.1 ~~HIGH: Per-Node Timeout Default Incorrect~~ FIXED
 
-**Location:** `liminallm/service/workflow.py:1525`
+**Status:** ✅ IMPLEMENTED
 
-`DEFAULT_NODE_TIMEOUT_MS = 15000` defined but hardcoded `timeout = 5` used instead.
+**Location:** `liminallm/service/workflow.py`
+
+**Fix Applied:**
+- Changed default timeout from 5 to 15 seconds per SPEC
+- Now uses `DEFAULT_NODE_TIMEOUT_MS` constant (15000ms)
 
 ### 12.2 MEDIUM: Retry Backoff Not Cancellable
 
@@ -716,27 +792,41 @@ No validation that adapter exists, is compatible, or user has permission.
 
 ## 17. Config Operations
 
-### 17.1 CRITICAL: Missing write_rate_limit_per_minute Config
+### 17.1 ~~CRITICAL: Missing write_rate_limit_per_minute Config~~ FIXED
 
-**Location:** `liminallm/config.py`
+**Status:** ✅ VERIFIED_FIXED
 
-Configuration parameter referenced in routes.py does not exist.
+**Location:** `liminallm/api/routes.py:361`
+
+The `write_rate_limit_per_minute` setting exists in the defaults dict at line 361 and is properly used via `_get_rate_limit(runtime, "write_rate_limit_per_minute")`.
 
 ---
 
 ## 18. Training Pipeline
 
-### 18.1 CRITICAL: No Deduplication in Dataset Generation
+### 18.1 ~~CRITICAL: No Deduplication in Dataset Generation~~ FIXED
 
-**Location:** `liminallm/training/dataset.py`
+**Status:** ✅ IMPLEMENTED
 
-Multiple identical prompt-response pairs can appear in training data.
+**Location:** `liminallm/service/training.py:_build_examples`
 
-### 18.2 CRITICAL: SFT Prompt Includes Target Message
+**SPEC §18 requires:** "dedupe by `(conversation_id, message_id)`"
 
-**Location:** `liminallm/training/sft.py`
+**Fix Applied:**
+- Added `seen` set to track (conversation_id, message_id) pairs
+- Skip events that have already been processed
+- Prevents duplicate prompt-response pairs in training data
 
-Target assistant message included in prompt, violating SFT principles.
+### 18.2 ~~CRITICAL: SFT Prompt Includes Target Message~~ FIXED
+
+**Status:** ✅ IMPLEMENTED
+
+**Location:** `liminallm/service/training.py:_build_examples`
+
+**Fix Applied:**
+- Target message (message_id match) is now excluded from prompt_chunks
+- Target text extracted for training target, but not included in prompt
+- Properly follows SFT principle: prompt should not contain the answer
 
 ---
 
@@ -970,28 +1060,28 @@ If message deletion fails partway through, conversation deleted but messages rem
 
 ## 22. Cache Invalidation and Consistency (4th Pass)
 
-### 22.1 CRITICAL: User Role Changes Not Invalidating Session Cache
+### 22.1 ~~CRITICAL: User Role Changes Not Invalidating Session Cache~~ FIXED
 
-**Location:** `liminallm/service/auth.py`, `liminallm/storage/redis_cache.py`
+**Status:** ✅ VERIFIED_FIXED
 
-When user role/permissions change, existing cached sessions retain old permissions until TTL expires.
+**Location:** `liminallm/service/auth.py:594-617`
 
-**Impact:** Privilege escalation window - demoted admin retains powers for cache TTL duration.
+**Fix Applied:**
+- `set_user_role()` method calls `revoke_all_user_sessions()` after role update
+- `revoke_user_sessions()` implemented in both RedisCache and SyncRedisCache
+- Sessions tracked in user session sets (`auth:user_sessions:{user_id}`) for bulk revocation
 
-**Fix:** Invalidate all user sessions on permission change, or include version in session token.
+### 22.2 ~~CRITICAL: Missing tenant_id in Cache Keys~~ FIXED
 
-### 22.2 CRITICAL: Missing tenant_id in Cache Keys
+**Status:** ✅ IMPLEMENTED
 
-**Location:** `liminallm/storage/redis_cache.py:194`, `liminallm/service/router.py:81`
+**Location:** `liminallm/storage/redis_cache.py`, `liminallm/service/runtime.py`
 
-```python
-f"router:last:{user_id}"  # Missing tenant_id
-f"idemp:{key}"            # Missing tenant_id
-```
-
-**Impact:** Cross-tenant cache pollution in multi-tenant deployment.
-
-**Fix:** Include tenant_id in all cache key prefixes.
+**Fix Applied:**
+- Added `tenant_id` parameter to all idempotency cache methods
+- Cache keys now include tenant prefix: `f"idemp:{tenant_prefix}{route}:{user_id}:{key}"`
+- Router cache already had tenant_id support: `f"router:last:{tenant_prefix}{user_id}:{ctx_hash}"`
+- In-memory fallback also includes tenant_id in cache keys
 
 ### 22.3 CRITICAL: Password Reset Wrong Cache Key Format
 
@@ -1023,31 +1113,29 @@ Conversation cached with 5m TTL but messages cached with 1m TTL. Can serve stale
 
 ## 23. Resource Cleanup and Memory Management (4th Pass)
 
-### 23.1 CRITICAL: ThreadPoolExecutor Relies on __del__
+### 23.1 ~~CRITICAL: ThreadPoolExecutor Relies on __del__~~ FIXED
 
-**Location:** `liminallm/service/workflow.py:1869-1873`
+**Status:** ✅ IMPLEMENTED
 
-```python
-def __del__(self):
-    if self._executor:
-        self._executor.shutdown(wait=False)
-```
+**Location:** `liminallm/service/workflow.py:133-150`, `liminallm/app.py:52-55`
 
-**Issue:** `__del__` not guaranteed to run. Executor threads can leak on ungraceful shutdown.
+**Fix Applied:**
+- Added explicit `shutdown(wait: bool)` method to WorkflowEngine
+- `_executor_shutdown` flag prevents double-shutdown
+- App lifespan shutdown calls `runtime.workflow.shutdown(wait=True)`
+- `__del__` now calls `shutdown(wait=False)` as fallback
 
-**Fix:** Implement explicit cleanup method called during app shutdown.
+### 23.2 ~~CRITICAL: Unbounded _active_requests Dictionary~~ FIXED
 
-### 23.2 CRITICAL: Unbounded _active_requests Dictionary
+**Status:** ✅ VERIFIED_FIXED
 
-**Location:** `liminallm/api/routes.py:112-125`
+**Location:** `liminallm/api/routes.py:122-174`
 
-```python
-_active_requests: Dict[str, RequestState] = {}
-```
-
-**Issue:** Entries added on request start, removed on completion. Network disconnects or crashes leave orphan entries that grow unbounded.
-
-**Fix:** Add TTL-based cleanup or use WeakValueDictionary.
+**Fix Applied:**
+- Added timestamp tracking: `_active_requests: Dict[str, tuple[asyncio.Event, datetime, str]]`
+- `_ACTIVE_REQUEST_TTL_SECONDS = 30 * 60` - Max age for stale entries
+- `_cleanup_stale_active_requests()` runs periodically during register/unregister
+- Stale entries automatically removed and cancelled
 
 ### 23.3 HIGH: WebSocket Listener Not Cleaned Up
 
@@ -1146,17 +1234,16 @@ SELECT * FROM preference_events WHERE user_id = $1
 
 **Fix:** Add mandatory pagination with max page size.
 
-### 25.2 CRITICAL: Chat Loads All Messages Unbounded
+### 25.2 ~~CRITICAL: Chat Loads All Messages Unbounded~~ FIXED
 
-**Location:** `liminallm/api/routes.py:1462-1466`
+**Status:** ✅ IMPLEMENTED
 
-```python
-messages = await store.list_messages(conversation_id)  # All messages
-```
+**Location:** `liminallm/api/routes.py`
 
-**Issue:** Conversations with thousands of messages loaded entirely into memory.
-
-**Fix:** Implement cursor-based pagination for messages.
+**Fix Applied:**
+- Messages endpoint now uses bounded limit: `min(limit or default, max_page_size)`
+- Default and max limits configurable via admin settings
+- Per SPEC §18: "limit is accepted as alias for page_size (defaults to 100, max 500)"
 
 ### 25.3 CRITICAL: search_chunks Loads All Before Scoring
 
@@ -1458,21 +1545,26 @@ Only 8 logging statements in 3,146 lines. Chat endpoint has no logging of:
 
 ## 31. Business Logic Constraint Violations (5th Pass)
 
-### 31.1 CRITICAL: Global Artifacts Inaccessible to Users
+### 31.1 ~~CRITICAL: Global Artifacts Inaccessible to Users~~ FIXED
 
-**Location:** `liminallm/api/routes.py:414-422`
+**Status:** ✅ IMPLEMENTED
 
-`_get_owned_artifact()` blocks access to global artifacts (visibility='global') for non-admin users.
+**Location:** `liminallm/storage/postgres.py:list_artifacts`
 
-**SPEC §12.2 requires:** Global artifacts accessible to all users.
+**Fix Applied:**
+- list_artifacts includes `visibility = 'global'` in visibility filter
+- All users can see global artifacts
+- Per SPEC §12.2: global artifacts accessible to all users
 
-### 31.2 CRITICAL: list_artifacts Missing Global Items
+### 31.2 ~~CRITICAL: list_artifacts Missing Global Items~~ FIXED
 
-**Location:** `liminallm/api/routes.py:1684-1690`
+**Status:** ✅ IMPLEMENTED
 
-Query only returns artifacts owned by user, missing global system artifacts.
+**Location:** `liminallm/storage/postgres.py:list_artifacts`
 
-**Impact:** Users can't discover default workflows, policies, tool specs.
+**Fix Applied:**
+- Visibility logic includes: user's private + all global + shared within tenant
+- Users can now discover default workflows, policies, tool specs
 
 ### 31.3 HIGH: RAG Cannot Access Shared Contexts
 
@@ -1480,13 +1572,13 @@ Query only returns artifacts owned by user, missing global system artifacts.
 
 RAG filters out all contexts not owned by user, preventing shared knowledge base access.
 
-### 31.4 HIGH: File Size Limits Not Plan-Differentiated
+### 31.4 ~~HIGH: File Size Limits Not Plan-Differentiated~~ FIXED
 
-**Location:** `liminallm/api/routes.py:2385-2388`
+**Status:** ✅ IMPLEMENTED (Issue 4.3)
 
-**SPEC §18 requires:** Free: 25MB/file, Paid: 200MB/file
-
-**Current:** Single global `max_upload_bytes` for all plans.
+**Fix Applied:**
+- Added `_get_plan_upload_limit()` with per-plan limits
+- free: 25MB, paid/enterprise: 200MB per SPEC §18
 
 ### 31.5 MEDIUM: Global Training Job Limit Missing
 
@@ -1638,13 +1730,13 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 | 9 | ~~X-Session header for WebSockets~~ ✅ DESIGN VARIANCE | routes.py:2853-2875 |
 | 10 | ~~Concurrency caps~~ ✅ FIXED | redis_cache.py, routes.py |
 | 11 | ~~Per-plan rate limits~~ ✅ FIXED | config.py, routes.py |
-| 12 | No file download endpoint | routes.py |
-| 13 | No signed URLs (10m expiry) | N/A |
+| ~~12~~ | ~~No file download endpoint~~ ✅ FIXED | routes.py |
+| ~~13~~ | ~~No signed URLs (10m expiry)~~ ✅ FIXED | fs.py |
 | 14 | Per-plan file size caps not enforced | routes.py:2385-2388 |
 | 15 | Missing request_id in stream events | routes.py:2954 |
-| 16 | No circuit breaker implementation | N/A |
-| 17 | No tool worker cgroup limits | workflow.py:1510-1554 |
-| 18 | No filesystem isolation for tools | N/A |
+| ~~16~~ | ~~No circuit breaker implementation~~ ✅ FIXED | redis_cache.py, workflow.py |
+| ~~17~~ | ~~No tool worker cgroup limits~~ ✅ FIXED | sandbox.py |
+| ~~18~~ | ~~No filesystem isolation for tools~~ ✅ FIXED | sandbox.py |
 | 19 | No allowlisted external fetch proxy | N/A |
 | 20 | No network egress allowlist | N/A |
 | 21 | Missing safety filtering for preferences | routes.py:1529-1572 |
@@ -2150,13 +2242,15 @@ Email regex with nested quantifiers vulnerable to catastrophic backtracking.
 
 ## 39. Type Coercion Vulnerabilities (6th Pass)
 
-### 39.1 CRITICAL: JSON Deserialization Without Error Handling
+### 39.1 ~~CRITICAL: JSON Deserialization Without Error Handling~~ FIXED
 
-**Location:** `liminallm/service/model_backend.py:1023`, `liminallm/storage/memory.py:1565`
+**Status:** ✅ VERIFIED_FIXED
 
-`json.loads()` called without try-except.
+**Location:** `liminallm/service/model_backend.py:1023-1028`, `liminallm/storage/memory.py:1693-1698`
 
-**Impact:** Invalid JSON crashes adapter loading or state restoration.
+**Fix Applied:**
+- `model_backend.py`: `json.loads()` wrapped in try-except with `json.JSONDecodeError, UnicodeDecodeError` handling
+- `memory.py`: State loading has try-except for `json.JSONDecodeError` with graceful error logging
 
 ### 39.2 HIGH: datetime.fromisoformat Without Error Handling
 
@@ -2452,13 +2546,20 @@ Cache keys include `user_id` but not `tenant_id`.
 
 ## 45. Embedding/Vector Security (7th Pass)
 
-### 45.1 CRITICAL: No NaN/Infinity Validation in Embeddings
+### 45.1 ~~CRITICAL: No NaN/Infinity Validation in Embeddings~~ FIXED
 
-**Location:** `liminallm/service/embeddings.py:29-36`
+**Status:** ✅ VERIFIED_FIXED
 
-`cosine_similarity()` does not check for NaN or Infinity values before computing similarity.
+**Location:** `liminallm/service/embeddings.py:11-50, 89-129`
 
-**Impact:** Poisoned embeddings corrupt similarity scores, centroid calculations, vector search results.
+**Fix Applied:**
+- `validate_embedding()` function raises ValueError for NaN/Infinity
+- `sanitize_embedding()` function replaces NaN/Infinity with safe values
+- `cosine_similarity()` has `validate` parameter that checks for NaN/Infinity (lines 107-114)
+- Result clamped to [-1, 1] and validated (lines 122-129)
+- `ensure_embedding_dim()` sanitizes NaN/Infinity during padding
+- `normalize_vector()` sanitizes before computing magnitude
+- `validate_centroid()` validates and normalizes cluster centroids
 
 ### 45.2 HIGH: Missing Embedding Dimension Validation
 
@@ -6514,4 +6615,98 @@ Issues were marked as FALSE POSITIVE only when:
 - Internal logging confused with client exposure
 - Test/development code not applicable to production
 - Standard industry practices (Docker isolation, env vars, etc.)
+
+---
+
+## 80. Bug Fixes Applied (December 2024)
+
+The following bugs were identified and fixed:
+
+### 80.1 ✅ FIXED: Double HTML Escaping in Citation Display
+
+**Location:** `frontend/chat.js:1213-1225`
+
+**Issue:** The `path` variable was HTML-escaped at line 1214, then `label` was derived from `path` at line 1216. When `escapeHtml(label)` was called at line 1225, it double-escaped the already-escaped content. For example, a file named "A&B.txt" would display as "A&amp;amp;B.txt".
+
+**Fix:** Removed the first `escapeHtml` call on line 1214 and kept only the output escaping at line 1225-1226.
+
+### 80.2 ✅ FIXED: Duplicate Authorization Header in Voice Transcription
+
+**Location:** `frontend/chat.js:2225-2229`
+
+**Issue:** The voice transcription fetch request set the `Authorization` header explicitly on line 2227 and then spread `...authHeaders()` on line 2228, which also includes an `Authorization` header. This created redundant code.
+
+**Fix:** Removed the explicit `Authorization` header line, using only `authHeaders()` for consistency.
+
+### 80.3 ✅ FIXED: Login Route Missing user_agent and ip_addr Parameters
+
+**Location:** `liminallm/api/routes.py:846-874`, `liminallm/service/auth.py:611-619`
+
+**Issue:** The `login` method signature accepted `user_agent` and `ip_addr` parameters for session metadata, but the login API route didn't extract these from the request and pass them. Sessions created during login had `None` for these fields.
+
+**Fix:** Added `request: Request` parameter to login route and extracted user_agent from headers and ip_addr from request.client.
+
+### 80.4 ✅ FIXED: Shell Command Sorting Bug in migrate.sh
+
+**Location:** `scripts/migrate.sh:19-21, 34-36`
+
+**Issue:** `IFS=$'\n' sorted_files=($(sort <<<"${sql_files[*]}"))` had a bug where `${sql_files[*]}` expanded with space as the separator, causing `sort` to receive all filenames as a single line. Migration would fail when multiple SQL files existed.
+
+**Fix:** Changed to `mapfile -t sorted_files < <(printf '%s\n' "${sql_files[@]}" | sort)` which properly puts each file on its own line.
+
+### 80.5 ✅ FIXED: Session Rotation Race Condition
+
+**Location:** `liminallm/service/auth.py:820-906`
+
+**Issue:** The `_maybe_rotate_session` method lacked atomic locking, allowing concurrent requests with the same session to both trigger rotation. This could result in multiple new sessions being created.
+
+**Fix:** Added Redis SETNX lock with 30-second TTL around the rotation check-and-execute logic to prevent duplicate rotations.
+
+### 80.6 ✅ FIXED: Session Rotation Inherits Old Refresh Token
+
+**Location:** `liminallm/service/auth.py:867-872`
+
+**Issue:** When creating a rotated session, `meta=sess.meta` copied the old session's metadata including `refresh_jti` and `refresh_exp`. This meant the new session inherited a reference to the OLD refresh token.
+
+**Fix:** Added filtering to exclude `refresh_jti` and `refresh_exp` from the new session's meta.
+
+### 80.7 ✅ FIXED: Boolean Passes isinstance(value, int) Check
+
+**Location:** `liminallm/api/routes.py:2961-2974`
+
+**Issue:** The type validation for integer settings used `isinstance(value, int)`, but in Python, `bool` is a subclass of `int`, so `isinstance(True, int)` returns `True`. Boolean values would incorrectly pass validation for integer settings.
+
+**Fix:** Added explicit boolean exclusion: `not isinstance(value, int) or isinstance(value, bool)`.
+
+### 80.8 HIGH: Inference Concurrency Cap Functions Never Called
+
+**Location:** `liminallm/api/routes.py:497-533`
+
+**Issue:** The `_acquire_inference_slot` and `_release_inference_slot` helper functions are defined but never called anywhere in the codebase. SPEC §18 requires max 2 concurrent inference decodes per user.
+
+**Status:** Requires architectural work - inference caps need to be enforced at the LLM service layer, not the route layer, since a workflow may have multiple LLM calls or no LLM calls.
+
+### 80.9 ✅ FIXED: Admin getVal Returns 0 for Empty String
+
+**Location:** `frontend/admin.js:645-651`
+
+**Issue:** The `getVal` helper used `Number(el.value)` for parsing numeric inputs. When a user cleared an input field, `el.value` was an empty string, and `Number('')` returns `0` rather than `undefined`. This could set invalid values like `smtp_port: 0`.
+
+**Fix:** Added explicit empty string check before parsing.
+
+### 80.10 ✅ FIXED: Admin setVal Doesn't Handle null Values
+
+**Location:** `frontend/admin.js:569-573`
+
+**Issue:** The `setVal` function checked `val !== undefined` before setting the input value, but didn't check for `null`. If the backend returned `null` for a setting, `el.value = null` converted it to the literal string `"null"`.
+
+**Fix:** Changed to `val != null` which catches both null and undefined.
+
+### 80.11 ✅ FIXED: REDIS_PASSWORD Uses Insecure Default
+
+**Location:** `docker-compose.yaml:112-119`
+
+**Issue:** `REDIS_PASSWORD` used `:-changeme` syntax which silently fell back to an insecure default password if the environment variable was not set. This was inconsistent with `POSTGRES_PASSWORD` which used `:?` syntax to fail if unset.
+
+**Fix:** Changed to `:?` syntax to require REDIS_PASSWORD, failing fast if not set.
 

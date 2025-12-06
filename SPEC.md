@@ -1340,7 +1340,10 @@ response:
 ### 13.3 files & contexts
 
 - `POST /v1/files/upload` — multipart; stores under `/users/{u}/files`; returns `fs_path`; optional `context_id` form field triggers chunking + embedding ingestion into that knowledge context.
-- `GET /v1/files` — list user files (paginated).
+- `GET /v1/files` — list user files (paginated); returns `{ files: [...], total, has_next }`.
+- `GET /v1/files/{filename}/url` — get signed download URL; returns `{ download_url, expires_at }`; URL valid for 10 minutes.
+- `GET /v1/files/download?path=...&expires=...&sig=...` — download file with validated HMAC signature; returns binary file with `Content-Disposition: attachment`.
+- `DELETE /v1/files/{filename}` — delete user file; returns `{ deleted: true }`.
 - `POST /v1/contexts` — create `knowledge_context`, attach file paths.
 - `GET /v1/contexts?limit=N` — list contexts + stats; supports `?owner=me|global`.
 - `GET /v1/contexts/{id}/chunks?limit=N` — list chunks for a context; default limit 100, max 500.

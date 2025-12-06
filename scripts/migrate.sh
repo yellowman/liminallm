@@ -16,9 +16,9 @@ if [[ ${#sql_files[@]} -eq 0 ]]; then
   exit 0
 fi
 
-# Sort files by name
-IFS=$'\n' sorted_files=($(sort <<<"${sql_files[*]}"))
-unset IFS
+# Sort files by name - use printf to put each file on its own line
+# Bug fix: ${sql_files[*]} with default IFS puts all files on one line
+mapfile -t sorted_files < <(printf '%s\n' "${sql_files[@]}" | sort)
 
 for sql_file in "${sorted_files[@]}"; do
   echo "Applying ${sql_file}"
@@ -32,8 +32,8 @@ shopt -u nullglob
 
 if [[ ${#seed_files[@]} -gt 0 ]]; then
   echo "Applying seed files"
-  IFS=$'\n' sorted_seeds=($(sort <<<"${seed_files[*]}"))
-  unset IFS
+  # Bug fix: Use printf to put each file on its own line for proper sorting
+  mapfile -t sorted_seeds < <(printf '%s\n' "${seed_files[@]}" | sort)
   for seed_file in "${sorted_seeds[@]}"; do
     echo "Applying ${seed_file}"
     psql "$DATABASE_URL" -f "$seed_file"

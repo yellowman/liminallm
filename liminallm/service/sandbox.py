@@ -1,9 +1,31 @@
+"""Expression evaluation and tool execution sandbox.
+
+SPEC §18: Tool workers run under a fixed UID with cgroup limits (CPU shares,
+memory hard cap) and no filesystem access except a tmp scratch.
+
+This module provides:
+- Safe expression evaluation (safe_eval_expr)
+- Resource limits (CPU, memory) for tool execution
+- Filesystem isolation (only tmp scratch allowed)
+- Privileged tool access controls
+"""
 from __future__ import annotations
 
 import ast
 import operator
+import os
+import resource
+import tempfile
 from collections.abc import Mapping, Sequence
-from typing import Any
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Callable, Optional, TypeVar
+
+from liminallm.logging import get_logger
+
+logger = get_logger(__name__)
+
+T = TypeVar("T")
 
 _BIN_OPS = {
     ast.Add: operator.add,
@@ -190,3 +212,399 @@ def safe_eval_expr(
             raise ValueError("disallowed syntax in expression")
 
     return _eval_node(parsed, names, allowed_callables)
+
+
+# =========================================================================
+# Tool Execution Sandbox (SPEC §18)
+# =========================================================================
+
+
+class SandboxError(Exception):
+    """Raised when sandbox constraints are violated."""
+
+
+class PrivilegedToolError(Exception):
+    """Raised when a privileged tool is invoked without proper authorization."""
+
+
+@dataclass
+class SandboxConfig:
+    """Configuration for tool sandbox execution.
+
+    SPEC §18: Tool workers run with constrained resources and limited
+    filesystem access.
+
+    Attributes:
+        max_memory_mb: Maximum memory in MB (default: 512)
+        max_cpu_seconds: Maximum CPU time in seconds (default: 30)
+        max_file_size_mb: Maximum file size tools can create (default: 100)
+        scratch_dir: Temporary scratch directory for tool file I/O
+        allowed_paths: Additional paths tools are allowed to access (read-only)
+        privileged: Whether this is a privileged tool (admin-only)
+    """
+
+    max_memory_mb: int = 512
+    max_cpu_seconds: int = 30
+    max_file_size_mb: int = 100
+    scratch_dir: Optional[Path] = None
+    allowed_paths: list[Path] = field(default_factory=list)
+    privileged: bool = False
+
+    # Cgroup configuration (when available)
+    cgroup_cpu_shares: int = 256  # Lower than default 1024 for tools
+    cgroup_memory_limit_mb: int = 512
+
+    def __post_init__(self) -> None:
+        if self.scratch_dir is None:
+            self.scratch_dir = Path(tempfile.gettempdir()) / "liminallm_sandbox"
+
+
+# Default sandbox configurations
+DEFAULT_SANDBOX_CONFIG = SandboxConfig()
+
+PRIVILEGED_SANDBOX_CONFIG = SandboxConfig(
+    max_memory_mb=1024,
+    max_cpu_seconds=120,
+    max_file_size_mb=500,
+    privileged=True,
+)
+
+
+def validate_path_access(
+    path: str | Path,
+    config: SandboxConfig,
+    *,
+    write: bool = False,
+) -> Path:
+    """Validate that a path is accessible within sandbox constraints.
+
+    SPEC §18: No filesystem access except tmp scratch.
+
+    Args:
+        path: Path to validate
+        config: Sandbox configuration
+        write: Whether write access is needed
+
+    Returns:
+        Validated Path object
+
+    Raises:
+        SandboxError: If path is not allowed
+    """
+    path_obj = Path(path).resolve()
+
+    # Always allow scratch directory
+    if config.scratch_dir:
+        scratch_resolved = config.scratch_dir.resolve()
+        if path_obj == scratch_resolved or scratch_resolved in path_obj.parents:
+            return path_obj
+
+    # Check allowed paths (read-only unless it's the scratch)
+    if not write:
+        for allowed in config.allowed_paths:
+            allowed_resolved = allowed.resolve()
+            if path_obj == allowed_resolved or allowed_resolved in path_obj.parents:
+                return path_obj
+
+    raise SandboxError(
+        f"Path '{path}' is not accessible. Tools can only access the scratch "
+        f"directory at '{config.scratch_dir}'"
+    )
+
+
+def apply_resource_limits(config: SandboxConfig) -> dict[str, bool]:
+    """Apply resource limits for tool execution.
+
+    Uses Python's resource module to set limits on the current process.
+    These limits are inherited by child processes.
+
+    SPEC §18: CPU shares and memory hard cap.
+
+    Returns:
+        Dict indicating which limits were successfully applied
+    """
+    results = {}
+
+    # Memory limit (virtual memory)
+    memory_bytes = config.max_memory_mb * 1024 * 1024
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (memory_bytes, memory_bytes))
+        results["memory"] = True
+    except (ValueError, OSError) as e:
+        logger.warning("sandbox_memory_limit_failed", error=str(e))
+        results["memory"] = False
+
+    # CPU time limit
+    try:
+        resource.setrlimit(
+            resource.RLIMIT_CPU,
+            (config.max_cpu_seconds, config.max_cpu_seconds + 5),
+        )
+        results["cpu"] = True
+    except (ValueError, OSError) as e:
+        logger.warning("sandbox_cpu_limit_failed", error=str(e))
+        results["cpu"] = False
+
+    # File size limit
+    file_size_bytes = config.max_file_size_mb * 1024 * 1024
+    try:
+        resource.setrlimit(resource.RLIMIT_FSIZE, (file_size_bytes, file_size_bytes))
+        results["file_size"] = True
+    except (ValueError, OSError) as e:
+        logger.warning("sandbox_file_limit_failed", error=str(e))
+        results["file_size"] = False
+
+    # Core dump disabled
+    try:
+        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+        results["core"] = True
+    except (ValueError, OSError) as e:
+        logger.warning("sandbox_core_limit_failed", error=str(e))
+        results["core"] = False
+
+    return results
+
+
+def ensure_scratch_dir(config: SandboxConfig) -> Path:
+    """Ensure scratch directory exists and is accessible.
+
+    Returns:
+        Path to scratch directory
+    """
+    if config.scratch_dir is None:
+        config.scratch_dir = Path(tempfile.gettempdir()) / "liminallm_sandbox"
+
+    config.scratch_dir.mkdir(parents=True, exist_ok=True)
+    return config.scratch_dir
+
+
+def check_privileged_access(
+    tool_name: str,
+    config: SandboxConfig,
+    *,
+    user_role: Optional[str] = None,
+    artifact_owner_id: Optional[str] = None,
+    requesting_user_id: Optional[str] = None,
+) -> None:
+    """Validate privileged tool access.
+
+    SPEC §18: `privileged:true` tools require admin-owned artifacts and are
+    never called by default workflows.
+
+    Args:
+        tool_name: Name of the tool being invoked
+        config: Sandbox configuration
+        user_role: Role of the requesting user
+        artifact_owner_id: Owner ID of the tool artifact
+        requesting_user_id: ID of the user making the request
+
+    Raises:
+        PrivilegedToolError: If access is denied
+    """
+    if not config.privileged:
+        return
+
+    # Privileged tools require admin role
+    if user_role != "admin":
+        raise PrivilegedToolError(
+            f"Tool '{tool_name}' requires admin role (current: {user_role})"
+        )
+
+    logger.info(
+        "privileged_tool_access",
+        tool=tool_name,
+        user_id=requesting_user_id,
+        user_role=user_role,
+    )
+
+
+class SandboxedFileHandle:
+    """File handle wrapper that enforces sandbox constraints."""
+
+    def __init__(self, path: Path, mode: str, config: SandboxConfig):
+        self.path = path
+        self.mode = mode
+        self.config = config
+        self._handle = None
+
+    def __enter__(self):
+        write = "w" in self.mode or "a" in self.mode
+        validate_path_access(self.path, self.config, write=write)
+        self._handle = open(self.path, self.mode)
+        return self._handle
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._handle:
+            self._handle.close()
+        return False
+
+
+def sandbox_open(
+    path: str | Path, mode: str = "r", config: Optional[SandboxConfig] = None
+):
+    """Open a file within sandbox constraints.
+
+    Use instead of built-in open() in tool code.
+    """
+    cfg = config or DEFAULT_SANDBOX_CONFIG
+    return SandboxedFileHandle(Path(path), mode, cfg)
+
+
+def run_in_sandbox(
+    func: Callable[..., T],
+    *args: Any,
+    config: Optional[SandboxConfig] = None,
+    **kwargs: Any,
+) -> T:
+    """Execute a function within sandbox constraints.
+
+    This applies resource limits before executing the function.
+    Note: Resource limits persist until the process ends.
+
+    Args:
+        func: Function to execute
+        *args: Positional arguments for function
+        config: Sandbox configuration (uses default if None)
+        **kwargs: Keyword arguments for function
+
+    Returns:
+        Function result
+    """
+    cfg = config or DEFAULT_SANDBOX_CONFIG
+    ensure_scratch_dir(cfg)
+    apply_resource_limits(cfg)
+    return func(*args, **kwargs)
+
+
+# Cgroup v2 integration (when available)
+def setup_cgroup(
+    cgroup_name: str,
+    config: SandboxConfig,
+    *,
+    cgroup_base: str = "/sys/fs/cgroup",
+) -> Optional[str]:
+    """Set up cgroup v2 for tool sandboxing.
+
+    This function attempts to create and configure a cgroup for the tool.
+    Requires appropriate permissions (typically root or cgroup delegation).
+
+    Args:
+        cgroup_name: Name for the cgroup
+        config: Sandbox configuration
+        cgroup_base: Base path for cgroup v2 filesystem
+
+    Returns:
+        Path to created cgroup, or None if cgroups are not available
+    """
+    cgroup_path = Path(cgroup_base) / "liminallm" / cgroup_name
+
+    try:
+        # Create cgroup hierarchy
+        cgroup_path.mkdir(parents=True, exist_ok=True)
+
+        # Set memory limit
+        memory_max = cgroup_path / "memory.max"
+        if memory_max.exists():
+            memory_bytes = config.cgroup_memory_limit_mb * 1024 * 1024
+            memory_max.write_text(str(memory_bytes))
+
+        # Set CPU weight (similar to shares in v1)
+        cpu_weight = cgroup_path / "cpu.weight"
+        if cpu_weight.exists():
+            # Convert shares (1-1024 scale) to weight (1-10000 scale)
+            weight = int((config.cgroup_cpu_shares / 1024) * 100)
+            cpu_weight.write_text(str(max(1, weight)))
+
+        logger.info("cgroup_setup_success", cgroup=str(cgroup_path))
+        return str(cgroup_path)
+
+    except PermissionError:
+        logger.warning("cgroup_setup_permission_denied", cgroup=str(cgroup_path))
+        return None
+    except Exception as e:
+        logger.warning("cgroup_setup_failed", cgroup=str(cgroup_path), error=str(e))
+        return None
+
+
+def add_to_cgroup(cgroup_path: str, pid: Optional[int] = None) -> bool:
+    """Add a process to a cgroup.
+
+    Args:
+        cgroup_path: Path to cgroup
+        pid: Process ID to add (defaults to current process)
+
+    Returns:
+        True if successful, False otherwise
+    """
+    if pid is None:
+        pid = os.getpid()
+
+    procs_file = Path(cgroup_path) / "cgroup.procs"
+    try:
+        procs_file.write_text(str(pid))
+        logger.debug("cgroup_process_added", cgroup=cgroup_path, pid=pid)
+        return True
+    except Exception as e:
+        logger.warning("cgroup_add_failed", cgroup=cgroup_path, pid=pid, error=str(e))
+        return False
+
+
+def cleanup_cgroup(cgroup_path: str) -> bool:
+    """Clean up a cgroup after tool execution.
+
+    Args:
+        cgroup_path: Path to cgroup to remove
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        cgroup = Path(cgroup_path)
+        if cgroup.exists():
+            # Move all processes to parent before removing
+            procs = (cgroup / "cgroup.procs").read_text().strip().split()
+            parent_procs = cgroup.parent / "cgroup.procs"
+            for pid in procs:
+                if pid:
+                    parent_procs.write_text(pid)
+            cgroup.rmdir()
+        return True
+    except Exception as e:
+        logger.warning("cgroup_cleanup_failed", cgroup=cgroup_path, error=str(e))
+        return False
+
+
+def get_tool_sandbox_config(
+    tool_spec: Optional[dict],
+    *,
+    user_role: Optional[str] = None,
+) -> SandboxConfig:
+    """Get sandbox configuration for a tool based on its specification.
+
+    Args:
+        tool_spec: Tool specification dict
+        user_role: Role of the invoking user
+
+    Returns:
+        SandboxConfig appropriate for the tool
+    """
+    if not tool_spec:
+        return DEFAULT_SANDBOX_CONFIG
+
+    is_privileged = tool_spec.get("privileged", False)
+
+    if is_privileged:
+        if user_role != "admin":
+            raise PrivilegedToolError(
+                f"Privileged tool requires admin role (current: {user_role})"
+            )
+        return PRIVILEGED_SANDBOX_CONFIG
+
+    # Custom limits from tool spec
+    limits = tool_spec.get("resource_limits", {})
+    return SandboxConfig(
+        max_memory_mb=min(limits.get("max_memory_mb", 512), 1024),
+        max_cpu_seconds=min(limits.get("max_cpu_seconds", 30), 120),
+        max_file_size_mb=min(limits.get("max_file_size_mb", 100), 500),
+        privileged=False,
+    )

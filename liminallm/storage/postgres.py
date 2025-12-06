@@ -71,13 +71,26 @@ class PostgresStore:
             raise
 
         try:
+            # Issue 48.2: Add connection pool timeout configuration
+            # timeout: max seconds to wait for a connection from the pool
+            # max_waiting: max requests that can wait for a connection
+            # reconnect_timeout: seconds to wait before reconnecting failed connection
             self.pool = ConnectionPool(
                 self.dsn,
                 min_size=2,
                 max_size=10,
+                timeout=30.0,  # Don't wait more than 30s for a connection
+                max_waiting=100,  # Limit waiting queue to prevent unbounded growth
+                reconnect_timeout=5.0,  # Quick reconnection on failure
                 kwargs={"row_factory": dict_row, "autocommit": False},
             )
-            self.logger.info("postgres_pool_created", min_size=2, max_size=10)
+            self.logger.info(
+                "postgres_pool_created",
+                min_size=2,
+                max_size=10,
+                timeout=30.0,
+                max_waiting=100,
+            )
         except Exception as exc:
             self.logger.error(
                 "postgres_pool_creation_failed",
@@ -786,6 +799,51 @@ class PostgresStore:
             meta=row.get("meta"),
         )
 
+    def claim_training_job(self, job_id: str) -> TrainingJob | None:
+        """Atomically claim a training job for processing (Issue 26.2).
+
+        Only claims the job if its status is 'queued'. This prevents race
+        conditions where multiple workers could claim the same job.
+
+        Args:
+            job_id: The job to claim
+
+        Returns:
+            The claimed TrainingJob with status='running' if successful, None if
+            the job doesn't exist or was already claimed by another worker.
+        """
+        now = datetime.utcnow()
+        with self._connect() as conn:
+            # Atomic conditional update - only succeeds if status is still 'queued'
+            row = conn.execute(
+                """
+                UPDATE training_job
+                SET status = 'running', updated_at = %s
+                WHERE id = %s AND status = 'queued'
+                RETURNING *
+                """,
+                (now, job_id),
+            ).fetchone()
+        if not row:
+            # Either job doesn't exist or already claimed
+            return None
+        return TrainingJob(
+            id=str(row["id"]),
+            user_id=str(row["user_id"]),
+            adapter_id=self._require_training_adapter_id(
+                row.get("adapter_id"), row.get("id")
+            ),
+            status="running",
+            num_events=row.get("num_events"),
+            created_at=row.get("created_at", now),
+            updated_at=now,
+            loss=row.get("loss"),
+            preference_event_ids=row.get("preference_event_ids") or [],
+            dataset_path=row.get("dataset_path"),
+            new_version=row.get("new_version"),
+            meta=row.get("meta"),
+        )
+
     def get_training_job(self, job_id: str) -> TrainingJob | None:
         with self._connect() as conn:
             row = conn.execute(
@@ -1385,15 +1443,19 @@ class PostgresStore:
                 self.sessions.pop(sid, None)
 
     def mark_session_verified(self, session_id: str) -> None:
+        # Issue 53.1: Cache update MUST only happen if DB update succeeds
+        # to prevent MFA bypass via transient database failures
         try:
             with self._connect() as conn:
                 conn.execute(
                     "UPDATE auth_session SET mfa_verified = TRUE WHERE id = %s",
                     (session_id,),
                 )
+            # Only update cache after successful DB commit
+            self._update_cached_session(session_id, mfa_verified=True)
         except Exception as exc:
-            self.logger.warning("mark_session_verified_failed", error=str(exc))
-        self._update_cached_session(session_id, mfa_verified=True)
+            self.logger.error("mark_session_verified_failed", session_id=session_id, error=str(exc))
+            raise  # Re-raise to signal failure to caller
 
     def get_session(self, session_id: str) -> Optional[Session]:
         with self._connect() as conn:
@@ -1530,11 +1592,12 @@ class PostgresStore:
                         "SELECT 1 FROM conversation WHERE id = %s FOR UPDATE",
                         (conversation_id,),
                     )
+                    # Issue 37.6: Use MAX(seq) instead of COUNT(*) to handle gaps in sequence
                     seq_row = conn.execute(
-                        "SELECT COUNT(*) AS c FROM message WHERE conversation_id = %s",
+                        "SELECT COALESCE(MAX(seq), -1) + 1 AS next_seq FROM message WHERE conversation_id = %s",
                         (conversation_id,),
                     ).fetchone()
-                    seq = seq_row["c"] if seq_row else 0
+                    seq = seq_row["next_seq"] if seq_row else 0
                     msg_id = str(uuid.uuid4())
                     now = datetime.utcnow()
                     conn.execute(

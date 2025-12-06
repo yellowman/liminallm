@@ -1,11 +1,95 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from datetime import datetime
 from typing import Any, List, Literal, Optional, Union
 from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+# Issue 46.1: Maximum nested JSON depth to prevent deserialization bombs
+MAX_JSON_DEPTH = 20
+# Issue 46.2: Maximum array items to prevent memory exhaustion
+MAX_ARRAY_ITEMS = 1000
+# Issue 46.3: Maximum string length for unbounded strings
+MAX_STRING_LENGTH = 65536
+
+
+def _validate_json_depth(obj: Any, max_depth: int = MAX_JSON_DEPTH, current_depth: int = 0) -> None:
+    """Validate nested JSON depth to prevent deserialization bombs (Issue 46.1).
+
+    Args:
+        obj: Object to validate
+        max_depth: Maximum allowed nesting depth
+        current_depth: Current depth (for recursion)
+
+    Raises:
+        ValueError: If depth exceeds maximum
+    """
+    if current_depth > max_depth:
+        raise ValueError(f"JSON nesting depth exceeds maximum of {max_depth}")
+
+    if isinstance(obj, dict):
+        for value in obj.values():
+            _validate_json_depth(value, max_depth, current_depth + 1)
+    elif isinstance(obj, list):
+        # Issue 46.2: Also check array length
+        if len(obj) > MAX_ARRAY_ITEMS:
+            raise ValueError(f"Array length {len(obj)} exceeds maximum of {MAX_ARRAY_ITEMS}")
+        for item in obj:
+            _validate_json_depth(item, max_depth, current_depth + 1)
+
+
+def _validate_dict_field(value: Optional[dict], field_name: str = "field") -> Optional[dict]:
+    """Validate a dict field for depth and size (Issue 46.1).
+
+    Args:
+        value: Dict to validate
+        field_name: Name for error messages
+
+    Returns:
+        Validated dict
+
+    Raises:
+        ValueError: If validation fails
+    """
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} must be a dict")
+    _validate_json_depth(value)
+    return value
+
+
+def _normalize_unicode(value: str) -> str:
+    """Normalize Unicode string using NFKC (Issue 46.4).
+
+    This handles:
+    - Combining diacritics
+    - Compatibility characters
+    - Zero-width characters
+
+    Args:
+        value: String to normalize
+
+    Returns:
+        NFKC normalized string
+    """
+    # Remove zero-width characters that could be used for spoofing
+    # U+200B ZERO WIDTH SPACE, U+200C ZERO WIDTH NON-JOINER,
+    # U+200D ZERO WIDTH JOINER, U+FEFF ZERO WIDTH NO-BREAK SPACE
+    zero_width = '\u200b\u200c\u200d\ufeff'
+    cleaned = ''.join(c for c in value if c not in zero_width)
+
+    # Remove RTL/LTR override characters that could be used for spoofing
+    # U+202A-U+202E, U+2066-U+2069
+    bidi_overrides = set(chr(c) for c in range(0x202A, 0x202F))
+    bidi_overrides.update(chr(c) for c in range(0x2066, 0x206A))
+    cleaned = ''.join(c for c in cleaned if c not in bidi_overrides)
+
+    # Apply NFKC normalization
+    return unicodedata.normalize('NFKC', cleaned)
 
 _VALID_ERROR_CODES = frozenset({
     "unauthorized",
@@ -56,7 +140,8 @@ _EMAIL_REGEX = re.compile(
 def _validate_email(value: str) -> str:
     if not isinstance(value, str):
         raise ValueError("email must be a string")
-    normalized = value.strip().lower()
+    # Issue 46.4: Apply Unicode normalization before validation
+    normalized = _normalize_unicode(value.strip().lower())
     if len(normalized) > 254:
         raise ValueError("email address too long")
     if len(normalized) < 3:
@@ -184,6 +269,12 @@ class UserSettingsRequest(BaseModel):
     default_style: Optional[dict] = Field(None, description="Default style preferences")
     flags: Optional[dict] = Field(None, description="Feature flags")
 
+    # Issue 46.1: Validate nested dict depth
+    @field_validator("default_style", "flags")
+    @classmethod
+    def _validate_dict_depth(cls, value: Optional[dict]) -> Optional[dict]:
+        return _validate_dict_field(value)
+
 
 class UserSettingsResponse(BaseModel):
     """User settings response."""
@@ -241,14 +332,21 @@ class ChatMessage(BaseModel):
     mode: str = Field(default="text", pattern="^(text|voice|structured)$")
     content_struct: Optional[dict] = None
 
+    # Issue 46.1: Validate nested dict depth
+    @field_validator("content_struct")
+    @classmethod
+    def _validate_content_struct(cls, value: Optional[dict]) -> Optional[dict]:
+        return _validate_dict_field(value, "content_struct")
+
 
 class ChatRequest(BaseModel):
-    conversation_id: Optional[str] = None
+    # Issue 46.3: Add max_length to string fields
+    conversation_id: Optional[str] = Field(None, max_length=128)
     message: ChatMessage
-    context_id: Optional[str] = None
-    workflow_id: Optional[str] = None
+    context_id: Optional[str] = Field(None, max_length=128)
+    workflow_id: Optional[str] = Field(None, max_length=128)
     stream: bool = True
-    client_request_id: Optional[str] = None
+    client_request_id: Optional[str] = Field(None, max_length=128)
 
 
 class ChatResponse(BaseModel):
@@ -276,11 +374,21 @@ class _SchemaPayload(BaseModel):
     def schema(self) -> dict:  # pragma: no cover - compatibility shim
         return self.schema_
 
+    # Issue 46.1: Validate nested dict depth
+    @field_validator("schema_")
+    @classmethod
+    def _validate_schema_depth(cls, value: dict) -> dict:
+        if value is None:
+            return value
+        _validate_json_depth(value)
+        return value
+
 
 class ArtifactRequest(_SchemaPayload):
-    type: Optional[str] = None
-    name: str
-    description: Optional[str] = ""
+    # Issue 46.3: Add max_length to string fields
+    type: Optional[str] = Field(None, max_length=64)
+    name: str = Field(..., max_length=256)
+    description: Optional[str] = Field("", max_length=4096)
 
 
 class ArtifactPatchRequest(BaseModel):

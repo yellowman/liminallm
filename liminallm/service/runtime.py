@@ -331,17 +331,20 @@ IDEMPOTENCY_TTL_SECONDS = 60 * 60 * 24
 
 
 async def _get_cached_idempotency_record(
-    runtime: Runtime, route: str, user_id: str, key: str
+    runtime: Runtime, route: str, user_id: str, key: str, *, tenant_id: Optional[str] = None
 ) -> Optional[dict]:
     now = datetime.utcnow()
     if runtime.cache:
-        return await runtime.cache.get_idempotency_record(route, user_id, key)
+        # Issue 22.2: Pass tenant_id for multi-tenant isolation
+        return await runtime.cache.get_idempotency_record(route, user_id, key, tenant_id=tenant_id)
     async with runtime._local_idempotency_lock:
-        record = runtime._local_idempotency.get((route, user_id, key))
+        # Include tenant_id in in-memory key for multi-tenant isolation
+        cache_key = (tenant_id, route, user_id, key) if tenant_id else (route, user_id, key)
+        record = runtime._local_idempotency.get(cache_key)
         if not record:
             return None
         if record.get("expires_at") and record["expires_at"] < now:
-            runtime._local_idempotency.pop((route, user_id, key), None)
+            runtime._local_idempotency.pop(cache_key, None)
             return None
         return record
 
@@ -354,15 +357,19 @@ async def _set_cached_idempotency_record(
     record: dict,
     *,
     ttl_seconds: int = IDEMPOTENCY_TTL_SECONDS,
+    tenant_id: Optional[str] = None,
 ) -> None:
     expires_at = datetime.utcnow() + timedelta(seconds=ttl_seconds)
     if runtime.cache:
+        # Issue 22.2: Pass tenant_id for multi-tenant isolation
         await runtime.cache.set_idempotency_record(
-            route, user_id, key, record, ttl_seconds=ttl_seconds
+            route, user_id, key, record, ttl_seconds=ttl_seconds, tenant_id=tenant_id
         )
         return
     async with runtime._local_idempotency_lock:
-        runtime._local_idempotency[(route, user_id, key)] = {
+        # Include tenant_id in in-memory key for multi-tenant isolation
+        cache_key = (tenant_id, route, user_id, key) if tenant_id else (route, user_id, key)
+        runtime._local_idempotency[cache_key] = {
             **record,
             "expires_at": expires_at,
         }
@@ -376,6 +383,7 @@ async def _acquire_idempotency_slot(
     record: dict,
     *,
     ttl_seconds: int = IDEMPOTENCY_TTL_SECONDS,
+    tenant_id: Optional[str] = None,
 ) -> tuple[bool, Optional[dict]]:
     """Atomically acquire an idempotency slot (Issue 19.4).
 
@@ -388,6 +396,7 @@ async def _acquire_idempotency_slot(
         key: Idempotency key
         record: Record to set if slot acquired
         ttl_seconds: TTL for the record
+        tenant_id: Optional tenant ID for multi-tenant isolation (Issue 22.2)
 
     Returns:
         Tuple of (acquired: bool, existing_record: Optional[dict])
@@ -396,13 +405,15 @@ async def _acquire_idempotency_slot(
     expires_at = now + timedelta(seconds=ttl_seconds)
 
     if runtime.cache:
+        # Issue 22.2: Pass tenant_id for multi-tenant isolation
         return await runtime.cache.acquire_idempotency_slot(
-            route, user_id, key, record, ttl_seconds=ttl_seconds
+            route, user_id, key, record, ttl_seconds=ttl_seconds, tenant_id=tenant_id
         )
 
     # In-memory fallback with atomic check-and-set within lock
     async with runtime._local_idempotency_lock:
-        cache_key = (route, user_id, key)
+        # Include tenant_id in in-memory key for multi-tenant isolation
+        cache_key = (tenant_id, route, user_id, key) if tenant_id else (route, user_id, key)
         existing = runtime._local_idempotency.get(cache_key)
 
         if existing:

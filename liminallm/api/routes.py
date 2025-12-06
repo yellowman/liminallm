@@ -8,6 +8,8 @@ from pathlib import Path as FilePath
 from typing import Any, Dict, Optional
 from uuid import uuid4
 
+import mimetypes
+
 from fastapi import (
     APIRouter,
     Depends,
@@ -22,6 +24,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
+from fastapi.responses import FileResponse
 
 from liminallm.api.schemas import (
     AdminCreateUserRequest,
@@ -94,7 +97,12 @@ from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service.auth import AuthContext
 from liminallm.service.errors import BadRequestError, NotFoundError
-from liminallm.service.fs import safe_join, PathTraversalError
+from liminallm.service.fs import (
+    safe_join,
+    PathTraversalError,
+    generate_signed_url,
+    validate_signed_url,
+)
 from liminallm.service.runtime import (
     IDEMPOTENCY_TTL_SECONDS,
     _acquire_idempotency_slot,
@@ -109,14 +117,28 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/v1")
 
-# Registry for active streaming requests - maps request_id to (cancel_event, timestamp)
+# Registry for active streaming requests - maps request_id to (cancel_event, timestamp, user_id)
 # Used by POST /chat/cancel to cancel in-progress streaming requests per SPEC §18
 # Issue 23.2: Added timestamp tracking for TTL-based cleanup
-_active_requests: Dict[str, tuple[asyncio.Event, datetime]] = {}
-_active_requests_lock = asyncio.Lock()
+# Issue 50.5: Added user_id for ownership validation to prevent cross-user cancellation
+_active_requests: Dict[str, tuple[asyncio.Event, datetime, str]] = {}
+# Issue 28.2: Lazily initialize asyncio.Lock to avoid "no running event loop" errors
+# at module import time. The lock is created on first use when an event loop exists.
+_active_requests_lock: Optional[asyncio.Lock] = None
 _active_requests_last_cleanup = datetime.utcnow()
 # Maximum age for active requests before they're considered stale (30 minutes)
 _ACTIVE_REQUEST_TTL_SECONDS = 30 * 60
+
+
+def _get_active_requests_lock() -> asyncio.Lock:
+    """Get or create the asyncio lock for _active_requests (Issue 28.2).
+
+    Lazily initializes the lock on first use to ensure an event loop exists.
+    """
+    global _active_requests_lock
+    if _active_requests_lock is None:
+        _active_requests_lock = asyncio.Lock()
+    return _active_requests_lock
 
 
 async def _cleanup_stale_active_requests() -> int:
@@ -134,12 +156,12 @@ async def _cleanup_stale_active_requests() -> int:
     _active_requests_last_cleanup = now
     threshold = now - timedelta(seconds=_ACTIVE_REQUEST_TTL_SECONDS)
     stale_keys = [
-        req_id for req_id, (_, created_at) in _active_requests.items()
+        req_id for req_id, (_, created_at, _) in _active_requests.items()
         if created_at < threshold
     ]
 
     for req_id in stale_keys:
-        event, _ = _active_requests.pop(req_id, (None, None))
+        event, _, _ = _active_requests.pop(req_id, (None, None, None))
         if event and not event.is_set():
             event.set()  # Cancel any stale request
 
@@ -152,30 +174,54 @@ async def _cleanup_stale_active_requests() -> int:
     return len(stale_keys)
 
 
-async def _register_cancel_event(request_id: str, cancel_event: asyncio.Event) -> None:
-    """Register a cancel event for an active streaming request."""
-    async with _active_requests_lock:
-        _active_requests[request_id] = (cancel_event, datetime.utcnow())
+async def _register_cancel_event(request_id: str, cancel_event: asyncio.Event, user_id: str) -> None:
+    """Register a cancel event for an active streaming request.
+
+    Args:
+        request_id: Unique request identifier
+        cancel_event: Event to signal cancellation
+        user_id: Owner of this request (Issue 50.5 - for ownership validation)
+    """
+    async with _get_active_requests_lock():
+        _active_requests[request_id] = (cancel_event, datetime.utcnow(), user_id)
         # Periodic cleanup to prevent unbounded growth (Issue 23.2)
         await _cleanup_stale_active_requests()
 
 
 async def _unregister_cancel_event(request_id: str) -> None:
     """Unregister a cancel event when request completes."""
-    async with _active_requests_lock:
+    async with _get_active_requests_lock():
         _active_requests.pop(request_id, None)
 
 
-async def _cancel_request(request_id: str) -> bool:
-    """Cancel an active request by request_id. Returns True if cancelled."""
-    async with _active_requests_lock:
+async def _cancel_request(request_id: str, user_id: str) -> tuple[bool, str]:
+    """Cancel an active request by request_id with ownership validation (Issue 50.5).
+
+    Args:
+        request_id: The request to cancel
+        user_id: The user attempting to cancel (must be request owner)
+
+    Returns:
+        Tuple of (cancelled: bool, reason: str)
+    """
+    async with _get_active_requests_lock():
         entry = _active_requests.get(request_id)
-        if entry:
-            cancel_event, _ = entry
-            if not cancel_event.is_set():
-                cancel_event.set()
-                return True
-        return False
+        if not entry:
+            return False, "request_not_found"
+        cancel_event, _, owner_id = entry
+        # Issue 50.5: Validate ownership to prevent cross-user cancellation attacks
+        if owner_id != user_id:
+            logger.warning(
+                "cancel_request_ownership_mismatch",
+                request_id=request_id,
+                owner_id=owner_id,
+                requester_id=user_id,
+            )
+            return False, "not_owner"
+        if not cancel_event.is_set():
+            cancel_event.set()
+            return True, "cancelled"
+        return False, "already_cancelled"
 
 
 def _http_error(
@@ -368,6 +414,26 @@ def _get_plan_rate_multiplier(runtime, plan_tier: str) -> float:
     return multipliers.get(plan_tier, 1.0)
 
 
+def _get_plan_upload_limit(runtime, plan_tier: str) -> int:
+    """Get per-plan file upload size limit (SPEC §18).
+
+    Args:
+        runtime: Application runtime context
+        plan_tier: User's plan tier (free, paid, enterprise)
+
+    Returns:
+        Maximum upload size in bytes for the user's plan
+    """
+    # SPEC §18: "free: 25MB/file, paid: 200MB/file"
+    # Enterprise gets same as paid by default
+    limits = {
+        "free": 25 * 1024 * 1024,        # 25MB
+        "paid": 200 * 1024 * 1024,       # 200MB
+        "enterprise": 200 * 1024 * 1024, # 200MB
+    }
+    return limits.get(plan_tier, limits["free"])
+
+
 def _get_rate_limit(runtime, key: str) -> int:
     """Get rate limit value from database settings.
 
@@ -400,6 +466,14 @@ async def _enforce_rate_limit(
     Raises:
         HTTPException with 429 if rate limit exceeded
     """
+    # Issue 53.8: Validate rate limit is positive to prevent bypass via negative values
+    if limit <= 0:
+        logger.warning("invalid_rate_limit_value", key=key, limit=limit)
+        limit = 1  # Default to strictest limit to prevent bypass
+    if window_seconds <= 0:
+        logger.warning("invalid_rate_limit_window", key=key, window_seconds=window_seconds)
+        window_seconds = 60  # Default to 1 minute window
+
     allowed, remaining = await check_rate_limit(runtime, key, limit, window_seconds, return_remaining=True)
     info = RateLimitInfo(limit, remaining, window_seconds)
 
@@ -803,12 +877,15 @@ async def signup(body: SignupRequest, response: Response):
         _get_rate_limit(runtime, "signup_rate_limit_per_minute"),
         60,
     )
+    # Issue 35.2/53.2: Per CLAUDE.md, derive tenant_id from server config, not user input
+    # This prevents tenant spoofing attacks where users register in arbitrary tenants
     user, session, tokens = await runtime.auth.signup(
         email=body.email,
         password=body.password,
         handle=body.handle,
-        tenant_id=body.tenant_id,
+        tenant_id=None,  # Use server's default_tenant_id
     )
+    logger.info("user_signup_completed", user_id=user.id, email=body.email)
     _apply_session_cookies(
         response,
         session,
@@ -831,7 +908,7 @@ async def signup(body: SignupRequest, response: Response):
 
 
 @router.post("/auth/login", response_model=Envelope, tags=["auth"])
-async def login(body: LoginRequest, response: Response):
+async def login(body: LoginRequest, request: Request, response: Response):
     """Authenticate user with email and password.
 
     Validates credentials and returns session tokens with authentication cookies.
@@ -848,14 +925,23 @@ async def login(body: LoginRequest, response: Response):
         _get_rate_limit(runtime, "login_rate_limit_per_minute"),
         60,
     )
+    # Bug fix: Pass user_agent and ip_addr for session metadata
+    user_agent = request.headers.get("user-agent")
+    ip_addr = request.client.host if request.client else None
+    # Issue 35.2: Per CLAUDE.md, tenant_id should come from user record, not request
+    # The auth service looks up the user by email and uses their stored tenant_id
     user, session, tokens = await runtime.auth.login(
         email=body.email,
         password=body.password,
         mfa_code=body.mfa_code,
-        tenant_id=body.tenant_id,
+        tenant_id=None,  # Derived from user's existing record
+        user_agent=user_agent,
+        ip_addr=ip_addr,
     )
     if not user or not session:
+        logger.warning("login_failed", email=body.email, ip=ip_addr)
         raise _http_error("unauthorized", "invalid credentials", status_code=401)
+    logger.info("user_login_completed", user_id=user.id, ip=ip_addr)
     _apply_session_cookies(
         response,
         session,
@@ -895,8 +981,10 @@ async def oauth_start(
         limit=20,
         window_seconds=60,
     )
+    # Issue 35.2: Per CLAUDE.md, derive tenant_id from server config, not user input
+    # This prevents tenant spoofing attacks where users can OAuth into arbitrary tenants
     start = await runtime.auth.start_oauth(
-        provider, redirect_uri=body.redirect_uri, tenant_id=body.tenant_id
+        provider, redirect_uri=body.redirect_uri, tenant_id=None
     )
     return Envelope(
         status="ok",
@@ -1000,7 +1088,8 @@ async def refresh_tokens(
 @router.get("/admin/users", response_model=Envelope, tags=["admin"])
 async def admin_list_users(
     tenant_id: Optional[str] = None,
-    limit: Optional[int] = Query(None, ge=1, description="Maximum users to return"),
+    # Issue 46.5: Add upper bound to prevent integer overflow/DoS
+    limit: Optional[int] = Query(None, ge=1, le=10000, description="Maximum users to return"),
     principal: AuthContext = Depends(get_admin_user),
 ):
     """List users in the admin's tenant.
@@ -1055,6 +1144,15 @@ async def admin_create_user(
         is_active=body.is_active,
         meta=body.meta,
     )
+    # Issue 51.2: Audit logging for admin user creation (GDPR/SOC2 compliance)
+    logger.info(
+        "admin_user_created",
+        admin_id=principal.user_id,
+        created_user_id=user.id,
+        created_email=user.email,
+        created_role=user.role,
+        tenant_id=target_tenant,
+    )
     return Envelope(
         status="ok",
         data=AdminCreateUserResponse(
@@ -1076,9 +1174,28 @@ async def admin_set_role(
         _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
         _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
     )
-    user = runtime.auth.set_user_role(user_id, body.role)
+    # Issue 50.3: Validate tenant isolation - admin can only modify users in their tenant
+    target_user = runtime.store.get_user(user_id)
+    if not target_user:
+        raise NotFoundError("user not found", detail={"user_id": user_id})
+    if target_user.tenant_id != principal.tenant_id:
+        raise _http_error(
+            "forbidden", "cannot modify users in other tenant", status_code=403
+        )
+    # Issue 22.1: set_user_role is now async to revoke sessions on role change
+    old_role = target_user.role
+    user = await runtime.auth.set_user_role(user_id, body.role)
     if not user:
         raise NotFoundError("user not found", detail={"user_id": user_id})
+    # Issue 51.4: Audit logging for permission changes (SOC2 compliance)
+    logger.info(
+        "admin_role_changed",
+        admin_id=principal.user_id,
+        target_user_id=user_id,
+        old_role=old_role,
+        new_role=body.role,
+        tenant_id=principal.tenant_id,
+    )
     return Envelope(status="ok", data=_user_to_response(user))
 
 
@@ -1093,9 +1210,26 @@ async def admin_delete_user(
         _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
         _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
     )
+    # Issue 50.4: Validate tenant isolation - admin can only delete users in their tenant
+    target_user = runtime.store.get_user(user_id)
+    if not target_user:
+        raise NotFoundError("user not found", detail={"user_id": user_id})
+    if target_user.tenant_id != principal.tenant_id:
+        raise _http_error(
+            "forbidden", "cannot delete users in other tenant", status_code=403
+        )
+    target_email = target_user.email  # Capture before deletion
     removed = runtime.auth.delete_user(user_id)
     if not removed:
         raise NotFoundError("user not found", detail={"user_id": user_id})
+    # Issue 51.3: Audit logging for user deletion (GDPR/SOC2 compliance)
+    logger.info(
+        "admin_user_deleted",
+        admin_id=principal.user_id,
+        deleted_user_id=user_id,
+        deleted_email=target_email,
+        tenant_id=principal.tenant_id,
+    )
     return Envelope(status="ok", data={"deleted": True, "user_id": user_id})
 
 
@@ -1257,13 +1391,32 @@ async def update_admin_settings(
 
 
 @router.post("/auth/mfa/request", response_model=Envelope, tags=["auth"])
-async def request_mfa(body: MFARequest):
+async def request_mfa(body: MFARequest, request: Request):
     runtime = get_runtime()
+    client_ip = request.client.host if request.client else "unknown"
+    # Issue 50.1: Rate limit per IP first to prevent session enumeration attacks
+    await _enforce_rate_limit(
+        runtime,
+        f"mfa:request:ip:{client_ip}",
+        _get_rate_limit(runtime, "mfa_rate_limit_per_minute"),
+        60,
+    )
     auth_ctx = await runtime.auth.resolve_session(
         body.session_id, allow_pending_mfa=True
     )
     if not auth_ctx:
+        logger.warning("mfa_request_invalid_session", ip=client_ip)
         raise _http_error("unauthorized", "invalid session", status_code=401)
+    # Issue 50.1: Validate session IP matches requester IP for security
+    session = runtime.store.get_session(body.session_id)
+    if session and session.ip_addr and str(session.ip_addr) != client_ip:
+        logger.warning(
+            "mfa_request_ip_mismatch",
+            session_id=body.session_id,
+            session_ip=str(session.ip_addr),
+            request_ip=client_ip,
+        )
+        raise _http_error("unauthorized", "session bound to different IP", status_code=401)
     await _enforce_rate_limit(
         runtime,
         f"mfa:request:{auth_ctx.user_id}",
@@ -1271,17 +1424,38 @@ async def request_mfa(body: MFARequest):
         60,
     )
     challenge = await runtime.auth.issue_mfa_challenge(user_id=auth_ctx.user_id)
+    logger.info("mfa_challenge_issued", user_id=auth_ctx.user_id, ip=client_ip)
     return Envelope(status="ok", data=challenge)
 
 
 @router.post("/auth/mfa/verify", response_model=Envelope, tags=["auth"])
-async def verify_mfa(body: MFAVerifyRequest, response: Response):
+async def verify_mfa(body: MFAVerifyRequest, request: Request, response: Response):
     runtime = get_runtime()
+    client_ip = request.client.host if request.client else "unknown"
+    # Issue 50.2: Rate limit per IP first to prevent brute force attacks
+    await _enforce_rate_limit(
+        runtime,
+        f"mfa:verify:ip:{client_ip}",
+        _get_rate_limit(runtime, "mfa_rate_limit_per_minute"),
+        60,
+    )
     auth_ctx = await runtime.auth.resolve_session(
         body.session_id, allow_pending_mfa=True
     )
     if not auth_ctx:
+        logger.warning("mfa_verify_invalid_session", ip=client_ip)
         raise _http_error("unauthorized", "invalid session", status_code=401)
+    # Issue 50.2: Validate session IP matches requester IP for security
+    session = runtime.store.get_session(body.session_id)
+    if session and session.ip_addr and str(session.ip_addr) != client_ip:
+        logger.warning(
+            "mfa_verify_ip_mismatch",
+            session_id=body.session_id,
+            session_ip=str(session.ip_addr),
+            request_ip=client_ip,
+            user_id=auth_ctx.user_id,
+        )
+        raise _http_error("unauthorized", "session bound to different IP", status_code=401)
     await _enforce_rate_limit(
         runtime,
         f"mfa:verify:{auth_ctx.user_id}",
@@ -1292,6 +1466,7 @@ async def verify_mfa(body: MFAVerifyRequest, response: Response):
         user_id=auth_ctx.user_id, code=body.code, session_id=body.session_id
     )
     if not ok:
+        logger.warning("mfa_verify_failed", user_id=auth_ctx.user_id, ip=client_ip)
         raise _http_error("unauthorized", "invalid mfa", status_code=401)
     user, session, tokens = runtime.auth.issue_tokens_for_session(body.session_id)
     resp: dict = {"status": "verified"}
@@ -1563,6 +1738,12 @@ async def change_password(
         principal.user_id, except_session_id=principal.session_id
     )
 
+    # Issue 51.6: Audit logging for password change (GDPR/SOC2 compliance)
+    logger.info(
+        "user_password_changed",
+        user_id=principal.user_id,
+        session_id=principal.session_id,
+    )
     return Envelope(status="ok", data={"status": "changed"})
 
 
@@ -1588,6 +1769,12 @@ async def logout(
                 raise _http_error("forbidden", "cannot revoke other user sessions", status_code=403)
         if target_session:
             await runtime.auth.revoke(target_session)
+            # Issue 51.9: Audit logging for session revocation (SOC2 compliance)
+            logger.info(
+                "session_revoked",
+                user_id=ctx.user_id,
+                session_id=target_session,
+            )
     response.delete_cookie("session_id", path="/", secure=True, samesite="lax")
     response.delete_cookie("refresh_token", path="/", secure=True, samesite="lax")
     return Envelope(status="ok", data={"message": "session revoked"})
@@ -1734,8 +1921,11 @@ async def chat(
                 status="ok", data=resp.model_dump(), request_id=idem.request_id
             )
             if runtime.cache:
+                # Issue 38.4: Add limit to prevent unbounded memory usage
+                # Use reasonable limit for conversation context caching
+                paging = _get_pagination_settings(runtime)
                 history = runtime.store.list_messages(
-                    conversation_id, user_id=principal.user_id
+                    conversation_id, limit=paging["max_page_size"], user_id=principal.user_id
                 )
                 await runtime.workflow.cache_conversation_state(conversation_id, history)
             await idem.store_result(envelope)
@@ -1772,8 +1962,8 @@ async def cancel_chat(
 
     request_id = body.request_id
 
-    # Try to cancel in-memory active request
-    cancelled = await _cancel_request(request_id)
+    # Try to cancel in-memory active request (Issue 50.5: validates ownership)
+    cancelled, reason = await _cancel_request(request_id, principal.user_id)
 
     if cancelled:
         logger.info("chat_request_cancelled", request_id=request_id, user_id=principal.user_id)
@@ -1784,6 +1974,12 @@ async def cancel_chat(
                 cancelled=True,
                 message="Request cancelled successfully",
             ).model_dump(),
+        )
+
+    # Issue 50.5: Return 403 if user doesn't own the request
+    if reason == "not_owner":
+        raise _http_error(
+            "forbidden", "cannot cancel requests owned by other users", status_code=403
         )
 
     # Request not found in active requests - may have already completed or never existed
@@ -1922,9 +2118,10 @@ async def list_artifacts(
     type: Optional[str] = None,
     kind: Optional[str] = None,
     visibility: Optional[str] = Query(None, pattern="^(private|shared|global)$", description="Filter by visibility"),
-    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
-    page_size: Optional[int] = Query(None, ge=1, description="Items per page"),
-    limit: Optional[int] = Query(None, ge=1, description="Alias for page_size (for frontend compatibility)"),
+    # Issue 46.5: Add upper bounds to prevent integer overflow/DoS
+    page: int = Query(1, ge=1, le=100000, description="Page number (1-indexed)"),
+    page_size: Optional[int] = Query(None, ge=1, le=1000, description="Items per page"),
+    limit: Optional[int] = Query(None, ge=1, le=1000, description="Alias for page_size (for frontend compatibility)"),
     principal: AuthContext = Depends(get_user),
 ):
     """List artifacts owned by the current user.
@@ -2940,13 +3137,15 @@ async def update_system_settings(
         },
     }
     for key, value in body.items():
-        if key in int_keys and not isinstance(value, int):
+        # Bug fix: bool is a subclass of int in Python, so explicitly exclude booleans
+        if key in int_keys and (not isinstance(value, int) or isinstance(value, bool)):
             raise _http_error(
                 "validation_error",
                 f"{key} must be an integer",
                 status_code=400,
             )
-        if key in float_keys and not isinstance(value, (int, float)):
+        # Bug fix: Also exclude booleans from float check
+        if key in float_keys and (not isinstance(value, (int, float)) or isinstance(value, bool)):
             raise _http_error(
                 "validation_error",
                 f"{key} must be a number",
@@ -3011,10 +3210,14 @@ async def get_file_limits(principal: AuthContext = Depends(get_user)):
         _get_rate_limit(runtime, "read_rate_limit_per_minute"),
         60,
     )
+    # Issue 4.3: Return per-plan upload limits (SPEC §18)
+    user = runtime.store.get_user(principal.user_id)
+    plan_tier = user.plan_tier if user else "free"
     return Envelope(
         status="ok",
         data={
-            "max_upload_bytes": _get_rate_limit(runtime, "max_upload_bytes"),
+            "max_upload_bytes": _get_plan_upload_limit(runtime, plan_tier),
+            "plan_tier": plan_tier,
         },
     )
 
@@ -3057,10 +3260,13 @@ async def upload_file(
             / principal.user_id
             / "files"
         )
-        max_bytes = max(1, _get_rate_limit(runtime, "max_upload_bytes"))
+        # Issue 4.3: Enforce per-plan file size limits (SPEC §18)
+        user = runtime.store.get_user(principal.user_id)
+        plan_tier = user.plan_tier if user else "free"
+        max_bytes = max(1, _get_plan_upload_limit(runtime, plan_tier))
         contents = await file.read(max_bytes + 1)
         if len(contents) > max_bytes:
-            raise _http_error("validation_error", "file too large", status_code=413)
+            raise _http_error("validation_error", f"file too large (max {max_bytes // 1024 // 1024}MB for {plan_tier} plan)", status_code=413)
         dest_path = safe_join(dest_dir, safe_filename)
         resolved_dest = dest_path.resolve()
         if (
@@ -3089,7 +3295,8 @@ async def upload_file(
             )
 
         # Now write the file
-        dest_path.write_bytes(contents)
+        # Issue 32.3: Use asyncio.to_thread to avoid blocking the event loop
+        await asyncio.to_thread(dest_path.write_bytes, contents)
         chunk_count = None
         if context_id:
             try:
@@ -3109,6 +3316,223 @@ async def upload_file(
         envelope = Envelope(status="ok", data=resp, request_id=idem.request_id)
         await idem.store_result(envelope)
         return envelope
+
+
+# =========================================================================
+# File Download Endpoints (SPEC §13.3, §18)
+# =========================================================================
+
+
+@router.get("/files", response_model=Envelope, tags=["files"])
+async def list_files(
+    limit: Optional[int] = Query(None, ge=1, le=100, description="Maximum files to return"),
+    offset: Optional[int] = Query(0, ge=0, description="Offset for pagination"),
+    principal: AuthContext = Depends(get_user),
+):
+    """List user's uploaded files with pagination.
+
+    SPEC §13.3: GET /v1/files - list user files (paginated)
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        60,
+    )
+    # Get user's file directory
+    files_dir = (
+        FilePath(runtime.settings.shared_fs_root)
+        / "users"
+        / principal.user_id
+        / "files"
+    )
+
+    if not files_dir.exists():
+        return Envelope(
+            status="ok",
+            data={"files": [], "total": 0, "limit": limit or 50, "offset": offset},
+        )
+
+    # List files with pagination
+    all_files = []
+    try:
+        for f in files_dir.iterdir():
+            if f.is_file():
+                stat = f.stat()
+                all_files.append({
+                    "name": f.name,
+                    "size": stat.st_size,
+                    "created_at": datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc).isoformat(),
+                    "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                })
+    except PermissionError:
+        logger.warning("files_list_permission_denied", user_id=principal.user_id)
+        return Envelope(status="ok", data={"files": [], "total": 0, "limit": limit or 50, "offset": offset})
+
+    # Sort by modified_at descending
+    all_files.sort(key=lambda x: x["modified_at"], reverse=True)
+
+    # Apply pagination
+    resolved_limit = limit or 50
+    paginated = all_files[offset:offset + resolved_limit]
+
+    return Envelope(
+        status="ok",
+        data={
+            "files": paginated,
+            "total": len(all_files),
+            "limit": resolved_limit,
+            "offset": offset,
+            "has_next": offset + resolved_limit < len(all_files),
+        },
+    )
+
+
+@router.get("/files/{filename}/url", response_model=Envelope, tags=["files"])
+async def get_file_download_url(
+    filename: str = Path(..., max_length=255, description="File name to download"),
+    principal: AuthContext = Depends(get_user),
+):
+    """Get a signed download URL for a file.
+
+    SPEC §18: Downloads use signed URLs with 10m expiry and content-disposition
+    set to prevent inline execution.
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        60,
+    )
+
+    # Verify file exists
+    files_dir = (
+        FilePath(runtime.settings.shared_fs_root)
+        / "users"
+        / principal.user_id
+        / "files"
+    )
+    try:
+        file_path = safe_join(files_dir, filename)
+    except PathTraversalError:
+        raise _http_error("validation_error", "invalid filename", status_code=400)
+
+    if not file_path.exists() or not file_path.is_file():
+        raise _http_error("not_found", "file not found", status_code=404)
+
+    # Generate signed URL with 10-minute expiry
+    signed_url = generate_signed_url(
+        file_path=filename,
+        user_id=principal.user_id,
+        secret_key=runtime.settings.jwt_secret,
+        expiry_seconds=600,  # SPEC §18: 10 minute expiry
+    )
+
+    return Envelope(
+        status="ok",
+        data={
+            "download_url": signed_url,
+            "expires_in": 600,
+            "filename": filename,
+        },
+    )
+
+
+@router.get("/files/download", tags=["files"])
+async def download_file(
+    path: str = Query(..., max_length=255, description="File path"),
+    expires: str = Query(..., description="Expiry timestamp"),
+    sig: str = Query(..., max_length=128, description="URL signature"),
+    principal: AuthContext = Depends(get_user),
+):
+    """Download a file using a signed URL.
+
+    SPEC §18: Downloads use signed URLs with 10m expiry and content-disposition
+    set to prevent inline execution.
+    """
+    runtime = get_runtime()
+
+    # Validate signed URL
+    is_valid, error_msg = validate_signed_url(
+        path=path,
+        expires=expires,
+        signature=sig,
+        user_id=principal.user_id,
+        secret_key=runtime.settings.jwt_secret,
+    )
+
+    if not is_valid:
+        raise _http_error("unauthorized", error_msg or "invalid signature", status_code=401)
+
+    # Build file path and validate
+    files_dir = (
+        FilePath(runtime.settings.shared_fs_root)
+        / "users"
+        / principal.user_id
+        / "files"
+    )
+    try:
+        file_path = safe_join(files_dir, path)
+    except PathTraversalError:
+        raise _http_error("validation_error", "invalid file path", status_code=400)
+
+    if not file_path.exists() or not file_path.is_file():
+        raise _http_error("not_found", "file not found", status_code=404)
+
+    # Determine content type
+    content_type, _ = mimetypes.guess_type(str(file_path))
+    if not content_type:
+        content_type = "application/octet-stream"
+
+    # SPEC §18: content-disposition set to prevent inline execution
+    # Use 'attachment' to force download rather than inline display
+    return FileResponse(
+        path=str(file_path),
+        filename=path,
+        media_type=content_type,
+        headers={
+            "Content-Disposition": f'attachment; filename="{path}"',
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "private, no-cache, no-store, must-revalidate",
+        },
+    )
+
+
+@router.delete("/files/{filename}", response_model=Envelope, tags=["files"])
+async def delete_file(
+    filename: str = Path(..., max_length=255, description="File name to delete"),
+    principal: AuthContext = Depends(get_user),
+):
+    """Delete a user's file."""
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"write:{principal.user_id}",
+        _get_rate_limit(runtime, "write_rate_limit_per_minute"),
+        60,
+    )
+
+    files_dir = (
+        FilePath(runtime.settings.shared_fs_root)
+        / "users"
+        / principal.user_id
+        / "files"
+    )
+    try:
+        file_path = safe_join(files_dir, filename)
+    except PathTraversalError:
+        raise _http_error("validation_error", "invalid filename", status_code=400)
+
+    if not file_path.exists() or not file_path.is_file():
+        raise _http_error("not_found", "file not found", status_code=404)
+
+    # Delete file
+    await asyncio.to_thread(file_path.unlink)
+
+    logger.info("file_deleted", user_id=principal.user_id, filename=filename)
+    return Envelope(status="ok", data={"deleted": filename})
 
 
 @router.get("/conversations/{conversation_id}/messages", response_model=Envelope, tags=["conversations"])
@@ -3685,8 +4109,10 @@ async def websocket_chat(ws: WebSocket):
             # Streaming mode: emit token, trace, message_done, error events
             cancel_event = asyncio.Event()
             # Register cancel event so POST /chat/cancel can cancel this request
-            await _register_cancel_event(request_id, cancel_event)
-            full_content = ""
+            # Issue 50.5: Include user_id for ownership validation
+            await _register_cancel_event(request_id, cancel_event, user_id)
+            # Issue 38.5: Use list for O(n) token accumulation instead of string += O(n²)
+            content_tokens: list[str] = []
             orchestration_dict: dict[str, Any] = {}
 
             # Concurrent task to listen for cancel requests while streaming
@@ -3728,7 +4154,8 @@ async def websocket_chat(ws: WebSocket):
                     await ws.send_json({"event": event_type, "data": event_data, "request_id": request_id})
 
                     if event_type == "token":
-                        full_content += event_data if isinstance(event_data, str) else ""
+                        if isinstance(event_data, str):
+                            content_tokens.append(event_data)
                     elif event_type == "message_done":
                         orchestration_dict = event_data if isinstance(event_data, dict) else {}
                     elif event_type == "error":
@@ -3752,6 +4179,8 @@ async def websocket_chat(ws: WebSocket):
 
             # Save assistant message after streaming completes
             adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
+            # Issue 38.5: Join tokens at end for O(n) performance
+            full_content = "".join(content_tokens)
             assistant_content = orchestration_dict.get("content", full_content or "No response generated.")
             assistant_content_struct = normalize_content_struct(
                 orchestration_dict.get("content_struct"),
