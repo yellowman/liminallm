@@ -307,22 +307,30 @@ Only refresh tokens are revoked on logout. Access tokens remain valid for full 3
 
 ## 4. File Upload/Download Security
 
-### 4.1 CRITICAL: No File Download Endpoint
+### 4.1 ~~CRITICAL: No File Download Endpoint~~ FIXED
 
 **Location:** `liminallm/api/routes.py`
 
 **SPEC §13.3 requires:** "GET /v1/files — list user files (paginated)"
 **SPEC §12.2 requires:** "signed download URLs for browser fetch"
 
-**Current:** Only `GET /files/limits` and `POST /files/upload` exist. No download capability.
+**Fix Applied:**
+- Added GET /files - list user files with pagination
+- Added GET /files/{filename}/url - get signed download URL
+- Added GET /files/download - download file with validated signature
+- Added DELETE /files/{filename} - delete user file
 
-### 4.2 CRITICAL: No Signed URLs (10-Minute Expiry)
+### 4.2 ~~CRITICAL: No Signed URLs (10-Minute Expiry)~~ FIXED
 
-**Location:** N/A (not implemented)
+**Location:** `liminallm/service/fs.py`
 
 **SPEC §18 requires:** "downloads use signed URLs with 10m expiry and content-disposition set to prevent inline execution"
 
-**Current:** No signed URL generation mechanism exists.
+**Fix Applied:**
+- Implemented `generate_signed_url()` with HMAC-SHA256 signatures
+- Implemented `validate_signed_url()` with constant-time comparison
+- Default 10-minute (600 second) expiry
+- Content-Disposition header set to 'attachment' to prevent inline execution
 
 ### 4.3 CRITICAL: Per-Plan Size Caps Not Enforced
 
@@ -394,25 +402,39 @@ No connection limit enforcement found. Single user could create unlimited concur
 
 ## 6. Tool Sandboxing and Circuit Breakers
 
-### 6.1 CRITICAL: No Circuit Breaker Implementation
+### 6.1 ~~CRITICAL: No Circuit Breaker Implementation~~ FIXED
 
 **SPEC §18 requires:** "circuit breaker opens for a tool after 5 failures in 1 minute"
 
-**Current:** No circuit breaker found anywhere in codebase.
+**Fix Applied:**
+- Added `check_circuit_breaker()` to redis_cache.py
+- Added `record_tool_failure()` with atomic Lua script
+- Added `record_tool_success()` to reset failure counter
+- Circuit opens after 5 failures in 1 minute (configurable)
+- Integrated circuit breaker checks in workflow.py `_execute_node()`
 
-### 6.2 CRITICAL: No Tool Worker Cgroup Limits
+### 6.2 ~~CRITICAL: No Tool Worker Cgroup Limits~~ FIXED
 
-**Location:** `liminallm/service/workflow.py:1510-1554`
+**Location:** `liminallm/service/sandbox.py`
 
 **SPEC §18 requires:** "Tool workers run under a fixed UID with cgroup limits (CPU shares, memory hard cap)"
 
-**Current:** Tools execute in same process as FastAPI app with no isolation.
+**Fix Applied:**
+- Added `SandboxConfig` with resource limits (CPU, memory, file size)
+- Added `apply_resource_limits()` using Python's resource module
+- Added `setup_cgroup()` and `add_to_cgroup()` for cgroup v2 integration
+- Limits: 512MB memory, 30s CPU, 100MB file size by default
+- Privileged tools get higher limits (1024MB, 120s)
 
-### 6.3 CRITICAL: No Filesystem Isolation for Tools
+### 6.3 ~~CRITICAL: No Filesystem Isolation for Tools~~ FIXED
 
 **SPEC §18 requires:** "no filesystem access except tmp scratch"
 
-**Current:** Tools have full access to application filesystem.
+**Fix Applied:**
+- Added `validate_path_access()` that restricts file access to scratch directory
+- Added `SandboxedFileHandle` for safe file operations
+- Added `sandbox_open()` as a drop-in replacement for built-in open()
+- Scratch directory defaults to `/tmp/liminallm_sandbox`
 
 ### 6.4 CRITICAL: No Allowlisted External Fetch Proxy
 
@@ -1638,13 +1660,13 @@ The `except_session_id` parameter in `revoke_all_user_sessions` now properly pas
 | 9 | ~~X-Session header for WebSockets~~ ✅ DESIGN VARIANCE | routes.py:2853-2875 |
 | 10 | ~~Concurrency caps~~ ✅ FIXED | redis_cache.py, routes.py |
 | 11 | ~~Per-plan rate limits~~ ✅ FIXED | config.py, routes.py |
-| 12 | No file download endpoint | routes.py |
-| 13 | No signed URLs (10m expiry) | N/A |
+| ~~12~~ | ~~No file download endpoint~~ ✅ FIXED | routes.py |
+| ~~13~~ | ~~No signed URLs (10m expiry)~~ ✅ FIXED | fs.py |
 | 14 | Per-plan file size caps not enforced | routes.py:2385-2388 |
 | 15 | Missing request_id in stream events | routes.py:2954 |
-| 16 | No circuit breaker implementation | N/A |
-| 17 | No tool worker cgroup limits | workflow.py:1510-1554 |
-| 18 | No filesystem isolation for tools | N/A |
+| ~~16~~ | ~~No circuit breaker implementation~~ ✅ FIXED | redis_cache.py, workflow.py |
+| ~~17~~ | ~~No tool worker cgroup limits~~ ✅ FIXED | sandbox.py |
+| ~~18~~ | ~~No filesystem isolation for tools~~ ✅ FIXED | sandbox.py |
 | 19 | No allowlisted external fetch proxy | N/A |
 | 20 | No network egress allowlist | N/A |
 | 21 | Missing safety filtering for preferences | routes.py:1529-1572 |
