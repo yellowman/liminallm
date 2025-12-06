@@ -856,12 +856,16 @@ async def oauth_callback(
     code: str = Query(..., max_length=512, description="Authorization code from OAuth provider"),
     state: str = Query(..., max_length=128, description="State parameter for CSRF protection"),
     response: Response = ...,
-    tenant_id: Optional[str] = Query(None, max_length=128, description="Optional tenant ID"),
+    # SECURITY: tenant_id is derived from OAuth state, not from query params
+    # This prevents tenant spoofing attacks per CLAUDE.md guidelines
 ):
     """Complete OAuth authentication flow.
 
     Exchanges authorization code for tokens and creates user session.
     Called by OAuth provider after user authorizes the application.
+
+    Note: tenant_id is securely derived from the OAuth state token that was
+    set during oauth_start, not from user-controllable query parameters.
     """
     runtime = get_runtime()
     # Rate limit OAuth callback to prevent code brute-forcing
@@ -871,8 +875,9 @@ async def oauth_callback(
         limit=10,
         window_seconds=60,
     )
+    # SECURITY: Don't pass tenant_id - it's derived from validated state
     user, session, tokens = await runtime.auth.complete_oauth(
-        provider, code, state, tenant_id=tenant_id
+        provider, code, state
     )
     if not user or not session:
         raise _http_error("unauthorized", "oauth verification failed", status_code=401)
@@ -1895,10 +1900,12 @@ async def list_artifacts(
     resolved_page_size = min(max(effective_page_size, 1), paging["max_page_size"])
 
     # Get one extra item to determine if there are more pages
+    # Pass tenant_id for proper shared artifact visibility filtering
     raw_items = list(runtime.store.list_artifacts(
         type_filter=type_filter,
         kind_filter=kind_filter,
         owner_user_id=principal.user_id,
+        tenant_id=principal.tenant_id,
         page=page,
         page_size=resolved_page_size + 1,
         visibility=visibility,

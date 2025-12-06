@@ -1015,27 +1015,72 @@ class MemoryStore:
         tenant_id: Optional[str] = None,
         visibility: Optional[str] = None,
     ) -> List[Artifact]:
-        artifacts = list(self.artifacts.values())
-        if tenant_id:
-            artifacts = [
-                a
-                for a in artifacts
-                if a.owner_user_id
-                and a.owner_user_id in self.users
-                and self.users[a.owner_user_id].tenant_id == tenant_id
-            ]
-        if owner_user_id:
-            artifacts = [a for a in artifacts if a.owner_user_id == owner_user_id]
+        """List artifacts with proper visibility filtering.
+
+        Visibility logic:
+        - If visibility='private': only user's own private artifacts
+        - If visibility='global': all global artifacts
+        - If visibility='shared': shared artifacts within user's tenant
+        - If no visibility filter: user's private + all global + shared within tenant
+        """
+        all_artifacts = list(self.artifacts.values())
+
+        # Helper to get artifact visibility
+        def get_visibility(a: Artifact) -> str:
+            return getattr(a, "visibility", "private")
+
+        # Helper to check if artifact owner is in tenant
+        def owner_in_tenant(a: Artifact, tid: str) -> bool:
+            if not a.owner_user_id or a.owner_user_id not in self.users:
+                return False
+            return self.users[a.owner_user_id].tenant_id == tid
+
+        # Apply visibility access control
+        if visibility:
+            # Specific visibility filter requested
+            if visibility == "private":
+                if owner_user_id:
+                    artifacts = [
+                        a for a in all_artifacts
+                        if get_visibility(a) == "private" and a.owner_user_id == owner_user_id
+                    ]
+                else:
+                    artifacts = [a for a in all_artifacts if get_visibility(a) == "private"]
+            elif visibility == "global":
+                artifacts = [a for a in all_artifacts if get_visibility(a) == "global"]
+            elif visibility == "shared":
+                if tenant_id:
+                    artifacts = [
+                        a for a in all_artifacts
+                        if get_visibility(a) == "shared" and owner_in_tenant(a, tenant_id)
+                    ]
+                else:
+                    artifacts = [a for a in all_artifacts if get_visibility(a) == "shared"]
+            else:
+                artifacts = [a for a in all_artifacts if get_visibility(a) == visibility]
+        else:
+            # No visibility filter: show accessible artifacts
+            # User sees: their private + all global + shared within tenant
+            artifacts = []
+            for a in all_artifacts:
+                vis = get_visibility(a)
+                if vis == "global":
+                    artifacts.append(a)
+                elif vis == "private" and owner_user_id and a.owner_user_id == owner_user_id:
+                    artifacts.append(a)
+                elif vis == "shared" and tenant_id and owner_in_tenant(a, tenant_id):
+                    artifacts.append(a)
+
+        # Apply type/kind filters
         if type_filter:
             artifacts = [a for a in artifacts if a.type == type_filter]
         if kind_filter:
             artifacts = [
-                a
-                for a in artifacts
+                a for a in artifacts
                 if isinstance(a.schema, dict) and a.schema.get("kind") == kind_filter
             ]
-        if visibility:
-            artifacts = [a for a in artifacts if getattr(a, "visibility", "private") == visibility]
+
+        # Pagination
         start = max(page - 1, 0) * max(page_size, 1)
         end = start + max(page_size, 1)
         return artifacts[start:end]

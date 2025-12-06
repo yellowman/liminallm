@@ -1669,28 +1669,68 @@ class PostgresStore:
         tenant_id: Optional[str] = None,
         visibility: Optional[str] = None,
     ) -> List[Artifact]:
+        """List artifacts with proper visibility filtering.
+
+        Visibility logic:
+        - If visibility='private': only user's own private artifacts
+        - If visibility='global': all global artifacts
+        - If visibility='shared': shared artifacts within user's tenant
+        - If no visibility filter: user's private + all global + shared within tenant
+        """
         offset = max(page - 1, 0) * max(page_size, 1)
         limit = max(page_size, 1)
         with self._connect() as conn:
             clauses = []
             params: list[Any] = []
+
+            # Type/kind filters apply regardless of visibility
             if type_filter:
                 clauses.append("type = %s")
                 params.append(type_filter)
             if kind_filter:
                 clauses.append("schema->>'kind' = %s")
                 params.append(kind_filter)
-            if owner_user_id:
-                clauses.append("owner_user_id = %s")
-                params.append(owner_user_id)
-            if tenant_id:
-                clauses.append(
-                    "owner_user_id IN (SELECT id FROM app_user WHERE tenant_id = %s)"
-                )
-                params.append(tenant_id)
+
+            # Build visibility access control clause
             if visibility:
-                clauses.append("visibility = %s")
-                params.append(visibility)
+                # Specific visibility filter requested
+                if visibility == "private":
+                    # Only user's own private artifacts
+                    if owner_user_id:
+                        clauses.append("(visibility = 'private' AND owner_user_id = %s)")
+                        params.append(owner_user_id)
+                    else:
+                        clauses.append("visibility = 'private'")
+                elif visibility == "global":
+                    # All global artifacts (visible to everyone)
+                    clauses.append("visibility = 'global'")
+                elif visibility == "shared":
+                    # Shared artifacts within tenant
+                    if tenant_id:
+                        clauses.append(
+                            "(visibility = 'shared' AND owner_user_id IN "
+                            "(SELECT id FROM app_user WHERE tenant_id = %s))"
+                        )
+                        params.append(tenant_id)
+                    else:
+                        clauses.append("visibility = 'shared'")
+            else:
+                # No visibility filter: show accessible artifacts
+                # User sees: their private + all global + shared within tenant
+                visibility_parts = []
+                if owner_user_id:
+                    visibility_parts.append("(visibility = 'private' AND owner_user_id = %s)")
+                    params.append(owner_user_id)
+                visibility_parts.append("visibility = 'global'")
+                if tenant_id:
+                    visibility_parts.append(
+                        "(visibility = 'shared' AND owner_user_id IN "
+                        "(SELECT id FROM app_user WHERE tenant_id = %s))"
+                    )
+                    params.append(tenant_id)
+                if visibility_parts:
+                    clauses.append("(" + " OR ".join(visibility_parts) + ")")
+
             where = ""
             if clauses:
                 where = " WHERE " + " AND ".join(clauses)

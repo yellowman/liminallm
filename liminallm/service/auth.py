@@ -473,8 +473,14 @@ class AuthService:
         return {"provider_uid": userinfo.get("id") or userinfo.get("sub")}
 
     async def complete_oauth(
-        self, provider: str, code: str, state: str, *, tenant_id: Optional[str] = None
+        self, provider: str, code: str, state: str
     ) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
+        """Complete OAuth authentication flow.
+
+        SECURITY: tenant_id is derived exclusively from the validated OAuth state
+        token, never from external parameters. This prevents tenant spoofing attacks
+        per CLAUDE.md security guidelines.
+        """
         cache_state_used = False
         stored = None
         if self.cache:
@@ -497,10 +503,8 @@ class AuthService:
         if not stored or stored[1] < now or stored[0] != provider:
             await _clear_oauth_state()
             return None, None, {}
-        _, _, tenant_hint = stored
-        if tenant_id and tenant_hint and tenant_id != tenant_hint:
-            await _clear_oauth_state()
-            return None, None, {}
+        # SECURITY: tenant_id comes from validated state, not from user input
+        _, _, state_tenant_id = stored
         identity = await self._exchange_oauth_code(provider, code)
         if not identity:
             await _clear_oauth_state()
@@ -509,7 +513,8 @@ class AuthService:
         provider_uid = identity.get("provider_uid")
         if not provider_uid:
             return None, None, {}
-        normalized_tenant = tenant_id or tenant_hint or self.settings.default_tenant_id
+        # Use tenant from state, falling back to default only if state had none
+        normalized_tenant = state_tenant_id or self.settings.default_tenant_id
         existing = None
         if hasattr(self.store, "get_user_by_provider"):
             existing = self.store.get_user_by_provider(provider, provider_uid)
