@@ -1020,7 +1020,17 @@ class LocalJaxLoRABackend:
                 path=str(params_path),
                 message="Adapter loaded without checksum verification - add schema.checksum for production use",
             )
-        weights_raw = json.loads(payload.decode())
+        # Issue 39.1: Add error handling for JSON deserialization
+        try:
+            weights_raw = json.loads(payload.decode())
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            logger.error(
+                "adapter_json_decode_error",
+                adapter_id=adapter_id,
+                path=str(params_path),
+                error=str(exc),
+            )
+            raise ValueError(f"Invalid adapter params.json: {exc}") from exc
         self._ensure_jax()
         weights = {
             k: self._jnp.array(v, dtype=self._jnp.float32)

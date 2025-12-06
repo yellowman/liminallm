@@ -1753,8 +1753,11 @@ async def chat(
                 status="ok", data=resp.model_dump(), request_id=idem.request_id
             )
             if runtime.cache:
+                # Issue 38.4: Add limit to prevent unbounded memory usage
+                # Use reasonable limit for conversation context caching
+                paging = _get_pagination_settings(runtime)
                 history = runtime.store.list_messages(
-                    conversation_id, user_id=principal.user_id
+                    conversation_id, limit=paging["max_page_size"], user_id=principal.user_id
                 )
                 await runtime.workflow.cache_conversation_state(conversation_id, history)
             await idem.store_result(envelope)
@@ -3708,7 +3711,8 @@ async def websocket_chat(ws: WebSocket):
             cancel_event = asyncio.Event()
             # Register cancel event so POST /chat/cancel can cancel this request
             await _register_cancel_event(request_id, cancel_event)
-            full_content = ""
+            # Issue 38.5: Use list for O(n) token accumulation instead of string += O(n²)
+            content_tokens: list[str] = []
             orchestration_dict: dict[str, Any] = {}
 
             # Concurrent task to listen for cancel requests while streaming
@@ -3750,7 +3754,8 @@ async def websocket_chat(ws: WebSocket):
                     await ws.send_json({"event": event_type, "data": event_data, "request_id": request_id})
 
                     if event_type == "token":
-                        full_content += event_data if isinstance(event_data, str) else ""
+                        if isinstance(event_data, str):
+                            content_tokens.append(event_data)
                     elif event_type == "message_done":
                         orchestration_dict = event_data if isinstance(event_data, dict) else {}
                     elif event_type == "error":
@@ -3774,6 +3779,8 @@ async def websocket_chat(ws: WebSocket):
 
             # Save assistant message after streaming completes
             adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
+            # Issue 38.5: Join tokens at end for O(n) performance
+            full_content = "".join(content_tokens)
             assistant_content = orchestration_dict.get("content", full_content or "No response generated.")
             assistant_content_struct = normalize_content_struct(
                 orchestration_dict.get("content_struct"),

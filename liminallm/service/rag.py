@@ -429,6 +429,10 @@ class RAGService:
             context_id, data, chunk_size=chunk_size, source_path=path
         )
 
+    # Issue 38.3: Default limits for recursive ingestion to prevent resource exhaustion
+    MAX_INGEST_FILES = 10000  # Maximum files to process in one ingest operation
+    MAX_INGEST_DEPTH = 20  # Maximum directory depth for recursive ingestion
+
     def ingest_path(
         self,
         context_id: str,
@@ -438,6 +442,8 @@ class RAGService:
         chunk_size: Optional[int] = None,
         extensions: Optional[List[str]] = None,
         allowed_base: Optional[Union[str, Path]] = None,
+        max_files: Optional[int] = None,
+        max_depth: Optional[int] = None,
     ) -> int:
         """Ingest content from a filesystem path (file or directory).
 
@@ -451,6 +457,8 @@ class RAGService:
             allowed_base: If provided, validates that fs_path is within this base
                          directory. Raises PathTraversalError if path escapes.
                          Per SPEC §18, path traversal prevention is mandatory.
+            max_files: Maximum number of files to process (default: 10000)
+            max_depth: Maximum directory depth for recursive mode (default: 20)
 
         Returns:
             Total number of chunks created
@@ -489,6 +497,10 @@ class RAGService:
                     raise
 
         path = Path(fs_path)
+        # Issue 38.3: Apply default limits to prevent resource exhaustion
+        file_limit = max_files or self.MAX_INGEST_FILES
+        depth_limit = max_depth or self.MAX_INGEST_DEPTH
+        base_depth = len(path.resolve().parts)
 
         # Default extensions for text-like files
         if extensions is None:
@@ -500,6 +512,7 @@ class RAGService:
             ]
 
         total_chunks = 0
+        files_processed = 0
 
         if path.is_file():
             # Single file
@@ -518,15 +531,33 @@ class RAGService:
             logger.warning("ingest_path_not_found", path=str(path))
             return 0
 
-        # Directory - iterate through files
+        # Directory - iterate through files with limits
         pattern = "**/*" if recursive else "*"
         for file_path in path.glob(pattern):
             if not file_path.is_file():
                 continue
             if extensions and file_path.suffix.lower() not in extensions:
                 continue
+
+            # Issue 38.3: Check depth limit for recursive ingestion
+            if recursive:
+                file_depth = len(file_path.resolve().parts) - base_depth
+                if file_depth > depth_limit:
+                    continue
+
+            # Issue 38.3: Check file count limit
+            if files_processed >= file_limit:
+                logger.warning(
+                    "ingest_path_file_limit_reached",
+                    context_id=context_id,
+                    fs_path=fs_path,
+                    limit=file_limit,
+                )
+                break
+
             try:
                 total_chunks += self.ingest_file(context_id, str(file_path), chunk_size)
+                files_processed += 1
             except Exception as exc:
                 logger.warning(
                     "ingest_path_file_failed",
@@ -539,6 +570,7 @@ class RAGService:
             context_id=context_id,
             fs_path=fs_path,
             recursive=recursive,
+            files_processed=files_processed,
             total_chunks=total_chunks,
         )
         return total_chunks

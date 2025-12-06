@@ -227,11 +227,13 @@ class RedisCache:
             return None
 
         expires_raw = data.get("expires_at")
-        expires_at = (
-            datetime.fromisoformat(expires_raw)
-            if isinstance(expires_raw, str)
-            else datetime.utcnow()
-        )
+        # Issue 39.2: Add error handling for datetime parsing
+        expires_at = datetime.utcnow()
+        if isinstance(expires_raw, str):
+            try:
+                expires_at = datetime.fromisoformat(expires_raw)
+            except (ValueError, TypeError):
+                pass  # Use default utcnow
         return data.get("provider"), expires_at, data.get("tenant_id")
 
     async def get_idempotency_record(
@@ -666,11 +668,13 @@ class SyncRedisCache:
             return None
 
         expires_raw = data.get("expires_at")
-        expires_at = (
-            datetime.fromisoformat(expires_raw)
-            if isinstance(expires_raw, str)
-            else datetime.utcnow()
-        )
+        # Issue 39.2: Add error handling for datetime parsing
+        expires_at = datetime.utcnow()
+        if isinstance(expires_raw, str):
+            try:
+                expires_at = datetime.fromisoformat(expires_raw)
+            except (ValueError, TypeError):
+                pass  # Use default utcnow
         return data.get("provider"), expires_at, data.get("tenant_id")
 
     async def get_idempotency_record(

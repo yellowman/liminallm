@@ -1530,11 +1530,12 @@ class PostgresStore:
                         "SELECT 1 FROM conversation WHERE id = %s FOR UPDATE",
                         (conversation_id,),
                     )
+                    # Issue 37.6: Use MAX(seq) instead of COUNT(*) to handle gaps in sequence
                     seq_row = conn.execute(
-                        "SELECT COUNT(*) AS c FROM message WHERE conversation_id = %s",
+                        "SELECT COALESCE(MAX(seq), -1) + 1 AS next_seq FROM message WHERE conversation_id = %s",
                         (conversation_id,),
                     ).fetchone()
-                    seq = seq_row["c"] if seq_row else 0
+                    seq = seq_row["next_seq"] if seq_row else 0
                     msg_id = str(uuid.uuid4())
                     now = datetime.utcnow()
                     conn.execute(

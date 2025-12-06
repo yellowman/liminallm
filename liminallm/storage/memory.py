@@ -1693,6 +1693,10 @@ class MemoryStore:
             data = json.loads(path.read_text())
         except FileNotFoundError:
             return False
+        except json.JSONDecodeError as exc:
+            # Issue 39.1: Handle corrupted state files gracefully
+            logger.error("memory_store_state_corrupted", path=str(path), error=str(exc))
+            return False
         self.users = {u["id"]: self._deserialize_user(u) for u in data.get("users", [])}
         self.sessions = {
             s["id"]: self._deserialize_session(s) for s in data.get("sessions", [])
