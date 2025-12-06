@@ -1385,15 +1385,19 @@ class PostgresStore:
                 self.sessions.pop(sid, None)
 
     def mark_session_verified(self, session_id: str) -> None:
+        # Issue 53.1: Cache update MUST only happen if DB update succeeds
+        # to prevent MFA bypass via transient database failures
         try:
             with self._connect() as conn:
                 conn.execute(
                     "UPDATE auth_session SET mfa_verified = TRUE WHERE id = %s",
                     (session_id,),
                 )
+            # Only update cache after successful DB commit
+            self._update_cached_session(session_id, mfa_verified=True)
         except Exception as exc:
-            self.logger.warning("mark_session_verified_failed", error=str(exc))
-        self._update_cached_session(session_id, mfa_verified=True)
+            self.logger.error("mark_session_verified_failed", session_id=session_id, error=str(exc))
+            raise  # Re-raise to signal failure to caller
 
     def get_session(self, session_id: str) -> Optional[Session]:
         with self._connect() as conn:

@@ -109,10 +109,11 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/v1")
 
-# Registry for active streaming requests - maps request_id to (cancel_event, timestamp)
+# Registry for active streaming requests - maps request_id to (cancel_event, timestamp, user_id)
 # Used by POST /chat/cancel to cancel in-progress streaming requests per SPEC §18
 # Issue 23.2: Added timestamp tracking for TTL-based cleanup
-_active_requests: Dict[str, tuple[asyncio.Event, datetime]] = {}
+# Issue 50.5: Added user_id for ownership validation to prevent cross-user cancellation
+_active_requests: Dict[str, tuple[asyncio.Event, datetime, str]] = {}
 # Issue 28.2: Lazily initialize asyncio.Lock to avoid "no running event loop" errors
 # at module import time. The lock is created on first use when an event loop exists.
 _active_requests_lock: Optional[asyncio.Lock] = None
@@ -147,12 +148,12 @@ async def _cleanup_stale_active_requests() -> int:
     _active_requests_last_cleanup = now
     threshold = now - timedelta(seconds=_ACTIVE_REQUEST_TTL_SECONDS)
     stale_keys = [
-        req_id for req_id, (_, created_at) in _active_requests.items()
+        req_id for req_id, (_, created_at, _) in _active_requests.items()
         if created_at < threshold
     ]
 
     for req_id in stale_keys:
-        event, _ = _active_requests.pop(req_id, (None, None))
+        event, _, _ = _active_requests.pop(req_id, (None, None, None))
         if event and not event.is_set():
             event.set()  # Cancel any stale request
 
@@ -165,10 +166,16 @@ async def _cleanup_stale_active_requests() -> int:
     return len(stale_keys)
 
 
-async def _register_cancel_event(request_id: str, cancel_event: asyncio.Event) -> None:
-    """Register a cancel event for an active streaming request."""
+async def _register_cancel_event(request_id: str, cancel_event: asyncio.Event, user_id: str) -> None:
+    """Register a cancel event for an active streaming request.
+
+    Args:
+        request_id: Unique request identifier
+        cancel_event: Event to signal cancellation
+        user_id: Owner of this request (Issue 50.5 - for ownership validation)
+    """
     async with _get_active_requests_lock():
-        _active_requests[request_id] = (cancel_event, datetime.utcnow())
+        _active_requests[request_id] = (cancel_event, datetime.utcnow(), user_id)
         # Periodic cleanup to prevent unbounded growth (Issue 23.2)
         await _cleanup_stale_active_requests()
 
@@ -179,16 +186,34 @@ async def _unregister_cancel_event(request_id: str) -> None:
         _active_requests.pop(request_id, None)
 
 
-async def _cancel_request(request_id: str) -> bool:
-    """Cancel an active request by request_id. Returns True if cancelled."""
+async def _cancel_request(request_id: str, user_id: str) -> tuple[bool, str]:
+    """Cancel an active request by request_id with ownership validation (Issue 50.5).
+
+    Args:
+        request_id: The request to cancel
+        user_id: The user attempting to cancel (must be request owner)
+
+    Returns:
+        Tuple of (cancelled: bool, reason: str)
+    """
     async with _get_active_requests_lock():
         entry = _active_requests.get(request_id)
-        if entry:
-            cancel_event, _ = entry
-            if not cancel_event.is_set():
-                cancel_event.set()
-                return True
-        return False
+        if not entry:
+            return False, "request_not_found"
+        cancel_event, _, owner_id = entry
+        # Issue 50.5: Validate ownership to prevent cross-user cancellation attacks
+        if owner_id != user_id:
+            logger.warning(
+                "cancel_request_ownership_mismatch",
+                request_id=request_id,
+                owner_id=owner_id,
+                requester_id=user_id,
+            )
+            return False, "not_owner"
+        if not cancel_event.is_set():
+            cancel_event.set()
+            return True, "cancelled"
+        return False, "already_cancelled"
 
 
 def _http_error(
@@ -816,12 +841,15 @@ async def signup(body: SignupRequest, response: Response):
         _get_rate_limit(runtime, "signup_rate_limit_per_minute"),
         60,
     )
+    # Issue 35.2/53.2: Per CLAUDE.md, derive tenant_id from server config, not user input
+    # This prevents tenant spoofing attacks where users register in arbitrary tenants
     user, session, tokens = await runtime.auth.signup(
         email=body.email,
         password=body.password,
         handle=body.handle,
-        tenant_id=body.tenant_id,
+        tenant_id=None,  # Use server's default_tenant_id
     )
+    logger.info("user_signup_completed", user_id=user.id, email=body.email)
     _apply_session_cookies(
         response,
         session,
@@ -864,16 +892,20 @@ async def login(body: LoginRequest, request: Request, response: Response):
     # Bug fix: Pass user_agent and ip_addr for session metadata
     user_agent = request.headers.get("user-agent")
     ip_addr = request.client.host if request.client else None
+    # Issue 35.2: Per CLAUDE.md, tenant_id should come from user record, not request
+    # The auth service looks up the user by email and uses their stored tenant_id
     user, session, tokens = await runtime.auth.login(
         email=body.email,
         password=body.password,
         mfa_code=body.mfa_code,
-        tenant_id=body.tenant_id,
+        tenant_id=None,  # Derived from user's existing record
         user_agent=user_agent,
         ip_addr=ip_addr,
     )
     if not user or not session:
+        logger.warning("login_failed", email=body.email, ip=ip_addr)
         raise _http_error("unauthorized", "invalid credentials", status_code=401)
+    logger.info("user_login_completed", user_id=user.id, ip=ip_addr)
     _apply_session_cookies(
         response,
         session,
@@ -913,8 +945,10 @@ async def oauth_start(
         limit=20,
         window_seconds=60,
     )
+    # Issue 35.2: Per CLAUDE.md, derive tenant_id from server config, not user input
+    # This prevents tenant spoofing attacks where users can OAuth into arbitrary tenants
     start = await runtime.auth.start_oauth(
-        provider, redirect_uri=body.redirect_uri, tenant_id=body.tenant_id
+        provider, redirect_uri=body.redirect_uri, tenant_id=None
     )
     return Envelope(
         status="ok",
@@ -1094,6 +1128,14 @@ async def admin_set_role(
         _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
         _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
     )
+    # Issue 50.3: Validate tenant isolation - admin can only modify users in their tenant
+    target_user = runtime.store.get_user(user_id)
+    if not target_user:
+        raise NotFoundError("user not found", detail={"user_id": user_id})
+    if target_user.tenant_id != principal.tenant_id:
+        raise _http_error(
+            "forbidden", "cannot modify users in other tenant", status_code=403
+        )
     # Issue 22.1: set_user_role is now async to revoke sessions on role change
     user = await runtime.auth.set_user_role(user_id, body.role)
     if not user:
@@ -1112,6 +1154,14 @@ async def admin_delete_user(
         _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
         _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
     )
+    # Issue 50.4: Validate tenant isolation - admin can only delete users in their tenant
+    target_user = runtime.store.get_user(user_id)
+    if not target_user:
+        raise NotFoundError("user not found", detail={"user_id": user_id})
+    if target_user.tenant_id != principal.tenant_id:
+        raise _http_error(
+            "forbidden", "cannot delete users in other tenant", status_code=403
+        )
     removed = runtime.auth.delete_user(user_id)
     if not removed:
         raise NotFoundError("user not found", detail={"user_id": user_id})
@@ -1276,13 +1326,32 @@ async def update_admin_settings(
 
 
 @router.post("/auth/mfa/request", response_model=Envelope, tags=["auth"])
-async def request_mfa(body: MFARequest):
+async def request_mfa(body: MFARequest, request: Request):
     runtime = get_runtime()
+    client_ip = request.client.host if request.client else "unknown"
+    # Issue 50.1: Rate limit per IP first to prevent session enumeration attacks
+    await _enforce_rate_limit(
+        runtime,
+        f"mfa:request:ip:{client_ip}",
+        _get_rate_limit(runtime, "mfa_rate_limit_per_minute"),
+        60,
+    )
     auth_ctx = await runtime.auth.resolve_session(
         body.session_id, allow_pending_mfa=True
     )
     if not auth_ctx:
+        logger.warning("mfa_request_invalid_session", ip=client_ip)
         raise _http_error("unauthorized", "invalid session", status_code=401)
+    # Issue 50.1: Validate session IP matches requester IP for security
+    session = runtime.store.get_session(body.session_id)
+    if session and session.ip_addr and str(session.ip_addr) != client_ip:
+        logger.warning(
+            "mfa_request_ip_mismatch",
+            session_id=body.session_id,
+            session_ip=str(session.ip_addr),
+            request_ip=client_ip,
+        )
+        raise _http_error("unauthorized", "session bound to different IP", status_code=401)
     await _enforce_rate_limit(
         runtime,
         f"mfa:request:{auth_ctx.user_id}",
@@ -1290,17 +1359,38 @@ async def request_mfa(body: MFARequest):
         60,
     )
     challenge = await runtime.auth.issue_mfa_challenge(user_id=auth_ctx.user_id)
+    logger.info("mfa_challenge_issued", user_id=auth_ctx.user_id, ip=client_ip)
     return Envelope(status="ok", data=challenge)
 
 
 @router.post("/auth/mfa/verify", response_model=Envelope, tags=["auth"])
-async def verify_mfa(body: MFAVerifyRequest, response: Response):
+async def verify_mfa(body: MFAVerifyRequest, request: Request, response: Response):
     runtime = get_runtime()
+    client_ip = request.client.host if request.client else "unknown"
+    # Issue 50.2: Rate limit per IP first to prevent brute force attacks
+    await _enforce_rate_limit(
+        runtime,
+        f"mfa:verify:ip:{client_ip}",
+        _get_rate_limit(runtime, "mfa_rate_limit_per_minute"),
+        60,
+    )
     auth_ctx = await runtime.auth.resolve_session(
         body.session_id, allow_pending_mfa=True
     )
     if not auth_ctx:
+        logger.warning("mfa_verify_invalid_session", ip=client_ip)
         raise _http_error("unauthorized", "invalid session", status_code=401)
+    # Issue 50.2: Validate session IP matches requester IP for security
+    session = runtime.store.get_session(body.session_id)
+    if session and session.ip_addr and str(session.ip_addr) != client_ip:
+        logger.warning(
+            "mfa_verify_ip_mismatch",
+            session_id=body.session_id,
+            session_ip=str(session.ip_addr),
+            request_ip=client_ip,
+            user_id=auth_ctx.user_id,
+        )
+        raise _http_error("unauthorized", "session bound to different IP", status_code=401)
     await _enforce_rate_limit(
         runtime,
         f"mfa:verify:{auth_ctx.user_id}",
@@ -1311,6 +1401,7 @@ async def verify_mfa(body: MFAVerifyRequest, response: Response):
         user_id=auth_ctx.user_id, code=body.code, session_id=body.session_id
     )
     if not ok:
+        logger.warning("mfa_verify_failed", user_id=auth_ctx.user_id, ip=client_ip)
         raise _http_error("unauthorized", "invalid mfa", status_code=401)
     user, session, tokens = runtime.auth.issue_tokens_for_session(body.session_id)
     resp: dict = {"status": "verified"}
@@ -1794,8 +1885,8 @@ async def cancel_chat(
 
     request_id = body.request_id
 
-    # Try to cancel in-memory active request
-    cancelled = await _cancel_request(request_id)
+    # Try to cancel in-memory active request (Issue 50.5: validates ownership)
+    cancelled, reason = await _cancel_request(request_id, principal.user_id)
 
     if cancelled:
         logger.info("chat_request_cancelled", request_id=request_id, user_id=principal.user_id)
@@ -1806,6 +1897,12 @@ async def cancel_chat(
                 cancelled=True,
                 message="Request cancelled successfully",
             ).model_dump(),
+        )
+
+    # Issue 50.5: Return 403 if user doesn't own the request
+    if reason == "not_owner":
+        raise _http_error(
+            "forbidden", "cannot cancel requests owned by other users", status_code=403
         )
 
     # Request not found in active requests - may have already completed or never existed
@@ -3710,7 +3807,8 @@ async def websocket_chat(ws: WebSocket):
             # Streaming mode: emit token, trace, message_done, error events
             cancel_event = asyncio.Event()
             # Register cancel event so POST /chat/cancel can cancel this request
-            await _register_cancel_event(request_id, cancel_event)
+            # Issue 50.5: Include user_id for ownership validation
+            await _register_cancel_event(request_id, cancel_event, user_id)
             # Issue 38.5: Use list for O(n) token accumulation instead of string += O(n²)
             content_tokens: list[str] = []
             orchestration_dict: dict[str, Any] = {}
