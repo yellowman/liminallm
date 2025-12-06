@@ -164,4 +164,5 @@ jobs:
       - name: Install bandit
         run: pip install bandit[toml]
       - name: Run security scan
-        run: bandit -r liminallm/ -ll --skip B101 || true
+        # Enforce Bandit findings instead of ignoring failures during development
+        run: bandit -r liminallm/ -ll --skip B101

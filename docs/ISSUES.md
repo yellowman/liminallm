@@ -5267,12 +5267,10 @@ This flag must be explicitly set. Production deployments should not set this fla
 
 **Fix Applied:** Added `--requirepass ${REDIS_PASSWORD:-changeme}` to Redis command. Updated REDIS_URL in app service to include authentication. Added REDIS_PASSWORD to .env.example as required variable.
 
-### 72.3 ~~CRITICAL: Security Scan Failures Ignored in CI~~ (FALSE POSITIVE - INTENTIONAL)
+### 72.3 ~~CRITICAL: Security Scan Failures Ignored in CI~~ FIXED
 **Location:** `.github/workflows/tests.yml:167`
 
-**Verification Result:** The `|| true` is intentional during development phase to allow CI to pass while security issues are being addressed. This should be changed to strict mode (`|| exit 1`) before production deployment.
-
-**Status:** Development-phase configuration. Add TODO comment to enforce before production.
+**Fix Applied:** Removed the `|| true` guard from the Bandit invocation so CI now fails on security findings. Added an inline comment to document the enforcement.
 
 ### 72.4 ~~CRITICAL: Shell Injection in Migration Script~~ (FIXED)
 **Location:** `scripts/migrate.sh`
