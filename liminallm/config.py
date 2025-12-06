@@ -39,6 +39,7 @@ class RagMode(str, Enum):
 
     PGVECTOR = "pgvector"
     MEMORY = "memory"
+    LOCAL_HYBRID = "local_hybrid"
 
 
 class AdapterMode(str, Enum):

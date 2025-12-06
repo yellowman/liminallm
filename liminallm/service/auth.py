@@ -260,8 +260,41 @@ class AuthService:
             "session_rotation_grace_seconds": 300,
             "access_token_ttl_minutes": 30,
             "refresh_token_ttl_minutes": 1440,
+            # Device-specific session TTLs (SPEC §18: 7d web, 1d mobile)
+            "session_ttl_minutes_web": 60 * 24 * 7,
+            "session_ttl_minutes_mobile": 60 * 24,
+            # Device-specific refresh TTLs aligned with session windows
+            "refresh_token_ttl_minutes_web": 60 * 24 * 7,
+            "refresh_token_ttl_minutes_mobile": 60 * 24,
         }
         return {**defaults, **db_settings}
+
+    def _get_session_ttl(self, device_type: str) -> int:
+        sys_settings = self._get_system_settings()
+        normalized = (device_type or "web").lower()
+        if normalized == "mobile":
+            return int(sys_settings.get("session_ttl_minutes_mobile", 60 * 24))
+        return int(sys_settings.get("session_ttl_minutes_web", 60 * 24 * 7))
+
+    def _get_refresh_ttl(self, device_type: str, sys_settings: dict[str, Any]) -> int:
+        normalized = (device_type or "web").lower()
+        if normalized == "mobile":
+            return int(
+                sys_settings.get("refresh_token_ttl_minutes_mobile", 60 * 24)
+            )
+        return int(
+            sys_settings.get("refresh_token_ttl_minutes_web", 60 * 24 * 7)
+        )
+
+    def _get_session_device(self, session: Session) -> str:
+        meta = session.meta or {}
+        if isinstance(meta, dict):
+            raw = meta.get("device_type")
+            if isinstance(raw, str) and raw:
+                normalized = raw.lower()
+                if normalized in {"web", "mobile"}:
+                    return normalized
+        return "web"
 
     async def signup(
         self,
@@ -277,8 +310,13 @@ class AuthService:
         )
         pwd_hash, algo = self._hash_password(password)
         self.store.save_password(user.id, pwd_hash, algo)
-        session = self.store.create_session(user.id, tenant_id=user.tenant_id)
-        tokens = self._issue_tokens(user, session)
+        session = self.store.create_session(
+            user.id,
+            tenant_id=user.tenant_id,
+            ttl_minutes=self._get_session_ttl("web"),
+            meta={"device_type": "web"},
+        )
+        tokens = self._issue_tokens(user, session, device_type="web")
         if self.cache:
             await self.cache.cache_session(session.id, user.id, session.expires_at)
         return user, session, tokens
@@ -587,8 +625,13 @@ class AuthService:
             except Exception as exc:
                 self.logger.error("link_oauth_provider_failed", error=str(exc))
                 raise
-        session = self.store.create_session(user.id, tenant_id=user.tenant_id)
-        tokens = self._issue_tokens(user, session)
+        session = self.store.create_session(
+            user.id,
+            tenant_id=user.tenant_id,
+            ttl_minutes=self._get_session_ttl("web"),
+            meta={"device_type": "web"},
+        )
+        tokens = self._issue_tokens(user, session, device_type="web")
         if self.cache:
             await self.cache.cache_session(session.id, user.id, session.expires_at)
         return user, session, tokens
@@ -635,6 +678,7 @@ class AuthService:
         tenant_id: Optional[str] = None,
         user_agent: Optional[str] = None,
         ip_addr: Optional[str] = None,
+        device_type: str = "web",
     ) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
         user = self.store.get_user_by_email(email)
         if not user or not self.verify_password(user.id, password):
@@ -654,23 +698,27 @@ class AuthService:
 
         mfa_cfg = self.store.get_user_mfa_secret(user.id) if self.mfa_enabled else None
         require_mfa = bool(self.mfa_enabled and mfa_cfg and mfa_cfg.enabled)
+        device = (device_type or "web").lower()
+        session_ttl = self._get_session_ttl(device)
         session = self.store.create_session(
             user.id,
             mfa_required=require_mfa,
             tenant_id=user.tenant_id,
             user_agent=user_agent,
             ip_addr=ip_addr,
+            ttl_minutes=session_ttl,
+            meta={"device_type": device},
         )
         tokens: dict[str, str] = {}
         if require_mfa and mfa_cfg:
             if mfa_code and self._verify_totp(mfa_cfg.secret, mfa_code):
                 self._mark_session_verified(session.id)
                 session.mfa_verified = True
-                tokens = self._issue_tokens(user, session)
+                tokens = self._issue_tokens(user, session, device_type=device)
             else:
                 session.mfa_verified = False
         else:
-            tokens = self._issue_tokens(user, session)
+            tokens = self._issue_tokens(user, session, device_type=device)
         if self.cache and (not require_mfa or session.mfa_verified):
             await self.cache.cache_session(session.id, user.id, session.expires_at)
             # Initialize session activity tracking
@@ -700,7 +748,8 @@ class AuthService:
             return None, None, {}
         if not self._refresh_token_matches(session, jti):
             return None, None, {}
-        tokens = self._issue_tokens(user, session)
+        device = self._get_session_device(session)
+        tokens = self._issue_tokens(user, session, device_type=device)
         await self._revoke_refresh_token(jti, payload.get("exp"))
         return user, session, tokens
 
@@ -981,7 +1030,8 @@ class AuthService:
         user = self.store.get_user(sess.user_id)
         if not user:
             return None, None, {}
-        tokens = self._issue_tokens(user, sess)
+        device = self._get_session_device(sess)
+        tokens = self._issue_tokens(user, sess, device_type=device)
         return user, sess, tokens
 
     async def issue_mfa_challenge(self, user_id: str) -> dict:
@@ -1306,7 +1356,9 @@ class AuthService:
             return None
         return payload
 
-    def _issue_tokens(self, user: User, session: Session) -> dict[str, str]:
+    def _issue_tokens(
+        self, user: User, session: Session, *, device_type: Optional[str] = None
+    ) -> dict[str, str]:
         now = self._now()
         sys_settings = self._get_system_settings()
         access_exp = int(
@@ -1314,11 +1366,9 @@ class AuthService:
                 now + timedelta(minutes=sys_settings.get("access_token_ttl_minutes", 30))
             ).timestamp()
         )
-        refresh_exp = int(
-            (
-                now + timedelta(minutes=sys_settings.get("refresh_token_ttl_minutes", 1440))
-            ).timestamp()
-        )
+        device = (device_type or self._get_session_device(session)).lower()
+        refresh_ttl = self._get_refresh_ttl(device, sys_settings)
+        refresh_exp = int((now + timedelta(minutes=refresh_ttl)).timestamp())
         # SPEC §12.1: Generate JTIs for both tokens to support denylist on logout
         access_jti = str(uuid.uuid4())
         refresh_jti = str(uuid.uuid4())

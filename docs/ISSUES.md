@@ -257,13 +257,16 @@ Conversation pagination defaults now match the global default (100 items) to avo
 - validate_access_token() checks denylist before validating
 - Per SPEC §12.1: "add JWT to short-lived denylist if JWTs used"
 
-### 2.5 MEDIUM: Session Expiry Not Differentiated by Device
+### 2.5 ~~MEDIUM: Session Expiry Not Differentiated by Device~~ FIXED
 
-**Location:** `liminallm/config.py:302-303`
+**Location:** `liminallm/service/auth.py`, `liminallm/api/schemas.py`
 
 **SPEC §18 requires:** "7 days web, 1 day mobile; configurable per plan"
 
-**Current:** Single 24h TTL for all sessions, no web/mobile differentiation.
+**Fix Applied:**
+- Login requests now carry an explicit `device_type` (`web` or `mobile`) validated by the schema.
+- Auth service maps device type to configurable TTLs (defaults: 7d web, 1d mobile) for both session rows and refresh tokens.
+- Session metadata persists the device type so refresh/rotation paths preserve the correct expiry budget.
 
 ---
 
@@ -765,9 +768,11 @@ Only workflow-level timeout checked during retries, not per-node.
 
 **Status:** ✅ `ingest_path()` now uses `safe_join()` from `liminallm.service.fs` and raises `PathTraversalError` if path escapes allowed directories. Logging at lines 479 and 493 records blocked attempts.
 
-### 14.2 MEDIUM: RagMode Enum Missing LOCAL_HYBRID
+### 14.2 ~~MEDIUM: RagMode Enum Missing LOCAL_HYBRID~~ FIXED
 
-**Location:** `liminallm/config.py:37-41`
+**Location:** `liminallm/config.py`, `liminallm/service/rag.py`
+
+**Fix Applied:** Added the `LOCAL_HYBRID` RagMode option so deployments that mix local chunk retrieval with pgvector shims can declare the mode explicitly without validation errors.
 
 ---
 

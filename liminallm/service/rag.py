@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import re
+from enum import Enum
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Union
 
@@ -50,13 +51,14 @@ class RAGService:
         store: PostgresStore | MemoryStore,
         default_chunk_size: int = 400,
         *,
-        rag_mode: str | None = None,
+        rag_mode: str | Enum | None = None,
         embed: Callable[[str], List[float]] = deterministic_embedding,
         embedding_model_id: str = "text-embedding",
     ) -> None:
         self.store = store
         self.default_chunk_size = max(default_chunk_size, 64)
-        self.rag_mode = (rag_mode or os.getenv("RAG_MODE") or "pgvector").lower()
+        mode_value = rag_mode.value if isinstance(rag_mode, Enum) else rag_mode
+        self.rag_mode = str(mode_value or os.getenv("RAG_MODE") or "pgvector").lower()
         self.embed = embed
         self.embedding_model_id = embedding_model_id
 

@@ -951,6 +951,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
         tenant_id=None,  # Derived from user's existing record
         user_agent=user_agent,
         ip_addr=ip_addr,
+        device_type=body.device_type,
     )
     if not user or not session:
         logger.warning("login_failed", email=body.email, ip=ip_addr)
