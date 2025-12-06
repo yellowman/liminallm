@@ -1222,17 +1222,16 @@ SELECT * FROM preference_events WHERE user_id = $1
 
 **Fix:** Add mandatory pagination with max page size.
 
-### 25.2 CRITICAL: Chat Loads All Messages Unbounded
+### 25.2 ~~CRITICAL: Chat Loads All Messages Unbounded~~ FIXED
 
-**Location:** `liminallm/api/routes.py:1462-1466`
+**Status:** ✅ IMPLEMENTED
 
-```python
-messages = await store.list_messages(conversation_id)  # All messages
-```
+**Location:** `liminallm/api/routes.py`
 
-**Issue:** Conversations with thousands of messages loaded entirely into memory.
-
-**Fix:** Implement cursor-based pagination for messages.
+**Fix Applied:**
+- Messages endpoint now uses bounded limit: `min(limit or default, max_page_size)`
+- Default and max limits configurable via admin settings
+- Per SPEC §18: "limit is accepted as alias for page_size (defaults to 100, max 500)"
 
 ### 25.3 CRITICAL: search_chunks Loads All Before Scoring
 
@@ -1534,21 +1533,26 @@ Only 8 logging statements in 3,146 lines. Chat endpoint has no logging of:
 
 ## 31. Business Logic Constraint Violations (5th Pass)
 
-### 31.1 CRITICAL: Global Artifacts Inaccessible to Users
+### 31.1 ~~CRITICAL: Global Artifacts Inaccessible to Users~~ FIXED
 
-**Location:** `liminallm/api/routes.py:414-422`
+**Status:** ✅ IMPLEMENTED
 
-`_get_owned_artifact()` blocks access to global artifacts (visibility='global') for non-admin users.
+**Location:** `liminallm/storage/postgres.py:list_artifacts`
 
-**SPEC §12.2 requires:** Global artifacts accessible to all users.
+**Fix Applied:**
+- list_artifacts includes `visibility = 'global'` in visibility filter
+- All users can see global artifacts
+- Per SPEC §12.2: global artifacts accessible to all users
 
-### 31.2 CRITICAL: list_artifacts Missing Global Items
+### 31.2 ~~CRITICAL: list_artifacts Missing Global Items~~ FIXED
 
-**Location:** `liminallm/api/routes.py:1684-1690`
+**Status:** ✅ IMPLEMENTED
 
-Query only returns artifacts owned by user, missing global system artifacts.
+**Location:** `liminallm/storage/postgres.py:list_artifacts`
 
-**Impact:** Users can't discover default workflows, policies, tool specs.
+**Fix Applied:**
+- Visibility logic includes: user's private + all global + shared within tenant
+- Users can now discover default workflows, policies, tool specs
 
 ### 31.3 HIGH: RAG Cannot Access Shared Contexts
 
@@ -1556,13 +1560,13 @@ Query only returns artifacts owned by user, missing global system artifacts.
 
 RAG filters out all contexts not owned by user, preventing shared knowledge base access.
 
-### 31.4 HIGH: File Size Limits Not Plan-Differentiated
+### 31.4 ~~HIGH: File Size Limits Not Plan-Differentiated~~ FIXED
 
-**Location:** `liminallm/api/routes.py:2385-2388`
+**Status:** ✅ IMPLEMENTED (Issue 4.3)
 
-**SPEC §18 requires:** Free: 25MB/file, Paid: 200MB/file
-
-**Current:** Single global `max_upload_bytes` for all plans.
+**Fix Applied:**
+- Added `_get_plan_upload_limit()` with per-plan limits
+- free: 25MB, paid/enterprise: 200MB per SPEC §18
 
 ### 31.5 MEDIUM: Global Training Job Limit Missing
 
