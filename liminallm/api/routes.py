@@ -113,10 +113,23 @@ router = APIRouter(prefix="/v1")
 # Used by POST /chat/cancel to cancel in-progress streaming requests per SPEC §18
 # Issue 23.2: Added timestamp tracking for TTL-based cleanup
 _active_requests: Dict[str, tuple[asyncio.Event, datetime]] = {}
-_active_requests_lock = asyncio.Lock()
+# Issue 28.2: Lazily initialize asyncio.Lock to avoid "no running event loop" errors
+# at module import time. The lock is created on first use when an event loop exists.
+_active_requests_lock: Optional[asyncio.Lock] = None
 _active_requests_last_cleanup = datetime.utcnow()
 # Maximum age for active requests before they're considered stale (30 minutes)
 _ACTIVE_REQUEST_TTL_SECONDS = 30 * 60
+
+
+def _get_active_requests_lock() -> asyncio.Lock:
+    """Get or create the asyncio lock for _active_requests (Issue 28.2).
+
+    Lazily initializes the lock on first use to ensure an event loop exists.
+    """
+    global _active_requests_lock
+    if _active_requests_lock is None:
+        _active_requests_lock = asyncio.Lock()
+    return _active_requests_lock
 
 
 async def _cleanup_stale_active_requests() -> int:
@@ -154,7 +167,7 @@ async def _cleanup_stale_active_requests() -> int:
 
 async def _register_cancel_event(request_id: str, cancel_event: asyncio.Event) -> None:
     """Register a cancel event for an active streaming request."""
-    async with _active_requests_lock:
+    async with _get_active_requests_lock():
         _active_requests[request_id] = (cancel_event, datetime.utcnow())
         # Periodic cleanup to prevent unbounded growth (Issue 23.2)
         await _cleanup_stale_active_requests()
@@ -162,13 +175,13 @@ async def _register_cancel_event(request_id: str, cancel_event: asyncio.Event) -
 
 async def _unregister_cancel_event(request_id: str) -> None:
     """Unregister a cancel event when request completes."""
-    async with _active_requests_lock:
+    async with _get_active_requests_lock():
         _active_requests.pop(request_id, None)
 
 
 async def _cancel_request(request_id: str) -> bool:
     """Cancel an active request by request_id. Returns True if cancelled."""
-    async with _active_requests_lock:
+    async with _get_active_requests_lock():
         entry = _active_requests.get(request_id)
         if entry:
             cancel_event, _ = entry
@@ -1076,7 +1089,8 @@ async def admin_set_role(
         _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
         _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
     )
-    user = runtime.auth.set_user_role(user_id, body.role)
+    # Issue 22.1: set_user_role is now async to revoke sessions on role change
+    user = await runtime.auth.set_user_role(user_id, body.role)
     if not user:
         raise NotFoundError("user not found", detail={"user_id": user_id})
     return Envelope(status="ok", data=_user_to_response(user))
@@ -3089,7 +3103,8 @@ async def upload_file(
             )
 
         # Now write the file
-        dest_path.write_bytes(contents)
+        # Issue 32.3: Use asyncio.to_thread to avoid blocking the event loop
+        await asyncio.to_thread(dest_path.write_bytes, contents)
         chunk_count = None
         if context_id:
             try:
