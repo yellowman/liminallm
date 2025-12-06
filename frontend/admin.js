@@ -13,6 +13,7 @@ const createdPasswordEl = document.getElementById('created-user-password');
 const runtimeConfigEl = document.getElementById('runtime-config');
 const decisionStatusInput = document.getElementById('decision-status');
 const patchStatusOptions = document.getElementById('patch-status-options');
+const settingsFeedbackEl = document.getElementById('settings-feedback');
 
 const sessionStorageKey = (key) => `liminal.${key}`;
 const readSession = (key) => sessionStorage.getItem(sessionStorageKey(key));
@@ -46,6 +47,16 @@ let knownPatchStatuses = new Set(defaultPatchStatuses);
 
 const randomIdempotencyKey = () => {
   if (window.crypto?.randomUUID) return window.crypto.randomUUID();
+  // Fallback using crypto.getRandomValues() - cryptographically secure, broader browser support
+  if (window.crypto?.getRandomValues) {
+    const bytes = new Uint8Array(16);
+    window.crypto.getRandomValues(bytes);
+    bytes[6] = (bytes[6] & 0x0f) | 0x40; // UUID v4 version
+    bytes[8] = (bytes[8] & 0x3f) | 0x80; // UUID v4 variant
+    const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+    return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+  }
+  // Ultimate fallback for ancient browsers without crypto support
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 };
 
@@ -168,9 +179,10 @@ const requestEnvelope = async (url, options, fallbackMessage) => {
 const setPatchStatusOptions = (statuses = []) => {
   knownPatchStatuses = new Set([...defaultPatchStatuses, ...statuses.map((s) => (s || '').toLowerCase())]);
   if (!patchStatusOptions) return;
+  // Escape status values to prevent XSS via malicious API data (Issue 69.7)
   patchStatusOptions.innerHTML = Array.from(knownPatchStatuses)
     .sort()
-    .map((status) => `<option value="${status}"></option>`)
+    .map((status) => `<option value="${escapeHtml(status)}">${escapeHtml(status)}</option>`)
     .join('');
 };
 
@@ -540,6 +552,189 @@ const runInspect = async () => {
   }
 };
 
+const showSettingsFeedback = (msg) => {
+  if (!settingsFeedbackEl) return;
+  settingsFeedbackEl.textContent = msg;
+  settingsFeedbackEl.style.display = msg ? 'block' : 'none';
+};
+
+const fetchSystemSettings = async () => {
+  showSettingsFeedback('Loading settings...');
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/admin/settings`,
+      { headers: headers() },
+      'Unable to load system settings'
+    );
+    const s = envelope.data || {};
+    const setVal = (id, val) => {
+      const el = document.getElementById(id);
+      if (el && val !== undefined) el.value = val;
+    };
+    // Session & Concurrency
+    setVal('setting-session-rotation-hours', s.session_rotation_hours);
+    setVal('setting-session-rotation-grace', s.session_rotation_grace_seconds);
+    setVal('setting-max-concurrent-workflows', s.max_concurrent_workflows);
+    setVal('setting-max-concurrent-inference', s.max_concurrent_inference);
+    // Plan multipliers
+    setVal('setting-rate-limit-free', s.rate_limit_multiplier_free);
+    setVal('setting-rate-limit-paid', s.rate_limit_multiplier_paid);
+    setVal('setting-rate-limit-enterprise', s.rate_limit_multiplier_enterprise);
+    // Rate limits
+    setVal('setting-chat-rate', s.chat_rate_limit_per_minute);
+    setVal('setting-chat-window', s.chat_rate_limit_window_seconds);
+    setVal('setting-login-rate', s.login_rate_limit_per_minute);
+    setVal('setting-signup-rate', s.signup_rate_limit_per_minute);
+    setVal('setting-reset-rate', s.reset_rate_limit_per_minute);
+    setVal('setting-mfa-rate', s.mfa_rate_limit_per_minute);
+    setVal('setting-admin-rate', s.admin_rate_limit_per_minute);
+    setVal('setting-admin-window', s.admin_rate_limit_window_seconds);
+    setVal('setting-files-rate', s.files_upload_rate_limit_per_minute);
+    setVal('setting-configops-rate', s.configops_rate_limit_per_hour);
+    setVal('setting-read-rate', s.read_rate_limit_per_minute);
+    // Pagination & Files
+    setVal('setting-page-size', s.default_page_size);
+    setVal('setting-max-page', s.max_page_size);
+    setVal('setting-conversations-limit', s.default_conversations_limit);
+    setVal('setting-max-upload', s.max_upload_bytes);
+    setVal('setting-rag-chunk', s.rag_chunk_size);
+    // Token TTL
+    setVal('setting-access-ttl', s.access_token_ttl_minutes);
+    setVal('setting-refresh-ttl', s.refresh_token_ttl_minutes);
+    // Feature Flags (checkboxes)
+    const setChecked = (id, val) => {
+      const el = document.getElementById(id);
+      if (el && val !== undefined) el.checked = val;
+    };
+    setChecked('setting-enable-mfa', s.enable_mfa);
+    setChecked('setting-allow-signup', s.allow_signup);
+    // Training Worker
+    setChecked('setting-training-enabled', s.training_worker_enabled);
+    setVal('setting-training-poll', s.training_worker_poll_interval);
+    // SMTP / Email
+    setVal('setting-smtp-host', s.smtp_host);
+    setVal('setting-smtp-port', s.smtp_port);
+    setVal('setting-smtp-user', s.smtp_user);
+    // Don't display password - leave field empty for security
+    setChecked('setting-smtp-tls', s.smtp_use_tls);
+    setVal('setting-email-from', s.email_from_address);
+    setVal('setting-email-name', s.email_from_name);
+    // URL Settings
+    setVal('setting-oauth-redirect', s.oauth_redirect_uri);
+    setVal('setting-app-base-url', s.app_base_url);
+    // Voice Settings
+    setVal('setting-voice-transcription', s.voice_transcription_model);
+    setVal('setting-voice-synthesis', s.voice_synthesis_model);
+    setVal('setting-voice-default', s.voice_default_voice);
+    // Model Settings
+    setVal('setting-model-path', s.model_path);
+    setVal('setting-model-backend', s.model_backend);
+    setVal('setting-adapter-mode', s.default_adapter_mode);
+    setVal('setting-rag-mode', s.rag_mode);
+    setVal('setting-embedding-model', s.embedding_model_id);
+    // Tenant & JWT Settings
+    setVal('setting-default-tenant', s.default_tenant_id);
+    setVal('setting-jwt-issuer', s.jwt_issuer);
+    setVal('setting-jwt-audience', s.jwt_audience);
+    showSettingsFeedback('Settings loaded');
+  } catch (err) {
+    showSettingsFeedback(err.message);
+  }
+};
+
+const saveSystemSettings = async () => {
+  const getVal = (id, parser) => {
+    const el = document.getElementById(id);
+    return el ? parser(el.value) : undefined;
+  };
+  const getChecked = (id) => {
+    const el = document.getElementById(id);
+    return el ? el.checked : undefined;
+  };
+  const settings = {
+    // Session & Concurrency
+    session_rotation_hours: getVal('setting-session-rotation-hours', Number),
+    session_rotation_grace_seconds: getVal('setting-session-rotation-grace', Number),
+    max_concurrent_workflows: getVal('setting-max-concurrent-workflows', Number),
+    max_concurrent_inference: getVal('setting-max-concurrent-inference', Number),
+    // Plan multipliers
+    rate_limit_multiplier_free: getVal('setting-rate-limit-free', parseFloat),
+    rate_limit_multiplier_paid: getVal('setting-rate-limit-paid', parseFloat),
+    rate_limit_multiplier_enterprise: getVal('setting-rate-limit-enterprise', parseFloat),
+    // Rate limits
+    chat_rate_limit_per_minute: getVal('setting-chat-rate', Number),
+    chat_rate_limit_window_seconds: getVal('setting-chat-window', Number),
+    login_rate_limit_per_minute: getVal('setting-login-rate', Number),
+    signup_rate_limit_per_minute: getVal('setting-signup-rate', Number),
+    reset_rate_limit_per_minute: getVal('setting-reset-rate', Number),
+    mfa_rate_limit_per_minute: getVal('setting-mfa-rate', Number),
+    admin_rate_limit_per_minute: getVal('setting-admin-rate', Number),
+    admin_rate_limit_window_seconds: getVal('setting-admin-window', Number),
+    files_upload_rate_limit_per_minute: getVal('setting-files-rate', Number),
+    configops_rate_limit_per_hour: getVal('setting-configops-rate', Number),
+    read_rate_limit_per_minute: getVal('setting-read-rate', Number),
+    // Pagination & Files
+    default_page_size: getVal('setting-page-size', Number),
+    max_page_size: getVal('setting-max-page', Number),
+    default_conversations_limit: getVal('setting-conversations-limit', Number),
+    max_upload_bytes: getVal('setting-max-upload', Number),
+    rag_chunk_size: getVal('setting-rag-chunk', Number),
+    // Token TTL
+    access_token_ttl_minutes: getVal('setting-access-ttl', Number),
+    refresh_token_ttl_minutes: getVal('setting-refresh-ttl', Number),
+    // Feature Flags
+    enable_mfa: getChecked('setting-enable-mfa'),
+    allow_signup: getChecked('setting-allow-signup'),
+    // Training Worker
+    training_worker_enabled: getChecked('setting-training-enabled'),
+    training_worker_poll_interval: getVal('setting-training-poll', Number),
+    // SMTP / Email
+    smtp_host: getVal('setting-smtp-host', String),
+    smtp_port: getVal('setting-smtp-port', Number),
+    smtp_user: getVal('setting-smtp-user', String),
+    smtp_use_tls: getChecked('setting-smtp-tls'),
+    email_from_address: getVal('setting-email-from', String),
+    email_from_name: getVal('setting-email-name', String),
+    // URL Settings
+    oauth_redirect_uri: getVal('setting-oauth-redirect', String),
+    app_base_url: getVal('setting-app-base-url', String),
+    // Voice Settings
+    voice_transcription_model: getVal('setting-voice-transcription', String),
+    voice_synthesis_model: getVal('setting-voice-synthesis', String),
+    voice_default_voice: getVal('setting-voice-default', String),
+    // Model Settings
+    model_path: getVal('setting-model-path', String),
+    model_backend: getVal('setting-model-backend', String),
+    default_adapter_mode: getVal('setting-adapter-mode', String),
+    rag_mode: getVal('setting-rag-mode', String),
+    embedding_model_id: getVal('setting-embedding-model', String),
+    // Tenant & JWT Settings
+    default_tenant_id: getVal('setting-default-tenant', String),
+    jwt_issuer: getVal('setting-jwt-issuer', String),
+    jwt_audience: getVal('setting-jwt-audience', String),
+  };
+  // Only include password if it was entered (non-empty)
+  const smtpPassword = document.getElementById('setting-smtp-password')?.value;
+  if (smtpPassword) {
+    settings.smtp_password = smtpPassword;
+  }
+  showSettingsFeedback('Saving...');
+  try {
+    await requestEnvelope(
+      `${apiBase}/admin/settings`,
+      {
+        method: 'PUT',
+        headers: headers(),
+        body: JSON.stringify(settings),
+      },
+      'Unable to save settings'
+    );
+    showSettingsFeedback('Settings saved');
+  } catch (err) {
+    showSettingsFeedback(err.message);
+  }
+};
+
 const logout = async () => {
   const tryRevoke = async () => {
     try {
@@ -597,12 +792,17 @@ const runInspectBtn = document.getElementById('run-inspect');
 if (runInspectBtn) runInspectBtn.addEventListener('click', runInspect);
 const refreshConfigBtn = document.getElementById('refresh-config');
 if (refreshConfigBtn) refreshConfigBtn.addEventListener('click', fetchRuntimeConfig);
+const refreshSettingsBtn = document.getElementById('refresh-settings');
+if (refreshSettingsBtn) refreshSettingsBtn.addEventListener('click', fetchSystemSettings);
+const saveSettingsBtn = document.getElementById('save-settings');
+if (saveSettingsBtn) saveSettingsBtn.addEventListener('click', saveSystemSettings);
 
 // Bootstrap existing session
 if (state.accessToken) {
   if (gatekeep()) {
     fetchPatches();
     fetchRuntimeConfig();
+    fetchSystemSettings();
     fetchUsers();
     fetchAdapters();
   }

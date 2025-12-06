@@ -126,6 +126,9 @@ class AuthService:
         self.cache = cache
         self.settings = settings
         self._mfa_challenges: dict[str, tuple[str, datetime]] = {}
+        # Issue 11.1: In-memory fallback for MFA lockout when Redis unavailable
+        self._mfa_attempts: dict[str, tuple[int, datetime]] = {}  # user_id -> (count, window_start)
+        self._mfa_lockouts: dict[str, datetime] = {}  # user_id -> locked_until
         self.mfa_enabled = mfa_enabled
         self.revoked_refresh_tokens: set[str] = set()
         self._oauth_states: dict[str, tuple[str, datetime, Optional[str]]] = {}
@@ -173,10 +176,30 @@ class AuthService:
             self._email_verification_tokens.pop(token, None)
             cleaned += 1
 
+        # Clean expired MFA lockouts (Issue 11.1)
+        expired_lockouts = [
+            user_id for user_id, locked_until in self._mfa_lockouts.items()
+            if locked_until <= now
+        ]
+        for user_id in expired_lockouts:
+            self._mfa_lockouts.pop(user_id, None)
+            cleaned += 1
+
+        # Clean expired MFA attempts (5-minute window)
+        window_threshold = now - timedelta(minutes=5)
+        expired_attempts = [
+            user_id for user_id, (_, window_start) in self._mfa_attempts.items()
+            if window_start <= window_threshold
+        ]
+        for user_id in expired_attempts:
+            self._mfa_attempts.pop(user_id, None)
+            cleaned += 1
+
         if cleaned > 0:
             self.logger.debug(
                 "auth_state_cleanup", cleaned=cleaned, oauth=len(expired_oauth),
-                mfa=len(expired_mfa), email=len(expired_email)
+                mfa=len(expired_mfa), email=len(expired_email),
+                mfa_lockouts=len(expired_lockouts), mfa_attempts=len(expired_attempts)
             )
 
         self._last_cleanup = now
@@ -198,6 +221,23 @@ class AuthService:
 
     def _generate_password(self) -> str:
         return base64.urlsafe_b64encode(os.urandom(12)).decode().rstrip("=")
+
+    def _get_system_settings(self) -> dict:
+        """Get admin-managed system settings from database.
+
+        Returns merged settings with defaults for any missing values.
+        """
+        if hasattr(self.store, "get_system_settings"):
+            db_settings = self.store.get_system_settings()
+        else:
+            db_settings = {}
+        defaults = {
+            "session_rotation_hours": 24,
+            "session_rotation_grace_seconds": 300,
+            "access_token_ttl_minutes": 30,
+            "refresh_token_ttl_minutes": 1440,
+        }
+        return {**defaults, **db_settings}
 
     async def signup(
         self,
@@ -456,8 +496,14 @@ class AuthService:
         return {"provider_uid": userinfo.get("id") or userinfo.get("sub")}
 
     async def complete_oauth(
-        self, provider: str, code: str, state: str, *, tenant_id: Optional[str] = None
+        self, provider: str, code: str, state: str
     ) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
+        """Complete OAuth authentication flow.
+
+        SECURITY: tenant_id is derived exclusively from the validated OAuth state
+        token, never from external parameters. This prevents tenant spoofing attacks
+        per CLAUDE.md security guidelines.
+        """
         cache_state_used = False
         stored = None
         if self.cache:
@@ -480,10 +526,8 @@ class AuthService:
         if not stored or stored[1] < now or stored[0] != provider:
             await _clear_oauth_state()
             return None, None, {}
-        _, _, tenant_hint = stored
-        if tenant_id and tenant_hint and tenant_id != tenant_hint:
-            await _clear_oauth_state()
-            return None, None, {}
+        # SECURITY: tenant_id comes from validated state, not from user input
+        _, _, state_tenant_id = stored
         identity = await self._exchange_oauth_code(provider, code)
         if not identity:
             await _clear_oauth_state()
@@ -492,7 +536,8 @@ class AuthService:
         provider_uid = identity.get("provider_uid")
         if not provider_uid:
             return None, None, {}
-        normalized_tenant = tenant_id or tenant_hint or self.settings.default_tenant_id
+        # Use tenant from state, falling back to default only if state had none
+        normalized_tenant = state_tenant_id or self.settings.default_tenant_id
         existing = None
         if hasattr(self.store, "get_user_by_provider"):
             existing = self.store.get_user_by_provider(provider, provider_uid)
@@ -537,16 +582,33 @@ class AuthService:
         mfa_code: Optional[str] = None,
         *,
         tenant_id: Optional[str] = None,
+        user_agent: Optional[str] = None,
+        ip_addr: Optional[str] = None,
     ) -> tuple[Optional[User], Optional[Session], dict[str, str]]:
         user = self.store.get_user_by_email(email)
         if not user or not self.verify_password(user.id, password):
             return None, None, {}
         if tenant_id and tenant_id != user.tenant_id:
             return None, None, {}
+
+        # SPEC §18: Single-session mode - invalidate prior sessions if enabled
+        user_meta = user.meta or {}
+        if user_meta.get("single_session"):
+            self.logger.info(
+                "single_session_mode_active",
+                user_id=user.id,
+                action="revoking_prior_sessions",
+            )
+            await self.revoke_all_user_sessions(user.id)
+
         mfa_cfg = self.store.get_user_mfa_secret(user.id) if self.mfa_enabled else None
         require_mfa = bool(self.mfa_enabled and mfa_cfg and mfa_cfg.enabled)
         session = self.store.create_session(
-            user.id, mfa_required=require_mfa, tenant_id=user.tenant_id
+            user.id,
+            mfa_required=require_mfa,
+            tenant_id=user.tenant_id,
+            user_agent=user_agent,
+            ip_addr=ip_addr,
         )
         tokens: dict[str, str] = {}
         if require_mfa and mfa_cfg:
@@ -560,6 +622,8 @@ class AuthService:
             tokens = self._issue_tokens(user, session)
         if self.cache and (not require_mfa or session.mfa_verified):
             await self.cache.cache_session(session.id, user.id, session.expires_at)
+            # Initialize session activity tracking
+            await self.cache.update_session_activity(session.id)
         return user, session, tokens
 
     async def refresh_tokens(
@@ -589,17 +653,30 @@ class AuthService:
         return user, session, tokens
 
     async def revoke(self, session_id: str) -> None:
+        """Revoke a session and denylist associated tokens per SPEC §12.1."""
         sess = self.store.get_session(session_id)
-        if sess:
-            refresh_jti = (
-                (sess.meta or {}).get("refresh_jti")
-                if isinstance(sess.meta, dict)
-                else None
-            )
+        if sess and isinstance(sess.meta, dict):
+            meta = sess.meta
+            # Denylist refresh token
+            refresh_jti = meta.get("refresh_jti")
             if refresh_jti:
-                await self._revoke_refresh_token(
-                    refresh_jti, (sess.meta or {}).get("refresh_exp")
-                )
+                await self._revoke_refresh_token(refresh_jti, meta.get("refresh_exp"))
+            # SPEC §12.1: "add JWT to short-lived denylist if JWTs used"
+            # Denylist access token to prevent use after logout
+            access_jti = meta.get("access_jti")
+            access_exp = meta.get("access_exp")
+            if access_jti and access_exp and self.cache:
+                ttl = max(0, int(access_exp - time.time()))
+                if ttl > 0:
+                    try:
+                        await self.cache.denylist_access_token(access_jti, ttl)
+                    except Exception as exc:
+                        # Log but don't fail - session revocation should still proceed
+                        self.logger.warning(
+                            "access_token_denylist_failed",
+                            session_id=session_id,
+                            error=str(exc),
+                        )
         self.store.revoke_session(session_id)
         if self.cache:
             await self.cache.revoke_session(session_id)
@@ -626,12 +703,16 @@ class AuthService:
                 self.logger.warning(
                     "revoke_user_sessions_failed", user_id=user_id, error=str(exc)
                 )
-        # Also clear from cache
+        # Also clear from cache using proper method (Issue 22.3)
         if self.cache:
             try:
-                await self.cache.client.delete(f"user_sessions:{user_id}")
-            except Exception:
-                pass
+                await self.cache.revoke_user_sessions(user_id, except_session_id)
+            except Exception as exc:
+                self.logger.warning(
+                    "revoke_user_sessions_cache_clear_failed",
+                    user_id=user_id,
+                    error=str(exc),
+                )
         return revoked_count
 
     async def resolve_session(
@@ -644,12 +725,25 @@ class AuthService:
     ) -> Optional[AuthContext]:
         if not session_id:
             return None
-        sess = self.store.get_session(session_id)
+
+        # SPEC §12.1: Check if this is a rotated session (grace period)
+        actual_session_id = session_id
+        if self.cache:
+            rotated_to = await self.cache.get_rotated_session(session_id)
+            if rotated_to:
+                actual_session_id = rotated_to
+                self.logger.debug(
+                    "session_rotation_grace",
+                    old_session=session_id,
+                    new_session=rotated_to,
+                )
+
+        sess = self.store.get_session(actual_session_id)
         if not sess and self.cache:
-            cached_user = await self.cache.get_session_user(session_id)
+            cached_user = await self.cache.get_session_user(actual_session_id)
             if not cached_user:
                 return None
-            sess = self.store.get_session(session_id)
+            sess = self.store.get_session(actual_session_id)
         if not sess:
             return None
         if sess.expires_at <= datetime.utcnow():
@@ -661,13 +755,24 @@ class AuthService:
             return None
         if required_role and not self._role_allows(user.role, required_role):
             return None
+
+        # SPEC §12.1: Session rotation after 24h of activity
+        final_session = sess
+        if self.cache:
+            rotated_session = await self._maybe_rotate_session(sess, user)
+            if rotated_session:
+                final_session = rotated_session
+
         if self.cache and (
-            not sess.mfa_required or sess.mfa_verified or not self.mfa_enabled
+            not final_session.mfa_required or final_session.mfa_verified or not self.mfa_enabled
         ):
-            await self.cache.cache_session(sess.id, sess.user_id, sess.expires_at)
+            await self.cache.cache_session(final_session.id, final_session.user_id, final_session.expires_at)
+            # Update activity timestamp on each session use
+            await self.cache.update_session_activity(final_session.id)
+
         if (
-            sess.mfa_required
-            and not sess.mfa_verified
+            final_session.mfa_required
+            and not final_session.mfa_verified
             and self.mfa_enabled
             and not allow_pending_mfa
         ):
@@ -676,8 +781,69 @@ class AuthService:
             user_id=user.id,
             role=user.role,
             tenant_id=user.tenant_id,
-            session_id=sess.id,
+            session_id=final_session.id,
         )
+
+    async def _maybe_rotate_session(
+        self, sess: Session, user: User
+    ) -> Optional[Session]:
+        """Rotate session if 24h of activity has passed (SPEC §12.1).
+
+        Returns the new session if rotated, None otherwise.
+        """
+        if not self.cache:
+            return None
+
+        last_activity = await self.cache.get_session_activity(sess.id)
+        if not last_activity:
+            # No activity record - initialize it
+            await self.cache.update_session_activity(sess.id)
+            return None
+
+        sys_settings = self._get_system_settings()
+        rotation_hours = sys_settings.get("session_rotation_hours", 24)
+        rotation_threshold = timedelta(hours=rotation_hours)
+        if datetime.utcnow() - last_activity < rotation_threshold:
+            return None
+
+        # Time to rotate - create new session
+        self.logger.info(
+            "session_rotation",
+            old_session=sess.id,
+            user_id=sess.user_id,
+            last_activity=last_activity.isoformat(),
+        )
+
+        new_session = self.store.create_session(
+            sess.user_id,
+            mfa_required=sess.mfa_required,
+            tenant_id=sess.tenant_id,
+            user_agent=sess.user_agent,
+            ip_addr=str(sess.ip_addr) if sess.ip_addr else None,
+            meta=sess.meta,
+        )
+
+        # Mark new session as MFA verified if old one was
+        if sess.mfa_verified:
+            self._mark_session_verified(new_session.id)
+            new_session.mfa_verified = True
+
+        # Set up grace period mapping
+        grace_seconds = sys_settings.get("session_rotation_grace_seconds", 300)
+        await self.cache.set_session_rotation_grace(
+            sess.id,
+            new_session.id,
+            grace_seconds,
+        )
+
+        # Revoke old session
+        self.store.revoke_session(sess.id)
+        await self.cache.revoke_session(sess.id)
+
+        # Initialize activity for new session
+        await self.cache.update_session_activity(new_session.id)
+
+        return new_session
 
     async def authenticate(
         self,
@@ -690,6 +856,24 @@ class AuthService:
     ) -> Optional[AuthContext]:
         token = self._extract_bearer(authorization)
         if token:
+            # SPEC §12.1: Check if access token is denylisted before validating
+            if self.cache:
+                payload = self._decode_jwt(token)
+                if payload and payload.get("token_type") == "access":
+                    jti = payload.get("jti")
+                    if jti:
+                        try:
+                            if await self.cache.is_access_token_denylisted(jti):
+                                self.logger.info("access_token_denylisted", jti=jti)
+                                return None
+                        except Exception as exc:
+                            # Fail-open: log warning but allow auth to proceed
+                            # This prevents Redis failures from blocking all auth
+                            self.logger.warning(
+                                "denylist_check_failed",
+                                jti=jti,
+                                error=str(exc),
+                            )
             token_ctx = self._authenticate_access_token(
                 token,
                 allow_pending_mfa=allow_pending_mfa,
@@ -742,30 +926,58 @@ class AuthService:
             return False
 
         # Check MFA lockout (5 failed attempts = 5 minute lockout per SPEC §18)
-        lockout_key = f"mfa:lockout:{user_id}"
-        attempts_key = f"mfa:attempts:{user_id}"
+        now = datetime.utcnow()
 
+        # Issue 19.3: Use atomic MFA lockout to prevent check-then-act race condition
+        # First check if already locked out (before TOTP verification)
         if self.cache:
-            locked = await self.cache.client.get(lockout_key)
-            if locked:
+            if await self.cache.check_mfa_lockout(user_id):
                 self.logger.warning("mfa_locked_out", user_id=user_id)
                 return False
+        else:
+            # In-memory fallback for lockout check
+            locked_until = self._mfa_lockouts.get(user_id)
+            if locked_until and locked_until > now:
+                self.logger.warning("mfa_locked_out", user_id=user_id)
+                return False
+            elif locked_until:
+                # Expired lockout, clean up
+                self._mfa_lockouts.pop(user_id, None)
 
         if not self._verify_totp(cfg.secret, code):
-            # Track failed attempt
+            # Issue 19.3: Use atomic operation to track failed attempt and check lockout
             if self.cache:
-                attempts = await self.cache.client.incr(attempts_key)
-                await self.cache.client.expire(attempts_key, 300)  # 5 minute window
+                is_locked, attempts = await self.cache.atomic_mfa_attempt(
+                    user_id, max_attempts=5, lockout_seconds=300
+                )
+                if is_locked and attempts >= 0:
+                    # Just triggered lockout (attempts >= 0 means we just incremented)
+                    self.logger.warning("mfa_lockout_triggered", user_id=user_id, attempts=attempts)
+            else:
+                # In-memory fallback for attempt tracking (Issue 11.1)
+                current = self._mfa_attempts.get(user_id)
+                window_start = now
+                attempts = 1
+                if current:
+                    count, prev_window_start = current
+                    # If within 5-minute window, increment; otherwise reset
+                    if now - prev_window_start < timedelta(minutes=5):
+                        attempts = count + 1
+                        window_start = prev_window_start
+                self._mfa_attempts[user_id] = (attempts, window_start)
                 if attempts >= 5:
                     # Lock out for 5 minutes
-                    await self.cache.client.set(lockout_key, "1", ex=300)
-                    await self.cache.client.delete(attempts_key)
+                    self._mfa_lockouts[user_id] = now + timedelta(minutes=5)
+                    self._mfa_attempts.pop(user_id, None)
                     self.logger.warning("mfa_lockout_triggered", user_id=user_id, attempts=attempts)
             return False
 
         # Success - clear any failed attempts
         if self.cache:
-            await self.cache.client.delete(attempts_key)
+            await self.cache.clear_mfa_attempts(user_id)
+        else:
+            # In-memory fallback - clear attempts on success
+            self._mfa_attempts.pop(user_id, None)
 
         self.store.set_user_mfa_secret(user_id, cfg.secret, enabled=True)
         if session_id:
@@ -974,16 +1186,19 @@ class AuthService:
 
     def _issue_tokens(self, user: User, session: Session) -> dict[str, str]:
         now = datetime.utcnow()
+        sys_settings = self._get_system_settings()
         access_exp = int(
             (
-                now + timedelta(minutes=self.settings.access_token_ttl_minutes)
+                now + timedelta(minutes=sys_settings.get("access_token_ttl_minutes", 30))
             ).timestamp()
         )
         refresh_exp = int(
             (
-                now + timedelta(minutes=self.settings.refresh_token_ttl_minutes)
+                now + timedelta(minutes=sys_settings.get("refresh_token_ttl_minutes", 1440))
             ).timestamp()
         )
+        # SPEC §12.1: Generate JTIs for both tokens to support denylist on logout
+        access_jti = str(uuid.uuid4())
         refresh_jti = str(uuid.uuid4())
         access_payload = {
             "iss": self.settings.jwt_issuer,
@@ -993,6 +1208,7 @@ class AuthService:
             "tenant_id": user.tenant_id,
             "role": user.role,
             "token_type": "access",
+            "jti": access_jti,  # Added for denylist support
             "exp": access_exp,
         }
         refresh_payload = {
@@ -1008,7 +1224,7 @@ class AuthService:
         }
         access_token = self._encode_jwt(access_payload)
         refresh_token = self._encode_jwt(refresh_payload)
-        self._persist_session_meta(session, refresh_jti, refresh_exp)
+        self._persist_session_meta(session, access_jti, access_exp, refresh_jti, refresh_exp)
         return {
             "access_token": access_token,
             "refresh_token": refresh_token,
@@ -1017,10 +1233,15 @@ class AuthService:
         }
 
     def _persist_session_meta(
-        self, session: Session, refresh_jti: str, refresh_exp: int
+        self, session: Session, access_jti: str, access_exp: int, refresh_jti: str, refresh_exp: int
     ) -> None:
         meta = dict(session.meta or {})
-        meta.update({"refresh_jti": refresh_jti, "refresh_exp": refresh_exp})
+        meta.update({
+            "access_jti": access_jti,
+            "access_exp": access_exp,
+            "refresh_jti": refresh_jti,
+            "refresh_exp": refresh_exp,
+        })
         session.meta = meta
         self.store.set_session_meta(session.id, meta)
 
@@ -1044,7 +1265,8 @@ class AuthService:
         if isinstance(exp, (int, float)):
             ttl = max(int(exp - datetime.utcnow().timestamp()), 0)
         if ttl is None:
-            ttl = max(int(self.settings.refresh_token_ttl_minutes * 60), 0)
+            sys_settings = self._get_system_settings()
+            ttl = max(int(sys_settings.get("refresh_token_ttl_minutes", 1440) * 60), 0)
         if self.cache:
             try:
                 await self.cache.mark_refresh_revoked(jti, ttl)

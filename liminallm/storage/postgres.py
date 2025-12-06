@@ -58,20 +58,50 @@ class PostgresStore:
     def __init__(self, dsn: str, fs_root: str) -> None:
         self.dsn = dsn
         self.fs_root = Path(fs_root)
-        self.fs_root.mkdir(parents=True, exist_ok=True)
         self.logger = get_logger(__name__)
-        self.pool = ConnectionPool(
-            self.dsn,
-            min_size=2,
-            max_size=10,
-            kwargs={"row_factory": dict_row, "autocommit": False},
-        )
+
+        try:
+            self.fs_root.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.logger.error(
+                "postgres_store_fs_root_error",
+                fs_root=fs_root,
+                error=str(exc),
+            )
+            raise
+
+        try:
+            self.pool = ConnectionPool(
+                self.dsn,
+                min_size=2,
+                max_size=10,
+                kwargs={"row_factory": dict_row, "autocommit": False},
+            )
+            self.logger.info("postgres_pool_created", min_size=2, max_size=10)
+        except Exception as exc:
+            self.logger.error(
+                "postgres_pool_creation_failed",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
+
         self.sessions: dict[str, Session] = {}
         self._session_lock = threading.Lock()
-        self._ensure_runtime_config_table()
-        self._verify_required_schema()
-        self._load_training_state()
-        self._ensure_default_artifacts()
+
+        try:
+            self._ensure_runtime_config_table()
+            self._verify_required_schema()
+            self._load_training_state()
+            self._ensure_default_artifacts()
+            self.logger.info("postgres_store_initialized")
+        except Exception as exc:
+            self.logger.error(
+                "postgres_store_init_failed",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
 
     def _cache_session(self, session: Session) -> Session:
         """Store session in the in-memory cache and return it.
@@ -366,6 +396,7 @@ class PostgresStore:
         cluster_id: str | None = None,
         *,
         tenant_id: str | None = None,
+        limit: int = 1000,
     ) -> list[PreferenceEvent]:
         clauses = []
         params: list[Any] = []
@@ -389,7 +420,9 @@ class PostgresStore:
         query = "SELECT * FROM preference_event"
         if clauses:
             query = " ".join([query, "WHERE", " AND ".join(clauses)])
-        query = " ".join([query, "ORDER BY created_at"])
+        # SPEC compliance: Always apply LIMIT to prevent unbounded queries
+        query = " ".join([query, "ORDER BY created_at LIMIT %s"])
+        params.append(limit)
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
         return [
@@ -1636,28 +1669,68 @@ class PostgresStore:
         tenant_id: Optional[str] = None,
         visibility: Optional[str] = None,
     ) -> List[Artifact]:
+        """List artifacts with proper visibility filtering.
+
+        Visibility logic:
+        - If visibility='private': only user's own private artifacts
+        - If visibility='global': all global artifacts
+        - If visibility='shared': shared artifacts within user's tenant
+        - If no visibility filter: user's private + all global + shared within tenant
+        """
         offset = max(page - 1, 0) * max(page_size, 1)
         limit = max(page_size, 1)
         with self._connect() as conn:
             clauses = []
             params: list[Any] = []
+
+            # Type/kind filters apply regardless of visibility
             if type_filter:
                 clauses.append("type = %s")
                 params.append(type_filter)
             if kind_filter:
                 clauses.append("schema->>'kind' = %s")
                 params.append(kind_filter)
-            if owner_user_id:
-                clauses.append("owner_user_id = %s")
-                params.append(owner_user_id)
-            if tenant_id:
-                clauses.append(
-                    "owner_user_id IN (SELECT id FROM app_user WHERE tenant_id = %s)"
-                )
-                params.append(tenant_id)
+
+            # Build visibility access control clause
             if visibility:
-                clauses.append("visibility = %s")
-                params.append(visibility)
+                # Specific visibility filter requested
+                if visibility == "private":
+                    # Only user's own private artifacts
+                    if owner_user_id:
+                        clauses.append("(visibility = 'private' AND owner_user_id = %s)")
+                        params.append(owner_user_id)
+                    else:
+                        clauses.append("visibility = 'private'")
+                elif visibility == "global":
+                    # All global artifacts (visible to everyone)
+                    clauses.append("visibility = 'global'")
+                elif visibility == "shared":
+                    # Shared artifacts within tenant
+                    if tenant_id:
+                        clauses.append(
+                            "(visibility = 'shared' AND owner_user_id IN "
+                            "(SELECT id FROM app_user WHERE tenant_id = %s))"
+                        )
+                        params.append(tenant_id)
+                    else:
+                        clauses.append("visibility = 'shared'")
+            else:
+                # No visibility filter: show accessible artifacts
+                # User sees: their private + all global + shared within tenant
+                visibility_parts = []
+                if owner_user_id:
+                    visibility_parts.append("(visibility = 'private' AND owner_user_id = %s)")
+                    params.append(owner_user_id)
+                visibility_parts.append("visibility = 'global'")
+                if tenant_id:
+                    visibility_parts.append(
+                        "(visibility = 'shared' AND owner_user_id IN "
+                        "(SELECT id FROM app_user WHERE tenant_id = %s))"
+                    )
+                    params.append(tenant_id)
+                if visibility_parts:
+                    clauses.append("(" + " OR ".join(visibility_parts) + ")")
+
             where = ""
             if clauses:
                 where = " WHERE " + " AND ".join(clauses)
@@ -1806,8 +1879,11 @@ class PostgresStore:
             self.logger.warning("artifact_validation_failed", errors=exc.errors)
             raise
         with self._connect() as conn, conn.transaction():
+            # Issue 19.5: Use SELECT ... FOR UPDATE to prevent race condition
+            # This locks the artifact row until the transaction completes,
+            # preventing concurrent version inserts from calculating the same next_version
             row = conn.execute(
-                "SELECT * FROM artifact WHERE id = %s", (artifact_id,)
+                "SELECT * FROM artifact WHERE id = %s FOR UPDATE", (artifact_id,)
             ).fetchone()
             if not row:
                 return None
@@ -2195,6 +2271,104 @@ class PostgresStore:
         existing = self.get_runtime_config()
         merged = {**existing, **config}
         self._set_runtime_config(merged)
+        return merged
+
+    def get_system_settings(self) -> dict:
+        """Get admin-managed system settings from database.
+
+        Returns settings for session rotation, concurrency caps, and rate limit
+        multipliers. These are managed via the admin UI instead of env vars.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT config FROM instance_config WHERE name = %s",
+                ("system_settings",)
+            ).fetchone()
+        if not row:
+            # Return defaults if no settings in database
+            return {
+                "session_rotation_hours": 24,
+                "session_rotation_grace_seconds": 300,
+                "max_concurrent_workflows": 3,
+                "max_concurrent_inference": 2,
+                "rate_limit_multiplier_free": 1.0,
+                "rate_limit_multiplier_paid": 2.0,
+                "rate_limit_multiplier_enterprise": 5.0,
+                "chat_rate_limit_per_minute": 60,
+                "chat_rate_limit_window_seconds": 60,
+                "login_rate_limit_per_minute": 10,
+                "signup_rate_limit_per_minute": 5,
+                "reset_rate_limit_per_minute": 5,
+                "mfa_rate_limit_per_minute": 5,
+                "admin_rate_limit_per_minute": 30,
+                "admin_rate_limit_window_seconds": 60,
+                "files_upload_rate_limit_per_minute": 10,
+                "configops_rate_limit_per_hour": 30,
+                "read_rate_limit_per_minute": 120,
+                "write_rate_limit_per_minute": 60,
+                "max_websocket_connections_per_user": 5,
+                "default_page_size": 100,
+                "max_page_size": 500,
+                "default_conversations_limit": 50,
+                "max_upload_bytes": 10485760,
+                "rag_chunk_size": 400,
+                "access_token_ttl_minutes": 30,
+                "refresh_token_ttl_minutes": 1440,
+                "enable_mfa": True,
+                "allow_signup": True,
+                "training_worker_enabled": True,
+                "training_worker_poll_interval": 60,
+                "smtp_host": "",
+                "smtp_port": 587,
+                "smtp_user": "",
+                "smtp_password": "",
+                "smtp_use_tls": True,
+                "email_from_address": "",
+                "email_from_name": "LiminalLM",
+                "oauth_redirect_uri": "",
+                "app_base_url": "http://localhost:8000",
+                "voice_transcription_model": "whisper-1",
+                "voice_synthesis_model": "tts-1",
+                "voice_default_voice": "alloy",
+                "rag_mode": "pgvector",
+                "embedding_model_id": "text-embedding",
+                "default_tenant_id": "public",
+                "jwt_issuer": "liminallm",
+                "jwt_audience": "liminal-clients",
+                "model_path": "gpt-4o-mini",
+                "model_backend": "openai",
+                "default_adapter_mode": "hybrid",
+            }
+        raw_config = row.get("config")
+        if isinstance(raw_config, str):
+            try:
+                return json.loads(raw_config)
+            except Exception as exc:
+                self.logger.warning("system_settings_parse_failed", error=str(exc))
+                return {}
+        if isinstance(raw_config, dict):
+            return raw_config
+        return {}
+
+    def set_system_settings(self, settings: dict) -> dict:
+        """Update admin-managed system settings.
+
+        Merges provided settings with existing settings and persists to database.
+        Returns the updated full settings.
+        """
+        existing = self.get_system_settings()
+        merged = {**existing, **settings}
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO instance_config (name, config, created_at, updated_at)
+                VALUES (%s, %s, now(), now())
+                ON CONFLICT (name) DO UPDATE SET
+                    config = EXCLUDED.config,
+                    updated_at = now()
+                """,
+                ("system_settings", json.dumps(merged)),
+            )
         return merged
 
     # knowledge

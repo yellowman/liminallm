@@ -91,6 +91,289 @@
           <div class="divider"></div>
 
           <div class="section-header">
+            <h3>System Settings</h3>
+            <button class="minor" id="refresh-settings">Refresh</button>
+          </div>
+          <div class="subtext">Adjust runtime behavior without code changes. Settings are stored in the database.</div>
+
+          <div class="stack">
+            <h4>Session &amp; Concurrency</h4>
+            <div class="field">
+              <label for="setting-session-rotation-hours">Session rotation hours</label>
+              <input type="number" id="setting-session-rotation-hours" min="1" max="720" value="24" />
+            </div>
+            <div class="field">
+              <label for="setting-session-rotation-grace">Session rotation grace (seconds)</label>
+              <input type="number" id="setting-session-rotation-grace" min="0" max="3600" value="300" />
+            </div>
+            <div class="field">
+              <label for="setting-max-concurrent-workflows">Max concurrent workflows per user</label>
+              <input type="number" id="setting-max-concurrent-workflows" min="1" max="20" value="3" />
+            </div>
+            <div class="field">
+              <label for="setting-max-concurrent-inference">Max concurrent inference per user</label>
+              <input type="number" id="setting-max-concurrent-inference" min="1" max="20" value="2" />
+            </div>
+
+            <h4>Plan Rate Multipliers</h4>
+            <div class="field">
+              <label for="setting-rate-limit-free">Free tier multiplier</label>
+              <input type="number" id="setting-rate-limit-free" min="0.1" max="10" step="0.1" value="1.0" />
+            </div>
+            <div class="field">
+              <label for="setting-rate-limit-paid">Paid tier multiplier</label>
+              <input type="number" id="setting-rate-limit-paid" min="0.1" max="10" step="0.1" value="2.0" />
+            </div>
+            <div class="field">
+              <label for="setting-rate-limit-enterprise">Enterprise tier multiplier</label>
+              <input type="number" id="setting-rate-limit-enterprise" min="0.1" max="10" step="0.1" value="5.0" />
+            </div>
+
+            <h4>Rate Limits</h4>
+            <div class="field">
+              <label for="setting-chat-rate">Chat rate limit (per minute)</label>
+              <input type="number" id="setting-chat-rate" min="1" max="1000" value="60" />
+            </div>
+            <div class="field">
+              <label for="setting-chat-window">Chat rate window (seconds)</label>
+              <input type="number" id="setting-chat-window" min="1" max="3600" value="60" />
+            </div>
+            <div class="field">
+              <label for="setting-login-rate">Login rate limit (per minute)</label>
+              <input type="number" id="setting-login-rate" min="1" max="100" value="10" />
+            </div>
+            <div class="field">
+              <label for="setting-signup-rate">Signup rate limit (per minute)</label>
+              <input type="number" id="setting-signup-rate" min="1" max="100" value="5" />
+            </div>
+            <div class="field">
+              <label for="setting-reset-rate">Reset rate limit (per minute)</label>
+              <input type="number" id="setting-reset-rate" min="1" max="100" value="5" />
+            </div>
+            <div class="field">
+              <label for="setting-mfa-rate">MFA rate limit (per minute)</label>
+              <input type="number" id="setting-mfa-rate" min="1" max="100" value="5" />
+            </div>
+            <div class="field">
+              <label for="setting-admin-rate">Admin rate limit (per minute)</label>
+              <input type="number" id="setting-admin-rate" min="1" max="100" value="30" />
+            </div>
+            <div class="field">
+              <label for="setting-admin-window">Admin rate window (seconds)</label>
+              <input type="number" id="setting-admin-window" min="1" max="3600" value="60" />
+            </div>
+            <div class="field">
+              <label for="setting-files-rate">Files upload rate (per minute)</label>
+              <input type="number" id="setting-files-rate" min="1" max="100" value="10" />
+            </div>
+            <div class="field">
+              <label for="setting-configops-rate">Config ops rate (per hour)</label>
+              <input type="number" id="setting-configops-rate" min="1" max="1000" value="30" />
+            </div>
+            <div class="field">
+              <label for="setting-read-rate">Read rate limit (per minute)</label>
+              <input type="number" id="setting-read-rate" min="1" max="1000" value="120" />
+            </div>
+
+            <h4>Pagination &amp; Files</h4>
+            <div class="field">
+              <label for="setting-page-size">Default page size</label>
+              <input type="number" id="setting-page-size" min="1" max="500" value="100" />
+            </div>
+            <div class="field">
+              <label for="setting-max-page">Max page size</label>
+              <input type="number" id="setting-max-page" min="1" max="1000" value="500" />
+            </div>
+            <div class="field">
+              <label for="setting-conversations-limit">Default conversations limit</label>
+              <input type="number" id="setting-conversations-limit" min="1" max="500" value="50" />
+            </div>
+            <div class="field">
+              <label for="setting-max-upload">Max upload bytes</label>
+              <input type="number" id="setting-max-upload" min="1" max="104857600" value="10485760" />
+            </div>
+            <div class="field">
+              <label for="setting-rag-chunk">RAG chunk size</label>
+              <input type="number" id="setting-rag-chunk" min="64" max="4000" value="400" />
+            </div>
+
+            <h4>Token TTL</h4>
+            <div class="field">
+              <label for="setting-access-ttl">Access token TTL (minutes)</label>
+              <input type="number" id="setting-access-ttl" min="1" max="1440" value="30" />
+            </div>
+            <div class="field">
+              <label for="setting-refresh-ttl">Refresh token TTL (minutes)</label>
+              <input type="number" id="setting-refresh-ttl" min="60" max="43200" value="1440" />
+            </div>
+
+            <h4>Feature Flags</h4>
+            <div class="field checkbox">
+              <label><input type="checkbox" id="setting-enable-mfa" checked /> Enable MFA</label>
+            </div>
+            <div class="field checkbox">
+              <label><input type="checkbox" id="setting-allow-signup" checked /> Allow signup</label>
+            </div>
+
+            <h4>Training Worker</h4>
+            <div class="field checkbox">
+              <label><input type="checkbox" id="setting-training-enabled" checked /> Training worker enabled</label>
+            </div>
+            <div class="field">
+              <label for="setting-training-poll">Training poll interval (seconds)</label>
+              <input type="number" id="setting-training-poll" min="10" max="3600" value="60" />
+            </div>
+
+            <h4>SMTP / Email</h4>
+            <div class="field">
+              <label for="setting-smtp-host">SMTP host</label>
+              <input type="text" id="setting-smtp-host" placeholder="smtp.example.com" />
+            </div>
+            <div class="field">
+              <label for="setting-smtp-port">SMTP port</label>
+              <input type="number" id="setting-smtp-port" min="1" max="65535" value="587" />
+            </div>
+            <div class="field">
+              <label for="setting-smtp-user">SMTP user</label>
+              <input type="text" id="setting-smtp-user" placeholder="user@example.com" />
+            </div>
+            <div class="field">
+              <label for="setting-smtp-password">SMTP password</label>
+              <input type="password" id="setting-smtp-password" placeholder="********" />
+            </div>
+            <div class="field checkbox">
+              <label><input type="checkbox" id="setting-smtp-tls" checked /> Use TLS</label>
+            </div>
+            <div class="field">
+              <label for="setting-email-from">From email address</label>
+              <input type="email" id="setting-email-from" placeholder="noreply@example.com" />
+            </div>
+            <div class="field">
+              <label for="setting-email-name">From name</label>
+              <input type="text" id="setting-email-name" value="LiminalLM" />
+            </div>
+
+            <h4>URL Settings</h4>
+            <div class="field">
+              <label for="setting-oauth-redirect">OAuth redirect URI</label>
+              <input type="url" id="setting-oauth-redirect" placeholder="https://example.com/auth/callback" />
+            </div>
+            <div class="field">
+              <label for="setting-app-base-url">Application base URL</label>
+              <input type="url" id="setting-app-base-url" value="http://localhost:8000" />
+            </div>
+
+            <h4>Voice Settings</h4>
+            <div class="field">
+              <label for="setting-voice-transcription">Transcription model</label>
+              <select id="setting-voice-transcription">
+                <option value="whisper-1" selected>whisper-1</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="setting-voice-synthesis">Synthesis model</label>
+              <select id="setting-voice-synthesis">
+                <option value="tts-1" selected>tts-1</option>
+                <option value="tts-1-hd">tts-1-hd</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="setting-voice-default">Default voice</label>
+              <select id="setting-voice-default">
+                <option value="alloy" selected>alloy</option>
+                <option value="echo">echo</option>
+                <option value="fable">fable</option>
+                <option value="onyx">onyx</option>
+                <option value="nova">nova</option>
+                <option value="shimmer">shimmer</option>
+              </select>
+            </div>
+
+            <h4>Model Settings</h4>
+            <div class="field">
+              <label for="setting-model-path">Model path</label>
+              <input type="text" id="setting-model-path" value="gpt-4o-mini" list="model-path-options" />
+              <datalist id="model-path-options">
+                <option value="gpt-4o">
+                <option value="gpt-4o-mini">
+                <option value="gpt-4-turbo">
+                <option value="gpt-4">
+                <option value="gpt-3.5-turbo">
+                <option value="claude-3-5-sonnet-20241022">
+                <option value="claude-3-5-haiku-20241022">
+                <option value="claude-3-opus-20240229">
+                <option value="gemini-1.5-pro">
+                <option value="gemini-1.5-flash">
+                <option value="meta-llama/Llama-3.1-70B-Instruct">
+                <option value="meta-llama/Llama-3.1-8B-Instruct">
+                <option value="mistralai/Mixtral-8x7B-Instruct-v0.1">
+              </datalist>
+            </div>
+            <div class="field">
+              <label for="setting-model-backend">Model backend</label>
+              <select id="setting-model-backend">
+                <option value="openai" selected>openai</option>
+                <option value="azure">azure</option>
+                <option value="azure_openai">azure_openai</option>
+                <option value="vertex">vertex</option>
+                <option value="gemini">gemini</option>
+                <option value="google">google</option>
+                <option value="bedrock">bedrock</option>
+                <option value="together">together</option>
+                <option value="together.ai">together.ai</option>
+                <option value="lorax">lorax</option>
+                <option value="adapter_server">adapter_server</option>
+                <option value="sagemaker">sagemaker</option>
+                <option value="aws_sagemaker">aws_sagemaker</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="setting-adapter-mode">Default adapter mode</label>
+              <select id="setting-adapter-mode">
+                <option value="local">local</option>
+                <option value="remote">remote</option>
+                <option value="prompt">prompt</option>
+                <option value="hybrid" selected>hybrid</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="setting-rag-mode">RAG mode</label>
+              <select id="setting-rag-mode">
+                <option value="pgvector" selected>pgvector</option>
+                <option value="memory">memory</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="setting-embedding-model">Embedding model ID</label>
+              <select id="setting-embedding-model">
+                <option value="text-embedding-3-small">text-embedding-3-small</option>
+                <option value="text-embedding-3-large">text-embedding-3-large</option>
+                <option value="text-embedding-ada-002">text-embedding-ada-002</option>
+                <option value="text-embedding" selected>text-embedding (local)</option>
+              </select>
+            </div>
+
+            <h4>Tenant & JWT Settings</h4>
+            <div class="field">
+              <label for="setting-default-tenant">Default tenant ID</label>
+              <input type="text" id="setting-default-tenant" value="public" />
+            </div>
+            <div class="field">
+              <label for="setting-jwt-issuer">JWT issuer</label>
+              <input type="text" id="setting-jwt-issuer" value="liminallm" />
+            </div>
+            <div class="field">
+              <label for="setting-jwt-audience">JWT audience</label>
+              <input type="text" id="setting-jwt-audience" value="liminal-clients" />
+            </div>
+
+            <button class="primary" id="save-settings">Save settings</button>
+          </div>
+          <div id="settings-feedback" role="status" class="subtext"></div>
+
+          <div class="divider"></div>
+
+          <div class="section-header">
             <h3>Runtime config</h3>
             <button class="minor" id="refresh-config">Refresh config</button>
           </div>

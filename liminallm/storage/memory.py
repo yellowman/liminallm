@@ -557,12 +557,13 @@ class MemoryStore:
     def get_conversation(
         self, conversation_id: str, *, user_id: Optional[str] = None
     ) -> Optional[Conversation]:
-        conv = self.conversations.get(conversation_id)
-        if not conv:
-            return None
-        if user_id and conv.user_id != user_id:
-            return None
-        return conv
+        with self._data_lock:
+            conv = self.conversations.get(conversation_id)
+            if not conv:
+                return None
+            if user_id and conv.user_id != user_id:
+                return None
+            return conv
 
     def append_message(
         self,
@@ -674,6 +675,7 @@ class MemoryStore:
         cluster_id: Optional[str] = None,
         *,
         tenant_id: Optional[str] = None,
+        limit: int = 1000,
     ) -> List[PreferenceEvent]:
         events = list(self.preference_events.values())
         if tenant_id:
@@ -690,7 +692,8 @@ class MemoryStore:
             events = [e for e in events if e.feedback in feedback_values]
         if cluster_id:
             events = [e for e in events if e.cluster_id == cluster_id]
-        return sorted(events, key=lambda e: e.created_at)
+        # Apply limit to prevent unbounded results
+        return sorted(events, key=lambda e: e.created_at)[:limit]
 
     def get_preference_event(self, event_id: str) -> Optional[PreferenceEvent]:
         with self._data_lock:
@@ -784,7 +787,8 @@ class MemoryStore:
         return sorted(clusters, key=lambda c: c.updated_at, reverse=True)
 
     def get_semantic_cluster(self, cluster_id: str) -> Optional[SemanticCluster]:
-        return self.semantic_clusters.get(cluster_id)
+        with self._data_lock:
+            return self.semantic_clusters.get(cluster_id)
 
     # training jobs
     def create_training_job(
@@ -997,9 +1001,10 @@ class MemoryStore:
     def list_conversations(
         self, user_id: str, limit: int = 20, offset: int = 0
     ) -> List[Conversation]:
-        convs = [c for c in self.conversations.values() if c.user_id == user_id]
-        convs.sort(key=lambda c: c.updated_at, reverse=True)
-        return convs[offset : offset + limit]
+        with self._data_lock:
+            convs = [c for c in self.conversations.values() if c.user_id == user_id]
+            convs.sort(key=lambda c: c.updated_at, reverse=True)
+            return convs[offset : offset + limit]
 
     # artifacts
     def list_artifacts(
@@ -1013,33 +1018,79 @@ class MemoryStore:
         tenant_id: Optional[str] = None,
         visibility: Optional[str] = None,
     ) -> List[Artifact]:
-        artifacts = list(self.artifacts.values())
-        if tenant_id:
-            artifacts = [
-                a
-                for a in artifacts
-                if a.owner_user_id
-                and a.owner_user_id in self.users
-                and self.users[a.owner_user_id].tenant_id == tenant_id
-            ]
-        if owner_user_id:
-            artifacts = [a for a in artifacts if a.owner_user_id == owner_user_id]
+        """List artifacts with proper visibility filtering.
+
+        Visibility logic:
+        - If visibility='private': only user's own private artifacts
+        - If visibility='global': all global artifacts
+        - If visibility='shared': shared artifacts within user's tenant
+        - If no visibility filter: user's private + all global + shared within tenant
+        """
+        all_artifacts = list(self.artifacts.values())
+
+        # Helper to get artifact visibility
+        def get_visibility(a: Artifact) -> str:
+            return getattr(a, "visibility", "private")
+
+        # Helper to check if artifact owner is in tenant
+        def owner_in_tenant(a: Artifact, tid: str) -> bool:
+            if not a.owner_user_id or a.owner_user_id not in self.users:
+                return False
+            return self.users[a.owner_user_id].tenant_id == tid
+
+        # Apply visibility access control
+        if visibility:
+            # Specific visibility filter requested
+            if visibility == "private":
+                if owner_user_id:
+                    artifacts = [
+                        a for a in all_artifacts
+                        if get_visibility(a) == "private" and a.owner_user_id == owner_user_id
+                    ]
+                else:
+                    artifacts = [a for a in all_artifacts if get_visibility(a) == "private"]
+            elif visibility == "global":
+                artifacts = [a for a in all_artifacts if get_visibility(a) == "global"]
+            elif visibility == "shared":
+                if tenant_id:
+                    artifacts = [
+                        a for a in all_artifacts
+                        if get_visibility(a) == "shared" and owner_in_tenant(a, tenant_id)
+                    ]
+                else:
+                    artifacts = [a for a in all_artifacts if get_visibility(a) == "shared"]
+            else:
+                artifacts = [a for a in all_artifacts if get_visibility(a) == visibility]
+        else:
+            # No visibility filter: show accessible artifacts
+            # User sees: their private + all global + shared within tenant
+            artifacts = []
+            for a in all_artifacts:
+                vis = get_visibility(a)
+                if vis == "global":
+                    artifacts.append(a)
+                elif vis == "private" and owner_user_id and a.owner_user_id == owner_user_id:
+                    artifacts.append(a)
+                elif vis == "shared" and tenant_id and owner_in_tenant(a, tenant_id):
+                    artifacts.append(a)
+
+        # Apply type/kind filters
         if type_filter:
             artifacts = [a for a in artifacts if a.type == type_filter]
         if kind_filter:
             artifacts = [
-                a
-                for a in artifacts
+                a for a in artifacts
                 if isinstance(a.schema, dict) and a.schema.get("kind") == kind_filter
             ]
-        if visibility:
-            artifacts = [a for a in artifacts if getattr(a, "visibility", "private") == visibility]
+
+        # Pagination
         start = max(page - 1, 0) * max(page_size, 1)
         end = start + max(page_size, 1)
         return artifacts[start:end]
 
     def get_artifact(self, artifact_id: str) -> Optional[Artifact]:
-        return self.artifacts.get(artifact_id)
+        with self._data_lock:
+            return self.artifacts.get(artifact_id)
 
     def create_artifact(
         self,
@@ -1244,6 +1295,76 @@ class MemoryStore:
         self.runtime_config.update(config)
         self._persist_state()
         return dict(self.runtime_config)
+
+    def get_system_settings(self) -> dict:
+        """Get admin-managed system settings.
+
+        Returns settings for session rotation, concurrency caps, rate limits,
+        and other operational parameters. Managed via admin UI instead of env vars.
+        """
+        return self.runtime_config.get("system_settings", {
+            "session_rotation_hours": 24,
+            "session_rotation_grace_seconds": 300,
+            "max_concurrent_workflows": 3,
+            "max_concurrent_inference": 2,
+            "rate_limit_multiplier_free": 1.0,
+            "rate_limit_multiplier_paid": 2.0,
+            "rate_limit_multiplier_enterprise": 5.0,
+            "chat_rate_limit_per_minute": 60,
+            "chat_rate_limit_window_seconds": 60,
+            "login_rate_limit_per_minute": 10,
+            "signup_rate_limit_per_minute": 5,
+            "reset_rate_limit_per_minute": 5,
+            "mfa_rate_limit_per_minute": 5,
+            "admin_rate_limit_per_minute": 30,
+            "admin_rate_limit_window_seconds": 60,
+            "files_upload_rate_limit_per_minute": 10,
+            "configops_rate_limit_per_hour": 30,
+            "read_rate_limit_per_minute": 120,
+            "default_page_size": 100,
+            "max_page_size": 500,
+            "default_conversations_limit": 50,
+            "max_upload_bytes": 10485760,
+            "rag_chunk_size": 400,
+            "access_token_ttl_minutes": 30,
+            "refresh_token_ttl_minutes": 1440,
+            "enable_mfa": True,
+            "allow_signup": True,
+            "training_worker_enabled": True,
+            "training_worker_poll_interval": 60,
+            "smtp_host": "",
+            "smtp_port": 587,
+            "smtp_user": "",
+            "smtp_password": "",
+            "smtp_use_tls": True,
+            "email_from_address": "",
+            "email_from_name": "LiminalLM",
+            "oauth_redirect_uri": "",
+            "app_base_url": "http://localhost:8000",
+            "voice_transcription_model": "whisper-1",
+            "voice_synthesis_model": "tts-1",
+            "voice_default_voice": "alloy",
+            "rag_mode": "pgvector",
+            "embedding_model_id": "text-embedding",
+            "default_tenant_id": "public",
+            "jwt_issuer": "liminallm",
+            "jwt_audience": "liminal-clients",
+            "model_path": "gpt-4o-mini",
+            "model_backend": "openai",
+            "default_adapter_mode": "hybrid",
+        })
+
+    def set_system_settings(self, settings: dict) -> dict:
+        """Update admin-managed system settings.
+
+        Merges provided settings with existing settings and persists.
+        Returns the updated full settings.
+        """
+        existing = self.get_system_settings()
+        merged = {**existing, **settings}
+        self.runtime_config["system_settings"] = merged
+        self._persist_state()
+        return merged
 
     def get_latest_workflow(self, workflow_id: str) -> Optional[dict]:
         versions = self.artifact_versions.get(workflow_id)
@@ -1551,6 +1672,13 @@ class MemoryStore:
             "mfa_secrets": [
                 self._serialize_mfa_config(cfg) for cfg in self.mfa_secrets.values()
             ],
+            "user_settings": [
+                self._serialize_user_settings(s) for s in self.user_settings.values()
+            ],
+            "adapter_router_state": [
+                self._serialize_adapter_router_state(s)
+                for s in self.adapter_router_state.values()
+            ],
         }
         path = self._state_path()
         try:
@@ -1642,6 +1770,14 @@ class MemoryStore:
         self.mfa_secrets = {
             cfg["user_id"]: self._deserialize_mfa_config(cfg)
             for cfg in data.get("mfa_secrets", [])
+        }
+        self.user_settings = {
+            s["user_id"]: self._deserialize_user_settings(s)
+            for s in data.get("user_settings", [])
+        }
+        self.adapter_router_state = {
+            s["artifact_id"]: self._deserialize_adapter_router_state(s)
+            for s in data.get("adapter_router_state", [])
         }
         return True
 
@@ -2066,5 +2202,53 @@ class MemoryStore:
             created_at=self._deserialize_datetime(
                 data.get("created_at", datetime.utcnow().isoformat())
             ),
+            meta=data.get("meta"),
+        )
+
+    def _serialize_user_settings(self, settings: UserSettings) -> dict:
+        """Serialize UserSettings for persistence."""
+        return {
+            "user_id": settings.user_id,
+            "locale": settings.locale,
+            "timezone": settings.timezone,
+            "default_voice": settings.default_voice,
+            "default_style": settings.default_style,
+            "flags": settings.flags,
+        }
+
+    def _deserialize_user_settings(self, data: dict) -> UserSettings:
+        """Deserialize UserSettings from persistence."""
+        return UserSettings(
+            user_id=data["user_id"],
+            locale=data.get("locale"),
+            timezone=data.get("timezone"),
+            default_voice=data.get("default_voice"),
+            default_style=data.get("default_style"),
+            flags=data.get("flags"),
+        )
+
+    def _serialize_adapter_router_state(self, state: AdapterRouterState) -> dict:
+        """Serialize AdapterRouterState for persistence."""
+        return {
+            "artifact_id": state.artifact_id,
+            "base_model": state.base_model,
+            "centroid_vec": state.centroid_vec,
+            "usage_count": state.usage_count,
+            "success_score": state.success_score,
+            "last_used_at": self._serialize_datetime(state.last_used_at) if state.last_used_at else None,
+            "last_trained_at": self._serialize_datetime(state.last_trained_at) if state.last_trained_at else None,
+            "meta": state.meta,
+        }
+
+    def _deserialize_adapter_router_state(self, data: dict) -> AdapterRouterState:
+        """Deserialize AdapterRouterState from persistence."""
+        return AdapterRouterState(
+            artifact_id=data["artifact_id"],
+            base_model=data.get("base_model"),
+            centroid_vec=data.get("centroid_vec"),
+            usage_count=data.get("usage_count", 0),
+            success_score=data.get("success_score", 0.0),
+            last_used_at=self._deserialize_datetime(data["last_used_at"]) if data.get("last_used_at") else None,
+            last_trained_at=self._deserialize_datetime(data["last_trained_at"]) if data.get("last_trained_at") else None,
             meta=data.get("meta"),
         )

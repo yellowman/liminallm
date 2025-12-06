@@ -31,13 +31,46 @@ class RedisCache:
         self, session_id: str, user_id: str, expires_at: datetime
     ) -> None:
         ttl = max(1, int((expires_at - datetime.utcnow()).total_seconds()))
-        await self.client.set(f"auth:session:{session_id}", user_id, ex=ttl)
+        pipe = self.client.pipeline()
+        pipe.set(f"auth:session:{session_id}", user_id, ex=ttl)
+        # Track session in user's session set for bulk revocation (Issue 22.3)
+        pipe.sadd(f"auth:user_sessions:{user_id}", session_id)
+        pipe.expire(f"auth:user_sessions:{user_id}", ttl)
+        await pipe.execute()
 
     async def get_session_user(self, session_id: str) -> Optional[str]:
         return await self.client.get(f"auth:session:{session_id}")
 
     async def revoke_session(self, session_id: str) -> None:
         await self.client.delete(f"auth:session:{session_id}")
+
+    async def revoke_user_sessions(
+        self, user_id: str, except_session_id: Optional[str] = None
+    ) -> int:
+        """Revoke all cached sessions for a user.
+
+        Args:
+            user_id: User whose sessions to revoke
+            except_session_id: Optional session ID to keep active
+
+        Returns:
+            Number of sessions revoked from cache
+        """
+        user_sessions_key = f"auth:user_sessions:{user_id}"
+        session_ids = await self.client.smembers(user_sessions_key)
+        if not session_ids:
+            return 0
+
+        revoked = 0
+        pipe = self.client.pipeline()
+        for session_id in session_ids:
+            if except_session_id and session_id == except_session_id:
+                continue
+            pipe.delete(f"auth:session:{session_id}")
+            pipe.srem(user_sessions_key, session_id)
+            revoked += 1
+        await pipe.execute()
+        return revoked
 
     async def check_rate_limit(
         self, key: str, limit: int, window_seconds: int, *, return_remaining: bool = False
@@ -77,6 +110,19 @@ class RedisCache:
 
     async def is_refresh_revoked(self, jti: str) -> bool:
         return bool(await self.client.exists(f"auth:refresh:revoked:{jti}"))
+
+    # SPEC §12.1: "logout: add JWT to short-lived denylist if JWTs used"
+    async def denylist_access_token(self, jti: str, ttl_seconds: int) -> None:
+        """Add access token JTI to denylist with TTL matching token expiry.
+
+        Per SPEC §4, token blacklists are stored in Redis for hot ephemeral state.
+        """
+        if ttl_seconds > 0:
+            await self.client.set(f"auth:access:denylist:{jti}", "1", ex=ttl_seconds)
+
+    async def is_access_token_denylisted(self, jti: str) -> bool:
+        """Check if access token JTI is in denylist."""
+        return bool(await self.client.exists(f"auth:access:denylist:{jti}"))
 
     async def get_router_cache(self, user_id: str, ctx_hash: str) -> Optional[dict]:
         cached = await self.client.get(f"router:last:{user_id}:{ctx_hash}")
@@ -212,6 +258,44 @@ class RedisCache:
             f"idemp:{route}:{user_id}:{key}", json.dumps(record), ex=ttl_seconds
         )
 
+    async def acquire_idempotency_slot(
+        self,
+        route: str,
+        user_id: str,
+        key: str,
+        record: dict,
+        ttl_seconds: int = 60 * 60 * 24,
+    ) -> tuple[bool, Optional[dict]]:
+        """Atomically acquire an idempotency slot using SETNX pattern (Issue 19.4).
+
+        Args:
+            route: Route/operation name
+            user_id: User ID
+            key: Idempotency key
+            record: Record to set if slot acquired (typically status=in_progress)
+            ttl_seconds: TTL for the record
+
+        Returns:
+            Tuple of (acquired: bool, existing_record: Optional[dict])
+            - If acquired=True, the slot was successfully claimed
+            - If acquired=False, existing_record contains the current record
+        """
+        cache_key = f"idemp:{route}:{user_id}:{key}"
+        # Use SET NX (set if not exists) for atomic acquisition
+        acquired = await self.client.set(
+            cache_key, json.dumps(record), ex=ttl_seconds, nx=True
+        )
+        if acquired:
+            return (True, None)
+        # Slot was not acquired, fetch existing record
+        existing = await self.client.get(cache_key)
+        if existing:
+            try:
+                return (False, json.loads(existing))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return (False, None)
+
     async def close(self) -> None:
         """Close Redis connection pool. Call when shutting down or resetting runtime."""
         await self.client.close()
@@ -220,6 +304,165 @@ class RedisCache:
     async def delete_workflow_state(self, state_key: str) -> None:
         """Delete workflow state from cache during rollback or cleanup."""
         await self.client.delete(f"workflow:state:{state_key}")
+
+    # =========================================================================
+    # Concurrency Caps (SPEC §18)
+    # =========================================================================
+
+    async def acquire_concurrency_slot(
+        self, slot_type: str, user_id: str, max_slots: int, ttl_seconds: int = 3600
+    ) -> tuple[bool, int]:
+        """Atomically acquire a concurrency slot for a user.
+
+        Args:
+            slot_type: Type of slot (e.g., "workflow", "inference")
+            user_id: User ID
+            max_slots: Maximum concurrent slots allowed
+            ttl_seconds: TTL for slot keys (safety cleanup)
+
+        Returns:
+            Tuple of (acquired: bool, current_count: int)
+        """
+        key = f"concurrency:{slot_type}:{user_id}"
+        # Use Lua script for atomic check-and-increment
+        lua_script = """
+        local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+        local max_allowed = tonumber(ARGV[1])
+        local ttl = tonumber(ARGV[2])
+        if current < max_allowed then
+            redis.call('INCR', KEYS[1])
+            redis.call('EXPIRE', KEYS[1], ttl)
+            return {1, current + 1}
+        end
+        return {0, current}
+        """
+        result = await self.client.eval(lua_script, 1, key, max_slots, ttl_seconds)
+        return (bool(result[0]), int(result[1]))
+
+    async def release_concurrency_slot(self, slot_type: str, user_id: str) -> int:
+        """Release a concurrency slot for a user.
+
+        Args:
+            slot_type: Type of slot (e.g., "workflow", "inference")
+            user_id: User ID
+
+        Returns:
+            Current count after release
+        """
+        key = f"concurrency:{slot_type}:{user_id}"
+        # Use Lua script to ensure we don't go below 0
+        lua_script = """
+        local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+        if current > 0 then
+            return redis.call('DECR', KEYS[1])
+        end
+        return 0
+        """
+        result = await self.client.eval(lua_script, 1, key)
+        return int(result)
+
+    async def get_concurrency_count(self, slot_type: str, user_id: str) -> int:
+        """Get current concurrency count for a user."""
+        key = f"concurrency:{slot_type}:{user_id}"
+        count = await self.client.get(key)
+        return int(count) if count else 0
+
+    # =========================================================================
+    # Session Activity Tracking (SPEC §12.1)
+    # =========================================================================
+
+    async def update_session_activity(self, session_id: str, ttl_seconds: int = 86400) -> None:
+        """Update session last activity timestamp."""
+        key = f"session:activity:{session_id}"
+        now = datetime.utcnow().isoformat()
+        await self.client.set(key, now, ex=ttl_seconds)
+
+    async def get_session_activity(self, session_id: str) -> Optional[datetime]:
+        """Get session last activity timestamp."""
+        key = f"session:activity:{session_id}"
+        value = await self.client.get(key)
+        if value:
+            try:
+                return datetime.fromisoformat(value)
+            except (ValueError, TypeError):
+                return None
+        return None
+
+    async def set_session_rotation_grace(
+        self, old_session_id: str, new_session_id: str, grace_seconds: int = 300
+    ) -> None:
+        """Store mapping from old to new session ID during grace period."""
+        key = f"session:rotation:{old_session_id}"
+        await self.client.set(key, new_session_id, ex=grace_seconds)
+
+    async def get_rotated_session(self, old_session_id: str) -> Optional[str]:
+        """Get new session ID if old session was rotated."""
+        key = f"session:rotation:{old_session_id}"
+        return await self.client.get(key)
+
+    # =========================================================================
+    # MFA Lockout Tracking (Issue 19.3 - Atomic operations)
+    # =========================================================================
+
+    async def check_mfa_lockout(self, user_id: str) -> bool:
+        """Check if user is locked out from MFA attempts.
+
+        Returns:
+            True if user is locked out, False otherwise
+        """
+        key = f"mfa:lockout:{user_id}"
+        return bool(await self.client.exists(key))
+
+    async def atomic_mfa_attempt(
+        self, user_id: str, max_attempts: int = 5, lockout_seconds: int = 300
+    ) -> tuple[bool, int]:
+        """Atomically record a failed MFA attempt and check/trigger lockout.
+
+        This uses a Lua script to ensure atomicity and prevent the race condition
+        where multiple concurrent failed attempts could each pass the lockout
+        check before any increment the counter.
+
+        Args:
+            user_id: User ID to track
+            max_attempts: Maximum failed attempts before lockout
+            lockout_seconds: Duration of lockout in seconds
+
+        Returns:
+            Tuple of (is_now_locked_out: bool, current_attempts: int)
+        """
+        lockout_key = f"mfa:lockout:{user_id}"
+        attempts_key = f"mfa:attempts:{user_id}"
+
+        # Lua script for atomic check-and-increment with lockout trigger
+        lua_script = """
+        -- Check if already locked out
+        if redis.call('EXISTS', KEYS[1]) == 1 then
+            return {1, -1}  -- Already locked out
+        end
+
+        -- Increment attempt counter
+        local attempts = redis.call('INCR', KEYS[2])
+        redis.call('EXPIRE', KEYS[2], ARGV[2])
+
+        -- Check if we should trigger lockout
+        local max_attempts = tonumber(ARGV[1])
+        if attempts >= max_attempts then
+            redis.call('SET', KEYS[1], '1', 'EX', ARGV[2])
+            redis.call('DEL', KEYS[2])
+            return {1, attempts}  -- Now locked out
+        end
+
+        return {0, attempts}  -- Not locked out
+        """
+        result = await self.client.eval(
+            lua_script, 2, lockout_key, attempts_key, max_attempts, lockout_seconds
+        )
+        return (bool(result[0]), int(result[1]))
+
+    async def clear_mfa_attempts(self, user_id: str) -> None:
+        """Clear MFA attempt counter on successful verification."""
+        attempts_key = f"mfa:attempts:{user_id}"
+        await self.client.delete(attempts_key)
 
 
 class _SyncClientAdapter:
@@ -278,13 +521,38 @@ class SyncRedisCache:
         self, session_id: str, user_id: str, expires_at: datetime
     ) -> None:
         ttl = max(1, int((expires_at - datetime.utcnow()).total_seconds()))
-        self._sync_client.set(f"auth:session:{session_id}", user_id, ex=ttl)
+        pipe = self._sync_client.pipeline()
+        pipe.set(f"auth:session:{session_id}", user_id, ex=ttl)
+        # Track session in user's session set for bulk revocation (Issue 22.3)
+        pipe.sadd(f"auth:user_sessions:{user_id}", session_id)
+        pipe.expire(f"auth:user_sessions:{user_id}", ttl)
+        pipe.execute()
 
     async def get_session_user(self, session_id: str) -> Optional[str]:
         return self._sync_client.get(f"auth:session:{session_id}")
 
     async def revoke_session(self, session_id: str) -> None:
         self._sync_client.delete(f"auth:session:{session_id}")
+
+    async def revoke_user_sessions(
+        self, user_id: str, except_session_id: Optional[str] = None
+    ) -> int:
+        """Revoke all cached sessions for a user (sync version)."""
+        user_sessions_key = f"auth:user_sessions:{user_id}"
+        session_ids = self._sync_client.smembers(user_sessions_key)
+        if not session_ids:
+            return 0
+
+        revoked = 0
+        pipe = self._sync_client.pipeline()
+        for session_id in session_ids:
+            if except_session_id and session_id == except_session_id:
+                continue
+            pipe.delete(f"auth:session:{session_id}")
+            pipe.srem(user_sessions_key, session_id)
+            revoked += 1
+        pipe.execute()
+        return revoked
 
     async def check_rate_limit(
         self, key: str, limit: int, window_seconds: int, *, return_remaining: bool = False
@@ -312,6 +580,16 @@ class SyncRedisCache:
 
     async def is_refresh_revoked(self, jti: str) -> bool:
         return bool(self._sync_client.exists(f"auth:refresh:revoked:{jti}"))
+
+    # SPEC §12.1: "logout: add JWT to short-lived denylist if JWTs used"
+    async def denylist_access_token(self, jti: str, ttl_seconds: int) -> None:
+        """Add access token JTI to denylist with TTL matching token expiry."""
+        if ttl_seconds > 0:
+            self._sync_client.set(f"auth:access:denylist:{jti}", "1", ex=ttl_seconds)
+
+    async def is_access_token_denylisted(self, jti: str) -> bool:
+        """Check if access token JTI is in denylist."""
+        return bool(self._sync_client.exists(f"auth:access:denylist:{jti}"))
 
     async def get_router_cache(self, user_id: str, ctx_hash: str) -> Optional[dict]:
         cached = self._sync_client.get(f"router:last:{user_id}:{ctx_hash}")
@@ -416,6 +694,27 @@ class SyncRedisCache:
     ) -> None:
         self._sync_client.set(f"idemp:{route}:{user_id}:{key}", json.dumps(record), ex=ttl_seconds)
 
+    async def acquire_idempotency_slot(
+        self,
+        route: str,
+        user_id: str,
+        key: str,
+        record: dict,
+        ttl_seconds: int = 60 * 60 * 24,
+    ) -> tuple[bool, Optional[dict]]:
+        """Atomically acquire an idempotency slot using SETNX (sync version)."""
+        cache_key = f"idemp:{route}:{user_id}:{key}"
+        acquired = self._sync_client.set(cache_key, json.dumps(record), ex=ttl_seconds, nx=True)
+        if acquired:
+            return (True, None)
+        existing = self._sync_client.get(cache_key)
+        if existing:
+            try:
+                return (False, json.loads(existing))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return (False, None)
+
     async def close(self) -> None:
         """Close Redis connection."""
         self._sync_client.close()
@@ -423,3 +722,116 @@ class SyncRedisCache:
     async def delete_workflow_state(self, state_key: str) -> None:
         """Delete workflow state from cache."""
         self._sync_client.delete(f"workflow:state:{state_key}")
+
+    # =========================================================================
+    # Concurrency Caps (SPEC §18)
+    # =========================================================================
+
+    async def acquire_concurrency_slot(
+        self, slot_type: str, user_id: str, max_slots: int, ttl_seconds: int = 3600
+    ) -> tuple[bool, int]:
+        """Atomically acquire a concurrency slot for a user."""
+        key = f"concurrency:{slot_type}:{user_id}"
+        lua_script = """
+        local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+        local max_allowed = tonumber(ARGV[1])
+        local ttl = tonumber(ARGV[2])
+        if current < max_allowed then
+            redis.call('INCR', KEYS[1])
+            redis.call('EXPIRE', KEYS[1], ttl)
+            return {1, current + 1}
+        end
+        return {0, current}
+        """
+        result = self._sync_client.eval(lua_script, 1, key, max_slots, ttl_seconds)
+        return (bool(result[0]), int(result[1]))
+
+    async def release_concurrency_slot(self, slot_type: str, user_id: str) -> int:
+        """Release a concurrency slot for a user."""
+        key = f"concurrency:{slot_type}:{user_id}"
+        lua_script = """
+        local current = tonumber(redis.call('GET', KEYS[1]) or '0')
+        if current > 0 then
+            return redis.call('DECR', KEYS[1])
+        end
+        return 0
+        """
+        result = self._sync_client.eval(lua_script, 1, key)
+        return int(result)
+
+    async def get_concurrency_count(self, slot_type: str, user_id: str) -> int:
+        """Get current concurrency count for a user."""
+        key = f"concurrency:{slot_type}:{user_id}"
+        count = self._sync_client.get(key)
+        return int(count) if count else 0
+
+    # =========================================================================
+    # Session Activity Tracking (SPEC §12.1)
+    # =========================================================================
+
+    async def update_session_activity(self, session_id: str, ttl_seconds: int = 86400) -> None:
+        """Update session last activity timestamp."""
+        key = f"session:activity:{session_id}"
+        now = datetime.utcnow().isoformat()
+        self._sync_client.set(key, now, ex=ttl_seconds)
+
+    async def get_session_activity(self, session_id: str) -> Optional[datetime]:
+        """Get session last activity timestamp."""
+        key = f"session:activity:{session_id}"
+        value = self._sync_client.get(key)
+        if value:
+            try:
+                return datetime.fromisoformat(value)
+            except (ValueError, TypeError):
+                return None
+        return None
+
+    async def set_session_rotation_grace(
+        self, old_session_id: str, new_session_id: str, grace_seconds: int = 300
+    ) -> None:
+        """Store mapping from old to new session ID during grace period."""
+        key = f"session:rotation:{old_session_id}"
+        self._sync_client.set(key, new_session_id, ex=grace_seconds)
+
+    async def get_rotated_session(self, old_session_id: str) -> Optional[str]:
+        """Get new session ID if old session was rotated."""
+        key = f"session:rotation:{old_session_id}"
+        return self._sync_client.get(key)
+
+    # =========================================================================
+    # MFA Lockout Tracking (Issue 19.3 - Atomic operations)
+    # =========================================================================
+
+    async def check_mfa_lockout(self, user_id: str) -> bool:
+        """Check if user is locked out from MFA attempts."""
+        key = f"mfa:lockout:{user_id}"
+        return bool(self._sync_client.exists(key))
+
+    async def atomic_mfa_attempt(
+        self, user_id: str, max_attempts: int = 5, lockout_seconds: int = 300
+    ) -> tuple[bool, int]:
+        """Atomically record a failed MFA attempt and check/trigger lockout (sync version)."""
+        lockout_key = f"mfa:lockout:{user_id}"
+        attempts_key = f"mfa:attempts:{user_id}"
+
+        lua_script = """
+        if redis.call('EXISTS', KEYS[1]) == 1 then
+            return {1, -1}
+        end
+        local attempts = redis.call('INCR', KEYS[2])
+        redis.call('EXPIRE', KEYS[2], ARGV[2])
+        local max_attempts = tonumber(ARGV[1])
+        if attempts >= max_attempts then
+            redis.call('SET', KEYS[1], '1', 'EX', ARGV[2])
+            redis.call('DEL', KEYS[2])
+            return {1, attempts}
+        end
+        return {0, attempts}
+        """
+        result = self._sync_client.eval(lua_script, 2, lockout_key, attempts_key, max_attempts, lockout_seconds)
+        return (bool(result[0]), int(result[1]))
+
+    async def clear_mfa_attempts(self, user_id: str) -> None:
+        """Clear MFA attempt counter on successful verification."""
+        attempts_key = f"mfa:attempts:{user_id}"
+        self._sync_client.delete(attempts_key)

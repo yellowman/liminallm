@@ -30,7 +30,12 @@ async def lifespan(app: FastAPI):
 
     try:
         runtime = get_runtime()
-        if runtime.settings.training_worker_enabled:
+        # Check training_worker_enabled from DB settings (falls back to env var)
+        training_worker_enabled = runtime.settings.training_worker_enabled
+        if hasattr(runtime.store, "get_system_settings"):
+            sys_settings = runtime.store.get_system_settings() or {}
+            training_worker_enabled = sys_settings.get("training_worker_enabled", training_worker_enabled)
+        if training_worker_enabled:
             await runtime.training_worker.start()
             logger.info("training_worker_started_on_startup")
     except Exception as exc:
@@ -286,8 +291,8 @@ async def metrics() -> Response:
                 lines.append('# HELP liminallm_users_total Total number of users')
                 lines.append('# TYPE liminallm_users_total gauge')
                 lines.append(f'liminallm_users_total {user_count}')
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("metrics_user_count_failed", error=str(exc))
 
         # Active sessions (if Redis available)
         if hasattr(runtime, "cache") and runtime.cache is not None:
@@ -308,8 +313,8 @@ async def metrics() -> Response:
                 db_healthy = 1
             else:
                 db_healthy = 1  # Memory store
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("metrics_database_health_failed", error=str(exc))
         lines.append('# HELP liminallm_database_healthy Database connection health')
         lines.append('# TYPE liminallm_database_healthy gauge')
         lines.append(f'liminallm_database_healthy {db_healthy}')

@@ -55,6 +55,16 @@ class ConfigOpsService:
     def decide_patch(
         self, patch_id: int, decision: str, reason: Optional[str] = None
     ) -> ConfigPatchAudit:
+        # Validate patch exists and is in pending status
+        patch = self.store.get_config_patch(patch_id)
+        if not patch:
+            raise NotFoundError("patch not found", detail={"patch_id": patch_id})
+        if patch.status != "pending":
+            raise BadRequestError(
+                "patch not in pending status",
+                detail={"patch_id": patch_id, "current_status": patch.status},
+            )
+
         normalized = decision.lower()
         if normalized in {"approve", "approved"}:
             normalized = "approved"
@@ -89,6 +99,12 @@ class ConfigOpsService:
         patch = self.store.get_config_patch(patch_id)
         if not patch:
             raise NotFoundError("patch not found", detail={"patch_id": patch_id})
+        # Security: Only apply approved patches
+        if patch.status != "approved":
+            raise BadRequestError(
+                "patch must be approved before applying",
+                detail={"patch_id": patch_id, "current_status": patch.status},
+            )
         artifact = self.store.get_artifact(patch.artifact_id)
         if not artifact:
             raise NotFoundError(

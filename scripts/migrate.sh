@@ -3,16 +3,38 @@ set -euo pipefail
 
 : "${DATABASE_URL:?DATABASE_URL must be set}"
 
-# Apply numbered migration files in order.
-for sql_file in $(ls sql/*.sql | sort); do
+# Change to script directory for consistent relative paths
+cd "$(dirname "$0")/.."
+
+# Apply numbered migration files in order (using glob pattern, sorted by filename)
+shopt -s nullglob
+sql_files=(sql/*.sql)
+shopt -u nullglob
+
+if [[ ${#sql_files[@]} -eq 0 ]]; then
+  echo "No migration files found in sql/"
+  exit 0
+fi
+
+# Sort files by name
+IFS=$'\n' sorted_files=($(sort <<<"${sql_files[*]}"))
+unset IFS
+
+for sql_file in "${sorted_files[@]}"; do
   echo "Applying ${sql_file}"
   psql "$DATABASE_URL" -f "$sql_file"
 done
 
-# Apply optional seed files if present.
-if ls sql/seed/*.sql >/dev/null 2>&1; then
+# Apply optional seed files if present (using glob pattern)
+shopt -s nullglob
+seed_files=(sql/seed/*.sql)
+shopt -u nullglob
+
+if [[ ${#seed_files[@]} -gt 0 ]]; then
   echo "Applying seed files"
-  for seed_file in $(ls sql/seed/*.sql | sort); do
+  IFS=$'\n' sorted_seeds=($(sort <<<"${seed_files[*]}"))
+  unset IFS
+  for seed_file in "${sorted_seeds[@]}"; do
     echo "Applying ${seed_file}"
     psql "$DATABASE_URL" -f "$seed_file"
   done

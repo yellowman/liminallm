@@ -251,16 +251,29 @@ class Settings(BaseModel):
     )
     redis_url: str = env_field("redis://localhost:6379/0", "REDIS_URL")
     shared_fs_root: str = env_field("/srv/liminallm", "SHARED_FS_ROOT")
-    model_path: str = env_field("gpt-4o-mini", "MODEL_PATH")
-    model_backend: ModelBackend | None = env_field(ModelBackend.OPENAI, "MODEL_BACKEND")
+    model_path: str = env_field(
+        "gpt-4o-mini", "MODEL_PATH", description="Model path (overridable via admin UI)"
+    )
+    model_backend: ModelBackend | None = env_field(
+        ModelBackend.OPENAI, "MODEL_BACKEND", description="Model backend (overridable via admin UI)"
+    )
     adapter_openai_api_key: str | None = env_field(None, "OPENAI_ADAPTER_API_KEY")
     adapter_openai_base_url: str | None = env_field(None, "OPENAI_ADAPTER_BASE_URL")
     adapter_server_model: str | None = env_field(None, "ADAPTER_SERVER_MODEL")
     # Voice service settings
     voice_api_key: str | None = env_field(None, "VOICE_API_KEY")
-    voice_transcription_model: str = env_field("whisper-1", "VOICE_TRANSCRIPTION_MODEL")
-    voice_synthesis_model: str = env_field("tts-1", "VOICE_SYNTHESIS_MODEL")
-    voice_default_voice: str = env_field("alloy", "VOICE_DEFAULT_VOICE")
+    voice_transcription_model: str = env_field(
+        "whisper-1", "VOICE_TRANSCRIPTION_MODEL",
+        description="Transcription model (overridable via admin UI)"
+    )
+    voice_synthesis_model: str = env_field(
+        "tts-1", "VOICE_SYNTHESIS_MODEL",
+        description="Synthesis model (overridable via admin UI)"
+    )
+    voice_default_voice: str = env_field(
+        "alloy", "VOICE_DEFAULT_VOICE",
+        description="Default voice (overridable via admin UI)"
+    )
     # OAuth settings
     oauth_google_client_id: str | None = env_field(None, "OAUTH_GOOGLE_CLIENT_ID")
     oauth_google_client_secret: str | None = env_field(None, "OAUTH_GOOGLE_CLIENT_SECRET")
@@ -268,22 +281,45 @@ class Settings(BaseModel):
     oauth_github_client_secret: str | None = env_field(None, "OAUTH_GITHUB_CLIENT_SECRET")
     oauth_microsoft_client_id: str | None = env_field(None, "OAUTH_MICROSOFT_CLIENT_ID")
     oauth_microsoft_client_secret: str | None = env_field(None, "OAUTH_MICROSOFT_CLIENT_SECRET")
-    oauth_redirect_uri: str | None = env_field(None, "OAUTH_REDIRECT_URI")
-    # Email service settings
-    smtp_host: str | None = env_field(None, "SMTP_HOST")
-    smtp_port: int = env_field(587, "SMTP_PORT")
-    smtp_user: str | None = env_field(None, "SMTP_USER")
-    smtp_password: str | None = env_field(None, "SMTP_PASSWORD")
-    smtp_use_tls: bool = env_field(True, "SMTP_USE_TLS")
-    email_from_address: str | None = env_field(None, "EMAIL_FROM_ADDRESS")
-    email_from_name: str = env_field("LiminalLM", "EMAIL_FROM_NAME")
-    app_base_url: str = env_field("http://localhost:8000", "APP_BASE_URL")
+    oauth_redirect_uri: str | None = env_field(
+        None, "OAUTH_REDIRECT_URI", description="OAuth redirect URI (overridable via admin UI)"
+    )
+    # Email service settings (env vars are fallbacks - prefer admin UI)
+    smtp_host: str | None = env_field(
+        None, "SMTP_HOST", description="SMTP server host (overridable via admin UI)"
+    )
+    smtp_port: int = env_field(
+        587, "SMTP_PORT", description="SMTP server port (overridable via admin UI)"
+    )
+    smtp_user: str | None = env_field(
+        None, "SMTP_USER", description="SMTP username (overridable via admin UI)"
+    )
+    smtp_password: str | None = env_field(
+        None, "SMTP_PASSWORD", description="SMTP password (overridable via admin UI)"
+    )
+    smtp_use_tls: bool = env_field(
+        True, "SMTP_USE_TLS", description="Use TLS for SMTP (overridable via admin UI)"
+    )
+    email_from_address: str | None = env_field(
+        None, "EMAIL_FROM_ADDRESS", description="Email from address (overridable via admin UI)"
+    )
+    email_from_name: str = env_field(
+        "LiminalLM", "EMAIL_FROM_NAME", description="Email from name (overridable via admin UI)"
+    )
+    app_base_url: str = env_field(
+        "http://localhost:8000", "APP_BASE_URL",
+        description="Application base URL (overridable via admin UI)"
+    )
     default_adapter_mode: AdapterMode = env_field(
         AdapterMode.HYBRID,
         "DEFAULT_ADAPTER_MODE",
-        description="Default mode for new adapters: local, remote, prompt, or hybrid",
+        description="Default mode for new adapters: local, remote, prompt, or hybrid (overridable via admin UI)",
     )
-    allow_signup: bool = env_field(True, "ALLOW_SIGNUP")
+    allow_signup: bool = env_field(
+        True,
+        "ALLOW_SIGNUP",
+        description="Allow new user signups (overridable via admin UI)",
+    )
     use_memory_store: bool = env_field(False, "USE_MEMORY_STORE")
     allow_redis_fallback_dev: bool = env_field(False, "ALLOW_REDIS_FALLBACK_DEV")
     test_mode: bool = env_field(
@@ -291,62 +327,99 @@ class Settings(BaseModel):
         "TEST_MODE",
         description="Toggle deterministic testing behaviors; required for CI pathways described in SPEC §14.",
     )
-    chat_rate_limit_per_minute: int = env_field(60, "CHAT_RATE_LIMIT_PER_MINUTE")
-    chat_rate_limit_window_seconds: int = env_field(
-        60, "CHAT_RATE_LIMIT_WINDOW_SECONDS"
+    enable_mfa: bool = env_field(
+        True,
+        "ENABLE_MFA",
+        description="Enable multi-factor authentication (overridable via admin UI)",
     )
-    enable_mfa: bool = env_field(True, "ENABLE_MFA")
     jwt_secret: str = env_field(None, "JWT_SECRET")
-    jwt_issuer: str = env_field("liminallm", "JWT_ISSUER")
-    jwt_audience: str = env_field("liminal-clients", "JWT_AUDIENCE")
-    access_token_ttl_minutes: int = env_field(30, "ACCESS_TOKEN_TTL_MINUTES")
-    refresh_token_ttl_minutes: int = env_field(24 * 60, "REFRESH_TOKEN_TTL_MINUTES")
-    default_tenant_id: str = env_field("public", "DEFAULT_TENANT_ID")
-    rag_chunk_size: int = env_field(400, "RAG_CHUNK_SIZE")
-    rag_mode: RagMode = env_field(RagMode.PGVECTOR, "RAG_MODE")
-    embedding_model_id: str = env_field("text-embedding", "EMBEDDING_MODEL_ID")
-    max_upload_bytes: int = env_field(10 * 1024 * 1024, "MAX_UPLOAD_BYTES")
-    login_rate_limit_per_minute: int = env_field(10, "LOGIN_RATE_LIMIT_PER_MINUTE")
-    signup_rate_limit_per_minute: int = env_field(5, "SIGNUP_RATE_LIMIT_PER_MINUTE")
-    reset_rate_limit_per_minute: int = env_field(5, "RESET_RATE_LIMIT_PER_MINUTE")
-    mfa_rate_limit_per_minute: int = env_field(5, "MFA_RATE_LIMIT_PER_MINUTE")
-    admin_rate_limit_per_minute: int = env_field(30, "ADMIN_RATE_LIMIT_PER_MINUTE")
-    admin_rate_limit_window_seconds: int = env_field(
-        60, "ADMIN_RATE_LIMIT_WINDOW_SECONDS"
+    jwt_issuer: str = env_field(
+        "liminallm", "JWT_ISSUER",
+        description="JWT issuer (overridable via admin UI)"
     )
-    files_upload_rate_limit_per_minute: int = env_field(
-        10, "FILES_UPLOAD_RATE_LIMIT_PER_MINUTE"
+    jwt_audience: str = env_field(
+        "liminal-clients", "JWT_AUDIENCE",
+        description="JWT audience (overridable via admin UI)"
     )
-    configops_rate_limit_per_hour: int = env_field(30, "CONFIGOPS_RATE_LIMIT_PER_HOUR")
-    read_rate_limit_per_minute: int = env_field(120, "READ_RATE_LIMIT_PER_MINUTE")
+    access_token_ttl_minutes: int = env_field(
+        30,
+        "ACCESS_TOKEN_TTL_MINUTES",
+        description="Access token TTL in minutes (overridable via admin UI)",
+    )
+    refresh_token_ttl_minutes: int = env_field(
+        24 * 60,
+        "REFRESH_TOKEN_TTL_MINUTES",
+        description="Refresh token TTL in minutes (overridable via admin UI)",
+    )
+    default_tenant_id: str = env_field(
+        "public", "DEFAULT_TENANT_ID",
+        description="Default tenant ID (overridable via admin UI)"
+    )
+    rag_mode: RagMode = env_field(
+        RagMode.PGVECTOR, "RAG_MODE",
+        description="RAG mode: pgvector or memory (overridable via admin UI)"
+    )
+    embedding_model_id: str = env_field(
+        "text-embedding", "EMBEDDING_MODEL_ID",
+        description="Embedding model ID (overridable via admin UI)"
+    )
 
-    # Training worker settings
+    # NOTE: The following operational settings have been moved to database-managed
+    # system settings (accessible via admin UI at /admin.html and API at /v1/admin/settings).
+    # Env var values serve as fallbacks when database settings are not present.
+    #
+    # Session & Concurrency:
+    # - session_rotation_hours, session_rotation_grace_seconds
+    # - max_concurrent_workflows, max_concurrent_inference
+    #
+    # Rate Limits:
+    # - chat_rate_limit_per_minute, chat_rate_limit_window_seconds
+    # - login_rate_limit_per_minute, signup_rate_limit_per_minute
+    # - reset_rate_limit_per_minute, mfa_rate_limit_per_minute
+    # - admin_rate_limit_per_minute, admin_rate_limit_window_seconds
+    # - files_upload_rate_limit_per_minute, configops_rate_limit_per_hour
+    # - read_rate_limit_per_minute, write_rate_limit_per_minute
+    # - rate_limit_multiplier_free/paid/enterprise
+    #
+    # Pagination & Files:
+    # - default_page_size, max_page_size, default_conversations_limit
+    # - max_upload_bytes, rag_chunk_size
+    #
+    # Token TTL:
+    # - access_token_ttl_minutes, refresh_token_ttl_minutes
+    #
+    # Feature Flags:
+    # - enable_mfa, allow_signup
+    #
+    # Training Worker:
+    # - training_worker_enabled, training_worker_poll_interval
+    #
+    # SMTP / Email (all settings including secrets):
+    # - smtp_host, smtp_port, smtp_user, smtp_password, smtp_use_tls
+    # - email_from_address, email_from_name
+    #
+    # URL Settings:
+    # - oauth_redirect_uri, app_base_url
+    #
+    # Voice Settings:
+    # - voice_transcription_model, voice_synthesis_model, voice_default_voice
+    #
+    # Model Settings:
+    # - model_path, model_backend, default_adapter_mode, rag_mode, embedding_model_id
+    #
+    # Tenant & JWT Settings:
+    # - default_tenant_id, jwt_issuer, jwt_audience
+
+    # Training worker settings (env vars are fallbacks - prefer admin UI)
     training_worker_enabled: bool = env_field(
         True,
         "TRAINING_WORKER_ENABLED",
-        description="Enable background training job worker",
+        description="Enable background training job worker (overridable via admin UI)",
     )
     training_worker_poll_interval: int = env_field(
         60,
         "TRAINING_WORKER_POLL_INTERVAL",
-        description="Training worker poll interval in seconds",
-    )
-
-    # Pagination defaults per SPEC §18
-    default_page_size: int = env_field(
-        100,
-        "DEFAULT_PAGE_SIZE",
-        description="Default page size for list endpoints (SPEC §18)",
-    )
-    max_page_size: int = env_field(
-        500,
-        "MAX_PAGE_SIZE",
-        description="Maximum page size for list endpoints (SPEC §18)",
-    )
-    default_conversations_limit: int = env_field(
-        50,
-        "DEFAULT_CONVERSATIONS_LIMIT",
-        description="Default limit for conversation list",
+        description="Training worker poll interval in seconds (overridable via admin UI)",
     )
 
     model_config = ConfigDict(extra="ignore")

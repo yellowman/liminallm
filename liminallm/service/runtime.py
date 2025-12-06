@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple, Union
+from urllib.parse import urlparse, urlunparse
 
 from liminallm.config import get_settings, reset_settings_cache
 from liminallm.logging import get_logger
@@ -25,18 +27,71 @@ from liminallm.storage.redis_cache import RedisCache, SyncRedisCache
 logger = get_logger(__name__)
 
 
+def _mask_url_password(url: Optional[str]) -> Optional[str]:
+    """Mask password in URL for safe logging (Issue 29.1).
+
+    Replaces password component with '***' to prevent sensitive data leakage in logs.
+    Example: redis://:mypassword@localhost:6379 -> redis://:***@localhost:6379
+    """
+    if not url:
+        return url
+    try:
+        parsed = urlparse(url)
+        if parsed.password:
+            # Reconstruct URL with masked password
+            netloc = parsed.hostname or ""
+            if parsed.port:
+                netloc = f"{netloc}:{parsed.port}"
+            if parsed.username:
+                netloc = f"{parsed.username}:***@{netloc}"
+            elif parsed.password:
+                netloc = f":***@{netloc}"
+            return urlunparse((
+                parsed.scheme,
+                netloc,
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment,
+            ))
+        return url
+    except Exception:
+        # If parsing fails, return masked placeholder
+        return "***url_parse_error***"
+
+
 class Runtime:
     """Holds singleton service instances for the FastAPI app."""
 
     def __init__(self):
         self.settings = get_settings()
-        self.store = (
-            MemoryStore(fs_root=self.settings.shared_fs_root)
-            if self.settings.use_memory_store
-            else PostgresStore(
-                self.settings.database_url, fs_root=self.settings.shared_fs_root
-            )
+        logger.info(
+            "runtime_init_started",
+            use_memory_store=self.settings.use_memory_store,
+            test_mode=self.settings.test_mode,
         )
+
+        try:
+            self.store = (
+                MemoryStore(fs_root=self.settings.shared_fs_root)
+                if self.settings.use_memory_store
+                else PostgresStore(
+                    self.settings.database_url, fs_root=self.settings.shared_fs_root
+                )
+            )
+            logger.info(
+                "runtime_store_initialized",
+                store_type="memory" if self.settings.use_memory_store else "postgres",
+            )
+        except Exception as exc:
+            logger.error(
+                "runtime_store_init_failed",
+                store_type="memory" if self.settings.use_memory_store else "postgres",
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
+
         self.cache = None
         redis_error: Exception | None = None
         if self.settings.redis_url:
@@ -68,7 +123,8 @@ class Runtime:
 
             logger.warning(
                 "redis_disabled_fallback",
-                redis_url=self.settings.redis_url,
+                # Issue 29.1: Mask password in URL for safe logging
+                redis_url=_mask_url_password(self.settings.redis_url),
                 error=str(redis_error) if redis_error else "redis_url_missing",
                 message=(
                     f"Running without Redis under {fallback_mode}; rate limits, idempotency durability, and "
@@ -76,16 +132,38 @@ class Runtime:
                 ),
                 mode=fallback_mode,
             )
-        # Compute backend_mode before creating services that need it
-        runtime_config = {}
-        db_backend_mode = None
-        if hasattr(self.store, "get_runtime_config"):
-            runtime_config = self.store.get_runtime_config() or {}
-            db_backend_mode = runtime_config.get("model_backend")
+        # Get system settings from DB early (falls back to env vars if not in DB)
+        sys_settings = {}
+        if hasattr(self.store, "get_system_settings"):
+            sys_settings = self.store.get_system_settings() or {}
+
+        # Resolve model settings from DB with env var fallback
         resolved_base_model = (
-            runtime_config.get("model_path") or self.settings.model_path
+            sys_settings.get("model_path") or self.settings.model_path
         )
-        backend_mode = db_backend_mode or self.settings.model_backend
+        backend_mode = sys_settings.get("model_backend") or self.settings.model_backend
+        default_adapter_mode = (
+            sys_settings.get("default_adapter_mode") or self.settings.default_adapter_mode
+        )
+
+        # Resolve other settings from DB with env var fallback
+        rag_mode = sys_settings.get("rag_mode") or self.settings.rag_mode
+        embedding_model_id = (
+            sys_settings.get("embedding_model_id") or self.settings.embedding_model_id
+        )
+        voice_transcription_model = (
+            sys_settings.get("voice_transcription_model")
+            or self.settings.voice_transcription_model
+        )
+        voice_synthesis_model = (
+            sys_settings.get("voice_synthesis_model")
+            or self.settings.voice_synthesis_model
+        )
+        voice_default_voice = (
+            sys_settings.get("voice_default_voice") or self.settings.voice_default_voice
+        )
+        app_base_url = sys_settings.get("app_base_url") or self.settings.app_base_url
+
         self.router = RouterEngine(cache=self.cache, backend_mode=backend_mode)
         adapter_configs = {
             "openai": {
@@ -94,7 +172,7 @@ class Runtime:
                 "adapter_server_model": self.settings.adapter_server_model,
             }
         }
-        self.embeddings = EmbeddingsService(self.settings.embedding_model_id)
+        self.embeddings = EmbeddingsService(embedding_model_id)
         self.llm = LLMService(
             base_model=resolved_base_model,
             backend_mode=backend_mode,
@@ -107,15 +185,15 @@ class Runtime:
         self.rag = RAGService(
             self.store,
             default_chunk_size=self.settings.rag_chunk_size,
-            rag_mode=self.settings.rag_mode,
+            rag_mode=rag_mode,
             embed=self.embeddings.embed,
-            embedding_model_id=self.settings.embedding_model_id,
+            embedding_model_id=embedding_model_id,
         )
         self.training = TrainingService(
             self.store,
             self.settings.shared_fs_root,
             runtime_base_model=resolved_base_model,
-            default_adapter_mode=self.settings.default_adapter_mode,
+            default_adapter_mode=default_adapter_mode,
             backend_mode=backend_mode,
         )
         self.clusterer = SemanticClusterer(self.store, self.llm, self.training)
@@ -125,81 +203,128 @@ class Runtime:
         self.voice = VoiceService(
             self.settings.shared_fs_root,
             api_key=self.settings.voice_api_key,
-            transcription_model=self.settings.voice_transcription_model,
-            synthesis_model=self.settings.voice_synthesis_model,
-            default_voice=self.settings.voice_default_voice,
+            transcription_model=voice_transcription_model,
+            synthesis_model=voice_synthesis_model,
+            default_voice=voice_default_voice,
         )
         self.config_ops = ConfigOpsService(
             self.store, self.llm, self.router, self.training
         )
+        # Use MFA setting from sys_settings (already fetched above)
+        mfa_enabled = sys_settings.get("enable_mfa", self.settings.enable_mfa)
         self.auth = AuthService(
             self.store,
             self.cache,
             self.settings,
-            mfa_enabled=self.settings.enable_mfa,
+            mfa_enabled=mfa_enabled,
+        )
+        # Get SMTP settings from sys_settings (falls back to env vars if not in DB)
+        smtp_host = sys_settings.get("smtp_host") or self.settings.smtp_host
+        smtp_port = sys_settings.get("smtp_port") or self.settings.smtp_port
+        smtp_user = sys_settings.get("smtp_user") or self.settings.smtp_user
+        smtp_password = sys_settings.get("smtp_password") or self.settings.smtp_password
+        smtp_use_tls = sys_settings.get("smtp_use_tls", self.settings.smtp_use_tls)
+        email_from_address = (
+            sys_settings.get("email_from_address") or self.settings.email_from_address
+        )
+        email_from_name = (
+            sys_settings.get("email_from_name") or self.settings.email_from_name
         )
         self.email = EmailService(
-            smtp_host=self.settings.smtp_host,
-            smtp_port=self.settings.smtp_port,
-            smtp_user=self.settings.smtp_user,
-            smtp_password=self.settings.smtp_password,
-            smtp_use_tls=self.settings.smtp_use_tls,
-            from_email=self.settings.email_from_address,
-            from_name=self.settings.email_from_name,
-            base_url=self.settings.app_base_url,
+            smtp_host=smtp_host,
+            smtp_port=smtp_port,
+            smtp_user=smtp_user,
+            smtp_password=smtp_password,
+            smtp_use_tls=smtp_use_tls,
+            from_email=email_from_address,
+            from_name=email_from_name,
+            base_url=app_base_url,
         )
         # Training worker for background job processing
+        poll_interval = sys_settings.get(
+            "training_worker_poll_interval", self.settings.training_worker_poll_interval
+        )
         self.training_worker = TrainingWorker(
             store=self.store,
             training_service=self.training,
             clusterer=self.clusterer,
-            poll_interval=self.settings.training_worker_poll_interval,
+            poll_interval=poll_interval,
         )
         self._local_idempotency: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         self._local_idempotency_lock = asyncio.Lock()
         self._local_rate_limits: Dict[str, Tuple[datetime, int]] = {}
         self._local_rate_limit_lock = asyncio.Lock()
 
+        # Log successful initialization with summary
+        logger.info(
+            "runtime_initialized",
+            model_path=resolved_base_model,
+            model_backend=str(backend_mode),
+            rag_mode=str(rag_mode),
+            adapter_mode=str(default_adapter_mode),
+            redis_enabled=self.cache is not None,
+            email_configured=self.email.is_configured,
+            voice_configured=self.voice.is_configured,
+            mfa_enabled=mfa_enabled,
+        )
+
 
 runtime: Runtime | None = None
+# Issue 28.1: Thread-safe singleton pattern using a lock
+_runtime_lock = threading.Lock()
 
 
 def get_runtime() -> Runtime:
+    """Get or create the Runtime singleton in a thread-safe manner.
+
+    Uses double-checked locking pattern for efficiency:
+    - First check without lock (fast path for existing runtime)
+    - Second check with lock to prevent race condition during creation
+    """
     global runtime
-    if runtime is None:
-        runtime = Runtime()
-    return runtime
+    # Fast path: runtime already exists
+    if runtime is not None:
+        return runtime
+    # Slow path: acquire lock and double-check before creating
+    with _runtime_lock:
+        if runtime is None:
+            runtime = Runtime()
+        return runtime
 
 
 def reset_runtime_for_tests() -> Runtime:
-    """Reinitialize the runtime singleton for isolated test runs."""
+    """Reinitialize the runtime singleton for isolated test runs.
+
+    Uses the same thread lock as get_runtime for safety (Issue 28.1).
+    """
     import asyncio
 
     global runtime
 
-    # Close existing Redis connections to avoid event loop issues
-    if runtime is not None and runtime.cache is not None:
-        try:
-            # SyncRedisCache uses a sync client internally, close it directly
-            if isinstance(runtime.cache, SyncRedisCache):
-                runtime.cache.client.close()
-            else:
-                # Async RedisCache - try to close properly
-                try:
-                    loop = asyncio.get_running_loop()
-                    loop.create_task(runtime.cache.close())
-                except RuntimeError:
-                    asyncio.run(runtime.cache.close())
-        except Exception:
-            # Ignore errors during cleanup - connection may already be closed
-            pass
+    with _runtime_lock:
+        # Close existing Redis connections to avoid event loop issues
+        if runtime is not None and runtime.cache is not None:
+            try:
+                # SyncRedisCache uses a sync client internally, close it directly
+                if isinstance(runtime.cache, SyncRedisCache):
+                    runtime.cache.client.close()
+                else:
+                    # Async RedisCache - try to close properly
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(runtime.cache.close())
+                    except RuntimeError:
+                        asyncio.run(runtime.cache.close())
+            except Exception:
+                # Ignore errors during cleanup - connection may already be closed
+                pass
 
-    reset_settings_cache()
-    settings = get_settings()
-    if not settings.test_mode:
-        raise RuntimeError("runtime reset is only allowed in TEST_MODE")
-    runtime = Runtime()
-    return runtime
+        reset_settings_cache()
+        settings = get_settings()
+        if not settings.test_mode:
+            raise RuntimeError("runtime reset is only allowed in TEST_MODE")
+        runtime = Runtime()
+        return runtime
 
 
 IDEMPOTENCY_TTL_SECONDS = 60 * 60 * 24
@@ -241,6 +366,60 @@ async def _set_cached_idempotency_record(
             **record,
             "expires_at": expires_at,
         }
+
+
+async def _acquire_idempotency_slot(
+    runtime: Runtime,
+    route: str,
+    user_id: str,
+    key: str,
+    record: dict,
+    *,
+    ttl_seconds: int = IDEMPOTENCY_TTL_SECONDS,
+) -> tuple[bool, Optional[dict]]:
+    """Atomically acquire an idempotency slot (Issue 19.4).
+
+    Uses SETNX for Redis or lock-protected check-and-set for in-memory fallback.
+
+    Args:
+        runtime: Application runtime
+        route: Route/operation name
+        user_id: User ID
+        key: Idempotency key
+        record: Record to set if slot acquired
+        ttl_seconds: TTL for the record
+
+    Returns:
+        Tuple of (acquired: bool, existing_record: Optional[dict])
+    """
+    now = datetime.utcnow()
+    expires_at = now + timedelta(seconds=ttl_seconds)
+
+    if runtime.cache:
+        return await runtime.cache.acquire_idempotency_slot(
+            route, user_id, key, record, ttl_seconds=ttl_seconds
+        )
+
+    # In-memory fallback with atomic check-and-set within lock
+    async with runtime._local_idempotency_lock:
+        cache_key = (route, user_id, key)
+        existing = runtime._local_idempotency.get(cache_key)
+
+        if existing:
+            # Check if expired
+            if existing.get("expires_at") and existing["expires_at"] < now:
+                # Expired, we can claim it
+                runtime._local_idempotency.pop(cache_key, None)
+            else:
+                # Not expired, return existing
+                return (False, existing)
+
+        # No existing record or it was expired, claim the slot
+        runtime._local_idempotency[cache_key] = {
+            **record,
+            "expires_at": expires_at,
+        }
+        return (True, None)
 
 
 async def check_rate_limit(

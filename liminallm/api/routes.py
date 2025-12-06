@@ -30,6 +30,7 @@ from liminallm.api.schemas import (
     AdminSettingsResponse,
     AdminSettingsUpdateRequest,
     ArtifactListResponse,
+    ArtifactPatchRequest,
     ArtifactRequest,
     ArtifactResponse,
     ArtifactVersionListResponse,
@@ -93,9 +94,10 @@ from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service.auth import AuthContext
 from liminallm.service.errors import BadRequestError, NotFoundError
-from liminallm.service.fs import safe_join
+from liminallm.service.fs import safe_join, PathTraversalError
 from liminallm.service.runtime import (
     IDEMPOTENCY_TTL_SECONDS,
+    _acquire_idempotency_slot,
     _get_cached_idempotency_record,
     _set_cached_idempotency_record,
     check_rate_limit,
@@ -107,16 +109,55 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/v1")
 
-# Registry for active streaming requests - maps request_id to cancel_event
+# Registry for active streaming requests - maps request_id to (cancel_event, timestamp)
 # Used by POST /chat/cancel to cancel in-progress streaming requests per SPEC §18
-_active_requests: Dict[str, asyncio.Event] = {}
+# Issue 23.2: Added timestamp tracking for TTL-based cleanup
+_active_requests: Dict[str, tuple[asyncio.Event, datetime]] = {}
 _active_requests_lock = asyncio.Lock()
+_active_requests_last_cleanup = datetime.utcnow()
+# Maximum age for active requests before they're considered stale (30 minutes)
+_ACTIVE_REQUEST_TTL_SECONDS = 30 * 60
+
+
+async def _cleanup_stale_active_requests() -> int:
+    """Remove stale entries from _active_requests (Issue 23.2).
+
+    Called periodically during register/unregister to prevent unbounded growth.
+    """
+    global _active_requests_last_cleanup
+    now = datetime.utcnow()
+
+    # Only run cleanup every 5 minutes to avoid performance overhead
+    if (now - _active_requests_last_cleanup).total_seconds() < 300:
+        return 0
+
+    _active_requests_last_cleanup = now
+    threshold = now - timedelta(seconds=_ACTIVE_REQUEST_TTL_SECONDS)
+    stale_keys = [
+        req_id for req_id, (_, created_at) in _active_requests.items()
+        if created_at < threshold
+    ]
+
+    for req_id in stale_keys:
+        event, _ = _active_requests.pop(req_id, (None, None))
+        if event and not event.is_set():
+            event.set()  # Cancel any stale request
+
+    if stale_keys:
+        logger.warning(
+            "active_requests_stale_cleanup",
+            cleaned=len(stale_keys),
+            remaining=len(_active_requests),
+        )
+    return len(stale_keys)
 
 
 async def _register_cancel_event(request_id: str, cancel_event: asyncio.Event) -> None:
     """Register a cancel event for an active streaming request."""
     async with _active_requests_lock:
-        _active_requests[request_id] = cancel_event
+        _active_requests[request_id] = (cancel_event, datetime.utcnow())
+        # Periodic cleanup to prevent unbounded growth (Issue 23.2)
+        await _cleanup_stale_active_requests()
 
 
 async def _unregister_cancel_event(request_id: str) -> None:
@@ -128,10 +169,12 @@ async def _unregister_cancel_event(request_id: str) -> None:
 async def _cancel_request(request_id: str) -> bool:
     """Cancel an active request by request_id. Returns True if cancelled."""
     async with _active_requests_lock:
-        cancel_event = _active_requests.get(request_id)
-        if cancel_event and not cancel_event.is_set():
-            cancel_event.set()
-            return True
+        entry = _active_requests.get(request_id)
+        if entry:
+            cancel_event, _ = entry
+            if not cancel_event.is_set():
+                cancel_event.set()
+                return True
         return False
 
 
@@ -239,6 +282,106 @@ class RateLimitInfo:
         response.headers["X-RateLimit-Reset"] = str(self.reset_seconds)
 
 
+def _get_system_settings(runtime) -> dict:
+    """Get admin-managed system settings from database.
+
+    Returns merged settings with defaults for any missing values.
+    """
+    if hasattr(runtime.store, "get_system_settings"):
+        db_settings = runtime.store.get_system_settings()
+    else:
+        db_settings = {}
+
+    # Defaults for any missing settings
+    defaults = {
+        "session_rotation_hours": 24,
+        "session_rotation_grace_seconds": 300,
+        "max_concurrent_workflows": 3,
+        "max_concurrent_inference": 2,
+        "rate_limit_multiplier_free": 1.0,
+        "rate_limit_multiplier_paid": 2.0,
+        "rate_limit_multiplier_enterprise": 5.0,
+        "chat_rate_limit_per_minute": 60,
+        "chat_rate_limit_window_seconds": 60,
+        "login_rate_limit_per_minute": 10,
+        "signup_rate_limit_per_minute": 5,
+        "reset_rate_limit_per_minute": 5,
+        "mfa_rate_limit_per_minute": 5,
+        "admin_rate_limit_per_minute": 30,
+        "admin_rate_limit_window_seconds": 60,
+        "files_upload_rate_limit_per_minute": 10,
+        "configops_rate_limit_per_hour": 30,
+        "read_rate_limit_per_minute": 120,
+        "write_rate_limit_per_minute": 60,
+        "max_websocket_connections_per_user": 5,
+        "default_page_size": 100,
+        "max_page_size": 500,
+        "default_conversations_limit": 50,
+        "max_upload_bytes": 10485760,
+        "rag_chunk_size": 400,
+        "access_token_ttl_minutes": 30,
+        "refresh_token_ttl_minutes": 1440,
+        "enable_mfa": True,
+        "allow_signup": True,
+        "training_worker_enabled": True,
+        "training_worker_poll_interval": 60,
+        "smtp_host": "",
+        "smtp_port": 587,
+        "smtp_user": "",
+        "smtp_password": "",
+        "smtp_use_tls": True,
+        "email_from_address": "",
+        "email_from_name": "LiminalLM",
+        "oauth_redirect_uri": "",
+        "app_base_url": "http://localhost:8000",
+        "voice_transcription_model": "whisper-1",
+        "voice_synthesis_model": "tts-1",
+        "voice_default_voice": "alloy",
+        "rag_mode": "pgvector",
+        "embedding_model_id": "text-embedding",
+        "default_tenant_id": "public",
+        "jwt_issuer": "liminallm",
+        "jwt_audience": "liminal-clients",
+        "model_path": "gpt-4o-mini",
+        "model_backend": "openai",
+        "default_adapter_mode": "hybrid",
+    }
+    return {**defaults, **db_settings}
+
+
+def _get_plan_rate_multiplier(runtime, plan_tier: str) -> float:
+    """Get rate limit multiplier for a user's plan tier (SPEC §18).
+
+    Args:
+        runtime: Application runtime context
+        plan_tier: User's plan tier (free, paid, enterprise)
+
+    Returns:
+        Multiplier to apply to base rate limits
+    """
+    sys_settings = _get_system_settings(runtime)
+    multipliers = {
+        "free": sys_settings.get("rate_limit_multiplier_free", 1.0),
+        "paid": sys_settings.get("rate_limit_multiplier_paid", 2.0),
+        "enterprise": sys_settings.get("rate_limit_multiplier_enterprise", 5.0),
+    }
+    return multipliers.get(plan_tier, 1.0)
+
+
+def _get_rate_limit(runtime, key: str) -> int:
+    """Get rate limit value from database settings.
+
+    Args:
+        runtime: Application runtime context
+        key: Rate limit key (e.g., "chat_rate_limit_per_minute")
+
+    Returns:
+        Rate limit value from database or default
+    """
+    sys_settings = _get_system_settings(runtime)
+    return sys_settings.get(key, 60)
+
+
 async def _enforce_rate_limit(
     runtime, key: str, limit: int, window_seconds: int, *, response: Optional[Response] = None
 ) -> RateLimitInfo:
@@ -269,6 +412,113 @@ async def _enforce_rate_limit(
     return info
 
 
+async def _enforce_rate_limit_per_plan(
+    runtime,
+    key: str,
+    base_limit: int,
+    window_seconds: int,
+    plan_tier: str,
+    *,
+    response: Optional[Response] = None,
+) -> RateLimitInfo:
+    """Enforce rate limit adjusted for user's plan tier (SPEC §18).
+
+    Args:
+        runtime: Application runtime context
+        key: Rate limit key (e.g., "chat:{user_id}")
+        base_limit: Base rate limit (will be multiplied by plan tier)
+        window_seconds: Rate limit window in seconds
+        plan_tier: User's plan tier for multiplier lookup
+        response: Optional response to add rate limit headers to
+
+    Returns:
+        RateLimitInfo with current rate limit state
+
+    Raises:
+        HTTPException with 429 if rate limit exceeded
+    """
+    multiplier = _get_plan_rate_multiplier(runtime, plan_tier)
+    adjusted_limit = int(base_limit * multiplier)
+    return await _enforce_rate_limit(runtime, key, adjusted_limit, window_seconds, response=response)
+
+
+async def _acquire_workflow_slot(runtime, user_id: str) -> bool:
+    """Acquire a workflow concurrency slot (SPEC §18: max 3 per user).
+
+    Args:
+        runtime: Application runtime context
+        user_id: User ID
+
+    Returns:
+        True if slot acquired, raises 409 if at capacity
+
+    Raises:
+        HTTPException with 409 if concurrency cap exceeded
+    """
+    if not runtime.cache:
+        # Without Redis, we can't track concurrency - allow the request
+        return True
+
+    sys_settings = _get_system_settings(runtime)
+    max_workflows = sys_settings.get("max_concurrent_workflows", 3)
+    acquired, current = await runtime.cache.acquire_concurrency_slot(
+        "workflow",
+        user_id,
+        max_workflows,
+    )
+    if not acquired:
+        raise _http_error(
+            "busy",
+            f"concurrent workflow limit ({max_workflows}) exceeded",
+            status_code=409,
+        )
+    return True
+
+
+async def _release_workflow_slot(runtime, user_id: str) -> None:
+    """Release a workflow concurrency slot."""
+    if runtime.cache:
+        await runtime.cache.release_concurrency_slot("workflow", user_id)
+
+
+async def _acquire_inference_slot(runtime, user_id: str) -> bool:
+    """Acquire an inference concurrency slot (SPEC §18: max 2 per user).
+
+    Args:
+        runtime: Application runtime context
+        user_id: User ID
+
+    Returns:
+        True if slot acquired, raises 409 if at capacity
+
+    Raises:
+        HTTPException with 409 if concurrency cap exceeded
+    """
+    if not runtime.cache:
+        return True
+
+    sys_settings = _get_system_settings(runtime)
+    max_inference = sys_settings.get("max_concurrent_inference", 2)
+    acquired, current = await runtime.cache.acquire_concurrency_slot(
+        "inference",
+        user_id,
+        max_inference,
+    )
+    if not acquired:
+        raise _http_error(
+            "busy",
+            f"concurrent inference limit ({max_inference}) exceeded",
+            status_code=409,
+        )
+    return True
+
+
+async def _release_inference_slot(runtime, user_id: str) -> None:
+    """Release an inference concurrency slot."""
+    if runtime.cache:
+        await runtime.cache.release_concurrency_slot("inference", user_id)
+
+
 async def _resolve_idempotency(
     route: str,
     user_id: str,
@@ -277,6 +527,11 @@ async def _resolve_idempotency(
     require: bool = False,
     request_id: Optional[str] = None,
 ) -> tuple[str, Optional[Envelope]]:
+    """Resolve idempotency key using atomic acquisition (Issue 19.4).
+
+    Uses SETNX pattern to atomically claim idempotency slot and prevent race conditions
+    where concurrent requests with the same key could both start processing.
+    """
     request_id = request_id or str(uuid4())
     runtime = get_runtime()
     if not idempotency_key:
@@ -285,31 +540,39 @@ async def _resolve_idempotency(
                 "validation_error", "Idempotency-Key header required", status_code=400
             )
         return request_id, None
-    record = await _get_cached_idempotency_record(
-        runtime, route, user_id, idempotency_key
-    )
-    if record:
-        status = record.get("status")
-        if status == "in_progress":
-            raise _http_error("conflict", "request in progress", status_code=409)
-        if status in {"completed", "failed"} and record.get("response"):
-            response_payload = record.get("response", {})
-            if "request_id" not in response_payload:
-                response_payload["request_id"] = record.get("request_id", request_id)
-            return record.get("request_id", request_id), Envelope(**response_payload)
-    await _set_cached_idempotency_record(
+
+    # Attempt atomic acquisition of idempotency slot (Issue 19.4)
+    in_progress_record = {
+        "status": "in_progress",
+        "request_id": request_id,
+        "started_at": datetime.utcnow().isoformat(),
+    }
+    acquired, existing_record = await _acquire_idempotency_slot(
         runtime,
         route,
         user_id,
         idempotency_key,
-        {
-            "status": "in_progress",
-            "request_id": request_id,
-            "started_at": datetime.utcnow().isoformat(),
-        },
+        in_progress_record,
         ttl_seconds=IDEMPOTENCY_TTL_SECONDS,
     )
-    return request_id, None
+
+    if acquired:
+        # We successfully claimed the slot
+        return request_id, None
+
+    # Slot was not acquired, check the existing record
+    if existing_record:
+        status = existing_record.get("status")
+        if status == "in_progress":
+            raise _http_error("conflict", "request in progress", status_code=409)
+        if status in {"completed", "failed"} and existing_record.get("response"):
+            response_payload = existing_record.get("response", {})
+            if "request_id" not in response_payload:
+                response_payload["request_id"] = existing_record.get("request_id", request_id)
+            return existing_record.get("request_id", request_id), Envelope(**response_payload)
+
+    # Record exists but is in an unexpected state - treat as conflict
+    raise _http_error("conflict", "request in progress", status_code=409)
 
 
 async def _store_idempotency_result(
@@ -445,22 +708,15 @@ def _get_artifact_kind(schema: Any) -> Optional[str]:
 
 
 def _get_pagination_settings(runtime) -> dict:
-    """Get pagination settings from runtime config with fallback to env settings.
+    """Get pagination settings from database-managed system settings.
 
     Returns dict with: default_page_size, max_page_size, default_conversations_limit
     """
-    settings = get_settings()
-    runtime_config = (
-        runtime.store.get_runtime_config()
-        if hasattr(runtime.store, "get_runtime_config")
-        else {}
-    )
+    sys_settings = _get_system_settings(runtime)
     return {
-        "default_page_size": runtime_config.get("default_page_size", settings.default_page_size),
-        "max_page_size": runtime_config.get("max_page_size", settings.max_page_size),
-        "default_conversations_limit": runtime_config.get(
-            "default_conversations_limit", settings.default_conversations_limit
-        ),
+        "default_page_size": sys_settings.get("default_page_size", 100),
+        "max_page_size": sys_settings.get("max_page_size", 500),
+        "default_conversations_limit": sys_settings.get("default_conversations_limit", 50),
     }
 
 
@@ -493,7 +749,7 @@ def _generate_conversation_title(message: str, max_length: int = 50) -> str:
 
 
 def _apply_session_cookies(
-    response: Response, session: Session, tokens: dict, *, refresh_ttl_minutes: int
+    response: Response, session: Session, tokens: dict, *, refresh_ttl_minutes: Optional[int] = None
 ) -> None:
     # Convert naive datetime to UTC-aware for cookie expiration
     expires_at = session.expires_at
@@ -510,6 +766,11 @@ def _apply_session_cookies(
     )
     refresh_token = tokens.get("refresh_token")
     if refresh_token:
+        # Get refresh TTL from database settings if not provided
+        if refresh_ttl_minutes is None:
+            runtime = get_runtime()
+            sys_settings = _get_system_settings(runtime)
+            refresh_ttl_minutes = sys_settings.get("refresh_token_ttl_minutes", 1440)
         response.set_cookie(
             "refresh_token",
             refresh_token,
@@ -532,14 +793,14 @@ async def signup(body: SignupRequest, response: Response):
         403: If signup is disabled in settings
         429: If rate limit exceeded for this email
     """
-    settings = get_settings()
-    if not settings.allow_signup:
-        raise _http_error("forbidden", "signup disabled", status_code=403)
     runtime = get_runtime()
+    sys_settings = _get_system_settings(runtime)
+    if not sys_settings.get("allow_signup", True):
+        raise _http_error("forbidden", "signup disabled", status_code=403)
     await _enforce_rate_limit(
         runtime,
         f"signup:{body.email.lower()}",
-        runtime.settings.signup_rate_limit_per_minute,
+        _get_rate_limit(runtime, "signup_rate_limit_per_minute"),
         60,
     )
     user, session, tokens = await runtime.auth.signup(
@@ -552,8 +813,7 @@ async def signup(body: SignupRequest, response: Response):
         response,
         session,
         tokens,
-        refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes,
-    )
+            )
     return Envelope(
         status="ok",
         data=AuthResponse(
@@ -585,7 +845,7 @@ async def login(body: LoginRequest, response: Response):
     await _enforce_rate_limit(
         runtime,
         f"login:{body.email.lower()}",
-        runtime.settings.login_rate_limit_per_minute,
+        _get_rate_limit(runtime, "login_rate_limit_per_minute"),
         60,
     )
     user, session, tokens = await runtime.auth.login(
@@ -600,8 +860,7 @@ async def login(body: LoginRequest, response: Response):
         response,
         session,
         tokens,
-        refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes,
-    )
+            )
     return Envelope(
         status="ok",
         data=AuthResponse(
@@ -655,12 +914,16 @@ async def oauth_callback(
     code: str = Query(..., max_length=512, description="Authorization code from OAuth provider"),
     state: str = Query(..., max_length=128, description="State parameter for CSRF protection"),
     response: Response = ...,
-    tenant_id: Optional[str] = Query(None, max_length=128, description="Optional tenant ID"),
+    # SECURITY: tenant_id is derived from OAuth state, not from query params
+    # This prevents tenant spoofing attacks per CLAUDE.md guidelines
 ):
     """Complete OAuth authentication flow.
 
     Exchanges authorization code for tokens and creates user session.
     Called by OAuth provider after user authorizes the application.
+
+    Note: tenant_id is securely derived from the OAuth state token that was
+    set during oauth_start, not from user-controllable query parameters.
     """
     runtime = get_runtime()
     # Rate limit OAuth callback to prevent code brute-forcing
@@ -670,8 +933,9 @@ async def oauth_callback(
         limit=10,
         window_seconds=60,
     )
+    # SECURITY: Don't pass tenant_id - it's derived from validated state
     user, session, tokens = await runtime.auth.complete_oauth(
-        provider, code, state, tenant_id=tenant_id
+        provider, code, state
     )
     if not user or not session:
         raise _http_error("unauthorized", "oauth verification failed", status_code=401)
@@ -679,8 +943,7 @@ async def oauth_callback(
         response,
         session,
         tokens,
-        refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes,
-    )
+            )
     return Envelope(
         status="ok",
         data=AuthResponse(
@@ -717,8 +980,7 @@ async def refresh_tokens(
         response,
         session,
         tokens,
-        refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes,
-    )
+            )
     return Envelope(
         status="ok",
         data=AuthResponse(
@@ -750,8 +1012,8 @@ async def admin_list_users(
     await _enforce_rate_limit(
         runtime,
         f"admin:read:{principal.user_id}",
-        runtime.settings.admin_rate_limit_per_minute,
-        runtime.settings.admin_rate_limit_window_seconds,
+        _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
+        _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
     )
     paging = _get_pagination_settings(runtime)
     resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"])
@@ -775,8 +1037,8 @@ async def admin_create_user(
     await _enforce_rate_limit(
         runtime,
         f"admin:create_user:{principal.user_id}",
-        runtime.settings.admin_rate_limit_per_minute,
-        runtime.settings.admin_rate_limit_window_seconds,
+        _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
+        _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
     )
     target_tenant = body.tenant_id or principal.tenant_id
     if target_tenant != principal.tenant_id:
@@ -811,8 +1073,8 @@ async def admin_set_role(
     await _enforce_rate_limit(
         runtime,
         f"admin:set_role:{principal.user_id}",
-        runtime.settings.admin_rate_limit_per_minute,
-        runtime.settings.admin_rate_limit_window_seconds,
+        _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
+        _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
     )
     user = runtime.auth.set_user_role(user_id, body.role)
     if not user:
@@ -828,8 +1090,8 @@ async def admin_delete_user(
     await _enforce_rate_limit(
         runtime,
         f"admin:delete_user:{principal.user_id}",
-        runtime.settings.admin_rate_limit_per_minute,
-        runtime.settings.admin_rate_limit_window_seconds,
+        _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
+        _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
     )
     removed = runtime.auth.delete_user(user_id)
     if not removed:
@@ -843,8 +1105,8 @@ async def admin_list_adapters(principal: AuthContext = Depends(get_admin_user)):
     await _enforce_rate_limit(
         runtime,
         f"admin:read:{principal.user_id}",
-        runtime.settings.admin_rate_limit_per_minute,
-        runtime.settings.admin_rate_limit_window_seconds,
+        _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
+        _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
     )
     # Filter adapters by tenant to prevent cross-tenant data exposure
     adapters = list(runtime.store.list_artifacts(
@@ -888,8 +1150,8 @@ async def admin_inspect_objects(
     await _enforce_rate_limit(
         runtime,
         f"admin:read:{principal.user_id}",
-        runtime.settings.admin_rate_limit_per_minute,
-        runtime.settings.admin_rate_limit_window_seconds,
+        _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
+        _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
     )
     paging = _get_pagination_settings(runtime)
     resolved_limit = min(limit or paging["default_conversations_limit"], paging["max_page_size"])
@@ -915,8 +1177,8 @@ async def get_admin_settings(principal: AuthContext = Depends(get_admin_user)):
     await _enforce_rate_limit(
         runtime,
         f"admin:read:{principal.user_id}",
-        runtime.settings.admin_rate_limit_per_minute,
-        runtime.settings.admin_rate_limit_window_seconds,
+        _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
+        _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
     )
     settings = get_settings()
     runtime_config = (
@@ -954,8 +1216,8 @@ async def update_admin_settings(
     await _enforce_rate_limit(
         runtime,
         f"admin:settings:{principal.user_id}",
-        runtime.settings.admin_rate_limit_per_minute,
-        runtime.settings.admin_rate_limit_window_seconds,
+        _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
+        _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
     )
 
     if not hasattr(runtime.store, "set_runtime_config"):
@@ -1005,7 +1267,7 @@ async def request_mfa(body: MFARequest):
     await _enforce_rate_limit(
         runtime,
         f"mfa:request:{auth_ctx.user_id}",
-        runtime.settings.mfa_rate_limit_per_minute,
+        _get_rate_limit(runtime, "mfa_rate_limit_per_minute"),
         60,
     )
     challenge = await runtime.auth.issue_mfa_challenge(user_id=auth_ctx.user_id)
@@ -1023,7 +1285,7 @@ async def verify_mfa(body: MFAVerifyRequest, response: Response):
     await _enforce_rate_limit(
         runtime,
         f"mfa:verify:{auth_ctx.user_id}",
-        runtime.settings.mfa_rate_limit_per_minute,
+        _get_rate_limit(runtime, "mfa_rate_limit_per_minute"),
         60,
     )
     ok = await runtime.auth.verify_mfa_challenge(
@@ -1051,8 +1313,7 @@ async def verify_mfa(body: MFAVerifyRequest, response: Response):
             response,
             session,
             tokens,
-            refresh_ttl_minutes=runtime.settings.refresh_token_ttl_minutes,
-        )
+                    )
     return Envelope(status="ok", data=resp)
 
 
@@ -1063,7 +1324,7 @@ async def get_mfa_status(principal: AuthContext = Depends(get_user)):
     await _enforce_rate_limit(
         runtime,
         f"mfa:status:{principal.user_id}",
-        runtime.settings.read_rate_limit_per_minute,
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
         60,
     )
     mfa_cfg = runtime.store.get_user_mfa_secret(principal.user_id)
@@ -1083,7 +1344,7 @@ async def disable_mfa(body: MFADisableRequest, principal: AuthContext = Depends(
     await _enforce_rate_limit(
         runtime,
         f"mfa:disable:{principal.user_id}",
-        runtime.settings.mfa_rate_limit_per_minute,
+        _get_rate_limit(runtime, "mfa_rate_limit_per_minute"),
         60,
     )
     mfa_cfg = runtime.store.get_user_mfa_secret(principal.user_id)
@@ -1109,7 +1370,7 @@ async def request_reset(body: PasswordResetRequest):
     await _enforce_rate_limit(
         runtime,
         f"reset:{body.email.lower()}",
-        runtime.settings.reset_rate_limit_per_minute,
+        _get_rate_limit(runtime, "reset_rate_limit_per_minute"),
         60,
     )
     # Check if user exists before generating token (don't reveal if user exists)
@@ -1148,7 +1409,7 @@ async def get_current_user(principal: AuthContext = Depends(get_user)):
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        runtime.settings.read_rate_limit_per_minute,
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
         60,
     )
     user = runtime.store.get_user(principal.user_id)
@@ -1180,7 +1441,7 @@ async def get_user_settings(principal: AuthContext = Depends(get_user)):
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        runtime.settings.read_rate_limit_per_minute,
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
         60,
     )
     settings = runtime.store.get_user_settings(principal.user_id)
@@ -1215,7 +1476,7 @@ async def update_user_settings(
     await _enforce_rate_limit(
         runtime,
         f"write:{principal.user_id}",
-        runtime.settings.chat_rate_limit_per_minute,
+        _get_rate_limit(runtime, "chat_rate_limit_per_minute"),
         60,
     )
     settings = runtime.store.set_user_settings(
@@ -1347,125 +1608,141 @@ async def chat(
     Raises:
         401: If authentication fails
         404: If conversation or context not found
+        409: If concurrent workflow limit exceeded (SPEC §18)
         429: If rate limit exceeded
     """
     runtime = get_runtime()
     user_id = principal.user_id
+
+    # Get user's plan tier for per-plan rate limits (SPEC §18)
+    user = runtime.store.get_user(user_id)
+    plan_tier = user.plan_tier if user else "free"
+
     # SPEC §18: Accept Idempotency-Key when provided (optional)
     async with IdempotencyGuard(
         "chat", user_id, idempotency_key, require=False
     ) as idem:
         if idem.cached:
             return idem.cached
-        await _enforce_rate_limit(
+
+        # SPEC §18: Per-plan adjustable rate limits
+        await _enforce_rate_limit_per_plan(
             runtime,
             f"chat:{user_id}",
-            runtime.settings.chat_rate_limit_per_minute,
-            runtime.settings.chat_rate_limit_window_seconds,
+            _get_rate_limit(runtime, "chat_rate_limit_per_minute"),
+            _get_rate_limit(runtime, "chat_rate_limit_window_seconds"),
+            plan_tier,
         )
-        conversation: Conversation | None = None
-        context_id = body.context_id
-        validated_context_id: str | None = None
-        if body.conversation_id:
-            conversation = _get_owned_conversation(
-                runtime, body.conversation_id, principal
-            )
-        else:
-            if context_id:
-                _get_owned_context(runtime, context_id, principal)
-                validated_context_id = context_id
-            # Generate title from first message for new conversations
-            auto_title = _generate_conversation_title(body.message.content)
-            conversation = runtime.store.create_conversation(
-                user_id=user_id, active_context_id=body.context_id, title=auto_title
-            )
-        conversation_id = conversation.id
-        context_id = context_id or conversation.active_context_id
-        if context_id and context_id != validated_context_id:
-            _get_owned_context(runtime, context_id, principal)
-        user_content = body.message.content
-        voice_meta: dict = {}
-        if body.message.mode == "voice":
-            try:
-                audio_bytes = base64.b64decode(body.message.content)
-            except Exception as exc:
-                raise _http_error(
-                    "bad_request",
-                    "invalid base64-encoded audio payload",
-                    status_code=400,
-                ) from exc
-            transcript = await runtime.voice.transcribe(audio_bytes, user_id=user_id) or {}
-            user_content = transcript.get("transcript") or transcript.get("text")
-            if not user_content:
-                raise _http_error(
-                    "bad_request", "unable to transcribe audio", status_code=400
+
+        # SPEC §18: Concurrency cap - max 3 concurrent workflows per user
+        await _acquire_workflow_slot(runtime, user_id)
+        try:
+            conversation: Conversation | None = None
+            context_id = body.context_id
+            validated_context_id: str | None = None
+            if body.conversation_id:
+                conversation = _get_owned_conversation(
+                    runtime, body.conversation_id, principal
                 )
-            voice_meta = {"mode": "voice", "transcript": transcript}
-        user_content_struct = normalize_content_struct(
-            body.message.content_struct, user_content
-        )
-        runtime.store.append_message(
-            conversation_id,
-            sender="user",
-            role="user",
-            content=user_content,
-            meta=voice_meta or None,
-            content_struct=user_content_struct,
-        )
-        orchestration = await runtime.workflow.run(
-            body.workflow_id,
-            conversation_id,
-            user_content,
-            context_id,
-            user_id,
-            tenant_id=principal.tenant_id,
-        )
-        orchestration_dict: dict[str, Any] = (
-            orchestration if isinstance(orchestration, dict) else {}
-        )
-        adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
-        assistant_content_struct = normalize_content_struct(
-            orchestration_dict.get("content_struct"),
-            orchestration_dict.get("content"),
-        )
-        assistant_content = orchestration_dict.get("content", "No response generated.")
-        assistant_msg = runtime.store.append_message(
-            conversation_id,
-            sender="assistant",
-            role="assistant",
-            content=assistant_content,
-            content_struct=assistant_content_struct,
-            meta={
-                "adapters": orchestration_dict.get("adapters", []),
-                "adapter_gates": orchestration_dict.get("adapter_gates", []),
-                "routing_trace": orchestration_dict.get("routing_trace", []),
-                "workflow_trace": orchestration_dict.get("workflow_trace", []),
-                "usage": orchestration_dict.get("usage", {}),
-            },
-        )
-        resp = ChatResponse(
-            message_id=assistant_msg.id,
-            conversation_id=conversation_id,
-            content=assistant_msg.content,
-            content_struct=assistant_msg.content_struct,
-            workflow_id=body.workflow_id,
-            adapters=adapter_names,
-            adapter_gates=orchestration_dict.get("adapter_gates", []),
-            usage=orchestration_dict.get("usage", {}),
-            context_snippets=orchestration_dict.get("context_snippets", []),
-            routing_trace=orchestration_dict.get("routing_trace", []),
-            workflow_trace=orchestration_dict.get("workflow_trace", []),
-        )
-        envelope = Envelope(
-            status="ok", data=resp.model_dump(), request_id=idem.request_id
-        )
-        if runtime.cache:
-            history = runtime.store.list_messages(
-                conversation_id, user_id=principal.user_id
+            else:
+                if context_id:
+                    _get_owned_context(runtime, context_id, principal)
+                    validated_context_id = context_id
+                # Generate title from first message for new conversations
+                auto_title = _generate_conversation_title(body.message.content)
+                conversation = runtime.store.create_conversation(
+                    user_id=user_id, active_context_id=body.context_id, title=auto_title
+                )
+            conversation_id = conversation.id
+            context_id = context_id or conversation.active_context_id
+            if context_id and context_id != validated_context_id:
+                _get_owned_context(runtime, context_id, principal)
+            user_content = body.message.content
+            voice_meta: dict = {}
+            if body.message.mode == "voice":
+                try:
+                    audio_bytes = base64.b64decode(body.message.content)
+                except Exception as exc:
+                    raise _http_error(
+                        "validation_error",
+                        "invalid base64-encoded audio payload",
+                        status_code=400,
+                    ) from exc
+                transcript = await runtime.voice.transcribe(audio_bytes, user_id=user_id) or {}
+                user_content = transcript.get("transcript") or transcript.get("text")
+                if not user_content:
+                    raise _http_error(
+                        "validation_error", "unable to transcribe audio", status_code=400
+                    )
+                voice_meta = {"mode": "voice", "transcript": transcript}
+            user_content_struct = normalize_content_struct(
+                body.message.content_struct, user_content
             )
-            await runtime.workflow.cache_conversation_state(conversation_id, history)
-        await idem.store_result(envelope)
-        return envelope
+            runtime.store.append_message(
+                conversation_id,
+                sender="user",
+                role="user",
+                content=user_content,
+                meta=voice_meta or None,
+                content_struct=user_content_struct,
+            )
+            orchestration = await runtime.workflow.run(
+                body.workflow_id,
+                conversation_id,
+                user_content,
+                context_id,
+                user_id,
+                tenant_id=principal.tenant_id,
+            )
+            orchestration_dict: dict[str, Any] = (
+                orchestration if isinstance(orchestration, dict) else {}
+            )
+            adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
+            assistant_content_struct = normalize_content_struct(
+                orchestration_dict.get("content_struct"),
+                orchestration_dict.get("content"),
+            )
+            assistant_content = orchestration_dict.get("content", "No response generated.")
+            assistant_msg = runtime.store.append_message(
+                conversation_id,
+                sender="assistant",
+                role="assistant",
+                content=assistant_content,
+                content_struct=assistant_content_struct,
+                meta={
+                    "adapters": orchestration_dict.get("adapters", []),
+                    "adapter_gates": orchestration_dict.get("adapter_gates", []),
+                    "routing_trace": orchestration_dict.get("routing_trace", []),
+                    "workflow_trace": orchestration_dict.get("workflow_trace", []),
+                    "usage": orchestration_dict.get("usage", {}),
+                },
+            )
+            resp = ChatResponse(
+                message_id=assistant_msg.id,
+                conversation_id=conversation_id,
+                content=assistant_msg.content,
+                content_struct=assistant_msg.content_struct,
+                workflow_id=body.workflow_id,
+                adapters=adapter_names,
+                adapter_gates=orchestration_dict.get("adapter_gates", []),
+                usage=orchestration_dict.get("usage", {}),
+                context_snippets=orchestration_dict.get("context_snippets", []),
+                routing_trace=orchestration_dict.get("routing_trace", []),
+                workflow_trace=orchestration_dict.get("workflow_trace", []),
+            )
+            envelope = Envelope(
+                status="ok", data=resp.model_dump(), request_id=idem.request_id
+            )
+            if runtime.cache:
+                history = runtime.store.list_messages(
+                    conversation_id, user_id=principal.user_id
+                )
+                await runtime.workflow.cache_conversation_state(conversation_id, history)
+            await idem.store_result(envelope)
+            return envelope
+        finally:
+            # Always release workflow slot, even on error
+            await _release_workflow_slot(runtime, user_id)
     # Exceptions bubble through the guard which records failed states
 
 
@@ -1668,7 +1945,7 @@ async def list_artifacts(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        runtime.settings.read_rate_limit_per_minute,
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
         60,
     )
     paging = _get_pagination_settings(runtime)
@@ -1681,10 +1958,12 @@ async def list_artifacts(
     resolved_page_size = min(max(effective_page_size, 1), paging["max_page_size"])
 
     # Get one extra item to determine if there are more pages
+    # Pass tenant_id for proper shared artifact visibility filtering
     raw_items = list(runtime.store.list_artifacts(
         type_filter=type_filter,
         kind_filter=kind_filter,
         owner_user_id=principal.user_id,
+        tenant_id=principal.tenant_id,
         page=page,
         page_size=resolved_page_size + 1,
         visibility=visibility,
@@ -1734,7 +2013,7 @@ async def get_artifact(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        runtime.settings.read_rate_limit_per_minute,
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
         60,
     )
     artifact = _get_owned_artifact(runtime, artifact_id, principal)
@@ -1765,7 +2044,7 @@ async def list_tool_specs(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        runtime.settings.read_rate_limit_per_minute,
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
         60,
     )
     resolved_page_size = min(max(page_size, 1), 200)
@@ -1815,7 +2094,7 @@ async def get_tool_spec(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        runtime.settings.read_rate_limit_per_minute,
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
         60,
     )
     artifact = _get_owned_artifact(runtime, artifact_id, principal)
@@ -1850,7 +2129,7 @@ async def list_workflows(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        runtime.settings.read_rate_limit_per_minute,
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
         60,
     )
     resolved_page_size = min(max(page_size, 1), 200)
@@ -1901,7 +2180,7 @@ async def list_artifact_versions(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        runtime.settings.read_rate_limit_per_minute,
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
         60,
     )
     paging = _get_pagination_settings(runtime)
@@ -2053,35 +2332,168 @@ async def create_artifact(
         return envelope
 
 
+def _apply_json_patch_ops(schema: dict, ops: list) -> dict:
+    """Apply RFC 6902 JSON Patch operations to a schema.
+
+    Supports: add, remove, replace, move, copy, test
+    """
+    import copy
+    result = copy.deepcopy(schema)
+
+    for op in ops:
+        action = op.get("op", "")
+        path = op.get("path", "")
+        value = op.get("value")
+        from_path = op.get("from", "")
+
+        segments = [seg for seg in path.strip("/").split("/") if seg]
+        if not segments:
+            continue
+
+        # Navigate to parent
+        parent = result
+        for seg in segments[:-1]:
+            if isinstance(parent, list):
+                try:
+                    parent = parent[int(seg)]
+                except (ValueError, IndexError):
+                    break
+            elif isinstance(parent, dict):
+                parent = parent.setdefault(seg, {})
+            else:
+                break
+
+        key = segments[-1]
+
+        if action in ("add", "replace"):
+            if isinstance(parent, dict):
+                parent[key] = value
+            elif isinstance(parent, list):
+                try:
+                    idx = int(key) if key != "-" else len(parent)
+                    if action == "add":
+                        parent.insert(idx, value)
+                    else:
+                        parent[idx] = value
+                except (ValueError, IndexError):
+                    pass
+
+        elif action == "remove":
+            if isinstance(parent, dict) and key in parent:
+                del parent[key]
+            elif isinstance(parent, list):
+                try:
+                    del parent[int(key)]
+                except (ValueError, IndexError):
+                    pass
+
+        elif action == "move":
+            # Get value from source
+            from_segments = [seg for seg in from_path.strip("/").split("/") if seg]
+            if from_segments:
+                src_parent = result
+                for seg in from_segments[:-1]:
+                    if isinstance(src_parent, dict):
+                        src_parent = src_parent.get(seg, {})
+                    elif isinstance(src_parent, list):
+                        try:
+                            src_parent = src_parent[int(seg)]
+                        except (ValueError, IndexError):
+                            break
+                src_key = from_segments[-1]
+                if isinstance(src_parent, dict) and src_key in src_parent:
+                    value = src_parent.pop(src_key)
+                    if isinstance(parent, dict):
+                        parent[key] = value
+
+        elif action == "copy":
+            from_segments = [seg for seg in from_path.strip("/").split("/") if seg]
+            if from_segments:
+                src = result
+                for seg in from_segments:
+                    if isinstance(src, dict):
+                        src = src.get(seg)
+                    elif isinstance(src, list):
+                        try:
+                            src = src[int(seg)]
+                        except (ValueError, IndexError):
+                            src = None
+                            break
+                if src is not None and isinstance(parent, dict):
+                    parent[key] = copy.deepcopy(src)
+
+        elif action == "test":
+            # Test operation - verify value matches
+            current = parent.get(key) if isinstance(parent, dict) else None
+            if current != value:
+                raise BadRequestError(
+                    "JSON Patch test operation failed",
+                    detail={"path": path, "expected": value, "actual": current},
+                )
+
+    return result
+
+
+def _deep_merge(base: dict, updates: dict) -> dict:
+    """Deep merge updates into base dict."""
+    import copy
+    result = copy.deepcopy(base)
+    for key, value in updates.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
 @router.patch("/artifacts/{artifact_id}", response_model=Envelope, tags=["artifacts"])
 async def patch_artifact(
-    artifact_id: str, body: ArtifactRequest, principal: AuthContext = Depends(get_user)
+    artifact_id: str,
+    body: ArtifactPatchRequest,
+    principal: AuthContext = Depends(get_user),
 ):
+    """Update an artifact via RFC 6902 JSON Patch or legacy schema update.
+
+    Accepts:
+    - RFC 6902 format: {"patch": [{"op": "replace", "path": "/schema/foo", "value": "bar"}]}
+    - Legacy format: {"schema": {...}, "description": "..."} (for backward compatibility)
+    """
     runtime = get_runtime()
     current = _get_owned_artifact(runtime, artifact_id, principal)
-    if not isinstance(body.schema, dict):
+
+    normalized = body.get_normalized_patch()
+    new_schema = dict(current.schema) if isinstance(current.schema, dict) else {}
+    new_description = current.description
+
+    if "ops" in normalized:
+        # RFC 6902 JSON Patch operations
+        ops = normalized["ops"]
+        if ops:
+            new_schema = _apply_json_patch_ops(new_schema, ops)
+    elif "schema_update" in normalized:
+        # Legacy schema update - deep merge
+        new_schema = _deep_merge(new_schema, normalized["schema_update"])
+
+    if "description" in normalized:
+        new_description = normalized["description"]
+
+    # Validate kind prefix
+    schema_kind = new_schema.get("kind")
+    if schema_kind and not schema_kind.startswith(f"{current.type}."):
         raise BadRequestError(
-            "artifact schema must be an object",
-            detail={"provided_type": type(body.schema).__name__},
+            "kind must start with the type prefix",
+            detail={"kind": schema_kind, "type": current.type},
         )
-    schema_kind = body.schema.get("kind")
-    artifact_schema = dict(body.schema)
-    if schema_kind:
-        if not schema_kind.startswith(f"{current.type}."):
-            raise BadRequestError(
-                "kind must start with the type prefix",
-                detail={"kind": schema_kind, "type": current.type},
-            )
-        artifact_schema["kind"] = schema_kind
+
     artifact = runtime.store.update_artifact(
         artifact_id,
-        schema=artifact_schema,
-        description=body.description,
+        schema=new_schema,
+        description=new_description,
         version_author=principal.user_id,
     )
     if not artifact:
         raise NotFoundError("artifact not found", detail={"artifact_id": artifact_id})
-    # Get the new version after update
+
     current_version = runtime.store.get_artifact_current_version(artifact_id)
     resp = ArtifactResponse(
         id=artifact.id,
@@ -2108,7 +2520,7 @@ async def propose_patch(
     await _enforce_rate_limit(
         runtime,
         f"configops:{principal.user_id}",
-        runtime.settings.configops_rate_limit_per_hour,
+        _get_rate_limit(runtime, "configops_rate_limit_per_hour"),
         3600,
     )
     proposer = "human_admin" if principal.role == "admin" else "user"
@@ -2142,7 +2554,7 @@ async def list_config_patches(
     await _enforce_rate_limit(
         runtime,
         f"configops:{principal.user_id}",
-        runtime.settings.configops_rate_limit_per_hour,
+        _get_rate_limit(runtime, "configops_rate_limit_per_hour"),
         3600,
     )
     patches = runtime.store.list_config_patches(status)
@@ -2175,7 +2587,7 @@ async def decide_config_patch(
     await _enforce_rate_limit(
         runtime,
         f"configops:{principal.user_id}",
-        runtime.settings.configops_rate_limit_per_hour,
+        _get_rate_limit(runtime, "configops_rate_limit_per_hour"),
         3600,
     )
     decision = runtime.config_ops.decide_patch(patch_id, body.decision, body.reason)
@@ -2203,7 +2615,7 @@ async def apply_config_patch(
     await _enforce_rate_limit(
         runtime,
         f"configops:{principal.user_id}",
-        runtime.settings.configops_rate_limit_per_hour,
+        _get_rate_limit(runtime, "configops_rate_limit_per_hour"),
         3600,
     )
     result = runtime.config_ops.apply_patch(
@@ -2238,7 +2650,7 @@ async def auto_patch(
     await _enforce_rate_limit(
         runtime,
         f"configops:{principal.user_id}",
-        runtime.settings.configops_rate_limit_per_hour,
+        _get_rate_limit(runtime, "configops_rate_limit_per_hour"),
         3600,
     )
     audit = runtime.config_ops.auto_generate_patch(
@@ -2266,8 +2678,8 @@ async def get_config(principal: AuthContext = Depends(get_admin_user)):
     await _enforce_rate_limit(
         runtime,
         f"admin:read:{principal.user_id}",
-        runtime.settings.admin_rate_limit_per_minute,
-        runtime.settings.admin_rate_limit_window_seconds,
+        _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
+        _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
     )
 
     def _sanitize_dict(data: dict) -> dict:
@@ -2327,19 +2739,282 @@ async def get_config(principal: AuthContext = Depends(get_admin_user)):
     )
 
 
+@router.get("/admin/settings", response_model=Envelope, tags=["admin"])
+async def get_system_settings(principal: AuthContext = Depends(get_admin_user)):
+    """Get admin-managed system settings.
+
+    Returns settings for session rotation, concurrency caps, and rate limit
+    multipliers that can be modified via the admin UI.
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"admin:read:{principal.user_id}",
+        _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
+        _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
+    )
+    settings = (
+        runtime.store.get_system_settings()
+        if hasattr(runtime.store, "get_system_settings")
+        else {}
+    )
+    return Envelope(status="ok", data=settings)
+
+
+@router.put("/admin/settings", response_model=Envelope, tags=["admin"])
+async def update_system_settings(
+    body: dict,
+    principal: AuthContext = Depends(get_admin_user),
+):
+    """Update admin-managed system settings.
+
+    Allows admins to modify operational parameters without restarting the application.
+
+    Supported settings (all have sensible defaults):
+    - Session: session_rotation_hours (24), session_rotation_grace_seconds (300)
+    - Concurrency: max_concurrent_workflows (3), max_concurrent_inference (2)
+    - Rate multipliers: rate_limit_multiplier_free (1.0), _paid (2.0), _enterprise (5.0)
+    - Rate limits: chat_rate_limit_per_minute (60), chat_rate_limit_window_seconds (60),
+      login_rate_limit_per_minute (10), signup_rate_limit_per_minute (5),
+      reset_rate_limit_per_minute (5), mfa_rate_limit_per_minute (5),
+      admin_rate_limit_per_minute (30), admin_rate_limit_window_seconds (60),
+      files_upload_rate_limit_per_minute (10), configops_rate_limit_per_hour (30),
+      read_rate_limit_per_minute (120)
+    - Pagination: default_page_size (100), max_page_size (500), default_conversations_limit (50)
+    - Files: max_upload_bytes (10485760), rag_chunk_size (400)
+    - Token TTL: access_token_ttl_minutes (30), refresh_token_ttl_minutes (1440)
+    - Feature flags: enable_mfa (true), allow_signup (true)
+    - Training worker: training_worker_enabled (true), training_worker_poll_interval (60)
+    - SMTP: smtp_host, smtp_port (587), smtp_user, smtp_password, smtp_use_tls (true),
+      email_from_address, email_from_name ("LiminalLM")
+    - URL settings: oauth_redirect_uri, app_base_url ("http://localhost:8000")
+    - Voice: voice_transcription_model (whisper-1), voice_synthesis_model (tts-1, tts-1-hd),
+      voice_default_voice (alloy, echo, fable, onyx, nova, shimmer)
+    - Model: rag_mode (pgvector, memory), embedding_model_id (text-embedding, text-embedding-3-small,
+      text-embedding-3-large, text-embedding-ada-002), model_path ("gpt-4o-mini" with suggestions),
+      model_backend (openai, azure, together, etc.), default_adapter_mode (local, remote, prompt, hybrid)
+    - Tenant: default_tenant_id ("public"), jwt_issuer ("liminallm"), jwt_audience ("liminal-clients")
+    """
+    runtime = get_runtime()
+    sys_settings = _get_system_settings(runtime)
+    await _enforce_rate_limit(
+        runtime,
+        f"admin:write:{principal.user_id}",
+        sys_settings.get("admin_rate_limit_per_minute", 30),
+        sys_settings.get("admin_rate_limit_window_seconds", 60),
+    )
+
+    # Validate settings
+    allowed_keys = {
+        "session_rotation_hours",
+        "session_rotation_grace_seconds",
+        "max_concurrent_workflows",
+        "max_concurrent_inference",
+        "rate_limit_multiplier_free",
+        "rate_limit_multiplier_paid",
+        "rate_limit_multiplier_enterprise",
+        "chat_rate_limit_per_minute",
+        "chat_rate_limit_window_seconds",
+        "login_rate_limit_per_minute",
+        "signup_rate_limit_per_minute",
+        "reset_rate_limit_per_minute",
+        "mfa_rate_limit_per_minute",
+        "admin_rate_limit_per_minute",
+        "admin_rate_limit_window_seconds",
+        "files_upload_rate_limit_per_minute",
+        "configops_rate_limit_per_hour",
+        "read_rate_limit_per_minute",
+        "default_page_size",
+        "max_page_size",
+        "default_conversations_limit",
+        "max_upload_bytes",
+        "rag_chunk_size",
+        "access_token_ttl_minutes",
+        "refresh_token_ttl_minutes",
+        "enable_mfa",
+        "allow_signup",
+        "training_worker_enabled",
+        "training_worker_poll_interval",
+        "smtp_host",
+        "smtp_port",
+        "smtp_user",
+        "smtp_password",
+        "smtp_use_tls",
+        "email_from_address",
+        "email_from_name",
+        "oauth_redirect_uri",
+        "app_base_url",
+        "voice_transcription_model",
+        "voice_synthesis_model",
+        "voice_default_voice",
+        "rag_mode",
+        "embedding_model_id",
+        "default_tenant_id",
+        "jwt_issuer",
+        "jwt_audience",
+        "model_path",
+        "model_backend",
+        "default_adapter_mode",
+    }
+    invalid_keys = set(body.keys()) - allowed_keys
+    if invalid_keys:
+        raise _http_error(
+            "validation_error",
+            f"Invalid settings keys: {', '.join(invalid_keys)}",
+            status_code=400,
+        )
+
+    # Type validation
+    int_keys = {
+        "session_rotation_hours",
+        "session_rotation_grace_seconds",
+        "max_concurrent_workflows",
+        "max_concurrent_inference",
+        "chat_rate_limit_per_minute",
+        "chat_rate_limit_window_seconds",
+        "login_rate_limit_per_minute",
+        "signup_rate_limit_per_minute",
+        "reset_rate_limit_per_minute",
+        "mfa_rate_limit_per_minute",
+        "admin_rate_limit_per_minute",
+        "admin_rate_limit_window_seconds",
+        "files_upload_rate_limit_per_minute",
+        "configops_rate_limit_per_hour",
+        "read_rate_limit_per_minute",
+        "default_page_size",
+        "max_page_size",
+        "default_conversations_limit",
+        "max_upload_bytes",
+        "rag_chunk_size",
+        "access_token_ttl_minutes",
+        "refresh_token_ttl_minutes",
+        "training_worker_poll_interval",
+        "smtp_port",
+    }
+    float_keys = {
+        "rate_limit_multiplier_free",
+        "rate_limit_multiplier_paid",
+        "rate_limit_multiplier_enterprise",
+    }
+    bool_keys = {
+        "enable_mfa",
+        "allow_signup",
+        "training_worker_enabled",
+        "smtp_use_tls",
+    }
+    string_keys = {
+        "smtp_host",
+        "smtp_user",
+        "smtp_password",
+        "email_from_address",
+        "email_from_name",
+        "oauth_redirect_uri",
+        "app_base_url",
+        "voice_transcription_model",
+        "voice_synthesis_model",
+        "voice_default_voice",
+        "rag_mode",
+        "embedding_model_id",
+        "default_tenant_id",
+        "jwt_issuer",
+        "jwt_audience",
+        "model_path",
+        "model_backend",
+        "default_adapter_mode",
+    }
+    # Enum validation for settings with known valid values
+    enum_values = {
+        "voice_transcription_model": {"whisper-1"},
+        "voice_synthesis_model": {"tts-1", "tts-1-hd"},
+        "voice_default_voice": {"alloy", "echo", "fable", "onyx", "nova", "shimmer"},
+        "rag_mode": {"pgvector", "memory"},
+        "model_backend": {
+            "openai", "azure", "azure_openai", "vertex", "gemini", "google",
+            "bedrock", "together", "together.ai", "lorax", "adapter_server",
+            "sagemaker", "aws_sagemaker",
+        },
+        "default_adapter_mode": {"local", "remote", "prompt", "hybrid"},
+        "embedding_model_id": {
+            "text-embedding", "text-embedding-3-small", "text-embedding-3-large",
+            "text-embedding-ada-002",
+        },
+    }
+    for key, value in body.items():
+        if key in int_keys and not isinstance(value, int):
+            raise _http_error(
+                "validation_error",
+                f"{key} must be an integer",
+                status_code=400,
+            )
+        if key in float_keys and not isinstance(value, (int, float)):
+            raise _http_error(
+                "validation_error",
+                f"{key} must be a number",
+                status_code=400,
+            )
+        if key in bool_keys and not isinstance(value, bool):
+            raise _http_error(
+                "validation_error",
+                f"{key} must be a boolean",
+                status_code=400,
+            )
+        if key in string_keys and not isinstance(value, str):
+            raise _http_error(
+                "validation_error",
+                f"{key} must be a string",
+                status_code=400,
+            )
+        # Validate positive values for numeric settings
+        if key in int_keys and isinstance(value, int) and value <= 0:
+            raise _http_error(
+                "validation_error",
+                f"{key} must be positive",
+                status_code=400,
+            )
+        if key in float_keys and isinstance(value, (int, float)) and value <= 0:
+            raise _http_error(
+                "validation_error",
+                f"{key} must be positive",
+                status_code=400,
+            )
+        # Validate enum values
+        if key in enum_values and value not in enum_values[key]:
+            raise _http_error(
+                "validation_error",
+                f"{key} must be one of: {', '.join(sorted(enum_values[key]))}",
+                status_code=400,
+            )
+
+    if hasattr(runtime.store, "set_system_settings"):
+        updated = runtime.store.set_system_settings(body)
+    else:
+        raise _http_error(
+            "not_implemented",
+            "System settings not supported with this storage backend",
+            status_code=501,
+        )
+
+    logger.info(
+        "system_settings_updated",
+        admin_user_id=principal.user_id,
+        updated_keys=list(body.keys()),
+    )
+    return Envelope(status="ok", data=updated)
+
+
 @router.get("/files/limits", response_model=Envelope, tags=["files"])
 async def get_file_limits(principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        runtime.settings.read_rate_limit_per_minute,
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
         60,
     )
     return Envelope(
         status="ok",
         data={
-            "max_upload_bytes": runtime.settings.max_upload_bytes,
+            "max_upload_bytes": _get_rate_limit(runtime, "max_upload_bytes"),
         },
     )
 
@@ -2359,7 +3034,7 @@ async def upload_file(
     await _enforce_rate_limit(
         runtime,
         f"files:upload:{principal.user_id}",
-        runtime.settings.files_upload_rate_limit_per_minute,
+        _get_rate_limit(runtime, "files_upload_rate_limit_per_minute"),
         60,
     )
     # SPEC §18: Accept Idempotency-Key when provided (optional)
@@ -2382,7 +3057,7 @@ async def upload_file(
             / principal.user_id
             / "files"
         )
-        max_bytes = max(1, runtime.settings.max_upload_bytes)
+        max_bytes = max(1, _get_rate_limit(runtime, "max_upload_bytes"))
         contents = await file.read(max_bytes + 1)
         if len(contents) > max_bytes:
             raise _http_error("validation_error", "file too large", status_code=413)
@@ -2446,7 +3121,7 @@ async def list_messages(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        runtime.settings.read_rate_limit_per_minute,
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
         60,
     )
     paging = _get_pagination_settings(runtime)
@@ -2496,7 +3171,7 @@ async def create_conversation(
         await _enforce_rate_limit(
             runtime,
             f"write:{principal.user_id}",
-            runtime.settings.write_rate_limit_per_minute,
+            _get_rate_limit(runtime, "write_rate_limit_per_minute"),
             60,
         )
         # Validate context_id if provided
@@ -2518,7 +3193,7 @@ async def create_conversation(
                 active_context_id=conversation.active_context_id,
             ),
         )
-        idem.result = response
+        await idem.store_result(response)
         return response
 
 
@@ -2532,7 +3207,7 @@ async def list_conversations(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        runtime.settings.read_rate_limit_per_minute,
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
         60,
     )
     paging = _get_pagination_settings(runtime)
@@ -2579,7 +3254,7 @@ async def get_conversation(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        runtime.settings.read_rate_limit_per_minute,
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
         60,
     )
     conversation = _get_owned_conversation(runtime, conversation_id, principal)
@@ -2644,7 +3319,7 @@ async def list_contexts(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        runtime.settings.read_rate_limit_per_minute,
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
         60,
     )
     paging = _get_pagination_settings(runtime)
@@ -2675,7 +3350,7 @@ async def list_chunks(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        runtime.settings.read_rate_limit_per_minute,
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
         60,
     )
     paging = _get_pagination_settings(runtime)
@@ -2714,6 +3389,46 @@ async def add_context_source(
     """
     runtime = get_runtime()
 
+    # SECURITY: Validate path to prevent path traversal attacks (Issue 14.1)
+    # Per SPEC §18: "all filesystem paths resolved via safe_join(base=/users/{user_id}, relative)"
+    user_base = FilePath(runtime.settings.shared_fs_root) / "users" / principal.user_id
+    shared_base = FilePath(runtime.settings.shared_fs_root) / "shared"
+
+    fs_path = body.fs_path
+    validated_path = None
+
+    # Try user's directory first
+    try:
+        validated_path = safe_join(user_base, fs_path)
+    except PathTraversalError:
+        pass
+
+    # Try shared directory if user directory didn't work
+    if validated_path is None:
+        try:
+            validated_path = safe_join(shared_base, fs_path)
+        except PathTraversalError:
+            pass
+
+    # Also allow absolute paths within allowed directories
+    if validated_path is None:
+        abs_path = FilePath(fs_path).resolve()
+        user_base_resolved = user_base.resolve()
+        shared_base_resolved = shared_base.resolve()
+        if abs_path == user_base_resolved or user_base_resolved in abs_path.parents:
+            validated_path = abs_path
+        elif abs_path == shared_base_resolved or shared_base_resolved in abs_path.parents:
+            validated_path = abs_path
+
+    if validated_path is None:
+        raise BadRequestError(
+            "path not allowed",
+            detail={
+                "fs_path": fs_path,
+                "reason": "path must be within user directory or shared directory",
+            },
+        )
+
     async with IdempotencyGuard(
         "context_sources:create", principal.user_id, idempotency_key, require=False
     ) as idem:
@@ -2723,19 +3438,21 @@ async def add_context_source(
         # Verify context ownership
         _get_owned_context(runtime, context_id, principal)
 
-        # Add the source
+        # Add the source with validated path
         source = runtime.store.add_context_source(
             context_id=context_id,
-            fs_path=body.fs_path,
+            fs_path=str(validated_path),
             recursive=body.recursive,
         )
 
-        # Trigger indexing via RAG service
+        # Trigger indexing via RAG service with validated path
+        # Pass allowed_base for defense-in-depth path traversal protection
         try:
             runtime.rag.ingest_path(
                 context_id=context_id,
-                fs_path=body.fs_path,
+                fs_path=str(validated_path),
                 recursive=body.recursive,
+                allowed_base=runtime.settings.shared_fs_root,
             )
         except Exception as exc:
             # Clean up the source record since ingestion failed
@@ -2780,7 +3497,7 @@ async def list_context_sources(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        runtime.settings.read_rate_limit_per_minute,
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
         60,
     )
 
@@ -2810,7 +3527,7 @@ async def transcribe_voice(
     await _enforce_rate_limit(
         runtime,
         f"voice:transcribe:{principal.user_id}",
-        runtime.settings.chat_rate_limit_per_minute,  # Use chat rate limit as default
+        _get_rate_limit(runtime, "chat_rate_limit_per_minute"),  # Use chat rate limit as default
         60,
     )
     # Limit audio file size to 10MB
@@ -2833,7 +3550,7 @@ async def synthesize_voice(
     await _enforce_rate_limit(
         runtime,
         f"voice:synthesize:{principal.user_id}",
-        runtime.settings.chat_rate_limit_per_minute,  # Use chat rate limit as default
+        _get_rate_limit(runtime, "chat_rate_limit_per_minute"),  # Use chat rate limit as default
         60,
     )
     # Limit text length to prevent resource exhaustion
@@ -2859,6 +3576,8 @@ async def websocket_chat(ws: WebSocket):
     # Generate request_id immediately to ensure traceability even on early errors
     request_id: str = str(uuid4())
     convo_id: Optional[str] = None
+    workflow_slot_acquired: bool = False
+    ws_connection_slot_acquired: bool = False
     try:
         init = await ws.receive_json()
         idempotency_key = init.get("idempotency_key")
@@ -2874,6 +3593,33 @@ async def websocket_chat(ws: WebSocket):
             await ws.close(code=4401)
             return
         user_id = auth_ctx.user_id
+
+        # Issue 5.2: Per-user WebSocket connection limits
+        if runtime.cache:
+            sys_settings = _get_system_settings(runtime)
+            max_ws_connections = sys_settings.get("max_websocket_connections_per_user", 5)
+            acquired, _ = await runtime.cache.acquire_concurrency_slot(
+                "websocket",
+                user_id,
+                max_ws_connections,
+            )
+            if not acquired:
+                await ws.send_json({
+                    "event": "error",
+                    "data": {
+                        "error": "connection_limit",
+                        "message": f"concurrent WebSocket connection limit ({max_ws_connections}) exceeded",
+                    },
+                    "request_id": request_id,
+                })
+                await ws.close(code=4429)  # Custom code for "too many connections"
+                return
+            ws_connection_slot_acquired = True
+
+        # Get user's plan tier for per-plan rate limits (SPEC §18)
+        user = runtime.store.get_user(user_id)
+        plan_tier = user.plan_tier if user else "free"
+
         # SPEC §18: Accept Idempotency-Key when provided (optional)
         request_id, cached = await _resolve_idempotency(
             "chat:ws", user_id, idempotency_key, require=False, request_id=request_id
@@ -2881,12 +3627,39 @@ async def websocket_chat(ws: WebSocket):
         if cached:
             await ws.send_json(cached.model_dump())
             return
-        await _enforce_rate_limit(
+
+        # SPEC §18: Per-plan adjustable rate limits
+        await _enforce_rate_limit_per_plan(
             runtime,
             f"chat:{user_id}",
-            runtime.settings.chat_rate_limit_per_minute,
-            runtime.settings.chat_rate_limit_window_seconds,
+            _get_rate_limit(runtime, "chat_rate_limit_per_minute"),
+            _get_rate_limit(runtime, "chat_rate_limit_window_seconds"),
+            plan_tier,
         )
+
+        # SPEC §18: Concurrency cap - max 3 concurrent workflows per user
+        # Check if we can acquire a slot; if not, close with 409-equivalent code
+        if runtime.cache:
+            sys_settings = _get_system_settings(runtime)
+            max_workflows = sys_settings.get("max_concurrent_workflows", 3)
+            acquired, _ = await runtime.cache.acquire_concurrency_slot(
+                "workflow",
+                user_id,
+                max_workflows,
+            )
+            if not acquired:
+                await ws.send_json({
+                    "event": "error",
+                    "data": {
+                        "error": "busy",
+                        "message": f"concurrent workflow limit ({max_workflows}) exceeded",
+                    },
+                    "request_id": request_id,
+                })
+                await ws.close(code=4409)  # Custom code for "busy"
+                return
+            workflow_slot_acquired = True
+
         convo_id = init.get("conversation_id")
         if convo_id:
             conversation = _get_owned_conversation(runtime, convo_id, auth_ctx)
@@ -2926,14 +3699,15 @@ async def websocket_chat(ws: WebSocket):
                                 cancel_event.set()
                                 return
                             elif msg.get("action") == "ping":
-                                await ws.send_json({"event": "pong", "data": None})
+                                await ws.send_json({"event": "pong", "data": None, "request_id": request_id})
                         except asyncio.TimeoutError:
                             continue
                         except WebSocketDisconnect:
                             cancel_event.set()
                             return
-                except Exception:
-                    pass  # Listener task should exit silently on errors
+                except Exception as exc:
+                    # Listener task exits silently on errors; log for debugging
+                    logger.debug("websocket_listener_exit", error=str(exc))
 
             cancel_listener = asyncio.create_task(listen_for_cancel())
 
@@ -2950,8 +3724,8 @@ async def websocket_chat(ws: WebSocket):
                     event_type = event.get("event")
                     event_data = event.get("data")
 
-                    # SPEC §18: WebSockets wrap as {"event": "token", "data": "..."}
-                    await ws.send_json({"event": event_type, "data": event_data})
+                    # SPEC §18: WebSockets wrap as {"event": "token", "data": "...", "request_id": "..."}
+                    await ws.send_json({"event": event_type, "data": event_data, "request_id": request_id})
 
                     if event_type == "token":
                         full_content += event_data if isinstance(event_data, str) else ""
@@ -3018,8 +3792,9 @@ async def websocket_chat(ws: WebSocket):
             await _store_idempotency_result("chat:ws", user_id, idempotency_key, envelope)
 
             # Send final event with message_id and conversation_id to client
+            # SPEC §18: Valid events are token, message_done, error, cancel_ack, trace
             await ws.send_json({
-                "event": "streaming_complete",
+                "event": "message_done",
                 "data": {
                     "message_id": assistant_msg.id,
                     "conversation_id": convo_id,
@@ -3029,7 +3804,8 @@ async def websocket_chat(ws: WebSocket):
                     "context_snippets": orchestration_dict.get("context_snippets", []),
                     "routing_trace": orchestration_dict.get("routing_trace", []),
                     "workflow_trace": orchestration_dict.get("workflow_trace", []),
-                }
+                },
+                "request_id": request_id,
             })
 
         else:
@@ -3111,13 +3887,13 @@ async def websocket_chat(ws: WebSocket):
         )
         error_env = Envelope(
             status="error",
-            error={"code": "invalid_json", "message": "Invalid JSON in request"},
+            error={"code": "validation_error", "message": "Invalid JSON in request"},
             request_id=request_id,
         )
         try:
             await ws.send_json(error_env.model_dump())
-        except Exception:
-            pass
+        except Exception as send_exc:
+            logger.debug("websocket_error_send_failed", error=str(send_exc))
         await ws.close(code=1003)
     except Exception as exc:
         # SECURITY: Use logger.error instead of logger.exception to avoid
@@ -3141,6 +3917,14 @@ async def websocket_chat(ws: WebSocket):
         # Send error envelope to client before closing
         try:
             await ws.send_json(error_env.model_dump())
-        except Exception:
-            pass  # Connection may already be closed
+        except Exception as send_exc:
+            # Connection may already be closed
+            logger.debug("websocket_error_send_failed", error=str(send_exc))
         await ws.close(code=1011)
+    finally:
+        # Always release slots, even on error
+        if workflow_slot_acquired and user_id and runtime.cache:
+            await runtime.cache.release_concurrency_slot("workflow", user_id)
+        # Issue 5.2: Release WebSocket connection slot
+        if ws_connection_slot_acquired and user_id and runtime.cache:
+            await runtime.cache.release_concurrency_slot("websocket", user_id)
