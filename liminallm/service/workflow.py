@@ -1531,7 +1531,7 @@ class WorkflowEngine:
                     await self.cache.record_tool_success(tool_name, tenant_id=tenant_id)
         except Exception as exc:
             self.logger.error("tool_invoke_failed", tool=tool_name, error=str(exc))
-            # SPEC §18: Record failure for circuit breaker
+            # SPEC §18: Record failure for circuit breaker (only here for exceptions)
             if self.cache and tool_name:
                 tripped, failures = await self.cache.record_tool_failure(
                     tool_name, tenant_id=tenant_id
@@ -1547,9 +1547,16 @@ class WorkflowEngine:
                 "status": "error",
                 "content": "tool execution failed",
                 "error": str(exc),
+                "_failure_recorded": True,  # Flag to prevent double-counting
             }
-        # Record failure for error results from _invoke_tool
-        if self.cache and tool_name and isinstance(tool_result, dict) and tool_result.get("status") == "error":
+        # Record failure for error results from _invoke_tool (but not if already recorded)
+        if (
+            self.cache
+            and tool_name
+            and isinstance(tool_result, dict)
+            and tool_result.get("status") == "error"
+            and not tool_result.get("_failure_recorded")
+        ):
             tripped, failures = await self.cache.record_tool_failure(
                 tool_name, tenant_id=tenant_id
             )
@@ -1568,7 +1575,7 @@ class WorkflowEngine:
             outputs = {
                 k: v
                 for k, v in tool_result.items()
-                if k not in {"usage", "context_snippets"}
+                if k not in {"usage", "context_snippets", "_failure_recorded"}
             }
         next_nodes = node.get("next")
         if isinstance(next_nodes, str):

@@ -1500,6 +1500,7 @@ const sendMessage = async (event) => {
     return new Promise((resolve, reject) => {
       let settled = false;
       let streamingMsg = null;
+      let messageDoneReceived = false;
       let messageDoneData = {};
 
       const cleanup = () => {
@@ -1532,6 +1533,7 @@ const sendMessage = async (event) => {
 
               case 'message_done':
                 // Streaming visually complete, but wait for streaming_complete for IDs
+                messageDoneReceived = true;
                 messageDoneData = msg.data || {};
                 if (streamingMsg) {
                   const adapters = (messageDoneData.adapters || []).map(a => a?.name || a?.id || a).filter(Boolean);
@@ -1603,7 +1605,7 @@ const sendMessage = async (event) => {
           settled = true;
           cleanup();
           // If we got message_done but not streaming_complete, resolve with what we have
-          if (Object.keys(messageDoneData).length > 0) {
+          if (messageDoneReceived) {
             if (streamingMsg) streamingMsg.finalize('');
             resolve(messageDoneData);
           } else {
@@ -2555,8 +2557,8 @@ const downloadFile = async (filename) => {
     const downloadUrl = envelope.data?.download_url;
     if (!downloadUrl) throw new Error('No download URL returned');
 
-    // Fetch the file using the signed URL
-    const response = await fetch(`${apiBase}${downloadUrl}`, {
+    // Fetch the file using the signed URL (already contains full path)
+    const response = await fetch(downloadUrl, {
       headers: headers(),
     });
 

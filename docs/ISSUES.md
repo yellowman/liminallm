@@ -1,6 +1,6 @@
 # Codebase Issues and Security Audit
 
-**Last Updated:** 2025-12-05
+**Last Updated:** 2025-12-06
 **Scope:** Comprehensive review against SPEC.md requirements (12th pass)
 
 ---
@@ -102,8 +102,8 @@ This document consolidates findings from deep analysis of the liminallm codebase
 **False Positives Identified:** 144 (verified via comprehensive code examination)
 **Design Variances:** 1 (X-Session WebSocket auth via JSON body - valid implementation)
 **Future Features Deferred:** 1 (Adapter pruning/merging - optimization feature)
-**Issues Fixed:** 19 (8 frontend + 7 infrastructure + 4 NOT IMPLEMENTED)
-**Effective Issues:** 516 (681 - 144 false positives - 2 variances/deferred - 19 fixed)
+**Issues Fixed:** 32 (10 frontend + 1 backend + 7 infrastructure + 4 NOT IMPLEMENTED + 10 previously unrecorded)
+**Effective Issues:** 503 (681 - 144 false positives - 2 variances/deferred - 32 fixed)
 **False Positive Rate:** 21.1%
 
 *Note: False positives include structural patterns (SQL parameterization, Python GIL, timeouts), development/test code, standard industry practices (Docker isolation, env vars), required functionality (MFA secret display, admin password display), misattributed issues (internal logging), and references to non-existent files (React-specific issues on vanilla JS codebase).*
@@ -117,6 +117,23 @@ This document consolidates findings from deep analysis of the liminallm codebase
 - 65.7: Input length validation added to chat messages
 - 69.7: Admin panel status values now properly escaped
 - 74.1: Cryptographically secure idempotency key generation using crypto.getRandomValues() fallback
+- 80.12: WebSocket message_done event detection now uses explicit flag instead of data key check
+- 80.13: File download URL no longer double-prefixes apiBase path
+
+**Backend Fixes Applied:**
+- 80.14: Circuit breaker no longer double-counts failures for tool exceptions
+
+**Previously Unrecorded Fixes (discovered during audit):**
+- 1.1: Invalid error codes (bad_request, invalid_json) now use SPEC-compliant codes
+- 1.4: OAuth tenant_id now derived from server config, not user input
+- 9.1: user_settings now persisted in memory store snapshots
+- 9.2: adapter_router_state now persisted in memory store snapshots
+- 9.3: Serialization methods for user_settings and adapter_router_state implemented
+- 14.1: Path traversal vulnerability in ingest_path fixed with safe_join validation
+- 22.5: Rate limit counters now include tenant_id for proper isolation
+- 25.1: list_preference_events now has LIMIT clause (default 1000)
+- 63.9: X-Content-Type-Options header now set
+- 63.10: Referrer-Policy header now set
 
 **Infrastructure Fixes Applied:**
 - 72.2: Redis authentication enabled with REDIS_PASSWORD
@@ -137,16 +154,11 @@ This document consolidates findings from deep analysis of the liminallm codebase
 
 ## 1. API Routes (SPEC Compliance)
 
-### 1.1 CRITICAL: Invalid Error Codes
+### 1.1 ~~CRITICAL: Invalid Error Codes~~ FIXED
 
 **Location:** `liminallm/api/routes.py`
 
-| Line | Current Code | Should Be | Context |
-|------|-------------|-----------|---------|
-| 1393, 1401 | `"bad_request"` | `"validation_error"` | Audio transcription/payload errors |
-| 3114 | `"invalid_json"` | `"validation_error"` | WebSocket JSON parse error |
-
-**SPEC Reference:** §18 defines valid codes: `unauthorized`, `forbidden`, `not_found`, `rate_limited`, `validation_error`, `conflict`, `server_error`
+**Status:** ✅ All error codes now use SPEC-compliant values (`validation_error`, `server_error`).
 
 ### 1.2 CRITICAL: Non-Spec WebSocket Event
 
@@ -166,11 +178,11 @@ idem.result = response  # BUG: IdempotencyGuard has no 'result' attribute
 
 Should be: `await idem.store_result(response)`
 
-### 1.4 CRITICAL: OAuth tenant_id From User Input
+### 1.4 ~~CRITICAL: OAuth tenant_id From User Input~~ FIXED
 
-**Location:** `liminallm/api/routes.py:640, 674`
+**Location:** `liminallm/api/routes.py:984-1015`
 
-OAuth endpoints accept `tenant_id` from query parameters before authentication is complete, violating CLAUDE.md security guideline.
+**Status:** ✅ OAuth tenant_id is now derived from server config/OAuth state, not user input. Comments at lines 984-985 and 1005-1006 document the security fix per CLAUDE.md guidelines.
 
 ### 1.5 CRITICAL: Visibility Filter Broken for Global/Shared Artifacts
 
@@ -605,31 +617,25 @@ The PATCH endpoint accepts a flat object instead of RFC 6902 JSON Patch operatio
 
 ## 9. Redis Usage and Memory Store Persistence
 
-### 9.1 CRITICAL: user_settings NOT Persisted in Memory Store
+### 9.1 ~~CRITICAL: user_settings NOT Persisted in Memory Store~~ FIXED
 
-**Location:** `liminallm/storage/memory.py:1498-1559`
+**Location:** `liminallm/storage/memory.py:1675-1780`
 
-**SPEC §3.3 requires:** Snapshot must cover "users, auth sessions, credentials, conversations/messages, artifacts + versions, config patches, knowledge contexts, and chunks"
+**Status:** ✅ `user_settings` now included in `_persist_state()` (line 1675-1677) and `_load_state()` (line 1778-1781).
 
-**Current:** `user_settings` stored in memory but NOT included in `_persist_state()` or `_load_state()`.
+### 9.2 ~~CRITICAL: adapter_router_state NOT Persisted in Memory Store~~ FIXED
 
-**Impact:** User settings (locale, timezone, voice, style) reset on restart.
+**Location:** `liminallm/storage/memory.py:1678-1784`
 
-### 9.2 CRITICAL: adapter_router_state NOT Persisted in Memory Store
+**Status:** ✅ `adapter_router_state` now included in `_persist_state()` (line 1678-1680) and `_load_state()` (line 1782-1784).
 
-**Location:** `liminallm/storage/memory.py:1498-1559`
+### 9.3 ~~HIGH: Missing Serialization Methods~~ FIXED
 
-**Current:** `adapter_router_state` stored in memory but NOT included in snapshot persistence.
+**Location:** `liminallm/storage/memory.py:2212-2260`
 
-**Impact:** Adapter routing statistics reset on restart.
-
-### 9.3 HIGH: Missing Serialization Methods
-
-**Location:** `liminallm/storage/memory.py`
-
-Missing methods:
-- `_serialize_user_settings()` / `_deserialize_user_settings()`
-- `_serialize_adapter_router_state()` / `_deserialize_adapter_router_state()`
+**Status:** ✅ All serialization/deserialization methods now implemented:
+- `_serialize_user_settings()` / `_deserialize_user_settings()` (lines 2212-2232)
+- `_serialize_adapter_router_state()` / `_deserialize_adapter_router_state()` (lines 2234-2260)
 
 ---
 
@@ -754,11 +760,11 @@ Only workflow-level timeout checked during retries, not per-node.
 
 ## 14. RAG Service
 
-### 14.1 CRITICAL: Path Traversal Vulnerability in ingest_path
+### 14.1 ~~CRITICAL: Path Traversal Vulnerability in ingest_path~~ FIXED
 
-**Location:** `liminallm/service/rag.py:453`
+**Location:** `liminallm/service/rag.py:436-493`
 
-`ingest_path()` does not validate that path stays within allowed directories.
+**Status:** ✅ `ingest_path()` now uses `safe_join()` from `liminallm.service.fs` and raises `PathTraversalError` if path escapes allowed directories. Logging at lines 479 and 493 records blocked attempts.
 
 ### 14.2 MEDIUM: RagMode Enum Missing LOCAL_HYBRID
 
@@ -1099,11 +1105,11 @@ f"user_sessions:{user_id}"  # Key pattern never created
 
 Artifact updates don't invalidate any caches. Stale artifact data served until TTL.
 
-### 22.5 HIGH: Rate Limit Counter Not Tenant-Isolated
+### 22.5 ~~HIGH: Rate Limit Counter Not Tenant-Isolated~~ FIXED
 
-**Location:** `liminallm/storage/redis_cache.py:42-73`
+**Location:** `liminallm/storage/redis_cache.py:84-119, 753-775`
 
-Rate limit keys don't include tenant_id, allowing cross-tenant rate limit exhaustion.
+**Status:** ✅ `check_rate_limit()` now accepts `tenant_id` parameter and includes it in cache key: `f"rate:{tenant_prefix}{key}:{now_bucket}"` (lines 102-104, 759-761). Comment at line 95 documents "Issue 44.3" fix.
 
 ### 22.6 MEDIUM: Conversation Cache TTL Mismatch
 
@@ -1222,17 +1228,11 @@ Text ingestion doesn't normalize Unicode. Same text with different normalization
 
 ## 25. Pagination and Large Payload Handling (4th Pass)
 
-### 25.1 CRITICAL: list_preference_events No LIMIT Clause
+### 25.1 ~~CRITICAL: list_preference_events No LIMIT Clause~~ FIXED
 
-**Location:** `liminallm/storage/postgres.py:370-413`
+**Location:** `liminallm/storage/postgres.py:405-441`
 
-```python
-SELECT * FROM preference_events WHERE user_id = $1
-```
-
-**Issue:** No LIMIT clause. Users with many events exhaust memory/timeout.
-
-**Fix:** Add mandatory pagination with max page size.
+**Status:** ✅ `list_preference_events()` now has `limit: int = 1000` parameter and query includes `LIMIT %s` (lines 412, 436-438). Comment at line 436 documents SPEC compliance fix.
 
 ### 25.2 ~~CRITICAL: Chat Loads All Messages Unbounded~~ FIXED
 
@@ -4581,15 +4581,15 @@ Sensitive responses lack `Cache-Control: no-store` headers.
 
 Missing CSP headers on API responses.
 
-### 63.9 MEDIUM: Missing X-Content-Type-Options
-**Location:** `liminallm/api/app.py`
+### 63.9 ~~MEDIUM: Missing X-Content-Type-Options~~ FIXED
+**Location:** `liminallm/app.py:117`
 
-Missing `nosniff` header.
+**Status:** ✅ Header now set: `response.headers.setdefault("X-Content-Type-Options", "nosniff")`
 
-### 63.10 MEDIUM: Missing Referrer-Policy
-**Location:** `liminallm/api/app.py`
+### 63.10 ~~MEDIUM: Missing Referrer-Policy~~ FIXED
+**Location:** `liminallm/app.py:119`
 
-No Referrer-Policy header configured.
+**Status:** ✅ Header now set: `response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")`
 
 ### 63.11 MEDIUM: Permissive CORS Configuration
 **Location:** `liminallm/api/app.py:89-95`
@@ -6709,4 +6709,28 @@ The following bugs were identified and fixed:
 **Issue:** `REDIS_PASSWORD` used `:-changeme` syntax which silently fell back to an insecure default password if the environment variable was not set. This was inconsistent with `POSTGRES_PASSWORD` which used `:?` syntax to fail if unset.
 
 **Fix:** Changed to `:?` syntax to require REDIS_PASSWORD, failing fast if not set.
+
+### 80.12 ✅ FIXED: WebSocket message_done Semantic Check Causes False Rejection
+
+**Location:** `frontend/chat.js:1503-1608`
+
+**Issue:** The change from initializing `messageDoneData` as `null` with a truthy check to initializing as `{}` with `Object.keys(messageDoneData).length > 0` altered semantic behavior. When a `message_done` event was received with empty or undefined data (`msg.data || {}`), the truthy check would have passed but the keys-length check failed, causing unexpected "Connection closed" rejection. The code comment stated "If we got message_done but not streaming_complete, resolve with what we have" but the check conflated "received the event" with "received data with keys."
+
+**Fix:** Added explicit `messageDoneReceived` boolean flag set to `true` when `message_done` event is received. The close handler now checks `if (messageDoneReceived)` instead of `if (Object.keys(messageDoneData).length > 0)`, correctly detecting whether the event was received regardless of its data content.
+
+### 80.13 ✅ FIXED: File Download URL Double-Prefixes apiBase Path
+
+**Location:** `frontend/chat.js:2559-2561`
+
+**Issue:** The `downloadFile` function concatenated `apiBase` (`/v1`) with `downloadUrl`, but the signed URL returned from the backend already includes the `/v1/files/download` path (from `generate_signed_url` with default `base_url="/v1/files/download"`). This resulted in the final URL being `/v1/v1/files/download?...` instead of the correct `/v1/files/download?...`, causing all file downloads to fail with a 404 error.
+
+**Fix:** Changed `fetch(\`${apiBase}${downloadUrl}\`, ...)` to `fetch(downloadUrl, ...)` since the download URL already contains the complete path.
+
+### 80.14 ✅ FIXED: Circuit Breaker Double-Counts Tool Failures
+
+**Location:** `liminallm/service/workflow.py:1532-1569`
+
+**Issue:** When `_invoke_tool` raised an exception, the code recorded a failure via `record_tool_failure` in the except block (lines 1535-1545) and set `tool_result` with `status: "error"`. Immediately after the try/except, the code at lines 1551-1562 checked if `tool_result.get("status") == "error"` and recorded another failure. This caused exceptions to be double-counted, potentially tripping the circuit breaker at half the intended threshold (after ~2.5 failures instead of 5).
+
+**Fix:** Added `_failure_recorded: True` flag to the error result created in the except block. The subsequent failure recording check now includes `and not tool_result.get("_failure_recorded")` to skip already-recorded failures. The internal flag is excluded from outputs.
 
