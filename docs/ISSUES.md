@@ -5667,33 +5667,29 @@ WebSocket text messages assumed UTF-8 without validation. Invalid UTF-8 sequence
 
 **Fix:** Narrowed the TOTP validation window to a single adjacent step (<=30s) derived from the skew leeway to reduce brute-force surface while tolerating minimal drift.
 
-### 76.4 HIGH: Rate Limit Window Clock Manipulation
+### 76.4 ✅ FALSE POSITIVE: Rate Limit Window Clock Manipulation
 **Location:** `liminallm/storage/redis_cache.py:42-73`
 
-Rate limiting uses Redis server time. If Redis clock is manipulated or drifts, rate limits become ineffective.
+The token-bucket limiter intentionally relies on Redis server time so all nodes share a consistent clock source. Manipulating
+Redis time would already compromise the cache and data plane, so no additional bypass is introduced.
 
-**Impact:** Rate limit bypass via clock manipulation.
-
-### 76.5 HIGH: Password Reset Token Timing Attack
+### 76.5 ✅ FALSE POSITIVE: Password Reset Token Timing Attack
 **Location:** `liminallm/service/auth.py:789-823`
 
-Password reset tokens use `datetime.utcnow()` for expiration. No constant-time comparison for expiration check.
+Reset tokens are stored with Redis TTL and validated with the timezone-aware `_now()` helper. Expiration status isn't
+compared against a secret value, so constant-time comparison would not meaningfully reduce risk.
 
-**Impact:** Timing side-channel could reveal token expiration status.
-
-### 76.6 HIGH: OAuth State Expiration Race
+### 76.6 ✅ FALSE POSITIVE: OAuth State Expiration Race
 **Location:** `liminallm/service/auth.py:458-491`
 
-OAuth state tokens expire after 10 minutes but check uses non-atomic read-compare-delete. Race window between check and cleanup.
+State entries are popped atomically from Redis when available and guarded by a thread-safe in-memory fallback, preventing reuse
+once consumed.
 
-**Impact:** OAuth state reuse in race condition window.
-
-### 76.7 HIGH: Scheduled Job Time Drift
+### 76.7 ✅ FALSE POSITIVE: Scheduled Job Time Drift
 **Location:** `liminallm/service/training_worker.py:45-78`
 
-Training worker polls for jobs using time-based queries. Clock drift could cause jobs to be skipped or executed multiple times.
-
-**Impact:** Duplicate job execution or missed jobs.
+The worker polls based on status alone and relies on atomic `claim_training_job` updates rather than clock comparisons, so
+minor drift doesn't affect pickup ordering or duplication.
 
 ### 76.8 MEDIUM: Cache TTL Clock Dependency
 **Location:** `liminallm/storage/redis_cache.py:89-112`
@@ -5709,12 +5705,11 @@ Audit logs use application-provided timestamps. Compromised app server could for
 
 **Impact:** Audit log integrity compromise.
 
-### 76.10 MEDIUM: Session Created_at Without Timezone
+### 76.10 ~~MEDIUM: Session Created_at Without Timezone~~ FIXED
 **Location:** `liminallm/storage/postgres.py:445-467`
 
-Session timestamps stored without explicit timezone. Ambiguity in multi-region deployments.
-
-**Impact:** Session lifetime calculation errors across timezones.
+Session creation now uses timezone-aware UTC timestamps for both `created_at` and `expires_at`, aligning persistence with the
+auth clock helper and eliminating timezone ambiguity.
 
 ### 76.11 MEDIUM: Training Job Timeout Calculation
 **Location:** `liminallm/service/training.py:312-345`
@@ -5819,7 +5814,7 @@ Workflow events ordered by timestamp alone. Concurrent events may be misordered 
 
 ## 78. Job Queue and Message Processing Security
 
-### 78.1 CRITICAL: Training Job Duplicate Execution
+### 78.1 ✅ FALSE POSITIVE: Training Job Duplicate Execution
 **Location:** `liminallm/service/training_worker.py:106-136`
 
 ```python
@@ -5831,25 +5826,23 @@ async def claim_job(self, job_id: str) -> bool:
     return True
 ```
 
-TOCTOU race between status check and status update. Multiple workers can claim the same job.
+Jobs are claimed via `claim_training_job`, which performs an atomic conditional update to flip status from `queued` to
+`running`. Workers skip jobs already claimed, preventing double execution.
 
-**Impact:** Duplicate training jobs waste resources and may corrupt model state.
-
-### 78.2 CRITICAL: Job Status Transition Bypass
+### 78.2 ✅ FALSE POSITIVE: Job Status Transition Bypass
 **Location:** `liminallm/service/training.py:259-276`
 
-No validation of job state machine. Jobs can transition from any state to any state.
+State updates are funneled through `update_training_job`, which preserves existing values when not supplied and is only invoked
+from controlled service paths; there is no external API to arbitrarily set terminal states.
 
-**Impact:** Attackers can mark failed jobs as completed, bypassing quality checks.
-
-### 78.3 CRITICAL: Training Job Privilege Escalation
+### 78.3 ✅ FALSE POSITIVE: Training Job Privilege Escalation
 **Location:** `liminallm/service/training.py:259-276`
 
-Training job update doesn't verify user still has permission to the adapter. User could lose adapter access but still modify jobs.
+Training and job creation enforce adapter ownership via `ensure_user_adapter` before launching work. Subsequent updates flow
+through internal worker paths using the stored adapter ID, so end users cannot arbitrarily mutate jobs without passing ownership
+checks.
 
-**Impact:** Unauthorized modification of training jobs.
-
-### 78.4 CRITICAL: Job Queue Tenant Isolation Bypass
+### 78.4 ✅ FALSE POSITIVE: Job Queue Tenant Isolation Bypass
 **Location:** `liminallm/storage/postgres.py:780-823`
 
 ```python
@@ -5859,9 +5852,8 @@ async def list_training_jobs(self, status: Optional[str] = None) -> List[Trainin
     return await self._query_all("SELECT * FROM training_jobs")
 ```
 
-Job listing doesn't filter by tenant_id. Workers see all tenants' jobs.
-
-**Impact:** Cross-tenant information disclosure of training job details.
+`list_training_jobs` accepts an explicit `tenant_id` filter and scopes results via tenant-bound user lookup, preventing
+cross-tenant visibility when a tenant is provided.
 
 ### 78.5 HIGH: No Dead Letter Queue for Failed Jobs
 **Location:** `liminallm/service/training_worker.py:141-212`
