@@ -30,6 +30,7 @@ from liminallm.api.schemas import (
     AdminSettingsResponse,
     AdminSettingsUpdateRequest,
     ArtifactListResponse,
+    ArtifactPatchRequest,
     ArtifactRequest,
     ArtifactResponse,
     ArtifactVersionListResponse,
@@ -93,9 +94,10 @@ from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service.auth import AuthContext
 from liminallm.service.errors import BadRequestError, NotFoundError
-from liminallm.service.fs import safe_join
+from liminallm.service.fs import safe_join, PathTraversalError
 from liminallm.service.runtime import (
     IDEMPOTENCY_TTL_SECONDS,
+    _acquire_idempotency_slot,
     _get_cached_idempotency_record,
     _set_cached_idempotency_record,
     check_rate_limit,
@@ -107,16 +109,55 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/v1")
 
-# Registry for active streaming requests - maps request_id to cancel_event
+# Registry for active streaming requests - maps request_id to (cancel_event, timestamp)
 # Used by POST /chat/cancel to cancel in-progress streaming requests per SPEC §18
-_active_requests: Dict[str, asyncio.Event] = {}
+# Issue 23.2: Added timestamp tracking for TTL-based cleanup
+_active_requests: Dict[str, tuple[asyncio.Event, datetime]] = {}
 _active_requests_lock = asyncio.Lock()
+_active_requests_last_cleanup = datetime.utcnow()
+# Maximum age for active requests before they're considered stale (30 minutes)
+_ACTIVE_REQUEST_TTL_SECONDS = 30 * 60
+
+
+async def _cleanup_stale_active_requests() -> int:
+    """Remove stale entries from _active_requests (Issue 23.2).
+
+    Called periodically during register/unregister to prevent unbounded growth.
+    """
+    global _active_requests_last_cleanup
+    now = datetime.utcnow()
+
+    # Only run cleanup every 5 minutes to avoid performance overhead
+    if (now - _active_requests_last_cleanup).total_seconds() < 300:
+        return 0
+
+    _active_requests_last_cleanup = now
+    threshold = now - timedelta(seconds=_ACTIVE_REQUEST_TTL_SECONDS)
+    stale_keys = [
+        req_id for req_id, (_, created_at) in _active_requests.items()
+        if created_at < threshold
+    ]
+
+    for req_id in stale_keys:
+        event, _ = _active_requests.pop(req_id, (None, None))
+        if event and not event.is_set():
+            event.set()  # Cancel any stale request
+
+    if stale_keys:
+        logger.warning(
+            "active_requests_stale_cleanup",
+            cleaned=len(stale_keys),
+            remaining=len(_active_requests),
+        )
+    return len(stale_keys)
 
 
 async def _register_cancel_event(request_id: str, cancel_event: asyncio.Event) -> None:
     """Register a cancel event for an active streaming request."""
     async with _active_requests_lock:
-        _active_requests[request_id] = cancel_event
+        _active_requests[request_id] = (cancel_event, datetime.utcnow())
+        # Periodic cleanup to prevent unbounded growth (Issue 23.2)
+        await _cleanup_stale_active_requests()
 
 
 async def _unregister_cancel_event(request_id: str) -> None:
@@ -128,10 +169,12 @@ async def _unregister_cancel_event(request_id: str) -> None:
 async def _cancel_request(request_id: str) -> bool:
     """Cancel an active request by request_id. Returns True if cancelled."""
     async with _active_requests_lock:
-        cancel_event = _active_requests.get(request_id)
-        if cancel_event and not cancel_event.is_set():
-            cancel_event.set()
-            return True
+        entry = _active_requests.get(request_id)
+        if entry:
+            cancel_event, _ = entry
+            if not cancel_event.is_set():
+                cancel_event.set()
+                return True
         return False
 
 
@@ -269,6 +312,8 @@ def _get_system_settings(runtime) -> dict:
         "files_upload_rate_limit_per_minute": 10,
         "configops_rate_limit_per_hour": 30,
         "read_rate_limit_per_minute": 120,
+        "write_rate_limit_per_minute": 60,
+        "max_websocket_connections_per_user": 5,
         "default_page_size": 100,
         "max_page_size": 500,
         "default_conversations_limit": 50,
@@ -482,6 +527,11 @@ async def _resolve_idempotency(
     require: bool = False,
     request_id: Optional[str] = None,
 ) -> tuple[str, Optional[Envelope]]:
+    """Resolve idempotency key using atomic acquisition (Issue 19.4).
+
+    Uses SETNX pattern to atomically claim idempotency slot and prevent race conditions
+    where concurrent requests with the same key could both start processing.
+    """
     request_id = request_id or str(uuid4())
     runtime = get_runtime()
     if not idempotency_key:
@@ -490,31 +540,39 @@ async def _resolve_idempotency(
                 "validation_error", "Idempotency-Key header required", status_code=400
             )
         return request_id, None
-    record = await _get_cached_idempotency_record(
-        runtime, route, user_id, idempotency_key
-    )
-    if record:
-        status = record.get("status")
-        if status == "in_progress":
-            raise _http_error("conflict", "request in progress", status_code=409)
-        if status in {"completed", "failed"} and record.get("response"):
-            response_payload = record.get("response", {})
-            if "request_id" not in response_payload:
-                response_payload["request_id"] = record.get("request_id", request_id)
-            return record.get("request_id", request_id), Envelope(**response_payload)
-    await _set_cached_idempotency_record(
+
+    # Attempt atomic acquisition of idempotency slot (Issue 19.4)
+    in_progress_record = {
+        "status": "in_progress",
+        "request_id": request_id,
+        "started_at": datetime.utcnow().isoformat(),
+    }
+    acquired, existing_record = await _acquire_idempotency_slot(
         runtime,
         route,
         user_id,
         idempotency_key,
-        {
-            "status": "in_progress",
-            "request_id": request_id,
-            "started_at": datetime.utcnow().isoformat(),
-        },
+        in_progress_record,
         ttl_seconds=IDEMPOTENCY_TTL_SECONDS,
     )
-    return request_id, None
+
+    if acquired:
+        # We successfully claimed the slot
+        return request_id, None
+
+    # Slot was not acquired, check the existing record
+    if existing_record:
+        status = existing_record.get("status")
+        if status == "in_progress":
+            raise _http_error("conflict", "request in progress", status_code=409)
+        if status in {"completed", "failed"} and existing_record.get("response"):
+            response_payload = existing_record.get("response", {})
+            if "request_id" not in response_payload:
+                response_payload["request_id"] = existing_record.get("request_id", request_id)
+            return existing_record.get("request_id", request_id), Envelope(**response_payload)
+
+    # Record exists but is in an unexpected state - treat as conflict
+    raise _http_error("conflict", "request in progress", status_code=409)
 
 
 async def _store_idempotency_result(
@@ -2274,35 +2332,168 @@ async def create_artifact(
         return envelope
 
 
+def _apply_json_patch_ops(schema: dict, ops: list) -> dict:
+    """Apply RFC 6902 JSON Patch operations to a schema.
+
+    Supports: add, remove, replace, move, copy, test
+    """
+    import copy
+    result = copy.deepcopy(schema)
+
+    for op in ops:
+        action = op.get("op", "")
+        path = op.get("path", "")
+        value = op.get("value")
+        from_path = op.get("from", "")
+
+        segments = [seg for seg in path.strip("/").split("/") if seg]
+        if not segments:
+            continue
+
+        # Navigate to parent
+        parent = result
+        for seg in segments[:-1]:
+            if isinstance(parent, list):
+                try:
+                    parent = parent[int(seg)]
+                except (ValueError, IndexError):
+                    break
+            elif isinstance(parent, dict):
+                parent = parent.setdefault(seg, {})
+            else:
+                break
+
+        key = segments[-1]
+
+        if action in ("add", "replace"):
+            if isinstance(parent, dict):
+                parent[key] = value
+            elif isinstance(parent, list):
+                try:
+                    idx = int(key) if key != "-" else len(parent)
+                    if action == "add":
+                        parent.insert(idx, value)
+                    else:
+                        parent[idx] = value
+                except (ValueError, IndexError):
+                    pass
+
+        elif action == "remove":
+            if isinstance(parent, dict) and key in parent:
+                del parent[key]
+            elif isinstance(parent, list):
+                try:
+                    del parent[int(key)]
+                except (ValueError, IndexError):
+                    pass
+
+        elif action == "move":
+            # Get value from source
+            from_segments = [seg for seg in from_path.strip("/").split("/") if seg]
+            if from_segments:
+                src_parent = result
+                for seg in from_segments[:-1]:
+                    if isinstance(src_parent, dict):
+                        src_parent = src_parent.get(seg, {})
+                    elif isinstance(src_parent, list):
+                        try:
+                            src_parent = src_parent[int(seg)]
+                        except (ValueError, IndexError):
+                            break
+                src_key = from_segments[-1]
+                if isinstance(src_parent, dict) and src_key in src_parent:
+                    value = src_parent.pop(src_key)
+                    if isinstance(parent, dict):
+                        parent[key] = value
+
+        elif action == "copy":
+            from_segments = [seg for seg in from_path.strip("/").split("/") if seg]
+            if from_segments:
+                src = result
+                for seg in from_segments:
+                    if isinstance(src, dict):
+                        src = src.get(seg)
+                    elif isinstance(src, list):
+                        try:
+                            src = src[int(seg)]
+                        except (ValueError, IndexError):
+                            src = None
+                            break
+                if src is not None and isinstance(parent, dict):
+                    parent[key] = copy.deepcopy(src)
+
+        elif action == "test":
+            # Test operation - verify value matches
+            current = parent.get(key) if isinstance(parent, dict) else None
+            if current != value:
+                raise BadRequestError(
+                    "JSON Patch test operation failed",
+                    detail={"path": path, "expected": value, "actual": current},
+                )
+
+    return result
+
+
+def _deep_merge(base: dict, updates: dict) -> dict:
+    """Deep merge updates into base dict."""
+    import copy
+    result = copy.deepcopy(base)
+    for key, value in updates.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = _deep_merge(result[key], value)
+        else:
+            result[key] = copy.deepcopy(value)
+    return result
+
+
 @router.patch("/artifacts/{artifact_id}", response_model=Envelope, tags=["artifacts"])
 async def patch_artifact(
-    artifact_id: str, body: ArtifactRequest, principal: AuthContext = Depends(get_user)
+    artifact_id: str,
+    body: ArtifactPatchRequest,
+    principal: AuthContext = Depends(get_user),
 ):
+    """Update an artifact via RFC 6902 JSON Patch or legacy schema update.
+
+    Accepts:
+    - RFC 6902 format: {"patch": [{"op": "replace", "path": "/schema/foo", "value": "bar"}]}
+    - Legacy format: {"schema": {...}, "description": "..."} (for backward compatibility)
+    """
     runtime = get_runtime()
     current = _get_owned_artifact(runtime, artifact_id, principal)
-    if not isinstance(body.schema, dict):
+
+    normalized = body.get_normalized_patch()
+    new_schema = dict(current.schema) if isinstance(current.schema, dict) else {}
+    new_description = current.description
+
+    if "ops" in normalized:
+        # RFC 6902 JSON Patch operations
+        ops = normalized["ops"]
+        if ops:
+            new_schema = _apply_json_patch_ops(new_schema, ops)
+    elif "schema_update" in normalized:
+        # Legacy schema update - deep merge
+        new_schema = _deep_merge(new_schema, normalized["schema_update"])
+
+    if "description" in normalized:
+        new_description = normalized["description"]
+
+    # Validate kind prefix
+    schema_kind = new_schema.get("kind")
+    if schema_kind and not schema_kind.startswith(f"{current.type}."):
         raise BadRequestError(
-            "artifact schema must be an object",
-            detail={"provided_type": type(body.schema).__name__},
+            "kind must start with the type prefix",
+            detail={"kind": schema_kind, "type": current.type},
         )
-    schema_kind = body.schema.get("kind")
-    artifact_schema = dict(body.schema)
-    if schema_kind:
-        if not schema_kind.startswith(f"{current.type}."):
-            raise BadRequestError(
-                "kind must start with the type prefix",
-                detail={"kind": schema_kind, "type": current.type},
-            )
-        artifact_schema["kind"] = schema_kind
+
     artifact = runtime.store.update_artifact(
         artifact_id,
-        schema=artifact_schema,
-        description=body.description,
+        schema=new_schema,
+        description=new_description,
         version_author=principal.user_id,
     )
     if not artifact:
         raise NotFoundError("artifact not found", detail={"artifact_id": artifact_id})
-    # Get the new version after update
+
     current_version = runtime.store.get_artifact_current_version(artifact_id)
     resp = ArtifactResponse(
         id=artifact.id,
@@ -2980,7 +3171,7 @@ async def create_conversation(
         await _enforce_rate_limit(
             runtime,
             f"write:{principal.user_id}",
-            runtime.settings.write_rate_limit_per_minute,
+            _get_rate_limit(runtime, "write_rate_limit_per_minute"),
             60,
         )
         # Validate context_id if provided
@@ -3198,6 +3389,46 @@ async def add_context_source(
     """
     runtime = get_runtime()
 
+    # SECURITY: Validate path to prevent path traversal attacks (Issue 14.1)
+    # Per SPEC §18: "all filesystem paths resolved via safe_join(base=/users/{user_id}, relative)"
+    user_base = FilePath(runtime.settings.shared_fs_root) / "users" / principal.user_id
+    shared_base = FilePath(runtime.settings.shared_fs_root) / "shared"
+
+    fs_path = body.fs_path
+    validated_path = None
+
+    # Try user's directory first
+    try:
+        validated_path = safe_join(user_base, fs_path)
+    except PathTraversalError:
+        pass
+
+    # Try shared directory if user directory didn't work
+    if validated_path is None:
+        try:
+            validated_path = safe_join(shared_base, fs_path)
+        except PathTraversalError:
+            pass
+
+    # Also allow absolute paths within allowed directories
+    if validated_path is None:
+        abs_path = FilePath(fs_path).resolve()
+        user_base_resolved = user_base.resolve()
+        shared_base_resolved = shared_base.resolve()
+        if abs_path == user_base_resolved or user_base_resolved in abs_path.parents:
+            validated_path = abs_path
+        elif abs_path == shared_base_resolved or shared_base_resolved in abs_path.parents:
+            validated_path = abs_path
+
+    if validated_path is None:
+        raise BadRequestError(
+            "path not allowed",
+            detail={
+                "fs_path": fs_path,
+                "reason": "path must be within user directory or shared directory",
+            },
+        )
+
     async with IdempotencyGuard(
         "context_sources:create", principal.user_id, idempotency_key, require=False
     ) as idem:
@@ -3207,19 +3438,21 @@ async def add_context_source(
         # Verify context ownership
         _get_owned_context(runtime, context_id, principal)
 
-        # Add the source
+        # Add the source with validated path
         source = runtime.store.add_context_source(
             context_id=context_id,
-            fs_path=body.fs_path,
+            fs_path=str(validated_path),
             recursive=body.recursive,
         )
 
-        # Trigger indexing via RAG service
+        # Trigger indexing via RAG service with validated path
+        # Pass allowed_base for defense-in-depth path traversal protection
         try:
             runtime.rag.ingest_path(
                 context_id=context_id,
-                fs_path=body.fs_path,
+                fs_path=str(validated_path),
                 recursive=body.recursive,
+                allowed_base=runtime.settings.shared_fs_root,
             )
         except Exception as exc:
             # Clean up the source record since ingestion failed
@@ -3344,6 +3577,7 @@ async def websocket_chat(ws: WebSocket):
     request_id: str = str(uuid4())
     convo_id: Optional[str] = None
     workflow_slot_acquired: bool = False
+    ws_connection_slot_acquired: bool = False
     try:
         init = await ws.receive_json()
         idempotency_key = init.get("idempotency_key")
@@ -3359,6 +3593,28 @@ async def websocket_chat(ws: WebSocket):
             await ws.close(code=4401)
             return
         user_id = auth_ctx.user_id
+
+        # Issue 5.2: Per-user WebSocket connection limits
+        if runtime.cache:
+            sys_settings = _get_system_settings(runtime)
+            max_ws_connections = sys_settings.get("max_websocket_connections_per_user", 5)
+            acquired, _ = await runtime.cache.acquire_concurrency_slot(
+                "websocket",
+                user_id,
+                max_ws_connections,
+            )
+            if not acquired:
+                await ws.send_json({
+                    "event": "error",
+                    "data": {
+                        "error": "connection_limit",
+                        "message": f"concurrent WebSocket connection limit ({max_ws_connections}) exceeded",
+                    },
+                    "request_id": request_id,
+                })
+                await ws.close(code=4429)  # Custom code for "too many connections"
+                return
+            ws_connection_slot_acquired = True
 
         # Get user's plan tier for per-plan rate limits (SPEC §18)
         user = runtime.store.get_user(user_id)
@@ -3449,8 +3705,9 @@ async def websocket_chat(ws: WebSocket):
                         except WebSocketDisconnect:
                             cancel_event.set()
                             return
-                except Exception:
-                    pass  # Listener task should exit silently on errors
+                except Exception as exc:
+                    # Listener task exits silently on errors; log for debugging
+                    logger.debug("websocket_listener_exit", error=str(exc))
 
             cancel_listener = asyncio.create_task(listen_for_cancel())
 
@@ -3635,8 +3892,8 @@ async def websocket_chat(ws: WebSocket):
         )
         try:
             await ws.send_json(error_env.model_dump())
-        except Exception:
-            pass
+        except Exception as send_exc:
+            logger.debug("websocket_error_send_failed", error=str(send_exc))
         await ws.close(code=1003)
     except Exception as exc:
         # SECURITY: Use logger.error instead of logger.exception to avoid
@@ -3660,10 +3917,14 @@ async def websocket_chat(ws: WebSocket):
         # Send error envelope to client before closing
         try:
             await ws.send_json(error_env.model_dump())
-        except Exception:
-            pass  # Connection may already be closed
+        except Exception as send_exc:
+            # Connection may already be closed
+            logger.debug("websocket_error_send_failed", error=str(send_exc))
         await ws.close(code=1011)
     finally:
-        # Always release workflow slot, even on error
+        # Always release slots, even on error
         if workflow_slot_acquired and user_id and runtime.cache:
             await runtime.cache.release_concurrency_slot("workflow", user_id)
+        # Issue 5.2: Release WebSocket connection slot
+        if ws_connection_slot_acquired and user_id and runtime.cache:
+            await runtime.cache.release_concurrency_slot("websocket", user_id)

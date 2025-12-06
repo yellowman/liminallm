@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any, List, Literal, Optional, Union
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 _VALID_ERROR_CODES = frozenset({
     "unauthorized",
@@ -281,6 +281,52 @@ class ArtifactRequest(_SchemaPayload):
     type: Optional[str] = None
     name: str
     description: Optional[str] = ""
+
+
+class ArtifactPatchRequest(BaseModel):
+    """RFC 6902 JSON Patch request for artifact updates.
+
+    Accepts:
+    - RFC 6902 array of operations: [{"op": "replace", "path": "/schema/foo", "value": "bar"}]
+    - Wrapper dict with "ops" key: {"ops": [...]}
+    - Legacy format for backward compatibility: {"schema": {...}, "description": "..."}
+    """
+    patch: Optional[Union[List[dict], dict]] = None
+    # Legacy fields for backward compatibility
+    schema_: Optional[dict] = Field(default=None, alias="schema")
+    description: Optional[str] = None
+
+    model_config = {"populate_by_name": True}
+
+    @model_validator(mode="after")
+    def _validate_request(self) -> "ArtifactPatchRequest":
+        """Validate that either patch or legacy fields are provided."""
+        has_patch = self.patch is not None
+        has_legacy = self.schema_ is not None or self.description is not None
+        if not has_patch and not has_legacy:
+            raise ValueError("Must provide either 'patch' (RFC 6902) or 'schema'/'description' fields")
+        return self
+
+    def get_normalized_patch(self) -> dict:
+        """Get patch in normalized format for processing."""
+        if self.patch is not None:
+            # RFC 6902 format
+            if isinstance(self.patch, list):
+                return {"ops": self.patch}
+            elif isinstance(self.patch, dict):
+                if "ops" in self.patch or "operations" in self.patch:
+                    ops = self.patch.get("ops") or self.patch.get("operations")
+                    return {"ops": ops}
+                # Dict without ops key - treat as legacy schema update
+                return {"schema_update": self.patch}
+            return {}
+        # Legacy format - convert to schema update
+        result = {}
+        if self.schema_ is not None:
+            result["schema_update"] = self.schema_
+        if self.description is not None:
+            result["description"] = self.description
+        return result
 
 
 class ArtifactResponse(_SchemaPayload):

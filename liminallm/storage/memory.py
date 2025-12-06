@@ -557,12 +557,13 @@ class MemoryStore:
     def get_conversation(
         self, conversation_id: str, *, user_id: Optional[str] = None
     ) -> Optional[Conversation]:
-        conv = self.conversations.get(conversation_id)
-        if not conv:
-            return None
-        if user_id and conv.user_id != user_id:
-            return None
-        return conv
+        with self._data_lock:
+            conv = self.conversations.get(conversation_id)
+            if not conv:
+                return None
+            if user_id and conv.user_id != user_id:
+                return None
+            return conv
 
     def append_message(
         self,
@@ -786,7 +787,8 @@ class MemoryStore:
         return sorted(clusters, key=lambda c: c.updated_at, reverse=True)
 
     def get_semantic_cluster(self, cluster_id: str) -> Optional[SemanticCluster]:
-        return self.semantic_clusters.get(cluster_id)
+        with self._data_lock:
+            return self.semantic_clusters.get(cluster_id)
 
     # training jobs
     def create_training_job(
@@ -999,9 +1001,10 @@ class MemoryStore:
     def list_conversations(
         self, user_id: str, limit: int = 20, offset: int = 0
     ) -> List[Conversation]:
-        convs = [c for c in self.conversations.values() if c.user_id == user_id]
-        convs.sort(key=lambda c: c.updated_at, reverse=True)
-        return convs[offset : offset + limit]
+        with self._data_lock:
+            convs = [c for c in self.conversations.values() if c.user_id == user_id]
+            convs.sort(key=lambda c: c.updated_at, reverse=True)
+            return convs[offset : offset + limit]
 
     # artifacts
     def list_artifacts(
@@ -1086,7 +1089,8 @@ class MemoryStore:
         return artifacts[start:end]
 
     def get_artifact(self, artifact_id: str) -> Optional[Artifact]:
-        return self.artifacts.get(artifact_id)
+        with self._data_lock:
+            return self.artifacts.get(artifact_id)
 
     def create_artifact(
         self,

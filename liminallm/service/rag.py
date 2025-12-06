@@ -4,10 +4,11 @@ import math
 import os
 import re
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Union
 
 from liminallm.logging import get_logger
 from liminallm.service.embeddings import deterministic_embedding
+from liminallm.service.fs import PathTraversalError, safe_join
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.models import KnowledgeChunk
 from liminallm.storage.postgres import PostgresStore
@@ -436,6 +437,7 @@ class RAGService:
         recursive: bool = True,
         chunk_size: Optional[int] = None,
         extensions: Optional[List[str]] = None,
+        allowed_base: Optional[Union[str, Path]] = None,
     ) -> int:
         """Ingest content from a filesystem path (file or directory).
 
@@ -446,10 +448,46 @@ class RAGService:
             chunk_size: Optional chunk size override
             extensions: File extensions to include (e.g., ['.txt', '.md', '.py'])
                        If None, defaults to common text file extensions.
+            allowed_base: If provided, validates that fs_path is within this base
+                         directory. Raises PathTraversalError if path escapes.
+                         Per SPEC §18, path traversal prevention is mandatory.
 
         Returns:
             Total number of chunks created
+
+        Raises:
+            PathTraversalError: If allowed_base is set and fs_path escapes it
         """
+        # SECURITY: Validate path against allowed base if specified (Issue 14.1)
+        if allowed_base is not None:
+            base = Path(allowed_base)
+            # For absolute paths, verify they're within allowed base
+            path_obj = Path(fs_path)
+            if path_obj.is_absolute():
+                resolved = path_obj.resolve()
+                base_resolved = base.resolve()
+                if resolved != base_resolved and base_resolved not in resolved.parents:
+                    logger.warning(
+                        "ingest_path_traversal_blocked",
+                        fs_path=fs_path,
+                        allowed_base=str(allowed_base),
+                    )
+                    raise PathTraversalError(
+                        f"path must be within allowed base directory: {allowed_base}"
+                    )
+            else:
+                # For relative paths, use safe_join which validates traversal
+                try:
+                    path_obj = safe_join(base, fs_path)
+                    fs_path = str(path_obj)  # Use validated absolute path
+                except PathTraversalError:
+                    logger.warning(
+                        "ingest_path_traversal_blocked",
+                        fs_path=fs_path,
+                        allowed_base=str(allowed_base),
+                    )
+                    raise
+
         path = Path(fs_path)
 
         # Default extensions for text-like files

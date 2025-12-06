@@ -291,8 +291,8 @@ async def metrics() -> Response:
                 lines.append('# HELP liminallm_users_total Total number of users')
                 lines.append('# TYPE liminallm_users_total gauge')
                 lines.append(f'liminallm_users_total {user_count}')
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("metrics_user_count_failed", error=str(exc))
 
         # Active sessions (if Redis available)
         if hasattr(runtime, "cache") and runtime.cache is not None:
@@ -313,8 +313,8 @@ async def metrics() -> Response:
                 db_healthy = 1
             else:
                 db_healthy = 1  # Memory store
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("metrics_database_health_failed", error=str(exc))
         lines.append('# HELP liminallm_database_healthy Database connection health')
         lines.append('# TYPE liminallm_database_healthy gauge')
         lines.append(f'liminallm_database_healthy {db_healthy}')

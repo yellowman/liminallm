@@ -126,6 +126,9 @@ class AuthService:
         self.cache = cache
         self.settings = settings
         self._mfa_challenges: dict[str, tuple[str, datetime]] = {}
+        # Issue 11.1: In-memory fallback for MFA lockout when Redis unavailable
+        self._mfa_attempts: dict[str, tuple[int, datetime]] = {}  # user_id -> (count, window_start)
+        self._mfa_lockouts: dict[str, datetime] = {}  # user_id -> locked_until
         self.mfa_enabled = mfa_enabled
         self.revoked_refresh_tokens: set[str] = set()
         self._oauth_states: dict[str, tuple[str, datetime, Optional[str]]] = {}
@@ -173,10 +176,30 @@ class AuthService:
             self._email_verification_tokens.pop(token, None)
             cleaned += 1
 
+        # Clean expired MFA lockouts (Issue 11.1)
+        expired_lockouts = [
+            user_id for user_id, locked_until in self._mfa_lockouts.items()
+            if locked_until <= now
+        ]
+        for user_id in expired_lockouts:
+            self._mfa_lockouts.pop(user_id, None)
+            cleaned += 1
+
+        # Clean expired MFA attempts (5-minute window)
+        window_threshold = now - timedelta(minutes=5)
+        expired_attempts = [
+            user_id for user_id, (_, window_start) in self._mfa_attempts.items()
+            if window_start <= window_threshold
+        ]
+        for user_id in expired_attempts:
+            self._mfa_attempts.pop(user_id, None)
+            cleaned += 1
+
         if cleaned > 0:
             self.logger.debug(
                 "auth_state_cleanup", cleaned=cleaned, oauth=len(expired_oauth),
-                mfa=len(expired_mfa), email=len(expired_email)
+                mfa=len(expired_mfa), email=len(expired_email),
+                mfa_lockouts=len(expired_lockouts), mfa_attempts=len(expired_attempts)
             )
 
         self._last_cleanup = now
@@ -680,12 +703,16 @@ class AuthService:
                 self.logger.warning(
                     "revoke_user_sessions_failed", user_id=user_id, error=str(exc)
                 )
-        # Also clear from cache
+        # Also clear from cache using proper method (Issue 22.3)
         if self.cache:
             try:
-                await self.cache.client.delete(f"user_sessions:{user_id}")
-            except Exception:
-                pass
+                await self.cache.revoke_user_sessions(user_id, except_session_id)
+            except Exception as exc:
+                self.logger.warning(
+                    "revoke_user_sessions_cache_clear_failed",
+                    user_id=user_id,
+                    error=str(exc),
+                )
         return revoked_count
 
     async def resolve_session(
@@ -901,12 +928,23 @@ class AuthService:
         # Check MFA lockout (5 failed attempts = 5 minute lockout per SPEC §18)
         lockout_key = f"mfa:lockout:{user_id}"
         attempts_key = f"mfa:attempts:{user_id}"
+        now = datetime.utcnow()
 
+        # Check lockout - use Redis if available, otherwise in-memory (Issue 11.1)
         if self.cache:
             locked = await self.cache.client.get(lockout_key)
             if locked:
                 self.logger.warning("mfa_locked_out", user_id=user_id)
                 return False
+        else:
+            # In-memory fallback for lockout check
+            locked_until = self._mfa_lockouts.get(user_id)
+            if locked_until and locked_until > now:
+                self.logger.warning("mfa_locked_out", user_id=user_id)
+                return False
+            elif locked_until:
+                # Expired lockout, clean up
+                self._mfa_lockouts.pop(user_id, None)
 
         if not self._verify_totp(cfg.secret, code):
             # Track failed attempt
@@ -918,11 +956,31 @@ class AuthService:
                     await self.cache.client.set(lockout_key, "1", ex=300)
                     await self.cache.client.delete(attempts_key)
                     self.logger.warning("mfa_lockout_triggered", user_id=user_id, attempts=attempts)
+            else:
+                # In-memory fallback for attempt tracking (Issue 11.1)
+                current = self._mfa_attempts.get(user_id)
+                window_start = now
+                attempts = 1
+                if current:
+                    count, prev_window_start = current
+                    # If within 5-minute window, increment; otherwise reset
+                    if now - prev_window_start < timedelta(minutes=5):
+                        attempts = count + 1
+                        window_start = prev_window_start
+                self._mfa_attempts[user_id] = (attempts, window_start)
+                if attempts >= 5:
+                    # Lock out for 5 minutes
+                    self._mfa_lockouts[user_id] = now + timedelta(minutes=5)
+                    self._mfa_attempts.pop(user_id, None)
+                    self.logger.warning("mfa_lockout_triggered", user_id=user_id, attempts=attempts)
             return False
 
         # Success - clear any failed attempts
         if self.cache:
             await self.cache.client.delete(attempts_key)
+        else:
+            # In-memory fallback - clear attempts on success
+            self._mfa_attempts.pop(user_id, None)
 
         self.store.set_user_mfa_secret(user_id, cfg.secret, enabled=True)
         if session_id:

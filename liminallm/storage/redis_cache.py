@@ -31,13 +31,46 @@ class RedisCache:
         self, session_id: str, user_id: str, expires_at: datetime
     ) -> None:
         ttl = max(1, int((expires_at - datetime.utcnow()).total_seconds()))
-        await self.client.set(f"auth:session:{session_id}", user_id, ex=ttl)
+        pipe = self.client.pipeline()
+        pipe.set(f"auth:session:{session_id}", user_id, ex=ttl)
+        # Track session in user's session set for bulk revocation (Issue 22.3)
+        pipe.sadd(f"auth:user_sessions:{user_id}", session_id)
+        pipe.expire(f"auth:user_sessions:{user_id}", ttl)
+        await pipe.execute()
 
     async def get_session_user(self, session_id: str) -> Optional[str]:
         return await self.client.get(f"auth:session:{session_id}")
 
     async def revoke_session(self, session_id: str) -> None:
         await self.client.delete(f"auth:session:{session_id}")
+
+    async def revoke_user_sessions(
+        self, user_id: str, except_session_id: Optional[str] = None
+    ) -> int:
+        """Revoke all cached sessions for a user.
+
+        Args:
+            user_id: User whose sessions to revoke
+            except_session_id: Optional session ID to keep active
+
+        Returns:
+            Number of sessions revoked from cache
+        """
+        user_sessions_key = f"auth:user_sessions:{user_id}"
+        session_ids = await self.client.smembers(user_sessions_key)
+        if not session_ids:
+            return 0
+
+        revoked = 0
+        pipe = self.client.pipeline()
+        for session_id in session_ids:
+            if except_session_id and session_id == except_session_id:
+                continue
+            pipe.delete(f"auth:session:{session_id}")
+            pipe.srem(user_sessions_key, session_id)
+            revoked += 1
+        await pipe.execute()
+        return revoked
 
     async def check_rate_limit(
         self, key: str, limit: int, window_seconds: int, *, return_remaining: bool = False
@@ -225,6 +258,44 @@ class RedisCache:
             f"idemp:{route}:{user_id}:{key}", json.dumps(record), ex=ttl_seconds
         )
 
+    async def acquire_idempotency_slot(
+        self,
+        route: str,
+        user_id: str,
+        key: str,
+        record: dict,
+        ttl_seconds: int = 60 * 60 * 24,
+    ) -> tuple[bool, Optional[dict]]:
+        """Atomically acquire an idempotency slot using SETNX pattern (Issue 19.4).
+
+        Args:
+            route: Route/operation name
+            user_id: User ID
+            key: Idempotency key
+            record: Record to set if slot acquired (typically status=in_progress)
+            ttl_seconds: TTL for the record
+
+        Returns:
+            Tuple of (acquired: bool, existing_record: Optional[dict])
+            - If acquired=True, the slot was successfully claimed
+            - If acquired=False, existing_record contains the current record
+        """
+        cache_key = f"idemp:{route}:{user_id}:{key}"
+        # Use SET NX (set if not exists) for atomic acquisition
+        acquired = await self.client.set(
+            cache_key, json.dumps(record), ex=ttl_seconds, nx=True
+        )
+        if acquired:
+            return (True, None)
+        # Slot was not acquired, fetch existing record
+        existing = await self.client.get(cache_key)
+        if existing:
+            try:
+                return (False, json.loads(existing))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return (False, None)
+
     async def close(self) -> None:
         """Close Redis connection pool. Call when shutting down or resetting runtime."""
         await self.client.close()
@@ -386,13 +457,38 @@ class SyncRedisCache:
         self, session_id: str, user_id: str, expires_at: datetime
     ) -> None:
         ttl = max(1, int((expires_at - datetime.utcnow()).total_seconds()))
-        self._sync_client.set(f"auth:session:{session_id}", user_id, ex=ttl)
+        pipe = self._sync_client.pipeline()
+        pipe.set(f"auth:session:{session_id}", user_id, ex=ttl)
+        # Track session in user's session set for bulk revocation (Issue 22.3)
+        pipe.sadd(f"auth:user_sessions:{user_id}", session_id)
+        pipe.expire(f"auth:user_sessions:{user_id}", ttl)
+        pipe.execute()
 
     async def get_session_user(self, session_id: str) -> Optional[str]:
         return self._sync_client.get(f"auth:session:{session_id}")
 
     async def revoke_session(self, session_id: str) -> None:
         self._sync_client.delete(f"auth:session:{session_id}")
+
+    async def revoke_user_sessions(
+        self, user_id: str, except_session_id: Optional[str] = None
+    ) -> int:
+        """Revoke all cached sessions for a user (sync version)."""
+        user_sessions_key = f"auth:user_sessions:{user_id}"
+        session_ids = self._sync_client.smembers(user_sessions_key)
+        if not session_ids:
+            return 0
+
+        revoked = 0
+        pipe = self._sync_client.pipeline()
+        for session_id in session_ids:
+            if except_session_id and session_id == except_session_id:
+                continue
+            pipe.delete(f"auth:session:{session_id}")
+            pipe.srem(user_sessions_key, session_id)
+            revoked += 1
+        pipe.execute()
+        return revoked
 
     async def check_rate_limit(
         self, key: str, limit: int, window_seconds: int, *, return_remaining: bool = False
@@ -533,6 +629,27 @@ class SyncRedisCache:
         ttl_seconds: int = 60 * 60 * 24,
     ) -> None:
         self._sync_client.set(f"idemp:{route}:{user_id}:{key}", json.dumps(record), ex=ttl_seconds)
+
+    async def acquire_idempotency_slot(
+        self,
+        route: str,
+        user_id: str,
+        key: str,
+        record: dict,
+        ttl_seconds: int = 60 * 60 * 24,
+    ) -> tuple[bool, Optional[dict]]:
+        """Atomically acquire an idempotency slot using SETNX (sync version)."""
+        cache_key = f"idemp:{route}:{user_id}:{key}"
+        acquired = self._sync_client.set(cache_key, json.dumps(record), ex=ttl_seconds, nx=True)
+        if acquired:
+            return (True, None)
+        existing = self._sync_client.get(cache_key)
+        if existing:
+            try:
+                return (False, json.loads(existing))
+            except (json.JSONDecodeError, TypeError):
+                pass
+        return (False, None)
 
     async def close(self) -> None:
         """Close Redis connection."""

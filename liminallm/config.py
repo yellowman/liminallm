@@ -378,7 +378,7 @@ class Settings(BaseModel):
     # - reset_rate_limit_per_minute, mfa_rate_limit_per_minute
     # - admin_rate_limit_per_minute, admin_rate_limit_window_seconds
     # - files_upload_rate_limit_per_minute, configops_rate_limit_per_hour
-    # - read_rate_limit_per_minute
+    # - read_rate_limit_per_minute, write_rate_limit_per_minute
     # - rate_limit_multiplier_free/paid/enterprise
     #
     # Pagination & Files:

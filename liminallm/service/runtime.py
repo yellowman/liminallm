@@ -315,6 +315,60 @@ async def _set_cached_idempotency_record(
         }
 
 
+async def _acquire_idempotency_slot(
+    runtime: Runtime,
+    route: str,
+    user_id: str,
+    key: str,
+    record: dict,
+    *,
+    ttl_seconds: int = IDEMPOTENCY_TTL_SECONDS,
+) -> tuple[bool, Optional[dict]]:
+    """Atomically acquire an idempotency slot (Issue 19.4).
+
+    Uses SETNX for Redis or lock-protected check-and-set for in-memory fallback.
+
+    Args:
+        runtime: Application runtime
+        route: Route/operation name
+        user_id: User ID
+        key: Idempotency key
+        record: Record to set if slot acquired
+        ttl_seconds: TTL for the record
+
+    Returns:
+        Tuple of (acquired: bool, existing_record: Optional[dict])
+    """
+    now = datetime.utcnow()
+    expires_at = now + timedelta(seconds=ttl_seconds)
+
+    if runtime.cache:
+        return await runtime.cache.acquire_idempotency_slot(
+            route, user_id, key, record, ttl_seconds=ttl_seconds
+        )
+
+    # In-memory fallback with atomic check-and-set within lock
+    async with runtime._local_idempotency_lock:
+        cache_key = (route, user_id, key)
+        existing = runtime._local_idempotency.get(cache_key)
+
+        if existing:
+            # Check if expired
+            if existing.get("expires_at") and existing["expires_at"] < now:
+                # Expired, we can claim it
+                runtime._local_idempotency.pop(cache_key, None)
+            else:
+                # Not expired, return existing
+                return (False, existing)
+
+        # No existing record or it was expired, claim the slot
+        runtime._local_idempotency[cache_key] = {
+            **record,
+            "expires_at": expires_at,
+        }
+        return (True, None)
+
+
 async def check_rate_limit(
     runtime: Runtime, key: str, limit: int, window_seconds: int, *, return_remaining: bool = False
 ) -> Union[bool, Tuple[bool, int]]:

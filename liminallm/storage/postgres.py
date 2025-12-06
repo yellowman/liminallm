@@ -2302,6 +2302,8 @@ class PostgresStore:
                 "files_upload_rate_limit_per_minute": 10,
                 "configops_rate_limit_per_hour": 30,
                 "read_rate_limit_per_minute": 120,
+                "write_rate_limit_per_minute": 60,
+                "max_websocket_connections_per_user": 5,
                 "default_page_size": 100,
                 "max_page_size": 500,
                 "default_conversations_limit": 50,
