@@ -869,7 +869,7 @@ async def pop_oauth_state(self, state: str) -> Optional[tuple[str, datetime, Opt
 
 **Status:** No vulnerability exists. Code uses atomic GETDEL or Lua script.
 
-### 19.2 HIGH: MemoryStore Reads Without Lock (PARTIALLY CORRECTED)
+### 19.2 ~~HIGH: MemoryStore Reads Without Lock~~ FIXED
 
 **Location:** `liminallm/storage/memory.py:557-565, 786-787, 997-1002, 1041-1042`
 
@@ -877,17 +877,15 @@ async def pop_oauth_state(self, state: str) -> Optional[tuple[str, datetime, Opt
 - ~~`get_session()`~~ - DOES use lock (line 487-489) ✓
 - ~~`get_user()`~~ - DOES use lock (line 281-283) ✓
 
-**Confirmed issues (TRUE POSITIVES):**
-- `get_conversation()` at lines 557-565 - NO lock
-- `get_artifact()` at lines 1041-1042 - NO lock
-- `get_semantic_cluster()` at lines 786-787 - NO lock
-- `list_conversations()` at lines 997-1002 - NO lock
+**Status:** ✅ All read paths now guard access with `_data_lock`.
 
-**Impact:** Concurrent reads during writes can see partial/inconsistent data for conversations, artifacts, and clusters.
+**Verification:**
+- `get_conversation()` now wraps access with `_data_lock` (lines 558-563).
+- `get_semantic_cluster()` uses `_data_lock` (lines 788-793).
+- `list_conversations()` holds `_data_lock` while slicing (lines 998-1003).
+- `get_artifact()` guards reads with `_data_lock` (lines 1089-1093).
 
-**Fix:** Wrap remaining unprotected read operations in `with self._data_lock:` blocks.
-
-### 19.3 CRITICAL: MFA Lockout Check-Then-Act Race
+### 19.3 ~~CRITICAL: MFA Lockout Check-Then-Act Race~~ FIXED
 
 **Location:** `liminallm/service/auth.py:744-763`
 
@@ -898,25 +896,17 @@ if failures >= self.max_mfa_attempts:
 await self.cache.increment_mfa_failures(user_id)
 ```
 
-**Issue:** Attacker can flood concurrent TOTP attempts. Each request reads failures=N, all pass check, all increment. Can exceed lockout threshold significantly.
+**Status:** ✅ Redis-backed `atomic_mfa_attempt` performs atomic increment + lockout checks; fallback uses thread-safe locks.
 
-**Fix:** Use atomic Redis INCR with conditional check in Lua script.
+**Implementation:**
+- `Auth.verify_mfa_challenge` calls `cache.atomic_mfa_attempt(...)` to increment and evaluate lockouts atomically (lines 1076-1093).
+- In-memory fallback now uses `_state_lock` to serialize updates and set lockouts (lines 1095-1107).
 
-### 19.4 CRITICAL: Idempotency Check-Then-Set Race
+### 19.4 ~~CRITICAL: Idempotency Check-Then-Set Race~~ FIXED
 
-**Location:** `liminallm/api/routes.py:272-312`
+**Location:** `liminallm/api/routes.py:609-655`
 
-```python
-existing = await store.get_idempotency_record(key)
-if existing:
-    return existing.response
-# ... process request
-await store.set_idempotency_record(key, response)
-```
-
-**Issue:** Two concurrent requests with same idempotency key both see no existing record, both process, potentially creating duplicates.
-
-**Fix:** Use atomic SETNX pattern or database advisory lock.
+**Fix Applied:** `_resolve_idempotency` uses `_acquire_idempotency_slot` (SETNX-style claim) to atomically reserve keys and returns 409 if another request is in progress, preventing duplicate processing.
 
 ### 19.5 CRITICAL: Artifact Version Race Condition
 
@@ -1153,15 +1143,11 @@ Conversation cached with 5m TTL but messages cached with 1m TTL. Can serve stale
 
 WebSocket handlers don't always clean up listener tasks on disconnect. Task references leak.
 
-### 23.4 HIGH: Workflow Trace Accumulation
+### 23.4 ~~HIGH: Workflow Trace Accumulation~~ FIXED
 
-**Location:** `liminallm/service/workflow.py:428-600`
+**Location:** `liminallm/service/workflow.py:428-940`
 
-```python
-workflow_traces.append(trace)  # Never truncated during execution
-```
-
-Long-running workflows accumulate unbounded trace data in memory.
+**Fix Applied:** Trace appends now route through `_append_trace`, which caps the in-memory trace list at 500 entries and discards oldest records during long-running workflows to prevent unbounded growth.
 
 ### 23.5 MEDIUM: Database Connection Pool Not Monitored
 
