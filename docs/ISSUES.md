@@ -1181,26 +1181,20 @@ expires_at = datetime.utcnow() + timedelta(...)  # Naive datetime
 
 **Fix:** Use `datetime.now(timezone.utc)` consistently throughout.
 
-### 24.2 HIGH: Unsafe .get() Without None Handling
+### 24.2 ~~HIGH: Unsafe .get() Without None Handling~~ (FALSE POSITIVE)
 
-**Location:** Multiple files
+**Analysis:** Reviewed `.get()` usages across the codebase; call sites that invoke
+subsequent methods supply safe defaults (e.g., empty strings before `.split()` or
+`.strip()`) and no occurrences of `.get(...).method()` without a default were
+found. The audit pattern does not appear in current sources.
 
-```python
-value = data.get("field")
-value.strip()  # AttributeError if None
-```
+### 24.3 ~~HIGH: Float Conversion Without Error Handling~~ FIXED
 
-Many `.get()` calls followed by method calls without None checks.
+**Location:** `liminallm/service/router.py`
 
-### 24.3 HIGH: Float Conversion Without Error Handling
-
-**Location:** `liminallm/service/router.py:145-160`
-
-```python
-score = float(raw_score)  # Can raise ValueError
-```
-
-Score conversions can fail on invalid input without try/except.
+**Resolution:** Added `_safe_float` helper to defensively coerce weights,
+similarities, and embedding hashes with structured logging and defaults instead of
+raising `ValueError`/`TypeError` on malformed inputs.
 
 ### 24.4 MEDIUM: Empty String vs None Inconsistency
 
@@ -1208,11 +1202,12 @@ Score conversions can fail on invalid input without try/except.
 
 Some methods treat empty string as falsy (skip), others store it. Behavior differs between backends.
 
-### 24.5 MEDIUM: Unicode Normalization Missing
+### 24.5 ~~MEDIUM: Unicode Normalization Missing~~ FIXED
 
-**Location:** `liminallm/service/rag.py:200-250`
+**Location:** `liminallm/service/rag.py`
 
-Text ingestion doesn't normalize Unicode. Same text with different normalization forms treated as different.
+**Resolution:** RAG ingestion now normalizes text to NFC before tokenization so
+canonically equivalent strings map to identical chunks across ingests.
 
 ### 24.6 MEDIUM: Locale-Dependent String Operations
 
@@ -1241,20 +1236,13 @@ Text ingestion doesn't normalize Unicode. Same text with different normalization
 - Default and max limits configurable via admin settings
 - Per SPEC §18: "limit is accepted as alias for page_size (defaults to 100, max 500)"
 
-### 25.3 CRITICAL: search_chunks Loads All Before Scoring
+### 25.3 ~~CRITICAL: search_chunks Loads All Before Scoring~~ FIXED
 
-**Location:** `liminallm/storage/postgres.py:2400-2450`
+**Location:** `liminallm/storage/postgres.py`
 
-```python
-# Load all matching chunks
-chunks = await conn.fetch("SELECT * FROM chunks WHERE context_id = $1", ...)
-# Then score in Python
-scored = [(score(c), c) for c in chunks]
-```
-
-**Issue:** Large contexts load all chunks into memory before filtering.
-
-**Fix:** Use database-side scoring and LIMIT.
+**Resolution:** Hybrid `search_chunks` now bounds database reads (5x the requested
+limit, capped at 500) before BM25/semantic scoring, preventing unbounded memory
+growth on large contexts while still re-ranking a representative candidate set.
 
 ### 25.4 HIGH: Artifact List No Default Limit
 

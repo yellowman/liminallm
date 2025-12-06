@@ -2761,7 +2761,10 @@ class PostgresStore:
             norm_b = sum(x * x for x in b) ** 0.5 or 1.0
             return dot / (norm_a * norm_b)
 
-        candidates = self.list_chunks(context_id)
+        candidate_limit = limit or 4
+        # Issue 25.3: prevent unbounded candidate loading by limiting DB reads
+        max_candidates = min(candidate_limit * 5, 500)
+        candidates = self.list_chunks(context_id, limit=max_candidates)
         if not candidates:
             return []
         query_tokens = _tokenize_text(query)

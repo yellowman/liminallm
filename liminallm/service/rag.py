@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import unicodedata
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Union
@@ -337,6 +338,8 @@ class RAGService:
         """
         if not hasattr(self.store, "add_chunks"):
             return 0
+        # Issue 24.5: Normalize Unicode input so equivalent text shares canonical form
+        text = unicodedata.normalize("NFC", text)
         lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
         blob = " ".join(lines)
         if not blob:
