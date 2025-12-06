@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 from datetime import datetime, timezone
 from pathlib import Path as FilePath
 from typing import Any, Dict, Optional
@@ -356,6 +357,7 @@ def _get_system_settings(runtime) -> dict:
         "admin_rate_limit_per_minute": 30,
         "admin_rate_limit_window_seconds": 60,
         "files_upload_rate_limit_per_minute": 10,
+        "websocket_connect_rate_limit_per_minute": 30,
         "configops_rate_limit_per_hour": 30,
         "read_rate_limit_per_minute": 120,
         "write_rate_limit_per_minute": 60,
@@ -449,7 +451,13 @@ def _get_rate_limit(runtime, key: str) -> int:
 
 
 async def _enforce_rate_limit(
-    runtime, key: str, limit: int, window_seconds: int, *, response: Optional[Response] = None
+    runtime,
+    key: str,
+    limit: int,
+    window_seconds: int,
+    *,
+    response: Optional[Response] = None,
+    cost: int = 1,
 ) -> RateLimitInfo:
     """Enforce rate limit and optionally apply headers to response.
 
@@ -474,8 +482,12 @@ async def _enforce_rate_limit(
         logger.warning("invalid_rate_limit_window", key=key, window_seconds=window_seconds)
         window_seconds = 60  # Default to 1 minute window
 
-    allowed, remaining = await check_rate_limit(runtime, key, limit, window_seconds, return_remaining=True)
-    info = RateLimitInfo(limit, remaining, window_seconds)
+    allowed, remaining, reset_after = await check_rate_limit(
+        runtime, key, limit, window_seconds, return_remaining=True, cost=cost
+    )
+    # Use calculated reset time when available to avoid leaking window details on failures (Issue 77.8)
+    reset_seconds = reset_after if reset_after is not None else window_seconds
+    info = RateLimitInfo(limit, remaining, reset_seconds)
 
     if response is not None:
         info.apply_headers(response)
@@ -3233,13 +3245,6 @@ async def upload_file(
     import re
 
     runtime = get_runtime()
-    # Rate limit file uploads per SPEC §18: 10 req/min
-    await _enforce_rate_limit(
-        runtime,
-        f"files:upload:{principal.user_id}",
-        _get_rate_limit(runtime, "files_upload_rate_limit_per_minute"),
-        60,
-    )
     # SPEC §18: Accept Idempotency-Key when provided (optional)
     async with IdempotencyGuard(
         "files:upload", principal.user_id, idempotency_key, require=False
@@ -3267,6 +3272,15 @@ async def upload_file(
         contents = await file.read(max_bytes + 1)
         if len(contents) > max_bytes:
             raise _http_error("validation_error", f"file too large (max {max_bytes // 1024 // 1024}MB for {plan_tier} plan)", status_code=413)
+        # Weight rate-limit cost by payload size to prevent request chunking bypass (Issue 77.4)
+        approx_cost = max(1, math.ceil(len(contents) / (256 * 1024)))
+        await _enforce_rate_limit(
+            runtime,
+            f"files:upload:{principal.user_id}",
+            _get_rate_limit(runtime, "files_upload_rate_limit_per_minute"),
+            60,
+            cost=approx_cost,
+        )
         dest_path = safe_join(dest_dir, safe_filename)
         resolved_dest = dest_path.resolve()
         if (
@@ -3994,6 +4008,20 @@ async def synthesize_voice(
 async def websocket_chat(ws: WebSocket):
     """Handle WebSocket chat connections for streaming responses."""
     runtime = get_runtime()
+    client_host = ws.client.host if ws.client else "unknown"
+    connect_limit = _get_system_settings(runtime).get(
+        "websocket_connect_rate_limit_per_minute", 30
+    )
+    allowed, _, _ = await check_rate_limit(
+        runtime,
+        f"ws:connect:{client_host}",
+        connect_limit,
+        60,
+        return_remaining=True,
+    )
+    if not allowed:
+        await ws.close(code=4429)
+        return
     await ws.accept()
     user_id: Optional[str] = None
     idempotency_key: Optional[str] = None

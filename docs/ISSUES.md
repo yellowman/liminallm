@@ -5772,94 +5772,65 @@ Workflow events ordered by timestamp alone. Concurrent events may be misordered 
 
 ## 77. Rate Limiting Implementation Flaws
 
-### 77.1 CRITICAL: Rate Limit Key Collision
+### 77.1 ~~CRITICAL: Rate Limit Key Collision~~ FIXED
 **Location:** `liminallm/storage/redis_cache.py:42-73`
 
-```python
-def rate_limit_key(self, user_id: str, resource: str, action: str) -> str:
-    return f"rate:{user_id}:{resource}:{action}"
-```
+**Fix:** Rate limit keys are normalized via SHA-256 hashing (with tenant isolation) to prevent delimiter collisions or crafted separators from affecting other users.
 
-Rate limit keys use colon separator but user_id, resource, action aren't validated for colons. Attacker with user_id `admin:chat` could manipulate rate limits for other users.
-
-**Impact:** Rate limit bypass or denial of service to other users.
-
-### 77.2 CRITICAL: Fixed Window Rate Limit Burst
+### 77.2 ~~CRITICAL: Fixed Window Rate Limit Burst~~ FIXED
 **Location:** `liminallm/service/runtime.py:278-312`
 
-Rate limiting uses fixed time windows. Attacker can burst 2x limit by timing requests at window boundary (end of window N + start of window N+1).
+**Fix:** Fixed-window counters replaced with token-bucket rate limiting (Redis-backed with local fallback) to smooth bursts and remove boundary-doubling.
 
-**Impact:** Effective rate limit is 2x configured limit.
-
-### 77.3 HIGH: No Rate Limit on Password Reset
+### 77.3 ✅ FIXED: No Rate Limit on Password Reset
 **Location:** `liminallm/api/routes.py:1234-1267`
 
-Password reset endpoint has no rate limiting. Attackers can enumerate valid emails and spam reset requests.
+**Note:** Password reset endpoints already enforce per-email rate limits; no code changes required.
 
-**Impact:** Email bombing, user enumeration.
-
-### 77.4 HIGH: Rate Limit Bypass via Request Chunking
+### 77.4 ~~HIGH: Rate Limit Bypass via Request Chunking~~ FIXED
 **Location:** `liminallm/service/runtime.py:278-285`
 
-Rate limits count requests but not payload size. Single request with large payload consumes more resources than rate limit accounts for.
+**Fix:** Rate limit enforcement now supports weighted `cost` and file uploads charge cost proportional to payload size to block large single-request bypass.
 
-**Impact:** Resource exhaustion within rate limits.
-
-### 77.5 HIGH: WebSocket Rate Limit Gap
+### 77.5 ~~HIGH: WebSocket Rate Limit Gap~~ FIXED
 **Location:** `liminallm/api/routes.py:2863-2976`
 
-WebSocket messages counted after initial connection. No limit on connection establishment rate.
+**Fix:** Added pre-accept connection rate limiting keyed by client host to cap handshake floods.
 
-**Impact:** Connection exhaustion via rapid WebSocket connections.
-
-### 77.6 MEDIUM: Rate Limit Not Applied to Admin Routes
+### 77.6 ✅ FIXED: Rate Limit Not Applied to Admin Routes
 **Location:** `liminallm/api/routes.py:2456-2567`
 
-Admin routes lack rate limiting. Compromised admin token can perform unlimited operations.
-
-**Impact:** Unlimited admin operations, potential DoS.
+**Note:** Admin endpoints already enforce rate limits; no code changes required.
 
 ### 77.7 MEDIUM: Local Rate Limit Cache Inconsistency
 **Location:** `liminallm/service/runtime.py:160, 278-285`
 
-Local rate limit cache (`_local_rate_limits`) not synchronized across instances. Distributed deployments have per-instance limits.
+**Fix:** Token-bucket limits are now centralized via Redis Lua script; the local cache remains a single-node degraded fallback per SPEC guidance.
 
-**Impact:** Rate limit multiplied by number of instances.
-
-### 77.8 MEDIUM: Rate Limit Error Reveals Limit Values
+### 77.8 ✅ FIXED: Rate Limit Error Reveals Limit Values
 **Location:** `liminallm/service/runtime.py:298-305`
 
-Rate limit error response includes remaining quota and reset time. Information disclosure aids attackers.
+**Note:** Rate limit errors return generic 429 without limit metadata; reset headers now rely on token-bucket refill time and avoid leaking window internals.
 
-**Impact:** Attackers can optimize attack timing and rate.
-
-### 77.9 MEDIUM: IP-Based Rate Limit Bypass via Headers
+### 77.9 ✅ FALSE POSITIVE: IP-Based Rate Limit Bypass via Headers
 **Location:** `liminallm/api/middleware.py:45-67`
 
-IP-based rate limiting trusts X-Forwarded-For header. Attackers can spoof different IPs to bypass limits.
+**Note:** The referenced middleware module does not exist; rate limits are scoped to authenticated users or connection hosts.
 
-**Impact:** Complete rate limit bypass via header manipulation.
-
-### 77.10 MEDIUM: Rate Limit Atomic Operation Race
+### 77.10 ~~MEDIUM: Rate Limit Atomic Operation Race~~ FIXED
 **Location:** `liminallm/storage/redis_cache.py:42-73`
 
-Rate limit increment uses GET + INCR which isn't atomic. Race condition could allow extra requests.
+**Fix:** Atomic Lua token-bucket script now performs refill and consume in a single Redis call.
 
-**Impact:** Slight rate limit overflow in high-concurrency scenarios.
-
-### 77.11 MEDIUM: No Rate Limit on File Upload
+### 77.11 ✅ FIXED: No Rate Limit on File Upload
 **Location:** `liminallm/api/routes.py:1847-1892`
 
-File upload endpoint has no rate limiting. Attackers can exhaust storage rapidly.
+**Note:** Upload endpoint already enforced per-user limits and now weights rate-limit cost by payload size (see 77.4).
 
-**Impact:** Storage exhaustion, DoS.
-
-### 77.12 MEDIUM: Rate Limit Token Bucket Not Implemented
+### 77.12 ~~MEDIUM: Rate Limit Token Bucket Not Implemented~~ FIXED
 **Location:** `liminallm/service/runtime.py:278-312`
 
-Simple counter-based rate limiting doesn't allow for burst tolerance. Legitimate burst traffic immediately rate limited.
-
-**Impact:** Poor user experience for legitimate bursty usage patterns.
+**Fix:** Implemented token-bucket rate limiting across Redis and local fallbacks with smooth refill for controlled bursts.
 
 ---
 
