@@ -438,6 +438,14 @@ async def _enforce_rate_limit(
     Raises:
         HTTPException with 429 if rate limit exceeded
     """
+    # Issue 53.8: Validate rate limit is positive to prevent bypass via negative values
+    if limit <= 0:
+        logger.warning("invalid_rate_limit_value", key=key, limit=limit)
+        limit = 1  # Default to strictest limit to prevent bypass
+    if window_seconds <= 0:
+        logger.warning("invalid_rate_limit_window", key=key, window_seconds=window_seconds)
+        window_seconds = 60  # Default to 1 minute window
+
     allowed, remaining = await check_rate_limit(runtime, key, limit, window_seconds, return_remaining=True)
     info = RateLimitInfo(limit, remaining, window_seconds)
 

@@ -93,6 +93,10 @@ app.add_middleware(
         "X-CSRF-Token",
         "X-Request-ID",  # For correlation ID tracing per SPEC §15.2
     ],
+    # Issue 52.9: Expose X-Request-ID header to frontend JavaScript
+    expose_headers=["X-Request-ID", "API-Version"],
+    # Issue 52.8: Cache preflight requests for 1 hour
+    max_age=3600,
 )
 
 
@@ -122,6 +126,10 @@ async def add_security_headers(request, call_next):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-XSS-Protection", "1; mode=block")
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
+    # Issue 52.3: Add Cache-Control header to prevent caching of API responses
+    # API responses should not be cached by proxies/CDNs to prevent data leakage
+    if request.url.path.startswith("/v1/") or request.url.path in ("/healthz", "/metrics"):
+        response.headers.setdefault("Cache-Control", "no-store, no-cache, must-revalidate, private")
     response.headers.setdefault(
         "Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()"
     )
