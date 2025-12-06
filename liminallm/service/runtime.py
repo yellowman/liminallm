@@ -252,7 +252,7 @@ class Runtime:
         )
         self._local_idempotency: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         self._local_idempotency_lock = asyncio.Lock()
-        self._local_rate_limits: Dict[str, Tuple[datetime, int]] = {}
+        self._local_rate_limits: Dict[str, Tuple[float, datetime]] = {}
         self._local_rate_limit_lock = asyncio.Lock()
 
         # Log successful initialization with summary
@@ -434,8 +434,14 @@ async def _acquire_idempotency_slot(
 
 
 async def check_rate_limit(
-    runtime: Runtime, key: str, limit: int, window_seconds: int, *, return_remaining: bool = False
-) -> Union[bool, Tuple[bool, int]]:
+    runtime: Runtime,
+    key: str,
+    limit: int,
+    window_seconds: int,
+    *,
+    return_remaining: bool = False,
+    cost: int = 1,
+) -> Union[bool, Tuple[bool, int, int]]:
     """Enforce rate limits even when Redis is unavailable.
 
     Per SPEC §18, rate limits use Redis token bucket with configurable defaults.
@@ -462,18 +468,22 @@ async def check_rate_limit(
         window_seconds = 60  # Default to 1 minute if invalid window per SPEC §18
     now = datetime.utcnow()
     if runtime.cache:
-        result = await runtime.cache.check_rate_limit(key, limit, window_seconds, return_remaining=return_remaining)
+        result = await runtime.cache.check_rate_limit(
+            key, limit, window_seconds, return_remaining=return_remaining, cost=cost
+        )
         return result
     window = timedelta(seconds=window_seconds)
+    refill_rate = float(limit) / float(window_seconds)
     async with runtime._local_rate_limit_lock:
-        window_start, count = runtime._local_rate_limits.get(key, (now, 0))
-        if now - window_start >= window:
-            window_start, count = now, 0
-        new_count = count + 1
-        allowed = new_count <= limit
+        tokens, last_ts = runtime._local_rate_limits.get(key, (float(limit), now))
+        elapsed = max(0.0, (now - last_ts).total_seconds())
+        tokens = min(float(limit), tokens + elapsed * refill_rate)
+        allowed = tokens >= cost
         if allowed:
-            runtime._local_rate_limits[key] = (window_start, new_count)
-        remaining = max(0, limit - new_count)
+            tokens -= cost
+            runtime._local_rate_limits[key] = (tokens, now)
+        reset_seconds = int(((cost - tokens) / refill_rate)) if not allowed and refill_rate > 0 else 0
+        remaining = int(tokens)
     if return_remaining:
-        return (allowed, remaining)
+        return (allowed, remaining, reset_seconds)
     return allowed

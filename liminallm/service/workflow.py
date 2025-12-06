@@ -301,6 +301,7 @@ class WorkflowEngine:
         tenant_id: Optional[str],
         workflow_start_time: float,
         workflow_timeout_ms: float,
+        cancel_event: Optional[asyncio.Event] = None,
     ) -> ParallelNodeResult:
         """Execute multiple nodes concurrently and merge results.
 
@@ -339,6 +340,7 @@ class WorkflowEngine:
                     tenant_id=tenant_id,
                     workflow_start_time=workflow_start_time,
                     workflow_timeout_ms=workflow_timeout_ms,
+                    cancel_event=cancel_event,
                 )
                 snippets = result.get("context_snippets", []) if isinstance(result, dict) else []
                 return node_id, result, snippets
@@ -436,6 +438,12 @@ class WorkflowEngine:
         )
         workflow_start_time = time.monotonic()
 
+        def _error_event(code: str, message: str, details: dict | None = None) -> dict:
+            return {
+                "event": "error",
+                "data": {"code": code, "message": message, "details": details or {}},
+            }
+
         adapters, routing_trace, adapter_gates = await self._select_adapters(
             user_message, user_id, context_id
         )
@@ -454,6 +462,15 @@ class WorkflowEngine:
 
         vars_scope: Dict[str, Any] = {}
         workflow_trace: List[Dict[str, Any]] = []
+        max_trace_entries = 500
+
+        def _append_trace(entry: Dict[str, Any]) -> None:
+            """Append to workflow_trace with bounded size (Issue 23.4)."""
+
+            workflow_trace.append(entry)
+            if len(workflow_trace) > max_trace_entries:
+                # Drop oldest entries to avoid unbounded growth during long runs
+                del workflow_trace[0 : len(workflow_trace) - max_trace_entries]
         context_snippets: List[str] = []
         context_seen = set()
         content = ""
@@ -584,12 +601,14 @@ class WorkflowEngine:
                     )
 
                     # Merge parallel results into workflow state
-                    workflow_trace.append({
-                        "node": node_id,
-                        "status": parallel_result.status,
-                        "parallel_nodes": parallel_node_ids,
-                        "failed_nodes": parallel_result.failed_nodes,
-                    })
+                    _append_trace(
+                        {
+                            "node": node_id,
+                            "status": parallel_result.status,
+                            "parallel_nodes": parallel_node_ids,
+                            "failed_nodes": parallel_result.failed_nodes,
+                        }
+                    )
 
                     # Update vars with namespaced parallel outputs
                     vars_scope.update(parallel_result.merged_outputs)
@@ -625,7 +644,7 @@ class WorkflowEngine:
                     pending.insert(0, after_node)
                 continue
 
-            workflow_trace.append({"node": node_id, **result})
+            _append_trace({"node": node_id, **result})
             if result.get("outputs"):
                 vars_scope.update(result["outputs"])
             if result.get("context_snippets"):
@@ -712,6 +731,12 @@ class WorkflowEngine:
         )
         workflow_start_time = time.monotonic()
 
+        def _error_event(code: str, message: str, details: dict | None = None) -> dict:
+            return {
+                "event": "error",
+                "data": {"code": code, "message": message, "details": details or {}},
+            }
+
         adapters, routing_trace, adapter_gates = await self._select_adapters(
             user_message, user_id, context_id
         )
@@ -723,7 +748,11 @@ class WorkflowEngine:
             n.get("id"): n for n in workflow_schema.get("nodes", []) if n.get("id")
         }
         if not node_map:
-            yield {"event": "error", "data": {"code": "validation_error", "message": "workflow has no nodes"}}
+            yield _error_event(
+                "validation_error",
+                "workflow has no nodes",
+                {"workflow_id": workflow_id},
+            )
             return
 
         entry = workflow_schema.get("entrypoint") or next(iter(node_map), None)
@@ -752,13 +781,11 @@ class WorkflowEngine:
             # Check workflow timeout
             elapsed_ms = (time.monotonic() - workflow_start_time) * 1000
             if elapsed_ms >= workflow_timeout_ms:
-                yield {
-                    "event": "error",
-                    "data": {
-                        "code": "server_error",
-                        "message": "workflow execution timed out",
-                    },
-                }
+                yield _error_event(
+                    "server_error",
+                    "workflow execution timed out",
+                    {"timeout_ms": workflow_timeout_ms},
+                )
                 return
 
             node_id = pending.pop(0)
@@ -797,12 +824,14 @@ class WorkflowEngine:
                         content = data.get("content", "")
                         node_usage = data.get("usage", {})
                         usage = self._merge_usage(usage, node_usage)
-                        workflow_trace.append({
-                            "node": node_id,
-                            "status": "ok",
-                            "content": content,
-                            "usage": node_usage,
-                        })
+                        _append_trace(
+                            {
+                                "node": node_id,
+                                "status": "ok",
+                                "content": content,
+                                "usage": node_usage,
+                            }
+                        )
                         # Emit trace event
                         yield {"event": "trace", "data": {"workflow_trace": workflow_trace[-1]}}
                     elif event["event"] == "error":
@@ -833,16 +862,15 @@ class WorkflowEngine:
                     tenant_id=tenant_id,
                     workflow_start_time=workflow_start_time,
                     workflow_timeout_ms=workflow_timeout_ms,
+                    cancel_event=cancel_event,
                 )
 
                 if result.get("status") == "error" and result.get("retries_exhausted"):
-                    yield {
-                        "event": "error",
-                        "data": {
-                            "code": "server_error",
-                            "message": result.get("error", "node execution failed"),
-                        },
-                    }
+                    yield _error_event(
+                        "server_error",
+                        result.get("error", "node execution failed"),
+                        {"node_id": node_id, "retries": result.get("retries", 0)},
+                    )
                     return
 
                 # Handle parallel node execution in streaming mode
@@ -869,15 +897,18 @@ class WorkflowEngine:
                             tenant_id=tenant_id,
                             workflow_start_time=workflow_start_time,
                             workflow_timeout_ms=workflow_timeout_ms,
+                            cancel_event=cancel_event,
                         )
 
                         # Record parallel execution in trace
-                        workflow_trace.append({
-                            "node": node_id,
-                            "status": parallel_result.status,
-                            "parallel_nodes": parallel_node_ids,
-                            "failed_nodes": parallel_result.failed_nodes,
-                        })
+                        _append_trace(
+                            {
+                                "node": node_id,
+                                "status": parallel_result.status,
+                                "parallel_nodes": parallel_node_ids,
+                                "failed_nodes": parallel_result.failed_nodes,
+                            }
+                        )
                         yield {"event": "trace", "data": {"workflow_trace": workflow_trace[-1]}}
 
                         # Merge parallel results
@@ -892,13 +923,11 @@ class WorkflowEngine:
 
                         # Handle parallel failures
                         if parallel_result.status == "error":
-                            yield {
-                                "event": "error",
-                                "data": {
-                                    "code": "server_error",
-                                    "message": f"All parallel nodes failed: {parallel_result.failed_nodes}",
-                                },
-                            }
+                            yield _error_event(
+                                "server_error",
+                                f"All parallel nodes failed: {parallel_result.failed_nodes}",
+                                {"failed_nodes": parallel_result.failed_nodes},
+                            )
                             return
 
                     # Continue to "after" node if specified
@@ -906,7 +935,7 @@ class WorkflowEngine:
                         pending.insert(0, after_node)
                     continue
 
-                workflow_trace.append({"node": node_id, **result})
+                _append_trace({"node": node_id, **result})
                 yield {"event": "trace", "data": {"workflow_trace": workflow_trace[-1]}}
 
                 if result.get("outputs"):
@@ -926,10 +955,11 @@ class WorkflowEngine:
 
                 pending.extend(next_nodes)
                 if result.get("status") == "error" and not next_nodes:
-                    yield {
-                        "event": "error",
-                        "data": {"code": "server_error", "message": result.get("error", "")},
-                    }
+                    yield _error_event(
+                        "server_error",
+                        result.get("error", ""),
+                        {"node_id": node_id},
+                    )
                     return
                 if result.get("status") == "end":
                     break
@@ -1006,10 +1036,11 @@ class WorkflowEngine:
 
         except Exception as exc:
             self.logger.error("llm_stream_error", error=str(exc))
-            yield {
-                "event": "error",
-                "data": {"code": "server_error", "message": str(exc)},
-            }
+            yield _error_event(
+                "server_error",
+                str(exc),
+                {"node_id": node.get("id"), "tool": node.get("tool")},
+            )
 
     async def _handle_node_failure(
         self,
@@ -1030,7 +1061,7 @@ class WorkflowEngine:
             "error": str(exc),
             "outputs": {},
         }
-        workflow_trace.append(failure_entry)
+        _append_trace(failure_entry)
         rollback_state = await self._rollback_workflow(
             state_key, workflow_trace, vars_scope, snapshots=snapshots
         )
@@ -1102,6 +1133,7 @@ class WorkflowEngine:
         tenant_id: Optional[str],
         workflow_start_time: float,
         workflow_timeout_ms: float,
+        cancel_event: Optional[asyncio.Event] = None,
     ) -> Tuple[Dict[str, Any], List[str]]:
         """Execute a node with SPEC §9/§18 exponential backoff retry logic.
 
@@ -1132,19 +1164,23 @@ class WorkflowEngine:
                         "attempts": attempt,
                     },
                     [],
-                )
+            )
 
             try:
-                result, next_nodes = self._execute_node(
-                    node,
-                    user_message=user_message,
-                    context_id=context_id,
-                    conversation_id=conversation_id,
-                    adapters=adapters,
-                    history=history,
-                    vars_scope=vars_scope,
-                    user_id=user_id,
-                    tenant_id=tenant_id,
+                node_timeout_ms = node.get("timeout_ms", DEFAULT_NODE_TIMEOUT_MS)
+                result, next_nodes = await asyncio.wait_for(
+                    self._execute_node(
+                        node,
+                        user_message=user_message,
+                        context_id=context_id,
+                        conversation_id=conversation_id,
+                        adapters=adapters,
+                        history=history,
+                        vars_scope=vars_scope,
+                        user_id=user_id,
+                        tenant_id=tenant_id,
+                    ),
+                    timeout=node_timeout_ms / 1000.0,
                 )
 
                 # If node executed successfully or has an on_error handler, return
@@ -1157,6 +1193,21 @@ class WorkflowEngine:
                 last_error = Exception(
                     result.get("error", "node returned error status")
                 )
+
+            except asyncio.TimeoutError:
+                last_error = asyncio.TimeoutError("node_timeout")
+                self.logger.warning(
+                    "workflow_node_timeout",
+                    node=node_id,
+                    attempt=attempt + 1,
+                    timeout_ms=node_timeout_ms,
+                )
+                result = {
+                    "status": "error",
+                    "error": "node_timeout",
+                    "timeout_ms": node_timeout_ms,
+                }
+                next_nodes = []
 
             except Exception as exc:
                 last_error = exc
@@ -1187,7 +1238,32 @@ class WorkflowEngine:
                         attempt=attempt,
                         backoff_ms=sleep_ms,
                     )
-                    await asyncio.sleep(sleep_ms / 1000.0)
+                    if cancel_event and cancel_event.is_set():
+                        return (
+                            {
+                                "status": "error",
+                                "error": "workflow_cancelled",
+                                "cancelled": True,
+                            },
+                            [],
+                        )
+                    if cancel_event:
+                        try:
+                            await asyncio.wait_for(
+                                cancel_event.wait(), timeout=sleep_ms / 1000.0
+                            )
+                            return (
+                                {
+                                    "status": "error",
+                                    "error": "workflow_cancelled",
+                                    "cancelled": True,
+                                },
+                                [],
+                            )
+                        except asyncio.TimeoutError:
+                            pass
+                    else:
+                        await asyncio.sleep(sleep_ms / 1000.0)
 
         # All retries exhausted
         self.logger.error(
@@ -1439,7 +1515,7 @@ class WorkflowEngine:
             ensure_embedding_dim(b, dim=EMBEDDING_DIM),
         )
 
-    def _execute_node(
+    async def _execute_node(
         self,
         node: Dict[str, Any],
         *,

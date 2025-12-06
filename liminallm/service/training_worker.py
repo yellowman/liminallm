@@ -30,6 +30,7 @@ DEFAULT_POLL_INTERVAL_SECONDS = 60
 DEFAULT_BATCH_SIZE = 5
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_DELAY_SECONDS = 30
+MAX_QUEUE_DEPTH = 100
 
 
 class TrainingWorker:
@@ -126,14 +127,22 @@ class TrainingWorker:
         list_fn = getattr(self.store, "list_training_jobs", None)
         if callable(list_fn):
             all_jobs = list_fn()
-            return [j for j in all_jobs if j.status == "queued"]
+            queued = [j for j in all_jobs if j.status == "queued"]
+            if len(queued) > MAX_QUEUE_DEPTH:
+                logger.warning(
+                    "training_queue_depth_capped",
+                    queued=len(queued),
+                    capped=MAX_QUEUE_DEPTH,
+                )
+            return queued[:MAX_QUEUE_DEPTH]
 
         # MemoryStore fallback
         if hasattr(self.store, "training_jobs"):
-            return [
+            queued = [
                 j for j in self.store.training_jobs.values()
                 if j.status == "queued"
             ]
+            return queued[:MAX_QUEUE_DEPTH]
 
         return []
 
@@ -224,18 +233,19 @@ class TrainingWorker:
                 )
 
                 if attempt < self.max_retries:
+                    backoff = min(self.retry_delay * (2 ** (attempt - 1)), 300)
                     logger.debug(
                         "training_job_retry_wait",
                         job_id=job_id,
-                        retry_delay=self.retry_delay,
+                        retry_delay=backoff,
                         next_attempt=attempt + 1,
                     )
-                    await asyncio.sleep(self.retry_delay)
+                    await asyncio.sleep(backoff)
 
         # All retries exhausted
         self.store.update_training_job(
             job_id,
-            status="failed",
+            status="dead_letter",
             meta={
                 "error": last_error,
                 "attempts": attempt,

@@ -109,13 +109,11 @@ class MemoryStore:
         return base64.urlsafe_b64encode(hashlib.sha256(key_material.encode()).digest())
 
     def _build_mfa_cipher(self, key_material: str | None) -> Fernet:
-        material = (
-            key_material or os.getenv("MFA_SECRET_KEY") or os.getenv("JWT_SECRET")
-        )
+        material = key_material or os.getenv("MFA_SECRET_KEY")
         if not material:
             shared_fs = Path(os.getenv("SHARED_FS_ROOT", "/srv/liminallm"))
-            secret_path = shared_fs / ".jwt_secret"
-            fallback_path = self.fs_root / ".jwt_secret"
+            secret_path = shared_fs / ".mfa_secret"
+            fallback_path = self.fs_root / ".mfa_secret"
             for candidate in (secret_path, fallback_path):
                 try:
                     if candidate.exists():
@@ -489,6 +487,12 @@ class MemoryStore:
             return self.sessions.get(session_id)
 
     def set_session_meta(self, session_id: str, meta: Dict) -> None:
+        if not isinstance(meta, dict):
+            raise ValueError("session meta must be a dictionary")
+        try:
+            json.dumps(meta)
+        except TypeError as exc:
+            raise ValueError("session meta must be JSON serializable") from exc
         with self._data_lock:
             sess = self.sessions.get(session_id)
             if not sess:
@@ -1567,6 +1571,10 @@ class MemoryStore:
         tenant_id: Optional[str] = None,
     ) -> List[KnowledgeChunk]:
         if not context_ids or not query_embedding:
+            return []
+        if not user_id:
+            # Defense in depth: enforce user isolation parity with Postgres implementation
+            self.logger.error("search_chunks_pgvector_missing_user_id")
             return []
 
         allowed_chunks: List[KnowledgeChunk] = []

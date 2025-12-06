@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from ipaddress import IPv4Address, IPv6Address, ip_address
 from typing import Dict, List, Optional
 
@@ -43,7 +43,7 @@ class Session:
         if (
             self.enforce_future_expiry
             and not self.allow_expired
-            and self.expires_at <= datetime.utcnow()
+            and self.expires_at <= datetime.now(timezone.utc)
         ):
             raise ValueError("session expiration must be in the future")
 
@@ -59,7 +59,7 @@ class Session:
         tenant_id: str = "public",
         meta: Dict | None = None,
     ) -> "Session":
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         parsed_ip = ip_address(ip_addr) if isinstance(ip_addr, str) else ip_addr
         return cls(
             id=str(uuid.uuid4()),
