@@ -211,6 +211,7 @@ class AuthResponse(BaseModel):
     access_token: Optional[str] = None
     refresh_token: Optional[str] = None
     token_type: Optional[str] = None
+    csrf_token: Optional[str] = None
     role: str = "user"
     tenant_id: str = "public"
 

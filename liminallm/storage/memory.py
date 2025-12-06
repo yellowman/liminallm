@@ -109,13 +109,11 @@ class MemoryStore:
         return base64.urlsafe_b64encode(hashlib.sha256(key_material.encode()).digest())
 
     def _build_mfa_cipher(self, key_material: str | None) -> Fernet:
-        material = (
-            key_material or os.getenv("MFA_SECRET_KEY") or os.getenv("JWT_SECRET")
-        )
+        material = key_material or os.getenv("MFA_SECRET_KEY")
         if not material:
             shared_fs = Path(os.getenv("SHARED_FS_ROOT", "/srv/liminallm"))
-            secret_path = shared_fs / ".jwt_secret"
-            fallback_path = self.fs_root / ".jwt_secret"
+            secret_path = shared_fs / ".mfa_secret"
+            fallback_path = self.fs_root / ".mfa_secret"
             for candidate in (secret_path, fallback_path):
                 try:
                     if candidate.exists():

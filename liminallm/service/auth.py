@@ -296,6 +296,21 @@ class AuthService:
                     return normalized
         return "web"
 
+    def _ensure_csrf_token(self, session: Session) -> str:
+        meta = session.meta if isinstance(session.meta, dict) else {}
+        token = None
+        if isinstance(meta, dict):
+            raw = meta.get("csrf_token")
+            if isinstance(raw, str) and raw:
+                token = raw
+        if not token:
+            token = secrets.token_urlsafe(32)
+            meta = dict(meta or {})
+            meta["csrf_token"] = token
+            session.meta = meta
+            self.store.set_session_meta(session.id, meta)
+        return token
+
     async def signup(
         self,
         email: str,
@@ -1394,6 +1409,7 @@ class AuthService:
             "jti": refresh_jti,
             "exp": refresh_exp,
         }
+        csrf_token = self._ensure_csrf_token(session)
         access_token = self._encode_jwt(access_payload)
         refresh_token = self._encode_jwt(refresh_payload)
         self._persist_session_meta(session, access_jti, access_exp, refresh_jti, refresh_exp)
@@ -1402,6 +1418,7 @@ class AuthService:
             "refresh_token": refresh_token,
             "token_type": "bearer",
             "expires_at": datetime.utcfromtimestamp(access_exp).isoformat(),
+            "csrf_token": csrf_token,
         }
 
     def _persist_session_meta(

@@ -7,9 +7,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List
 
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from liminallm.api.error_handling import register_exception_handlers
@@ -59,6 +59,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="LiminalLM Kernel", version=__version__, lifespan=lifespan)
+
+
+_CSRF_SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
 
 
 def _allowed_origins() -> List[str]:
@@ -122,6 +125,52 @@ async def add_correlation_id(request, call_next):
     response = await call_next(request)
     response.headers["X-Request-ID"] = correlation_id
     return response
+
+
+@app.middleware("http")
+async def enforce_csrf_token(request: Request, call_next):
+    # Only enforce CSRF for state-changing requests that include session cookies
+    if request.method.upper() in _CSRF_SAFE_METHODS:
+        return await call_next(request)
+    if request.headers.get("Authorization"):
+        return await call_next(request)
+    session_cookie = request.cookies.get("session_id")
+    if not session_cookie:
+        return await call_next(request)
+    header_token = request.headers.get("X-CSRF-Token")
+    cookie_token = request.cookies.get("csrf_token")
+    if not header_token or not cookie_token or header_token != cookie_token:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "status": "error",
+                "error": {"code": "forbidden", "message": "missing or invalid CSRF token"},
+            },
+        )
+    try:
+        from liminallm.service.runtime import get_runtime
+
+        runtime = get_runtime()
+        session = runtime.store.get_session(session_cookie)
+    except Exception as exc:
+        logger.warning("csrf_validation_failed", error=str(exc))
+        return JSONResponse(
+            status_code=403,
+            content={
+                "status": "error",
+                "error": {"code": "forbidden", "message": "invalid session for CSRF check"},
+            },
+        )
+    expected = session.meta.get("csrf_token") if session and isinstance(session.meta, dict) else None
+    if not expected or expected != header_token:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "status": "error",
+                "error": {"code": "forbidden", "message": "missing or invalid CSRF token"},
+            },
+        )
+    return await call_next(request)
 
 
 @app.middleware("http")

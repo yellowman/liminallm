@@ -868,6 +868,18 @@ def _apply_session_cookies(
             max_age=refresh_ttl_minutes * 60,
             path="/",
         )
+    csrf_token = tokens.get("csrf_token")
+    if csrf_token:
+        response.set_cookie(
+            "csrf_token",
+            csrf_token,
+            httponly=False,
+            secure=True,
+            samesite="lax",
+            expires=expires_at,
+            path="/",
+        )
+        response.headers.setdefault("X-CSRF-Token", csrf_token)
 
 
 @router.post("/auth/signup", response_model=Envelope, status_code=201, tags=["auth"])
@@ -915,6 +927,7 @@ async def signup(body: SignupRequest, response: Response):
             access_token=tokens.get("access_token"),
             refresh_token=tokens.get("refresh_token"),
             token_type=tokens.get("token_type"),
+            csrf_token=tokens.get("csrf_token"),
             role=user.role,
             tenant_id=user.tenant_id,
         ),
@@ -972,6 +985,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
             access_token=tokens.get("access_token"),
             refresh_token=tokens.get("refresh_token"),
             token_type=tokens.get("token_type"),
+            csrf_token=tokens.get("csrf_token"),
             role=user.role,
             tenant_id=user.tenant_id,
         ),
@@ -1057,6 +1071,7 @@ async def oauth_callback(
             access_token=tokens.get("access_token"),
             refresh_token=tokens.get("refresh_token"),
             token_type=tokens.get("token_type"),
+            csrf_token=tokens.get("csrf_token"),
             role=user.role,
             tenant_id=user.tenant_id,
         ),
@@ -1094,6 +1109,7 @@ async def refresh_tokens(
             access_token=tokens.get("access_token"),
             refresh_token=tokens.get("refresh_token"),
             token_type=tokens.get("token_type"),
+            csrf_token=tokens.get("csrf_token"),
             role=user.role,
             tenant_id=user.tenant_id,
         ),
@@ -1495,6 +1511,7 @@ async def verify_mfa(body: MFAVerifyRequest, request: Request, response: Respons
                 access_token=tokens.get("access_token"),
                 refresh_token=tokens.get("refresh_token"),
                 token_type=tokens.get("token_type"),
+                csrf_token=tokens.get("csrf_token"),
                 role=user.role,
                 tenant_id=user.tenant_id,
             ).model_dump()
@@ -1792,6 +1809,7 @@ async def logout(
             )
     response.delete_cookie("session_id", path="/", secure=True, samesite="lax")
     response.delete_cookie("refresh_token", path="/", secure=True, samesite="lax")
+    response.delete_cookie("csrf_token", path="/", secure=True, samesite="lax")
     return Envelope(status="ok", data={"message": "session revoked"})
 
 

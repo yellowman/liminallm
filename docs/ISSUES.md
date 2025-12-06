@@ -2278,6 +2278,8 @@ CORS headers advertise `X-CSRF-Token` support but tokens are never generated or 
 
 **Impact:** All state-changing endpoints vulnerable to CSRF attacks.
 
+**Status:** ✅ Fixed. A double-submit CSRF token is now generated per session, persisted alongside session metadata, returned in auth responses, and set as a `csrf_token` cookie. State-changing requests with a session cookie must present a matching `X-CSRF-Token` header and stored session token, enforced via middleware in `app.py`.
+
 ### 40.2 CRITICAL: Tokens Exposed in Email URLs
 
 **Location:** `liminallm/service/email.py:108, 160`
@@ -3416,7 +3418,7 @@ The cited line numbers (259, 295, 329, 539 in admin.js) are not error displays -
 2. JWT tokens in Authorization header provide request authentication
 3. Frontend cannot implement CSRF protection alone - it's enforced server-side
 
-**Status:** Backend concern. See Issue 40.1 for CSRF implementation requirements.
+**Status:** ✅ Fixed in backend. CSRF tokens are now issued per session, stored server-side, and validated for all state-changing requests that send the session cookie. Frontend submits the `X-CSRF-Token` header to pair with the `csrf_token` cookie, satisfying the CSRF protections outlined in Issue 40.1.
 
 ### 54.8 ~~HIGH: Sensitive Data in Session Storage~~ (FALSE POSITIVE - INDUSTRY STANDARD)
 **Location:** `frontend/chat.js:13-20, 67-76`
@@ -5170,6 +5172,8 @@ Slowloris-style DoS via hanging WebSocket connections.
 This is a backend code issue, not an infrastructure issue. The code should use a dedicated MFA_SECRET_KEY.
 
 **Note:** Reclassified as backend security issue (not infrastructure).
+
+**Status:** ✅ Fixed. MFA encryption now requires a dedicated `MFA_SECRET_KEY` or persists a per-service `.mfa_secret` key, eliminating the insecure fallback to `JWT_SECRET`.
 
 ### 71.3 ~~CRITICAL: TEST_MODE Bypasses Security Controls~~ (FALSE POSITIVE - BY DESIGN)
 **Location:** `tests/conftest.py:11`, `liminallm/service/runtime.py:45-78`
