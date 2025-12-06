@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, Union
 
 import redis.asyncio as aioredis
@@ -62,6 +62,21 @@ return {1, tokens, 0}
         # Register token bucket script for atomic rate limiting (Issue 77.10)
         self._token_bucket = self.client.register_script(self._TOKEN_BUCKET_SCRIPT)
 
+    @staticmethod
+    def _ttl_seconds(expires_at: datetime) -> int:
+        """Compute a safe TTL from an absolute expiry timestamp.
+
+        Sessions now use timezone-aware UTC timestamps; older records may be naive.
+        Normalize to UTC and clamp to at least 1 second to avoid Redis rejecting
+        negative or zero TTL values. (Issue 2.6)
+        """
+
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        else:
+            expires_at = expires_at.astimezone(timezone.utc)
+        return max(1, int((expires_at - datetime.now(timezone.utc)).total_seconds()))
+
     def verify_connection(self) -> None:
         """Assert Redis connectivity before enabling dependent features."""
         from redis import Redis
@@ -77,7 +92,7 @@ return {1, tokens, 0}
     async def cache_session(
         self, session_id: str, user_id: str, expires_at: datetime
     ) -> None:
-        ttl = max(1, int((expires_at - datetime.utcnow()).total_seconds()))
+        ttl = self._ttl_seconds(expires_at)
         pipe = self.client.pipeline()
         pipe.set(f"auth:session:{session_id}", user_id, ex=ttl)
         # Track session in user's session set for bulk revocation (Issue 22.3)
@@ -761,7 +776,7 @@ class SyncRedisCache:
     async def cache_session(
         self, session_id: str, user_id: str, expires_at: datetime
     ) -> None:
-        ttl = max(1, int((expires_at - datetime.utcnow()).total_seconds()))
+        ttl = RedisCache._ttl_seconds(expires_at)
         pipe = self._sync_client.pipeline()
         pipe.set(f"auth:session:{session_id}", user_id, ex=ttl)
         # Track session in user's session set for bulk revocation (Issue 22.3)

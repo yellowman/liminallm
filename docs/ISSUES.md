@@ -268,6 +268,14 @@ Conversation pagination defaults now match the global default (100 items) to avo
 - Auth service maps device type to configurable TTLs (defaults: 7d web, 1d mobile) for both session rows and refresh tokens.
 - Session metadata persists the device type so refresh/rotation paths preserve the correct expiry budget.
 
+### 2.6 HIGH: Redis Session Cache TTL Breaks With Aware Timestamps FIXED
+
+**Location:** `liminallm/storage/redis_cache.py`
+
+**Issue:** Session creation recently switched to timezone-aware UTC expirations. The Redis cache TTL calculation still used `datetime.utcnow()` and naive subtraction, which raises `TypeError` for aware datetimes and could write sessions without an expiry when the cache call fails silently.
+
+**Fix:** Normalize expiry timestamps to UTC, handle both naive and aware values, and clamp TTLs to at least one second via a shared helper so both async and sync Redis clients compute safe expiries.
+
 ---
 
 ## 3. Rate Limiting and Concurrency
