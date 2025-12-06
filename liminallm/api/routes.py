@@ -1052,7 +1052,8 @@ async def refresh_tokens(
 @router.get("/admin/users", response_model=Envelope, tags=["admin"])
 async def admin_list_users(
     tenant_id: Optional[str] = None,
-    limit: Optional[int] = Query(None, ge=1, description="Maximum users to return"),
+    # Issue 46.5: Add upper bound to prevent integer overflow/DoS
+    limit: Optional[int] = Query(None, ge=1, le=10000, description="Maximum users to return"),
     principal: AuthContext = Depends(get_admin_user),
 ):
     """List users in the admin's tenant.
@@ -2081,9 +2082,10 @@ async def list_artifacts(
     type: Optional[str] = None,
     kind: Optional[str] = None,
     visibility: Optional[str] = Query(None, pattern="^(private|shared|global)$", description="Filter by visibility"),
-    page: int = Query(1, ge=1, description="Page number (1-indexed)"),
-    page_size: Optional[int] = Query(None, ge=1, description="Items per page"),
-    limit: Optional[int] = Query(None, ge=1, description="Alias for page_size (for frontend compatibility)"),
+    # Issue 46.5: Add upper bounds to prevent integer overflow/DoS
+    page: int = Query(1, ge=1, le=100000, description="Page number (1-indexed)"),
+    page_size: Optional[int] = Query(None, ge=1, le=1000, description="Items per page"),
+    limit: Optional[int] = Query(None, ge=1, le=1000, description="Alias for page_size (for frontend compatibility)"),
     principal: AuthContext = Depends(get_user),
 ):
     """List artifacts owned by the current user.
