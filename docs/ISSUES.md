@@ -160,23 +160,17 @@ This document consolidates findings from deep analysis of the liminallm codebase
 
 **Status:** ✅ All error codes now use SPEC-compliant values (`validation_error`, `server_error`).
 
-### 1.2 CRITICAL: Non-Spec WebSocket Event
+### 1.2 ~~CRITICAL: Non-Spec WebSocket Event~~ (FALSE POSITIVE)
 
-**Location:** `liminallm/api/routes.py:3020-3033`
+**Location:** `liminallm/api/routes.py`
 
-After streaming completes, the code sends event `"streaming_complete"` which is NOT in SPEC §18.
+**Status:** Streams emit only SPEC-sanctioned events (`token`, `message_done`, `error`, `cancel_ack`, `trace`); no `"streaming_complete"` event is present.
 
-**SPEC-defined events:** `token`, `message_done`, `error`, `cancel_ack`, `trace`
+### 1.3 ~~BUG: Idempotency Not Stored for create_conversation~~ FIXED
 
-### 1.3 BUG: Idempotency Not Stored for create_conversation
+**Location:** `liminallm/api/routes.py`
 
-**Location:** `liminallm/api/routes.py:2521`
-
-```python
-idem.result = response  # BUG: IdempotencyGuard has no 'result' attribute
-```
-
-Should be: `await idem.store_result(response)`
+`create_conversation` persists responses via `await idem.store_result(...)`, ensuring idempotent replay per SPEC.
 
 ### 1.4 ~~CRITICAL: OAuth tenant_id From User Input~~ FIXED
 
@@ -184,23 +178,23 @@ Should be: `await idem.store_result(response)`
 
 **Status:** ✅ OAuth tenant_id is now derived from server config/OAuth state, not user input. Comments at lines 984-985 and 1005-1006 document the security fix per CLAUDE.md guidelines.
 
-### 1.5 CRITICAL: Visibility Filter Broken for Global/Shared Artifacts
+### 1.5 ~~CRITICAL: Visibility Filter Broken for Global/Shared Artifacts~~ (FALSE POSITIVE)
 
-**Location:** `liminallm/api/routes.py:1684-1691`
+**Location:** `liminallm/api/routes.py`
 
-The visibility filter logic incorrectly restricts access to global artifacts.
+Visibility filtering defers to storage, which unions private (owner), shared (tenant), and global artifacts appropriately when tenant_id is provided.
 
-### 1.6 CRITICAL: PATCH /artifacts Not RFC 6902 Compliant
+### 1.6 ~~CRITICAL: PATCH /artifacts Not RFC 6902 Compliant~~ FIXED
 
-**Location:** `liminallm/api/routes.py:1720-1745`
+**Location:** `liminallm/api/routes.py`
 
-The PATCH endpoint accepts a flat object instead of RFC 6902 JSON Patch operations.
+PATCH accepts RFC 6902 operations through `ArtifactPatchRequest` with `_apply_json_patch_ops`, keeping legacy deep merges only for backward compatibility.
 
-### 1.7 Minor: Pagination Default Inconsistency
+### 1.7 ~~Minor: Pagination Default Inconsistency~~ FIXED
 
-**Location:** `liminallm/api/routes.py:2539`
+**Location:** `liminallm/api/routes.py`
 
-`/conversations` uses `default_conversations_limit=50` while other endpoints use `default_page_size=100`.
+Conversation pagination defaults now match the global default (100 items) to avoid list endpoint inconsistencies.
 
 ---
 
@@ -311,13 +305,11 @@ The PATCH endpoint accepts a flat object instead of RFC 6902 JSON Patch operatio
 - Chat endpoints now look up user's `plan_tier` and apply multiplier to base rate limits
 - Both REST and WebSocket endpoints use per-plan rate limiting
 
-### 3.3 MEDIUM: Token Bucket Is Fixed-Window Counter
+### 3.3 ~~MEDIUM: Token Bucket Is Fixed-Window Counter~~ FIXED
 
-**Location:** `liminallm/storage/redis_cache.py:42-73`
+**Location:** `liminallm/storage/redis_cache.py`
 
-**SPEC §18 specifies:** "Redis token bucket"
-
-**Current:** Uses fixed-window counter, not true token bucket. Vulnerable to boundary condition attacks (requests spike at window edges).
+Redis rate limiting now uses an atomic Lua token bucket with weighted costs and collision-resistant keys, eliminating the fixed-window boundary spike.
 
 ---
 
@@ -372,11 +364,11 @@ The PATCH endpoint accepts a flat object instead of RFC 6902 JSON Patch operatio
 - GET /files/download sets `Content-Disposition: attachment; filename="{path}"`
 - Prevents inline execution of downloaded files in browser
 
-### 4.5 HIGH: MIME Type Validation Absent
+### 4.5 ~~HIGH: MIME Type Validation Absent~~ FIXED
 
 **SPEC §2.5 requires:** "skip files over plan cap or unknown mime type"
 
-**Current:** Upload endpoint accepts any file without MIME type validation.
+**Fix Applied:** Uploads now require a recognized MIME type (rejecting unknown or `application/octet-stream`) before proceeding.
 
 ### 4.6 MEDIUM: Temp File Cleanup Not Scheduled
 
@@ -384,11 +376,11 @@ The PATCH endpoint accepts a flat object instead of RFC 6902 JSON Patch operatio
 
 **Current:** No cleanup scheduler exists.
 
-### 4.7 MEDIUM: File Checksum Validation Absent
+### 4.7 ~~MEDIUM: File Checksum Validation Absent~~ FIXED
 
 **SPEC §2.5 requires:** "dedupe by (fs_path_checksum, path)"
 
-**Current:** No checksum calculation on upload, no deduplication.
+**Fix Applied:** Uploads compute SHA-256 checksums and persist a per-user manifest; identical re-uploads short-circuit when the checksum matches the existing file.
 
 ---
 
@@ -423,13 +415,11 @@ The PATCH endpoint accepts a flat object instead of RFC 6902 JSON Patch operatio
 
 **Current:** No validation that session is "fresh" for WebSocket use.
 
-### 5.4 MEDIUM: Error Events Lack Details Field
+### 5.4 ~~MEDIUM: Error Events Lack Details Field~~ FIXED
 
-**Location:** `liminallm/service/workflow.py:728-732`
+**Location:** `liminallm/service/workflow.py`
 
-**SPEC §18 requires:** Error envelope with `details: <object|array|null>`
-
-**Current:** Error events only have `code` and `message`, no `details` field.
+**Fix Applied:** Error events now include a `details` object (e.g., timeout_ms, node_id, failed_nodes) alongside code and message.
 
 ---
 

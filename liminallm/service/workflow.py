@@ -436,6 +436,12 @@ class WorkflowEngine:
         )
         workflow_start_time = time.monotonic()
 
+        def _error_event(code: str, message: str, details: dict | None = None) -> dict:
+            return {
+                "event": "error",
+                "data": {"code": code, "message": message, "details": details or {}},
+            }
+
         adapters, routing_trace, adapter_gates = await self._select_adapters(
             user_message, user_id, context_id
         )
@@ -712,6 +718,12 @@ class WorkflowEngine:
         )
         workflow_start_time = time.monotonic()
 
+        def _error_event(code: str, message: str, details: dict | None = None) -> dict:
+            return {
+                "event": "error",
+                "data": {"code": code, "message": message, "details": details or {}},
+            }
+
         adapters, routing_trace, adapter_gates = await self._select_adapters(
             user_message, user_id, context_id
         )
@@ -723,7 +735,11 @@ class WorkflowEngine:
             n.get("id"): n for n in workflow_schema.get("nodes", []) if n.get("id")
         }
         if not node_map:
-            yield {"event": "error", "data": {"code": "validation_error", "message": "workflow has no nodes"}}
+            yield _error_event(
+                "validation_error",
+                "workflow has no nodes",
+                {"workflow_id": workflow_id},
+            )
             return
 
         entry = workflow_schema.get("entrypoint") or next(iter(node_map), None)
@@ -752,13 +768,11 @@ class WorkflowEngine:
             # Check workflow timeout
             elapsed_ms = (time.monotonic() - workflow_start_time) * 1000
             if elapsed_ms >= workflow_timeout_ms:
-                yield {
-                    "event": "error",
-                    "data": {
-                        "code": "server_error",
-                        "message": "workflow execution timed out",
-                    },
-                }
+                yield _error_event(
+                    "server_error",
+                    "workflow execution timed out",
+                    {"timeout_ms": workflow_timeout_ms},
+                )
                 return
 
             node_id = pending.pop(0)
@@ -836,13 +850,11 @@ class WorkflowEngine:
                 )
 
                 if result.get("status") == "error" and result.get("retries_exhausted"):
-                    yield {
-                        "event": "error",
-                        "data": {
-                            "code": "server_error",
-                            "message": result.get("error", "node execution failed"),
-                        },
-                    }
+                    yield _error_event(
+                        "server_error",
+                        result.get("error", "node execution failed"),
+                        {"node_id": node_id, "retries": result.get("retries", 0)},
+                    )
                     return
 
                 # Handle parallel node execution in streaming mode
@@ -892,13 +904,11 @@ class WorkflowEngine:
 
                         # Handle parallel failures
                         if parallel_result.status == "error":
-                            yield {
-                                "event": "error",
-                                "data": {
-                                    "code": "server_error",
-                                    "message": f"All parallel nodes failed: {parallel_result.failed_nodes}",
-                                },
-                            }
+                            yield _error_event(
+                                "server_error",
+                                f"All parallel nodes failed: {parallel_result.failed_nodes}",
+                                {"failed_nodes": parallel_result.failed_nodes},
+                            )
                             return
 
                     # Continue to "after" node if specified
@@ -926,10 +936,11 @@ class WorkflowEngine:
 
                 pending.extend(next_nodes)
                 if result.get("status") == "error" and not next_nodes:
-                    yield {
-                        "event": "error",
-                        "data": {"code": "server_error", "message": result.get("error", "")},
-                    }
+                    yield _error_event(
+                        "server_error",
+                        result.get("error", ""),
+                        {"node_id": node_id},
+                    )
                     return
                 if result.get("status") == "end":
                     break
@@ -1006,10 +1017,11 @@ class WorkflowEngine:
 
         except Exception as exc:
             self.logger.error("llm_stream_error", error=str(exc))
-            yield {
-                "event": "error",
-                "data": {"code": "server_error", "message": str(exc)},
-            }
+            yield _error_event(
+                "server_error",
+                str(exc),
+                {"node_id": node.get("id"), "tool": node.get("tool")},
+            )
 
     async def _handle_node_failure(
         self,

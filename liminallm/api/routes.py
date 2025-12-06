@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
 import math
 from datetime import datetime, timezone
@@ -802,7 +803,8 @@ def _get_pagination_settings(runtime) -> dict:
     return {
         "default_page_size": sys_settings.get("default_page_size", 100),
         "max_page_size": sys_settings.get("max_page_size", 500),
-        "default_conversations_limit": sys_settings.get("default_conversations_limit", 50),
+        # Keep conversation pagination consistent with general defaults (SPEC pagination guidance)
+        "default_conversations_limit": sys_settings.get("default_conversations_limit", 100),
     }
 
 
@@ -3272,6 +3274,10 @@ async def upload_file(
         contents = await file.read(max_bytes + 1)
         if len(contents) > max_bytes:
             raise _http_error("validation_error", f"file too large (max {max_bytes // 1024 // 1024}MB for {plan_tier} plan)", status_code=413)
+        detected_mime = file.content_type or mimetypes.guess_type(safe_filename)[0]
+        if not detected_mime or detected_mime == "application/octet-stream":
+            raise _http_error("validation_error", "unknown or unsupported MIME type", status_code=400)
+        checksum = hashlib.sha256(contents).hexdigest()
         # Weight rate-limit cost by payload size to prevent request chunking bypass (Issue 77.4)
         approx_cost = max(1, math.ceil(len(contents) / (256 * 1024)))
         await _enforce_rate_limit(
@@ -3289,6 +3295,22 @@ async def upload_file(
         ):
             raise _http_error("validation_error", "invalid file path", status_code=400)
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        manifest_path = dest_dir / ".checksums.json"
+        existing_checksums: dict[str, str] = {}
+        if manifest_path.exists():
+            try:
+                existing_checksums = json.loads(manifest_path.read_text())
+            except Exception:
+                logger.warning("file_checksum_manifest_read_failed", path=str(manifest_path))
+        prior_checksum = existing_checksums.get(safe_filename)
+        if dest_path.exists() and prior_checksum == checksum:
+            resp = FileUploadResponse(
+                fs_path=safe_filename, context_id=context_id, chunk_count=None
+            )
+            envelope = Envelope(status="ok", data=resp, request_id=idem.request_id)
+            await idem.store_result(envelope)
+            return envelope
 
         # Atomic idempotency: record intent BEFORE writing file
         # This prevents duplicate file writes if idempotency storage fails after file write
@@ -3322,6 +3344,15 @@ async def upload_file(
                 # Clean up file on any error (not just ConstraintViolation)
                 dest_path.unlink(missing_ok=True)
                 raise
+
+        # Persist checksum manifest for deduplication (SPEC §2.5)
+        try:
+            existing_checksums[safe_filename] = checksum
+            manifest_path.write_text(json.dumps(existing_checksums, indent=2))
+        except Exception:
+            logger.warning(
+                "file_checksum_manifest_write_failed", path=str(manifest_path)
+            )
 
         # Update idempotency with final result
         resp = FileUploadResponse(
