@@ -630,17 +630,30 @@ class AuthService:
         return user, session, tokens
 
     async def revoke(self, session_id: str) -> None:
+        """Revoke a session and denylist associated tokens per SPEC §12.1."""
         sess = self.store.get_session(session_id)
-        if sess:
-            refresh_jti = (
-                (sess.meta or {}).get("refresh_jti")
-                if isinstance(sess.meta, dict)
-                else None
-            )
+        if sess and isinstance(sess.meta, dict):
+            meta = sess.meta
+            # Denylist refresh token
+            refresh_jti = meta.get("refresh_jti")
             if refresh_jti:
-                await self._revoke_refresh_token(
-                    refresh_jti, (sess.meta or {}).get("refresh_exp")
-                )
+                await self._revoke_refresh_token(refresh_jti, meta.get("refresh_exp"))
+            # SPEC §12.1: "add JWT to short-lived denylist if JWTs used"
+            # Denylist access token to prevent use after logout
+            access_jti = meta.get("access_jti")
+            access_exp = meta.get("access_exp")
+            if access_jti and access_exp and self.cache:
+                ttl = max(0, int(access_exp - time.time()))
+                if ttl > 0:
+                    try:
+                        await self.cache.denylist_access_token(access_jti, ttl)
+                    except Exception as exc:
+                        # Log but don't fail - session revocation should still proceed
+                        self.logger.warning(
+                            "access_token_denylist_failed",
+                            session_id=session_id,
+                            error=str(exc),
+                        )
         self.store.revoke_session(session_id)
         if self.cache:
             await self.cache.revoke_session(session_id)
@@ -816,6 +829,24 @@ class AuthService:
     ) -> Optional[AuthContext]:
         token = self._extract_bearer(authorization)
         if token:
+            # SPEC §12.1: Check if access token is denylisted before validating
+            if self.cache:
+                payload = self._decode_jwt(token)
+                if payload and payload.get("token_type") == "access":
+                    jti = payload.get("jti")
+                    if jti:
+                        try:
+                            if await self.cache.is_access_token_denylisted(jti):
+                                self.logger.info("access_token_denylisted", jti=jti)
+                                return None
+                        except Exception as exc:
+                            # Fail-open: log warning but allow auth to proceed
+                            # This prevents Redis failures from blocking all auth
+                            self.logger.warning(
+                                "denylist_check_failed",
+                                jti=jti,
+                                error=str(exc),
+                            )
             token_ctx = self._authenticate_access_token(
                 token,
                 allow_pending_mfa=allow_pending_mfa,
@@ -1111,6 +1142,8 @@ class AuthService:
                 now + timedelta(minutes=sys_settings.get("refresh_token_ttl_minutes", 1440))
             ).timestamp()
         )
+        # SPEC §12.1: Generate JTIs for both tokens to support denylist on logout
+        access_jti = str(uuid.uuid4())
         refresh_jti = str(uuid.uuid4())
         access_payload = {
             "iss": self.settings.jwt_issuer,
@@ -1120,6 +1153,7 @@ class AuthService:
             "tenant_id": user.tenant_id,
             "role": user.role,
             "token_type": "access",
+            "jti": access_jti,  # Added for denylist support
             "exp": access_exp,
         }
         refresh_payload = {
@@ -1135,7 +1169,7 @@ class AuthService:
         }
         access_token = self._encode_jwt(access_payload)
         refresh_token = self._encode_jwt(refresh_payload)
-        self._persist_session_meta(session, refresh_jti, refresh_exp)
+        self._persist_session_meta(session, access_jti, access_exp, refresh_jti, refresh_exp)
         return {
             "access_token": access_token,
             "refresh_token": refresh_token,
@@ -1144,10 +1178,15 @@ class AuthService:
         }
 
     def _persist_session_meta(
-        self, session: Session, refresh_jti: str, refresh_exp: int
+        self, session: Session, access_jti: str, access_exp: int, refresh_jti: str, refresh_exp: int
     ) -> None:
         meta = dict(session.meta or {})
-        meta.update({"refresh_jti": refresh_jti, "refresh_exp": refresh_exp})
+        meta.update({
+            "access_jti": access_jti,
+            "access_exp": access_exp,
+            "refresh_jti": refresh_jti,
+            "refresh_exp": refresh_exp,
+        })
         session.meta = meta
         self.store.set_session_meta(session.id, meta)
 

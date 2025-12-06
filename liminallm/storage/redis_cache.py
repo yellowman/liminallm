@@ -78,6 +78,19 @@ class RedisCache:
     async def is_refresh_revoked(self, jti: str) -> bool:
         return bool(await self.client.exists(f"auth:refresh:revoked:{jti}"))
 
+    # SPEC §12.1: "logout: add JWT to short-lived denylist if JWTs used"
+    async def denylist_access_token(self, jti: str, ttl_seconds: int) -> None:
+        """Add access token JTI to denylist with TTL matching token expiry.
+
+        Per SPEC §4, token blacklists are stored in Redis for hot ephemeral state.
+        """
+        if ttl_seconds > 0:
+            await self.client.set(f"auth:access:denylist:{jti}", "1", ex=ttl_seconds)
+
+    async def is_access_token_denylisted(self, jti: str) -> bool:
+        """Check if access token JTI is in denylist."""
+        return bool(await self.client.exists(f"auth:access:denylist:{jti}"))
+
     async def get_router_cache(self, user_id: str, ctx_hash: str) -> Optional[dict]:
         cached = await self.client.get(f"router:last:{user_id}:{ctx_hash}")
         if not cached:
@@ -407,6 +420,16 @@ class SyncRedisCache:
 
     async def is_refresh_revoked(self, jti: str) -> bool:
         return bool(self._sync_client.exists(f"auth:refresh:revoked:{jti}"))
+
+    # SPEC §12.1: "logout: add JWT to short-lived denylist if JWTs used"
+    async def denylist_access_token(self, jti: str, ttl_seconds: int) -> None:
+        """Add access token JTI to denylist with TTL matching token expiry."""
+        if ttl_seconds > 0:
+            self._sync_client.set(f"auth:access:denylist:{jti}", "1", ex=ttl_seconds)
+
+    async def is_access_token_denylisted(self, jti: str) -> bool:
+        """Check if access token JTI is in denylist."""
+        return bool(self._sync_client.exists(f"auth:access:denylist:{jti}"))
 
     async def get_router_cache(self, user_id: str, ctx_hash: str) -> Optional[dict]:
         cached = self._sync_client.get(f"router:last:{user_id}:{ctx_hash}")
