@@ -5648,12 +5648,11 @@ once consumed.
 The worker polls based on status alone and relies on atomic `claim_training_job` updates rather than clock comparisons, so
 minor drift doesn't affect pickup ordering or duplication.
 
-### 76.8 MEDIUM: Cache TTL Clock Dependency
+### 76.8 ~~MEDIUM: Cache TTL Clock Dependency~~ FIXED
 **Location:** `liminallm/storage/redis_cache.py:89-112`
 
-Cache TTL relies on Redis EXPIRE which uses Redis server clock. TTL behavior inconsistent if Redis clock changes.
-
-**Impact:** Premature cache expiration or stale data.
+TTL calculations now use Redis server time (with application-clock fallback) so expirations track Redis's countdown source.
+OAuth and session caching pass the synchronized timestamp into TTL helpers to avoid stale entries if clocks drift.
 
 ### 76.9 ✅ FALSE POSITIVE: Audit Log Timestamp Manipulation
 **Location:** `liminallm/storage/postgres.py:1156-1178`
