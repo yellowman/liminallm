@@ -1341,6 +1341,7 @@ class MemoryStore:
             "smtp_user": "",
             "smtp_password": "",
             "smtp_use_tls": True,
+            "smtp_allow_insecure": False,
             "email_from_address": "",
             "email_from_name": "LiminalLM",
             "oauth_redirect_uri": "",

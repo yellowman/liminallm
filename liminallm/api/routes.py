@@ -379,6 +379,7 @@ def _get_system_settings(runtime) -> dict:
         "smtp_user": "",
         "smtp_password": "",
         "smtp_use_tls": True,
+        "smtp_allow_insecure": False,
         "email_from_address": "",
         "email_from_name": "LiminalLM",
         "oauth_redirect_uri": "",
@@ -3096,6 +3097,7 @@ async def update_system_settings(
         "smtp_user",
         "smtp_password",
         "smtp_use_tls",
+        "smtp_allow_insecure",
         "email_from_address",
         "email_from_name",
         "oauth_redirect_uri",
@@ -3157,6 +3159,7 @@ async def update_system_settings(
         "allow_signup",
         "training_worker_enabled",
         "smtp_use_tls",
+        "smtp_allow_insecure",
     }
     string_keys = {
         "smtp_host",

@@ -40,6 +40,7 @@ VALUES (
     "smtp_user": "",
     "smtp_password": "",
     "smtp_use_tls": true,
+    "smtp_allow_insecure": false,
     "email_from_address": "",
     "email_from_name": "LiminalLM",
     "oauth_redirect_uri": "",

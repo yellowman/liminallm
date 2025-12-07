@@ -3487,40 +3487,56 @@ NO sensitive data: no tokens, no credentials, no PII. The user's own draft messa
 
 Reset and verification tokens exposed in URL query parameters - logged in access logs, browser history.
 
+**Status:** ✅ FIXED - Tokens now placed in hash fragments (reset/verify) to keep secrets out of HTTP request lines.
+
 ### 55.2 MEDIUM: Missing Input Validation on OAuth Responses
 **Location:** `liminallm/service/auth.py:373-416, 430-456`
 
 OAuth token response structure not validated - could fail silently on malformed responses.
+
+**Status:** ✅ FIXED - OAuth exchanges now validate JSON parsing, required fields, and userinfo formats before issuing identities.
 
 ### 55.3 MEDIUM: Insecure Redirect Following on OAuth Calls
 **Location:** `liminallm/service/auth.py:356`
 
 Default httpx behavior follows redirects without limits - potential SSRF.
 
+**Status:** ✅ FIXED - OAuth HTTP clients disable redirect following to prevent unintended hops.
+
 ### 55.4 MEDIUM: No API Key Rotation Handling
 **Location:** `liminallm/service/voice.py:32-42`, `liminallm/service/model_backend.py:354-371`
 
 API keys cannot be rotated without restarting application.
+
+**Status:** ✅ FIXED - API adapter backend refreshes OpenAI-compatible clients when credentials change (env overrides), enabling hot rotation.
 
 ### 55.5 MEDIUM: Missing Validation on OAuth Redirect URI
 **Location:** `liminallm/service/auth.py:282-286, 348-351`
 
 Redirect URI not validated for HTTPS or allowed domain.
 
+**Status:** ✅ FIXED - Redirect URIs are validated for HTTPS or localhost-only HTTP before issuing authorization URLs.
+
 ### 55.6 MEDIUM: Default Insecure SMTP Configuration
 **Location:** `liminallm/service/email.py:85-97`
 
 Configuration naming confusing - `smtp_use_tls=False` uses SMTP_SSL.
+
+**Status:** ✅ FIXED - SMTP sending enforces encrypted transport by default and requires explicit opt-in for plaintext ports.
 
 ### 55.7 LOW: No Timeout on OpenAI Client
 **Location:** `liminallm/service/model_backend.py:368-371`
 
 OpenAI client uses default timeout (may be infinite).
 
+**Status:** ✅ FIXED - OpenAI-compatible client creation now enforces a 30s timeout.
+
 ### 55.8 LOW: Missing Explicit Error Handling for JSON Parsing
 **Location:** `liminallm/service/voice.py:95-100`
 
 JSON parsing could fail even after raise_for_status().
+
+**Status:** ✅ FIXED - Voice transcription responses validate JSON decoding and surface user-friendly errors.
 
 ---
 
@@ -3531,20 +3547,28 @@ JSON parsing could fail even after raise_for_status().
 
 Test JWT secret only 27 characters - lower entropy than production requirement.
 
+**Status:** ✅ FIXED - Tests now use a high-entropy secret mirroring production strength.
+
 ### 56.2 MEDIUM: MFA Encryption Key Fallback Chain
 **Location:** `liminallm/storage/memory.py:111-114`
 
 MFA encryption uses JWT_SECRET as fallback - violates key separation principle.
+
+**Status:** ⚠️ FALSE POSITIVE - MFA cipher generation no longer references JWT secrets and persists a dedicated key; no fallback to JWT exists.
 
 ### 56.3 MEDIUM: OAuth State Parameter Not Redis-Backed
 **Location:** `liminallm/service/auth.py:131, 276-278`
 
 OAuth state stored in-memory - fails in multi-process deployments without Redis.
 
+**Status:** ✅ FIXED - OAuth flows now require the Redis cache outside test mode to ensure shared state across processes.
+
 ### 56.4 ADVISORY: SHA1 in TOTP Implementation
 **Location:** `liminallm/service/auth.py:903`
 
 TOTP uses SHA1 per RFC 6238 - acceptable but documented limitation.
+
+**Status:** ✅ FIXED - TOTP generation now uses SHA-256 for stronger digests.
 
 ---
 

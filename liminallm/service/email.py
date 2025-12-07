@@ -29,6 +29,7 @@ class EmailService:
         smtp_user: Optional[str] = None,
         smtp_password: Optional[str] = None,
         smtp_use_tls: bool = True,
+        smtp_allow_insecure: bool = False,
         from_email: Optional[str] = None,
         from_name: str = "LiminalLM",
         base_url: Optional[str] = None,
@@ -38,6 +39,7 @@ class EmailService:
         self.smtp_user = smtp_user
         self.smtp_password = smtp_password
         self.smtp_use_tls = smtp_use_tls
+        self.smtp_allow_insecure = smtp_allow_insecure
         self.from_email = from_email or smtp_user
         self.from_name = from_name
         self.base_url = base_url or "http://localhost:8000"
@@ -75,6 +77,11 @@ class EmailService:
             )
             return True
 
+        if not self.smtp_use_tls and not self.smtp_allow_insecure:
+            logger.info("email_ssl_mode", mode="ssl", port=self.smtp_port)
+        elif self.smtp_use_tls:
+            logger.info("email_ssl_mode", mode="starttls", port=self.smtp_port)
+
         try:
             msg = MIMEMultipart("alternative")
             msg["Subject"] = subject
@@ -104,6 +111,10 @@ class EmailService:
                         server.login(self.smtp_user, self.smtp_password)
                     server.sendmail(self.from_email, to_email, msg.as_string())
             else:
+                if not self.smtp_allow_insecure and self.smtp_port in {25, 2525}:
+                    raise ValueError(
+                        "Plaintext SMTP is disabled; enable TLS/SSL or set smtp_allow_insecure=True"
+                    )
                 with smtplib.SMTP_SSL(
                     self.smtp_host, self.smtp_port, context=context, timeout=30
                 ) as server:
@@ -187,7 +198,7 @@ class EmailService:
 
     def send_password_reset(self, to_email: str, token: str) -> bool:
         """Send password reset email with reset link."""
-        reset_url = f"{self.base_url}/?reset_token={token}"
+        reset_url = f"{self.base_url}#/reset?token={token}"
 
         subject = "Reset your LiminalLM password"
 
@@ -239,7 +250,7 @@ LiminalLM
 
     def send_email_verification(self, to_email: str, token: str) -> bool:
         """Send email verification link."""
-        verify_url = f"{self.base_url}/?verify_token={token}"
+        verify_url = f"{self.base_url}#/verify?token={token}"
 
         subject = "Verify your LiminalLM email"
 

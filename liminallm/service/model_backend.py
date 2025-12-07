@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import importlib.util
 import json
 import time
@@ -365,14 +366,37 @@ class ApiAdapterBackend:
         self.adapter_server_model = adapter_server_model
         self.adapter_mode = adapter_mode
         self.mode = adapter_mode
-        self.client = (
-            _OpenAIClient(api_key=api_key, base_url=base_url)
-            if api_key and _OpenAIClient
-            else None
-        )
+        self._api_key = api_key
+        self._base_url = base_url
+        self._client_timeout = 30.0
+        self._active_api_key: Optional[str] = None
+        self.client = None
+        self._ensure_client()
         # Infer provider from adapter_mode if not specified
         self.provider = provider or self._infer_provider(adapter_mode)
         self.capabilities = get_provider_capabilities(self.provider)
+
+    def _ensure_client(self) -> None:
+        """Ensure the OpenAI-compatible client reflects the latest credentials."""
+
+        if not _OpenAIClient:
+            self.client = None
+            return
+
+        # Allow runtime rotation by picking up environment updates
+        env_key = os.getenv("OPENAI_API_KEY")
+        active_key = env_key or self._api_key
+
+        if not active_key:
+            self.client = None
+            return
+
+        # Rebuild the client if credentials changed
+        if not self.client or self._active_api_key != active_key:
+            self.client = _OpenAIClient(
+                api_key=active_key, base_url=self._base_url, timeout=self._client_timeout
+            )
+            self._active_api_key = active_key
 
     def _infer_provider(self, adapter_mode: str) -> str:
         """Infer provider from adapter_mode string."""
@@ -402,6 +426,8 @@ class ApiAdapterBackend:
         *,
         user_id: Optional[str] = None,
     ) -> dict:
+        self._ensure_client()
+
         adapter_list = adapters or []
         # Process adapters based on provider capabilities
         processed = self._process_adapters_for_provider(adapter_list)
@@ -462,6 +488,8 @@ class ApiAdapterBackend:
         - {"event": "message_done", "data": {"content": "full_text", "usage": {...}}}
         - {"event": "error", "data": {"code": "...", "message": "..."}}
         """
+        self._ensure_client()
+
         adapter_list = adapters or []
         processed = self._process_adapters_for_provider(adapter_list)
         target_model = processed["model"]

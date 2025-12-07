@@ -229,6 +229,9 @@ class Runtime:
         smtp_user = sys_settings.get("smtp_user") or self.settings.smtp_user
         smtp_password = sys_settings.get("smtp_password") or self.settings.smtp_password
         smtp_use_tls = sys_settings.get("smtp_use_tls", self.settings.smtp_use_tls)
+        smtp_allow_insecure = sys_settings.get(
+            "smtp_allow_insecure", self.settings.smtp_allow_insecure
+        )
         email_from_address = (
             sys_settings.get("email_from_address") or self.settings.email_from_address
         )
@@ -241,6 +244,7 @@ class Runtime:
             smtp_user=smtp_user,
             smtp_password=smtp_password,
             smtp_use_tls=smtp_use_tls,
+            smtp_allow_insecure=smtp_allow_insecure,
             from_email=email_from_address,
             from_name=email_from_name,
             base_url=app_base_url,

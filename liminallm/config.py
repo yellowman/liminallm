@@ -313,6 +313,11 @@ class Settings(BaseModel):
     smtp_use_tls: bool = env_field(
         True, "SMTP_USE_TLS", description="Use TLS for SMTP (overridable via admin UI)"
     )
+    smtp_allow_insecure: bool = env_field(
+        False,
+        "SMTP_ALLOW_INSECURE",
+        description="Allow plaintext SMTP when explicitly enabled (overridable via admin UI)",
+    )
     email_from_address: str | None = env_field(
         None, "EMAIL_FROM_ADDRESS", description="Email from address (overridable via admin UI)"
     )
