@@ -4096,6 +4096,7 @@ async def websocket_chat(ws: WebSocket):
         return_remaining=True,
     )
     if not allowed:
+        await ws.accept()
         await ws.close(code=4429)
         return
     await ws.accept()
