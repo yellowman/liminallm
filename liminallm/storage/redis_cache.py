@@ -768,6 +768,10 @@ class SyncRedisCache:
         )
         # Wrap sync client with async-compatible adapter for direct client access
         self.client = _SyncClientAdapter(self._sync_client)
+        # Register token bucket script for atomic rate limiting (Issue 77.10)
+        self._token_bucket = self._sync_client.register_script(
+            RedisCache._TOKEN_BUCKET_SCRIPT
+        )
 
     def verify_connection(self) -> None:
         """Assert Redis connectivity."""
@@ -811,28 +815,28 @@ class SyncRedisCache:
         return revoked
 
     async def check_rate_limit(
-        self, key: str, limit: int, window_seconds: int, *, return_remaining: bool = False,
-        tenant_id: Optional[str] = None
-    ) -> Union[bool, Tuple[bool, int]]:
-        now = datetime.utcnow()
-        now_bucket = int(now.timestamp() // window_seconds)
-        # Issue 44.3: Include tenant_id in cache key for tenant isolation
-        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
-        redis_key = f"rate:{tenant_prefix}{key}:{now_bucket}"
-        bucket_end = (now_bucket + 1) * window_seconds
-        ttl = max(1, int(bucket_end - now.timestamp()))
+        self,
+        key: str,
+        limit: int,
+        window_seconds: int,
+        *,
+        return_remaining: bool = False,
+        tenant_id: Optional[str] = None,
+        cost: int = 1,
+    ) -> Union[bool, Tuple[bool, int, int]]:
+        now = time.time()
+        safe_key = RedisCache._normalize_rate_key(key, tenant_id)
+        refill_rate = float(limit) / float(window_seconds)
+        allowed, tokens, reset_after = self._token_bucket(
+            keys=[safe_key], args=[now, refill_rate, limit, max(1, cost)]
+        )
 
-        pipe = self._sync_client.pipeline()
-        pipe.incr(redis_key)
-        pipe.expire(redis_key, ttl)
-        results = pipe.execute()
-        current = results[0]
-
-        allowed = current <= limit
+        allowed_bool = bool(int(allowed))
+        remaining = max(0, int(tokens))
+        reset_seconds = int(reset_after) if reset_after else 0
         if return_remaining:
-            remaining = max(0, limit - current)
-            return (allowed, remaining)
-        return allowed
+            return (allowed_bool, remaining, reset_seconds)
+        return allowed_bool
 
     async def mark_refresh_revoked(self, jti: str, ttl_seconds: int) -> None:
         self._sync_client.set(f"auth:refresh:revoked:{jti}", "1", ex=ttl_seconds)
