@@ -637,7 +637,10 @@ class AuthService:
                 stored = await self.cache.pop_oauth_state(state)
                 cache_state_used = stored is not None
             except Exception as exc:
-                self.logger.warning("pop_oauth_state_failed", error=str(exc))
+                # Issue 53.9: Fail closed if cache state cannot be retrieved to
+                # avoid stale OAuth state reuse
+                self.logger.error("pop_oauth_state_failed", error=str(exc))
+                return None, None, {}
         # Issue 28.4: Thread-safe state mutation
         with self._state_lock:
             if stored is None:

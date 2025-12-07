@@ -202,6 +202,14 @@ class SignupRequest(BaseModel):
     def _validate_handle(cls, value: Optional[str]) -> Optional[str]:
         return _validate_handle(value)
 
+    @model_validator(mode="after")
+    def _reject_tenant_id(self):
+        # Issue 53.2: tenant_id must be derived from server config per SPEC §12
+        if getattr(self, "tenant_id", None):
+            raise ValueError("tenant_id is managed server-side and cannot be provided")
+        self.tenant_id = None
+        return self
+
 
 class AuthResponse(BaseModel):
     user_id: str
@@ -245,6 +253,14 @@ class TokenRefreshRequest(BaseModel):
 class OAuthStartRequest(BaseModel):
     redirect_uri: Optional[str] = Field(default=None, max_length=2048)
     tenant_id: Optional[str] = Field(default=None, max_length=128)
+
+    @model_validator(mode="after")
+    def _reject_oauth_tenant(self):
+        # Issue 53.3: tenant_id must be bound to server-created OAuth state
+        if getattr(self, "tenant_id", None):
+            raise ValueError("tenant_id is derived from OAuth state, not request input")
+        self.tenant_id = None
+        return self
 
 
 class OAuthStartResponse(BaseModel):

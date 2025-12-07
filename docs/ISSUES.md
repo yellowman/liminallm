@@ -3256,6 +3256,8 @@ self._update_cached_session(session_id, mfa_verified=True)  # ALWAYS EXECUTES
 
 **Impact:** Complete MFA bypass - database transient failure enables MFA-protected account compromise.
 
+**Status:** ✅ Fixed. `mark_session_verified` now requires the database update to succeed (`rowcount > 0`) before mutating the cache and raises on failure, ensuring MFA verification cannot be bypassed by transient DB errors. (See `liminallm/storage/postgres.py:1445-1460`).
+
 ### 53.2 CRITICAL: Tenant Spoofing via Signup Endpoint
 **Location:** `liminallm/api/routes.py:545-549`, `liminallm/service/auth.py:202-220`
 
@@ -3263,10 +3265,14 @@ Signup endpoint accepts `tenant_id` directly from request body, violating CLAUDE
 
 **Impact:** Attacker can register in ANY tenant by specifying arbitrary tenant_id.
 
+**Status:** ✅ Fixed. Signup now rejects any provided `tenant_id` via schema validation and forces server-derived tenancy; the route passes `tenant_id=None` so the service applies the configured default tenant. (See `liminallm/api/schemas.py:184-205` and `liminallm/api/routes.py:918-938`).
+
 ### 53.3 CRITICAL: Tenant Spoofing via OAuth Complete
 **Location:** `liminallm/service/auth.py:484-495`
 
 OAuth callback accepts `tenant_id` parameter - can create account in attacker-specified tenant.
+
+**Status:** ✅ Fixed. OAuth start/callback derive tenant exclusively from signed state; schema validation rejects user-provided `tenant_id`, and `complete_oauth` uses the validated state value or default tenant. (See `liminallm/api/schemas.py:247-258`, `liminallm/api/routes.py:1024-1077`, and `liminallm/service/auth.py:624-674`).
 
 ### 53.4 CRITICAL: TOCTOU Race Condition in Session Revocation
 **Location:** `liminallm/api/routes.py:1325-1329`
@@ -3298,10 +3304,14 @@ No validation that `limit` is positive - negative limit bypasses rate limiting.
 
 Cache deletion failures silently ignored - ghost sessions may persist.
 
+**Status:** ✅ Fixed. OAuth state retrieval now fails closed on cache errors, logging and aborting the flow instead of proceeding with potentially stale state. (See `liminallm/service/auth.py:633-640`).
+
 ### 53.10 MEDIUM: Race Condition in Session Cache Eviction
 **Location:** `liminallm/storage/postgres.py:76-94`
 
 Session may expire between sort and eviction decision.
+
+**Status:** ✅ Fixed. Session caching now prunes expired entries before capacity checks, preventing eviction of valid sessions due to stale cache entries. (See `liminallm/storage/postgres.py:122-133`).
 
 ---
 

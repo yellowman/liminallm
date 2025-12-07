@@ -122,6 +122,15 @@ class PostgresStore:
         Thread-safe per SPEC §18 inference/adapter cache discipline.
         """
         with self._session_lock:
+            now = datetime.utcnow()
+            # First prune any expired sessions to avoid evicting valid ones (Issue 53.10)
+            expired_ids = [
+                sid
+                for sid, sess in self.sessions.items()
+                if sess.expires_at is not None and sess.expires_at <= now
+            ]
+            for sid in expired_ids:
+                self.sessions.pop(sid, None)
             # Evict soonest-to-expire entries if cache is at capacity
             if len(self.sessions) >= _MAX_SESSION_CACHE_SIZE:
                 # Remove ~10% of entries closest to expiration
@@ -1447,10 +1456,13 @@ class PostgresStore:
         # to prevent MFA bypass via transient database failures
         try:
             with self._connect() as conn:
-                conn.execute(
+                result = conn.execute(
                     "UPDATE auth_session SET mfa_verified = TRUE WHERE id = %s",
                     (session_id,),
                 )
+                # If no row was updated, treat as failure and do not mutate cache
+                if getattr(result, "rowcount", 0) == 0:
+                    raise RuntimeError("session_update_failed")
             # Only update cache after successful DB commit
             self._update_cached_session(session_id, mfa_verified=True)
         except Exception as exc:
