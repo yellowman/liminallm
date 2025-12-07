@@ -554,9 +554,6 @@ class AuthService:
                 if not identity.get("provider_uid"):
                     self.logger.error("oauth_identity_missing_uid", provider=provider)
                     return None
-                if not identity.get("email"):
-                    self.logger.error("oauth_identity_missing_email", provider=provider)
-                    return None
 
                 # For GitHub, we may need to fetch email separately
                 if provider == "github" and not identity.get("email"):
@@ -572,6 +569,10 @@ class AuthService:
                         )
                         if primary_email:
                             identity["email"] = primary_email
+
+                if not identity.get("email"):
+                    self.logger.error("oauth_identity_missing_email", provider=provider)
+                    return None
 
                 self.logger.info(
                     "oauth_exchange_success",
