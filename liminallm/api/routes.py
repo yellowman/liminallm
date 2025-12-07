@@ -3338,6 +3338,15 @@ async def upload_file(
             cost=approx_cost,
         )
         contents = await file.read(max_bytes + 1)
+        actual_cost = max(1, math.ceil(len(contents) / (256 * 1024)))
+        if actual_cost > approx_cost:
+            await _enforce_rate_limit(
+                runtime,
+                f"files:upload:{principal.user_id}",
+                _get_rate_limit(runtime, "files_upload_rate_limit_per_minute"),
+                60,
+                cost=actual_cost - approx_cost,
+            )
         if len(contents) > max_bytes:
             raise _http_error("validation_error", f"file too large (max {max_bytes // 1024 // 1024}MB for {plan_tier} plan)", status_code=413)
         detected_mime = file.content_type or mimetypes.guess_type(safe_filename)[0]
