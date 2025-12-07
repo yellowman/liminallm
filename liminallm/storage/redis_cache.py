@@ -90,6 +90,27 @@ return {1, tokens, 0}
             1, int((expires_at - datetime.now(timezone.utc)).total_seconds())
         )
 
+    @staticmethod
+    def _prepare_oauth_state(
+        provider: str, expires_at: datetime, tenant_id: Optional[str]
+    ) -> tuple[dict, int]:
+        """Normalize OAuth expirations and compute a safe TTL.
+
+        OAuth callers now pass timezone-aware timestamps; older callers may pass
+        naive datetimes. Normalize everything to UTC before calculating TTL to
+        avoid naive/aware subtraction errors. Returns the serialized payload and
+        TTL seconds so both async and sync caches share identical logic.
+        """
+
+        normalized_expiry = RedisCache._normalize_utc(expires_at)
+        ttl = RedisCache._ttl_seconds(normalized_expiry)
+        payload = {
+            "provider": provider,
+            "expires_at": normalized_expiry.isoformat(),
+            "tenant_id": tenant_id,
+        }
+        return payload, ttl
+
     def verify_connection(self) -> None:
         """Assert Redis connectivity before enabling dependent features."""
         from redis import Redis
@@ -284,13 +305,7 @@ return {1, tokens, 0}
     async def set_oauth_state(
         self, state: str, provider: str, expires_at: datetime, tenant_id: Optional[str]
     ) -> None:
-        expires_at = self._normalize_utc(expires_at)
-        ttl = self._ttl_seconds(expires_at)
-        payload = {
-            "provider": provider,
-            "expires_at": expires_at.isoformat(),
-            "tenant_id": tenant_id,
-        }
+        payload, ttl = self._prepare_oauth_state(provider, expires_at, tenant_id)
         await self.client.set(f"auth:oauth:{state}", json.dumps(payload), ex=ttl)
 
     async def pop_oauth_state(
@@ -942,13 +957,7 @@ class SyncRedisCache:
     async def set_oauth_state(
         self, state: str, provider: str, expires_at: datetime, tenant_id: Optional[str]
     ) -> None:
-        expires_at = RedisCache._normalize_utc(expires_at)
-        ttl = RedisCache._ttl_seconds(expires_at)
-        payload = {
-            "provider": provider,
-            "expires_at": expires_at.isoformat(),
-            "tenant_id": tenant_id,
-        }
+        payload, ttl = RedisCache._prepare_oauth_state(provider, expires_at, tenant_id)
         self._sync_client.set(f"auth:oauth:{state}", json.dumps(payload), ex=ttl)
 
     async def pop_oauth_state(
