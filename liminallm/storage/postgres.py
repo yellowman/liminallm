@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+import time
 import uuid
 from datetime import datetime
 from ipaddress import ip_address
@@ -60,6 +61,8 @@ class PostgresStore:
         self.dsn = dsn
         self.fs_root = Path(fs_root)
         self.logger = get_logger(__name__)
+        self._connect_max_retries = 3
+        self._connect_retry_backoff = 0.25
 
         try:
             self.fs_root.mkdir(parents=True, exist_ok=True)
@@ -179,6 +182,23 @@ class PostgresStore:
             self.sessions[session_id] = sess
 
     def _connect(self):
+        attempt = 0
+        last_exc: Exception | None = None
+        while attempt < self._connect_max_retries:
+            try:
+                return self.pool.connection()
+            except Exception as exc:
+                last_exc = exc
+                attempt += 1
+                self.logger.warning(
+                    "postgres_connect_retry",
+                    attempt=attempt,
+                    max_attempts=self._connect_max_retries,
+                    error=str(exc),
+                )
+                time.sleep(self._connect_retry_backoff * attempt)
+        if last_exc:
+            raise last_exc
         return self.pool.connection()
 
     def _ensure_runtime_config_table(self) -> None:

@@ -906,8 +906,8 @@ class AuthService:
 
         sess = self.store.get_session(actual_session_id)
         if not sess and self.cache:
-            cached_user = await self.cache.get_session_user(actual_session_id)
-            if not cached_user:
+            found, cached_user = await self.cache.get_session_user(actual_session_id)
+            if not found or not cached_user:
                 return None
             sess = self.store.get_session(actual_session_id)
         if not sess:

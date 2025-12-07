@@ -795,13 +795,17 @@ MFA challenges dictionary is used for in-memory challenge tracking. Additionally
 
 ## 15. LLM Service
 
-### 15.1 HIGH: Missing max_tokens Enforcement
+### 15.1 ~~HIGH: Missing max_tokens Enforcement~~ FIXED
 
-No validation against SPEC maximum of 4096 tokens.
+**Status:** ✅ Chat requests now enforce the SPEC token ceiling (4096) using a shared estimator before processing.
 
-### 15.2 MEDIUM: Context Window Overflow Not Handled
+**Location:** `liminallm/api/schemas.py`, `liminallm/service/tokenizer_utils.py`
 
-No truncation or error when context + prompt exceeds model window.
+### 15.2 ~~MEDIUM: Context Window Overflow Not Handled~~ FIXED
+
+**Status:** ✅ Workflow LLM calls prune context/history to stay within the 4096-token window and raise validation errors if the prompt alone exceeds the limit.
+
+**Location:** `liminallm/service/workflow.py`
 
 ---
 
@@ -811,9 +815,11 @@ No truncation or error when context + prompt exceeds model window.
 
 Algorithm and threshold not documented in SPEC §8.
 
-### 16.2 MEDIUM: No Adapter Validation on Assignment
+### 16.2 ~~MEDIUM: No Adapter Validation on Assignment~~ FIXED
 
-No validation that adapter exists, is compatible, or user has permission.
+**Status:** ✅ Adapter selection now scopes candidates to the requesting user/tenant and relies on backend compatibility filtering before routing.
+
+**Location:** `liminallm/service/workflow.py`
 
 ---
 
@@ -1015,17 +1021,17 @@ Training jobs perform multiple database operations:
 
 **Fix Applied:** Streaming WebSocket sends are now wrapped to catch disconnects/runtime send errors, set the cancel flag, and log context before exiting gracefully, preventing uncaught exceptions from leaking and ensuring cleanup runs.
 
-### 20.5 HIGH: Database Connection Errors Not Retried
+### 20.5 ~~HIGH: Database Connection Errors Not Retried~~ FIXED
 
-**Location:** `liminallm/storage/postgres.py` (throughout)
+**Status:** ✅ Connection acquisition now retries with bounded backoff before surfacing errors.
 
-Database operations fail immediately on connection errors without retry logic.
+**Location:** `liminallm/storage/postgres.py`
 
-### 20.6 MEDIUM: Redis GET Returns None vs Missing Key
+### 20.6 ~~MEDIUM: Redis GET Returns None vs Missing Key~~ FIXED
 
-**Location:** `liminallm/storage/redis_cache.py:102-115`
+**Status:** ✅ Session cache lookups now differentiate missing keys from explicit null values via existence-aware responses.
 
-No distinction between "key exists with None value" and "key does not exist".
+**Location:** `liminallm/storage/redis_cache.py`, `liminallm/service/auth.py`
 
 ---
 

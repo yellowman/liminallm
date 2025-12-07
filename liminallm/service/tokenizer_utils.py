@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import re
 from typing import Any
 
 from liminallm.logging import get_logger
@@ -7,6 +9,26 @@ from liminallm.logging import get_logger
 logger = get_logger(__name__)
 
 DEFAULT_VOCAB_SIZE = 32000
+MAX_GENERATION_TOKENS = 4096
+
+
+def estimate_token_count(text: str) -> int:
+    """Lightweight token estimate for enforcing model window limits.
+
+    Avoids heavyweight tokenizer dependencies while providing a conservative
+    approximation that scales with both whitespace-delimited words and overall
+    character length. This is used to enforce SPEC token budgets on inputs and
+    assembled prompts (Issue 15.1/15.2).
+    """
+
+    if not text:
+        return 0
+    normalized = text.strip()
+    # Count non-space spans and fall back to a character-based heuristic to
+    # avoid undercounting text with long tokens or lack of whitespace.
+    wordish = len(re.findall(r"\S+", normalized))
+    char_estimate = math.ceil(len(normalized) / 4)
+    return max(wordish, char_estimate)
 
 
 def vocab_size_from_tokenizer(

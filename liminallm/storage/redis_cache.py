@@ -162,8 +162,13 @@ return {1, tokens, 0}
         tenant_prefix = f"{tenant_id}:" if tenant_id else ""
         return f"rate:{tenant_prefix}{digest}"
 
-    async def get_session_user(self, session_id: str) -> Optional[str]:
-        return await self.client.get(f"auth:session:{session_id}")
+    async def get_session_user(self, session_id: str) -> Tuple[bool, Optional[str]]:
+        key = f"auth:session:{session_id}"
+        value = await self.client.get(key)
+        if value is not None:
+            return True, value
+        exists = bool(await self.client.exists(key))
+        return exists, None
 
     async def revoke_session(self, session_id: str) -> None:
         await self.client.delete(f"auth:session:{session_id}")
@@ -858,8 +863,13 @@ class SyncRedisCache:
             pipe.expire(f"auth:user_sessions:{user_id}", ttl)
             pipe.execute()
 
-    async def get_session_user(self, session_id: str) -> Optional[str]:
-        return self._sync_client.get(f"auth:session:{session_id}")
+    async def get_session_user(self, session_id: str) -> Tuple[bool, Optional[str]]:
+        key = f"auth:session:{session_id}"
+        value = self._sync_client.get(key)
+        if value is not None:
+            return True, value
+        exists = bool(self._sync_client.exists(key))
+        return exists, None
 
     async def revoke_session(self, session_id: str) -> None:
         self._sync_client.delete(f"auth:session:{session_id}")

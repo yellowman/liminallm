@@ -8,6 +8,11 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from liminallm.service.tokenizer_utils import (
+    MAX_GENERATION_TOKENS,
+    estimate_token_count,
+)
+
 # Issue 46.1: Maximum nested JSON depth to prevent deserialization bombs
 MAX_JSON_DEPTH = 20
 # Issue 46.2: Maximum array items to prevent memory exhaustion
@@ -367,6 +372,15 @@ class ChatMessage(BaseModel):
     @classmethod
     def _validate_content_struct(cls, value: Optional[dict]) -> Optional[dict]:
         return _validate_dict_field(value, "content_struct")
+
+    @field_validator("content")
+    @classmethod
+    def _validate_token_budget(cls, value: str) -> str:
+        if estimate_token_count(value) > MAX_GENERATION_TOKENS:
+            raise ValueError(
+                f"message exceeds maximum token budget of {MAX_GENERATION_TOKENS}"
+            )
+        return value
 
 
 class ChatRequest(BaseModel):

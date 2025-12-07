@@ -40,6 +40,10 @@ from liminallm.service.sandbox import (
     safe_eval_expr,
     tool_network_guard,
 )
+from liminallm.service.tokenizer_utils import (
+    MAX_GENERATION_TOKENS,
+    estimate_token_count,
+)
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.models import Message
 from liminallm.storage.postgres import PostgresStore
@@ -480,7 +484,7 @@ class WorkflowEngine:
         workflow_start_time = time.monotonic()
 
         adapters, routing_trace, adapter_gates = await self._select_adapters(
-            user_message, user_id, context_id
+            user_message, user_id, context_id, tenant_id
         )
         history = await self._load_conversation_history(
             conversation_id, user_id=user_id, tenant_id=tenant_id
@@ -761,7 +765,7 @@ class WorkflowEngine:
         workflow_start_time = time.monotonic()
 
         adapters, routing_trace, adapter_gates = await self._select_adapters(
-            user_message, user_id, context_id
+            user_message, user_id, context_id, tenant_id
         )
         history = await self._load_conversation_history(
             conversation_id, user_id=user_id, tenant_id=tenant_id
@@ -1039,6 +1043,9 @@ class WorkflowEngine:
             allowed_ctx_ids, message, user_id=user_id, tenant_id=tenant_id
         )
         context_snippets = [c.text for c in ctx_chunks]
+        context_snippets, history = self._apply_prompt_budget(
+            message or "", context_snippets, history
+        )
 
         # Stream from LLM
         try:
@@ -1345,6 +1352,75 @@ class WorkflowEngine:
         await self.cache_conversation_state(conversation_id, history)
         return history
 
+    def _apply_prompt_budget(
+        self,
+        prompt: str,
+        context_snippets: List[str],
+        history: List[Any],
+    ) -> tuple[List[str], List[Any]]:
+        """Enforce the SPEC token budget by pruning context/history if needed."""
+
+        budget = MAX_GENERATION_TOKENS
+        total = estimate_token_count(prompt)
+
+        def _content_from_history(entry: Any) -> str:
+            if isinstance(entry, dict):
+                return str(entry.get("content") or "")
+            if hasattr(entry, "content"):
+                return str(getattr(entry, "content") or "")
+            return str(entry or "")
+
+        history_tokens: list[int] = []
+        normalized_history: list[Any] = []
+        for entry in history or []:
+            content = _content_from_history(entry)
+            normalized_history.append(entry)
+            token_count = estimate_token_count(content)
+            history_tokens.append(token_count)
+            total += token_count
+
+        context_tokens: list[int] = []
+        normalized_context = list(context_snippets or [])
+        for snippet in normalized_context:
+            token_count = estimate_token_count(snippet)
+            context_tokens.append(token_count)
+            total += token_count
+
+        if total <= budget:
+            return normalized_context, normalized_history
+
+        # Drop context snippets from the end until within budget
+        while normalized_context and total > budget:
+            removed_tokens = context_tokens.pop() if context_tokens else 0
+            normalized_context.pop()
+            total -= removed_tokens
+            self.logger.debug(
+                "context_pruned_for_budget",
+                removed_tokens=removed_tokens,
+                remaining_tokens=total,
+            )
+
+        if total <= budget:
+            return normalized_context, normalized_history
+
+        # Drop oldest history entries if still over budget
+        while normalized_history and total > budget:
+            removed_tokens = history_tokens.pop(0)
+            normalized_history.pop(0)
+            total -= removed_tokens
+            self.logger.debug(
+                "history_pruned_for_budget",
+                removed_tokens=removed_tokens,
+                remaining_tokens=total,
+            )
+
+        if total > budget:
+            raise BadRequestError(
+                f"prompt exceeds maximum token budget of {MAX_GENERATION_TOKENS}"
+            )
+
+        return normalized_context, normalized_history
+
     async def cache_conversation_state(
         self, conversation_id: Optional[str], history: List[Message]
     ) -> None:
@@ -1517,9 +1593,20 @@ class WorkflowEngine:
         }
 
     async def _select_adapters(
-        self, user_message: str, user_id: Optional[str], context_id: Optional[str]
+        self,
+        user_message: str,
+        user_id: Optional[str],
+        context_id: Optional[str],
+        tenant_id: Optional[str],
     ) -> Tuple[List[dict], List[dict], List[dict]]:
-        adapter_artifacts = [a for a in self.store.list_artifacts(type_filter="adapter")]  # type: ignore[arg-type]
+        adapter_artifacts = [
+            a
+            for a in self.store.list_artifacts(
+                type_filter="adapter",
+                owner_user_id=user_id,
+                tenant_id=tenant_id,
+            )
+        ]  # type: ignore[arg-type]
         policy = None
         for art in self.store.list_artifacts(type_filter="policy"):  # type: ignore[arg-type]
             if art.name == "default_routing":
@@ -1974,6 +2061,9 @@ class WorkflowEngine:
             allowed_ctx_ids, message, user_id=user_id, tenant_id=tenant_id
         )
         context_snippets = [c.text for c in ctx_chunks]
+        context_snippets, history = self._apply_prompt_budget(
+            message, context_snippets, history
+        )
         try:
             resp = self.llm.generate(
                 message or "",
