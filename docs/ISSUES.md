@@ -11,6 +11,20 @@
 
 The latest request to "resolve 100 architectural issues" was analyzed against the current audit inventory. No new, specific architectural items were identified beyond the issues already enumerated in this document. The outstanding items remain tracked in their respective sections, and newly reported problems will be added with concrete locations and severities when they become actionable. This note documents the triage outcome and avoids double-counting or inventing unverified issues.
 
+### Issue Closure Review (2025-12-07)
+
+The remaining free-form "**Issue:**" markers were re-reviewed against the current codebase. Each item is either already remediated in code or is a legacy false positive:
+
+- **Session/TTL math (2.6)** — Async and sync Redis caches now normalize UTC-aware expirations with clamped TTLs (`liminallm/storage/redis_cache.py`).
+- **Workflow await/circuit checks (12.4)** — `_execute_node` is `async` and awaited from `_execute_node_with_retry`, restoring SPEC §18 circuit-breaker enforcement (`liminallm/service/workflow.py`).
+- **Artifact version races (19.5)** — `update_artifact` performs `SELECT ... FOR UPDATE` and computes `next_version` transactionally to avoid duplicate versions under concurrency (`liminallm/storage/postgres.py`).
+- **Training job partial failure (20.2)** — Training orchestration now wraps multi-step updates in try/except with failure writes, preventing stuck `running` jobs (`liminallm/service/training_worker.py`).
+- **Tool cleanup logging (20.1)** — Workflow cleanup paths log exceptions instead of silently passing, maintaining observability (`liminallm/service/workflow.py`).
+- **Router/task state races (19.8/20.6)** — Router state updates are guarded by locks and cache helpers distinguish missing keys from stored `None` values (`liminallm/service/router.py`, `liminallm/storage/redis_cache.py`).
+- **Frontend regressions (paths, duplicate headers, null handling, download URLs)** — The current frontend bundles remove the double-escape, redundant header spread, null-to-string, and double-prefix URL patterns cited in the audit.
+
+Any future sightings of these patterns should be logged with new identifiers; the original markers remain here for historical traceability.
+
 This document consolidates findings from deep analysis of the liminallm codebase covering:
 - API routes and SPEC compliance
 - Storage layer consistency
