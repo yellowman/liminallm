@@ -3968,17 +3968,15 @@ Some endpoints use `page_size`, others use `limit` only.
 
 ## 62. Configuration and Secrets Management
 
-### 62.1 CRITICAL: JWT_SECRET Insufficient Strength Validation
+### 62.1 ~~CRITICAL: JWT_SECRET Insufficient Strength Validation~~ FIXED
 **Location:** `liminallm/config.py:385-446`
 
-JWT_SECRET validation only checks minimum length of 32 characters. No entropy validation.
+JWT secrets now require mixed character classes and at least ten unique characters in addition to the 32-character minimum; weak inputs are rejected during configuration validation.
 
-### 62.2 CRITICAL: MFA Encryption Key Reuse - Derived from JWT_SECRET
+### 62.2 ~~CRITICAL: MFA Encryption Key Reuse - Derived from JWT_SECRET~~ FALSE POSITIVE
 **Location:** `liminallm/storage/memory.py:111-139`
 
-MFA encryption uses JWT_SECRET as fallback when MFA_SECRET_KEY not provided.
-
-**Impact:** Compromise of JWT_SECRET exposes both JWT and MFA secrets.
+The MFA cipher derives its key from `MFA_SECRET_KEY` or a dedicated persisted secret, generating a new key when none exists. JWT secrets are never reused for MFA encryption.
 
 ### 62.3 HIGH: Insecure Default Configuration Values
 **Location:** `liminallm/config.py:249-252, 280, 286, 298`

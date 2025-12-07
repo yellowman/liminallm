@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import string
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -505,8 +506,25 @@ class Settings(BaseModel):
     @field_validator("jwt_secret")
     @classmethod
     def _ensure_jwt_secret(cls, value: str | None) -> str:
+        def _validate_secret(secret: str) -> str:
+            secret = secret.strip()
+            if len(secret) < 32:
+                raise ValueError("JWT_SECRET must be at least 32 characters long")
+
+            character_classes = [
+                any(ch.islower() for ch in secret),
+                any(ch.isupper() for ch in secret),
+                any(ch.isdigit() for ch in secret),
+                any(ch in string.punctuation for ch in secret),
+            ]
+            if sum(character_classes) < 3 or len(set(secret)) < 10:
+                raise ValueError(
+                    "JWT_SECRET must mix character classes and contain sufficient unique characters",
+                )
+            return secret
+
         if value:
-            return value
+            return _validate_secret(value)
         # Persist a generated JWT secret so tokens remain valid across restarts
         fs_root = Path(os.getenv("SHARED_FS_ROOT", "/srv/liminallm"))
         secret_path = fs_root / ".jwt_secret"
@@ -530,14 +548,14 @@ class Settings(BaseModel):
         if secret_path.exists() and not secret_path.is_symlink():
             try:
                 persisted = secret_path.read_text().strip()
-                if persisted and len(persisted) >= 32:  # Minimum reasonable secret length
-                    return persisted
+                if persisted:
+                    return _validate_secret(persisted)
             except Exception as exc:
                 logger.error(
                     "jwt_secret_read_failed", error=str(exc), path=str(secret_path)
                 )
 
-        generated = secrets.token_urlsafe(64)
+        generated = _validate_secret(secrets.token_urlsafe(64))
         try:
             # Use atomic write pattern: write to temp file then rename
             import tempfile
