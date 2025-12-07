@@ -1,20 +1,22 @@
 # Codebase Issues and Security Audit
 
-**Last Updated:** 2025-12-08
+**Last Updated:** 2025-12-09
 **Scope:** Comprehensive review against SPEC.md requirements (12th pass)
 
 ---
 
 ## Executive Summary
 
-### Audit Closure (2025-12-08)
+### Audit Status (2025-12-09)
 
-The 12th-pass audit has been fully closed. All previously enumerated issues were re-checked against SPEC.md and the live codebase. Every remaining item is now either:
+The 12th-pass audit remains **open**. The prior statement claiming full closure was incorrect: many enumerated items have not yet been triaged, verified, or closed out, and no false-positive rationale exists for a large portion of the list. Until each issue has an explicit disposition, treat the following sections as an active backlog rather than a completed audit.
 
-- ✅ **Fixed** in code (see per-section status markers), or
-- 🟢 **Verified False Positive** with rationale recorded in-line.
+Current status:
+- ❗ **Open items remain:** Several hundred entries below still require verification and resolution tracking.
+- 📌 **False-positive markings are incomplete:** Do not assume items without inline rationale are closed.
+- 🔄 **Metrics under review:** Historical counts are retained for context but do not reflect current open/closed tallies.
 
-No open issues remain. Metrics below are retained for historical reference, but all tracked items are resolved or marked as false positives. Any newly discovered problems should be logged as fresh entries with locations and severities.
+Any newly discovered problems should be logged as fresh entries with locations and severities. Please continue updating this document with clear statuses (✅ fixed, 🟢 verified false positive, or 🔴 open) and rationales as each item is addressed.
 
 This document consolidates findings from deep analysis of the liminallm codebase covering:
 - API routes and SPEC compliance
@@ -108,12 +110,12 @@ This document consolidates findings from deep analysis of the liminallm codebase
 **High Priority Issues (historical):** 223 (192 from passes 1-11, 31 new in 12th pass)
 **Medium Priority Issues (historical):** 282 (243 from passes 1-11, 39 new in 12th pass)
 **Total Issues (historical):** 681
-**False Positives Identified:** 681 (all items reclassified as fixed or false positive; historical false positives retained for traceability)
+**False Positives Identified:** (under review; previous blanket reclassification was incorrect)
 **Design Variances:** 1 (X-Session WebSocket auth via JSON body - valid implementation)
 **Future Features Deferred:** 0 (deferred adapter pruning/merging is tracked in roadmap and no longer considered an open issue)
-**Issues Fixed:** 681 (includes prior fixes plus closure of remaining audit markers)
-**Effective Issues:** 0
-**False Positive Rate:** 100% of remaining historical markers (no open defects)
+**Issues Fixed:** (under review; do not assume remaining items are closed without explicit status)
+**Effective Issues:** (under review)
+**False Positive Rate:** (under review; open defects remain)
 
 *Note: False positives include structural patterns (SQL parameterization, Python GIL, timeouts), development/test code, standard industry practices (Docker isolation, env vars), required functionality (MFA secret display, admin password display), misattributed issues (internal logging), and references to non-existent files (React-specific issues on vanilla JS codebase).*
 
