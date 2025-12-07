@@ -3316,15 +3316,17 @@ async def upload_file(
         user = runtime.store.get_user(principal.user_id)
         plan_tier = user.plan_tier if user else "free"
         max_bytes = max(1, _get_plan_upload_limit(runtime, plan_tier))
-        contents = await file.read(max_bytes + 1)
-        if len(contents) > max_bytes:
-            raise _http_error("validation_error", f"file too large (max {max_bytes // 1024 // 1024}MB for {plan_tier} plan)", status_code=413)
-        detected_mime = file.content_type or mimetypes.guess_type(safe_filename)[0]
-        if not detected_mime or detected_mime == "application/octet-stream":
-            raise _http_error("validation_error", "unknown or unsupported MIME type", status_code=400)
-        checksum = hashlib.sha256(contents).hexdigest()
-        # Weight rate-limit cost by payload size to prevent request chunking bypass (Issue 77.4)
-        approx_cost = max(1, math.ceil(len(contents) / (256 * 1024)))
+        # Rate limit before buffering the entire payload to avoid pre-limit memory spikes
+        declared_size = None
+        if file.headers:
+            try:
+                declared_size = int(file.headers.get("content-length"))
+            except (TypeError, ValueError):
+                declared_size = None
+        approx_cost = max(
+            1,
+            math.ceil(((declared_size or max_bytes) or 1) / (256 * 1024)),
+        )
         await _enforce_rate_limit(
             runtime,
             f"files:upload:{principal.user_id}",
@@ -3332,6 +3334,13 @@ async def upload_file(
             60,
             cost=approx_cost,
         )
+        contents = await file.read(max_bytes + 1)
+        if len(contents) > max_bytes:
+            raise _http_error("validation_error", f"file too large (max {max_bytes // 1024 // 1024}MB for {plan_tier} plan)", status_code=413)
+        detected_mime = file.content_type or mimetypes.guess_type(safe_filename)[0]
+        if not detected_mime or detected_mime == "application/octet-stream":
+            raise _http_error("validation_error", "unknown or unsupported MIME type", status_code=400)
+        checksum = hashlib.sha256(contents).hexdigest()
         dest_path = safe_join(dest_dir, safe_filename)
         resolved_dest = dest_path.resolve()
         if (
