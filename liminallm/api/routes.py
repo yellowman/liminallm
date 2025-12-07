@@ -214,7 +214,7 @@ async def _unregister_cancel_event(request_id: str) -> None:
     """Unregister a cancel event when request completes."""
     async with _get_active_requests_lock():
         _active_requests.pop(request_id, None)
-    await _cleanup_stale_active_requests()
+        await _cleanup_stale_active_requests()
 
 
 async def _cancel_request(request_id: str, user_id: str) -> tuple[bool, str]:
@@ -4339,6 +4339,7 @@ async def websocket_chat(ws: WebSocket):
             # Issue 38.5: Use list for O(n) token accumulation instead of string += O(n²)
             content_tokens: list[str] = []
             orchestration_dict: dict[str, Any] = {}
+            message_done_received = False
 
             # Concurrent task to listen for cancel requests while streaming
             async def listen_for_cancel():
@@ -4394,6 +4395,7 @@ async def websocket_chat(ws: WebSocket):
                         if isinstance(event_data, str):
                             content_tokens.append(event_data)
                     elif event_type == "message_done":
+                        message_done_received = True
                         orchestration_dict = event_data if isinstance(event_data, dict) else {}
                     elif event_type == "error":
                         # Error already sent, close connection
@@ -4418,7 +4420,9 @@ async def websocket_chat(ws: WebSocket):
                     await cancel_listener
                 await _unregister_cancel_event(request_id)
 
-            # Save assistant message after streaming completes
+            # Save assistant message after streaming completes (only if successful)
+            if cancel_event.is_set() or not message_done_received:
+                return
             adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
             # Issue 38.5: Join tokens at end for O(n) performance
             full_content = "".join(content_tokens)

@@ -1522,6 +1522,17 @@ class WorkflowEngine:
 
         import html
 
+        def _escape_html(value: Any) -> Any:
+            if value is None:
+                return ""
+            if isinstance(value, str):
+                return html.escape(value, quote=True)
+            if isinstance(value, list):
+                return [_escape_html(v) for v in value]
+            if isinstance(value, dict):
+                return {k: _escape_html(v) for k, v in value.items()}
+            return value
+
         if isinstance(value, list):
             return [self._sanitize_html_untrusted(v) for v in value]
         if isinstance(value, dict):
@@ -1532,7 +1543,7 @@ class WorkflowEngine:
                     sanitized[k] = v
                     continue
                 if is_html_untrusted and k == "content":
-                    sanitized[k] = html.escape(str(v or ""), quote=True)
+                    sanitized[k] = _escape_html(v)
                     continue
                 sanitized[k] = self._sanitize_html_untrusted(v)
             return sanitized

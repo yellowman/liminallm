@@ -141,13 +141,20 @@ class PostgresStore:
         Thread-safe per SPEC §18 inference/adapter cache discipline.
         """
         with self._session_lock:
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
+
+            def _is_expired(session: Session) -> bool:
+                if session.expires_at is None:
+                    return False
+                expires_at = (
+                    session.expires_at
+                    if session.expires_at.tzinfo
+                    else session.expires_at.replace(tzinfo=timezone.utc)
+                )
+                return expires_at <= now
+
             # First prune any expired sessions to avoid evicting valid ones (Issue 53.10)
-            expired_ids = [
-                sid
-                for sid, sess in self.sessions.items()
-                if sess.expires_at is not None and sess.expires_at <= now
-            ]
+            expired_ids = [sid for sid, sess in self.sessions.items() if _is_expired(sess)]
             for sid in expired_ids:
                 self.sessions.pop(sid, None)
             # Evict soonest-to-expire entries if cache is at capacity
@@ -1810,9 +1817,12 @@ class PostgresStore:
         - If no visibility filter: user's private + all global + shared within tenant
         """
         # SPEC pagination: default 100, cap 500 to avoid unbounded scans
-        effective_page_size = max(page_size, 1)
-        limit = min(effective_page_size, 500)
-        offset = max(page - 1, 0) * limit
+        max_page_size = 500
+        requested_page_size = max(page_size, 1)
+        capped_page_size = min(requested_page_size, max_page_size)
+        # Allow one extra record for has_next detection when caller requests page_size + 1
+        limit = capped_page_size + (1 if requested_page_size > capped_page_size else 0)
+        offset = max(page - 1, 0) * capped_page_size
         with self._connect() as conn:
             clauses = []
             params: list[Any] = []

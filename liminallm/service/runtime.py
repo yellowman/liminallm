@@ -537,10 +537,11 @@ async def check_rate_limit(
     """
     if limit <= 0:
         return (True, limit, 0) if return_remaining else True
+    rate_limit_key = key
     if window_seconds <= 0:
         logger.warning(
             "rate_limit_invalid_window",
-            key=key,
+            key=rate_limit_key,
             window_seconds=window_seconds,
             message="Invalid rate limit window_seconds; defaulting to 60 seconds",
         )
@@ -548,7 +549,11 @@ async def check_rate_limit(
     now = datetime.utcnow()
     if runtime.cache:
         result = await runtime.cache.check_rate_limit(
-            key, limit, window_seconds, return_remaining=return_remaining, cost=cost
+            rate_limit_key,
+            limit,
+            window_seconds,
+            return_remaining=return_remaining,
+            cost=cost,
         )
         return result
     window = timedelta(seconds=window_seconds)
@@ -560,7 +565,8 @@ async def check_rate_limit(
         if (now - runtime._local_rate_limit_last_cleanup).total_seconds() > 300:
             runtime._local_rate_limit_last_cleanup = now
             expired_keys = [
-                key for key, (_, ts) in runtime._local_rate_limits.items()
+                stale_key
+                for stale_key, (_, ts) in runtime._local_rate_limits.items()
                 if (now - ts).total_seconds() > max_age_seconds
             ]
             for stale_key in expired_keys:
@@ -579,13 +585,13 @@ async def check_rate_limit(
                     cleaned=len(expired_keys),
                     remaining=len(runtime._local_rate_limits),
                 )
-        tokens, last_ts = runtime._local_rate_limits.get(key, (float(limit), now))
+        tokens, last_ts = runtime._local_rate_limits.get(rate_limit_key, (float(limit), now))
         elapsed = max(0.0, (now - last_ts).total_seconds())
         tokens = min(float(limit), tokens + elapsed * refill_rate)
         allowed = tokens >= cost
         if allowed:
             tokens -= cost
-            runtime._local_rate_limits[key] = (tokens, now)
+            runtime._local_rate_limits[rate_limit_key] = (tokens, now)
         reset_seconds = int(((cost - tokens) / refill_rate)) if not allowed and refill_rate > 0 else 0
         remaining = int(tokens)
     if return_remaining:
