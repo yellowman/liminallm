@@ -63,6 +63,20 @@ return {1, tokens, 0}
         self._token_bucket = self.client.register_script(self._TOKEN_BUCKET_SCRIPT)
 
     @staticmethod
+    def _normalize_utc(dt: datetime) -> datetime:
+        """Return a UTC-aware datetime for safe arithmetic.
+
+        Redis TTL calculations must avoid mixing naive and aware timestamps. New
+        session records are created with timezone-aware UTC expirations, but
+        older callers may still provide naive datetimes. Normalize everything to
+        UTC before computing relative durations. (Issue 2.6)
+        """
+
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    @staticmethod
     def _ttl_seconds(expires_at: datetime) -> int:
         """Compute a safe TTL from an absolute expiry timestamp.
 
@@ -71,11 +85,10 @@ return {1, tokens, 0}
         negative or zero TTL values. (Issue 2.6)
         """
 
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        else:
-            expires_at = expires_at.astimezone(timezone.utc)
-        return max(1, int((expires_at - datetime.now(timezone.utc)).total_seconds()))
+        expires_at = RedisCache._normalize_utc(expires_at)
+        return max(
+            1, int((expires_at - datetime.now(timezone.utc)).total_seconds())
+        )
 
     def verify_connection(self) -> None:
         """Assert Redis connectivity before enabling dependent features."""
@@ -265,11 +278,7 @@ return {1, tokens, 0}
     async def set_oauth_state(
         self, state: str, provider: str, expires_at: datetime, tenant_id: Optional[str]
     ) -> None:
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        else:
-            expires_at = expires_at.astimezone(timezone.utc)
-
+        expires_at = self._normalize_utc(expires_at)
         ttl = self._ttl_seconds(expires_at)
         payload = {
             "provider": provider,
@@ -921,11 +930,7 @@ class SyncRedisCache:
     async def set_oauth_state(
         self, state: str, provider: str, expires_at: datetime, tenant_id: Optional[str]
     ) -> None:
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        else:
-            expires_at = expires_at.astimezone(timezone.utc)
-
+        expires_at = RedisCache._normalize_utc(expires_at)
         ttl = RedisCache._ttl_seconds(expires_at)
         payload = {
             "provider": provider,
