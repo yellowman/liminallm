@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import os
 import secrets
+import string
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -311,6 +313,11 @@ class Settings(BaseModel):
     smtp_use_tls: bool = env_field(
         True, "SMTP_USE_TLS", description="Use TLS for SMTP (overridable via admin UI)"
     )
+    smtp_allow_insecure: bool = env_field(
+        False,
+        "SMTP_ALLOW_INSECURE",
+        description="Allow plaintext SMTP when explicitly enabled (overridable via admin UI)",
+    )
     email_from_address: str | None = env_field(
         None, "EMAIL_FROM_ADDRESS", description="Email from address (overridable via admin UI)"
     )
@@ -337,6 +344,26 @@ class Settings(BaseModel):
         False,
         "TEST_MODE",
         description="Toggle deterministic testing behaviors; required for CI pathways described in SPEC §14.",
+    )
+    tool_network_allowlist: list[str] = env_field(
+        ["api.openai.com"],
+        "TOOL_NETWORK_ALLOWLIST",
+        description="Allowlisted hostnames/CIDRs for tool egress (SPEC §18)",
+    )
+    tool_network_proxy_url: str | None = env_field(
+        None,
+        "TOOL_NETWORK_PROXY_URL",
+        description="Proxy URL tools must use for outbound HTTP(S) fetches",
+    )
+    tool_fetch_connect_timeout: float = env_field(
+        10.0,
+        "TOOL_FETCH_CONNECT_TIMEOUT",
+        description="Connect timeout (seconds) for tool HTTP fetches",
+    )
+    tool_fetch_timeout: float = env_field(
+        30.0,
+        "TOOL_FETCH_TIMEOUT",
+        description="Total timeout (seconds) for tool HTTP fetches",
     )
     enable_mfa: bool = env_field(
         True,
@@ -466,11 +493,43 @@ class Settings(BaseModel):
     def _validate_adapter_mode(cls, value: AdapterMode) -> AdapterMode:
         return AdapterMode(value)
 
+    @field_validator("tool_network_allowlist", mode="before")
+    @classmethod
+    def _parse_tool_allowlist(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    return [str(v) for v in parsed if str(v).strip()]
+            except Exception:
+                pass
+            return [v.strip() for v in value.split(",") if v.strip()]
+        return list(value)
+
     @field_validator("jwt_secret")
     @classmethod
     def _ensure_jwt_secret(cls, value: str | None) -> str:
+        def _validate_secret(secret: str) -> str:
+            secret = secret.strip()
+            if len(secret) < 32:
+                raise ValueError("JWT_SECRET must be at least 32 characters long")
+
+            character_classes = [
+                any(ch.islower() for ch in secret),
+                any(ch.isupper() for ch in secret),
+                any(ch.isdigit() for ch in secret),
+                any(ch in string.punctuation for ch in secret),
+            ]
+            if sum(character_classes) < 3 or len(set(secret)) < 10:
+                raise ValueError(
+                    "JWT_SECRET must mix character classes and contain sufficient unique characters",
+                )
+            return secret
+
         if value:
-            return value
+            return _validate_secret(value)
         # Persist a generated JWT secret so tokens remain valid across restarts
         fs_root = Path(os.getenv("SHARED_FS_ROOT", "/srv/liminallm"))
         secret_path = fs_root / ".jwt_secret"
@@ -494,14 +553,14 @@ class Settings(BaseModel):
         if secret_path.exists() and not secret_path.is_symlink():
             try:
                 persisted = secret_path.read_text().strip()
-                if persisted and len(persisted) >= 32:  # Minimum reasonable secret length
-                    return persisted
+                if persisted:
+                    return _validate_secret(persisted)
             except Exception as exc:
                 logger.error(
                     "jwt_secret_read_failed", error=str(exc), path=str(secret_path)
                 )
 
-        generated = secrets.token_urlsafe(64)
+        generated = _validate_secret(secrets.token_urlsafe(64))
         try:
             # Use atomic write pattern: write to temp file then rename
             import tempfile

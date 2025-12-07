@@ -22,7 +22,7 @@ from liminallm.config import Settings
 def settings():
     """Create test settings."""
     return Settings(
-        jwt_secret="test-secret-key-for-testing-only",
+        jwt_secret="Test-Secret-Key_for-Automation-Only-987654321!",
         access_token_ttl_minutes=15,
         refresh_token_ttl_minutes=60 * 24,
         mfa_enabled=False,  # Disable MFA for simpler testing

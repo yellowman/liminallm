@@ -63,7 +63,21 @@ return {1, tokens, 0}
         self._token_bucket = self.client.register_script(self._TOKEN_BUCKET_SCRIPT)
 
     @staticmethod
-    def _ttl_seconds(expires_at: datetime) -> int:
+    def _normalize_utc(dt: datetime) -> datetime:
+        """Return a UTC-aware datetime for safe arithmetic.
+
+        Redis TTL calculations must avoid mixing naive and aware timestamps. New
+        session records are created with timezone-aware UTC expirations, but
+        older callers may still provide naive datetimes. Normalize everything to
+        UTC before computing relative durations. (Issue 2.6)
+        """
+
+        if dt.tzinfo is None:
+            return dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    @staticmethod
+    def _ttl_seconds(expires_at: datetime, *, now: Optional[datetime] = None) -> int:
         """Compute a safe TTL from an absolute expiry timestamp.
 
         Sessions now use timezone-aware UTC timestamps; older records may be naive.
@@ -71,11 +85,46 @@ return {1, tokens, 0}
         negative or zero TTL values. (Issue 2.6)
         """
 
-        if expires_at.tzinfo is None:
-            expires_at = expires_at.replace(tzinfo=timezone.utc)
-        else:
-            expires_at = expires_at.astimezone(timezone.utc)
-        return max(1, int((expires_at - datetime.now(timezone.utc)).total_seconds()))
+        expires_at = RedisCache._normalize_utc(expires_at)
+        now = now or datetime.now(timezone.utc)
+        return max(1, int((expires_at - now).total_seconds()))
+
+    async def _redis_now(self) -> datetime:
+        """Return Redis server time to align TTLs with Redis clock (Issue 76.8)."""
+
+        try:
+            seconds, microseconds = await self.client.time()
+            return datetime.fromtimestamp(
+                seconds + microseconds / 1_000_000, tz=timezone.utc
+            )
+        except Exception:
+            # Fall back to application clock if Redis TIME is unavailable.
+            return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _prepare_oauth_state(
+        provider: str,
+        expires_at: datetime,
+        tenant_id: Optional[str],
+        *,
+        now: Optional[datetime] = None,
+    ) -> tuple[dict, int]:
+        """Normalize OAuth expirations and compute a safe TTL.
+
+        OAuth callers now pass timezone-aware timestamps; older callers may pass
+        naive datetimes. Normalize everything to UTC before calculating TTL to
+        avoid naive/aware subtraction errors. Returns the serialized payload and
+        TTL seconds so both async and sync caches share identical logic.
+        """
+
+        normalized_expiry = RedisCache._normalize_utc(expires_at)
+        ttl = RedisCache._ttl_seconds(normalized_expiry, now=now)
+        payload = {
+            "provider": provider,
+            "expires_at": normalized_expiry.isoformat(),
+            "tenant_id": tenant_id,
+        }
+        return payload, ttl
 
     def verify_connection(self) -> None:
         """Assert Redis connectivity before enabling dependent features."""
@@ -92,7 +141,8 @@ return {1, tokens, 0}
     async def cache_session(
         self, session_id: str, user_id: str, expires_at: datetime
     ) -> None:
-        ttl = self._ttl_seconds(expires_at)
+        now = await self._redis_now()
+        ttl = self._ttl_seconds(expires_at, now=now)
         pipe = self.client.pipeline()
         pipe.set(f"auth:session:{session_id}", user_id, ex=ttl)
         # Track session in user's session set for bulk revocation (Issue 22.3)
@@ -156,6 +206,12 @@ return {1, tokens, 0}
         tenant_id: Optional[str] = None,
         cost: int = 1,
     ) -> Union[bool, Tuple[bool, int, int]]:
+        if limit <= 0:
+            return (True, limit, 0) if return_remaining else True
+
+        if window_seconds <= 0:
+            window_seconds = 60
+
         """Check rate limit using Redis-backed token bucket.
 
         Uses a Lua script for atomic refill and consumption to avoid race
@@ -265,12 +321,10 @@ return {1, tokens, 0}
     async def set_oauth_state(
         self, state: str, provider: str, expires_at: datetime, tenant_id: Optional[str]
     ) -> None:
-        ttl = max(1, int((expires_at - datetime.utcnow()).total_seconds()))
-        payload = {
-            "provider": provider,
-            "expires_at": expires_at.isoformat(),
-            "tenant_id": tenant_id,
-        }
+        now = await self._redis_now()
+        payload, ttl = self._prepare_oauth_state(
+            provider, expires_at, tenant_id, now=now
+        )
         await self.client.set(f"auth:oauth:{state}", json.dumps(payload), ex=ttl)
 
     async def pop_oauth_state(
@@ -315,12 +369,14 @@ return {1, tokens, 0}
 
         expires_raw = data.get("expires_at")
         # Issue 39.2: Add error handling for datetime parsing
-        expires_at = datetime.utcnow()
+        expires_at = datetime.now(timezone.utc)
         if isinstance(expires_raw, str):
             try:
                 expires_at = datetime.fromisoformat(expires_raw)
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
             except (ValueError, TypeError):
-                pass  # Use default utcnow
+                pass  # Use default current UTC time
         return data.get("provider"), expires_at, data.get("tenant_id")
 
     async def get_idempotency_record(
@@ -491,7 +547,7 @@ return {1, tokens, 0}
     async def update_session_activity(self, session_id: str, ttl_seconds: int = 86400) -> None:
         """Update session last activity timestamp."""
         key = f"session:activity:{session_id}"
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         await self.client.set(key, now, ex=ttl_seconds)
 
     async def get_session_activity(self, session_id: str) -> Optional[datetime]:
@@ -500,7 +556,10 @@ return {1, tokens, 0}
         value = await self.client.get(key)
         if value:
             try:
-                return datetime.fromisoformat(value)
+                parsed = datetime.fromisoformat(value)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed
             except (ValueError, TypeError):
                 return None
         return None
@@ -768,6 +827,21 @@ class SyncRedisCache:
         )
         # Wrap sync client with async-compatible adapter for direct client access
         self.client = _SyncClientAdapter(self._sync_client)
+        # Register token bucket script for atomic rate limiting (Issue 77.10)
+        self._token_bucket = self._sync_client.register_script(
+            RedisCache._TOKEN_BUCKET_SCRIPT
+        )
+
+    def _redis_now(self) -> datetime:
+        """Return Redis server time to align TTLs with Redis clock (Issue 76.8)."""
+
+        try:
+            seconds, microseconds = self._sync_client.time()
+            return datetime.fromtimestamp(
+                seconds + microseconds / 1_000_000, tz=timezone.utc
+            )
+        except Exception:
+            return datetime.now(timezone.utc)
 
     def verify_connection(self) -> None:
         """Assert Redis connectivity."""
@@ -776,7 +850,7 @@ class SyncRedisCache:
     async def cache_session(
         self, session_id: str, user_id: str, expires_at: datetime
     ) -> None:
-        ttl = RedisCache._ttl_seconds(expires_at)
+        ttl = RedisCache._ttl_seconds(expires_at, now=self._redis_now())
         pipe = self._sync_client.pipeline()
         pipe.set(f"auth:session:{session_id}", user_id, ex=ttl)
         # Track session in user's session set for bulk revocation (Issue 22.3)
@@ -811,28 +885,34 @@ class SyncRedisCache:
         return revoked
 
     async def check_rate_limit(
-        self, key: str, limit: int, window_seconds: int, *, return_remaining: bool = False,
-        tenant_id: Optional[str] = None
-    ) -> Union[bool, Tuple[bool, int]]:
-        now = datetime.utcnow()
-        now_bucket = int(now.timestamp() // window_seconds)
-        # Issue 44.3: Include tenant_id in cache key for tenant isolation
-        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
-        redis_key = f"rate:{tenant_prefix}{key}:{now_bucket}"
-        bucket_end = (now_bucket + 1) * window_seconds
-        ttl = max(1, int(bucket_end - now.timestamp()))
+        self,
+        key: str,
+        limit: int,
+        window_seconds: int,
+        *,
+        return_remaining: bool = False,
+        tenant_id: Optional[str] = None,
+        cost: int = 1,
+    ) -> Union[bool, Tuple[bool, int, int]]:
+        if limit <= 0:
+            return (True, limit, 0) if return_remaining else True
 
-        pipe = self._sync_client.pipeline()
-        pipe.incr(redis_key)
-        pipe.expire(redis_key, ttl)
-        results = pipe.execute()
-        current = results[0]
+        if window_seconds <= 0:
+            window_seconds = 60
 
-        allowed = current <= limit
+        now = time.time()
+        safe_key = RedisCache._normalize_rate_key(key, tenant_id)
+        refill_rate = float(limit) / float(window_seconds)
+        allowed, tokens, reset_after = self._token_bucket(
+            keys=[safe_key], args=[now, refill_rate, limit, max(1, cost)]
+        )
+
+        allowed_bool = bool(int(allowed))
+        remaining = max(0, int(tokens))
+        reset_seconds = int(reset_after) if reset_after else 0
         if return_remaining:
-            remaining = max(0, limit - current)
-            return (allowed, remaining)
-        return allowed
+            return (allowed_bool, remaining, reset_seconds)
+        return allowed_bool
 
     async def mark_refresh_revoked(self, jti: str, ttl_seconds: int) -> None:
         self._sync_client.set(f"auth:refresh:revoked:{jti}", "1", ex=ttl_seconds)
@@ -909,12 +989,9 @@ class SyncRedisCache:
     async def set_oauth_state(
         self, state: str, provider: str, expires_at: datetime, tenant_id: Optional[str]
     ) -> None:
-        ttl = max(1, int((expires_at - datetime.utcnow()).total_seconds()))
-        payload = {
-            "provider": provider,
-            "expires_at": expires_at.isoformat(),
-            "tenant_id": tenant_id,
-        }
+        payload, ttl = RedisCache._prepare_oauth_state(
+            provider, expires_at, tenant_id, now=self._redis_now()
+        )
         self._sync_client.set(f"auth:oauth:{state}", json.dumps(payload), ex=ttl)
 
     async def pop_oauth_state(
@@ -940,12 +1017,14 @@ class SyncRedisCache:
 
         expires_raw = data.get("expires_at")
         # Issue 39.2: Add error handling for datetime parsing
-        expires_at = datetime.utcnow()
+        expires_at = datetime.now(timezone.utc)
         if isinstance(expires_raw, str):
             try:
                 expires_at = datetime.fromisoformat(expires_raw)
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
             except (ValueError, TypeError):
-                pass  # Use default utcnow
+                pass  # Use default current UTC time
         return data.get("provider"), expires_at, data.get("tenant_id")
 
     async def get_idempotency_record(
@@ -1072,7 +1151,7 @@ class SyncRedisCache:
     async def update_session_activity(self, session_id: str, ttl_seconds: int = 86400) -> None:
         """Update session last activity timestamp."""
         key = f"session:activity:{session_id}"
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         self._sync_client.set(key, now, ex=ttl_seconds)
 
     async def get_session_activity(self, session_id: str) -> Optional[datetime]:
@@ -1081,7 +1160,10 @@ class SyncRedisCache:
         value = self._sync_client.get(key)
         if value:
             try:
-                return datetime.fromisoformat(value)
+                parsed = datetime.fromisoformat(value)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed
             except (ValueError, TypeError):
                 return None
         return None

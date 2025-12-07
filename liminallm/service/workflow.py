@@ -18,6 +18,7 @@ from typing import (
     Tuple,
 )
 
+from liminallm.config import Settings
 from liminallm.logging import get_logger
 from liminallm.service.embeddings import (
     EMBEDDING_DIM,
@@ -29,7 +30,13 @@ from liminallm.service.errors import BadRequestError
 from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
 from liminallm.service.router import RouterEngine
-from liminallm.service.sandbox import safe_eval_expr
+from liminallm.service.sandbox import (
+    AllowlistedFetcher,
+    ToolNetworkPolicy,
+    build_tool_network_policy,
+    safe_eval_expr,
+    tool_network_guard,
+)
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.models import Message
 from liminallm.storage.postgres import PostgresStore
@@ -117,6 +124,7 @@ class WorkflowEngine:
         *,
         cache: Optional[RedisCache] = None,
         tool_workers: int = DEFAULT_TOOL_WORKERS,
+        settings: Optional[Settings] = None,
     ) -> None:
         self.store = store
         self.llm = llm
@@ -125,10 +133,40 @@ class WorkflowEngine:
         self.logger = get_logger(__name__)
         self.tool_registry = self._build_tool_registry()
         self.cache = cache
+        self.tool_network_policy: ToolNetworkPolicy = build_tool_network_policy(
+            allowlist=(settings.tool_network_allowlist if settings else []),
+            proxy_url=settings.tool_network_proxy_url if settings else None,
+            connect_timeout=(
+                settings.tool_fetch_connect_timeout if settings else 10.0
+            ),
+            total_timeout=settings.tool_fetch_timeout if settings else 30.0,
+        )
+        self.tool_fetcher = AllowlistedFetcher(self.tool_network_policy)
         # Issue 48.6: Configurable worker pool with bounds
         workers = min(max(1, tool_workers), self.MAX_TOOL_WORKERS)
         self._tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
         self._executor_shutdown = False
+
+    def _error_event(
+        self, code: str, message: str, details: dict | None = None
+    ) -> dict:
+        return {
+            "event": "error",
+            "data": {"code": code, "message": message, "details": details or {}},
+        }
+
+    def _append_trace(
+        self,
+        workflow_trace: List[Dict[str, Any]],
+        entry: Dict[str, Any],
+        max_entries: int = 500,
+    ) -> None:
+        """Append to workflow_trace with bounded size (Issue 23.4)."""
+
+        workflow_trace.append(entry)
+        if len(workflow_trace) > max_entries:
+            # Drop oldest entries to avoid unbounded growth during long runs
+            del workflow_trace[0 : len(workflow_trace) - max_entries]
 
     def shutdown(self, wait: bool = True) -> None:
         """Explicitly shutdown the executor. Call during app shutdown.
@@ -438,12 +476,6 @@ class WorkflowEngine:
         )
         workflow_start_time = time.monotonic()
 
-        def _error_event(code: str, message: str, details: dict | None = None) -> dict:
-            return {
-                "event": "error",
-                "data": {"code": code, "message": message, "details": details or {}},
-            }
-
         adapters, routing_trace, adapter_gates = await self._select_adapters(
             user_message, user_id, context_id
         )
@@ -463,14 +495,6 @@ class WorkflowEngine:
         vars_scope: Dict[str, Any] = {}
         workflow_trace: List[Dict[str, Any]] = []
         max_trace_entries = 500
-
-        def _append_trace(entry: Dict[str, Any]) -> None:
-            """Append to workflow_trace with bounded size (Issue 23.4)."""
-
-            workflow_trace.append(entry)
-            if len(workflow_trace) > max_trace_entries:
-                # Drop oldest entries to avoid unbounded growth during long runs
-                del workflow_trace[0 : len(workflow_trace) - max_trace_entries]
         context_snippets: List[str] = []
         context_seen = set()
         content = ""
@@ -601,13 +625,15 @@ class WorkflowEngine:
                     )
 
                     # Merge parallel results into workflow state
-                    _append_trace(
+                    self._append_trace(
+                        workflow_trace,
                         {
                             "node": node_id,
                             "status": parallel_result.status,
                             "parallel_nodes": parallel_node_ids,
                             "failed_nodes": parallel_result.failed_nodes,
-                        }
+                        },
+                        max_trace_entries,
                     )
 
                     # Update vars with namespaced parallel outputs
@@ -644,7 +670,7 @@ class WorkflowEngine:
                     pending.insert(0, after_node)
                 continue
 
-            _append_trace({"node": node_id, **result})
+            self._append_trace(workflow_trace, {"node": node_id, **result}, max_trace_entries)
             if result.get("outputs"):
                 vars_scope.update(result["outputs"])
             if result.get("context_snippets"):
@@ -731,12 +757,6 @@ class WorkflowEngine:
         )
         workflow_start_time = time.monotonic()
 
-        def _error_event(code: str, message: str, details: dict | None = None) -> dict:
-            return {
-                "event": "error",
-                "data": {"code": code, "message": message, "details": details or {}},
-            }
-
         adapters, routing_trace, adapter_gates = await self._select_adapters(
             user_message, user_id, context_id
         )
@@ -748,7 +768,7 @@ class WorkflowEngine:
             n.get("id"): n for n in workflow_schema.get("nodes", []) if n.get("id")
         }
         if not node_map:
-            yield _error_event(
+            yield self._error_event(
                 "validation_error",
                 "workflow has no nodes",
                 {"workflow_id": workflow_id},
@@ -781,7 +801,7 @@ class WorkflowEngine:
             # Check workflow timeout
             elapsed_ms = (time.monotonic() - workflow_start_time) * 1000
             if elapsed_ms >= workflow_timeout_ms:
-                yield _error_event(
+                yield self._error_event(
                     "server_error",
                     "workflow execution timed out",
                     {"timeout_ms": workflow_timeout_ms},
@@ -824,13 +844,14 @@ class WorkflowEngine:
                         content = data.get("content", "")
                         node_usage = data.get("usage", {})
                         usage = self._merge_usage(usage, node_usage)
-                        _append_trace(
+                        self._append_trace(
+                            workflow_trace,
                             {
                                 "node": node_id,
                                 "status": "ok",
                                 "content": content,
                                 "usage": node_usage,
-                            }
+                            },
                         )
                         # Emit trace event
                         yield {"event": "trace", "data": {"workflow_trace": workflow_trace[-1]}}
@@ -866,7 +887,7 @@ class WorkflowEngine:
                 )
 
                 if result.get("status") == "error" and result.get("retries_exhausted"):
-                    yield _error_event(
+                    yield self._error_event(
                         "server_error",
                         result.get("error", "node execution failed"),
                         {"node_id": node_id, "retries": result.get("retries", 0)},
@@ -901,13 +922,14 @@ class WorkflowEngine:
                         )
 
                         # Record parallel execution in trace
-                        _append_trace(
+                        self._append_trace(
+                            workflow_trace,
                             {
                                 "node": node_id,
                                 "status": parallel_result.status,
                                 "parallel_nodes": parallel_node_ids,
                                 "failed_nodes": parallel_result.failed_nodes,
-                            }
+                            },
                         )
                         yield {"event": "trace", "data": {"workflow_trace": workflow_trace[-1]}}
 
@@ -923,7 +945,7 @@ class WorkflowEngine:
 
                         # Handle parallel failures
                         if parallel_result.status == "error":
-                            yield _error_event(
+                            yield self._error_event(
                                 "server_error",
                                 f"All parallel nodes failed: {parallel_result.failed_nodes}",
                                 {"failed_nodes": parallel_result.failed_nodes},
@@ -935,7 +957,7 @@ class WorkflowEngine:
                         pending.insert(0, after_node)
                     continue
 
-                _append_trace({"node": node_id, **result})
+                self._append_trace(workflow_trace, {"node": node_id, **result})
                 yield {"event": "trace", "data": {"workflow_trace": workflow_trace[-1]}}
 
                 if result.get("outputs"):
@@ -955,7 +977,7 @@ class WorkflowEngine:
 
                 pending.extend(next_nodes)
                 if result.get("status") == "error" and not next_nodes:
-                    yield _error_event(
+                    yield self._error_event(
                         "server_error",
                         result.get("error", ""),
                         {"node_id": node_id},
@@ -1036,7 +1058,7 @@ class WorkflowEngine:
 
         except Exception as exc:
             self.logger.error("llm_stream_error", error=str(exc))
-            yield _error_event(
+            yield self._error_event(
                 "server_error",
                 str(exc),
                 {"node_id": node.get("id"), "tool": node.get("tool")},
@@ -1061,7 +1083,7 @@ class WorkflowEngine:
             "error": str(exc),
             "outputs": {},
         }
-        _append_trace(failure_entry)
+        self._append_trace(workflow_trace, failure_entry)
         rollback_state = await self._rollback_workflow(
             state_key, workflow_trace, vars_scope, snapshots=snapshots
         )
@@ -1701,18 +1723,19 @@ class WorkflowEngine:
             handler = self._builtin_tool_handlers().get(tool_spec.get("handler"))
 
         def _run_handler() -> Dict[str, Any]:
-            if not handler:
-                return {"status": "error", "content": f"unknown tool {tool_name}"}
-            return handler(
-                inputs,
-                adapters,
-                history,
-                context_id,
-                conversation_id,
-                user_message,
-                user_id,
-                tenant_id,
-            )
+            with tool_network_guard(self.tool_network_policy):
+                if not handler:
+                    return {"status": "error", "content": f"unknown tool {tool_name}"}
+                return handler(
+                    inputs,
+                    adapters,
+                    history,
+                    context_id,
+                    conversation_id,
+                    user_message,
+                    user_id,
+                    tenant_id,
+                )
 
         future = self._tool_executor.submit(_run_handler)
         cancelled = False

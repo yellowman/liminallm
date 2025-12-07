@@ -5,8 +5,10 @@ import hashlib
 import hmac
 import json
 import os
+import secrets
 import time
 import uuid
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional, Protocol, Tuple
@@ -372,6 +374,16 @@ class AuthService:
             return self.settings.oauth_microsoft_client_id, self.settings.oauth_microsoft_client_secret
         return None, None
 
+    def _validate_redirect_uri(self, redirect_uri: str) -> str:
+        parsed = urlparse(redirect_uri)
+        if parsed.scheme not in {"https", "http"}:
+            raise ValueError("OAuth redirect URI must be http(s)")
+        if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1"}:
+            raise ValueError("Insecure redirect URI not allowed outside localhost")
+        if not parsed.netloc:
+            raise ValueError("OAuth redirect URI must include host")
+        return redirect_uri
+
     async def start_oauth(
         self,
         provider: str,
@@ -403,6 +415,10 @@ class AuthService:
         if not callback_uri:
             self.logger.error("oauth_no_redirect_uri_configured", provider=provider)
             raise ValueError("No OAuth redirect URI configured")
+        callback_uri = self._validate_redirect_uri(callback_uri)
+
+        if not self.cache and not self.settings.test_mode:
+            raise RuntimeError("OAuth state cache is required for multi-process safety")
 
         # Build proper OAuth authorization URL
         provider_config = OAUTH_PROVIDERS[provider]
@@ -472,7 +488,7 @@ class AuthService:
         provider_config = OAUTH_PROVIDERS[provider]
 
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=False) as client:
                 # Exchange code for access token
                 token_data = {
                     "client_id": client_id,
@@ -489,9 +505,15 @@ class AuthService:
                     headers=headers,
                 )
                 token_response.raise_for_status()
-                token_result = token_response.json()
+                try:
+                    token_result = token_response.json()
+                except Exception as exc:
+                    self.logger.error(
+                        "oauth_token_parse_error", provider=provider, error=str(exc)
+                    )
+                    return None
 
-                access_token = token_result.get("access_token")
+                access_token = token_result.get("access_token") if isinstance(token_result, dict) else None
                 if not access_token:
                     self.logger.error("oauth_no_access_token", provider=provider)
                     return None
@@ -507,10 +529,34 @@ class AuthService:
                     headers=userinfo_headers,
                 )
                 userinfo_response.raise_for_status()
-                userinfo = userinfo_response.json()
+                try:
+                    userinfo = userinfo_response.json()
+                except Exception as exc:
+                    self.logger.error(
+                        "oauth_userinfo_parse_error",
+                        provider=provider,
+                        error=str(exc),
+                    )
+                    return None
+
+                if not isinstance(userinfo, dict):
+                    self.logger.error(
+                        "oauth_userinfo_invalid_format", provider=provider, type=str(type(userinfo))
+                    )
+                    return None
 
                 # Extract user identity based on provider
                 identity = self._parse_oauth_userinfo(provider, userinfo)
+
+                if not identity or not isinstance(identity, dict):
+                    self.logger.error("oauth_identity_empty", provider=provider)
+                    return None
+                if not identity.get("provider_uid"):
+                    self.logger.error("oauth_identity_missing_uid", provider=provider)
+                    return None
+                if not identity.get("email"):
+                    self.logger.error("oauth_identity_missing_email", provider=provider)
+                    return None
 
                 # For GitHub, we may need to fetch email separately
                 if provider == "github" and not identity.get("email"):
@@ -955,12 +1001,14 @@ class AuthService:
                 new_meta = {k: v for k, v in sess.meta.items()
                            if k not in ("refresh_jti", "refresh_exp")}
 
+            device_type = self._get_session_device(sess)
             new_session = self.store.create_session(
                 sess.user_id,
                 mfa_required=sess.mfa_required,
                 tenant_id=sess.tenant_id,
                 user_agent=sess.user_agent,
                 ip_addr=str(sess.ip_addr) if sess.ip_addr else None,
+                ttl_minutes=self._get_session_ttl(device_type),
                 meta=new_meta,
             )
 
@@ -1304,8 +1352,7 @@ class AuthService:
             self.logger.warning("totp_secret_invalid")
             return ""
         counter = int(timestamp // interval).to_bytes(8, "big")
-        # TOTP standard uses SHA1 - do not change without migration
-        digest = hmac.new(key, counter, hashlib.sha1).digest()
+        digest = hmac.new(key, counter, hashlib.sha256).digest()
         offset = digest[-1] & 0x0F
         code_int = (int.from_bytes(digest[offset : offset + 4], "big") & 0x7FFFFFFF) % (
             10**digits

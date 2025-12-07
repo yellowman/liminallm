@@ -198,7 +198,12 @@ class Runtime:
         )
         self.clusterer = SemanticClusterer(self.store, self.llm, self.training)
         self.workflow = WorkflowEngine(
-            self.store, self.llm, self.router, self.rag, cache=self.cache
+            self.store,
+            self.llm,
+            self.router,
+            self.rag,
+            cache=self.cache,
+            settings=self.settings,
         )
         self.voice = VoiceService(
             self.settings.shared_fs_root,
@@ -224,6 +229,9 @@ class Runtime:
         smtp_user = sys_settings.get("smtp_user") or self.settings.smtp_user
         smtp_password = sys_settings.get("smtp_password") or self.settings.smtp_password
         smtp_use_tls = sys_settings.get("smtp_use_tls", self.settings.smtp_use_tls)
+        smtp_allow_insecure = sys_settings.get(
+            "smtp_allow_insecure", self.settings.smtp_allow_insecure
+        )
         email_from_address = (
             sys_settings.get("email_from_address") or self.settings.email_from_address
         )
@@ -236,6 +244,7 @@ class Runtime:
             smtp_user=smtp_user,
             smtp_password=smtp_password,
             smtp_use_tls=smtp_use_tls,
+            smtp_allow_insecure=smtp_allow_insecure,
             from_email=email_from_address,
             from_name=email_from_name,
             base_url=app_base_url,
@@ -454,10 +463,10 @@ async def check_rate_limit(
         return_remaining: If True, return tuple of (allowed, remaining)
 
     Returns:
-        bool if return_remaining is False, else (bool, int) tuple
+        bool if return_remaining is False, else (bool, int, int) tuple
     """
     if limit <= 0:
-        return (True, limit) if return_remaining else True
+        return (True, limit, 0) if return_remaining else True
     if window_seconds <= 0:
         logger.warning(
             "rate_limit_invalid_window",

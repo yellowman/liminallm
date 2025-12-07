@@ -97,7 +97,16 @@ class VoiceService:
                 files=files,
             )
             response.raise_for_status()
-            data = response.json()
+            try:
+                data = response.json()
+            except Exception as exc:
+                logger.error(
+                    "voice_transcribe_parse_error",
+                    user_id=user_id,
+                    error=str(exc),
+                    model=self.transcription_model,
+                )
+                raise ValueError("Invalid transcription response") from exc
 
             transcript = data.get("text", "")
             # OpenAI doesn't return duration, estimate from audio size

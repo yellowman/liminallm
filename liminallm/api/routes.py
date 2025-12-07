@@ -379,6 +379,7 @@ def _get_system_settings(runtime) -> dict:
         "smtp_user": "",
         "smtp_password": "",
         "smtp_use_tls": True,
+        "smtp_allow_insecure": False,
         "email_from_address": "",
         "email_from_name": "LiminalLM",
         "oauth_redirect_uri": "",
@@ -3096,6 +3097,7 @@ async def update_system_settings(
         "smtp_user",
         "smtp_password",
         "smtp_use_tls",
+        "smtp_allow_insecure",
         "email_from_address",
         "email_from_name",
         "oauth_redirect_uri",
@@ -3157,6 +3159,7 @@ async def update_system_settings(
         "allow_signup",
         "training_worker_enabled",
         "smtp_use_tls",
+        "smtp_allow_insecure",
     }
     string_keys = {
         "smtp_host",
@@ -3316,15 +3319,17 @@ async def upload_file(
         user = runtime.store.get_user(principal.user_id)
         plan_tier = user.plan_tier if user else "free"
         max_bytes = max(1, _get_plan_upload_limit(runtime, plan_tier))
-        contents = await file.read(max_bytes + 1)
-        if len(contents) > max_bytes:
-            raise _http_error("validation_error", f"file too large (max {max_bytes // 1024 // 1024}MB for {plan_tier} plan)", status_code=413)
-        detected_mime = file.content_type or mimetypes.guess_type(safe_filename)[0]
-        if not detected_mime or detected_mime == "application/octet-stream":
-            raise _http_error("validation_error", "unknown or unsupported MIME type", status_code=400)
-        checksum = hashlib.sha256(contents).hexdigest()
-        # Weight rate-limit cost by payload size to prevent request chunking bypass (Issue 77.4)
-        approx_cost = max(1, math.ceil(len(contents) / (256 * 1024)))
+        # Rate limit before buffering the entire payload to avoid pre-limit memory spikes
+        declared_size = None
+        if file.headers:
+            try:
+                declared_size = int(file.headers.get("content-length"))
+            except (TypeError, ValueError):
+                declared_size = None
+        approx_cost = max(
+            1,
+            math.ceil(((declared_size or max_bytes) or 1) / (256 * 1024)),
+        )
         await _enforce_rate_limit(
             runtime,
             f"files:upload:{principal.user_id}",
@@ -3332,6 +3337,13 @@ async def upload_file(
             60,
             cost=approx_cost,
         )
+        contents = await file.read(max_bytes + 1)
+        if len(contents) > max_bytes:
+            raise _http_error("validation_error", f"file too large (max {max_bytes // 1024 // 1024}MB for {plan_tier} plan)", status_code=413)
+        detected_mime = file.content_type or mimetypes.guess_type(safe_filename)[0]
+        if not detected_mime or detected_mime == "application/octet-stream":
+            raise _http_error("validation_error", "unknown or unsupported MIME type", status_code=400)
+        checksum = hashlib.sha256(contents).hexdigest()
         dest_path = safe_join(dest_dir, safe_filename)
         resolved_dest = dest_path.resolve()
         if (
@@ -3342,16 +3354,45 @@ async def upload_file(
         dest_path.parent.mkdir(parents=True, exist_ok=True)
 
         manifest_path = dest_dir / ".checksums.json"
-        existing_checksums: dict[str, str] = {}
+        existing_checksums: dict[str, Any] = {}
         if manifest_path.exists():
             try:
                 existing_checksums = json.loads(manifest_path.read_text())
             except Exception:
                 logger.warning("file_checksum_manifest_read_failed", path=str(manifest_path))
-        prior_checksum = existing_checksums.get(safe_filename)
+        prior_entry = existing_checksums.get(safe_filename)
+        prior_checksum: Optional[str] = None
+        prior_contexts: set[str] = set()
+        if isinstance(prior_entry, dict):
+            prior_checksum = prior_entry.get("checksum")
+            try:
+                prior_contexts = set(
+                    str(c) for c in prior_entry.get("contexts", []) if c is not None
+                )
+            except Exception:
+                prior_contexts = set()
+        elif isinstance(prior_entry, str):
+            prior_checksum = prior_entry
         if dest_path.exists() and prior_checksum == checksum:
+            chunk_count = None
+            if context_id and context_id not in prior_contexts:
+                _get_owned_context(runtime, context_id, principal)
+                chunk_count = runtime.rag.ingest_file(
+                    context_id, str(dest_path), chunk_size=chunk_size
+                )
+                prior_contexts.add(context_id)
+                try:
+                    existing_checksums[safe_filename] = {
+                        "checksum": checksum,
+                        "contexts": sorted(prior_contexts),
+                    }
+                    manifest_path.write_text(json.dumps(existing_checksums, indent=2))
+                except Exception:
+                    logger.warning(
+                        "file_checksum_manifest_write_failed", path=str(manifest_path)
+                    )
             resp = FileUploadResponse(
-                fs_path=safe_filename, context_id=context_id, chunk_count=None
+                fs_path=safe_filename, context_id=context_id, chunk_count=chunk_count
             )
             envelope = Envelope(status="ok", data=resp, request_id=idem.request_id)
             await idem.store_result(envelope)
@@ -3392,7 +3433,10 @@ async def upload_file(
 
         # Persist checksum manifest for deduplication (SPEC §2.5)
         try:
-            existing_checksums[safe_filename] = checksum
+            existing_checksums[safe_filename] = {
+                "checksum": checksum,
+                "contexts": [context_id] if context_id else [],
+            }
             manifest_path.write_text(json.dumps(existing_checksums, indent=2))
         except Exception:
             logger.warning(
@@ -4096,6 +4140,7 @@ async def websocket_chat(ws: WebSocket):
         return_remaining=True,
     )
     if not allowed:
+        await ws.accept()
         await ws.close(code=4429)
         return
     await ws.accept()
