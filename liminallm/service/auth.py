@@ -956,12 +956,14 @@ class AuthService:
                 new_meta = {k: v for k, v in sess.meta.items()
                            if k not in ("refresh_jti", "refresh_exp")}
 
+            device_type = self._get_session_device(sess)
             new_session = self.store.create_session(
                 sess.user_id,
                 mfa_required=sess.mfa_required,
                 tenant_id=sess.tenant_id,
                 user_agent=sess.user_agent,
                 ip_addr=str(sess.ip_addr) if sess.ip_addr else None,
+                ttl_minutes=self._get_session_ttl(device_type),
                 meta=new_meta,
             )
 
