@@ -1247,11 +1247,13 @@ canonically equivalent strings map to identical chunks across ingests.
 limit, capped at 500) before BM25/semantic scoring, preventing unbounded memory
 growth on large contexts while still re-ranking a representative candidate set.
 
-### 25.4 HIGH: Artifact List No Default Limit
+### 25.4 ~~HIGH: Artifact List No Default Limit~~ FIXED
 
 **Location:** `liminallm/storage/postgres.py:1700-1750`
 
-`list_artifacts()` accepts optional limit but defaults to unlimited.
+**Resolution:** `list_artifacts()` now enforces SPEC pagination caps by bounding
+`page_size` to a maximum of 500 (default 100), preventing unbounded scans while
+keeping existing paging behavior.
 
 ### 25.5 HIGH: Webhook Payload Size Unbounded
 
@@ -1336,43 +1338,38 @@ Messages can be edited to change their status field directly, bypassing any work
 
 ## 27. API Contract Validation (5th Pass)
 
-### 27.1 HIGH: Missing Path Parameter Validators
+### 27.1 ~~HIGH: Missing Path Parameter Validators~~ FIXED
 
 **Location:** `liminallm/api/routes.py` (multiple endpoints)
 
-Multiple endpoints lack proper `Path(...)` validators on path parameters:
-- `/conversations/{conversation_id}/messages` (line 2441)
-- `/admin/users/{user_id}/role` (line 806)
-- `/tools/{tool_id}/invoke` (line 1937)
-- `/artifacts/{artifact_id}` PATCH (line 2058)
-- `/config/patches/{patch_id}/decide` (line 2169)
+**Resolution:** Added explicit `Path(...)` validation to the flagged endpoints
+(`/conversations/{conversation_id}/messages`, `/admin/users/{user_id}/role`,
+`/tools/{tool_id}/invoke`, `/artifacts/{artifact_id}` PATCH, and config patch
+`decide/apply`) with max-length bounds and positive integer guards where
+appropriate to align with SPEC pagination and ID safety guidance.
 
-**Issue:** No length/type validation on path parameters.
-
-**Fix:** Add `Path(..., max_length=255)` validators.
-
-### 27.2 HIGH: ArtifactRequest.type Claimed Optional But Required
+### 27.2 ~~HIGH: ArtifactRequest.type Claimed Optional But Required~~ FIXED
 
 **Location:** `liminallm/api/schemas.py:280-284`
 
-```python
-class ArtifactRequest(_SchemaPayload):
-    type: Optional[str] = None  # Claims optional but actually required
-```
+**Resolution:** `ArtifactRequest.type` is now required with a max-length bound,
+matching SPEC contract and the routing layer's enforcement.
 
-**Issue:** Schema says optional but `routes.py:2020` raises error if missing.
-
-### 27.3 MEDIUM: File Limits Response Missing Extensions
+### 27.3 ~~MEDIUM: File Limits Response Missing Extensions~~ FIXED
 
 **Location:** `liminallm/api/routes.py:2330-2344`
 
-`/files/limits` returns only `max_upload_bytes` but SPEC §17 mentions "allowed extensions from GET /v1/files/limits".
+**Resolution:** `/files/limits` now returns both `max_upload_bytes` and the
+allowlist of supported extensions, which is also enforced during upload
+validation per SPEC §17.
 
-### 27.4 MEDIUM: Schema Validation Not JSON-Serializable Check
+### 27.4 ~~MEDIUM: Schema Validation Not JSON-Serializable Check~~ FIXED
 
 **Location:** `liminallm/api/schemas.py:268-277`
 
-`_SchemaPayload.schema_` field accepts any dict without validating JSON serializability.
+**Resolution:** Schema payloads are now validated for JSON serializability in
+addition to depth constraints, raising a validation error when non-serializable
+objects are provided.
 
 ---
 

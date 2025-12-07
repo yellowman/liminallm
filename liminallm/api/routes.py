@@ -15,6 +15,7 @@ import mimetypes
 
 from fastapi import (
     APIRouter,
+    Body,
     Depends,
     File,
     Form,
@@ -117,6 +118,24 @@ from liminallm.service.runtime import (
 from liminallm.storage.models import Conversation, KnowledgeContext, Session
 
 logger = get_logger(__name__)
+
+# File upload policy (SPEC §17): allowed extensions returned via /files/limits
+ALLOWED_UPLOAD_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".pdf",
+    ".json",
+    ".csv",
+    ".tsv",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".mp3",
+    ".wav",
+    ".ogg",
+}
 
 router = APIRouter(prefix="/v1")
 
@@ -1201,8 +1220,8 @@ async def admin_create_user(
 
 @router.post("/admin/users/{user_id}/role", response_model=Envelope, tags=["admin"])
 async def admin_set_role(
-    user_id: str,
-    body: UpdateUserRoleRequest,
+    user_id: str = Path(..., max_length=255, description="User identifier"),
+    body: UpdateUserRoleRequest = Body(...),
     principal: AuthContext = Depends(get_admin_user),
 ):
     runtime = get_runtime()
@@ -2471,8 +2490,8 @@ async def list_artifact_versions(
 
 @router.post("/tools/{tool_id}/invoke", response_model=Envelope, tags=["tools"])
 async def invoke_tool(
-    tool_id: str,
-    body: ToolInvokeRequest,
+    tool_id: str = Path(..., max_length=255, description="Tool artifact identifier"),
+    body: ToolInvokeRequest = Body(...),
     principal: AuthContext = Depends(get_user),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
@@ -2706,8 +2725,8 @@ def _deep_merge(base: dict, updates: dict) -> dict:
 
 @router.patch("/artifacts/{artifact_id}", response_model=Envelope, tags=["artifacts"])
 async def patch_artifact(
-    artifact_id: str,
-    body: ArtifactPatchRequest,
+    artifact_id: str = Path(..., max_length=255, description="Artifact identifier"),
+    body: ArtifactPatchRequest = Body(...),
     principal: AuthContext = Depends(get_user),
 ):
     """Update an artifact via RFC 6902 JSON Patch or legacy schema update.
@@ -2836,8 +2855,8 @@ async def list_config_patches(
 
 @router.post("/config/patches/{patch_id}/decide", response_model=Envelope, tags=["config"])
 async def decide_config_patch(
-    patch_id: int,
-    body: ConfigPatchDecisionRequest,
+    patch_id: int = Path(..., ge=1, description="Config patch identifier"),
+    body: ConfigPatchDecisionRequest = Body(...),
     principal: AuthContext = Depends(get_admin_user),
 ):
     runtime = get_runtime()
@@ -2866,7 +2885,8 @@ async def decide_config_patch(
 
 @router.post("/config/patches/{patch_id}/apply", response_model=Envelope, tags=["config"])
 async def apply_config_patch(
-    patch_id: int, principal: AuthContext = Depends(get_admin_user)
+    patch_id: int = Path(..., ge=1, description="Config patch identifier"),
+    principal: AuthContext = Depends(get_admin_user)
 ):
     runtime = get_runtime()
     # Rate limit configops per SPEC §18: 30 req/hour
@@ -3281,6 +3301,7 @@ async def get_file_limits(principal: AuthContext = Depends(get_user)):
         data={
             "max_upload_bytes": _get_plan_upload_limit(runtime, plan_tier),
             "plan_tier": plan_tier,
+            "allowed_extensions": sorted(ALLOWED_UPLOAD_EXTENSIONS),
         },
     )
 
@@ -3310,6 +3331,13 @@ async def upload_file(
         safe_filename = safe_filename[:255]  # Limit length
         if not safe_filename:
             safe_filename = "untitled"
+        ext = FilePath(safe_filename).suffix.lower()
+        if ext not in ALLOWED_UPLOAD_EXTENSIONS:
+            raise _http_error(
+                "validation_error",
+                f"unsupported file extension: {ext or 'none'}",
+                status_code=400,
+            )
         dest_dir = (
             FilePath(runtime.settings.shared_fs_root)
             / "users"
@@ -3681,7 +3709,9 @@ async def delete_file(
 
 @router.get("/conversations/{conversation_id}/messages", response_model=Envelope, tags=["conversations"])
 async def list_messages(
-    conversation_id: str,
+    conversation_id: str = Path(
+        ..., max_length=255, description="Conversation identifier"
+    ),
     limit: Optional[int] = Query(None, ge=1, description="Maximum messages to return"),
     principal: AuthContext = Depends(get_user),
 ):

@@ -391,12 +391,16 @@ class _SchemaPayload(BaseModel):
         if value is None:
             return value
         _validate_json_depth(value)
+        try:
+            json.dumps(value)
+        except TypeError as exc:
+            raise ValueError("schema must be JSON-serializable") from exc
         return value
 
 
 class ArtifactRequest(_SchemaPayload):
     # Issue 46.3: Add max_length to string fields
-    type: Optional[str] = Field(None, max_length=64)
+    type: str = Field(..., max_length=64)
     name: str = Field(..., max_length=256)
     description: Optional[str] = Field("", max_length=4096)
 

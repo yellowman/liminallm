@@ -1740,8 +1740,10 @@ class PostgresStore:
         - If visibility='shared': shared artifacts within user's tenant
         - If no visibility filter: user's private + all global + shared within tenant
         """
-        offset = max(page - 1, 0) * max(page_size, 1)
-        limit = max(page_size, 1)
+        # SPEC pagination: default 100, cap 500 to avoid unbounded scans
+        effective_page_size = max(page_size, 1)
+        limit = min(effective_page_size, 500)
+        offset = max(page - 1, 0) * limit
         with self._connect() as conn:
             clauses = []
             params: list[Any] = []
