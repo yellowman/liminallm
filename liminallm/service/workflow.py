@@ -130,6 +130,14 @@ class WorkflowEngine:
         self._tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
         self._executor_shutdown = False
 
+    def _error_event(
+        self, code: str, message: str, details: dict | None = None
+    ) -> dict:
+        return {
+            "event": "error",
+            "data": {"code": code, "message": message, "details": details or {}},
+        }
+
     def shutdown(self, wait: bool = True) -> None:
         """Explicitly shutdown the executor. Call during app shutdown.
 
@@ -438,12 +446,6 @@ class WorkflowEngine:
         )
         workflow_start_time = time.monotonic()
 
-        def _error_event(code: str, message: str, details: dict | None = None) -> dict:
-            return {
-                "event": "error",
-                "data": {"code": code, "message": message, "details": details or {}},
-            }
-
         adapters, routing_trace, adapter_gates = await self._select_adapters(
             user_message, user_id, context_id
         )
@@ -731,12 +733,6 @@ class WorkflowEngine:
         )
         workflow_start_time = time.monotonic()
 
-        def _error_event(code: str, message: str, details: dict | None = None) -> dict:
-            return {
-                "event": "error",
-                "data": {"code": code, "message": message, "details": details or {}},
-            }
-
         adapters, routing_trace, adapter_gates = await self._select_adapters(
             user_message, user_id, context_id
         )
@@ -748,7 +744,7 @@ class WorkflowEngine:
             n.get("id"): n for n in workflow_schema.get("nodes", []) if n.get("id")
         }
         if not node_map:
-            yield _error_event(
+            yield self._error_event(
                 "validation_error",
                 "workflow has no nodes",
                 {"workflow_id": workflow_id},
@@ -781,7 +777,7 @@ class WorkflowEngine:
             # Check workflow timeout
             elapsed_ms = (time.monotonic() - workflow_start_time) * 1000
             if elapsed_ms >= workflow_timeout_ms:
-                yield _error_event(
+                yield self._error_event(
                     "server_error",
                     "workflow execution timed out",
                     {"timeout_ms": workflow_timeout_ms},
@@ -866,7 +862,7 @@ class WorkflowEngine:
                 )
 
                 if result.get("status") == "error" and result.get("retries_exhausted"):
-                    yield _error_event(
+                    yield self._error_event(
                         "server_error",
                         result.get("error", "node execution failed"),
                         {"node_id": node_id, "retries": result.get("retries", 0)},
@@ -923,7 +919,7 @@ class WorkflowEngine:
 
                         # Handle parallel failures
                         if parallel_result.status == "error":
-                            yield _error_event(
+                            yield self._error_event(
                                 "server_error",
                                 f"All parallel nodes failed: {parallel_result.failed_nodes}",
                                 {"failed_nodes": parallel_result.failed_nodes},
@@ -955,7 +951,7 @@ class WorkflowEngine:
 
                 pending.extend(next_nodes)
                 if result.get("status") == "error" and not next_nodes:
-                    yield _error_event(
+                    yield self._error_event(
                         "server_error",
                         result.get("error", ""),
                         {"node_id": node_id},
@@ -1036,7 +1032,7 @@ class WorkflowEngine:
 
         except Exception as exc:
             self.logger.error("llm_stream_error", error=str(exc))
-            yield _error_event(
+            yield self._error_event(
                 "server_error",
                 str(exc),
                 {"node_id": node.get("id"), "tool": node.get("tool")},
