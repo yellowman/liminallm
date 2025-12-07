@@ -198,7 +198,12 @@ class Runtime:
         )
         self.clusterer = SemanticClusterer(self.store, self.llm, self.training)
         self.workflow = WorkflowEngine(
-            self.store, self.llm, self.router, self.rag, cache=self.cache
+            self.store,
+            self.llm,
+            self.router,
+            self.rag,
+            cache=self.cache,
+            settings=self.settings,
         )
         self.voice = VoiceService(
             self.settings.shared_fs_root,

@@ -18,6 +18,7 @@ from typing import (
     Tuple,
 )
 
+from liminallm.config import Settings
 from liminallm.logging import get_logger
 from liminallm.service.embeddings import (
     EMBEDDING_DIM,
@@ -29,7 +30,13 @@ from liminallm.service.errors import BadRequestError
 from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
 from liminallm.service.router import RouterEngine
-from liminallm.service.sandbox import safe_eval_expr
+from liminallm.service.sandbox import (
+    AllowlistedFetcher,
+    ToolNetworkPolicy,
+    build_tool_network_policy,
+    safe_eval_expr,
+    tool_network_guard,
+)
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.models import Message
 from liminallm.storage.postgres import PostgresStore
@@ -117,6 +124,7 @@ class WorkflowEngine:
         *,
         cache: Optional[RedisCache] = None,
         tool_workers: int = DEFAULT_TOOL_WORKERS,
+        settings: Optional[Settings] = None,
     ) -> None:
         self.store = store
         self.llm = llm
@@ -125,6 +133,15 @@ class WorkflowEngine:
         self.logger = get_logger(__name__)
         self.tool_registry = self._build_tool_registry()
         self.cache = cache
+        self.tool_network_policy: ToolNetworkPolicy = build_tool_network_policy(
+            allowlist=(settings.tool_network_allowlist if settings else []),
+            proxy_url=settings.tool_network_proxy_url if settings else None,
+            connect_timeout=(
+                settings.tool_fetch_connect_timeout if settings else 10.0
+            ),
+            total_timeout=settings.tool_fetch_timeout if settings else 30.0,
+        )
+        self.tool_fetcher = AllowlistedFetcher(self.tool_network_policy)
         # Issue 48.6: Configurable worker pool with bounds
         workers = min(max(1, tool_workers), self.MAX_TOOL_WORKERS)
         self._tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
@@ -1706,18 +1723,19 @@ class WorkflowEngine:
             handler = self._builtin_tool_handlers().get(tool_spec.get("handler"))
 
         def _run_handler() -> Dict[str, Any]:
-            if not handler:
-                return {"status": "error", "content": f"unknown tool {tool_name}"}
-            return handler(
-                inputs,
-                adapters,
-                history,
-                context_id,
-                conversation_id,
-                user_message,
-                user_id,
-                tenant_id,
-            )
+            with tool_network_guard(self.tool_network_policy):
+                if not handler:
+                    return {"status": "error", "content": f"unknown tool {tool_name}"}
+                return handler(
+                    inputs,
+                    adapters,
+                    history,
+                    context_id,
+                    conversation_id,
+                    user_message,
+                    user_id,
+                    tenant_id,
+                )
 
         future = self._tool_executor.submit(_run_handler)
         cancelled = False

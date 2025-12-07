@@ -12,14 +12,21 @@ This module provides:
 from __future__ import annotations
 
 import ast
+import ipaddress
 import operator
 import os
 import resource
+import socket
 import tempfile
+import threading
+from contextlib import contextmanager
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Any, Callable, Optional, TypeVar
+
+import httpx
 
 from liminallm.logging import get_logger
 
@@ -268,6 +275,181 @@ PRIVILEGED_SANDBOX_CONFIG = SandboxConfig(
     max_file_size_mb=500,
     privileged=True,
 )
+
+
+@dataclass
+class ToolNetworkPolicy:
+    """Network egress policy for tool execution (SPEC §18).
+
+    Attributes:
+        allowlist: Allowed target host patterns (hostname, wildcard, or CIDR)
+        proxy_url: Optional HTTP proxy all tool fetches must use
+        connect_timeout: Connection timeout in seconds
+        total_timeout: Total request timeout in seconds
+    """
+
+    allowlist: list[str] = field(default_factory=list)
+    proxy_url: Optional[str] = None
+    connect_timeout: float = 10.0
+    total_timeout: float = 30.0
+
+    def connection_allowlist(self) -> list[str]:
+        """Hosts the sandbox may connect to for outbound requests.
+
+        If a proxy is configured, only the proxy host is reachable; otherwise
+        the target allowlist is used directly.
+        """
+
+        if self.proxy_url:
+            parsed = urlparse(self.proxy_url)
+            return [h for h in [parsed.hostname] if h]
+        return list(self.allowlist)
+
+
+def _normalize_allowlist(entries: Sequence[str] | None) -> list[str]:
+    normalized: list[str] = []
+    for entry in entries or []:
+        stripped = entry.strip().lower()
+        if stripped:
+            normalized.append(stripped)
+    return normalized
+
+
+def build_tool_network_policy(
+    *,
+    allowlist: Sequence[str] | None,
+    proxy_url: Optional[str],
+    connect_timeout: float = 10.0,
+    total_timeout: float = 30.0,
+) -> ToolNetworkPolicy:
+    """Create a normalized ToolNetworkPolicy from raw values."""
+
+    return ToolNetworkPolicy(
+        allowlist=_normalize_allowlist(list(allowlist or [])),
+        proxy_url=proxy_url,
+        connect_timeout=connect_timeout,
+        total_timeout=total_timeout,
+    )
+
+
+_NETWORK_POLICY_STATE = threading.local()
+
+
+def _host_matches_allowlist(host: str, allowlist: Sequence[str]) -> bool:
+    if not host:
+        return False
+    lowered = host.lower()
+    for entry in allowlist:
+        candidate = entry.lower()
+        if candidate.startswith("*."):
+            if lowered.endswith(candidate[1:]):
+                return True
+        elif lowered == candidate:
+            return True
+        else:
+            if "/" in candidate:
+                try:
+                    net = ipaddress.ip_network(candidate, strict=False)
+                    ip_obj = ipaddress.ip_address(host)
+                    if ip_obj in net:
+                        return True
+                except ValueError:
+                    continue
+    return False
+
+
+def _enforce_network_allowlist(host: str) -> None:
+    policy: ToolNetworkPolicy | None = getattr(_NETWORK_POLICY_STATE, "policy", None)
+    if not policy:
+        return
+
+    allowed_hosts = policy.connection_allowlist()
+    if not allowed_hosts:
+        raise SandboxError("Tool network access disabled (empty allowlist)")
+
+    if not _host_matches_allowlist(host, allowed_hosts):
+        raise SandboxError(f"Egress host '{host}' is not allowlisted for tools")
+
+
+_ORIGINAL_CREATE_CONNECTION = socket.create_connection
+_ORIGINAL_SOCKET_CONNECT = socket.socket.connect
+
+
+def _guarded_create_connection(address, *args, **kwargs):  # type: ignore[override]
+    host = address[0] if isinstance(address, (list, tuple)) and address else None
+    if host:
+        _enforce_network_allowlist(str(host))
+    return _ORIGINAL_CREATE_CONNECTION(address, *args, **kwargs)
+
+
+def _guarded_socket_connect(self: socket.socket, address):  # type: ignore[override]
+    host = address[0] if isinstance(address, (list, tuple)) and address else None
+    if host:
+        _enforce_network_allowlist(str(host))
+    return _ORIGINAL_SOCKET_CONNECT(self, address)
+
+
+socket.create_connection = _guarded_create_connection
+socket.socket.connect = _guarded_socket_connect
+
+
+@contextmanager
+def tool_network_guard(policy: ToolNetworkPolicy):
+    """Apply thread-local network egress policy for tool execution."""
+
+    previous = getattr(_NETWORK_POLICY_STATE, "policy", None)
+    _NETWORK_POLICY_STATE.policy = policy
+    try:
+        yield
+    finally:
+        if previous is None:
+            _NETWORK_POLICY_STATE.__dict__.pop("policy", None)
+        else:
+            _NETWORK_POLICY_STATE.policy = previous
+
+
+class AllowlistedFetcher:
+    """HTTP client enforcing tool network allowlist and proxy requirements."""
+
+    def __init__(self, policy: ToolNetworkPolicy):
+        self.policy = policy
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: Optional[dict[str, str]] = None,
+        data: Any = None,
+        json: Any = None,
+    ) -> httpx.Response:
+        parsed = urlparse(url)
+        host = parsed.hostname
+        if not host:
+            raise SandboxError("URL is missing host for tool fetch")
+
+        if not self.policy.allowlist:
+            raise SandboxError("Tool network allowlist is empty; outbound fetch blocked")
+
+        if not _host_matches_allowlist(host, self.policy.allowlist):
+            raise SandboxError(f"Target host '{host}' is not allowlisted for tool fetch")
+
+        timeout = httpx.Timeout(self.policy.total_timeout, connect=self.policy.connect_timeout)
+        try:
+            return httpx.request(
+                method,
+                url,
+                headers=headers,
+                data=data,
+                json=json,
+                timeout=timeout,
+                proxies=self.policy.proxy_url,
+                follow_redirects=False,
+            )
+        except httpx.TimeoutException as exc:
+            raise SandboxError("tool fetch timed out") from exc
+        except httpx.HTTPError as exc:
+            raise SandboxError(f"tool fetch failed: {exc}") from exc
 
 
 def validate_path_access(

@@ -470,17 +470,17 @@ Redis rate limiting now uses an atomic Lua token bucket with weighted costs and 
 - Added `sandbox_open()` as a drop-in replacement for built-in open()
 - Scratch directory defaults to `/tmp/liminallm_sandbox`
 
-### 6.4 CRITICAL: No Allowlisted External Fetch Proxy
+### 6.4 ~~CRITICAL: No Allowlisted External Fetch Proxy~~ FIXED
 
 **SPEC §18 requires:** "External fetches from tools use a allowlisted proxy with 10s connect + 30s total timeout"
 
-**Current:** No proxy implementation. Tools can make arbitrary outbound requests.
+**Fix Applied:** Tool execution threads now run under a thread-local network guard that only permits socket connections to the configured proxy host when one is set. The sandbox exposes an `AllowlistedFetcher` that enforces proxy usage with a 10s connect timeout and 30s total timeout for outbound tool HTTP requests.
 
-### 6.5 CRITICAL: No Network Egress Allowlist
+### 6.5 ~~CRITICAL: No Network Egress Allowlist~~ FIXED
 
 **SPEC §18 requires:** "network egress allowlist enforcement"
 
-**Current:** No allowlist implementation.
+**Fix Applied:** Added configurable host/CIDR allowlist for tool egress. Socket connections from tool handlers are intercepted and blocked unless the destination matches the allowlist (or the proxy host when configured), preventing arbitrary outbound requests.
 
 ### 6.6 HIGH: No JSON Schema Validation on Tool Inputs/Outputs
 

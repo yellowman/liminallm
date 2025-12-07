@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import secrets
 from dataclasses import dataclass
@@ -338,6 +339,26 @@ class Settings(BaseModel):
         "TEST_MODE",
         description="Toggle deterministic testing behaviors; required for CI pathways described in SPEC §14.",
     )
+    tool_network_allowlist: list[str] = env_field(
+        ["api.openai.com"],
+        "TOOL_NETWORK_ALLOWLIST",
+        description="Allowlisted hostnames/CIDRs for tool egress (SPEC §18)",
+    )
+    tool_network_proxy_url: str | None = env_field(
+        None,
+        "TOOL_NETWORK_PROXY_URL",
+        description="Proxy URL tools must use for outbound HTTP(S) fetches",
+    )
+    tool_fetch_connect_timeout: float = env_field(
+        10.0,
+        "TOOL_FETCH_CONNECT_TIMEOUT",
+        description="Connect timeout (seconds) for tool HTTP fetches",
+    )
+    tool_fetch_timeout: float = env_field(
+        30.0,
+        "TOOL_FETCH_TIMEOUT",
+        description="Total timeout (seconds) for tool HTTP fetches",
+    )
     enable_mfa: bool = env_field(
         True,
         "ENABLE_MFA",
@@ -465,6 +486,21 @@ class Settings(BaseModel):
     @classmethod
     def _validate_adapter_mode(cls, value: AdapterMode) -> AdapterMode:
         return AdapterMode(value)
+
+    @field_validator("tool_network_allowlist", mode="before")
+    @classmethod
+    def _parse_tool_allowlist(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, list):
+                    return [str(v) for v in parsed if str(v).strip()]
+            except Exception:
+                pass
+            return [v.strip() for v in value.split(",") if v.strip()]
+        return list(value)
 
     @field_validator("jwt_secret")
     @classmethod
