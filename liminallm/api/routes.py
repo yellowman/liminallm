@@ -1880,6 +1880,15 @@ async def chat(
     # Get user's plan tier for per-plan rate limits (SPEC §18)
     user = runtime.store.get_user(user_id)
     plan_tier = user.plan_tier if user else "free"
+    logger.info(
+        "chat_request",
+        user_id=user_id,
+        conversation_id=body.conversation_id,
+        context_id=body.context_id,
+        workflow_id=body.workflow_id,
+        plan_tier=plan_tier,
+        idempotency_key=bool(idempotency_key),
+    )
 
     # SPEC §18: Accept Idempotency-Key when provided (optional)
     async with IdempotencyGuard(
@@ -1962,6 +1971,7 @@ async def chat(
                 orchestration_dict: dict[str, Any] = (
                     orchestration if isinstance(orchestration, dict) else {}
                 )
+                usage: dict[str, Any] = orchestration_dict.get("usage") or {}
                 adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
                 assistant_content_struct = normalize_content_struct(
                     orchestration_dict.get("content_struct"),
@@ -1979,7 +1989,7 @@ async def chat(
                         "adapter_gates": orchestration_dict.get("adapter_gates", []),
                         "routing_trace": orchestration_dict.get("routing_trace", []),
                         "workflow_trace": orchestration_dict.get("workflow_trace", []),
-                        "usage": orchestration_dict.get("usage", {}),
+                        "usage": usage,
                     },
                 )
                 resp = ChatResponse(
@@ -1990,13 +2000,25 @@ async def chat(
                     workflow_id=body.workflow_id,
                     adapters=adapter_names,
                     adapter_gates=orchestration_dict.get("adapter_gates", []),
-                    usage=orchestration_dict.get("usage", {}),
+                    usage=usage,
                     context_snippets=orchestration_dict.get("context_snippets", []),
                     routing_trace=orchestration_dict.get("routing_trace", []),
                     workflow_trace=orchestration_dict.get("workflow_trace", []),
                 )
                 envelope = Envelope(
                     status="ok", data=resp.model_dump(), request_id=idem.request_id
+                )
+                logger.info(
+                    "chat_response",
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    context_id=context_id,
+                    workflow_id=body.workflow_id,
+                    adapters=adapter_names,
+                    total_tokens=usage.get("total_tokens"),
+                    prompt_tokens=usage.get("prompt_tokens"),
+                    completion_tokens=usage.get("completion_tokens"),
+                    request_id=idem.request_id,
                 )
                 if runtime.cache:
                     # Issue 38.4: Add limit to prevent unbounded memory usage

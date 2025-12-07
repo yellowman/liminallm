@@ -281,6 +281,21 @@ def normalize_preference_weight(weight: Optional[float]) -> float:
     return weight if weight is not None else 1.0
 
 
+def normalize_optional_text(value: Optional[str]) -> Optional[str]:
+    """Standardize optional text fields across storage backends.
+
+    Empty strings are treated as missing values so both in-memory and Postgres
+    stores persist `None` rather than backend-specific empty strings. This
+    avoids subtle discrepancies when round-tripping optional text attributes
+    such as user handles or cluster labels. (docs/ISSUES.md §24.4)
+    """
+
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
 # ============================================================================
 # SEMANTIC CLUSTER HELPERS
 # ============================================================================

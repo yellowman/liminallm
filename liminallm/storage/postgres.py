@@ -30,6 +30,7 @@ from liminallm.storage.common import (
     compute_text_embedding,
     get_default_chat_workflow_schema,
     get_default_tool_specs,
+    normalize_optional_text,
 )
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
@@ -569,19 +570,21 @@ class PostgresStore:
         now = datetime.utcnow()
         existing = self.get_semantic_cluster(cid)
         created_at = existing.created_at if existing else now
+        normalized_label = normalize_optional_text(
+            label if label is not None else (existing.label if existing else None)
+        )
+        normalized_description = normalize_optional_text(
+            description
+            if description is not None
+            else (existing.description if existing else None)
+        )
         cluster = SemanticCluster(
             id=cid,
             user_id=user_id,
             centroid=list(centroid),
             size=size,
-            label=(
-                label if label is not None else (existing.label if existing else None)
-            ),
-            description=(
-                description
-                if description is not None
-                else (existing.description if existing else None)
-            ),
+            label=normalized_label,
+            description=normalized_description,
             sample_message_ids=sample_message_ids
             or (existing.sample_message_ids if existing else []),
             created_at=created_at,
@@ -621,8 +624,12 @@ class PostgresStore:
             user_id=user_id,
             centroid=cluster.centroid,
             size=size,
-            label=row.get("label") if row else cluster.label,
-            description=row.get("description") if row else cluster.description,
+            label=normalize_optional_text(row.get("label")) if row else cluster.label,
+            description=(
+                normalize_optional_text(row.get("description"))
+                if row
+                else cluster.description
+            ),
             sample_message_ids=(
                 row.get("sample_message_ids") if row else cluster.sample_message_ids
             ),
@@ -646,6 +653,12 @@ class PostgresStore:
             return None
         new_centroid = list(centroid) if centroid is not None else existing.centroid
         new_size = size if size is not None else existing.size
+        new_label = normalize_optional_text(
+            label if label is not None else existing.label
+        )
+        new_description = normalize_optional_text(
+            description if description is not None else existing.description
+        )
         with self._connect() as conn:
             row = conn.execute(
                 """
@@ -660,8 +673,8 @@ class PostgresStore:
                 RETURNING *
                 """,
                 (
-                    label if label is not None else existing.label,
-                    description if description is not None else existing.description,
+                    new_label,
+                    new_description,
                     new_centroid,
                     new_size,
                     meta if meta is not None else existing.meta,
@@ -675,8 +688,8 @@ class PostgresStore:
             user_id=row.get("user_id"),
             centroid=row.get("centroid", new_centroid) or [],
             size=row.get("size", new_size),
-            label=row.get("label"),
-            description=row.get("description"),
+            label=normalize_optional_text(row.get("label")),
+            description=normalize_optional_text(row.get("description")),
             sample_message_ids=row.get("sample_message_ids") or [],
             created_at=row.get("created_at", existing.created_at),
             updated_at=row.get("updated_at", datetime.utcnow()),
@@ -702,8 +715,8 @@ class PostgresStore:
                 user_id=row.get("user_id"),
                 centroid=row.get("centroid") or [],
                 size=row.get("size", 0),
-                label=row.get("label"),
-                description=row.get("description"),
+                label=normalize_optional_text(row.get("label")),
+                description=normalize_optional_text(row.get("description")),
                 sample_message_ids=row.get("sample_message_ids") or [],
                 created_at=row.get("created_at", datetime.utcnow()),
                 updated_at=row.get("updated_at", datetime.utcnow()),
@@ -975,6 +988,7 @@ class PostgresStore:
         user_id = str(uuid.uuid4())
         normalized_meta = meta.copy() if meta else {}
         normalized_meta.setdefault("email_verified", False)
+        normalized_handle = normalize_optional_text(handle)
         try:
             with self._connect() as conn:
                 conn.execute(
@@ -985,7 +999,7 @@ class PostgresStore:
                     (
                         user_id,
                         email,
-                        handle,
+                        normalized_handle,
                         tenant_id,
                         role,
                         plan_tier,
@@ -998,7 +1012,7 @@ class PostgresStore:
         return User(
             id=user_id,
             email=email,
-            handle=handle,
+            handle=normalized_handle,
             tenant_id=tenant_id,
             role=role,
             plan_tier=plan_tier,
@@ -1915,6 +1929,7 @@ class PostgresStore:
         version_author: Optional[str] = None,
         change_note: Optional[str] = None,
     ) -> Artifact:
+        normalized_description = normalize_optional_text(description)
         try:
             validate_artifact(type_, schema)
         except ArtifactValidationError as exc:
@@ -1931,7 +1946,7 @@ class PostgresStore:
                         owner_user_id,
                         type_,
                         name,
-                        description,
+                        normalized_description,
                         json.dumps(schema),
                         fs_path,
                         schema.get("base_model"),
@@ -1957,7 +1972,7 @@ class PostgresStore:
             id=artifact_id,
             type=type_,
             name=name,
-            description=description,
+            description=normalized_description or "",
             schema=schema,
             owner_user_id=owner_user_id,
             fs_path=fs_path,

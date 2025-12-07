@@ -32,6 +32,7 @@ from liminallm.storage.common import (
     compute_text_embedding,
     get_default_chat_workflow_schema,
     hybrid_search_chunks,
+    normalize_optional_text,
     normalize_preference_weight,
 )
 from liminallm.storage.errors import ConstraintViolation
@@ -235,10 +236,11 @@ class MemoryStore:
             user_id = str(uuid.uuid4())
             normalized_meta = meta.copy() if meta else {}
             normalized_meta.setdefault("email_verified", False)
+            normalized_handle = normalize_optional_text(handle)
             user = User(
                 id=user_id,
                 email=email,
-                handle=handle,
+                handle=normalized_handle,
                 tenant_id=tenant_id,
                 role=role,
                 plan_tier=plan_tier,
@@ -737,10 +739,10 @@ class MemoryStore:
             user_id=user_id,
             centroid=list(centroid),
             size=size,
-            label=(
+            label=normalize_optional_text(
                 label if label is not None else (existing.label if existing else None)
             ),
-            description=(
+            description=normalize_optional_text(
                 description
                 if description is not None
                 else (existing.description if existing else None)
@@ -769,9 +771,9 @@ class MemoryStore:
         if not cluster:
             return None
         if label is not None:
-            cluster.label = label
+            cluster.label = normalize_optional_text(label)
         if description is not None:
-            cluster.description = description
+            cluster.description = normalize_optional_text(description)
         if centroid is not None:
             cluster.centroid = list(centroid)
         if size is not None:
@@ -1119,12 +1121,13 @@ class MemoryStore:
         artifact_id = str(uuid.uuid4())
         fs_path = self.persist_artifact_payload(artifact_id, schema)
         author = version_author or owner_user_id or "system_llm"
+        normalized_description = normalize_optional_text(description) or ""
         artifact = Artifact(
             id=artifact_id,
             type=type_,
             name=name,
             schema=schema,
-            description=description,
+            description=normalized_description,
             owner_user_id=owner_user_id,
             fs_path=fs_path,
             base_model=schema.get("base_model"),
@@ -1175,7 +1178,7 @@ class MemoryStore:
         author = version_author or artifact.owner_user_id or "system_llm"
         artifact.schema = schema
         if description is not None:
-            artifact.description = description
+            artifact.description = normalize_optional_text(description) or ""
         artifact.updated_at = datetime.utcnow()
         artifact.fs_path = fs_path
         artifact.base_model = schema.get("base_model")

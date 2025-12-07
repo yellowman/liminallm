@@ -1209,6 +1209,8 @@ raising `ValueError`/`TypeError` on malformed inputs.
 
 Some methods treat empty string as falsy (skip), others store it. Behavior differs between backends.
 
+**Status:** ✅ FIXED - Optional text fields now flow through `normalize_optional_text`, storing `None` instead of empty strings across both storage backends to prevent divergent representations.
+
 ### 24.5 ~~MEDIUM: Unicode Normalization Missing~~ FIXED
 
 **Location:** `liminallm/service/rag.py`
@@ -1221,6 +1223,8 @@ canonically equivalent strings map to identical chunks across ingests.
 **Location:** `liminallm/service/clustering.py:150-180`
 
 `.lower()` and similar operations are locale-dependent, can give inconsistent results.
+
+**Status:** 🟢 FALSE POSITIVE - Current clustering label/description parsing avoids locale-sensitive casing; no `.lower()` or locale-dependent transforms are present in the referenced code paths.
 
 ---
 
@@ -1520,6 +1524,8 @@ except Exception:
 
 **Impact:** Redis failures invisible; debugging impossible.
 
+**Status:** 🟢 FALSE POSITIVE - Auth cache revocation now logs failures with structured warnings (`revoke_user_sessions_cache_clear_failed`, `pop_oauth_state_failed`) and no bare `pass` blocks remain.
+
 ### 30.5 MEDIUM: Chat Endpoint Minimal Logging
 
 **Location:** `liminallm/api/routes.py:1336-1468`
@@ -1528,6 +1534,8 @@ Only 8 logging statements in 3,146 lines. Chat endpoint has no logging of:
 - Request metadata with correlation IDs
 - Token counts
 - Adapter selection decisions
+
+**Status:** ✅ FIXED - Chat requests now emit structured start/finish logs including conversation/context identifiers, workflow ID, adapter selections, and token usage metrics keyed by idempotency request IDs.
 
 ---
 
@@ -1616,6 +1624,8 @@ async def upload_file(...):
 ```
 
 **Impact:** Large file uploads block all concurrent requests.
+
+**Status:** ✅ FIXED - Upload handler writes files via `asyncio.to_thread`, keeping the event loop non-blocking while persisting payloads.
 
 ---
 
