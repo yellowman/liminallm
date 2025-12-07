@@ -138,6 +138,19 @@ class WorkflowEngine:
             "data": {"code": code, "message": message, "details": details or {}},
         }
 
+    def _append_trace(
+        self,
+        workflow_trace: List[Dict[str, Any]],
+        entry: Dict[str, Any],
+        max_entries: int = 500,
+    ) -> None:
+        """Append to workflow_trace with bounded size (Issue 23.4)."""
+
+        workflow_trace.append(entry)
+        if len(workflow_trace) > max_entries:
+            # Drop oldest entries to avoid unbounded growth during long runs
+            del workflow_trace[0 : len(workflow_trace) - max_entries]
+
     def shutdown(self, wait: bool = True) -> None:
         """Explicitly shutdown the executor. Call during app shutdown.
 
@@ -465,14 +478,6 @@ class WorkflowEngine:
         vars_scope: Dict[str, Any] = {}
         workflow_trace: List[Dict[str, Any]] = []
         max_trace_entries = 500
-
-        def _append_trace(entry: Dict[str, Any]) -> None:
-            """Append to workflow_trace with bounded size (Issue 23.4)."""
-
-            workflow_trace.append(entry)
-            if len(workflow_trace) > max_trace_entries:
-                # Drop oldest entries to avoid unbounded growth during long runs
-                del workflow_trace[0 : len(workflow_trace) - max_trace_entries]
         context_snippets: List[str] = []
         context_seen = set()
         content = ""
@@ -603,13 +608,15 @@ class WorkflowEngine:
                     )
 
                     # Merge parallel results into workflow state
-                    _append_trace(
+                    self._append_trace(
+                        workflow_trace,
                         {
                             "node": node_id,
                             "status": parallel_result.status,
                             "parallel_nodes": parallel_node_ids,
                             "failed_nodes": parallel_result.failed_nodes,
-                        }
+                        },
+                        max_trace_entries,
                     )
 
                     # Update vars with namespaced parallel outputs
@@ -646,7 +653,7 @@ class WorkflowEngine:
                     pending.insert(0, after_node)
                 continue
 
-            _append_trace({"node": node_id, **result})
+            self._append_trace(workflow_trace, {"node": node_id, **result}, max_trace_entries)
             if result.get("outputs"):
                 vars_scope.update(result["outputs"])
             if result.get("context_snippets"):
@@ -820,13 +827,14 @@ class WorkflowEngine:
                         content = data.get("content", "")
                         node_usage = data.get("usage", {})
                         usage = self._merge_usage(usage, node_usage)
-                        _append_trace(
+                        self._append_trace(
+                            workflow_trace,
                             {
                                 "node": node_id,
                                 "status": "ok",
                                 "content": content,
                                 "usage": node_usage,
-                            }
+                            },
                         )
                         # Emit trace event
                         yield {"event": "trace", "data": {"workflow_trace": workflow_trace[-1]}}
@@ -897,13 +905,14 @@ class WorkflowEngine:
                         )
 
                         # Record parallel execution in trace
-                        _append_trace(
+                        self._append_trace(
+                            workflow_trace,
                             {
                                 "node": node_id,
                                 "status": parallel_result.status,
                                 "parallel_nodes": parallel_node_ids,
                                 "failed_nodes": parallel_result.failed_nodes,
-                            }
+                            },
                         )
                         yield {"event": "trace", "data": {"workflow_trace": workflow_trace[-1]}}
 
@@ -931,7 +940,7 @@ class WorkflowEngine:
                         pending.insert(0, after_node)
                     continue
 
-                _append_trace({"node": node_id, **result})
+                self._append_trace(workflow_trace, {"node": node_id, **result})
                 yield {"event": "trace", "data": {"workflow_trace": workflow_trace[-1]}}
 
                 if result.get("outputs"):
@@ -1057,7 +1066,7 @@ class WorkflowEngine:
             "error": str(exc),
             "outputs": {},
         }
-        _append_trace(failure_entry)
+        self._append_trace(workflow_trace, failure_entry)
         rollback_state = await self._rollback_workflow(
             state_key, workflow_trace, vars_scope, snapshots=snapshots
         )
