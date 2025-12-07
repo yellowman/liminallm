@@ -505,7 +505,10 @@ return {1, tokens, 0}
         value = await self.client.get(key)
         if value:
             try:
-                return datetime.fromisoformat(value)
+                parsed = datetime.fromisoformat(value)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed
             except (ValueError, TypeError):
                 return None
         return None
@@ -1095,7 +1098,10 @@ class SyncRedisCache:
         value = self._sync_client.get(key)
         if value:
             try:
-                return datetime.fromisoformat(value)
+                parsed = datetime.fromisoformat(value)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed
             except (ValueError, TypeError):
                 return None
         return None
