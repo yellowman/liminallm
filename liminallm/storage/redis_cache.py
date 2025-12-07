@@ -169,6 +169,12 @@ return {1, tokens, 0}
         tenant_id: Optional[str] = None,
         cost: int = 1,
     ) -> Union[bool, Tuple[bool, int, int]]:
+        if limit <= 0:
+            return (True, limit, 0) if return_remaining else True
+
+        if window_seconds <= 0:
+            window_seconds = 60
+
         """Check rate limit using Redis-backed token bucket.
 
         Uses a Lua script for atomic refill and consumption to avoid race
@@ -841,6 +847,12 @@ class SyncRedisCache:
         tenant_id: Optional[str] = None,
         cost: int = 1,
     ) -> Union[bool, Tuple[bool, int, int]]:
+        if limit <= 0:
+            return (True, limit, 0) if return_remaining else True
+
+        if window_seconds <= 0:
+            window_seconds = 60
+
         now = time.time()
         safe_key = RedisCache._normalize_rate_key(key, tenant_id)
         refill_rate = float(limit) / float(window_seconds)
