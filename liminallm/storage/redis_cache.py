@@ -265,7 +265,7 @@ return {1, tokens, 0}
     async def set_oauth_state(
         self, state: str, provider: str, expires_at: datetime, tenant_id: Optional[str]
     ) -> None:
-        ttl = max(1, int((expires_at - datetime.utcnow()).total_seconds()))
+        ttl = self._ttl_seconds(expires_at)
         payload = {
             "provider": provider,
             "expires_at": expires_at.isoformat(),
@@ -315,12 +315,12 @@ return {1, tokens, 0}
 
         expires_raw = data.get("expires_at")
         # Issue 39.2: Add error handling for datetime parsing
-        expires_at = datetime.utcnow()
+        expires_at = datetime.now(timezone.utc)
         if isinstance(expires_raw, str):
             try:
                 expires_at = datetime.fromisoformat(expires_raw)
             except (ValueError, TypeError):
-                pass  # Use default utcnow
+                pass  # Use default current UTC time
         return data.get("provider"), expires_at, data.get("tenant_id")
 
     async def get_idempotency_record(
@@ -491,7 +491,7 @@ return {1, tokens, 0}
     async def update_session_activity(self, session_id: str, ttl_seconds: int = 86400) -> None:
         """Update session last activity timestamp."""
         key = f"session:activity:{session_id}"
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         await self.client.set(key, now, ex=ttl_seconds)
 
     async def get_session_activity(self, session_id: str) -> Optional[datetime]:
@@ -913,7 +913,7 @@ class SyncRedisCache:
     async def set_oauth_state(
         self, state: str, provider: str, expires_at: datetime, tenant_id: Optional[str]
     ) -> None:
-        ttl = max(1, int((expires_at - datetime.utcnow()).total_seconds()))
+        ttl = RedisCache._ttl_seconds(expires_at)
         payload = {
             "provider": provider,
             "expires_at": expires_at.isoformat(),
@@ -944,12 +944,12 @@ class SyncRedisCache:
 
         expires_raw = data.get("expires_at")
         # Issue 39.2: Add error handling for datetime parsing
-        expires_at = datetime.utcnow()
+        expires_at = datetime.now(timezone.utc)
         if isinstance(expires_raw, str):
             try:
                 expires_at = datetime.fromisoformat(expires_raw)
             except (ValueError, TypeError):
-                pass  # Use default utcnow
+                pass  # Use default current UTC time
         return data.get("provider"), expires_at, data.get("tenant_id")
 
     async def get_idempotency_record(
@@ -1076,7 +1076,7 @@ class SyncRedisCache:
     async def update_session_activity(self, session_id: str, ttl_seconds: int = 86400) -> None:
         """Update session last activity timestamp."""
         key = f"session:activity:{session_id}"
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         self._sync_client.set(key, now, ex=ttl_seconds)
 
     async def get_session_activity(self, session_id: str) -> Optional[datetime]:
