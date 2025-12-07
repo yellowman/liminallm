@@ -454,10 +454,10 @@ async def check_rate_limit(
         return_remaining: If True, return tuple of (allowed, remaining)
 
     Returns:
-        bool if return_remaining is False, else (bool, int) tuple
+        bool if return_remaining is False, else (bool, int, int) tuple
     """
     if limit <= 0:
-        return (True, limit) if return_remaining else True
+        return (True, limit, 0) if return_remaining else True
     if window_seconds <= 0:
         logger.warning(
             "rate_limit_invalid_window",
