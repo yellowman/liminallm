@@ -265,6 +265,11 @@ return {1, tokens, 0}
     async def set_oauth_state(
         self, state: str, provider: str, expires_at: datetime, tenant_id: Optional[str]
     ) -> None:
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        else:
+            expires_at = expires_at.astimezone(timezone.utc)
+
         ttl = self._ttl_seconds(expires_at)
         payload = {
             "provider": provider,
@@ -913,6 +918,11 @@ class SyncRedisCache:
     async def set_oauth_state(
         self, state: str, provider: str, expires_at: datetime, tenant_id: Optional[str]
     ) -> None:
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        else:
+            expires_at = expires_at.astimezone(timezone.utc)
+
         ttl = RedisCache._ttl_seconds(expires_at)
         payload = {
             "provider": provider,
