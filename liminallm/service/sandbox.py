@@ -443,7 +443,7 @@ class AllowlistedFetcher:
                 data=data,
                 json=json,
                 timeout=timeout,
-                proxies=self.policy.proxy_url,
+                proxy=self.policy.proxy_url,
                 follow_redirects=False,
             )
         except httpx.TimeoutException as exc:
