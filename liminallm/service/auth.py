@@ -1235,13 +1235,12 @@ class AuthService:
             return False
         pwd_hash, algo = self._hash_password(new_password)
         self.store.save_password(user.id, pwd_hash, algo)
-        if hasattr(self.store, "revoke_user_sessions"):
-            try:
-                self.store.revoke_user_sessions(user.id)  # type: ignore[attr-defined]
-            except Exception as exc:
-                self.logger.warning(
-                    "revoke_sessions_failed", user_id=user.id, error=str(exc)
-                )
+        try:
+            await self.revoke_all_user_sessions(user.id)
+        except Exception as exc:
+            self.logger.warning(
+                "revoke_sessions_failed", user_id=user.id, error=str(exc)
+            )
         if self.cache:
             await self.cache.client.delete(f"reset:{token}")
         self.logger.info("password_reset_completed", user_id=user.id)

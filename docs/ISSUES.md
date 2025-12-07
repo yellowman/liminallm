@@ -493,19 +493,17 @@ Redis rate limiting now uses an atomic Lua token bucket with weighted costs and 
 
 **Fix Applied:** Added configurable host/CIDR allowlist for tool egress. Socket connections from tool handlers are intercepted and blocked unless the destination matches the allowlist (or the proxy host when configured), preventing arbitrary outbound requests.
 
-### 6.6 HIGH: No JSON Schema Validation on Tool Inputs/Outputs
+### 6.6 ~~HIGH: No JSON Schema Validation on Tool Inputs/Outputs~~ FIXED
 
-**Location:** `liminallm/service/workflow.py:1292-1326`
+**Location:** `liminallm/service/workflow.py`
 
-**SPEC §9.2 requires:** "JSON Schema validation enforced on tool inputs/outputs"
+**Fix Applied:** Tool invocations now validate inputs and outputs against optional `input_schema` and `output_schema` fields using Draft 2020-12 JSON Schema. Validation failures return structured `validation_error` details before execution or on invalid responses.
 
-**Current:** Tools invoked with unvalidated inputs, outputs not validated.
-
-### 6.7 HIGH: No html_untrusted Content Sanitization
+### 6.7 ~~HIGH: No html_untrusted Content Sanitization~~ FIXED
 
 **SPEC §9.2 requires:** "outputs flagged `content_type: "html_untrusted"` must be sanitized"
 
-**Current:** No content type tracking or sanitization.
+**Fix Applied:** Tool results are recursively sanitized when `content_type` is `html_untrusted`, escaping HTML payloads before they are returned to callers.
 
 ### 6.8 ~~HIGH: No Privileged Tool Access Controls~~ FIXED
 
@@ -1100,15 +1098,11 @@ If message deletion fails partway through, conversation deleted but messages rem
 - Router cache already had tenant_id support: `f"router:last:{tenant_prefix}{user_id}:{ctx_hash}"`
 - In-memory fallback also includes tenant_id in cache keys
 
-### 22.3 CRITICAL: Password Reset Wrong Cache Key Format
+### 22.3 ~~CRITICAL: Password Reset Wrong Cache Key Format~~ FIXED
 
-**Location:** `liminallm/service/auth.py:632`
+**Location:** `liminallm/service/auth.py`
 
-```python
-f"user_sessions:{user_id}"  # Key pattern never created
-```
-
-**Issue:** Password reset attempts to invalidate sessions using wrong key pattern. Sessions not actually invalidated.
+**Fix Applied:** Password resets now call `revoke_all_user_sessions`, which clears both persistent and cached session sets using the correct `auth:user_sessions:{user_id}` key pattern before completing the reset.
 
 ### 22.4 HIGH: Artifact Update Cache Invalidation Missing
 
@@ -1154,11 +1148,11 @@ Conversation cached with 5m TTL but messages cached with 1m TTL. Can serve stale
 - `_cleanup_stale_active_requests()` runs periodically during register/unregister
 - Stale entries automatically removed and cancelled
 
-### 23.3 HIGH: WebSocket Listener Not Cleaned Up
+### 23.3 ~~HIGH: WebSocket Listener Not Cleaned Up~~ FIXED
 
-**Location:** `liminallm/api/routes.py:2852-3100`
+**Location:** `liminallm/api/routes.py`
 
-WebSocket handlers don't always clean up listener tasks on disconnect. Task references leak.
+**Fix Applied:** Cancel-listener tasks are now awaited with cancellation suppression on disconnect and exit paths, ensuring cleanup even when the WebSocket closes mid-stream.
 
 ### 23.4 ~~HIGH: Workflow Trace Accumulation~~ FIXED
 
@@ -1170,11 +1164,9 @@ WebSocket handlers don't always clean up listener tasks on disconnect. Task refe
 
 No metrics or alerts for connection pool exhaustion. Silent failures under load.
 
-### 23.6 MEDIUM: File Handle Leaks in Training
+### 23.6 ~~MEDIUM: File Handle Leaks in Training~~ (FALSE POSITIVE)
 
-**Location:** `liminallm/training/dataset.py`
-
-Some file operations don't use context managers, risking handle leaks.
+**Analysis:** Training data is written via `Path.open()` inside context managers (`with dataset_path.open("w") as f` in `liminallm/service/training.py:307`). No unmanaged file handles are present.
 
 ---
 

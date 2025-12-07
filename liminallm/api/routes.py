@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import math
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path as FilePath
 from typing import Any, Dict, Optional
@@ -4342,10 +4343,14 @@ async def websocket_chat(ws: WebSocket):
             except WebSocketDisconnect:
                 cancel_event.set()
                 cancel_listener.cancel()
+                with suppress(asyncio.CancelledError):
+                    await cancel_listener
                 await _unregister_cancel_event(request_id)
                 return
             finally:
                 cancel_listener.cancel()
+                with suppress(asyncio.CancelledError):
+                    await cancel_listener
                 await _unregister_cancel_event(request_id)
 
             # Save assistant message after streaming completes

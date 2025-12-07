@@ -18,6 +18,9 @@ from typing import (
     Tuple,
 )
 
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
+
 from liminallm.config import Settings
 from liminallm.logging import get_logger
 from liminallm.service.embeddings import (
@@ -1415,6 +1418,50 @@ class WorkflowEngine:
                     registry[artifact.schema["name"]] = artifact.schema
         return registry
 
+    def _validate_tool_payload(
+        self, payload: Any, schema: Optional[dict], *, phase: str, tool_name: str
+    ) -> Optional[List[str]]:
+        if not schema or not isinstance(schema, dict):
+            return None
+        try:
+            validator = Draft202012Validator(schema)
+        except SchemaError as exc:  # pragma: no cover - defensive logging
+            self.logger.warning(
+                "tool_schema_invalid", phase=phase, tool=tool_name, error=str(exc)
+            )
+            return [f"invalid {phase} schema: {exc.message}"]
+        errors = sorted(validator.iter_errors(payload), key=lambda e: e.path)
+        if errors:
+            return [e.message for e in errors]
+        return None
+
+    def _sanitize_html_untrusted(self, value: Any) -> Any:
+        """Escape untrusted HTML strings recursively.
+
+        SPEC §9.2 requires sanitizing outputs flagged as html_untrusted. We avoid
+        external dependencies and escape markup using the stdlib `html` module.
+        Only payloads explicitly marked with `content_type: "html_untrusted"`
+        are escaped to avoid mutating other tool outputs.
+        """
+
+        import html
+
+        if isinstance(value, list):
+            return [self._sanitize_html_untrusted(v) for v in value]
+        if isinstance(value, dict):
+            sanitized: Dict[str, Any] = {}
+            is_html_untrusted = value.get("content_type") == "html_untrusted"
+            for k, v in value.items():
+                if k == "content_type":
+                    sanitized[k] = v
+                    continue
+                if is_html_untrusted and k == "content":
+                    sanitized[k] = html.escape(str(v or ""), quote=True)
+                    continue
+                sanitized[k] = self._sanitize_html_untrusted(v)
+            return sanitized
+        return value
+
     def invoke_tool(
         self,
         tool_schema: dict,
@@ -1718,6 +1765,16 @@ class WorkflowEngine:
         # Issue 6.9: Apply hardcap per SPEC §18 (default 15s, hard cap 60s)
         raw_timeout = tool_spec.get("timeout_seconds", 15) if tool_spec else 15
         timeout = min(raw_timeout, MAX_NODE_TIMEOUT_SECONDS)
+        validation_errors = self._validate_tool_payload(
+            inputs, tool_spec.get("input_schema") if tool_spec else None, phase="input", tool_name=tool_name
+        )
+        if validation_errors:
+            return {
+                "status": "error",
+                "content": "tool input validation failed",
+                "error": "validation_error",
+                "details": {"errors": validation_errors},
+            }
         handler = self._builtin_tool_handlers().get(tool_name)
         if tool_spec and not handler:
             handler = self._builtin_tool_handlers().get(tool_spec.get("handler"))
@@ -1740,7 +1797,22 @@ class WorkflowEngine:
         future = self._tool_executor.submit(_run_handler)
         cancelled = False
         try:
-            return future.result(timeout=timeout)
+            result = future.result(timeout=timeout)
+            sanitized = self._sanitize_html_untrusted(result)
+            output_errors = self._validate_tool_payload(
+                sanitized,
+                tool_spec.get("output_schema") if tool_spec else None,
+                phase="output",
+                tool_name=tool_name,
+            )
+            if output_errors:
+                return {
+                    "status": "error",
+                    "content": "tool output validation failed",
+                    "error": "validation_error",
+                    "details": {"errors": output_errors},
+                }
+            return sanitized
         except concurrent.futures.TimeoutError:
             self.logger.warning("tool_timeout", tool=tool_name, timeout=timeout)
             cancelled = future.cancel()
