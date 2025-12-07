@@ -27,7 +27,10 @@ from liminallm.service.bm25 import (
     tokenize_text as _tokenize_text,
 )
 from liminallm.storage.common import (
+    blend_centroid,
+    clamp_success_score,
     compute_text_embedding,
+    ensure_policy_compliant_texts,
     get_default_chat_workflow_schema,
     get_default_tool_specs,
     normalize_optional_text,
@@ -395,6 +398,14 @@ class PostgresStore:
                     "preference message conversation mismatch",
                     {"message_id": message_id, "conversation_id": conversation_id},
                 )
+            ensure_policy_compliant_texts(
+                (msg_row.get("content"), context_text, corrected_text),
+                violation_context={
+                    "message_id": message_id,
+                    "conversation_id": conversation_id,
+                    "user_id": user_id,
+                },
+            )
             embedding = context_embedding or compute_text_embedding(
                 context_text or msg_row.get("content")
             )
@@ -2124,9 +2135,49 @@ class PostgresStore:
     def persist_artifact_payload(self, artifact_id: str, schema: dict) -> str:
         """Public wrapper kept for parity with MemoryStore."""
 
-        existing = self.list_artifact_versions(artifact_id)
-        next_version = (existing[0].version + 1) if existing else 1
-        return self._persist_payload(artifact_id, next_version, schema)
+        with self._connect() as conn, conn.transaction():
+            artifact_row = conn.execute(
+                "SELECT id, schema, base_model FROM artifact WHERE id = %s FOR UPDATE",
+                (artifact_id,),
+            ).fetchone()
+            if not artifact_row:
+                raise ConstraintViolation(
+                    "artifact missing", {"artifact_id": artifact_id}
+                )
+            version_row = conn.execute(
+                "SELECT COALESCE(MAX(version), 0) AS v FROM artifact_version WHERE artifact_id = %s FOR UPDATE",
+                (artifact_id,),
+            ).fetchone()
+            next_version = (version_row["v"] or 0) + 1
+            fs_path = self._persist_payload(artifact_id, next_version, schema)
+
+            base_model = schema.get("base_model")
+            existing_schema = artifact_row.get("schema") if isinstance(artifact_row, dict) else None
+            if not base_model and existing_schema:
+                if isinstance(existing_schema, str):
+                    try:
+                        existing_schema = json.loads(existing_schema)
+                    except Exception:
+                        existing_schema = {}
+                base_model = (existing_schema or {}).get("base_model")
+
+            conn.execute(
+                "UPDATE artifact SET schema = %s, fs_path = %s, base_model = %s, updated_at = now() WHERE id = %s",
+                (json.dumps(schema), fs_path, base_model, artifact_id),
+            )
+            conn.execute(
+                "INSERT INTO artifact_version (artifact_id, version, schema, fs_path, base_model, created_by, change_note) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (
+                    artifact_id,
+                    next_version,
+                    json.dumps(schema),
+                    fs_path,
+                    base_model,
+                    "system_llm",
+                    None,
+                ),
+            )
+        return fs_path
 
     def get_latest_workflow(self, workflow_id: str) -> Optional[dict]:
         with self._connect() as conn:
@@ -2192,6 +2243,93 @@ class PostgresStore:
                 )
             )
         return states
+
+    def update_adapter_router_state(
+        self,
+        adapter_id: str,
+        *,
+        centroid_vec: Optional[list[float]] = None,
+        success_score: Optional[float] = None,
+        last_used_at: Optional[datetime] = None,
+        last_trained_at: Optional[datetime] = None,
+    ) -> AdapterRouterState:
+        """Upsert adapter router state with EMA centroids and bounded scores."""
+
+        with self._connect() as conn, conn.transaction():
+            artifact_row = conn.execute(
+                "SELECT id, base_model FROM artifact WHERE id = %s FOR UPDATE",
+                (adapter_id,),
+            ).fetchone()
+            if not artifact_row:
+                raise ConstraintViolation(
+                    "adapter missing for router state", {"adapter_id": adapter_id}
+                )
+
+            existing = conn.execute(
+                "SELECT * FROM adapter_router_state WHERE artifact_id = %s FOR UPDATE",
+                (adapter_id,),
+            ).fetchone()
+
+            merged_centroid = blend_centroid(
+                existing.get("centroid_vec") if existing else None, centroid_vec
+            )
+            merged_success = clamp_success_score(
+                success_score
+                if success_score is not None
+                else (existing.get("success_score") if existing else 0.0)
+            )
+            usage_count = existing.get("usage_count", 0) if existing else 0
+            merged_last_used = last_used_at or (existing.get("last_used_at") if existing else None)
+            merged_last_trained = last_trained_at or (
+                existing.get("last_trained_at") if existing else None
+            )
+            meta = existing.get("meta") if existing else None
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = None
+
+            if existing:
+                conn.execute(
+                    "UPDATE adapter_router_state SET centroid_vec = %s, usage_count = %s, "
+                    "success_score = %s, last_used_at = %s, last_trained_at = %s, meta = %s "
+                    "WHERE artifact_id = %s",
+                    (
+                        merged_centroid or None,
+                        usage_count,
+                        merged_success,
+                        merged_last_used,
+                        merged_last_trained,
+                        json.dumps(meta) if isinstance(meta, dict) else meta,
+                        adapter_id,
+                    ),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO adapter_router_state (artifact_id, centroid_vec, usage_count, success_score, last_used_at, last_trained_at, meta) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        adapter_id,
+                        merged_centroid or None,
+                        usage_count,
+                        merged_success,
+                        merged_last_used,
+                        merged_last_trained,
+                        json.dumps(meta) if isinstance(meta, dict) else meta,
+                    ),
+                )
+
+        return AdapterRouterState(
+            artifact_id=adapter_id,
+            base_model=artifact_row.get("base_model") if artifact_row else None,
+            centroid_vec=merged_centroid or None,
+            usage_count=usage_count,
+            success_score=merged_success,
+            last_used_at=merged_last_used,
+            last_trained_at=merged_last_trained,
+            meta=meta,
+        )
 
     def record_config_patch(
         self, artifact_id: str, proposer: str, patch: dict, justification: Optional[str]

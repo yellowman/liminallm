@@ -1560,7 +1560,13 @@ class WorkflowEngine:
             ):
                 try:
                     history = self.store.list_messages(conversation_id, user_id=user_id)  # type: ignore[attr-defined]
-                except Exception:
+                except Exception as exc:
+                    self.logger.warning(
+                        "conversation_history_load_failed",
+                        conversation_id=conversation_id,
+                        user_id=user_id,
+                        error=str(exc),
+                    )
                     history = []
         return self._invoke_tool(
             tool_name,

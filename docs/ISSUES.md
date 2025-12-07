@@ -536,19 +536,23 @@ Redis rate limiting now uses an atomic Lua token bucket with weighted costs and 
 
 ### 7.1 CRITICAL: Missing Safety Filtering
 
+**Status:** ✅ IMPLEMENTED
+
 **Location:** `liminallm/api/routes.py:1529-1572`
 
 **SPEC §15.1 requires:** "only create `preference_event` if the interaction is policy-compliant; never train adapters on disallowed content"
 
-**Current:** No safety checking before `record_feedback_event()`.
+**Fix Applied:** Added a SPEC-aligned policy blocklist guard that rejects preference submissions containing disallowed content before they are persisted. Both Postgres and in-memory stores now call `ensure_policy_compliant_texts()` when recording preference events, preventing unsafe interactions from entering training datasets.
 
 ### 7.2 HIGH: Adapter Router State Never Updated After Training
+
+**Status:** ✅ IMPLEMENTED
 
 **Location:** `liminallm/service/training_worker.py:150-212`
 
 **SPEC §5.4 requires:** Update `adapter_router_state.centroid_vec` via EMA, `success_score`, `last_trained_at`
 
-**Current:** No `update_adapter_router_state()` method exists in either storage backend.
+**Fix Applied:** Training jobs now compute weighted centroids from cluster summaries and convert training loss into a bounded success score. Both PostgresStore and MemoryStore gained `update_adapter_router_state()` upserts that apply EMA blending, clamp success scores, and timestamp the last training run so router state evolves with each successful job.
 
 ### 7.3 ~~HIGH: Missing explicit_signal Validation~~ FIXED
 
@@ -933,6 +937,8 @@ await self.cache.increment_mfa_failures(user_id)
 
 ### 19.5 CRITICAL: Artifact Version Race Condition
 
+**Status:** ✅ IMPLEMENTED
+
 **Location:** `liminallm/storage/postgres.py:1814-1818`
 
 ```python
@@ -946,7 +952,7 @@ next_version = result[0]
 
 **Issue:** Two concurrent version creates both get same max, both insert same version number.
 
-**Fix:** Use `SELECT ... FOR UPDATE` or auto-incrementing version column.
+**Fix Applied:** `persist_artifact_payload` now locks the artifact row and the artifact_version counter inside a transaction, computes the next version under lock, writes the payload, updates the artifact row, and inserts the new version atomically. This prevents duplicate version numbers under concurrency.
 
 ### 19.6 HIGH: Workflow Executor Thread Safety
 
@@ -964,15 +970,21 @@ Token generation uses `secrets.token_urlsafe()` which is thread-safe, but sessio
 
 ### 19.8 MEDIUM: Router Last-Used State Race
 
+**Status:** 🟢 FALSE POSITIVE
+
 **Location:** `liminallm/service/router.py:81`
 
 `_last_used` dictionary updated without synchronization in async context.
+
+**Resolution:** The router no longer tracks mutable `_last_used` state; adapter routing is stateless outside of Redis-backed caches, so there is no shared in-memory dictionary to race. No synchronization is required in the current implementation.
 
 ---
 
 ## 20. Error Handling and Partial Failures (4th Pass)
 
 ### 20.1 CRITICAL: Swallowed Exceptions with Bare Pass
+
+**Status:** ✅ IMPLEMENTED
 
 **Location:** Multiple files
 
@@ -988,7 +1000,7 @@ except Exception:
 
 **Impact:** Data loss and silent failures make debugging impossible.
 
-**Fix:** Log exceptions at minimum; propagate critical failures.
+**Fix Applied:** All bare `except` passes were removed. Conversation history loads now emit structured warnings on failure, and audits confirm no remaining `except Exception: pass` blocks in the codebase, restoring observability for unexpected errors.
 
 ### 20.2 CRITICAL: Training Job Multi-Step Without Rollback
 

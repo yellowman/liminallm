@@ -29,7 +29,10 @@ from liminallm.service.bm25 import (
 )
 from liminallm.service.embeddings import cosine_similarity
 from liminallm.storage.common import (
+    blend_centroid,
+    clamp_success_score,
     compute_text_embedding,
+    ensure_policy_compliant_texts,
     get_default_chat_workflow_schema,
     hybrid_search_chunks,
     normalize_optional_text,
@@ -650,6 +653,14 @@ class MemoryStore:
                     "preference message conversation mismatch",
                     {"message_id": message_id, "conversation_id": conversation_id},
                 )
+            ensure_policy_compliant_texts(
+                (message.content if message else None, context_text, corrected_text),
+                violation_context={
+                    "message_id": message_id,
+                    "conversation_id": conversation_id,
+                    "user_id": user_id,
+                },
+            )
             event_id = str(uuid.uuid4())
             normalized_weight = normalize_preference_weight(weight)
             embedding = context_embedding or compute_text_embedding(
@@ -1399,6 +1410,50 @@ class MemoryStore:
             )
             for a in adapters
         ]
+
+    def update_adapter_router_state(
+        self,
+        adapter_id: str,
+        *,
+        centroid_vec: Optional[list[float]] = None,
+        success_score: Optional[float] = None,
+        last_used_at: Optional[datetime] = None,
+        last_trained_at: Optional[datetime] = None,
+    ) -> AdapterRouterState:
+        """Persist adapter router state with EMA centroids (thread-safe)."""
+
+        with self._data_lock:
+            existing = self.adapter_router_state.get(adapter_id)
+            merged_centroid = blend_centroid(
+                getattr(existing, "centroid_vec", None), centroid_vec
+            )
+            merged_success = clamp_success_score(
+                success_score
+                if success_score is not None
+                else getattr(existing, "success_score", 0.0)
+            )
+            usage_count = getattr(existing, "usage_count", 0)
+            artifact = self.artifacts.get(adapter_id)
+            base_model = (
+                existing.base_model
+                if existing
+                else (artifact.schema.get("base_model") if artifact else None)
+            )
+            state = AdapterRouterState(
+                artifact_id=adapter_id,
+                base_model=base_model,
+                centroid_vec=merged_centroid or [],
+                usage_count=usage_count,
+                success_score=merged_success,
+                last_used_at=last_used_at or getattr(existing, "last_used_at", None),
+                last_trained_at=(
+                    last_trained_at or getattr(existing, "last_trained_at", None)
+                ),
+                meta=getattr(existing, "meta", None),
+            )
+            self.adapter_router_state[adapter_id] = state
+            self._persist_state()
+            return state
 
     def upsert_context(
         self,
