@@ -143,12 +143,12 @@ return {1, tokens, 0}
     ) -> None:
         now = await self._redis_now()
         ttl = self._ttl_seconds(expires_at, now=now)
-        pipe = self.client.pipeline()
-        pipe.set(f"auth:session:{session_id}", user_id, ex=ttl)
-        # Track session in user's session set for bulk revocation (Issue 22.3)
-        pipe.sadd(f"auth:user_sessions:{user_id}", session_id)
-        pipe.expire(f"auth:user_sessions:{user_id}", ttl)
-        await pipe.execute()
+        async with self.client.pipeline() as pipe:
+            pipe.set(f"auth:session:{session_id}", user_id, ex=ttl)
+            # Track session in user's session set for bulk revocation (Issue 22.3)
+            pipe.sadd(f"auth:user_sessions:{user_id}", session_id)
+            pipe.expire(f"auth:user_sessions:{user_id}", ttl)
+            await pipe.execute()
 
     @staticmethod
     def _normalize_rate_key(key: str, tenant_id: Optional[str]) -> str:
@@ -162,8 +162,13 @@ return {1, tokens, 0}
         tenant_prefix = f"{tenant_id}:" if tenant_id else ""
         return f"rate:{tenant_prefix}{digest}"
 
-    async def get_session_user(self, session_id: str) -> Optional[str]:
-        return await self.client.get(f"auth:session:{session_id}")
+    async def get_session_user(self, session_id: str) -> Tuple[bool, Optional[str]]:
+        key = f"auth:session:{session_id}"
+        value = await self.client.get(key)
+        if value is not None:
+            return True, value
+        exists = bool(await self.client.exists(key))
+        return exists, None
 
     async def revoke_session(self, session_id: str) -> None:
         await self.client.delete(f"auth:session:{session_id}")
@@ -186,14 +191,14 @@ return {1, tokens, 0}
             return 0
 
         revoked = 0
-        pipe = self.client.pipeline()
-        for session_id in session_ids:
-            if except_session_id and session_id == except_session_id:
-                continue
-            pipe.delete(f"auth:session:{session_id}")
-            pipe.srem(user_sessions_key, session_id)
-            revoked += 1
-        await pipe.execute()
+        async with self.client.pipeline() as pipe:
+            for session_id in session_ids:
+                if except_session_id and session_id == except_session_id:
+                    continue
+                pipe.delete(f"auth:session:{session_id}")
+                pipe.srem(user_sessions_key, session_id)
+                revoked += 1
+            await pipe.execute()
         return revoked
 
     async def check_rate_limit(
@@ -765,10 +770,10 @@ return {1, tokens, 0}
         tenant_prefix = f"{tenant_id}:" if tenant_id else ""
         open_key = f"circuit:{tenant_prefix}{tool_id}:open"
         failures_key = f"circuit:{tenant_prefix}{tool_id}:failures"
-        pipe = self.client.pipeline()
-        pipe.delete(open_key)
-        pipe.delete(failures_key)
-        await pipe.execute()
+        async with self.client.pipeline() as pipe:
+            pipe.delete(open_key)
+            pipe.delete(failures_key)
+            await pipe.execute()
 
 
 class _SyncClientAdapter:
@@ -851,15 +856,20 @@ class SyncRedisCache:
         self, session_id: str, user_id: str, expires_at: datetime
     ) -> None:
         ttl = RedisCache._ttl_seconds(expires_at, now=self._redis_now())
-        pipe = self._sync_client.pipeline()
-        pipe.set(f"auth:session:{session_id}", user_id, ex=ttl)
-        # Track session in user's session set for bulk revocation (Issue 22.3)
-        pipe.sadd(f"auth:user_sessions:{user_id}", session_id)
-        pipe.expire(f"auth:user_sessions:{user_id}", ttl)
-        pipe.execute()
+        with self._sync_client.pipeline() as pipe:
+            pipe.set(f"auth:session:{session_id}", user_id, ex=ttl)
+            # Track session in user's session set for bulk revocation (Issue 22.3)
+            pipe.sadd(f"auth:user_sessions:{user_id}", session_id)
+            pipe.expire(f"auth:user_sessions:{user_id}", ttl)
+            pipe.execute()
 
-    async def get_session_user(self, session_id: str) -> Optional[str]:
-        return self._sync_client.get(f"auth:session:{session_id}")
+    async def get_session_user(self, session_id: str) -> Tuple[bool, Optional[str]]:
+        key = f"auth:session:{session_id}"
+        value = self._sync_client.get(key)
+        if value is not None:
+            return True, value
+        exists = bool(self._sync_client.exists(key))
+        return exists, None
 
     async def revoke_session(self, session_id: str) -> None:
         self._sync_client.delete(f"auth:session:{session_id}")
@@ -874,14 +884,14 @@ class SyncRedisCache:
             return 0
 
         revoked = 0
-        pipe = self._sync_client.pipeline()
-        for session_id in session_ids:
-            if except_session_id and session_id == except_session_id:
-                continue
-            pipe.delete(f"auth:session:{session_id}")
-            pipe.srem(user_sessions_key, session_id)
-            revoked += 1
-        pipe.execute()
+        with self._sync_client.pipeline() as pipe:
+            for session_id in session_ids:
+                if except_session_id and session_id == except_session_id:
+                    continue
+                pipe.delete(f"auth:session:{session_id}")
+                pipe.srem(user_sessions_key, session_id)
+                revoked += 1
+            pipe.execute()
         return revoked
 
     async def check_rate_limit(

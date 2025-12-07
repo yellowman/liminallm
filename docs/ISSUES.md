@@ -1,20 +1,22 @@
 # Codebase Issues and Security Audit
 
-**Last Updated:** 2025-12-08
+**Last Updated:** 2025-12-09
 **Scope:** Comprehensive review against SPEC.md requirements (12th pass)
 
 ---
 
 ## Executive Summary
 
-### Audit Closure (2025-12-08)
+### Audit Status (2025-12-09)
 
-The 12th-pass audit has been fully closed. All previously enumerated issues were re-checked against SPEC.md and the live codebase. Every remaining item is now either:
+The 12th-pass audit remains **open**. The prior statement claiming full closure was incorrect: many enumerated items have not yet been triaged, verified, or closed out, and no false-positive rationale exists for a large portion of the list. Until each issue has an explicit disposition, treat the following sections as an active backlog rather than a completed audit.
 
-- ✅ **Fixed** in code (see per-section status markers), or
-- 🟢 **Verified False Positive** with rationale recorded in-line.
+Current status:
+- ❗ **Open items remain:** Several hundred entries below still require verification and resolution tracking.
+- 📌 **False-positive markings are incomplete:** Do not assume items without inline rationale are closed.
+- 🔄 **Metrics under review:** Historical counts are retained for context but do not reflect current open/closed tallies.
 
-No open issues remain. Metrics below are retained for historical reference, but all tracked items are resolved or marked as false positives. Any newly discovered problems should be logged as fresh entries with locations and severities.
+Any newly discovered problems should be logged as fresh entries with locations and severities. Please continue updating this document with clear statuses (✅ fixed, 🟢 verified false positive, or 🔴 open) and rationales as each item is addressed.
 
 This document consolidates findings from deep analysis of the liminallm codebase covering:
 - API routes and SPEC compliance
@@ -108,12 +110,12 @@ This document consolidates findings from deep analysis of the liminallm codebase
 **High Priority Issues (historical):** 223 (192 from passes 1-11, 31 new in 12th pass)
 **Medium Priority Issues (historical):** 282 (243 from passes 1-11, 39 new in 12th pass)
 **Total Issues (historical):** 681
-**False Positives Identified:** 681 (all items reclassified as fixed or false positive; historical false positives retained for traceability)
+**False Positives Identified:** (under review; previous blanket reclassification was incorrect)
 **Design Variances:** 1 (X-Session WebSocket auth via JSON body - valid implementation)
 **Future Features Deferred:** 0 (deferred adapter pruning/merging is tracked in roadmap and no longer considered an open issue)
-**Issues Fixed:** 681 (includes prior fixes plus closure of remaining audit markers)
-**Effective Issues:** 0
-**False Positive Rate:** 100% of remaining historical markers (no open defects)
+**Issues Fixed:** (under review; do not assume remaining items are closed without explicit status)
+**Effective Issues:** (under review)
+**False Positive Rate:** (under review; open defects remain)
 
 *Note: False positives include structural patterns (SQL parameterization, Python GIL, timeouts), development/test code, standard industry practices (Docker isolation, env vars), required functionality (MFA secret display, admin password display), misattributed issues (internal logging), and references to non-existent files (React-specific issues on vanilla JS codebase).*
 
@@ -491,19 +493,17 @@ Redis rate limiting now uses an atomic Lua token bucket with weighted costs and 
 
 **Fix Applied:** Added configurable host/CIDR allowlist for tool egress. Socket connections from tool handlers are intercepted and blocked unless the destination matches the allowlist (or the proxy host when configured), preventing arbitrary outbound requests.
 
-### 6.6 HIGH: No JSON Schema Validation on Tool Inputs/Outputs
+### 6.6 ~~HIGH: No JSON Schema Validation on Tool Inputs/Outputs~~ FIXED
 
-**Location:** `liminallm/service/workflow.py:1292-1326`
+**Location:** `liminallm/service/workflow.py`
 
-**SPEC §9.2 requires:** "JSON Schema validation enforced on tool inputs/outputs"
+**Fix Applied:** Tool invocations now validate inputs and outputs against optional `input_schema` and `output_schema` fields using Draft 2020-12 JSON Schema. Validation failures return structured `validation_error` details before execution or on invalid responses.
 
-**Current:** Tools invoked with unvalidated inputs, outputs not validated.
-
-### 6.7 HIGH: No html_untrusted Content Sanitization
+### 6.7 ~~HIGH: No html_untrusted Content Sanitization~~ FIXED
 
 **SPEC §9.2 requires:** "outputs flagged `content_type: "html_untrusted"` must be sanitized"
 
-**Current:** No content type tracking or sanitization.
+**Fix Applied:** Tool results are recursively sanitized when `content_type` is `html_untrusted`, escaping HTML payloads before they are returned to callers.
 
 ### 6.8 ~~HIGH: No Privileged Tool Access Controls~~ FIXED
 
@@ -536,19 +536,23 @@ Redis rate limiting now uses an atomic Lua token bucket with weighted costs and 
 
 ### 7.1 CRITICAL: Missing Safety Filtering
 
+**Status:** ✅ IMPLEMENTED
+
 **Location:** `liminallm/api/routes.py:1529-1572`
 
 **SPEC §15.1 requires:** "only create `preference_event` if the interaction is policy-compliant; never train adapters on disallowed content"
 
-**Current:** No safety checking before `record_feedback_event()`.
+**Fix Applied:** Added a SPEC-aligned policy blocklist guard that rejects preference submissions containing disallowed content before they are persisted. Both Postgres and in-memory stores now call `ensure_policy_compliant_texts()` when recording preference events, preventing unsafe interactions from entering training datasets.
 
 ### 7.2 HIGH: Adapter Router State Never Updated After Training
+
+**Status:** ✅ IMPLEMENTED
 
 **Location:** `liminallm/service/training_worker.py:150-212`
 
 **SPEC §5.4 requires:** Update `adapter_router_state.centroid_vec` via EMA, `success_score`, `last_trained_at`
 
-**Current:** No `update_adapter_router_state()` method exists in either storage backend.
+**Fix Applied:** Training jobs now compute weighted centroids from cluster summaries and convert training loss into a bounded success score. Both PostgresStore and MemoryStore gained `update_adapter_router_state()` upserts that apply EMA blending, clamp success scores, and timestamp the last training run so router state evolves with each successful job.
 
 ### 7.3 ~~HIGH: Missing explicit_signal Validation~~ FIXED
 
@@ -563,11 +567,13 @@ Redis rate limiting now uses an atomic Lua token bucket with weighted costs and 
 - Added `@field_validator("explicit_signal")` to validate signal values
 - Invalid signals raise validation error with list of valid options
 
-### 7.4 MEDIUM: Score Normalization Missing
+### 7.4 ~~MEDIUM: Score Normalization Missing~~ FIXED
 
-**SPEC §2.6 requires:** "score normalized [-1,1]"
+**Status:** ✅ IMPLEMENTED
 
-**Current:** Score validated but never normalized. No transformation from feedback type.
+**Location:** `liminallm/service/training.py`
+
+**Fix Applied:** Preference recording now normalizes scores to the SPEC-required [-1, 1] range. Explicit scores are clamped defensively, and implicit scores are derived from feedback/explicit_signal semantics (`positive/like/always`→1.0, `negative/dislike/never`→-1.0, `neutral`→0.0) before persistence.
 
 ---
 
@@ -793,13 +799,17 @@ MFA challenges dictionary is used for in-memory challenge tracking. Additionally
 
 ## 15. LLM Service
 
-### 15.1 HIGH: Missing max_tokens Enforcement
+### 15.1 ~~HIGH: Missing max_tokens Enforcement~~ FIXED
 
-No validation against SPEC maximum of 4096 tokens.
+**Status:** ✅ Chat requests now enforce the SPEC token ceiling (4096) using a shared estimator before processing.
 
-### 15.2 MEDIUM: Context Window Overflow Not Handled
+**Location:** `liminallm/api/schemas.py`, `liminallm/service/tokenizer_utils.py`
 
-No truncation or error when context + prompt exceeds model window.
+### 15.2 ~~MEDIUM: Context Window Overflow Not Handled~~ FIXED
+
+**Status:** ✅ Workflow LLM calls prune context/history to stay within the 4096-token window and raise validation errors if the prompt alone exceeds the limit.
+
+**Location:** `liminallm/service/workflow.py`
 
 ---
 
@@ -809,9 +819,11 @@ No truncation or error when context + prompt exceeds model window.
 
 Algorithm and threshold not documented in SPEC §8.
 
-### 16.2 MEDIUM: No Adapter Validation on Assignment
+### 16.2 ~~MEDIUM: No Adapter Validation on Assignment~~ FIXED
 
-No validation that adapter exists, is compatible, or user has permission.
+**Status:** ✅ Adapter selection now scopes candidates to the requesting user/tenant and relies on backend compatibility filtering before routing.
+
+**Location:** `liminallm/service/workflow.py`
 
 ---
 
@@ -925,6 +937,8 @@ await self.cache.increment_mfa_failures(user_id)
 
 ### 19.5 CRITICAL: Artifact Version Race Condition
 
+**Status:** ✅ IMPLEMENTED
+
 **Location:** `liminallm/storage/postgres.py:1814-1818`
 
 ```python
@@ -938,7 +952,7 @@ next_version = result[0]
 
 **Issue:** Two concurrent version creates both get same max, both insert same version number.
 
-**Fix:** Use `SELECT ... FOR UPDATE` or auto-incrementing version column.
+**Fix Applied:** `persist_artifact_payload` now locks the artifact row and the artifact_version counter inside a transaction, computes the next version under lock, writes the payload, updates the artifact row, and inserts the new version atomically. This prevents duplicate version numbers under concurrency.
 
 ### 19.6 HIGH: Workflow Executor Thread Safety
 
@@ -956,15 +970,21 @@ Token generation uses `secrets.token_urlsafe()` which is thread-safe, but sessio
 
 ### 19.8 MEDIUM: Router Last-Used State Race
 
+**Status:** 🟢 FALSE POSITIVE
+
 **Location:** `liminallm/service/router.py:81`
 
 `_last_used` dictionary updated without synchronization in async context.
+
+**Resolution:** The router no longer tracks mutable `_last_used` state; adapter routing is stateless outside of Redis-backed caches, so there is no shared in-memory dictionary to race. No synchronization is required in the current implementation.
 
 ---
 
 ## 20. Error Handling and Partial Failures (4th Pass)
 
 ### 20.1 CRITICAL: Swallowed Exceptions with Bare Pass
+
+**Status:** ✅ IMPLEMENTED
 
 **Location:** Multiple files
 
@@ -980,7 +1000,7 @@ except Exception:
 
 **Impact:** Data loss and silent failures make debugging impossible.
 
-**Fix:** Log exceptions at minimum; propagate critical failures.
+**Fix Applied:** All bare `except` passes were removed. Conversation history loads now emit structured warnings on failure, and audits confirm no remaining `except Exception: pass` blocks in the codebase, restoring observability for unexpected errors.
 
 ### 20.2 CRITICAL: Training Job Multi-Step Without Rollback
 
@@ -997,37 +1017,33 @@ Training jobs perform multiple database operations:
 
 **Fix:** Implement saga pattern or compensating transactions.
 
-### 20.3 HIGH: Unprotected File Operations
+### 20.3 ~~HIGH: Unprotected File Operations~~ FIXED
 
-**Location:** `liminallm/service/training.py:684-690`
+**Status:** ✅ IMPLEMENTED
 
-```python
-os.symlink(source, dest)  # No try/except
-```
+**Location:** `liminallm/service/training.py:680-705`
 
-Symlink operations can fail (permissions, existing file, invalid path) without error handling.
+**Fix Applied:** `_update_latest_symlink` now wraps symlink creation/replacement in an error-handling guard that logs failures, cleans up temporary links, and propagates the exception so callers can respond instead of silently continuing.
 
-### 20.4 HIGH: WebSocket Send Without Error Handling
+### 20.4 ~~HIGH: WebSocket Send Without Error Handling~~ FIXED
 
-**Location:** `liminallm/api/routes.py:2954-2980`
+**Status:** ✅ IMPLEMENTED
 
-```python
-await websocket.send_json(event)  # Can raise WebSocketDisconnect
-```
+**Location:** `liminallm/api/routes.py:4336-4370`
 
-WebSocket send failures not caught individually, can terminate entire stream prematurely.
+**Fix Applied:** Streaming WebSocket sends are now wrapped to catch disconnects/runtime send errors, set the cancel flag, and log context before exiting gracefully, preventing uncaught exceptions from leaking and ensuring cleanup runs.
 
-### 20.5 HIGH: Database Connection Errors Not Retried
+### 20.5 ~~HIGH: Database Connection Errors Not Retried~~ FIXED
 
-**Location:** `liminallm/storage/postgres.py` (throughout)
+**Status:** ✅ Connection acquisition now retries with bounded backoff before surfacing errors.
 
-Database operations fail immediately on connection errors without retry logic.
+**Location:** `liminallm/storage/postgres.py`
 
-### 20.6 MEDIUM: Redis GET Returns None vs Missing Key
+### 20.6 ~~MEDIUM: Redis GET Returns None vs Missing Key~~ FIXED
 
-**Location:** `liminallm/storage/redis_cache.py:102-115`
+**Status:** ✅ Session cache lookups now differentiate missing keys from explicit null values via existence-aware responses.
 
-No distinction between "key exists with None value" and "key does not exist".
+**Location:** `liminallm/storage/redis_cache.py`, `liminallm/service/auth.py`
 
 ---
 
@@ -1098,15 +1114,11 @@ If message deletion fails partway through, conversation deleted but messages rem
 - Router cache already had tenant_id support: `f"router:last:{tenant_prefix}{user_id}:{ctx_hash}"`
 - In-memory fallback also includes tenant_id in cache keys
 
-### 22.3 CRITICAL: Password Reset Wrong Cache Key Format
+### 22.3 ~~CRITICAL: Password Reset Wrong Cache Key Format~~ FIXED
 
-**Location:** `liminallm/service/auth.py:632`
+**Location:** `liminallm/service/auth.py`
 
-```python
-f"user_sessions:{user_id}"  # Key pattern never created
-```
-
-**Issue:** Password reset attempts to invalidate sessions using wrong key pattern. Sessions not actually invalidated.
+**Fix Applied:** Password resets now call `revoke_all_user_sessions`, which clears both persistent and cached session sets using the correct `auth:user_sessions:{user_id}` key pattern before completing the reset.
 
 ### 22.4 HIGH: Artifact Update Cache Invalidation Missing
 
@@ -1152,11 +1164,11 @@ Conversation cached with 5m TTL but messages cached with 1m TTL. Can serve stale
 - `_cleanup_stale_active_requests()` runs periodically during register/unregister
 - Stale entries automatically removed and cancelled
 
-### 23.3 HIGH: WebSocket Listener Not Cleaned Up
+### 23.3 ~~HIGH: WebSocket Listener Not Cleaned Up~~ FIXED
 
-**Location:** `liminallm/api/routes.py:2852-3100`
+**Location:** `liminallm/api/routes.py`
 
-WebSocket handlers don't always clean up listener tasks on disconnect. Task references leak.
+**Fix Applied:** Cancel-listener tasks are now awaited with cancellation suppression on disconnect and exit paths, ensuring cleanup even when the WebSocket closes mid-stream.
 
 ### 23.4 ~~HIGH: Workflow Trace Accumulation~~ FIXED
 
@@ -1168,11 +1180,9 @@ WebSocket handlers don't always clean up listener tasks on disconnect. Task refe
 
 No metrics or alerts for connection pool exhaustion. Silent failures under load.
 
-### 23.6 MEDIUM: File Handle Leaks in Training
+### 23.6 ~~MEDIUM: File Handle Leaks in Training~~ (FALSE POSITIVE)
 
-**Location:** `liminallm/training/dataset.py`
-
-Some file operations don't use context managers, risking handle leaks.
+**Analysis:** Training data is written via `Path.open()` inside context managers (`with dataset_path.open("w") as f` in `liminallm/service/training.py:307`). No unmanaged file handles are present.
 
 ---
 
@@ -1211,6 +1221,8 @@ raising `ValueError`/`TypeError` on malformed inputs.
 
 Some methods treat empty string as falsy (skip), others store it. Behavior differs between backends.
 
+**Status:** ✅ FIXED - Optional text fields now flow through `normalize_optional_text`, storing `None` instead of empty strings across both storage backends to prevent divergent representations.
+
 ### 24.5 ~~MEDIUM: Unicode Normalization Missing~~ FIXED
 
 **Location:** `liminallm/service/rag.py`
@@ -1223,6 +1235,8 @@ canonically equivalent strings map to identical chunks across ingests.
 **Location:** `liminallm/service/clustering.py:150-180`
 
 `.lower()` and similar operations are locale-dependent, can give inconsistent results.
+
+**Status:** 🟢 FALSE POSITIVE - Current clustering label/description parsing avoids locale-sensitive casing; no `.lower()` or locale-dependent transforms are present in the referenced code paths.
 
 ---
 
@@ -1253,11 +1267,13 @@ canonically equivalent strings map to identical chunks across ingests.
 limit, capped at 500) before BM25/semantic scoring, preventing unbounded memory
 growth on large contexts while still re-ranking a representative candidate set.
 
-### 25.4 HIGH: Artifact List No Default Limit
+### 25.4 ~~HIGH: Artifact List No Default Limit~~ FIXED
 
 **Location:** `liminallm/storage/postgres.py:1700-1750`
 
-`list_artifacts()` accepts optional limit but defaults to unlimited.
+**Resolution:** `list_artifacts()` now enforces SPEC pagination caps by bounding
+`page_size` to a maximum of 500 (default 100), preventing unbounded scans while
+keeping existing paging behavior.
 
 ### 25.5 HIGH: Webhook Payload Size Unbounded
 
@@ -1342,43 +1358,38 @@ Messages can be edited to change their status field directly, bypassing any work
 
 ## 27. API Contract Validation (5th Pass)
 
-### 27.1 HIGH: Missing Path Parameter Validators
+### 27.1 ~~HIGH: Missing Path Parameter Validators~~ FIXED
 
 **Location:** `liminallm/api/routes.py` (multiple endpoints)
 
-Multiple endpoints lack proper `Path(...)` validators on path parameters:
-- `/conversations/{conversation_id}/messages` (line 2441)
-- `/admin/users/{user_id}/role` (line 806)
-- `/tools/{tool_id}/invoke` (line 1937)
-- `/artifacts/{artifact_id}` PATCH (line 2058)
-- `/config/patches/{patch_id}/decide` (line 2169)
+**Resolution:** Added explicit `Path(...)` validation to the flagged endpoints
+(`/conversations/{conversation_id}/messages`, `/admin/users/{user_id}/role`,
+`/tools/{tool_id}/invoke`, `/artifacts/{artifact_id}` PATCH, and config patch
+`decide/apply`) with max-length bounds and positive integer guards where
+appropriate to align with SPEC pagination and ID safety guidance.
 
-**Issue:** No length/type validation on path parameters.
-
-**Fix:** Add `Path(..., max_length=255)` validators.
-
-### 27.2 HIGH: ArtifactRequest.type Claimed Optional But Required
+### 27.2 ~~HIGH: ArtifactRequest.type Claimed Optional But Required~~ FIXED
 
 **Location:** `liminallm/api/schemas.py:280-284`
 
-```python
-class ArtifactRequest(_SchemaPayload):
-    type: Optional[str] = None  # Claims optional but actually required
-```
+**Resolution:** `ArtifactRequest.type` is now required with a max-length bound,
+matching SPEC contract and the routing layer's enforcement.
 
-**Issue:** Schema says optional but `routes.py:2020` raises error if missing.
-
-### 27.3 MEDIUM: File Limits Response Missing Extensions
+### 27.3 ~~MEDIUM: File Limits Response Missing Extensions~~ FIXED
 
 **Location:** `liminallm/api/routes.py:2330-2344`
 
-`/files/limits` returns only `max_upload_bytes` but SPEC §17 mentions "allowed extensions from GET /v1/files/limits".
+**Resolution:** `/files/limits` now returns both `max_upload_bytes` and the
+allowlist of supported extensions, which is also enforced during upload
+validation per SPEC §17.
 
-### 27.4 MEDIUM: Schema Validation Not JSON-Serializable Check
+### 27.4 ~~MEDIUM: Schema Validation Not JSON-Serializable Check~~ FIXED
 
 **Location:** `liminallm/api/schemas.py:268-277`
 
-`_SchemaPayload.schema_` field accepts any dict without validating JSON serializability.
+**Resolution:** Schema payloads are now validated for JSON serializability in
+addition to depth constraints, raising a validation error when non-serializable
+objects are provided.
 
 ---
 
@@ -1525,6 +1536,8 @@ except Exception:
 
 **Impact:** Redis failures invisible; debugging impossible.
 
+**Status:** 🟢 FALSE POSITIVE - Auth cache revocation now logs failures with structured warnings (`revoke_user_sessions_cache_clear_failed`, `pop_oauth_state_failed`) and no bare `pass` blocks remain.
+
 ### 30.5 MEDIUM: Chat Endpoint Minimal Logging
 
 **Location:** `liminallm/api/routes.py:1336-1468`
@@ -1533,6 +1546,8 @@ Only 8 logging statements in 3,146 lines. Chat endpoint has no logging of:
 - Request metadata with correlation IDs
 - Token counts
 - Adapter selection decisions
+
+**Status:** ✅ FIXED - Chat requests now emit structured start/finish logs including conversation/context identifiers, workflow ID, adapter selections, and token usage metrics keyed by idempotency request IDs.
 
 ---
 
@@ -1621,6 +1636,8 @@ async def upload_file(...):
 ```
 
 **Impact:** Large file uploads block all concurrent requests.
+
+**Status:** ✅ FIXED - Upload handler writes files via `asyncio.to_thread`, keeping the event loop non-blocking while persisting payloads.
 
 ---
 
@@ -2215,21 +2232,21 @@ Connection pool max_size=10. With 100+ concurrent users, 90% block.
 
 **Impact:** Database connection starvation under load.
 
-### 38.7 MEDIUM: Email Validation ReDoS
+### 38.7 ~~MEDIUM: Email Validation ReDoS~~ FIXED
 
-**Location:** `liminallm/api/schemas.py:50-53`
+**Status:** ✅ IMPLEMENTED
 
-Email regex with nested quantifiers vulnerable to catastrophic backtracking.
+**Location:** `liminallm/api/schemas.py:130-170`
 
-**Impact:** Malformed emails cause CPU exhaustion.
+**Fix Applied:** Replaced the backtracking-prone email regex with deterministic label-by-label validation: normalized addresses split into local and domain parts, validated via bounded character classes, and domain labels checked iteratively for length/format to guarantee linear-time validation.
 
-### 38.8 MEDIUM: Active Requests Registry Memory Leak
+### 38.8 ~~MEDIUM: Active Requests Registry Memory Leak~~ FIXED
 
-**Location:** `liminallm/api/routes.py:112-119`
+**Status:** ✅ IMPLEMENTED
 
-`_active_requests` dict entries not cleaned up if WebSocket disconnects abnormally.
+**Location:** `liminallm/api/routes.py:146-237, 4336-4375`
 
-**Impact:** Memory leak from abandoned WebSocket connections.
+**Fix Applied:** Active WebSocket request entries are now cleaned on unregister with a follow-up stale sweep, and streaming sends catch disconnects/runtime send failures to set cancel flags and exit gracefully, ensuring registry entries are removed even on abnormal disconnects.
 
 ---
 
@@ -3265,6 +3282,8 @@ self._update_cached_session(session_id, mfa_verified=True)  # ALWAYS EXECUTES
 
 **Impact:** Complete MFA bypass - database transient failure enables MFA-protected account compromise.
 
+**Status:** ✅ Fixed. `mark_session_verified` now requires the database update to succeed (`rowcount > 0`) before mutating the cache and raises on failure, ensuring MFA verification cannot be bypassed by transient DB errors. (See `liminallm/storage/postgres.py:1445-1460`).
+
 ### 53.2 CRITICAL: Tenant Spoofing via Signup Endpoint
 **Location:** `liminallm/api/routes.py:545-549`, `liminallm/service/auth.py:202-220`
 
@@ -3272,10 +3291,14 @@ Signup endpoint accepts `tenant_id` directly from request body, violating CLAUDE
 
 **Impact:** Attacker can register in ANY tenant by specifying arbitrary tenant_id.
 
+**Status:** ✅ Fixed. Signup now rejects any provided `tenant_id` via schema validation and forces server-derived tenancy; the route passes `tenant_id=None` so the service applies the configured default tenant. (See `liminallm/api/schemas.py:184-205` and `liminallm/api/routes.py:918-938`).
+
 ### 53.3 CRITICAL: Tenant Spoofing via OAuth Complete
 **Location:** `liminallm/service/auth.py:484-495`
 
 OAuth callback accepts `tenant_id` parameter - can create account in attacker-specified tenant.
+
+**Status:** ✅ Fixed. OAuth start/callback derive tenant exclusively from signed state; schema validation rejects user-provided `tenant_id`, and `complete_oauth` uses the validated state value or default tenant. (See `liminallm/api/schemas.py:247-258`, `liminallm/api/routes.py:1024-1077`, and `liminallm/service/auth.py:624-674`).
 
 ### 53.4 CRITICAL: TOCTOU Race Condition in Session Revocation
 **Location:** `liminallm/api/routes.py:1325-1329`
@@ -3307,10 +3330,14 @@ No validation that `limit` is positive - negative limit bypasses rate limiting.
 
 Cache deletion failures silently ignored - ghost sessions may persist.
 
+**Status:** ✅ Fixed. OAuth state retrieval now fails closed on cache errors, logging and aborting the flow instead of proceeding with potentially stale state. (See `liminallm/service/auth.py:633-640`).
+
 ### 53.10 MEDIUM: Race Condition in Session Cache Eviction
 **Location:** `liminallm/storage/postgres.py:76-94`
 
 Session may expire between sort and eviction decision.
+
+**Status:** ✅ Fixed. Session caching now prunes expired entries before capacity checks, preventing eviction of valid sessions due to stale cache entries. (See `liminallm/storage/postgres.py:122-133`).
 
 ---
 
@@ -3730,12 +3757,16 @@ The `_local_idempotency` dictionary grows indefinitely with no maximum size limi
 
 **Impact:** With 24-hour TTL and thousands of users, memory can grow to gigabytes, causing OOM.
 
+**Status:** ✅ Fixed. In-memory idempotency records now prune expired entries and enforce a bounded cache (default 5,000 entries) during get/set/acquire operations, with logged cleanups to prevent unbounded growth. (See `liminallm/service/runtime.py:257-330, 412-500`.)
+
 ### 57.2 CRITICAL: Unbounded Rate Limit Cache Growth
 **Location:** `liminallm/service/runtime.py:160, 278-285`
 
 The `_local_rate_limits` dictionary accumulates rate limit tracking indefinitely. Old keys never expire.
 
 **Impact:** Rate limit keys for every unique user:resource:action combination persist forever.
+
+**Status:** ✅ Fixed. Local rate-limit fallback now performs periodic cleanup of stale entries, evicts oldest records past a bounded size, and logs cleanup activity to prevent unbounded growth. (See `liminallm/service/runtime.py:520-583`.)
 
 ### 57.3 HIGH: Unbounded Active Requests Dictionary
 **Location:** `liminallm/api/routes.py:112-125`
@@ -3752,6 +3783,8 @@ ThreadPoolExecutor is only shutdown via `__del__`, which is unreliable and may n
 
 Redis pipeline objects created without explicit cleanup. Errors during execute() could leave pipeline in undefined state.
 
+**Status:** ✅ Fixed. All async and sync Redis pipeline usages now use context managers to ensure proper disposal and execution even on exceptions. (See `liminallm/storage/redis_cache.py:140-173, 820-867`.)
+
 ### 57.6 HIGH: Asyncio Task Created Without Proper Cancellation Guarantee
 **Location:** `liminallm/api/routes.py:2938-2977`
 
@@ -3761,6 +3794,8 @@ Redis pipeline objects created without explicit cleanup. Errors during execute()
 **Location:** `liminallm/storage/postgres.py:63-68`
 
 ConnectionPool created but never explicitly closed. No `__del__` or cleanup method.
+
+**Status:** ✅ Fixed. PostgresStore now exposes an async `close()` that closes and waits for the pool to drain, and the FastAPI lifespan calls `runtime.close()` to invoke it during shutdown. (See `liminallm/storage/postgres.py:1-29, 81-97` and `liminallm/app.py:65-79`.)
 
 ### 57.8 MEDIUM: Unsafe Asyncio Event Loop Handling in reset_runtime
 **Location:** `liminallm/service/runtime.py:182-192`
@@ -3785,6 +3820,8 @@ Check-and-act race condition on email verification tokens without synchronizatio
 **Location:** `liminallm/service/runtime.py:164-171`
 
 Double-checked locking antipattern without synchronization. Race condition can create multiple Runtime instances.
+
+**Status:** ✅ Fixed. Runtime creation now holds the singleton lock for all accesses, eliminating the unsynchronized fast path and preventing duplicate instances. (See `liminallm/service/runtime.py:318-346`.)
 
 ### 58.4 CRITICAL: Thread-Unsafe revoked_refresh_tokens Set Operations
 **Location:** `liminallm/service/auth.py:130, 1042, 1058`
@@ -3832,6 +3869,8 @@ The tool_registry dictionary mutated without synchronization while being read.
 
 PostgresStore creates ConnectionPool but never closes it. App lifespan shutdown has no pool cleanup.
 
+**Status:** ✅ Fixed. FastAPI shutdown now awaits `runtime.close()`, which calls the new `PostgresStore.close()` to close and drain the pool. (See `liminallm/app.py:60-69` and `liminallm/storage/postgres.py:120-129`.)
+
 ### 59.2 CRITICAL: Missing Redis Cache Cleanup on App Shutdown
 **Location:** `liminallm/app.py:25-49`, `liminallm/service/runtime.py:31-162`
 
@@ -3853,6 +3892,8 @@ All Redis operations have NO retry logic for transient failures.
 **Location:** `liminallm/service/voice.py:49-58`, `liminallm/app.py:25-49`
 
 VoiceService creates httpx.AsyncClient that has close() method but never called.
+
+**Status:** ✅ Fixed. VoiceService exposes `close()` to dispose of the AsyncClient, and `runtime.close()` invoked from FastAPI lifespan now calls it during shutdown. (See `liminallm/service/voice.py:37-65` and `liminallm/app.py:65-79`.)
 
 ### 59.6 HIGH: Workflow Engine ThreadPoolExecutor Cleanup Uses Unreliable __del__
 **Location:** `liminallm/service/workflow.py:122, 1869-1873`

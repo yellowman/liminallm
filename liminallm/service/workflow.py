@@ -18,6 +18,9 @@ from typing import (
     Tuple,
 )
 
+from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
+
 from liminallm.config import Settings
 from liminallm.logging import get_logger
 from liminallm.service.embeddings import (
@@ -36,6 +39,10 @@ from liminallm.service.sandbox import (
     build_tool_network_policy,
     safe_eval_expr,
     tool_network_guard,
+)
+from liminallm.service.tokenizer_utils import (
+    MAX_GENERATION_TOKENS,
+    estimate_token_count,
 )
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.models import Message
@@ -477,7 +484,7 @@ class WorkflowEngine:
         workflow_start_time = time.monotonic()
 
         adapters, routing_trace, adapter_gates = await self._select_adapters(
-            user_message, user_id, context_id
+            user_message, user_id, context_id, tenant_id
         )
         history = await self._load_conversation_history(
             conversation_id, user_id=user_id, tenant_id=tenant_id
@@ -758,7 +765,7 @@ class WorkflowEngine:
         workflow_start_time = time.monotonic()
 
         adapters, routing_trace, adapter_gates = await self._select_adapters(
-            user_message, user_id, context_id
+            user_message, user_id, context_id, tenant_id
         )
         history = await self._load_conversation_history(
             conversation_id, user_id=user_id, tenant_id=tenant_id
@@ -1036,6 +1043,9 @@ class WorkflowEngine:
             allowed_ctx_ids, message, user_id=user_id, tenant_id=tenant_id
         )
         context_snippets = [c.text for c in ctx_chunks]
+        context_snippets, history = self._apply_prompt_budget(
+            message or "", context_snippets, history
+        )
 
         # Stream from LLM
         try:
@@ -1342,6 +1352,75 @@ class WorkflowEngine:
         await self.cache_conversation_state(conversation_id, history)
         return history
 
+    def _apply_prompt_budget(
+        self,
+        prompt: str,
+        context_snippets: List[str],
+        history: List[Any],
+    ) -> tuple[List[str], List[Any]]:
+        """Enforce the SPEC token budget by pruning context/history if needed."""
+
+        budget = MAX_GENERATION_TOKENS
+        total = estimate_token_count(prompt)
+
+        def _content_from_history(entry: Any) -> str:
+            if isinstance(entry, dict):
+                return str(entry.get("content") or "")
+            if hasattr(entry, "content"):
+                return str(getattr(entry, "content") or "")
+            return str(entry or "")
+
+        history_tokens: list[int] = []
+        normalized_history: list[Any] = []
+        for entry in history or []:
+            content = _content_from_history(entry)
+            normalized_history.append(entry)
+            token_count = estimate_token_count(content)
+            history_tokens.append(token_count)
+            total += token_count
+
+        context_tokens: list[int] = []
+        normalized_context = list(context_snippets or [])
+        for snippet in normalized_context:
+            token_count = estimate_token_count(snippet)
+            context_tokens.append(token_count)
+            total += token_count
+
+        if total <= budget:
+            return normalized_context, normalized_history
+
+        # Drop context snippets from the end until within budget
+        while normalized_context and total > budget:
+            removed_tokens = context_tokens.pop() if context_tokens else 0
+            normalized_context.pop()
+            total -= removed_tokens
+            self.logger.debug(
+                "context_pruned_for_budget",
+                removed_tokens=removed_tokens,
+                remaining_tokens=total,
+            )
+
+        if total <= budget:
+            return normalized_context, normalized_history
+
+        # Drop oldest history entries if still over budget
+        while normalized_history and total > budget:
+            removed_tokens = history_tokens.pop(0)
+            normalized_history.pop(0)
+            total -= removed_tokens
+            self.logger.debug(
+                "history_pruned_for_budget",
+                removed_tokens=removed_tokens,
+                remaining_tokens=total,
+            )
+
+        if total > budget:
+            raise BadRequestError(
+                f"prompt exceeds maximum token budget of {MAX_GENERATION_TOKENS}"
+            )
+
+        return normalized_context, normalized_history
+
     async def cache_conversation_state(
         self, conversation_id: Optional[str], history: List[Message]
     ) -> None:
@@ -1415,6 +1494,61 @@ class WorkflowEngine:
                     registry[artifact.schema["name"]] = artifact.schema
         return registry
 
+    def _validate_tool_payload(
+        self, payload: Any, schema: Optional[dict], *, phase: str, tool_name: str
+    ) -> Optional[List[str]]:
+        if not schema or not isinstance(schema, dict):
+            return None
+        try:
+            validator = Draft202012Validator(schema)
+        except SchemaError as exc:  # pragma: no cover - defensive logging
+            self.logger.warning(
+                "tool_schema_invalid", phase=phase, tool=tool_name, error=str(exc)
+            )
+            return [f"invalid {phase} schema: {exc.message}"]
+        errors = sorted(validator.iter_errors(payload), key=lambda e: e.path)
+        if errors:
+            return [e.message for e in errors]
+        return None
+
+    def _sanitize_html_untrusted(self, value: Any) -> Any:
+        """Escape untrusted HTML strings recursively.
+
+        SPEC §9.2 requires sanitizing outputs flagged as html_untrusted. We avoid
+        external dependencies and escape markup using the stdlib `html` module.
+        Only payloads explicitly marked with `content_type: "html_untrusted"`
+        are escaped to avoid mutating other tool outputs.
+        """
+
+        import html
+
+        def _escape_html(value: Any) -> Any:
+            if value is None:
+                return ""
+            if isinstance(value, str):
+                return html.escape(value, quote=True)
+            if isinstance(value, list):
+                return [_escape_html(v) for v in value]
+            if isinstance(value, dict):
+                return {k: _escape_html(v) for k, v in value.items()}
+            return value
+
+        if isinstance(value, list):
+            return [self._sanitize_html_untrusted(v) for v in value]
+        if isinstance(value, dict):
+            sanitized: Dict[str, Any] = {}
+            is_html_untrusted = value.get("content_type") == "html_untrusted"
+            for k, v in value.items():
+                if k == "content_type":
+                    sanitized[k] = v
+                    continue
+                if is_html_untrusted and k == "content":
+                    sanitized[k] = _escape_html(v)
+                    continue
+                sanitized[k] = self._sanitize_html_untrusted(v)
+            return sanitized
+        return value
+
     def invoke_tool(
         self,
         tool_schema: dict,
@@ -1437,7 +1571,13 @@ class WorkflowEngine:
             ):
                 try:
                     history = self.store.list_messages(conversation_id, user_id=user_id)  # type: ignore[attr-defined]
-                except Exception:
+                except Exception as exc:
+                    self.logger.warning(
+                        "conversation_history_load_failed",
+                        conversation_id=conversation_id,
+                        user_id=user_id,
+                        error=str(exc),
+                    )
                     history = []
         return self._invoke_tool(
             tool_name,
@@ -1470,9 +1610,20 @@ class WorkflowEngine:
         }
 
     async def _select_adapters(
-        self, user_message: str, user_id: Optional[str], context_id: Optional[str]
+        self,
+        user_message: str,
+        user_id: Optional[str],
+        context_id: Optional[str],
+        tenant_id: Optional[str],
     ) -> Tuple[List[dict], List[dict], List[dict]]:
-        adapter_artifacts = [a for a in self.store.list_artifacts(type_filter="adapter")]  # type: ignore[arg-type]
+        adapter_artifacts = [
+            a
+            for a in self.store.list_artifacts(
+                type_filter="adapter",
+                owner_user_id=user_id,
+                tenant_id=tenant_id,
+            )
+        ]  # type: ignore[arg-type]
         policy = None
         for art in self.store.list_artifacts(type_filter="policy"):  # type: ignore[arg-type]
             if art.name == "default_routing":
@@ -1718,6 +1869,16 @@ class WorkflowEngine:
         # Issue 6.9: Apply hardcap per SPEC §18 (default 15s, hard cap 60s)
         raw_timeout = tool_spec.get("timeout_seconds", 15) if tool_spec else 15
         timeout = min(raw_timeout, MAX_NODE_TIMEOUT_SECONDS)
+        validation_errors = self._validate_tool_payload(
+            inputs, tool_spec.get("input_schema") if tool_spec else None, phase="input", tool_name=tool_name
+        )
+        if validation_errors:
+            return {
+                "status": "error",
+                "content": "tool input validation failed",
+                "error": "validation_error",
+                "details": {"errors": validation_errors},
+            }
         handler = self._builtin_tool_handlers().get(tool_name)
         if tool_spec and not handler:
             handler = self._builtin_tool_handlers().get(tool_spec.get("handler"))
@@ -1740,7 +1901,22 @@ class WorkflowEngine:
         future = self._tool_executor.submit(_run_handler)
         cancelled = False
         try:
-            return future.result(timeout=timeout)
+            result = future.result(timeout=timeout)
+            sanitized = self._sanitize_html_untrusted(result)
+            output_errors = self._validate_tool_payload(
+                sanitized,
+                tool_spec.get("output_schema") if tool_spec else None,
+                phase="output",
+                tool_name=tool_name,
+            )
+            if output_errors:
+                return {
+                    "status": "error",
+                    "content": "tool output validation failed",
+                    "error": "validation_error",
+                    "details": {"errors": output_errors},
+                }
+            return sanitized
         except concurrent.futures.TimeoutError:
             self.logger.warning("tool_timeout", tool=tool_name, timeout=timeout)
             cancelled = future.cancel()
@@ -1902,6 +2078,9 @@ class WorkflowEngine:
             allowed_ctx_ids, message, user_id=user_id, tenant_id=tenant_id
         )
         context_snippets = [c.text for c in ctx_chunks]
+        context_snippets, history = self._apply_prompt_budget(
+            message, context_snippets, history
+        )
         try:
             resp = self.llm.generate(
                 message or "",

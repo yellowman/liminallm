@@ -7,9 +7,10 @@ consistent behavior across storage backends.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from ipaddress import ip_address
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional
 
 # Import from canonical location to avoid duplication
 from liminallm.service.embeddings import (
@@ -36,6 +37,41 @@ def compute_text_embedding(text: Optional[str], dim: int = 64) -> List[float]:
     if not text:
         return []
     return deterministic_embedding(text, dim=dim)
+
+
+# ============================================================================
+# POLICY COMPLIANCE FILTERING (SPEC §15.1)
+# ============================================================================
+
+_DEFAULT_POLICY_BLOCKLIST = (
+    re.compile(r"<script", re.IGNORECASE),
+    re.compile(r"(?i)child\s+sexual|csam"),
+    re.compile(r"(?i)terror|bomb|explosive|weapon"),
+)
+
+
+def ensure_policy_compliant_texts(
+    texts: Iterable[str | None], *, violation_context: Optional[Dict[str, Any]] = None
+) -> None:
+    """Raise ConstraintViolation if any text violates basic policy filters.
+
+    The blocklist is intentionally conservative to keep training data free of
+    obviously disallowed content. SPEC §15.1 requires preference events to be
+    policy-compliant before they are persisted or used for training.
+    """
+
+    for text in texts:
+        if not text:
+            continue
+        for pattern in _DEFAULT_POLICY_BLOCKLIST:
+            if pattern.search(text):
+                raise ConstraintViolation(
+                    "preference policy violation",
+                    {
+                        "pattern": pattern.pattern,
+                        **(violation_context or {}),
+                    },
+                )
 
 
 # ============================================================================
@@ -281,6 +317,21 @@ def normalize_preference_weight(weight: Optional[float]) -> float:
     return weight if weight is not None else 1.0
 
 
+def normalize_optional_text(value: Optional[str]) -> Optional[str]:
+    """Standardize optional text fields across storage backends.
+
+    Empty strings are treated as missing values so both in-memory and Postgres
+    stores persist `None` rather than backend-specific empty strings. This
+    avoids subtle discrepancies when round-tripping optional text attributes
+    such as user handles or cluster labels. (docs/ISSUES.md §24.4)
+    """
+
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
 # ============================================================================
 # SEMANTIC CLUSTER HELPERS
 # ============================================================================
@@ -424,6 +475,33 @@ def get_default_tool_specs() -> List[dict]:
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
+
+
+def blend_centroid(
+    previous: Optional[List[float]], update: Optional[List[float]], alpha: float = 0.5
+) -> List[float]:
+    """Compute an exponential moving average of centroid vectors."""
+
+    if not update:
+        return list(previous or [])
+    if not previous:
+        return list(update)
+    weight = max(0.0, min(1.0, alpha))
+    size = max(len(previous), len(update))
+    padded_prev = list(previous) + [0.0] * (size - len(previous))
+    padded_update = list(update) + [0.0] * (size - len(update))
+    return [
+        (1.0 - weight) * p + weight * u for p, u in zip(padded_prev, padded_update)
+    ]
+
+
+def clamp_success_score(score: Optional[float]) -> float:
+    """Clamp success_score into [-1, 1] for router state tracking."""
+
+    if score is None:
+        return 0.0
+    return max(-1.0, min(1.0, float(score)))
+
 
 def safe_row_value(row: Any, key: str, default: Optional[Any] = None) -> Optional[Any]:
     """Safely extract value from row dict or object.

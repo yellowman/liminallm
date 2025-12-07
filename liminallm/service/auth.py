@@ -554,9 +554,6 @@ class AuthService:
                 if not identity.get("provider_uid"):
                     self.logger.error("oauth_identity_missing_uid", provider=provider)
                     return None
-                if not identity.get("email"):
-                    self.logger.error("oauth_identity_missing_email", provider=provider)
-                    return None
 
                 # For GitHub, we may need to fetch email separately
                 if provider == "github" and not identity.get("email"):
@@ -572,6 +569,10 @@ class AuthService:
                         )
                         if primary_email:
                             identity["email"] = primary_email
+
+                if not identity.get("email"):
+                    self.logger.error("oauth_identity_missing_email", provider=provider)
+                    return None
 
                 self.logger.info(
                     "oauth_exchange_success",
@@ -636,7 +637,10 @@ class AuthService:
                 stored = await self.cache.pop_oauth_state(state)
                 cache_state_used = stored is not None
             except Exception as exc:
-                self.logger.warning("pop_oauth_state_failed", error=str(exc))
+                # Issue 53.9: Fail closed if cache state cannot be retrieved to
+                # avoid stale OAuth state reuse
+                self.logger.error("pop_oauth_state_failed", error=str(exc))
+                return None, None, {}
         # Issue 28.4: Thread-safe state mutation
         with self._state_lock:
             if stored is None:
@@ -902,8 +906,8 @@ class AuthService:
 
         sess = self.store.get_session(actual_session_id)
         if not sess and self.cache:
-            cached_user = await self.cache.get_session_user(actual_session_id)
-            if not cached_user:
+            found, cached_user = await self.cache.get_session_user(actual_session_id)
+            if not found or not cached_user:
                 return None
             sess = self.store.get_session(actual_session_id)
         if not sess:
@@ -1234,13 +1238,12 @@ class AuthService:
             return False
         pwd_hash, algo = self._hash_password(new_password)
         self.store.save_password(user.id, pwd_hash, algo)
-        if hasattr(self.store, "revoke_user_sessions"):
-            try:
-                self.store.revoke_user_sessions(user.id)  # type: ignore[attr-defined]
-            except Exception as exc:
-                self.logger.warning(
-                    "revoke_sessions_failed", user_id=user.id, error=str(exc)
-                )
+        try:
+            await self.revoke_all_user_sessions(user.id)
+        except Exception as exc:
+            self.logger.warning(
+                "revoke_sessions_failed", user_id=user.id, error=str(exc)
+            )
         if self.cache:
             await self.cache.client.delete(f"reset:{token}")
         self.logger.info("password_reset_completed", user_id=user.id)

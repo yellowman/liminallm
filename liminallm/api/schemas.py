@@ -8,6 +8,11 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from liminallm.service.tokenizer_utils import (
+    MAX_GENERATION_TOKENS,
+    estimate_token_count,
+)
+
 # Issue 46.1: Maximum nested JSON depth to prevent deserialization bombs
 MAX_JSON_DEPTH = 20
 # Issue 46.2: Maximum array items to prevent memory exhaustion
@@ -131,10 +136,8 @@ class Envelope(BaseModel):
     request_id: str = Field(default_factory=lambda: str(uuid4()))
 
 
-_EMAIL_REGEX = re.compile(
-    r"^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
-    r"(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$"
-)
+_EMAIL_LOCAL_PART = re.compile(r"^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+$")
+_EMAIL_DOMAIN_LABEL = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$")
 
 
 def _validate_email(value: str) -> str:
@@ -151,8 +154,14 @@ def _validate_email(value: str) -> str:
         raise ValueError("invalid email address")
     if len(local) > 64:
         raise ValueError("email local part too long")
-    if not _EMAIL_REGEX.match(normalized):
+    if not _EMAIL_LOCAL_PART.match(local):
         raise ValueError("invalid email address format")
+    domain_parts = domain.split(".")
+    if len(domain_parts) < 2:
+        raise ValueError("invalid email address format")
+    for label in domain_parts:
+        if len(label) > 63 or not _EMAIL_DOMAIN_LABEL.match(label):
+            raise ValueError("invalid email address format")
     return normalized
 
 
@@ -202,6 +211,14 @@ class SignupRequest(BaseModel):
     def _validate_handle(cls, value: Optional[str]) -> Optional[str]:
         return _validate_handle(value)
 
+    @model_validator(mode="after")
+    def _reject_tenant_id(self):
+        # Issue 53.2: tenant_id must be derived from server config per SPEC §12
+        if getattr(self, "tenant_id", None):
+            raise ValueError("tenant_id is managed server-side and cannot be provided")
+        self.tenant_id = None
+        return self
+
 
 class AuthResponse(BaseModel):
     user_id: str
@@ -245,6 +262,14 @@ class TokenRefreshRequest(BaseModel):
 class OAuthStartRequest(BaseModel):
     redirect_uri: Optional[str] = Field(default=None, max_length=2048)
     tenant_id: Optional[str] = Field(default=None, max_length=128)
+
+    @model_validator(mode="after")
+    def _reject_oauth_tenant(self):
+        # Issue 53.3: tenant_id must be bound to server-created OAuth state
+        if getattr(self, "tenant_id", None):
+            raise ValueError("tenant_id is derived from OAuth state, not request input")
+        self.tenant_id = None
+        return self
 
 
 class OAuthStartResponse(BaseModel):
@@ -348,6 +373,15 @@ class ChatMessage(BaseModel):
     def _validate_content_struct(cls, value: Optional[dict]) -> Optional[dict]:
         return _validate_dict_field(value, "content_struct")
 
+    @field_validator("content")
+    @classmethod
+    def _validate_token_budget(cls, value: str) -> str:
+        if estimate_token_count(value) > MAX_GENERATION_TOKENS:
+            raise ValueError(
+                f"message exceeds maximum token budget of {MAX_GENERATION_TOKENS}"
+            )
+        return value
+
 
 class ChatRequest(BaseModel):
     # Issue 46.3: Add max_length to string fields
@@ -391,12 +425,16 @@ class _SchemaPayload(BaseModel):
         if value is None:
             return value
         _validate_json_depth(value)
+        try:
+            json.dumps(value)
+        except TypeError as exc:
+            raise ValueError("schema must be JSON-serializable") from exc
         return value
 
 
 class ArtifactRequest(_SchemaPayload):
     # Issue 46.3: Add max_length to string fields
-    type: Optional[str] = Field(None, max_length=64)
+    type: str = Field(..., max_length=64)
     name: str = Field(..., max_length=256)
     description: Optional[str] = Field("", max_length=4096)
 

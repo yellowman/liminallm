@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import random
 import uuid
+from contextlib import suppress
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
@@ -403,12 +404,15 @@ class TrainingService:
             meta["adapter_gates"] = adapter_gates
         if notes:
             meta["notes"] = notes
+        normalized_score = self._normalize_feedback_score(
+            feedback=feedback, explicit_signal=explicit_signal, score=score
+        )
         event = self.store.record_preference_event(
             user_id=user_id,
             conversation_id=conversation_id,
             message_id=message_id,
             feedback=feedback,
-            score=score,
+            score=normalized_score,
             corrected_text=corrected_text,
             context_text=context_text,
             weight=weight,
@@ -694,10 +698,47 @@ class TrainingService:
     def _update_latest_symlink(self, adapter_dir: Path, version_dir: Path) -> None:
         latest = adapter_dir / "latest"
         temp = adapter_dir / f".latest.{uuid.uuid4()}"
-        if temp.exists() or temp.is_symlink():
-            temp.unlink()
-        temp.symlink_to(version_dir, target_is_directory=True)
-        temp.replace(latest)
+        try:
+            if temp.exists() or temp.is_symlink():
+                temp.unlink()
+            temp.symlink_to(version_dir, target_is_directory=True)
+            temp.replace(latest)
+        except OSError as exc:
+            logger.warning(
+                "update_latest_symlink_failed",
+                adapter_dir=str(adapter_dir),
+                version_dir=str(version_dir),
+                error=str(exc),
+            )
+            with suppress(FileNotFoundError):
+                temp.unlink(missing_ok=True)  # type: ignore[arg-type]
+            raise
+
+    @staticmethod
+    def _normalize_feedback_score(
+        *, feedback: str, explicit_signal: Optional[str], score: Optional[float]
+    ) -> Optional[float]:
+        """Normalize feedback scores to [-1, 1] per SPEC §2.6.
+
+        - If a score is provided, clamp to [-1, 1].
+        - Otherwise, derive from feedback/explicit_signal strings.
+        """
+
+        if score is not None:
+            try:
+                normalized = float(score)
+            except (TypeError, ValueError):
+                return None
+            return max(-1.0, min(1.0, normalized))
+
+        signal = (explicit_signal or feedback or "").lower()
+        if signal in {"positive", "like", "always"}:
+            return 1.0
+        if signal in {"negative", "dislike", "never"}:
+            return -1.0
+        if signal == "neutral":
+            return 0.0
+        return None
 
     def _init_lora_weights(
         self, rank: int, layers: List[int], matrices: List[str]

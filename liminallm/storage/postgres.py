@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
+import time
 import uuid
 from datetime import datetime
 from ipaddress import ip_address
@@ -25,9 +27,13 @@ from liminallm.service.bm25 import (
     tokenize_text as _tokenize_text,
 )
 from liminallm.storage.common import (
+    blend_centroid,
+    clamp_success_score,
     compute_text_embedding,
+    ensure_policy_compliant_texts,
     get_default_chat_workflow_schema,
     get_default_tool_specs,
+    normalize_optional_text,
 )
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
@@ -59,6 +65,8 @@ class PostgresStore:
         self.dsn = dsn
         self.fs_root = Path(fs_root)
         self.logger = get_logger(__name__)
+        self._connect_max_retries = 3
+        self._connect_retry_backoff = 0.25
 
         try:
             self.fs_root.mkdir(parents=True, exist_ok=True)
@@ -116,12 +124,39 @@ class PostgresStore:
             )
             raise
 
+    async def close(self) -> None:
+        """Close the connection pool for graceful shutdown (Issues 57.7, 59.1)."""
+
+        try:
+            self.pool.close()
+            # wait_closed is synchronous; run in thread to avoid blocking event loop callers
+            await asyncio.to_thread(self.pool.wait_closed)
+            self.logger.info("postgres_pool_closed")
+        except Exception as exc:
+            self.logger.warning("postgres_pool_close_failed", error=str(exc))
+
     def _cache_session(self, session: Session) -> Session:
         """Store session in the in-memory cache and return it.
 
         Thread-safe per SPEC §18 inference/adapter cache discipline.
         """
         with self._session_lock:
+            now = datetime.now(timezone.utc)
+
+            def _is_expired(session: Session) -> bool:
+                if session.expires_at is None:
+                    return False
+                expires_at = (
+                    session.expires_at
+                    if session.expires_at.tzinfo
+                    else session.expires_at.replace(tzinfo=timezone.utc)
+                )
+                return expires_at <= now
+
+            # First prune any expired sessions to avoid evicting valid ones (Issue 53.10)
+            expired_ids = [sid for sid, sess in self.sessions.items() if _is_expired(sess)]
+            for sid in expired_ids:
+                self.sessions.pop(sid, None)
             # Evict soonest-to-expire entries if cache is at capacity
             if len(self.sessions) >= _MAX_SESSION_CACHE_SIZE:
                 # Remove ~10% of entries closest to expiration
@@ -158,6 +193,23 @@ class PostgresStore:
             self.sessions[session_id] = sess
 
     def _connect(self):
+        attempt = 0
+        last_exc: Exception | None = None
+        while attempt < self._connect_max_retries:
+            try:
+                return self.pool.connection()
+            except Exception as exc:
+                last_exc = exc
+                attempt += 1
+                self.logger.warning(
+                    "postgres_connect_retry",
+                    attempt=attempt,
+                    max_attempts=self._connect_max_retries,
+                    error=str(exc),
+                )
+                time.sleep(self._connect_retry_backoff * attempt)
+        if last_exc:
+            raise last_exc
         return self.pool.connection()
 
     def _ensure_runtime_config_table(self) -> None:
@@ -353,6 +405,14 @@ class PostgresStore:
                     "preference message conversation mismatch",
                     {"message_id": message_id, "conversation_id": conversation_id},
                 )
+            ensure_policy_compliant_texts(
+                (msg_row.get("content"), context_text, corrected_text),
+                violation_context={
+                    "message_id": message_id,
+                    "conversation_id": conversation_id,
+                    "user_id": user_id,
+                },
+            )
             embedding = context_embedding or compute_text_embedding(
                 context_text or msg_row.get("content")
             )
@@ -528,19 +588,21 @@ class PostgresStore:
         now = datetime.utcnow()
         existing = self.get_semantic_cluster(cid)
         created_at = existing.created_at if existing else now
+        normalized_label = normalize_optional_text(
+            label if label is not None else (existing.label if existing else None)
+        )
+        normalized_description = normalize_optional_text(
+            description
+            if description is not None
+            else (existing.description if existing else None)
+        )
         cluster = SemanticCluster(
             id=cid,
             user_id=user_id,
             centroid=list(centroid),
             size=size,
-            label=(
-                label if label is not None else (existing.label if existing else None)
-            ),
-            description=(
-                description
-                if description is not None
-                else (existing.description if existing else None)
-            ),
+            label=normalized_label,
+            description=normalized_description,
             sample_message_ids=sample_message_ids
             or (existing.sample_message_ids if existing else []),
             created_at=created_at,
@@ -580,8 +642,12 @@ class PostgresStore:
             user_id=user_id,
             centroid=cluster.centroid,
             size=size,
-            label=row.get("label") if row else cluster.label,
-            description=row.get("description") if row else cluster.description,
+            label=normalize_optional_text(row.get("label")) if row else cluster.label,
+            description=(
+                normalize_optional_text(row.get("description"))
+                if row
+                else cluster.description
+            ),
             sample_message_ids=(
                 row.get("sample_message_ids") if row else cluster.sample_message_ids
             ),
@@ -605,6 +671,12 @@ class PostgresStore:
             return None
         new_centroid = list(centroid) if centroid is not None else existing.centroid
         new_size = size if size is not None else existing.size
+        new_label = normalize_optional_text(
+            label if label is not None else existing.label
+        )
+        new_description = normalize_optional_text(
+            description if description is not None else existing.description
+        )
         with self._connect() as conn:
             row = conn.execute(
                 """
@@ -619,8 +691,8 @@ class PostgresStore:
                 RETURNING *
                 """,
                 (
-                    label if label is not None else existing.label,
-                    description if description is not None else existing.description,
+                    new_label,
+                    new_description,
                     new_centroid,
                     new_size,
                     meta if meta is not None else existing.meta,
@@ -634,8 +706,8 @@ class PostgresStore:
             user_id=row.get("user_id"),
             centroid=row.get("centroid", new_centroid) or [],
             size=row.get("size", new_size),
-            label=row.get("label"),
-            description=row.get("description"),
+            label=normalize_optional_text(row.get("label")),
+            description=normalize_optional_text(row.get("description")),
             sample_message_ids=row.get("sample_message_ids") or [],
             created_at=row.get("created_at", existing.created_at),
             updated_at=row.get("updated_at", datetime.utcnow()),
@@ -661,8 +733,8 @@ class PostgresStore:
                 user_id=row.get("user_id"),
                 centroid=row.get("centroid") or [],
                 size=row.get("size", 0),
-                label=row.get("label"),
-                description=row.get("description"),
+                label=normalize_optional_text(row.get("label")),
+                description=normalize_optional_text(row.get("description")),
                 sample_message_ids=row.get("sample_message_ids") or [],
                 created_at=row.get("created_at", datetime.utcnow()),
                 updated_at=row.get("updated_at", datetime.utcnow()),
@@ -934,6 +1006,7 @@ class PostgresStore:
         user_id = str(uuid.uuid4())
         normalized_meta = meta.copy() if meta else {}
         normalized_meta.setdefault("email_verified", False)
+        normalized_handle = normalize_optional_text(handle)
         try:
             with self._connect() as conn:
                 conn.execute(
@@ -944,7 +1017,7 @@ class PostgresStore:
                     (
                         user_id,
                         email,
-                        handle,
+                        normalized_handle,
                         tenant_id,
                         role,
                         plan_tier,
@@ -957,7 +1030,7 @@ class PostgresStore:
         return User(
             id=user_id,
             email=email,
-            handle=handle,
+            handle=normalized_handle,
             tenant_id=tenant_id,
             role=role,
             plan_tier=plan_tier,
@@ -1447,10 +1520,13 @@ class PostgresStore:
         # to prevent MFA bypass via transient database failures
         try:
             with self._connect() as conn:
-                conn.execute(
+                result = conn.execute(
                     "UPDATE auth_session SET mfa_verified = TRUE WHERE id = %s",
                     (session_id,),
                 )
+                # If no row was updated, treat as failure and do not mutate cache
+                if getattr(result, "rowcount", 0) == 0:
+                    raise RuntimeError("session_update_failed")
             # Only update cache after successful DB commit
             self._update_cached_session(session_id, mfa_verified=True)
         except Exception as exc:
@@ -1740,8 +1816,13 @@ class PostgresStore:
         - If visibility='shared': shared artifacts within user's tenant
         - If no visibility filter: user's private + all global + shared within tenant
         """
-        offset = max(page - 1, 0) * max(page_size, 1)
-        limit = max(page_size, 1)
+        # SPEC pagination: default 100, cap 500 to avoid unbounded scans
+        max_page_size = 500
+        requested_page_size = max(page_size, 1)
+        capped_page_size = min(requested_page_size, max_page_size)
+        # Allow one extra record for has_next detection when caller requests page_size + 1
+        limit = capped_page_size + (1 if requested_page_size > capped_page_size else 0)
+        offset = max(page - 1, 0) * capped_page_size
         with self._connect() as conn:
             clauses = []
             params: list[Any] = []
@@ -1869,6 +1950,7 @@ class PostgresStore:
         version_author: Optional[str] = None,
         change_note: Optional[str] = None,
     ) -> Artifact:
+        normalized_description = normalize_optional_text(description)
         try:
             validate_artifact(type_, schema)
         except ArtifactValidationError as exc:
@@ -1885,7 +1967,7 @@ class PostgresStore:
                         owner_user_id,
                         type_,
                         name,
-                        description,
+                        normalized_description,
                         json.dumps(schema),
                         fs_path,
                         schema.get("base_model"),
@@ -1911,7 +1993,7 @@ class PostgresStore:
             id=artifact_id,
             type=type_,
             name=name,
-            description=description,
+            description=normalized_description or "",
             schema=schema,
             owner_user_id=owner_user_id,
             fs_path=fs_path,
@@ -2063,9 +2145,49 @@ class PostgresStore:
     def persist_artifact_payload(self, artifact_id: str, schema: dict) -> str:
         """Public wrapper kept for parity with MemoryStore."""
 
-        existing = self.list_artifact_versions(artifact_id)
-        next_version = (existing[0].version + 1) if existing else 1
-        return self._persist_payload(artifact_id, next_version, schema)
+        with self._connect() as conn, conn.transaction():
+            artifact_row = conn.execute(
+                "SELECT id, schema, base_model FROM artifact WHERE id = %s FOR UPDATE",
+                (artifact_id,),
+            ).fetchone()
+            if not artifact_row:
+                raise ConstraintViolation(
+                    "artifact missing", {"artifact_id": artifact_id}
+                )
+            version_row = conn.execute(
+                "SELECT COALESCE(MAX(version), 0) AS v FROM artifact_version WHERE artifact_id = %s FOR UPDATE",
+                (artifact_id,),
+            ).fetchone()
+            next_version = (version_row["v"] or 0) + 1
+            fs_path = self._persist_payload(artifact_id, next_version, schema)
+
+            base_model = schema.get("base_model")
+            existing_schema = artifact_row.get("schema") if isinstance(artifact_row, dict) else None
+            if not base_model and existing_schema:
+                if isinstance(existing_schema, str):
+                    try:
+                        existing_schema = json.loads(existing_schema)
+                    except Exception:
+                        existing_schema = {}
+                base_model = (existing_schema or {}).get("base_model")
+
+            conn.execute(
+                "UPDATE artifact SET schema = %s, fs_path = %s, base_model = %s, updated_at = now() WHERE id = %s",
+                (json.dumps(schema), fs_path, base_model, artifact_id),
+            )
+            conn.execute(
+                "INSERT INTO artifact_version (artifact_id, version, schema, fs_path, base_model, created_by, change_note) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (
+                    artifact_id,
+                    next_version,
+                    json.dumps(schema),
+                    fs_path,
+                    base_model,
+                    "system_llm",
+                    None,
+                ),
+            )
+        return fs_path
 
     def get_latest_workflow(self, workflow_id: str) -> Optional[dict]:
         with self._connect() as conn:
@@ -2131,6 +2253,93 @@ class PostgresStore:
                 )
             )
         return states
+
+    def update_adapter_router_state(
+        self,
+        adapter_id: str,
+        *,
+        centroid_vec: Optional[list[float]] = None,
+        success_score: Optional[float] = None,
+        last_used_at: Optional[datetime] = None,
+        last_trained_at: Optional[datetime] = None,
+    ) -> AdapterRouterState:
+        """Upsert adapter router state with EMA centroids and bounded scores."""
+
+        with self._connect() as conn, conn.transaction():
+            artifact_row = conn.execute(
+                "SELECT id, base_model FROM artifact WHERE id = %s FOR UPDATE",
+                (adapter_id,),
+            ).fetchone()
+            if not artifact_row:
+                raise ConstraintViolation(
+                    "adapter missing for router state", {"adapter_id": adapter_id}
+                )
+
+            existing = conn.execute(
+                "SELECT * FROM adapter_router_state WHERE artifact_id = %s FOR UPDATE",
+                (adapter_id,),
+            ).fetchone()
+
+            merged_centroid = blend_centroid(
+                existing.get("centroid_vec") if existing else None, centroid_vec
+            )
+            merged_success = clamp_success_score(
+                success_score
+                if success_score is not None
+                else (existing.get("success_score") if existing else 0.0)
+            )
+            usage_count = existing.get("usage_count", 0) if existing else 0
+            merged_last_used = last_used_at or (existing.get("last_used_at") if existing else None)
+            merged_last_trained = last_trained_at or (
+                existing.get("last_trained_at") if existing else None
+            )
+            meta = existing.get("meta") if existing else None
+            if isinstance(meta, str):
+                try:
+                    meta = json.loads(meta)
+                except Exception:
+                    meta = None
+
+            if existing:
+                conn.execute(
+                    "UPDATE adapter_router_state SET centroid_vec = %s, usage_count = %s, "
+                    "success_score = %s, last_used_at = %s, last_trained_at = %s, meta = %s "
+                    "WHERE artifact_id = %s",
+                    (
+                        merged_centroid or None,
+                        usage_count,
+                        merged_success,
+                        merged_last_used,
+                        merged_last_trained,
+                        json.dumps(meta) if isinstance(meta, dict) else meta,
+                        adapter_id,
+                    ),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO adapter_router_state (artifact_id, centroid_vec, usage_count, success_score, last_used_at, last_trained_at, meta) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        adapter_id,
+                        merged_centroid or None,
+                        usage_count,
+                        merged_success,
+                        merged_last_used,
+                        merged_last_trained,
+                        json.dumps(meta) if isinstance(meta, dict) else meta,
+                    ),
+                )
+
+        return AdapterRouterState(
+            artifact_id=adapter_id,
+            base_model=artifact_row.get("base_model") if artifact_row else None,
+            centroid_vec=merged_centroid or None,
+            usage_count=usage_count,
+            success_score=merged_success,
+            last_used_at=merged_last_used,
+            last_trained_at=merged_last_trained,
+            meta=meta,
+        )
 
     def record_config_patch(
         self, artifact_id: str, proposer: str, patch: dict, justification: Optional[str]
