@@ -354,6 +354,8 @@ return {1, tokens, 0}
         if isinstance(expires_raw, str):
             try:
                 expires_at = datetime.fromisoformat(expires_raw)
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
             except (ValueError, TypeError):
                 pass  # Use default current UTC time
         return data.get("provider"), expires_at, data.get("tenant_id")
@@ -987,6 +989,8 @@ class SyncRedisCache:
         if isinstance(expires_raw, str):
             try:
                 expires_at = datetime.fromisoformat(expires_raw)
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
             except (ValueError, TypeError):
                 pass  # Use default current UTC time
         return data.get("provider"), expires_at, data.get("tenant_id")
