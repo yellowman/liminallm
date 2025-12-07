@@ -3731,12 +3731,16 @@ The `_local_idempotency` dictionary grows indefinitely with no maximum size limi
 
 **Impact:** With 24-hour TTL and thousands of users, memory can grow to gigabytes, causing OOM.
 
+**Status:** ✅ Fixed. In-memory idempotency records now prune expired entries and enforce a bounded cache (default 5,000 entries) during get/set/acquire operations, with logged cleanups to prevent unbounded growth. (See `liminallm/service/runtime.py:257-330, 412-500`.)
+
 ### 57.2 CRITICAL: Unbounded Rate Limit Cache Growth
 **Location:** `liminallm/service/runtime.py:160, 278-285`
 
 The `_local_rate_limits` dictionary accumulates rate limit tracking indefinitely. Old keys never expire.
 
 **Impact:** Rate limit keys for every unique user:resource:action combination persist forever.
+
+**Status:** ✅ Fixed. Local rate-limit fallback now performs periodic cleanup of stale entries, evicts oldest records past a bounded size, and logs cleanup activity to prevent unbounded growth. (See `liminallm/service/runtime.py:520-583`.)
 
 ### 57.3 HIGH: Unbounded Active Requests Dictionary
 **Location:** `liminallm/api/routes.py:112-125`
@@ -3753,6 +3757,8 @@ ThreadPoolExecutor is only shutdown via `__del__`, which is unreliable and may n
 
 Redis pipeline objects created without explicit cleanup. Errors during execute() could leave pipeline in undefined state.
 
+**Status:** ✅ Fixed. All async and sync Redis pipeline usages now use context managers to ensure proper disposal and execution even on exceptions. (See `liminallm/storage/redis_cache.py:140-173, 820-867`.)
+
 ### 57.6 HIGH: Asyncio Task Created Without Proper Cancellation Guarantee
 **Location:** `liminallm/api/routes.py:2938-2977`
 
@@ -3762,6 +3768,8 @@ Redis pipeline objects created without explicit cleanup. Errors during execute()
 **Location:** `liminallm/storage/postgres.py:63-68`
 
 ConnectionPool created but never explicitly closed. No `__del__` or cleanup method.
+
+**Status:** ✅ Fixed. PostgresStore now exposes an async `close()` that closes and waits for the pool to drain, and the FastAPI lifespan calls `runtime.close()` to invoke it during shutdown. (See `liminallm/storage/postgres.py:1-29, 81-97` and `liminallm/app.py:65-79`.)
 
 ### 57.8 MEDIUM: Unsafe Asyncio Event Loop Handling in reset_runtime
 **Location:** `liminallm/service/runtime.py:182-192`
@@ -3786,6 +3794,8 @@ Check-and-act race condition on email verification tokens without synchronizatio
 **Location:** `liminallm/service/runtime.py:164-171`
 
 Double-checked locking antipattern without synchronization. Race condition can create multiple Runtime instances.
+
+**Status:** ✅ Fixed. Runtime creation now holds the singleton lock for all accesses, eliminating the unsynchronized fast path and preventing duplicate instances. (See `liminallm/service/runtime.py:318-346`.)
 
 ### 58.4 CRITICAL: Thread-Unsafe revoked_refresh_tokens Set Operations
 **Location:** `liminallm/service/auth.py:130, 1042, 1058`
@@ -3833,6 +3843,8 @@ The tool_registry dictionary mutated without synchronization while being read.
 
 PostgresStore creates ConnectionPool but never closes it. App lifespan shutdown has no pool cleanup.
 
+**Status:** ✅ Fixed. FastAPI shutdown now awaits `runtime.close()`, which calls the new `PostgresStore.close()` to close and drain the pool. (See `liminallm/app.py:60-69` and `liminallm/storage/postgres.py:120-129`.)
+
 ### 59.2 CRITICAL: Missing Redis Cache Cleanup on App Shutdown
 **Location:** `liminallm/app.py:25-49`, `liminallm/service/runtime.py:31-162`
 
@@ -3854,6 +3866,8 @@ All Redis operations have NO retry logic for transient failures.
 **Location:** `liminallm/service/voice.py:49-58`, `liminallm/app.py:25-49`
 
 VoiceService creates httpx.AsyncClient that has close() method but never called.
+
+**Status:** ✅ Fixed. VoiceService exposes `close()` to dispose of the AsyncClient, and `runtime.close()` invoked from FastAPI lifespan now calls it during shutdown. (See `liminallm/service/voice.py:37-65` and `liminallm/app.py:65-79`.)
 
 ### 59.6 HIGH: Workflow Engine ThreadPoolExecutor Cleanup Uses Unreliable __del__
 **Location:** `liminallm/service/workflow.py:122, 1869-1873`

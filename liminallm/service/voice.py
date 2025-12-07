@@ -57,6 +57,13 @@ class VoiceService:
             )
         return self._client
 
+    async def close(self) -> None:
+        """Close the underlying HTTP client (Issue 59.5)."""
+
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
     async def transcribe(
         self,
         audio_bytes: bytes,

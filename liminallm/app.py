@@ -64,13 +64,8 @@ async def lifespan(app: FastAPI):
             _cleanup_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await _cleanup_task
-        if runtime.training_worker:
-            await runtime.training_worker.stop()
-            logger.info("training_worker_stopped_on_shutdown")
-        # Issue 23.1: Explicitly shutdown workflow engine's executor
-        if runtime.workflow:
-            runtime.workflow.shutdown(wait=True)
-            logger.info("workflow_engine_shutdown_on_exit")
+        await runtime.close()
+        logger.info("runtime_cleanup_complete")
     except Exception as exc:
         logger.error("shutdown_failed", error=str(exc))
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import threading
 import uuid
@@ -115,6 +116,17 @@ class PostgresStore:
                 error=str(exc),
             )
             raise
+
+    async def close(self) -> None:
+        """Close the connection pool for graceful shutdown (Issues 57.7, 59.1)."""
+
+        try:
+            self.pool.close()
+            # wait_closed is synchronous; run in thread to avoid blocking event loop callers
+            await asyncio.to_thread(self.pool.wait_closed)
+            self.logger.info("postgres_pool_closed")
+        except Exception as exc:
+            self.logger.warning("postgres_pool_close_failed", error=str(exc))
 
     def _cache_session(self, session: Session) -> Session:
         """Store session in the in-memory cache and return it.
