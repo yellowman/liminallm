@@ -563,11 +563,13 @@ Redis rate limiting now uses an atomic Lua token bucket with weighted costs and 
 - Added `@field_validator("explicit_signal")` to validate signal values
 - Invalid signals raise validation error with list of valid options
 
-### 7.4 MEDIUM: Score Normalization Missing
+### 7.4 ~~MEDIUM: Score Normalization Missing~~ FIXED
 
-**SPEC §2.6 requires:** "score normalized [-1,1]"
+**Status:** ✅ IMPLEMENTED
 
-**Current:** Score validated but never normalized. No transformation from feedback type.
+**Location:** `liminallm/service/training.py`
+
+**Fix Applied:** Preference recording now normalizes scores to the SPEC-required [-1, 1] range. Explicit scores are clamped defensively, and implicit scores are derived from feedback/explicit_signal semantics (`positive/like/always`→1.0, `negative/dislike/never`→-1.0, `neutral`→0.0) before persistence.
 
 ---
 
@@ -997,25 +999,21 @@ Training jobs perform multiple database operations:
 
 **Fix:** Implement saga pattern or compensating transactions.
 
-### 20.3 HIGH: Unprotected File Operations
+### 20.3 ~~HIGH: Unprotected File Operations~~ FIXED
 
-**Location:** `liminallm/service/training.py:684-690`
+**Status:** ✅ IMPLEMENTED
 
-```python
-os.symlink(source, dest)  # No try/except
-```
+**Location:** `liminallm/service/training.py:680-705`
 
-Symlink operations can fail (permissions, existing file, invalid path) without error handling.
+**Fix Applied:** `_update_latest_symlink` now wraps symlink creation/replacement in an error-handling guard that logs failures, cleans up temporary links, and propagates the exception so callers can respond instead of silently continuing.
 
-### 20.4 HIGH: WebSocket Send Without Error Handling
+### 20.4 ~~HIGH: WebSocket Send Without Error Handling~~ FIXED
 
-**Location:** `liminallm/api/routes.py:2954-2980`
+**Status:** ✅ IMPLEMENTED
 
-```python
-await websocket.send_json(event)  # Can raise WebSocketDisconnect
-```
+**Location:** `liminallm/api/routes.py:4336-4370`
 
-WebSocket send failures not caught individually, can terminate entire stream prematurely.
+**Fix Applied:** Streaming WebSocket sends are now wrapped to catch disconnects/runtime send errors, set the cancel flag, and log context before exiting gracefully, preventing uncaught exceptions from leaking and ensuring cleanup runs.
 
 ### 20.5 HIGH: Database Connection Errors Not Retried
 
@@ -2206,21 +2204,21 @@ Connection pool max_size=10. With 100+ concurrent users, 90% block.
 
 **Impact:** Database connection starvation under load.
 
-### 38.7 MEDIUM: Email Validation ReDoS
+### 38.7 ~~MEDIUM: Email Validation ReDoS~~ FIXED
 
-**Location:** `liminallm/api/schemas.py:50-53`
+**Status:** ✅ IMPLEMENTED
 
-Email regex with nested quantifiers vulnerable to catastrophic backtracking.
+**Location:** `liminallm/api/schemas.py:130-170`
 
-**Impact:** Malformed emails cause CPU exhaustion.
+**Fix Applied:** Replaced the backtracking-prone email regex with deterministic label-by-label validation: normalized addresses split into local and domain parts, validated via bounded character classes, and domain labels checked iteratively for length/format to guarantee linear-time validation.
 
-### 38.8 MEDIUM: Active Requests Registry Memory Leak
+### 38.8 ~~MEDIUM: Active Requests Registry Memory Leak~~ FIXED
 
-**Location:** `liminallm/api/routes.py:112-119`
+**Status:** ✅ IMPLEMENTED
 
-`_active_requests` dict entries not cleaned up if WebSocket disconnects abnormally.
+**Location:** `liminallm/api/routes.py:146-237, 4336-4375`
 
-**Impact:** Memory leak from abandoned WebSocket connections.
+**Fix Applied:** Active WebSocket request entries are now cleaned on unregister with a follow-up stale sweep, and streaming sends catch disconnects/runtime send failures to set cancel flags and exit gracefully, ensuring registry entries are removed even on abnormal disconnects.
 
 ---
 

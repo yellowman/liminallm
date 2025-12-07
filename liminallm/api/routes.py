@@ -214,6 +214,7 @@ async def _unregister_cancel_event(request_id: str) -> None:
     """Unregister a cancel event when request completes."""
     async with _get_active_requests_lock():
         _active_requests.pop(request_id, None)
+    await _cleanup_stale_active_requests()
 
 
 async def _cancel_request(request_id: str, user_id: str) -> tuple[bool, str]:
@@ -4353,7 +4354,19 @@ async def websocket_chat(ws: WebSocket):
                     event_data = event.get("data")
 
                     # SPEC §18: WebSockets wrap as {"event": "token", "data": "...", "request_id": "..."}
-                    await ws.send_json({"event": event_type, "data": event_data, "request_id": request_id})
+                    try:
+                        await ws.send_json(
+                            {"event": event_type, "data": event_data, "request_id": request_id}
+                        )
+                    except WebSocketDisconnect:
+                        cancel_event.set()
+                        break
+                    except RuntimeError as exc:
+                        cancel_event.set()
+                        logger.warning(
+                            "websocket_send_failed", request_id=request_id, error=str(exc)
+                        )
+                        break
 
                     if event_type == "token":
                         if isinstance(event_data, str):

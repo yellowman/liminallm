@@ -131,10 +131,8 @@ class Envelope(BaseModel):
     request_id: str = Field(default_factory=lambda: str(uuid4()))
 
 
-_EMAIL_REGEX = re.compile(
-    r"^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
-    r"(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+$"
-)
+_EMAIL_LOCAL_PART = re.compile(r"^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+$")
+_EMAIL_DOMAIN_LABEL = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$")
 
 
 def _validate_email(value: str) -> str:
@@ -151,8 +149,14 @@ def _validate_email(value: str) -> str:
         raise ValueError("invalid email address")
     if len(local) > 64:
         raise ValueError("email local part too long")
-    if not _EMAIL_REGEX.match(normalized):
+    if not _EMAIL_LOCAL_PART.match(local):
         raise ValueError("invalid email address format")
+    domain_parts = domain.split(".")
+    if len(domain_parts) < 2:
+        raise ValueError("invalid email address format")
+    for label in domain_parts:
+        if len(label) > 63 or not _EMAIL_DOMAIN_LABEL.match(label):
+            raise ValueError("invalid email address format")
     return normalized
 
 
