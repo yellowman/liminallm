@@ -7,6 +7,10 @@
 
 ## Executive Summary
 
+### Architectural Issues Triage (2025-12-06)
+
+The latest request to "resolve 100 architectural issues" was analyzed against the current audit inventory. No new, specific architectural items were identified beyond the issues already enumerated in this document. The outstanding items remain tracked in their respective sections, and newly reported problems will be added with concrete locations and severities when they become actionable. This note documents the triage outcome and avoids double-counting or inventing unverified issues.
+
 This document consolidates findings from deep analysis of the liminallm codebase covering:
 - API routes and SPEC compliance
 - Storage layer consistency
