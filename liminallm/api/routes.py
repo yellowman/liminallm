@@ -3351,16 +3351,45 @@ async def upload_file(
         dest_path.parent.mkdir(parents=True, exist_ok=True)
 
         manifest_path = dest_dir / ".checksums.json"
-        existing_checksums: dict[str, str] = {}
+        existing_checksums: dict[str, Any] = {}
         if manifest_path.exists():
             try:
                 existing_checksums = json.loads(manifest_path.read_text())
             except Exception:
                 logger.warning("file_checksum_manifest_read_failed", path=str(manifest_path))
-        prior_checksum = existing_checksums.get(safe_filename)
+        prior_entry = existing_checksums.get(safe_filename)
+        prior_checksum: Optional[str] = None
+        prior_contexts: set[str] = set()
+        if isinstance(prior_entry, dict):
+            prior_checksum = prior_entry.get("checksum")
+            try:
+                prior_contexts = set(
+                    str(c) for c in prior_entry.get("contexts", []) if c is not None
+                )
+            except Exception:
+                prior_contexts = set()
+        elif isinstance(prior_entry, str):
+            prior_checksum = prior_entry
         if dest_path.exists() and prior_checksum == checksum:
+            chunk_count = None
+            if context_id and context_id not in prior_contexts:
+                _get_owned_context(runtime, context_id, principal)
+                chunk_count = runtime.rag.ingest_file(
+                    context_id, str(dest_path), chunk_size=chunk_size
+                )
+                prior_contexts.add(context_id)
+                try:
+                    existing_checksums[safe_filename] = {
+                        "checksum": checksum,
+                        "contexts": sorted(prior_contexts),
+                    }
+                    manifest_path.write_text(json.dumps(existing_checksums, indent=2))
+                except Exception:
+                    logger.warning(
+                        "file_checksum_manifest_write_failed", path=str(manifest_path)
+                    )
             resp = FileUploadResponse(
-                fs_path=safe_filename, context_id=context_id, chunk_count=None
+                fs_path=safe_filename, context_id=context_id, chunk_count=chunk_count
             )
             envelope = Envelope(status="ok", data=resp, request_id=idem.request_id)
             await idem.store_result(envelope)
@@ -3401,7 +3430,10 @@ async def upload_file(
 
         # Persist checksum manifest for deduplication (SPEC §2.5)
         try:
-            existing_checksums[safe_filename] = checksum
+            existing_checksums[safe_filename] = {
+                "checksum": checksum,
+                "contexts": [context_id] if context_id else [],
+            }
             manifest_path.write_text(json.dumps(existing_checksums, indent=2))
         except Exception:
             logger.warning(
