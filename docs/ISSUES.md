@@ -7,10 +7,6 @@
 
 ## Executive Summary
 
-### Architectural Issues Triage (2025-12-06)
-
-The latest request to "resolve 100 architectural issues" was analyzed against the current audit inventory. No new, specific architectural items were identified beyond the issues already enumerated in this document. The outstanding items remain tracked in their respective sections, and newly reported problems will be added with concrete locations and severities when they become actionable. This note documents the triage outcome and avoids double-counting or inventing unverified issues.
-
 ### Issue Closure Review (2025-12-07)
 
 The remaining free-form "**Issue:**" markers were re-reviewed against the current codebase. Each item is either already remediated in code or is a legacy false positive:
