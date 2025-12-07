@@ -1093,6 +1093,11 @@ async def refresh_tokens(
         body.refresh_token, tenant_hint=tenant_hint
     )
     if not user or not session:
+        logger.warning(
+            "refresh_invalid",
+            tenant_hint=tenant_hint,
+            has_header=bool(authorization),
+        )
         raise _http_error("unauthorized", "invalid refresh", status_code=401)
     _apply_session_cookies(
         response,
@@ -1425,6 +1430,7 @@ async def update_admin_settings(
 async def request_mfa(body: MFARequest, request: Request):
     runtime = get_runtime()
     client_ip = request.client.host if request.client else "unknown"
+    session_cookie = request.cookies.get("session_id")
     # Issue 50.1: Rate limit per IP first to prevent session enumeration attacks
     await _enforce_rate_limit(
         runtime,
@@ -1432,6 +1438,13 @@ async def request_mfa(body: MFARequest, request: Request):
         _get_rate_limit(runtime, "mfa_rate_limit_per_minute"),
         60,
     )
+    if not session_cookie or session_cookie != body.session_id:
+        logger.warning(
+            "mfa_request_missing_cookie",
+            ip=client_ip,
+            cookie_present=bool(session_cookie),
+        )
+        raise _http_error("unauthorized", "invalid session", status_code=401)
     auth_ctx = await runtime.auth.resolve_session(
         body.session_id, allow_pending_mfa=True
     )
@@ -1463,6 +1476,7 @@ async def request_mfa(body: MFARequest, request: Request):
 async def verify_mfa(body: MFAVerifyRequest, request: Request, response: Response):
     runtime = get_runtime()
     client_ip = request.client.host if request.client else "unknown"
+    session_cookie = request.cookies.get("session_id")
     # Issue 50.2: Rate limit per IP first to prevent brute force attacks
     await _enforce_rate_limit(
         runtime,
@@ -1470,6 +1484,13 @@ async def verify_mfa(body: MFAVerifyRequest, request: Request, response: Respons
         _get_rate_limit(runtime, "mfa_rate_limit_per_minute"),
         60,
     )
+    if not session_cookie or session_cookie != body.session_id:
+        logger.warning(
+            "mfa_verify_missing_cookie",
+            ip=client_ip,
+            cookie_present=bool(session_cookie),
+        )
+        raise _http_error("unauthorized", "invalid session", status_code=401)
     auth_ctx = await runtime.auth.resolve_session(
         body.session_id, allow_pending_mfa=True
     )

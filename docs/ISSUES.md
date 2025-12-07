@@ -3066,128 +3066,99 @@ This pass focused on 8 specialized security audit areas:
 
 ## 50. RBAC and Permission Security
 
-### 50.1 CRITICAL: MFA Request Endpoint Missing Authentication
-**Location:** `liminallm/api/routes.py:997-1012`
+### 50.1 ✅ FIXED: MFA Request Endpoint Requires Session Cookie Ownership
+**Location:** `liminallm/api/routes.py:1418-1456`
 
-The `POST /auth/mfa/request` endpoint does NOT require authentication and accepts an arbitrary `session_id` from the request body without validating ownership.
+`POST /auth/mfa/request` now requires the caller to present the session cookie matching the provided `session_id` and logs invalid attempts, preventing blind enumeration. IP-bound checks and rate limits remain in place.
 
-```python
-@router.post("/auth/mfa/request", response_model=Envelope, tags=["auth"])
-async def request_mfa(body: MFARequest):
-    auth_ctx = await runtime.auth.resolve_session(
-        body.session_id, allow_pending_mfa=True  # No ownership validation
-    )
-```
+### 50.2 ✅ FIXED: MFA Verify Endpoint Requires Session Cookie Ownership
+**Location:** `liminallm/api/routes.py:1461-1505`
 
-**Impact:** Attacker can enumerate session IDs and trigger MFA challenges for arbitrary other users' sessions.
+`POST /auth/mfa/verify` enforces the same cookie/session binding and logs invalid attempts before verifying codes, stopping unauthenticated MFA completion.
 
-### 50.2 CRITICAL: MFA Verify Endpoint Missing Session Ownership Validation
-**Location:** `liminallm/api/routes.py:1015-1050`
+### 50.3 ✅ FIXED: Admin User Role Modification Tenant Isolation
+**Location:** `liminallm/api/routes.py:1195-1225`
 
-The `POST /auth/mfa/verify` endpoint does NOT require authentication. An unauthenticated attacker can pass ANY session_id and attempt to verify MFA for that session without being the session owner.
+Tenant membership is enforced and audited before role changes; cross-tenant role updates now return `403`.
 
-**Impact:** **Account Takeover** - If a target user has MFA disabled, an attacker can receive valid tokens for the victim's session by enumerating session IDs.
+### 50.4 ✅ FIXED: Admin User Deletion Tenant Isolation
+**Location:** `liminallm/api/routes.py:1233-1261`
 
-### 50.3 CRITICAL: Admin User Role Modification Missing Tenant Isolation
-**Location:** `liminallm/api/routes.py:804-820`
+Deletes now validate tenant ownership and emit audit logs, preventing cross-tenant deletion.
 
-The `POST /admin/users/{user_id}/role` endpoint does NOT validate that the target `user_id` belongs to the admin's tenant.
+### 50.5 ✅ FIXED: Chat Request Cancellation Ownership Validation
+**Location:** `liminallm/api/routes.py:1977-2027`
 
-**Impact:** Admins from Tenant A can promote/demote users from Tenant B, violating multi-tenant isolation.
+Cancellation calls validate ownership through `_cancel_request` and return `403` on mismatches, with rate limits applied.
 
-### 50.4 CRITICAL: Admin User Deletion Missing Tenant Isolation
-**Location:** `liminallm/api/routes.py:823-837`
+### 50.6 ✅ FIXED: Consistent Tenant Validation Across Admin Endpoints
+**Location:** Admin endpoints in `liminallm/api/routes.py`
 
-The `DELETE /admin/users/{user_id}` endpoint does NOT validate tenant isolation.
-
-**Impact:** Admins from one tenant can delete users from other tenants.
-
-### 50.5 HIGH: Chat Request Cancellation Missing Ownership Validation
-**Location:** `liminallm/api/routes.py:1472-1510`
-
-The `POST /chat/cancel` endpoint accepts a `request_id` but does NOT validate that the request belongs to the authenticated user.
-
-**Impact:** Attackers can cancel other users' active chat requests, causing denial of service.
-
-### 50.6 MEDIUM: Inconsistent Tenant Validation Across Admin Endpoints
-**Location:** Multiple admin endpoints in `liminallm/api/routes.py`
-
-- ✅ `/admin/users` (GET, line 759) - VALIDATES tenant
-- ✅ `/admin/users` (POST, line 781) - VALIDATES tenant
-- ❌ `/admin/users/{user_id}/role` (POST, line 804) - MISSING validation
-- ❌ `/admin/users/{user_id}` (DELETE, line 823) - MISSING validation
+All admin user mutation endpoints enforce tenant checks and emit audit logs for creation, role changes, and deletions.
 
 ---
 
 ## 51. Audit Logging and Compliance Gaps
 
-### 51.1 CRITICAL: Missing Audit Logging for User Signup
-**Location:** `liminallm/api/routes.py:525-570`
+### 51.1 ✅ FIXED: Audit Logging for User Signup
+**Location:** `liminallm/api/routes.py:885-934`
 
-User signup endpoint creates new accounts with **zero logging**. No record of success/failure, email created, timestamps, or tenant assignments.
+Signup now emits `user_signup_completed` with user_id/email; failures already log `login_failed`, satisfying GDPR/SOC2 traceability.
 
-**Compliance Impact:** FAILS GDPR requirement for user access logs and SOC2 accountability.
+### 51.2 ✅ FIXED: Audit Logging for Admin User Creation
+**Location:** `liminallm/api/routes.py:1137-1186`
 
-### 51.2 CRITICAL: Missing Audit Logging for Admin User Creation
-**Location:** `liminallm/api/routes.py:771-801`
+Admin user creation logs the acting admin, target user, role, and tenant.
 
-Privileged operation to create users has no logging of which admin created the user, user details, or timestamps.
+### 51.3 ✅ FIXED: Audit Logging for User Deletion
+**Location:** `liminallm/api/routes.py:1233-1261`
 
-**Compliance Impact:** CRITICAL for SOC2 Type II - no audit trail for privileged operations.
+Deletions emit `admin_user_deleted` with admin, user, email, and tenant context.
 
-### 51.3 CRITICAL: Missing Audit Logging for User Deletion
-**Location:** `liminallm/api/routes.py:824-837`
+### 51.4 ✅ FIXED: Audit Logging for Permission Changes
+**Location:** `liminallm/api/routes.py:1195-1225`
 
-User deletion operations are completely unlogged.
+Role changes are logged (`admin_role_changed`) with before/after roles and tenant.
 
-**Compliance Impact:** GDPR & SOC2 require audit trail of data deletion.
+### 51.5 ✅ FIXED: Failed Login Attempts Logged
+**Location:** `liminallm/api/routes.py:958-973`
 
-### 51.4 CRITICAL: Missing Audit Logging for Permission Changes
-**Location:** `liminallm/api/routes.py:805-820`
+Failed authentication attempts emit `login_failed` with email and IP.
 
-Role/permission changes are unlogged - no record of who changed what role.
+### 51.6 ✅ FIXED: Password Change/Reset Events Logged
+**Location:** `liminallm/service/auth.py:1137-1186`
 
-**Compliance Impact:** SOC2 requires detailed access control change logs.
+Password reset initiation and completion now log hashed email identifiers, user IDs, and invalid token attempts.
 
-### 51.5 CRITICAL: Failed Login Attempts Not Logged
-**Location:** `liminallm/api/routes.py:597-598`
+### 51.7 ✅ FIXED: Email Verification Events Logged
+**Location:** `liminallm/service/auth.py:1188-1248`
 
-Failed authentication attempts have no logging - cannot detect brute force attacks.
+Verification issuance and completion are logged; invalid tokens and missing users are audited.
 
-### 51.6 CRITICAL: Password Change Events Not Logged
-**Location:** `liminallm/api/routes.py:1277-1305`
+### 51.8 ✅ FIXED: Password Reset Completion Logged
+**Location:** `liminallm/service/auth.py:1137-1186`
 
-Credential changes completely unlogged - no audit trail for GDPR/SOC2 compliance.
+Password reset success/failure paths emit structured audit logs.
 
-### 51.7 CRITICAL: Email Verification Events Not Logged
-**Location:** `liminallm/service/auth.py:828-855`
-
-Email verification success/failure completely unlogged.
-
-### 51.8 CRITICAL: Password Reset Completion Not Logged
-**Location:** `liminallm/service/auth.py:788-810`
-
-Password recovery operations unlogged.
-
-### 51.9 CRITICAL: Session Revocation Not Logged
+### 51.9 ✅ FIXED: Session Revocation Logged
 **Location:** `liminallm/api/routes.py:1308-1332`
 
-Session termination completely unlogged - cannot audit user access patterns.
+Session termination already logs revocation outcomes per prior fixes.
 
-### 51.10 HIGH: PII (Email Addresses) Being Logged
-**Location:** `liminallm/service/email.py:65, 99, 103`
+### 51.10 ✅ FIXED: Email Addresses Redacted in Logs
+**Location:** `liminallm/service/email.py:18-208`
 
-Email addresses logged directly despite PII redaction being configured.
+Logging now redacts recipient emails via `_redact_email`, avoiding PII leakage.
 
-### 51.11 HIGH: No Logging for Failed Password Verification
-**Location:** `liminallm/service/auth.py:862-873`
+### 51.11 ✅ FIXED: Failed Password Verification Logged
+**Location:** `liminallm/service/auth.py:1240-1256`
 
-Failed password attempts silently fail with no logging - cannot detect brute force.
+Password verification now logs missing records, algorithm mismatches, and invalid attempts.
 
-### 51.12 HIGH: Token Refresh Failures Not Logged
-**Location:** `liminallm/api/routes.py:714-715`
+### 51.12 ✅ FIXED: Token Refresh Failures Logged
+**Location:** `liminallm/api/routes.py:1082-1108`
 
-Failed token refresh completely unlogged - could indicate token theft.
+Refresh failures log `refresh_invalid` with tenant hint/header context before returning 401.
 
 ### 51.13 HIGH: Insufficient OAuth Exchange Logging
 **Location:** `liminallm/service/auth.py:411-415`
@@ -3218,10 +3189,10 @@ Admin approval/rejection decisions lack detailed logs.
 
 ## 52. HTTP Security Headers
 
-### 52.1 MEDIUM: X-Frame-Options Configuration Mismatch
-**Location:** `nginx.conf:40` vs `liminallm/app.py:116`
+### 52.1 ✅ FIXED: X-Frame-Options Configuration Aligned
+**Location:** `nginx.conf:40` and `liminallm/app.py:183-209`
 
-Nginx sets `SAMEORIGIN` while app sets `DENY` - nginx takes precedence, weakening protection.
+Both app and nginx now use `X-Frame-Options: DENY`, eliminating the mismatch.
 
 ### 52.2 MEDIUM: Missing Cache-Control on Sensitive Endpoints
 **Location:** `liminallm/app.py:174-260, 263-320`
@@ -3238,30 +3209,30 @@ No Cache-Control header set globally for API responses - intermediate proxies co
 
 HSTS is disabled by default (must enable via ENABLE_HSTS) - relies on nginx fallback.
 
-### 52.5 MEDIUM: /healthz and /metrics Not Rate Limited
-**Location:** `nginx.conf:119-123`
+### 52.5 ✅ FIXED: /healthz and /metrics Rate Limited
+**Location:** `nginx.conf:95-123`
 
-Health and metrics endpoints have no rate limiting - DoS vector.
+Dedicated `ops` limit zone caps health and metrics requests (burst 5 @ 5r/s) to deter abuse.
 
 ### 52.6 MEDIUM: FileResponse Not Setting Cache Headers
 **Location:** `liminallm/app.py:150-171`
 
 FileResponse for HTML pages doesn't set Cache-Control - admin.html could be cached.
 
-### 52.7 LOW: Missing Server Header Suppression
+### 52.7 ✅ FIXED: Server Header Suppressed
 **Location:** `nginx.conf`
 
-Missing `server_tokens off;` - nginx version information disclosure.
+`server_tokens off;` added to hide nginx version headers.
 
-### 52.8 LOW: CORS Missing Max-Age Header
-**Location:** `liminallm/app.py:75-91`
+### 52.8 ✅ FIXED: CORS Max-Age Header Set
+**Location:** `liminallm/app.py:68-96`
 
-No explicit `max_age` configured for CORS preflight caching.
+`max_age=3600` caches preflight requests for one hour.
 
-### 52.9 LOW: CORS Missing Expose-Headers
-**Location:** `liminallm/app.py:75-91`
+### 52.9 ✅ FIXED: CORS Expose-Headers Updated
+**Location:** `liminallm/app.py:68-96`
 
-X-Request-ID header not exposed to frontend JavaScript.
+`X-Request-ID` and `API-Version` are exposed to frontend JavaScript.
 
 ### 52.10 LOW: Incomplete CSP Directives
 **Location:** `liminallm/app.py:132-135`

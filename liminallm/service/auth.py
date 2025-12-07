@@ -1150,6 +1150,10 @@ class AuthService:
             # Issue 11.2: In-memory fallback for password reset tokens
             with self._state_lock:
                 self._password_reset_tokens[token] = (email, expires_at)
+        self.logger.info(
+            "password_reset_requested",
+            email_hash=hashlib.sha256(email.encode()).hexdigest(),
+        )
         return token
 
     async def complete_password_reset(self, token: str, new_password: str) -> bool:
@@ -1169,11 +1173,16 @@ class AuthService:
                         email = stored_email
                         self._password_reset_tokens.pop(token, None)
         if not email:
+            self.logger.warning("password_reset_invalid_token", token_prefix=token[:8])
             return False
         if isinstance(email, bytes):
             email = email.decode()
         user = self.store.get_user_by_email(email)
         if not user:
+            self.logger.warning(
+                "password_reset_user_missing",
+                email_hash=hashlib.sha256(email.encode()).hexdigest(),
+            )
             return False
         pwd_hash, algo = self._hash_password(new_password)
         self.store.save_password(user.id, pwd_hash, algo)
@@ -1186,6 +1195,7 @@ class AuthService:
                 )
         if self.cache:
             await self.cache.client.delete(f"reset:{token}")
+        self.logger.info("password_reset_completed", user_id=user.id)
         return True
 
     async def request_email_verification(self, user: User) -> str:
@@ -1204,6 +1214,7 @@ class AuthService:
             # Issue 28.4: Thread-safe state mutation
             with self._state_lock:
                 self._email_verification_tokens[token] = (user.id, expires_at)
+        self.logger.info("email_verification_requested", user_id=user.id)
         return token
 
     async def complete_email_verification(self, token: str) -> bool:
@@ -1225,9 +1236,11 @@ class AuthService:
         if isinstance(user_id, bytes):
             user_id = user_id.decode()
         if not user_id:
+            self.logger.warning("email_verification_invalid_token", token_prefix=token[:8])
             return False
         user = self.store.get_user(user_id)
         if not user:
+            self.logger.warning("email_verification_missing_user", user_id=user_id)
             return False
         if hasattr(self.store, "mark_email_verified"):
             self.store.mark_email_verified(user.id)
@@ -1236,6 +1249,7 @@ class AuthService:
         else:
             with self._state_lock:
                 self._email_verification_tokens.pop(token, None)
+        self.logger.info("email_verified", user_id=user.id)
         return True
 
     def _hash_password(self, password: str) -> Tuple[str, str]:
@@ -1247,13 +1261,16 @@ class AuthService:
         """Verify a user's password against stored hash."""
         record = self.store.get_password_record(user_id)
         if not record:
+            self.logger.warning("password_record_missing", user_id=user_id)
             return False
         stored_hash, algo = record
         if algo != "argon2id":
+            self.logger.warning("password_algo_mismatch", user_id=user_id, algo=algo)
             return False
         try:
             return self._pwd_hasher.verify(stored_hash, password)
         except (InvalidHash, VerifyMismatchError):
+            self.logger.warning("password_verification_failed", user_id=user_id)
             return False
 
     def save_password(self, user_id: str, password: str) -> None:
