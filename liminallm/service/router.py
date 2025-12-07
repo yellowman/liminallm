@@ -54,6 +54,20 @@ class RouterEngine:
         self.backend_mode = backend_mode
         self._compatible_modes = get_compatible_adapter_modes(backend_mode or "openai")
 
+    def _safe_float(self, value: Any, default: float = 0.0, *, context: str = "") -> float:
+        """Convert value to float with defensive fallback.
+
+        Prevents ValueError/TypeError surfacing to callers when router artifacts
+        contain unexpected types (e.g., strings or objects) by returning a
+        bounded default and logging context for debugging.
+        """
+
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            logger.warning("router_float_parse_failed", context=context, value=value)
+            return default
+
     async def route(
         self,
         policy: dict,
@@ -174,7 +188,10 @@ class RouterEngine:
 
         if not embedding:
             return ""
-        packed = struct.pack(f">{len(embedding)}d", *[float(v) for v in embedding])
+        packed = struct.pack(
+            f">{len(embedding)}d",
+            *[self._safe_float(v, context="embedding_hash") for v in embedding],
+        )
         return hashlib.blake2b(packed, digest_size=32).hexdigest()
 
     def _hash_adapters(self, adapters: List[dict]) -> str:
@@ -335,9 +352,11 @@ class RouterEngine:
         """
         weight: float
         if isinstance(configured_weight, (int, float)):
-            weight = float(configured_weight)
+            weight = self._safe_float(
+                configured_weight, default=1.0, context="adapter_weight"
+            )
         elif isinstance(configured_weight, str) and configured_weight == "similarity":
-            weight = float(similarity or 0.0)
+            weight = self._safe_float(similarity or 0.0, context="adapter_weight")
         else:
             weight = 1.0
         # SPEC §8.1: clamp gate weights to [0, 1]
@@ -396,7 +415,11 @@ class RouterEngine:
         if not ranked:
             return None, None, []
         top = ranked[0]
-        return str(top.get("id")), float(top.get("similarity") or 0.0), ranked
+        return (
+            str(top.get("id")),
+            self._safe_float(top.get("similarity") or 0.0, context="top_similarity"),
+            ranked,
+        )
 
     def _normalize_weights(
         self, weights: Dict[str, float], policy: dict

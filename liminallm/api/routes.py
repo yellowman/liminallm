@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import json
+import math
 from datetime import datetime, timezone
 from pathlib import Path as FilePath
 from typing import Any, Dict, Optional
@@ -356,6 +358,7 @@ def _get_system_settings(runtime) -> dict:
         "admin_rate_limit_per_minute": 30,
         "admin_rate_limit_window_seconds": 60,
         "files_upload_rate_limit_per_minute": 10,
+        "websocket_connect_rate_limit_per_minute": 30,
         "configops_rate_limit_per_hour": 30,
         "read_rate_limit_per_minute": 120,
         "write_rate_limit_per_minute": 60,
@@ -449,7 +452,13 @@ def _get_rate_limit(runtime, key: str) -> int:
 
 
 async def _enforce_rate_limit(
-    runtime, key: str, limit: int, window_seconds: int, *, response: Optional[Response] = None
+    runtime,
+    key: str,
+    limit: int,
+    window_seconds: int,
+    *,
+    response: Optional[Response] = None,
+    cost: int = 1,
 ) -> RateLimitInfo:
     """Enforce rate limit and optionally apply headers to response.
 
@@ -474,8 +483,12 @@ async def _enforce_rate_limit(
         logger.warning("invalid_rate_limit_window", key=key, window_seconds=window_seconds)
         window_seconds = 60  # Default to 1 minute window
 
-    allowed, remaining = await check_rate_limit(runtime, key, limit, window_seconds, return_remaining=True)
-    info = RateLimitInfo(limit, remaining, window_seconds)
+    allowed, remaining, reset_after = await check_rate_limit(
+        runtime, key, limit, window_seconds, return_remaining=True, cost=cost
+    )
+    # Use calculated reset time when available to avoid leaking window details on failures (Issue 77.8)
+    reset_seconds = reset_after if reset_after is not None else window_seconds
+    info = RateLimitInfo(limit, remaining, reset_seconds)
 
     if response is not None:
         info.apply_headers(response)
@@ -790,7 +803,8 @@ def _get_pagination_settings(runtime) -> dict:
     return {
         "default_page_size": sys_settings.get("default_page_size", 100),
         "max_page_size": sys_settings.get("max_page_size", 500),
-        "default_conversations_limit": sys_settings.get("default_conversations_limit", 50),
+        # Keep conversation pagination consistent with general defaults (SPEC pagination guidance)
+        "default_conversations_limit": sys_settings.get("default_conversations_limit", 100),
     }
 
 
@@ -854,6 +868,18 @@ def _apply_session_cookies(
             max_age=refresh_ttl_minutes * 60,
             path="/",
         )
+    csrf_token = tokens.get("csrf_token")
+    if csrf_token:
+        response.set_cookie(
+            "csrf_token",
+            csrf_token,
+            httponly=False,
+            secure=True,
+            samesite="lax",
+            expires=expires_at,
+            path="/",
+        )
+        response.headers.setdefault("X-CSRF-Token", csrf_token)
 
 
 @router.post("/auth/signup", response_model=Envelope, status_code=201, tags=["auth"])
@@ -901,6 +927,7 @@ async def signup(body: SignupRequest, response: Response):
             access_token=tokens.get("access_token"),
             refresh_token=tokens.get("refresh_token"),
             token_type=tokens.get("token_type"),
+            csrf_token=tokens.get("csrf_token"),
             role=user.role,
             tenant_id=user.tenant_id,
         ),
@@ -937,6 +964,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
         tenant_id=None,  # Derived from user's existing record
         user_agent=user_agent,
         ip_addr=ip_addr,
+        device_type=body.device_type,
     )
     if not user or not session:
         logger.warning("login_failed", email=body.email, ip=ip_addr)
@@ -957,6 +985,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
             access_token=tokens.get("access_token"),
             refresh_token=tokens.get("refresh_token"),
             token_type=tokens.get("token_type"),
+            csrf_token=tokens.get("csrf_token"),
             role=user.role,
             tenant_id=user.tenant_id,
         ),
@@ -1042,6 +1071,7 @@ async def oauth_callback(
             access_token=tokens.get("access_token"),
             refresh_token=tokens.get("refresh_token"),
             token_type=tokens.get("token_type"),
+            csrf_token=tokens.get("csrf_token"),
             role=user.role,
             tenant_id=user.tenant_id,
         ),
@@ -1063,6 +1093,11 @@ async def refresh_tokens(
         body.refresh_token, tenant_hint=tenant_hint
     )
     if not user or not session:
+        logger.warning(
+            "refresh_invalid",
+            tenant_hint=tenant_hint,
+            has_header=bool(authorization),
+        )
         raise _http_error("unauthorized", "invalid refresh", status_code=401)
     _apply_session_cookies(
         response,
@@ -1079,6 +1114,7 @@ async def refresh_tokens(
             access_token=tokens.get("access_token"),
             refresh_token=tokens.get("refresh_token"),
             token_type=tokens.get("token_type"),
+            csrf_token=tokens.get("csrf_token"),
             role=user.role,
             tenant_id=user.tenant_id,
         ),
@@ -1394,6 +1430,7 @@ async def update_admin_settings(
 async def request_mfa(body: MFARequest, request: Request):
     runtime = get_runtime()
     client_ip = request.client.host if request.client else "unknown"
+    session_cookie = request.cookies.get("session_id")
     # Issue 50.1: Rate limit per IP first to prevent session enumeration attacks
     await _enforce_rate_limit(
         runtime,
@@ -1401,6 +1438,13 @@ async def request_mfa(body: MFARequest, request: Request):
         _get_rate_limit(runtime, "mfa_rate_limit_per_minute"),
         60,
     )
+    if not session_cookie or session_cookie != body.session_id:
+        logger.warning(
+            "mfa_request_missing_cookie",
+            ip=client_ip,
+            cookie_present=bool(session_cookie),
+        )
+        raise _http_error("unauthorized", "invalid session", status_code=401)
     auth_ctx = await runtime.auth.resolve_session(
         body.session_id, allow_pending_mfa=True
     )
@@ -1432,6 +1476,7 @@ async def request_mfa(body: MFARequest, request: Request):
 async def verify_mfa(body: MFAVerifyRequest, request: Request, response: Response):
     runtime = get_runtime()
     client_ip = request.client.host if request.client else "unknown"
+    session_cookie = request.cookies.get("session_id")
     # Issue 50.2: Rate limit per IP first to prevent brute force attacks
     await _enforce_rate_limit(
         runtime,
@@ -1439,6 +1484,13 @@ async def verify_mfa(body: MFAVerifyRequest, request: Request, response: Respons
         _get_rate_limit(runtime, "mfa_rate_limit_per_minute"),
         60,
     )
+    if not session_cookie or session_cookie != body.session_id:
+        logger.warning(
+            "mfa_verify_missing_cookie",
+            ip=client_ip,
+            cookie_present=bool(session_cookie),
+        )
+        raise _http_error("unauthorized", "invalid session", status_code=401)
     auth_ctx = await runtime.auth.resolve_session(
         body.session_id, allow_pending_mfa=True
     )
@@ -1480,6 +1532,7 @@ async def verify_mfa(body: MFAVerifyRequest, request: Request, response: Respons
                 access_token=tokens.get("access_token"),
                 refresh_token=tokens.get("refresh_token"),
                 token_type=tokens.get("token_type"),
+                csrf_token=tokens.get("csrf_token"),
                 role=user.role,
                 tenant_id=user.tenant_id,
             ).model_dump()
@@ -1777,6 +1830,7 @@ async def logout(
             )
     response.delete_cookie("session_id", path="/", secure=True, samesite="lax")
     response.delete_cookie("refresh_token", path="/", secure=True, samesite="lax")
+    response.delete_cookie("csrf_token", path="/", secure=True, samesite="lax")
     return Envelope(status="ok", data={"message": "session revoked"})
 
 
@@ -1821,118 +1875,123 @@ async def chat(
             plan_tier,
         )
 
-        # SPEC §18: Concurrency cap - max 3 concurrent workflows per user
-        await _acquire_workflow_slot(runtime, user_id)
+        # SPEC §18: Concurrency caps - limit decode pressure per user
+        await _acquire_inference_slot(runtime, user_id)
         try:
-            conversation: Conversation | None = None
-            context_id = body.context_id
-            validated_context_id: str | None = None
-            if body.conversation_id:
-                conversation = _get_owned_conversation(
-                    runtime, body.conversation_id, principal
-                )
-            else:
-                if context_id:
-                    _get_owned_context(runtime, context_id, principal)
-                    validated_context_id = context_id
-                # Generate title from first message for new conversations
-                auto_title = _generate_conversation_title(body.message.content)
-                conversation = runtime.store.create_conversation(
-                    user_id=user_id, active_context_id=body.context_id, title=auto_title
-                )
-            conversation_id = conversation.id
-            context_id = context_id or conversation.active_context_id
-            if context_id and context_id != validated_context_id:
-                _get_owned_context(runtime, context_id, principal)
-            user_content = body.message.content
-            voice_meta: dict = {}
-            if body.message.mode == "voice":
-                try:
-                    audio_bytes = base64.b64decode(body.message.content)
-                except Exception as exc:
-                    raise _http_error(
-                        "validation_error",
-                        "invalid base64-encoded audio payload",
-                        status_code=400,
-                    ) from exc
-                transcript = await runtime.voice.transcribe(audio_bytes, user_id=user_id) or {}
-                user_content = transcript.get("transcript") or transcript.get("text")
-                if not user_content:
-                    raise _http_error(
-                        "validation_error", "unable to transcribe audio", status_code=400
+            await _acquire_workflow_slot(runtime, user_id)
+            try:
+                conversation: Conversation | None = None
+                context_id = body.context_id
+                validated_context_id: str | None = None
+                if body.conversation_id:
+                    conversation = _get_owned_conversation(
+                        runtime, body.conversation_id, principal
                     )
-                voice_meta = {"mode": "voice", "transcript": transcript}
-            user_content_struct = normalize_content_struct(
-                body.message.content_struct, user_content
-            )
-            runtime.store.append_message(
-                conversation_id,
-                sender="user",
-                role="user",
-                content=user_content,
-                meta=voice_meta or None,
-                content_struct=user_content_struct,
-            )
-            orchestration = await runtime.workflow.run(
-                body.workflow_id,
-                conversation_id,
-                user_content,
-                context_id,
-                user_id,
-                tenant_id=principal.tenant_id,
-            )
-            orchestration_dict: dict[str, Any] = (
-                orchestration if isinstance(orchestration, dict) else {}
-            )
-            adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
-            assistant_content_struct = normalize_content_struct(
-                orchestration_dict.get("content_struct"),
-                orchestration_dict.get("content"),
-            )
-            assistant_content = orchestration_dict.get("content", "No response generated.")
-            assistant_msg = runtime.store.append_message(
-                conversation_id,
-                sender="assistant",
-                role="assistant",
-                content=assistant_content,
-                content_struct=assistant_content_struct,
-                meta={
-                    "adapters": orchestration_dict.get("adapters", []),
-                    "adapter_gates": orchestration_dict.get("adapter_gates", []),
-                    "routing_trace": orchestration_dict.get("routing_trace", []),
-                    "workflow_trace": orchestration_dict.get("workflow_trace", []),
-                    "usage": orchestration_dict.get("usage", {}),
-                },
-            )
-            resp = ChatResponse(
-                message_id=assistant_msg.id,
-                conversation_id=conversation_id,
-                content=assistant_msg.content,
-                content_struct=assistant_msg.content_struct,
-                workflow_id=body.workflow_id,
-                adapters=adapter_names,
-                adapter_gates=orchestration_dict.get("adapter_gates", []),
-                usage=orchestration_dict.get("usage", {}),
-                context_snippets=orchestration_dict.get("context_snippets", []),
-                routing_trace=orchestration_dict.get("routing_trace", []),
-                workflow_trace=orchestration_dict.get("workflow_trace", []),
-            )
-            envelope = Envelope(
-                status="ok", data=resp.model_dump(), request_id=idem.request_id
-            )
-            if runtime.cache:
-                # Issue 38.4: Add limit to prevent unbounded memory usage
-                # Use reasonable limit for conversation context caching
-                paging = _get_pagination_settings(runtime)
-                history = runtime.store.list_messages(
-                    conversation_id, limit=paging["max_page_size"], user_id=principal.user_id
+                else:
+                    if context_id:
+                        _get_owned_context(runtime, context_id, principal)
+                        validated_context_id = context_id
+                    # Generate title from first message for new conversations
+                    auto_title = _generate_conversation_title(body.message.content)
+                    conversation = runtime.store.create_conversation(
+                        user_id=user_id, active_context_id=body.context_id, title=auto_title
+                    )
+                conversation_id = conversation.id
+                context_id = context_id or conversation.active_context_id
+                if context_id and context_id != validated_context_id:
+                    _get_owned_context(runtime, context_id, principal)
+                user_content = body.message.content
+                voice_meta: dict = {}
+                if body.message.mode == "voice":
+                    try:
+                        audio_bytes = base64.b64decode(body.message.content)
+                    except Exception as exc:
+                        raise _http_error(
+                            "validation_error",
+                            "invalid base64-encoded audio payload",
+                            status_code=400,
+                        ) from exc
+                    transcript = await runtime.voice.transcribe(audio_bytes, user_id=user_id) or {}
+                    user_content = transcript.get("transcript") or transcript.get("text")
+                    if not user_content:
+                        raise _http_error(
+                            "validation_error", "unable to transcribe audio", status_code=400
+                        )
+                    voice_meta = {"mode": "voice", "transcript": transcript}
+                user_content_struct = normalize_content_struct(
+                    body.message.content_struct, user_content
                 )
-                await runtime.workflow.cache_conversation_state(conversation_id, history)
-            await idem.store_result(envelope)
-            return envelope
+                runtime.store.append_message(
+                    conversation_id,
+                    sender="user",
+                    role="user",
+                    content=user_content,
+                    meta=voice_meta or None,
+                    content_struct=user_content_struct,
+                )
+                orchestration = await runtime.workflow.run(
+                    body.workflow_id,
+                    conversation_id,
+                    user_content,
+                    context_id,
+                    user_id,
+                    tenant_id=principal.tenant_id,
+                )
+                orchestration_dict: dict[str, Any] = (
+                    orchestration if isinstance(orchestration, dict) else {}
+                )
+                adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
+                assistant_content_struct = normalize_content_struct(
+                    orchestration_dict.get("content_struct"),
+                    orchestration_dict.get("content"),
+                )
+                assistant_content = orchestration_dict.get("content", "No response generated.")
+                assistant_msg = runtime.store.append_message(
+                    conversation_id,
+                    sender="assistant",
+                    role="assistant",
+                    content=assistant_content,
+                    content_struct=assistant_content_struct,
+                    meta={
+                        "adapters": orchestration_dict.get("adapters", []),
+                        "adapter_gates": orchestration_dict.get("adapter_gates", []),
+                        "routing_trace": orchestration_dict.get("routing_trace", []),
+                        "workflow_trace": orchestration_dict.get("workflow_trace", []),
+                        "usage": orchestration_dict.get("usage", {}),
+                    },
+                )
+                resp = ChatResponse(
+                    message_id=assistant_msg.id,
+                    conversation_id=conversation_id,
+                    content=assistant_msg.content,
+                    content_struct=assistant_msg.content_struct,
+                    workflow_id=body.workflow_id,
+                    adapters=adapter_names,
+                    adapter_gates=orchestration_dict.get("adapter_gates", []),
+                    usage=orchestration_dict.get("usage", {}),
+                    context_snippets=orchestration_dict.get("context_snippets", []),
+                    routing_trace=orchestration_dict.get("routing_trace", []),
+                    workflow_trace=orchestration_dict.get("workflow_trace", []),
+                )
+                envelope = Envelope(
+                    status="ok", data=resp.model_dump(), request_id=idem.request_id
+                )
+                if runtime.cache:
+                    # Issue 38.4: Add limit to prevent unbounded memory usage
+                    # Use reasonable limit for conversation context caching
+                    paging = _get_pagination_settings(runtime)
+                    history = runtime.store.list_messages(
+                        conversation_id, limit=paging["max_page_size"], user_id=principal.user_id
+                    )
+                    await runtime.workflow.cache_conversation_state(conversation_id, history)
+                await idem.store_result(envelope)
+                return envelope
+            finally:
+                # Always release workflow slot, even on error
+                await _release_workflow_slot(runtime, user_id)
         finally:
-            # Always release workflow slot, even on error
-            await _release_workflow_slot(runtime, user_id)
+            # SPEC §18: Ensure inference slots are returned promptly
+            await _release_inference_slot(runtime, user_id)
     # Exceptions bubble through the guard which records failed states
 
 
@@ -3233,13 +3292,6 @@ async def upload_file(
     import re
 
     runtime = get_runtime()
-    # Rate limit file uploads per SPEC §18: 10 req/min
-    await _enforce_rate_limit(
-        runtime,
-        f"files:upload:{principal.user_id}",
-        _get_rate_limit(runtime, "files_upload_rate_limit_per_minute"),
-        60,
-    )
     # SPEC §18: Accept Idempotency-Key when provided (optional)
     async with IdempotencyGuard(
         "files:upload", principal.user_id, idempotency_key, require=False
@@ -3267,6 +3319,19 @@ async def upload_file(
         contents = await file.read(max_bytes + 1)
         if len(contents) > max_bytes:
             raise _http_error("validation_error", f"file too large (max {max_bytes // 1024 // 1024}MB for {plan_tier} plan)", status_code=413)
+        detected_mime = file.content_type or mimetypes.guess_type(safe_filename)[0]
+        if not detected_mime or detected_mime == "application/octet-stream":
+            raise _http_error("validation_error", "unknown or unsupported MIME type", status_code=400)
+        checksum = hashlib.sha256(contents).hexdigest()
+        # Weight rate-limit cost by payload size to prevent request chunking bypass (Issue 77.4)
+        approx_cost = max(1, math.ceil(len(contents) / (256 * 1024)))
+        await _enforce_rate_limit(
+            runtime,
+            f"files:upload:{principal.user_id}",
+            _get_rate_limit(runtime, "files_upload_rate_limit_per_minute"),
+            60,
+            cost=approx_cost,
+        )
         dest_path = safe_join(dest_dir, safe_filename)
         resolved_dest = dest_path.resolve()
         if (
@@ -3275,6 +3340,22 @@ async def upload_file(
         ):
             raise _http_error("validation_error", "invalid file path", status_code=400)
         dest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        manifest_path = dest_dir / ".checksums.json"
+        existing_checksums: dict[str, str] = {}
+        if manifest_path.exists():
+            try:
+                existing_checksums = json.loads(manifest_path.read_text())
+            except Exception:
+                logger.warning("file_checksum_manifest_read_failed", path=str(manifest_path))
+        prior_checksum = existing_checksums.get(safe_filename)
+        if dest_path.exists() and prior_checksum == checksum:
+            resp = FileUploadResponse(
+                fs_path=safe_filename, context_id=context_id, chunk_count=None
+            )
+            envelope = Envelope(status="ok", data=resp, request_id=idem.request_id)
+            await idem.store_result(envelope)
+            return envelope
 
         # Atomic idempotency: record intent BEFORE writing file
         # This prevents duplicate file writes if idempotency storage fails after file write
@@ -3308,6 +3389,15 @@ async def upload_file(
                 # Clean up file on any error (not just ConstraintViolation)
                 dest_path.unlink(missing_ok=True)
                 raise
+
+        # Persist checksum manifest for deduplication (SPEC §2.5)
+        try:
+            existing_checksums[safe_filename] = checksum
+            manifest_path.write_text(json.dumps(existing_checksums, indent=2))
+        except Exception:
+            logger.warning(
+                "file_checksum_manifest_write_failed", path=str(manifest_path)
+            )
 
         # Update idempotency with final result
         resp = FileUploadResponse(
@@ -3994,6 +4084,20 @@ async def synthesize_voice(
 async def websocket_chat(ws: WebSocket):
     """Handle WebSocket chat connections for streaming responses."""
     runtime = get_runtime()
+    client_host = ws.client.host if ws.client else "unknown"
+    connect_limit = _get_system_settings(runtime).get(
+        "websocket_connect_rate_limit_per_minute", 30
+    )
+    allowed, _, _ = await check_rate_limit(
+        runtime,
+        f"ws:connect:{client_host}",
+        connect_limit,
+        60,
+        return_remaining=True,
+    )
+    if not allowed:
+        await ws.close(code=4429)
+        return
     await ws.accept()
     user_id: Optional[str] = None
     idempotency_key: Optional[str] = None
@@ -4009,6 +4113,19 @@ async def websocket_chat(ws: WebSocket):
         request_id = init.get("request_id") or request_id
         session_id = init.get("session_id")
         access_token = init.get("access_token")
+        if session_id and access_token:
+            await ws.send_json(
+                {
+                    "event": "error",
+                    "data": {
+                        "error": "fresh_session_required",
+                        "message": "provide a single authentication method (refresh session before switching transports)",
+                    },
+                    "request_id": request_id,
+                }
+            )
+            await ws.close(code=4401)
+            return
         auth_ctx = await runtime.auth.authenticate(
             f"Bearer {access_token}" if access_token else None,
             session_id,

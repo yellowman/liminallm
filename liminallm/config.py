@@ -39,6 +39,7 @@ class RagMode(str, Enum):
 
     PGVECTOR = "pgvector"
     MEMORY = "memory"
+    LOCAL_HYBRID = "local_hybrid"
 
 
 class AdapterMode(str, Enum):
@@ -251,6 +252,16 @@ class Settings(BaseModel):
     )
     redis_url: str = env_field("redis://localhost:6379/0", "REDIS_URL")
     shared_fs_root: str = env_field("/srv/liminallm", "SHARED_FS_ROOT")
+    tmp_cleanup_interval_seconds: int = env_field(
+        86400,
+        "TMP_CLEANUP_INTERVAL_SECONDS",
+        description="How often to sweep per-user tmp scratch directories (seconds)",
+    )
+    tmp_max_age_hours: int = env_field(
+        24,
+        "TMP_MAX_AGE_HOURS",
+        description="Delete tmp scratch files older than this many hours",
+    )
     model_path: str = env_field(
         "gpt-4o-mini", "MODEL_PATH", description="Model path (overridable via admin UI)"
     )

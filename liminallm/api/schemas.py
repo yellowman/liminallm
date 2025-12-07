@@ -211,6 +211,7 @@ class AuthResponse(BaseModel):
     access_token: Optional[str] = None
     refresh_token: Optional[str] = None
     token_type: Optional[str] = None
+    csrf_token: Optional[str] = None
     role: str = "user"
     tenant_id: str = "public"
 
@@ -220,11 +221,20 @@ class LoginRequest(BaseModel):
     password: str
     mfa_code: Optional[str] = Field(default=None, max_length=10)
     tenant_id: Optional[str] = Field(default=None, max_length=128)
+    device_type: str = Field(default="web", max_length=16)
 
     @field_validator("email")
     @classmethod
     def _validate_login_email(cls, value: str) -> str:
         return _validate_email(value)
+
+    @field_validator("device_type")
+    @classmethod
+    def _normalize_device_type(cls, value: str) -> str:
+        normalized = (value or "web").lower()
+        if normalized not in {"web", "mobile"}:
+            raise ValueError("device_type must be 'web' or 'mobile'")
+        return normalized
 
 
 class TokenRefreshRequest(BaseModel):

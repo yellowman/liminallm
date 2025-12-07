@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import json
-from datetime import datetime
+import time
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, Union
 
 import redis.asyncio as aioredis
@@ -14,6 +16,40 @@ class RedisCache:
     # Issue 48.3: Default operation timeout for Redis commands
     DEFAULT_OPERATION_TIMEOUT = 5.0  # 5 seconds
 
+    # Lua token bucket script (Issue 77.2/77.10/77.12): atomic refill + consume
+    _TOKEN_BUCKET_SCRIPT = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1])
+local refill_rate = tonumber(ARGV[2])
+local capacity = tonumber(ARGV[3])
+local cost = tonumber(ARGV[4])
+
+local data = redis.call('HMGET', key, 'tokens', 'ts')
+local tokens = tonumber(data[1])
+local last = tonumber(data[2])
+
+if tokens == nil or last == nil then
+  tokens = capacity
+  last = now
+end
+
+local delta = math.max(0, now - last)
+tokens = math.min(capacity, tokens + delta * refill_rate)
+
+if tokens < cost then
+  redis.call('HMSET', key, 'tokens', tokens, 'ts', now)
+  local reset_after = math.ceil((cost - tokens) / refill_rate)
+  redis.call('EXPIRE', key, math.max(reset_after, 1))
+  return {0, tokens, reset_after}
+end
+
+tokens = tokens - cost
+redis.call('HMSET', key, 'tokens', tokens, 'ts', now)
+local ttl = math.ceil(capacity / refill_rate)
+redis.call('EXPIRE', key, math.max(ttl, 1))
+return {1, tokens, 0}
+"""
+
     def __init__(self, redis_url: str, *, socket_timeout: float = 5.0):
         self.redis_url = redis_url
         # Issue 48.3: Configure connection with explicit timeouts
@@ -23,6 +59,23 @@ class RedisCache:
             socket_timeout=socket_timeout,
             socket_connect_timeout=socket_timeout,
         )
+        # Register token bucket script for atomic rate limiting (Issue 77.10)
+        self._token_bucket = self.client.register_script(self._TOKEN_BUCKET_SCRIPT)
+
+    @staticmethod
+    def _ttl_seconds(expires_at: datetime) -> int:
+        """Compute a safe TTL from an absolute expiry timestamp.
+
+        Sessions now use timezone-aware UTC timestamps; older records may be naive.
+        Normalize to UTC and clamp to at least 1 second to avoid Redis rejecting
+        negative or zero TTL values. (Issue 2.6)
+        """
+
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        else:
+            expires_at = expires_at.astimezone(timezone.utc)
+        return max(1, int((expires_at - datetime.now(timezone.utc)).total_seconds()))
 
     def verify_connection(self) -> None:
         """Assert Redis connectivity before enabling dependent features."""
@@ -39,13 +92,25 @@ class RedisCache:
     async def cache_session(
         self, session_id: str, user_id: str, expires_at: datetime
     ) -> None:
-        ttl = max(1, int((expires_at - datetime.utcnow()).total_seconds()))
+        ttl = self._ttl_seconds(expires_at)
         pipe = self.client.pipeline()
         pipe.set(f"auth:session:{session_id}", user_id, ex=ttl)
         # Track session in user's session set for bulk revocation (Issue 22.3)
         pipe.sadd(f"auth:user_sessions:{user_id}", session_id)
         pipe.expire(f"auth:user_sessions:{user_id}", ttl)
         await pipe.execute()
+
+    @staticmethod
+    def _normalize_rate_key(key: str, tenant_id: Optional[str]) -> str:
+        """Generate collision-resistant rate keys (Issue 77.1).
+
+        Components are hashed to avoid delimiter injection while still
+        providing stable keys per logical rate limit subject.
+        """
+
+        digest = hashlib.sha256(key.encode()).hexdigest()
+        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
+        return f"rate:{tenant_prefix}{digest}"
 
     async def get_session_user(self, session_id: str) -> Optional[str]:
         return await self.client.get(f"auth:session:{session_id}")
@@ -82,41 +147,36 @@ class RedisCache:
         return revoked
 
     async def check_rate_limit(
-        self, key: str, limit: int, window_seconds: int, *, return_remaining: bool = False,
-        tenant_id: Optional[str] = None
-    ) -> Union[bool, Tuple[bool, int]]:
-        """Check rate limit using Redis token bucket with atomic operations.
+        self,
+        key: str,
+        limit: int,
+        window_seconds: int,
+        *,
+        return_remaining: bool = False,
+        tenant_id: Optional[str] = None,
+        cost: int = 1,
+    ) -> Union[bool, Tuple[bool, int, int]]:
+        """Check rate limit using Redis-backed token bucket.
 
-        Args:
-            key: Rate limit key
-            limit: Maximum requests per window
-            window_seconds: Window duration in seconds
-            return_remaining: If True, return (allowed, remaining) tuple
-            tenant_id: Optional tenant ID for isolation (Issue 44.3)
-
-        Returns:
-            bool if return_remaining is False, else (allowed, remaining) tuple
+        Uses a Lua script for atomic refill and consumption to avoid race
+        conditions (Issues 77.2, 77.10, 77.12) and hashes the key to prevent
+        delimiter collisions (Issue 77.1).
         """
-        now = datetime.utcnow()
-        now_bucket = int(now.timestamp() // window_seconds)
-        # Issue 44.3: Include tenant_id in cache key for tenant isolation
-        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
-        redis_key = f"rate:{tenant_prefix}{key}:{now_bucket}"
-        bucket_end = (now_bucket + 1) * window_seconds
-        ttl = max(1, int(bucket_end - now.timestamp()))
 
-        # Use pipeline for atomic INCR + EXPIRE to prevent race conditions
-        pipe = self.client.pipeline()
-        pipe.incr(redis_key)
-        pipe.expire(redis_key, ttl)
-        results = await pipe.execute()
-        current = results[0]
+        safe_key = self._normalize_rate_key(key, tenant_id)
+        refill_rate = float(limit) / float(window_seconds)
+        # Execute Lua script atomically
+        allowed, tokens, reset_after = await self._token_bucket(
+            keys=[safe_key],
+            args=[time.time(), refill_rate, limit, max(1, cost)],
+        )
 
-        allowed = current <= limit
+        allowed_bool = bool(int(allowed))
+        remaining = max(0, int(tokens))
+        reset_seconds = int(reset_after) if reset_after else 0
         if return_remaining:
-            remaining = max(0, limit - current)
-            return (allowed, remaining)
-        return allowed
+            return (allowed_bool, remaining, reset_seconds)
+        return allowed_bool
 
     async def mark_refresh_revoked(self, jti: str, ttl_seconds: int) -> None:
         await self.client.set(f"auth:refresh:revoked:{jti}", "1", ex=ttl_seconds)
@@ -716,7 +776,7 @@ class SyncRedisCache:
     async def cache_session(
         self, session_id: str, user_id: str, expires_at: datetime
     ) -> None:
-        ttl = max(1, int((expires_at - datetime.utcnow()).total_seconds()))
+        ttl = RedisCache._ttl_seconds(expires_at)
         pipe = self._sync_client.pipeline()
         pipe.set(f"auth:session:{session_id}", user_id, ex=ttl)
         # Track session in user's session set for bulk revocation (Issue 22.3)

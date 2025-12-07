@@ -47,6 +47,13 @@ class EmailService:
         """Check if email sending is properly configured."""
         return bool(self.smtp_host and self.from_email)
 
+    def _redact_email(self, email: str) -> str:
+        """Redact an email address for logging to avoid PII leakage."""
+        if "@" not in email:
+            return "redacted"
+        local, domain = email.split("@", 1)
+        return f"{local[:2]}***@{domain}"
+
     def _send_email(
         self,
         to_email: str,
@@ -62,7 +69,7 @@ class EmailService:
             # Dev mode: log the email instead of sending
             logger.info(
                 "email_dev_mode",
-                to=to_email,
+                to=self._redact_email(to_email),
                 subject=subject,
                 body_preview=text_body[:200] if text_body else html_body[:200],
             )
@@ -87,7 +94,7 @@ class EmailService:
                 host=self.smtp_host,
                 port=self.smtp_port,
                 use_tls=self.smtp_use_tls,
-                to=to_email,
+                to=self._redact_email(to_email),
             )
 
             if self.smtp_use_tls:
@@ -104,13 +111,13 @@ class EmailService:
                         server.login(self.smtp_user, self.smtp_password)
                     server.sendmail(self.from_email, to_email, msg.as_string())
 
-            logger.info("email_sent", to=to_email, subject=subject)
+            logger.info("email_sent", to=self._redact_email(to_email), subject=subject)
             return True
 
         except smtplib.SMTPAuthenticationError as e:
             logger.error(
                 "email_auth_failed",
-                to=to_email,
+                to=self._redact_email(to_email),
                 host=self.smtp_host,
                 user=self.smtp_user,
                 error=str(e),
@@ -120,7 +127,7 @@ class EmailService:
         except smtplib.SMTPConnectError as e:
             logger.error(
                 "email_connect_failed",
-                to=to_email,
+                to=self._redact_email(to_email),
                 host=self.smtp_host,
                 port=self.smtp_port,
                 error=str(e),
@@ -129,7 +136,7 @@ class EmailService:
         except smtplib.SMTPRecipientsRefused as e:
             logger.error(
                 "email_recipient_refused",
-                to=to_email,
+                to=self._redact_email(to_email),
                 error=str(e),
                 refused=list(e.recipients.keys()) if hasattr(e, "recipients") else None,
             )
@@ -137,7 +144,7 @@ class EmailService:
         except smtplib.SMTPSenderRefused as e:
             logger.error(
                 "email_sender_refused",
-                to=to_email,
+                to=self._redact_email(to_email),
                 sender=self.from_email,
                 error=str(e),
             )
@@ -145,7 +152,7 @@ class EmailService:
         except smtplib.SMTPException as e:
             logger.error(
                 "email_smtp_error",
-                to=to_email,
+                to=self._redact_email(to_email),
                 host=self.smtp_host,
                 error_type=type(e).__name__,
                 error=str(e),
@@ -154,7 +161,7 @@ class EmailService:
         except ssl.SSLError as e:
             logger.error(
                 "email_ssl_error",
-                to=to_email,
+                to=self._redact_email(to_email),
                 host=self.smtp_host,
                 port=self.smtp_port,
                 error=str(e),
@@ -163,7 +170,7 @@ class EmailService:
         except TimeoutError as e:
             logger.error(
                 "email_timeout",
-                to=to_email,
+                to=self._redact_email(to_email),
                 host=self.smtp_host,
                 port=self.smtp_port,
                 error=str(e),
@@ -172,7 +179,7 @@ class EmailService:
         except Exception as e:
             logger.error(
                 "email_send_failed",
-                to=to_email,
+                to=self._redact_email(to_email),
                 error_type=type(e).__name__,
                 error=str(e),
             )

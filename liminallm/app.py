@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import os
+import asyncio
+import contextlib
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from liminallm.api.error_handling import register_exception_handlers
@@ -22,9 +24,13 @@ __version__ = "0.1.0"
 __build__ = os.getenv("BUILD_SHA", "dev")
 
 
+_cleanup_task: asyncio.Task | None = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events."""
+    global _cleanup_task
     # Startup
     from liminallm.service.runtime import get_runtime
 
@@ -38,6 +44,14 @@ async def lifespan(app: FastAPI):
         if training_worker_enabled:
             await runtime.training_worker.start()
             logger.info("training_worker_started_on_startup")
+        # Issue 4.6: Schedule cleanup of per-user tmp scratch directories
+        _cleanup_task = asyncio.create_task(
+            _run_tmp_cleanup(
+                Path(runtime.settings.shared_fs_root),
+                runtime.settings.tmp_cleanup_interval_seconds,
+                runtime.settings.tmp_max_age_hours,
+            )
+        )
     except Exception as exc:
         logger.error("startup_training_worker_failed", error=str(exc))
 
@@ -46,6 +60,10 @@ async def lifespan(app: FastAPI):
     # Shutdown
     try:
         runtime = get_runtime()
+        if _cleanup_task:
+            _cleanup_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await _cleanup_task
         if runtime.training_worker:
             await runtime.training_worker.stop()
             logger.info("training_worker_stopped_on_shutdown")
@@ -58,6 +76,9 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="LiminalLM Kernel", version=__version__, lifespan=lifespan)
+
+
+_CSRF_SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
 
 
 def _allowed_origins() -> List[str]:
@@ -121,6 +142,52 @@ async def add_correlation_id(request, call_next):
     response = await call_next(request)
     response.headers["X-Request-ID"] = correlation_id
     return response
+
+
+@app.middleware("http")
+async def enforce_csrf_token(request: Request, call_next):
+    # Only enforce CSRF for state-changing requests that include session cookies
+    if request.method.upper() in _CSRF_SAFE_METHODS:
+        return await call_next(request)
+    if request.headers.get("Authorization"):
+        return await call_next(request)
+    session_cookie = request.cookies.get("session_id")
+    if not session_cookie:
+        return await call_next(request)
+    header_token = request.headers.get("X-CSRF-Token")
+    cookie_token = request.cookies.get("csrf_token")
+    if not header_token or not cookie_token or header_token != cookie_token:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "status": "error",
+                "error": {"code": "forbidden", "message": "missing or invalid CSRF token"},
+            },
+        )
+    try:
+        from liminallm.service.runtime import get_runtime
+
+        runtime = get_runtime()
+        session = runtime.store.get_session(session_cookie)
+    except Exception as exc:
+        logger.warning("csrf_validation_failed", error=str(exc))
+        return JSONResponse(
+            status_code=403,
+            content={
+                "status": "error",
+                "error": {"code": "forbidden", "message": "invalid session for CSRF check"},
+            },
+        )
+    expected = session.meta.get("csrf_token") if session and isinstance(session.meta, dict) else None
+    if not expected or expected != header_token:
+        return JSONResponse(
+            status_code=403,
+            content={
+                "status": "error",
+                "error": {"code": "forbidden", "message": "missing or invalid CSRF token"},
+            },
+        )
+    return await call_next(request)
 
 
 @app.middleware("http")
@@ -225,6 +292,9 @@ async def serve_admin() -> FileResponse:
     return FileResponse(admin)
 
 
+HEALTH_CHECK_TIMEOUT_SECONDS = 3
+
+
 @app.get("/healthz")
 async def health() -> Dict[str, Any]:
     """Health check endpoint per SPEC §18.
@@ -247,63 +317,62 @@ async def health() -> Dict[str, Any]:
         "build": __build__,
     }
 
+    async def _run_bounded(label: str, func) -> bool:
+        try:
+            await asyncio.wait_for(asyncio.to_thread(func), HEALTH_CHECK_TIMEOUT_SECONDS)
+            return True
+        except asyncio.TimeoutError:
+            logger.error(
+                "health_check_timeout", component=label, timeout=HEALTH_CHECK_TIMEOUT_SECONDS
+            )
+        except Exception as exc:  # pragma: no cover - defensive logging path
+            logger.error(f"health_check_{label}_failed", error=str(exc))
+        return False
+
     # Database check
-    try:
-        runtime = get_runtime()
-        if hasattr(runtime.store, "verify_connection"):
-            runtime.store.verify_connection()
-            checks["database"] = {"status": "healthy"}
-        elif hasattr(runtime.store, "_connect"):
-            # Postgres store - try a simple query
+    runtime = get_runtime()
+    if hasattr(runtime.store, "verify_connection"):
+        db_ok = await _run_bounded("database", runtime.store.verify_connection)
+    elif hasattr(runtime.store, "_connect"):
+        def _db_probe() -> None:
             with runtime.store._connect() as conn:
                 conn.execute("SELECT 1").fetchone()
-            checks["database"] = {"status": "healthy"}
-        else:
-            # Memory store - always healthy if runtime exists
-            checks["database"] = {"status": "healthy", "type": "memory"}
-    except Exception as exc:
-        logger.error("health_check_database_failed", error=str(exc))
-        # SECURITY: Don't expose internal error details in response
-        checks["database"] = {"status": "unhealthy"}
-        overall_healthy = False
+
+        db_ok = await _run_bounded("database", _db_probe)
+    else:
+        db_ok = True
+        checks["database"] = {"status": "healthy", "type": "memory"}
+
+    if not checks.get("database"):
+        checks["database"] = {"status": "healthy" if db_ok else "unhealthy"}
+    overall_healthy = overall_healthy and db_ok
 
     # Redis check (if configured)
-    try:
-        runtime = get_runtime()
-        if hasattr(runtime, "cache") and runtime.cache is not None:
-            runtime.cache.verify_connection()
-            checks["redis"] = {"status": "healthy"}
-        else:
-            checks["redis"] = {"status": "not_configured"}
-    except Exception as exc:
-        logger.error("health_check_redis_failed", error=str(exc))
-        # SECURITY: Don't expose internal error details in response
-        checks["redis"] = {"status": "unhealthy", "degraded": True}
+    if hasattr(runtime, "cache") and runtime.cache is not None:
+        redis_ok = await _run_bounded("redis", runtime.cache.verify_connection)
+        checks["redis"] = {"status": "healthy" if redis_ok else "unhealthy", "degraded": not redis_ok}
+        overall_healthy = overall_healthy and redis_ok
+    else:
+        checks["redis"] = {"status": "not_configured"}
 
     # Filesystem check
-    try:
-        runtime = get_runtime()
-        fs_root = getattr(runtime.store, "fs_root", None)
-        if fs_root:
-            fs_path = Path(fs_root)
-            if fs_path.exists() and fs_path.is_dir():
-                # Try to write/read a health check file
-                health_file = fs_path / ".health_check"
-                health_file.write_text(datetime.utcnow().isoformat())
-                health_file.read_text()
-                health_file.unlink(missing_ok=True)
-                # SECURITY: Don't expose filesystem paths in response
-                checks["filesystem"] = {"status": "healthy"}
-            else:
-                checks["filesystem"] = {"status": "unhealthy"}
-                overall_healthy = False
-        else:
-            checks["filesystem"] = {"status": "not_configured"}
-    except Exception as exc:
-        logger.error("health_check_filesystem_failed", error=str(exc))
-        # SECURITY: Don't expose internal error details in response
-        checks["filesystem"] = {"status": "unhealthy"}
-        overall_healthy = False
+    fs_root = getattr(runtime.store, "fs_root", None)
+    if fs_root:
+        fs_path = Path(fs_root)
+
+        def _fs_probe() -> None:
+            if not fs_path.exists() or not fs_path.is_dir():
+                raise FileNotFoundError(fs_path)
+            health_file = fs_path / ".health_check"
+            health_file.write_text(datetime.utcnow().isoformat())
+            health_file.read_text()
+            health_file.unlink(missing_ok=True)
+
+        fs_ok = await _run_bounded("filesystem", _fs_probe)
+        checks["filesystem"] = {"status": "healthy" if fs_ok else "unhealthy"}
+        overall_healthy = overall_healthy and fs_ok
+    else:
+        checks["filesystem"] = {"status": "not_configured"}
 
     status = "healthy" if overall_healthy else "unhealthy"
     return {
@@ -372,6 +441,64 @@ async def metrics() -> Response:
         logger.error("metrics_collection_failed", error=str(exc))
 
     return Response(content="\n".join(lines) + "\n", media_type="text/plain")
+
+
+def _sweep_tmp_dirs(shared_root: Path, max_age_hours: int) -> None:
+    """Remove stale files from per-user tmp scratch directories.
+
+    SPEC §18 requires per-user scratch cleanup on a daily cadence. This helper
+    runs in a thread to avoid blocking the event loop.
+    """
+
+    cutoff_ts = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).timestamp()
+    user_root = shared_root / "users"
+    if not user_root.exists():
+        return
+
+    for user_dir in user_root.iterdir():
+        tmp_dir = user_dir / "tmp"
+        if not tmp_dir.exists():
+            continue
+        # Delete stale files and then prune empty directories depth-first
+        for path in sorted(tmp_dir.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            if path.is_file() and stat.st_mtime < cutoff_ts:
+                path.unlink(missing_ok=True)
+        # Remove empty directories after file cleanup
+        for path in sorted(tmp_dir.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+            if path.is_dir():
+                try:
+                    next(path.iterdir())
+                except (OSError, StopIteration):
+                    with contextlib.suppress(OSError):
+                        path.rmdir()
+        try:
+            next(tmp_dir.iterdir())
+        except (OSError, StopIteration):
+            with contextlib.suppress(OSError):
+                tmp_dir.rmdir()
+
+
+async def _run_tmp_cleanup(
+    shared_root: Path, interval_seconds: int, max_age_hours: int
+) -> None:
+    """Background loop to periodically clean tmp scratch directories."""
+
+    interval = max(interval_seconds, 300)
+    try:
+        while True:
+            try:
+                await asyncio.to_thread(_sweep_tmp_dirs, shared_root, max_age_hours)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover - best-effort cleanup
+                logger.warning("tmp_cleanup_failed", error=str(exc))
+            await asyncio.sleep(interval)
+    except asyncio.CancelledError:
+        logger.info("tmp_cleanup_task_cancelled")
 
 
 def create_app() -> FastAPI:

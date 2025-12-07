@@ -38,6 +38,8 @@ ALTER TABLE artifact_version
 CREATE INDEX IF NOT EXISTS idx_artifact_owner_user_id ON artifact(owner_user_id);
 CREATE INDEX IF NOT EXISTS idx_artifact_type ON artifact(type);
 CREATE INDEX IF NOT EXISTS idx_artifact_kind ON artifact((schema->>'kind'));
+CREATE INDEX IF NOT EXISTS idx_artifact_visibility ON artifact(visibility);
+CREATE INDEX IF NOT EXISTS idx_artifact_owner_visibility ON artifact(owner_user_id, visibility);
 
 CREATE TABLE IF NOT EXISTS config_patch (
   id              BIGSERIAL PRIMARY KEY,
