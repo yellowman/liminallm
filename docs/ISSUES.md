@@ -1,6 +1,6 @@
 # Codebase Issues and Security Audit
 
-**Last Updated:** 2025-12-09
+**Last Updated:** 2025-12-08
 **Scope:** Comprehensive review against SPEC.md requirements (12th pass)
 
 ---
@@ -160,6 +160,29 @@ This document consolidates findings from deep analysis of the liminallm codebase
 - 2.2: Single-session mode (`meta.single_session=true` revokes prior sessions on login)
 - 3.1: Concurrency caps (max 3 workflows, 2 inference per user) with 409 responses
 - 3.2: Per-plan adjustable rate limits (free: 1x, paid: 2x, enterprise: 5x multipliers)
+
+---
+
+## Recent Verifications (2025-12-08)
+
+- ✅ **Workflow sanitization preserves structured tool output** (BUG check):
+  - **Location:** `liminallm/service/workflow.py:1514-1549`
+  - **Status:** Confirmed fixed. `_sanitize_html_untrusted` now recursively escapes only string leaves while leaving lists/dicts intact, preventing `content` from being stringified before escaping when `content_type` is `html_untrusted`.
+- ✅ **Artifact pagination respects has_next detection at 500-item cap** (BUG check):
+  - **Location:** `liminallm/storage/postgres.py:1800-1824`
+  - **Status:** Confirmed fixed. Storage still returns one extra record for pagination detection when callers request `page_size + 1`, even when capped at 500, so `has_next` remains accurate for max-sized pages.
+- ✅ **Session cache expiration comparison handles timezone-aware datetimes** (BUG check):
+  - **Location:** `liminallm/storage/postgres.py:138-172`
+  - **Status:** Confirmed fixed. Cache pruning uses `datetime.now(timezone.utc)` and normalizes `expires_at` to timezone-aware values before comparison, avoiding `TypeError` from naive/aware mismatches.
+- ✅ **Local rate limit cleanup avoids key shadowing** (BUG check):
+  - **Location:** `liminallm/service/runtime.py:561-595`
+  - **Status:** Confirmed fixed. Cleanup comprehensions use `stale_key` and preserve the `key` parameter for subsequent updates, preventing rate-limit checks from rebinding to an incorrect identifier.
+- ✅ **Active request cleanup runs under lock** (BUG check):
+  - **Location:** `liminallm/api/routes.py:200-217`
+  - **Status:** Confirmed fixed. `_cleanup_stale_active_requests()` is invoked inside the `_get_active_requests_lock()` context for both registration and unregistration, eliminating the prior race on `_active_requests`.
+- ✅ **WebSocket disconnects no longer persist partial assistant messages** (BUG check):
+  - **Location:** `liminallm/api/routes.py:4370-4445`
+  - **Status:** Confirmed fixed. Disconnect handling sets `cancel_event`, executes cleanup, and returns early when streaming ends without `message_done`, preventing empty/partial assistant messages from being saved after broken connections.
 
 ---
 
