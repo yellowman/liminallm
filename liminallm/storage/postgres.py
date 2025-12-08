@@ -1821,7 +1821,7 @@ class PostgresStore:
         requested_page_size = max(page_size, 1)
         capped_page_size = min(requested_page_size, max_page_size)
         # Allow one extra record for has_next detection when caller requests page_size + 1
-        limit = capped_page_size + (1 if requested_page_size > capped_page_size else 0)
+        limit = capped_page_size + (1 if requested_page_size >= max_page_size else 0)
         offset = max(page - 1, 0) * capped_page_size
         with self._connect() as conn:
             clauses = []
