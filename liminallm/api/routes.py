@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import math
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path as FilePath
 from typing import Any, Dict, Optional
@@ -14,6 +15,7 @@ import mimetypes
 
 from fastapi import (
     APIRouter,
+    Body,
     Depends,
     File,
     Form,
@@ -117,6 +119,24 @@ from liminallm.storage.models import Conversation, KnowledgeContext, Session
 
 logger = get_logger(__name__)
 
+# File upload policy (SPEC §17): allowed extensions returned via /files/limits
+ALLOWED_UPLOAD_EXTENSIONS = {
+    ".txt",
+    ".md",
+    ".pdf",
+    ".json",
+    ".csv",
+    ".tsv",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".mp3",
+    ".wav",
+    ".ogg",
+}
+
 router = APIRouter(prefix="/v1")
 
 # Registry for active streaming requests - maps request_id to (cancel_event, timestamp, user_id)
@@ -194,6 +214,7 @@ async def _unregister_cancel_event(request_id: str) -> None:
     """Unregister a cancel event when request completes."""
     async with _get_active_requests_lock():
         _active_requests.pop(request_id, None)
+        await _cleanup_stale_active_requests()
 
 
 async def _cancel_request(request_id: str, user_id: str) -> tuple[bool, str]:
@@ -1200,8 +1221,8 @@ async def admin_create_user(
 
 @router.post("/admin/users/{user_id}/role", response_model=Envelope, tags=["admin"])
 async def admin_set_role(
-    user_id: str,
-    body: UpdateUserRoleRequest,
+    user_id: str = Path(..., max_length=255, description="User identifier"),
+    body: UpdateUserRoleRequest = Body(...),
     principal: AuthContext = Depends(get_admin_user),
 ):
     runtime = get_runtime()
@@ -1859,6 +1880,15 @@ async def chat(
     # Get user's plan tier for per-plan rate limits (SPEC §18)
     user = runtime.store.get_user(user_id)
     plan_tier = user.plan_tier if user else "free"
+    logger.info(
+        "chat_request",
+        user_id=user_id,
+        conversation_id=body.conversation_id,
+        context_id=body.context_id,
+        workflow_id=body.workflow_id,
+        plan_tier=plan_tier,
+        idempotency_key=bool(idempotency_key),
+    )
 
     # SPEC §18: Accept Idempotency-Key when provided (optional)
     async with IdempotencyGuard(
@@ -1941,6 +1971,7 @@ async def chat(
                 orchestration_dict: dict[str, Any] = (
                     orchestration if isinstance(orchestration, dict) else {}
                 )
+                usage: dict[str, Any] = orchestration_dict.get("usage") or {}
                 adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
                 assistant_content_struct = normalize_content_struct(
                     orchestration_dict.get("content_struct"),
@@ -1958,7 +1989,7 @@ async def chat(
                         "adapter_gates": orchestration_dict.get("adapter_gates", []),
                         "routing_trace": orchestration_dict.get("routing_trace", []),
                         "workflow_trace": orchestration_dict.get("workflow_trace", []),
-                        "usage": orchestration_dict.get("usage", {}),
+                        "usage": usage,
                     },
                 )
                 resp = ChatResponse(
@@ -1969,13 +2000,25 @@ async def chat(
                     workflow_id=body.workflow_id,
                     adapters=adapter_names,
                     adapter_gates=orchestration_dict.get("adapter_gates", []),
-                    usage=orchestration_dict.get("usage", {}),
+                    usage=usage,
                     context_snippets=orchestration_dict.get("context_snippets", []),
                     routing_trace=orchestration_dict.get("routing_trace", []),
                     workflow_trace=orchestration_dict.get("workflow_trace", []),
                 )
                 envelope = Envelope(
                     status="ok", data=resp.model_dump(), request_id=idem.request_id
+                )
+                logger.info(
+                    "chat_response",
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    context_id=context_id,
+                    workflow_id=body.workflow_id,
+                    adapters=adapter_names,
+                    total_tokens=usage.get("total_tokens"),
+                    prompt_tokens=usage.get("prompt_tokens"),
+                    completion_tokens=usage.get("completion_tokens"),
+                    request_id=idem.request_id,
                 )
                 if runtime.cache:
                     # Issue 38.4: Add limit to prevent unbounded memory usage
@@ -2470,8 +2513,8 @@ async def list_artifact_versions(
 
 @router.post("/tools/{tool_id}/invoke", response_model=Envelope, tags=["tools"])
 async def invoke_tool(
-    tool_id: str,
-    body: ToolInvokeRequest,
+    tool_id: str = Path(..., max_length=255, description="Tool artifact identifier"),
+    body: ToolInvokeRequest = Body(...),
     principal: AuthContext = Depends(get_user),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
@@ -2705,8 +2748,8 @@ def _deep_merge(base: dict, updates: dict) -> dict:
 
 @router.patch("/artifacts/{artifact_id}", response_model=Envelope, tags=["artifacts"])
 async def patch_artifact(
-    artifact_id: str,
-    body: ArtifactPatchRequest,
+    artifact_id: str = Path(..., max_length=255, description="Artifact identifier"),
+    body: ArtifactPatchRequest = Body(...),
     principal: AuthContext = Depends(get_user),
 ):
     """Update an artifact via RFC 6902 JSON Patch or legacy schema update.
@@ -2835,8 +2878,8 @@ async def list_config_patches(
 
 @router.post("/config/patches/{patch_id}/decide", response_model=Envelope, tags=["config"])
 async def decide_config_patch(
-    patch_id: int,
-    body: ConfigPatchDecisionRequest,
+    patch_id: int = Path(..., ge=1, description="Config patch identifier"),
+    body: ConfigPatchDecisionRequest = Body(...),
     principal: AuthContext = Depends(get_admin_user),
 ):
     runtime = get_runtime()
@@ -2865,7 +2908,8 @@ async def decide_config_patch(
 
 @router.post("/config/patches/{patch_id}/apply", response_model=Envelope, tags=["config"])
 async def apply_config_patch(
-    patch_id: int, principal: AuthContext = Depends(get_admin_user)
+    patch_id: int = Path(..., ge=1, description="Config patch identifier"),
+    principal: AuthContext = Depends(get_admin_user)
 ):
     runtime = get_runtime()
     # Rate limit configops per SPEC §18: 30 req/hour
@@ -3280,6 +3324,7 @@ async def get_file_limits(principal: AuthContext = Depends(get_user)):
         data={
             "max_upload_bytes": _get_plan_upload_limit(runtime, plan_tier),
             "plan_tier": plan_tier,
+            "allowed_extensions": sorted(ALLOWED_UPLOAD_EXTENSIONS),
         },
     )
 
@@ -3309,6 +3354,13 @@ async def upload_file(
         safe_filename = safe_filename[:255]  # Limit length
         if not safe_filename:
             safe_filename = "untitled"
+        ext = FilePath(safe_filename).suffix.lower()
+        if ext not in ALLOWED_UPLOAD_EXTENSIONS:
+            raise _http_error(
+                "validation_error",
+                f"unsupported file extension: {ext or 'none'}",
+                status_code=400,
+            )
         dest_dir = (
             FilePath(runtime.settings.shared_fs_root)
             / "users"
@@ -3338,6 +3390,15 @@ async def upload_file(
             cost=approx_cost,
         )
         contents = await file.read(max_bytes + 1)
+        actual_cost = max(1, math.ceil(len(contents) / (256 * 1024)))
+        if actual_cost > approx_cost:
+            await _enforce_rate_limit(
+                runtime,
+                f"files:upload:{principal.user_id}",
+                _get_rate_limit(runtime, "files_upload_rate_limit_per_minute"),
+                60,
+                cost=actual_cost - approx_cost,
+            )
         if len(contents) > max_bytes:
             raise _http_error("validation_error", f"file too large (max {max_bytes // 1024 // 1024}MB for {plan_tier} plan)", status_code=413)
         detected_mime = file.content_type or mimetypes.guess_type(safe_filename)[0]
@@ -3671,7 +3732,9 @@ async def delete_file(
 
 @router.get("/conversations/{conversation_id}/messages", response_model=Envelope, tags=["conversations"])
 async def list_messages(
-    conversation_id: str,
+    conversation_id: str = Path(
+        ..., max_length=255, description="Conversation identifier"
+    ),
     limit: Optional[int] = Query(None, ge=1, description="Maximum messages to return"),
     principal: AuthContext = Depends(get_user),
 ):
@@ -4276,6 +4339,7 @@ async def websocket_chat(ws: WebSocket):
             # Issue 38.5: Use list for O(n) token accumulation instead of string += O(n²)
             content_tokens: list[str] = []
             orchestration_dict: dict[str, Any] = {}
+            message_done_received = False
 
             # Concurrent task to listen for cancel requests while streaming
             async def listen_for_cancel():
@@ -4313,12 +4377,25 @@ async def websocket_chat(ws: WebSocket):
                     event_data = event.get("data")
 
                     # SPEC §18: WebSockets wrap as {"event": "token", "data": "...", "request_id": "..."}
-                    await ws.send_json({"event": event_type, "data": event_data, "request_id": request_id})
+                    try:
+                        await ws.send_json(
+                            {"event": event_type, "data": event_data, "request_id": request_id}
+                        )
+                    except WebSocketDisconnect:
+                        cancel_event.set()
+                        break
+                    except RuntimeError as exc:
+                        cancel_event.set()
+                        logger.warning(
+                            "websocket_send_failed", request_id=request_id, error=str(exc)
+                        )
+                        break
 
                     if event_type == "token":
                         if isinstance(event_data, str):
                             content_tokens.append(event_data)
                     elif event_type == "message_done":
+                        message_done_received = True
                         orchestration_dict = event_data if isinstance(event_data, dict) else {}
                     elif event_type == "error":
                         # Error already sent, close connection
@@ -4333,13 +4410,19 @@ async def websocket_chat(ws: WebSocket):
             except WebSocketDisconnect:
                 cancel_event.set()
                 cancel_listener.cancel()
+                with suppress(asyncio.CancelledError):
+                    await cancel_listener
                 await _unregister_cancel_event(request_id)
                 return
             finally:
                 cancel_listener.cancel()
+                with suppress(asyncio.CancelledError):
+                    await cancel_listener
                 await _unregister_cancel_event(request_id)
 
-            # Save assistant message after streaming completes
+            # Save assistant message after streaming completes (only if successful)
+            if cancel_event.is_set() or not message_done_received:
+                return
             adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
             # Issue 38.5: Join tokens at end for O(n) performance
             full_content = "".join(content_tokens)

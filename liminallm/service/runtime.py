@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import inspect
 import threading
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Tuple, Union
@@ -261,8 +263,12 @@ class Runtime:
         )
         self._local_idempotency: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         self._local_idempotency_lock = asyncio.Lock()
+        self._local_idempotency_last_cleanup = datetime.utcnow()
+        self._local_idempotency_max_entries = 5000
         self._local_rate_limits: Dict[str, Tuple[float, datetime]] = {}
         self._local_rate_limit_lock = asyncio.Lock()
+        self._local_rate_limit_last_cleanup = datetime.utcnow()
+        self._local_rate_limit_max_entries = 5000
 
         # Log successful initialization with summary
         logger.info(
@@ -276,6 +282,37 @@ class Runtime:
             voice_configured=self.voice.is_configured,
             mfa_enabled=mfa_enabled,
         )
+
+    async def close(self) -> None:
+        """Cleanup resources for graceful shutdown (Issues 57.7, 59.1)."""
+
+        if getattr(self, "training_worker", None):
+            with contextlib.suppress(Exception):
+                await self.training_worker.stop()
+
+        if getattr(self, "workflow", None):
+            with contextlib.suppress(Exception):
+                self.workflow.shutdown(wait=True)
+
+        if getattr(self, "voice", None):
+            with contextlib.suppress(Exception):
+                await self.voice.close()
+
+        if getattr(self, "cache", None):
+            close_fn = getattr(self.cache, "close", None)
+            if close_fn:
+                with contextlib.suppress(Exception):
+                    result = close_fn()
+                    if inspect.isawaitable(result):
+                        await result
+
+        if getattr(self, "store", None):
+            close_fn = getattr(self.store, "close", None)
+            if close_fn:
+                with contextlib.suppress(Exception):
+                    result = close_fn()
+                    if inspect.isawaitable(result):
+                        await result
 
 
 runtime: Runtime | None = None
@@ -291,10 +328,6 @@ def get_runtime() -> Runtime:
     - Second check with lock to prevent race condition during creation
     """
     global runtime
-    # Fast path: runtime already exists
-    if runtime is not None:
-        return runtime
-    # Slow path: acquire lock and double-check before creating
     with _runtime_lock:
         if runtime is None:
             runtime = Runtime()
@@ -339,6 +372,36 @@ def reset_runtime_for_tests() -> Runtime:
 IDEMPOTENCY_TTL_SECONDS = 60 * 60 * 24
 
 
+def _cleanup_local_idempotency(
+    runtime: Runtime, now: datetime
+) -> tuple[int, int]:
+    """Prune expired or excess in-memory idempotency records.
+
+    Returns a tuple of (expired_removed, evicted_removed).
+    """
+
+    expired = [
+        key
+        for key, record in runtime._local_idempotency.items()
+        if record.get("expires_at") and record["expires_at"] < now
+    ]
+    for key in expired:
+        runtime._local_idempotency.pop(key, None)
+
+    evicted = 0
+    if len(runtime._local_idempotency) > runtime._local_idempotency_max_entries:
+        # Evict oldest entries first
+        sorted_items = sorted(
+            runtime._local_idempotency.items(),
+            key=lambda item: item[1].get("expires_at", now),
+        )
+        excess = len(runtime._local_idempotency) - runtime._local_idempotency_max_entries
+        for i in range(excess):
+            runtime._local_idempotency.pop(sorted_items[i][0], None)
+            evicted += 1
+    return len(expired), evicted
+
+
 async def _get_cached_idempotency_record(
     runtime: Runtime, route: str, user_id: str, key: str, *, tenant_id: Optional[str] = None
 ) -> Optional[dict]:
@@ -349,6 +412,7 @@ async def _get_cached_idempotency_record(
     async with runtime._local_idempotency_lock:
         # Include tenant_id in in-memory key for multi-tenant isolation
         cache_key = (tenant_id, route, user_id, key) if tenant_id else (route, user_id, key)
+        _cleanup_local_idempotency(runtime, now)
         record = runtime._local_idempotency.get(cache_key)
         if not record:
             return None
@@ -378,10 +442,8 @@ async def _set_cached_idempotency_record(
     async with runtime._local_idempotency_lock:
         # Include tenant_id in in-memory key for multi-tenant isolation
         cache_key = (tenant_id, route, user_id, key) if tenant_id else (route, user_id, key)
-        runtime._local_idempotency[cache_key] = {
-            **record,
-            "expires_at": expires_at,
-        }
+        _cleanup_local_idempotency(runtime, datetime.utcnow())
+        runtime._local_idempotency[cache_key] = {**record, "expires_at": expires_at}
 
 
 async def _acquire_idempotency_slot(
@@ -423,6 +485,14 @@ async def _acquire_idempotency_slot(
     async with runtime._local_idempotency_lock:
         # Include tenant_id in in-memory key for multi-tenant isolation
         cache_key = (tenant_id, route, user_id, key) if tenant_id else (route, user_id, key)
+        expired, evicted = _cleanup_local_idempotency(runtime, now)
+        if expired or evicted:
+            logger.info(
+                "idempotency_local_cleanup",
+                expired=expired,
+                evicted=evicted,
+                remaining=len(runtime._local_idempotency),
+            )
         existing = runtime._local_idempotency.get(cache_key)
 
         if existing:
@@ -467,10 +537,11 @@ async def check_rate_limit(
     """
     if limit <= 0:
         return (True, limit, 0) if return_remaining else True
+    rate_limit_key = key
     if window_seconds <= 0:
         logger.warning(
             "rate_limit_invalid_window",
-            key=key,
+            key=rate_limit_key,
             window_seconds=window_seconds,
             message="Invalid rate limit window_seconds; defaulting to 60 seconds",
         )
@@ -478,19 +549,49 @@ async def check_rate_limit(
     now = datetime.utcnow()
     if runtime.cache:
         result = await runtime.cache.check_rate_limit(
-            key, limit, window_seconds, return_remaining=return_remaining, cost=cost
+            rate_limit_key,
+            limit,
+            window_seconds,
+            return_remaining=return_remaining,
+            cost=cost,
         )
         return result
     window = timedelta(seconds=window_seconds)
     refill_rate = float(limit) / float(window_seconds)
     async with runtime._local_rate_limit_lock:
-        tokens, last_ts = runtime._local_rate_limits.get(key, (float(limit), now))
+        now = datetime.utcnow()
+        # Cleanup old or excess entries to prevent unbounded growth (Issue 57.2)
+        max_age_seconds = max(window_seconds * 2, 3600)
+        if (now - runtime._local_rate_limit_last_cleanup).total_seconds() > 300:
+            runtime._local_rate_limit_last_cleanup = now
+            expired_keys = [
+                stale_key
+                for stale_key, (_, ts) in runtime._local_rate_limits.items()
+                if (now - ts).total_seconds() > max_age_seconds
+            ]
+            for stale_key in expired_keys:
+                runtime._local_rate_limits.pop(stale_key, None)
+            if len(runtime._local_rate_limits) > runtime._local_rate_limit_max_entries:
+                # Evict oldest by timestamp
+                sorted_items = sorted(
+                    runtime._local_rate_limits.items(), key=lambda item: item[1][1]
+                )
+                excess = len(runtime._local_rate_limits) - runtime._local_rate_limit_max_entries
+                for i in range(excess):
+                    runtime._local_rate_limits.pop(sorted_items[i][0], None)
+            if expired_keys:
+                logger.info(
+                    "rate_limit_local_cleanup",
+                    cleaned=len(expired_keys),
+                    remaining=len(runtime._local_rate_limits),
+                )
+        tokens, last_ts = runtime._local_rate_limits.get(rate_limit_key, (float(limit), now))
         elapsed = max(0.0, (now - last_ts).total_seconds())
         tokens = min(float(limit), tokens + elapsed * refill_rate)
         allowed = tokens >= cost
         if allowed:
             tokens -= cost
-            runtime._local_rate_limits[key] = (tokens, now)
+            runtime._local_rate_limits[rate_limit_key] = (tokens, now)
         reset_seconds = int(((cost - tokens) / refill_rate)) if not allowed and refill_rate > 0 else 0
         remaining = int(tokens)
     if return_remaining:

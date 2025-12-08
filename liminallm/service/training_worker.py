@@ -205,6 +205,11 @@ class TrainingWorker:
                         version=result.get("version"),
                     )
 
+                    self._update_adapter_router_state(
+                        adapter_id=adapter_id,
+                        loss=result.get("loss"),
+                        clusters=result.get("clusters"),
+                    )
                     # Trigger clustering after successful training
                     await self._run_post_training_clustering(user_id)
                     return
@@ -327,6 +332,54 @@ class TrainingWorker:
             logger.warning(
                 "post_training_clustering_failed",
                 user_id=user_id,
+                error=str(exc),
+            )
+
+    def _aggregate_cluster_centroid(self, clusters: Optional[List[dict]]) -> List[float]:
+        if not clusters:
+            return []
+        accum: List[float] = []
+        weight_sum = 0
+        for cluster in clusters:
+            centroid = cluster.get("centroid") or []
+            count = cluster.get("count") or 0
+            if not isinstance(centroid, list) or not count:
+                continue
+            if len(accum) < len(centroid):
+                accum += [0.0] * (len(centroid) - len(accum))
+            padded = list(centroid) + [0.0] * (len(accum) - len(centroid))
+            accum = [a + c * count for a, c in zip(accum, padded)]
+            weight_sum += count
+        if not weight_sum:
+            return []
+        return [val / weight_sum for val in accum]
+
+    def _score_from_loss(self, loss: Optional[float]) -> float:
+        if loss is None or not isinstance(loss, (int, float)):
+            return 0.0
+        if loss < 0:
+            return 0.0
+        return 1.0 / (1.0 + float(loss))
+
+    def _update_adapter_router_state(
+        self, *, adapter_id: str, loss: Optional[float], clusters: Optional[List[dict]]
+    ) -> None:
+        """Update adapter router state after training (SPEC §5.4)."""
+
+        if not hasattr(self.store, "update_adapter_router_state"):
+            return
+        centroid_vec = self._aggregate_cluster_centroid(clusters)
+        try:
+            self.store.update_adapter_router_state(
+                adapter_id,
+                centroid_vec=centroid_vec,
+                success_score=self._score_from_loss(loss),
+                last_trained_at=datetime.utcnow(),
+            )
+        except Exception as exc:
+            logger.warning(
+                "adapter_router_state_update_failed",
+                adapter_id=adapter_id,
                 error=str(exc),
             )
 
