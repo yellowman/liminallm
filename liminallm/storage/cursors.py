@@ -7,7 +7,11 @@ from typing import Tuple
 def encode_time_id_cursor(created_at: datetime, identifier: str) -> str:
     """Encode a cursor combining a timestamp and identifier for keyset paging."""
 
-    ts = created_at if created_at.tzinfo else created_at.replace(tzinfo=timezone.utc)
+    ts = (
+        created_at.astimezone(timezone.utc)
+        if created_at.tzinfo
+        else created_at.replace(tzinfo=timezone.utc)
+    )
     return f"{ts.isoformat()}|{identifier}"
 
 
@@ -18,9 +22,12 @@ def decode_time_id_cursor(cursor: str) -> Tuple[datetime, str]:
     if len(parts) != 2:
         raise ValueError("invalid artifact cursor")
     ts = datetime.fromisoformat(parts[0])
-    if ts.tzinfo is None:
-        ts = ts.replace(tzinfo=timezone.utc)
-    return ts, parts[1]
+    ts = (
+        ts.astimezone(timezone.utc)
+        if ts.tzinfo is not None
+        else ts.replace(tzinfo=timezone.utc)
+    )
+    return ts.replace(tzinfo=None), parts[1]
 
 
 def encode_index_cursor(index: int, identifier: str) -> str:

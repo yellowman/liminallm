@@ -406,6 +406,7 @@ class SemanticClusterer:
             if ratio < positive_ratio:
                 continue
             owner_id = cluster.user_id
+            visibility = "private" if owner_id else "global"
             schema = {
                 "kind": "adapter.lora",
                 "scope": "per-user" if cluster.user_id else "global",
@@ -431,6 +432,7 @@ class SemanticClusterer:
                 schema=schema,
                 description=cluster.description or "Cluster skill adapter",
                 owner_user_id=owner_id,
+                visibility=visibility,
             )
             if self.training and cluster.user_id:
                 self.training.ensure_user_adapter(

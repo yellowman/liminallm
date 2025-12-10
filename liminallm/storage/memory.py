@@ -8,7 +8,7 @@ import secrets
 import shutil
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from cryptography.fernet import Fernet, InvalidToken
 
 from liminallm.content_struct import normalize_content_struct
+from liminallm.errors import NotFoundError
 from liminallm.logging import get_logger
 from liminallm.service.artifact_validation import (
     ArtifactValidationError,
@@ -70,6 +71,14 @@ from liminallm.storage.models import (
     UserMFAConfig,
     UserSettings,
 )
+
+
+def _to_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if not dt:
+        return dt
+    if dt.tzinfo:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 class MemoryStore:
@@ -263,6 +272,9 @@ class MemoryStore:
                 meta=normalized_meta,
             )
             self.users[user_id] = user
+            # Issue 21.4: seed settings at creation to keep state consistent
+            if user_id not in self.user_settings:
+                self.user_settings[user_id] = UserSettings(user_id=user_id)
             self._persist_state()
             return user
 
@@ -585,6 +597,23 @@ class MemoryStore:
             if user_id and conv.user_id != user_id:
                 return None
             return conv
+
+    def delete_conversation(
+        self, conversation_id: str, *, user_id: Optional[str] = None
+    ) -> bool:
+        """Remove a conversation and its messages in a single lock."""
+
+        with self._data_lock:
+            conv = self.conversations.get(conversation_id)
+            if not conv:
+                return False
+            if user_id and conv.user_id != user_id:
+                return False
+
+            self.conversations.pop(conversation_id, None)
+            self.messages.pop(conversation_id, None)
+            self._persist_state()
+            return True
 
     def append_message(
         self,
@@ -1135,17 +1164,20 @@ class MemoryStore:
         capped_page_size = min(requested_page_size, max_page_size)
         limit = capped_page_size + (1 if include_sentinel else 0)
 
-        artifacts.sort(key=lambda a: a.created_at, reverse=True)
+        artifacts.sort(
+            key=lambda a: _to_naive_utc(a.created_at) or datetime.min, reverse=True
+        )
         if cursor:
             try:
                 cursor_ts, cursor_id = decode_artifact_cursor(cursor)
+                cursor_ts = _to_naive_utc(cursor_ts) or datetime.min
                 artifacts = [
                     a
                     for a in artifacts
                     if (
-                        (a.created_at or datetime.min) < cursor_ts
+                        (_to_naive_utc(a.created_at) or datetime.min) < cursor_ts
                         or (
-                            (a.created_at or datetime.min) == cursor_ts
+                            (_to_naive_utc(a.created_at) or datetime.min) == cursor_ts
                             and a.id < cursor_id
                         )
                     )
@@ -1168,6 +1200,7 @@ class MemoryStore:
         schema: dict,
         description: str = "",
         owner_user_id: Optional[str] = None,
+        visibility: str = "private",
         *,
         version_author: Optional[str] = None,
         change_note: Optional[str] = None,
@@ -1192,6 +1225,7 @@ class MemoryStore:
             schema=schema,
             description=normalized_description,
             owner_user_id=owner_user_id,
+            visibility=visibility,
             fs_path=fs_path,
             base_model=schema.get("base_model"),
         )
@@ -1350,6 +1384,60 @@ class MemoryStore:
             patch.meta = merged
         self._persist_state()
         return patch
+
+    def apply_config_patch(
+        self,
+        patch: ConfigPatchAudit,
+        new_schema: dict,
+        *,
+        artifact_description: Optional[str] = None,
+        approver_user_id: Optional[str] = None,
+    ) -> tuple[Artifact, ConfigPatchAudit]:
+        """Apply a config patch and mark it applied under a single lock."""
+
+        with self._data_lock:
+            artifact = self.artifacts.get(patch.artifact_id)
+            if not artifact:
+                raise NotFoundError("artifact missing", detail={"artifact_id": patch.artifact_id})
+
+            versions = self.artifact_versions.get(patch.artifact_id, [])
+            next_version = (versions[0].version if versions else 0) + 1
+            updated_artifact = Artifact(
+                id=artifact.id,
+                type=artifact.type,
+                name=artifact.name,
+                description=artifact_description or artifact.description or "",
+                schema=new_schema,
+                owner_user_id=artifact.owner_user_id,
+                visibility=artifact.visibility,
+                fs_path=artifact.fs_path,
+                base_model=new_schema.get("base_model", artifact.base_model),
+            )
+            version = ArtifactVersion(
+                id=str(uuid.uuid4()),
+                artifact_id=artifact.id,
+                version=next_version,
+                schema=new_schema,
+                fs_path=artifact.fs_path,
+                base_model=updated_artifact.base_model,
+                created_by=approver_user_id or patch.proposer or "system_llm",
+                change_note=patch.justification,
+            )
+            self.artifacts[artifact.id] = updated_artifact
+            self.artifact_versions.setdefault(artifact.id, []).insert(0, version)
+
+            merged_meta: Dict[str, Any] = {}
+            if patch.meta and isinstance(patch.meta, dict):
+                merged_meta.update(patch.meta)
+            if approver_user_id:
+                merged_meta["applied_by"] = approver_user_id
+
+            patch.status = "applied"
+            patch.applied_at = datetime.utcnow()
+            patch.meta = merged_meta
+            self.config_patches[patch.id] = patch
+            self._persist_state()
+            return updated_artifact, patch
 
     def get_runtime_config(self) -> dict:
         """Return the runtime configuration persisted for the web admin UI."""
@@ -1556,18 +1644,21 @@ class MemoryStore:
         contexts = [
             ctx for ctx in self.contexts.values() if ctx.owner_user_id == owner_user_id
         ]
-        contexts.sort(key=lambda c: c.created_at, reverse=True)
+        contexts.sort(
+            key=lambda c: _to_naive_utc(c.created_at) or datetime.min, reverse=True
+        )
 
         if cursor:
             try:
                 cursor_ts, cursor_id = decode_time_id_cursor(cursor)
+                cursor_ts = _to_naive_utc(cursor_ts) or datetime.min
                 contexts = [
                     ctx
                     for ctx in contexts
                     if (
-                        (ctx.created_at or datetime.min) < cursor_ts
+                        (_to_naive_utc(ctx.created_at) or datetime.min) < cursor_ts
                         or (
-                            (ctx.created_at or datetime.min) == cursor_ts
+                            (_to_naive_utc(ctx.created_at) or datetime.min) == cursor_ts
                             and ctx.id < cursor_id
                         )
                     )
@@ -1690,17 +1781,24 @@ class MemoryStore:
                 ctx = self.contexts.get(vals[0].context_id)
                 if ctx and ctx.owner_user_id == owner_user_id:
                     chunks.extend(vals)
-        chunks.sort(key=lambda ch: (ch.created_at, ch.id or 0), reverse=True)
+        chunks.sort(
+            key=lambda ch: (
+                _to_naive_utc(ch.created_at) or datetime.min,
+                ch.id or 0,
+            ),
+            reverse=True,
+        )
         if cursor:
             try:
                 cursor_ts, cursor_id = decode_time_id_cursor(cursor)
+                cursor_ts = _to_naive_utc(cursor_ts) or datetime.min
                 chunks = [
                     ch
                     for ch in chunks
                     if (
-                        (ch.created_at or datetime.min) < cursor_ts
+                        (_to_naive_utc(ch.created_at) or datetime.min) < cursor_ts
                         or (
-                            (ch.created_at or datetime.min) == cursor_ts
+                            (_to_naive_utc(ch.created_at) or datetime.min) == cursor_ts
                             and str(ch.id or "") < cursor_id
                         )
                     )
@@ -1720,7 +1818,7 @@ class MemoryStore:
         limit: int = 4,
     ) -> List[KnowledgeChunk]:
         """Hybrid BM25 + semantic search using common implementation."""
-        candidates = self.list_chunks(context_id)
+        candidates = self.list_chunks(context_id, limit=10000)
         if not candidates:
             return []
 
@@ -1765,7 +1863,7 @@ class MemoryStore:
                 owner = self.users.get(ctx.owner_user_id)
                 if not owner or owner.tenant_id != tenant_id:
                     continue
-            allowed_chunks.extend(self.list_chunks(ctx_id))
+            allowed_chunks.extend(self.list_chunks(ctx_id, limit=10000))
 
         if not allowed_chunks:
             return []

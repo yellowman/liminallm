@@ -22,7 +22,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 
 from liminallm.config import Settings
-from liminallm.logging import get_logger
+from liminallm.logging import get_logger, log_routing_trace, log_workflow_trace
 from liminallm.service.embeddings import (
     EMBEDDING_DIM,
     cosine_similarity,
@@ -997,6 +997,11 @@ class WorkflowEngine:
         if not content:
             content = "No response generated."
 
+        # Emit structured traces for observability (Issue 30.x)
+        log_workflow_trace(workflow_trace, logger=self.logger)
+        if routing_trace:
+            log_routing_trace(routing_trace, logger=self.logger)
+
         # Emit final message_done with complete response
         yield {
             "event": "message_done",
@@ -1200,6 +1205,7 @@ class WorkflowEngine:
             )
 
             try:
+                start_ms = time.monotonic() * 1000
                 node_timeout_ms = node.get("timeout_ms", DEFAULT_NODE_TIMEOUT_MS)
                 result, next_nodes = await asyncio.wait_for(
                     self._execute_node(
@@ -1216,6 +1222,8 @@ class WorkflowEngine:
                     timeout=node_timeout_ms / 1000.0,
                 )
 
+                result["latency_ms"] = (time.monotonic() * 1000) - start_ms
+
                 # If node executed successfully or has an on_error handler, return
                 if result.get("status") != "error" or node.get("on_error"):
                     if attempt > 0:
@@ -1228,17 +1236,20 @@ class WorkflowEngine:
                 )
 
             except asyncio.TimeoutError:
+                timeout_latency = (time.monotonic() * 1000) - start_ms
                 last_error = asyncio.TimeoutError("node_timeout")
                 self.logger.warning(
                     "workflow_node_timeout",
                     node=node_id,
                     attempt=attempt + 1,
                     timeout_ms=node_timeout_ms,
+                    latency_ms=timeout_latency,
                 )
                 result = {
                     "status": "error",
                     "error": "node_timeout",
                     "timeout_ms": node_timeout_ms,
+                    "latency_ms": timeout_latency,
                 }
                 next_nodes = []
 

@@ -111,24 +111,33 @@ class ConfigOpsService:
                 "artifact missing", detail={"artifact_id": patch.artifact_id}
             )
 
-        # Step 1: Apply patch to artifact
+        # Step 1: Apply patch to artifact (pure function)
         new_schema = self._apply_patch_to_schema(artifact.schema, patch.patch)
-        updated = self.store.update_artifact(
-            artifact.id, new_schema, artifact.description
-        )
 
-        # Step 2: Mark patch as applied
+        # Step 2: Persist schema and mark patch applied atomically when supported
         applied_patch = None
         status_update_failed = False
         try:
-            applied_patch = self.store.update_config_patch_status(
-                patch_id,
-                "applied",
-                meta={"applied_by": approver_user_id} if approver_user_id else None,
-                mark_applied=True,
-            )
+            if hasattr(self.store, "apply_config_patch"):
+                updated, applied_patch = self.store.apply_config_patch(  # type: ignore[attr-defined]
+                    patch,
+                    new_schema,
+                    artifact_description=artifact.description,
+                    approver_user_id=approver_user_id,
+                )
+            else:
+                updated = self.store.update_artifact(
+                    artifact.id, new_schema, artifact.description
+                )
+                applied_patch = self.store.update_config_patch_status(
+                    patch_id,
+                    "applied",
+                    meta={"applied_by": approver_user_id}
+                    if approver_user_id
+                    else None,
+                    mark_applied=True,
+                )
         except Exception as exc:
-            # Log the error but don't fail - artifact is already updated
             status_update_failed = True
             logger.error(
                 "config_patch_status_update_failed",
@@ -137,6 +146,8 @@ class ConfigOpsService:
                 error=str(exc),
                 message="Artifact was updated but patch status could not be marked as applied",
             )
+            if not applied_patch:
+                applied_patch = self.store.get_config_patch(patch_id)
 
         result = {"artifact": updated, "patch": applied_patch or patch}
         if status_update_failed:

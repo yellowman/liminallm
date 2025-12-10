@@ -5,7 +5,7 @@ import json
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -44,6 +44,7 @@ from liminallm.storage.cursors import (
     decode_index_cursor,
     decode_time_id_cursor,
 )
+from liminallm.errors import NotFoundError
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
     AdapterRouterState,
@@ -650,7 +651,7 @@ class PostgresStore:
         meta: dict | None = None,
     ) -> SemanticCluster:
         cid = cluster_id or str(uuid.uuid4())
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         existing = self.get_semantic_cluster(cid)
         created_at = existing.created_at if existing else now
         normalized_label = normalize_optional_text(
@@ -1073,7 +1074,7 @@ class PostgresStore:
         normalized_meta.setdefault("email_verified", False)
         normalized_handle = normalize_optional_text(handle)
         try:
-            with self._connect() as conn:
+            with self._connect() as conn, conn.transaction():
                 conn.execute(
                     """
                     INSERT INTO app_user (id, email, handle, tenant_id, role, plan_tier, is_active, meta)
@@ -1089,6 +1090,14 @@ class PostgresStore:
                         is_active,
                         json.dumps(normalized_meta) if normalized_meta else None,
                     ),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO user_settings (user_id, locale, timezone, default_voice, default_style, flags)
+                    VALUES (%s, NULL, NULL, NULL, NULL, NULL)
+                    ON CONFLICT (user_id) DO NOTHING
+                    """,
+                    (user_id,),
                 )
         except errors.UniqueViolation:
             raise ConstraintViolation("email already exists", {"field": "email"})
@@ -1714,6 +1723,29 @@ class PostgresStore:
             meta=raw_meta,
         )
 
+    def delete_conversation(
+        self, conversation_id: str, *, user_id: Optional[str] = None
+    ) -> bool:
+        """Delete a conversation and its messages atomically."""
+
+        with self._connect() as conn, conn.transaction():
+            params: list[Any] = [conversation_id]
+            where_clause = "id = %s"
+            if user_id:
+                where_clause += " AND user_id = %s"
+                params.append(user_id)
+
+            deleted = conn.execute(
+                f"DELETE FROM conversation WHERE {where_clause} RETURNING id", tuple(params)
+            ).fetchone()
+            if not deleted:
+                return False
+
+            conn.execute(
+                "DELETE FROM message WHERE conversation_id = %s", (conversation_id,)
+            )
+        return True
+
     def append_message(
         self,
         conversation_id: str,
@@ -2024,6 +2056,7 @@ class PostgresStore:
         schema: dict,
         description: str = "",
         owner_user_id: Optional[str] = None,
+        visibility: str = "private",
         *,
         version_author: Optional[str] = None,
         change_note: Optional[str] = None,
@@ -2039,7 +2072,7 @@ class PostgresStore:
         try:
             with self._connect() as conn, conn.transaction():
                 conn.execute(
-                    "INSERT INTO artifact (id, owner_user_id, type, name, description, schema, fs_path, base_model) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    "INSERT INTO artifact (id, owner_user_id, type, name, description, schema, fs_path, base_model, visibility) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     (
                         artifact_id,
                         owner_user_id,
@@ -2049,6 +2082,7 @@ class PostgresStore:
                         json.dumps(schema),
                         fs_path,
                         schema.get("base_model"),
+                        visibility,
                     ),
                 )
                 conn.execute(
@@ -2074,6 +2108,7 @@ class PostgresStore:
             description=normalized_description or "",
             schema=schema,
             owner_user_id=owner_user_id,
+            visibility=visibility,
             fs_path=fs_path,
             base_model=schema.get("base_model"),
         )
@@ -2489,7 +2524,7 @@ class PostgresStore:
             ).fetchone()
             if not existing:
                 return None
-            now = datetime.utcnow()
+            now = datetime.now(timezone.utc)
             existing_meta = existing.get("meta") or {}
             if isinstance(existing_meta, str):
                 try:
@@ -2524,6 +2559,85 @@ class PostgresStore:
                 "SELECT * FROM config_patch WHERE id = %s", (patch_id,)
             ).fetchone()
         return self._config_patch_from_row(row) if row else None
+
+    def apply_config_patch(
+        self,
+        patch: ConfigPatchAudit,
+        new_schema: dict,
+        *,
+        artifact_description: Optional[str] = None,
+        approver_user_id: Optional[str] = None,
+    ) -> tuple[Artifact, ConfigPatchAudit]:
+        """Atomically persist a config patch application and mark it applied."""
+
+        with self._connect() as conn, conn.transaction():
+            artifact_row = conn.execute(
+                "SELECT * FROM artifact WHERE id = %s FOR UPDATE", (patch.artifact_id,)
+            ).fetchone()
+            if not artifact_row:
+                raise NotFoundError("artifact missing", detail={"artifact_id": patch.artifact_id})
+
+            versions = conn.execute(
+                "SELECT COALESCE(MAX(version), 0) AS v FROM artifact_version WHERE artifact_id = %s",
+                (patch.artifact_id,),
+            ).fetchone()
+            next_version = (versions["v"] or 0) + 1
+            fs_path = self._persist_payload(patch.artifact_id, next_version, new_schema)
+            base_model = new_schema.get("base_model") or artifact_row.get("base_model")
+
+            conn.execute(
+                "UPDATE artifact SET schema = %s, description = COALESCE(%s, description), updated_at = now(), fs_path = %s, base_model = %s WHERE id = %s",
+                (json.dumps(new_schema), artifact_description, fs_path, base_model, patch.artifact_id),
+            )
+            conn.execute(
+                "INSERT INTO artifact_version (artifact_id, version, schema, fs_path, base_model, created_by, change_note) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                (
+                    patch.artifact_id,
+                    next_version,
+                    json.dumps(new_schema),
+                    fs_path,
+                    base_model,
+                    approver_user_id or patch.proposer,
+                    patch.justification,
+                ),
+            )
+
+            merged_meta: Dict[str, Any] = {}
+            if patch.meta:
+                if isinstance(patch.meta, dict):
+                    merged_meta.update(patch.meta)
+                else:
+                    try:
+                        parsed = json.loads(patch.meta)
+                        if isinstance(parsed, dict):
+                            merged_meta.update(parsed)
+                    except Exception:
+                        merged_meta = {}
+            if approver_user_id:
+                merged_meta["applied_by"] = approver_user_id
+
+            conn.execute(
+                "UPDATE config_patch SET status = %s, applied_at = now(), meta = %s WHERE id = %s",
+                ("applied", json.dumps(merged_meta) if merged_meta else json.dumps({}), patch.id),
+            )
+            refreshed = conn.execute(
+                "SELECT * FROM config_patch WHERE id = %s", (patch.id,)
+            ).fetchone()
+
+        updated_artifact = Artifact(
+            id=str(artifact_row["id"]),
+            type=artifact_row["type"],
+            name=artifact_row["name"],
+            description=artifact_description or artifact_row.get("description") or "",
+            schema=new_schema,
+            owner_user_id=(
+                str(artifact_row["owner_user_id"]) if artifact_row.get("owner_user_id") else None
+            ),
+            visibility=artifact_row.get("visibility", "private"),
+            fs_path=fs_path,
+            base_model=base_model,
+        )
+        return updated_artifact, self._config_patch_from_row(refreshed)
 
     def _config_patch_from_row(self, row) -> ConfigPatchAudit:
         raw_patch = row.get("patch") if isinstance(row, dict) else row["patch"]

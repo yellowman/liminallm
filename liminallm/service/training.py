@@ -46,6 +46,7 @@ class TrainingService:
         runtime_base_model: Optional[str] = None,
         default_adapter_mode: str = AdapterMode.HYBRID,
         backend_mode: Optional[str] = None,
+        max_active_training_jobs: int = 10,
     ) -> None:
         self.store = store
         self.fs_root = Path(fs_root)
@@ -60,6 +61,7 @@ class TrainingService:
         self.default_adapter_mode = default_adapter_mode
         self.backend_mode = backend_mode
         self._compatible_modes = get_compatible_adapter_modes(backend_mode or "openai")
+        self.max_active_training_jobs = max_active_training_jobs
 
     def _safe_int(self, value: object, default: int, *, context: str) -> int:
         """Coerce values to int with fallback to avoid ValueError crashes (Issue 39.3)."""
@@ -454,6 +456,22 @@ class TrainingService:
         recent_jobs = self._list_user_training_jobs(user_id)
         for job in recent_jobs:
             if job.status in active_statuses:
+                return False
+        global_jobs: List = []
+        list_all = getattr(self.store, "list_training_jobs", None)
+        if callable(list_all):
+            try:
+                global_jobs = list_all(status=None)
+            except TypeError:
+                global_jobs = list_all()
+        if global_jobs:
+            active_global = [j for j in global_jobs if j.status in active_statuses]
+            if len(active_global) >= self.max_active_training_jobs:
+                logger.info(
+                    "training_job_global_limit_reached",
+                    active=len(active_global),
+                    max_allowed=self.max_active_training_jobs,
+                )
                 return False
         if not recent_jobs:
             return True

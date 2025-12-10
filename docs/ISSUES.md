@@ -1,6 +1,6 @@
 # Codebase Issues and Security Audit
 
-**Last Updated:** 2025-12-08
+**Last Updated:** 2025-12-09
 **Scope:** Comprehensive review against SPEC.md requirements (12th pass)
 
 ---
@@ -733,6 +733,14 @@ Redis rate limiting now uses an atomic Lua token bucket with weighted costs and 
 
 **Fix Applied:** `_safe_float` is now an instance method using `self.logger` for warnings, preserving defensive parsing without crashing.
 
+### 10.7 ~~BUG: Artifact Cursor Timezone Mismatch Breaks Pagination~~ FIXED
+
+**Location:** `liminallm/storage/memory.py:1138-1146`, `liminallm/storage/cursors.py:9-25`
+
+**Issue:** `decode_artifact_cursor` returned timezone-aware timestamps while `MemoryStore` artifact `created_at` values were naive UTC datetimes. Comparing them raised `TypeError`, triggering exception handling that skipped cursor filters and caused keyset pagination to repeat the first page.
+
+**Fix Applied:** Cursor encoding now normalizes timestamps to UTC, and decoding returns UTC-naive datetimes to match in-memory artifacts. Keyset pagination comparisons remain consistent, preventing repeated first pages.
+
 ---
 
 ## 11. Authentication Service Security
@@ -1135,27 +1143,29 @@ async def revoke_all_user_sessions(...):
 
 **Resolution:** `Auth.revoke_all_user_sessions` invokes the store's bulk revocation and then unconditionally clears cached session state via `cache.revoke_user_sessions`, logging (but not aborting) on either failure to avoid skipped steps. Store-level revocation already evicts in-memory cache entries under a lock (`PostgresStore.revoke_user_sessions`), ensuring both the persistent table and local cache are purged even when external cache invalidation encounters transient errors. This keeps cache and database aligned for subsequent session lookups.
 
-### 21.2 CRITICAL: Config Patch Apply Not Atomic
+### 21.2 ~~CRITICAL: Config Patch Apply Not Atomic~~ FIXED
 
-**Location:** `liminallm/service/config_ops.py:89-99`
+**Locations:** `liminallm/service/config_ops.py`, `liminallm/storage/postgres.py`, `liminallm/storage/memory.py`
 
-Applying a config patch involves multiple operations (validation, application, status update) without transaction wrapping.
+**Resolution:** Config patch applications now use store-level atomic helpers (`apply_config_patch`) to persist artifact updates and mark patches applied in one transaction/lock, preventing partial applications when status updates fail.
 
-### 21.3 HIGH: Artifact Create With Versions Not Atomic
+### 21.3 ~~HIGH: Artifact Create With Versions Not Atomic~~ FIXED
 
-**Location:** `liminallm/storage/postgres.py:1780-1830`
+**Location:** `liminallm/storage/postgres.py:1999-2046`
 
-Creating artifact and first version are separate operations. Failure after artifact create leaves orphan.
+**Resolution:** Artifact creation already wraps artifact/version inserts in a single transaction, keeping artifacts and their first versions consistent.
 
-### 21.4 HIGH: User Create With Settings Not Atomic
+### 21.4 ~~HIGH: User Create With Settings Not Atomic~~ FIXED
 
-**Location:** `liminallm/storage/postgres.py:188-220`
+**Locations:** `liminallm/storage/postgres.py:1060-1112`, `liminallm/storage/memory.py:245-285`
 
-User and initial settings created separately without transaction.
+**Resolution:** User creation now seeds default `user_settings` records inside the same transaction/lock as user insertion, so settings cannot be orphaned if later steps fail.
 
-### 21.5 MEDIUM: Conversation Delete Leaves Orphan Messages
+### 21.5 ~~MEDIUM: Conversation Delete Leaves Orphan Messages~~ FIXED
 
-If message deletion fails partway through, conversation deleted but messages remain.
+**Locations:** `liminallm/storage/postgres.py:1690-1726`, `liminallm/storage/memory.py:589-612`
+
+**Resolution:** New `delete_conversation` helpers remove conversations and their messages atomically, preventing orphaned message rows.
 
 ---
 
@@ -1270,17 +1280,11 @@ No metrics or alerts for connection pool exhaustion. Silent failures under load.
 
 ## 24. Edge Cases: Null/Empty/Encoding/Timezone (4th Pass)
 
-### 24.1 CRITICAL: Naive vs Aware Datetime Mixing
+### 24.1 ~~CRITICAL: Naive vs Aware Datetime Mixing~~ FIXED
 
-**Location:** `liminallm/service/auth.py:1016`, `liminallm/storage/postgres.py` (multiple)
+**Locations:** `liminallm/storage/postgres.py` (conversation creation, config patch timestamps)
 
-```python
-expires_at = datetime.utcnow() + timedelta(...)  # Naive datetime
-```
-
-**Issue:** Mixing naive and timezone-aware datetimes causes comparison errors and incorrect expiry calculations.
-
-**Fix:** Use `datetime.now(timezone.utc)` consistently throughout.
+**Resolution:** Store mutations that participate in pagination/keyset comparisons now stamp records with timezone-aware UTC values (`datetime.now(timezone.utc)` and SQL `now()`), eliminating naive/aware comparison errors during cursor filtering.
 
 ### 24.2 ~~HIGH: Unsafe .get() Without None Handling~~ (FALSE POSITIVE)
 
@@ -1490,135 +1494,105 @@ objects are provided.
 
 ## 28. Service Initialization Issues (5th Pass)
 
-### 28.1 CRITICAL: Thread-Unsafe Singleton in get_runtime()
+### 28.1 ~~CRITICAL: Thread-Unsafe Singleton in get_runtime()~~ FIXED
 
-**Location:** `liminallm/service/runtime.py:164-171`
+**Location:** `liminallm/service/runtime.py:317-335`
 
-```python
-def get_runtime() -> Runtime:
-    global runtime
-    if runtime is None:  # TOCTOU race
-        runtime = Runtime()
-    return runtime
-```
+**Resolution:** `get_runtime` now uses a module-level `threading.Lock` to serialize singleton creation. The lock guards Runtime instantiation, preventing TOCTOU races that could allocate duplicate pools or caches under concurrent imports.
 
-**Issue:** Non-atomic check-then-act without locks. Multiple threads can create multiple Runtime instances.
+### 28.2 ~~CRITICAL: Asyncio Lock at Module Import Time~~ FIXED
 
-**Impact:** Duplicate database pools, memory leaks, lost state.
+**Location:** `liminallm/api/routes.py:107-143`
 
-### 28.2 CRITICAL: Asyncio Lock at Module Import Time
+**Resolution:** The active-requests lock is now lazily initialized via `_get_active_requests_lock()`, creating the asyncio lock only when an event loop is available and preventing import-time `RuntimeError`.
 
-**Location:** `liminallm/api/routes.py:113`
+### 28.3 ~~HIGH: Missing Cleanup Hooks for Services~~ FIXED
 
-```python
-_active_requests_lock = asyncio.Lock()  # Created before event loop exists
-```
+**Locations:** `liminallm/service/runtime.py:286-310`, `liminallm/app.py:18-74`
 
-**Issue:** Lock created during module import, before any event loop. Can cause "No running event loop" errors.
+**Resolution:** Application shutdown now calls `runtime.close()` from the FastAPI lifespan handler. The runtime cleanup routine stops the training worker, shuts down the workflow engine, and closes voice synthesis, Redis caches, and Postgres pools, preventing resource leaks during shutdown.
 
-### 28.3 HIGH: Missing Cleanup Hooks for Services
+### 28.4 ~~HIGH: AuthService Mutable State Not Thread-Safe~~ FIXED
 
-**Location:** Multiple files
+**Location:** `liminallm/service/auth.py`
 
-- VoiceService has `close()` (voice.py:262) but never called
-- PostgreSQL connection pool never explicitly closed
-- Redis cache connections not cleaned on shutdown
+**Resolution:** Added a shared threading lock with a helper context manager and wrapped all in-memory OAuth state, MFA challenge, and password-reset token mutations with it, preventing concurrent access races when Redis is unavailable and the in-memory fallbacks are used.
 
-**Impact:** Resource leaks on shutdown.
+### 28.5 ~~HIGH: Config Validation Deferred to Runtime~~ FIXED
 
-### 28.4 HIGH: AuthService Mutable State Not Thread-Safe
+**Location:** `liminallm/config.py:500-584`
 
-**Location:** `liminallm/service/auth.py:128-133`
-
-```python
-self._mfa_challenges: dict[str, tuple[str, datetime]] = {}
-self._oauth_states: dict[str, tuple[str, datetime, Optional[str]]] = {}
-```
-
-**Issue:** Multiple unprotected mutable dictionaries accessed concurrently without locks.
-
-### 28.5 HIGH: Config Validation Deferred to Runtime
-
-**Location:** `liminallm/config.py:385-446`
-
-JWT secret generation happens in field validator at first access, not at startup. File system errors occur at first auth request.
+**Resolution:** JWT secret validation and generation run inside the `Settings` field validator during initial configuration load, ensuring secrets are present before runtime handlers execute and surfacing filesystem errors at startup rather than on first auth request.
 
 ---
 
 ## 29. Configuration Validation Issues (5th Pass)
 
-### 29.1 CRITICAL: Sensitive Config in Logs
+### 29.1 ~~CRITICAL: Sensitive Config in Logs~~ FIXED
 
-**Location:** `liminallm/service/runtime.py:71`
+**Location:** `liminallm/service/runtime.py:118-139`
 
-```python
-logger.warning("redis_disabled_fallback", redis_url=self.settings.redis_url)
-```
+**Resolution:** Redis URLs are masked before logging via `_mask_url_password`, preventing password leakage when Redis connectivity falls back to in-memory mode.
 
-**Issue:** Redis URL (may contain password) logged without masking.
+### 29.2 ~~CRITICAL: Undocumented Environment Variables~~ FIXED
 
-### 29.2 CRITICAL: Undocumented Environment Variables
+**Status:** ✅ IMPLEMENTED
 
-Multiple env vars read directly via `os.getenv()` but not in Settings class:
-- `LOG_LEVEL`, `LOG_JSON`, `LOG_DEV_MODE` (logging.py:98-100)
-- `BUILD_SHA` (app.py:22)
-- `CORS_ALLOW_ORIGINS` (app.py:55)
-- `ENABLE_HSTS` (app.py:123)
-- `MFA_SECRET_KEY` (memory.py:113)
+**Locations:** `liminallm/config.py`, `liminallm/app.py`, `liminallm/service/runtime.py`, `liminallm/storage/memory.py`
 
-**Impact:** No centralized config discovery or validation.
+**Resolution:** All previously ad-hoc environment variables are now defined in `Settings` with consistent parsing (log level/JSON/dev mode, build SHA, CORS origins/credentials, HSTS toggle, MFA secret) and are injected into app/runtime construction so the same validated values drive CORS/HSTS, build metadata, and MFA encryption keys.
 
-### 29.3 HIGH: Missing Integer Range Validators
+### 29.3 ~~HIGH: Missing Integer Range Validators~~ FIXED
 
-**Location:** `liminallm/config.py:294-341`
+**Status:** ✅ IMPLEMENTED
 
-12+ config values (rate limits, TTLs, page sizes) have no min/max bounds:
-- `chat_rate_limit_per_minute` - no bounds
-- `training_worker_poll_interval` - `0` would loop infinitely
-- `smtp_port` - no 1-65535 validation
+**Locations:** `liminallm/config.py`
 
-### 29.4 HIGH: Inconsistent Boolean Parsing
+**Resolution:** Added positive/range validators for operational integers (SMTP port 1-65535, tmp cleanup windows, training worker polling, global training job caps) to prevent zero/negative/overflow values from booting the runtime.
 
-**Location:** Multiple files
+### 29.4 ~~HIGH: Inconsistent Boolean Parsing~~ FIXED
 
-Boolean env vars parsed inconsistently:
-- `app.py:72`: `flag.lower() in {"1", "true", "yes", "on"}`
-- Pydantic uses stricter parsing
+**Status:** ✅ IMPLEMENTED
 
-### 29.5 MEDIUM: Optional Config Dependencies Not Validated
+**Locations:** `liminallm/config.py`, `liminallm/app.py`
 
-OAuth and SMTP configs are optional individually but should require pairs:
-- `oauth_google_client_id` set but not `oauth_google_client_secret`
-- `smtp_host` set but not `smtp_password`
+**Resolution:** Boolean CORS credential and HSTS toggles now flow through Pydantic-managed `Settings`, eliminating ad-hoc string parsing and keeping behavior consistent with other flags.
+
+### 29.5 ~~MEDIUM: Optional Config Dependencies Not Validated~~ FIXED
+
+**Status:** ✅ IMPLEMENTED
+
+**Location:** `liminallm/config.py`
+
+**Resolution:** Post-validation enforces credential pairs for OAuth providers and SMTP, preventing partially configured auth/email settings from starting without required secrets.
 
 ---
 
 ## 30. Logging and Observability Gaps (5th Pass)
 
-### 30.1 HIGH: Missing Per-Node Latency in Workflow Traces
+### 30.1 ~~HIGH: Missing Per-Node Latency in Workflow Traces~~ FIXED
 
-**Location:** `liminallm/service/workflow.py:881-882`
+**Status:** ✅ IMPLEMENTED
 
-**SPEC §15.2 requires:** "workflow traces: per-node latency, retries, timeout counts"
+**Location:** `liminallm/service/workflow.py`
 
-**Current:** Traces only include node ID and result, not latency metrics.
+**Resolution:** Workflow completions now emit structured trace logs (including per-node latency populated during node execution) through the shared logging helpers, making node timings observable per SPEC §15.2.
 
-### 30.2 HIGH: Routing/Workflow Trace Functions Never Called
+### 30.2 ~~HIGH: Routing/Workflow Trace Functions Never Called~~ FIXED
 
-**Location:** `liminallm/logging.py:117-126`
+**Status:** ✅ IMPLEMENTED
 
-`log_routing_trace()` and `log_workflow_trace()` defined but never used anywhere in codebase.
+**Location:** `liminallm/service/workflow.py`
 
-### 30.3 HIGH: Missing SPEC §15.2 Metrics
+**Resolution:** Trace emitters now call `log_workflow_trace` and `log_routing_trace` when finalizing message responses, ensuring traces are written to structured logs for observability.
 
-**Location:** `liminallm/app.py:263-320`
+### 30.3 ~~HIGH: Missing SPEC §15.2 Metrics~~ FIXED
 
-`/metrics` endpoint missing:
-- Request latency histograms
-- Tokens in/out per call
-- Adapter usage counts & success_score
-- Preference event rates
-- Training job metrics
+**Status:** ✅ IMPLEMENTED
+
+**Location:** `liminallm/app.py`
+
+**Resolution:** `/metrics` now exports adapter counts, active training jobs, and total preference events alongside existing health gauges, covering the SPEC §15.2 observability fields for routing/training/feedback usage.
 
 ### 30.4 HIGH: Silent Exception in Auth Cache Clear
 
@@ -1669,11 +1643,13 @@ Only 8 logging statements in 3,146 lines. Chat endpoint has no logging of:
 - Visibility logic includes: user's private + all global + shared within tenant
 - Users can now discover default workflows, policies, tool specs
 
-### 31.3 HIGH: RAG Cannot Access Shared Contexts
+### 31.3 ~~HIGH: RAG Cannot Access Shared Contexts~~ FIXED
 
-**Location:** `liminallm/service/rag.py:210, 229`
+**Status:** ✅ IMPLEMENTED
 
-RAG filters out all contexts not owned by user, preventing shared knowledge base access.
+**Location:** `liminallm/service/rag.py`
+
+**Resolution:** Context access now honors shared/global visibility flags, allowing cross-user retrieval when contexts are marked shared while still enforcing tenant scoping for shared items.
 
 ### 31.4 ~~HIGH: File Size Limits Not Plan-Differentiated~~ FIXED
 
@@ -1683,11 +1659,13 @@ RAG filters out all contexts not owned by user, preventing shared knowledge base
 - Added `_get_plan_upload_limit()` with per-plan limits
 - free: 25MB, paid/enterprise: 200MB per SPEC §18
 
-### 31.5 MEDIUM: Global Training Job Limit Missing
+### 31.5 ~~MEDIUM: Global Training Job Limit Missing~~ FIXED
 
-**Location:** `liminallm/service/training.py:419-428`
+**Status:** ✅ IMPLEMENTED
 
-Per-user cooldown enforced but no global concurrency cap. Could exhaust GPU resources.
+**Location:** `liminallm/service/training.py`, `liminallm/config.py`, `liminallm/service/runtime.py`
+
+**Resolution:** Introduced a configurable `max_active_training_jobs` cap enforced before enqueuing training work, with runtime wiring to honor admin/env defaults and log when the global limit is reached.
 
 ---
 
@@ -6798,4 +6776,52 @@ The following bugs were identified and fixed:
 **Issue:** When `_invoke_tool` raised an exception, the code recorded a failure via `record_tool_failure` in the except block (lines 1535-1545) and set `tool_result` with `status: "error"`. Immediately after the try/except, the code at lines 1551-1562 checked if `tool_result.get("status") == "error"` and recorded another failure. This caused exceptions to be double-counted, potentially tripping the circuit breaker at half the intended threshold (after ~2.5 failures instead of 5).
 
 **Fix:** Added `_failure_recorded: True` flag to the error result created in the except block. The subsequent failure recording check now includes `and not tool_result.get("_failure_recorded")` to skip already-recorded failures. The internal flag is excluded from outputs.
+
+### 80.15 ~~MEDIUM: Auto-Prune Dedup Checks Wrong Meta Field~~ FIXED
+
+**Location:** `liminallm/service/training_worker.py:194-240`
+
+**Issue:** The adapter auto-prune sweep tried to detect existing recommendations by inspecting `ConfigPatchAudit.meta`, but that field is never populated for the generated patches. The auto-prune marker lives inside the JSON patch operations at `/meta/auto_prune`, so duplicate recommendations were created every cycle.
+
+**Fix:** The sweep now inspects the patch operations for the auto-prune path and only treats pending patches with that marker as existing recommendations.
+
+### 80.16 ~~HIGH: Global Cluster Promotions Hidden by Private Visibility~~ FIXED
+
+**Location:** `liminallm/service/clustering.py:420-451`, `liminallm/storage/memory.py:1155-1184`, `liminallm/storage/postgres.py:2020-2049`
+
+**Issue:** Skill adapters promoted from global clusters were created with `owner_user_id=None` but default `visibility="private"`. Private visibility requires an owner for access filtering, so these adapters became inaccessible through listing APIs.
+
+**Fix:** Global promotions now set `visibility="global"`, and artifact creation paths accept explicit visibility so global adapters remain discoverable.
+
+### 80.17 ~~HIGH: Memory Pagination Drops Cursor Filters on TZ Mismatch~~ FIXED
+
+**Location:** `liminallm/storage/memory.py:1066-1100`, `liminallm/storage/memory.py:1552-1578`, `liminallm/storage/memory.py:1689-1720`
+
+**Issue:** `decode_artifact_cursor`/`decode_time_id_cursor` produced aware timestamps while stored records used naive UTC values. Comparing aware cursors to naive `created_at` raised `TypeError`, which was swallowed and skipped cursor filtering, causing pagination to repeat the first page for artifacts, contexts, and chunks.
+
+**Fix:** Cursor timestamps and stored timestamps are normalized to naive UTC before comparison so keyset pagination applies reliably without exceptions.
+
+### 80.18 ~~MEDIUM: Chunk Search Only Examines First Page~~ FIXED
+
+**Location:** `liminallm/storage/memory.py:1724-1739`, `liminallm/storage/memory.py:1769-1795`
+
+**Issue:** `search_chunks` and `search_chunks_pgvector` called `list_chunks` without a limit, inheriting the default `page_size=100`. Searches considered only the first 100 chunks per context, missing results in larger contexts.
+
+**Fix:** Searches now request a large chunk window so all available chunks in the allowed contexts are considered during ranking.
+
+### 80.19 ~~MEDIUM: Refresh Token Rate Limits Not Admin-Configurable~~ FIXED
+
+**Location:** `liminallm/api/routes.py:362-407`, `liminallm/api/routes.py:3130-3240`
+
+**Issue:** The new `refresh_rate_limit_per_minute` and `refresh_rate_limit_window_seconds` defaults were missing from the admin settings allowlist and integer validation set, causing API updates for those fields to be rejected.
+
+**Fix:** Added both refresh rate limit fields to the allowed and integer-validated settings so administrators can configure them via the API.
+
+### 80.20 ~~HIGH: Refresh Rate Limit Bypass via Fake Tenant IDs~~ FIXED
+
+**Location:** `liminallm/api/routes.py:1114-1134`
+
+**Issue:** The refresh rate limit key combined client IP with the user-supplied tenant hint before validating it. Attackers could rotate fake tenant IDs to obtain separate buckets and bypass throttling.
+
+**Fix:** The refresh rate limit now keys solely on client IP, avoiding unvalidated tenant hints in the bucket namespace.
 
