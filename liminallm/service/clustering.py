@@ -151,7 +151,7 @@ class SemanticClusterer:
 
         k = min(k, len(embeddings))
 
-        initial_centroids = self._warm_start_centroids(scope_user_id, k)
+        initial_centroids = await self._warm_start_centroids(scope_user_id, k)
         centroids, assignments = self._mini_batch_kmeans(
             embeddings,
             k=k,
@@ -239,13 +239,15 @@ class SemanticClusterer:
         if not centroids:
             return [], []
         assignments: list[int] = [0 for _ in embeddings]
+        cluster_counts: list[int] = [0 for _ in range(len(centroids))]
 
         if streaming:
             for idx, vec in enumerate(embeddings):
                 sims = [cosine_similarity(vec, c) for c in centroids]
                 best = max(range(len(sims)), key=lambda i: sims[i])
                 assignments[idx] = best
-                lr = 1.0 / max(1, assignments.count(best))
+                cluster_counts[best] += 1
+                lr = 1.0 / max(1, cluster_counts[best])
                 updated = [
                     c + lr * (v - c) for c, v in zip(centroids[best], vec)
                 ]
@@ -286,15 +288,14 @@ class SemanticClusterer:
             assignments[idx] = max(range(len(sims)), key=lambda i: sims[i])
         return centroids, assignments
 
-    def _warm_start_centroids(
+    async def _warm_start_centroids(
         self, user_id: str | None, k: int
     ) -> list[list[float]]:
         if not hasattr(self.store, "list_semantic_clusters"):
             return []
         clusters = self.store.list_semantic_clusters(user_id=user_id)
         if inspect.isawaitable(clusters):
-            # Avoid blocking event loop if an async implementation is provided.
-            return []
+            clusters = await clusters
         sorted_clusters = sorted(
             clusters,
             key=lambda c: c.size,
@@ -404,10 +405,10 @@ class SemanticClusterer:
             ratio = len(positive) / len(events) if events else 0.0
             if ratio < positive_ratio:
                 continue
-            owner_id = cluster.user_id or events[0].user_id
+            owner_id = cluster.user_id
             schema = {
                 "kind": "adapter.lora",
-                "scope": "per-user" if owner_id else "global",
+                "scope": "per-user" if cluster.user_id else "global",
                 "backend": "local",
                 "rank": 4,
                 "layers": [0, 1, 2],
@@ -431,7 +432,7 @@ class SemanticClusterer:
                 description=cluster.description or "Cluster skill adapter",
                 owner_user_id=owner_id,
             )
-            if self.training:
+            if self.training and owner_id:
                 self.training.ensure_user_adapter(
                     owner_id, adapter_id_override=adapter.id
                 )

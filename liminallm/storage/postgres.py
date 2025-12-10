@@ -2519,14 +2519,13 @@ class PostgresStore:
                 return None
         return None
 
-    @staticmethod
-    def _safe_float(value: Any, default: float = 1.0, *, context: str = "") -> float:
+    def _safe_float(self, value: Any, default: float = 1.0, *, context: str = "") -> float:
         """Parse floats defensively to avoid crashes on malformed data (Issue 39.3)."""
 
         try:
             return float(value)
         except (TypeError, ValueError):
-            logger.warning("postgres_float_parse_failed", context=context, value=value)
+            self.logger.warning("postgres_float_parse_failed", context=context, value=value)
             return default
 
     def get_runtime_config(self) -> dict:

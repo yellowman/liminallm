@@ -136,7 +136,10 @@ class TrainingWorker:
         users = []
         if hasattr(self.store, "list_users"):
             users_raw = self.store.list_users(limit=self.cluster_user_limit)
-            users = [] if inspect.isawaitable(users_raw) else list(users_raw)
+            if inspect.isawaitable(users_raw):
+                users = list(await users_raw)
+            else:
+                users = list(users_raw)
 
         for user in users:
             try:
