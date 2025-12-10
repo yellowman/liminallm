@@ -376,6 +376,21 @@ class ApiAdapterBackend:
         self.provider = provider or self._infer_provider(adapter_mode)
         self.capabilities = get_provider_capabilities(self.provider)
 
+    def _safe_float(self, value: Any, default: float = 1.0, *, context: str = "") -> float:
+        """Coerce adapter weights to float with defensive fallback.
+
+        Router artifacts may carry user-authored weights that fail `float()`
+        coercion. Issue 39.3 requires gracefully handling these cases to avoid
+        request crashes. We clamp to a caller-provided default and emit a
+        warning for visibility instead of propagating ValueError/TypeError.
+        """
+
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            logger.warning("adapter_weight_parse_failed", context=context, value=value)
+            return default
+
     def _ensure_client(self) -> None:
         """Ensure the OpenAI-compatible client reflects the latest credentials."""
 
@@ -699,7 +714,9 @@ class ApiAdapterBackend:
                             weight = adapter.get("gate_weight")
                         if weight is None:
                             weight = 1.0
-                        gate_weights.append(float(weight))
+                        gate_weights.append(
+                            self._safe_float(weight, context="adapter_param_gate_weight")
+                        )
 
             # Mark dropped adapters
             for a in adapters:
@@ -1316,7 +1333,9 @@ class LocalJaxLoRABackend:
                 gate_weight = adapter.get("schema", {}).get("weight")
             if gate_weight is None:
                 gate_weight = 1.0
-            gate_weight = float(gate_weight)
+            gate_weight = self._safe_float(
+                gate_weight, default=1.0, context="blend_gate_weight"
+            )
 
             # Clamp gate weight to [0, 1] per SPEC §8.1 guardrails
             gate_weight = max(0.0, min(1.0, gate_weight))

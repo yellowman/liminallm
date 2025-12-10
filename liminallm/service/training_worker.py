@@ -12,6 +12,8 @@ and executes them using the TrainingService. It handles:
 from __future__ import annotations
 
 import asyncio
+import inspect
+import time
 from datetime import datetime
 from typing import TYPE_CHECKING, List, Optional
 
@@ -31,6 +33,9 @@ DEFAULT_BATCH_SIZE = 5
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_DELAY_SECONDS = 30
 MAX_QUEUE_DEPTH = 100
+DEFAULT_CLUSTER_INTERVAL_SECONDS = 15 * 60
+DEFAULT_CLUSTER_USER_LIMIT = 50
+DEFAULT_CLUSTER_EVENT_LIMIT = 500
 
 
 class TrainingWorker:
@@ -50,6 +55,9 @@ class TrainingWorker:
         batch_size: int = DEFAULT_BATCH_SIZE,
         max_retries: int = DEFAULT_MAX_RETRIES,
         retry_delay: int = DEFAULT_RETRY_DELAY_SECONDS,
+        cluster_interval: int = DEFAULT_CLUSTER_INTERVAL_SECONDS,
+        cluster_user_limit: int = DEFAULT_CLUSTER_USER_LIMIT,
+        cluster_event_limit: int = DEFAULT_CLUSTER_EVENT_LIMIT,
     ) -> None:
         self.store = store
         self.training = training_service
@@ -58,8 +66,12 @@ class TrainingWorker:
         self.batch_size = batch_size
         self.max_retries = max_retries
         self.retry_delay = retry_delay
+        self.cluster_interval = cluster_interval
+        self.cluster_user_limit = cluster_user_limit
+        self.cluster_event_limit = cluster_event_limit
         self._running = False
         self._task: Optional[asyncio.Task] = None
+        self._last_cluster_run: float = 0.0
 
     async def start(self) -> None:
         """Start the background worker."""
@@ -89,6 +101,7 @@ class TrainingWorker:
         while self._running:
             try:
                 await self._process_queued_jobs()
+                await self._maybe_run_periodic_clustering()
                 consecutive_errors = 0
             except Exception as exc:
                 consecutive_errors += 1
@@ -110,6 +123,44 @@ class TrainingWorker:
                     continue
 
             await asyncio.sleep(self.poll_interval)
+
+    async def _maybe_run_periodic_clustering(self) -> None:
+        if not self.clusterer or self.cluster_interval <= 0:
+            return
+
+        now = time.monotonic()
+        if self._last_cluster_run and (now - self._last_cluster_run) < self.cluster_interval:
+            return
+
+        self._last_cluster_run = now
+        users = []
+        if hasattr(self.store, "list_users"):
+            users_raw = self.store.list_users(limit=self.cluster_user_limit)
+            users = [] if inspect.isawaitable(users_raw) else list(users_raw)
+
+        for user in users:
+            try:
+                await self.clusterer.cluster_user_preferences(
+                    user.id,
+                    max_events=self.cluster_event_limit,
+                    streaming=True,
+                    approximate=True,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "periodic_user_clustering_failed",
+                    user_id=user.id,
+                    error=str(exc),
+                )
+
+        try:
+            await self.clusterer.cluster_global_preferences(
+                max_events=self.cluster_event_limit,
+                streaming=True,
+                approximate=True,
+            )
+        except Exception as exc:
+            logger.warning("periodic_global_clustering_failed", error=str(exc))
 
     async def _process_queued_jobs(self) -> None:
         """Process a batch of queued training jobs."""

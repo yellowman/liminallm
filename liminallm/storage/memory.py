@@ -27,7 +27,11 @@ from liminallm.service.bm25 import (
 from liminallm.service.bm25 import (
     tokenize_text as _tokenize_text,
 )
-from liminallm.service.embeddings import cosine_similarity
+from liminallm.service.embeddings import (
+    EMBEDDING_DIM,
+    cosine_similarity,
+    validated_embedding,
+)
 from liminallm.storage.common import (
     blend_centroid,
     clamp_success_score,
@@ -663,9 +667,24 @@ class MemoryStore:
             )
             event_id = str(uuid.uuid4())
             normalized_weight = normalize_preference_weight(weight)
-            embedding = context_embedding or compute_text_embedding(
+            embedding_source = context_embedding or compute_text_embedding(
                 context_text or message.content
             )
+            try:
+                embedding = validated_embedding(
+                    embedding_source,
+                    expected_dim=EMBEDDING_DIM,
+                    name="context_embedding",
+                )
+            except ValueError as exc:
+                raise ConstraintViolation(
+                    "invalid context_embedding",
+                    {
+                        "message_id": message_id,
+                        "conversation_id": conversation_id,
+                        "error": str(exc),
+                    },
+                ) from exc
             event = PreferenceEvent(
                 id=event_id,
                 user_id=user_id,

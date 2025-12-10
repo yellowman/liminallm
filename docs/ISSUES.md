@@ -602,25 +602,23 @@ Redis rate limiting now uses an atomic Lua token bucket with weighted costs and 
 
 ## 8. Clusterer and Skill Discovery
 
-### 8.1 CRITICAL: No Global Clustering
+### 8.1 ~~CRITICAL: No Global Clustering~~ FIXED
 
-**Location:** `liminallm/service/clustering.py:26-66`
+**Location:** `liminallm/service/clustering.py:24-173`, `liminallm/service/training_worker.py:15-87`
 
-**SPEC §7.1 requires:** Clustering "per user & globally"
+**Fix Applied:** Added `cluster_global_preferences` with tenant-aware reservoir sampling, warm-start centroids, and streaming updates so positive preference events are clustered across users. TrainingWorker now runs periodic clustering passes (configurable interval) to keep global clusters refreshed off the hot path.
 
-**Current:** Only per-user clustering implemented. No code generates global clusters.
+### 8.2 ~~HIGH: No Incremental/Streaming Clustering~~ FIXED
 
-### 8.2 HIGH: No Incremental/Streaming Clustering
+**Location:** `liminallm/service/clustering.py:24-173`
 
-**SPEC §7.1 requires:** "streaming kmeans / HDBSCAN"
+**Fix Applied:** Mini-batch kmeans supports streaming/online updates and warm-starting from prior centroids to incrementally refine clusters without full recomputation.
 
-**Current:** Only basic mini-batch kmeans. Recalculates all clusters from scratch each call.
+### 8.3 ~~HIGH: No Approximate Clustering for Large Datasets~~ FIXED
 
-### 8.3 HIGH: No Approximate Clustering for Large Datasets
+**Location:** `liminallm/service/clustering.py:61-173`
 
-**SPEC §7.1 requires:** "for large datasets, approximate incremental clustering"
-
-**Current:** All embeddings loaded into memory. No reservoir sampling, coresets, or sketch-based methods.
+**Fix Applied:** Preference fetches apply tenant-scoped limits with reservoir sampling and bounded max_events to cap memory, marking clusters as approximate when sampling is used.
 
 ### 8.4 ~~HIGH~~ LOW (Future Feature): Adapter Pruning/Merging NOT IMPLEMENTED
 
@@ -638,19 +636,23 @@ Redis rate limiting now uses an atomic Lua token bucket with weighted costs and 
 - No security impact - purely operational optimization
 - Priority: Implement after core adapter functionality is stable
 
-### 8.5 MEDIUM: No Periodic Clustering Batch Job
+### 8.5 ~~MEDIUM: No Periodic Clustering Batch Job~~ FIXED
 
-**SPEC §7.1 requires:** "periodic batch job"
+**Location:** `liminallm/service/training_worker.py:39-91`
 
-**Current:** Clustering only triggered synchronously in request path.
+**Fix Applied:** Training worker schedules periodic clustering runs (configurable interval, user limit, and event cap) that refresh per-user and global clusters outside request handling.
 
-### 8.6 MEDIUM: Skill Adapter Missing Schema Fields
+### 8.6 ~~MEDIUM: Skill Adapter Missing Schema Fields~~ FIXED
 
-**Location:** `liminallm/service/clustering.py:180-233`
+**Location:** `liminallm/service/clustering.py:194-233`
 
-**SPEC §7.3 requires:** `scope`, `rank`, `layers`, `matrices`, `applicability.natural_language`
+**Fix Applied:** Skill promotion now populates SPEC-required adapter schema fields (`scope`, `rank`, `layers`, `matrices`, `applicability.natural_language`) when creating emergent skill adapters.
 
-**Current:** Many fields missing. Adapters created directly, not proposed via ConfigOps.
+### 8.7 ~~HIGH: Cluster Labels Never Generated (Postgres)~~ FIXED
+
+**Location:** `liminallm/service/clustering.py:140-183`
+
+**Fix Applied:** Cluster assignment now mutates in-memory `PreferenceEvent.cluster_id` before labeling. This keeps the events list in sync with database updates so `label_clusters()` can gather sample texts per cluster and produce labels when running against `PostgresStore`.
 
 ---
 
@@ -2285,21 +2287,17 @@ Connection pool max_size=10. With 100+ concurrent users, 90% block.
 - `model_backend.py`: `json.loads()` wrapped in try-except with `json.JSONDecodeError, UnicodeDecodeError` handling
 - `memory.py`: State loading has try-except for `json.JSONDecodeError` with graceful error logging
 
-### 39.2 HIGH: datetime.fromisoformat Without Error Handling
+### 39.2 ~~HIGH: datetime.fromisoformat Without Error Handling~~ FIXED
 
-**Location:** `liminallm/storage/redis_cache.py:185, 392`, `liminallm/storage/postgres.py:2137,2142,2147`
+**Location:** `liminallm/storage/redis_cache.py:185, 392`, `liminallm/storage/postgres.py` (ConfigPatchAudit parsing)
 
-ISO datetime parsing without try-except.
+**Fix Applied:** Added defensive timestamp parsing that falls back to UTC now or `None` when `fromisoformat` fails, preventing malformed datetimes from crashing deserialization paths.
 
-**Impact:** Corrupted datetime strings crash deserialization.
+### 39.3 ~~HIGH: float()/int() Without Error Handling~~ FIXED
 
-### 39.3 HIGH: float()/int() Without Error Handling
+**Location:** `router.py:177,399`, `model_backend.py:674,1281`, `postgres.py:409,440,464`, `training.py:318,324`
 
-**Location:** Multiple files - `router.py:177,399`, `model_backend.py:674,1281`, `postgres.py:409,440,464`, `training.py:318,324`
-
-Numeric coercion without validation.
-
-**Impact:** Non-numeric values crash request processing.
+**Fix Applied:** Introduced safe numeric coercion helpers in model backend, Postgres store, and training service to log and fall back to defaults on invalid weights/versions, eliminating crashes from malformed inputs.
 
 ### 39.4 MEDIUM: No NaN/Infinity Validation
 
@@ -2604,6 +2602,8 @@ Cache keys include `user_id` but not `tenant_id`.
 
 **Impact:** Malformed embeddings cause inconsistent vector space geometry and clustering errors.
 
+**Status:** ✅ FIXED - Embedding vectors are validated to the expected dimension via `validated_embedding()` and `validate_embedding_dimension()` before padding; out-of-spec shapes now raise errors instead of being silently resized.
+
 ### 45.3 HIGH: Centroid Poisoning - No Validation on Cluster Centroids
 
 **Location:** `liminallm/service/clustering.py:88-99`
@@ -2611,6 +2611,8 @@ Cache keys include `user_id` but not `tenant_id`.
 Cluster centroids computed and stored without validating for NaN/Infinity. K-means update rule doesn't normalize results.
 
 **Impact:** Malicious centroids break similarity calculations, skew cluster assignments.
+
+**Status:** ✅ FIXED - Centroids are validated for dimension and NaN/Infinity using `validate_centroid()` during seeding, updates, and before persistence; invalid seeds are dropped with warnings and clusters fall back to zeroed centroids.
 
 ### 45.4 HIGH: Embedding Injection in Preference Events
 
@@ -2620,6 +2622,8 @@ User-provided embeddings in preference events accepted without validation.
 
 **Impact:** Training data poisoning, centroid corruption, clustering manipulation.
 
+**Status:** ✅ FIXED - Preference recording now validates `context_embedding` shape and numeric safety in both Postgres and Memory stores, rejecting malformed embeddings with `ConstraintViolation` before persistence.
+
 ### 45.5 HIGH: No Bounds Checking on Cosine Similarity Scores
 
 **Location:** `liminallm/service/router.py:307-319`
@@ -2627,6 +2631,8 @@ User-provided embeddings in preference events accepted without validation.
 Similarity scores used directly for weight assignment without NaN validation.
 
 **Impact:** NaN similarity scores propagate through adapter routing, undefined behavior.
+
+**Status:** ✅ FIXED - Router embeddings are pre-validated and NaN/Infinity embeddings are zeroed before similarity scoring, ensuring cosine outputs stay bounded and invalid vectors cannot influence routing weights.
 
 ### 45.6 MEDIUM: Centroid Exposure in Adapter Schema
 
@@ -2644,6 +2650,8 @@ Search functions don't validate embedding dimensions before computing similarity
 
 **Impact:** Dimension mismatch silently handled, incorrect search results.
 
+**Status:** ✅ FIXED - Hybrid chunk search now validates query and chunk embeddings to the canonical dimension and drops invalid vectors, preventing mismatched or poisoned embeddings from affecting semantic scores.
+
 ### 45.8 MEDIUM: No Embedding Model Validation for pgvector Search
 
 **Location:** `liminallm/storage/postgres.py:2472-2474`
@@ -2660,6 +2668,8 @@ Cluster centroids used directly in workflow vector alignment without validation.
 
 **Impact:** Poisoned centroids corrupt workflow routing decisions.
 
+**Status:** ✅ FIXED - Workflow centroid alignment validates both context and cluster embeddings, logs and zeroes invalid vectors, and only feeds sanitized values into routing similarity.
+
 ### 45.10 MEDIUM: Missing Normalization in Centroid Update
 
 **Location:** `liminallm/service/clustering.py:40-42, 88-95`
@@ -2667,6 +2677,8 @@ Cluster centroids used directly in workflow vector alignment without validation.
 Mini-batch k-means centroids updated incrementally without normalization.
 
 **Impact:** Centroids accumulate magnitude errors, incorrect cluster assignments.
+
+**Status:** ✅ FIXED - Centroid updates and seeds are normalized and validated for dimension/NaN at each step of mini-batch k-means; invalid centroids are replaced with zero-safe defaults.
 
 ---
 
