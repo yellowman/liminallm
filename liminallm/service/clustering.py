@@ -238,7 +238,7 @@ class SemanticClusterer:
                 centroids.append([0.0] * EMBEDDING_DIM)
         if not centroids:
             return [], []
-        assignments: list[int] = [0 for _ in embeddings]
+        assignments: list[int] = [-1 for _ in embeddings]
         cluster_counts: list[int] = [0 for _ in range(len(centroids))]
 
         if streaming:
@@ -432,14 +432,14 @@ class SemanticClusterer:
                 description=cluster.description or "Cluster skill adapter",
                 owner_user_id=owner_id,
             )
-            if self.training and owner_id:
+            if self.training and cluster.user_id:
                 self.training.ensure_user_adapter(
-                    owner_id, adapter_id_override=adapter.id
+                    cluster.user_id, adapter_id_override=adapter.id
                 )
                 create_training_job = getattr(self.store, "create_training_job", None)
                 if callable(create_training_job):
                     create_training_job(
-                        user_id=owner_id,
+                        user_id=cluster.user_id,
                         adapter_id=adapter.id,
                         preference_event_ids=[e.id for e in events],
                     )
