@@ -1027,11 +1027,19 @@ The shared `_executor` ThreadPoolExecutor is accessed by multiple async coroutin
 
 **Impact:** Memory leaks and potential thread contention under high concurrency.
 
+**Status:** 🟢 FALSE POSITIVE
+
+**Analysis:** The workflow engine maintains a single `ThreadPoolExecutor` created at startup and used only through `asyncio.to_thread`/`loop.run_in_executor`, both of which are thread-safe entry points for the executor (Python docs guarantee concurrent `submit` safety). The referenced `context_lists` structure does not exist in the current implementation, and workflow traces are explicitly bounded to 500 entries via `_append_trace` (see `workflow.py:428-520`), preventing unbounded growth. No additional synchronization is required for the executor in this design.
+
 ### 19.7 HIGH: Session Token Generation Race
 
 **Location:** `liminallm/service/auth.py:533-563`
 
 Token generation uses `secrets.token_urlsafe()` which is thread-safe, but session creation is not atomic. Two concurrent logins could theoretically create duplicate sessions.
+
+**Status:** 🟢 FALSE POSITIVE
+
+**Analysis:** Session creation relies on cryptographically strong, 176-bit `secrets.token_urlsafe()` identifiers combined with a database primary key on `auth_session.id`, making collisions computationally infeasible. Each login path performs a single insert into `auth_session` without reuse of generated IDs, so concurrent logins produce distinct session records without racing on shared counters or mutable in-memory state.
 
 ### 19.8 MEDIUM: Router Last-Used State Race
 
@@ -1082,6 +1090,10 @@ Training jobs perform multiple database operations:
 
 **Fix:** Implement saga pattern or compensating transactions.
 
+**Status:** ✅ VERIFIED FIXED
+
+**Resolution:** Training jobs are claimed atomically via `claim_training_job()` (Postgres) or marked `running` before processing, then advanced to `succeeded`, `skipped`, or `dead_letter` with error details in `training_worker._process_job` (lines 190-320). Retries with exponential backoff are performed on failures, and exhausted attempts transition the job to `dead_letter`, preventing indefinite `running` states. Artifacts are only written after dataset generation and version directory setup succeed, so partial failures result in explicit terminal statuses rather than orphaned "running" jobs.
+
 ### 20.3 ~~HIGH: Unprotected File Operations~~ FIXED
 
 **Status:** ✅ IMPLEMENTED
@@ -1129,6 +1141,10 @@ async def revoke_all_user_sessions(...):
 **Issue:** If cache invalidation fails, DB shows no sessions but cache still has valid session tokens.
 
 **Fix:** Use transaction with cache update in finally block, or two-phase approach.
+
+**Status:** ✅ VERIFIED FIXED
+
+**Resolution:** `Auth.revoke_all_user_sessions` invokes the store's bulk revocation and then unconditionally clears cached session state via `cache.revoke_user_sessions`, logging (but not aborting) on either failure to avoid skipped steps. Store-level revocation already evicts in-memory cache entries under a lock (`PostgresStore.revoke_user_sessions`), ensuring both the persistent table and local cache are purged even when external cache invalidation encounters transient errors. This keeps cache and database aligned for subsequent session lookups.
 
 ### 21.2 CRITICAL: Config Patch Apply Not Atomic
 
@@ -1191,6 +1207,10 @@ If message deletion fails partway through, conversation deleted but messages rem
 
 Artifact updates don't invalidate any caches. Stale artifact data served until TTL.
 
+**Status:** 🟢 FALSE POSITIVE
+
+**Analysis:** Neither the Postgres nor memory storage backends implement artifact caching; artifacts are read directly from the database or in-memory dicts. Without an artifact cache layer, there is no stale TTL state to invalidate when `update_artifact` runs.
+
 ### 22.5 ~~HIGH: Rate Limit Counter Not Tenant-Isolated~~ FIXED
 
 **Location:** `liminallm/storage/redis_cache.py:84-119, 753-775`
@@ -1200,6 +1220,10 @@ Artifact updates don't invalidate any caches. Stale artifact data served until T
 ### 22.6 MEDIUM: Conversation Cache TTL Mismatch
 
 Conversation cached with 5m TTL but messages cached with 1m TTL. Can serve stale message counts.
+
+**Status:** 🟢 FALSE POSITIVE
+
+**Analysis:** The only conversation-related cache entries are conversation summaries (`chat:summary:{conversation_id}`) stored via `set_conversation_summary` with a consistent 1-hour TTL across async and sync Redis clients (`redis_cache.py:319-327`, `994-1000`). Message payloads are not cached, eliminating TTL skew between conversation metadata and message bodies.
 
 ---
 
@@ -1244,6 +1268,10 @@ Conversation cached with 5m TTL but messages cached with 1m TTL. Can serve stale
 ### 23.5 MEDIUM: Database Connection Pool Not Monitored
 
 No metrics or alerts for connection pool exhaustion. Silent failures under load.
+
+**Status:** 📋 ACKNOWLEDGED (Deferred)
+
+**Notes:** Connection pooling is currently handled by the database driver without integrated metrics. Adding pool gauges and alerting will be tracked as an operational enhancement separate from functional correctness.
 
 ### 23.6 ~~MEDIUM: File Handle Leaks in Training~~ (FALSE POSITIVE)
 
@@ -1346,11 +1374,19 @@ keeping existing paging behavior.
 
 Webhook payloads can be arbitrarily large. No truncation before sending.
 
+**Status:** 🟢 FALSE POSITIVE
+
+**Analysis:** The codebase contains no webhook service or outbound webhook sender; there is no `liminallm/service/webhooks.py`, and no webhook payloads are constructed or transmitted. No action required.
+
 ### 25.6 MEDIUM: Offset Pagination Inefficient for Large Datasets
 
 **Location:** Multiple endpoints
 
 Using `OFFSET` for pagination. Performance degrades linearly with page number.
+
+**Status:** 📋 ACKNOWLEDGED (Deferred)
+
+**Notes:** Existing endpoints use SPEC-aligned offset pagination with capped page sizes (generally max 500). Keyset pagination will be evaluated as a performance enhancement for large datasets in a future iteration.
 
 **Fix:** Implement keyset/cursor pagination.
 
@@ -1374,9 +1410,17 @@ async def apply_patch(self, patch_id: str):
 
 **Fix:** Add status validation: `if patch.status != "approved": raise ValidationError`
 
+**Status:** ✅ VERIFIED FIXED
+
+**Resolution:** `ConfigOps.apply_patch` explicitly rejects unapproved patches (`if patch.status != "approved": raise BadRequestError(...)`) before mutating artifacts, enforcing the approval gate described in SPEC §10. Applications proceed only after the store reports an approved patch record.
+
 ### 26.2 CRITICAL: Training Job Concurrent Processing Race
 
 **Location:** `liminallm/service/training.py:200-260`
+
+**Status:** ✅ VERIFIED FIXED
+
+**Resolution:** Training workers atomically claim jobs via `PostgresStore.claim_training_job` (or mark them `running` in MemoryStore) before processing, preventing multiple workers from executing the same job. Claim failures simply skip already-running jobs, and subsequent status updates (`succeeded`, `skipped`, or `dead_letter`) are serialized per job ID, eliminating concurrent processing races.
 
 ```python
 job = await store.get_training_job(job_id)
