@@ -654,6 +654,30 @@ Redis rate limiting now uses an atomic Lua token bucket with weighted costs and 
 
 **Fix Applied:** Cluster assignment now mutates in-memory `PreferenceEvent.cluster_id` before labeling. This keeps the events list in sync with database updates so `label_clusters()` can gather sample texts per cluster and produce labels when running against `PostgresStore`.
 
+### 8.8 ~~MEDIUM: Async Store Clustering Skipped~~ FIXED
+
+**Location:** `liminallm/service/training_worker.py:126-150`, `liminallm/service/clustering.py:262-281`
+
+**Issue:** Periodic clustering did not await async store implementations for user listings or warm-start centroid retrieval. Async stores returned coroutines that were replaced with empty lists, silently skipping per-user clustering and centroid seeding.
+
+**Fix Applied:** Both the training worker and clusterer now detect awaitable store methods and await them before use, ensuring async stores participate fully in clustering and warm starts.
+
+### 8.9 ~~MEDIUM: Streaming Cluster Counts Include Unassigned Slots~~ FIXED
+
+**Location:** `liminallm/service/clustering.py:197-229`
+
+**Issue:** Streaming k-means used `assignments.count(best)` while the assignments array was prefilled with zeros. Cluster 0 accumulated counts for unprocessed rows, shrinking its learning rate and biasing centroid updates.
+
+**Fix Applied:** Assignments initialize with a sentinel (-1) and cluster counts are tracked explicitly per centroid, yielding correct learning rates for all clusters during streaming updates.
+
+### 8.10 ~~MEDIUM: Global Cluster Promotions Scoped Per-User~~ FIXED
+
+**Location:** `liminallm/service/clustering.py:391-444`
+
+**Issue:** Skill adapter promotion defaulted `owner_id` to the first event's user, causing global clusters (`user_id=None`) to be recorded as per-user adapters with incorrect scope.
+
+**Fix Applied:** Adapter schema scope now derives directly from `cluster.user_id`, and promotion/training hooks only attach to user-owned clusters, preserving global promotions as system-wide artifacts.
+
 ---
 
 ## 9. Redis Usage and Memory Store Persistence
@@ -703,6 +727,22 @@ Redis rate limiting now uses an atomic Lua token bucket with weighted costs and 
 ### 10.4 ~~MEDIUM: SQL Schema Missing Performance Indexes~~ FIXED
 
 **Status:** ✅ Added targeted indexes for frequent lookups on sessions (`tenant_id`), artifacts (`visibility`, owner+visibility), and knowledge chunks (`fs_path`, `context_id`+`chunk_index`).
+
+### 10.5 ~~MEDIUM: Pagination Sentinel Skipped at Max Page Size~~ FIXED
+
+**Location:** `liminallm/storage/postgres.py:1844-1848`, `liminallm/storage/memory.py:1124-1127`
+
+**Issue:** Pagination added a sentinel row only when `requested_page_size > max_page_size`, so callers requesting exactly the cap (500) skipped sentinel detection and received incorrect `has_next` values.
+
+**Fix Applied:** Sentinel rows now append whenever requests meet or exceed the cap, keeping `has_next` accurate for max-sized pages.
+
+### 10.6 ~~MEDIUM: Static Float Parsing References Missing Logger~~ FIXED
+
+**Location:** `liminallm/storage/postgres.py:2518-2530`
+
+**Issue:** `_safe_float` was a `@staticmethod` that logged via an undefined module-level `logger`, raising `NameError` when float coercion failed.
+
+**Fix Applied:** `_safe_float` is now an instance method using `self.logger` for warnings, preserving defensive parsing without crashing.
 
 ---
 
