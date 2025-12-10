@@ -1494,41 +1494,23 @@ objects are provided.
 
 ## 28. Service Initialization Issues (5th Pass)
 
-### 28.1 CRITICAL: Thread-Unsafe Singleton in get_runtime()
+### 28.1 ~~CRITICAL: Thread-Unsafe Singleton in get_runtime()~~ FIXED
 
-**Location:** `liminallm/service/runtime.py:164-171`
+**Location:** `liminallm/service/runtime.py:317-335`
 
-```python
-def get_runtime() -> Runtime:
-    global runtime
-    if runtime is None:  # TOCTOU race
-        runtime = Runtime()
-    return runtime
-```
+**Resolution:** `get_runtime` now uses a module-level `threading.Lock` to serialize singleton creation. The lock guards Runtime instantiation, preventing TOCTOU races that could allocate duplicate pools or caches under concurrent imports.
 
-**Issue:** Non-atomic check-then-act without locks. Multiple threads can create multiple Runtime instances.
+### 28.2 ~~CRITICAL: Asyncio Lock at Module Import Time~~ FIXED
 
-**Impact:** Duplicate database pools, memory leaks, lost state.
+**Location:** `liminallm/api/routes.py:107-143`
 
-### 28.2 CRITICAL: Asyncio Lock at Module Import Time
+**Resolution:** The active-requests lock is now lazily initialized via `_get_active_requests_lock()`, creating the asyncio lock only when an event loop is available and preventing import-time `RuntimeError`.
 
-**Location:** `liminallm/api/routes.py:113`
+### 28.3 ~~HIGH: Missing Cleanup Hooks for Services~~ FIXED
 
-```python
-_active_requests_lock = asyncio.Lock()  # Created before event loop exists
-```
+**Locations:** `liminallm/service/runtime.py:286-310`, `liminallm/app.py:18-74`
 
-**Issue:** Lock created during module import, before any event loop. Can cause "No running event loop" errors.
-
-### 28.3 HIGH: Missing Cleanup Hooks for Services
-
-**Location:** Multiple files
-
-- VoiceService has `close()` (voice.py:262) but never called
-- PostgreSQL connection pool never explicitly closed
-- Redis cache connections not cleaned on shutdown
-
-**Impact:** Resource leaks on shutdown.
+**Resolution:** Application shutdown now calls `runtime.close()` from the FastAPI lifespan handler. The runtime cleanup routine stops the training worker, shuts down the workflow engine, and closes voice synthesis, Redis caches, and Postgres pools, preventing resource leaks during shutdown.
 
 ### 28.4 ~~HIGH: AuthService Mutable State Not Thread-Safe~~ FIXED
 
@@ -1536,25 +1518,21 @@ _active_requests_lock = asyncio.Lock()  # Created before event loop exists
 
 **Resolution:** Added a shared threading lock with a helper context manager and wrapped all in-memory OAuth state, MFA challenge, and password-reset token mutations with it, preventing concurrent access races when Redis is unavailable and the in-memory fallbacks are used.
 
-### 28.5 HIGH: Config Validation Deferred to Runtime
+### 28.5 ~~HIGH: Config Validation Deferred to Runtime~~ FIXED
 
-**Location:** `liminallm/config.py:385-446`
+**Location:** `liminallm/config.py:500-584`
 
-JWT secret generation happens in field validator at first access, not at startup. File system errors occur at first auth request.
+**Resolution:** JWT secret validation and generation run inside the `Settings` field validator during initial configuration load, ensuring secrets are present before runtime handlers execute and surfacing filesystem errors at startup rather than on first auth request.
 
 ---
 
 ## 29. Configuration Validation Issues (5th Pass)
 
-### 29.1 CRITICAL: Sensitive Config in Logs
+### 29.1 ~~CRITICAL: Sensitive Config in Logs~~ FIXED
 
-**Location:** `liminallm/service/runtime.py:71`
+**Location:** `liminallm/service/runtime.py:118-139`
 
-```python
-logger.warning("redis_disabled_fallback", redis_url=self.settings.redis_url)
-```
-
-**Issue:** Redis URL (may contain password) logged without masking.
+**Resolution:** Redis URLs are masked before logging via `_mask_url_password`, preventing password leakage when Redis connectivity falls back to in-memory mode.
 
 ### 29.2 CRITICAL: Undocumented Environment Variables
 
