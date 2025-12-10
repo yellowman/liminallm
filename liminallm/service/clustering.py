@@ -7,11 +7,14 @@ import random
 from datetime import datetime
 from typing import Dict, Iterable, List, Sequence, Tuple
 
+from liminallm.logging import get_logger
 from liminallm.service.embeddings import (
+    EMBEDDING_DIM,
     cosine_similarity,
     normalize_vector,
-    pad_vectors,
     sanitize_embedding,
+    validated_embedding,
+    validate_centroid,
 )
 from liminallm.storage.models import (
     POSITIVE_FEEDBACK_VALUES,
@@ -22,6 +25,8 @@ from liminallm.storage.models import (
 
 class SemanticClusterer:
     """Cluster preference events and label emergent skills."""
+
+    logger = get_logger(__name__)
 
     def __init__(self, store, llm=None, training=None) -> None:
         self.store = store
@@ -124,10 +129,26 @@ class SemanticClusterer:
         approximate: bool,
         meta_extra: Dict | None = None,
     ) -> List[SemanticCluster]:
-        if len(events) < min_events:
+        embeddings: list[list[float]] = []
+        valid_events: list[PreferenceEvent] = []
+        for evt in events:
+            try:
+                embeddings.append(
+                    validated_embedding(
+                        evt.context_embedding,
+                        expected_dim=EMBEDDING_DIM,
+                        name="context_embedding",
+                    )
+                )
+                valid_events.append(evt)
+            except ValueError as exc:
+                self.logger.warning(
+                    "cluster_embedding_invalid", event_id=evt.id, error=str(exc)
+                )
+
+        if len(valid_events) < min_events:
             return []
 
-        embeddings = pad_vectors([list(e.context_embedding) for e in events])
         k = min(k, len(embeddings))
 
         initial_centroids = self._warm_start_centroids(scope_user_id, k)
@@ -141,7 +162,7 @@ class SemanticClusterer:
         cluster_events: Dict[int, list[PreferenceEvent]] = {
             i: [] for i in range(len(centroids))
         }
-        for idx, event in enumerate(events):
+        for idx, event in enumerate(valid_events):
             cluster_idx = assignments[idx]
             cluster_events.setdefault(cluster_idx, []).append(event)
         results: List[SemanticCluster] = []
@@ -168,7 +189,7 @@ class SemanticClusterer:
             for evt in members:
                 self.store.update_preference_event(evt.id, cluster_id=cluster.id)
             results.append(cluster)
-        await self.label_clusters(results, events)
+        await self.label_clusters(results, valid_events)
         return results
 
     def _mini_batch_kmeans(
@@ -185,14 +206,35 @@ class SemanticClusterer:
             return [], []
         k = min(k, len(embeddings))
 
-        seed_source = list(initial_centroids or [])
+        seed_source: list[list[float]] = []
+        for centroid in list(initial_centroids or []):
+            try:
+                seed_source.append(
+                    validate_centroid(
+                        list(centroid), expected_dim=EMBEDDING_DIM, name="initial_centroid"
+                    )
+                )
+            except ValueError as exc:
+                self.logger.warning("cluster_centroid_seed_invalid", error=str(exc))
         if len(seed_source) < k:
             expanded = list(embeddings)
             random.shuffle(expanded)
             seed_source.extend(expanded[: k - len(seed_source)])
         if not seed_source:
             seed_source = list(embeddings)
-        centroids = [sanitize_embedding(vec) for vec in seed_source[:k]]
+        centroids = []
+        for vec in seed_source[:k]:
+            try:
+                centroids.append(
+                    validate_centroid(
+                        sanitize_embedding(vec),
+                        expected_dim=EMBEDDING_DIM,
+                        name="seed_centroid",
+                    )
+                )
+            except ValueError as exc:
+                self.logger.warning("cluster_centroid_invalid", error=str(exc))
+                centroids.append([0.0] * EMBEDDING_DIM)
         if not centroids:
             return [], []
         assignments: list[int] = [0 for _ in embeddings]
@@ -223,7 +265,20 @@ class SemanticClusterer:
                     ]
                     centroids[best] = normalize_vector(updated)
 
-        centroids = [normalize_vector(c) for c in centroids]
+        cleaned_centroids: list[list[float]] = []
+        for centroid in centroids:
+            try:
+                cleaned_centroids.append(
+                    validate_centroid(
+                        centroid,
+                        expected_dim=EMBEDDING_DIM,
+                        name="cluster_centroid",
+                    )
+                )
+            except ValueError as exc:
+                self.logger.warning("cluster_centroid_invalid", error=str(exc))
+                cleaned_centroids.append([0.0] * EMBEDDING_DIM)
+        centroids = cleaned_centroids
 
         for idx, vec in enumerate(embeddings):
             sims = [cosine_similarity(vec, c) for c in centroids]

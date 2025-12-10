@@ -16,6 +16,10 @@ from psycopg_pool import ConnectionPool
 
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
+from liminallm.service.embeddings import (
+    EMBEDDING_DIM,
+    validated_embedding,
+)
 from liminallm.service.artifact_validation import (
     ArtifactValidationError,
     validate_artifact,
@@ -413,9 +417,24 @@ class PostgresStore:
                     "user_id": user_id,
                 },
             )
-            embedding = context_embedding or compute_text_embedding(
+            embedding_source = context_embedding or compute_text_embedding(
                 context_text or msg_row.get("content")
             )
+            try:
+                embedding = validated_embedding(
+                    embedding_source,
+                    expected_dim=EMBEDDING_DIM,
+                    name="context_embedding",
+                )
+            except ValueError as exc:
+                raise ConstraintViolation(
+                    "invalid context_embedding",
+                    {
+                        "message_id": message_id,
+                        "conversation_id": conversation_id,
+                        "error": str(exc),
+                    },
+                ) from exc
             row = conn.execute(
                 """
                 INSERT INTO preference_event (

@@ -9,7 +9,12 @@ from liminallm.logging import get_logger
 from liminallm.service.model_backend import get_adapter_mode
 from liminallm.storage.redis_cache import RedisCache
 
-from .embeddings import EMBEDDING_DIM, cosine_similarity, ensure_embedding_dim
+from .embeddings import (
+    EMBEDDING_DIM,
+    cosine_similarity,
+    ensure_embedding_dim,
+    validated_embedding,
+)
 from .sandbox import safe_eval_expr
 
 logger = get_logger(__name__)
@@ -68,6 +73,17 @@ class RouterEngine:
             logger.warning("router_float_parse_failed", context=context, value=value)
             return default
 
+    def _safe_embedding(self, value: Any, *, name: str) -> List[float]:
+        """Validate embeddings before routing decisions (Issues 45.2, 45.5)."""
+
+        if not value:
+            return ensure_embedding_dim([], dim=EMBEDDING_DIM)
+        try:
+            return validated_embedding(value, expected_dim=EMBEDDING_DIM, name=name)
+        except ValueError as exc:
+            logger.warning("router_embedding_invalid", name=name, error=str(exc))
+            return ensure_embedding_dim([], dim=EMBEDDING_DIM)
+
     async def route(
         self,
         policy: dict,
@@ -78,11 +94,7 @@ class RouterEngine:
         ctx_cluster: Optional[dict] = None,
         user_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        ctx_emb = (
-            ensure_embedding_dim(context_embedding, dim=EMBEDDING_DIM)
-            if context_embedding
-            else []
-        )
+        ctx_emb = self._safe_embedding(context_embedding, name="context_embedding")
 
         # Filter adapters to only those compatible with current backend mode
         all_adapters = adapters or []
@@ -444,6 +456,4 @@ class RouterEngine:
 
     def _adapter_embedding(self, adapter: dict) -> List[float]:
         emb = adapter.get("embedding") or adapter.get("centroid") or []
-        if not isinstance(emb, list):
-            return ensure_embedding_dim([], dim=EMBEDDING_DIM)
-        return ensure_embedding_dim(emb, dim=EMBEDDING_DIM)
+        return self._safe_embedding(emb, name="adapter_embedding")

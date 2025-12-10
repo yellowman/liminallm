@@ -28,6 +28,7 @@ from liminallm.service.embeddings import (
     cosine_similarity,
     deterministic_embedding,
     ensure_embedding_dim,
+    validated_embedding,
 )
 from liminallm.service.errors import BadRequestError
 from liminallm.service.llm import LLMService
@@ -1683,10 +1684,23 @@ class WorkflowEngine:
     def _align_vectors(
         self, a: List[float], b: List[float]
     ) -> Tuple[List[float], List[float]]:
-        return (
-            ensure_embedding_dim(a, dim=EMBEDDING_DIM),
-            ensure_embedding_dim(b, dim=EMBEDDING_DIM),
-        )
+        try:
+            aligned_a = validated_embedding(
+                a, expected_dim=EMBEDDING_DIM, name="workflow_context_embedding"
+            )
+        except ValueError as exc:
+            self.logger.warning("workflow_embedding_invalid", source="context", error=str(exc))
+            aligned_a = ensure_embedding_dim([], dim=EMBEDDING_DIM)
+
+        try:
+            aligned_b = validated_embedding(
+                b, expected_dim=EMBEDDING_DIM, name="workflow_cluster_centroid"
+            )
+        except ValueError as exc:
+            self.logger.warning("workflow_embedding_invalid", source="centroid", error=str(exc))
+            aligned_b = ensure_embedding_dim([], dim=EMBEDDING_DIM)
+
+        return aligned_a, aligned_b
 
     async def _execute_node(
         self,

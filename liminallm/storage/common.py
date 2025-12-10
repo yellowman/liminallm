@@ -14,8 +14,10 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional
 
 # Import from canonical location to avoid duplication
 from liminallm.service.embeddings import (
+    EMBEDDING_DIM,
     cosine_similarity,
     deterministic_embedding,
+    validated_embedding,
 )
 from liminallm.storage.errors import ConstraintViolation
 
@@ -118,13 +120,27 @@ def hybrid_search_chunks(
     bm25_scores = bm25_scores_fn(query_tokens, doc_tokens)
 
     # Compute semantic scores
-    semantic_scores = []
+    semantic_scores: List[float] = []
+    try:
+        normalized_query = (
+            validated_embedding(query_embedding, expected_dim=EMBEDDING_DIM, name="query_embedding")
+            if query_embedding
+            else []
+        )
+    except ValueError:
+        normalized_query = []
     for ch in candidates:
-        if not query_embedding or not ch.embedding:
+        if not normalized_query or not ch.embedding:
             semantic_scores.append(0.0)
             continue
-        dim = min(len(query_embedding), len(ch.embedding))
-        semantic_scores.append(cosine_fn(query_embedding[:dim], ch.embedding[:dim]))
+        try:
+            chunk_embedding = validated_embedding(
+                ch.embedding, expected_dim=EMBEDDING_DIM, name="chunk_embedding"
+            )
+        except ValueError:
+            semantic_scores.append(0.0)
+            continue
+        semantic_scores.append(cosine_fn(normalized_query, chunk_embedding))
 
     # Normalize BM25 scores and combine
     max_bm25 = max(bm25_scores) if bm25_scores else 1.0

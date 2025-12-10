@@ -51,7 +51,7 @@ def sanitize_embedding(vec: Iterable[float], *, replace_value: float = 0.0) -> L
 
 def validate_embedding_dimension(
     vec: Iterable[float], expected_dim: int, *, name: str = "embedding"
-) -> None:
+) -> List[float]:
     """Validate embedding has expected dimension (Issue 45.2).
 
     Args:
@@ -59,12 +59,17 @@ def validate_embedding_dimension(
         expected_dim: Expected dimension
         name: Name for error messages
 
+    Returns:
+        Materialized embedding list for reuse after validation
+
     Raises:
         ValueError: If dimension doesn't match
     """
-    actual = len(list(vec))
+    materialized = list(vec)
+    actual = len(materialized)
     if actual != expected_dim:
         raise ValueError(f"{name} has dimension {actual}, expected {expected_dim}")
+    return materialized
 
 
 def deterministic_embedding(text: str, dim: int = EMBEDDING_DIM) -> List[float]:
@@ -130,7 +135,12 @@ def cosine_similarity(
 
 
 def ensure_embedding_dim(
-    vec: Iterable[float] | None, *, dim: int = EMBEDDING_DIM, sanitize: bool = True
+    vec: Iterable[float] | None,
+    *,
+    dim: int = EMBEDDING_DIM,
+    sanitize: bool = True,
+    validate_length: bool = False,
+    name: str = "embedding",
 ) -> List[float]:
     """Ensure embedding has the correct dimension by padding or truncating.
 
@@ -144,7 +154,12 @@ def ensure_embedding_dim(
     """
     if not vec:
         return [0.0] * dim
-    trimmed = list(vec)[:dim]
+
+    materialized = list(vec)
+    if validate_length and len(materialized) != dim:
+        raise ValueError(f"{name} has dimension {len(materialized)}, expected {dim}")
+
+    trimmed = materialized[:dim]
 
     # Issue 45.2: Sanitize NaN/Infinity values during dimension adjustment
     if sanitize:
@@ -153,6 +168,23 @@ def ensure_embedding_dim(
     if len(trimmed) < dim:
         trimmed += [0.0] * (dim - len(trimmed))
     return trimmed
+
+
+def validated_embedding(
+    vec: Iterable[float] | None,
+    *,
+    expected_dim: int = EMBEDDING_DIM,
+    name: str = "embedding",
+) -> List[float]:
+    """Validate and size an embedding before downstream use (Issues 45.2, 45.4)."""
+
+    if vec is None:
+        raise ValueError(f"{name} is required")
+    sanitized = validate_embedding(vec, name=name)
+    _ = validate_embedding_dimension(sanitized, expected_dim, name=name)
+    return ensure_embedding_dim(
+        sanitized, dim=expected_dim, sanitize=True, validate_length=True, name=name
+    )
 
 
 def pad_vectors(
@@ -195,12 +227,15 @@ def normalize_vector(vec: List[float]) -> List[float]:
     return [v / magnitude for v in clean]
 
 
-def validate_centroid(centroid: List[float], *, name: str = "centroid") -> List[float]:
+def validate_centroid(
+    centroid: List[float], *, name: str = "centroid", expected_dim: int | None = EMBEDDING_DIM
+) -> List[float]:
     """Validate and normalize a centroid vector (Issue 45.3).
 
     Args:
         centroid: Centroid vector to validate
         name: Name for error messages
+        expected_dim: Optional dimension check
 
     Returns:
         Validated and normalized centroid
@@ -210,6 +245,9 @@ def validate_centroid(centroid: List[float], *, name: str = "centroid") -> List[
     """
     if not centroid:
         raise ValueError(f"{name} is empty")
+
+    if expected_dim:
+        _ = validate_embedding_dimension(centroid, expected_dim, name=name)
 
     # Check for NaN/Infinity
     for i, val in enumerate(centroid):

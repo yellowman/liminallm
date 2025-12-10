@@ -2600,6 +2600,8 @@ Cache keys include `user_id` but not `tenant_id`.
 
 **Impact:** Malformed embeddings cause inconsistent vector space geometry and clustering errors.
 
+**Status:** ✅ FIXED - Embedding vectors are validated to the expected dimension via `validated_embedding()` and `validate_embedding_dimension()` before padding; out-of-spec shapes now raise errors instead of being silently resized.
+
 ### 45.3 HIGH: Centroid Poisoning - No Validation on Cluster Centroids
 
 **Location:** `liminallm/service/clustering.py:88-99`
@@ -2607,6 +2609,8 @@ Cache keys include `user_id` but not `tenant_id`.
 Cluster centroids computed and stored without validating for NaN/Infinity. K-means update rule doesn't normalize results.
 
 **Impact:** Malicious centroids break similarity calculations, skew cluster assignments.
+
+**Status:** ✅ FIXED - Centroids are validated for dimension and NaN/Infinity using `validate_centroid()` during seeding, updates, and before persistence; invalid seeds are dropped with warnings and clusters fall back to zeroed centroids.
 
 ### 45.4 HIGH: Embedding Injection in Preference Events
 
@@ -2616,6 +2620,8 @@ User-provided embeddings in preference events accepted without validation.
 
 **Impact:** Training data poisoning, centroid corruption, clustering manipulation.
 
+**Status:** ✅ FIXED - Preference recording now validates `context_embedding` shape and numeric safety in both Postgres and Memory stores, rejecting malformed embeddings with `ConstraintViolation` before persistence.
+
 ### 45.5 HIGH: No Bounds Checking on Cosine Similarity Scores
 
 **Location:** `liminallm/service/router.py:307-319`
@@ -2623,6 +2629,8 @@ User-provided embeddings in preference events accepted without validation.
 Similarity scores used directly for weight assignment without NaN validation.
 
 **Impact:** NaN similarity scores propagate through adapter routing, undefined behavior.
+
+**Status:** ✅ FIXED - Router embeddings are pre-validated and NaN/Infinity embeddings are zeroed before similarity scoring, ensuring cosine outputs stay bounded and invalid vectors cannot influence routing weights.
 
 ### 45.6 MEDIUM: Centroid Exposure in Adapter Schema
 
@@ -2640,6 +2648,8 @@ Search functions don't validate embedding dimensions before computing similarity
 
 **Impact:** Dimension mismatch silently handled, incorrect search results.
 
+**Status:** ✅ FIXED - Hybrid chunk search now validates query and chunk embeddings to the canonical dimension and drops invalid vectors, preventing mismatched or poisoned embeddings from affecting semantic scores.
+
 ### 45.8 MEDIUM: No Embedding Model Validation for pgvector Search
 
 **Location:** `liminallm/storage/postgres.py:2472-2474`
@@ -2656,6 +2666,8 @@ Cluster centroids used directly in workflow vector alignment without validation.
 
 **Impact:** Poisoned centroids corrupt workflow routing decisions.
 
+**Status:** ✅ FIXED - Workflow centroid alignment validates both context and cluster embeddings, logs and zeroes invalid vectors, and only feeds sanitized values into routing similarity.
+
 ### 45.10 MEDIUM: Missing Normalization in Centroid Update
 
 **Location:** `liminallm/service/clustering.py:40-42, 88-95`
@@ -2663,6 +2675,8 @@ Cluster centroids used directly in workflow vector alignment without validation.
 Mini-batch k-means centroids updated incrementally without normalization.
 
 **Impact:** Centroids accumulate magnitude errors, incorrect cluster assignments.
+
+**Status:** ✅ FIXED - Centroid updates and seeds are normalized and validated for dimension/NaN at each step of mini-batch k-means; invalid centroids are replaced with zero-safe defaults.
 
 ---
 
