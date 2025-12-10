@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, List, Optional
 
 from liminallm.logging import get_logger
@@ -36,6 +36,10 @@ MAX_QUEUE_DEPTH = 100
 DEFAULT_CLUSTER_INTERVAL_SECONDS = 15 * 60
 DEFAULT_CLUSTER_USER_LIMIT = 50
 DEFAULT_CLUSTER_EVENT_LIMIT = 500
+DEFAULT_ADAPTER_PRUNE_INTERVAL_SECONDS = 6 * 60 * 60
+ADAPTER_PRUNE_MIN_USAGE = 2
+ADAPTER_PRUNE_MAX_SUCCESS = 0.25
+ADAPTER_PRUNE_STALE_DAYS = 7
 
 
 class TrainingWorker:
@@ -58,6 +62,7 @@ class TrainingWorker:
         cluster_interval: int = DEFAULT_CLUSTER_INTERVAL_SECONDS,
         cluster_user_limit: int = DEFAULT_CLUSTER_USER_LIMIT,
         cluster_event_limit: int = DEFAULT_CLUSTER_EVENT_LIMIT,
+        adapter_prune_interval: int = DEFAULT_ADAPTER_PRUNE_INTERVAL_SECONDS,
     ) -> None:
         self.store = store
         self.training = training_service
@@ -69,9 +74,11 @@ class TrainingWorker:
         self.cluster_interval = cluster_interval
         self.cluster_user_limit = cluster_user_limit
         self.cluster_event_limit = cluster_event_limit
+        self.adapter_prune_interval = adapter_prune_interval
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._last_cluster_run: float = 0.0
+        self._last_prune_run: float = 0.0
 
     async def start(self) -> None:
         """Start the background worker."""
@@ -102,6 +109,7 @@ class TrainingWorker:
             try:
                 await self._process_queued_jobs()
                 await self._maybe_run_periodic_clustering()
+                await self._maybe_recommend_adapter_pruning()
                 consecutive_errors = 0
             except Exception as exc:
                 consecutive_errors += 1
@@ -136,7 +144,10 @@ class TrainingWorker:
         users = []
         if hasattr(self.store, "list_users"):
             users_raw = self.store.list_users(limit=self.cluster_user_limit)
-            users = [] if inspect.isawaitable(users_raw) else list(users_raw)
+            if inspect.isawaitable(users_raw):
+                users = list(await users_raw)
+            else:
+                users = list(users_raw)
 
         for user in users:
             try:
@@ -161,6 +172,98 @@ class TrainingWorker:
             )
         except Exception as exc:
             logger.warning("periodic_global_clustering_failed", error=str(exc))
+
+    async def _maybe_recommend_adapter_pruning(self) -> None:
+        """Surface low-quality adapters via ConfigOps auto-proposals."""
+
+        if self.adapter_prune_interval <= 0:
+            return
+
+        now = time.monotonic()
+        if self._last_prune_run and (now - self._last_prune_run) < self.adapter_prune_interval:
+            return
+        self._last_prune_run = now
+
+        list_states = getattr(self.store, "list_adapter_router_state", None)
+        record_patch = getattr(self.store, "record_config_patch", None)
+        list_patches = getattr(self.store, "list_config_patches", None)
+        if not callable(list_states) or not callable(record_patch):
+            return
+
+        try:
+            states = list_states()  # type: ignore[call-arg]
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("adapter_prune_state_fetch_failed", error=str(exc))
+            return
+
+        existing_targets: set[str] = set()
+        if callable(list_patches):
+            try:
+                for patch in list_patches():
+                    if (
+                        isinstance(patch.meta, dict)
+                        and patch.meta.get("auto_prune")
+                        and getattr(patch, "status", "pending") == "pending"
+                    ):
+                        existing_targets.add(patch.artifact_id)
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.debug("adapter_prune_patch_scan_failed", error=str(exc))
+
+        stale_cutoff = datetime.utcnow() - timedelta(days=ADAPTER_PRUNE_STALE_DAYS)
+        for state in states:
+            artifact = self.store.get_artifact(state.artifact_id)
+            if not artifact or artifact.type != "adapter":
+                continue
+
+            last_used = state.last_used_at or state.last_trained_at or artifact.updated_at
+            if not last_used:
+                last_used = artifact.created_at
+            if last_used and last_used.tzinfo:
+                last_used = last_used.astimezone(timezone.utc).replace(tzinfo=None)
+
+            if (
+                state.artifact_id not in existing_targets
+                and state.usage_count < ADAPTER_PRUNE_MIN_USAGE
+                and state.success_score < ADAPTER_PRUNE_MAX_SUCCESS
+                and (not last_used or last_used < stale_cutoff)
+            ):
+                patch = {
+                    "ops": [
+                        {
+                            "op": "add",
+                            "path": "/meta/auto_prune",
+                            "value": {
+                                "recommended": True,
+                                "reason": "low_usage_and_success_score",
+                                "usage_count": state.usage_count,
+                                "success_score": state.success_score,
+                                "last_used_at": last_used.isoformat() if last_used else None,
+                            },
+                        }
+                    ]
+                }
+                try:
+                    record_patch(
+                        artifact_id=state.artifact_id,
+                        proposer="system_llm",
+                        patch=patch,
+                        justification=(
+                            "Auto-prune recommendation for low-usage adapter; consider disabling or merging."
+                        ),
+                    )
+                    existing_targets.add(state.artifact_id)
+                    logger.info(
+                        "adapter_prune_recommendation_created",
+                        adapter_id=state.artifact_id,
+                        usage_count=state.usage_count,
+                        success_score=state.success_score,
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        "adapter_prune_patch_failed",
+                        adapter_id=state.artifact_id,
+                        error=str(exc),
+                    )
 
     async def _process_queued_jobs(self) -> None:
         """Process a batch of queued training jobs."""
