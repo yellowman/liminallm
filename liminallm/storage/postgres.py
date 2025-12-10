@@ -2076,6 +2076,7 @@ class PostgresStore:
             description=normalized_description or "",
             schema=schema,
             owner_user_id=owner_user_id,
+            visibility=visibility,
             fs_path=fs_path,
             base_model=schema.get("base_model"),
         )
