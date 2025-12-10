@@ -127,6 +127,10 @@ for v1 these can all live in one python app with clear module boundaries.
   - all “product behavior” in data (artifacts / policies / workflows)
   - evolution driven by usage + llm suggestions, not constant code surgery
 
+## deployment
+
+- install and runtime guidance (docker compose and manual host setup) live in `docs/DEPLOYMENT.md`
+
 ### implementation completeness (prototype)
 
 - **implemented**

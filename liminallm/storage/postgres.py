@@ -39,6 +39,11 @@ from liminallm.storage.common import (
     get_default_tool_specs,
     normalize_optional_text,
 )
+from liminallm.storage.cursors import (
+    decode_artifact_cursor,
+    decode_index_cursor,
+    decode_time_id_cursor,
+)
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
     AdapterRouterState,
@@ -71,6 +76,7 @@ class PostgresStore:
         self.logger = get_logger(__name__)
         self._connect_max_retries = 3
         self._connect_retry_backoff = 0.25
+        self._last_pool_metrics_log = 0.0
 
         try:
             self.fs_root.mkdir(parents=True, exist_ok=True)
@@ -201,7 +207,11 @@ class PostgresStore:
         last_exc: Exception | None = None
         while attempt < self._connect_max_retries:
             try:
-                return self.pool.connection()
+                start = time.monotonic()
+                conn = self.pool.connection()
+                elapsed_ms = (time.monotonic() - start) * 1000
+                self._maybe_log_pool_metrics(elapsed_ms)
+                return conn
             except Exception as exc:
                 last_exc = exc
                 attempt += 1
@@ -215,6 +225,38 @@ class PostgresStore:
         if last_exc:
             raise last_exc
         return self.pool.connection()
+
+    def _maybe_log_pool_metrics(self, wait_ms: float) -> None:
+        """Emit periodic pool health metrics to surface saturation early."""
+
+        now = time.monotonic()
+        if (now - self._last_pool_metrics_log) < 60 and wait_ms < 500:
+            return
+
+        stats_fn = getattr(self.pool, "get_stats", None)
+        waiting = used = free = open_conns = None
+        max_size = getattr(self.pool, "max_size", None)
+        if callable(stats_fn):
+            try:
+                stats = stats_fn()
+                waiting = getattr(stats, "waiting", None)
+                used = getattr(stats, "used", None)
+                free = getattr(stats, "free", None)
+                open_conns = getattr(stats, "open", None)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                self.logger.debug("postgres_pool_stats_failed", error=str(exc))
+
+        if wait_ms >= 500 or (waiting and waiting > 0) or (used and max_size and used >= max_size):
+            self.logger.warning(
+                "postgres_pool_pressure",
+                wait_ms=round(wait_ms, 2),
+                waiting=waiting,
+                used=used,
+                free=free,
+                open_connections=open_conns,
+                max_size=max_size,
+            )
+            self._last_pool_metrics_log = now
 
     def _ensure_runtime_config_table(self) -> None:
         """Create the ``instance_config`` table if it is missing."""
@@ -1827,6 +1869,8 @@ class PostgresStore:
         *,
         page: int = 1,
         page_size: int = 100,
+        cursor: Optional[str] = None,
+        include_sentinel: bool = False,
         owner_user_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
         visibility: Optional[str] = None,
@@ -1843,9 +1887,18 @@ class PostgresStore:
         max_page_size = 500
         requested_page_size = max(page_size, 1)
         capped_page_size = min(requested_page_size, max_page_size)
-        # Allow one extra record for has_next detection when caller requests page_size + 1
-        limit = capped_page_size + (1 if requested_page_size >= max_page_size else 0)
-        offset = max(page - 1, 0) * capped_page_size
+        # Optionally fetch one extra record for has_next detection
+        limit = capped_page_size + (1 if include_sentinel else 0)
+        offset = 0 if cursor else max(page - 1, 0) * capped_page_size
+        cursor_filter: list[str] = []
+        cursor_params: list[Any] = []
+        if cursor:
+            try:
+                created_at_cursor, artifact_cursor_id = decode_artifact_cursor(cursor)
+                cursor_filter.append("(created_at, id) < (%s, %s)")
+                cursor_params.extend([created_at_cursor, artifact_cursor_id])
+            except Exception as exc:
+                self.logger.warning("artifact_cursor_decode_failed", error=str(exc))
         with self._connect() as conn:
             clauses = []
             params: list[Any] = []
@@ -1898,14 +1951,16 @@ class PostgresStore:
                 if visibility_parts:
                     clauses.append("(" + " OR ".join(visibility_parts) + ")")
 
-            where = ""
-            if clauses:
-                where = " WHERE " + " AND ".join(clauses)
+            if cursor_filter:
+                clauses.extend(cursor_filter)
+
+            where = " WHERE " + " AND ".join(clauses) if clauses else ""
             query = (
                 "SELECT * FROM artifact"
                 + where
-                + " ORDER BY created_at DESC LIMIT %s OFFSET %s"
+                + " ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s"
             )
+            params.extend(cursor_params)
             params.extend([limit, offset])
             rows = conn.execute(query, tuple(params)).fetchall()
         artifacts: List[Artifact] = []
@@ -2519,14 +2574,13 @@ class PostgresStore:
                 return None
         return None
 
-    @staticmethod
-    def _safe_float(value: Any, default: float = 1.0, *, context: str = "") -> float:
+    def _safe_float(self, value: Any, default: float = 1.0, *, context: str = "") -> float:
         """Parse floats defensively to avoid crashes on malformed data (Issue 39.3)."""
 
         try:
             return float(value)
         except (TypeError, ValueError):
-            logger.warning("postgres_float_parse_failed", context=context, value=value)
+            self.logger.warning("postgres_float_parse_failed", context=context, value=value)
             return default
 
     def get_runtime_config(self) -> dict:
@@ -2737,15 +2791,44 @@ class PostgresStore:
         )
 
     def list_contexts(
-        self, owner_user_id: Optional[str] = None, limit: int = 100
+        self,
+        owner_user_id: Optional[str] = None,
+        *,
+        page: int = 1,
+        page_size: int = 100,
+        cursor: Optional[str] = None,
+        include_sentinel: bool = False,
+        limit: Optional[int] = None,
     ) -> List[KnowledgeContext]:
         if not owner_user_id:
             return []
+
+        effective_page_size = max(1, limit or page_size)
+        capped_page_size = min(effective_page_size, 500)
+        fetch_limit = capped_page_size + (1 if include_sentinel else 0)
+        offset = 0 if cursor else max(page - 1, 0) * capped_page_size
+
+        cursor_filter = ""
+        cursor_params: list[Any] = []
+        if cursor:
+            try:
+                cursor_ts, cursor_id = decode_time_id_cursor(cursor)
+                cursor_filter = " AND (created_at, id) < (%s, %s)"
+                cursor_params.extend([cursor_ts, cursor_id])
+            except Exception as exc:  # pragma: no cover - defensive
+                self.logger.warning("context_cursor_decode_failed", error=str(exc))
+
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM knowledge_context WHERE owner_user_id = %s ORDER BY created_at DESC LIMIT %s",
-                (owner_user_id, limit),
-            ).fetchall()
+            query = (
+                "SELECT * FROM knowledge_context WHERE owner_user_id = %s"
+                + cursor_filter
+                + " ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s"
+            )
+            params: list[Any] = [owner_user_id]
+            params.extend(cursor_params)
+            params.extend([fetch_limit, offset])
+            rows = conn.execute(query, tuple(params)).fetchall()
+
         contexts: List[KnowledgeContext] = []
         for row in rows:
             contexts.append(
@@ -2857,29 +2940,62 @@ class PostgresStore:
         context_id: Optional[str] = None,
         *,
         owner_user_id: Optional[str] = None,
+        page: int = 1,
+        page_size: int = 100,
+        cursor: Optional[str] = None,
+        include_sentinel: bool = False,
         limit: Optional[int] = None,
     ) -> List[KnowledgeChunk]:
+        effective_page_size = max(1, limit or page_size)
+        capped_page_size = min(effective_page_size, 500)
+        fetch_limit = capped_page_size + (1 if include_sentinel else 0)
+        offset = 0 if cursor else max(page - 1, 0) * capped_page_size
+
         with self._connect() as conn:
             if context_id:
                 params: list[Any] = []
+                cursor_filter = ""
+                cursor_params: list[Any] = []
+                if cursor:
+                    try:
+                        cursor_idx, cursor_id = decode_index_cursor(cursor)
+                        cursor_filter = " AND (kc.chunk_index, kc.id) > (%s, %s)"
+                        cursor_params.extend([cursor_idx, cursor_id])
+                    except Exception as exc:  # pragma: no cover - defensive
+                        self.logger.warning("chunk_cursor_decode_failed", error=str(exc))
+
                 query = "SELECT kc.* FROM knowledge_chunk kc"
                 if owner_user_id:
                     query += " JOIN knowledge_context ctx ON ctx.id = kc.context_id AND ctx.owner_user_id = %s"
                     params.append(owner_user_id)
-                query += " WHERE kc.context_id = %s ORDER BY kc.chunk_index ASC"
+                query += " WHERE kc.context_id = %s"
                 params.append(context_id)
-                if limit is not None:
-                    query += " LIMIT %s"
-                    params.append(limit)
+                if cursor_filter:
+                    query += cursor_filter
+                    params.extend(cursor_params)
+                query += " ORDER BY kc.chunk_index ASC, kc.id ASC LIMIT %s OFFSET %s"
+                params.extend([fetch_limit, offset])
                 rows = conn.execute(query, tuple(params)).fetchall()
             else:
                 if not owner_user_id:
                     return []
                 params = [owner_user_id]
-                query = "SELECT kc.* FROM knowledge_chunk kc JOIN knowledge_context ctx ON ctx.id = kc.context_id WHERE ctx.owner_user_id = %s ORDER BY kc.created_at DESC"
-                if limit is not None:
-                    query += " LIMIT %s"
-                    params.append(limit)
+                cursor_filter = ""
+                if cursor:
+                    try:
+                        cursor_ts, cursor_id = decode_time_id_cursor(cursor)
+                        cursor_filter = " AND (kc.created_at, kc.id) < (%s, %s)"
+                        params.extend([cursor_ts, cursor_id])
+                    except Exception as exc:  # pragma: no cover - defensive
+                        self.logger.warning("chunk_cursor_decode_failed", error=str(exc))
+
+                query = (
+                    "SELECT kc.* FROM knowledge_chunk kc JOIN knowledge_context ctx "
+                    "ON ctx.id = kc.context_id WHERE ctx.owner_user_id = %s"
+                    + cursor_filter
+                    + " ORDER BY kc.created_at DESC, kc.id DESC LIMIT %s OFFSET %s"
+                )
+                params.extend([fetch_limit, offset])
                 rows = conn.execute(query, tuple(params)).fetchall()
         chunks: List[KnowledgeChunk] = []
         for row in rows:
