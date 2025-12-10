@@ -8,7 +8,7 @@ import secrets
 import shutil
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
@@ -70,6 +70,14 @@ from liminallm.storage.models import (
     UserMFAConfig,
     UserSettings,
 )
+
+
+def _to_naive_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    if not dt:
+        return dt
+    if dt.tzinfo:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 class MemoryStore:
@@ -1135,17 +1143,20 @@ class MemoryStore:
         capped_page_size = min(requested_page_size, max_page_size)
         limit = capped_page_size + (1 if include_sentinel else 0)
 
-        artifacts.sort(key=lambda a: a.created_at, reverse=True)
+        artifacts.sort(
+            key=lambda a: _to_naive_utc(a.created_at) or datetime.min, reverse=True
+        )
         if cursor:
             try:
                 cursor_ts, cursor_id = decode_artifact_cursor(cursor)
+                cursor_ts = _to_naive_utc(cursor_ts) or datetime.min
                 artifacts = [
                     a
                     for a in artifacts
                     if (
-                        (a.created_at or datetime.min) < cursor_ts
+                        (_to_naive_utc(a.created_at) or datetime.min) < cursor_ts
                         or (
-                            (a.created_at or datetime.min) == cursor_ts
+                            (_to_naive_utc(a.created_at) or datetime.min) == cursor_ts
                             and a.id < cursor_id
                         )
                     )
@@ -1168,6 +1179,7 @@ class MemoryStore:
         schema: dict,
         description: str = "",
         owner_user_id: Optional[str] = None,
+        visibility: str = "private",
         *,
         version_author: Optional[str] = None,
         change_note: Optional[str] = None,
@@ -1192,6 +1204,7 @@ class MemoryStore:
             schema=schema,
             description=normalized_description,
             owner_user_id=owner_user_id,
+            visibility=visibility,
             fs_path=fs_path,
             base_model=schema.get("base_model"),
         )
@@ -1556,18 +1569,21 @@ class MemoryStore:
         contexts = [
             ctx for ctx in self.contexts.values() if ctx.owner_user_id == owner_user_id
         ]
-        contexts.sort(key=lambda c: c.created_at, reverse=True)
+        contexts.sort(
+            key=lambda c: _to_naive_utc(c.created_at) or datetime.min, reverse=True
+        )
 
         if cursor:
             try:
                 cursor_ts, cursor_id = decode_time_id_cursor(cursor)
+                cursor_ts = _to_naive_utc(cursor_ts) or datetime.min
                 contexts = [
                     ctx
                     for ctx in contexts
                     if (
-                        (ctx.created_at or datetime.min) < cursor_ts
+                        (_to_naive_utc(ctx.created_at) or datetime.min) < cursor_ts
                         or (
-                            (ctx.created_at or datetime.min) == cursor_ts
+                            (_to_naive_utc(ctx.created_at) or datetime.min) == cursor_ts
                             and ctx.id < cursor_id
                         )
                     )
@@ -1690,17 +1706,24 @@ class MemoryStore:
                 ctx = self.contexts.get(vals[0].context_id)
                 if ctx and ctx.owner_user_id == owner_user_id:
                     chunks.extend(vals)
-        chunks.sort(key=lambda ch: (ch.created_at, ch.id or 0), reverse=True)
+        chunks.sort(
+            key=lambda ch: (
+                _to_naive_utc(ch.created_at) or datetime.min,
+                ch.id or 0,
+            ),
+            reverse=True,
+        )
         if cursor:
             try:
                 cursor_ts, cursor_id = decode_time_id_cursor(cursor)
+                cursor_ts = _to_naive_utc(cursor_ts) or datetime.min
                 chunks = [
                     ch
                     for ch in chunks
                     if (
-                        (ch.created_at or datetime.min) < cursor_ts
+                        (_to_naive_utc(ch.created_at) or datetime.min) < cursor_ts
                         or (
-                            (ch.created_at or datetime.min) == cursor_ts
+                            (_to_naive_utc(ch.created_at) or datetime.min) == cursor_ts
                             and str(ch.id or "") < cursor_id
                         )
                     )
@@ -1720,7 +1743,7 @@ class MemoryStore:
         limit: int = 4,
     ) -> List[KnowledgeChunk]:
         """Hybrid BM25 + semantic search using common implementation."""
-        candidates = self.list_chunks(context_id)
+        candidates = self.list_chunks(context_id, limit=10000)
         if not candidates:
             return []
 
@@ -1765,7 +1788,7 @@ class MemoryStore:
                 owner = self.users.get(ctx.owner_user_id)
                 if not owner or owner.tenant_id != tenant_id:
                     continue
-            allowed_chunks.extend(self.list_chunks(ctx_id))
+            allowed_chunks.extend(self.list_chunks(ctx_id, limit=10000))
 
         if not allowed_chunks:
             return []

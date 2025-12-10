@@ -2024,6 +2024,7 @@ class PostgresStore:
         schema: dict,
         description: str = "",
         owner_user_id: Optional[str] = None,
+        visibility: str = "private",
         *,
         version_author: Optional[str] = None,
         change_note: Optional[str] = None,
@@ -2039,7 +2040,7 @@ class PostgresStore:
         try:
             with self._connect() as conn, conn.transaction():
                 conn.execute(
-                    "INSERT INTO artifact (id, owner_user_id, type, name, description, schema, fs_path, base_model) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)",
+                    "INSERT INTO artifact (id, owner_user_id, type, name, description, schema, fs_path, base_model, visibility) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     (
                         artifact_id,
                         owner_user_id,
@@ -2049,6 +2050,7 @@ class PostgresStore:
                         json.dumps(schema),
                         fs_path,
                         schema.get("base_model"),
+                        visibility,
                     ),
                 )
                 conn.execute(

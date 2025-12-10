@@ -196,15 +196,22 @@ class TrainingWorker:
             logger.warning("adapter_prune_state_fetch_failed", error=str(exc))
             return
 
+        def _is_auto_prune_patch(patch: ConfigPatchAudit) -> bool:
+            if getattr(patch, "status", "pending") != "pending":
+                return False
+            ops = []
+            if isinstance(getattr(patch, "patch", None), dict):
+                ops = patch.patch.get("ops") or []
+            for op in ops:
+                if isinstance(op, dict) and op.get("path") == "/meta/auto_prune":
+                    return True
+            return False
+
         existing_targets: set[str] = set()
         if callable(list_patches):
             try:
                 for patch in list_patches():
-                    if (
-                        isinstance(patch.meta, dict)
-                        and patch.meta.get("auto_prune")
-                        and getattr(patch, "status", "pending") == "pending"
-                    ):
+                    if _is_auto_prune_patch(patch):
                         existing_targets.add(patch.artifact_id)
             except Exception as exc:  # pragma: no cover - defensive
                 logger.debug("adapter_prune_patch_scan_failed", error=str(exc))

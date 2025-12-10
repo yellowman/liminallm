@@ -6807,3 +6807,51 @@ The following bugs were identified and fixed:
 
 **Fix:** Added `_failure_recorded: True` flag to the error result created in the except block. The subsequent failure recording check now includes `and not tool_result.get("_failure_recorded")` to skip already-recorded failures. The internal flag is excluded from outputs.
 
+### 80.15 ~~MEDIUM: Auto-Prune Dedup Checks Wrong Meta Field~~ FIXED
+
+**Location:** `liminallm/service/training_worker.py:194-240`
+
+**Issue:** The adapter auto-prune sweep tried to detect existing recommendations by inspecting `ConfigPatchAudit.meta`, but that field is never populated for the generated patches. The auto-prune marker lives inside the JSON patch operations at `/meta/auto_prune`, so duplicate recommendations were created every cycle.
+
+**Fix:** The sweep now inspects the patch operations for the auto-prune path and only treats pending patches with that marker as existing recommendations.
+
+### 80.16 ~~HIGH: Global Cluster Promotions Hidden by Private Visibility~~ FIXED
+
+**Location:** `liminallm/service/clustering.py:420-451`, `liminallm/storage/memory.py:1155-1184`, `liminallm/storage/postgres.py:2020-2049`
+
+**Issue:** Skill adapters promoted from global clusters were created with `owner_user_id=None` but default `visibility="private"`. Private visibility requires an owner for access filtering, so these adapters became inaccessible through listing APIs.
+
+**Fix:** Global promotions now set `visibility="global"`, and artifact creation paths accept explicit visibility so global adapters remain discoverable.
+
+### 80.17 ~~HIGH: Memory Pagination Drops Cursor Filters on TZ Mismatch~~ FIXED
+
+**Location:** `liminallm/storage/memory.py:1066-1100`, `liminallm/storage/memory.py:1552-1578`, `liminallm/storage/memory.py:1689-1720`
+
+**Issue:** `decode_artifact_cursor`/`decode_time_id_cursor` produced aware timestamps while stored records used naive UTC values. Comparing aware cursors to naive `created_at` raised `TypeError`, which was swallowed and skipped cursor filtering, causing pagination to repeat the first page for artifacts, contexts, and chunks.
+
+**Fix:** Cursor timestamps and stored timestamps are normalized to naive UTC before comparison so keyset pagination applies reliably without exceptions.
+
+### 80.18 ~~MEDIUM: Chunk Search Only Examines First Page~~ FIXED
+
+**Location:** `liminallm/storage/memory.py:1724-1739`, `liminallm/storage/memory.py:1769-1795`
+
+**Issue:** `search_chunks` and `search_chunks_pgvector` called `list_chunks` without a limit, inheriting the default `page_size=100`. Searches considered only the first 100 chunks per context, missing results in larger contexts.
+
+**Fix:** Searches now request a large chunk window so all available chunks in the allowed contexts are considered during ranking.
+
+### 80.19 ~~MEDIUM: Refresh Token Rate Limits Not Admin-Configurable~~ FIXED
+
+**Location:** `liminallm/api/routes.py:362-407`, `liminallm/api/routes.py:3130-3240`
+
+**Issue:** The new `refresh_rate_limit_per_minute` and `refresh_rate_limit_window_seconds` defaults were missing from the admin settings allowlist and integer validation set, causing API updates for those fields to be rejected.
+
+**Fix:** Added both refresh rate limit fields to the allowed and integer-validated settings so administrators can configure them via the API.
+
+### 80.20 ~~HIGH: Refresh Rate Limit Bypass via Fake Tenant IDs~~ FIXED
+
+**Location:** `liminallm/api/routes.py:1114-1134`
+
+**Issue:** The refresh rate limit key combined client IP with the user-supplied tenant hint before validating it. Attackers could rotate fake tenant IDs to obtain separate buckets and bypass throttling.
+
+**Fix:** The refresh rate limit now keys solely on client IP, avoiding unvalidated tenant hints in the bucket namespace.
+

@@ -1119,11 +1119,10 @@ async def refresh_tokens(
 ):
     runtime = get_runtime()
     tenant_hint = body.tenant_id or x_tenant_id
-    tenant_key = tenant_hint or "default"
     client_ip = request.client.host if request.client else "unknown"
     await _enforce_rate_limit(
         runtime,
-        f"refresh:{tenant_key}:{client_ip}",
+        f"refresh:{client_ip}",
         _get_rate_limit(runtime, "refresh_rate_limit_per_minute"),
         _get_rate_limit(runtime, "refresh_rate_limit_window_seconds"),
     )
@@ -3144,6 +3143,8 @@ async def update_system_settings(
         "chat_rate_limit_per_minute",
         "chat_rate_limit_window_seconds",
         "login_rate_limit_per_minute",
+        "refresh_rate_limit_per_minute",
+        "refresh_rate_limit_window_seconds",
         "signup_rate_limit_per_minute",
         "reset_rate_limit_per_minute",
         "mfa_rate_limit_per_minute",
@@ -3202,6 +3203,8 @@ async def update_system_settings(
         "chat_rate_limit_per_minute",
         "chat_rate_limit_window_seconds",
         "login_rate_limit_per_minute",
+        "refresh_rate_limit_per_minute",
+        "refresh_rate_limit_window_seconds",
         "signup_rate_limit_per_minute",
         "reset_rate_limit_per_minute",
         "mfa_rate_limit_per_minute",
