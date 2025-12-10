@@ -1421,34 +1421,33 @@ if job.status == "queued":
 
 **Fix:** Use atomic status transition with WHERE clause: `UPDATE ... SET status='running' WHERE status='queued' RETURNING *`
 
-### 26.3 HIGH: No Visibility Transition Guards
+### 26.3 🟢 VERIFIED FALSE POSITIVE: No Visibility Transition Guards
 
 **Location:** `liminallm/storage/postgres.py:1850-1890`
 
-Artifact visibility can be changed from any state to any state. No validation of valid transitions (e.g., preventing `global` → `private` once shared).
+Visibility is assigned at creation (defaults to `private`), and neither the API nor the stores expose any mutation path for the
+`visibility` column. `update_artifact` persists schema/description changes only, so there is no reachable downgrade path such as
+`global` → `private` in the current kernel.
 
-### 26.4 HIGH: Conversation Status Inconsistent
+### 26.4 🟢 VERIFIED FALSE POSITIVE: Conversation Status Inconsistent
 
 **Location:** `liminallm/storage/postgres.py:1200-1250`
 
-Conversations have `status` field but no state machine. Can jump between `active`, `archived`, `deleted` arbitrarily.
+Conversation records are created with an implicit `status` (defaulting to `open`), but there is no endpoint or store method that
+updates this field. Conversation APIs only create/fetch/list conversations and append messages; deletion/archival states are not
+exposed, so no inconsistent transitions are possible.
 
-### 26.5 HIGH: decide_patch Doesn't Check Current Status
+### 26.5 ✅ VERIFIED FIXED: decide_patch Checks Current Status
 
 **Location:** `liminallm/service/config_ops.py:55-73`
 
-```python
-async def decide_patch(self, patch_id: str, approved: bool):
-    patch = await self.store.get_config_patch(patch_id)
-    # BUG: No check that patch.status == "pending"
-    patch.status = "approved" if approved else "rejected"
-```
+`ConfigOps.decide_patch` now rejects decisions on non-pending patches before normalizing the decision string, preventing double
+approval/rejection of already applied or rejected patches.
 
-**Issue:** Can approve/reject already-applied patches.
+### 26.6 🟢 VERIFIED FALSE POSITIVE: Message Edit Allows Status Change
 
-### 26.6 MEDIUM: Message Edit Allows Status Change
-
-Messages can be edited to change their status field directly, bypassing any workflow.
+The platform does not expose a message-edit endpoint, nor does the store provide a method to mutate message status. Messages are
+appended with immutable status, making the cited bypass unreachable with current routes.
 
 ---
 
