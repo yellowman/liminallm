@@ -1,6 +1,6 @@
 # Codebase Issues and Security Audit
 
-**Last Updated:** 2025-12-08
+**Last Updated:** 2025-12-09
 **Scope:** Comprehensive review against SPEC.md requirements (12th pass)
 
 ---
@@ -732,6 +732,14 @@ Redis rate limiting now uses an atomic Lua token bucket with weighted costs and 
 **Issue:** `_safe_float` was a `@staticmethod` that logged via an undefined module-level `logger`, raising `NameError` when float coercion failed.
 
 **Fix Applied:** `_safe_float` is now an instance method using `self.logger` for warnings, preserving defensive parsing without crashing.
+
+### 10.7 ~~BUG: Artifact Cursor Timezone Mismatch Breaks Pagination~~ FIXED
+
+**Location:** `liminallm/storage/memory.py:1138-1146`, `liminallm/storage/cursors.py:9-25`
+
+**Issue:** `decode_artifact_cursor` returned timezone-aware timestamps while `MemoryStore` artifact `created_at` values were naive UTC datetimes. Comparing them raised `TypeError`, triggering exception handling that skipped cursor filters and caused keyset pagination to repeat the first page.
+
+**Fix Applied:** Cursor encoding now normalizes timestamps to UTC, and decoding returns UTC-naive datetimes to match in-memory artifacts. Keyset pagination comparisons remain consistent, preventing repeated first pages.
 
 ---
 
