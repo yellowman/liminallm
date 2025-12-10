@@ -1100,9 +1100,13 @@ class MemoryStore:
                 if isinstance(a.schema, dict) and a.schema.get("kind") == kind_filter
             ]
 
-        # Pagination
-        start = max(page - 1, 0) * max(page_size, 1)
-        end = start + max(page_size, 1)
+        # Pagination (cap at 500, allow sentinel row for has_next detection at cap)
+        max_page_size = 500
+        requested_page_size = max(page_size, 1)
+        capped_page_size = min(requested_page_size, max_page_size)
+        limit = capped_page_size + (1 if requested_page_size >= max_page_size else 0)
+        start = max(page - 1, 0) * capped_page_size
+        end = start + limit
         return artifacts[start:end]
 
     def get_artifact(self, artifact_id: str) -> Optional[Artifact]:
