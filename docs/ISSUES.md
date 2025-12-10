@@ -1530,16 +1530,11 @@ _active_requests_lock = asyncio.Lock()  # Created before event loop exists
 
 **Impact:** Resource leaks on shutdown.
 
-### 28.4 HIGH: AuthService Mutable State Not Thread-Safe
+### 28.4 ~~HIGH: AuthService Mutable State Not Thread-Safe~~ FIXED
 
-**Location:** `liminallm/service/auth.py:128-133`
+**Location:** `liminallm/service/auth.py`
 
-```python
-self._mfa_challenges: dict[str, tuple[str, datetime]] = {}
-self._oauth_states: dict[str, tuple[str, datetime, Optional[str]]] = {}
-```
-
-**Issue:** Multiple unprotected mutable dictionaries accessed concurrently without locks.
+**Resolution:** Added a shared threading lock with a helper context manager and wrapped all in-memory OAuth state, MFA challenge, and password-reset token mutations with it, preventing concurrent access races when Redis is unavailable and the in-memory fallbacks are used.
 
 ### 28.5 HIGH: Config Validation Deferred to Runtime
 

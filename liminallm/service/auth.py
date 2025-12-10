@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import hmac
 import json
@@ -130,6 +131,7 @@ class AuthService:
         # Issue 28.4: Thread-safe lock for mutable state dictionaries
         # Protects all in-memory fallback state from concurrent access
         import threading
+
         self._state_lock = threading.Lock()
         self._mfa_challenges: dict[str, tuple[str, datetime]] = {}
         # Issue 11.1: In-memory fallback for MFA lockout when Redis unavailable
@@ -152,6 +154,13 @@ class AuthService:
         """Timezone-aware UTC helper to avoid naive datetime usage."""
 
         return datetime.now(timezone.utc)
+
+    @contextlib.contextmanager
+    def _with_state_lock(self):
+        """Context manager for thread-safe state dictionary access (Issue 28.4)."""
+
+        with self._state_lock:
+            yield
 
     def cleanup_expired_states(self) -> int:
         """Clean up expired OAuth states, MFA challenges, and email verification tokens.
@@ -406,7 +415,8 @@ class AuthService:
         expires_at = self._now() + timedelta(minutes=10)
         # Issue 28.4: Thread-safe state mutation
         with self._state_lock:
-            self._oauth_states[state] = (provider, expires_at, tenant_id)
+            with self._with_state_lock():
+                self._oauth_states[state] = (provider, expires_at, tenant_id)
         if self.cache:
             await self.cache.set_oauth_state(state, provider, expires_at, tenant_id)
 
@@ -644,14 +654,17 @@ class AuthService:
         # Issue 28.4: Thread-safe state mutation
         with self._state_lock:
             if stored is None:
-                stored = self._oauth_states.pop(state, None)
+                with self._with_state_lock():
+                    stored = self._oauth_states.pop(state, None)
             else:
-                self._oauth_states.pop(state, None)
+                with self._with_state_lock():
+                    self._oauth_states.pop(state, None)
         now = self._now()
 
         async def _clear_oauth_state() -> None:
             with self._state_lock:
-                self._oauth_states.pop(state, None)
+                with self._with_state_lock():
+                    self._oauth_states.pop(state, None)
             if self.cache and not cache_state_used:
                 await self.cache.pop_oauth_state(state)
 
@@ -1201,7 +1214,8 @@ class AuthService:
         else:
             # Issue 11.2: In-memory fallback for password reset tokens
             with self._state_lock:
-                self._password_reset_tokens[token] = (email, expires_at)
+                with self._with_state_lock():
+                    self._password_reset_tokens[token] = (email, expires_at)
         self.logger.info(
             "password_reset_requested",
             email_hash=hashlib.sha256(email.encode()).hexdigest(),
@@ -1215,15 +1229,18 @@ class AuthService:
         else:
             # Issue 11.2: In-memory fallback for password reset tokens
             with self._state_lock:
-                stored = self._password_reset_tokens.get(token)
+                with self._with_state_lock():
+                    stored = self._password_reset_tokens.get(token)
                 if stored:
                     stored_email, expires_at = stored
                     if expires_at <= self._now() - self._clock_skew_leeway:
                         # Remove expired token to prevent memory leak
-                        self._password_reset_tokens.pop(token, None)
+                        with self._with_state_lock():
+                            self._password_reset_tokens.pop(token, None)
                     else:
                         email = stored_email
-                        self._password_reset_tokens.pop(token, None)
+                        with self._with_state_lock():
+                            self._password_reset_tokens.pop(token, None)
         if not email:
             self.logger.warning("password_reset_invalid_token", token_prefix=token[:8])
             return False
