@@ -662,6 +662,9 @@ class KnowledgeContextListResponse(BaseModel):
     items: List[KnowledgeContextResponse]
     total_count: Optional[int] = Field(default=None, description="Total number of contexts")
     has_next: Optional[bool] = Field(default=None, description="Whether more items exist")
+    next_cursor: Optional[str] = Field(default=None, description="Cursor for the next page")
+    next_page: Optional[int] = Field(default=None, description="Next page number when using page/page_size")
+    page_size: Optional[int] = Field(default=None, description="Resolved page size")
 
 
 class KnowledgeChunkResponse(BaseModel):
@@ -674,6 +677,10 @@ class KnowledgeChunkResponse(BaseModel):
 
 class KnowledgeChunkListResponse(BaseModel):
     items: List[KnowledgeChunkResponse]
+    has_next: Optional[bool] = Field(default=None, description="Whether more chunks exist")
+    next_cursor: Optional[str] = Field(default=None, description="Cursor for the next page")
+    next_page: Optional[int] = Field(default=None, description="Next page number when using page/page_size")
+    page_size: Optional[int] = Field(default=None, description="Resolved page size")
 
 
 class ContextSourceRequest(BaseModel):

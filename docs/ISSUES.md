@@ -4110,6 +4110,8 @@ list_contexts() and list_chunks() return no pagination metadata (no has_next, ne
 
 **SPEC §18:** "pagination uses page/page_size or opaque next_cursor"
 
+**Status:** ✅ Fixed. Both endpoints now accept `page`/`page_size` or `cursor`, request a sentinel row from the stores, and return `has_next`, `next_page`, `next_cursor`, and `page_size` metadata to callers.
+
 ### 61.2 HIGH: Streaming Trace Events Not Emitted for All Node Executions
 **Location:** `liminallm/service/workflow.py:667-925`
 
@@ -4121,6 +4123,8 @@ Trace events only emitted conditionally, not during regular workflow execution.
 **Location:** `liminallm/api/routes.py:2669-2700`
 
 Endpoint accepts `limit` but response has no way to know if more chunks exist.
+
+**Status:** ✅ Fixed. Chunk listings paginate deterministically by `(chunk_index, id)` with cursor support and surface `has_next`/`next_cursor` to clients.
 
 ### 61.4 MEDIUM: Session Rotation Not Implemented
 **Location:** `liminallm/service/auth.py`

@@ -42,7 +42,14 @@ from liminallm.storage.common import (
     normalize_optional_text,
     normalize_preference_weight,
 )
-from liminallm.storage.cursors import decode_artifact_cursor, encode_artifact_cursor
+from liminallm.storage.cursors import (
+    decode_artifact_cursor,
+    decode_index_cursor,
+    decode_time_id_cursor,
+    encode_artifact_cursor,
+    encode_index_cursor,
+    encode_time_id_cursor,
+)
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
     AdapterRouterState,
@@ -1533,15 +1540,44 @@ class MemoryStore:
         return self.contexts.get(context_id)
 
     def list_contexts(
-        self, owner_user_id: Optional[str] = None, limit: int = 100
+        self,
+        owner_user_id: Optional[str] = None,
+        *,
+        page: int = 1,
+        page_size: int = 100,
+        cursor: Optional[str] = None,
+        include_sentinel: bool = False,
+        limit: Optional[int] = None,
     ) -> List[KnowledgeContext]:
         if not owner_user_id:
             return []
+
+        effective_page_size = max(1, limit or page_size)
         contexts = [
             ctx for ctx in self.contexts.values() if ctx.owner_user_id == owner_user_id
         ]
         contexts.sort(key=lambda c: c.created_at, reverse=True)
-        return contexts[:limit]
+
+        if cursor:
+            try:
+                cursor_ts, cursor_id = decode_time_id_cursor(cursor)
+                contexts = [
+                    ctx
+                    for ctx in contexts
+                    if (
+                        (ctx.created_at or datetime.min) < cursor_ts
+                        or (
+                            (ctx.created_at or datetime.min) == cursor_ts
+                            and ctx.id < cursor_id
+                        )
+                    )
+                ]
+            except Exception as exc:  # pragma: no cover - defensive
+                self.logger.warning("context_cursor_decode_failed", error=str(exc))
+
+        start = 0 if cursor else max(page - 1, 0) * effective_page_size
+        end = start + effective_page_size + (1 if include_sentinel else 0)
+        return contexts[start:end]
 
     def add_context_source(
         self,
@@ -1619,16 +1655,33 @@ class MemoryStore:
         context_id: Optional[str] = None,
         *,
         owner_user_id: Optional[str] = None,
+        page: int = 1,
+        page_size: int = 100,
+        cursor: Optional[str] = None,
+        include_sentinel: bool = False,
         limit: Optional[int] = None,
     ) -> List[KnowledgeChunk]:
+        effective_page_size = max(1, limit or page_size)
         if context_id:
             ctx = self.contexts.get(context_id)
             if owner_user_id and (not ctx or ctx.owner_user_id != owner_user_id):
                 return []
             result = list(self.chunks.get(context_id, []))
-            if limit is not None:
-                result = result[:limit]
-            return result
+            result.sort(key=lambda ch: (ch.chunk_index, ch.id or 0))
+            if cursor:
+                try:
+                    cursor_idx, cursor_id = decode_index_cursor(cursor)
+                    cursor_id_int = int(cursor_id)
+                    result = [
+                        ch
+                        for ch in result
+                        if (ch.chunk_index, ch.id or 0) > (cursor_idx, cursor_id_int)
+                    ]
+                except Exception as exc:  # pragma: no cover - defensive
+                    self.logger.warning("chunk_cursor_decode_failed", error=str(exc))
+            start = 0 if cursor else max(page - 1, 0) * effective_page_size
+            end = start + effective_page_size + (1 if include_sentinel else 0)
+            return result[start:end]
         if not owner_user_id:
             return []
         chunks: List[KnowledgeChunk] = []
@@ -1637,9 +1690,27 @@ class MemoryStore:
                 ctx = self.contexts.get(vals[0].context_id)
                 if ctx and ctx.owner_user_id == owner_user_id:
                     chunks.extend(vals)
-        if limit is not None:
-            chunks = chunks[:limit]
-        return chunks
+        chunks.sort(key=lambda ch: (ch.created_at, ch.id or 0), reverse=True)
+        if cursor:
+            try:
+                cursor_ts, cursor_id = decode_time_id_cursor(cursor)
+                chunks = [
+                    ch
+                    for ch in chunks
+                    if (
+                        (ch.created_at or datetime.min) < cursor_ts
+                        or (
+                            (ch.created_at or datetime.min) == cursor_ts
+                            and str(ch.id or "") < cursor_id
+                        )
+                    )
+                ]
+            except Exception as exc:  # pragma: no cover - defensive
+                self.logger.warning("chunk_cursor_decode_failed", error=str(exc))
+
+        start = 0 if cursor else max(page - 1, 0) * effective_page_size
+        end = start + effective_page_size + (1 if include_sentinel else 0)
+        return chunks[start:end]
 
     def search_chunks(
         self,

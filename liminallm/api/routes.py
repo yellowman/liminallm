@@ -115,7 +115,11 @@ from liminallm.service.runtime import (
     check_rate_limit,
     get_runtime,
 )
-from liminallm.storage.cursors import encode_artifact_cursor
+from liminallm.storage.cursors import (
+    encode_artifact_cursor,
+    encode_index_cursor,
+    encode_time_id_cursor,
+)
 from liminallm.storage.models import Conversation, KnowledgeContext, Session
 
 logger = get_logger(__name__)
@@ -3946,6 +3950,13 @@ async def create_context(
 @router.get("/contexts", response_model=Envelope, tags=["knowledge"])
 async def list_contexts(
     limit: Optional[int] = Query(None, ge=1, description="Maximum contexts to return"),
+    page: int = Query(1, ge=1, description="Page number (ignored when cursor is set)"),
+    page_size: Optional[int] = Query(
+        None, ge=1, description="Number of contexts per page (alias: limit)"
+    ),
+    cursor: Optional[str] = Query(
+        None, description="Keyset cursor returned by a previous response"
+    ),
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
@@ -3956,8 +3967,22 @@ async def list_contexts(
         60,
     )
     paging = _get_pagination_settings(runtime)
-    resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"])
-    contexts = runtime.store.list_contexts(owner_user_id=principal.user_id, limit=resolved_limit)
+    effective_page_size = page_size or limit or paging["default_page_size"]
+    resolved_page_size = min(max(effective_page_size, 1), paging["max_page_size"])
+    contexts = runtime.store.list_contexts(
+        owner_user_id=principal.user_id,
+        page=page,
+        page_size=resolved_page_size,
+        cursor=cursor,
+        include_sentinel=True,
+    )
+    has_next = len(contexts) > resolved_page_size
+    page_contexts = contexts[:resolved_page_size]
+    next_cursor = None
+    if has_next and page_contexts:
+        last_ctx = page_contexts[-1]
+        next_cursor = encode_time_id_cursor(last_ctx.created_at, last_ctx.id)
+    next_page = None if cursor else (page + 1 if has_next else None)
     items = [
         KnowledgeContextResponse(
             id=c.id,
@@ -3968,15 +3993,31 @@ async def list_contexts(
             owner_user_id=c.owner_user_id,
             meta=c.meta,
         )
-        for c in contexts
+        for c in page_contexts
     ]
-    return Envelope(status="ok", data=KnowledgeContextListResponse(items=items))
+    return Envelope(
+        status="ok",
+        data=KnowledgeContextListResponse(
+            items=items,
+            has_next=has_next,
+            next_cursor=next_cursor,
+            next_page=next_page,
+            page_size=resolved_page_size,
+        ),
+    )
 
 
 @router.get("/contexts/{context_id}/chunks", response_model=Envelope, tags=["knowledge"])
 async def list_chunks(
     context_id: str = Path(..., max_length=255, description="Knowledge context ID"),
     limit: Optional[int] = Query(None, ge=1, description="Maximum chunks to return"),
+    page: int = Query(1, ge=1, description="Page number (ignored when cursor is set)"),
+    page_size: Optional[int] = Query(
+        None, ge=1, description="Number of chunks per page (alias: limit)"
+    ),
+    cursor: Optional[str] = Query(
+        None, description="Cursor returned by a previous response"
+    ),
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
@@ -3987,14 +4028,29 @@ async def list_chunks(
         60,
     )
     paging = _get_pagination_settings(runtime)
-    resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"])
+    effective_page_size = page_size or limit or paging["default_page_size"]
+    resolved_page_size = min(max(effective_page_size, 1), paging["max_page_size"])
     _get_owned_context(runtime, context_id, principal)
-    chunks = runtime.store.list_chunks(context_id, owner_user_id=principal.user_id, limit=resolved_limit)
+    chunks = runtime.store.list_chunks(
+        context_id,
+        owner_user_id=principal.user_id,
+        page=page,
+        page_size=resolved_page_size,
+        cursor=cursor,
+        include_sentinel=True,
+    )
     for ch in chunks:
         if ch.id is None:
             raise _http_error(
                 "server_error", "chunk id missing for context", status_code=500
             )
+    has_next = len(chunks) > resolved_page_size
+    page_chunks = chunks[:resolved_page_size]
+    next_cursor = None
+    if has_next and page_chunks:
+        last_chunk = page_chunks[-1]
+        next_cursor = encode_index_cursor(last_chunk.chunk_index, str(last_chunk.id))
+    next_page = None if cursor else (page + 1 if has_next else None)
     data = [
         KnowledgeChunkResponse(
             id=int(ch.id),
@@ -4003,9 +4059,18 @@ async def list_chunks(
             content=ch.content,
             chunk_index=ch.chunk_index,
         )
-        for ch in chunks
+        for ch in page_chunks
     ]
-    return Envelope(status="ok", data=KnowledgeChunkListResponse(items=data))
+    return Envelope(
+        status="ok",
+        data=KnowledgeChunkListResponse(
+            items=data,
+            has_next=has_next,
+            next_cursor=next_cursor,
+            next_page=next_page,
+            page_size=resolved_page_size,
+        ),
+    )
 
 
 @router.post("/contexts/{context_id}/sources", response_model=Envelope, status_code=201, tags=["knowledge"])

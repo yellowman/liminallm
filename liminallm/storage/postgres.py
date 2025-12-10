@@ -39,7 +39,11 @@ from liminallm.storage.common import (
     get_default_tool_specs,
     normalize_optional_text,
 )
-from liminallm.storage.cursors import decode_artifact_cursor
+from liminallm.storage.cursors import (
+    decode_artifact_cursor,
+    decode_index_cursor,
+    decode_time_id_cursor,
+)
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
     AdapterRouterState,
@@ -2787,15 +2791,44 @@ class PostgresStore:
         )
 
     def list_contexts(
-        self, owner_user_id: Optional[str] = None, limit: int = 100
+        self,
+        owner_user_id: Optional[str] = None,
+        *,
+        page: int = 1,
+        page_size: int = 100,
+        cursor: Optional[str] = None,
+        include_sentinel: bool = False,
+        limit: Optional[int] = None,
     ) -> List[KnowledgeContext]:
         if not owner_user_id:
             return []
+
+        effective_page_size = max(1, limit or page_size)
+        capped_page_size = min(effective_page_size, 500)
+        fetch_limit = capped_page_size + (1 if include_sentinel else 0)
+        offset = 0 if cursor else max(page - 1, 0) * capped_page_size
+
+        cursor_filter = ""
+        cursor_params: list[Any] = []
+        if cursor:
+            try:
+                cursor_ts, cursor_id = decode_time_id_cursor(cursor)
+                cursor_filter = " AND (created_at, id) < (%s, %s)"
+                cursor_params.extend([cursor_ts, cursor_id])
+            except Exception as exc:  # pragma: no cover - defensive
+                self.logger.warning("context_cursor_decode_failed", error=str(exc))
+
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM knowledge_context WHERE owner_user_id = %s ORDER BY created_at DESC LIMIT %s",
-                (owner_user_id, limit),
-            ).fetchall()
+            query = (
+                "SELECT * FROM knowledge_context WHERE owner_user_id = %s"
+                + cursor_filter
+                + " ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s"
+            )
+            params: list[Any] = [owner_user_id]
+            params.extend(cursor_params)
+            params.extend([fetch_limit, offset])
+            rows = conn.execute(query, tuple(params)).fetchall()
+
         contexts: List[KnowledgeContext] = []
         for row in rows:
             contexts.append(
@@ -2907,29 +2940,62 @@ class PostgresStore:
         context_id: Optional[str] = None,
         *,
         owner_user_id: Optional[str] = None,
+        page: int = 1,
+        page_size: int = 100,
+        cursor: Optional[str] = None,
+        include_sentinel: bool = False,
         limit: Optional[int] = None,
     ) -> List[KnowledgeChunk]:
+        effective_page_size = max(1, limit or page_size)
+        capped_page_size = min(effective_page_size, 500)
+        fetch_limit = capped_page_size + (1 if include_sentinel else 0)
+        offset = 0 if cursor else max(page - 1, 0) * capped_page_size
+
         with self._connect() as conn:
             if context_id:
                 params: list[Any] = []
+                cursor_filter = ""
+                cursor_params: list[Any] = []
+                if cursor:
+                    try:
+                        cursor_idx, cursor_id = decode_index_cursor(cursor)
+                        cursor_filter = " AND (kc.chunk_index, kc.id) > (%s, %s)"
+                        cursor_params.extend([cursor_idx, cursor_id])
+                    except Exception as exc:  # pragma: no cover - defensive
+                        self.logger.warning("chunk_cursor_decode_failed", error=str(exc))
+
                 query = "SELECT kc.* FROM knowledge_chunk kc"
                 if owner_user_id:
                     query += " JOIN knowledge_context ctx ON ctx.id = kc.context_id AND ctx.owner_user_id = %s"
                     params.append(owner_user_id)
-                query += " WHERE kc.context_id = %s ORDER BY kc.chunk_index ASC"
+                query += " WHERE kc.context_id = %s"
                 params.append(context_id)
-                if limit is not None:
-                    query += " LIMIT %s"
-                    params.append(limit)
+                if cursor_filter:
+                    query += cursor_filter
+                    params.extend(cursor_params)
+                query += " ORDER BY kc.chunk_index ASC, kc.id ASC LIMIT %s OFFSET %s"
+                params.extend([fetch_limit, offset])
                 rows = conn.execute(query, tuple(params)).fetchall()
             else:
                 if not owner_user_id:
                     return []
                 params = [owner_user_id]
-                query = "SELECT kc.* FROM knowledge_chunk kc JOIN knowledge_context ctx ON ctx.id = kc.context_id WHERE ctx.owner_user_id = %s ORDER BY kc.created_at DESC"
-                if limit is not None:
-                    query += " LIMIT %s"
-                    params.append(limit)
+                cursor_filter = ""
+                if cursor:
+                    try:
+                        cursor_ts, cursor_id = decode_time_id_cursor(cursor)
+                        cursor_filter = " AND (kc.created_at, kc.id) < (%s, %s)"
+                        params.extend([cursor_ts, cursor_id])
+                    except Exception as exc:  # pragma: no cover - defensive
+                        self.logger.warning("chunk_cursor_decode_failed", error=str(exc))
+
+                query = (
+                    "SELECT kc.* FROM knowledge_chunk kc JOIN knowledge_context ctx "
+                    "ON ctx.id = kc.context_id WHERE ctx.owner_user_id = %s"
+                    + cursor_filter
+                    + " ORDER BY kc.created_at DESC, kc.id DESC LIMIT %s OFFSET %s"
+                )
+                params.extend([fetch_limit, offset])
                 rows = conn.execute(query, tuple(params)).fetchall()
         chunks: List[KnowledgeChunk] = []
         for row in rows:
