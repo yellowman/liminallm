@@ -378,6 +378,8 @@ def _get_system_settings(runtime) -> dict:
         "chat_rate_limit_per_minute": 60,
         "chat_rate_limit_window_seconds": 60,
         "login_rate_limit_per_minute": 10,
+        "refresh_rate_limit_per_minute": 20,
+        "refresh_rate_limit_window_seconds": 60,
         "signup_rate_limit_per_minute": 5,
         "reset_rate_limit_per_minute": 5,
         "mfa_rate_limit_per_minute": 5,
@@ -1109,6 +1111,7 @@ async def oauth_callback(
 async def refresh_tokens(
     body: TokenRefreshRequest,
     response: Response,
+    request: Request,
     authorization: Optional[str] = Header(None),
     x_tenant_id: Optional[str] = Header(
         None, convert_underscores=False, alias="X-Tenant-ID"
@@ -1116,6 +1119,14 @@ async def refresh_tokens(
 ):
     runtime = get_runtime()
     tenant_hint = body.tenant_id or x_tenant_id
+    tenant_key = tenant_hint or "default"
+    client_ip = request.client.host if request.client else "unknown"
+    await _enforce_rate_limit(
+        runtime,
+        f"refresh:{tenant_key}:{client_ip}",
+        _get_rate_limit(runtime, "refresh_rate_limit_per_minute"),
+        _get_rate_limit(runtime, "refresh_rate_limit_window_seconds"),
+    )
     user, session, tokens = await runtime.auth.refresh_tokens(
         body.refresh_token, tenant_hint=tenant_hint
     )
