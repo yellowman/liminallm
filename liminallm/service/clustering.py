@@ -29,21 +29,114 @@ class SemanticClusterer:
         self.training = training
 
     async def cluster_user_preferences(
-        self, user_id: str, *, k: int = 3, batch_size: int = 8, min_events: int = 3
+        self,
+        user_id: str,
+        *,
+        k: int = 3,
+        batch_size: int = 8,
+        min_events: int = 3,
+        max_events: int = 500,
+        streaming: bool = True,
+        approximate: bool = True,
+        tenant_id: str | None = None,
     ) -> List[SemanticCluster]:
+        events = await self._fetch_preference_events(
+            user_id=user_id,
+            tenant_id=tenant_id,
+            max_events=max_events,
+        )
+        return await self._cluster_preferences(
+            events,
+            scope_user_id=user_id,
+            k=k,
+            batch_size=batch_size,
+            min_events=min_events,
+            streaming=streaming,
+            approximate=approximate,
+            meta_extra={"scope": "per-user", "tenant_id": tenant_id},
+        )
+
+    async def cluster_global_preferences(
+        self,
+        *,
+        k: int = 5,
+        batch_size: int = 16,
+        min_events: int = 5,
+        max_events: int = 1200,
+        streaming: bool = True,
+        approximate: bool = True,
+        tenant_id: str | None = None,
+    ) -> List[SemanticCluster]:
+        events = await self._fetch_preference_events(
+            user_id=None, tenant_id=tenant_id, max_events=max_events
+        )
+        return await self._cluster_preferences(
+            events,
+            scope_user_id=None,
+            k=k,
+            batch_size=batch_size,
+            min_events=min_events,
+            streaming=streaming,
+            approximate=approximate,
+            meta_extra={"scope": "global", "tenant_id": tenant_id},
+        )
+
+    async def _fetch_preference_events(
+        self,
+        *,
+        user_id: str | None,
+        tenant_id: str | None,
+        max_events: int,
+    ) -> list[PreferenceEvent]:
         events_raw = self.store.list_preference_events(
-            user_id=user_id, feedback=POSITIVE_FEEDBACK_VALUES
+            user_id=user_id, feedback=POSITIVE_FEEDBACK_VALUES, tenant_id=tenant_id, limit=max_events * 4
         )
         events = events_raw
         if inspect.isawaitable(events_raw):
             events = await events_raw
-        events = [e for e in events if e.context_embedding]
+        filtered = [e for e in events if e.context_embedding]
+        if len(filtered) > max_events:
+            filtered = self._reservoir_sample(filtered, max_events)
+        return filtered
+
+    def _reservoir_sample(
+        self, events: Sequence[PreferenceEvent], k: int
+    ) -> list[PreferenceEvent]:
+        reservoir: list[PreferenceEvent] = []
+        for i, evt in enumerate(events):
+            if i < k:
+                reservoir.append(evt)
+                continue
+            j = random.randint(0, i)
+            if j < k:
+                reservoir[j] = evt
+        return reservoir
+
+    async def _cluster_preferences(
+        self,
+        events: Sequence[PreferenceEvent],
+        *,
+        scope_user_id: str | None,
+        k: int,
+        batch_size: int,
+        min_events: int,
+        streaming: bool,
+        approximate: bool,
+        meta_extra: Dict | None = None,
+    ) -> List[SemanticCluster]:
         if len(events) < min_events:
             return []
+
         embeddings = pad_vectors([list(e.context_embedding) for e in events])
         k = min(k, len(embeddings))
+
+        initial_centroids = self._warm_start_centroids(scope_user_id, k)
         centroids, assignments = self._mini_batch_kmeans(
-            embeddings, k=k, batch_size=batch_size
+            embeddings,
+            k=k,
+            batch_size=batch_size,
+            initial_centroids=initial_centroids,
+            streaming=streaming,
         )
         cluster_events: Dict[int, list[PreferenceEvent]] = {
             i: [] for i in range(len(centroids))
@@ -57,12 +150,20 @@ class SemanticClusterer:
             if not members:
                 continue
             sample_messages = [m.message_id for m in members[:5]]
+            meta: Dict = {
+                "method": "mini_batch_kmeans",
+                "k": k,
+                "approximate": approximate or len(events) > len(members),
+                "streaming": streaming,
+            }
+            if meta_extra:
+                meta.update({k_: v for k_, v in meta_extra.items() if v is not None})
             cluster = self.store.upsert_semantic_cluster(
-                user_id=user_id,
+                user_id=scope_user_id,
                 centroid=centroid,
                 size=len(members),
                 sample_message_ids=sample_messages,
-                meta={"method": "mini_batch_kmeans", "k": k},
+                meta=meta,
             )
             for evt in members:
                 self.store.update_preference_event(evt.id, cluster_id=cluster.id)
@@ -76,41 +177,74 @@ class SemanticClusterer:
         k: int,
         batch_size: int = 8,
         iters: int = 10,
+        *,
+        initial_centroids: list[list[float]] | None = None,
+        streaming: bool = False,
     ) -> Tuple[List[List[float]], List[int]]:
         if not embeddings or k <= 0:
             return [], []
         k = min(k, len(embeddings))
 
-        # Issue 45.3: Sanitize initial centroids
-        centroids = [sanitize_embedding(vec) for vec in random.sample(list(embeddings), k)]
+        seed_source = list(initial_centroids or [])
+        if len(seed_source) < k:
+            expanded = list(embeddings)
+            random.shuffle(expanded)
+            seed_source.extend(expanded[: k - len(seed_source)])
+        if not seed_source:
+            seed_source = list(embeddings)
+        centroids = [sanitize_embedding(vec) for vec in seed_source[:k]]
         if not centroids:
             return [], []
-        assignments = [0 for _ in embeddings]
-        for _ in range(iters):
-            batch_indices = random.sample(
-                range(len(embeddings)), min(batch_size, len(embeddings))
-            )
-            for idx in batch_indices:
-                vec = embeddings[idx]
+        assignments: list[int] = [0 for _ in embeddings]
+
+        if streaming:
+            for idx, vec in enumerate(embeddings):
                 sims = [cosine_similarity(vec, c) for c in centroids]
                 best = max(range(len(sims)), key=lambda i: sims[i])
                 assignments[idx] = best
-                # simple centroid update
-                lr = 0.2
+                lr = 1.0 / max(1, assignments.count(best))
                 updated = [
                     c + lr * (v - c) for c, v in zip(centroids[best], vec)
                 ]
-                # Issue 45.10: Normalize centroid after update to prevent magnitude drift
                 centroids[best] = normalize_vector(updated)
+        else:
+            for _ in range(iters):
+                batch_indices = random.sample(
+                    range(len(embeddings)), min(batch_size, len(embeddings))
+                )
+                for idx in batch_indices:
+                    vec = embeddings[idx]
+                    sims = [cosine_similarity(vec, c) for c in centroids]
+                    best = max(range(len(sims)), key=lambda i: sims[i])
+                    assignments[idx] = best
+                    lr = 0.2
+                    updated = [
+                        c + lr * (v - c) for c, v in zip(centroids[best], vec)
+                    ]
+                    centroids[best] = normalize_vector(updated)
 
-        # Final normalization pass on all centroids (Issue 45.10)
         centroids = [normalize_vector(c) for c in centroids]
 
-        # final assignment
         for idx, vec in enumerate(embeddings):
             sims = [cosine_similarity(vec, c) for c in centroids]
             assignments[idx] = max(range(len(sims)), key=lambda i: sims[i])
         return centroids, assignments
+
+    def _warm_start_centroids(
+        self, user_id: str | None, k: int
+    ) -> list[list[float]]:
+        if not hasattr(self.store, "list_semantic_clusters"):
+            return []
+        clusters = self.store.list_semantic_clusters(user_id=user_id)
+        if inspect.isawaitable(clusters):
+            # Avoid blocking event loop if an async implementation is provided.
+            return []
+        sorted_clusters = sorted(
+            clusters,
+            key=lambda c: c.size,
+            reverse=True,
+        )
+        return [list(c.centroid) for c in sorted_clusters[:k]]
 
     async def label_clusters(
         self,
@@ -217,12 +351,22 @@ class SemanticClusterer:
             owner_id = cluster.user_id or events[0].user_id
             schema = {
                 "kind": "adapter.lora",
+                "scope": "per-user" if owner_id else "global",
                 "backend": "local",
+                "rank": 4,
+                "layers": [0, 1, 2],
+                "matrices": ["attn_q"],
                 "cluster_id": cluster.id,
                 "centroid": cluster.centroid,
                 "label": cluster.label,
                 "description": cluster.description,
                 "current_version": 0,
+                "applicability": {
+                    "natural_language": "Skill: "
+                    + (cluster.label or "")
+                    + " – "
+                    + (cluster.description or ""),
+                },
             }
             adapter = self.store.create_artifact(
                 type_="adapter",

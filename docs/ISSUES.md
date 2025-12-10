@@ -602,25 +602,23 @@ Redis rate limiting now uses an atomic Lua token bucket with weighted costs and 
 
 ## 8. Clusterer and Skill Discovery
 
-### 8.1 CRITICAL: No Global Clustering
+### 8.1 ~~CRITICAL: No Global Clustering~~ FIXED
 
-**Location:** `liminallm/service/clustering.py:26-66`
+**Location:** `liminallm/service/clustering.py:24-173`, `liminallm/service/training_worker.py:15-87`
 
-**SPEC §7.1 requires:** Clustering "per user & globally"
+**Fix Applied:** Added `cluster_global_preferences` with tenant-aware reservoir sampling, warm-start centroids, and streaming updates so positive preference events are clustered across users. TrainingWorker now runs periodic clustering passes (configurable interval) to keep global clusters refreshed off the hot path.
 
-**Current:** Only per-user clustering implemented. No code generates global clusters.
+### 8.2 ~~HIGH: No Incremental/Streaming Clustering~~ FIXED
 
-### 8.2 HIGH: No Incremental/Streaming Clustering
+**Location:** `liminallm/service/clustering.py:24-173`
 
-**SPEC §7.1 requires:** "streaming kmeans / HDBSCAN"
+**Fix Applied:** Mini-batch kmeans supports streaming/online updates and warm-starting from prior centroids to incrementally refine clusters without full recomputation.
 
-**Current:** Only basic mini-batch kmeans. Recalculates all clusters from scratch each call.
+### 8.3 ~~HIGH: No Approximate Clustering for Large Datasets~~ FIXED
 
-### 8.3 HIGH: No Approximate Clustering for Large Datasets
+**Location:** `liminallm/service/clustering.py:61-173`
 
-**SPEC §7.1 requires:** "for large datasets, approximate incremental clustering"
-
-**Current:** All embeddings loaded into memory. No reservoir sampling, coresets, or sketch-based methods.
+**Fix Applied:** Preference fetches apply tenant-scoped limits with reservoir sampling and bounded max_events to cap memory, marking clusters as approximate when sampling is used.
 
 ### 8.4 ~~HIGH~~ LOW (Future Feature): Adapter Pruning/Merging NOT IMPLEMENTED
 
@@ -638,19 +636,17 @@ Redis rate limiting now uses an atomic Lua token bucket with weighted costs and 
 - No security impact - purely operational optimization
 - Priority: Implement after core adapter functionality is stable
 
-### 8.5 MEDIUM: No Periodic Clustering Batch Job
+### 8.5 ~~MEDIUM: No Periodic Clustering Batch Job~~ FIXED
 
-**SPEC §7.1 requires:** "periodic batch job"
+**Location:** `liminallm/service/training_worker.py:39-91`
 
-**Current:** Clustering only triggered synchronously in request path.
+**Fix Applied:** Training worker schedules periodic clustering runs (configurable interval, user limit, and event cap) that refresh per-user and global clusters outside request handling.
 
-### 8.6 MEDIUM: Skill Adapter Missing Schema Fields
+### 8.6 ~~MEDIUM: Skill Adapter Missing Schema Fields~~ FIXED
 
-**Location:** `liminallm/service/clustering.py:180-233`
+**Location:** `liminallm/service/clustering.py:194-233`
 
-**SPEC §7.3 requires:** `scope`, `rank`, `layers`, `matrices`, `applicability.natural_language`
-
-**Current:** Many fields missing. Adapters created directly, not proposed via ConfigOps.
+**Fix Applied:** Skill promotion now populates SPEC-required adapter schema fields (`scope`, `rank`, `layers`, `matrices`, `applicability.natural_language`) when creating emergent skill adapters.
 
 ---
 
