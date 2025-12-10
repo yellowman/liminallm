@@ -61,6 +61,15 @@ class TrainingService:
         self.backend_mode = backend_mode
         self._compatible_modes = get_compatible_adapter_modes(backend_mode or "openai")
 
+    def _safe_int(self, value: object, default: int, *, context: str) -> int:
+        """Coerce values to int with fallback to avoid ValueError crashes (Issue 39.3)."""
+
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            logger.warning("training_int_parse_failed", context=context, value=value)
+            return default
+
     def _ensure_tokenizer(self, base_model: Optional[str]) -> None:
         model_name = base_model or self.runtime_base_model
         if not model_name:
@@ -316,13 +325,21 @@ class TrainingService:
                 "clusters": cluster_meta,
             },
         )
-        next_version = int(adapter.schema.get("current_version", 0)) + 1
+        next_version = self._safe_int(
+            adapter.schema.get("current_version", 0),
+            default=0,
+            context="adapter_current_version",
+        ) + 1
         adapter_dir = self._adapter_dir(user_id, adapter.id, adapter.schema)
         version_dir = adapter_dir / f"v{next_version:04d}"
         version_dir.mkdir(parents=True, exist_ok=True)
         params_path = version_dir / "params.json"
         weights = self._init_lora_weights(
-            rank=int(adapter.schema.get("rank", 4)),
+            rank=self._safe_int(
+                adapter.schema.get("rank", 4),
+                default=4,
+                context="adapter_rank",
+            ),
             layers=adapter.schema.get("layers", []),
             matrices=adapter.schema.get("matrices", []),
         )

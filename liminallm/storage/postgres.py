@@ -393,7 +393,11 @@ class PostgresStore:
         context_text: str | None = None,
         meta: dict | None = None,
     ) -> PreferenceEvent:
-        normalized_weight = weight if weight is not None else 1.0
+        normalized_weight = self._safe_float(
+            weight if weight is not None else 1.0,
+            default=1.0,
+            context="record_preference_event_weight",
+        )
         event_id = str(uuid.uuid4())
         with self._connect() as conn:
             msg_row = conn.execute(
@@ -531,7 +535,7 @@ class PostgresStore:
                 context_text=row.get("context_text"),
                 corrected_text=row.get("corrected_text"),
                 created_at=row.get("created_at", datetime.utcnow()),
-                weight=float(row.get("weight", 1.0)),
+                weight=self._safe_float(row.get("weight", 1.0), context="list_preference_events"),
                 meta=row.get("meta"),
             )
             for row in rows
@@ -562,7 +566,7 @@ class PostgresStore:
             context_text=row.get("context_text"),
             corrected_text=row.get("corrected_text"),
             created_at=row.get("created_at", datetime.utcnow()),
-            weight=float(row.get("weight", 1.0)),
+            weight=self._safe_float(row.get("weight", 1.0), context="update_preference_event"),
             meta=row.get("meta"),
         )
 
@@ -586,7 +590,7 @@ class PostgresStore:
             context_text=row.get("context_text"),
             corrected_text=row.get("corrected_text"),
             created_at=row.get("created_at", datetime.utcnow()),
-            weight=float(row.get("weight", 1.0)),
+            weight=self._safe_float(row.get("weight", 1.0), context="get_preference_event"),
             meta=row.get("meta"),
         )
 
@@ -2498,21 +2502,9 @@ class PostgresStore:
             status=(
                 row.get("status", "pending") if isinstance(row, dict) else row["status"]
             ),
-            created_at=(
-                created
-                if isinstance(created, datetime)
-                else datetime.fromisoformat(str(created))
-            ),
-            decided_at=(
-                decided_at
-                if isinstance(decided_at, datetime) or decided_at is None
-                else datetime.fromisoformat(str(decided_at))
-            ),
-            applied_at=(
-                applied_at
-                if isinstance(applied_at, datetime) or applied_at is None
-                else datetime.fromisoformat(str(applied_at))
-            ),
+            created_at=self._parse_ts(created) or datetime.utcnow(),
+            decided_at=self._parse_ts(decided_at),
+            applied_at=self._parse_ts(applied_at),
             meta=meta if isinstance(meta, dict) else {},
         )
 
@@ -2526,6 +2518,16 @@ class PostgresStore:
             except ValueError:
                 return None
         return None
+
+    @staticmethod
+    def _safe_float(value: Any, default: float = 1.0, *, context: str = "") -> float:
+        """Parse floats defensively to avoid crashes on malformed data (Issue 39.3)."""
+
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            logger.warning("postgres_float_parse_failed", context=context, value=value)
+            return default
 
     def get_runtime_config(self) -> dict:
         """Return deployment config sourced from SQL (placeholder until admin UI writes it).
@@ -2896,7 +2898,10 @@ class PostgresStore:
         return chunks
 
     def _format_vector(self, embedding: Sequence[float]) -> str:
-        return "[" + ",".join(f"{float(val):.6f}" for val in embedding) + "]"
+        safe_vals = (
+            self._safe_float(val, default=0.0, context="format_vector") for val in embedding
+        )
+        return "[" + ",".join(f"{val:.6f}" for val in safe_vals) + "]"
 
     def search_chunks_pgvector(
         self,

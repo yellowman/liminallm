@@ -2281,21 +2281,17 @@ Connection pool max_size=10. With 100+ concurrent users, 90% block.
 - `model_backend.py`: `json.loads()` wrapped in try-except with `json.JSONDecodeError, UnicodeDecodeError` handling
 - `memory.py`: State loading has try-except for `json.JSONDecodeError` with graceful error logging
 
-### 39.2 HIGH: datetime.fromisoformat Without Error Handling
+### 39.2 ~~HIGH: datetime.fromisoformat Without Error Handling~~ FIXED
 
-**Location:** `liminallm/storage/redis_cache.py:185, 392`, `liminallm/storage/postgres.py:2137,2142,2147`
+**Location:** `liminallm/storage/redis_cache.py:185, 392`, `liminallm/storage/postgres.py` (ConfigPatchAudit parsing)
 
-ISO datetime parsing without try-except.
+**Fix Applied:** Added defensive timestamp parsing that falls back to UTC now or `None` when `fromisoformat` fails, preventing malformed datetimes from crashing deserialization paths.
 
-**Impact:** Corrupted datetime strings crash deserialization.
+### 39.3 ~~HIGH: float()/int() Without Error Handling~~ FIXED
 
-### 39.3 HIGH: float()/int() Without Error Handling
+**Location:** `router.py:177,399`, `model_backend.py:674,1281`, `postgres.py:409,440,464`, `training.py:318,324`
 
-**Location:** Multiple files - `router.py:177,399`, `model_backend.py:674,1281`, `postgres.py:409,440,464`, `training.py:318,324`
-
-Numeric coercion without validation.
-
-**Impact:** Non-numeric values crash request processing.
+**Fix Applied:** Introduced safe numeric coercion helpers in model backend, Postgres store, and training service to log and fall back to defaults on invalid weights/versions, eliminating crashes from malformed inputs.
 
 ### 39.4 MEDIUM: No NaN/Infinity Validation
 
