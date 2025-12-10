@@ -16,6 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from cryptography.fernet import Fernet, InvalidToken
 
 from liminallm.content_struct import normalize_content_struct
+from liminallm.errors import NotFoundError
 from liminallm.logging import get_logger
 from liminallm.service.artifact_validation import (
     ArtifactValidationError,
@@ -271,6 +272,9 @@ class MemoryStore:
                 meta=normalized_meta,
             )
             self.users[user_id] = user
+            # Issue 21.4: seed settings at creation to keep state consistent
+            if user_id not in self.user_settings:
+                self.user_settings[user_id] = UserSettings(user_id=user_id)
             self._persist_state()
             return user
 
@@ -593,6 +597,23 @@ class MemoryStore:
             if user_id and conv.user_id != user_id:
                 return None
             return conv
+
+    def delete_conversation(
+        self, conversation_id: str, *, user_id: Optional[str] = None
+    ) -> bool:
+        """Remove a conversation and its messages in a single lock."""
+
+        with self._data_lock:
+            conv = self.conversations.get(conversation_id)
+            if not conv:
+                return False
+            if user_id and conv.user_id != user_id:
+                return False
+
+            self.conversations.pop(conversation_id, None)
+            self.messages.pop(conversation_id, None)
+            self._persist_state()
+            return True
 
     def append_message(
         self,
@@ -1363,6 +1384,60 @@ class MemoryStore:
             patch.meta = merged
         self._persist_state()
         return patch
+
+    def apply_config_patch(
+        self,
+        patch: ConfigPatchAudit,
+        new_schema: dict,
+        *,
+        artifact_description: Optional[str] = None,
+        approver_user_id: Optional[str] = None,
+    ) -> tuple[Artifact, ConfigPatchAudit]:
+        """Apply a config patch and mark it applied under a single lock."""
+
+        with self._data_lock:
+            artifact = self.artifacts.get(patch.artifact_id)
+            if not artifact:
+                raise NotFoundError("artifact missing", detail={"artifact_id": patch.artifact_id})
+
+            versions = self.artifact_versions.get(patch.artifact_id, [])
+            next_version = (versions[0].version if versions else 0) + 1
+            updated_artifact = Artifact(
+                id=artifact.id,
+                type=artifact.type,
+                name=artifact.name,
+                description=artifact_description or artifact.description or "",
+                schema=new_schema,
+                owner_user_id=artifact.owner_user_id,
+                visibility=artifact.visibility,
+                fs_path=artifact.fs_path,
+                base_model=new_schema.get("base_model", artifact.base_model),
+            )
+            version = ArtifactVersion(
+                id=str(uuid.uuid4()),
+                artifact_id=artifact.id,
+                version=next_version,
+                schema=new_schema,
+                fs_path=artifact.fs_path,
+                base_model=updated_artifact.base_model,
+                created_by=approver_user_id or patch.proposer or "system_llm",
+                change_note=patch.justification,
+            )
+            self.artifacts[artifact.id] = updated_artifact
+            self.artifact_versions.setdefault(artifact.id, []).insert(0, version)
+
+            merged_meta: Dict[str, Any] = {}
+            if patch.meta and isinstance(patch.meta, dict):
+                merged_meta.update(patch.meta)
+            if approver_user_id:
+                merged_meta["applied_by"] = approver_user_id
+
+            patch.status = "applied"
+            patch.applied_at = datetime.utcnow()
+            patch.meta = merged_meta
+            self.config_patches[patch.id] = patch
+            self._persist_state()
+            return updated_artifact, patch
 
     def get_runtime_config(self) -> dict:
         """Return the runtime configuration persisted for the web admin UI."""

@@ -1143,27 +1143,29 @@ async def revoke_all_user_sessions(...):
 
 **Resolution:** `Auth.revoke_all_user_sessions` invokes the store's bulk revocation and then unconditionally clears cached session state via `cache.revoke_user_sessions`, logging (but not aborting) on either failure to avoid skipped steps. Store-level revocation already evicts in-memory cache entries under a lock (`PostgresStore.revoke_user_sessions`), ensuring both the persistent table and local cache are purged even when external cache invalidation encounters transient errors. This keeps cache and database aligned for subsequent session lookups.
 
-### 21.2 CRITICAL: Config Patch Apply Not Atomic
+### 21.2 ~~CRITICAL: Config Patch Apply Not Atomic~~ FIXED
 
-**Location:** `liminallm/service/config_ops.py:89-99`
+**Locations:** `liminallm/service/config_ops.py`, `liminallm/storage/postgres.py`, `liminallm/storage/memory.py`
 
-Applying a config patch involves multiple operations (validation, application, status update) without transaction wrapping.
+**Resolution:** Config patch applications now use store-level atomic helpers (`apply_config_patch`) to persist artifact updates and mark patches applied in one transaction/lock, preventing partial applications when status updates fail.
 
-### 21.3 HIGH: Artifact Create With Versions Not Atomic
+### 21.3 ~~HIGH: Artifact Create With Versions Not Atomic~~ FIXED
 
-**Location:** `liminallm/storage/postgres.py:1780-1830`
+**Location:** `liminallm/storage/postgres.py:1999-2046`
 
-Creating artifact and first version are separate operations. Failure after artifact create leaves orphan.
+**Resolution:** Artifact creation already wraps artifact/version inserts in a single transaction, keeping artifacts and their first versions consistent.
 
-### 21.4 HIGH: User Create With Settings Not Atomic
+### 21.4 ~~HIGH: User Create With Settings Not Atomic~~ FIXED
 
-**Location:** `liminallm/storage/postgres.py:188-220`
+**Locations:** `liminallm/storage/postgres.py:1060-1112`, `liminallm/storage/memory.py:245-285`
 
-User and initial settings created separately without transaction.
+**Resolution:** User creation now seeds default `user_settings` records inside the same transaction/lock as user insertion, so settings cannot be orphaned if later steps fail.
 
-### 21.5 MEDIUM: Conversation Delete Leaves Orphan Messages
+### 21.5 ~~MEDIUM: Conversation Delete Leaves Orphan Messages~~ FIXED
 
-If message deletion fails partway through, conversation deleted but messages remain.
+**Locations:** `liminallm/storage/postgres.py:1690-1726`, `liminallm/storage/memory.py:589-612`
+
+**Resolution:** New `delete_conversation` helpers remove conversations and their messages atomically, preventing orphaned message rows.
 
 ---
 
@@ -1278,17 +1280,11 @@ No metrics or alerts for connection pool exhaustion. Silent failures under load.
 
 ## 24. Edge Cases: Null/Empty/Encoding/Timezone (4th Pass)
 
-### 24.1 CRITICAL: Naive vs Aware Datetime Mixing
+### 24.1 ~~CRITICAL: Naive vs Aware Datetime Mixing~~ FIXED
 
-**Location:** `liminallm/service/auth.py:1016`, `liminallm/storage/postgres.py` (multiple)
+**Locations:** `liminallm/storage/postgres.py` (conversation creation, config patch timestamps)
 
-```python
-expires_at = datetime.utcnow() + timedelta(...)  # Naive datetime
-```
-
-**Issue:** Mixing naive and timezone-aware datetimes causes comparison errors and incorrect expiry calculations.
-
-**Fix:** Use `datetime.now(timezone.utc)` consistently throughout.
+**Resolution:** Store mutations that participate in pagination/keyset comparisons now stamp records with timezone-aware UTC values (`datetime.now(timezone.utc)` and SQL `now()`), eliminating naive/aware comparison errors during cursor filtering.
 
 ### 24.2 ~~HIGH: Unsafe .get() Without None Handling~~ (FALSE POSITIVE)
 
