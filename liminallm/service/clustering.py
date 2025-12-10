@@ -187,6 +187,7 @@ class SemanticClusterer:
                 meta=meta,
             )
             for evt in members:
+                evt.cluster_id = cluster.id
                 self.store.update_preference_event(evt.id, cluster_id=cluster.id)
             results.append(cluster)
         await self.label_clusters(results, valid_events)

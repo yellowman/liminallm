@@ -648,6 +648,12 @@ Redis rate limiting now uses an atomic Lua token bucket with weighted costs and 
 
 **Fix Applied:** Skill promotion now populates SPEC-required adapter schema fields (`scope`, `rank`, `layers`, `matrices`, `applicability.natural_language`) when creating emergent skill adapters.
 
+### 8.7 ~~HIGH: Cluster Labels Never Generated (Postgres)~~ FIXED
+
+**Location:** `liminallm/service/clustering.py:140-183`
+
+**Fix Applied:** Cluster assignment now mutates in-memory `PreferenceEvent.cluster_id` before labeling. This keeps the events list in sync with database updates so `label_clusters()` can gather sample texts per cluster and produce labels when running against `PostgresStore`.
+
 ---
 
 ## 9. Redis Usage and Memory Store Persistence
