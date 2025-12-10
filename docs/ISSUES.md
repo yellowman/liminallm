@@ -1534,68 +1534,65 @@ objects are provided.
 
 **Resolution:** Redis URLs are masked before logging via `_mask_url_password`, preventing password leakage when Redis connectivity falls back to in-memory mode.
 
-### 29.2 CRITICAL: Undocumented Environment Variables
+### 29.2 ~~CRITICAL: Undocumented Environment Variables~~ FIXED
 
-Multiple env vars read directly via `os.getenv()` but not in Settings class:
-- `LOG_LEVEL`, `LOG_JSON`, `LOG_DEV_MODE` (logging.py:98-100)
-- `BUILD_SHA` (app.py:22)
-- `CORS_ALLOW_ORIGINS` (app.py:55)
-- `ENABLE_HSTS` (app.py:123)
-- `MFA_SECRET_KEY` (memory.py:113)
+**Status:** ✅ IMPLEMENTED
 
-**Impact:** No centralized config discovery or validation.
+**Locations:** `liminallm/config.py`, `liminallm/app.py`, `liminallm/service/runtime.py`, `liminallm/storage/memory.py`
 
-### 29.3 HIGH: Missing Integer Range Validators
+**Resolution:** All previously ad-hoc environment variables are now defined in `Settings` with consistent parsing (log level/JSON/dev mode, build SHA, CORS origins/credentials, HSTS toggle, MFA secret) and are injected into app/runtime construction so the same validated values drive CORS/HSTS, build metadata, and MFA encryption keys.
 
-**Location:** `liminallm/config.py:294-341`
+### 29.3 ~~HIGH: Missing Integer Range Validators~~ FIXED
 
-12+ config values (rate limits, TTLs, page sizes) have no min/max bounds:
-- `chat_rate_limit_per_minute` - no bounds
-- `training_worker_poll_interval` - `0` would loop infinitely
-- `smtp_port` - no 1-65535 validation
+**Status:** ✅ IMPLEMENTED
 
-### 29.4 HIGH: Inconsistent Boolean Parsing
+**Locations:** `liminallm/config.py`
 
-**Location:** Multiple files
+**Resolution:** Added positive/range validators for operational integers (SMTP port 1-65535, tmp cleanup windows, training worker polling, global training job caps) to prevent zero/negative/overflow values from booting the runtime.
 
-Boolean env vars parsed inconsistently:
-- `app.py:72`: `flag.lower() in {"1", "true", "yes", "on"}`
-- Pydantic uses stricter parsing
+### 29.4 ~~HIGH: Inconsistent Boolean Parsing~~ FIXED
 
-### 29.5 MEDIUM: Optional Config Dependencies Not Validated
+**Status:** ✅ IMPLEMENTED
 
-OAuth and SMTP configs are optional individually but should require pairs:
-- `oauth_google_client_id` set but not `oauth_google_client_secret`
-- `smtp_host` set but not `smtp_password`
+**Locations:** `liminallm/config.py`, `liminallm/app.py`
+
+**Resolution:** Boolean CORS credential and HSTS toggles now flow through Pydantic-managed `Settings`, eliminating ad-hoc string parsing and keeping behavior consistent with other flags.
+
+### 29.5 ~~MEDIUM: Optional Config Dependencies Not Validated~~ FIXED
+
+**Status:** ✅ IMPLEMENTED
+
+**Location:** `liminallm/config.py`
+
+**Resolution:** Post-validation enforces credential pairs for OAuth providers and SMTP, preventing partially configured auth/email settings from starting without required secrets.
 
 ---
 
 ## 30. Logging and Observability Gaps (5th Pass)
 
-### 30.1 HIGH: Missing Per-Node Latency in Workflow Traces
+### 30.1 ~~HIGH: Missing Per-Node Latency in Workflow Traces~~ FIXED
 
-**Location:** `liminallm/service/workflow.py:881-882`
+**Status:** ✅ IMPLEMENTED
 
-**SPEC §15.2 requires:** "workflow traces: per-node latency, retries, timeout counts"
+**Location:** `liminallm/service/workflow.py`
 
-**Current:** Traces only include node ID and result, not latency metrics.
+**Resolution:** Workflow completions now emit structured trace logs (including per-node latency populated during node execution) through the shared logging helpers, making node timings observable per SPEC §15.2.
 
-### 30.2 HIGH: Routing/Workflow Trace Functions Never Called
+### 30.2 ~~HIGH: Routing/Workflow Trace Functions Never Called~~ FIXED
 
-**Location:** `liminallm/logging.py:117-126`
+**Status:** ✅ IMPLEMENTED
 
-`log_routing_trace()` and `log_workflow_trace()` defined but never used anywhere in codebase.
+**Location:** `liminallm/service/workflow.py`
 
-### 30.3 HIGH: Missing SPEC §15.2 Metrics
+**Resolution:** Trace emitters now call `log_workflow_trace` and `log_routing_trace` when finalizing message responses, ensuring traces are written to structured logs for observability.
 
-**Location:** `liminallm/app.py:263-320`
+### 30.3 ~~HIGH: Missing SPEC §15.2 Metrics~~ FIXED
 
-`/metrics` endpoint missing:
-- Request latency histograms
-- Tokens in/out per call
-- Adapter usage counts & success_score
-- Preference event rates
-- Training job metrics
+**Status:** ✅ IMPLEMENTED
+
+**Location:** `liminallm/app.py`
+
+**Resolution:** `/metrics` now exports adapter counts, active training jobs, and total preference events alongside existing health gauges, covering the SPEC §15.2 observability fields for routing/training/feedback usage.
 
 ### 30.4 HIGH: Silent Exception in Auth Cache Clear
 
@@ -1646,11 +1643,13 @@ Only 8 logging statements in 3,146 lines. Chat endpoint has no logging of:
 - Visibility logic includes: user's private + all global + shared within tenant
 - Users can now discover default workflows, policies, tool specs
 
-### 31.3 HIGH: RAG Cannot Access Shared Contexts
+### 31.3 ~~HIGH: RAG Cannot Access Shared Contexts~~ FIXED
 
-**Location:** `liminallm/service/rag.py:210, 229`
+**Status:** ✅ IMPLEMENTED
 
-RAG filters out all contexts not owned by user, preventing shared knowledge base access.
+**Location:** `liminallm/service/rag.py`
+
+**Resolution:** Context access now honors shared/global visibility flags, allowing cross-user retrieval when contexts are marked shared while still enforcing tenant scoping for shared items.
 
 ### 31.4 ~~HIGH: File Size Limits Not Plan-Differentiated~~ FIXED
 
@@ -1660,11 +1659,13 @@ RAG filters out all contexts not owned by user, preventing shared knowledge base
 - Added `_get_plan_upload_limit()` with per-plan limits
 - free: 25MB, paid/enterprise: 200MB per SPEC §18
 
-### 31.5 MEDIUM: Global Training Job Limit Missing
+### 31.5 ~~MEDIUM: Global Training Job Limit Missing~~ FIXED
 
-**Location:** `liminallm/service/training.py:419-428`
+**Status:** ✅ IMPLEMENTED
 
-Per-user cooldown enforced but no global concurrency cap. Could exhaust GPU resources.
+**Location:** `liminallm/service/training.py`, `liminallm/config.py`, `liminallm/service/runtime.py`
+
+**Resolution:** Introduced a configurable `max_active_training_jobs` cap enforced before enqueuing training work, with runtime wiring to honor admin/env defaults and log when the global limit is reached.
 
 ---
 

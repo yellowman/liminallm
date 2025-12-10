@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import dotenv_values
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from liminallm.logging import get_logger
 
@@ -338,6 +338,24 @@ class Settings(BaseModel):
         "ALLOW_SIGNUP",
         description="Allow new user signups (overridable via admin UI)",
     )
+    log_level: str = env_field("INFO", "LOG_LEVEL")
+    log_json: bool = env_field(True, "LOG_JSON")
+    log_dev_mode: bool = env_field(False, "LOG_DEV_MODE")
+    build_sha: str = env_field("dev", "BUILD_SHA")
+    cors_allow_origins: list[str] = env_field(
+        [
+            "http://localhost",
+            "http://localhost:3000",
+            "http://localhost:5173",
+            "http://127.0.0.1:3000",
+            "http://127.0.0.1:5173",
+        ],
+        "CORS_ALLOW_ORIGINS",
+        description="Comma-separated CORS origins (overridable via admin UI)",
+    )
+    cors_allow_credentials: bool = env_field(False, "CORS_ALLOW_CREDENTIALS")
+    enable_hsts: bool = env_field(False, "ENABLE_HSTS")
+    mfa_secret_key: str | None = env_field(None, "MFA_SECRET_KEY")
     use_memory_store: bool = env_field(False, "USE_MEMORY_STORE")
     allow_redis_fallback_dev: bool = env_field(False, "ALLOW_REDIS_FALLBACK_DEV")
     test_mode: bool = env_field(
@@ -459,8 +477,57 @@ class Settings(BaseModel):
         "TRAINING_WORKER_POLL_INTERVAL",
         description="Training worker poll interval in seconds (overridable via admin UI)",
     )
+    max_active_training_jobs: int = env_field(
+        10,
+        "MAX_ACTIVE_TRAINING_JOBS",
+        description="Global cap on simultaneously active training jobs",
+    )
 
     model_config = ConfigDict(extra="ignore")
+
+    @field_validator("cors_allow_origins", mode="before")
+    @classmethod
+    def _parse_cors_origins(cls, value: Any) -> list[str]:
+        if value is None:
+            return []
+        if isinstance(value, str):
+            return [v.strip() for v in value.split(",") if v.strip()]
+        if isinstance(value, list):
+            return value
+        return []
+
+    @field_validator(
+        "smtp_port", "training_worker_poll_interval", "tmp_cleanup_interval_seconds", "tmp_max_age_hours", "max_active_training_jobs"
+    )
+    @classmethod
+    def _validate_positive_int(cls, value: int) -> int:
+        if value <= 0:
+            raise ValueError("must be positive")
+        return value
+
+    @field_validator("smtp_port")
+    @classmethod
+    def _validate_smtp_port(cls, value: int) -> int:
+        if not 1 <= value <= 65535:
+            raise ValueError("smtp_port must be between 1 and 65535")
+        return value
+
+    @field_validator("log_level")
+    @classmethod
+    def _normalize_log_level(cls, value: str) -> str:
+        return (value or "INFO").upper()
+
+    @model_validator(mode="after")
+    def _validate_required_pairs(self):
+        if self.oauth_google_client_id and not self.oauth_google_client_secret:
+            raise ValueError("oauth_google_client_secret required when client_id is set")
+        if self.oauth_github_client_id and not self.oauth_github_client_secret:
+            raise ValueError("oauth_github_client_secret required when client_id is set")
+        if self.oauth_microsoft_client_id and not self.oauth_microsoft_client_secret:
+            raise ValueError("oauth_microsoft_client_secret required when client_id is set")
+        if (self.smtp_host or self.smtp_user) and not self.smtp_password:
+            raise ValueError("smtp_password required when smtp_host or smtp_user is set")
+        return self
 
     @classmethod
     def from_env(cls) -> "Settings":

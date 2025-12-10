@@ -22,7 +22,7 @@ from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 
 from liminallm.config import Settings
-from liminallm.logging import get_logger
+from liminallm.logging import get_logger, log_routing_trace, log_workflow_trace
 from liminallm.service.embeddings import (
     EMBEDDING_DIM,
     cosine_similarity,
@@ -996,6 +996,11 @@ class WorkflowEngine:
 
         if not content:
             content = "No response generated."
+
+        # Emit structured traces for observability (Issue 30.x)
+        log_workflow_trace(workflow_trace, logger=self.logger)
+        if routing_trace:
+            log_routing_trace(routing_trace, logger=self.logger)
 
         # Emit final message_done with complete response
         yield {

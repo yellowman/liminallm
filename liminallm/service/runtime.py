@@ -75,7 +75,10 @@ class Runtime:
 
         try:
             self.store = (
-                MemoryStore(fs_root=self.settings.shared_fs_root)
+                MemoryStore(
+                    fs_root=self.settings.shared_fs_root,
+                    mfa_encryption_key=self.settings.mfa_secret_key,
+                )
                 if self.settings.use_memory_store
                 else PostgresStore(
                     self.settings.database_url, fs_root=self.settings.shared_fs_root
@@ -197,6 +200,7 @@ class Runtime:
             runtime_base_model=resolved_base_model,
             default_adapter_mode=default_adapter_mode,
             backend_mode=backend_mode,
+            max_active_training_jobs=self.settings.max_active_training_jobs,
         )
         self.clusterer = SemanticClusterer(self.store, self.llm, self.training)
         self.workflow = WorkflowEngine(

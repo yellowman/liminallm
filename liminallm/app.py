@@ -15,13 +15,16 @@ from fastapi.staticfiles import StaticFiles
 
 from liminallm.api.error_handling import register_exception_handlers
 from liminallm.api.routes import get_admin_user, router
+from liminallm.config import Settings
 from liminallm.logging import get_logger, set_correlation_id
 
 logger = get_logger(__name__)
 
+_settings = Settings.from_env()
+
 # Version info per SPEC §18
 __version__ = "0.1.0"
-__build__ = os.getenv("BUILD_SHA", "dev")
+__build__ = _settings.build_sha
 
 
 _cleanup_task: asyncio.Task | None = None
@@ -77,9 +80,8 @@ _CSRF_SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
 
 
 def _allowed_origins() -> List[str]:
-    env_value = os.getenv("CORS_ALLOW_ORIGINS")
-    if env_value:
-        return [origin.strip() for origin in env_value.split(",") if origin.strip()]
+    if _settings.cors_allow_origins:
+        return _settings.cors_allow_origins
     # Default to common local dev hosts; avoid wildcard when credentials are enabled.
     return [
         "http://localhost",
@@ -91,10 +93,7 @@ def _allowed_origins() -> List[str]:
 
 
 def _allow_credentials() -> bool:
-    flag = os.getenv("CORS_ALLOW_CREDENTIALS")
-    if flag is None:
-        return False
-    return flag.lower() in {"1", "true", "yes", "on"}
+    return _settings.cors_allow_credentials
 
 
 app.add_middleware(
@@ -199,12 +198,7 @@ async def add_security_headers(request, call_next):
     response.headers.setdefault(
         "Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()"
     )
-    if request.url.scheme == "https" and os.getenv("ENABLE_HSTS", "false").lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
+    if request.url.scheme == "https" and _settings.enable_hsts:
         response.headers.setdefault(
             "Strict-Transport-Security", "max-age=63072000; includeSubDomains"
         )
@@ -431,6 +425,38 @@ async def metrics() -> Response:
         lines.append('# HELP liminallm_database_healthy Database connection health')
         lines.append('# TYPE liminallm_database_healthy gauge')
         lines.append(f'liminallm_database_healthy {db_healthy}')
+
+        # Training job activity
+        list_jobs = getattr(runtime.store, "list_training_jobs", None)
+        if callable(list_jobs):
+            try:
+                jobs = list_jobs()
+                active = len([j for j in jobs if j.status in {"queued", "running"}])
+                lines.append('# HELP liminallm_training_jobs_active Active training jobs')
+                lines.append('# TYPE liminallm_training_jobs_active gauge')
+                lines.append(f'liminallm_training_jobs_active {active}')
+            except Exception as exc:
+                logger.warning("metrics_training_jobs_failed", error=str(exc))
+
+        # Preference event ingestion rate proxy
+        if hasattr(runtime.store, "list_preference_events"):
+            try:
+                events = runtime.store.list_preference_events(user_id=None)  # type: ignore[arg-type]
+                lines.append('# HELP liminallm_preference_events_total Total recorded preference events')
+                lines.append('# TYPE liminallm_preference_events_total counter')
+                lines.append(f'liminallm_preference_events_total {len(events)}')
+            except Exception as exc:
+                logger.warning("metrics_preference_events_failed", error=str(exc))
+
+        # Adapter usage counts
+        if hasattr(runtime.store, "list_artifacts"):
+            try:
+                adapters = runtime.store.list_artifacts(kind="adapter", owner_user_id=None)  # type: ignore[arg-type]
+                lines.append('# HELP liminallm_adapters_total Adapters stored in system')
+                lines.append('# TYPE liminallm_adapters_total gauge')
+                lines.append(f'liminallm_adapters_total {len(adapters)}')
+            except Exception as exc:
+                logger.warning("metrics_adapters_failed", error=str(exc))
 
     except Exception as exc:
         logger.error("metrics_collection_failed", error=str(exc))
