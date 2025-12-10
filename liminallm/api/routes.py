@@ -115,6 +115,7 @@ from liminallm.service.runtime import (
     check_rate_limit,
     get_runtime,
 )
+from liminallm.storage.cursors import encode_artifact_cursor
 from liminallm.storage.models import Conversation, KnowledgeContext, Session
 
 logger = get_logger(__name__)
@@ -2225,6 +2226,9 @@ async def list_artifacts(
     page: int = Query(1, ge=1, le=100000, description="Page number (1-indexed)"),
     page_size: Optional[int] = Query(None, ge=1, le=1000, description="Items per page"),
     limit: Optional[int] = Query(None, ge=1, le=1000, description="Alias for page_size (for frontend compatibility)"),
+    cursor: Optional[str] = Query(
+        None, description="Keyset cursor returned by a previous response"
+    ),
     principal: AuthContext = Depends(get_user),
 ):
     """List artifacts owned by the current user.
@@ -2265,12 +2269,19 @@ async def list_artifacts(
         owner_user_id=principal.user_id,
         tenant_id=principal.tenant_id,
         page=page,
-        page_size=resolved_page_size + 1,
+        page_size=resolved_page_size,
+        cursor=cursor,
+        include_sentinel=True,
         visibility=visibility,
     ))
 
     has_next = len(raw_items) > resolved_page_size
     page_items = raw_items[:resolved_page_size]
+    next_cursor = None
+    if has_next and page_items:
+        last_item = page_items[-1]
+        next_cursor = encode_artifact_cursor(last_item.created_at, last_item.id)
+    next_page = None if cursor else (page + 1 if has_next else None)
 
     # Batch fetch current versions for all artifacts
     artifact_ids = [a.id for a in page_items]
@@ -2298,7 +2309,8 @@ async def list_artifacts(
         data=ArtifactListResponse(
             items=items,
             has_next=has_next,
-            next_page=page + 1 if has_next else None,
+            next_page=next_page,
+            next_cursor=next_cursor,
             page_size=resolved_page_size,
         ),
     )

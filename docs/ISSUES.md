@@ -615,21 +615,15 @@ Redis rate limiting now uses an atomic Lua token bucket with weighted costs and 
 
 **Fix Applied:** Preference fetches apply tenant-scoped limits with reservoir sampling and bounded max_events to cap memory, marking clusters as approximate when sampling is used.
 
-### 8.4 ~~HIGH~~ LOW (Future Feature): Adapter Pruning/Merging NOT IMPLEMENTED
+### 8.4 ~~HIGH~~ LOW: Adapter Pruning/Merging Implemented
 
-**Status:** 📋 ACKNOWLEDGED - Future optimization feature (not a security issue)
+**Status:** ✅ IMPLEMENTED
 
-**Location:** N/A (not implemented)
+**Location:** `liminallm/service/training_worker.py:170-246`
 
 **SPEC §7.4 requires:** Monitor adapter_router_state for low usage_count, poor success_score. Propose via ConfigOps to disable or merge adapters.
 
-**Current:** No pruning or merging logic exists.
-
-**Analysis:** This is an optimization/maintenance feature for production scale:
-- Monitors adapter performance metrics over time
-- Proposes cleanup via ConfigOps (admin workflow)
-- No security impact - purely operational optimization
-- Priority: Implement after core adapter functionality is stable
+**Fix Applied:** TrainingWorker now performs periodic adapter health sweeps (6h default), scanning router state for stale, low-usage adapters. When an adapter meets the threshold (usage <2, success_score <0.25, unused >7 days) and no pending auto-prune patch exists, the worker records a ConfigOps patch with an `/meta/auto_prune` recommendation so operators can disable or merge the adapter via standard approval flows.
 
 ### 8.5 ~~MEDIUM: No Periodic Clustering Batch Job~~ FIXED
 
@@ -1260,13 +1254,13 @@ Conversation cached with 5m TTL but messages cached with 1m TTL. Can serve stale
 
 **Fix Applied:** Trace appends now route through `_append_trace`, which caps the in-memory trace list at 500 entries and discards oldest records during long-running workflows to prevent unbounded growth.
 
-### 23.5 MEDIUM: Database Connection Pool Not Monitored
+### 23.5 MEDIUM: Database Connection Pool Monitored
 
 No metrics or alerts for connection pool exhaustion. Silent failures under load.
 
-**Status:** 📋 ACKNOWLEDGED (Deferred)
+**Status:** ✅ IMPLEMENTED
 
-**Notes:** Connection pooling is currently handled by the database driver without integrated metrics. Adding pool gauges and alerting will be tracked as an operational enhancement separate from functional correctness.
+**Fix Applied:** PostgresStore now measures acquisition latency on every pool checkout and logs `postgres_pool_pressure` with live pool stats when waits exceed 500ms or when the pool reports waiting borrowers. Metrics logging is rate-limited to once per minute to avoid noise while still surfacing saturation before exhaustion.
 
 ### 23.6 ~~MEDIUM: File Handle Leaks in Training~~ (FALSE POSITIVE)
 
@@ -1379,11 +1373,9 @@ Webhook payloads can be arbitrarily large. No truncation before sending.
 
 Using `OFFSET` for pagination. Performance degrades linearly with page number.
 
-**Status:** 📋 ACKNOWLEDGED (Deferred)
+**Status:** ✅ IMPLEMENTED
 
-**Notes:** Existing endpoints use SPEC-aligned offset pagination with capped page sizes (generally max 500). Keyset pagination will be evaluated as a performance enhancement for large datasets in a future iteration.
-
-**Fix:** Implement keyset/cursor pagination.
+**Fix Applied:** Artifact listing now supports keyset pagination via opaque `cursor` tokens (timestamp|id) with next-cursor hints in API responses. Both Postgres and Memory stores accept `cursor` to avoid large OFFSET scans while preserving page/size compatibility for existing clients.
 
 ---
 

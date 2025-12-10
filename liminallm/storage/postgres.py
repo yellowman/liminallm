@@ -39,6 +39,7 @@ from liminallm.storage.common import (
     get_default_tool_specs,
     normalize_optional_text,
 )
+from liminallm.storage.cursors import decode_artifact_cursor
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
     AdapterRouterState,
@@ -71,6 +72,7 @@ class PostgresStore:
         self.logger = get_logger(__name__)
         self._connect_max_retries = 3
         self._connect_retry_backoff = 0.25
+        self._last_pool_metrics_log = 0.0
 
         try:
             self.fs_root.mkdir(parents=True, exist_ok=True)
@@ -201,7 +203,11 @@ class PostgresStore:
         last_exc: Exception | None = None
         while attempt < self._connect_max_retries:
             try:
-                return self.pool.connection()
+                start = time.monotonic()
+                conn = self.pool.connection()
+                elapsed_ms = (time.monotonic() - start) * 1000
+                self._maybe_log_pool_metrics(elapsed_ms)
+                return conn
             except Exception as exc:
                 last_exc = exc
                 attempt += 1
@@ -215,6 +221,38 @@ class PostgresStore:
         if last_exc:
             raise last_exc
         return self.pool.connection()
+
+    def _maybe_log_pool_metrics(self, wait_ms: float) -> None:
+        """Emit periodic pool health metrics to surface saturation early."""
+
+        now = time.monotonic()
+        if (now - self._last_pool_metrics_log) < 60 and wait_ms < 500:
+            return
+
+        stats_fn = getattr(self.pool, "get_stats", None)
+        waiting = used = free = open_conns = None
+        max_size = getattr(self.pool, "max_size", None)
+        if callable(stats_fn):
+            try:
+                stats = stats_fn()
+                waiting = getattr(stats, "waiting", None)
+                used = getattr(stats, "used", None)
+                free = getattr(stats, "free", None)
+                open_conns = getattr(stats, "open", None)
+            except Exception as exc:  # pragma: no cover - defensive logging
+                self.logger.debug("postgres_pool_stats_failed", error=str(exc))
+
+        if wait_ms >= 500 or (waiting and waiting > 0) or (used and max_size and used >= max_size):
+            self.logger.warning(
+                "postgres_pool_pressure",
+                wait_ms=round(wait_ms, 2),
+                waiting=waiting,
+                used=used,
+                free=free,
+                open_connections=open_conns,
+                max_size=max_size,
+            )
+            self._last_pool_metrics_log = now
 
     def _ensure_runtime_config_table(self) -> None:
         """Create the ``instance_config`` table if it is missing."""
@@ -1827,6 +1865,8 @@ class PostgresStore:
         *,
         page: int = 1,
         page_size: int = 100,
+        cursor: Optional[str] = None,
+        include_sentinel: bool = False,
         owner_user_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
         visibility: Optional[str] = None,
@@ -1843,9 +1883,18 @@ class PostgresStore:
         max_page_size = 500
         requested_page_size = max(page_size, 1)
         capped_page_size = min(requested_page_size, max_page_size)
-        # Allow one extra record for has_next detection when caller requests page_size + 1
-        limit = capped_page_size + (1 if requested_page_size >= max_page_size else 0)
-        offset = max(page - 1, 0) * capped_page_size
+        # Optionally fetch one extra record for has_next detection
+        limit = capped_page_size + (1 if include_sentinel else 0)
+        offset = 0 if cursor else max(page - 1, 0) * capped_page_size
+        cursor_filter: list[str] = []
+        cursor_params: list[Any] = []
+        if cursor:
+            try:
+                created_at_cursor, artifact_cursor_id = decode_artifact_cursor(cursor)
+                cursor_filter.append("(created_at, id) < (%s, %s)")
+                cursor_params.extend([created_at_cursor, artifact_cursor_id])
+            except Exception as exc:
+                self.logger.warning("artifact_cursor_decode_failed", error=str(exc))
         with self._connect() as conn:
             clauses = []
             params: list[Any] = []
@@ -1898,14 +1947,16 @@ class PostgresStore:
                 if visibility_parts:
                     clauses.append("(" + " OR ".join(visibility_parts) + ")")
 
-            where = ""
-            if clauses:
-                where = " WHERE " + " AND ".join(clauses)
+            if cursor_filter:
+                clauses.extend(cursor_filter)
+
+            where = " WHERE " + " AND ".join(clauses) if clauses else ""
             query = (
                 "SELECT * FROM artifact"
                 + where
-                + " ORDER BY created_at DESC LIMIT %s OFFSET %s"
+                + " ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s"
             )
+            params.extend(cursor_params)
             params.extend([limit, offset])
             rows = conn.execute(query, tuple(params)).fetchall()
         artifacts: List[Artifact] = []

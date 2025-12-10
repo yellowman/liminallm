@@ -42,6 +42,7 @@ from liminallm.storage.common import (
     normalize_optional_text,
     normalize_preference_weight,
 )
+from liminallm.storage.cursors import decode_artifact_cursor, encode_artifact_cursor
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
     AdapterRouterState,
@@ -1050,6 +1051,8 @@ class MemoryStore:
         *,
         page: int = 1,
         page_size: int = 100,
+        cursor: Optional[str] = None,
+        include_sentinel: bool = False,
         owner_user_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
         visibility: Optional[str] = None,
@@ -1119,12 +1122,31 @@ class MemoryStore:
                 if isinstance(a.schema, dict) and a.schema.get("kind") == kind_filter
             ]
 
-        # Pagination (cap at 500, allow sentinel row for has_next detection at cap)
+        # Pagination (cap at 500, allow sentinel row for has_next detection)
         max_page_size = 500
         requested_page_size = max(page_size, 1)
         capped_page_size = min(requested_page_size, max_page_size)
-        limit = capped_page_size + (1 if requested_page_size >= max_page_size else 0)
-        start = max(page - 1, 0) * capped_page_size
+        limit = capped_page_size + (1 if include_sentinel else 0)
+
+        artifacts.sort(key=lambda a: a.created_at, reverse=True)
+        if cursor:
+            try:
+                cursor_ts, cursor_id = decode_artifact_cursor(cursor)
+                artifacts = [
+                    a
+                    for a in artifacts
+                    if (
+                        (a.created_at or datetime.min) < cursor_ts
+                        or (
+                            (a.created_at or datetime.min) == cursor_ts
+                            and a.id < cursor_id
+                        )
+                    )
+                ]
+            except Exception as exc:
+                self.logger.warning("artifact_cursor_decode_failed", error=str(exc))
+
+        start = max(page - 1, 0) * capped_page_size if not cursor else 0
         end = start + limit
         return artifacts[start:end]
 

@@ -503,6 +503,9 @@ class ArtifactListResponse(BaseModel):
     total_count: Optional[int] = Field(default=None, description="Total number of matching artifacts (when available)")
     has_next: Optional[bool] = Field(default=None, description="Whether more items exist beyond this page")
     next_page: Optional[int] = Field(default=None, description="Next page number, if available")
+    next_cursor: Optional[str] = Field(
+        default=None, description="Cursor token for keyset pagination"
+    )
     page_size: int = Field(default=100, description="Number of items per page")
 
 
