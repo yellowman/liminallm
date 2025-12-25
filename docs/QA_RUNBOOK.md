@@ -139,6 +139,143 @@ bandit -r liminallm/ -ll
 # - CSRF: Token-based auth with CSRF tokens for forms
 ```
 
+## Post-Smoke Run Procedure
+
+After your first successful smoke test, run these additional checks to catch idempotency, caching, race conditions, and isolation issues.
+
+### Step 9: Repeat Smoke Test (3x)
+
+Run the smoke script 3 times consecutively to catch:
+- Idempotency key collisions
+- Cache staleness issues
+- Race conditions in concurrent requests
+
+```bash
+# Run 3 times
+for i in 1 2 3; do
+    echo "=== Smoke Run $i ==="
+    ./scripts/smoke_test.sh http://localhost:8000
+    sleep 2
+done
+```
+
+**Pass Criteria:** All 3 runs pass without errors.
+
+### Step 10: File Extension Upload Test
+
+Test uploads for each allowed extension. Supported extensions:
+- Text: `.txt`, `.md`, `.json`, `.csv`, `.tsv`
+- Documents: `.pdf`
+- Images: `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`
+- Audio: `.mp3`, `.wav`, `.ogg`
+
+```bash
+# Create test files
+echo "test content" > /tmp/test.txt
+echo "# Markdown" > /tmp/test.md
+echo '{"key": "value"}' > /tmp/test.json
+echo "a,b,c" > /tmp/test.csv
+
+# Upload each (requires valid $TOKEN)
+for ext in txt md json csv; do
+    curl -X POST "http://localhost:8000/v1/files/upload" \
+        -H "Authorization: Bearer $TOKEN" \
+        -F "file=@/tmp/test.$ext"
+    echo ""
+done
+```
+
+**Pass Criteria:** Each upload returns `{"status":"ok",...}` with a `file_id`.
+
+### Step 11: Logout and Token Invalidation
+
+Test that logout properly invalidates tokens:
+
+```bash
+# 1. Login and get token
+LOGIN=$(curl -s -X POST "http://localhost:8000/v1/auth/login" \
+    -H "Content-Type: application/json" \
+    -d '{"email": "test@example.com", "password": "TestPass123!"}')
+TOKEN=$(echo "$LOGIN" | jq -r '.data.access_token')
+
+# 2. Verify token works
+curl -s "http://localhost:8000/v1/conversations" \
+    -H "Authorization: Bearer $TOKEN" | jq '.status'
+# Should return "ok"
+
+# 3. Logout
+curl -s -X POST "http://localhost:8000/v1/auth/logout" \
+    -H "Authorization: Bearer $TOKEN"
+
+# 4. Verify token is invalidated
+curl -s "http://localhost:8000/v1/conversations" \
+    -H "Authorization: Bearer $TOKEN" | jq '.error.code'
+# Should return "unauthorized" or "invalid session"
+```
+
+**Pass Criteria:** After logout, the token should be rejected with 401.
+
+### Step 12: Password Reset Flow
+
+```bash
+# Request password reset (may require email configuration)
+curl -s -X POST "http://localhost:8000/v1/auth/password/reset" \
+    -H "Content-Type: application/json" \
+    -d '{"email": "test@example.com"}'
+# In test mode without email: token is returned in response
+# In production: check email for reset link
+```
+
+### Step 13: Tenant Isolation Test
+
+Create 2 users and verify they cannot access each other's data:
+
+```bash
+# Create User A
+SIGNUP_A=$(curl -s -X POST "http://localhost:8000/v1/auth/signup" \
+    -H "Content-Type: application/json" \
+    -d '{"email": "userA@test.local", "password": "TestPass123!"}')
+TOKEN_A=$(echo "$SIGNUP_A" | jq -r '.data.access_token')
+
+# Create User B
+SIGNUP_B=$(curl -s -X POST "http://localhost:8000/v1/auth/signup" \
+    -H "Content-Type: application/json" \
+    -d '{"email": "userB@test.local", "password": "TestPass123!"}')
+TOKEN_B=$(echo "$SIGNUP_B" | jq -r '.data.access_token')
+
+# User A creates a conversation
+CONV_A=$(curl -s -X POST "http://localhost:8000/v1/conversations" \
+    -H "Authorization: Bearer $TOKEN_A" \
+    -H "Content-Type: application/json" \
+    -d '{"title": "User A Private"}')
+CONV_A_ID=$(echo "$CONV_A" | jq -r '.data.id')
+
+# User B tries to access User A's conversation
+RESULT=$(curl -s "http://localhost:8000/v1/conversations/$CONV_A_ID" \
+    -H "Authorization: Bearer $TOKEN_B")
+echo "$RESULT" | jq '.error'
+# Should return 404 or 403, NOT the conversation data
+
+# User B lists their own conversations (should be empty)
+LIST_B=$(curl -s "http://localhost:8000/v1/conversations" \
+    -H "Authorization: Bearer $TOKEN_B")
+echo "$LIST_B" | jq '.data | length'
+# Should return 0 (User B has no conversations)
+```
+
+**Pass Criteria:**
+- User B cannot read User A's conversation (404 or 403)
+- User B's conversation list does not include User A's data
+- Each user can only see their own files and artifacts
+
+### Automated Post-Smoke Tests
+
+Run the automated test suite:
+
+```bash
+pytest tests/test_post_smoke.py -v
+```
+
 ## Acceptance Criteria
 
 | Check | Command | Expected |
@@ -147,6 +284,7 @@ bandit -r liminallm/ -ll
 | Unit tests | `pytest tests/` | All pass |
 | Admin tests | `pytest tests/test_integration_admin.py` | 18 pass |
 | Smoke tests | `./scripts/smoke_test.sh` | All pass |
+| Post-smoke tests | `pytest tests/test_post_smoke.py` | All pass |
 | Security scan | `bandit -r liminallm/ -ll` | No high severity |
 
 ## Troubleshooting
