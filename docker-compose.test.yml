@@ -7,7 +7,7 @@
 
 services:
   postgres:
-    image: postgres:15-alpine
+    image: pgvector/pgvector:pg16
     environment:
       POSTGRES_DB: liminallm_test
       POSTGRES_USER: liminallm
