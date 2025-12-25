@@ -124,12 +124,107 @@ for v1 these can all live in one python app with clear module boundaries.
   - interfaces & schemas are expected to change
 - goal is to keep:
   - implementation minimal
-  - all “product behavior” in data (artifacts / policies / workflows)
+  - all "product behavior" in data (artifacts / policies / workflows)
   - evolution driven by usage + llm suggestions, not constant code surgery
+
+---
+
+## quick start
+
+### Option 1: Docker (Recommended for QA/Testing)
+
+```bash
+# Start the full test stack (Postgres, Redis, App)
+docker compose -f docker-compose.test.yml up --build
+
+# Verify health
+curl http://localhost:8000/healthz
+
+# Pre-configured admin credentials:
+#   Email: admin@test.local
+#   Password: TestAdmin123!
+```
+
+This automatically:
+- Runs database migrations
+- Bootstraps an admin user
+- Serves the chat UI at `http://localhost:8000/`
+- Serves the admin console at `http://localhost:8000/admin`
+
+### Option 2: Local Development
+
+```bash
+# Install dependencies
+pip install -e ".[dev]"
+
+# Set required environment variables
+export JWT_SECRET="YourSecure-JWT-Secret-With-32-Characters!"
+export SHARED_FS_ROOT="/tmp/liminallm"
+export USE_MEMORY_STORE=true  # Skip Postgres/Redis for quick testing
+
+# Start the API server
+uvicorn liminallm.app:app --reload
+
+# Verify health
+curl http://localhost:8000/healthz
+
+# Bootstrap an admin user
+ADMIN_EMAIL=admin@test.local ADMIN_PASSWORD=TestAdmin123! \
+  python scripts/bootstrap_admin.py
+```
+
+### Option 3: With PostgreSQL and Redis
+
+```bash
+# Install dependencies
+pip install -e ".[dev]"
+
+# Set environment variables
+export DATABASE_URL="postgresql://user:pass@localhost:5432/liminallm"
+export REDIS_URL="redis://localhost:6379/0"
+export JWT_SECRET="YourSecure-JWT-Secret-With-32-Characters!"
+export SHARED_FS_ROOT="/srv/liminallm"
+
+# Run migrations
+./scripts/migrate.sh
+
+# Bootstrap admin
+python scripts/bootstrap_admin.py --email admin@test.local --password TestAdmin123!
+
+# Start the server
+uvicorn liminallm.app:app --host 0.0.0.0 --port 8000
+```
+
+---
+
+## acceptance criteria (ready to test)
+
+Before QA begins, verify:
+
+| Criterion | How to Verify |
+|-----------|---------------|
+| **Health check** | `curl http://localhost:8000/healthz` returns `{"status": "healthy"}` |
+| **Chat UI loads** | Open `http://localhost:8000/` in browser |
+| **User signup** | Sign up via UI or `POST /v1/auth/signup` |
+| **User login** | Log in via UI or `POST /v1/auth/login` |
+| **Send message** | Create conversation and send via `/v1/chat` |
+| **Admin protected** | Regular user gets 403 on `/v1/admin/settings` |
+| **Admin access** | Admin user gets 200 on `/v1/admin/settings` |
+| **Tests pass** | `./scripts/run_tests.sh` passes on fresh install |
+| **Bootstrap works** | `python scripts/bootstrap_admin.py` creates admin |
+
+Run the automated smoke test:
+```bash
+./scripts/smoke_test.sh http://localhost:8000
+```
+
+---
 
 ## deployment
 
-- install and runtime guidance (docker compose and manual host setup) live in `docs/DEPLOYMENT.md`
+- Install and runtime guidance (docker compose and manual host setup) live in `docs/DEPLOYMENT.md`
+- Configuration architecture documented in `docs/CONFIGURATION.md`
+- Testing guide in `TESTING.md`
 
 ### implementation completeness (prototype)
 
@@ -288,43 +383,30 @@ for v1 these can all live in one python app with clear module boundaries.
 
 MIT
 
-## docker deployment
-
-```bash
-# Set required secrets
-export POSTGRES_PASSWORD=your-secure-password
-export JWT_SECRET=$(openssl rand -hex 32)
-
-# Start all services (app, postgres, redis)
-docker-compose up -d
-
-# With nginx reverse proxy for production
-docker-compose --profile production up -d
-```
-
-The stack exposes:
-- `/healthz` - health check with dependency status
-- `/metrics` - Prometheus-compatible metrics
-
-## dev quickstart (prototype)
-
-- install dependencies: `pip install -e .`
-- run migrations: `DATABASE_URL=postgres://... ./scripts/migrate.sh`
-- start api: `uvicorn liminallm.app:app --reload`
-- hit health check: `curl http://localhost:8000/healthz`
-- call kernel endpoints (Bearer access token preferred; legacy `session_id` header supported for compatibility):
-  - `POST /v1/auth/signup` → returns session + signed access/refresh tokens scoped to the tenant
-  - `POST /v1/auth/login` → returns tokens, with MFA gating when enabled
-  - `POST /v1/auth/refresh` → rotates refresh tokens and issues a new access token
-  - `POST /v1/chat` → creates conversation + LLM reply (live if `OPENAI_ADAPTER_API_KEY` is set, echo otherwise)
-  - `GET /v1/artifacts` → lists data-driven workflows/policies
-- admin config endpoints (`/v1/config/*`) require an admin-role token and are intended for the admin UI only
-
 ## testing
 
-- Default tests run with in-memory stores: `TEST_MODE=true USE_MEMORY_STORE=true ALLOW_REDIS_FALLBACK_DEV=true ./scripts/run_tests.sh`
-- To exercise Postgres-backed behaviors, start a local Postgres instance and set `DATABASE_URL` plus `USE_MEMORY_STORE=false` before running the script.
-- CI runs compile-time checks and the pytest suite against a Postgres service via `.github/workflows/tests.yml`.
+See `TESTING.md` for comprehensive testing documentation.
+
+```bash
+# Quick test (in-memory, no external dependencies)
+./scripts/run_tests.sh
+
+# Full integration test with Docker
+docker compose -f docker-compose.test.yml up --build
+./scripts/smoke_test.sh
+```
+
+## API endpoints
+
+Key endpoints (Bearer access token required):
+- `POST /v1/auth/signup` → returns session + signed access/refresh tokens
+- `POST /v1/auth/login` → returns tokens, with MFA gating when enabled
+- `POST /v1/auth/refresh` → rotates refresh tokens
+- `POST /v1/chat` → creates conversation + LLM reply
+- `GET /v1/artifacts` → lists data-driven workflows/policies
+- `GET /v1/admin/settings` → admin-only system settings
+
+Admin endpoints (`/v1/admin/*`, `/v1/config/*`) require admin role.
 
 ## operational hardening
 
