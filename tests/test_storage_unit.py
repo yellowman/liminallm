@@ -8,11 +8,10 @@ Tests for:
 - Artifact operations
 """
 
+
 import pytest
-from datetime import datetime
 
 from liminallm.storage.memory import MemoryStore
-from liminallm.storage.models import UserSettings
 
 
 @pytest.fixture

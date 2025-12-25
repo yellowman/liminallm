@@ -3,9 +3,10 @@
 Tests that rate limiting is properly applied to protected endpoints.
 """
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
 from fastapi.testclient import TestClient
-from unittest.mock import patch, AsyncMock
 
 from liminallm import app as app_module
 

@@ -8,7 +8,6 @@ from liminallm.config import AdapterMode, get_compatible_adapter_modes
 from liminallm.service.training import TrainingService
 from liminallm.storage.memory import MemoryStore
 
-
 # ==============================================================================
 # TrainingService Initialization Tests
 # ==============================================================================

@@ -561,7 +561,7 @@ async def check_rate_limit(
             cost=cost,
         )
         return result
-    window = timedelta(seconds=window_seconds)
+    timedelta(seconds=window_seconds)
     refill_rate = float(limit) / float(window_seconds)
     async with runtime._local_rate_limit_lock:
         now = datetime.utcnow()

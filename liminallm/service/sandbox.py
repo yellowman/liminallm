@@ -19,12 +19,12 @@ import resource
 import socket
 import tempfile
 import threading
-from contextlib import contextmanager
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from urllib.parse import urlparse
 from typing import Any, Callable, Optional, TypeVar
+from urllib.parse import urlparse
 
 import httpx
 

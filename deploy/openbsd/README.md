@@ -169,7 +169,7 @@ ksh -n /etc/liminallm/env
 ls -la /var/liminallm /etc/liminallm
 
 # Run manually for debugging
-su -s /bin/ksh _liminallm -c ". /etc/liminallm/env && python3 -m uvicorn liminallm.api.routes:app --host 127.0.0.1 --port 8000"
+su -s /bin/ksh _liminallm -c ". /etc/liminallm/env && python3 -m uvicorn liminallm.app:app --host 127.0.0.1 --port 8000"
 ```
 
 **Database connection issues:**

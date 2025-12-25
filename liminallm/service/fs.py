@@ -3,7 +3,7 @@ import hmac
 import time
 from pathlib import Path
 from typing import Optional, Tuple
-from urllib.parse import parse_qs, urlencode
+from urllib.parse import urlencode
 
 
 class PathTraversalError(ValueError):

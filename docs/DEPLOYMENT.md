@@ -50,7 +50,7 @@ data directories under `SHARED_FS_ROOT` must be writable:
    - create the `liminallm` db/user; enable `vector` and `citext`.
    - run migrations: `DATABASE_URL=postgres://liminallm:<password>@localhost:5432/liminallm ./scripts/migrate.sh`.
 5. run redis with `--requirepass` and set `REDIS_URL`.
-6. start api: `python -m uvicorn liminallm.api.routes:app --host 0.0.0.0 --port 8000 --workers 4`. static assets live under `/frontend`; readiness at `/healthz`.
+6. start api: `python -m uvicorn liminallm.app:app --host 0.0.0.0 --port 8000 --workers 4`. static assets live under `/frontend`; readiness at `/healthz`.
 7. front-end: browse `http://<host>:8000/` (chat) and `/admin` (admin role needed). put tls in front via nginx or your proxy of choice.
 
 ## backend lanes and scenarios
@@ -58,7 +58,7 @@ data directories under `SHARED_FS_ROOT` must be writable:
 - set `MODEL_BACKEND=local_gpu_lora`, `MODEL_PATH=/srv/liminallm/models/<base-model>` (hugging face-style dir), optional `MODEL_TOKENIZER` if tokenizer differs.
 - copy base weights into `/srv/liminallm/models`; adapters live under `/srv/liminallm/adapters/<adapter_id>/adapter.lora`.
 - gpu prep: install the matching jax gpu wheel (cuda/rocm), verify `nvidia-smi` sees the card, and keep drivers + cuda in `$LD_LIBRARY_PATH`.
-- run: `python -m uvicorn liminallm.api.routes:app --host 0.0.0.0 --port 8000 --workers 1` (jax likes fewer workers). requests specify `adapter_id` and optionally `adapter_mode` (local/hybrid/prompt); the backend overlays adapters over the frozen base and serves tokens locally.
+- run: `python -m uvicorn liminallm.app:app --host 0.0.0.0 --port 8000 --workers 1` (jax likes fewer workers). requests specify `adapter_id` and optionally `adapter_mode` (local/hybrid/prompt); the backend overlays adapters over the frozen base and serves tokens locally.
 - the base model remains immutable; training writes only adapter weights.
 
 ### api backend (remote inference)

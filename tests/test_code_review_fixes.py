@@ -3,14 +3,11 @@
 from __future__ import annotations
 
 import threading
-from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
-from liminallm.api.schemas import ErrorBody, Envelope
-from liminallm.config import AdapterMode
-
+from liminallm.api.schemas import Envelope, ErrorBody
 
 # ==============================================================================
 # Zero-Weight Adapter Handling Tests
@@ -86,8 +83,9 @@ class TestMemoryStoreThreadSafety:
 
     def test_artifact_version_seq_thread_safe(self):
         """_next_artifact_version_id should be thread-safe."""
-        from liminallm.storage.memory import MemoryStore
         import tempfile
+
+        from liminallm.storage.memory import MemoryStore
 
         with tempfile.TemporaryDirectory() as tmpdir:
             store = MemoryStore(fs_root=tmpdir)
@@ -114,8 +112,9 @@ class TestMemoryStoreThreadSafety:
 
     def test_chunk_id_seq_thread_safe(self):
         """_next_chunk_id should be thread-safe."""
-        from liminallm.storage.memory import MemoryStore
         import tempfile
+
+        from liminallm.storage.memory import MemoryStore
 
         with tempfile.TemporaryDirectory() as tmpdir:
             store = MemoryStore(fs_root=tmpdir)
@@ -170,9 +169,10 @@ class TestTokenBasedRAGChunking:
 
     def test_chunking_creates_overlap(self):
         """Chunks should have overlapping tokens."""
-        from liminallm.service.rag import RAGService, _simple_tokenize
-        from liminallm.storage.memory import MemoryStore
         import tempfile
+
+        from liminallm.service.rag import RAGService
+        from liminallm.storage.memory import MemoryStore
 
         with tempfile.TemporaryDirectory() as tmpdir:
             store = MemoryStore(fs_root=tmpdir)
@@ -203,9 +203,10 @@ class TestTokenBasedRAGChunking:
 
     def test_chunk_metadata_includes_token_info(self):
         """Chunks should have token count metadata."""
+        import tempfile
+
         from liminallm.service.rag import RAGService
         from liminallm.storage.memory import MemoryStore
-        import tempfile
 
         with tempfile.TemporaryDirectory() as tmpdir:
             store = MemoryStore(fs_root=tmpdir)
@@ -361,9 +362,10 @@ class TestRefreshTokenRevocationSecurity:
     @pytest.mark.asyncio
     async def test_cache_failure_defaults_to_revoked(self):
         """When Redis cache fails, should assume token is revoked (safe default)."""
-        from liminallm.service.auth import AuthService
-        from liminallm.config import Settings
         from unittest.mock import AsyncMock
+
+        from liminallm.config import Settings
+        from liminallm.service.auth import AuthService
 
         # Create auth service with failing cache
         mock_store = MagicMock()
@@ -383,9 +385,10 @@ class TestRefreshTokenRevocationSecurity:
     @pytest.mark.asyncio
     async def test_cache_success_returns_actual_value(self):
         """When cache succeeds, should return actual revocation status."""
-        from liminallm.service.auth import AuthService
-        from liminallm.config import Settings
         from unittest.mock import AsyncMock
+
+        from liminallm.config import Settings
+        from liminallm.service.auth import AuthService
 
         mock_store = MagicMock()
         mock_cache = MagicMock()

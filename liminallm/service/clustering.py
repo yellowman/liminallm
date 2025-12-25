@@ -13,8 +13,8 @@ from liminallm.service.embeddings import (
     cosine_similarity,
     normalize_vector,
     sanitize_embedding,
-    validated_embedding,
     validate_centroid,
+    validated_embedding,
 )
 from liminallm.storage.models import (
     POSITIVE_FEEDBACK_VALUES,

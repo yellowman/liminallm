@@ -16,7 +16,6 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from cryptography.fernet import Fernet, InvalidToken
 
 from liminallm.content_struct import normalize_content_struct
-from liminallm.service.errors import NotFoundError
 from liminallm.logging import get_logger
 from liminallm.service.artifact_validation import (
     ArtifactValidationError,
@@ -33,6 +32,7 @@ from liminallm.service.embeddings import (
     cosine_similarity,
     validated_embedding,
 )
+from liminallm.service.errors import NotFoundError
 from liminallm.storage.common import (
     blend_centroid,
     clamp_success_score,
@@ -47,9 +47,6 @@ from liminallm.storage.cursors import (
     decode_artifact_cursor,
     decode_index_cursor,
     decode_time_id_cursor,
-    encode_artifact_cursor,
-    encode_index_cursor,
-    encode_time_id_cursor,
 )
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
@@ -1976,7 +1973,7 @@ class MemoryStore:
             return False
         except json.JSONDecodeError as exc:
             # Issue 39.1: Handle corrupted state files gracefully
-            logger.error("memory_store_state_corrupted", path=str(path), error=str(exc))
+            self.logger.error("memory_store_state_corrupted", path=str(path), error=str(exc))
             return False
         self.users = {u["id"]: self._deserialize_user(u) for u in data.get("users", [])}
         self.sessions = {

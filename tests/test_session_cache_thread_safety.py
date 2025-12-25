@@ -10,9 +10,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List
 
-
 from liminallm.storage.models import Session
-from liminallm.storage.postgres import PostgresStore, _MAX_SESSION_CACHE_SIZE
+from liminallm.storage.postgres import _MAX_SESSION_CACHE_SIZE, PostgresStore
 
 
 class DummyPool:

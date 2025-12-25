@@ -343,9 +343,3 @@ class VoiceService:
         Assumes ~16kbps for typical speech audio.
         """
         return max(1000, len(audio_bytes) * 8 // 16)
-
-    async def close(self) -> None:
-        """Close the HTTP client."""
-        if self._client:
-            await self._client.aclose()
-            self._client = None

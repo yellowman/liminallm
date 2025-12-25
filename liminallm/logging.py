@@ -147,6 +147,7 @@ _SENSITIVE_ERROR_PATTERNS = [
 
 # Compiled patterns for performance
 import re
+
 _SENSITIVE_PATTERNS_COMPILED = [re.compile(p) for p in _SENSITIVE_ERROR_PATTERNS]
 
 # Keys that should be redacted in response data

@@ -33,7 +33,7 @@ def admin_user(client):
     )
     assert response.status_code == 201, f"Signup failed: {response.text}"
     user_id = response.json()["data"]["user_id"]
-    access_token = response.json()["data"]["access_token"]
+    response.json()["data"]["access_token"]
 
     # Promote to admin via direct store access (in tests only)
     runtime = get_runtime()

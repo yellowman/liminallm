@@ -5,13 +5,12 @@ import base64
 import hashlib
 import json
 import math
+import mimetypes
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path as FilePath
 from typing import Any, Dict, Optional
 from uuid import uuid4
-
-import mimetypes
 
 from fastapi import (
     APIRouter,
@@ -101,15 +100,14 @@ from liminallm.logging import get_logger
 from liminallm.service.auth import AuthContext
 from liminallm.service.errors import BadRequestError, NotFoundError
 from liminallm.service.fs import (
-    safe_join,
     PathTraversalError,
     generate_signed_url,
+    safe_join,
     validate_signed_url,
 )
 from liminallm.service.runtime import (
     IDEMPOTENCY_TTL_SECONDS,
     _acquire_idempotency_slot,
-    _get_cached_idempotency_record,
     _set_cached_idempotency_record,
     check_rate_limit,
     get_runtime,
