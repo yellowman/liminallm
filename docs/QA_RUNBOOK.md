@@ -5,11 +5,11 @@ This runbook documents the quality assurance process for validating LiminalLM re
 ## Quick Start
 
 ```bash
-# Run all QA checks (requires Docker)
-make qa
+# Native (no Docker) - recommended for most testing
+make qa-unit
 
-# Run unit tests only (no Docker)
-make test
+# With Docker
+make qa
 
 # Run smoke tests against running instance
 ./scripts/smoke_test.sh http://localhost:8000
@@ -17,9 +17,38 @@ make test
 
 ## Pre-requisites
 
+### Native Testing (No Docker)
+
 - Python 3.11+
-- Docker and Docker Compose (for integration tests)
 - curl and jq (for smoke tests)
+- No external dependencies required - uses in-memory stores
+
+### Docker Testing
+
+- Docker and Docker Compose
+- curl and jq (for smoke tests)
+
+## Native Testing Quick Start
+
+Most QA testing can be done without Docker using in-memory stores:
+
+```bash
+# 1. Install dependencies
+pip install -e ".[dev]"
+
+# 2. Run all unit and integration tests (in-memory mode)
+TEST_MODE=true USE_MEMORY_STORE=true pytest tests/ -v
+
+# 3. Start server for manual testing
+export JWT_SECRET="Test-Secret-Key-4-Testing-Only-Do-Not-Use-In-Production!"
+export SHARED_FS_ROOT="/tmp/liminallm-data"
+export USE_MEMORY_STORE=true
+export TEST_MODE=true
+uvicorn liminallm.app:app --reload --host 0.0.0.0 --port 8000
+
+# 4. Run smoke tests (in another terminal)
+./scripts/smoke_test.sh http://localhost:8000
+```
 
 ## QA Procedure
 
@@ -89,7 +118,9 @@ curl -s -X POST "$BASE_URL/v1/chat" \
 - Signup returns access_token
 - Chat returns status: ok
 
-### Step 5: Integration Tests with PostgreSQL
+### Step 5: Integration Tests with PostgreSQL (Optional - Docker)
+
+Skip this step if you don't have Docker. The in-memory tests in Step 2 cover the same functionality.
 
 ```bash
 # Start PostgreSQL container
@@ -104,7 +135,24 @@ DATABASE_URL="postgresql://testuser:testpass@localhost:5433/liminallm_test" \
 docker compose -f docker-compose.test.yml down -v
 ```
 
-### Step 6: Full Docker Compose Test
+### Step 5 (Native Alternative): Integration Tests with Local PostgreSQL
+
+If you have PostgreSQL installed locally without Docker:
+
+```bash
+# Create test database
+sudo -u postgres psql -c "CREATE DATABASE liminallm_test;"
+sudo -u postgres psql -d liminallm_test -c "CREATE EXTENSION IF NOT EXISTS vector;"
+sudo -u postgres psql -d liminallm_test -c "CREATE EXTENSION IF NOT EXISTS citext;"
+
+# Run tests
+DATABASE_URL="postgresql://postgres@localhost:5432/liminallm_test" \
+    pytest tests/ -v
+```
+
+### Step 6: Full Docker Compose Test (Optional - Docker)
+
+Skip this step if you don't have Docker. Steps 2-4 and Step 7+ work natively.
 
 ```bash
 # Build and start all services

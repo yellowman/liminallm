@@ -151,7 +151,13 @@ This automatically:
 - Serves the chat UI at `http://localhost:8000/`
 - Serves the admin console at `http://localhost:8000/admin`
 
-### Option 2: Local Development
+### Option 2: Native Deployment (No Docker)
+
+For running directly on a Linux host without containers.
+
+#### Quick Start (In-Memory Mode)
+
+For development and testing without external dependencies:
 
 ```bash
 # Install dependencies
@@ -160,40 +166,72 @@ pip install -e ".[dev]"
 # Set required environment variables
 export JWT_SECRET="YourSecure-JWT-Secret-With-32-Characters!"
 export SHARED_FS_ROOT="/tmp/liminallm"
-export USE_MEMORY_STORE=true  # Skip Postgres/Redis for quick testing
+export USE_MEMORY_STORE=true
+export TEST_MODE=true
 
 # Start the API server
-uvicorn liminallm.app:app --reload
+uvicorn liminallm.app:app --reload --host 0.0.0.0 --port 8000
 
 # Verify health
 curl http://localhost:8000/healthz
-
-# Bootstrap an admin user
-ADMIN_EMAIL=admin@test.local ADMIN_PASSWORD=TestAdmin123! \
-  python scripts/bootstrap_admin.py
 ```
 
-### Option 3: With PostgreSQL and Redis
+#### Production (With PostgreSQL and Redis)
+
+For persistent storage and production use:
 
 ```bash
-# Install dependencies
+# 1. Install system dependencies
+sudo apt update
+sudo apt install -y python3.11 python3.11-venv postgresql-16 redis-server libpq-dev gcc
+
+# 2. Install PostgreSQL extensions
+sudo -u postgres psql -c "CREATE DATABASE liminallm;"
+sudo -u postgres psql -c "CREATE USER liminallm WITH PASSWORD 'yourpassword';"
+sudo -u postgres psql -d liminallm -c "CREATE EXTENSION IF NOT EXISTS vector;"
+sudo -u postgres psql -d liminallm -c "CREATE EXTENSION IF NOT EXISTS citext;"
+sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE liminallm TO liminallm;"
+
+# 3. Create Python environment and install
+python3.11 -m venv .venv
+source .venv/bin/activate
 pip install -e ".[dev]"
 
-# Set environment variables
-export DATABASE_URL="postgresql://user:pass@localhost:5432/liminallm"
+# 4. Create data directories
+sudo mkdir -p /srv/liminallm/{adapters,artifacts,models,users}
+sudo chown -R $USER:$USER /srv/liminallm
+
+# 5. Set environment variables
+export DATABASE_URL="postgresql://liminallm:yourpassword@localhost:5432/liminallm"
 export REDIS_URL="redis://localhost:6379/0"
 export JWT_SECRET="YourSecure-JWT-Secret-With-32-Characters!"
 export SHARED_FS_ROOT="/srv/liminallm"
 
-# Run migrations
+# 6. Run database migrations
 ./scripts/migrate.sh
 
-# Bootstrap admin
+# 7. Bootstrap admin user
 python scripts/bootstrap_admin.py --email admin@test.local --password TestAdmin123!
 
-# Start the server
-uvicorn liminallm.app:app --host 0.0.0.0 --port 8000
+# 8. Start the server
+uvicorn liminallm.app:app --host 0.0.0.0 --port 8000 --workers 4
 ```
+
+#### Running Tests (Native)
+
+```bash
+# Run all tests in memory mode
+TEST_MODE=true USE_MEMORY_STORE=true pytest tests/ -v
+
+# Run specific test suites
+pytest tests/test_post_smoke.py -v  # Post-smoke tests
+pytest tests/test_integration_admin.py -v  # Admin tests
+
+# Run smoke tests
+./scripts/smoke_test.sh http://localhost:8000
+```
+
+See `docs/DEPLOYMENT.md` for complete native deployment documentation including systemd services, TLS setup, and GPU configuration.
 
 ---
 
