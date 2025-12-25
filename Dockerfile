@@ -71,6 +71,6 @@ USER liminallm
 EXPOSE 8000
 
 # Use uvicorn with production settings
-CMD ["python", "-m", "uvicorn", "liminallm.api.routes:app", \
+CMD ["python", "-m", "uvicorn", "liminallm.app:app", \
      "--host", "0.0.0.0", "--port", "8000", \
-     "--workers", "4", "--loop", "uvloop", "--http", "httptools"]
+     "--workers", "4"]

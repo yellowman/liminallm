@@ -60,7 +60,15 @@ class Session:
         meta: Dict | None = None,
     ) -> "Session":
         now = datetime.now(timezone.utc)
-        parsed_ip = ip_address(ip_addr) if isinstance(ip_addr, str) else ip_addr
+        parsed_ip = None
+        if isinstance(ip_addr, str):
+            try:
+                parsed_ip = ip_address(ip_addr)
+            except ValueError:
+                # Invalid IP address (e.g., "testclient" in tests) - leave as None
+                parsed_ip = None
+        elif ip_addr is not None:
+            parsed_ip = ip_addr
         return cls(
             id=str(uuid.uuid4()),
             user_id=user_id,

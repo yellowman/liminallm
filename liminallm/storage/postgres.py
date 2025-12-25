@@ -44,7 +44,7 @@ from liminallm.storage.cursors import (
     decode_index_cursor,
     decode_time_id_cursor,
 )
-from liminallm.errors import NotFoundError
+from liminallm.service.errors import NotFoundError
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
     AdapterRouterState,

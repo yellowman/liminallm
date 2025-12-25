@@ -127,7 +127,7 @@ class TestAdminSettings:
 
     def test_admin_can_update_settings(self, client, admin_user):
         """Test that admin can update system settings."""
-        response = client.patch(
+        response = client.put(
             "/v1/admin/settings",
             headers=admin_user["headers"],
             json={"default_page_size": 50},

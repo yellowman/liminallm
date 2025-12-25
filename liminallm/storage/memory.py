@@ -16,7 +16,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 from cryptography.fernet import Fernet, InvalidToken
 
 from liminallm.content_struct import normalize_content_struct
-from liminallm.errors import NotFoundError
+from liminallm.service.errors import NotFoundError
 from liminallm.logging import get_logger
 from liminallm.service.artifact_validation import (
     ArtifactValidationError,
