@@ -14,7 +14,7 @@ services:
       - "${HOST_PORT:-8000}:8000"
     environment:
       # Database
-      DATABASE_URL: postgres://liminallm:${POSTGRES_PASSWORD}@postgres:5432/liminallm
+      DATABASE_URL: postgresql://liminallm:${POSTGRES_PASSWORD}@postgres:5432/liminallm
       # Redis (with authentication)
       REDIS_URL: redis://:${REDIS_PASSWORD:-changeme}@redis:6379/0
       # Storage

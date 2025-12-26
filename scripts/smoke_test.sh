@@ -284,6 +284,35 @@ test_file_upload() {
     fi
 }
 
+test_file_limits() {
+    run_test "File limits endpoint"
+
+    local response
+    local http_code
+    local tmpfile
+    tmpfile=$(mktemp)
+
+    http_code=$(curl -s -w "%{http_code}" -o "$tmpfile" -X GET "$BASE_URL/v1/files/limits" \
+        -H "Authorization: Bearer $USER_ACCESS_TOKEN" 2>&1)
+
+    response=$(cat "$tmpfile")
+    rm -f "$tmpfile"
+
+    if [ "$http_code" = "200" ]; then
+        # Verify response contains expected fields
+        if echo "$response" | grep -q "allowed_extensions"; then
+            log_pass "File limits endpoint returns allowed_extensions"
+            return 0
+        else
+            log_fail "File limits response missing allowed_extensions: $response"
+            return 1
+        fi
+    else
+        log_fail "File limits failed with status $http_code: $response"
+        return 1
+    fi
+}
+
 test_admin_settings_protected() {
     run_test "Admin settings protected from regular user"
 
@@ -381,6 +410,7 @@ main() {
     test_create_conversation || true
     test_chat_message || true
     test_file_upload || true
+    test_file_limits || true
     test_list_artifacts || true
     test_admin_settings_protected || true
     test_admin_settings_accessible || true
