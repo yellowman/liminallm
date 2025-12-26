@@ -48,6 +48,16 @@ async def bootstrap_admin(email: str, password: str, dry_run: bool = False) -> d
 
     runtime = get_runtime()
 
+    # Sync MODEL_BACKEND env var to system_settings (if set)
+    # This ensures runtime uses the env value instead of DB default
+    desired_backend = os.environ.get("MODEL_BACKEND")
+    if desired_backend and not dry_run:
+        current_settings = runtime.store.get_system_settings()
+        if current_settings.get("model_backend") != desired_backend:
+            current_settings["model_backend"] = desired_backend
+            runtime.store.set_system_settings(current_settings)
+            print(f"Set system_settings.model_backend = {desired_backend}")
+
     # Check if user already exists
     existing_user = runtime.store.get_user_by_email(email)
 

@@ -102,6 +102,8 @@ services:
       ADMIN_EMAIL: admin@test.local
       ADMIN_PASSWORD: TestAdmin123!
       SHARED_FS_ROOT: /srv/liminallm
+      # Sync MODEL_BACKEND to system_settings during bootstrap
+      MODEL_BACKEND: stub
     command: ["python", "/app/scripts/bootstrap_admin.py"]
     depends_on:
       migrate:
