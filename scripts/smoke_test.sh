@@ -233,8 +233,8 @@ test_chat_message() {
     local tmpfile
     tmpfile=$(mktemp)
 
-    # Note: This may fail if no LLM backend is configured, which is expected
     # ChatRequest schema requires: conversation_id, message: {content, mode}, stream
+    # With MODEL_BACKEND=stub, this should always return 200 with a canned response
     http_code=$(curl -s -w "%{http_code}" -o "$tmpfile" -X POST "$BASE_URL/v1/chat" \
         -H "Authorization: Bearer $USER_ACCESS_TOKEN" \
         -H "Content-Type: application/json" \
@@ -243,10 +243,15 @@ test_chat_message() {
     response=$(cat "$tmpfile")
     rm -f "$tmpfile"
 
-    # Accept 200 (success) or 503 (no LLM backend configured)
-    # Do NOT accept 422 - that indicates a malformed request which is a test bug
-    if [ "$http_code" = "200" ] || [ "$http_code" = "503" ]; then
-        log_pass "Chat endpoint reachable (status: $http_code)"
+    # Require 200 - stub backend should always succeed
+    # Do NOT accept 422 (malformed request) or 503 (no backend)
+    if [ "$http_code" = "200" ]; then
+        # Verify response contains content from stub backend
+        if echo "$response" | grep -q "stub response"; then
+            log_pass "Chat endpoint returned stub response (status: 200)"
+        else
+            log_pass "Chat endpoint successful (status: 200)"
+        fi
         return 0
     else
         log_fail "Chat request failed with status $http_code: $response"

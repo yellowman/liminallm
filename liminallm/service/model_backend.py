@@ -279,6 +279,48 @@ class ModelBackend(Protocol):
         ...
 
 
+class StubBackend:
+    """Stub backend for testing - returns deterministic canned responses.
+
+    Used with MODEL_BACKEND=stub to enable smoke tests without a real LLM.
+    """
+
+    mode = "stub"
+
+    STUB_RESPONSE = "This is a stub response for testing purposes."
+
+    def generate(
+        self,
+        messages: List[dict],
+        adapters: List[dict],
+        *,
+        user_id: Optional[str] = None,
+    ) -> dict:
+        return {
+            "content": self.STUB_RESPONSE,
+            "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+        }
+
+    def generate_stream(
+        self,
+        messages: List[dict],
+        adapters: List[dict],
+        *,
+        user_id: Optional[str] = None,
+    ) -> Iterator[dict]:
+        # Yield tokens one word at a time
+        words = self.STUB_RESPONSE.split()
+        for word in words:
+            yield {"event": "token", "data": word + " "}
+        yield {
+            "event": "message_done",
+            "data": {
+                "content": self.STUB_RESPONSE,
+                "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+            },
+        }
+
+
 @dataclass(frozen=True)
 class AdapterPlug:
     """Describes a pluggable adapter backend."""

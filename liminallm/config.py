@@ -34,6 +34,8 @@ class ModelBackend(str, Enum):
     ADAPTER_SERVER = "adapter_server"
     SAGEMAKER = "sagemaker"
     AWS_SAGEMAKER = "aws_sagemaker"
+    # Stub backend for testing - returns canned responses
+    STUB = "stub"
 
 
 class RagMode(str, Enum):

@@ -54,9 +54,8 @@ services:
       # Admin bootstrap credentials
       ADMIN_EMAIL: admin@test.local
       ADMIN_PASSWORD: TestAdmin123!
-      # Model backend (use openai-compatible for testing)
-      MODEL_BACKEND: openai
-      MODEL_PATH: gpt-4o-mini
+      # Model backend (use stub for deterministic testing without real LLM)
+      MODEL_BACKEND: stub
       # Disable email verification for easier testing
       REQUIRE_EMAIL_VERIFICATION: "false"
       # Disable MFA for easier testing
