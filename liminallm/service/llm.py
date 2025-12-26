@@ -8,6 +8,7 @@ from liminallm.service.model_backend import (
     ApiAdapterBackend,
     LocalJaxLoRABackend,
     ModelBackend,
+    StubBackend,
 )
 from liminallm.storage.models import Message
 
@@ -170,6 +171,9 @@ class LLMService:
         fs_root: Optional[str],
     ) -> ModelBackend:
         mode = (backend_mode or "openai").lower()
+        # Stub backend for testing - returns canned responses
+        if mode == "stub":
+            return StubBackend()
         plug = self._resolve_plug(mode)
         if plug:
             plug_config = self.adapter_configs.get(plug.key, {})

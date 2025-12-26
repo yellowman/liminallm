@@ -25,8 +25,12 @@ make qa
 
 ### Docker Testing
 
-- Docker and Docker Compose
+- Docker Engine 20.10+
+- Docker Compose v2.1+ (required for `--wait` flag used in Makefile targets)
 - curl and jq (for smoke tests)
+
+Check your Compose version with `docker compose version`. If you have an older version,
+either upgrade or use the native testing path which doesn't require Docker.
 
 ## Native Testing Quick Start
 
@@ -123,9 +127,8 @@ curl -s -X POST "$BASE_URL/v1/chat" \
 Skip this step if you don't have Docker. The in-memory tests in Step 2 cover the same functionality.
 
 ```bash
-# Start PostgreSQL and Redis containers (credentials match docker-compose.test.yml)
-docker compose -f docker-compose.test.yml up -d postgres redis
-sleep 5
+# Start PostgreSQL and Redis containers (--wait ensures health checks pass)
+docker compose -f docker-compose.test.yml up -d --wait postgres redis
 
 # Run migrations to create tables
 docker compose -f docker-compose.test.yml run --rm migrate
@@ -165,9 +168,8 @@ DATABASE_URL="postgresql://postgres@localhost:5432/liminallm_test" \
 Skip this step if you don't have Docker. Steps 2-4 and Step 7+ work natively.
 
 ```bash
-# Build and start all services
-docker compose -f docker-compose.test.yml up --build -d
-sleep 10
+# Build and start all services (--wait ensures all health checks pass)
+docker compose -f docker-compose.test.yml up --build -d --wait
 
 # Run smoke tests
 ./scripts/smoke_test.sh http://localhost:8000

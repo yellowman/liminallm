@@ -7,7 +7,7 @@
 #   make dev       - Start development server
 #   make docker    - Build and test with Docker
 
-.PHONY: help install test lint security qa dev docker clean
+.PHONY: help install test lint security qa dev docker clean docker-clean
 
 # Default target
 help:
@@ -24,6 +24,7 @@ help:
 	@echo "  make docker     Build and run with docker-compose"
 	@echo "  make smoke      Run smoke tests against localhost:8000"
 	@echo "  make clean      Remove build artifacts"
+	@echo "  make docker-clean  Remove test containers/volumes"
 
 # Environment variables for testing
 export TEST_MODE := true
@@ -42,15 +43,17 @@ test:
 
 # Run tests with PostgreSQL (requires docker-compose)
 # Credentials must match docker-compose.test.yml
+# Uses trap to ensure cleanup runs even if tests fail
 test-pg:
-	docker compose -f docker-compose.test.yml up -d postgres redis
-	sleep 5
-	docker compose -f docker-compose.test.yml run --rm migrate
-	USE_MEMORY_STORE=false \
-	DATABASE_URL="postgresql://liminallm:testpassword123@localhost:5433/liminallm_test" \
-	REDIS_URL="redis://localhost:6380/0" \
-		python -m pytest tests/ -v --tb=short
-	docker compose -f docker-compose.test.yml down
+	@bash -c '\
+		trap "docker compose -f docker-compose.test.yml down" EXIT; \
+		docker compose -f docker-compose.test.yml up -d --wait postgres redis && \
+		docker compose -f docker-compose.test.yml run --rm migrate && \
+		USE_MEMORY_STORE=false \
+		DATABASE_URL="postgresql://liminallm:testpassword123@localhost:5433/liminallm_test" \
+		REDIS_URL="redis://localhost:6380/0" \
+		python -m pytest tests/ -v --tb=short \
+	'
 
 # Lint with ruff (auto-fix safe issues)
 lint:
@@ -85,14 +88,20 @@ smoke:
 	./scripts/smoke_test.sh http://localhost:8000
 
 # Build and test with Docker
+# Uses trap to ensure cleanup runs even if tests fail
 docker:
-	docker compose -f docker-compose.test.yml up --build -d
-	sleep 10
-	./scripts/smoke_test.sh http://localhost:8000
-	docker compose -f docker-compose.test.yml down -v
+	@bash -c '\
+		trap "docker compose -f docker-compose.test.yml down -v" EXIT; \
+		docker compose -f docker-compose.test.yml up --build -d --wait && \
+		./scripts/smoke_test.sh http://localhost:8000 \
+	'
 
 # Clean build artifacts
 clean:
 	rm -rf .pytest_cache __pycache__ *.egg-info dist build
 	find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 	find . -type f -name "*.pyc" -delete 2>/dev/null || true
+
+# Clean up Docker test containers and volumes (useful after interrupted tests)
+docker-clean:
+	docker compose -f docker-compose.test.yml down -v --remove-orphans 2>/dev/null || true
