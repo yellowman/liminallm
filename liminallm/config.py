@@ -21,6 +21,7 @@ class ModelBackend(str, Enum):
     """Accepted model backend modes as defined in SPEC §5."""
 
     OPENAI = "openai"
+    ANTHROPIC = "anthropic"
     AZURE = "azure"
     AZURE_OPENAI = "azure_openai"
     AZURE_OPENAI_ALT = AZURE_OPENAI
@@ -34,6 +35,10 @@ class ModelBackend(str, Enum):
     ADAPTER_SERVER = "adapter_server"
     SAGEMAKER = "sagemaker"
     AWS_SAGEMAKER = "aws_sagemaker"
+    # Zhipu AI GLM models (glm-4, glm-4-plus, etc.)
+    ZHIPU = "zhipu"
+    ZHIPU_AI = "zhipu.ai"
+    GLM = "glm"
     # Stub backend for testing - returns canned responses
     STUB = "stub"
 
