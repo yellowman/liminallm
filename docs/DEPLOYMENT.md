@@ -16,7 +16,7 @@ set env vars before boot:
 - database: `DATABASE_URL` (example: `postgres://liminallm:<password>@postgres:5432/liminallm`).
 - redis: `REDIS_URL` (example: `redis://:<password>@redis:6379/0`).
 - secrets: `JWT_SECRET` (required), `JWT_ISSUER`/`JWT_AUDIENCE` (optional defaults exist).
-- model backend: `MODEL_BACKEND` (defaults to `openai`), `MODEL_PATH` for local base models, adapter keys like `ADAPTER_OPENAI_API_KEY`/`ADAPTER_OPENAI_BASE_URL`, optional `VOICE_*`.
+- model backend: `MODEL_BACKEND` (defaults to `openai`), `MODEL_PATH` for local base models, adapter keys like `OPENAI_ADAPTER_API_KEY`/`OPENAI_ADAPTER_BASE_URL`, optional `VOICE_*`.
 - routing/limits: `CHAT_RATE_LIMIT_PER_MINUTE`, `RESET_RATE_LIMIT_PER_MINUTE`.
 - smtp/oauth: `SMTP_*`, `OAUTH_*` if needed.
 - ports: `HOST_PORT` (compose host), `PORT` (app listen).
@@ -145,7 +145,7 @@ MODEL_BACKEND="openai"
 # MODEL_PATH="/srv/liminallm/models/your-model"
 
 # API keys (if using openai backend)
-ADAPTER_OPENAI_API_KEY="sk-..."
+OPENAI_ADAPTER_API_KEY="sk-..."
 
 # Rate limits
 CHAT_RATE_LIMIT_PER_MINUTE=60
@@ -329,7 +329,7 @@ make qa-unit
 - the base model remains immutable; training writes only adapter weights.
 
 ### api backend (remote inference)
-- set `MODEL_BACKEND=openai` (default) or another provider hook; set `ADAPTER_OPENAI_API_KEY`/`ADAPTER_OPENAI_BASE_URL` or peer keys for your provider.
+- set `MODEL_BACKEND=openai` (default) or another provider hook; set `OPENAI_ADAPTER_API_KEY`/`OPENAI_ADAPTER_BASE_URL` or peer keys for your provider.
 - calls go out to the remote model id you pass as `base_model`; adapters travel as ids or prompt patches when the provider supports multi-lora/prompt layering.
 - scenarios:
   - **managed foundation only**: set `base_model` to the provider model, omit adapters for pure hosted inference.
