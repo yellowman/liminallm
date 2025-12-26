@@ -3206,13 +3206,35 @@ async def update_system_settings(
                 f"{key} must be a string",
                 status_code=400,
             )
+        # Rate limit keys that accept 0 (meaning "disabled/unlimited")
+        rate_limit_keys = {
+            "chat_rate_limit_per_minute",
+            "login_rate_limit_per_minute",
+            "refresh_rate_limit_per_minute",
+            "signup_rate_limit_per_minute",
+            "reset_rate_limit_per_minute",
+            "mfa_rate_limit_per_minute",
+            "admin_rate_limit_per_minute",
+            "files_upload_rate_limit_per_minute",
+            "configops_rate_limit_per_hour",
+            "read_rate_limit_per_minute",
+        }
         # Validate positive values for numeric settings
-        if key in int_keys and isinstance(value, int) and value <= 0:
-            raise _http_error(
-                "validation_error",
-                f"{key} must be positive",
-                status_code=400,
-            )
+        # Rate limit keys allow 0 (disabled), but not negative
+        if key in int_keys and isinstance(value, int):
+            if key in rate_limit_keys:
+                if value < 0:
+                    raise _http_error(
+                        "validation_error",
+                        f"{key} must be non-negative (0 = disabled/unlimited)",
+                        status_code=400,
+                    )
+            elif value <= 0:
+                raise _http_error(
+                    "validation_error",
+                    f"{key} must be positive",
+                    status_code=400,
+                )
         if key in float_keys and isinstance(value, (int, float)) and value <= 0:
             raise _http_error(
                 "validation_error",
@@ -3242,6 +3264,19 @@ async def update_system_settings(
         updated_keys=list(body.keys()),
     )
     return Envelope(status="ok", data=updated)
+
+
+@router.patch("/admin/settings", response_model=Envelope, tags=["admin"])
+async def patch_system_settings(
+    body: dict,
+    principal: AuthContext = Depends(get_admin_user),
+):
+    """Partial update of admin-managed system settings.
+
+    Alias for PUT - both methods perform partial updates (only provided keys are changed).
+    PATCH is provided for REST convention compatibility with frontend clients.
+    """
+    return await update_system_settings(body, principal)
 
 
 @router.get("/files/limits", response_model=Envelope, tags=["files"])

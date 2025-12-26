@@ -135,6 +135,18 @@ class TestAdminSettings:
 
         assert response.status_code == 200
 
+    def test_admin_can_patch_settings(self, client, admin_user):
+        """Test that admin can patch system settings (partial update)."""
+        response = client.patch(
+            "/v1/admin/settings",
+            headers=admin_user["headers"],
+            json={"default_page_size": 75},
+        )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["data"]["default_page_size"] == 75
+
     def test_regular_user_cannot_get_admin_settings(self, client, regular_user):
         """Test that regular users cannot access admin settings."""
         response = client.get("/v1/admin/settings", headers=regular_user["headers"])

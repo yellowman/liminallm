@@ -168,7 +168,7 @@ class Runtime:
             sys_settings.get("voice_default_voice") or self.settings.voice_default_voice
         )
         app_base_url = sys_settings.get("app_base_url") or self.settings.app_base_url
-        rag_chunk_size = sys_settings.get("rag_chunk_size") or self.settings.rag_chunk_size
+        rag_chunk_size = sys_settings.get("rag_chunk_size", 400)
 
         self.router = RouterEngine(cache=self.cache, backend_mode=backend_mode)
         adapter_configs = {
