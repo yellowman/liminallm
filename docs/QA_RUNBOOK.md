@@ -127,6 +127,9 @@ Skip this step if you don't have Docker. The in-memory tests in Step 2 cover the
 docker compose -f docker-compose.test.yml up -d postgres redis
 sleep 5
 
+# Run migrations to create tables
+docker compose -f docker-compose.test.yml run --rm migrate
+
 # Run tests with real database (must disable memory store)
 USE_MEMORY_STORE=false \
 DATABASE_URL="postgresql://liminallm:testpassword123@localhost:5433/liminallm_test" \
@@ -146,6 +149,10 @@ If you have PostgreSQL installed locally without Docker:
 sudo -u postgres psql -c "CREATE DATABASE liminallm_test;"
 sudo -u postgres psql -d liminallm_test -c "CREATE EXTENSION IF NOT EXISTS vector;"
 sudo -u postgres psql -d liminallm_test -c "CREATE EXTENSION IF NOT EXISTS citext;"
+
+# Run migrations to create tables
+DATABASE_URL="postgresql://postgres@localhost:5432/liminallm_test" \
+    ./scripts/migrate.sh
 
 # Run tests (must disable memory store)
 USE_MEMORY_STORE=false \
