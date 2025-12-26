@@ -45,6 +45,7 @@ test:
 test-pg:
 	docker compose -f docker-compose.test.yml up -d postgres redis
 	sleep 5
+	docker compose -f docker-compose.test.yml run --rm migrate
 	USE_MEMORY_STORE=false \
 	DATABASE_URL="postgresql://liminallm:testpassword123@localhost:5433/liminallm_test" \
 	REDIS_URL="redis://localhost:6380/0" \

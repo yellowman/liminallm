@@ -3,7 +3,8 @@
 #
 # Known test credentials (after bootstrap):
 #   Admin: admin@test.local / TestAdmin123!
-#   User:  user@test.local / TestUser123!
+#
+# Note: Regular users are created via signup during tests (smoke_test.sh creates one)
 
 services:
   postgres:
