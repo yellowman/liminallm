@@ -3171,7 +3171,7 @@ async def update_system_settings(
         "model_backend": {
             "openai", "azure", "azure_openai", "vertex", "gemini", "google",
             "bedrock", "together", "together.ai", "lorax", "adapter_server",
-            "sagemaker", "aws_sagemaker",
+            "sagemaker", "aws_sagemaker", "stub",  # stub is for testing only
         },
         "default_adapter_mode": {"local", "remote", "prompt", "hybrid"},
         "embedding_model_id": {
