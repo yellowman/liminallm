@@ -13,7 +13,7 @@ api backends (remote inference). you can run them side by side.
 
 ## config cheatsheet
 set env vars before boot:
-- database: `DATABASE_URL` (example: `postgres://liminallm:<password>@postgres:5432/liminallm`).
+- database: `DATABASE_URL` (example: `postgresql://liminallm:<password>@postgres:5432/liminallm`).
 - redis: `REDIS_URL` (example: `redis://:<password>@redis:6379/0`).
 - secrets: `JWT_SECRET` (required), `JWT_ISSUER`/`JWT_AUDIENCE` (optional defaults exist).
 - model backend: `MODEL_BACKEND` (defaults to `openai`), `MODEL_PATH` for local base models, adapter keys like `OPENAI_ADAPTER_API_KEY`/`OPENAI_ADAPTER_BASE_URL`, optional `VOICE_*`.
