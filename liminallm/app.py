@@ -250,6 +250,19 @@ app.include_router(router)
 
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "frontend"
+
+
+@app.middleware("http")
+async def block_direct_admin_access(request: Request, call_next):
+    """Block direct access to /static/admin.html - use /admin route instead."""
+    if request.url.path == "/static/admin.html":
+        return JSONResponse(
+            status_code=403,
+            content={"detail": "Use /admin route for admin UI"},
+        )
+    return await call_next(request)
+
+
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=STATIC_DIR, html=False), name="static")
 else:
