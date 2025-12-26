@@ -100,7 +100,7 @@ app.add_middleware(
     allow_origins=_allowed_origins(),
     allow_credentials=_allow_credentials(),
     # Restrict to only required HTTP methods
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     # Restrict to only required headers
     allow_headers=[
         "Content-Type",
