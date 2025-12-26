@@ -9,10 +9,10 @@ import os
 import secrets
 import time
 import uuid
-from urllib.parse import urlparse
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional, Protocol, Tuple
+from urllib.parse import urlparse
 
 import httpx
 from argon2 import PasswordHasher, Type

@@ -3,9 +3,10 @@
 Tests that rate limiting is properly applied to protected endpoints.
 """
 
+from unittest.mock import AsyncMock, patch
+
 import pytest
 from fastapi.testclient import TestClient
-from unittest.mock import patch, AsyncMock
 
 from liminallm import app as app_module
 
@@ -137,8 +138,8 @@ class TestRateLimitErrorResponse:
         """Test that rate limit exceeded returns 429."""
         # Patch where check_rate_limit is used, not where it's defined
         with patch("liminallm.api.routes.check_rate_limit", new_callable=AsyncMock) as mock_check:
-            # Simulate rate limit exceeded - return tuple (allowed=False, remaining=0)
-            mock_check.return_value = (False, 0)
+            # Simulate rate limit exceeded - return tuple (allowed=False, remaining=0, reset_after=60)
+            mock_check.return_value = (False, 0, 60)
 
             response = client.get("/v1/artifacts", headers=auth_headers)
 
@@ -148,7 +149,7 @@ class TestRateLimitErrorResponse:
     def test_rate_limit_error_has_proper_format(self, client, auth_headers):
         """Test that rate limit error has proper JSON format."""
         with patch("liminallm.api.routes.check_rate_limit", new_callable=AsyncMock) as mock_check:
-            mock_check.return_value = (False, 0)
+            mock_check.return_value = (False, 0, 60)
 
             response = client.get("/v1/artifacts", headers=auth_headers)
 

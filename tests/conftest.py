@@ -11,7 +11,7 @@ os.environ.setdefault("SHARED_FS_ROOT", _test_tmp_dir)
 os.environ.setdefault("TEST_MODE", "true")
 os.environ.setdefault("USE_MEMORY_STORE", "true")
 os.environ.setdefault("ALLOW_REDIS_FALLBACK_DEV", "true")
-os.environ.setdefault("JWT_SECRET", "test-secret-key-for-testing-only-do-not-use-in-production")
+os.environ.setdefault("JWT_SECRET", "Test-Secret-Key-4-Testing-Only-Do-Not-Use-In-Production!")
 # Use Redis in tests via SyncRedisCache to avoid async event loop issues
 # Falls back to in-memory if Redis is not available (via ALLOW_REDIS_FALLBACK_DEV)
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/1")
@@ -25,7 +25,6 @@ if str(ROOT) not in sys.path:
 
 
 from liminallm.service.runtime import reset_runtime_for_tests  # noqa: E402
-
 
 # Avoid import-time failures for routes that rely on python-multipart in constrained test environments.
 fastapi_dep_utils.ensure_multipart_is_installed = lambda: None

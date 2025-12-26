@@ -2,18 +2,16 @@
 
 from __future__ import annotations
 
-
 from liminallm.config import (
-    AdapterMode,
     BACKEND_ADAPTER_COMPATIBILITY,
     DEFAULT_PROVIDER_CAPABILITIES,
     PROVIDER_CAPABILITIES,
+    AdapterMode,
     ProviderCapabilities,
     RemoteStyle,
     get_compatible_adapter_modes,
     get_provider_capabilities,
 )
-
 
 # ==============================================================================
 # RemoteStyle Enum Tests

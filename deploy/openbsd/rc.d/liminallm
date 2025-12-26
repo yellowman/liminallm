@@ -13,7 +13,7 @@
 #   rcctl start liminallm
 
 daemon="/usr/local/bin/python3"
-daemon_flags="-m uvicorn liminallm.api.routes:app --host 127.0.0.1 --port 8000 --workers 4"
+daemon_flags="-m uvicorn liminallm.app:app --host 127.0.0.1 --port 8000 --workers 4"
 daemon_user="_liminallm"
 daemon_logger="daemon.info"
 

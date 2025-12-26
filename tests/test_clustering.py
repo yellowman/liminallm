@@ -1,8 +1,7 @@
+import asyncio
 import json
 
 from liminallm.service.clustering import SemanticClusterer
-import asyncio
-
 from liminallm.storage.models import PreferenceEvent, SemanticCluster
 
 

@@ -5,13 +5,12 @@ import base64
 import hashlib
 import json
 import math
+import mimetypes
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path as FilePath
 from typing import Any, Dict, Optional
 from uuid import uuid4
-
-import mimetypes
 
 from fastapi import (
     APIRouter,
@@ -23,6 +22,7 @@ from fastapi import (
     HTTPException,
     Path,
     Query,
+    Request,
     Response,
     UploadFile,
     WebSocket,
@@ -34,8 +34,6 @@ from liminallm.api.schemas import (
     AdminCreateUserRequest,
     AdminCreateUserResponse,
     AdminInspectionResponse,
-    AdminSettingsResponse,
-    AdminSettingsUpdateRequest,
     ArtifactListResponse,
     ArtifactPatchRequest,
     ArtifactRequest,
@@ -102,15 +100,14 @@ from liminallm.logging import get_logger
 from liminallm.service.auth import AuthContext
 from liminallm.service.errors import BadRequestError, NotFoundError
 from liminallm.service.fs import (
-    safe_join,
     PathTraversalError,
     generate_signed_url,
+    safe_join,
     validate_signed_url,
 )
 from liminallm.service.runtime import (
     IDEMPOTENCY_TTL_SECONDS,
     _acquire_idempotency_slot,
-    _get_cached_idempotency_record,
     _set_cached_idempotency_record,
     check_rate_limit,
     get_runtime,
@@ -1370,96 +1367,6 @@ async def admin_inspect_objects(
     summary = {k: len(v) for k, v in details.items()}
     return Envelope(
         status="ok", data=AdminInspectionResponse(summary=summary, details=details)
-    )
-
-
-@router.get("/admin/settings", response_model=Envelope, tags=["admin"])
-async def get_admin_settings(principal: AuthContext = Depends(get_admin_user)):
-    """Get current runtime settings configurable via admin UI.
-
-    Returns pagination limits, model settings, and other runtime configuration
-    that can be modified without restarting the server.
-    """
-    runtime = get_runtime()
-    await _enforce_rate_limit(
-        runtime,
-        f"admin:read:{principal.user_id}",
-        _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
-        _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
-    )
-    settings = get_settings()
-    runtime_config = (
-        runtime.store.get_runtime_config()
-        if hasattr(runtime.store, "get_runtime_config")
-        else {}
-    )
-
-    # Merge runtime config with env defaults (runtime config takes precedence)
-    return Envelope(
-        status="ok",
-        data=AdminSettingsResponse(
-            default_page_size=runtime_config.get("default_page_size", settings.default_page_size),
-            max_page_size=runtime_config.get("max_page_size", settings.max_page_size),
-            default_conversations_limit=runtime_config.get(
-                "default_conversations_limit", settings.default_conversations_limit
-            ),
-            model_backend=runtime_config.get("model_backend"),
-            model_path=runtime_config.get("model_path"),
-        ),
-    )
-
-
-@router.patch("/admin/settings", response_model=Envelope, tags=["admin"])
-async def update_admin_settings(
-    body: AdminSettingsUpdateRequest,
-    principal: AuthContext = Depends(get_admin_user),
-):
-    """Update runtime settings via admin UI.
-
-    Only provided fields are updated. Changes take effect immediately
-    without requiring a server restart.
-    """
-    runtime = get_runtime()
-    await _enforce_rate_limit(
-        runtime,
-        f"admin:settings:{principal.user_id}",
-        _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
-        _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
-    )
-
-    if not hasattr(runtime.store, "set_runtime_config"):
-        raise BadRequestError("runtime config update not supported by storage backend")
-
-    # Build update dict from non-None fields
-    update = {}
-    if body.default_page_size is not None:
-        update["default_page_size"] = body.default_page_size
-    if body.max_page_size is not None:
-        update["max_page_size"] = body.max_page_size
-    if body.default_conversations_limit is not None:
-        update["default_conversations_limit"] = body.default_conversations_limit
-    if body.model_backend is not None:
-        update["model_backend"] = body.model_backend
-    if body.model_path is not None:
-        update["model_path"] = body.model_path
-
-    if not update:
-        raise BadRequestError("no settings provided to update")
-
-    updated_config = runtime.store.set_runtime_config(update)
-    settings = get_settings()
-
-    return Envelope(
-        status="ok",
-        data=AdminSettingsResponse(
-            default_page_size=updated_config.get("default_page_size", settings.default_page_size),
-            max_page_size=updated_config.get("max_page_size", settings.max_page_size),
-            default_conversations_limit=updated_config.get(
-                "default_conversations_limit", settings.default_conversations_limit
-            ),
-            model_backend=updated_config.get("model_backend"),
-            model_path=updated_config.get("model_path"),
-        ),
     )
 
 

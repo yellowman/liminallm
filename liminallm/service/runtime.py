@@ -168,6 +168,7 @@ class Runtime:
             sys_settings.get("voice_default_voice") or self.settings.voice_default_voice
         )
         app_base_url = sys_settings.get("app_base_url") or self.settings.app_base_url
+        rag_chunk_size = sys_settings.get("rag_chunk_size") or self.settings.rag_chunk_size
 
         self.router = RouterEngine(cache=self.cache, backend_mode=backend_mode)
         adapter_configs = {
@@ -189,7 +190,7 @@ class Runtime:
         )
         self.rag = RAGService(
             self.store,
-            default_chunk_size=self.settings.rag_chunk_size,
+            default_chunk_size=rag_chunk_size,
             rag_mode=rag_mode,
             embed=self.embeddings.embed,
             embedding_model_id=embedding_model_id,
@@ -560,7 +561,7 @@ async def check_rate_limit(
             cost=cost,
         )
         return result
-    window = timedelta(seconds=window_seconds)
+    timedelta(seconds=window_seconds)
     refill_rate = float(limit) / float(window_seconds)
     async with runtime._local_rate_limit_lock:
         now = datetime.utcnow()

@@ -42,23 +42,290 @@ data directories under `SHARED_FS_ROOT` must be writable:
 3. health: `curl http://localhost:${HOST_PORT:-8000}/healthz` should yield `"ok"`.
 4. persistence: app data in `liminallm-data`, postgres in `postgres-data`, redis in `redis-data`; migrations from `sql/` apply on first boot.
 
-## option b: manual host (bare metal)
-1. install python 3.11, postgres client libs + pgvector, redis, build deps (`gcc`, `libpq-dev`).
-2. create venv + install: `python -m venv .venv && source .venv/bin/activate && pip install -e .`.
-3. prep storage: `mkdir -p /srv/liminallm` and give the service user ownership.
-4. databases:
-   - create the `liminallm` db/user; enable `vector` and `citext`.
-   - run migrations: `DATABASE_URL=postgres://liminallm:<password>@localhost:5432/liminallm ./scripts/migrate.sh`.
-5. run redis with `--requirepass` and set `REDIS_URL`.
-6. start api: `python -m uvicorn liminallm.api.routes:app --host 0.0.0.0 --port 8000 --workers 4`. static assets live under `/frontend`; readiness at `/healthz`.
-7. front-end: browse `http://<host>:8000/` (chat) and `/admin` (admin role needed). put tls in front via nginx or your proxy of choice.
+## option b: native deployment (bare metal / no docker)
+
+complete instructions for running liminallm directly on a linux host without containers.
+
+### step 1: system dependencies
+
+```bash
+# debian/ubuntu
+sudo apt update
+sudo apt install -y \
+    python3.11 python3.11-venv python3.11-dev \
+    postgresql-16 postgresql-16-pgvector \
+    redis-server \
+    gcc libpq-dev libffi-dev \
+    nginx certbot python3-certbot-nginx
+
+# rhel/rocky/alma
+sudo dnf install -y \
+    python3.11 python3.11-devel \
+    postgresql16-server postgresql16-pgvector \
+    redis \
+    gcc libpq-devel libffi-devel \
+    nginx certbot python3-certbot-nginx
+```
+
+### step 2: create service user
+
+```bash
+sudo useradd -r -m -d /srv/liminallm -s /bin/bash liminallm
+sudo mkdir -p /srv/liminallm/{adapters,artifacts,models,users,logs}
+sudo chown -R liminallm:liminallm /srv/liminallm
+```
+
+### step 3: postgresql setup
+
+```bash
+# start and enable postgresql
+sudo systemctl enable --now postgresql
+
+# create database and user
+sudo -u postgres psql << 'EOF'
+CREATE USER liminallm WITH PASSWORD 'your-secure-password';
+CREATE DATABASE liminallm OWNER liminallm;
+\c liminallm
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE EXTENSION IF NOT EXISTS citext;
+GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO liminallm;
+EOF
+
+# verify extensions
+sudo -u postgres psql -d liminallm -c "\dx"
+```
+
+### step 4: redis setup
+
+```bash
+# configure redis with password
+sudo tee /etc/redis/redis.conf.d/liminallm.conf << 'EOF'
+requirepass your-redis-password
+maxmemory 256mb
+maxmemory-policy allkeys-lru
+EOF
+
+sudo systemctl restart redis
+sudo systemctl enable redis
+```
+
+### step 5: application installation
+
+```bash
+# switch to service user
+sudo -u liminallm -i
+
+# clone and install
+cd /srv/liminallm
+git clone https://github.com/your-org/liminallm.git app
+cd app
+
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install -e ".[dev]"
+```
+
+### step 6: environment configuration
+
+```bash
+# create environment file
+sudo tee /srv/liminallm/.env << 'EOF'
+# Core
+JWT_SECRET="your-32-character-secure-secret-key-here!"
+SHARED_FS_ROOT="/srv/liminallm"
+
+# Database
+DATABASE_URL="postgresql://liminallm:your-secure-password@localhost:5432/liminallm"
+REDIS_URL="redis://:your-redis-password@localhost:6379/0"
+
+# Model backend (choose one)
+MODEL_BACKEND="openai"
+# MODEL_BACKEND="local_gpu_lora"
+# MODEL_PATH="/srv/liminallm/models/your-model"
+
+# API keys (if using openai backend)
+ADAPTER_OPENAI_API_KEY="sk-..."
+
+# Rate limits
+CHAT_RATE_LIMIT_PER_MINUTE=60
+RESET_RATE_LIMIT_PER_MINUTE=5
+
+# Optional: SMTP for email
+# SMTP_HOST="smtp.example.com"
+# SMTP_PORT=587
+# SMTP_USER="noreply@example.com"
+# SMTP_PASSWORD="..."
+EOF
+
+chmod 600 /srv/liminallm/.env
+```
+
+### step 7: database migrations
+
+```bash
+sudo -u liminallm -i
+cd /srv/liminallm/app
+source .venv/bin/activate
+source /srv/liminallm/.env
+
+./scripts/migrate.sh
+```
+
+### step 8: bootstrap admin user
+
+```bash
+python scripts/bootstrap_admin.py \
+    --email admin@yourdomain.com \
+    --password YourSecureAdminPassword123!
+```
+
+### step 9: systemd service
+
+```bash
+sudo tee /etc/systemd/system/liminallm.service << 'EOF'
+[Unit]
+Description=LiminalLM API Server
+After=network.target postgresql.service redis.service
+Requires=postgresql.service redis.service
+
+[Service]
+Type=simple
+User=liminallm
+Group=liminallm
+WorkingDirectory=/srv/liminallm/app
+EnvironmentFile=/srv/liminallm/.env
+ExecStart=/srv/liminallm/app/.venv/bin/uvicorn liminallm.app:app \
+    --host 127.0.0.1 \
+    --port 8000 \
+    --workers 4 \
+    --access-log \
+    --log-level info
+Restart=always
+RestartSec=5
+StandardOutput=append:/srv/liminallm/logs/app.log
+StandardError=append:/srv/liminallm/logs/error.log
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/srv/liminallm
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now liminallm
+sudo systemctl status liminallm
+```
+
+### step 10: nginx reverse proxy with tls
+
+```bash
+sudo tee /etc/nginx/sites-available/liminallm << 'EOF'
+server {
+    listen 80;
+    server_name yourdomain.com;
+    return 301 https://$server_name$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name yourdomain.com;
+
+    ssl_certificate /etc/letsencrypt/live/yourdomain.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/yourdomain.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
+    ssl_prefer_server_ciphers off;
+
+    client_max_body_size 50M;
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 300s;
+        proxy_connect_timeout 75s;
+    }
+
+    location /healthz {
+        proxy_pass http://127.0.0.1:8000/healthz;
+        access_log off;
+    }
+}
+EOF
+
+# enable site
+sudo ln -s /etc/nginx/sites-available/liminallm /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
+
+# obtain tls certificate
+sudo certbot --nginx -d yourdomain.com
+```
+
+### step 11: verify deployment
+
+```bash
+# check service status
+sudo systemctl status liminallm
+
+# check health endpoint
+curl http://localhost:8000/healthz
+
+# check logs
+sudo tail -f /srv/liminallm/logs/app.log
+
+# test signup
+curl -X POST http://localhost:8000/v1/auth/signup \
+    -H "Content-Type: application/json" \
+    -d '{"email": "test@example.com", "password": "TestPass123!"}'
+```
+
+### running in-memory mode (development/testing)
+
+for quick testing without postgresql/redis:
+
+```bash
+export JWT_SECRET="Test-Secret-Key-4-Testing-Only!"
+export SHARED_FS_ROOT="/tmp/liminallm"
+export USE_MEMORY_STORE=true
+export TEST_MODE=true
+
+uvicorn liminallm.app:app --reload --host 0.0.0.0 --port 8000
+```
+
+### running tests (native)
+
+```bash
+# all tests with in-memory store
+TEST_MODE=true USE_MEMORY_STORE=true pytest tests/ -v
+
+# specific test files
+pytest tests/test_post_smoke.py -v          # post-smoke tests
+pytest tests/test_integration_admin.py -v    # admin tests
+pytest tests/test_integration_auth.py -v     # auth tests
+
+# smoke tests against running server
+./scripts/smoke_test.sh http://localhost:8000
+
+# qa gate (lint + security + tests)
+make qa-unit
+```
 
 ## backend lanes and scenarios
 ### local gpu lora (adapters only; base stays frozen)
 - set `MODEL_BACKEND=local_gpu_lora`, `MODEL_PATH=/srv/liminallm/models/<base-model>` (hugging face-style dir), optional `MODEL_TOKENIZER` if tokenizer differs.
 - copy base weights into `/srv/liminallm/models`; adapters live under `/srv/liminallm/adapters/<adapter_id>/adapter.lora`.
 - gpu prep: install the matching jax gpu wheel (cuda/rocm), verify `nvidia-smi` sees the card, and keep drivers + cuda in `$LD_LIBRARY_PATH`.
-- run: `python -m uvicorn liminallm.api.routes:app --host 0.0.0.0 --port 8000 --workers 1` (jax likes fewer workers). requests specify `adapter_id` and optionally `adapter_mode` (local/hybrid/prompt); the backend overlays adapters over the frozen base and serves tokens locally.
+- run: `python -m uvicorn liminallm.app:app --host 0.0.0.0 --port 8000 --workers 1` (jax likes fewer workers). requests specify `adapter_id` and optionally `adapter_mode` (local/hybrid/prompt); the backend overlays adapters over the frozen base and serves tokens locally.
 - the base model remains immutable; training writes only adapter weights.
 
 ### api backend (remote inference)

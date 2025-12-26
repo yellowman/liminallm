@@ -16,10 +16,6 @@ from psycopg_pool import ConnectionPool
 
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
-from liminallm.service.embeddings import (
-    EMBEDDING_DIM,
-    validated_embedding,
-)
 from liminallm.service.artifact_validation import (
     ArtifactValidationError,
     validate_artifact,
@@ -30,6 +26,11 @@ from liminallm.service.bm25 import (
 from liminallm.service.bm25 import (
     tokenize_text as _tokenize_text,
 )
+from liminallm.service.embeddings import (
+    EMBEDDING_DIM,
+    validated_embedding,
+)
+from liminallm.service.errors import NotFoundError
 from liminallm.storage.common import (
     blend_centroid,
     clamp_success_score,
@@ -44,7 +45,6 @@ from liminallm.storage.cursors import (
     decode_index_cursor,
     decode_time_id_cursor,
 )
-from liminallm.errors import NotFoundError
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
     AdapterRouterState,

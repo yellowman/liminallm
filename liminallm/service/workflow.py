@@ -1769,6 +1769,7 @@ class WorkflowEngine:
                     "error": "circuit_breaker_open",
                 }
                 outputs = {}
+                node_id = node.get("id", "unknown")
                 next_nodes = node.get("next")
                 if isinstance(next_nodes, str):
                     next_nodes_list = [next_nodes]

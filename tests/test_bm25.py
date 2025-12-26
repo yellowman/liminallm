@@ -5,10 +5,10 @@ per SPEC §2.5 retrieval strategy.
 """
 
 from liminallm.service.bm25 import (
-    BM25_K1,
     BM25_B,
-    tokenize_text,
+    BM25_K1,
     compute_bm25_scores,
+    tokenize_text,
 )
 
 

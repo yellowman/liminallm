@@ -1,0 +1,117 @@
+# Docker Compose for QA/Testing Environment
+# Usage: docker compose -f docker-compose.test.yml up --build
+#
+# Known test credentials (after bootstrap):
+#   Admin: admin@test.local / TestAdmin123!
+#   User:  user@test.local / TestUser123!
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: liminallm_test
+      POSTGRES_USER: liminallm
+      POSTGRES_PASSWORD: testpassword123
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres_test_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U liminallm -d liminallm_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      # Database
+      DATABASE_URL: postgresql://liminallm:testpassword123@postgres:5432/liminallm_test
+      # Redis
+      REDIS_URL: redis://redis:6379/0
+      # Auth (test-only secret, DO NOT use in production)
+      JWT_SECRET: Test-JWT-Secret-For-QA-Environment-Only-32chars!
+      JWT_ISSUER: liminallm-test
+      JWT_AUDIENCE: test-clients
+      # Test mode settings
+      TEST_MODE: "false"
+      ALLOW_REDIS_FALLBACK_DEV: "false"
+      # Admin bootstrap credentials
+      ADMIN_EMAIL: admin@test.local
+      ADMIN_PASSWORD: TestAdmin123!
+      # Model backend (use openai-compatible for testing)
+      MODEL_BACKEND: openai
+      MODEL_PATH: gpt-4o-mini
+      # Disable email verification for easier testing
+      REQUIRE_EMAIL_VERIFICATION: "false"
+      # Disable MFA for easier testing
+      ENABLE_MFA: "false"
+      # Filesystem
+      SHARED_FS_ROOT: /srv/liminallm
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    volumes:
+      - app_test_data:/srv/liminallm
+
+  # Migration runner (runs once then exits)
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql://liminallm:testpassword123@postgres:5432/liminallm_test
+    command: ["bash", "/app/scripts/migrate.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Bootstrap admin user (runs once then exits)
+  bootstrap:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: postgresql://liminallm:testpassword123@postgres:5432/liminallm_test
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: Test-JWT-Secret-For-QA-Environment-Only-32chars!
+      ADMIN_EMAIL: admin@test.local
+      ADMIN_PASSWORD: TestAdmin123!
+      SHARED_FS_ROOT: /srv/liminallm
+    command: ["python", "/app/scripts/bootstrap_admin.py"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+volumes:
+  postgres_test_data:
+  app_test_data:
+
+# Network configuration
+networks:
+  default:
+    name: liminallm-test

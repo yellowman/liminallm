@@ -1,6 +1,7 @@
 import json
 from dataclasses import fields
 from typing import get_type_hints
+
 import pytest
 
 from liminallm.api.schemas import KnowledgeChunkResponse

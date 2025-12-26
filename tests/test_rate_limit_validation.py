@@ -6,7 +6,7 @@ Invalid window_seconds should be logged and default to 60 seconds.
 
 import asyncio
 from datetime import datetime
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -156,7 +156,7 @@ class TestRateLimitIntegration:
 
     async def test_rate_limit_with_memory_runtime(self):
         """Rate limiting works with actual memory-based runtime."""
-        from liminallm.service.runtime import get_runtime, check_rate_limit
+        from liminallm.service.runtime import check_rate_limit, get_runtime
 
         runtime = get_runtime()
 
@@ -176,7 +176,7 @@ class TestRateLimitIntegration:
 
     async def test_concurrent_rate_limit_calls(self):
         """Concurrent rate limit calls are handled correctly."""
-        from liminallm.service.runtime import get_runtime, check_rate_limit
+        from liminallm.service.runtime import check_rate_limit, get_runtime
 
         runtime = get_runtime()
         runtime._local_rate_limits = {}

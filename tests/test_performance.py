@@ -4,9 +4,9 @@ These tests measure response times and throughput for key operations
 to ensure the system meets performance requirements.
 """
 
+import statistics
 import time
 import uuid
-import statistics
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import pytest
@@ -185,7 +185,6 @@ class TestMemoryUsage:
     def test_no_memory_leak_on_repeated_requests(self, perf_client, auth_headers):
         """Memory should not grow significantly over repeated requests."""
         import gc
-        import sys
 
         # Warm up
         for _ in range(10):

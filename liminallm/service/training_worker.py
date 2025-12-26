@@ -23,6 +23,7 @@ if TYPE_CHECKING:
     from liminallm.service.clustering import SemanticClusterer
     from liminallm.service.training import TrainingService
     from liminallm.storage.memory import MemoryStore
+    from liminallm.storage.models import ConfigPatchAudit
     from liminallm.storage.postgres import PostgresStore
 
 logger = get_logger(__name__)

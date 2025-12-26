@@ -15,12 +15,12 @@ These tests verify that error responses conform to the stable API envelope forma
 import pytest
 from pydantic import ValidationError
 
-from liminallm.api.schemas import Envelope, ErrorBody
 from liminallm.api.error_handling import (
+    _STATUS_TO_CODE,
     _error_code_for_status,
     _error_response,
-    _STATUS_TO_CODE,
 )
+from liminallm.api.schemas import Envelope, ErrorBody
 
 
 class TestErrorBody:

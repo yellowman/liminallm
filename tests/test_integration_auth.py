@@ -14,7 +14,6 @@ import pytest
 from fastapi.testclient import TestClient
 
 from liminallm import app as app_module
-from liminallm.service.runtime import get_runtime
 
 
 @pytest.fixture

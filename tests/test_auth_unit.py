@@ -10,12 +10,13 @@ Tests for:
 """
 
 import asyncio
-import pytest
 from datetime import datetime
 
-from liminallm.storage.memory import MemoryStore
-from liminallm.service.auth import AuthService
+import pytest
+
 from liminallm.config import Settings
+from liminallm.service.auth import AuthService
+from liminallm.storage.memory import MemoryStore
 
 
 @pytest.fixture
