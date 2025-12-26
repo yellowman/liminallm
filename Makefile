@@ -43,8 +43,7 @@ test:
 # Run tests with PostgreSQL (requires docker-compose)
 # Credentials must match docker-compose.test.yml
 test-pg:
-	docker compose -f docker-compose.test.yml up -d postgres redis
-	sleep 5
+	docker compose -f docker-compose.test.yml up -d --wait postgres redis
 	docker compose -f docker-compose.test.yml run --rm migrate
 	USE_MEMORY_STORE=false \
 	DATABASE_URL="postgresql://liminallm:testpassword123@localhost:5433/liminallm_test" \
@@ -86,8 +85,7 @@ smoke:
 
 # Build and test with Docker
 docker:
-	docker compose -f docker-compose.test.yml up --build -d
-	sleep 10
+	docker compose -f docker-compose.test.yml up --build -d --wait
 	./scripts/smoke_test.sh http://localhost:8000
 	docker compose -f docker-compose.test.yml down -v
 
