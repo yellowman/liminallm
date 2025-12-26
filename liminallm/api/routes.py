@@ -3266,6 +3266,19 @@ async def update_system_settings(
     return Envelope(status="ok", data=updated)
 
 
+@router.patch("/admin/settings", response_model=Envelope, tags=["admin"])
+async def patch_system_settings(
+    body: dict,
+    principal: AuthContext = Depends(get_admin_user),
+):
+    """Partial update of admin-managed system settings.
+
+    Alias for PUT - both methods perform partial updates (only provided keys are changed).
+    PATCH is provided for REST convention compatibility with frontend clients.
+    """
+    return await update_system_settings(body, principal)
+
+
 @router.get("/files/limits", response_model=Envelope, tags=["files"])
 async def get_file_limits(principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
