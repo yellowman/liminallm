@@ -25,8 +25,12 @@ make qa
 
 ### Docker Testing
 
-- Docker and Docker Compose
+- Docker Engine 20.10+
+- Docker Compose v2.1+ (required for `--wait` flag used in Makefile targets)
 - curl and jq (for smoke tests)
+
+Check your Compose version with `docker compose version`. If you have an older version,
+either upgrade or use the native testing path which doesn't require Docker.
 
 ## Native Testing Quick Start
 
