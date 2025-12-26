@@ -123,12 +123,14 @@ curl -s -X POST "$BASE_URL/v1/chat" \
 Skip this step if you don't have Docker. The in-memory tests in Step 2 cover the same functionality.
 
 ```bash
-# Start PostgreSQL container
-docker compose -f docker-compose.test.yml up -d postgres
+# Start PostgreSQL and Redis containers (credentials match docker-compose.test.yml)
+docker compose -f docker-compose.test.yml up -d postgres redis
 sleep 5
 
-# Run tests
-DATABASE_URL="postgresql://testuser:testpass@localhost:5433/liminallm_test" \
+# Run tests with real database (must disable memory store)
+USE_MEMORY_STORE=false \
+DATABASE_URL="postgresql://liminallm:testpassword123@localhost:5433/liminallm_test" \
+REDIS_URL="redis://localhost:6380/0" \
     python -m pytest tests/ -v
 
 # Cleanup
@@ -140,12 +142,13 @@ docker compose -f docker-compose.test.yml down -v
 If you have PostgreSQL installed locally without Docker:
 
 ```bash
-# Create test database
+# Create test database (requires pgvector extension)
 sudo -u postgres psql -c "CREATE DATABASE liminallm_test;"
 sudo -u postgres psql -d liminallm_test -c "CREATE EXTENSION IF NOT EXISTS vector;"
 sudo -u postgres psql -d liminallm_test -c "CREATE EXTENSION IF NOT EXISTS citext;"
 
-# Run tests
+# Run tests (must disable memory store)
+USE_MEMORY_STORE=false \
 DATABASE_URL="postgresql://postgres@localhost:5432/liminallm_test" \
     pytest tests/ -v
 ```

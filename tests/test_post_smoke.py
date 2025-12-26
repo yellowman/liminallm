@@ -184,7 +184,8 @@ class TestFileExtensionUpload:
         # Accept 200, 201 (success) or 429 (rate limit)
         assert resp.status_code in (200, 201, 429), f"Upload {ext} failed: {resp.json()}"
         if resp.status_code in (200, 201):
-            assert "file_id" in resp.json()["data"] or "id" in resp.json()["data"]
+            # FileUploadResponse returns fs_path (the file system path)
+            assert "fs_path" in resp.json()["data"], f"Missing fs_path in response: {resp.json()}"
 
     def test_upload_disallowed_extension_rejected(self, authenticated_user):
         """Verify that disallowed extensions are rejected."""
@@ -472,12 +473,14 @@ class TestTenantIsolation:
         conv_id = resp.json()["data"]["id"]
 
         # User B tries to send a message to User A's conversation
+        # ChatRequest schema: {conversation_id, message: {content, mode}, stream}
         resp = client.post(
             "/v1/chat",
             headers=user_b["headers"],
             json={
                 "conversation_id": conv_id,
-                "content": "Trying to infiltrate!",
+                "message": {"content": "Trying to infiltrate!", "mode": "text"},
+                "stream": False,
             },
         )
         # Should be 403 or 404 (not 200 or 503)

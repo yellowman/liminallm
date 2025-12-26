@@ -41,10 +41,13 @@ test:
 	python -m pytest tests/ -v --tb=short
 
 # Run tests with PostgreSQL (requires docker-compose)
+# Credentials must match docker-compose.test.yml
 test-pg:
-	docker compose -f docker-compose.test.yml up -d postgres
+	docker compose -f docker-compose.test.yml up -d postgres redis
 	sleep 5
-	DATABASE_URL="postgresql://testuser:testpass@localhost:5433/liminallm_test" \
+	USE_MEMORY_STORE=false \
+	DATABASE_URL="postgresql://liminallm:testpassword123@localhost:5433/liminallm_test" \
+	REDIS_URL="redis://localhost:6380/0" \
 		python -m pytest tests/ -v --tb=short
 	docker compose -f docker-compose.test.yml down
 

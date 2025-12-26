@@ -39,17 +39,17 @@ log_info() {
 
 log_pass() {
     echo -e "${GREEN}[PASS]${NC} $1"
-    ((TESTS_PASSED++))
+    TESTS_PASSED=$((TESTS_PASSED + 1))
 }
 
 log_fail() {
     echo -e "${RED}[FAIL]${NC} $1"
-    ((TESTS_FAILED++))
+    TESTS_FAILED=$((TESTS_FAILED + 1))
 }
 
 run_test() {
     local name="$1"
-    ((TESTS_RUN++))
+    TESTS_RUN=$((TESTS_RUN + 1))
     echo -e "\n--- Test $TESTS_RUN: $name ---"
 }
 
@@ -229,21 +229,23 @@ test_chat_message() {
     fi
 
     local response
+    local http_code
+    local tmpfile
+    tmpfile=$(mktemp)
 
     # Note: This may fail if no LLM backend is configured, which is expected
-    response=$(curl -s -X POST "$BASE_URL/v1/chat" \
+    # ChatRequest schema requires: conversation_id, message: {content, mode}, stream
+    http_code=$(curl -s -w "%{http_code}" -o "$tmpfile" -X POST "$BASE_URL/v1/chat" \
         -H "Authorization: Bearer $USER_ACCESS_TOKEN" \
         -H "Content-Type: application/json" \
-        -d "{\"conversation_id\": \"$CONVERSATION_ID\", \"content\": \"Hello, this is a smoke test.\"}" 2>&1)
+        -d "{\"conversation_id\": \"$CONVERSATION_ID\", \"message\": {\"content\": \"Hello, this is a smoke test.\", \"mode\": \"text\"}, \"stream\": false}" 2>&1)
 
-    local http_code
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/v1/chat" \
-        -H "Authorization: Bearer $USER_ACCESS_TOKEN" \
-        -H "Content-Type: application/json" \
-        -d "{\"conversation_id\": \"$CONVERSATION_ID\", \"content\": \"Hello, this is a smoke test.\"}" 2>&1)
+    response=$(cat "$tmpfile")
+    rm -f "$tmpfile"
 
-    # Accept 200 (success), 503 (no LLM backend), or 422 (validation)
-    if [ "$http_code" = "200" ] || [ "$http_code" = "503" ] || [ "$http_code" = "422" ]; then
+    # Accept 200 (success) or 503 (no LLM backend configured)
+    # Do NOT accept 422 - that indicates a malformed request which is a test bug
+    if [ "$http_code" = "200" ] || [ "$http_code" = "503" ]; then
         log_pass "Chat endpoint reachable (status: $http_code)"
         return 0
     else
@@ -262,21 +264,22 @@ test_file_upload() {
 
     local response
     local http_code
+    local tmpfile
+    tmpfile=$(mktemp)
 
-    http_code=$(curl -s -o /dev/null -w "%{http_code}" -X POST "$BASE_URL/v1/files" \
+    # Correct endpoint is /v1/files/upload (not /v1/files which is GET-only)
+    http_code=$(curl -s -w "%{http_code}" -o "$tmpfile" -X POST "$BASE_URL/v1/files/upload" \
         -H "Authorization: Bearer $USER_ACCESS_TOKEN" \
-        -F "file=@$test_file;filename=smoke_test.txt" 2>&1)
+        -F "file=@$test_file;filename=smoke_test.txt;type=text/plain" 2>&1)
 
-    rm -f "$test_file"
+    response=$(cat "$tmpfile")
+    rm -f "$test_file" "$tmpfile"
 
     if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
         log_pass "File upload successful"
         return 0
-    elif [ "$http_code" = "422" ]; then
-        log_pass "File upload endpoint reachable (validation response)"
-        return 0
     else
-        log_fail "File upload failed with status $http_code"
+        log_fail "File upload failed with status $http_code: $response"
         return 1
     fi
 }
@@ -369,18 +372,18 @@ main() {
     check_dependencies
     wait_for_service
 
-    # Run tests
-    test_healthz
-    test_unauthenticated_protected
-    test_signup_user
-    test_login_user
-    test_login_admin
-    test_create_conversation
-    test_chat_message
-    test_file_upload
-    test_list_artifacts
-    test_admin_settings_protected
-    test_admin_settings_accessible
+    # Run tests (use || true to continue on test failures with set -e)
+    test_healthz || true
+    test_unauthenticated_protected || true
+    test_signup_user || true
+    test_login_user || true
+    test_login_admin || true
+    test_create_conversation || true
+    test_chat_message || true
+    test_file_upload || true
+    test_list_artifacts || true
+    test_admin_settings_protected || true
+    test_admin_settings_accessible || true
 
     # Summary
     echo ""
