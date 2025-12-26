@@ -571,6 +571,9 @@ different API providers handle adapters in fundamentally different ways. the ker
 | `adapter_server` | adapter_param | ✓ | ✓ | 3 |
 | `sagemaker` | adapter_param | ✗ | ✗ | 1 |
 | `local_lora` | none | ✓ | ✓ | 3 |
+| `stub` | none | ✗ | ✗ | 0 |
+
+The `stub` backend returns deterministic canned responses without calling any LLM. It is intended for testing and CI pipelines where real inference is not required.
 
 **adapter schema fields by provider type:**
 
@@ -1699,7 +1702,7 @@ the following are treated as constants the kernel must honor; LLM edits happen o
     - SMTP (all settings including secrets): `smtp_host`, `smtp_port`, `smtp_user`, `smtp_password`, `smtp_use_tls`, `email_from_address`, `email_from_name`
     - URL settings: `oauth_redirect_uri`, `app_base_url`
     - voice settings: `voice_transcription_model` (enum: whisper-1), `voice_synthesis_model` (enum: tts-1, tts-1-hd), `voice_default_voice` (enum: alloy, echo, fable, onyx, nova, shimmer)
-    - model settings: `model_path` (with common suggestions), `model_backend` (enum: openai, azure, together, lorax, etc.), `default_adapter_mode` (enum: local, remote, prompt, hybrid), `rag_mode` (enum: pgvector, memory), `embedding_model_id` (enum: text-embedding, text-embedding-3-small, text-embedding-3-large, text-embedding-ada-002)
+    - model settings: `model_path` (with common suggestions), `model_backend` (enum: openai, azure, azure_openai, vertex, gemini, google, bedrock, together, together.ai, lorax, adapter_server, sagemaker, aws_sagemaker, stub), `default_adapter_mode` (enum: local, remote, prompt, hybrid), `rag_mode` (enum: pgvector, memory), `embedding_model_id` (enum: text-embedding, text-embedding-3-small, text-embedding-3-large, text-embedding-ada-002)
     - tenant & JWT: `default_tenant_id`, `jwt_issuer`, `jwt_audience`
   - **environment-only settings** (infrastructure decisions or bootstrap secrets):
     - database connection: `DATABASE_URL`, `REDIS_URL`

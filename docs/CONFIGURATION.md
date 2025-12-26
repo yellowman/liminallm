@@ -68,6 +68,25 @@ When the runtime initializes, settings are resolved in this order:
 model_path = sys_settings.get("model_path") or self.settings.model_path
 ```
 
+### Bootstrap Sync for MODEL_BACKEND
+
+Because system_settings takes precedence over environment variables, the `MODEL_BACKEND`
+env var would normally be ignored if the database has a default value (e.g., "openai").
+
+To ensure environment variables work as expected during initial setup or testing,
+`scripts/bootstrap_admin.py` syncs `MODEL_BACKEND` from the environment to system_settings:
+
+```python
+# During bootstrap, if MODEL_BACKEND env var is set, write it to system_settings
+desired_backend = os.environ.get("MODEL_BACKEND")
+if desired_backend:
+    runtime.store.set_system_settings({"model_backend": desired_backend})
+```
+
+This is particularly useful for:
+- **Testing**: Set `MODEL_BACKEND=stub` to use deterministic canned responses
+- **CI pipelines**: Override the default backend without modifying the database manually
+
 ## Admin UI Workflow
 
 ```
