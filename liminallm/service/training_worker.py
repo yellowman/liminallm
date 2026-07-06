@@ -345,6 +345,7 @@ class TrainingWorker:
                     user_id=user_id,
                     adapter_id=adapter_id,
                     cluster_id=self._get_cluster_id(job),
+                    job_id=job_id,
                 )
 
                 if result:
@@ -431,12 +432,16 @@ class TrainingWorker:
         user_id: str,
         adapter_id: str,
         cluster_id: Optional[str] = None,
+        job_id: Optional[str] = None,
     ) -> Optional[dict]:
         """Execute the actual training via TrainingService."""
+        # Pass the already-claimed job_id so training reuses it instead of
+        # creating a duplicate queued job on every worker run.
         result = self.training.train_from_preferences(
             user_id=user_id,
             adapter_id=adapter_id,
             cluster_id=cluster_id,
+            job_id=job_id,
         )
 
         if result:

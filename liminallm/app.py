@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import posixpath
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -255,9 +256,12 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "frontend"
 @app.middleware("http")
 async def block_direct_admin_access(request: Request, call_next):
     """Block direct access to /static/admin.html - use /admin route instead."""
-    # Normalize path: collapse double slashes, remove trailing slash
-    path = request.url.path.replace("//", "/").rstrip("/")
-    if path == "/static/admin.html" or path == "/static/admin":
+    # Canonicalize the path so dot-segments and redundant slashes
+    # (/static/./admin.html, /static//admin.html, /static/../static/admin.html)
+    # can't slip past the guard while StaticFiles still resolves the file.
+    raw_path = request.url.path.replace("\\", "/")
+    normalized = posixpath.normpath(raw_path).rstrip("/").lower()
+    if normalized in {"/static/admin.html", "/static/admin"}:
         return JSONResponse(
             status_code=403,
             content={"detail": "Use /admin route for admin UI"},

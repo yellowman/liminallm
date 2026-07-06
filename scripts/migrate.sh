@@ -22,7 +22,9 @@ mapfile -t sorted_files < <(printf '%s\n' "${sql_files[@]}" | sort)
 
 for sql_file in "${sorted_files[@]}"; do
   echo "Applying ${sql_file}"
-  psql "$DATABASE_URL" -f "$sql_file"
+  # ON_ERROR_STOP + single transaction: a failing statement aborts the file and
+  # exits non-zero (tripping set -e) instead of leaving a half-applied schema.
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 --single-transaction -f "$sql_file"
 done
 
 # Apply optional seed files if present (using glob pattern)
@@ -36,6 +38,6 @@ if [[ ${#seed_files[@]} -gt 0 ]]; then
   mapfile -t sorted_seeds < <(printf '%s\n' "${seed_files[@]}" | sort)
   for seed_file in "${sorted_seeds[@]}"; do
     echo "Applying ${seed_file}"
-    psql "$DATABASE_URL" -f "$seed_file"
+    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 --single-transaction -f "$seed_file"
   done
 fi

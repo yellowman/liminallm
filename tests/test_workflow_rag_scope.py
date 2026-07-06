@@ -44,7 +44,7 @@ async def test_workflow_rag_tools_receive_identity():
     rag = RecordingRAG()
     engine = WorkflowEngine(StubStore(), StubLLM(), StubRouter(), rag)
 
-    engine.invoke_tool(
+    await engine.invoke_tool(
         {"name": "llm.generic"},
         {"context_id": "ctx-1", "message": "hello"},
         user_id="user-1",

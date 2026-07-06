@@ -11,7 +11,10 @@ services:
     container_name: liminallm-app
     restart: unless-stopped
     ports:
-      - "${HOST_PORT:-8000}:8000"
+      # Bind to localhost by default so the app is reachable through nginx (via
+      # the docker network) but not published to the public interface. Set
+      # HOST_BIND=0.0.0.0 for direct dev access without a proxy.
+      - "${HOST_BIND:-127.0.0.1}:${HOST_PORT:-8000}:8000"
     environment:
       # Database
       DATABASE_URL: postgresql://liminallm:${POSTGRES_PASSWORD}@postgres:5432/liminallm
@@ -25,6 +28,12 @@ services:
       OPENAI_ADAPTER_API_KEY: ${OPENAI_ADAPTER_API_KEY:-}
       OPENAI_ADAPTER_BASE_URL: ${OPENAI_ADAPTER_BASE_URL:-https://api.openai.com/v1}
       ADAPTER_SERVER_MODEL: ${ADAPTER_SERVER_MODEL:-gpt-4o}
+      # Provider API keys for non-OpenAI backends (MODEL_BACKEND=anthropic|zhipu|glm|together|gemini)
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ZHIPU_API_KEY: ${ZHIPU_API_KEY:-}
+      TOGETHER_API_KEY: ${TOGETHER_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-text-embedding-3-small}
       # Voice (optional)
       VOICE_API_KEY: ${OPENAI_ADAPTER_API_KEY:-}
@@ -55,14 +64,12 @@ services:
       OAUTH_MICROSOFT_CLIENT_ID: ${OAUTH_MICROSOFT_CLIENT_ID:-}
       OAUTH_MICROSOFT_CLIENT_SECRET: ${OAUTH_MICROSOFT_CLIENT_SECRET:-}
       OAUTH_REDIRECT_URI: ${OAUTH_REDIRECT_URI:-}
-      # Rate limits
-      CHAT_RATE_LIMIT_PER_MINUTE: ${CHAT_RATE_LIMIT_PER_MINUTE:-60}
-      RESET_RATE_LIMIT_PER_MINUTE: ${RESET_RATE_LIMIT_PER_MINUTE:-5}
+      # Note: rate limits are admin-managed in system_settings, not env vars.
     volumes:
       - liminallm-data:/srv/liminallm
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
     healthcheck:
@@ -105,6 +112,22 @@ services:
         reservations:
           cpus: '0.25'
           memory: 256M
+
+  # Migration runner: applies sql/ migrations on every deploy (not just first
+  # boot) so schema changes reach existing volumes, then exits. The app waits
+  # for this to complete successfully before starting.
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: liminallm-migrate
+    environment:
+      DATABASE_URL: postgresql://liminallm:${POSTGRES_PASSWORD}@postgres:5432/liminallm
+    command: ["bash", "/app/scripts/migrate.sh"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
 
   redis:
     image: redis:7-alpine

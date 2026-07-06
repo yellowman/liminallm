@@ -1076,13 +1076,17 @@ class AuthService:
                                 self.logger.info("access_token_denylisted", jti=jti)
                                 return None
                         except Exception as exc:
-                            # Fail-open: log warning but allow auth to proceed
-                            # This prevents Redis failures from blocking all auth
+                            # Fail closed: the denylist is the token-revocation
+                            # control, so if it can't be consulted we must not
+                            # honor a token that may have been revoked. Access
+                            # tokens are short-lived, bounding the availability
+                            # impact of a transient cache error.
                             self.logger.warning(
                                 "denylist_check_failed",
                                 jti=jti,
                                 error=str(exc),
                             )
+                            return None
             token_ctx = self._authenticate_access_token(
                 token,
                 allow_pending_mfa=allow_pending_mfa,

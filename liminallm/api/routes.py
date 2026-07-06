@@ -101,6 +101,7 @@ from liminallm.config import (
     SYSTEM_SETTINGS_INT_KEYS,
     SYSTEM_SETTINGS_RATE_LIMIT_KEYS,
     SYSTEM_SETTINGS_STRING_KEYS,
+    ModelBackend,
     get_settings,
 )
 from liminallm.content_struct import normalize_content_struct
@@ -267,6 +268,17 @@ def _http_error(
     if details is not None:
         payload["error"]["details"] = details  # type: ignore[index]
     return HTTPException(status_code=status_code, detail=payload)
+
+
+def _client_ip(request: Optional[Request]) -> str:
+    """Best-effort client IP for keying unauthenticated rate limits.
+
+    Prevents a single client from exhausting a globally-shared limit (password
+    reset, email verification, OAuth) for every other user on the platform.
+    """
+    if request is None or request.client is None:
+        return "unknown"
+    return request.client.host
 
 
 class IdempotencyGuard:
@@ -452,10 +464,9 @@ async def _enforce_rate_limit(
     Raises:
         HTTPException with 429 if rate limit exceeded
     """
-    # Issue 53.8: Validate rate limit is positive to prevent bypass via negative values
-    if limit <= 0:
-        logger.warning("invalid_rate_limit_value", key=key, limit=limit)
-        limit = 1  # Default to strictest limit to prevent bypass
+    # limit <= 0 means "disabled/unlimited" per the admin-settings contract, and
+    # check_rate_limit() honors that. Do NOT clamp to 1 here — that would turn
+    # an operator's "unlimited" into the strictest possible limit.
     if window_seconds <= 0:
         logger.warning("invalid_rate_limit_window", key=key, window_seconds=window_seconds)
         window_seconds = 60  # Default to 1 minute window
@@ -629,11 +640,28 @@ async def _resolve_idempotency(
         status = existing_record.get("status")
         if status == "in_progress":
             raise _http_error("conflict", "request in progress", status_code=409)
-        if status in {"completed", "failed"} and existing_record.get("response"):
+        if status == "completed" and existing_record.get("response"):
+            # Replay only successful results so duplicate side effects are avoided.
             response_payload = existing_record.get("response", {})
             if "request_id" not in response_payload:
                 response_payload["request_id"] = existing_record.get("request_id", request_id)
             return existing_record.get("request_id", request_id), Envelope(**response_payload)
+        if status == "failed":
+            # Never replay a prior (possibly transient) failure — reclaim the
+            # slot so the retry recomputes instead of being served a cached error.
+            await _set_cached_idempotency_record(
+                runtime,
+                route,
+                user_id,
+                idempotency_key,
+                {
+                    "status": "in_progress",
+                    "request_id": request_id,
+                    "started_at": datetime.utcnow().isoformat(),
+                },
+                ttl_seconds=IDEMPOTENCY_TTL_SECONDS,
+            )
+            return request_id, None
 
     # Record exists but is in an unexpected state - treat as conflict
     raise _http_error("conflict", "request in progress", status_code=409)
@@ -971,6 +999,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
 
 @router.post("/auth/oauth/{provider}/start", response_model=Envelope, tags=["auth"])
 async def oauth_start(
+    request: Request,
     provider: str = Path(..., description="OAuth provider (google, github, etc.)"),
     body: OAuthStartRequest = ...,
 ):
@@ -980,10 +1009,10 @@ async def oauth_start(
     Client should redirect user to this URL to complete authentication.
     """
     runtime = get_runtime()
-    # Rate limit OAuth start to prevent state token exhaustion
+    # Rate limit OAuth start per client to prevent state token exhaustion
     await _enforce_rate_limit(
         runtime,
-        f"oauth:start:{provider}",
+        f"oauth:start:{provider}:{_client_ip(request)}",
         limit=20,
         window_seconds=60,
     )
@@ -1004,6 +1033,7 @@ async def oauth_start(
 
 @router.get("/auth/oauth/{provider}/callback", response_model=Envelope, tags=["auth"])
 async def oauth_callback(
+    request: Request,
     provider: str = Path(..., description="OAuth provider"),
     code: str = Query(..., max_length=512, description="Authorization code from OAuth provider"),
     state: str = Query(..., max_length=128, description="State parameter for CSRF protection"),
@@ -1020,10 +1050,10 @@ async def oauth_callback(
     set during oauth_start, not from user-controllable query parameters.
     """
     runtime = get_runtime()
-    # Rate limit OAuth callback to prevent code brute-forcing
+    # Rate limit OAuth callback per client to prevent code brute-forcing
     await _enforce_rate_limit(
         runtime,
-        f"oauth:callback:{provider}",
+        f"oauth:callback:{provider}:{_client_ip(request)}",
         limit=10,
         window_seconds=60,
     )
@@ -1507,12 +1537,13 @@ async def request_reset(body: PasswordResetRequest):
 
 
 @router.post("/auth/reset/confirm", response_model=Envelope, tags=["auth"])
-async def confirm_reset(body: PasswordResetConfirm):
+async def confirm_reset(body: PasswordResetConfirm, request: Request):
     runtime = get_runtime()
-    # Rate limit to prevent token brute-forcing
+    # Rate limit per client to prevent token brute-forcing without letting one
+    # client lock out password reset for everyone.
     await _enforce_rate_limit(
         runtime,
-        "reset:confirm",
+        f"reset:confirm:{_client_ip(request)}",
         limit=5,
         window_seconds=300,
     )
@@ -1642,12 +1673,13 @@ async def request_email_verification(principal: AuthContext = Depends(get_user))
 
 
 @router.post("/auth/verify_email", response_model=Envelope, tags=["auth"])
-async def verify_email(body: EmailVerificationRequest):
+async def verify_email(body: EmailVerificationRequest, request: Request):
     runtime = get_runtime()
-    # Rate limit to prevent token brute-forcing
+    # Rate limit per client to prevent token brute-forcing without letting one
+    # client block email verification platform-wide.
     await _enforce_rate_limit(
         runtime,
-        "verify:email",
+        f"verify:email:{_client_ip(request)}",
         limit=10,
         window_seconds=300,
     )
@@ -2415,7 +2447,7 @@ async def invoke_tool(
             and artifact.schema.get("kind") == "tool.spec"
         ):
             raise NotFoundError("tool spec not found", detail={"artifact_id": tool_id})
-        result = runtime.workflow.invoke_tool(
+        result = await runtime.workflow.invoke_tool(
             artifact.schema,
             body.inputs or {},
             conversation_id=body.conversation_id,
@@ -3011,12 +3043,8 @@ async def update_system_settings(
         "voice_synthesis_model": {"tts-1", "tts-1-hd"},
         "voice_default_voice": {"alloy", "echo", "fable", "onyx", "nova", "shimmer"},
         "rag_mode": {"pgvector", "memory"},
-        "model_backend": {
-            "openai", "anthropic", "azure", "azure_openai", "vertex", "gemini", "google",
-            "bedrock", "together", "together.ai", "lorax", "adapter_server",
-            "sagemaker", "aws_sagemaker", "zhipu", "zhipu.ai", "glm",
-            "stub",  # stub is for testing only
-        },
+        # Derived from the ModelBackend enum so new backends never drift out of sync.
+        "model_backend": {b.value for b in ModelBackend},
         "default_adapter_mode": {"local", "remote", "prompt", "hybrid"},
         "embedding_model_id": {
             "text-embedding", "text-embedding-3-small", "text-embedding-3-large",
@@ -3088,6 +3116,22 @@ async def update_system_settings(
             "System settings not supported with this storage backend",
             status_code=501,
         )
+
+    # Rebuild backend-dependent services so a changed model_backend / model_path
+    # (or rag/embedding setting) takes effect without a process restart.
+    model_affecting_keys = {
+        "model_backend",
+        "model_path",
+        "default_adapter_mode",
+        "rag_mode",
+        "embedding_model_id",
+        "rag_chunk_size",
+    }
+    if model_affecting_keys & set(body.keys()):
+        try:
+            runtime.reload_model_services()
+        except Exception as exc:
+            logger.warning("model_services_reload_failed", error=str(exc))
 
     logger.info(
         "system_settings_updated",
@@ -3181,9 +3225,12 @@ async def upload_file(
                 declared_size = int(file.headers.get("content-length"))
             except (TypeError, ValueError):
                 declared_size = None
-        approx_cost = max(
-            1,
-            math.ceil(((declared_size or max_bytes) or 1) / (256 * 1024)),
+        # Pre-charge from the declared size when the client sends one; otherwise
+        # charge a nominal 1 and top up by the real cost after reading (below).
+        # Multipart part headers usually omit content-length, so defaulting to
+        # max_bytes here would make every such upload exceed the bucket.
+        approx_cost = (
+            max(1, math.ceil(declared_size / (256 * 1024))) if declared_size else 1
         )
         await _enforce_rate_limit(
             runtime,
@@ -3262,26 +3309,10 @@ async def upload_file(
             await idem.store_result(envelope)
             return envelope
 
-        # Atomic idempotency: record intent BEFORE writing file
-        # This prevents duplicate file writes if idempotency storage fails after file write
-        # Per SPEC §18: Idempotency must work reliably for POST endpoints
-        pending_envelope = Envelope(
-            status="pending",
-            data={"fs_path": safe_filename, "context_id": context_id},
-            request_id=idem.request_id,
-        )
-        try:
-            await idem.store_result(pending_envelope, status="processing")
-        except Exception:
-            # If we can't record idempotency, log but continue (degraded mode)
-            # SECURITY: Don't log exception details that may contain sensitive info
-            logger.warning(
-                "file_upload_idempotency_pre_record_failed",
-                request_id=idem.request_id,
-            )
-
-        # Now write the file
-        # Issue 32.3: Use asyncio.to_thread to avoid blocking the event loop
+        # The IdempotencyGuard already claimed an in-progress slot on entry, so
+        # a concurrent duplicate request is rejected with 409 while this write
+        # proceeds; no separate intent record is needed.
+        # Write the file (Issue 32.3: off the event loop to avoid blocking)
         await asyncio.to_thread(dest_path.write_bytes, contents)
         chunk_count = None
         if context_id:

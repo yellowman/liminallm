@@ -179,6 +179,7 @@ class MemoryStore:
             description="LLM-only chat workflow defined as data.",
             schema=default_schema,
             fs_path=payload_path,
+            visibility="global",
         )
         self.artifact_versions[chat_workflow_id] = [
             ArtifactVersion(
@@ -1276,7 +1277,10 @@ class MemoryStore:
             artifact.description = normalize_optional_text(description) or ""
         artifact.updated_at = datetime.utcnow()
         artifact.fs_path = fs_path
-        artifact.base_model = schema.get("base_model")
+        # Preserve the existing base_model when the new schema omits the key,
+        # matching PostgresStore.update_artifact.
+        resolved_base_model = schema.get("base_model", artifact.base_model)
+        artifact.base_model = resolved_base_model
         versions = self.artifact_versions.setdefault(artifact_id, [])
         versions.append(
             ArtifactVersion(
@@ -1287,7 +1291,7 @@ class MemoryStore:
                 created_by=author,
                 change_note=change_note,
                 fs_path=fs_path,
-                base_model=schema.get("base_model"),
+                base_model=resolved_base_model,
             )
         )
         self._persist_state()
@@ -1399,7 +1403,7 @@ class MemoryStore:
                 raise NotFoundError("artifact missing", detail={"artifact_id": patch.artifact_id})
 
             versions = self.artifact_versions.get(patch.artifact_id, [])
-            next_version = (versions[0].version if versions else 0) + 1
+            next_version = (max(v.version for v in versions) if versions else 0) + 1
             updated_artifact = Artifact(
                 id=artifact.id,
                 type=artifact.type,
@@ -1412,7 +1416,7 @@ class MemoryStore:
                 base_model=new_schema.get("base_model", artifact.base_model),
             )
             version = ArtifactVersion(
-                id=str(uuid.uuid4()),
+                id=self._next_artifact_version_id(),
                 artifact_id=artifact.id,
                 version=next_version,
                 schema=new_schema,
@@ -1422,7 +1426,9 @@ class MemoryStore:
                 change_note=patch.justification,
             )
             self.artifacts[artifact.id] = updated_artifact
-            self.artifact_versions.setdefault(artifact.id, []).insert(0, version)
+            # Append (newest last) so get_latest_workflow()/[-1] returns this
+            # version, consistent with update_artifact ordering.
+            self.artifact_versions.setdefault(artifact.id, []).append(version)
 
             merged_meta: Dict[str, Any] = {}
             if patch.meta and isinstance(patch.meta, dict):
@@ -1459,19 +1465,26 @@ class MemoryStore:
         and other operational parameters. Managed via admin UI instead of env vars.
         Uses SYSTEM_SETTINGS_DEFAULTS from config.py as single source of truth.
         """
-        return self.runtime_config.get("system_settings", SYSTEM_SETTINGS_DEFAULTS.copy())
+        stored = self.runtime_config.get("system_settings") or {}
+        if not isinstance(stored, dict):
+            stored = {}
+        # Merge stored overrides over defaults so callers get a complete,
+        # current dict; return a fresh copy so mutation can't edit store state.
+        return {**SYSTEM_SETTINGS_DEFAULTS, **stored}
 
     def set_system_settings(self, settings: dict) -> dict:
         """Update admin-managed system settings.
 
-        Merges provided settings with existing settings and persists.
-        Returns the updated full settings.
+        Persists only explicit overrides (never bakes defaults) and returns the
+        full effective settings (defaults + overrides).
         """
-        existing = self.get_system_settings()
-        merged = {**existing, **settings}
+        stored = self.runtime_config.get("system_settings") or {}
+        if not isinstance(stored, dict):
+            stored = {}
+        merged = {**stored, **settings}
         self.runtime_config["system_settings"] = merged
         self._persist_state()
-        return merged
+        return {**SYSTEM_SETTINGS_DEFAULTS, **merged}
 
     def get_latest_workflow(self, workflow_id: str) -> Optional[dict]:
         versions = self.artifact_versions.get(workflow_id)
@@ -1482,22 +1495,32 @@ class MemoryStore:
     def list_adapter_router_state(
         self, user_id: Optional[str] = None
     ) -> list[AdapterRouterState]:
-        """Return synthetic router state for adapters in memory."""
+        """Return persisted router state, mirroring PostgresStore.
 
-        adapters = [a for a in self.artifacts.values() if a.type == "adapter"]
-        if user_id:
-            adapters = [a for a in adapters if a.owner_user_id == user_id]
-        return [
-            AdapterRouterState(
-                artifact_id=a.id,
-                base_model=a.schema.get("base_model"),
-                centroid_vec=a.schema.get("embedding_centroid") or [],
-                usage_count=0,
-                success_score=0.0,
-                meta=None,
+        Only adapters that have a stored state row and a still-existing artifact
+        are returned (joined on artifact ownership when user_id is given),
+        ordered by last_used_at DESC NULLS LAST, then usage_count DESC.
+        """
+        with self._data_lock:
+            states = list(self.adapter_router_state.values())
+
+        def _visible(state: AdapterRouterState) -> bool:
+            artifact = self.artifacts.get(state.artifact_id)
+            if artifact is None:
+                return False
+            return user_id is None or artifact.owner_user_id == user_id
+
+        def _sort_key(state: AdapterRouterState) -> tuple:
+            last_used = state.last_used_at
+            return (
+                last_used is not None,
+                last_used.timestamp() if last_used else 0.0,
+                state.usage_count or 0,
             )
-            for a in adapters
-        ]
+
+        visible = [s for s in states if _visible(s)]
+        visible.sort(key=_sort_key, reverse=True)
+        return visible
 
     def update_adapter_router_state(
         self,

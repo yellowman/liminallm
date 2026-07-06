@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -323,64 +324,6 @@ class StubBackend:
         }
 
 
-@dataclass(frozen=True)
-class AdapterPlug:
-    """Describes a pluggable adapter backend."""
-
-    key: str
-    label: str
-    description: str
-    backend_mode: str
-
-    def build_backend(
-        self,
-        *,
-        base_model: str,
-        api_key: Optional[str],
-        base_url: Optional[str],
-        adapter_server_model: Optional[str],
-        fs_root: Optional[str],
-    ) -> ModelBackend:
-        if self.backend_mode == "local_lora":
-            return LocalJaxLoRABackend(base_model, fs_root or "/srv/liminallm")
-        adapter_mode = (
-            "adapter_server"
-            if self.backend_mode == "adapter_server"
-            else "api_adapters"
-        )
-        if adapter_mode not in {"api_adapters", "adapter_server"}:
-            adapter_mode = "api_adapters"
-        return ApiAdapterBackend(
-            base_model,
-            adapter_mode=adapter_mode,
-            api_key=api_key,
-            base_url=base_url,
-            adapter_server_model=adapter_server_model,
-        )
-
-
-BUILTIN_ADAPTER_PLUGS: dict[str, AdapterPlug] = {
-    "openai": AdapterPlug(
-        key="openai",
-        label="OpenAI / compatible API",
-        description="Calls OpenAI-style chat completions with optional adapter passthrough.",
-        backend_mode="api_adapters",
-    ),
-    "local_gpu_lora": AdapterPlug(
-        key="local_gpu_lora",
-        label="Local GPU LoRA",
-        description="Runs a local JAX backend that applies filesystem-backed LoRA adapters.",
-        backend_mode="local_lora",
-    ),
-}
-
-
-def list_adapter_plugs() -> List[AdapterPlug]:
-    """Return the built-in adapter plugs."""
-
-    return list(BUILTIN_ADAPTER_PLUGS.values())
-
-
 class ApiAdapterBackend:
     """Backend that targets external APIs with capability-aware adapter handling.
 
@@ -405,6 +348,7 @@ class ApiAdapterBackend:
         base_url: Optional[str] = None,
         adapter_server_model: Optional[str] = None,
         provider: Optional[str] = None,
+        api_key_env: Optional[str] = None,
     ) -> None:
         self.base_model = base_model
         self.adapter_server_model = adapter_server_model
@@ -412,6 +356,9 @@ class ApiAdapterBackend:
         self.mode = adapter_mode
         self._api_key = api_key
         self._base_url = base_url
+        # Env var consulted for credential rotation; provider-specific so that,
+        # e.g., a Zhipu backend reads ZHIPU_API_KEY rather than OPENAI_API_KEY.
+        self._api_key_env = api_key_env or "OPENAI_API_KEY"
         self._client_timeout = 30.0
         self._active_api_key: Optional[str] = None
         self.client = None
@@ -442,8 +389,10 @@ class ApiAdapterBackend:
             self.client = None
             return
 
-        # Allow runtime rotation by picking up environment updates
-        env_key = os.getenv("OPENAI_API_KEY")
+        # Allow runtime rotation by picking up environment updates. The env var
+        # is provider-specific (self._api_key_env), so each backend reads its
+        # own credentials rather than defaulting to OPENAI_API_KEY.
+        env_key = os.getenv(self._api_key_env)
         active_key = env_key or self._api_key
 
         if not active_key:
@@ -610,9 +559,10 @@ class ApiAdapterBackend:
             # Fallback: simulate streaming for non-API mode
             fallback = augmented_messages[-1]["content"] if augmented_messages else ""
             response = f"[api-backend model={target_model}] {fallback}"
-            # Simulate token-by-token streaming
-            for word in response.split():
-                yield {"event": "token", "data": word + " "}
+            # Simulate token-by-token streaming. Preserve original whitespace so
+            # the concatenation of streamed tokens equals message_done.content.
+            for token in re.findall(r"\S+\s*", response):
+                yield {"event": "token", "data": token}
             yield {
                 "event": "message_done",
                 "data": {

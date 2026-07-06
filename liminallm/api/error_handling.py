@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-from liminallm.api.schemas import Envelope, ErrorBody
+from liminallm.api.schemas import _VALID_ERROR_CODES, Envelope, ErrorBody
 from liminallm.logging import get_logger
 from liminallm.service.artifact_validation import ArtifactValidationError
 from liminallm.service.errors import ServiceError
@@ -37,6 +37,11 @@ def _error_response(
 ) -> JSONResponse:
     """Create a SPEC §18 compliant error response envelope."""
     error_code = code or _error_code_for_status(status_code)
+    # Never let an unsanctioned code raise inside the error handler itself
+    # (which would turn a clean 4xx/5xx into a bare 500). Fall back to the
+    # status-derived code when the provided one isn't whitelisted.
+    if error_code not in _VALID_ERROR_CODES:
+        error_code = _error_code_for_status(status_code)
     error_body = ErrorBody(code=error_code, message=message, details=details)
     envelope = Envelope(status="error", error=error_body)
     return JSONResponse(status_code=status_code, content=envelope.model_dump())

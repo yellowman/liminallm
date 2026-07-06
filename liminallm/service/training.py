@@ -273,6 +273,8 @@ class TrainingService:
         user_id: str,
         adapter_id: Optional[str] = None,
         cluster_id: Optional[str] = None,
+        *,
+        job_id: Optional[str] = None,
     ) -> Optional[dict]:
         adapter = (
             self.ensure_user_adapter(user_id)
@@ -308,19 +310,23 @@ class TrainingService:
             self.store.update_artifact(adapter.id, adapter_schema)
             adapter = self.store.get_artifact(adapter.id) or adapter
             self._apply_adapter_vocab_size(adapter)
-        job = self.store.create_training_job(
-            user_id=user_id,
-            adapter_id=adapter.id,
-            preference_event_ids=[e.id for e in events],
-        )
-        job_dir = self._job_dir(user_id, adapter.id, job.id, adapter.schema)
+        # Reuse a job the worker already claimed; only create one when invoked
+        # directly (job_id is None), so the worker path can't spawn duplicates.
+        if job_id is None:
+            job = self.store.create_training_job(
+                user_id=user_id,
+                adapter_id=adapter.id,
+                preference_event_ids=[e.id for e in events],
+            )
+            job_id = job.id
+        job_dir = self._job_dir(user_id, adapter.id, job_id, adapter.schema)
         job_dir.mkdir(parents=True, exist_ok=True)
         dataset_path = job_dir / "dataset.jsonl"
         with dataset_path.open("w") as f:
             for row in dataset_entries:
                 f.write(json.dumps(row) + "\n")
         self.store.update_training_job(
-            job.id,
+            job_id,
             dataset_path=str(dataset_path),
             meta={
                 "token_batches": [b["shape"] for b in token_batches],
@@ -357,17 +363,19 @@ class TrainingService:
             "clusters": cluster_meta,
         }
         (version_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
-        updated_schema = dict(adapter.schema)
-        updated_schema["current_version"] = next_version
-        updated_schema["fs_dir"] = str(adapter_dir)
-        self.store.update_artifact(adapter.id, updated_schema)
-        self._update_latest_symlink(adapter_dir, version_dir)
         training_trace = self._run_jax_optax_training(
             weights,
             token_batches,
             params_path=params_path,
             checkpoint_dir=version_dir / "checkpoints",
         )
+        # Promote the new version only after training completes without raising,
+        # so a failed run never repoints "latest" at randomly-initialized weights.
+        updated_schema = dict(adapter.schema)
+        updated_schema["current_version"] = next_version
+        updated_schema["fs_dir"] = str(adapter_dir)
+        self.store.update_artifact(adapter.id, updated_schema)
+        self._update_latest_symlink(adapter_dir, version_dir)
         # Extract actual loss from JAX training instead of using heuristic
         # Per SPEC §5.4: metrics = loss and preference alignment rate
         loss = 1.0 / (1 + len(dataset_entries))  # Fallback heuristic
@@ -379,7 +387,7 @@ class TrainingService:
                 if isinstance(actual_loss, (int, float)) and actual_loss >= 0:
                     loss = float(actual_loss)
         self.store.update_training_job(
-            job.id,
+            job_id,
             status="succeeded",
             loss=loss,
             new_version=next_version,
@@ -390,7 +398,7 @@ class TrainingService:
             },
         )
         return {
-            "job_id": job.id,
+            "job_id": job_id,
             "adapter_id": adapter.id,
             "version_dir": str(version_dir),
             "loss": loss,

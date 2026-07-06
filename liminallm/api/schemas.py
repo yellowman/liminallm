@@ -105,6 +105,10 @@ _VALID_ERROR_CODES = frozenset({
     "validation_error",
     "conflict",
     "server_error",
+    # Codes raised by route handlers (concurrency caps, ingestion, 501s).
+    "busy",
+    "ingest_failed",
+    "not_implemented",
 })
 
 

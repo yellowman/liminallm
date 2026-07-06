@@ -1048,7 +1048,7 @@ class WorkflowEngine:
         ctx_chunks = self.rag.retrieve(
             allowed_ctx_ids, message, user_id=user_id, tenant_id=tenant_id
         )
-        context_snippets = [c.text for c in ctx_chunks]
+        context_snippets = [c.content for c in ctx_chunks]
         context_snippets, history = self._apply_prompt_budget(
             message or "", context_snippets, history
         )
@@ -1561,7 +1561,7 @@ class WorkflowEngine:
             return sanitized
         return value
 
-    def invoke_tool(
+    async def invoke_tool(
         self,
         tool_schema: dict,
         inputs: Dict[str, Any],
@@ -1591,7 +1591,7 @@ class WorkflowEngine:
                         error=str(exc),
                     )
                     history = []
-        return self._invoke_tool(
+        return await self._invoke_tool(
             tool_name,
             inputs,
             adapters=[],
@@ -1789,7 +1789,7 @@ class WorkflowEngine:
                 return result_payload, next_nodes_list
 
         try:
-            tool_result = self._invoke_tool(
+            tool_result = await self._invoke_tool(
                 tool_name,
                 inputs,
                 adapters,
@@ -1877,7 +1877,7 @@ class WorkflowEngine:
                     result_payload[k] = tool_result[k]
         return result_payload, next_nodes_list
 
-    def _invoke_tool(
+    async def _invoke_tool(
         self,
         tool: str,
         inputs: Dict[str, Any],
@@ -1925,9 +1925,13 @@ class WorkflowEngine:
                 )
 
         future = self._tool_executor.submit(_run_handler)
-        cancelled = False
         try:
-            result = future.result(timeout=timeout)
+            # Await the worker-thread future instead of blocking the event loop on
+            # future.result(); this keeps the loop responsive so node/workflow
+            # timeouts fire and other requests are not stalled by a slow tool.
+            result = await asyncio.wait_for(
+                asyncio.wrap_future(future), timeout=timeout
+            )
             sanitized = self._sanitize_html_untrusted(result)
             output_errors = self._validate_tool_payload(
                 sanitized,
@@ -1943,10 +1947,9 @@ class WorkflowEngine:
                     "details": {"errors": output_errors},
                 }
             return sanitized
-        except concurrent.futures.TimeoutError:
+        except (asyncio.TimeoutError, concurrent.futures.TimeoutError):
             self.logger.warning("tool_timeout", tool=tool_name, timeout=timeout)
-            cancelled = future.cancel()
-            if not cancelled:
+            if not future.cancel():
                 self.logger.warning("tool_timeout_cancellation_failed", tool=tool_name)
             return {"status": "error", "content": "tool timed out", "error": "timeout"}
 
@@ -2103,7 +2106,7 @@ class WorkflowEngine:
         ctx_chunks = self.rag.retrieve(
             allowed_ctx_ids, message, user_id=user_id, tenant_id=tenant_id
         )
-        context_snippets = [c.text for c in ctx_chunks]
+        context_snippets = [c.content for c in ctx_chunks]
         context_snippets, history = self._apply_prompt_budget(
             message, context_snippets, history
         )
@@ -2148,7 +2151,7 @@ class WorkflowEngine:
         chunks = self.rag.retrieve(
             allowed_ctx_ids, question, user_id=user_id, tenant_id=tenant_id
         )
-        snippets = [c.text for c in chunks]
+        snippets = [c.content for c in chunks]
         try:
             resp = self.llm.generate(
                 question or "",

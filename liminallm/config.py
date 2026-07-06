@@ -7,7 +7,7 @@ import string
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -39,6 +39,9 @@ class ModelBackend(str, Enum):
     ZHIPU = "zhipu"
     ZHIPU_AI = "zhipu.ai"
     GLM = "glm"
+    # Local JAX + LoRA serving
+    LOCAL_LORA = "local_lora"
+    LOCAL_GPU_LORA = "local_gpu_lora"
     # Stub backend for testing - returns canned responses
     STUB = "stub"
 
@@ -287,6 +290,35 @@ def get_provider_capabilities(provider: str) -> ProviderCapabilities:
     return PROVIDER_CAPABILITIES.get(provider.lower(), DEFAULT_PROVIDER_CAPABILITIES)
 
 
+# OpenAI-compatible API endpoints for first-party providers. Each provider is
+# reachable through the OpenAI chat-completions client by pointing base_url at
+# the provider and supplying its API key, so a single ApiAdapterBackend serves
+# OpenAI, Anthropic, Zhipu/GLM, Together, Gemini, etc. `provider` is the key
+# into PROVIDER_CAPABILITIES; `api_key_env` is the env var read for credentials.
+PROVIDER_ENDPOINTS: dict[str, dict[str, Optional[str]]] = {
+    "openai": {"provider": "openai", "api_key_env": "OPENAI_API_KEY", "base_url": None},
+    "anthropic": {"provider": "anthropic", "api_key_env": "ANTHROPIC_API_KEY", "base_url": "https://api.anthropic.com/v1"},
+    "azure": {"provider": "azure", "api_key_env": "AZURE_OPENAI_API_KEY", "base_url": None},
+    "azure_openai": {"provider": "azure_openai", "api_key_env": "AZURE_OPENAI_API_KEY", "base_url": None},
+    "gemini": {"provider": "gemini", "api_key_env": "GEMINI_API_KEY", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai"},
+    "google": {"provider": "gemini", "api_key_env": "GEMINI_API_KEY", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai"},
+    "zhipu": {"provider": "zhipu", "api_key_env": "ZHIPU_API_KEY", "base_url": "https://open.bigmodel.cn/api/paas/v4"},
+    "zhipu.ai": {"provider": "zhipu", "api_key_env": "ZHIPU_API_KEY", "base_url": "https://open.bigmodel.cn/api/paas/v4"},
+    "glm": {"provider": "zhipu", "api_key_env": "ZHIPU_API_KEY", "base_url": "https://open.bigmodel.cn/api/paas/v4"},
+    "together": {"provider": "together", "api_key_env": "TOGETHER_API_KEY", "base_url": "https://api.together.xyz/v1"},
+    "together.ai": {"provider": "together", "api_key_env": "TOGETHER_API_KEY", "base_url": "https://api.together.xyz/v1"},
+}
+
+
+def resolve_provider_endpoint(mode: str) -> Optional[dict[str, Optional[str]]]:
+    """Return endpoint wiring for an OpenAI-compatible API provider backend mode.
+
+    Returns None for modes that are not API providers (stub, local_lora,
+    local_gpu_lora, adapter_server), which are constructed by other paths.
+    """
+    return PROVIDER_ENDPOINTS.get((mode or "").lower())
+
+
 def env_field(default: Any, env: str, **kwargs):
     extra = kwargs.pop("json_schema_extra", {}) or {}
     extra = {**extra, "env": env}
@@ -435,7 +467,7 @@ class Settings(BaseModel):
         "ENABLE_MFA",
         description="Enable multi-factor authentication (overridable via admin UI)",
     )
-    jwt_secret: str = env_field(None, "JWT_SECRET")
+    jwt_secret: str = env_field(None, "JWT_SECRET", validate_default=True)
     jwt_issuer: str = env_field(
         "liminallm", "JWT_ISSUER",
         description="JWT issuer (overridable via admin UI)"
@@ -622,7 +654,7 @@ class Settings(BaseModel):
             return [v.strip() for v in value.split(",") if v.strip()]
         return list(value)
 
-    @field_validator("jwt_secret")
+    @field_validator("jwt_secret", mode="before")
     @classmethod
     def _ensure_jwt_secret(cls, value: str | None) -> str:
         def _validate_secret(secret: str) -> str:

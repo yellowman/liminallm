@@ -168,8 +168,10 @@ def main():
             print("\nAdmin user created successfully!")
             print(f"  Email: {result['email']}")
             print(f"  User ID: {result['user_id']}")
-            if result.get("access_token"):
-                print(f"  Access Token: {result['access_token'][:50]}...")
+            # Do NOT print the access token: this runs as a compose service and
+            # would leak a live admin credential into `docker logs`. Log in with
+            # the email/password to obtain a token.
+            print("  Log in with the admin email/password to obtain a token.")
         elif result["status"] == "promoted":
             print("\nExisting user promoted to admin!")
         elif result["status"] == "already_admin":

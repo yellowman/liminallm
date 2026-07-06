@@ -398,6 +398,7 @@ class PostgresStore:
                 "default_chat_workflow",
                 default_schema,
                 "LLM-only chat workflow defined as data.",
+                visibility="global",
                 version_author="system_llm",
                 change_note="Seeded default workflow",
             )
@@ -416,6 +417,7 @@ class PostgresStore:
                 spec["name"],
                 spec,
                 spec.get("description", ""),
+                visibility="global",
                 version_author="system_llm",
                 change_note="Seeded default tool spec",
             )
@@ -505,7 +507,7 @@ class PostgresStore:
                     context_text,
                     corrected_text,
                     normalized_weight,
-                    meta,
+                    self._json_param(meta),
                 ),
             ).fetchone()
         return PreferenceEvent(
@@ -574,7 +576,7 @@ class PostgresStore:
                 feedback=row["feedback"],
                 score=row.get("score"),
                 explicit_signal=row.get("explicit_signal"),
-                context_embedding=row.get("context_embedding") or [],
+                context_embedding=self._parse_vector(row.get("context_embedding")),
                 cluster_id=row.get("cluster_id"),
                 context_text=row.get("context_text"),
                 corrected_text=row.get("corrected_text"),
@@ -605,7 +607,7 @@ class PostgresStore:
             feedback=row["feedback"],
             score=row.get("score"),
             explicit_signal=row.get("explicit_signal"),
-            context_embedding=row.get("context_embedding") or [],
+            context_embedding=self._parse_vector(row.get("context_embedding")),
             cluster_id=row.get("cluster_id"),
             context_text=row.get("context_text"),
             corrected_text=row.get("corrected_text"),
@@ -629,7 +631,7 @@ class PostgresStore:
             feedback=row["feedback"],
             score=row.get("score"),
             explicit_signal=row.get("explicit_signal"),
-            context_embedding=row.get("context_embedding") or [],
+            context_embedding=self._parse_vector(row.get("context_embedding")),
             cluster_id=row.get("cluster_id"),
             context_text=row.get("context_text"),
             corrected_text=row.get("corrected_text"),
@@ -694,12 +696,12 @@ class PostgresStore:
                 (
                     cid,
                     user_id,
-                    cluster.centroid,
+                    self._format_vector(cluster.centroid) if cluster.centroid else None,
                     size,
                     cluster.label,
                     cluster.description,
                     cluster.sample_message_ids,
-                    cluster.meta,
+                    self._json_param(cluster.meta),
                     created_at,
                     now,
                 ),
@@ -760,9 +762,9 @@ class PostgresStore:
                 (
                     new_label,
                     new_description,
-                    new_centroid,
+                    self._format_vector(new_centroid) if new_centroid else None,
                     new_size,
-                    meta if meta is not None else existing.meta,
+                    self._json_param(meta if meta is not None else existing.meta),
                     cluster_id,
                 ),
             ).fetchone()
@@ -771,7 +773,7 @@ class PostgresStore:
         return SemanticCluster(
             id=str(row["id"]),
             user_id=row.get("user_id"),
-            centroid=row.get("centroid", new_centroid) or [],
+            centroid=self._parse_vector(row.get("centroid")) or new_centroid,
             size=row.get("size", new_size),
             label=normalize_optional_text(row.get("label")),
             description=normalize_optional_text(row.get("description")),
@@ -798,7 +800,7 @@ class PostgresStore:
             SemanticCluster(
                 id=str(row["id"]),
                 user_id=row.get("user_id"),
-                centroid=row.get("centroid") or [],
+                centroid=self._parse_vector(row.get("centroid")),
                 size=row.get("size", 0),
                 label=normalize_optional_text(row.get("label")),
                 description=normalize_optional_text(row.get("description")),
@@ -820,7 +822,7 @@ class PostgresStore:
         return SemanticCluster(
             id=str(row["id"]),
             user_id=row.get("user_id"),
-            centroid=row.get("centroid") or [],
+            centroid=self._parse_vector(row.get("centroid")),
             size=row.get("size", 0),
             label=row.get("label"),
             description=row.get("description"),
@@ -863,7 +865,7 @@ class PostgresStore:
                     num_events,
                     dataset_path,
                     pref_ids if pref_ids else None,
-                    meta,
+                    self._json_param(meta),
                 ),
             ).fetchone()
         return TrainingJob(
@@ -913,7 +915,7 @@ class PostgresStore:
                     loss if loss is not None else existing.loss,
                     new_version if new_version is not None else existing.new_version,
                     dataset_path if dataset_path is not None else existing.dataset_path,
-                    meta if meta is not None else existing.meta,
+                    self._json_param(meta if meta is not None else existing.meta),
                     new_updated_at,
                     job_id,
                 ),
@@ -1467,7 +1469,7 @@ class PostgresStore:
             # 6. Delete config patches for user's artifacts
             if artifact_ids:
                 conn.execute(
-                    "DELETE FROM config_patch_audit WHERE artifact_id = ANY(%s)", (artifact_ids,)
+                    "DELETE FROM config_patch WHERE artifact_id = ANY(%s)", (artifact_ids,)
                 )
 
             # 7. Delete artifact versions for user's artifacts
@@ -1498,7 +1500,7 @@ class PostgresStore:
             conn.execute("DELETE FROM auth_session WHERE user_id = %s", (user_id,))
 
             # 14. Delete MFA config
-            conn.execute("DELETE FROM user_mfa_config WHERE user_id = %s", (user_id,))
+            conn.execute("DELETE FROM user_mfa_secret WHERE user_id = %s", (user_id,))
 
             # 15. Delete auth credentials
             conn.execute("DELETE FROM user_auth_credential WHERE user_id = %s", (user_id,))
@@ -2345,7 +2347,9 @@ class PostgresStore:
                     meta = json.loads(meta)
                 except Exception:
                     meta = None
-            centroid_vec = row.get("centroid_vec") if isinstance(row, dict) else None
+            centroid_vec = (
+                self._parse_vector(row.get("centroid_vec")) if isinstance(row, dict) else None
+            )
             states.append(
                 AdapterRouterState(
                     artifact_id=str(row["artifact_id"]),
@@ -2395,7 +2399,8 @@ class PostgresStore:
             ).fetchone()
 
             merged_centroid = blend_centroid(
-                existing.get("centroid_vec") if existing else None, centroid_vec
+                self._parse_vector(existing.get("centroid_vec")) if existing else None,
+                centroid_vec,
             )
             merged_success = clamp_success_score(
                 success_score
@@ -2420,7 +2425,7 @@ class PostgresStore:
                     "success_score = %s, last_used_at = %s, last_trained_at = %s, meta = %s "
                     "WHERE artifact_id = %s",
                     (
-                        merged_centroid or None,
+                        self._format_vector(merged_centroid) if merged_centroid else None,
                         usage_count,
                         merged_success,
                         merged_last_used,
@@ -2435,7 +2440,7 @@ class PostgresStore:
                     "VALUES (%s, %s, %s, %s, %s, %s, %s)",
                     (
                         adapter_id,
-                        merged_centroid or None,
+                        self._format_vector(merged_centroid) if merged_centroid else None,
                         usage_count,
                         merged_success,
                         merged_last_used,
@@ -2742,34 +2747,49 @@ class PostgresStore:
         multipliers. These are managed via the admin UI instead of env vars.
         Uses SYSTEM_SETTINGS_DEFAULTS from config.py as single source of truth.
         """
+        # Always merge stored overrides over defaults so callers get a complete,
+        # current settings dict even when the row is partial, absent, or corrupt.
+        return {**SYSTEM_SETTINGS_DEFAULTS, **self._get_stored_system_settings()}
+
+    def _get_stored_system_settings(self) -> dict:
+        """Return only the explicitly-persisted settings (no defaults merged).
+
+        Defaults are never baked into storage, so a future change to a default
+        propagates to keys the admin never overrode.
+        """
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT config FROM instance_config WHERE name = %s",
-                ("system_settings",)
+                ("system_settings",),
             ).fetchone()
+        return self._coerce_stored_settings(row)
+
+    @staticmethod
+    def _coerce_stored_settings(row: Any) -> dict:
         if not row:
-            # Return defaults if no settings in database
-            return SYSTEM_SETTINGS_DEFAULTS.copy()
-        raw_config = row.get("config")
+            return {}
+        raw_config = row.get("config") if isinstance(row, dict) else None
         if isinstance(raw_config, str):
             try:
-                return json.loads(raw_config)
-            except Exception as exc:
-                self.logger.warning("system_settings_parse_failed", error=str(exc))
+                parsed = json.loads(raw_config)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
                 return {}
-        if isinstance(raw_config, dict):
-            return raw_config
-        return {}
+        return raw_config if isinstance(raw_config, dict) else {}
 
     def set_system_settings(self, settings: dict) -> dict:
         """Update admin-managed system settings.
 
-        Merges provided settings with existing settings and persists to database.
-        Returns the updated full settings.
+        Reads and writes the stored overrides in one transaction so concurrent
+        admin updates don't clobber each other, and never persists defaults.
+        Returns the full effective settings (defaults + overrides).
         """
-        existing = self.get_system_settings()
-        merged = {**existing, **settings}
-        with self._connect() as conn:
+        with self._connect() as conn, conn.transaction():
+            row = conn.execute(
+                "SELECT config FROM instance_config WHERE name = %s FOR UPDATE",
+                ("system_settings",),
+            ).fetchone()
+            merged = {**self._coerce_stored_settings(row), **settings}
             conn.execute(
                 """
                 INSERT INTO instance_config (name, config, created_at, updated_at)
@@ -2780,7 +2800,7 @@ class PostgresStore:
                 """,
                 ("system_settings", json.dumps(merged)),
             )
-        return merged
+        return {**SYSTEM_SETTINGS_DEFAULTS, **merged}
 
     # knowledge
     def upsert_context(
@@ -2800,7 +2820,7 @@ class PostgresStore:
             with self._connect() as conn:
                 conn.execute(
                     "INSERT INTO knowledge_context (id, owner_user_id, name, description, fs_path, meta) VALUES (%s, %s, %s, %s, %s, %s)",
-                    (ctx_id, owner_user_id, name, description, fs_path, meta),
+                    (ctx_id, owner_user_id, name, description, fs_path, self._json_param(meta)),
                 )
         except errors.ForeignKeyViolation:
             raise ConstraintViolation(
@@ -3069,7 +3089,7 @@ class PostgresStore:
                     context_id=str(row["context_id"]),
                     fs_path=row["fs_path"],
                     content=row["content"],
-                    embedding=row.get("embedding") or [],
+                    embedding=self._parse_vector(row.get("embedding")),
                     chunk_index=row.get("chunk_index", 0),
                     created_at=row.get("created_at", datetime.utcnow()),
                     meta=row.get("meta"),
@@ -3082,6 +3102,43 @@ class PostgresStore:
             self._safe_float(val, default=0.0, context="format_vector") for val in embedding
         )
         return "[" + ",".join(f"{val:.6f}" for val in safe_vals) + "]"
+
+    def _parse_vector(self, value: Any) -> List[float]:
+        """Coerce a pgvector column value to list[float].
+
+        Without a registered pgvector type adapter, VECTOR columns come back as
+        their text representation ("[0.1,0.2]"). Normalize that and any
+        already-parsed sequence to a plain float list so downstream vector math
+        never operates on characters.
+        """
+        if value is None:
+            return []
+        if isinstance(value, str):
+            stripped = value.strip().strip("[]")
+            if not stripped:
+                return []
+            return [
+                self._safe_float(part, default=0.0, context="parse_vector")
+                for part in stripped.split(",")
+            ]
+        try:
+            return [float(v) for v in value]
+        except (TypeError, ValueError):
+            return []
+
+    @staticmethod
+    def _json_param(value: Any) -> Optional[str]:
+        """Serialize a dict/list to JSON text for a JSONB column parameter.
+
+        psycopg cannot adapt a bare dict/list to JSONB, so mappings are dumped
+        to text (Postgres applies the text->jsonb assignment cast). Strings pass
+        through unchanged and None maps to SQL NULL.
+        """
+        if value is None:
+            return None
+        if isinstance(value, str):
+            return value
+        return json.dumps(value)
 
     def search_chunks_pgvector(
         self,
@@ -3148,7 +3205,7 @@ class PostgresStore:
                 context_id=str(row["context_id"]),
                 fs_path=row["fs_path"],
                 content=row["content"],
-                embedding=row.get("embedding") or [],
+                embedding=self._parse_vector(row.get("embedding")),
                 chunk_index=row.get("chunk_index", 0),
                 created_at=row.get("created_at", datetime.utcnow()),
                 meta=row.get("meta"),

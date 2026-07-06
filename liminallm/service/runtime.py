@@ -142,20 +142,13 @@ class Runtime:
         if hasattr(self.store, "get_system_settings"):
             sys_settings = self.store.get_system_settings() or {}
 
-        # Resolve model settings from DB with env var fallback
-        resolved_base_model = (
-            sys_settings.get("model_path") or self.settings.model_path
-        )
-        backend_mode = sys_settings.get("model_backend") or self.settings.model_backend
-        default_adapter_mode = (
-            sys_settings.get("default_adapter_mode") or self.settings.default_adapter_mode
-        )
+        # Build all backend-dependent services (router, llm, rag, training,
+        # clusterer, workflow, config_ops). Extracted into a helper so
+        # reload_model_services() can rebuild them when an admin changes
+        # model_backend/model_path without restarting the process.
+        self._build_model_services(sys_settings)
 
-        # Resolve other settings from DB with env var fallback
-        rag_mode = sys_settings.get("rag_mode") or self.settings.rag_mode
-        embedding_model_id = (
-            sys_settings.get("embedding_model_id") or self.settings.embedding_model_id
-        )
+        # Voice/email settings resolve from DB with env var fallback
         voice_transcription_model = (
             sys_settings.get("voice_transcription_model")
             or self.settings.voice_transcription_model
@@ -168,59 +161,13 @@ class Runtime:
             sys_settings.get("voice_default_voice") or self.settings.voice_default_voice
         )
         app_base_url = sys_settings.get("app_base_url") or self.settings.app_base_url
-        rag_chunk_size = sys_settings.get("rag_chunk_size", 400)
 
-        self.router = RouterEngine(cache=self.cache, backend_mode=backend_mode)
-        adapter_configs = {
-            "openai": {
-                "api_key": self.settings.adapter_openai_api_key,
-                "base_url": self.settings.adapter_openai_base_url,
-                "adapter_server_model": self.settings.adapter_server_model,
-            }
-        }
-        self.embeddings = EmbeddingsService(embedding_model_id)
-        self.llm = LLMService(
-            base_model=resolved_base_model,
-            backend_mode=backend_mode,
-            adapter_configs=adapter_configs,
-            api_key=self.settings.adapter_openai_api_key,
-            base_url=self.settings.adapter_openai_base_url,
-            adapter_server_model=self.settings.adapter_server_model,
-            fs_root=self.settings.shared_fs_root,
-        )
-        self.rag = RAGService(
-            self.store,
-            default_chunk_size=rag_chunk_size,
-            rag_mode=rag_mode,
-            embed=self.embeddings.embed,
-            embedding_model_id=embedding_model_id,
-        )
-        self.training = TrainingService(
-            self.store,
-            self.settings.shared_fs_root,
-            runtime_base_model=resolved_base_model,
-            default_adapter_mode=default_adapter_mode,
-            backend_mode=backend_mode,
-            max_active_training_jobs=self.settings.max_active_training_jobs,
-        )
-        self.clusterer = SemanticClusterer(self.store, self.llm, self.training)
-        self.workflow = WorkflowEngine(
-            self.store,
-            self.llm,
-            self.router,
-            self.rag,
-            cache=self.cache,
-            settings=self.settings,
-        )
         self.voice = VoiceService(
             self.settings.shared_fs_root,
             api_key=self.settings.voice_api_key,
             transcription_model=voice_transcription_model,
             synthesis_model=voice_synthesis_model,
             default_voice=voice_default_voice,
-        )
-        self.config_ops = ConfigOpsService(
-            self.store, self.llm, self.router, self.training
         )
         # Use MFA setting from sys_settings (already fetched above)
         mfa_enabled = sys_settings.get("enable_mfa", self.settings.enable_mfa)
@@ -278,14 +225,106 @@ class Runtime:
         # Log successful initialization with summary
         logger.info(
             "runtime_initialized",
-            model_path=resolved_base_model,
-            model_backend=str(backend_mode),
-            rag_mode=str(rag_mode),
-            adapter_mode=str(default_adapter_mode),
+            model_path=self.resolved_base_model,
+            model_backend=str(self.backend_mode),
+            rag_mode=str(self.rag_mode),
+            adapter_mode=str(self.default_adapter_mode),
             redis_enabled=self.cache is not None,
             email_configured=self.email.is_configured,
             voice_configured=self.voice.is_configured,
             mfa_enabled=mfa_enabled,
+        )
+
+    def _build_model_services(self, sys_settings: dict) -> None:
+        """Construct all backend-dependent services from system settings.
+
+        Shared by __init__ and reload_model_services so a runtime
+        model_backend / model_path change takes effect without a restart.
+        """
+        self.resolved_base_model = (
+            sys_settings.get("model_path") or self.settings.model_path
+        )
+        self.backend_mode = (
+            sys_settings.get("model_backend") or self.settings.model_backend
+        )
+        self.default_adapter_mode = (
+            sys_settings.get("default_adapter_mode")
+            or self.settings.default_adapter_mode
+        )
+        self.rag_mode = sys_settings.get("rag_mode") or self.settings.rag_mode
+        embedding_model_id = (
+            sys_settings.get("embedding_model_id") or self.settings.embedding_model_id
+        )
+        rag_chunk_size = sys_settings.get("rag_chunk_size", 400)
+        adapter_configs = {
+            "openai": {
+                "api_key": self.settings.adapter_openai_api_key,
+                "base_url": self.settings.adapter_openai_base_url,
+                "adapter_server_model": self.settings.adapter_server_model,
+            }
+        }
+        self.router = RouterEngine(cache=self.cache, backend_mode=self.backend_mode)
+        self.embeddings = EmbeddingsService(embedding_model_id)
+        self.llm = LLMService(
+            base_model=self.resolved_base_model,
+            backend_mode=self.backend_mode,
+            adapter_configs=adapter_configs,
+            api_key=self.settings.adapter_openai_api_key,
+            base_url=self.settings.adapter_openai_base_url,
+            adapter_server_model=self.settings.adapter_server_model,
+            fs_root=self.settings.shared_fs_root,
+        )
+        self.rag = RAGService(
+            self.store,
+            default_chunk_size=rag_chunk_size,
+            rag_mode=self.rag_mode,
+            embed=self.embeddings.embed,
+            embedding_model_id=embedding_model_id,
+        )
+        self.training = TrainingService(
+            self.store,
+            self.settings.shared_fs_root,
+            runtime_base_model=self.resolved_base_model,
+            default_adapter_mode=self.default_adapter_mode,
+            backend_mode=self.backend_mode,
+            max_active_training_jobs=self.settings.max_active_training_jobs,
+        )
+        self.clusterer = SemanticClusterer(self.store, self.llm, self.training)
+        self.workflow = WorkflowEngine(
+            self.store,
+            self.llm,
+            self.router,
+            self.rag,
+            cache=self.cache,
+            settings=self.settings,
+        )
+        self.config_ops = ConfigOpsService(
+            self.store, self.llm, self.router, self.training
+        )
+
+    def reload_model_services(self) -> None:
+        """Rebuild backend-dependent services after a system-settings change.
+
+        Lets an admin switch model_backend / model_path (and rag/embedding
+        settings) at runtime without restarting. In-flight workflow threads
+        finish on the old engine; new requests use the rebuilt services.
+        """
+        old_workflow = getattr(self, "workflow", None)
+        sys_settings = {}
+        if hasattr(self.store, "get_system_settings"):
+            sys_settings = self.store.get_system_settings() or {}
+        self._build_model_services(sys_settings)
+        if getattr(self, "training_worker", None):
+            self.training_worker.training = self.training
+            self.training_worker.clusterer = self.clusterer
+        if old_workflow is not None and old_workflow is not self.workflow:
+            with contextlib.suppress(Exception):
+                old_workflow.shutdown(wait=False)
+        logger.info(
+            "runtime_model_services_reloaded",
+            model_path=self.resolved_base_model,
+            model_backend=str(self.backend_mode),
+            rag_mode=str(self.rag_mode),
         )
 
     async def close(self) -> None:

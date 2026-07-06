@@ -133,7 +133,8 @@ tests/
 ├── conftest.py              # Pytest fixtures and configuration
 ├── test_integration_admin.py    # Admin API integration tests
 ├── test_endpoint_rate_limits.py # Rate limiting tests
-├── test_auth.py                 # Authentication tests
+├── test_auth_unit.py            # Authentication unit tests
+├── test_integration_auth.py     # Authentication integration tests
 └── ...
 
 scripts/
