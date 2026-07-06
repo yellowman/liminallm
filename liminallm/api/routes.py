@@ -94,7 +94,15 @@ from liminallm.api.schemas import (
     VoiceTranscriptionResponse,
     WorkflowListResponse,
 )
-from liminallm.config import get_settings
+from liminallm.config import (
+    SYSTEM_SETTINGS_BOOL_KEYS,
+    SYSTEM_SETTINGS_DEFAULTS,
+    SYSTEM_SETTINGS_FLOAT_KEYS,
+    SYSTEM_SETTINGS_INT_KEYS,
+    SYSTEM_SETTINGS_RATE_LIMIT_KEYS,
+    SYSTEM_SETTINGS_STRING_KEYS,
+    get_settings,
+)
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service.auth import AuthContext
@@ -357,71 +365,14 @@ def _get_system_settings(runtime) -> dict:
     """Get admin-managed system settings from database.
 
     Returns merged settings with defaults for any missing values.
+    Uses SYSTEM_SETTINGS_DEFAULTS from config.py as single source of truth.
     """
     if hasattr(runtime.store, "get_system_settings"):
-        db_settings = runtime.store.get_system_settings()
+        db_settings = runtime.store.get_system_settings() or {}
     else:
         db_settings = {}
 
-    # Defaults for any missing settings
-    defaults = {
-        "session_rotation_hours": 24,
-        "session_rotation_grace_seconds": 300,
-        "max_concurrent_workflows": 3,
-        "max_concurrent_inference": 2,
-        "rate_limit_multiplier_free": 1.0,
-        "rate_limit_multiplier_paid": 2.0,
-        "rate_limit_multiplier_enterprise": 5.0,
-        "chat_rate_limit_per_minute": 60,
-        "chat_rate_limit_window_seconds": 60,
-        "login_rate_limit_per_minute": 10,
-        "refresh_rate_limit_per_minute": 20,
-        "refresh_rate_limit_window_seconds": 60,
-        "signup_rate_limit_per_minute": 5,
-        "reset_rate_limit_per_minute": 5,
-        "mfa_rate_limit_per_minute": 5,
-        "admin_rate_limit_per_minute": 30,
-        "admin_rate_limit_window_seconds": 60,
-        "files_upload_rate_limit_per_minute": 10,
-        "websocket_connect_rate_limit_per_minute": 30,
-        "configops_rate_limit_per_hour": 30,
-        "read_rate_limit_per_minute": 120,
-        "write_rate_limit_per_minute": 60,
-        "max_websocket_connections_per_user": 5,
-        "default_page_size": 100,
-        "max_page_size": 500,
-        "default_conversations_limit": 50,
-        "max_upload_bytes": 10485760,
-        "rag_chunk_size": 400,
-        "access_token_ttl_minutes": 30,
-        "refresh_token_ttl_minutes": 1440,
-        "enable_mfa": True,
-        "allow_signup": True,
-        "training_worker_enabled": True,
-        "training_worker_poll_interval": 60,
-        "smtp_host": "",
-        "smtp_port": 587,
-        "smtp_user": "",
-        "smtp_password": "",
-        "smtp_use_tls": True,
-        "smtp_allow_insecure": False,
-        "email_from_address": "",
-        "email_from_name": "LiminalLM",
-        "oauth_redirect_uri": "",
-        "app_base_url": "http://localhost:8000",
-        "voice_transcription_model": "whisper-1",
-        "voice_synthesis_model": "tts-1",
-        "voice_default_voice": "alloy",
-        "rag_mode": "pgvector",
-        "embedding_model_id": "text-embedding",
-        "default_tenant_id": "public",
-        "jwt_issuer": "liminallm",
-        "jwt_audience": "liminal-clients",
-        "model_path": "gpt-4o-mini",
-        "model_backend": "openai",
-        "default_adapter_mode": "hybrid",
-    }
-    return {**defaults, **db_settings}
+    return {**SYSTEM_SETTINGS_DEFAULTS, **db_settings}
 
 
 def _get_plan_rate_multiplier(runtime, plan_tier: str) -> float:
@@ -3039,60 +2990,8 @@ async def update_system_settings(
     )
 
     # Validate settings
-    allowed_keys = {
-        "session_rotation_hours",
-        "session_rotation_grace_seconds",
-        "max_concurrent_workflows",
-        "max_concurrent_inference",
-        "rate_limit_multiplier_free",
-        "rate_limit_multiplier_paid",
-        "rate_limit_multiplier_enterprise",
-        "chat_rate_limit_per_minute",
-        "chat_rate_limit_window_seconds",
-        "login_rate_limit_per_minute",
-        "refresh_rate_limit_per_minute",
-        "refresh_rate_limit_window_seconds",
-        "signup_rate_limit_per_minute",
-        "reset_rate_limit_per_minute",
-        "mfa_rate_limit_per_minute",
-        "admin_rate_limit_per_minute",
-        "admin_rate_limit_window_seconds",
-        "files_upload_rate_limit_per_minute",
-        "configops_rate_limit_per_hour",
-        "read_rate_limit_per_minute",
-        "default_page_size",
-        "max_page_size",
-        "default_conversations_limit",
-        "max_upload_bytes",
-        "rag_chunk_size",
-        "access_token_ttl_minutes",
-        "refresh_token_ttl_minutes",
-        "enable_mfa",
-        "allow_signup",
-        "training_worker_enabled",
-        "training_worker_poll_interval",
-        "smtp_host",
-        "smtp_port",
-        "smtp_user",
-        "smtp_password",
-        "smtp_use_tls",
-        "smtp_allow_insecure",
-        "email_from_address",
-        "email_from_name",
-        "oauth_redirect_uri",
-        "app_base_url",
-        "voice_transcription_model",
-        "voice_synthesis_model",
-        "voice_default_voice",
-        "rag_mode",
-        "embedding_model_id",
-        "default_tenant_id",
-        "jwt_issuer",
-        "jwt_audience",
-        "model_path",
-        "model_backend",
-        "default_adapter_mode",
-    }
+    # Use centralized settings definitions from config.py (single source of truth)
+    allowed_keys = set(SYSTEM_SETTINGS_DEFAULTS.keys())
     invalid_keys = set(body.keys()) - allowed_keys
     if invalid_keys:
         raise _http_error(
@@ -3101,67 +3000,11 @@ async def update_system_settings(
             status_code=400,
         )
 
-    # Type validation
-    int_keys = {
-        "session_rotation_hours",
-        "session_rotation_grace_seconds",
-        "max_concurrent_workflows",
-        "max_concurrent_inference",
-        "chat_rate_limit_per_minute",
-        "chat_rate_limit_window_seconds",
-        "login_rate_limit_per_minute",
-        "refresh_rate_limit_per_minute",
-        "refresh_rate_limit_window_seconds",
-        "signup_rate_limit_per_minute",
-        "reset_rate_limit_per_minute",
-        "mfa_rate_limit_per_minute",
-        "admin_rate_limit_per_minute",
-        "admin_rate_limit_window_seconds",
-        "files_upload_rate_limit_per_minute",
-        "configops_rate_limit_per_hour",
-        "read_rate_limit_per_minute",
-        "default_page_size",
-        "max_page_size",
-        "default_conversations_limit",
-        "max_upload_bytes",
-        "rag_chunk_size",
-        "access_token_ttl_minutes",
-        "refresh_token_ttl_minutes",
-        "training_worker_poll_interval",
-        "smtp_port",
-    }
-    float_keys = {
-        "rate_limit_multiplier_free",
-        "rate_limit_multiplier_paid",
-        "rate_limit_multiplier_enterprise",
-    }
-    bool_keys = {
-        "enable_mfa",
-        "allow_signup",
-        "training_worker_enabled",
-        "smtp_use_tls",
-        "smtp_allow_insecure",
-    }
-    string_keys = {
-        "smtp_host",
-        "smtp_user",
-        "smtp_password",
-        "email_from_address",
-        "email_from_name",
-        "oauth_redirect_uri",
-        "app_base_url",
-        "voice_transcription_model",
-        "voice_synthesis_model",
-        "voice_default_voice",
-        "rag_mode",
-        "embedding_model_id",
-        "default_tenant_id",
-        "jwt_issuer",
-        "jwt_audience",
-        "model_path",
-        "model_backend",
-        "default_adapter_mode",
-    }
+    # Type validation - derived from SYSTEM_SETTINGS_DEFAULTS types
+    int_keys = SYSTEM_SETTINGS_INT_KEYS
+    float_keys = SYSTEM_SETTINGS_FLOAT_KEYS
+    bool_keys = SYSTEM_SETTINGS_BOOL_KEYS
+    string_keys = SYSTEM_SETTINGS_STRING_KEYS
     # Enum validation for settings with known valid values
     enum_values = {
         "voice_transcription_model": {"whisper-1"},
@@ -3207,23 +3050,10 @@ async def update_system_settings(
                 f"{key} must be a string",
                 status_code=400,
             )
-        # Rate limit keys that accept 0 (meaning "disabled/unlimited")
-        rate_limit_keys = {
-            "chat_rate_limit_per_minute",
-            "login_rate_limit_per_minute",
-            "refresh_rate_limit_per_minute",
-            "signup_rate_limit_per_minute",
-            "reset_rate_limit_per_minute",
-            "mfa_rate_limit_per_minute",
-            "admin_rate_limit_per_minute",
-            "files_upload_rate_limit_per_minute",
-            "configops_rate_limit_per_hour",
-            "read_rate_limit_per_minute",
-        }
         # Validate positive values for numeric settings
         # Rate limit keys allow 0 (disabled), but not negative
         if key in int_keys and isinstance(value, int):
-            if key in rate_limit_keys:
+            if key in SYSTEM_SETTINGS_RATE_LIMIT_KEYS:
                 if value < 0:
                     raise _http_error(
                         "validation_error",

@@ -255,7 +255,9 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "frontend"
 @app.middleware("http")
 async def block_direct_admin_access(request: Request, call_next):
     """Block direct access to /static/admin.html - use /admin route instead."""
-    if request.url.path == "/static/admin.html":
+    # Normalize path: collapse double slashes, remove trailing slash
+    path = request.url.path.replace("//", "/").rstrip("/")
+    if path == "/static/admin.html" or path == "/static/admin":
         return JSONResponse(
             status_code=403,
             content={"detail": "Use /admin route for admin UI"},

@@ -308,10 +308,12 @@ class StubBackend:
         *,
         user_id: Optional[str] = None,
     ) -> Iterator[dict]:
-        # Yield tokens one word at a time
+        # Yield tokens one word at a time, with space between words (not after last)
         words = self.STUB_RESPONSE.split()
-        for word in words:
-            yield {"event": "token", "data": word + " "}
+        for i, word in enumerate(words):
+            # Add space after all words except the last
+            token = word + " " if i < len(words) - 1 else word
+            yield {"event": "token", "data": token}
         yield {
             "event": "message_done",
             "data": {
@@ -460,6 +462,7 @@ class ApiAdapterBackend:
         mode_lower = (adapter_mode or "").lower()
         if mode_lower in {
             "openai",
+            "anthropic",
             "azure",
             "azure_openai",
             "vertex",
@@ -467,6 +470,8 @@ class ApiAdapterBackend:
             "bedrock",
         }:
             return mode_lower
+        if mode_lower in {"zhipu", "zhipu.ai", "glm"}:
+            return "zhipu"
         if mode_lower in {"together", "together.ai"}:
             return "together"
         if mode_lower in {"lorax", "adapter_server"}:

@@ -74,12 +74,17 @@ class AdapterMode(str, Enum):
 BACKEND_ADAPTER_COMPATIBILITY: dict[str, set[str]] = {
     # API backends can use remote adapters or prompt-based
     "openai": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "anthropic": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
     "azure": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
     "azure_openai": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
     "vertex": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
     "gemini": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
     "google": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
     "bedrock": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    # Zhipu AI GLM models
+    "zhipu": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "zhipu.ai": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "glm": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
     # Adapter-aware API backends support remote adapter IDs
     "together": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
     "together.ai": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
@@ -90,6 +95,8 @@ BACKEND_ADAPTER_COMPATIBILITY: dict[str, set[str]] = {
     # Local backend supports local weights
     "local_lora": {AdapterMode.LOCAL, AdapterMode.PROMPT, AdapterMode.HYBRID},
     "local_gpu_lora": {AdapterMode.LOCAL, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    # Stub backend for testing
+    "stub": {AdapterMode.PROMPT},
 }
 
 
@@ -175,6 +182,32 @@ PROVIDER_CAPABILITIES: dict[str, ProviderCapabilities] = {
         gate_weights=False,
         max_adapters=1,
     ),
+    # Anthropic Claude models (claude-3, claude-sonnet-4, claude-opus-4-5, etc.)
+    "anthropic": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+    ),
+    # Zhipu AI GLM models (glm-4, glm-4-plus, glm-5, etc.)
+    "zhipu": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+    ),
+    "zhipu.ai": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+    ),
+    "glm": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+    ),
     # Adapter-parameter style providers (support multi-adapter)
     "together": ProviderCapabilities(
         remote_style=RemoteStyle.ADAPTER_PARAM,
@@ -230,6 +263,13 @@ PROVIDER_CAPABILITIES: dict[str, ProviderCapabilities] = {
         multi_adapter=True,
         gate_weights=True,
         max_adapters=3,
+    ),
+    # Stub backend for testing (no adapter support)
+    "stub": ProviderCapabilities(
+        remote_style=RemoteStyle.NONE,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=0,
     ),
 }
 
@@ -661,6 +701,106 @@ class Settings(BaseModel):
                 "Unable to persist JWT secret; set JWT_SECRET env var or make SHARED_FS_ROOT writable"
             ) from exc
         return generated
+
+
+# Centralized system settings defaults - single source of truth
+# Used by routes.py, memory.py, postgres.py, and sql seeds
+SYSTEM_SETTINGS_DEFAULTS: dict = {
+    # Session & concurrency
+    "session_rotation_hours": 24,
+    "session_rotation_grace_seconds": 300,
+    "max_concurrent_workflows": 3,
+    "max_concurrent_inference": 2,
+    # Rate limit multipliers
+    "rate_limit_multiplier_free": 1.0,
+    "rate_limit_multiplier_paid": 2.0,
+    "rate_limit_multiplier_enterprise": 5.0,
+    # Rate limits (0 = disabled/unlimited)
+    "chat_rate_limit_per_minute": 60,
+    "chat_rate_limit_window_seconds": 60,
+    "login_rate_limit_per_minute": 10,
+    "refresh_rate_limit_per_minute": 20,
+    "refresh_rate_limit_window_seconds": 60,
+    "signup_rate_limit_per_minute": 5,
+    "reset_rate_limit_per_minute": 5,
+    "mfa_rate_limit_per_minute": 5,
+    "admin_rate_limit_per_minute": 30,
+    "admin_rate_limit_window_seconds": 60,
+    "files_upload_rate_limit_per_minute": 10,
+    "websocket_connect_rate_limit_per_minute": 30,
+    "configops_rate_limit_per_hour": 30,
+    "read_rate_limit_per_minute": 120,
+    "write_rate_limit_per_minute": 60,
+    "max_websocket_connections_per_user": 5,
+    # Pagination
+    "default_page_size": 100,
+    "max_page_size": 500,
+    "default_conversations_limit": 50,
+    # Files
+    "max_upload_bytes": 10485760,
+    "rag_chunk_size": 400,
+    # Token TTLs
+    "access_token_ttl_minutes": 30,
+    "refresh_token_ttl_minutes": 1440,
+    # Feature flags
+    "enable_mfa": True,
+    "allow_signup": True,
+    "training_worker_enabled": True,
+    "training_worker_poll_interval": 60,
+    # SMTP
+    "smtp_host": "",
+    "smtp_port": 587,
+    "smtp_user": "",
+    "smtp_password": "",
+    "smtp_use_tls": True,
+    "smtp_allow_insecure": False,
+    "email_from_address": "",
+    "email_from_name": "LiminalLM",
+    # URLs
+    "oauth_redirect_uri": "",
+    "app_base_url": "http://localhost:8000",
+    # Voice
+    "voice_transcription_model": "whisper-1",
+    "voice_synthesis_model": "tts-1",
+    "voice_default_voice": "alloy",
+    # Model/RAG
+    "rag_mode": "pgvector",
+    "embedding_model_id": "text-embedding",
+    "model_path": "gpt-4o-mini",
+    "model_backend": "openai",
+    "default_adapter_mode": "hybrid",
+    # Tenant/JWT
+    "default_tenant_id": "public",
+    "jwt_issuer": "liminallm",
+    "jwt_audience": "liminal-clients",
+}
+
+# Derived validation sets for admin settings API
+SYSTEM_SETTINGS_INT_KEYS = {
+    k for k, v in SYSTEM_SETTINGS_DEFAULTS.items()
+    if isinstance(v, int) and not isinstance(v, bool)
+}
+
+SYSTEM_SETTINGS_FLOAT_KEYS = {
+    k for k, v in SYSTEM_SETTINGS_DEFAULTS.items()
+    if isinstance(v, float)
+}
+
+SYSTEM_SETTINGS_BOOL_KEYS = {
+    k for k, v in SYSTEM_SETTINGS_DEFAULTS.items()
+    if isinstance(v, bool)
+}
+
+SYSTEM_SETTINGS_STRING_KEYS = {
+    k for k, v in SYSTEM_SETTINGS_DEFAULTS.items()
+    if isinstance(v, str)
+}
+
+# Rate limit keys that allow 0 (disabled/unlimited)
+SYSTEM_SETTINGS_RATE_LIMIT_KEYS = {
+    k for k in SYSTEM_SETTINGS_DEFAULTS.keys()
+    if k.endswith("_per_minute") or k.endswith("_per_hour")
+}
 
 
 def get_settings() -> Settings:

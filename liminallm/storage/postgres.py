@@ -14,6 +14,7 @@ from psycopg import errors
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
+from liminallm.config import SYSTEM_SETTINGS_DEFAULTS
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service.artifact_validation import (
@@ -2739,6 +2740,7 @@ class PostgresStore:
 
         Returns settings for session rotation, concurrency caps, and rate limit
         multipliers. These are managed via the admin UI instead of env vars.
+        Uses SYSTEM_SETTINGS_DEFAULTS from config.py as single source of truth.
         """
         with self._connect() as conn:
             row = conn.execute(
@@ -2747,59 +2749,7 @@ class PostgresStore:
             ).fetchone()
         if not row:
             # Return defaults if no settings in database
-            return {
-                "session_rotation_hours": 24,
-                "session_rotation_grace_seconds": 300,
-                "max_concurrent_workflows": 3,
-                "max_concurrent_inference": 2,
-                "rate_limit_multiplier_free": 1.0,
-                "rate_limit_multiplier_paid": 2.0,
-                "rate_limit_multiplier_enterprise": 5.0,
-                "chat_rate_limit_per_minute": 60,
-                "chat_rate_limit_window_seconds": 60,
-                "login_rate_limit_per_minute": 10,
-                "signup_rate_limit_per_minute": 5,
-                "reset_rate_limit_per_minute": 5,
-                "mfa_rate_limit_per_minute": 5,
-                "admin_rate_limit_per_minute": 30,
-                "admin_rate_limit_window_seconds": 60,
-                "files_upload_rate_limit_per_minute": 10,
-                "configops_rate_limit_per_hour": 30,
-                "read_rate_limit_per_minute": 120,
-                "write_rate_limit_per_minute": 60,
-                "max_websocket_connections_per_user": 5,
-                "default_page_size": 100,
-                "max_page_size": 500,
-                "default_conversations_limit": 50,
-                "max_upload_bytes": 10485760,
-                "rag_chunk_size": 400,
-                "access_token_ttl_minutes": 30,
-                "refresh_token_ttl_minutes": 1440,
-                "enable_mfa": True,
-                "allow_signup": True,
-                "training_worker_enabled": True,
-                "training_worker_poll_interval": 60,
-                "smtp_host": "",
-                "smtp_port": 587,
-                "smtp_user": "",
-                "smtp_password": "",
-                "smtp_use_tls": True,
-                "email_from_address": "",
-                "email_from_name": "LiminalLM",
-                "oauth_redirect_uri": "",
-                "app_base_url": "http://localhost:8000",
-                "voice_transcription_model": "whisper-1",
-                "voice_synthesis_model": "tts-1",
-                "voice_default_voice": "alloy",
-                "rag_mode": "pgvector",
-                "embedding_model_id": "text-embedding",
-                "default_tenant_id": "public",
-                "jwt_issuer": "liminallm",
-                "jwt_audience": "liminal-clients",
-                "model_path": "gpt-4o-mini",
-                "model_backend": "openai",
-                "default_adapter_mode": "hybrid",
-            }
+            return SYSTEM_SETTINGS_DEFAULTS.copy()
         raw_config = row.get("config")
         if isinstance(raw_config, str):
             try:
