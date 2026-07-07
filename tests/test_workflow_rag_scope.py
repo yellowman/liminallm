@@ -32,7 +32,7 @@ class StubRouter:
 
 
 class StubStore:
-    def list_artifacts(self, type_filter=None):
+    def list_artifacts(self, type_filter=None, **kwargs):
         return []
 
     def list_semantic_clusters(self, user_id=None):

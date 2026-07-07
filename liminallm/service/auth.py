@@ -413,10 +413,10 @@ class AuthService:
 
         state = uuid.uuid4().hex
         expires_at = self._now() + timedelta(minutes=10)
-        # Issue 28.4: Thread-safe state mutation
-        with self._state_lock:
-            with self._with_state_lock():
-                self._oauth_states[state] = (provider, expires_at, tenant_id)
+        # Issue 28.4: Thread-safe state mutation (single lock acquisition;
+        # _with_state_lock() already holds _state_lock).
+        with self._with_state_lock():
+            self._oauth_states[state] = (provider, expires_at, tenant_id)
         if self.cache:
             await self.cache.set_oauth_state(state, provider, expires_at, tenant_id)
 
@@ -651,20 +651,17 @@ class AuthService:
                 # avoid stale OAuth state reuse
                 self.logger.error("pop_oauth_state_failed", error=str(exc))
                 return None, None, {}
-        # Issue 28.4: Thread-safe state mutation
-        with self._state_lock:
+        # Issue 28.4: Thread-safe state mutation (single lock acquisition).
+        with self._with_state_lock():
             if stored is None:
-                with self._with_state_lock():
-                    stored = self._oauth_states.pop(state, None)
+                stored = self._oauth_states.pop(state, None)
             else:
-                with self._with_state_lock():
-                    self._oauth_states.pop(state, None)
+                self._oauth_states.pop(state, None)
         now = self._now()
 
         async def _clear_oauth_state() -> None:
-            with self._state_lock:
-                with self._with_state_lock():
-                    self._oauth_states.pop(state, None)
+            with self._with_state_lock():
+                self._oauth_states.pop(state, None)
             if self.cache and not cache_state_used:
                 await self.cache.pop_oauth_state(state)
 
@@ -1216,10 +1213,11 @@ class AuthService:
                 ex=int((expires_at - self._now()).total_seconds()),
             )
         else:
-            # Issue 11.2: In-memory fallback for password reset tokens
-            with self._state_lock:
-                with self._with_state_lock():
-                    self._password_reset_tokens[token] = (email, expires_at)
+            # Issue 11.2: In-memory fallback for password reset tokens.
+            # _with_state_lock() already acquires _state_lock (a non-reentrant
+            # Lock); acquiring it again here would deadlock.
+            with self._with_state_lock():
+                self._password_reset_tokens[token] = (email, expires_at)
         self.logger.info(
             "password_reset_requested",
             email_hash=hashlib.sha256(email.encode()).hexdigest(),
@@ -1231,20 +1229,19 @@ class AuthService:
         if self.cache:
             email = await self.cache.client.get(f"reset:{token}")
         else:
-            # Issue 11.2: In-memory fallback for password reset tokens
-            with self._state_lock:
-                with self._with_state_lock():
-                    stored = self._password_reset_tokens.get(token)
+            # Issue 11.2: In-memory fallback for password reset tokens. Hold the
+            # state lock once for the whole read-modify-write (nesting
+            # _with_state_lock inside would re-acquire the same lock and hang).
+            with self._with_state_lock():
+                stored = self._password_reset_tokens.get(token)
                 if stored:
                     stored_email, expires_at = stored
                     if expires_at <= self._now() - self._clock_skew_leeway:
                         # Remove expired token to prevent memory leak
-                        with self._with_state_lock():
-                            self._password_reset_tokens.pop(token, None)
+                        self._password_reset_tokens.pop(token, None)
                     else:
                         email = stored_email
-                        with self._with_state_lock():
-                            self._password_reset_tokens.pop(token, None)
+                        self._password_reset_tokens.pop(token, None)
         if not email:
             self.logger.warning("password_reset_invalid_token", token_prefix=token[:8])
             return False

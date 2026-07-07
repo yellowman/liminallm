@@ -891,6 +891,26 @@ class MemoryStore:
     def get_training_job(self, job_id: str) -> Optional[TrainingJob]:
         return self.training_jobs.get(job_id)
 
+    def claim_training_job(self, job_id: str) -> Optional[TrainingJob]:
+        """Atomically claim a queued training job (queued -> running).
+
+        Mirrors PostgresStore.claim_training_job so the worker uses one code
+        path across stores. Returns the running job, or None if it is missing
+        or was already claimed.
+        """
+        with self._data_lock:
+            job = self.training_jobs.get(job_id)
+            if not job or job.status != "queued":
+                return None
+            job.status = "running"
+            job.updated_at = datetime.utcnow()
+            self._persist_state()
+            return job
+
+    async def close(self) -> None:
+        """No-op close for parity with PostgresStore (no connections to release)."""
+        return None
+
     def update_training_job(
         self,
         job_id: str,

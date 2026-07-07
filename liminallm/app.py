@@ -80,8 +80,11 @@ _CSRF_SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
 
 
 def _allowed_origins() -> List[str]:
-    if _settings.cors_allow_origins:
-        return _settings.cors_allow_origins
+    # Read current settings rather than the import-time snapshot so the
+    # configured CORS_ALLOW_ORIGINS is honored (and testable).
+    settings = Settings.from_env()
+    if settings.cors_allow_origins:
+        return settings.cors_allow_origins
     # Default to common local dev hosts; avoid wildcard when credentials are enabled.
     return [
         "http://localhost",
@@ -93,7 +96,7 @@ def _allowed_origins() -> List[str]:
 
 
 def _allow_credentials() -> bool:
-    return _settings.cors_allow_credentials
+    return Settings.from_env().cors_allow_credentials
 
 
 app.add_middleware(

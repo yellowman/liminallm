@@ -155,9 +155,14 @@ class TrainingService:
             adapter_id_override: Specific adapter ID to use
             adapter_mode: Override default adapter mode (local/remote/prompt/hybrid)
         """
+        # Pass owner_user_id so the user's own private adapters are returned;
+        # without it list_artifacts only yields global artifacts and this method
+        # would never find an existing adapter (creating a duplicate each call).
         existing = [
             a
-            for a in self.store.list_artifacts(type_filter="adapter")
+            for a in self.store.list_artifacts(
+                type_filter="adapter", owner_user_id=user_id
+            )
             if a.owner_user_id == user_id
         ]
         if adapter_id_override:

@@ -153,12 +153,18 @@ class TestMFAFlow:
             "/v1/auth/signup",
             json={"email": test_user_email, "password": test_user_password},
         )
-        session_id = signup_resp.json()["data"]["session_id"]
+        signup_data = signup_resp.json()["data"]
+        session_id = signup_data["session_id"]
+        csrf_token = signup_data.get("csrf_token")
 
-        # Request MFA setup
+        # Request MFA setup. The endpoint requires the session_id as a cookie
+        # (double-submit guard, Issue 50.1) and, because a session cookie is
+        # present, the CSRF middleware requires the matching X-CSRF-Token.
         response = client.post(
             "/v1/auth/mfa/request",
             json={"session_id": session_id},
+            cookies={"session_id": session_id, "csrf_token": csrf_token},
+            headers={"X-CSRF-Token": csrf_token},
         )
 
         assert response.status_code == 200

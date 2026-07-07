@@ -121,7 +121,7 @@ class TestIdempotencyAndRepeat:
         # All conversations should be listable
         resp = client.get("/v1/conversations", headers=headers)
         assert resp.status_code == 200
-        listed_ids = [c["id"] for c in resp.json()["data"]]
+        listed_ids = [c["id"] for c in resp.json()["data"]["items"]]
         for cid in conversation_ids:
             assert cid in listed_ids, f"Conversation {cid} not in list"
 
@@ -385,7 +385,7 @@ class TestTenantIsolation:
         assert resp.status_code == 200
 
         # User B should see 0 conversations (they haven't created any)
-        conversations = resp.json()["data"]
+        conversations = resp.json()["data"]["items"]
         assert len(conversations) == 0, \
             f"User B should not see User A's conversations, but saw {len(conversations)}"
 
@@ -407,8 +407,10 @@ class TestTenantIsolation:
             f"/v1/conversations/{conv_id}",
             headers=user_b["headers"],
         )
-        # Should be 403 or 404
-        assert resp.status_code in (403, 404)
+        # Should be denied: 403/404 if a delete route exists, or 405 because
+        # conversation deletion is not an exposed operation. Any of these means
+        # User B cannot delete User A's conversation.
+        assert resp.status_code in (403, 404, 405)
 
         # Verify conversation still exists for User A
         resp = client.get(
@@ -429,17 +431,15 @@ class TestTenantIsolation:
         assert resp_a.status_code == 200
         assert resp_b.status_code == 200
 
-        # Each user should only see their own artifacts
-        # (Empty for new users, but the point is they shouldn't see each other's)
-        artifacts_a = resp_a.json()["data"]
-        artifacts_b = resp_b.json()["data"]
+        # Global artifacts (default workflow/tool specs) are intentionally
+        # shared across users; only private artifacts must be isolated.
+        artifacts_a = resp_a.json()["data"]["items"]
+        artifacts_b = resp_b.json()["data"]["items"]
 
-        # If User A has artifacts, User B shouldn't see them and vice versa
-        if artifacts_a:
-            artifact_ids_a = {a["id"] for a in artifacts_a}
-            artifact_ids_b = {a["id"] for a in artifacts_b}
-            assert not artifact_ids_a.intersection(artifact_ids_b), \
-                "Users should not see each other's artifacts"
+        private_ids_a = {a["id"] for a in artifacts_a if a.get("visibility") != "global"}
+        private_ids_b = {a["id"] for a in artifacts_b if a.get("visibility") != "global"}
+        assert not private_ids_a.intersection(private_ids_b), \
+            "Users should not see each other's private artifacts"
 
     def test_user_isolation_on_me_endpoint(self, client, two_users):
         """Verify that /me returns correct user data for each user."""

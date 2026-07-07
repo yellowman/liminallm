@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from liminallm.service.router import RouterEngine
+from liminallm.service.router import EMBEDDING_DIM, RouterEngine
 
 
 def test_router_applies_rules_and_normalizes():
@@ -47,11 +47,13 @@ def test_router_applies_rules_and_normalizes():
 
 def test_router_similarity_boost_when_no_rules_fire():
     engine = RouterEngine()
+    # Embeddings must match the router's EMBEDDING_DIM or they are rejected as
+    # invalid; use full-width vectors so the similarity boost can be computed.
+    ctx_emb = [1.0] + [0.0] * (EMBEDDING_DIM - 1)
     adapters = [
-        {"id": "similar", "embedding": [0.7, 0.7]},
-        {"id": "dissimilar", "embedding": [0.0, 1.0]},
+        {"id": "similar", "embedding": [1.0] + [0.0] * (EMBEDDING_DIM - 1)},
+        {"id": "dissimilar", "embedding": [0.0, 1.0] + [0.0] * (EMBEDDING_DIM - 2)},
     ]
-    ctx_emb = [0.7, 0.7]
 
     result = asyncio.run(engine.route({}, ctx_emb, adapters))
 
