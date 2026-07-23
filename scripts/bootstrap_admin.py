@@ -61,8 +61,11 @@ async def bootstrap_admin(email: str, password: str, dry_run: bool = False) -> d
         else:
             current_settings = runtime.store.get_system_settings() or {}
             if current_settings.get("model_backend") != desired_backend:
-                current_settings["model_backend"] = desired_backend
-                runtime.store.set_system_settings(current_settings)
+                # Persist ONLY the changed key. get_system_settings() returns
+                # defaults merged with overrides, so writing the whole dict back
+                # would bake every default in as an override and block future
+                # default changes (set_system_settings stores overrides only).
+                runtime.store.set_system_settings({"model_backend": desired_backend})
                 print(f"Set system_settings.model_backend = {desired_backend}")
 
     # Check if user already exists
