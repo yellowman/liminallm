@@ -4,6 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>LiminalLM Chat</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
     <link rel="stylesheet" href="/static/styles.css" />
     <script defer src="/static/chat.js"></script>
   </head>
@@ -490,7 +491,7 @@
                   </div>
                 </form>
                 <div id="tool-invoke-status" class="small" role="status"></div>
-                <div id="tool-invoke-result" class="code-block" style="display: none;"></div>
+                <div id="tool-invoke-result" class="code-block hidden"></div>
               </div>
               <div id="tool-invoke-placeholder" class="empty">Select a tool above to invoke it</div>
 
@@ -793,7 +794,7 @@
               </div>
 
               <!-- Admin Settings Section (only visible to admins) -->
-              <div id="admin-settings-section" style="display: none;">
+              <div id="admin-settings-section" class="hidden">
                 <div class="divider"></div>
                 <h3>Admin Settings</h3>
                 <p class="subtext">System-wide settings (admin only). Changes take effect immediately.</p>
@@ -816,7 +817,7 @@
                   <span class="small">Default limit for conversation list (1-500)</span>
                 </div>
 
-                <div class="pill-row" style="margin-top: 1rem;">
+                <div class="pill-row mt-12">
                   <button class="primary" id="save-admin-settings-btn">Save settings</button>
                   <button class="ghost" id="reload-admin-settings-btn">Reload</button>
                 </div>

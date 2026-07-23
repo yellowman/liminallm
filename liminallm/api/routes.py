@@ -1002,9 +1002,14 @@ async def oauth_start(
     )
     # Issue 35.2: Per CLAUDE.md, derive tenant_id from server config, not user input
     # This prevents tenant spoofing attacks where users can OAuth into arbitrary tenants
-    start = await runtime.auth.start_oauth(
-        provider, redirect_uri=body.redirect_uri, tenant_id=None
-    )
+    try:
+        start = await runtime.auth.start_oauth(
+            provider, redirect_uri=body.redirect_uri, tenant_id=None
+        )
+    except ValueError as exc:
+        # Unsupported or unconfigured provider is a client-visible condition,
+        # not a server fault.
+        raise _http_error("invalid_request", str(exc), status_code=400)
     return Envelope(
         status="ok",
         data=OAuthStartResponse(

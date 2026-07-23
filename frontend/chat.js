@@ -303,12 +303,28 @@ const debounce = (fn, waitMs) => {
   };
 };
 
+// Double-submit CSRF: the server sets a JS-readable csrf_token cookie and
+// expects it echoed in X-CSRF-Token on mutating requests that rely on cookies.
+const getCsrfToken = () => {
+  const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
+  return match ? decodeURIComponent(match[1]) : null;
+};
+
 const authHeaders = (idempotencyKey) => {
   const h = {};
   if (state.accessToken) h['Authorization'] = `Bearer ${state.accessToken}`;
   if (state.tenantId) h['X-Tenant-ID'] = state.tenantId;
   if (state.sessionId) h['session_id'] = state.sessionId;
+  const csrf = getCsrfToken();
+  if (csrf) h['X-CSRF-Token'] = csrf;
   h['Idempotency-Key'] = idempotencyKey || randomIdempotencyKey();
+  return h;
+};
+
+const jsonHeaders = () => {
+  const h = { 'Content-Type': 'application/json' };
+  const csrf = getCsrfToken();
+  if (csrf) h['X-CSRF-Token'] = csrf;
   return h;
 };
 
@@ -358,7 +374,7 @@ const tryRefreshToken = async () => {
   try {
     const resp = await fetch(`${apiBase}/auth/refresh`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: jsonHeaders(),
       body: JSON.stringify({ refresh_token: state.refreshToken, tenant_id: state.tenantId }),
     });
     if (!resp.ok) return false;
@@ -486,6 +502,14 @@ const initTabs = () => {
       document.querySelectorAll('.tab-panel').forEach((panel) => {
         panel.classList.toggle('active', panel.id === tabId);
       });
+
+      // Lazy-load the data behind the tab; login only preloads a subset.
+      if (state.accessToken) {
+        if (tabId === 'contexts-tab') fetchContexts();
+        else if (tabId === 'artifacts-tab') fetchArtifacts();
+        else if (tabId === 'tools-tab') refreshToolsAndWorkflows();
+        else if (tabId === 'insights-tab') fetchInsights();
+      }
     });
   });
 };
@@ -499,7 +523,12 @@ const initCollapsibleSections = () => {
     header.addEventListener('click', (e) => {
       if (e.target.tagName === 'BUTTON') return;
       const section = header.closest('.panel-section');
-      section?.classList.toggle('collapsed');
+      if (!section) return;
+      section.classList.toggle('collapsed');
+      // Lazy-load the files list the first time the section opens.
+      if (section.id === 'files-section' && !section.classList.contains('collapsed')) {
+        fetchUserFiles();
+      }
     });
   });
 };
@@ -565,7 +594,7 @@ const handleLogin = async (event) => {
     toggleButtonBusy(authSubmit, true, 'Signing in...');
     const envelope = await requestEnvelope(
       `${apiBase}/auth/login`,
-      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
+      { method: 'POST', headers: jsonHeaders(), body: JSON.stringify(body) },
       'Login failed'
     );
 
@@ -640,7 +669,7 @@ const startOAuth = async (provider) => {
       `${apiBase}/auth/oauth/${provider}/start`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders(),
         body: JSON.stringify({
           redirect_uri: redirectUri,
           tenant_id: tenant,
@@ -708,7 +737,7 @@ const handleOAuthCallback = async () => {
       `${apiBase}/auth/oauth/${provider}/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`,
       {
         method: 'GET',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders(),
       },
       `OAuth callback failed`
     );
@@ -783,7 +812,7 @@ const handleSignup = async (event) => {
       `${apiBase}/auth/signup`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders(),
         body: JSON.stringify({ email, password, tenant_id: tenant }),
       },
       'Signup failed'
@@ -834,7 +863,7 @@ const handleResetRequest = async (event) => {
       `${apiBase}/auth/reset/request`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders(),
         body: JSON.stringify({ email }),
       },
       'Reset request failed'
@@ -876,7 +905,7 @@ const handleResetConfirm = async (event) => {
       `${apiBase}/auth/reset/confirm`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders(),
         body: JSON.stringify({
           token: code,
           new_password: newPassword,
@@ -980,7 +1009,7 @@ const handleResetWithToken = async (event) => {
       `${apiBase}/auth/reset/confirm`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders(),
         body: JSON.stringify({
           token: pendingResetToken,
           new_password: newPassword,
@@ -1021,7 +1050,7 @@ const handleVerifyTokenCallback = async () => {
       `${apiBase}/auth/verify_email`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders(),
         body: JSON.stringify({ token: verifyToken }),
       },
       'Email verification failed'
@@ -2297,7 +2326,12 @@ const speakText = async (text) => {
     }
 
     const envelope = await response.json();
-    if (envelope.status === 'ok' && envelope.data?.audio_url) {
+    if (envelope.status === 'ok' && envelope.data?.format === 'text/placeholder') {
+      // Server has no TTS backend configured and returned a text stub;
+      // don't try to play it as audio.
+      if (voiceOutputBtn) voiceOutputBtn.classList.remove('playing');
+      speakWithBrowser();
+    } else if (envelope.status === 'ok' && envelope.data?.audio_url) {
       currentAudio = new Audio(envelope.data.audio_url);
       currentAudio.onended = () => {
         if (voiceOutputBtn) voiceOutputBtn.classList.remove('playing');
@@ -2446,7 +2480,6 @@ const filesListEl = $('files-list');
 const filesEmptyEl = $('files-empty');
 const filesPaginationEl = $('files-pagination');
 const refreshFilesBtn = $('refresh-files-btn');
-const filesSectionToggle = $('files-section-toggle');
 
 let filesOffset = 0;
 const FILES_LIMIT = 20;
@@ -2706,7 +2739,7 @@ const startMfaSetup = async () => {
       `${apiBase}/auth/mfa/request`,
       {
         method: 'POST',
-        headers: authHeaders(),
+        headers: headers(),
         body: JSON.stringify({ session_id: state.sessionId }),
       },
       'Failed to start MFA setup'
@@ -2774,7 +2807,7 @@ const verifyMfaSetup = async (event) => {
       `${apiBase}/auth/mfa/verify`,
       {
         method: 'POST',
-        headers: authHeaders(),
+        headers: headers(),
         body: JSON.stringify({ session_id: state.sessionId, code }),
       },
       'Invalid code. Try again.'
@@ -2832,7 +2865,7 @@ const disableMfa = async (event) => {
       `${apiBase}/auth/mfa/disable`,
       {
         method: 'POST',
-        headers: authHeaders(),
+        headers: headers(),
         body: JSON.stringify({ code }),
       },
       'Invalid code. Try again.'
@@ -2998,7 +3031,7 @@ const changePassword = async (event) => {
       `${apiBase}/auth/password/change`,
       {
         method: 'POST',
-        headers: authHeaders(),
+        headers: headers(),
         body: JSON.stringify({
           current_password: currentPassword,
           new_password: newPassword,
@@ -3081,7 +3114,7 @@ const saveUserSettings = async (event) => {
       `${apiBase}/settings`,
       {
         method: 'PATCH',
-        headers: authHeaders(),
+        headers: headers(),
         body: JSON.stringify({
           locale: locale || null,
           timezone: timezone || null,
@@ -3187,7 +3220,7 @@ const saveAdminSettings = async () => {
 const renderAdminSettingsSection = () => {
   const section = $('admin-settings-section');
   if (section) {
-    section.style.display = state.role === 'admin' ? 'block' : 'none';
+    section.classList.toggle('hidden', state.role !== 'admin');
   }
   if (state.role === 'admin') {
     fetchAdminSettings();
@@ -3744,7 +3777,7 @@ const invokeTool = async (event) => {
   try {
     toggleButtonBusy(invokeBtn, true, 'Invoking...');
     if (statusEl) statusEl.textContent = '';
-    if (resultEl) resultEl.style.display = 'none';
+    if (resultEl) resultEl.classList.add('hidden');
 
     const envelope = await requestEnvelope(
       `${apiBase}/tools/${selectedTool.id}/invoke`,
@@ -3759,7 +3792,7 @@ const invokeTool = async (event) => {
     if (statusEl) statusEl.textContent = 'Tool invoked successfully';
     if (resultEl) {
       resultEl.textContent = JSON.stringify(envelope.data, null, 2);
-      resultEl.style.display = 'block';
+      resultEl.classList.remove('hidden');
     }
   } catch (err) {
     if (statusEl) statusEl.textContent = err.message;
@@ -3887,23 +3920,28 @@ const renderInsights = (data) => {
   const negativeEl = $('insights-negative-count');
   const neutralEl = $('insights-neutral-count');
 
-  if (totalEl) totalEl.textContent = data.total_events ?? '-';
-  if (positiveEl) positiveEl.textContent = data.positive_count ?? '-';
-  if (negativeEl) negativeEl.textContent = data.negative_count ?? '-';
-  if (neutralEl) neutralEl.textContent = data.neutral_count ?? '-';
+  const totals = data.totals || {};
+  const positive = totals.positive ?? 0;
+  const negative = totals.negative ?? 0;
+  const neutral = totals.neutral ?? 0;
 
-  // Top adapters
+  if (totalEl) totalEl.textContent = positive + negative + neutral;
+  if (positiveEl) positiveEl.textContent = positive;
+  if (negativeEl) negativeEl.textContent = negative;
+  if (neutralEl) neutralEl.textContent = neutral;
+
+  // Adapters
   const adaptersEl = $('insights-top-adapters');
   if (adaptersEl) {
-    const adapters = data.top_adapters || [];
+    const adapters = data.adapters || [];
     if (!adapters.length) {
       adaptersEl.innerHTML = '<div class="empty">No adapter data yet</div>';
     } else {
       adaptersEl.innerHTML = adapters
         .map((a) => `
           <div class="adapter-item">
-            <span class="adapter-name">${escapeHtml(a.adapter_id || a.name || 'Unknown')}</span>
-            <span class="adapter-score">+${a.positive_count || 0} / -${a.negative_count || 0}</span>
+            <span class="adapter-name">${escapeHtml(a.name || a.id || 'Unknown')}</span>
+            <span class="adapter-score">${escapeHtml(a.base_model || a.description || '')}</span>
           </div>
         `)
         .join('');
@@ -3913,7 +3951,7 @@ const renderInsights = (data) => {
   // Recent preferences
   const recentEl = $('insights-recent-list');
   if (recentEl) {
-    const recent = data.recent_events || [];
+    const recent = data.events || [];
     if (!recent.length) {
       recentEl.innerHTML = '<div class="empty">No preference events yet</div>';
     } else {
@@ -3945,7 +3983,7 @@ const renderInsights = (data) => {
         .map((c) => `
           <div class="cluster-card">
             <div class="cluster-label">${escapeHtml(c.label || 'Unlabeled')}</div>
-            <div class="cluster-description">${escapeHtml(c.description || '-')}</div>
+            <div class="cluster-description">${escapeHtml(c.similarity_hint || c.description || '-')}</div>
             <div class="cluster-meta">
               <span>${c.size || 0} events</span>
               ${c.adapter_id ? `<span class="has-adapter">Has adapter</span>` : ''}
@@ -4083,18 +4121,9 @@ const initEventListeners = () => {
   if (refreshFilesBtn) refreshFilesBtn.addEventListener('click', fetchUserFiles);
   if (filesListEl) filesListEl.addEventListener('click', handleFileAction);
   if (filesPaginationEl) filesPaginationEl.addEventListener('click', handleFileAction);
-  if (filesSectionToggle) {
-    filesSectionToggle.addEventListener('click', () => {
-      const section = $('files-section');
-      if (section) {
-        section.classList.toggle('collapsed');
-        // Fetch files when section is expanded
-        if (!section.classList.contains('collapsed')) {
-          fetchUserFiles();
-        }
-      }
-    });
-  }
+  // Note: the files section expand/collapse (and its lazy fetch) is handled
+  // by initCollapsibleSections; a second toggle listener here made every
+  // click toggle twice, so the section could never be opened.
 
   // Settings
   $('clear-drafts-btn')?.addEventListener('click', handleClearDrafts);
