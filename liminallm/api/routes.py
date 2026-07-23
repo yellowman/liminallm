@@ -635,35 +635,19 @@ async def _resolve_idempotency(
         # We successfully claimed the slot
         return request_id, None
 
-    # Slot was not acquired, check the existing record
+    # Slot was not acquired. A prior "failed" record is reclaimed atomically
+    # inside _acquire_idempotency_slot (so acquired would be True), meaning a
+    # non-acquired record here is either in progress or a completed result.
     if existing_record:
         status = existing_record.get("status")
-        if status == "in_progress":
-            raise _http_error("conflict", "request in progress", status_code=409)
         if status == "completed" and existing_record.get("response"):
             # Replay only successful results so duplicate side effects are avoided.
             response_payload = existing_record.get("response", {})
             if "request_id" not in response_payload:
                 response_payload["request_id"] = existing_record.get("request_id", request_id)
             return existing_record.get("request_id", request_id), Envelope(**response_payload)
-        if status == "failed":
-            # Never replay a prior (possibly transient) failure — reclaim the
-            # slot so the retry recomputes instead of being served a cached error.
-            await _set_cached_idempotency_record(
-                runtime,
-                route,
-                user_id,
-                idempotency_key,
-                {
-                    "status": "in_progress",
-                    "request_id": request_id,
-                    "started_at": datetime.utcnow().isoformat(),
-                },
-                ttl_seconds=IDEMPOTENCY_TTL_SECONDS,
-            )
-            return request_id, None
 
-    # Record exists but is in an unexpected state - treat as conflict
+    # In progress (or any other non-completed state) - treat as conflict.
     raise _http_error("conflict", "request in progress", status_code=409)
 
 
@@ -3131,7 +3115,21 @@ async def update_system_settings(
         try:
             runtime.reload_model_services()
         except Exception as exc:
-            logger.warning("model_services_reload_failed", error=str(exc))
+            # Settings are persisted, but the live stack could not be rebuilt.
+            # Surface this instead of reporting success so the caller knows the
+            # change is not yet active. The persisted settings make a retry
+            # (or restart) apply them; the runtime keeps the previous backend.
+            logger.error(
+                "model_services_reload_failed",
+                admin_user_id=principal.user_id,
+                error=str(exc),
+            )
+            raise _http_error(
+                "server_error",
+                "Settings were saved but the model services failed to reload; the "
+                "previous backend remains active. Retry, or restart to apply them.",
+                status_code=500,
+            )
 
     logger.info(
         "system_settings_updated",

@@ -302,18 +302,51 @@ class Runtime:
             self.store, self.llm, self.router, self.training
         )
 
+    # Attributes set by _build_model_services; snapshotted for atomic reload.
+    _MODEL_SERVICE_ATTRS = (
+        "resolved_base_model",
+        "backend_mode",
+        "default_adapter_mode",
+        "rag_mode",
+        "router",
+        "embeddings",
+        "llm",
+        "rag",
+        "training",
+        "clusterer",
+        "workflow",
+        "config_ops",
+    )
+
     def reload_model_services(self) -> None:
         """Rebuild backend-dependent services after a system-settings change.
 
-        Lets an admin switch model_backend / model_path (and rag/embedding
-        settings) at runtime without restarting. In-flight workflow threads
-        finish on the old engine; new requests use the rebuilt services.
+        Atomic: on any failure the previous services are restored so the runtime
+        never runs on a half-rebuilt stack, and the exception propagates so the
+        caller can report that the change did not take effect live. In-flight
+        workflow threads finish on the old engine; new requests use the rebuilt
+        services.
         """
+        snapshot = {
+            name: getattr(self, name, None) for name in self._MODEL_SERVICE_ATTRS
+        }
         old_workflow = getattr(self, "workflow", None)
         sys_settings = {}
         if hasattr(self.store, "get_system_settings"):
             sys_settings = self.store.get_system_settings() or {}
-        self._build_model_services(sys_settings)
+        try:
+            self._build_model_services(sys_settings)
+        except Exception as exc:
+            # Restore the previous stack so a partial rebuild can't leave the
+            # runtime inconsistent, then let the caller surface the failure.
+            for name, value in snapshot.items():
+                setattr(self, name, value)
+            logger.error(
+                "runtime_model_services_reload_failed",
+                model_backend=str(sys_settings.get("model_backend")),
+                error=str(exc),
+            )
+            raise
         if getattr(self, "training_worker", None):
             self.training_worker.training = self.training
             self.training_worker.clusterer = self.clusterer
@@ -540,12 +573,14 @@ async def _acquire_idempotency_slot(
         existing = runtime._local_idempotency.get(cache_key)
 
         if existing:
-            # Check if expired
-            if existing.get("expires_at") and existing["expires_at"] < now:
-                # Expired, we can claim it
+            is_expired = existing.get("expires_at") and existing["expires_at"] < now
+            # Reclaim a prior failed attempt atomically (within this lock) so a
+            # retry proceeds without a separate racy overwrite.
+            is_failed = existing.get("status") == "failed"
+            if is_expired or is_failed:
                 runtime._local_idempotency.pop(cache_key, None)
             else:
-                # Not expired, return existing
+                # Live in-progress/completed record: return it.
                 return (False, existing)
 
         # No existing record or it was expired, claim the slot

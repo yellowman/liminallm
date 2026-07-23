@@ -9,6 +9,24 @@ from typing import Any, Dict, Optional, Tuple, Union
 import redis.asyncio as aioredis
 from redis import Redis
 
+# Atomically acquire an idempotency slot: claim it if absent, or reclaim it if
+# the existing record is a prior "failed" attempt (so a retry can proceed
+# without a separate, racy overwrite). Otherwise return the existing record.
+# Returns {acquired(1/0), existing_json_or_empty}.
+_ACQUIRE_OR_RECLAIM_IDEMPOTENCY = """
+local existing = redis.call('GET', KEYS[1])
+if not existing then
+    redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+    return {1, ''}
+end
+local ok, decoded = pcall(cjson.decode, existing)
+if ok and type(decoded) == 'table' and decoded['status'] == 'failed' then
+    redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+    return {1, ''}
+end
+return {0, existing}
+"""
+
 
 class RedisCache:
     """Thin Redis wrapper for sessions and rate limits."""
@@ -442,14 +460,18 @@ return {1, tokens, 0}
         # Issue 22.2: Include tenant_id in cache key for multi-tenant isolation
         tenant_prefix = f"{tenant_id}:" if tenant_id else ""
         cache_key = f"idemp:{tenant_prefix}{route}:{user_id}:{key}"
-        # Use SET NX (set if not exists) for atomic acquisition
-        acquired = await self.client.set(
-            cache_key, json.dumps(record), ex=ttl_seconds, nx=True
+        # Atomic acquire-or-reclaim-failed via Lua so concurrent retries after a
+        # failure can't both claim the slot (a plain SET would bypass the gate).
+        result = await self.client.eval(
+            _ACQUIRE_OR_RECLAIM_IDEMPOTENCY,
+            1,
+            cache_key,
+            json.dumps(record),
+            str(ttl_seconds),
         )
-        if acquired:
+        if result and result[0]:
             return (True, None)
-        # Slot was not acquired, fetch existing record
-        existing = await self.client.get(cache_key)
+        existing = result[1] if result and len(result) > 1 else None
         if existing:
             try:
                 return (False, json.loads(existing))
@@ -1074,14 +1096,20 @@ class SyncRedisCache:
         *,
         tenant_id: Optional[str] = None,
     ) -> tuple[bool, Optional[dict]]:
-        """Atomically acquire an idempotency slot using SETNX (sync version)."""
+        """Atomically acquire (or reclaim a failed) idempotency slot (sync version)."""
         # Issue 22.2: Include tenant_id in cache key for multi-tenant isolation
         tenant_prefix = f"{tenant_id}:" if tenant_id else ""
         cache_key = f"idemp:{tenant_prefix}{route}:{user_id}:{key}"
-        acquired = self._sync_client.set(cache_key, json.dumps(record), ex=ttl_seconds, nx=True)
-        if acquired:
+        result = self._sync_client.eval(
+            _ACQUIRE_OR_RECLAIM_IDEMPOTENCY,
+            1,
+            cache_key,
+            json.dumps(record),
+            str(ttl_seconds),
+        )
+        if result and result[0]:
             return (True, None)
-        existing = self._sync_client.get(cache_key)
+        existing = result[1] if result and len(result) > 1 else None
         if existing:
             try:
                 return (False, json.loads(existing))
