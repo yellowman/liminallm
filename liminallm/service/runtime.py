@@ -221,6 +221,10 @@ class Runtime:
         self._local_rate_limit_lock = asyncio.Lock()
         self._local_rate_limit_last_cleanup = datetime.utcnow()
         self._local_rate_limit_max_entries = 5000
+        # Cross-worker settings reload coordination: the version this worker's
+        # model stack was built from, and a lock serializing rebuilds.
+        self._reload_lock = threading.Lock()
+        self._applied_settings_version = self._read_settings_version()
 
         # Log successful initialization with summary
         logger.info(
@@ -301,6 +305,57 @@ class Runtime:
         self.config_ops = ConfigOpsService(
             self.store, self.llm, self.router, self.training
         )
+        # Record the model-affecting settings this stack was built from so a
+        # watcher can tell whether a later settings write actually changed them.
+        self._model_settings_signature = self._model_signature(sys_settings)
+
+    def _model_signature(self, sys_settings: dict) -> tuple:
+        """Signature of the settings that affect the model service stack."""
+        return (
+            sys_settings.get("model_path") or self.settings.model_path,
+            str(sys_settings.get("model_backend") or self.settings.model_backend),
+            str(
+                sys_settings.get("default_adapter_mode")
+                or self.settings.default_adapter_mode
+            ),
+            str(sys_settings.get("rag_mode") or self.settings.rag_mode),
+            sys_settings.get("embedding_model_id") or self.settings.embedding_model_id,
+            sys_settings.get("rag_chunk_size", 400),
+        )
+
+    def _read_settings_version(self) -> Optional[str]:
+        getter = getattr(self.store, "get_system_settings_version", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter()
+        except Exception as exc:
+            logger.warning("settings_version_read_failed", error=str(exc))
+            return None
+
+    def maybe_reload_model_services(self) -> bool:
+        """Reload model services if another worker changed model settings.
+
+        Each Uvicorn worker holds its own in-process Runtime, so a settings
+        change made in one worker (and persisted to the store) must be observed
+        by the others. Compares the persisted settings version to the one this
+        worker last applied and, only when a model-affecting value actually
+        differs, rebuilds the stack. Returns True if a reload occurred.
+        """
+        version = self._read_settings_version()
+        if version is not None and version == self._applied_settings_version:
+            return False
+        sys_settings = {}
+        if hasattr(self.store, "get_system_settings"):
+            sys_settings = self.store.get_system_settings() or {}
+        target = self._model_signature(sys_settings)
+        # Record the version even when nothing model-relevant changed, so an
+        # unrelated settings write (e.g. a rate-limit tweak) isn't rechecked.
+        self._applied_settings_version = version
+        if target != self._model_settings_signature:
+            self.reload_model_services()
+            return True
+        return False
 
     # Attributes set by _build_model_services; snapshotted for atomic reload.
     _MODEL_SERVICE_ATTRS = (
@@ -327,32 +382,38 @@ class Runtime:
         workflow threads finish on the old engine; new requests use the rebuilt
         services.
         """
-        snapshot = {
-            name: getattr(self, name, None) for name in self._MODEL_SERVICE_ATTRS
-        }
-        old_workflow = getattr(self, "workflow", None)
-        sys_settings = {}
-        if hasattr(self.store, "get_system_settings"):
-            sys_settings = self.store.get_system_settings() or {}
-        try:
-            self._build_model_services(sys_settings)
-        except Exception as exc:
-            # Restore the previous stack so a partial rebuild can't leave the
-            # runtime inconsistent, then let the caller surface the failure.
-            for name, value in snapshot.items():
-                setattr(self, name, value)
-            logger.error(
-                "runtime_model_services_reload_failed",
-                model_backend=str(sys_settings.get("model_backend")),
-                error=str(exc),
-            )
-            raise
-        if getattr(self, "training_worker", None):
-            self.training_worker.training = self.training
-            self.training_worker.clusterer = self.clusterer
-        if old_workflow is not None and old_workflow is not self.workflow:
-            with contextlib.suppress(Exception):
-                old_workflow.shutdown(wait=False)
+        # Serialize rebuilds so a request-triggered reload and the background
+        # settings watcher on the same worker can't rebuild concurrently.
+        with self._reload_lock:
+            snapshot = {
+                name: getattr(self, name, None) for name in self._MODEL_SERVICE_ATTRS
+            }
+            old_workflow = getattr(self, "workflow", None)
+            sys_settings = {}
+            if hasattr(self.store, "get_system_settings"):
+                sys_settings = self.store.get_system_settings() or {}
+            version = self._read_settings_version()
+            try:
+                self._build_model_services(sys_settings)
+            except Exception as exc:
+                # Restore the previous stack so a partial rebuild can't leave the
+                # runtime inconsistent, then let the caller surface the failure.
+                for name, value in snapshot.items():
+                    setattr(self, name, value)
+                logger.error(
+                    "runtime_model_services_reload_failed",
+                    model_backend=str(sys_settings.get("model_backend")),
+                    error=str(exc),
+                )
+                raise
+            # Mark this version applied so the watcher doesn't reload again.
+            self._applied_settings_version = version
+            if getattr(self, "training_worker", None):
+                self.training_worker.training = self.training
+                self.training_worker.clusterer = self.clusterer
+            if old_workflow is not None and old_workflow is not self.workflow:
+                with contextlib.suppress(Exception):
+                    old_workflow.shutdown(wait=False)
         logger.info(
             "runtime_model_services_reloaded",
             model_path=self.resolved_base_model,

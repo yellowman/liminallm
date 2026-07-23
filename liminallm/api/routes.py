@@ -3113,7 +3113,9 @@ async def update_system_settings(
     }
     if model_affecting_keys & set(body.keys()):
         try:
-            runtime.reload_model_services()
+            # Off the event loop: the rebuild is synchronous and takes the
+            # reload lock, which the background watcher may briefly hold.
+            await asyncio.to_thread(runtime.reload_model_services)
         except Exception as exc:
             # Settings are persisted, but the live stack could not be rebuilt.
             # Surface this instead of reporting success so the caller knows the

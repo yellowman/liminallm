@@ -556,6 +556,15 @@ class Settings(BaseModel):
         "TRAINING_WORKER_POLL_INTERVAL",
         description="Training worker poll interval in seconds (overridable via admin UI)",
     )
+    settings_watch_interval_seconds: int = env_field(
+        10,
+        "SETTINGS_WATCH_INTERVAL_SECONDS",
+        description=(
+            "How often each worker checks for admin settings changes and "
+            "reloads its model services (cross-process consistency across "
+            "multiple Uvicorn workers)"
+        ),
+    )
     max_active_training_jobs: int = env_field(
         10,
         "MAX_ACTIVE_TRAINING_JOBS",
@@ -576,7 +585,7 @@ class Settings(BaseModel):
         return []
 
     @field_validator(
-        "smtp_port", "training_worker_poll_interval", "tmp_cleanup_interval_seconds", "tmp_max_age_hours", "max_active_training_jobs"
+        "smtp_port", "training_worker_poll_interval", "tmp_cleanup_interval_seconds", "tmp_max_age_hours", "max_active_training_jobs", "settings_watch_interval_seconds"
     )
     @classmethod
     def _validate_positive_int(cls, value: int) -> int:

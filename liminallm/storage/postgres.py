@@ -2751,6 +2751,23 @@ class PostgresStore:
         # current settings dict even when the row is partial, absent, or corrupt.
         return {**SYSTEM_SETTINGS_DEFAULTS, **self._get_stored_system_settings()}
 
+    def get_system_settings_version(self) -> Optional[str]:
+        """Return a token that changes whenever system settings are written.
+
+        Uses instance_config.updated_at (bumped on every set) so every Uvicorn
+        worker, which holds its own in-process Runtime, can detect a settings
+        change made by another worker and reload its model services.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT updated_at FROM instance_config WHERE name = %s",
+                ("system_settings",),
+            ).fetchone()
+        if not row:
+            return None
+        updated_at = row.get("updated_at") if isinstance(row, dict) else None
+        return updated_at.isoformat() if updated_at else None
+
     def _get_stored_system_settings(self) -> dict:
         """Return only the explicitly-persisted settings (no defaults merged).
 

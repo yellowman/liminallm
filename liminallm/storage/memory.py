@@ -1492,6 +1492,14 @@ class MemoryStore:
         # current dict; return a fresh copy so mutation can't edit store state.
         return {**SYSTEM_SETTINGS_DEFAULTS, **stored}
 
+    def get_system_settings_version(self) -> Optional[str]:
+        """Return a token that changes whenever system settings are written.
+
+        The in-memory store is single-process, so this only needs to reflect
+        writes made in this process (interface parity with PostgresStore).
+        """
+        return str(self.runtime_config.get("system_settings_version", 0))
+
     def set_system_settings(self, settings: dict) -> dict:
         """Update admin-managed system settings.
 
@@ -1503,6 +1511,12 @@ class MemoryStore:
             stored = {}
         merged = {**stored, **settings}
         self.runtime_config["system_settings"] = merged
+        version = self.runtime_config.get("system_settings_version", 0)
+        try:
+            version = int(version)
+        except (TypeError, ValueError):
+            version = 0
+        self.runtime_config["system_settings_version"] = version + 1
         self._persist_state()
         return {**SYSTEM_SETTINGS_DEFAULTS, **merged}
 
