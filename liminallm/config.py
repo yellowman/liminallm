@@ -7,7 +7,7 @@ import string
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from dotenv import dotenv_values
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -21,6 +21,7 @@ class ModelBackend(str, Enum):
     """Accepted model backend modes as defined in SPEC §5."""
 
     OPENAI = "openai"
+    ANTHROPIC = "anthropic"
     AZURE = "azure"
     AZURE_OPENAI = "azure_openai"
     AZURE_OPENAI_ALT = AZURE_OPENAI
@@ -34,6 +35,13 @@ class ModelBackend(str, Enum):
     ADAPTER_SERVER = "adapter_server"
     SAGEMAKER = "sagemaker"
     AWS_SAGEMAKER = "aws_sagemaker"
+    # Zhipu AI GLM models (glm-4, glm-4-plus, etc.)
+    ZHIPU = "zhipu"
+    ZHIPU_AI = "zhipu.ai"
+    GLM = "glm"
+    # Local JAX + LoRA serving
+    LOCAL_LORA = "local_lora"
+    LOCAL_GPU_LORA = "local_gpu_lora"
     # Stub backend for testing - returns canned responses
     STUB = "stub"
 
@@ -69,12 +77,17 @@ class AdapterMode(str, Enum):
 BACKEND_ADAPTER_COMPATIBILITY: dict[str, set[str]] = {
     # API backends can use remote adapters or prompt-based
     "openai": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "anthropic": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
     "azure": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
     "azure_openai": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
     "vertex": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
     "gemini": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
     "google": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
     "bedrock": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    # Zhipu AI GLM models
+    "zhipu": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "zhipu.ai": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "glm": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
     # Adapter-aware API backends support remote adapter IDs
     "together": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
     "together.ai": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
@@ -85,6 +98,8 @@ BACKEND_ADAPTER_COMPATIBILITY: dict[str, set[str]] = {
     # Local backend supports local weights
     "local_lora": {AdapterMode.LOCAL, AdapterMode.PROMPT, AdapterMode.HYBRID},
     "local_gpu_lora": {AdapterMode.LOCAL, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    # Stub backend for testing
+    "stub": {AdapterMode.PROMPT},
 }
 
 
@@ -170,6 +185,32 @@ PROVIDER_CAPABILITIES: dict[str, ProviderCapabilities] = {
         gate_weights=False,
         max_adapters=1,
     ),
+    # Anthropic Claude models (claude-3, claude-sonnet-4, claude-opus-4-5, etc.)
+    "anthropic": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+    ),
+    # Zhipu AI GLM models (glm-4, glm-4-plus, glm-5, etc.)
+    "zhipu": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+    ),
+    "zhipu.ai": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+    ),
+    "glm": ProviderCapabilities(
+        remote_style=RemoteStyle.MODEL_ID,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=1,
+    ),
     # Adapter-parameter style providers (support multi-adapter)
     "together": ProviderCapabilities(
         remote_style=RemoteStyle.ADAPTER_PARAM,
@@ -226,6 +267,13 @@ PROVIDER_CAPABILITIES: dict[str, ProviderCapabilities] = {
         gate_weights=True,
         max_adapters=3,
     ),
+    # Stub backend for testing (no adapter support)
+    "stub": ProviderCapabilities(
+        remote_style=RemoteStyle.NONE,
+        multi_adapter=False,
+        gate_weights=False,
+        max_adapters=0,
+    ),
 }
 
 # Default capabilities for unknown providers (conservative)
@@ -240,6 +288,35 @@ DEFAULT_PROVIDER_CAPABILITIES = ProviderCapabilities(
 def get_provider_capabilities(provider: str) -> ProviderCapabilities:
     """Get capabilities for a provider, with sensible defaults for unknown providers."""
     return PROVIDER_CAPABILITIES.get(provider.lower(), DEFAULT_PROVIDER_CAPABILITIES)
+
+
+# OpenAI-compatible API endpoints for first-party providers. Each provider is
+# reachable through the OpenAI chat-completions client by pointing base_url at
+# the provider and supplying its API key, so a single ApiAdapterBackend serves
+# OpenAI, Anthropic, Zhipu/GLM, Together, Gemini, etc. `provider` is the key
+# into PROVIDER_CAPABILITIES; `api_key_env` is the env var read for credentials.
+PROVIDER_ENDPOINTS: dict[str, dict[str, Optional[str]]] = {
+    "openai": {"provider": "openai", "api_key_env": "OPENAI_API_KEY", "base_url": None},
+    "anthropic": {"provider": "anthropic", "api_key_env": "ANTHROPIC_API_KEY", "base_url": "https://api.anthropic.com/v1"},
+    "azure": {"provider": "azure", "api_key_env": "AZURE_OPENAI_API_KEY", "base_url": None},
+    "azure_openai": {"provider": "azure_openai", "api_key_env": "AZURE_OPENAI_API_KEY", "base_url": None},
+    "gemini": {"provider": "gemini", "api_key_env": "GEMINI_API_KEY", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai"},
+    "google": {"provider": "gemini", "api_key_env": "GEMINI_API_KEY", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai"},
+    "zhipu": {"provider": "zhipu", "api_key_env": "ZHIPU_API_KEY", "base_url": "https://open.bigmodel.cn/api/paas/v4"},
+    "zhipu.ai": {"provider": "zhipu", "api_key_env": "ZHIPU_API_KEY", "base_url": "https://open.bigmodel.cn/api/paas/v4"},
+    "glm": {"provider": "zhipu", "api_key_env": "ZHIPU_API_KEY", "base_url": "https://open.bigmodel.cn/api/paas/v4"},
+    "together": {"provider": "together", "api_key_env": "TOGETHER_API_KEY", "base_url": "https://api.together.xyz/v1"},
+    "together.ai": {"provider": "together", "api_key_env": "TOGETHER_API_KEY", "base_url": "https://api.together.xyz/v1"},
+}
+
+
+def resolve_provider_endpoint(mode: str) -> Optional[dict[str, Optional[str]]]:
+    """Return endpoint wiring for an OpenAI-compatible API provider backend mode.
+
+    Returns None for modes that are not API providers (stub, local_lora,
+    local_gpu_lora, adapter_server), which are constructed by other paths.
+    """
+    return PROVIDER_ENDPOINTS.get((mode or "").lower())
 
 
 def env_field(default: Any, env: str, **kwargs):
@@ -390,7 +467,7 @@ class Settings(BaseModel):
         "ENABLE_MFA",
         description="Enable multi-factor authentication (overridable via admin UI)",
     )
-    jwt_secret: str = env_field(None, "JWT_SECRET")
+    jwt_secret: str = env_field(None, "JWT_SECRET", validate_default=True)
     jwt_issuer: str = env_field(
         "liminallm", "JWT_ISSUER",
         description="JWT issuer (overridable via admin UI)"
@@ -479,6 +556,15 @@ class Settings(BaseModel):
         "TRAINING_WORKER_POLL_INTERVAL",
         description="Training worker poll interval in seconds (overridable via admin UI)",
     )
+    settings_watch_interval_seconds: int = env_field(
+        10,
+        "SETTINGS_WATCH_INTERVAL_SECONDS",
+        description=(
+            "How often each worker checks for admin settings changes and "
+            "reloads its model services (cross-process consistency across "
+            "multiple Uvicorn workers)"
+        ),
+    )
     max_active_training_jobs: int = env_field(
         10,
         "MAX_ACTIVE_TRAINING_JOBS",
@@ -499,7 +585,7 @@ class Settings(BaseModel):
         return []
 
     @field_validator(
-        "smtp_port", "training_worker_poll_interval", "tmp_cleanup_interval_seconds", "tmp_max_age_hours", "max_active_training_jobs"
+        "smtp_port", "training_worker_poll_interval", "tmp_cleanup_interval_seconds", "tmp_max_age_hours", "max_active_training_jobs", "settings_watch_interval_seconds"
     )
     @classmethod
     def _validate_positive_int(cls, value: int) -> int:
@@ -577,7 +663,7 @@ class Settings(BaseModel):
             return [v.strip() for v in value.split(",") if v.strip()]
         return list(value)
 
-    @field_validator("jwt_secret")
+    @field_validator("jwt_secret", mode="before")
     @classmethod
     def _ensure_jwt_secret(cls, value: str | None) -> str:
         def _validate_secret(secret: str) -> str:
@@ -656,6 +742,106 @@ class Settings(BaseModel):
                 "Unable to persist JWT secret; set JWT_SECRET env var or make SHARED_FS_ROOT writable"
             ) from exc
         return generated
+
+
+# Centralized system settings defaults - single source of truth
+# Used by routes.py, memory.py, postgres.py, and sql seeds
+SYSTEM_SETTINGS_DEFAULTS: dict = {
+    # Session & concurrency
+    "session_rotation_hours": 24,
+    "session_rotation_grace_seconds": 300,
+    "max_concurrent_workflows": 3,
+    "max_concurrent_inference": 2,
+    # Rate limit multipliers
+    "rate_limit_multiplier_free": 1.0,
+    "rate_limit_multiplier_paid": 2.0,
+    "rate_limit_multiplier_enterprise": 5.0,
+    # Rate limits (0 = disabled/unlimited)
+    "chat_rate_limit_per_minute": 60,
+    "chat_rate_limit_window_seconds": 60,
+    "login_rate_limit_per_minute": 10,
+    "refresh_rate_limit_per_minute": 20,
+    "refresh_rate_limit_window_seconds": 60,
+    "signup_rate_limit_per_minute": 5,
+    "reset_rate_limit_per_minute": 5,
+    "mfa_rate_limit_per_minute": 5,
+    "admin_rate_limit_per_minute": 30,
+    "admin_rate_limit_window_seconds": 60,
+    "files_upload_rate_limit_per_minute": 10,
+    "websocket_connect_rate_limit_per_minute": 30,
+    "configops_rate_limit_per_hour": 30,
+    "read_rate_limit_per_minute": 120,
+    "write_rate_limit_per_minute": 60,
+    "max_websocket_connections_per_user": 5,
+    # Pagination
+    "default_page_size": 100,
+    "max_page_size": 500,
+    "default_conversations_limit": 50,
+    # Files
+    "max_upload_bytes": 10485760,
+    "rag_chunk_size": 400,
+    # Token TTLs
+    "access_token_ttl_minutes": 30,
+    "refresh_token_ttl_minutes": 1440,
+    # Feature flags
+    "enable_mfa": True,
+    "allow_signup": True,
+    "training_worker_enabled": True,
+    "training_worker_poll_interval": 60,
+    # SMTP
+    "smtp_host": "",
+    "smtp_port": 587,
+    "smtp_user": "",
+    "smtp_password": "",
+    "smtp_use_tls": True,
+    "smtp_allow_insecure": False,
+    "email_from_address": "",
+    "email_from_name": "LiminalLM",
+    # URLs
+    "oauth_redirect_uri": "",
+    "app_base_url": "http://localhost:8000",
+    # Voice
+    "voice_transcription_model": "whisper-1",
+    "voice_synthesis_model": "tts-1",
+    "voice_default_voice": "alloy",
+    # Model/RAG
+    "rag_mode": "pgvector",
+    "embedding_model_id": "text-embedding",
+    "model_path": "gpt-4o-mini",
+    "model_backend": "openai",
+    "default_adapter_mode": "hybrid",
+    # Tenant/JWT
+    "default_tenant_id": "public",
+    "jwt_issuer": "liminallm",
+    "jwt_audience": "liminal-clients",
+}
+
+# Derived validation sets for admin settings API
+SYSTEM_SETTINGS_INT_KEYS = {
+    k for k, v in SYSTEM_SETTINGS_DEFAULTS.items()
+    if isinstance(v, int) and not isinstance(v, bool)
+}
+
+SYSTEM_SETTINGS_FLOAT_KEYS = {
+    k for k, v in SYSTEM_SETTINGS_DEFAULTS.items()
+    if isinstance(v, float)
+}
+
+SYSTEM_SETTINGS_BOOL_KEYS = {
+    k for k, v in SYSTEM_SETTINGS_DEFAULTS.items()
+    if isinstance(v, bool)
+}
+
+SYSTEM_SETTINGS_STRING_KEYS = {
+    k for k, v in SYSTEM_SETTINGS_DEFAULTS.items()
+    if isinstance(v, str)
+}
+
+# Rate limit keys that allow 0 (disabled/unlimited)
+SYSTEM_SETTINGS_RATE_LIMIT_KEYS = {
+    k for k in SYSTEM_SETTINGS_DEFAULTS.keys()
+    if k.endswith("_per_minute") or k.endswith("_per_hour")
+}
 
 
 def get_settings() -> Settings:

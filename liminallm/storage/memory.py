@@ -15,6 +15,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from cryptography.fernet import Fernet, InvalidToken
 
+from liminallm.config import SYSTEM_SETTINGS_DEFAULTS
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service.artifact_validation import (
@@ -178,6 +179,7 @@ class MemoryStore:
             description="LLM-only chat workflow defined as data.",
             schema=default_schema,
             fs_path=payload_path,
+            visibility="global",
         )
         self.artifact_versions[chat_workflow_id] = [
             ArtifactVersion(
@@ -889,6 +891,26 @@ class MemoryStore:
     def get_training_job(self, job_id: str) -> Optional[TrainingJob]:
         return self.training_jobs.get(job_id)
 
+    def claim_training_job(self, job_id: str) -> Optional[TrainingJob]:
+        """Atomically claim a queued training job (queued -> running).
+
+        Mirrors PostgresStore.claim_training_job so the worker uses one code
+        path across stores. Returns the running job, or None if it is missing
+        or was already claimed.
+        """
+        with self._data_lock:
+            job = self.training_jobs.get(job_id)
+            if not job or job.status != "queued":
+                return None
+            job.status = "running"
+            job.updated_at = datetime.utcnow()
+            self._persist_state()
+            return job
+
+    async def close(self) -> None:
+        """No-op close for parity with PostgresStore (no connections to release)."""
+        return None
+
     def update_training_job(
         self,
         job_id: str,
@@ -1275,7 +1297,10 @@ class MemoryStore:
             artifact.description = normalize_optional_text(description) or ""
         artifact.updated_at = datetime.utcnow()
         artifact.fs_path = fs_path
-        artifact.base_model = schema.get("base_model")
+        # Preserve the existing base_model when the new schema omits the key,
+        # matching PostgresStore.update_artifact.
+        resolved_base_model = schema.get("base_model", artifact.base_model)
+        artifact.base_model = resolved_base_model
         versions = self.artifact_versions.setdefault(artifact_id, [])
         versions.append(
             ArtifactVersion(
@@ -1286,7 +1311,7 @@ class MemoryStore:
                 created_by=author,
                 change_note=change_note,
                 fs_path=fs_path,
-                base_model=schema.get("base_model"),
+                base_model=resolved_base_model,
             )
         )
         self._persist_state()
@@ -1398,7 +1423,7 @@ class MemoryStore:
                 raise NotFoundError("artifact missing", detail={"artifact_id": patch.artifact_id})
 
             versions = self.artifact_versions.get(patch.artifact_id, [])
-            next_version = (versions[0].version if versions else 0) + 1
+            next_version = (max(v.version for v in versions) if versions else 0) + 1
             updated_artifact = Artifact(
                 id=artifact.id,
                 type=artifact.type,
@@ -1411,7 +1436,7 @@ class MemoryStore:
                 base_model=new_schema.get("base_model", artifact.base_model),
             )
             version = ArtifactVersion(
-                id=str(uuid.uuid4()),
+                id=self._next_artifact_version_id(),
                 artifact_id=artifact.id,
                 version=next_version,
                 schema=new_schema,
@@ -1421,7 +1446,9 @@ class MemoryStore:
                 change_note=patch.justification,
             )
             self.artifacts[artifact.id] = updated_artifact
-            self.artifact_versions.setdefault(artifact.id, []).insert(0, version)
+            # Append (newest last) so get_latest_workflow()/[-1] returns this
+            # version, consistent with update_artifact ordering.
+            self.artifact_versions.setdefault(artifact.id, []).append(version)
 
             merged_meta: Dict[str, Any] = {}
             if patch.meta and isinstance(patch.meta, dict):
@@ -1456,71 +1483,42 @@ class MemoryStore:
 
         Returns settings for session rotation, concurrency caps, rate limits,
         and other operational parameters. Managed via admin UI instead of env vars.
+        Uses SYSTEM_SETTINGS_DEFAULTS from config.py as single source of truth.
         """
-        return self.runtime_config.get("system_settings", {
-            "session_rotation_hours": 24,
-            "session_rotation_grace_seconds": 300,
-            "max_concurrent_workflows": 3,
-            "max_concurrent_inference": 2,
-            "rate_limit_multiplier_free": 1.0,
-            "rate_limit_multiplier_paid": 2.0,
-            "rate_limit_multiplier_enterprise": 5.0,
-            "chat_rate_limit_per_minute": 60,
-            "chat_rate_limit_window_seconds": 60,
-            "login_rate_limit_per_minute": 10,
-            "signup_rate_limit_per_minute": 5,
-            "reset_rate_limit_per_minute": 5,
-            "mfa_rate_limit_per_minute": 5,
-            "admin_rate_limit_per_minute": 30,
-            "admin_rate_limit_window_seconds": 60,
-            "files_upload_rate_limit_per_minute": 10,
-            "configops_rate_limit_per_hour": 30,
-            "read_rate_limit_per_minute": 120,
-            "default_page_size": 100,
-            "max_page_size": 500,
-            "default_conversations_limit": 50,
-            "max_upload_bytes": 10485760,
-            "rag_chunk_size": 400,
-            "access_token_ttl_minutes": 30,
-            "refresh_token_ttl_minutes": 1440,
-            "enable_mfa": True,
-            "allow_signup": True,
-            "training_worker_enabled": True,
-            "training_worker_poll_interval": 60,
-            "smtp_host": "",
-            "smtp_port": 587,
-            "smtp_user": "",
-            "smtp_password": "",
-            "smtp_use_tls": True,
-            "smtp_allow_insecure": False,
-            "email_from_address": "",
-            "email_from_name": "LiminalLM",
-            "oauth_redirect_uri": "",
-            "app_base_url": "http://localhost:8000",
-            "voice_transcription_model": "whisper-1",
-            "voice_synthesis_model": "tts-1",
-            "voice_default_voice": "alloy",
-            "rag_mode": "pgvector",
-            "embedding_model_id": "text-embedding",
-            "default_tenant_id": "public",
-            "jwt_issuer": "liminallm",
-            "jwt_audience": "liminal-clients",
-            "model_path": "gpt-4o-mini",
-            "model_backend": "openai",
-            "default_adapter_mode": "hybrid",
-        })
+        stored = self.runtime_config.get("system_settings") or {}
+        if not isinstance(stored, dict):
+            stored = {}
+        # Merge stored overrides over defaults so callers get a complete,
+        # current dict; return a fresh copy so mutation can't edit store state.
+        return {**SYSTEM_SETTINGS_DEFAULTS, **stored}
+
+    def get_system_settings_version(self) -> Optional[str]:
+        """Return a token that changes whenever system settings are written.
+
+        The in-memory store is single-process, so this only needs to reflect
+        writes made in this process (interface parity with PostgresStore).
+        """
+        return str(self.runtime_config.get("system_settings_version", 0))
 
     def set_system_settings(self, settings: dict) -> dict:
         """Update admin-managed system settings.
 
-        Merges provided settings with existing settings and persists.
-        Returns the updated full settings.
+        Persists only explicit overrides (never bakes defaults) and returns the
+        full effective settings (defaults + overrides).
         """
-        existing = self.get_system_settings()
-        merged = {**existing, **settings}
+        stored = self.runtime_config.get("system_settings") or {}
+        if not isinstance(stored, dict):
+            stored = {}
+        merged = {**stored, **settings}
         self.runtime_config["system_settings"] = merged
+        version = self.runtime_config.get("system_settings_version", 0)
+        try:
+            version = int(version)
+        except (TypeError, ValueError):
+            version = 0
+        self.runtime_config["system_settings_version"] = version + 1
         self._persist_state()
-        return merged
+        return {**SYSTEM_SETTINGS_DEFAULTS, **merged}
 
     def get_latest_workflow(self, workflow_id: str) -> Optional[dict]:
         versions = self.artifact_versions.get(workflow_id)
@@ -1531,22 +1529,32 @@ class MemoryStore:
     def list_adapter_router_state(
         self, user_id: Optional[str] = None
     ) -> list[AdapterRouterState]:
-        """Return synthetic router state for adapters in memory."""
+        """Return persisted router state, mirroring PostgresStore.
 
-        adapters = [a for a in self.artifacts.values() if a.type == "adapter"]
-        if user_id:
-            adapters = [a for a in adapters if a.owner_user_id == user_id]
-        return [
-            AdapterRouterState(
-                artifact_id=a.id,
-                base_model=a.schema.get("base_model"),
-                centroid_vec=a.schema.get("embedding_centroid") or [],
-                usage_count=0,
-                success_score=0.0,
-                meta=None,
+        Only adapters that have a stored state row and a still-existing artifact
+        are returned (joined on artifact ownership when user_id is given),
+        ordered by last_used_at DESC NULLS LAST, then usage_count DESC.
+        """
+        with self._data_lock:
+            states = list(self.adapter_router_state.values())
+
+        def _visible(state: AdapterRouterState) -> bool:
+            artifact = self.artifacts.get(state.artifact_id)
+            if artifact is None:
+                return False
+            return user_id is None or artifact.owner_user_id == user_id
+
+        def _sort_key(state: AdapterRouterState) -> tuple:
+            last_used = state.last_used_at
+            return (
+                last_used is not None,
+                last_used.timestamp() if last_used else 0.0,
+                state.usage_count or 0,
             )
-            for a in adapters
-        ]
+
+        visible = [s for s in states if _visible(s)]
+        visible.sort(key=_sort_key, reverse=True)
+        return visible
 
     def update_adapter_router_state(
         self,

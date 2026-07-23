@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from typing import Iterator, List, Optional
 
+import os
+
+from liminallm.config import resolve_provider_endpoint
 from liminallm.service.model_backend import (
-    BUILTIN_ADAPTER_PLUGS,
-    AdapterPlug,
     ApiAdapterBackend,
     LocalJaxLoRABackend,
     ModelBackend,
@@ -174,37 +175,51 @@ class LLMService:
         # Stub backend for testing - returns canned responses
         if mode == "stub":
             return StubBackend()
-        plug = self._resolve_plug(mode)
-        if plug:
-            plug_config = self.adapter_configs.get(plug.key, {})
-            plug_api_key = plug_config.get("api_key", api_key)
-            plug_base_url = plug_config.get("base_url", base_url)
-            plug_adapter_server_model = plug_config.get(
-                "adapter_server_model", adapter_server_model
-            )
-            return plug.build_backend(
-                base_model=self.base_model,
-                api_key=plug_api_key,
-                base_url=plug_base_url,
-                adapter_server_model=plug_adapter_server_model,
-                fs_root=fs_root,
-            )
         if mode in {"local_lora", "local_gpu_lora"}:
             return LocalJaxLoRABackend(self.base_model, fs_root or "/srv/liminallm")
-        if mode not in {"api_adapters", "adapter_server"}:
-            mode = "api_adapters"
+
+        # OpenAI-compatible API providers (openai, anthropic, zhipu/glm, together,
+        # gemini). Each resolves credentials as: explicit adapter_configs override,
+        # then the caller-supplied key (openai only), then the provider's env var.
+        endpoint = resolve_provider_endpoint(mode)
+        if endpoint:
+            provider = endpoint["provider"]
+            override = (
+                self.adapter_configs.get(mode)
+                or self.adapter_configs.get(provider)
+                or {}
+            )
+            fallback_key = api_key if provider == "openai" else None
+            fallback_base = base_url if provider == "openai" else None
+            api_key_env = endpoint["api_key_env"]
+            resolved_key = (
+                override.get("api_key")
+                or fallback_key
+                or (os.getenv(api_key_env) if api_key_env else None)
+            )
+            resolved_base = (
+                override.get("base_url") or fallback_base or endpoint["base_url"]
+            )
+            return ApiAdapterBackend(
+                self.base_model,
+                adapter_mode="api_adapters",
+                api_key=resolved_key,
+                base_url=resolved_base,
+                adapter_server_model=adapter_server_model,
+                provider=provider,
+                api_key_env=api_key_env,
+            )
+
+        # adapter_server and other adapter-id providers (azure, vertex, bedrock,
+        # lorax, sagemaker). Preserve the provider so capabilities resolve
+        # correctly rather than defaulting everything to OpenAI.
+        adapter_mode = mode if mode in {"api_adapters", "adapter_server"} else "api_adapters"
+        provider = None if mode in {"api_adapters", "adapter_server"} else mode
         return ApiAdapterBackend(
             self.base_model,
-            adapter_mode=mode,
+            adapter_mode=adapter_mode,
             api_key=api_key,
             base_url=base_url,
             adapter_server_model=adapter_server_model,
+            provider=provider,
         )
-
-    def _resolve_plug(self, mode: str) -> AdapterPlug | None:
-        if not mode:
-            return None
-        normalized = mode.lower()
-        if normalized in BUILTIN_ADAPTER_PLUGS:
-            return BUILTIN_ADAPTER_PLUGS[normalized]
-        return None

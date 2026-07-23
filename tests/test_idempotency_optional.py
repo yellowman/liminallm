@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
@@ -139,14 +139,21 @@ class TestResolveIdempotency:
 
         with (
             patch("liminallm.api.routes.get_runtime") as mock_runtime,
-            patch("liminallm.api.routes._get_cached_idempotency_record") as mock_get,
+            patch(
+                "liminallm.api.routes._acquire_idempotency_slot",
+                new_callable=AsyncMock,
+            ) as mock_acquire,
         ):
             mock_runtime.return_value = MagicMock()
-            mock_get.return_value = {
-                "status": "completed",
-                "request_id": "prev-req-id",
-                "response": cached_envelope,
-            }
+            # Slot not acquired; the existing record is a completed result.
+            mock_acquire.return_value = (
+                False,
+                {
+                    "status": "completed",
+                    "request_id": "prev-req-id",
+                    "response": cached_envelope,
+                },
+            )
 
             request_id, cached = await _resolve_idempotency(
                 route="chat",
@@ -164,13 +171,17 @@ class TestResolveIdempotency:
         """Should raise 409 Conflict when prior request is still in progress."""
         with (
             patch("liminallm.api.routes.get_runtime") as mock_runtime,
-            patch("liminallm.api.routes._get_cached_idempotency_record") as mock_get,
+            patch(
+                "liminallm.api.routes._acquire_idempotency_slot",
+                new_callable=AsyncMock,
+            ) as mock_acquire,
         ):
             mock_runtime.return_value = MagicMock()
-            mock_get.return_value = {
-                "status": "in_progress",
-                "request_id": "ongoing-req",
-            }
+            # Slot not acquired; a prior request is still in progress.
+            mock_acquire.return_value = (
+                False,
+                {"status": "in_progress", "request_id": "ongoing-req"},
+            )
 
             with pytest.raises(HTTPException) as exc_info:
                 await _resolve_idempotency(

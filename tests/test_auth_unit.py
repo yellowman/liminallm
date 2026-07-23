@@ -10,7 +10,7 @@ Tests for:
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -128,7 +128,8 @@ class TestSessionManagement:
 
         assert session.id is not None
         assert session.user_id == test_user.id
-        assert session.expires_at > datetime.utcnow()
+        # Session.new() produces timezone-aware timestamps.
+        assert session.expires_at > datetime.now(timezone.utc)
 
     def test_get_session(self, test_user, memory_store):
         """Test getting a session."""
@@ -178,7 +179,7 @@ class TestSignupFlow:
 
     def test_signup_creates_user(self, auth_service, memory_store):
         """Test that signup creates a new user."""
-        user, session, tokens = asyncio.get_event_loop().run_until_complete(
+        user, session, tokens = asyncio.run(
             auth_service.signup("new@example.com", "NewPassword123!")
         )
 
@@ -188,7 +189,7 @@ class TestSignupFlow:
 
     def test_signup_stores_hashed_password(self, auth_service, memory_store):
         """Test that signup stores hashed password."""
-        user, session, tokens = asyncio.get_event_loop().run_until_complete(
+        user, session, tokens = asyncio.run(
             auth_service.signup("another@example.com", "Password123!")
         )
 
@@ -203,7 +204,7 @@ class TestLoginFlow:
 
     def test_login_with_valid_credentials(self, auth_service, test_user, memory_store):
         """Test login with valid email and password."""
-        user, session, tokens = asyncio.get_event_loop().run_until_complete(
+        user, session, tokens = asyncio.run(
             auth_service.login("test@example.com", "TestPassword123!")
         )
 
@@ -213,7 +214,7 @@ class TestLoginFlow:
 
     def test_login_with_invalid_password(self, auth_service, test_user):
         """Test login with wrong password."""
-        user, session, tokens = asyncio.get_event_loop().run_until_complete(
+        user, session, tokens = asyncio.run(
             auth_service.login("test@example.com", "WrongPassword!")
         )
 
@@ -222,7 +223,7 @@ class TestLoginFlow:
 
     def test_login_with_nonexistent_email(self, auth_service):
         """Test login with non-existent email."""
-        user, session, tokens = asyncio.get_event_loop().run_until_complete(
+        user, session, tokens = asyncio.run(
             auth_service.login("nonexistent@example.com", "AnyPassword!")
         )
 

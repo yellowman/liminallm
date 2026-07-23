@@ -28,10 +28,14 @@ def test_user(memory_store):
 class TestUserSettings:
     """Tests for user settings storage methods."""
 
-    def test_get_user_settings_returns_none_for_new_user(self, memory_store, test_user):
-        """New users should have no settings."""
+    def test_get_user_settings_defaults_for_new_user(self, memory_store, test_user):
+        """New users are seeded with default (empty) settings (Issue 21.4)."""
         settings = memory_store.get_user_settings(test_user.id)
-        assert settings is None
+        assert settings is not None
+        assert settings.user_id == test_user.id
+        assert settings.locale is None
+        assert settings.timezone is None
+        assert settings.flags is None
 
     def test_set_user_settings_creates_new(self, memory_store, test_user):
         """set_user_settings should create settings for user."""
@@ -301,8 +305,14 @@ class TestArtifactOperations:
             owner_user_id=test_user.id,
         )
 
-        workflows = memory_store.list_artifacts(type_filter="workflow")
-        tools = memory_store.list_artifacts(type_filter="tool")
+        # Pass owner_user_id: private artifacts are only visible to their owner
+        # under the visibility ACL (an owner-less list returns global only).
+        workflows = memory_store.list_artifacts(
+            type_filter="workflow", owner_user_id=test_user.id
+        )
+        tools = memory_store.list_artifacts(
+            type_filter="tool", owner_user_id=test_user.id
+        )
 
         assert any(a.name == "Workflow 1" for a in workflows)
         assert any(a.name == "Tool 1" for a in tools)

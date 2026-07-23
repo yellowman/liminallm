@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import posixpath
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -27,12 +28,35 @@ __build__ = _settings.build_sha
 
 
 _cleanup_task: asyncio.Task | None = None
+_settings_watch_task: asyncio.Task | None = None
+
+
+async def _run_settings_watcher(runtime, interval_seconds: int) -> None:
+    """Per-worker loop that reloads model services when admin settings change.
+
+    Uvicorn runs multiple workers, each with its own in-process Runtime, so a
+    settings change persisted by one worker must be picked up by the others.
+    This polls the persisted settings version and reloads only when a
+    model-affecting value actually differs (see Runtime.maybe_reload_model_services).
+    """
+    interval = max(int(interval_seconds), 1)
+    try:
+        while True:
+            await asyncio.sleep(interval)
+            try:
+                await asyncio.to_thread(runtime.maybe_reload_model_services)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # best-effort; keep the worker serving
+                logger.warning("settings_watch_reload_failed", error=str(exc))
+    except asyncio.CancelledError:
+        logger.info("settings_watch_task_cancelled")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan context manager for startup and shutdown events."""
-    global _cleanup_task
+    global _cleanup_task, _settings_watch_task
     # Startup
     from liminallm.service.runtime import get_runtime
 
@@ -54,6 +78,12 @@ async def lifespan(app: FastAPI):
                 runtime.settings.tmp_max_age_hours,
             )
         )
+        # Watch for admin settings changes made by other workers and reload.
+        _settings_watch_task = asyncio.create_task(
+            _run_settings_watcher(
+                runtime, runtime.settings.settings_watch_interval_seconds
+            )
+        )
     except Exception as exc:
         logger.error("startup_training_worker_failed", error=str(exc))
 
@@ -66,6 +96,10 @@ async def lifespan(app: FastAPI):
             _cleanup_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await _cleanup_task
+        if _settings_watch_task:
+            _settings_watch_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await _settings_watch_task
         await runtime.close()
         logger.info("runtime_cleanup_complete")
     except Exception as exc:
@@ -79,8 +113,11 @@ _CSRF_SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
 
 
 def _allowed_origins() -> List[str]:
-    if _settings.cors_allow_origins:
-        return _settings.cors_allow_origins
+    # Read current settings rather than the import-time snapshot so the
+    # configured CORS_ALLOW_ORIGINS is honored (and testable).
+    settings = Settings.from_env()
+    if settings.cors_allow_origins:
+        return settings.cors_allow_origins
     # Default to common local dev hosts; avoid wildcard when credentials are enabled.
     return [
         "http://localhost",
@@ -92,7 +129,7 @@ def _allowed_origins() -> List[str]:
 
 
 def _allow_credentials() -> bool:
-    return _settings.cors_allow_credentials
+    return Settings.from_env().cors_allow_credentials
 
 
 app.add_middleware(
@@ -255,7 +292,12 @@ STATIC_DIR = Path(__file__).resolve().parent.parent / "frontend"
 @app.middleware("http")
 async def block_direct_admin_access(request: Request, call_next):
     """Block direct access to /static/admin.html - use /admin route instead."""
-    if request.url.path == "/static/admin.html":
+    # Canonicalize the path so dot-segments and redundant slashes
+    # (/static/./admin.html, /static//admin.html, /static/../static/admin.html)
+    # can't slip past the guard while StaticFiles still resolves the file.
+    raw_path = request.url.path.replace("\\", "/")
+    normalized = posixpath.normpath(raw_path).rstrip("/").lower()
+    if normalized in {"/static/admin.html", "/static/admin"}:
         return JSONResponse(
             status_code=403,
             content={"detail": "Use /admin route for admin UI"},

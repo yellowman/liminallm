@@ -23,6 +23,10 @@ class TestCheckRateLimit:
         runtime.cache = None
         runtime._local_rate_limits = {}
         runtime._local_rate_limit_lock = asyncio.Lock()
+        # Instance attributes aren't covered by spec=Runtime; set the ones the
+        # local rate-limit path reads.
+        runtime._local_rate_limit_last_cleanup = datetime.utcnow()
+        runtime._local_rate_limit_max_entries = 5000
         return runtime
 
     @pytest.fixture
@@ -33,6 +37,10 @@ class TestCheckRateLimit:
         runtime = MagicMock(spec=Runtime)
         runtime.cache = AsyncMock()
         runtime.cache.check_rate_limit = AsyncMock(return_value=True)
+        runtime._local_rate_limits = {}
+        runtime._local_rate_limit_lock = asyncio.Lock()
+        runtime._local_rate_limit_last_cleanup = datetime.utcnow()
+        runtime._local_rate_limit_max_entries = 5000
         return runtime
 
     async def test_zero_limit_always_passes(self, mock_runtime):
@@ -114,7 +122,7 @@ class TestCheckRateLimit:
         await check_rate_limit(mock_runtime_with_cache, "test_key", 10, 60)
 
         mock_runtime_with_cache.cache.check_rate_limit.assert_called_once_with(
-            "test_key", 10, 60, return_remaining=False
+            "test_key", 10, 60, return_remaining=False, cost=1
         )
 
     async def test_fallback_to_local_without_redis(self, mock_runtime):
@@ -139,14 +147,15 @@ class TestCheckRateLimit:
         result = await check_rate_limit(mock_runtime, "test_key", 2, 1)
         assert result is False
 
-        # Manually simulate window expiry by backdating the window start
-        window_start, count = mock_runtime._local_rate_limits["test_key"]
+        # The local limiter is a token bucket storing (tokens, last_ts).
+        # Backdate the timestamp so elapsed time refills the bucket.
+        tokens, _last_ts = mock_runtime._local_rate_limits["test_key"]
         from datetime import timedelta
 
-        expired_start = datetime.utcnow() - timedelta(seconds=2)
-        mock_runtime._local_rate_limits["test_key"] = (expired_start, count)
+        backdated_ts = datetime.utcnow() - timedelta(seconds=2)
+        mock_runtime._local_rate_limits["test_key"] = (tokens, backdated_ts)
 
-        # Should pass now (window reset)
+        # Should pass now (bucket refilled after elapsed time)
         result = await check_rate_limit(mock_runtime, "test_key", 2, 1)
         assert result is True
 

@@ -216,7 +216,7 @@ class RAGService:
                     if visibility not in {"shared", "global"}:
                         filtered_reasons[ctx_id] = "owner_mismatch"
                         continue
-                if tenant_id and visibility == "shared":
+                if tenant_id and visibility in {"shared", "global"}:
                     owner = (
                         users.get(ctx.owner_user_id)
                         if isinstance(users, dict)
@@ -239,7 +239,7 @@ class RAGService:
                     if visibility not in {"shared", "global"}:
                         filtered_reasons[ctx_id] = "owner_mismatch"
                         continue
-                if tenant_id and visibility == "shared":
+                if tenant_id and visibility in {"shared", "global"}:
                     owner = getattr(self.store, "get_user", lambda *_: None)(
                         context.owner_user_id
                     )

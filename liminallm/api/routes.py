@@ -94,7 +94,16 @@ from liminallm.api.schemas import (
     VoiceTranscriptionResponse,
     WorkflowListResponse,
 )
-from liminallm.config import get_settings
+from liminallm.config import (
+    SYSTEM_SETTINGS_BOOL_KEYS,
+    SYSTEM_SETTINGS_DEFAULTS,
+    SYSTEM_SETTINGS_FLOAT_KEYS,
+    SYSTEM_SETTINGS_INT_KEYS,
+    SYSTEM_SETTINGS_RATE_LIMIT_KEYS,
+    SYSTEM_SETTINGS_STRING_KEYS,
+    ModelBackend,
+    get_settings,
+)
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service.auth import AuthContext
@@ -261,6 +270,17 @@ def _http_error(
     return HTTPException(status_code=status_code, detail=payload)
 
 
+def _client_ip(request: Optional[Request]) -> str:
+    """Best-effort client IP for keying unauthenticated rate limits.
+
+    Prevents a single client from exhausting a globally-shared limit (password
+    reset, email verification, OAuth) for every other user on the platform.
+    """
+    if request is None or request.client is None:
+        return "unknown"
+    return request.client.host
+
+
 class IdempotencyGuard:
     def __init__(
         self,
@@ -357,71 +377,14 @@ def _get_system_settings(runtime) -> dict:
     """Get admin-managed system settings from database.
 
     Returns merged settings with defaults for any missing values.
+    Uses SYSTEM_SETTINGS_DEFAULTS from config.py as single source of truth.
     """
     if hasattr(runtime.store, "get_system_settings"):
-        db_settings = runtime.store.get_system_settings()
+        db_settings = runtime.store.get_system_settings() or {}
     else:
         db_settings = {}
 
-    # Defaults for any missing settings
-    defaults = {
-        "session_rotation_hours": 24,
-        "session_rotation_grace_seconds": 300,
-        "max_concurrent_workflows": 3,
-        "max_concurrent_inference": 2,
-        "rate_limit_multiplier_free": 1.0,
-        "rate_limit_multiplier_paid": 2.0,
-        "rate_limit_multiplier_enterprise": 5.0,
-        "chat_rate_limit_per_minute": 60,
-        "chat_rate_limit_window_seconds": 60,
-        "login_rate_limit_per_minute": 10,
-        "refresh_rate_limit_per_minute": 20,
-        "refresh_rate_limit_window_seconds": 60,
-        "signup_rate_limit_per_minute": 5,
-        "reset_rate_limit_per_minute": 5,
-        "mfa_rate_limit_per_minute": 5,
-        "admin_rate_limit_per_minute": 30,
-        "admin_rate_limit_window_seconds": 60,
-        "files_upload_rate_limit_per_minute": 10,
-        "websocket_connect_rate_limit_per_minute": 30,
-        "configops_rate_limit_per_hour": 30,
-        "read_rate_limit_per_minute": 120,
-        "write_rate_limit_per_minute": 60,
-        "max_websocket_connections_per_user": 5,
-        "default_page_size": 100,
-        "max_page_size": 500,
-        "default_conversations_limit": 50,
-        "max_upload_bytes": 10485760,
-        "rag_chunk_size": 400,
-        "access_token_ttl_minutes": 30,
-        "refresh_token_ttl_minutes": 1440,
-        "enable_mfa": True,
-        "allow_signup": True,
-        "training_worker_enabled": True,
-        "training_worker_poll_interval": 60,
-        "smtp_host": "",
-        "smtp_port": 587,
-        "smtp_user": "",
-        "smtp_password": "",
-        "smtp_use_tls": True,
-        "smtp_allow_insecure": False,
-        "email_from_address": "",
-        "email_from_name": "LiminalLM",
-        "oauth_redirect_uri": "",
-        "app_base_url": "http://localhost:8000",
-        "voice_transcription_model": "whisper-1",
-        "voice_synthesis_model": "tts-1",
-        "voice_default_voice": "alloy",
-        "rag_mode": "pgvector",
-        "embedding_model_id": "text-embedding",
-        "default_tenant_id": "public",
-        "jwt_issuer": "liminallm",
-        "jwt_audience": "liminal-clients",
-        "model_path": "gpt-4o-mini",
-        "model_backend": "openai",
-        "default_adapter_mode": "hybrid",
-    }
-    return {**defaults, **db_settings}
+    return {**SYSTEM_SETTINGS_DEFAULTS, **db_settings}
 
 
 def _get_plan_rate_multiplier(runtime, plan_tier: str) -> float:
@@ -501,10 +464,9 @@ async def _enforce_rate_limit(
     Raises:
         HTTPException with 429 if rate limit exceeded
     """
-    # Issue 53.8: Validate rate limit is positive to prevent bypass via negative values
-    if limit <= 0:
-        logger.warning("invalid_rate_limit_value", key=key, limit=limit)
-        limit = 1  # Default to strictest limit to prevent bypass
+    # limit <= 0 means "disabled/unlimited" per the admin-settings contract, and
+    # check_rate_limit() honors that. Do NOT clamp to 1 here — that would turn
+    # an operator's "unlimited" into the strictest possible limit.
     if window_seconds <= 0:
         logger.warning("invalid_rate_limit_window", key=key, window_seconds=window_seconds)
         window_seconds = 60  # Default to 1 minute window
@@ -673,18 +635,19 @@ async def _resolve_idempotency(
         # We successfully claimed the slot
         return request_id, None
 
-    # Slot was not acquired, check the existing record
+    # Slot was not acquired. A prior "failed" record is reclaimed atomically
+    # inside _acquire_idempotency_slot (so acquired would be True), meaning a
+    # non-acquired record here is either in progress or a completed result.
     if existing_record:
         status = existing_record.get("status")
-        if status == "in_progress":
-            raise _http_error("conflict", "request in progress", status_code=409)
-        if status in {"completed", "failed"} and existing_record.get("response"):
+        if status == "completed" and existing_record.get("response"):
+            # Replay only successful results so duplicate side effects are avoided.
             response_payload = existing_record.get("response", {})
             if "request_id" not in response_payload:
                 response_payload["request_id"] = existing_record.get("request_id", request_id)
             return existing_record.get("request_id", request_id), Envelope(**response_payload)
 
-    # Record exists but is in an unexpected state - treat as conflict
+    # In progress (or any other non-completed state) - treat as conflict.
     raise _http_error("conflict", "request in progress", status_code=409)
 
 
@@ -1020,6 +983,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
 
 @router.post("/auth/oauth/{provider}/start", response_model=Envelope, tags=["auth"])
 async def oauth_start(
+    request: Request,
     provider: str = Path(..., description="OAuth provider (google, github, etc.)"),
     body: OAuthStartRequest = ...,
 ):
@@ -1029,10 +993,10 @@ async def oauth_start(
     Client should redirect user to this URL to complete authentication.
     """
     runtime = get_runtime()
-    # Rate limit OAuth start to prevent state token exhaustion
+    # Rate limit OAuth start per client to prevent state token exhaustion
     await _enforce_rate_limit(
         runtime,
-        f"oauth:start:{provider}",
+        f"oauth:start:{provider}:{_client_ip(request)}",
         limit=20,
         window_seconds=60,
     )
@@ -1053,6 +1017,7 @@ async def oauth_start(
 
 @router.get("/auth/oauth/{provider}/callback", response_model=Envelope, tags=["auth"])
 async def oauth_callback(
+    request: Request,
     provider: str = Path(..., description="OAuth provider"),
     code: str = Query(..., max_length=512, description="Authorization code from OAuth provider"),
     state: str = Query(..., max_length=128, description="State parameter for CSRF protection"),
@@ -1069,10 +1034,10 @@ async def oauth_callback(
     set during oauth_start, not from user-controllable query parameters.
     """
     runtime = get_runtime()
-    # Rate limit OAuth callback to prevent code brute-forcing
+    # Rate limit OAuth callback per client to prevent code brute-forcing
     await _enforce_rate_limit(
         runtime,
-        f"oauth:callback:{provider}",
+        f"oauth:callback:{provider}:{_client_ip(request)}",
         limit=10,
         window_seconds=60,
     )
@@ -1556,12 +1521,13 @@ async def request_reset(body: PasswordResetRequest):
 
 
 @router.post("/auth/reset/confirm", response_model=Envelope, tags=["auth"])
-async def confirm_reset(body: PasswordResetConfirm):
+async def confirm_reset(body: PasswordResetConfirm, request: Request):
     runtime = get_runtime()
-    # Rate limit to prevent token brute-forcing
+    # Rate limit per client to prevent token brute-forcing without letting one
+    # client lock out password reset for everyone.
     await _enforce_rate_limit(
         runtime,
-        "reset:confirm",
+        f"reset:confirm:{_client_ip(request)}",
         limit=5,
         window_seconds=300,
     )
@@ -1691,12 +1657,13 @@ async def request_email_verification(principal: AuthContext = Depends(get_user))
 
 
 @router.post("/auth/verify_email", response_model=Envelope, tags=["auth"])
-async def verify_email(body: EmailVerificationRequest):
+async def verify_email(body: EmailVerificationRequest, request: Request):
     runtime = get_runtime()
-    # Rate limit to prevent token brute-forcing
+    # Rate limit per client to prevent token brute-forcing without letting one
+    # client block email verification platform-wide.
     await _enforce_rate_limit(
         runtime,
-        "verify:email",
+        f"verify:email:{_client_ip(request)}",
         limit=10,
         window_seconds=300,
     )
@@ -2464,7 +2431,7 @@ async def invoke_tool(
             and artifact.schema.get("kind") == "tool.spec"
         ):
             raise NotFoundError("tool spec not found", detail={"artifact_id": tool_id})
-        result = runtime.workflow.invoke_tool(
+        result = await runtime.workflow.invoke_tool(
             artifact.schema,
             body.inputs or {},
             conversation_id=body.conversation_id,
@@ -3039,60 +3006,8 @@ async def update_system_settings(
     )
 
     # Validate settings
-    allowed_keys = {
-        "session_rotation_hours",
-        "session_rotation_grace_seconds",
-        "max_concurrent_workflows",
-        "max_concurrent_inference",
-        "rate_limit_multiplier_free",
-        "rate_limit_multiplier_paid",
-        "rate_limit_multiplier_enterprise",
-        "chat_rate_limit_per_minute",
-        "chat_rate_limit_window_seconds",
-        "login_rate_limit_per_minute",
-        "refresh_rate_limit_per_minute",
-        "refresh_rate_limit_window_seconds",
-        "signup_rate_limit_per_minute",
-        "reset_rate_limit_per_minute",
-        "mfa_rate_limit_per_minute",
-        "admin_rate_limit_per_minute",
-        "admin_rate_limit_window_seconds",
-        "files_upload_rate_limit_per_minute",
-        "configops_rate_limit_per_hour",
-        "read_rate_limit_per_minute",
-        "default_page_size",
-        "max_page_size",
-        "default_conversations_limit",
-        "max_upload_bytes",
-        "rag_chunk_size",
-        "access_token_ttl_minutes",
-        "refresh_token_ttl_minutes",
-        "enable_mfa",
-        "allow_signup",
-        "training_worker_enabled",
-        "training_worker_poll_interval",
-        "smtp_host",
-        "smtp_port",
-        "smtp_user",
-        "smtp_password",
-        "smtp_use_tls",
-        "smtp_allow_insecure",
-        "email_from_address",
-        "email_from_name",
-        "oauth_redirect_uri",
-        "app_base_url",
-        "voice_transcription_model",
-        "voice_synthesis_model",
-        "voice_default_voice",
-        "rag_mode",
-        "embedding_model_id",
-        "default_tenant_id",
-        "jwt_issuer",
-        "jwt_audience",
-        "model_path",
-        "model_backend",
-        "default_adapter_mode",
-    }
+    # Use centralized settings definitions from config.py (single source of truth)
+    allowed_keys = set(SYSTEM_SETTINGS_DEFAULTS.keys())
     invalid_keys = set(body.keys()) - allowed_keys
     if invalid_keys:
         raise _http_error(
@@ -3101,78 +3016,19 @@ async def update_system_settings(
             status_code=400,
         )
 
-    # Type validation
-    int_keys = {
-        "session_rotation_hours",
-        "session_rotation_grace_seconds",
-        "max_concurrent_workflows",
-        "max_concurrent_inference",
-        "chat_rate_limit_per_minute",
-        "chat_rate_limit_window_seconds",
-        "login_rate_limit_per_minute",
-        "refresh_rate_limit_per_minute",
-        "refresh_rate_limit_window_seconds",
-        "signup_rate_limit_per_minute",
-        "reset_rate_limit_per_minute",
-        "mfa_rate_limit_per_minute",
-        "admin_rate_limit_per_minute",
-        "admin_rate_limit_window_seconds",
-        "files_upload_rate_limit_per_minute",
-        "configops_rate_limit_per_hour",
-        "read_rate_limit_per_minute",
-        "default_page_size",
-        "max_page_size",
-        "default_conversations_limit",
-        "max_upload_bytes",
-        "rag_chunk_size",
-        "access_token_ttl_minutes",
-        "refresh_token_ttl_minutes",
-        "training_worker_poll_interval",
-        "smtp_port",
-    }
-    float_keys = {
-        "rate_limit_multiplier_free",
-        "rate_limit_multiplier_paid",
-        "rate_limit_multiplier_enterprise",
-    }
-    bool_keys = {
-        "enable_mfa",
-        "allow_signup",
-        "training_worker_enabled",
-        "smtp_use_tls",
-        "smtp_allow_insecure",
-    }
-    string_keys = {
-        "smtp_host",
-        "smtp_user",
-        "smtp_password",
-        "email_from_address",
-        "email_from_name",
-        "oauth_redirect_uri",
-        "app_base_url",
-        "voice_transcription_model",
-        "voice_synthesis_model",
-        "voice_default_voice",
-        "rag_mode",
-        "embedding_model_id",
-        "default_tenant_id",
-        "jwt_issuer",
-        "jwt_audience",
-        "model_path",
-        "model_backend",
-        "default_adapter_mode",
-    }
+    # Type validation - derived from SYSTEM_SETTINGS_DEFAULTS types
+    int_keys = SYSTEM_SETTINGS_INT_KEYS
+    float_keys = SYSTEM_SETTINGS_FLOAT_KEYS
+    bool_keys = SYSTEM_SETTINGS_BOOL_KEYS
+    string_keys = SYSTEM_SETTINGS_STRING_KEYS
     # Enum validation for settings with known valid values
     enum_values = {
         "voice_transcription_model": {"whisper-1"},
         "voice_synthesis_model": {"tts-1", "tts-1-hd"},
         "voice_default_voice": {"alloy", "echo", "fable", "onyx", "nova", "shimmer"},
         "rag_mode": {"pgvector", "memory"},
-        "model_backend": {
-            "openai", "azure", "azure_openai", "vertex", "gemini", "google",
-            "bedrock", "together", "together.ai", "lorax", "adapter_server",
-            "sagemaker", "aws_sagemaker", "stub",  # stub is for testing only
-        },
+        # Derived from the ModelBackend enum so new backends never drift out of sync.
+        "model_backend": {b.value for b in ModelBackend},
         "default_adapter_mode": {"local", "remote", "prompt", "hybrid"},
         "embedding_model_id": {
             "text-embedding", "text-embedding-3-small", "text-embedding-3-large",
@@ -3206,23 +3062,10 @@ async def update_system_settings(
                 f"{key} must be a string",
                 status_code=400,
             )
-        # Rate limit keys that accept 0 (meaning "disabled/unlimited")
-        rate_limit_keys = {
-            "chat_rate_limit_per_minute",
-            "login_rate_limit_per_minute",
-            "refresh_rate_limit_per_minute",
-            "signup_rate_limit_per_minute",
-            "reset_rate_limit_per_minute",
-            "mfa_rate_limit_per_minute",
-            "admin_rate_limit_per_minute",
-            "files_upload_rate_limit_per_minute",
-            "configops_rate_limit_per_hour",
-            "read_rate_limit_per_minute",
-        }
         # Validate positive values for numeric settings
         # Rate limit keys allow 0 (disabled), but not negative
         if key in int_keys and isinstance(value, int):
-            if key in rate_limit_keys:
+            if key in SYSTEM_SETTINGS_RATE_LIMIT_KEYS:
                 if value < 0:
                     raise _http_error(
                         "validation_error",
@@ -3257,6 +3100,38 @@ async def update_system_settings(
             "System settings not supported with this storage backend",
             status_code=501,
         )
+
+    # Rebuild backend-dependent services so a changed model_backend / model_path
+    # (or rag/embedding setting) takes effect without a process restart.
+    model_affecting_keys = {
+        "model_backend",
+        "model_path",
+        "default_adapter_mode",
+        "rag_mode",
+        "embedding_model_id",
+        "rag_chunk_size",
+    }
+    if model_affecting_keys & set(body.keys()):
+        try:
+            # Off the event loop: the rebuild is synchronous and takes the
+            # reload lock, which the background watcher may briefly hold.
+            await asyncio.to_thread(runtime.reload_model_services)
+        except Exception as exc:
+            # Settings are persisted, but the live stack could not be rebuilt.
+            # Surface this instead of reporting success so the caller knows the
+            # change is not yet active. The persisted settings make a retry
+            # (or restart) apply them; the runtime keeps the previous backend.
+            logger.error(
+                "model_services_reload_failed",
+                admin_user_id=principal.user_id,
+                error=str(exc),
+            )
+            raise _http_error(
+                "server_error",
+                "Settings were saved but the model services failed to reload; the "
+                "previous backend remains active. Retry, or restart to apply them.",
+                status_code=500,
+            )
 
     logger.info(
         "system_settings_updated",
@@ -3350,9 +3225,12 @@ async def upload_file(
                 declared_size = int(file.headers.get("content-length"))
             except (TypeError, ValueError):
                 declared_size = None
-        approx_cost = max(
-            1,
-            math.ceil(((declared_size or max_bytes) or 1) / (256 * 1024)),
+        # Pre-charge from the declared size when the client sends one; otherwise
+        # charge a nominal 1 and top up by the real cost after reading (below).
+        # Multipart part headers usually omit content-length, so defaulting to
+        # max_bytes here would make every such upload exceed the bucket.
+        approx_cost = (
+            max(1, math.ceil(declared_size / (256 * 1024))) if declared_size else 1
         )
         await _enforce_rate_limit(
             runtime,
@@ -3431,26 +3309,10 @@ async def upload_file(
             await idem.store_result(envelope)
             return envelope
 
-        # Atomic idempotency: record intent BEFORE writing file
-        # This prevents duplicate file writes if idempotency storage fails after file write
-        # Per SPEC §18: Idempotency must work reliably for POST endpoints
-        pending_envelope = Envelope(
-            status="pending",
-            data={"fs_path": safe_filename, "context_id": context_id},
-            request_id=idem.request_id,
-        )
-        try:
-            await idem.store_result(pending_envelope, status="processing")
-        except Exception:
-            # If we can't record idempotency, log but continue (degraded mode)
-            # SECURITY: Don't log exception details that may contain sensitive info
-            logger.warning(
-                "file_upload_idempotency_pre_record_failed",
-                request_id=idem.request_id,
-            )
-
-        # Now write the file
-        # Issue 32.3: Use asyncio.to_thread to avoid blocking the event loop
+        # The IdempotencyGuard already claimed an in-progress slot on entry, so
+        # a concurrent duplicate request is rejected with 409 while this write
+        # proceeds; no separate intent record is needed.
+        # Write the file (Issue 32.3: off the event loop to avoid blocking)
         await asyncio.to_thread(dest_path.write_bytes, contents)
         chunk_count = None
         if context_id:

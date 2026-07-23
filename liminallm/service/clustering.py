@@ -407,8 +407,17 @@ class SemanticClusterer:
                 continue
             owner_id = cluster.user_id
             visibility = "private" if owner_id else "global"
+            # base_model is required by the adapter schema; source it from the
+            # runtime/training base model so promotion validates instead of
+            # silently failing.
+            base_model = (
+                getattr(self.training, "runtime_base_model", None)
+                or getattr(self.llm, "base_model", None)
+                or "jax-base"
+            )
             schema = {
                 "kind": "adapter.lora",
+                "base_model": base_model,
                 "scope": "per-user" if cluster.user_id else "global",
                 "backend": "local",
                 "rank": 4,

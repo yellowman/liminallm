@@ -142,20 +142,13 @@ class Runtime:
         if hasattr(self.store, "get_system_settings"):
             sys_settings = self.store.get_system_settings() or {}
 
-        # Resolve model settings from DB with env var fallback
-        resolved_base_model = (
-            sys_settings.get("model_path") or self.settings.model_path
-        )
-        backend_mode = sys_settings.get("model_backend") or self.settings.model_backend
-        default_adapter_mode = (
-            sys_settings.get("default_adapter_mode") or self.settings.default_adapter_mode
-        )
+        # Build all backend-dependent services (router, llm, rag, training,
+        # clusterer, workflow, config_ops). Extracted into a helper so
+        # reload_model_services() can rebuild them when an admin changes
+        # model_backend/model_path without restarting the process.
+        self._build_model_services(sys_settings)
 
-        # Resolve other settings from DB with env var fallback
-        rag_mode = sys_settings.get("rag_mode") or self.settings.rag_mode
-        embedding_model_id = (
-            sys_settings.get("embedding_model_id") or self.settings.embedding_model_id
-        )
+        # Voice/email settings resolve from DB with env var fallback
         voice_transcription_model = (
             sys_settings.get("voice_transcription_model")
             or self.settings.voice_transcription_model
@@ -168,59 +161,13 @@ class Runtime:
             sys_settings.get("voice_default_voice") or self.settings.voice_default_voice
         )
         app_base_url = sys_settings.get("app_base_url") or self.settings.app_base_url
-        rag_chunk_size = sys_settings.get("rag_chunk_size", 400)
 
-        self.router = RouterEngine(cache=self.cache, backend_mode=backend_mode)
-        adapter_configs = {
-            "openai": {
-                "api_key": self.settings.adapter_openai_api_key,
-                "base_url": self.settings.adapter_openai_base_url,
-                "adapter_server_model": self.settings.adapter_server_model,
-            }
-        }
-        self.embeddings = EmbeddingsService(embedding_model_id)
-        self.llm = LLMService(
-            base_model=resolved_base_model,
-            backend_mode=backend_mode,
-            adapter_configs=adapter_configs,
-            api_key=self.settings.adapter_openai_api_key,
-            base_url=self.settings.adapter_openai_base_url,
-            adapter_server_model=self.settings.adapter_server_model,
-            fs_root=self.settings.shared_fs_root,
-        )
-        self.rag = RAGService(
-            self.store,
-            default_chunk_size=rag_chunk_size,
-            rag_mode=rag_mode,
-            embed=self.embeddings.embed,
-            embedding_model_id=embedding_model_id,
-        )
-        self.training = TrainingService(
-            self.store,
-            self.settings.shared_fs_root,
-            runtime_base_model=resolved_base_model,
-            default_adapter_mode=default_adapter_mode,
-            backend_mode=backend_mode,
-            max_active_training_jobs=self.settings.max_active_training_jobs,
-        )
-        self.clusterer = SemanticClusterer(self.store, self.llm, self.training)
-        self.workflow = WorkflowEngine(
-            self.store,
-            self.llm,
-            self.router,
-            self.rag,
-            cache=self.cache,
-            settings=self.settings,
-        )
         self.voice = VoiceService(
             self.settings.shared_fs_root,
             api_key=self.settings.voice_api_key,
             transcription_model=voice_transcription_model,
             synthesis_model=voice_synthesis_model,
             default_voice=voice_default_voice,
-        )
-        self.config_ops = ConfigOpsService(
-            self.store, self.llm, self.router, self.training
         )
         # Use MFA setting from sys_settings (already fetched above)
         mfa_enabled = sys_settings.get("enable_mfa", self.settings.enable_mfa)
@@ -274,18 +221,204 @@ class Runtime:
         self._local_rate_limit_lock = asyncio.Lock()
         self._local_rate_limit_last_cleanup = datetime.utcnow()
         self._local_rate_limit_max_entries = 5000
+        # Cross-worker settings reload coordination: the version this worker's
+        # model stack was built from, and a lock serializing rebuilds.
+        self._reload_lock = threading.Lock()
+        self._applied_settings_version = self._read_settings_version()
 
         # Log successful initialization with summary
         logger.info(
             "runtime_initialized",
-            model_path=resolved_base_model,
-            model_backend=str(backend_mode),
-            rag_mode=str(rag_mode),
-            adapter_mode=str(default_adapter_mode),
+            model_path=self.resolved_base_model,
+            model_backend=str(self.backend_mode),
+            rag_mode=str(self.rag_mode),
+            adapter_mode=str(self.default_adapter_mode),
             redis_enabled=self.cache is not None,
             email_configured=self.email.is_configured,
             voice_configured=self.voice.is_configured,
             mfa_enabled=mfa_enabled,
+        )
+
+    def _build_model_services(self, sys_settings: dict) -> None:
+        """Construct all backend-dependent services from system settings.
+
+        Shared by __init__ and reload_model_services so a runtime
+        model_backend / model_path change takes effect without a restart.
+        """
+        self.resolved_base_model = (
+            sys_settings.get("model_path") or self.settings.model_path
+        )
+        self.backend_mode = (
+            sys_settings.get("model_backend") or self.settings.model_backend
+        )
+        self.default_adapter_mode = (
+            sys_settings.get("default_adapter_mode")
+            or self.settings.default_adapter_mode
+        )
+        self.rag_mode = sys_settings.get("rag_mode") or self.settings.rag_mode
+        embedding_model_id = (
+            sys_settings.get("embedding_model_id") or self.settings.embedding_model_id
+        )
+        rag_chunk_size = sys_settings.get("rag_chunk_size", 400)
+        adapter_configs = {
+            "openai": {
+                "api_key": self.settings.adapter_openai_api_key,
+                "base_url": self.settings.adapter_openai_base_url,
+                "adapter_server_model": self.settings.adapter_server_model,
+            }
+        }
+        self.router = RouterEngine(cache=self.cache, backend_mode=self.backend_mode)
+        self.embeddings = EmbeddingsService(embedding_model_id)
+        self.llm = LLMService(
+            base_model=self.resolved_base_model,
+            backend_mode=self.backend_mode,
+            adapter_configs=adapter_configs,
+            api_key=self.settings.adapter_openai_api_key,
+            base_url=self.settings.adapter_openai_base_url,
+            adapter_server_model=self.settings.adapter_server_model,
+            fs_root=self.settings.shared_fs_root,
+        )
+        self.rag = RAGService(
+            self.store,
+            default_chunk_size=rag_chunk_size,
+            rag_mode=self.rag_mode,
+            embed=self.embeddings.embed,
+            embedding_model_id=embedding_model_id,
+        )
+        self.training = TrainingService(
+            self.store,
+            self.settings.shared_fs_root,
+            runtime_base_model=self.resolved_base_model,
+            default_adapter_mode=self.default_adapter_mode,
+            backend_mode=self.backend_mode,
+            max_active_training_jobs=self.settings.max_active_training_jobs,
+        )
+        self.clusterer = SemanticClusterer(self.store, self.llm, self.training)
+        self.workflow = WorkflowEngine(
+            self.store,
+            self.llm,
+            self.router,
+            self.rag,
+            cache=self.cache,
+            settings=self.settings,
+        )
+        self.config_ops = ConfigOpsService(
+            self.store, self.llm, self.router, self.training
+        )
+        # Record the model-affecting settings this stack was built from so a
+        # watcher can tell whether a later settings write actually changed them.
+        self._model_settings_signature = self._model_signature(sys_settings)
+
+    def _model_signature(self, sys_settings: dict) -> tuple:
+        """Signature of the settings that affect the model service stack."""
+        return (
+            sys_settings.get("model_path") or self.settings.model_path,
+            str(sys_settings.get("model_backend") or self.settings.model_backend),
+            str(
+                sys_settings.get("default_adapter_mode")
+                or self.settings.default_adapter_mode
+            ),
+            str(sys_settings.get("rag_mode") or self.settings.rag_mode),
+            sys_settings.get("embedding_model_id") or self.settings.embedding_model_id,
+            sys_settings.get("rag_chunk_size", 400),
+        )
+
+    def _read_settings_version(self) -> Optional[str]:
+        getter = getattr(self.store, "get_system_settings_version", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter()
+        except Exception as exc:
+            logger.warning("settings_version_read_failed", error=str(exc))
+            return None
+
+    def maybe_reload_model_services(self) -> bool:
+        """Reload model services if another worker changed model settings.
+
+        Each Uvicorn worker holds its own in-process Runtime, so a settings
+        change made in one worker (and persisted to the store) must be observed
+        by the others. Compares the persisted settings version to the one this
+        worker last applied and, only when a model-affecting value actually
+        differs, rebuilds the stack. Returns True if a reload occurred.
+        """
+        version = self._read_settings_version()
+        if version is not None and version == self._applied_settings_version:
+            return False
+        sys_settings = {}
+        if hasattr(self.store, "get_system_settings"):
+            sys_settings = self.store.get_system_settings() or {}
+        target = self._model_signature(sys_settings)
+        # Record the version even when nothing model-relevant changed, so an
+        # unrelated settings write (e.g. a rate-limit tweak) isn't rechecked.
+        self._applied_settings_version = version
+        if target != self._model_settings_signature:
+            self.reload_model_services()
+            return True
+        return False
+
+    # Attributes set by _build_model_services; snapshotted for atomic reload.
+    _MODEL_SERVICE_ATTRS = (
+        "resolved_base_model",
+        "backend_mode",
+        "default_adapter_mode",
+        "rag_mode",
+        "router",
+        "embeddings",
+        "llm",
+        "rag",
+        "training",
+        "clusterer",
+        "workflow",
+        "config_ops",
+    )
+
+    def reload_model_services(self) -> None:
+        """Rebuild backend-dependent services after a system-settings change.
+
+        Atomic: on any failure the previous services are restored so the runtime
+        never runs on a half-rebuilt stack, and the exception propagates so the
+        caller can report that the change did not take effect live. In-flight
+        workflow threads finish on the old engine; new requests use the rebuilt
+        services.
+        """
+        # Serialize rebuilds so a request-triggered reload and the background
+        # settings watcher on the same worker can't rebuild concurrently.
+        with self._reload_lock:
+            snapshot = {
+                name: getattr(self, name, None) for name in self._MODEL_SERVICE_ATTRS
+            }
+            old_workflow = getattr(self, "workflow", None)
+            sys_settings = {}
+            if hasattr(self.store, "get_system_settings"):
+                sys_settings = self.store.get_system_settings() or {}
+            version = self._read_settings_version()
+            try:
+                self._build_model_services(sys_settings)
+            except Exception as exc:
+                # Restore the previous stack so a partial rebuild can't leave the
+                # runtime inconsistent, then let the caller surface the failure.
+                for name, value in snapshot.items():
+                    setattr(self, name, value)
+                logger.error(
+                    "runtime_model_services_reload_failed",
+                    model_backend=str(sys_settings.get("model_backend")),
+                    error=str(exc),
+                )
+                raise
+            # Mark this version applied so the watcher doesn't reload again.
+            self._applied_settings_version = version
+            if getattr(self, "training_worker", None):
+                self.training_worker.training = self.training
+                self.training_worker.clusterer = self.clusterer
+            if old_workflow is not None and old_workflow is not self.workflow:
+                with contextlib.suppress(Exception):
+                    old_workflow.shutdown(wait=False)
+        logger.info(
+            "runtime_model_services_reloaded",
+            model_path=self.resolved_base_model,
+            model_backend=str(self.backend_mode),
+            rag_mode=str(self.rag_mode),
         )
 
     async def close(self) -> None:
@@ -501,12 +634,14 @@ async def _acquire_idempotency_slot(
         existing = runtime._local_idempotency.get(cache_key)
 
         if existing:
-            # Check if expired
-            if existing.get("expires_at") and existing["expires_at"] < now:
-                # Expired, we can claim it
+            is_expired = existing.get("expires_at") and existing["expires_at"] < now
+            # Reclaim a prior failed attempt atomically (within this lock) so a
+            # retry proceeds without a separate racy overwrite.
+            is_failed = existing.get("status") == "failed"
+            if is_expired or is_failed:
                 runtime._local_idempotency.pop(cache_key, None)
             else:
-                # Not expired, return existing
+                # Live in-progress/completed record: return it.
                 return (False, existing)
 
         # No existing record or it was expired, claim the slot

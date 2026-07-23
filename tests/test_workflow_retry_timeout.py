@@ -71,6 +71,19 @@ class MockRedisCache:
     async def set_workflow_state(self, key: str, state: dict) -> None:
         pass
 
+    async def delete_workflow_state(self, key: str) -> None:
+        pass
+
+    async def check_circuit_breaker(self, tool_name: str, *, tenant_id=None):
+        # Circuit closed so the tool handler is actually invoked.
+        return False, None
+
+    async def record_tool_success(self, tool_name: str, *, tenant_id=None) -> None:
+        pass
+
+    async def record_tool_failure(self, tool_name: str, *, tenant_id=None):
+        return False, 0
+
 
 @pytest.fixture
 def workflow_engine():

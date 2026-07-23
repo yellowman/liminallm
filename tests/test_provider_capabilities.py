@@ -277,8 +277,14 @@ class TestBackendAdapterCompatibility:
             assert AdapterMode.PROMPT in modes, f"{backend} should support PROMPT mode"
 
     def test_all_backends_support_hybrid(self):
-        """All backends should support HYBRID mode."""
+        """All real backends should support HYBRID mode.
+
+        The stub backend is a test double returning canned responses, so it
+        intentionally supports PROMPT only and is excluded here.
+        """
         for backend, modes in BACKEND_ADAPTER_COMPATIBILITY.items():
+            if backend == "stub":
+                continue
             assert AdapterMode.HYBRID in modes, f"{backend} should support HYBRID mode"
 
 

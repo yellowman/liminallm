@@ -59,6 +59,30 @@ _CMP_OPS = {
 
 
 _MAX_RECURSION_DEPTH = 100
+# Bounds to stop a single expression from pinning a CPU core or exhausting memory
+# via exponentiation (9**9**9) or sequence/int repetition ([0]*10**9, "a"*10**8).
+_MAX_POW_EXPONENT = 1000
+_MAX_INT_BITS = 10000
+_MAX_SEQUENCE_LEN = 100_000
+
+
+def _guard_binop(op_type: type, left: Any, right: Any) -> None:
+    """Reject arithmetic whose result would blow up CPU/memory."""
+    if op_type is ast.Pow and isinstance(left, int) and isinstance(right, int):
+        if right > _MAX_POW_EXPONENT or (
+            right > 0 and left.bit_length() * right > _MAX_INT_BITS
+        ):
+            raise ValueError("exponentiation result too large")
+    elif op_type is ast.Mult:
+        if isinstance(left, (str, bytes, list, tuple)) and isinstance(right, int):
+            if len(left) * max(right, 0) > _MAX_SEQUENCE_LEN:
+                raise ValueError("sequence repetition too large")
+        elif isinstance(right, (str, bytes, list, tuple)) and isinstance(left, int):
+            if len(right) * max(left, 0) > _MAX_SEQUENCE_LEN:
+                raise ValueError("sequence repetition too large")
+        elif isinstance(left, int) and isinstance(right, int):
+            if left.bit_length() + right.bit_length() > _MAX_INT_BITS:
+                raise ValueError("multiplication result too large")
 
 
 def _eval_node(
@@ -110,13 +134,14 @@ def _eval_node(
         raise ValueError("unsupported unary operator")
 
     if isinstance(node, ast.BinOp):
-        op = _BIN_OPS.get(type(node.op))
+        op_type = type(node.op)
+        op = _BIN_OPS.get(op_type)
         if op is None:
             raise ValueError("unsupported binary operator")
-        return op(
-            _eval_node(node.left, names, allowed_callables, _depth + 1),
-            _eval_node(node.right, names, allowed_callables, _depth + 1),
-        )
+        left = _eval_node(node.left, names, allowed_callables, _depth + 1)
+        right = _eval_node(node.right, names, allowed_callables, _depth + 1)
+        _guard_binop(op_type, left, right)
+        return op(left, right)
 
     if isinstance(node, ast.Compare):
         left = _eval_node(node.left, names, allowed_callables, _depth + 1)

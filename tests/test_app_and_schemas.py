@@ -81,7 +81,7 @@ def test_signup_request_validates_email_and_password():
 
 
 def test_schema_payload_aliasing_and_defaults():
-    payload = {"schema": {"title": "Example"}, "name": "artifact"}
+    payload = {"type": "tool", "schema": {"title": "Example"}, "name": "artifact"}
     req = schemas.ArtifactRequest(**payload)
 
     dumped = req.model_dump(by_alias=True)
