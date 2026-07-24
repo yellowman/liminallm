@@ -199,9 +199,6 @@
                   <button class="minor" id="refresh-conversations">Refresh history</button>
                 </div>
               </div>
-              <div class="subtext">
-                Provide an optional context ID to ground retrieval-augmented answers and a workflow ID to steer execution.
-              </div>
               <div class="input-grid">
                 <div class="field compact">
                   <label for="context-id">Context ID</label>
@@ -269,7 +266,7 @@
 
               <form id="chat-form">
                 <div class="field textarea-wrap">
-                  <label for="message-input">Message</label>
+                  <label for="message-input" class="sr-only">Message</label>
                   <textarea id="message-input" placeholder="Ask anything..." rows="3"></textarea>
                   <div class="draft-indicator" id="draft-indicator"></div>
                 </div>

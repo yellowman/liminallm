@@ -199,7 +199,6 @@ body {
 .conversation-item {
   padding: 9px 10px;
   border-radius: var(--radius-sm);
-  border-left: 2px solid transparent;
   cursor: pointer;
   margin-bottom: 2px;
   transition: background 0.15s ease;
@@ -209,9 +208,17 @@ body {
   background: var(--panel-muted);
 }
 
+/* Active conversation inverts instead of the usual accent stripe */
 .conversation-item.active {
-  background: var(--panel-muted);
-  border-left-color: var(--accent);
+  background: var(--text);
+}
+
+.conversation-item.active .title {
+  color: #ffffff;
+}
+
+.conversation-item.active .meta {
+  color: rgba(255, 255, 255, 0.6);
 }
 
 .conversation-item .title {
@@ -575,13 +582,18 @@ button.minor:hover {
   align-items: flex-end;
 }
 
+/* Role is conveyed by bubble alignment/color; keep the label for screen
+   readers only. */
 .message .role {
-  text-transform: uppercase;
-  font-weight: 600;
-  font-size: 11px;
-  color: var(--text-muted);
-  letter-spacing: 0.05em;
-  padding: 0 2px;
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .message .bubble {
@@ -1106,6 +1118,19 @@ button.minor:hover {
 
 .hidden {
   display: none !important;
+}
+
+/* Visually hidden but available to screen readers */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 .flex-wrap {
