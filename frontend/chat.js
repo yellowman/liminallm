@@ -132,6 +132,111 @@ const escapeHtml = (str) => {
   return div.innerHTML;
 };
 
+/**
+ * Minimal, dependency-free markdown renderer for assistant messages.
+ *
+ * The input is HTML-escaped FIRST, then markdown constructs are rewritten
+ * into a fixed set of safe tags, so message content can never inject markup.
+ * Supports: fenced/inline code, bold, italic, strikethrough, http(s) links,
+ * headings, ordered/unordered lists, blockquotes, tables, and rules.
+ */
+const renderMarkdown = (raw) => {
+  // Strip NULs so message text can never reference the placeholder table.
+  let text = escapeHtml(String(raw || '').replace(/\u0000/g, ''));
+
+  // Protect code from all later transforms.
+  const codeBlocks = [];
+  text = text.replace(/```([\w-]*)\n?([\s\S]*?)```/g, (m, lang, code) => {
+    codeBlocks.push(`<pre><code${lang ? ` class="lang-${escapeHtml(lang)}"` : ''}>${code.replace(/\n$/, '')}</code></pre>`);
+    return `\u0000B${codeBlocks.length - 1}\u0000`;
+  });
+  const inlineCode = [];
+  text = text.replace(/`([^`\n]+)`/g, (m, code) => {
+    inlineCode.push(`<code>${code}</code>`);
+    return `\u0000I${inlineCode.length - 1}\u0000`;
+  });
+
+  // Inline formatting (operates on escaped text).
+  text = text
+    .replace(/!?\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[\s(])\*([^*\n]+)\*/gm, '$1<em>$2</em>')
+    .replace(/(^|[\s(])_([^_\n]+)_/gm, '$1<em>$2</em>')
+    .replace(/~~([^~\n]+)~~/g, '<del>$1</del>');
+
+  // Block-level pass.
+  const lines = text.split('\n');
+  const out = [];
+  let i = 0;
+  const isTableSep = (l) => /^\s*\|?[\s:|-]+\|?\s*$/.test(l || '') && (l || '').includes('-');
+  const cells = (l) => l.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map((c) => c.trim());
+
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) { i += 1; continue; }
+    let match;
+    if (/^\u0000B\d+\u0000$/.test(line.trim())) {
+      out.push(line.trim());
+      i += 1;
+    } else if ((match = line.match(/^(#{1,4})\s+(.*)$/))) {
+      out.push(`<h${match[1].length + 2}>${match[2]}</h${match[1].length + 2}>`);
+      i += 1;
+    } else if (/^\s*([-*_])\s*\1\s*\1[\s\-*_]*$/.test(line)) {
+      out.push('<hr>');
+      i += 1;
+    } else if (/^&gt;\s?/.test(line)) {
+      const quote = [];
+      while (i < lines.length && /^&gt;\s?/.test(lines[i])) {
+        quote.push(lines[i].replace(/^&gt;\s?/, ''));
+        i += 1;
+      }
+      out.push(`<blockquote>${quote.join('<br>')}</blockquote>`);
+    } else if (/^\s*[-*+]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) {
+        items.push(`<li>${lines[i].replace(/^\s*[-*+]\s+/, '')}</li>`);
+        i += 1;
+      }
+      out.push(`<ul>${items.join('')}</ul>`);
+    } else if (/^\s*\d+\.\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+        items.push(`<li>${lines[i].replace(/^\s*\d+\.\s+/, '')}</li>`);
+        i += 1;
+      }
+      out.push(`<ol>${items.join('')}</ol>`);
+    } else if (line.includes('|') && isTableSep(lines[i + 1])) {
+      const header = cells(line);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].includes('|') && lines[i].trim()) {
+        rows.push(cells(lines[i]));
+        i += 1;
+      }
+      out.push(
+        `<table><thead><tr>${header.map((h) => `<th>${h}</th>`).join('')}</tr></thead>` +
+        `<tbody>${rows.map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table>`
+      );
+    } else {
+      const para = [];
+      while (
+        i < lines.length && lines[i].trim() &&
+        !/^(#{1,4})\s|^&gt;\s?|^\s*[-*+]\s+|^\s*\d+\.\s+/.test(lines[i]) &&
+        !/^\u0000B\d+\u0000$/.test(lines[i].trim())
+      ) {
+        para.push(lines[i]);
+        i += 1;
+      }
+      out.push(`<p>${para.join('<br>')}</p>`);
+    }
+  }
+
+  let html = out.join('');
+  html = html.replace(/\u0000B(\d+)\u0000/g, (m, n) => codeBlocks[Number(n)]);
+  html = html.replace(/\u0000I(\d+)\u0000/g, (m, n) => inlineCode[Number(n)]);
+  return html;
+};
+
 // Citation modal for displaying source content
 const showCitationModal = (element) => {
   try {
@@ -1213,7 +1318,7 @@ const renderMessages = (messages) => {
 
 const renderMessage = (m) => {
   const role = escapeHtml(m.role || 'unknown');
-  const content = escapeHtml(m.content || '');
+  const content = role === 'assistant' ? renderMarkdown(m.content || '') : escapeHtml(m.content || '');
 
   const metaBits = [];
   if (m.token_count) metaBits.push(`${m.token_count} tokens`);
@@ -1278,7 +1383,11 @@ const appendMessage = (role, content, meta = '') => {
   roleEl.textContent = role;
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
-  bubble.textContent = content;
+  if (role === 'assistant') {
+    bubble.innerHTML = renderMarkdown(content);
+  } else {
+    bubble.textContent = content;
+  }
   const metaEl = document.createElement('div');
   metaEl.className = 'meta';
   metaEl.textContent = meta;
@@ -1328,7 +1437,11 @@ const createStreamingMessage = (role) => {
     /** Append a token to the message */
     update(token) {
       content += token;
-      bubble.textContent = content;
+      if (role === 'assistant') {
+        bubble.innerHTML = renderMarkdown(content);
+      } else {
+        bubble.textContent = content;
+      }
       if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
     },
     /** Finalize the message with optional meta info */
