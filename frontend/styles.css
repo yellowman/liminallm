@@ -72,6 +72,13 @@ body {
   background: var(--accent);
 }
 
+/* Pre-rendered Inter wordmark (SVG paths, no webfont dependency) */
+.brand .wordmark {
+  display: block;
+  height: 20px;
+  width: auto;
+}
+
 .bar-actions {
   display: flex;
   align-items: center;
