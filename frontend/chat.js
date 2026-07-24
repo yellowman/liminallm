@@ -1355,12 +1355,11 @@ const scrollToBottom = () => {
 // Chat submission
 // =============================================================================
 
+// The server's /chat/stream endpoint handles exactly one message per
+// connection (it reads a single init frame, streams the reply, and returns),
+// so the client opens a fresh socket per send. chatSocket tracks the
+// in-flight socket so Stop/teardown can reach it.
 let chatSocket = null;
-let chatSocketConnecting = false;
-let chatSocketReconnectTimer = null;
-let chatSocketReconnectAttempts = 0;
-const WS_MAX_RECONNECT_DELAY = 30000; // 30 seconds max delay
-const WS_BASE_RECONNECT_DELAY = 1000; // 1 second base delay
 let isStreaming = false;
 
 const updateStreamingUI = (streaming) => {
@@ -1389,81 +1388,34 @@ const cancelStreaming = () => {
 };
 
 const cleanupWebSocket = () => {
-  if (chatSocketReconnectTimer) {
-    clearTimeout(chatSocketReconnectTimer);
-    chatSocketReconnectTimer = null;
-  }
   if (chatSocket) {
-    chatSocket.onopen = null;
-    chatSocket.onerror = null;
-    chatSocket.onclose = null;
-    chatSocket.onmessage = null;
     if (chatSocket.readyState === WebSocket.OPEN || chatSocket.readyState === WebSocket.CONNECTING) {
       chatSocket.close();
     }
     chatSocket = null;
   }
-  chatSocketConnecting = false;
 };
 
 window.addEventListener('beforeunload', cleanupWebSocket);
 
-const connectWebSocket = () => {
-  if (chatSocketConnecting) return chatSocket;
-  if (chatSocket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(chatSocket.readyState)) {
-    return chatSocket;
-  }
-  chatSocketConnecting = true;
-  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-  const wsUrl = `${protocol}://${window.location.host}${apiBase}/chat/stream`;
-  chatSocket = new WebSocket(wsUrl);
-  chatSocket.onopen = () => {
-    chatSocketConnecting = false;
-    chatSocketReconnectAttempts = 0; // Reset on successful connection
-  };
-  chatSocket.onerror = () => { chatSocketConnecting = false; };
-  chatSocket.onclose = () => {
-    chatSocketConnecting = false;
-    chatSocket = null;
-    if (chatSocketReconnectTimer) clearTimeout(chatSocketReconnectTimer);
-    // Exponential backoff: delay = base * 2^attempts, capped at max
-    const delay = Math.min(
-      WS_BASE_RECONNECT_DELAY * Math.pow(2, chatSocketReconnectAttempts),
-      WS_MAX_RECONNECT_DELAY
-    );
-    chatSocketReconnectAttempts += 1;
-    chatSocketReconnectTimer = setTimeout(() => {
-      chatSocketReconnectTimer = null;
-      connectWebSocket();
-    }, delay);
-  };
-  return chatSocket;
-};
-
-const ensureWebSocket = () =>
+// Open a fresh socket for one chat exchange; resolves once it is usable.
+const openChatSocket = () =>
   new Promise((resolve, reject) => {
-    const socket = connectWebSocket();
-    if (!socket) {
-      reject(new Error('WebSocket unavailable'));
-      return;
-    }
-    if (socket.readyState === WebSocket.OPEN) {
-      resolve(socket);
-      return;
-    }
+    const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const socket = new WebSocket(`${protocol}://${window.location.host}${apiBase}/chat/stream`);
     const timeout = setTimeout(() => {
-      cleanup();
+      socket.close();
       reject(new Error('WebSocket connection timeout'));
     }, 5000);
-    const cleanup = () => {
+    socket.addEventListener('open', () => {
       clearTimeout(timeout);
-      socket.removeEventListener('open', handleOpen);
-      socket.removeEventListener('error', handleError);
-    };
-    const handleOpen = () => { cleanup(); resolve(socket); };
-    const handleError = () => { cleanup(); reject(new Error('WebSocket connection failed')); };
-    socket.addEventListener('open', handleOpen);
-    socket.addEventListener('error', handleError);
+      chatSocket = socket;
+      resolve(socket);
+    });
+    socket.addEventListener('error', () => {
+      clearTimeout(timeout);
+      reject(new Error('WebSocket connection failed'));
+    });
   });
 
 // Maximum message length (characters) - approximately 2k tokens per SPEC §18
@@ -1525,21 +1477,41 @@ const sendMessage = async (event) => {
    * Handles events: token, trace, message_done, streaming_complete, error, cancel_ack
    */
   const chatViaWebSocketStreaming = async () => {
-    const ws = await ensureWebSocket();
+    const ws = await openChatSocket();
     return new Promise((resolve, reject) => {
       let settled = false;
       let streamingMsg = null;
       let messageDoneReceived = false;
       let messageDoneData = {};
+      let idleTimer = null;
 
       const cleanup = () => {
+        if (idleTimer) clearTimeout(idleTimer);
         ws.removeEventListener('message', handleMessage);
         ws.removeEventListener('error', handleError);
         ws.removeEventListener('close', handleClose);
+        // One exchange per connection - the server won't read another message.
+        try { ws.close(); } catch { /* already closed */ }
+        if (chatSocket === ws) chatSocket = null;
       };
+
+      // If nothing arrives for a while, give up rather than leaving the
+      // send button stuck; the caller falls back to the REST endpoint.
+      const armIdleTimer = () => {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          if (streamingMsg) streamingMsg.finalize('Timed out');
+          reject(new Error('Streaming timed out'));
+        }, 120000);
+      };
+      armIdleTimer();
 
       const handleMessage = (event) => {
         if (settled) return;
+        armIdleTimer();
         try {
           const msg = JSON.parse(event.data);
 
@@ -1566,14 +1538,20 @@ const sendMessage = async (event) => {
                 // 'streaming_complete' event the server never sends, which left
                 // the send button disabled forever after a streamed reply.)
                 messageDoneReceived = true;
-                messageDoneData = msg.data || {};
+                messageDoneData = { ...messageDoneData, ...(msg.data || {}) };
                 if (streamingMsg) {
                   const adapters = (messageDoneData.adapters || []).map(a => a?.name || a?.id || a).filter(Boolean);
                   streamingMsg.finalize(adapters.length ? `Adapters: ${adapters.join(', ')}` : '');
                 }
-                settled = true;
-                cleanup();
-                resolve(messageDoneData);
+                // Older servers relayed an interim message_done without IDs
+                // before the persisted one; only settle once we have the
+                // message_id (the close handler and idle timer cover servers
+                // that never send it).
+                if (messageDoneData.message_id) {
+                  settled = true;
+                  cleanup();
+                  resolve(messageDoneData);
+                }
                 break;
 
               case 'error':
