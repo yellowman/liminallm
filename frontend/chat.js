@@ -1561,23 +1561,19 @@ const sendMessage = async (event) => {
                 break;
 
               case 'message_done':
-                // Streaming visually complete, but wait for streaming_complete for IDs
+                // Final event per SPEC §18 - carries message_id, conversation_id,
+                // adapters, and usage. (The client used to wait for a
+                // 'streaming_complete' event the server never sends, which left
+                // the send button disabled forever after a streamed reply.)
                 messageDoneReceived = true;
                 messageDoneData = msg.data || {};
                 if (streamingMsg) {
                   const adapters = (messageDoneData.adapters || []).map(a => a?.name || a?.id || a).filter(Boolean);
                   streamingMsg.finalize(adapters.length ? `Adapters: ${adapters.join(', ')}` : '');
                 }
-                // Don't resolve yet - wait for streaming_complete with message_id
-                break;
-
-              case 'streaming_complete':
-                // Final event with message_id and conversation_id after DB save
                 settled = true;
                 cleanup();
-                // Merge with any data from message_done
-                const finalData = { ...messageDoneData, ...(msg.data || {}) };
-                resolve(finalData);
+                resolve(messageDoneData);
                 break;
 
               case 'error':
@@ -1633,7 +1629,8 @@ const sendMessage = async (event) => {
         if (!settled) {
           settled = true;
           cleanup();
-          // If we got message_done but not streaming_complete, resolve with what we have
+          // Safety net: if the socket closed right after message_done, resolve
+          // with what we have rather than erroring a completed exchange.
           if (messageDoneReceived) {
             if (streamingMsg) streamingMsg.finalize('');
             resolve(messageDoneData);
@@ -1656,8 +1653,10 @@ const sendMessage = async (event) => {
         workflow_id: payload.workflow_id,
         context_id: payload.context_id,
         conversation_id: payload.conversation_id,
-        access_token: state.accessToken,
-        session_id: state.sessionId,
+        // The server rejects dual auth on the socket (fresh_session_required),
+        // so send exactly one method — prefer the bearer token.
+        access_token: state.accessToken || undefined,
+        session_id: state.accessToken ? undefined : state.sessionId,
         tenant_id: state.tenantId,
         stream: true,
       }));
