@@ -7033,3 +7033,34 @@ carried forward: keep a Playwright end-to-end pass (auth flows, one streamed
 chat turn, one RAG turn) in CI so contract drift fails a build instead of
 shipping.
 
+---
+
+## TODO
+
+### 📋 Add a Playwright end-to-end pass to CI
+
+Every critical/high finding in the 13th pass lived at an integration seam
+(client<->server contract, dependency wiring, middleware interaction) that
+unit tests on either side cannot observe. A small browser-driven suite run in
+CI would turn future contract drift into a failed build instead of a shipped
+regression.
+
+Scope (keep it minimal - minutes, not hours):
+1. Boot the app in TEST_MODE with the in-memory store and
+   `MODEL_BACKEND=stub` (no live LLM, no network).
+2. Drive Chromium via Playwright through the seams that broke:
+   - signup -> logout -> login again (exercises the CSRF double-submit path)
+   - one chat turn over the WebSocket, asserting a streamed bubble appears,
+     `message_done` carries message_id, and the Send button is restored
+   - a second turn in the same conversation (multi-turn conversation_id)
+   - settings save + password change (Content-Type/422 class)
+   - load /admin and sign in (route reachability)
+   - fail the run on any console error or unexpected 4xx/5xx response
+3. Wire into CI (e.g. a `make e2e` target plus a GitHub Actions job with a
+   Playwright container image) and into the QA gate alongside `make qa`.
+
+Notes: the throwaway scripts used for the 13th pass (`bigtest.js`,
+`chatflow.js`) already cover most of step 2 and can be adapted; they need a
+stub-model mode, deterministic waits instead of sleeps, and unique per-run
+identities (both already partially done).
+
