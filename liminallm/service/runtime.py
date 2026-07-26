@@ -292,6 +292,13 @@ class Runtime:
             default_adapter_mode=self.default_adapter_mode,
             backend_mode=self.backend_mode,
             max_active_training_jobs=self.settings.max_active_training_jobs,
+            # SPEC §7.5: the serving LLM doubles as distillation teacher when
+            # enabled; targets are rewritten into clean exemplars pre-training.
+            teacher=self.llm,
+            distillation_enabled=sys_settings.get(
+                "training_distillation_enabled",
+                self.settings.training_distillation_enabled,
+            ),
         )
         self.clusterer = SemanticClusterer(self.store, self.llm, self.training)
         self.workflow = WorkflowEngine(

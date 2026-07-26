@@ -6,7 +6,6 @@ import json
 import os
 import re
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Protocol, Tuple
 
@@ -250,6 +249,22 @@ else:  # pragma: no cover - optional dependency absent
     _OpenAIClient = None  # type: ignore
 
 
+def _safe_weight(value: Any, default: float = 1.0, *, context: str = "") -> float:
+    """Coerce adapter weights to float with defensive fallback.
+
+    Router artifacts may carry user-authored weights that fail `float()`
+    coercion. Issue 39.3 requires gracefully handling these cases to avoid
+    request crashes. Shared by every backend (the JAX blending path used to
+    call a method that only existed on ApiAdapterBackend - dead code until
+    jax was actually installed).
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        logger.warning("adapter_weight_parse_failed", context=context, value=value)
+        return default
+
+
 class ModelBackend(Protocol):
     """Interface for pluggable generation backends."""
 
@@ -368,19 +383,7 @@ class ApiAdapterBackend:
         self.capabilities = get_provider_capabilities(self.provider)
 
     def _safe_float(self, value: Any, default: float = 1.0, *, context: str = "") -> float:
-        """Coerce adapter weights to float with defensive fallback.
-
-        Router artifacts may carry user-authored weights that fail `float()`
-        coercion. Issue 39.3 requires gracefully handling these cases to avoid
-        request crashes. We clamp to a caller-provided default and emit a
-        warning for visibility instead of propagating ValueError/TypeError.
-        """
-
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            logger.warning("adapter_weight_parse_failed", context=context, value=value)
-            return default
+        return _safe_weight(value, default, context=context)
 
     def _ensure_client(self) -> None:
         """Ensure the OpenAI-compatible client reflects the latest credentials."""
@@ -1330,7 +1333,7 @@ class LocalJaxLoRABackend:
                 gate_weight = adapter.get("schema", {}).get("weight")
             if gate_weight is None:
                 gate_weight = 1.0
-            gate_weight = self._safe_float(
+            gate_weight = _safe_weight(
                 gate_weight, default=1.0, context="blend_gate_weight"
             )
 

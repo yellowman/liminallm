@@ -570,6 +570,14 @@ class Settings(BaseModel):
         "MAX_ACTIVE_TRAINING_JOBS",
         description="Global cap on simultaneously active training jobs",
     )
+    training_distillation_enabled: bool = env_field(
+        False,
+        "TRAINING_DISTILLATION",
+        description=(
+            "Distill preference-event targets through the configured LLM "
+            "(teacher) before adapter training (SPEC §7.5)"
+        ),
+    )
 
     model_config = ConfigDict(extra="ignore")
 

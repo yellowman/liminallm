@@ -381,12 +381,45 @@ class SemanticClusterer:
         description = lines[1] if len(lines) > 1 else ""
         return label, description or label
 
+    def _skill_prompt_instructions(self, cluster, events) -> str:
+        """Compose prompt-mode instructions for a newborn skill adapter.
+
+        SPEC §5.6: every skill is born as behavior-as-prompt so it is useful
+        immediately on any backend; trained weights come later, if the data
+        earns them. Kept deliberately short - small models pay for every token.
+        """
+        lines = [
+            f"Skill: {cluster.label or 'unnamed skill'}.",
+        ]
+        if cluster.description:
+            lines.append(cluster.description.strip())
+        exemplars = []
+        for event in events:
+            text = (event.corrected_text or event.context_text or "").strip()
+            if text:
+                exemplars.append(text[:200])
+            if len(exemplars) == 3:
+                break
+        if exemplars:
+            lines.append("Examples of responses users rated highly:")
+            lines.extend(f"- {ex}" for ex in exemplars)
+        return "\n".join(lines)
+
     def promote_skill_adapters(
         self,
         *,
         min_size: int = 5,
         positive_ratio: float = 0.7,
+        weights_min_events: int = 20,
     ) -> List[str]:
+        """Create skill adapters from qualifying clusters (SPEC §7.3).
+
+        The adapter ladder: qualifying clusters get a prompt-mode adapter
+        immediately; a weights-training job is enqueued only once the cluster
+        has pooled at least ``weights_min_events`` positive events, and the
+        eval gate in TrainingService decides whether trained weights actually
+        replace the prompt rung.
+        """
         promoted: List[str] = []
         clusters = self.store.list_semantic_clusters()
         adapters = self.store.list_artifacts(type_filter="adapter")  # type: ignore[arg-type]
@@ -419,7 +452,17 @@ class SemanticClusterer:
                 "kind": "adapter.lora",
                 "base_model": base_model,
                 "scope": "per-user" if cluster.user_id else "global",
-                "backend": "local",
+                # Born on the prompt rung of the adapter ladder (SPEC §5.6).
+                "mode": "prompt",
+                "backend": "prompt",
+                "provider": "prompt",
+                "prompt_instructions": self._skill_prompt_instructions(
+                    cluster, positive
+                ),
+                "lifecycle": {
+                    "stage": "prompt",
+                    "weights_min_events": weights_min_events,
+                },
                 "rank": 4,
                 "layers": [0, 1, 2],
                 "matrices": ["attn_q"],
@@ -443,16 +486,23 @@ class SemanticClusterer:
                 owner_user_id=owner_id,
                 visibility=visibility,
             )
-            if self.training and cluster.user_id:
-                self.training.ensure_user_adapter(
-                    cluster.user_id, adapter_id_override=adapter.id
-                )
+            # Weights rung: enqueue training only once the cluster has pooled
+            # enough positive events to be worth training on. Global skill
+            # adapters use the most frequent contributor as the job's nominal
+            # owner; the training service pools cluster-wide regardless.
+            if self.training and len(positive) >= weights_min_events:
+                job_owner = cluster.user_id
+                if not job_owner:
+                    counts: dict[str, int] = {}
+                    for event in positive:
+                        counts[event.user_id] = counts.get(event.user_id, 0) + 1
+                    job_owner = max(counts, key=counts.get) if counts else None
                 create_training_job = getattr(self.store, "create_training_job", None)
-                if callable(create_training_job):
+                if job_owner and callable(create_training_job):
                     create_training_job(
-                        user_id=cluster.user_id,
+                        user_id=job_owner,
                         adapter_id=adapter.id,
-                        preference_event_ids=[e.id for e in events],
+                        preference_event_ids=[e.id for e in positive],
                     )
             promoted.append(adapter.id)
         return promoted

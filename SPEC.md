@@ -10,8 +10,19 @@
 - **chatgpt-like web interface** with:
   - multi-user, multi-session chat
   - text + (optional) voice interface
+- **small models, deeply adapted** (the core bet):
+  - the system targets small/self-hosted base models, where LoRA genuinely
+    outperforms prompting: behavior baked into weights survives context
+    pressure, frees the window for user content, and costs nothing per token.
+  - JAX is the primary training and local-serving framework.
+  - a frontier model may be used as a **teacher** (distillation, labeling)
+    but is never required at inference time.
 - **deep, evolving user-specific behavior** via:
-  - per-user / per-skill LoRA adapters
+  - per-user persona adapters (small, low-stakes: tone and format)
+  - per-skill LoRA adapters trained on **pooled** cluster data (§7.3) - a
+    single user's feedback is too sparse to train weights on
+  - the adapter ladder (§5.5): every skill is born as a prompt, and only
+    earns weights when the data justifies it and the eval gate passes
   - natural, emergent domains & skills from usage
 - **natural, notebookLM-style grounding** via:
   - user files on a shared filesystem
@@ -739,11 +750,22 @@ loop for a `training_job`:
     - write JSONL to the shared filesystem per job: `{ "prompt", "target", "weight", "context" }`.
    - dedupe by `(conversation_id, message_seq)` to avoid replaying the same correction.
    - cap per-example tokens (e.g., 2048) and per-job total tokens (plan-tier bound) to control spend.
+   - batch layout is causal-LM SFT: one `prompt+target` sequence per example,
+     next-token labels, loss masked to the target span only.
+   - optional teacher distillation pass rewrites targets first (§7.5).
 
-6. evaluation + rollout:
+6. evaluation + rollout (**normative - the eval gate**):
 
-   - hold-out slice from recent preference events; metrics = loss + alignment rate to positive feedback.
-   - auto-apply new adapter version only if eval improves or human review approves; otherwise keep previous version pinned.
+   - once a dataset has ≥5 examples, every 5th example is held out; the job
+     trains on the remainder for several epochs and evaluates holdout loss
+     with the initial weights and again with the trained weights.
+   - a new adapter version is promoted (becomes `latest`, bumps
+     `current_version`, and graduates a prompt-mode adapter to `hybrid` per
+     §5.5) **only** when holdout loss improves by ≥1% relative.
+   - a skipped run (JAX unavailable) or a regression **never** promotes:
+     the artifact is left untouched and the gate decision is recorded in
+     `training_job.meta.eval_gate` for audit. "training ran without raising"
+     is not a promotion criterion.
 
 7. scheduling:
 
@@ -770,7 +792,56 @@ loop for a `training_job`:
 - per-user fairness: limit concurrent jobs per user to 1; global cap to avoid GPU exhaustion.
 - retry policy: exponential backoff on transient failures (I/O, OOM); max 3 attempts; mark failed with reason.
 - dataset materialization: store tokenized batches (packed with attention masks) in `/users/{u}/adapters/{id}/vNNNN/batches/` for reproducibility; include manifest JSON summarizing sources.
-- evaluation: optional held-out batch; record perplexity / accuracy proxies in `training_job.meta`.
+- evaluation: the held-out batch of §5.4.6 is required whenever the dataset supports it; gate decisions are recorded in `training_job.meta.eval_gate`.
+
+### 5.5 adapter ladder (prompt → weights lifecycle)
+
+every skill adapter climbs the same ladder; the rungs are data thresholds and
+eval gates, not human ceremony:
+
+```
+cluster qualifies          pooled events ≥ threshold      eval gate passes
+      │                              │                          │
+      ▼                              ▼                          ▼
+ mode: prompt      ──────▶   training job enqueued   ──────▶  mode: hybrid
+ (instructions from          (data pooled across              (trained weights,
+  cluster label +             the whole cluster)               prompt kept as
+  positive exemplars)                                          portable fallback)
+```
+
+1. **born as a prompt.** when a cluster qualifies (§7.3), its skill adapter is
+   created with `mode: "prompt"` and `prompt_instructions` composed from the
+   cluster label, description, and up to 3 highly-rated exemplars. it is
+   immediately useful on every backend and costs nothing to create.
+   `lifecycle: { "stage": "prompt", "weights_min_events": N }` records the
+   next rung.
+2. **weights when the data earns them.** once the cluster has pooled at least
+   `weights_min_events` positive events (default 20), a training job is
+   enqueued. skill training data is pooled **across all contributors to the
+   cluster** - persona adapters remain strictly per-user.
+3. **graduation is gated.** if the job passes the §5.4.6 eval gate, the
+   adapter flips to `mode: "hybrid"` (`lifecycle.stage: "weights"`): trained
+   weights where the backend supports them, with `prompt_instructions` kept
+   as the portable fallback. a failed or skipped gate leaves the adapter on
+   the prompt rung; nothing regresses.
+4. **demotion mirrors promotion.** pruning (§7.4) can push an adapter back
+   down the ladder (disable weights, keep prompt) via the same ConfigOps
+   pipeline.
+
+### 5.6 remote multi-lora serving (scale-out option)
+
+JAX local serving is the primary path. at scale, the same artifacts can be
+served by a dedicated multi-LoRA server (LoRAX-style, vLLM multi-LoRA,
+Together adapter APIs) behind the existing OpenAI-compatible transport:
+
+- the kernel already models this as `remote`/`adapter_param` providers
+  (§5.0.2); adapters trained by the JAX pipeline are exported per-version to
+  the shared filesystem and mounted by the server.
+- prompt-rung adapters work unchanged on every remote backend (instructions
+  are injected into the system prompt), so the ladder is portable across
+  deployment modes by construction.
+- switching serving modes is a config change, not a migration: artifacts,
+  versions, and router policies are identical in both.
 
 ---
 
@@ -974,23 +1045,23 @@ for each sizeable cluster:
 
 3. upsert `semantic_cluster.label` & `description`.
 
-### 7.3 skill adapter creation
+### 7.3 skill adapter creation (prompt-first, pooled data)
 
 when:
 
 - `semantic_cluster.size >= min_skill_size`, AND
-- many positive `preference_event`s in that cluster, AND
+- positive ratio among the cluster's `preference_event`s ≥ threshold, AND
 - no existing adapter bound to this cluster:
 
-then:
-
-1. ConfigOps proposes a new adapter artifact:
+then a skill adapter is created **on the prompt rung of the ladder (§5.5)**:
 
 ```json
 {
   "kind": "adapter.lora",
-  "scope": "per-user",
-  "user_id": "...",
+  "mode": "prompt",
+  "scope": "global",              // or "per-user" for user-scoped clusters
+  "prompt_instructions": "Skill: <label>.\n<description>\nExamples of responses users rated highly:\n- ...",
+  "lifecycle": { "stage": "prompt", "weights_min_events": 20 },
   "rank": 4,
   "layers": [0,1,2],
   "matrices": ["attn_q"],
@@ -1001,9 +1072,16 @@ then:
 }
 ```
 
-2. human/admin or automated rule approves creation.
-3. artifact created with initial LoRA params = zeros.
-4. training jobs for that cluster events are enqueued to train new adapter.
+- the adapter is useful immediately (instructions injected on any backend);
+  no zero-weight artifact ever becomes `latest`.
+- a **weights** training job is enqueued only once the cluster has pooled
+  `weights_min_events` positive events. training data for skill adapters is
+  pooled **across every contributor to the cluster** (tenant-scoped); the
+  job's nominal owner is the cluster's user, or for global clusters the most
+  frequent contributor.
+- graduation to `hybrid` happens only through the §5.4.6 eval gate.
+- persona adapters are exempt from pooling: they train strictly on their
+  owner's events.
 
 ### 7.4 adapter pruning / merging
 
@@ -1019,6 +1097,20 @@ then:
   - disable adapter (`status=disabled`),
   - or merge into another adapter:
     - training job that distills it into a more successful sibling adapter.
+
+### 7.5 teacher distillation (optional)
+
+small students train better on clean exemplars than on raw chat transcripts.
+when `training_distillation_enabled` is set, the configured serving LLM acts
+as a **teacher** during dataset assembly:
+
+- each example's target is rewritten by the teacher into a concise, ideal
+  exemplar that preserves meaning and facts; the raw target is kept on any
+  failure, so distillation can never lose data.
+- calls are capped per job (default 32) to bound teacher cost.
+- the count of distilled examples is recorded in `training_job.meta`.
+- the teacher can be the local model itself, or a frontier API model used
+  offline - inference never depends on it.
 
 ---
 
@@ -1173,6 +1265,10 @@ execution guardrails:
 - **sandbox simulation**:
   - run router/workflow in dry-run mode on a small sample of past conversations.
   - compute metrics; optionally block patch if regression is obvious.
+- **eval gates before promotion** (implemented for adapters):
+  - adapter weight promotion is gated on measured holdout improvement
+    (§5.4.6); the same principle applies to any auto-applied change - no
+    artifact version becomes active on "it ran without raising" alone.
 - **rate limiting**:
   - limit how often automatic patches can be applied.
 - **rollback**:
