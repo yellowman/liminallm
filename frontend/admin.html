@@ -4,6 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Admin Console · LiminalLM</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
     <link rel="stylesheet" href="/static/styles.css" />
     <script defer src="/static/admin.js"></script>
   </head>
@@ -63,7 +64,7 @@
           </div>
           <div class="field">
             <label for="patch-body">Patch JSON</label>
-            <textarea id="patch-body" placeholder='{"op": "replace", "path": "..."}'></textarea>
+            <textarea id="patch-body" placeholder='[{"op": "replace", "path": "/description", "value": "..."}]'></textarea>
           </div>
           <div class="flex-row flex-wrap mb-14">
             <button class="primary" id="propose-patch">Propose patch</button>

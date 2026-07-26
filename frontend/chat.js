@@ -132,6 +132,111 @@ const escapeHtml = (str) => {
   return div.innerHTML;
 };
 
+/**
+ * Minimal, dependency-free markdown renderer for assistant messages.
+ *
+ * The input is HTML-escaped FIRST, then markdown constructs are rewritten
+ * into a fixed set of safe tags, so message content can never inject markup.
+ * Supports: fenced/inline code, bold, italic, strikethrough, http(s) links,
+ * headings, ordered/unordered lists, blockquotes, tables, and rules.
+ */
+const renderMarkdown = (raw) => {
+  // Strip NULs so message text can never reference the placeholder table.
+  let text = escapeHtml(String(raw || '').replace(/\u0000/g, ''));
+
+  // Protect code from all later transforms.
+  const codeBlocks = [];
+  text = text.replace(/```([\w-]*)\n?([\s\S]*?)```/g, (m, lang, code) => {
+    codeBlocks.push(`<pre><code${lang ? ` class="lang-${escapeHtml(lang)}"` : ''}>${code.replace(/\n$/, '')}</code></pre>`);
+    return `\u0000B${codeBlocks.length - 1}\u0000`;
+  });
+  const inlineCode = [];
+  text = text.replace(/`([^`\n]+)`/g, (m, code) => {
+    inlineCode.push(`<code>${code}</code>`);
+    return `\u0000I${inlineCode.length - 1}\u0000`;
+  });
+
+  // Inline formatting (operates on escaped text).
+  text = text
+    .replace(/!?\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[\s(])\*([^*\n]+)\*/gm, '$1<em>$2</em>')
+    .replace(/(^|[\s(])_([^_\n]+)_/gm, '$1<em>$2</em>')
+    .replace(/~~([^~\n]+)~~/g, '<del>$1</del>');
+
+  // Block-level pass.
+  const lines = text.split('\n');
+  const out = [];
+  let i = 0;
+  const isTableSep = (l) => /^\s*\|?[\s:|-]+\|?\s*$/.test(l || '') && (l || '').includes('-');
+  const cells = (l) => l.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map((c) => c.trim());
+
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) { i += 1; continue; }
+    let match;
+    if (/^\u0000B\d+\u0000$/.test(line.trim())) {
+      out.push(line.trim());
+      i += 1;
+    } else if ((match = line.match(/^(#{1,4})\s+(.*)$/))) {
+      out.push(`<h${match[1].length + 2}>${match[2]}</h${match[1].length + 2}>`);
+      i += 1;
+    } else if (/^\s*([-*_])\s*\1\s*\1[\s\-*_]*$/.test(line)) {
+      out.push('<hr>');
+      i += 1;
+    } else if (/^&gt;\s?/.test(line)) {
+      const quote = [];
+      while (i < lines.length && /^&gt;\s?/.test(lines[i])) {
+        quote.push(lines[i].replace(/^&gt;\s?/, ''));
+        i += 1;
+      }
+      out.push(`<blockquote>${quote.join('<br>')}</blockquote>`);
+    } else if (/^\s*[-*+]\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) {
+        items.push(`<li>${lines[i].replace(/^\s*[-*+]\s+/, '')}</li>`);
+        i += 1;
+      }
+      out.push(`<ul>${items.join('')}</ul>`);
+    } else if (/^\s*\d+\.\s+/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
+        items.push(`<li>${lines[i].replace(/^\s*\d+\.\s+/, '')}</li>`);
+        i += 1;
+      }
+      out.push(`<ol>${items.join('')}</ol>`);
+    } else if (line.includes('|') && isTableSep(lines[i + 1])) {
+      const header = cells(line);
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].includes('|') && lines[i].trim()) {
+        rows.push(cells(lines[i]));
+        i += 1;
+      }
+      out.push(
+        `<table><thead><tr>${header.map((h) => `<th>${h}</th>`).join('')}</tr></thead>` +
+        `<tbody>${rows.map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table>`
+      );
+    } else {
+      const para = [];
+      while (
+        i < lines.length && lines[i].trim() &&
+        !/^(#{1,4})\s|^&gt;\s?|^\s*[-*+]\s+|^\s*\d+\.\s+/.test(lines[i]) &&
+        !/^\u0000B\d+\u0000$/.test(lines[i].trim())
+      ) {
+        para.push(lines[i]);
+        i += 1;
+      }
+      out.push(`<p>${para.join('<br>')}</p>`);
+    }
+  }
+
+  let html = out.join('');
+  html = html.replace(/\u0000B(\d+)\u0000/g, (m, n) => codeBlocks[Number(n)]);
+  html = html.replace(/\u0000I(\d+)\u0000/g, (m, n) => inlineCode[Number(n)]);
+  return html;
+};
+
 // Citation modal for displaying source content
 const showCitationModal = (element) => {
   try {
@@ -303,12 +408,28 @@ const debounce = (fn, waitMs) => {
   };
 };
 
+// Double-submit CSRF: the server sets a JS-readable csrf_token cookie and
+// expects it echoed in X-CSRF-Token on mutating requests that rely on cookies.
+const getCsrfToken = () => {
+  const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
+  return match ? decodeURIComponent(match[1]) : null;
+};
+
 const authHeaders = (idempotencyKey) => {
   const h = {};
   if (state.accessToken) h['Authorization'] = `Bearer ${state.accessToken}`;
   if (state.tenantId) h['X-Tenant-ID'] = state.tenantId;
   if (state.sessionId) h['session_id'] = state.sessionId;
+  const csrf = getCsrfToken();
+  if (csrf) h['X-CSRF-Token'] = csrf;
   h['Idempotency-Key'] = idempotencyKey || randomIdempotencyKey();
+  return h;
+};
+
+const jsonHeaders = () => {
+  const h = { 'Content-Type': 'application/json' };
+  const csrf = getCsrfToken();
+  if (csrf) h['X-CSRF-Token'] = csrf;
   return h;
 };
 
@@ -358,7 +479,7 @@ const tryRefreshToken = async () => {
   try {
     const resp = await fetch(`${apiBase}/auth/refresh`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: jsonHeaders(),
       body: JSON.stringify({ refresh_token: state.refreshToken, tenant_id: state.tenantId }),
     });
     if (!resp.ok) return false;
@@ -486,6 +607,14 @@ const initTabs = () => {
       document.querySelectorAll('.tab-panel').forEach((panel) => {
         panel.classList.toggle('active', panel.id === tabId);
       });
+
+      // Lazy-load the data behind the tab; login only preloads a subset.
+      if (state.accessToken) {
+        if (tabId === 'contexts-tab') fetchContexts();
+        else if (tabId === 'artifacts-tab') fetchArtifacts();
+        else if (tabId === 'tools-tab') refreshToolsAndWorkflows();
+        else if (tabId === 'insights-tab') fetchInsights();
+      }
     });
   });
 };
@@ -499,7 +628,12 @@ const initCollapsibleSections = () => {
     header.addEventListener('click', (e) => {
       if (e.target.tagName === 'BUTTON') return;
       const section = header.closest('.panel-section');
-      section?.classList.toggle('collapsed');
+      if (!section) return;
+      section.classList.toggle('collapsed');
+      // Lazy-load the files list the first time the section opens.
+      if (section.id === 'files-section' && !section.classList.contains('collapsed')) {
+        fetchUserFiles();
+      }
     });
   });
 };
@@ -565,7 +699,7 @@ const handleLogin = async (event) => {
     toggleButtonBusy(authSubmit, true, 'Signing in...');
     const envelope = await requestEnvelope(
       `${apiBase}/auth/login`,
-      { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) },
+      { method: 'POST', headers: jsonHeaders(), body: JSON.stringify(body) },
       'Login failed'
     );
 
@@ -640,7 +774,7 @@ const startOAuth = async (provider) => {
       `${apiBase}/auth/oauth/${provider}/start`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders(),
         body: JSON.stringify({
           redirect_uri: redirectUri,
           tenant_id: tenant,
@@ -708,7 +842,7 @@ const handleOAuthCallback = async () => {
       `${apiBase}/auth/oauth/${provider}/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`,
       {
         method: 'GET',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders(),
       },
       `OAuth callback failed`
     );
@@ -783,7 +917,7 @@ const handleSignup = async (event) => {
       `${apiBase}/auth/signup`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders(),
         body: JSON.stringify({ email, password, tenant_id: tenant }),
       },
       'Signup failed'
@@ -834,7 +968,7 @@ const handleResetRequest = async (event) => {
       `${apiBase}/auth/reset/request`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders(),
         body: JSON.stringify({ email }),
       },
       'Reset request failed'
@@ -876,7 +1010,7 @@ const handleResetConfirm = async (event) => {
       `${apiBase}/auth/reset/confirm`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders(),
         body: JSON.stringify({
           token: code,
           new_password: newPassword,
@@ -980,7 +1114,7 @@ const handleResetWithToken = async (event) => {
       `${apiBase}/auth/reset/confirm`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders(),
         body: JSON.stringify({
           token: pendingResetToken,
           new_password: newPassword,
@@ -1021,7 +1155,7 @@ const handleVerifyTokenCallback = async () => {
       `${apiBase}/auth/verify_email`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: jsonHeaders(),
         body: JSON.stringify({ token: verifyToken }),
       },
       'Email verification failed'
@@ -1184,7 +1318,7 @@ const renderMessages = (messages) => {
 
 const renderMessage = (m) => {
   const role = escapeHtml(m.role || 'unknown');
-  const content = escapeHtml(m.content || '');
+  const content = role === 'assistant' ? renderMarkdown(m.content || '') : escapeHtml(m.content || '');
 
   const metaBits = [];
   if (m.token_count) metaBits.push(`${m.token_count} tokens`);
@@ -1249,7 +1383,11 @@ const appendMessage = (role, content, meta = '') => {
   roleEl.textContent = role;
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
-  bubble.textContent = content;
+  if (role === 'assistant') {
+    bubble.innerHTML = renderMarkdown(content);
+  } else {
+    bubble.textContent = content;
+  }
   const metaEl = document.createElement('div');
   metaEl.className = 'meta';
   metaEl.textContent = meta;
@@ -1299,7 +1437,11 @@ const createStreamingMessage = (role) => {
     /** Append a token to the message */
     update(token) {
       content += token;
-      bubble.textContent = content;
+      if (role === 'assistant') {
+        bubble.innerHTML = renderMarkdown(content);
+      } else {
+        bubble.textContent = content;
+      }
       if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
     },
     /** Finalize the message with optional meta info */
@@ -1326,12 +1468,11 @@ const scrollToBottom = () => {
 // Chat submission
 // =============================================================================
 
+// The server's /chat/stream endpoint handles exactly one message per
+// connection (it reads a single init frame, streams the reply, and returns),
+// so the client opens a fresh socket per send. chatSocket tracks the
+// in-flight socket so Stop/teardown can reach it.
 let chatSocket = null;
-let chatSocketConnecting = false;
-let chatSocketReconnectTimer = null;
-let chatSocketReconnectAttempts = 0;
-const WS_MAX_RECONNECT_DELAY = 30000; // 30 seconds max delay
-const WS_BASE_RECONNECT_DELAY = 1000; // 1 second base delay
 let isStreaming = false;
 
 const updateStreamingUI = (streaming) => {
@@ -1360,81 +1501,34 @@ const cancelStreaming = () => {
 };
 
 const cleanupWebSocket = () => {
-  if (chatSocketReconnectTimer) {
-    clearTimeout(chatSocketReconnectTimer);
-    chatSocketReconnectTimer = null;
-  }
   if (chatSocket) {
-    chatSocket.onopen = null;
-    chatSocket.onerror = null;
-    chatSocket.onclose = null;
-    chatSocket.onmessage = null;
     if (chatSocket.readyState === WebSocket.OPEN || chatSocket.readyState === WebSocket.CONNECTING) {
       chatSocket.close();
     }
     chatSocket = null;
   }
-  chatSocketConnecting = false;
 };
 
 window.addEventListener('beforeunload', cleanupWebSocket);
 
-const connectWebSocket = () => {
-  if (chatSocketConnecting) return chatSocket;
-  if (chatSocket && [WebSocket.OPEN, WebSocket.CONNECTING].includes(chatSocket.readyState)) {
-    return chatSocket;
-  }
-  chatSocketConnecting = true;
-  const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-  const wsUrl = `${protocol}://${window.location.host}${apiBase}/chat/stream`;
-  chatSocket = new WebSocket(wsUrl);
-  chatSocket.onopen = () => {
-    chatSocketConnecting = false;
-    chatSocketReconnectAttempts = 0; // Reset on successful connection
-  };
-  chatSocket.onerror = () => { chatSocketConnecting = false; };
-  chatSocket.onclose = () => {
-    chatSocketConnecting = false;
-    chatSocket = null;
-    if (chatSocketReconnectTimer) clearTimeout(chatSocketReconnectTimer);
-    // Exponential backoff: delay = base * 2^attempts, capped at max
-    const delay = Math.min(
-      WS_BASE_RECONNECT_DELAY * Math.pow(2, chatSocketReconnectAttempts),
-      WS_MAX_RECONNECT_DELAY
-    );
-    chatSocketReconnectAttempts += 1;
-    chatSocketReconnectTimer = setTimeout(() => {
-      chatSocketReconnectTimer = null;
-      connectWebSocket();
-    }, delay);
-  };
-  return chatSocket;
-};
-
-const ensureWebSocket = () =>
+// Open a fresh socket for one chat exchange; resolves once it is usable.
+const openChatSocket = () =>
   new Promise((resolve, reject) => {
-    const socket = connectWebSocket();
-    if (!socket) {
-      reject(new Error('WebSocket unavailable'));
-      return;
-    }
-    if (socket.readyState === WebSocket.OPEN) {
-      resolve(socket);
-      return;
-    }
+    const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+    const socket = new WebSocket(`${protocol}://${window.location.host}${apiBase}/chat/stream`);
     const timeout = setTimeout(() => {
-      cleanup();
+      socket.close();
       reject(new Error('WebSocket connection timeout'));
     }, 5000);
-    const cleanup = () => {
+    socket.addEventListener('open', () => {
       clearTimeout(timeout);
-      socket.removeEventListener('open', handleOpen);
-      socket.removeEventListener('error', handleError);
-    };
-    const handleOpen = () => { cleanup(); resolve(socket); };
-    const handleError = () => { cleanup(); reject(new Error('WebSocket connection failed')); };
-    socket.addEventListener('open', handleOpen);
-    socket.addEventListener('error', handleError);
+      chatSocket = socket;
+      resolve(socket);
+    });
+    socket.addEventListener('error', () => {
+      clearTimeout(timeout);
+      reject(new Error('WebSocket connection failed'));
+    });
   });
 
 // Maximum message length (characters) - approximately 2k tokens per SPEC §18
@@ -1496,21 +1590,41 @@ const sendMessage = async (event) => {
    * Handles events: token, trace, message_done, streaming_complete, error, cancel_ack
    */
   const chatViaWebSocketStreaming = async () => {
-    const ws = await ensureWebSocket();
+    const ws = await openChatSocket();
     return new Promise((resolve, reject) => {
       let settled = false;
       let streamingMsg = null;
       let messageDoneReceived = false;
       let messageDoneData = {};
+      let idleTimer = null;
 
       const cleanup = () => {
+        if (idleTimer) clearTimeout(idleTimer);
         ws.removeEventListener('message', handleMessage);
         ws.removeEventListener('error', handleError);
         ws.removeEventListener('close', handleClose);
+        // One exchange per connection - the server won't read another message.
+        try { ws.close(); } catch { /* already closed */ }
+        if (chatSocket === ws) chatSocket = null;
       };
+
+      // If nothing arrives for a while, give up rather than leaving the
+      // send button stuck; the caller falls back to the REST endpoint.
+      const armIdleTimer = () => {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          if (streamingMsg) streamingMsg.finalize('Timed out');
+          reject(new Error('Streaming timed out'));
+        }, 120000);
+      };
+      armIdleTimer();
 
       const handleMessage = (event) => {
         if (settled) return;
+        armIdleTimer();
         try {
           const msg = JSON.parse(event.data);
 
@@ -1532,23 +1646,25 @@ const sendMessage = async (event) => {
                 break;
 
               case 'message_done':
-                // Streaming visually complete, but wait for streaming_complete for IDs
+                // Final event per SPEC §18 - carries message_id, conversation_id,
+                // adapters, and usage. (The client used to wait for a
+                // 'streaming_complete' event the server never sends, which left
+                // the send button disabled forever after a streamed reply.)
                 messageDoneReceived = true;
-                messageDoneData = msg.data || {};
+                messageDoneData = { ...messageDoneData, ...(msg.data || {}) };
                 if (streamingMsg) {
                   const adapters = (messageDoneData.adapters || []).map(a => a?.name || a?.id || a).filter(Boolean);
                   streamingMsg.finalize(adapters.length ? `Adapters: ${adapters.join(', ')}` : '');
                 }
-                // Don't resolve yet - wait for streaming_complete with message_id
-                break;
-
-              case 'streaming_complete':
-                // Final event with message_id and conversation_id after DB save
-                settled = true;
-                cleanup();
-                // Merge with any data from message_done
-                const finalData = { ...messageDoneData, ...(msg.data || {}) };
-                resolve(finalData);
+                // Older servers relayed an interim message_done without IDs
+                // before the persisted one; only settle once we have the
+                // message_id (the close handler and idle timer cover servers
+                // that never send it).
+                if (messageDoneData.message_id) {
+                  settled = true;
+                  cleanup();
+                  resolve(messageDoneData);
+                }
                 break;
 
               case 'error':
@@ -1604,7 +1720,8 @@ const sendMessage = async (event) => {
         if (!settled) {
           settled = true;
           cleanup();
-          // If we got message_done but not streaming_complete, resolve with what we have
+          // Safety net: if the socket closed right after message_done, resolve
+          // with what we have rather than erroring a completed exchange.
           if (messageDoneReceived) {
             if (streamingMsg) streamingMsg.finalize('');
             resolve(messageDoneData);
@@ -1627,8 +1744,10 @@ const sendMessage = async (event) => {
         workflow_id: payload.workflow_id,
         context_id: payload.context_id,
         conversation_id: payload.conversation_id,
-        access_token: state.accessToken,
-        session_id: state.sessionId,
+        // The server rejects dual auth on the socket (fresh_session_required),
+        // so send exactly one method — prefer the bearer token.
+        access_token: state.accessToken || undefined,
+        session_id: state.accessToken ? undefined : state.sessionId,
         tenant_id: state.tenantId,
         stream: true,
       }));
@@ -2297,7 +2416,12 @@ const speakText = async (text) => {
     }
 
     const envelope = await response.json();
-    if (envelope.status === 'ok' && envelope.data?.audio_url) {
+    if (envelope.status === 'ok' && envelope.data?.format === 'text/placeholder') {
+      // Server has no TTS backend configured and returned a text stub;
+      // don't try to play it as audio.
+      if (voiceOutputBtn) voiceOutputBtn.classList.remove('playing');
+      speakWithBrowser();
+    } else if (envelope.status === 'ok' && envelope.data?.audio_url) {
       currentAudio = new Audio(envelope.data.audio_url);
       currentAudio.onended = () => {
         if (voiceOutputBtn) voiceOutputBtn.classList.remove('playing');
@@ -2446,7 +2570,6 @@ const filesListEl = $('files-list');
 const filesEmptyEl = $('files-empty');
 const filesPaginationEl = $('files-pagination');
 const refreshFilesBtn = $('refresh-files-btn');
-const filesSectionToggle = $('files-section-toggle');
 
 let filesOffset = 0;
 const FILES_LIMIT = 20;
@@ -2706,7 +2829,7 @@ const startMfaSetup = async () => {
       `${apiBase}/auth/mfa/request`,
       {
         method: 'POST',
-        headers: authHeaders(),
+        headers: headers(),
         body: JSON.stringify({ session_id: state.sessionId }),
       },
       'Failed to start MFA setup'
@@ -2774,7 +2897,7 @@ const verifyMfaSetup = async (event) => {
       `${apiBase}/auth/mfa/verify`,
       {
         method: 'POST',
-        headers: authHeaders(),
+        headers: headers(),
         body: JSON.stringify({ session_id: state.sessionId, code }),
       },
       'Invalid code. Try again.'
@@ -2832,7 +2955,7 @@ const disableMfa = async (event) => {
       `${apiBase}/auth/mfa/disable`,
       {
         method: 'POST',
-        headers: authHeaders(),
+        headers: headers(),
         body: JSON.stringify({ code }),
       },
       'Invalid code. Try again.'
@@ -2998,7 +3121,7 @@ const changePassword = async (event) => {
       `${apiBase}/auth/password/change`,
       {
         method: 'POST',
-        headers: authHeaders(),
+        headers: headers(),
         body: JSON.stringify({
           current_password: currentPassword,
           new_password: newPassword,
@@ -3081,7 +3204,7 @@ const saveUserSettings = async (event) => {
       `${apiBase}/settings`,
       {
         method: 'PATCH',
-        headers: authHeaders(),
+        headers: headers(),
         body: JSON.stringify({
           locale: locale || null,
           timezone: timezone || null,
@@ -3187,7 +3310,7 @@ const saveAdminSettings = async () => {
 const renderAdminSettingsSection = () => {
   const section = $('admin-settings-section');
   if (section) {
-    section.style.display = state.role === 'admin' ? 'block' : 'none';
+    section.classList.toggle('hidden', state.role !== 'admin');
   }
   if (state.role === 'admin') {
     fetchAdminSettings();
@@ -3744,7 +3867,7 @@ const invokeTool = async (event) => {
   try {
     toggleButtonBusy(invokeBtn, true, 'Invoking...');
     if (statusEl) statusEl.textContent = '';
-    if (resultEl) resultEl.style.display = 'none';
+    if (resultEl) resultEl.classList.add('hidden');
 
     const envelope = await requestEnvelope(
       `${apiBase}/tools/${selectedTool.id}/invoke`,
@@ -3759,7 +3882,7 @@ const invokeTool = async (event) => {
     if (statusEl) statusEl.textContent = 'Tool invoked successfully';
     if (resultEl) {
       resultEl.textContent = JSON.stringify(envelope.data, null, 2);
-      resultEl.style.display = 'block';
+      resultEl.classList.remove('hidden');
     }
   } catch (err) {
     if (statusEl) statusEl.textContent = err.message;
@@ -3887,23 +4010,28 @@ const renderInsights = (data) => {
   const negativeEl = $('insights-negative-count');
   const neutralEl = $('insights-neutral-count');
 
-  if (totalEl) totalEl.textContent = data.total_events ?? '-';
-  if (positiveEl) positiveEl.textContent = data.positive_count ?? '-';
-  if (negativeEl) negativeEl.textContent = data.negative_count ?? '-';
-  if (neutralEl) neutralEl.textContent = data.neutral_count ?? '-';
+  const totals = data.totals || {};
+  const positive = totals.positive ?? 0;
+  const negative = totals.negative ?? 0;
+  const neutral = totals.neutral ?? 0;
 
-  // Top adapters
+  if (totalEl) totalEl.textContent = positive + negative + neutral;
+  if (positiveEl) positiveEl.textContent = positive;
+  if (negativeEl) negativeEl.textContent = negative;
+  if (neutralEl) neutralEl.textContent = neutral;
+
+  // Adapters
   const adaptersEl = $('insights-top-adapters');
   if (adaptersEl) {
-    const adapters = data.top_adapters || [];
+    const adapters = data.adapters || [];
     if (!adapters.length) {
       adaptersEl.innerHTML = '<div class="empty">No adapter data yet</div>';
     } else {
       adaptersEl.innerHTML = adapters
         .map((a) => `
           <div class="adapter-item">
-            <span class="adapter-name">${escapeHtml(a.adapter_id || a.name || 'Unknown')}</span>
-            <span class="adapter-score">+${a.positive_count || 0} / -${a.negative_count || 0}</span>
+            <span class="adapter-name">${escapeHtml(a.name || a.id || 'Unknown')}</span>
+            <span class="adapter-score">${escapeHtml(a.base_model || a.description || '')}</span>
           </div>
         `)
         .join('');
@@ -3913,7 +4041,7 @@ const renderInsights = (data) => {
   // Recent preferences
   const recentEl = $('insights-recent-list');
   if (recentEl) {
-    const recent = data.recent_events || [];
+    const recent = data.events || [];
     if (!recent.length) {
       recentEl.innerHTML = '<div class="empty">No preference events yet</div>';
     } else {
@@ -3945,7 +4073,7 @@ const renderInsights = (data) => {
         .map((c) => `
           <div class="cluster-card">
             <div class="cluster-label">${escapeHtml(c.label || 'Unlabeled')}</div>
-            <div class="cluster-description">${escapeHtml(c.description || '-')}</div>
+            <div class="cluster-description">${escapeHtml(c.similarity_hint || c.description || '-')}</div>
             <div class="cluster-meta">
               <span>${c.size || 0} events</span>
               ${c.adapter_id ? `<span class="has-adapter">Has adapter</span>` : ''}
@@ -4083,18 +4211,9 @@ const initEventListeners = () => {
   if (refreshFilesBtn) refreshFilesBtn.addEventListener('click', fetchUserFiles);
   if (filesListEl) filesListEl.addEventListener('click', handleFileAction);
   if (filesPaginationEl) filesPaginationEl.addEventListener('click', handleFileAction);
-  if (filesSectionToggle) {
-    filesSectionToggle.addEventListener('click', () => {
-      const section = $('files-section');
-      if (section) {
-        section.classList.toggle('collapsed');
-        // Fetch files when section is expanded
-        if (!section.classList.contains('collapsed')) {
-          fetchUserFiles();
-        }
-      }
-    });
-  }
+  // Note: the files section expand/collapse (and its lazy fetch) is handled
+  // by initCollapsibleSections; a second toggle listener here made every
+  // click toggle twice, so the section could never be opened.
 
   // Settings
   $('clear-drafts-btn')?.addEventListener('click', handleClearDrafts);

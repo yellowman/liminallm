@@ -60,11 +60,19 @@ const randomIdempotencyKey = () => {
   return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 };
 
+// Double-submit CSRF: echo the JS-readable csrf_token cookie on mutating requests.
+const getCsrfToken = () => {
+  const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
+  return match ? decodeURIComponent(match[1]) : null;
+};
+
 const headers = (idempotencyKey) => {
   const h = { 'Content-Type': 'application/json' };
   if (state.accessToken) h['Authorization'] = `Bearer ${state.accessToken}`;
   if (state.tenantId) h['X-Tenant-ID'] = state.tenantId;
   if (state.sessionId) h['session_id'] = state.sessionId;
+  const csrf = getCsrfToken();
+  if (csrf) h['X-CSRF-Token'] = csrf;
   h['Idempotency-Key'] = idempotencyKey || randomIdempotencyKey();
   return h;
 };
@@ -199,7 +207,12 @@ const handleLogin = async (event) => {
       `${apiBase}/auth/login`,
       {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: (() => {
+          const h = { 'Content-Type': 'application/json' };
+          const csrf = getCsrfToken();
+          if (csrf) h['X-CSRF-Token'] = csrf;
+          return h;
+        })(),
         body: JSON.stringify(body),
       },
       'Login failed'
@@ -276,8 +289,8 @@ const proposePatch = async () => {
   const artifact = document.getElementById('patch-artifact').value;
   const justification = document.getElementById('patch-justification').value;
   const body = document.getElementById('patch-body').value;
-  if (!artifact || !body) {
-    showError('Artifact and patch body are required');
+  if (!artifact || !body || !justification) {
+    showError('Artifact, justification, and patch body are required');
     return;
   }
   let parsed;
@@ -295,7 +308,7 @@ const proposePatch = async () => {
         headers: headers(),
         body: JSON.stringify({
           artifact_id: artifact,
-          justification: justification || undefined,
+          justification,
           patch: parsed,
         }),
       },

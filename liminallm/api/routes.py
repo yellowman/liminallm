@@ -1002,9 +1002,14 @@ async def oauth_start(
     )
     # Issue 35.2: Per CLAUDE.md, derive tenant_id from server config, not user input
     # This prevents tenant spoofing attacks where users can OAuth into arbitrary tenants
-    start = await runtime.auth.start_oauth(
-        provider, redirect_uri=body.redirect_uri, tenant_id=None
-    )
+    try:
+        start = await runtime.auth.start_oauth(
+            provider, redirect_uri=body.redirect_uri, tenant_id=None
+        )
+    except ValueError as exc:
+        # Unsupported or unconfigured provider is a client-visible condition,
+        # not a server fault.
+        raise _http_error("invalid_request", str(exc), status_code=400)
     return Envelope(
         status="ok",
         data=OAuthStartResponse(
@@ -3383,11 +3388,13 @@ async def list_files(
             data={"files": [], "total": 0, "limit": limit or 50, "offset": offset},
         )
 
-    # List files with pagination
+    # List files with pagination. Hidden files are internal bookkeeping
+    # (e.g. the .checksums.json upload manifest) — uploads strip leading dots,
+    # so users can never own a dotfile here.
     all_files = []
     try:
         for f in files_dir.iterdir():
-            if f.is_file():
+            if f.is_file() and not f.name.startswith("."):
                 stat = f.stat()
                 all_files.append({
                     "name": f.name,
@@ -3448,7 +3455,8 @@ async def get_file_download_url(
     except PathTraversalError:
         raise _http_error("validation_error", "invalid filename", status_code=400)
 
-    if not file_path.exists() or not file_path.is_file():
+    # Hidden files are internal bookkeeping; report them as absent.
+    if filename.startswith(".") or not file_path.exists() or not file_path.is_file():
         raise _http_error("not_found", "file not found", status_code=404)
 
     # Generate signed URL with 10-minute expiry
@@ -3554,11 +3562,23 @@ async def delete_file(
     except PathTraversalError:
         raise _http_error("validation_error", "invalid filename", status_code=400)
 
-    if not file_path.exists() or not file_path.is_file():
+    # Hidden files are internal bookkeeping (upload strips leading dots, so a
+    # user can never own one); report them as absent rather than deletable.
+    if filename.startswith(".") or not file_path.exists() or not file_path.is_file():
         raise _http_error("not_found", "file not found", status_code=404)
 
     # Delete file
     await asyncio.to_thread(file_path.unlink)
+
+    # Drop the file's entry from the checksum manifest so it doesn't go stale.
+    manifest_path = files_dir / ".checksums.json"
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text())
+            if manifest.pop(filename, None) is not None:
+                manifest_path.write_text(json.dumps(manifest, indent=2))
+        except Exception:
+            logger.warning("file_checksum_manifest_update_failed", path=str(manifest_path))
 
     logger.info("file_deleted", user_id=principal.user_id, filename=filename)
     return Envelope(status="ok", data={"deleted": filename})
@@ -4272,19 +4292,25 @@ async def websocket_chat(ws: WebSocket):
                     event_data = event.get("data")
 
                     # SPEC §18: WebSockets wrap as {"event": "token", "data": "...", "request_id": "..."}
-                    try:
-                        await ws.send_json(
-                            {"event": event_type, "data": event_data, "request_id": request_id}
-                        )
-                    except WebSocketDisconnect:
-                        cancel_event.set()
-                        break
-                    except RuntimeError as exc:
-                        cancel_event.set()
-                        logger.warning(
-                            "websocket_send_failed", request_id=request_id, error=str(exc)
-                        )
-                        break
+                    # The workflow's own message_done is a control signal for this
+                    # route (it lacks message_id/conversation_id); the client gets
+                    # exactly one message_done - the final one sent after the
+                    # assistant message is persisted. Forwarding both made clients
+                    # bind to an ID-less completion and lose the conversation id.
+                    if event_type != "message_done":
+                        try:
+                            await ws.send_json(
+                                {"event": event_type, "data": event_data, "request_id": request_id}
+                            )
+                        except WebSocketDisconnect:
+                            cancel_event.set()
+                            break
+                        except RuntimeError as exc:
+                            cancel_event.set()
+                            logger.warning(
+                                "websocket_send_failed", request_id=request_id, error=str(exc)
+                            )
+                            break
 
                     if event_type == "token":
                         if isinstance(event_data, str):

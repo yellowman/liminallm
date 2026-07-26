@@ -3,18 +3,19 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import posixpath
+import re
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from liminallm.api.error_handling import register_exception_handlers
-from liminallm.api.routes import get_admin_user, router
+from liminallm.api.routes import router
 from liminallm.config import Settings
 from liminallm.logging import get_logger, set_correlation_id
 
@@ -184,6 +185,22 @@ async def enforce_csrf_token(request: Request, call_next):
     session_cookie = request.cookies.get("session_id")
     if not session_cookie:
         return await call_next(request)
+    try:
+        from liminallm.service.runtime import get_runtime
+
+        runtime = get_runtime()
+        session = runtime.store.get_session(session_cookie)
+    except Exception as exc:
+        logger.warning("csrf_session_lookup_failed", error=str(exc))
+        session = None
+    if session is None:
+        # Stale cookie referencing a session the server no longer knows about
+        # (expired, revoked, or lost across a restart). A dead session cannot
+        # authenticate anything, so there is nothing for CSRF to protect;
+        # blocking here would lock browsers out of /auth/login until cookies
+        # are cleared manually. Handlers still treat the request as
+        # unauthenticated.
+        return await call_next(request)
     header_token = request.headers.get("X-CSRF-Token")
     cookie_token = request.cookies.get("csrf_token")
     if not header_token or not cookie_token or header_token != cookie_token:
@@ -194,21 +211,7 @@ async def enforce_csrf_token(request: Request, call_next):
                 "error": {"code": "forbidden", "message": "missing or invalid CSRF token"},
             },
         )
-    try:
-        from liminallm.service.runtime import get_runtime
-
-        runtime = get_runtime()
-        session = runtime.store.get_session(session_cookie)
-    except Exception as exc:
-        logger.warning("csrf_validation_failed", error=str(exc))
-        return JSONResponse(
-            status_code=403,
-            content={
-                "status": "error",
-                "error": {"code": "forbidden", "message": "invalid session for CSRF check"},
-            },
-        )
-    expected = session.meta.get("csrf_token") if session and isinstance(session.meta, dict) else None
+    expected = session.meta.get("csrf_token") if isinstance(session.meta, dict) else None
     if not expected or expected != header_token:
         return JSONResponse(
             status_code=403,
@@ -323,7 +326,11 @@ async def serve_chat() -> FileResponse:
     return FileResponse(index)
 
 
-@app.get("/admin", response_class=FileResponse, dependencies=[Depends(get_admin_user)])
+# The admin page carries its own sign-in form and every API it calls enforces
+# the admin role server-side. Requiring admin auth to serve the static HTML
+# made the page unreachable: browser navigation sends no Authorization header,
+# so this route always returned 403 — including to admins.
+@app.get("/admin", response_class=FileResponse)
 async def serve_admin() -> FileResponse:
     if not STATIC_DIR.exists():
         logger.warning("frontend_not_built", path=str(STATIC_DIR))
@@ -333,6 +340,42 @@ async def serve_admin() -> FileResponse:
         logger.warning("frontend_missing_admin", admin=str(admin))
         raise HTTPException(status_code=404, detail="admin ui missing")
     return FileResponse(admin)
+
+
+_VOICE_FILE_RE = re.compile(r"^[0-9a-fA-F-]{36}\.(mp3|txt)$")
+
+
+@app.get("/voice/{user_id}/{filename}")
+async def serve_voice_file(user_id: str, filename: str, request: Request) -> FileResponse:
+    """Serve synthesized voice files referenced by /v1/voice/synthesize.
+
+    The synthesize endpoint returns audio_url values under /voice/, which
+    browsers load via <audio> elements. Those requests carry session cookies
+    but no Authorization header, so this route authenticates via the session
+    cookie and only serves a user their own files (or the shared pool).
+    """
+    if not _VOICE_FILE_RE.fullmatch(filename):
+        raise HTTPException(status_code=404, detail="not found")
+    session_cookie = request.cookies.get("session_id")
+    if not session_cookie:
+        raise HTTPException(status_code=401, detail="authentication required")
+    from liminallm.service.runtime import get_runtime
+
+    runtime = get_runtime()
+    try:
+        session = runtime.store.get_session(session_cookie)
+    except Exception:
+        session = None
+    if session is None:
+        raise HTTPException(status_code=401, detail="authentication required")
+    if user_id != "shared" and session.user_id != user_id:
+        raise HTTPException(status_code=403, detail="forbidden")
+    base = (Path(runtime.settings.shared_fs_root) / "voice" / user_id).resolve()
+    path = (base / filename).resolve()
+    if base not in path.parents or not path.is_file():
+        raise HTTPException(status_code=404, detail="not found")
+    media_type = "audio/mpeg" if filename.endswith(".mp3") else "text/plain"
+    return FileResponse(path, media_type=media_type)
 
 
 HEALTH_CHECK_TIMEOUT_SECONDS = 3
