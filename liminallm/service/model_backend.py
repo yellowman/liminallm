@@ -1034,7 +1034,14 @@ class LocalJaxLoRABackend:
             )
 
         path = Path(self._adapter_path(adapter, requested_user_id=user_id))
-        params_path = self._resolve_params_path(path)
+        # SPEC §5.4.6: only the promoted version may be served. current_version
+        # is authoritative - without it, resolution would fall back to "newest
+        # directory on disk", which serves weights the eval gate rejected.
+        schema = adapter.get("schema") if isinstance(adapter.get("schema"), dict) else {}
+        current_version = adapter.get("current_version")
+        if current_version is None:
+            current_version = (schema or {}).get("current_version")
+        params_path = self._resolve_params_path(path, current_version=current_version)
         if not params_path:
             return {}
         mtime = params_path.stat().st_mtime
@@ -1084,9 +1091,33 @@ class LocalJaxLoRABackend:
         self._adapter_cache[adapter_id] = (mtime, weights)
         return weights
 
-    def _resolve_params_path(self, path: Path) -> Optional[Path]:
+    def _resolve_params_path(
+        self, path: Path, *, current_version: Optional[int] = None
+    ) -> Optional[Path]:
         if path.is_file() and path.name == "params.json":
             return path
+        # When the artifact records a promoted version, serve exactly that
+        # version (or the `latest` pointer maintained alongside it). Never fall
+        # back to scanning for the newest directory: an un-promoted version
+        # left on disk by a gate-rejected training run would win that scan.
+        if current_version:
+            try:
+                pinned = int(current_version)
+            except (TypeError, ValueError):
+                pinned = 0
+            if pinned > 0:
+                exact = path / f"v{pinned:04d}" / "params.json"
+                if exact.exists():
+                    return exact
+                latest_pinned = path / "latest" / "params.json"
+                if latest_pinned.exists():
+                    return latest_pinned
+                logger.warning(
+                    "adapter_promoted_version_missing",
+                    adapter_path=str(path),
+                    current_version=pinned,
+                )
+                return None
         candidates: list[Path] = []
         direct = path / "params.json"
         if direct.exists():

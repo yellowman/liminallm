@@ -438,8 +438,31 @@ class SemanticClusterer:
             ratio = len(positive) / len(events) if events else 0.0
             if ratio < positive_ratio:
                 continue
-            owner_id = cluster.user_id
-            visibility = "private" if owner_id else "global"
+            # Tenant scoping (CLAUDE.md): a cluster-wide skill adapter is
+            # trained on several users' events, so it must stay inside the
+            # tenant those users belong to. "shared" visibility resolves the
+            # tenant through the owner, so a cross-user cluster is owned by its
+            # most frequent contributor and shared within that tenant - never
+            # "global", which every tenant can see.
+            contributor_counts: dict[str, int] = {}
+            for event in positive:
+                contributor_counts[event.user_id] = (
+                    contributor_counts.get(event.user_id, 0) + 1
+                )
+            top_contributor = (
+                max(contributor_counts, key=contributor_counts.get)
+                if contributor_counts
+                else None
+            )
+            owner_id = cluster.user_id or top_contributor
+            if not owner_id:
+                self.logger.warning("skill_promotion_no_owner", cluster_id=cluster.id)
+                continue
+            visibility = "private" if cluster.user_id else "shared"
+            tenant_id = None
+            get_user = getattr(self.store, "get_user", None)
+            if callable(get_user):
+                tenant_id = getattr(get_user(owner_id), "tenant_id", None)
             # base_model is required by the adapter schema; source it from the
             # runtime/training base model so promotion validates instead of
             # silently failing.
@@ -451,7 +474,10 @@ class SemanticClusterer:
             schema = {
                 "kind": "adapter.lora",
                 "base_model": base_model,
-                "scope": "per-user" if cluster.user_id else "global",
+                # "tenant" scope means pooled across the tenant's contributors;
+                # the training service keys its pooling decision on this.
+                "scope": "per-user" if cluster.user_id else "tenant",
+                "tenant_id": tenant_id,
                 # Born on the prompt rung of the adapter ladder (SPEC §5.6).
                 "mode": "prompt",
                 "backend": "prompt",
@@ -491,12 +517,7 @@ class SemanticClusterer:
             # adapters use the most frequent contributor as the job's nominal
             # owner; the training service pools cluster-wide regardless.
             if self.training and len(positive) >= weights_min_events:
-                job_owner = cluster.user_id
-                if not job_owner:
-                    counts: dict[str, int] = {}
-                    for event in positive:
-                        counts[event.user_id] = counts.get(event.user_id, 0) + 1
-                    job_owner = max(counts, key=counts.get) if counts else None
+                job_owner = owner_id
                 create_training_job = getattr(self.store, "create_training_job", None)
                 if job_owner and callable(create_training_job):
                     create_training_job(

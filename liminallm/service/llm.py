@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from typing import Iterator, List, Optional
-
 import os
+from typing import Iterator, List, Optional
 
 from liminallm.config import resolve_provider_endpoint
 from liminallm.service.model_backend import (

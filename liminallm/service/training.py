@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import shutil
 import uuid
 from contextlib import suppress
 from dataclasses import asdict
@@ -306,10 +307,28 @@ class TrainingService:
         )
         if not adapter:
             raise ConstraintViolation("adapter missing", {"adapter_id": adapter_id})
+        adapter_scope = (adapter.schema or {}).get("scope")
+        caller_tenant = getattr(
+            getattr(self.store, "get_user", lambda _uid: None)(user_id),
+            "tenant_id",
+            None,
+        )
         if adapter.owner_user_id and adapter.owner_user_id != user_id:
-            raise ConstraintViolation(
-                "adapter ownership mismatch", {"adapter_id": adapter.id}
+            # Tenant-scoped skill adapters are pooled across contributors, so
+            # their nominal owner is bookkeeping; any caller inside the same
+            # tenant may train them. Everything else stays owner-only.
+            owner_tenant = getattr(
+                getattr(self.store, "get_user", lambda _uid: None)(
+                    adapter.owner_user_id
+                ),
+                "tenant_id",
+                None,
             )
+            same_tenant = bool(caller_tenant) and caller_tenant == owner_tenant
+            if not (adapter_scope == "tenant" and same_tenant):
+                raise ConstraintViolation(
+                    "adapter ownership mismatch", {"adapter_id": adapter.id}
+                )
         adapter = self._assert_adapter_base(adapter)
         self._apply_adapter_vocab_size(adapter)
         adapter_schema_now = adapter.schema or {}
@@ -318,12 +337,38 @@ class TrainingService:
         # pool positive events across every contributor to the cluster - one
         # user's thumbs are too sparse to train weights on. Persona adapters
         # stay strictly per-user.
-        pooled_skill = bool(adapter_cluster) and not adapter.owner_user_id
-        events = self.store.list_preference_events(
-            user_id=None if pooled_skill else user_id,
-            feedback=POSITIVE_FEEDBACK_VALUES,
-            cluster_id=adapter_cluster if pooled_skill else cluster_id,
+        # Pooling is decided by scope, not ownership: tenant-scoped skill
+        # adapters carry a nominal owner for visibility purposes.
+        pooled_skill = bool(adapter_cluster) and (
+            adapter_scope == "tenant" or not adapter.owner_user_id
         )
+        if pooled_skill:
+            # CLAUDE.md / SPEC §12: pooling must never cross a tenant boundary.
+            # Scope to the requesting user's tenant so one tenant's content can
+            # never end up in weights another tenant is served.
+            tenant_id = (adapter.schema or {}).get("tenant_id") or caller_tenant
+            if not tenant_id:
+                logger.warning(
+                    "pooled_training_tenant_unresolved",
+                    user_id=user_id,
+                    adapter_id=adapter.id,
+                )
+                raise ConstraintViolation(
+                    "cannot resolve tenant for pooled training",
+                    {"user_id": user_id, "adapter_id": adapter.id},
+                )
+            events = self.store.list_preference_events(
+                user_id=None,
+                feedback=POSITIVE_FEEDBACK_VALUES,
+                cluster_id=adapter_cluster,
+                tenant_id=tenant_id,
+            )
+        else:
+            events = self.store.list_preference_events(
+                user_id=user_id,
+                feedback=POSITIVE_FEEDBACK_VALUES,
+                cluster_id=cluster_id,
+            )
         if not events:
             return None
         cluster_meta = self._cluster_events(events, user_id)
@@ -434,6 +479,27 @@ class TrainingService:
             self.store.update_artifact(adapter.id, updated_schema)
             self._update_latest_symlink(adapter_dir, version_dir)
         else:
+            # Quarantine the un-promoted weights. Leaving them in place as
+            # vNNNN/ let the serving backend pick them up as "newest on disk",
+            # which silently defeated the gate; they are kept under rejected/
+            # for debugging instead of deleted.
+            try:
+                rejected_root = adapter_dir / "rejected"
+                rejected_root.mkdir(parents=True, exist_ok=True)
+                destination = rejected_root / version_dir.name
+                if destination.exists():
+                    shutil.rmtree(destination, ignore_errors=True)
+                shutil.move(str(version_dir), str(destination))
+            except Exception as exc:
+                # Never fail the job over cleanup, but do not leave live
+                # weights behind either - drop them and log loudly.
+                logger.warning(
+                    "adapter_rejected_quarantine_failed",
+                    adapter_id=adapter.id,
+                    version_dir=str(version_dir),
+                    error=str(exc),
+                )
+                shutil.rmtree(version_dir, ignore_errors=True)
             logger.info(
                 "adapter_promotion_gated",
                 adapter_id=adapter.id,

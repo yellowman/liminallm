@@ -77,7 +77,7 @@ class TestPromptFirstLadder:
         jobs = [j for j in store.training_jobs.values() if j.adapter_id == adapter_id]
         assert len(jobs) == 1
 
-    def test_global_cluster_gets_nominal_job_owner(self, tmp_path):
+    def test_cross_user_cluster_is_tenant_scoped_not_global(self, tmp_path):
         store = MemoryStore(fs_root=str(tmp_path))
         training = TrainingService(store, str(tmp_path))
         clusterer = SemanticClusterer(store, llm=None, training=training)
@@ -88,7 +88,12 @@ class TestPromptFirstLadder:
         promoted = clusterer.promote_skill_adapters(min_size=5, weights_min_events=8)
 
         adapter = store.get_artifact(promoted[0])
-        assert adapter.owner_user_id is None  # global skill
+        # A cluster spanning several users is owned by its top contributor and
+        # shared within that tenant - never "global", which every tenant sees.
+        assert adapter.visibility == "shared"
+        assert adapter.owner_user_id == heavy_user.id
+        assert adapter.schema["scope"] == "tenant"
+        assert adapter.schema["tenant_id"] == "public"
         jobs = [j for j in store.training_jobs.values() if j.adapter_id == adapter.id]
         assert len(jobs) == 1
         assert jobs[0].user_id == heavy_user.id  # most frequent contributor
@@ -230,3 +235,114 @@ class TestDistillation:
         training.train_from_preferences(user.id)
 
         assert teacher.calls == 0
+
+
+class TestTenantIsolation:
+    """Regression tests: pooled skill training must never cross tenants."""
+
+    def _seed_tenant(self, store, email, tenant, cluster_id, n, secret):
+        user = store.create_user(email=f"{uuid.uuid4().hex[:8]}_{email}", tenant_id=tenant)
+        convo = store.create_conversation(user.id, title="t")
+        for i in range(n):
+            store.append_message(convo.id, "user", "user", f"q{i}")
+            reply = store.append_message(convo.id, "assistant", "assistant", secret)
+            store.record_preference_event(
+                user.id, convo.id, reply.id, "positive",
+                corrected_text=secret, context_embedding=[0.1] * 64,
+                cluster_id=cluster_id, context_text=secret,
+            )
+        return user
+
+    def test_pooled_training_excludes_other_tenants(self, tmp_path):
+        store = MemoryStore(fs_root=str(tmp_path))
+        training = TrainingService(store, str(tmp_path))
+        clusterer = SemanticClusterer(store, llm=None, training=training)
+        cluster = _make_cluster(store, user_id=None)
+        acme = self._seed_tenant(store, "a@acme", "acme", cluster.id, 6, "ACME_SECRET")
+        self._seed_tenant(store, "b@initech", "initech", cluster.id, 4, "INITECH_SECRET")
+
+        adapter_id = clusterer.promote_skill_adapters(
+            min_size=5, weights_min_events=10
+        )[0]
+        result = training.train_from_preferences(acme.id, adapter_id=adapter_id)
+
+        dataset = open(store.get_training_job(result["job_id"]).dataset_path).read()
+        assert "ACME_SECRET" in dataset
+        assert "INITECH_SECRET" not in dataset
+
+    def test_tenant_adapter_not_visible_to_other_tenant(self, tmp_path):
+        store = MemoryStore(fs_root=str(tmp_path))
+        training = TrainingService(store, str(tmp_path))
+        clusterer = SemanticClusterer(store, llm=None, training=training)
+        cluster = _make_cluster(store, user_id=None)
+        self._seed_tenant(store, "a@acme", "acme", cluster.id, 6, "ACME_SECRET")
+        outsider = self._seed_tenant(
+            store, "b@initech", "initech", cluster.id, 4, "INITECH_SECRET"
+        )
+
+        adapter_id = clusterer.promote_skill_adapters(
+            min_size=5, weights_min_events=10
+        )[0]
+
+        visible = [
+            a.id
+            for a in store.list_artifacts(
+                type_filter="adapter", owner_user_id=outsider.id, tenant_id="initech"
+            )
+        ]
+        assert adapter_id not in visible
+
+
+class TestRejectedWeightsNotServed:
+    """Regression test: gate-rejected weights must be unreachable at inference."""
+
+    def test_rejected_version_is_quarantined_and_unresolvable(self, tmp_path):
+        pytest.importorskip("jax")
+        from pathlib import Path
+
+        from liminallm.service.model_backend import LocalJaxLoRABackend
+
+        store = MemoryStore(fs_root=str(tmp_path))
+        training = TrainingService(store, str(tmp_path))
+        cluster = _make_cluster(store)
+        user, _ = _seed_user_with_events(store, "a@t.local", cluster.id, 10)
+        adapter = training.ensure_user_adapter(user.id)
+
+        original = training._run_jax_optax_training
+
+        def regressing(*args, **kwargs):
+            trace = original(*args, **kwargs)
+            if trace.get("status") == "ok":
+                trace["eval_before"], trace["eval_after"] = 1.0, 2.0  # got worse
+            return trace
+
+        training._run_jax_optax_training = regressing
+        result = training.train_from_preferences(user.id)
+
+        assert result["eval_gate"]["promoted"] is False
+        adapter_dir = Path(training._adapter_dir(user.id, adapter.id, adapter.schema))
+        assert list(adapter_dir.glob("v*")) == []  # nothing live
+        assert (adapter_dir / "rejected").exists()  # kept for debugging
+
+        refreshed = store.get_artifact(adapter.id)
+        backend = LocalJaxLoRABackend.__new__(LocalJaxLoRABackend)
+        resolved = backend._resolve_params_path(
+            adapter_dir, current_version=refreshed.schema.get("current_version")
+        )
+        assert resolved is None
+
+    def test_promoted_version_is_pinned_not_newest_on_disk(self, tmp_path):
+        from pathlib import Path
+
+        from liminallm.service.model_backend import LocalJaxLoRABackend
+
+        adapter_dir = tmp_path / "adapter"
+        for version in (1, 2):
+            vdir = adapter_dir / f"v{version:04d}"
+            vdir.mkdir(parents=True)
+            (vdir / "params.json").write_text("{}")
+
+        backend = LocalJaxLoRABackend.__new__(LocalJaxLoRABackend)
+        # v0002 is newest on disk, but v0001 is the promoted version.
+        resolved = backend._resolve_params_path(adapter_dir, current_version=1)
+        assert resolved == adapter_dir / "v0001" / "params.json"

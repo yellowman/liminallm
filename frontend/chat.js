@@ -124,12 +124,39 @@ const state = createState({ read: readStorage, write: writeStorage });
 
 const $ = (id) => document.getElementById(id);
 
+// Escapes for BOTH text and attribute context. The previous
+// textContent/innerHTML trick left `"` and `'` unescaped (the serializer only
+// escapes them inside real attributes), so any escaped value interpolated
+// into an attribute could break out of it.
 const escapeHtml = (str) => {
   if (str == null) return '';
-  const text = String(str);
-  const div = document.createElement('div');
-  div.textContent = text;
-  return div.innerHTML;
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+};
+
+/**
+ * Return a safe href for a markdown link, or null if it must not be linkified.
+ * Only absolute http(s) URLs are allowed, and anything that could terminate an
+ * HTML attribute or smuggle a scheme is rejected outright.
+ */
+const safeLinkHref = (raw) => {
+  const url = String(raw || '').trim();
+  if (!/^https?:\/\//i.test(url)) return null;
+  // Quotes, angle brackets, backticks, whitespace and control characters have
+  // no business in a URL we are about to place inside an attribute.
+  if (/["'`<>\\\s]/.test(url)) return null;
+  if (/[\u0000-\u001f\u007f]/.test(url)) return null;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  } catch {
+    return null;
+  }
+  return url;
 };
 
 /**
@@ -146,10 +173,19 @@ const renderMarkdown = (raw) => {
 
   // Protect code from all later transforms.
   const codeBlocks = [];
-  text = text.replace(/```([\w-]*)\n?([\s\S]*?)```/g, (m, lang, code) => {
+  const pushCodeBlock = (lang, code) => {
     codeBlocks.push(`<pre><code${lang ? ` class="lang-${escapeHtml(lang)}"` : ''}>${code.replace(/\n$/, '')}</code></pre>`);
     return `\u0000B${codeBlocks.length - 1}\u0000`;
-  });
+  };
+  text = text.replace(/```([\w-]*)\n?([\s\S]*?)```/g, (m, lang, code) =>
+    pushCodeBlock(lang, code)
+  );
+  // A fence that is still open - the common case while a reply streams in -
+  // renders as a code block immediately, instead of leaking raw backticks
+  // into the bubble until the closing fence arrives.
+  text = text.replace(/```([\w-]*)\n?([\s\S]*)$/, (m, lang, code) =>
+    pushCodeBlock(lang, code)
+  );
   const inlineCode = [];
   text = text.replace(/`([^`\n]+)`/g, (m, code) => {
     inlineCode.push(`<code>${code}</code>`);
@@ -158,10 +194,22 @@ const renderMarkdown = (raw) => {
 
   // Inline formatting (operates on escaped text).
   text = text
-    .replace(/!?\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    .replace(/!?\[([^\]\n]+)\]\(([^)\s]+)\)/g, (whole, label, url) => {
+      // The URL is already HTML-escaped here, so &quot; etc. must be decoded
+      // before validation - otherwise a quote hides behind its entity.
+      const decoded = url
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&amp;/g, '&');
+      const href = safeLinkHref(decoded);
+      if (!href) return whole; // leave unsafe/relative links as plain text
+      return `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    })
     .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/(^|[\s(])\*([^*\n]+)\*/gm, '$1<em>$2</em>')
-    .replace(/(^|[\s(])_([^_\n]+)_/gm, '$1<em>$2</em>')
+    .replace(/(^|[\s(])\*([^\s*][^*\n]*?)\*/gm, '$1<em>$2</em>')
+    .replace(/(^|[\s(])_([^\s_][^_\n]*?)_/gm, '$1<em>$2</em>')
     .replace(/~~([^~\n]+)~~/g, '<del>$1</del>');
 
   // Block-level pass.
