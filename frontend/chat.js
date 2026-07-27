@@ -64,7 +64,9 @@ const updateDraftIndicator = () => {
 // State management
 // =============================================================================
 
-const persistedKeys = ['accessToken', 'refreshToken', 'sessionId', 'tenantId', 'role', 'userId'];
+// conversationId shares the auth session's lifetime so a reload reopens the
+// active thread; logout (resetAuth) clears it along with the tokens.
+const persistedKeys = ['accessToken', 'refreshToken', 'sessionId', 'tenantId', 'role', 'userId', 'conversationId'];
 
 const createState = (storage) => {
   const backing = {
@@ -74,7 +76,7 @@ const createState = (storage) => {
     tenantId: storage.read('tenantId'),
     role: storage.read('role'),
     userId: storage.read('userId'),
-    conversationId: null,
+    conversationId: storage.read('conversationId'),
     lastAssistant: null,
     contexts: [],
     artifacts: [],
@@ -1341,7 +1343,7 @@ const renderConversationList = () => {
 };
 
 const loadConversation = async (conversationId) => {
-  if (!conversationId) return;
+  if (!conversationId) return false;
 
   state.conversationId = conversationId;
   state.lastAssistant = null;
@@ -1371,9 +1373,11 @@ const loadConversation = async (conversationId) => {
     if (messageInput) {
       messageInput.value = getDraft(conversationId);
     }
+    return true;
   } catch (err) {
     showStatus(err.message, true);
     if (conversationLabel) conversationLabel.textContent = 'Error loading';
+    return false;
   }
 };
 
@@ -4526,6 +4530,14 @@ const init = async () => {
       fetchEmailVerificationStatus(),
       fetchUserSettings(),
     ]);
+
+    // Reopen the thread that was active before the reload; if it no longer
+    // exists (deleted, or a stale id), fall back to a fresh conversation.
+    if (state.conversationId && !(await loadConversation(state.conversationId))) {
+      setConversation(null);
+      showStatus('');
+      if (messageInput) messageInput.value = getDraft(null);
+    }
   }
 
   updateEmptyState();
