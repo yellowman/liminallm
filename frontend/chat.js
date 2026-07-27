@@ -167,121 +167,239 @@ const safeLinkHref = (raw) => {
  * Supports: fenced/inline code, bold, italic, strikethrough, http(s) links,
  * headings, ordered/unordered lists, blockquotes, tables, and rules.
  */
-const renderMarkdown = (raw) => {
-  // Strip NULs so message text can never reference the placeholder table.
-  let text = escapeHtml(String(raw || '').replace(/\u0000/g, ''));
 
-  // Protect code from all later transforms.
+// GitHub-Flavored-Markdown-ish renderer. Everything is HTML-escaped up front
+// and only a fixed set of tags is ever emitted, so message content can never
+// inject markup; links/images are additionally routed through safeLinkHref.
+const renderMarkdown = (raw) => {
   const codeBlocks = [];
+  const inlineCode = [];
+  const NUL = String.fromCharCode(0);
+  const SB = NUL + 'B';
+  const SI = NUL + 'I';
+
+  const decodeEntities = (s) =>
+    s
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&amp;/g, '&');
+
+  // Inline emphasis for an already-escaped, code-sentinelized text run. The
+  // "no space adjacent to the marker" rule (\S ... \S) keeps "2 * 3 * 4" plain
+  // and only treats _ as emphasis at a word boundary (snake_case stays literal).
+  const emphasis = (s) =>
+    s
+      .replace(/\*\*\*(\S(?:[^*]*\S)?)\*\*\*/g, '<strong><em>$1</em></strong>')
+      .replace(/\*\*(\S(?:[^*]*\S)?)\*\*/g, '<strong>$1</strong>')
+      .replace(/(^|[\s([{])\*(\S(?:[^*\n]*\S)?)\*/g, '$1<em>$2</em>')
+      .replace(/(^|[\s([{])__(\S(?:[^_]*\S)?)__/g, '$1<strong>$2</strong>')
+      .replace(/(^|[\s([{])_(\S(?:[^_\n]*\S)?)_/g, '$1<em>$2</em>')
+      .replace(/~~(\S(?:[^~]*\S)?)~~/g, '<del>$1</del>');
+
+  const inline = (s) =>
+    emphasis(
+      s
+        // images: ![alt](url) - only safe http(s) URLs, alt is already escaped
+        .replace(/!\[([^\]\n]*)\]\(([^)\s]+)\)/g, (whole, alt, url) => {
+          const href = safeLinkHref(decodeEntities(url));
+          return href
+            ? `<img src="${escapeHtml(href)}" alt="${alt}" loading="lazy">`
+            : whole;
+        })
+        // explicit links: [label](url)
+        .replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (whole, label, url) => {
+          const href = safeLinkHref(decodeEntities(url));
+          return href
+            ? `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${emphasis(label)}</a>`
+            : whole;
+        })
+        // bare autolinks: the URL inside a built href is preceded by `"`, which
+        // the required leading start/space/paren excludes, so we never re-link it
+        .replace(/(^|[\s(])(https?:\/\/[^\s<)]+[^\s<).,;:!?'"])/g, (m, pre, url) => {
+          const href = safeLinkHref(decodeEntities(url));
+          return href
+            ? `${pre}<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${url}</a>`
+            : m;
+        })
+    );
+
+  // Build a possibly-nested list from collected items via a level stack.
+  const buildList = (items) => {
+    let html = '';
+    const tags = []; // tags[level] = 'ul' | 'ol'
+    for (const it of items) {
+      const level = it.level;
+      while (tags.length - 1 > level) html += `</li></${tags.pop()}>`;
+      if (tags.length - 1 === level) {
+        html += '</li>';
+        const want = it.ordered ? 'ol' : 'ul';
+        if (tags[level] !== want) {
+          html += `</${tags.pop()}>`;
+          tags.push(want);
+          html += `<${want}>`;
+        }
+      } else {
+        while (tags.length - 1 < level) {
+          const want = it.ordered ? 'ol' : 'ul';
+          tags.push(want);
+          html += `<${want}>`;
+        }
+      }
+      const isTask = it.checked !== null;
+      html += `<li${isTask ? ' class="task-item"' : ''}>`;
+      if (isTask) {
+        html += `<input type="checkbox" disabled${it.checked ? ' checked' : ''}> `;
+      }
+      html += inline(it.text);
+    }
+    while (tags.length) html += `</li></${tags.pop()}>`;
+    return html;
+  };
+
+  // Column alignments from a GFM separator row: :--- / :--: / ---:
+  const columnAligns = (sep) =>
+    sep
+      .replace(/^\s*\|/, '')
+      .replace(/\|\s*$/, '')
+      .split('|')
+      .map((c) => {
+        const t = c.trim();
+        const left = t.startsWith(':');
+        const right = t.endsWith(':');
+        if (left && right) return 'md-center';
+        if (right) return 'md-right';
+        if (left) return 'md-left';
+        return '';
+      });
+
+  const cells = (l) =>
+    l.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map((c) => c.trim());
+  const isTableSep = (l) =>
+    /^\s*\|?[\s:|-]+\|?\s*$/.test(l || '') && (l || '').includes('-');
+
+  const sentinelLine = new RegExp('^' + NUL + 'B\\d+' + NUL + '$');
+  const sentinelLineG = new RegExp('^' + NUL + 'B\\d+' + NUL + '$');
+
+  // Render already-escaped, code-sentinelized text into block HTML. Recurses
+  // for blockquote contents so nested quotes/lists work.
+  const renderBlocks = (text) => {
+    const lines = text.split('\n');
+    const out = [];
+    let i = 0;
+    const itemRe = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
+    const ruleRe = /^\s*([-*_])\s*(\1\s*){2,}$/;
+
+    while (i < lines.length) {
+      const line = lines[i];
+      if (!line.trim()) { i += 1; continue; }
+      const stripped = line.trim();
+      let m;
+
+      if (sentinelLine.test(stripped)) {
+        out.push(stripped);
+        i += 1;
+      } else if ((m = line.match(/^(#{1,6})\s+(.*?)\s*#*\s*$/))) {
+        const level = m[1].length;
+        out.push(`<h${level}>${inline(m[2])}</h${level}>`);
+        i += 1;
+      } else if (ruleRe.test(line)) {
+        out.push('<hr>');
+        i += 1;
+      } else if (/^\s*&gt;\s?/.test(line)) {
+        const quote = [];
+        while (i < lines.length && /^\s*&gt;\s?/.test(lines[i])) {
+          quote.push(lines[i].replace(/^\s*&gt;\s?/, ''));
+          i += 1;
+        }
+        out.push(`<blockquote>${renderBlocks(quote.join('\n'))}</blockquote>`);
+      } else if (itemRe.test(line)) {
+        const items = [];
+        while (i < lines.length && (m = lines[i].match(itemRe))) {
+          const indent = m[1].replace(/\t/g, '  ').length;
+          let itemText = m[3];
+          let checked = null;
+          const task = itemText.match(/^\[([ xX])\]\s+(.*)$/);
+          if (task) {
+            checked = task[1].toLowerCase() === 'x';
+            itemText = task[2];
+          }
+          items.push({
+            level: Math.floor(indent / 2),
+            ordered: /\d/.test(m[2]),
+            checked,
+            text: itemText,
+          });
+          i += 1;
+        }
+        out.push(buildList(items));
+      } else if (line.includes('|') && isTableSep(lines[i + 1])) {
+        const header = cells(line);
+        const aligns = columnAligns(lines[i + 1]);
+        i += 2;
+        const rows = [];
+        while (i < lines.length && lines[i].includes('|') && lines[i].trim()) {
+          rows.push(cells(lines[i]));
+          i += 1;
+        }
+        const cls = (n) => (aligns[n] ? ` class="${aligns[n]}"` : '');
+        out.push(
+          `<table><thead><tr>${header
+            .map((h, n) => `<th${cls(n)}>${inline(h)}</th>`)
+            .join('')}</tr></thead><tbody>${rows
+            .map(
+              (r) =>
+                `<tr>${r
+                  .map((c, n) => `<td${cls(n)}>${inline(c)}</td>`)
+                  .join('')}</tr>`
+            )
+            .join('')}</tbody></table>`
+        );
+      } else {
+        const para = [];
+        while (
+          i < lines.length &&
+          lines[i].trim() &&
+          !/^(#{1,6})\s|^\s*&gt;\s?/.test(lines[i]) &&
+          !itemRe.test(lines[i]) &&
+          !ruleRe.test(lines[i]) &&
+          !sentinelLineG.test(lines[i].trim())
+        ) {
+          para.push(lines[i]);
+          i += 1;
+        }
+        out.push(`<p>${inline(para.join('\n')).replace(/\n/g, '<br>')}</p>`);
+      }
+    }
+    return out.join('');
+  };
+
+  // Strip NULs so message text can never reference the placeholder table.
+  let text = escapeHtml(String(raw || '').replace(new RegExp(NUL, 'g'), ''));
+
   const pushCodeBlock = (lang, code) => {
-    codeBlocks.push(`<pre><code${lang ? ` class="lang-${escapeHtml(lang)}"` : ''}>${code.replace(/\n$/, '')}</code></pre>`);
-    return `\u0000B${codeBlocks.length - 1}\u0000`;
+    codeBlocks.push(
+      `<pre><code${lang ? ` class="lang-${escapeHtml(lang)}"` : ''}>${code.replace(/\n$/, '')}</code></pre>`
+    );
+    return `${SB}${codeBlocks.length - 1}${NUL}`;
   };
   text = text.replace(/```([\w-]*)\n?([\s\S]*?)```/g, (m, lang, code) =>
     pushCodeBlock(lang, code)
   );
-  // A fence that is still open - the common case while a reply streams in -
-  // renders as a code block immediately, instead of leaking raw backticks
-  // into the bubble until the closing fence arrives.
+  // A fence still open - the common case while a reply streams in - renders as
+  // a code block immediately instead of leaking raw backticks into the bubble.
   text = text.replace(/```([\w-]*)\n?([\s\S]*)$/, (m, lang, code) =>
     pushCodeBlock(lang, code)
   );
-  const inlineCode = [];
   text = text.replace(/`([^`\n]+)`/g, (m, code) => {
     inlineCode.push(`<code>${code}</code>`);
-    return `\u0000I${inlineCode.length - 1}\u0000`;
+    return `${SI}${inlineCode.length - 1}${NUL}`;
   });
 
-  // Inline formatting (operates on escaped text).
-  text = text
-    .replace(/!?\[([^\]\n]+)\]\(([^)\s]+)\)/g, (whole, label, url) => {
-      // The URL is already HTML-escaped here, so &quot; etc. must be decoded
-      // before validation - otherwise a quote hides behind its entity.
-      const decoded = url
-        .replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'")
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/&amp;/g, '&');
-      const href = safeLinkHref(decoded);
-      if (!href) return whole; // leave unsafe/relative links as plain text
-      return `<a href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer">${label}</a>`;
-    })
-    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/(^|[\s(])\*([^\s*][^*\n]*?)\*/gm, '$1<em>$2</em>')
-    .replace(/(^|[\s(])_([^\s_][^_\n]*?)_/gm, '$1<em>$2</em>')
-    .replace(/~~([^~\n]+)~~/g, '<del>$1</del>');
-
-  // Block-level pass.
-  const lines = text.split('\n');
-  const out = [];
-  let i = 0;
-  const isTableSep = (l) => /^\s*\|?[\s:|-]+\|?\s*$/.test(l || '') && (l || '').includes('-');
-  const cells = (l) => l.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map((c) => c.trim());
-
-  while (i < lines.length) {
-    const line = lines[i];
-    if (!line.trim()) { i += 1; continue; }
-    let match;
-    if (/^\u0000B\d+\u0000$/.test(line.trim())) {
-      out.push(line.trim());
-      i += 1;
-    } else if ((match = line.match(/^(#{1,4})\s+(.*)$/))) {
-      out.push(`<h${match[1].length + 2}>${match[2]}</h${match[1].length + 2}>`);
-      i += 1;
-    } else if (/^\s*([-*_])\s*\1\s*\1[\s\-*_]*$/.test(line)) {
-      out.push('<hr>');
-      i += 1;
-    } else if (/^&gt;\s?/.test(line)) {
-      const quote = [];
-      while (i < lines.length && /^&gt;\s?/.test(lines[i])) {
-        quote.push(lines[i].replace(/^&gt;\s?/, ''));
-        i += 1;
-      }
-      out.push(`<blockquote>${quote.join('<br>')}</blockquote>`);
-    } else if (/^\s*[-*+]\s+/.test(line)) {
-      const items = [];
-      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) {
-        items.push(`<li>${lines[i].replace(/^\s*[-*+]\s+/, '')}</li>`);
-        i += 1;
-      }
-      out.push(`<ul>${items.join('')}</ul>`);
-    } else if (/^\s*\d+\.\s+/.test(line)) {
-      const items = [];
-      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
-        items.push(`<li>${lines[i].replace(/^\s*\d+\.\s+/, '')}</li>`);
-        i += 1;
-      }
-      out.push(`<ol>${items.join('')}</ol>`);
-    } else if (line.includes('|') && isTableSep(lines[i + 1])) {
-      const header = cells(line);
-      i += 2;
-      const rows = [];
-      while (i < lines.length && lines[i].includes('|') && lines[i].trim()) {
-        rows.push(cells(lines[i]));
-        i += 1;
-      }
-      out.push(
-        `<table><thead><tr>${header.map((h) => `<th>${h}</th>`).join('')}</tr></thead>` +
-        `<tbody>${rows.map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table>`
-      );
-    } else {
-      const para = [];
-      while (
-        i < lines.length && lines[i].trim() &&
-        !/^(#{1,4})\s|^&gt;\s?|^\s*[-*+]\s+|^\s*\d+\.\s+/.test(lines[i]) &&
-        !/^\u0000B\d+\u0000$/.test(lines[i].trim())
-      ) {
-        para.push(lines[i]);
-        i += 1;
-      }
-      out.push(`<p>${para.join('<br>')}</p>`);
-    }
-  }
-
-  let html = out.join('');
-  html = html.replace(/\u0000B(\d+)\u0000/g, (m, n) => codeBlocks[Number(n)]);
-  html = html.replace(/\u0000I(\d+)\u0000/g, (m, n) => inlineCode[Number(n)]);
+  let html = renderBlocks(text);
+  html = html.replace(new RegExp(NUL + 'B(\\d+)' + NUL, 'g'), (m, n) => codeBlocks[Number(n)]);
+  html = html.replace(new RegExp(NUL + 'I(\\d+)' + NUL, 'g'), (m, n) => inlineCode[Number(n)]);
   return html;
 };
 
