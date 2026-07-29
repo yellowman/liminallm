@@ -40,6 +40,7 @@ from liminallm.storage.common import (
     compute_text_embedding,
     ensure_policy_compliant_texts,
     get_default_chat_workflow_schema,
+    get_default_tool_specs,
     hybrid_search_chunks,
     normalize_optional_text,
     normalize_preference_weight,
@@ -168,7 +169,30 @@ class MemoryStore:
         return datetime.fromisoformat(raw)
 
     def default_artifacts(self) -> None:
-        """Seed default workflow artifact using common schema."""
+        """Seed default workflow and tool-spec artifacts using common schemas."""
+        # Tool specs first, mirroring the Postgres store's seeding, so the
+        # Tools tab and /tools/specs work the same against either store.
+        for spec in get_default_tool_specs():
+            tool_id = str(uuid.uuid4())
+            tool_path = self.persist_artifact_payload(tool_id, spec)
+            self.artifacts[tool_id] = Artifact(
+                id=tool_id,
+                type="tool",
+                name=spec["name"],
+                description=spec.get("description"),
+                schema=spec,
+                fs_path=tool_path,
+                visibility="global",
+            )
+            self.artifact_versions[tool_id] = [
+                ArtifactVersion(
+                    id=self._next_artifact_version_id(),
+                    artifact_id=tool_id,
+                    version=1,
+                    schema=spec,
+                    fs_path=tool_path,
+                )
+            ]
         chat_workflow_id = str(uuid.uuid4())
         default_schema = get_default_chat_workflow_schema()
         payload_path = self.persist_artifact_payload(chat_workflow_id, default_schema)
@@ -1491,6 +1515,15 @@ class MemoryStore:
         # Merge stored overrides over defaults so callers get a complete,
         # current dict; return a fresh copy so mutation can't edit store state.
         return {**SYSTEM_SETTINGS_DEFAULTS, **stored}
+
+    def get_system_settings_overrides(self) -> dict:
+        """Explicitly stored admin settings only, no defaults merged in.
+
+        Lets the runtime give env vars precedence over code defaults for
+        settings the admin never actually overrode.
+        """
+        stored = self.runtime_config.get("system_settings") or {}
+        return dict(stored) if isinstance(stored, dict) else {}
 
     def get_system_settings_version(self) -> Optional[str]:
         """Return a token that changes whenever system settings are written.

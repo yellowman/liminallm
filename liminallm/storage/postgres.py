@@ -2751,6 +2751,14 @@ class PostgresStore:
         # current settings dict even when the row is partial, absent, or corrupt.
         return {**SYSTEM_SETTINGS_DEFAULTS, **self._get_stored_system_settings()}
 
+    def get_system_settings_overrides(self) -> dict:
+        """Explicitly stored admin settings only, no defaults merged in.
+
+        Lets the runtime give env vars precedence over code defaults for
+        settings the admin never actually overrode.
+        """
+        return dict(self._get_stored_system_settings())
+
     def get_system_settings_version(self) -> Optional[str]:
         """Return a token that changes whenever system settings are written.
 

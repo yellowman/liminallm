@@ -146,7 +146,7 @@ class Runtime:
         # clusterer, workflow, config_ops). Extracted into a helper so
         # reload_model_services() can rebuild them when an admin changes
         # model_backend/model_path without restarting the process.
-        self._build_model_services(sys_settings)
+        self._build_model_services()
 
         # Voice/email settings resolve from DB with env var fallback
         voice_transcription_model = (
@@ -239,27 +239,44 @@ class Runtime:
             mfa_enabled=mfa_enabled,
         )
 
-    def _build_model_services(self, sys_settings: dict) -> None:
+    def _system_settings_overrides(self) -> dict:
+        """Explicitly stored admin settings only, without defaults merged in.
+
+        get_system_settings() merges code defaults over the stored values, so
+        resolving model settings from it would let those defaults permanently
+        shadow MODEL_PATH / MODEL_BACKEND env vars the admin never overrode.
+        Precedence here is: admin override > env var > code default.
+        """
+        getter = getattr(self.store, "get_system_settings_overrides", None)
+        if callable(getter):
+            try:
+                return getter() or {}
+            except Exception as exc:
+                logger.warning("settings_overrides_read_failed", error=str(exc))
+        return {}
+
+    def _build_model_services(self) -> None:
         """Construct all backend-dependent services from system settings.
 
         Shared by __init__ and reload_model_services so a runtime
         model_backend / model_path change takes effect without a restart.
         """
+        overrides = self._system_settings_overrides()
         self.resolved_base_model = (
-            sys_settings.get("model_path") or self.settings.model_path
+            overrides.get("model_path") or self.settings.model_path
         )
         self.backend_mode = (
-            sys_settings.get("model_backend") or self.settings.model_backend
+            overrides.get("model_backend") or self.settings.model_backend
         )
         self.default_adapter_mode = (
-            sys_settings.get("default_adapter_mode")
+            overrides.get("default_adapter_mode")
             or self.settings.default_adapter_mode
         )
-        self.rag_mode = sys_settings.get("rag_mode") or self.settings.rag_mode
+        self.rag_mode = overrides.get("rag_mode") or self.settings.rag_mode
         embedding_model_id = (
-            sys_settings.get("embedding_model_id") or self.settings.embedding_model_id
+            overrides.get("embedding_model_id") or self.settings.embedding_model_id
         )
-        rag_chunk_size = sys_settings.get("rag_chunk_size", 400)
+        rag_chunk_size = overrides.get("rag_chunk_size") or 400
         adapter_configs = {
             "openai": {
                 "api_key": self.settings.adapter_openai_api_key,
@@ -307,20 +324,21 @@ class Runtime:
         )
         # Record the model-affecting settings this stack was built from so a
         # watcher can tell whether a later settings write actually changed them.
-        self._model_settings_signature = self._model_signature(sys_settings)
+        self._model_settings_signature = self._model_signature()
 
-    def _model_signature(self, sys_settings: dict) -> tuple:
+    def _model_signature(self) -> tuple:
         """Signature of the settings that affect the model service stack."""
+        overrides = self._system_settings_overrides()
         return (
-            sys_settings.get("model_path") or self.settings.model_path,
-            str(sys_settings.get("model_backend") or self.settings.model_backend),
+            overrides.get("model_path") or self.settings.model_path,
+            str(overrides.get("model_backend") or self.settings.model_backend),
             str(
-                sys_settings.get("default_adapter_mode")
+                overrides.get("default_adapter_mode")
                 or self.settings.default_adapter_mode
             ),
-            str(sys_settings.get("rag_mode") or self.settings.rag_mode),
-            sys_settings.get("embedding_model_id") or self.settings.embedding_model_id,
-            sys_settings.get("rag_chunk_size", 400),
+            str(overrides.get("rag_mode") or self.settings.rag_mode),
+            overrides.get("embedding_model_id") or self.settings.embedding_model_id,
+            overrides.get("rag_chunk_size") or 400,
         )
 
     def _read_settings_version(self) -> Optional[str]:
@@ -345,10 +363,7 @@ class Runtime:
         version = self._read_settings_version()
         if version is not None and version == self._applied_settings_version:
             return False
-        sys_settings = {}
-        if hasattr(self.store, "get_system_settings"):
-            sys_settings = self.store.get_system_settings() or {}
-        target = self._model_signature(sys_settings)
+        target = self._model_signature()
         # Record the version even when nothing model-relevant changed, so an
         # unrelated settings write (e.g. a rate-limit tweak) isn't rechecked.
         self._applied_settings_version = version
@@ -389,12 +404,9 @@ class Runtime:
                 name: getattr(self, name, None) for name in self._MODEL_SERVICE_ATTRS
             }
             old_workflow = getattr(self, "workflow", None)
-            sys_settings = {}
-            if hasattr(self.store, "get_system_settings"):
-                sys_settings = self.store.get_system_settings() or {}
             version = self._read_settings_version()
             try:
-                self._build_model_services(sys_settings)
+                self._build_model_services()
             except Exception as exc:
                 # Restore the previous stack so a partial rebuild can't leave the
                 # runtime inconsistent, then let the caller surface the failure.
@@ -402,7 +414,9 @@ class Runtime:
                     setattr(self, name, value)
                 logger.error(
                     "runtime_model_services_reload_failed",
-                    model_backend=str(sys_settings.get("model_backend")),
+                    model_backend=str(
+                        self._system_settings_overrides().get("model_backend")
+                    ),
                     error=str(exc),
                 )
                 raise
