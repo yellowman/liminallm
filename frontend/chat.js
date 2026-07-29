@@ -502,8 +502,15 @@ const conversationSearchEl = $('conversation-search');
 
 const DEFAULT_UPLOAD_BYTES = 10 * 1024 * 1024;
 let uploadLimitBytes = null;
-const ALLOWED_UPLOAD_TYPES = ['text/plain', 'text/markdown', 'application/pdf', 'application/json', 'text/csv'];
-const ALLOWED_UPLOAD_EXTENSIONS = ['.txt', '.md', '.markdown', '.pdf', '.json', '.csv', '.yaml', '.yml'];
+const ALLOWED_UPLOAD_TYPES = [
+  'text/plain', 'text/markdown', 'application/pdf', 'application/json', 'text/csv',
+  'application/zip', 'application/x-zip-compressed', 'application/gzip', 'application/x-gzip', 'application/x-tar',
+];
+const ALLOWED_UPLOAD_EXTENSIONS = ['.txt', '.md', '.markdown', '.pdf', '.json', '.csv', '.yaml', '.yml', '.zip', '.tar', '.tgz', '.gz'];
+const ARCHIVE_EXTENSIONS = ['.zip', '.tar', '.tgz', '.tar.gz', '.gz'];
+const isArchiveName = (name) => ARCHIVE_EXTENSIONS.some((ext) => name.toLowerCase().endsWith(ext));
+// Encode a relative path for a URL, keeping the / separators.
+const encodePath = (p) => p.split('/').map(encodeURIComponent).join('/');
 
 const getUploadLimit = () => uploadLimitBytes || DEFAULT_UPLOAD_BYTES;
 
@@ -2779,6 +2786,7 @@ const renderFilesList = (files, total, hasNext) => {
         <div class="file-meta">${formatBytes(file.size)} · ${formatRelativeTime(file.modified_at)}</div>
       </div>
       <div class="file-actions">
+        ${isArchiveName(file.name) ? '<button type="button" class="download-btn" data-action="extract">Extract</button>' : ''}
         <button type="button" class="download-btn" data-action="download">Download</button>
         <button type="button" class="delete-btn" data-action="delete">Delete</button>
       </div>
@@ -2822,6 +2830,35 @@ const handleFileAction = async (event) => {
     await downloadFile(filename);
   } else if (action === 'delete') {
     await deleteFile(filename);
+  } else if (action === 'extract') {
+    await extractFile(filename, target);
+  }
+};
+
+const extractFile = async (filename, button) => {
+  if (!state.accessToken) return;
+
+  try {
+    toggleButtonBusy(button, true, 'Extracting...');
+    if (fileUploadStatus) fileUploadStatus.textContent = `Extracting ${filename}...`;
+
+    const envelope = await requestEnvelope(
+      `${apiBase}/files/${encodePath(filename)}/extract`,
+      { method: 'POST', headers: headers() },
+      'Extraction failed'
+    );
+
+    const data = envelope.data || {};
+    const skipped = data.skipped?.length ? `, ${data.skipped.length} skipped` : '';
+    if (fileUploadStatus) {
+      fileUploadStatus.textContent =
+        `Extracted ${data.files?.length || 0} file(s) to ${data.extracted_to}/${skipped}`;
+    }
+    await fetchUserFiles();
+  } catch (err) {
+    if (fileUploadStatus) fileUploadStatus.textContent = err.message;
+  } finally {
+    toggleButtonBusy(button, false);
   }
 };
 
@@ -2831,7 +2868,7 @@ const downloadFile = async (filename) => {
   try {
     // Get signed download URL
     const envelope = await requestEnvelope(
-      `${apiBase}/files/${encodeURIComponent(filename)}/url`,
+      `${apiBase}/files/${encodePath(filename)}/url`,
       { headers: headers() },
       'Failed to get download URL'
     );
@@ -2868,7 +2905,7 @@ const deleteFile = async (filename) => {
 
   try {
     await requestEnvelope(
-      `${apiBase}/files/${encodeURIComponent(filename)}`,
+      `${apiBase}/files/${encodePath(filename)}`,
       {
         method: 'DELETE',
         headers: headers(),

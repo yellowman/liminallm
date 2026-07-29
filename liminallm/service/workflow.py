@@ -36,8 +36,10 @@ from liminallm.service.rag import RAGService
 from liminallm.service.router import RouterEngine
 from liminallm.service.sandbox import (
     AllowlistedFetcher,
+    PrivilegedToolError,
     ToolNetworkPolicy,
     build_tool_network_policy,
+    get_tool_sandbox_config,
     safe_eval_expr,
     tool_network_guard,
 )
@@ -1905,6 +1907,25 @@ class WorkflowEngine:
                 "error": "validation_error",
                 "details": {"errors": validation_errors},
             }
+        # SPEC §18: privileged tools require admin role; enforced here so both
+        # workflow nodes and direct /tools/{id}/invoke go through the check.
+        if tool_spec and tool_spec.get("privileged"):
+            role = None
+            get_user = getattr(self.store, "get_user", None)
+            if user_id and callable(get_user):
+                user = get_user(user_id)
+                role = getattr(user, "role", None)
+            try:
+                get_tool_sandbox_config(tool_spec, user_role=role)
+            except PrivilegedToolError as exc:
+                self.logger.warning(
+                    "privileged_tool_denied",
+                    tool=tool_name,
+                    user_id=user_id,
+                    role=role,
+                )
+                return {"status": "error", "content": str(exc), "error": "forbidden"}
+
         handler = self._builtin_tool_handlers().get(tool_name)
         if tool_spec and not handler:
             handler = self._builtin_tool_handlers().get(tool_spec.get("handler"))

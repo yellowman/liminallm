@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import mimetypes
+import shutil
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path as FilePath
@@ -106,8 +107,15 @@ from liminallm.config import (
 )
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
+from liminallm.service.archive import (
+    ArchiveExtractionError,
+    archive_stem,
+    extract_archive_sandboxed,
+    is_archive_filename,
+)
 from liminallm.service.auth import AuthContext
 from liminallm.service.errors import BadRequestError, NotFoundError
+from liminallm.service.sandbox import SandboxError
 from liminallm.service.fs import (
     PathTraversalError,
     generate_signed_url,
@@ -146,6 +154,12 @@ ALLOWED_UPLOAD_EXTENSIONS = {
     ".mp3",
     ".wav",
     ".ogg",
+    # Archives are stored as-is and expanded only via POST /files/{name}/extract
+    # (never auto-ingested); extraction enforces zip-bomb and zip-slip limits.
+    ".zip",
+    ".tar",
+    ".tgz",
+    ".gz",
 }
 
 router = APIRouter(prefix="/v1")
@@ -3289,6 +3303,15 @@ async def upload_file(
                 prior_contexts = set()
         elif isinstance(prior_entry, str):
             prior_checksum = prior_entry
+        # Archives are binary; they are stored but never text-ingested.
+        # POST /files/{name}/extract expands them (with ingestion) instead.
+        if context_id and is_archive_filename(safe_filename):
+            raise _http_error(
+                "validation_error",
+                "archives cannot be ingested directly; upload without context_id, "
+                "then extract",
+                status_code=400,
+            )
         if dest_path.exists() and prior_checksum == checksum:
             chunk_count = None
             if context_id and context_id not in prior_contexts:
@@ -3388,20 +3411,25 @@ async def list_files(
             data={"files": [], "total": 0, "limit": limit or 50, "offset": offset},
         )
 
-    # List files with pagination. Hidden files are internal bookkeeping
-    # (e.g. the .checksums.json upload manifest) — uploads strip leading dots,
-    # so users can never own a dotfile here.
+    # List files with pagination, walking extracted-archive subdirectories.
+    # Hidden components are internal bookkeeping (e.g. the .checksums.json
+    # upload manifest) — uploads and extraction strip leading dots, so users
+    # can never own a dotfile here.
     all_files = []
     try:
-        for f in files_dir.iterdir():
-            if f.is_file() and not f.name.startswith("."):
-                stat = f.stat()
-                all_files.append({
-                    "name": f.name,
-                    "size": stat.st_size,
-                    "created_at": datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc).isoformat(),
-                    "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
-                })
+        for f in files_dir.rglob("*"):
+            if not f.is_file():
+                continue
+            rel = f.relative_to(files_dir)
+            if any(part.startswith(".") for part in rel.parts):
+                continue
+            stat = f.stat()
+            all_files.append({
+                "name": rel.as_posix(),
+                "size": stat.st_size,
+                "created_at": datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc).isoformat(),
+                "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+            })
     except PermissionError:
         logger.warning("files_list_permission_denied", user_id=principal.user_id)
         return Envelope(status="ok", data={"files": [], "total": 0, "limit": limit or 50, "offset": offset})
@@ -3425,9 +3453,14 @@ async def list_files(
     )
 
 
-@router.get("/files/{filename}/url", response_model=Envelope, tags=["files"])
+def _is_hidden_relpath(filename: str) -> bool:
+    """True when any component of a user-supplied relative path is hidden."""
+    return any(part.startswith(".") for part in FilePath(filename).parts)
+
+
+@router.get("/files/{filename:path}/url", response_model=Envelope, tags=["files"])
 async def get_file_download_url(
-    filename: str = Path(..., max_length=255, description="File name to download"),
+    filename: str = Path(..., max_length=512, description="File name to download"),
     principal: AuthContext = Depends(get_user),
 ):
     """Get a signed download URL for a file.
@@ -3456,7 +3489,7 @@ async def get_file_download_url(
         raise _http_error("validation_error", "invalid filename", status_code=400)
 
     # Hidden files are internal bookkeeping; report them as absent.
-    if filename.startswith(".") or not file_path.exists() or not file_path.is_file():
+    if _is_hidden_relpath(filename) or not file_path.exists() or not file_path.is_file():
         raise _http_error("not_found", "file not found", status_code=404)
 
     # Generate signed URL with 10-minute expiry
@@ -3537,12 +3570,12 @@ async def download_file(
     )
 
 
-@router.delete("/files/{filename}", response_model=Envelope, tags=["files"])
+@router.delete("/files/{filename:path}", response_model=Envelope, tags=["files"])
 async def delete_file(
-    filename: str = Path(..., max_length=255, description="File name to delete"),
+    filename: str = Path(..., max_length=512, description="File or folder to delete"),
     principal: AuthContext = Depends(get_user),
 ):
-    """Delete a user's file."""
+    """Delete a user's file, or a folder produced by archive extraction."""
     runtime = get_runtime()
     await _enforce_rate_limit(
         runtime,
@@ -3564,11 +3597,19 @@ async def delete_file(
 
     # Hidden files are internal bookkeeping (upload strips leading dots, so a
     # user can never own one); report them as absent rather than deletable.
-    if filename.startswith(".") or not file_path.exists() or not file_path.is_file():
+    # The files root itself is never deletable.
+    if (
+        _is_hidden_relpath(filename)
+        or not file_path.exists()
+        or file_path == files_dir.resolve()
+    ):
         raise _http_error("not_found", "file not found", status_code=404)
 
-    # Delete file
-    await asyncio.to_thread(file_path.unlink)
+    # Delete file, or an extracted-archive folder recursively
+    if file_path.is_dir():
+        await asyncio.to_thread(shutil.rmtree, file_path)
+    else:
+        await asyncio.to_thread(file_path.unlink)
 
     # Drop the file's entry from the checksum manifest so it doesn't go stale.
     manifest_path = files_dir / ".checksums.json"
@@ -3582,6 +3623,126 @@ async def delete_file(
 
     logger.info("file_deleted", user_id=principal.user_id, filename=filename)
     return Envelope(status="ok", data={"deleted": filename})
+
+
+@router.post("/files/{filename:path}/extract", response_model=Envelope, tags=["files"])
+async def extract_uploaded_archive(
+    filename: str = Path(..., max_length=512, description="Archive to extract"),
+    context_id: Optional[str] = Query(None, max_length=255),
+    chunk_size: Optional[int] = Query(None, ge=64, le=4000),
+    principal: AuthContext = Depends(get_user),
+):
+    """Extract an uploaded archive into a folder next to it.
+
+    SPEC §18: extraction is hardened against zip bombs (streamed size,
+    entry-count, and compression-ratio budgets), zip-slip (component-wise
+    path sanitization + safe_join), and hostile members (symlinks, devices,
+    and hardlinks are skipped; nested archives are never auto-expanded), and
+    the whole job runs in a resource-limited sandbox subprocess. Extracted
+    files can optionally be ingested into a knowledge context.
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"write:{principal.user_id}",
+        _get_rate_limit(runtime, "write_rate_limit_per_minute"),
+        60,
+    )
+
+    files_dir = (
+        FilePath(runtime.settings.shared_fs_root)
+        / "users"
+        / principal.user_id
+        / "files"
+    )
+    try:
+        archive_path = safe_join(files_dir, filename)
+    except PathTraversalError:
+        raise _http_error("validation_error", "invalid filename", status_code=400)
+    if (
+        _is_hidden_relpath(filename)
+        or not archive_path.exists()
+        or not archive_path.is_file()
+    ):
+        raise _http_error("not_found", "file not found", status_code=404)
+    if not is_archive_filename(filename):
+        raise _http_error(
+            "validation_error",
+            "not an archive (.zip, .tar, .tar.gz, .tgz, .gz)",
+            status_code=400,
+        )
+
+    # Destination folder sits next to the archive, named after its stem.
+    dest_rel = FilePath(filename).parent / archive_stem(archive_path.name)
+    try:
+        dest_path = safe_join(files_dir, dest_rel.as_posix())
+    except PathTraversalError:
+        raise _http_error("validation_error", "invalid filename", status_code=400)
+    if dest_path.exists():
+        raise _http_error(
+            "conflict",
+            f"'{dest_rel.as_posix()}' already exists; delete it first",
+            status_code=409,
+        )
+
+    # Budgets scale with the user's plan: per-member = upload limit,
+    # total = 10x upload limit. Ratio and entry caps stop crafted bombs.
+    user = runtime.store.get_user(principal.user_id)
+    plan_tier = user.plan_tier if user else "free"
+    member_bytes = max(1, _get_plan_upload_limit(runtime, plan_tier))
+    limits = {
+        "max_entries": 1000,
+        "max_member_bytes": member_bytes,
+        "max_total_bytes": member_bytes * 10,
+        "max_ratio": 100,
+        "allowed_extensions": sorted(ALLOWED_UPLOAD_EXTENSIONS),
+    }
+    try:
+        report = await asyncio.to_thread(
+            extract_archive_sandboxed, str(archive_path), str(dest_path), limits
+        )
+    except ArchiveExtractionError as exc:
+        raise _http_error("validation_error", str(exc), status_code=413)
+    except SandboxError as exc:
+        logger.warning(
+            "archive_extraction_sandbox_failed",
+            user_id=principal.user_id,
+            filename=filename,
+            error=str(exc),
+        )
+        raise _http_error(
+            "validation_error", f"extraction failed: {exc}", status_code=422
+        )
+
+    chunk_count = None
+    if context_id:
+        _get_owned_context(runtime, context_id, principal)
+        chunk_count = runtime.rag.ingest_path(
+            context_id,
+            str(dest_path),
+            recursive=True,
+            chunk_size=chunk_size,
+            allowed_base=files_dir,
+        )
+
+    logger.info(
+        "archive_extracted",
+        user_id=principal.user_id,
+        filename=filename,
+        files=len(report["extracted"]),
+        skipped=len(report["skipped"]),
+        total_bytes=report["total_bytes"],
+    )
+    return Envelope(
+        status="ok",
+        data={
+            "extracted_to": dest_rel.as_posix(),
+            "files": report["extracted"],
+            "skipped": report["skipped"],
+            "total_bytes": report["total_bytes"],
+            "chunk_count": chunk_count,
+        },
+    )
 
 
 @router.get("/conversations/{conversation_id}/messages", response_model=Envelope, tags=["conversations"])
