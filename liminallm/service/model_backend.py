@@ -349,6 +349,7 @@ class ApiAdapterBackend:
         adapter_server_model: Optional[str] = None,
         provider: Optional[str] = None,
         api_key_env: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> None:
         self.base_model = base_model
         self.adapter_server_model = adapter_server_model
@@ -356,6 +357,13 @@ class ApiAdapterBackend:
         self.mode = adapter_mode
         self._api_key = api_key
         self._base_url = base_url
+        # Thinking control for reasoning models (OpenAI o-series, Gemini 2.5/3
+        # via the OpenAI-compatible endpoint): "low" | "medium" | "high", or
+        # "none" to disable where the provider allows it. Sent via extra_body
+        # so older openai SDKs work; omitted entirely when unset.
+        self._reasoning_effort = (
+            reasoning_effort or os.getenv("MODEL_REASONING_EFFORT") or ""
+        ).strip().lower() or None
         # Env var consulted for credential rotation; provider-specific so that,
         # e.g., a Zhipu backend reads ZHIPU_API_KEY rather than OPENAI_API_KEY.
         self._api_key_env = api_key_env or "OPENAI_API_KEY"
@@ -430,6 +438,12 @@ class ApiAdapterBackend:
         # Default to openai-style for unknown modes
         return "openai"
 
+    def _with_reasoning_effort(self, extra_body: Optional[dict]) -> Optional[dict]:
+        """Merge the configured reasoning effort into the request extra_body."""
+        if not self._reasoning_effort:
+            return extra_body
+        return {**(extra_body or {}), "reasoning_effort": self._reasoning_effort}
+
     def generate(
         self,
         messages: List[dict],
@@ -448,6 +462,7 @@ class ApiAdapterBackend:
 
         # Inject adapter prompts if any hybrid/prompt adapters
         augmented_messages = self._inject_adapter_prompts(messages, prompt_injections)
+        extra_body = self._with_reasoning_effort(extra_body)
 
         if self.client:
             completion = self.client.chat.completions.create(
@@ -507,6 +522,7 @@ class ApiAdapterBackend:
         extra_body = processed["extra_body"]
         prompt_injections = processed["prompt_injections"]
         augmented_messages = self._inject_adapter_prompts(messages, prompt_injections)
+        extra_body = self._with_reasoning_effort(extra_body)
 
         if self.client:
             try:
