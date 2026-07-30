@@ -326,6 +326,41 @@ async def serve_chat() -> FileResponse:
     return FileResponse(index)
 
 
+# Public share pages (SPEC §18): read-only views of conversations the owner
+# explicitly published. The directory and pages are noindex by default — both
+# via X-Robots-Tag here and robots.txt below — so shared chats don't end up
+# in search engines unless that policy is deliberately changed.
+_SHARE_NOINDEX = {"X-Robots-Tag": "noindex, nofollow"}
+
+
+def _serve_share_page() -> FileResponse:
+    share = STATIC_DIR / "share.html"
+    if not STATIC_DIR.exists() or not share.exists():
+        logger.warning("frontend_missing_share", share=str(share))
+        raise HTTPException(status_code=404, detail="share ui missing")
+    return FileResponse(share, headers=_SHARE_NOINDEX)
+
+
+@app.get("/share", response_class=FileResponse)
+async def serve_share_directory() -> FileResponse:
+    return _serve_share_page()
+
+
+@app.get("/share/{conversation_id}", response_class=FileResponse)
+async def serve_share_conversation(conversation_id: str) -> FileResponse:
+    # The id is resolved client-side from the URL; this route only serves the
+    # static page (and exists so deep links work), so the parameter is unused.
+    return _serve_share_page()
+
+
+@app.get("/robots.txt")
+async def serve_robots() -> Response:
+    return Response(
+        "User-agent: *\nDisallow: /share/\nDisallow: /share\n",
+        media_type="text/plain",
+    )
+
+
 # The admin page carries its own sign-in form and every API it calls enforces
 # the admin role server-side. Requiring admin auth to serve the static HTML
 # made the page unreachable: browser navigation sends no Authorization header,

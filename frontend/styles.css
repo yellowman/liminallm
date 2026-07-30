@@ -883,6 +883,93 @@ button.minor:hover {
   letter-spacing: 0.06em;
 }
 
+/* Copy-message affordance: quiet until the message is hovered */
+.msg-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.message.user .msg-actions {
+  justify-content: flex-end;
+}
+
+.msg-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 0.45;
+  transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.message:hover .msg-copy,
+.msg-copy:focus-visible {
+  opacity: 1;
+}
+
+.msg-copy:hover {
+  background: var(--panel-muted);
+  color: var(--text);
+}
+
+.msg-copy .icon-check {
+  display: none;
+}
+
+.msg-copy.copied {
+  color: var(--accent-strong);
+  opacity: 1;
+}
+
+.msg-copy.copied .icon-copy {
+  display: none;
+}
+
+.msg-copy.copied .icon-check {
+  display: inline;
+}
+
+/* Share button reflects the conversation's public state */
+#share-btn.shared {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+#share-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Public share page */
+.share-brand {
+  font-weight: 600;
+  font-size: 15px;
+  letter-spacing: -0.01em;
+}
+
+.share-page #share-messages {
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+  padding: 18px 4px 24px;
+}
+
+.share-dir-item {
+  display: block;
+  text-decoration: none;
+  color: var(--text);
+  border: 1px solid var(--border);
+  margin-bottom: 8px;
+}
+
 /* Citation links */
 .citation-link {
   display: inline-block;

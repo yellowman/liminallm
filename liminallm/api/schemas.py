@@ -623,6 +623,12 @@ class ConversationSummary(BaseModel):
     title: Optional[str]
     status: str
     active_context_id: Optional[str]
+    # Sharing state (SPEC §18): conversations are private by default.
+    public: bool = False
+
+
+class ConversationShareRequest(BaseModel):
+    public: bool
 
 
 class ConversationListResponse(BaseModel):

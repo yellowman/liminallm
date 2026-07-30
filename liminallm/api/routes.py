@@ -55,6 +55,7 @@ from liminallm.api.schemas import (
     ContextSourceRequest,
     ContextSourceResponse,
     ConversationListResponse,
+    ConversationShareRequest,
     ConversationMessagesResponse,
     ConversationSummary,
     CreateConversationRequest,
@@ -3903,7 +3904,133 @@ async def get_conversation(
             title=conversation.title,
             status=conversation.status,
             active_context_id=conversation.active_context_id,
+            public=bool((conversation.meta or {}).get("public")),
         ),
+    )
+
+
+@router.post(
+    "/conversations/{conversation_id}/share", response_model=Envelope, tags=["conversations"]
+)
+async def share_conversation(
+    body: ConversationShareRequest,
+    conversation_id: str = Path(..., max_length=255, description="Conversation identifier"),
+    principal: AuthContext = Depends(get_user),
+):
+    """Toggle public sharing for a conversation.
+
+    Conversations are private by default; the owner can publish one to the
+    read-only /share/{id} page and unpublish it again at any time.
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"write:{principal.user_id}",
+        _get_rate_limit(runtime, "write_rate_limit_per_minute"),
+        60,
+    )
+    conversation = runtime.store.set_conversation_public(
+        conversation_id, user_id=principal.user_id, public=body.public
+    )
+    if not conversation:
+        raise NotFoundError(
+            "conversation not found", detail={"conversation_id": conversation_id}
+        )
+    logger.info(
+        "conversation_share_toggled",
+        user_id=principal.user_id,
+        conversation_id=conversation_id,
+        public=body.public,
+    )
+    return Envelope(
+        status="ok",
+        data={
+            "conversation_id": conversation.id,
+            "public": bool((conversation.meta or {}).get("public")),
+            "share_path": f"/share/{conversation.id}",
+        },
+    )
+
+
+# =========================================================================
+# Public (unauthenticated) read-only access to shared conversations.
+# The share directory and pages are noindex by default (SPEC §18): both the
+# API and page responses carry X-Robots-Tag, and robots.txt disallows /share/.
+# =========================================================================
+
+_PUBLIC_NOINDEX = {"X-Robots-Tag": "noindex, nofollow"}
+
+
+@router.get("/public/conversations", response_model=Envelope, tags=["public"])
+async def list_public_conversations(
+    response: Response,
+    limit: Optional[int] = Query(None, ge=1, le=100),
+):
+    """Directory of publicly shared conversations (unauthenticated)."""
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        "public:read",
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        60,
+    )
+    response.headers.update(_PUBLIC_NOINDEX)
+    items = runtime.store.list_public_conversations(limit=limit or 50)
+    return Envelope(
+        status="ok",
+        data={
+            "items": [
+                {
+                    "id": c.id,
+                    "title": c.title or "Untitled conversation",
+                    "updated_at": c.updated_at,
+                }
+                for c in items
+            ]
+        },
+    )
+
+
+@router.get(
+    "/public/conversations/{conversation_id}", response_model=Envelope, tags=["public"]
+)
+async def get_public_conversation(
+    response: Response,
+    conversation_id: str = Path(..., max_length=255),
+):
+    """Read a publicly shared conversation (unauthenticated).
+
+    Only role, content, and timestamps are exposed — message metadata,
+    adapter traces, and owner identity stay private.
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        "public:read",
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        60,
+    )
+    response.headers.update(_PUBLIC_NOINDEX)
+    conversation = runtime.store.get_public_conversation(conversation_id)
+    if not conversation:
+        raise NotFoundError(
+            "conversation not found", detail={"conversation_id": conversation_id}
+        )
+    messages = runtime.store.list_messages(
+        conversation_id, limit=500, user_id=conversation.user_id
+    )
+    ordered = sorted(messages, key=lambda m: m.created_at)
+    return Envelope(
+        status="ok",
+        data={
+            "id": conversation.id,
+            "title": conversation.title or "Shared conversation",
+            "updated_at": conversation.updated_at,
+            "messages": [
+                {"role": m.role, "content": m.content, "created_at": m.created_at}
+                for m in ordered
+            ],
+        },
     )
 
 

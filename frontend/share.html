@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Shared conversations are noindex by default (SPEC §18) -->
+    <meta name="robots" content="noindex, nofollow" />
+    <title>Shared conversation · liminallm</title>
+    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
+    <link rel="stylesheet" href="/static/styles.css" />
+    <!-- chat.js provides the markdown renderer; share.js drives this page -->
+    <script defer src="/static/chat.js"></script>
+    <script defer src="/static/share.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="spark"></span>
+          <span class="share-brand">liminallm</span>
+        </div>
+        <div class="bar-actions">
+          <a href="/">Open liminallm</a>
+        </div>
+      </header>
+      <main class="layout">
+        <section class="panel chat-panel share-page">
+          <div class="conversation-header">
+            <div class="badge">
+              <span class="dot"></span>
+              <span id="share-title">Shared conversation</span>
+            </div>
+            <div class="small" id="share-updated"></div>
+          </div>
+          <div id="share-messages" aria-live="polite"></div>
+          <div id="share-empty" class="empty">Loading…</div>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

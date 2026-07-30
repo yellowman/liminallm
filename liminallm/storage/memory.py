@@ -621,6 +621,39 @@ class MemoryStore:
                 return None
             return conv
 
+    def set_conversation_public(
+        self, conversation_id: str, *, user_id: str, public: bool
+    ) -> Optional[Conversation]:
+        """Toggle a conversation's public sharing flag; owner-only."""
+        with self._data_lock:
+            conv = self.conversations.get(conversation_id)
+            if not conv or conv.user_id != user_id:
+                return None
+            meta = dict(conv.meta or {})
+            meta["public"] = bool(public)
+            conv.meta = meta
+            conv.updated_at = datetime.utcnow()
+            self._persist_state()
+            return conv
+
+    def get_public_conversation(self, conversation_id: str) -> Optional[Conversation]:
+        """Fetch a conversation only if it has been explicitly made public."""
+        with self._data_lock:
+            conv = self.conversations.get(conversation_id)
+            if conv and (conv.meta or {}).get("public"):
+                return conv
+            return None
+
+    def list_public_conversations(self, limit: int = 50) -> List[Conversation]:
+        """Public conversations, newest first, for the share directory."""
+        with self._data_lock:
+            shared = [
+                c for c in self.conversations.values()
+                if (c.meta or {}).get("public")
+            ]
+            shared.sort(key=lambda c: c.updated_at, reverse=True)
+            return shared[:limit]
+
     def delete_conversation(
         self, conversation_id: str, *, user_id: Optional[str] = None
     ) -> bool:

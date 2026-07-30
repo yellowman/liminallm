@@ -134,6 +134,21 @@ const escapeHtml = (str) => {
   return div.innerHTML;
 };
 
+// escapeHtml leaves quotes alone (fine for text nodes); attribute values need
+// them encoded too.
+const escapeAttr = (str) => escapeHtml(str).replace(/"/g, '&quot;');
+
+// Copy-message button: overlapping-squares icon, swapped for a check when
+// the copy lands. Shown under every user and assistant message.
+const MSG_COPY_BUTTON_HTML =
+  '<button type="button" class="msg-copy" title="Copy message" aria-label="Copy message">' +
+  '<svg class="icon-copy" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<rect x="9" y="9" width="12" height="12" rx="2"></rect>' +
+  '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>' +
+  '<svg class="icon-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<polyline points="20 6 9 17 4 12"></polyline></svg>' +
+  '</button>';
+
 // =============================================================================
 // Markdown renderer — GitHub-flavored subset, dependency-free, escape-first.
 // The input is HTML-escaped FIRST, then markdown constructs are rewritten into
@@ -1365,6 +1380,8 @@ const loadConversation = async (conversationId) => {
 
     const convo = envelope.data;
     if (conversationLabel) conversationLabel.textContent = convo.title || 'Conversation';
+    state.conversationPublic = Boolean(convo.public);
+    updateShareButton();
 
     const messagesEnvelope = await requestEnvelope(
       `${apiBase}/conversations/${conversationId}/messages?limit=100`,
@@ -1389,11 +1406,66 @@ const loadConversation = async (conversationId) => {
 };
 
 const setConversation = (id) => {
+  // A different (or new) conversation starts from the private default until
+  // loadConversation reports otherwise.
+  if (id !== state.conversationId) state.conversationPublic = false;
   state.conversationId = id;
   if (conversationLabel) conversationLabel.textContent = id ? `Conversation ${id.slice(0, 8)}...` : 'New conversation';
+  updateShareButton();
   if (!id) {
     state.lastAssistant = null;
     renderPreferencePanel();
+  }
+};
+
+// =============================================================================
+// Conversation sharing (private by default; owner can publish to /share/{id})
+// =============================================================================
+
+const updateShareButton = () => {
+  const btn = $('share-btn');
+  if (!btn) return;
+  btn.disabled = !state.conversationId;
+  btn.textContent = state.conversationPublic ? 'Make Private' : 'Share It';
+  btn.title = state.conversationPublic
+    ? 'This conversation is public — click to make it private again'
+    : 'Publish this conversation to a public read-only page';
+  btn.classList.toggle('shared', Boolean(state.conversationPublic));
+};
+
+const toggleShareConversation = async () => {
+  if (!state.conversationId) {
+    showStatus('Start a conversation before sharing it.', true);
+    return;
+  }
+  const btn = $('share-btn');
+  const makePublic = !state.conversationPublic;
+  try {
+    toggleButtonBusy(btn, true, 'Working...');
+    const envelope = await requestEnvelope(
+      `${apiBase}/conversations/${state.conversationId}/share`,
+      { method: 'POST', headers: headers(), body: JSON.stringify({ public: makePublic }) },
+      'Sharing failed'
+    );
+    state.conversationPublic = Boolean(envelope.data?.public);
+    if (state.conversationPublic) {
+      const url = `${window.location.origin}${envelope.data.share_path}`;
+      let copied = false;
+      if (navigator.clipboard) {
+        try {
+          await navigator.clipboard.writeText(url);
+          copied = true;
+        } catch { /* clipboard unavailable */ }
+      }
+      showStatus(copied ? `Public link copied: ${url}` : `Public link: ${url}`);
+    } else {
+      showStatus('Conversation is private again.');
+    }
+  } catch (err) {
+    showStatus(err.message, true);
+  } finally {
+    toggleButtonBusy(btn, false);
+    updateShareButton();
   }
 };
 
@@ -1489,11 +1561,12 @@ const renderMessage = (m) => {
   }
 
   return `
-    <div class="message ${role}" data-id="${escapeHtml(m.id || '')}">
+    <div class="message ${role}" data-id="${escapeHtml(m.id || '')}" data-raw="${escapeAttr(m.content || '')}">
       <div class="role">${role}</div>
       <div>
         <div class="bubble">${content}</div>
         ${citationsHtml}
+        <div class="msg-actions">${MSG_COPY_BUTTON_HTML}</div>
         ${metaBits.length ? `<div class="meta">${metaBits.join(' · ')}</div>` : ''}
       </div>
     </div>
@@ -1516,9 +1589,14 @@ const appendMessage = (role, content, meta = '') => {
   const metaEl = document.createElement('div');
   metaEl.className = 'meta';
   metaEl.textContent = meta;
+  wrapper.dataset.raw = content;
   wrapper.appendChild(roleEl);
   const contentWrap = document.createElement('div');
   contentWrap.appendChild(bubble);
+  const actionsEl = document.createElement('div');
+  actionsEl.className = 'msg-actions';
+  actionsEl.innerHTML = MSG_COPY_BUTTON_HTML;
+  contentWrap.appendChild(actionsEl);
   if (meta) contentWrap.appendChild(metaEl);
   wrapper.appendChild(contentWrap);
   if (messagesEl) {
@@ -1587,6 +1665,12 @@ const createStreamingMessage = (role) => {
       if (frame) cancelAnimationFrame(frame);
       render(true);
       wrapper.classList.remove('streaming');
+      // The copy affordance appears once the message is complete.
+      wrapper.dataset.raw = content;
+      const actionsEl = document.createElement('div');
+      actionsEl.className = 'msg-actions';
+      actionsEl.innerHTML = MSG_COPY_BUTTON_HTML;
+      contentWrap.insertBefore(actionsEl, metaEl);
       if (meta) metaEl.textContent = meta;
     },
     /** Get the accumulated content */
@@ -4349,15 +4433,28 @@ const initEventListeners = () => {
   // Chat
   if (chatForm) chatForm.addEventListener('submit', sendMessage);
   $('message-input')?.addEventListener('input', handleMessageInputChange);
+  $('share-btn')?.addEventListener('click', toggleShareConversation);
   $('new-thread')?.addEventListener('click', newConversation);
   $('new-thread-secondary')?.addEventListener('click', newConversation);
   $('stop-stream-btn')?.addEventListener('click', cancelStreaming);
   $('new-conversation-btn')?.addEventListener('click', newConversation);
   $('refresh-conversations')?.addEventListener('click', fetchConversations);
 
-  // Citation + code-copy click delegation (CSP-compliant instead of inline onclick)
+  // Citation + copy click delegation (CSP-compliant instead of inline onclick)
   if (messagesEl) {
     messagesEl.addEventListener('click', (e) => {
+      const msgCopy = e.target.closest('.msg-copy');
+      if (msgCopy) {
+        const msg = msgCopy.closest('.message');
+        const raw = msg?.dataset.raw || msg?.querySelector('.bubble')?.innerText || '';
+        if (raw && navigator.clipboard) {
+          navigator.clipboard.writeText(raw).then(() => {
+            msgCopy.classList.add('copied');
+            setTimeout(() => msgCopy.classList.remove('copied'), 1600);
+          }).catch(() => {});
+        }
+        return;
+      }
       const copyBtn = e.target.closest('.code-copy');
       if (copyBtn) {
         const code = copyBtn.closest('.codeblock')?.querySelector('code');
@@ -4513,6 +4610,7 @@ const init = async () => {
   initCollapsibleSections();
   initEventListeners();
   updateAuthUI();
+  updateShareButton();
   updateDraftIndicator();
   renderPreferencePanel();
   renderUploadHint();

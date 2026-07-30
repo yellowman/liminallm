@@ -1726,6 +1726,42 @@ class PostgresStore:
             meta=raw_meta,
         )
 
+    def set_conversation_public(
+        self, conversation_id: str, *, user_id: str, public: bool
+    ) -> Optional[Conversation]:
+        """Toggle a conversation's public sharing flag; owner-only."""
+        now = datetime.utcnow()
+        with self._connect() as conn:
+            row = conn.execute(
+                "UPDATE conversation SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
+                "updated_at = %s WHERE id = %s AND user_id = %s RETURNING id",
+                (json.dumps({"public": bool(public)}), now, conversation_id, user_id),
+            ).fetchone()
+        if not row:
+            return None
+        return self.get_conversation(conversation_id)
+
+    def get_public_conversation(self, conversation_id: str) -> Optional[Conversation]:
+        """Fetch a conversation only if it has been explicitly made public."""
+        conv = self.get_conversation(conversation_id)
+        if conv and (conv.meta or {}).get("public"):
+            return conv
+        return None
+
+    def list_public_conversations(self, limit: int = 50) -> List[Conversation]:
+        """Public conversations, newest first, for the share directory."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM conversation WHERE (meta->>'public') = 'true' "
+                "ORDER BY updated_at DESC LIMIT %s",
+                (limit,),
+            ).fetchall()
+        ids = [
+            str(r["id"] if hasattr(r, "get") else r[0]) for r in rows
+        ]
+        found = (self.get_conversation(cid) for cid in ids)
+        return [c for c in found if c]
+
     def delete_conversation(
         self, conversation_id: str, *, user_id: Optional[str] = None
     ) -> bool:
