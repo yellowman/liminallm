@@ -163,8 +163,8 @@ def test_marker_lookalikes_are_defanged():
 def test_wrapper_states_the_trust_boundary():
     wrapped = wrap_untrusted("some page text", source="http://example.com/x")
     lowered = wrapped.lower()
-    assert "untrusted data" in lowered
-    assert "never follow directions" in lowered
+    assert "untrusted" in lowered
+    assert "not follow directions" in lowered
     assert "http://example.com/x" in wrapped
 
 

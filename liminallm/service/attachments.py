@@ -197,21 +197,16 @@ def build_attachment_preamble(
     if not attachments:
         return ""
     parts = [
-        "The user has attached files to this conversation:",
+        "Files attached to this conversation:",
         describe_attachments(attachments),
     ]
     inline = read_inline_contents(attachments, fs_root=fs_root, user_id=user_id)
     for item in inline:
         parts.append(f"\n--- contents of {item['name']} ---\n{item['content']}")
+    # Which capability applies to these files; how each tool works is already
+    # in its schema description — say it once, there.
     if any(a.get("searchable") for a in attachments):
-        parts.append(
-            "\nCall file_search to look inside the searchable files; you may "
-            "call it several times with different phrasings. Cite the file "
-            "names you used."
-        )
+        parts.append("\nUse file_search to look inside the searchable files.")
     if any(a.get("analyzable") for a in attachments):
-        parts.append(
-            "\nCall run_python to parse, unzip, or compute over the files "
-            "(they are in the current working directory)."
-        )
+        parts.append("\nUse run_python to work on the files directly.")
     return "\n".join(parts)
