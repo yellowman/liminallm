@@ -1496,15 +1496,22 @@ const refreshTurnLabels = async () => {
       { headers: headers() },
       'Failed to refresh labels'
     );
-    // Match positionally, not by id: messages appended live during a send have
-    // no data-id (only history-rendered ones do), but the order is the same.
+    // Messages appended live during a send have no data-id (only
+    // history-rendered ones do), so fall back to positional matching — but
+    // align from the END, not the start: the API returns the newest page of
+    // messages, so when either side is truncated the two lists share their
+    // tail, not their head. Aligning from the start pinned label N onto turn 0.
     const userMessages = (envelope.data?.messages || [])
       .filter((m) => m.role === 'user')
       .sort((a, b) => (a.seq || 0) - (b.seq || 0));
     const rendered = [...(messagesEl?.querySelectorAll('.message.user') || [])];
+    const offset = rendered.length - userMessages.length;
     let patched = false;
     rendered.forEach((el, i) => {
-      const label = userMessages[i]?.meta?.turn_label;
+      const m = el.dataset.id
+        ? userMessages.find((x) => x.id === el.dataset.id)
+        : userMessages[i - offset];
+      const label = m?.meta?.turn_label;
       if (label && el.dataset.turnLabel !== label) {
         el.dataset.turnLabel = label;
         patched = true;

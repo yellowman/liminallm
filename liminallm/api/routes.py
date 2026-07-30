@@ -123,6 +123,7 @@ from liminallm.service.attachments import (
 )
 from liminallm.service.auth import AuthContext
 from liminallm.service import labels
+from liminallm.service.upload_policy import ALLOWED_UPLOAD_EXTENSIONS
 from liminallm.service.errors import BadRequestError, NotFoundError
 from liminallm.service.sandbox import SandboxError
 from liminallm.service.fs import (
@@ -147,29 +148,9 @@ from liminallm.storage.models import Conversation, KnowledgeContext, Session
 
 logger = get_logger(__name__)
 
-# File upload policy (SPEC §17): allowed extensions returned via /files/limits
-ALLOWED_UPLOAD_EXTENSIONS = {
-    ".txt",
-    ".md",
-    ".pdf",
-    ".json",
-    ".csv",
-    ".tsv",
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".webp",
-    ".mp3",
-    ".wav",
-    ".ogg",
-    # Archives are stored as-is and expanded only via POST /files/{name}/extract
-    # (never auto-ingested); extraction enforces zip-bomb and zip-slip limits.
-    ".zip",
-    ".tar",
-    ".tgz",
-    ".gz",
-}
+# ALLOWED_UPLOAD_EXTENSIONS (SPEC §17) is imported above from
+# service.upload_policy so the tool sandbox can apply the same policy; it stays
+# importable from this module because callers and tests reference it here.
 
 router = APIRouter(prefix="/v1")
 

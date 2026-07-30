@@ -37,6 +37,7 @@ from liminallm.service.embeddings import (
 from liminallm.service import attachments as attachments_service
 from liminallm.service import interpreter
 from liminallm.service import web
+from liminallm.service.upload_policy import ALLOWED_UPLOAD_EXTENSIONS
 from liminallm.service.errors import BadRequestError
 from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
@@ -2280,7 +2281,10 @@ class WorkflowEngine:
             code, workdir=session["workdir"], timeout=self.PYTHON_TOOL_TIMEOUT
         )
         published = interpreter.publish_artifacts(
-            session["workdir"], str(files_dir), result.get("created_files") or []
+            session["workdir"],
+            str(files_dir),
+            result.get("created_files") or [],
+            allowed_extensions=ALLOWED_UPLOAD_EXTENSIONS,
         )
         parts = []
         if result.get("stdout"):
@@ -2608,6 +2612,10 @@ class WorkflowEngine:
         snippets: List[str] = []
         tool_trace: List[dict] = []
         usage: Dict[str, Any] = {}
+        content = ""
+        # Once a token has reached the client, restarting on the plain node
+        # would append a second answer to the same bubble.
+        emitted_tokens = False
         deadline = time.monotonic() + self.AGENT_DEADLINE_SECONDS
 
         def _turn(msgs: List[dict], offer: List[dict]) -> dict:
@@ -2684,6 +2692,7 @@ class WorkflowEngine:
                 kind = event.get("event")
                 if kind == "token":
                     content_parts.append(str(event.get("data") or ""))
+                    emitted_tokens = True
                     yield event
                 elif kind == "message_done":
                     data = event.get("data") or {}
@@ -2700,7 +2709,24 @@ class WorkflowEngine:
                 "attachment_agent_stream_failed",
                 conversation_id=conversation_id,
                 error=str(exc),
+                emitted_tokens=emitted_tokens,
             )
+            if emitted_tokens:
+                # Keep the partial answer rather than gluing a second one after
+                # it; the caller stores what was streamed.
+                content = "".join(content_parts)
+                interpreter.cleanup_workdir(session.pop("workdir", None))
+                yield {
+                    "event": "message_done",
+                    "data": {
+                        "content": content,
+                        "usage": usage,
+                        "context_snippets": snippets,
+                        "tool_calls": tool_trace,
+                        "injection_findings": session.get("injection_findings", []),
+                    },
+                }
+                return
             async for event in self._stream_llm_node(
                 node,
                 user_message=user_message,

@@ -36,7 +36,7 @@ import socket
 from html import unescape
 from html.parser import HTMLParser
 from typing import Any, Optional
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 import httpx
 
@@ -338,35 +338,57 @@ def fetch_url(
         cookies=None,
         trust_env=False if proxy else True,
     ) as client:
+        body = b""
         for _ in range(MAX_REDIRECTS + 1):
             try:
-                response = client.get(current, headers=headers)
+                # Stream rather than read: a hostile server can advertise a
+                # small page and send gigabytes, so stop pulling bytes at the
+                # cap instead of buffering the whole body and truncating after.
+                with client.stream("GET", current, headers=headers) as response:
+                    if response.is_redirect:
+                        location = response.headers.get("location")
+                        if not location:
+                            raise WebFetchError("redirect without a target")
+                        current = validate_url(
+                            urljoin(current, location), allow_private=allow_private
+                        )
+                        continue
+
+                    if response.status_code >= 400:
+                        raise WebFetchError(
+                            f"server returned HTTP {response.status_code}"
+                        )
+                    content_type = (
+                        (response.headers.get("content-type") or "")
+                        .split(";")[0]
+                        .strip()
+                        .lower()
+                    )
+                    if content_type and not content_type.startswith(
+                        ALLOWED_CONTENT_PREFIXES
+                    ):
+                        raise WebFetchError(
+                            f"unsupported content type '{content_type}'"
+                        )
+                    chunks: list[bytes] = []
+                    read = 0
+                    for chunk in response.iter_bytes():
+                        chunks.append(chunk)
+                        read += len(chunk)
+                        if read >= max_bytes:
+                            break
+                    body = b"".join(chunks)[:max_bytes]
+                    final_url = str(response.url)
+                    encoding = response.encoding
+                break
             except httpx.TimeoutException as exc:
                 raise WebFetchError("the request timed out") from exc
             except httpx.HTTPError as exc:
                 raise WebFetchError(f"request failed: {exc}") from exc
-
-            if response.is_redirect:
-                location = response.headers.get("location")
-                if not location:
-                    raise WebFetchError("redirect without a target")
-                current = validate_url(
-                    urljoin(current, location), allow_private=allow_private
-                )
-                continue
-            break
         else:
             raise WebFetchError("too many redirects")
 
-    if response.status_code >= 400:
-        raise WebFetchError(f"server returned HTTP {response.status_code}")
-
-    content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
-    if content_type and not content_type.startswith(ALLOWED_CONTENT_PREFIXES):
-        raise WebFetchError(f"unsupported content type '{content_type}'")
-
-    body = response.content[:max_bytes]
-    charset = response.encoding or "utf-8"
+    charset = encoding or "utf-8"
     try:
         raw = body.decode(charset, errors="replace")
     except LookupError:
@@ -388,7 +410,7 @@ def fetch_url(
     findings = title_findings + findings
     if len(findings) > MAX_INJECTION_FINDINGS:
         logger.warning(
-            "web_fetch_refused_injection", url=str(response.url), findings=len(findings)
+            "web_fetch_refused_injection", url=final_url, findings=len(findings)
         )
         raise WebFetchError(
             f"refusing to use this page: {len(findings)} prompt-injection "
@@ -397,12 +419,12 @@ def fetch_url(
     if findings:
         logger.warning(
             "web_fetch_injection_redacted",
-            url=str(response.url),
+            url=final_url,
             findings=[f["type"] for f in findings],
         )
 
     return {
-        "url": str(response.url),
+        "url": final_url,
         "title": title,
         "text": text,
         "truncated": truncated,
@@ -541,13 +563,31 @@ _DDG_RESULT_RE = re.compile(
 )
 
 
+def _unwrap_ddg_url(href: str) -> str:
+    """Recover the destination from DuckDuckGo's redirect wrapper.
+
+    Result links come back as protocol-relative wrappers such as
+    ``//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.com%2Fx``; taking the href
+    verbatim yields a URL that fails the http(s) check and drops the result.
+    """
+    href = unescape(href or "").strip()
+    if href.startswith("//"):
+        href = "https:" + href
+    parsed = urlparse(href)
+    if "duckduckgo.com" in (parsed.hostname or "") and parsed.query:
+        target = parse_qs(parsed.query).get("uddg", [None])[0]
+        if target:
+            return target
+    return href
+
+
 def _results_from_ddg_html(html: str) -> list[dict[str, str]]:
     """Best-effort parse of DuckDuckGo's HTML endpoint (no API key needed)."""
     results = []
     for match in _DDG_RESULT_RE.finditer(html):
         _, title = html_to_text(match.group("title"))
         results.append(
-            {"title": title, "url": unescape(match.group("url")), "snippet": ""}
+            {"title": title, "url": _unwrap_ddg_url(match.group("url")), "snippet": ""}
         )
     return results
 

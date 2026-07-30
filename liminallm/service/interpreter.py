@@ -162,8 +162,18 @@ def prepare_workdir(
     return str(workdir)
 
 
-def publish_artifacts(workdir: str, dest_dir: str, created: list[dict]) -> list[str]:
-    """Copy files the code produced into the user's file area."""
+def publish_artifacts(
+    workdir: str,
+    dest_dir: str,
+    created: list[dict],
+    allowed_extensions: Optional[set[str]] = None,
+) -> list[str]:
+    """Copy files the code produced into the user's file area.
+
+    Model-written code chooses these filenames, so they go through the same
+    extension policy as an upload: publishing arbitrary types would let the
+    interpreter put files into the user's area that /files/upload would reject.
+    """
     published: list[str] = []
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
@@ -171,6 +181,9 @@ def publish_artifacts(workdir: str, dest_dir: str, created: list[dict]) -> list[
         name = str(item.get("name") or "")
         if not name or "/" in name or name.startswith("."):
             continue
+        if allowed_extensions is not None:
+            if Path(name).suffix.lower() not in allowed_extensions:
+                continue
         src = Path(workdir) / name
         if not src.is_file() or src.stat().st_size > MAX_ARTIFACT_BYTES:
             continue
