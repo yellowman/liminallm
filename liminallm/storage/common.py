@@ -533,6 +533,31 @@ def get_default_tool_specs() -> List[dict]:
         },
         {
             "kind": "tool.spec",
+            "name": "web.search_v1",
+            "description": (
+                "Search the public web. Results are sanitized and scanned for "
+                "prompt injection before the model sees them."
+            ),
+            "inputs": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "optional": True},
+            },
+            "handler": "web.search_v1",
+            "timeout_seconds": 30,
+        },
+        {
+            "kind": "tool.spec",
+            "name": "web.fetch_v1",
+            "description": (
+                "Read a web page as untrusted data. Blocks private/reserved "
+                "addresses, strips hidden content, and redacts injections."
+            ),
+            "inputs": {"url": {"type": "string"}},
+            "handler": "web.fetch_v1",
+            "timeout_seconds": 30,
+        },
+        {
+            "kind": "tool.spec",
             "name": "code.python_v1",
             "description": (
                 "Run Python in a resource-limited sandbox whose working "

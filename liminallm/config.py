@@ -462,6 +462,47 @@ class Settings(BaseModel):
         "TOOL_FETCH_TIMEOUT",
         description="Total timeout (seconds) for tool HTTP fetches",
     )
+    # Web tools (SPEC §18). Browsing is enabled by default but constrained:
+    # SSRF protection is always on, and search stays inert until a provider and
+    # its key are configured.
+    web_tools_enabled: bool = env_field(
+        True,
+        "WEB_TOOLS_ENABLED",
+        description="Allow the model to call web_search / web_fetch",
+    )
+    web_search_provider: str = env_field(
+        "none",
+        "WEB_SEARCH_PROVIDER",
+        description="Search backend: none | brave | tavily | google_cse | duckduckgo",
+    )
+    web_search_api_key: str | None = env_field(
+        None,
+        "WEB_SEARCH_API_KEY",
+        description="API key for the configured web search provider",
+    )
+    web_search_engine_id: str | None = env_field(
+        None,
+        "WEB_SEARCH_ENGINE_ID",
+        description="Search engine ID (google_cse only)",
+    )
+    web_fetch_timeout: float = env_field(
+        15.0,
+        "WEB_FETCH_TIMEOUT",
+        description="Total timeout (seconds) for a web page fetch",
+    )
+    web_fetch_max_bytes: int = env_field(
+        2 * 1024 * 1024,
+        "WEB_FETCH_MAX_BYTES",
+        description="Maximum bytes read from a fetched page",
+    )
+    web_fetch_allow_private: bool = env_field(
+        False,
+        "WEB_FETCH_ALLOW_PRIVATE",
+        description=(
+            "TEST ONLY: permit fetching private/loopback addresses. Disables "
+            "SSRF protection — never enable in production."
+        ),
+    )
     enable_mfa: bool = env_field(
         True,
         "ENABLE_MFA",

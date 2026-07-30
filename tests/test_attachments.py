@@ -361,7 +361,9 @@ def test_streaming_agent_emits_tool_traces_then_tokens(client, user, tool_callin
         e for e in events if e["event"] == "trace" and (e.get("data") or {}).get("tool")
     ]
     assert tool_traces, kinds
-    assert {t["data"]["tool"] for t in tool_traces} <= {"file_search", "run_python"}
+    assert {t["data"]["tool"] for t in tool_traces} <= {
+        "file_search", "run_python", "web_search", "web_fetch",
+    }
 
     tokens = [e for e in events if e["event"] == "token"]
     assert len(tokens) > 1, f"expected a token stream, got {len(tokens)}"

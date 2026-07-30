@@ -883,6 +883,19 @@ button.minor:hover {
   letter-spacing: 0.06em;
 }
 
+/* Prompt-injection notice on an answer that read untrusted web content */
+.msg-warning {
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--danger);
+  background: var(--danger-light);
+  border-radius: 4px;
+  font-family: var(--font);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--danger);
+}
+
 /* Copy-message affordance: quiet until the message is hovered */
 .msg-actions {
   display: flex;

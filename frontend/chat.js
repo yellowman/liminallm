@@ -1829,6 +1829,13 @@ const createStreamingMessage = (role) => {
       contentWrap.insertBefore(actionsEl, metaEl);
       if (meta) metaEl.textContent = meta;
     },
+    /** Show a warning banner above the message meta */
+    warn(text) {
+      const el = document.createElement('div');
+      el.className = 'msg-warning';
+      el.textContent = text;
+      contentWrap.insertBefore(el, metaEl);
+    },
     /** Get the accumulated content */
     getContent() {
       return content;
@@ -1851,6 +1858,21 @@ let typingEl = null;
 const TOOL_ACTIVITY_LABELS = {
   file_search: 'Searching your files',
   run_python: 'Running code',
+  web_search: 'Searching the web',
+  web_fetch: 'Reading a web page',
+};
+
+// Injection attempts found in fetched pages, surfaced from the workflow trace.
+const injectionFindingsFromTrace = (trace) => {
+  const kinds = [];
+  for (const entry of Array.isArray(trace) ? trace : []) {
+    const found = [
+      ...(entry?.injection_findings || []),
+      ...(entry?.outputs?.injection_findings || []),
+    ];
+    for (const kind of found) if (!kinds.includes(kind)) kinds.push(kind);
+  }
+  return kinds;
 };
 
 const showTypingIndicator = (label = '') => {
@@ -2090,6 +2112,15 @@ const sendMessage = async (event) => {
                   if (tools.length) bits.push(`Used: ${tools.join(', ')}`);
                   if (adapters.length) bits.push(`Adapters: ${adapters.join(', ')}`);
                   streamingMsg.finalize(bits.join(' · '));
+                  // A page tried to hijack the model: say so where the user
+                  // reads the answer, not just in the server log.
+                  const injections = injectionFindingsFromTrace(messageDoneData.workflow_trace);
+                  if (injections.length) {
+                    streamingMsg.warn(
+                      `A fetched page attempted a prompt injection (${injections.join(', ')}). ` +
+                      'It was redacted — treat this answer with extra care.'
+                    );
+                  }
                 }
                 // Older servers relayed an interim message_done without IDs
                 // before the persisted one; only settle once we have the
