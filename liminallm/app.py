@@ -232,7 +232,7 @@ async def add_security_headers(request, call_next):
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
     # Issue 52.3: Add Cache-Control header to prevent caching of API responses
     # API responses should not be cached by proxies/CDNs to prevent data leakage
-    if request.url.path.startswith("/v1/") or request.url.path in ("/healthz", "/metrics"):
+    if request.url.path.startswith("/v1/") or request.url.path in ("/healthz", "/readyz", "/metrics"):
         response.headers.setdefault("Cache-Control", "no-store, no-cache, must-revalidate, private")
     response.headers.setdefault(
         "Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()"
@@ -416,27 +416,21 @@ async def serve_voice_file(user_id: str, filename: str, request: Request) -> Fil
 HEALTH_CHECK_TIMEOUT_SECONDS = 3
 
 
-@app.get("/healthz")
-async def health() -> Dict[str, Any]:
-    """Health check endpoint per SPEC §18.
+async def _dependency_checks() -> tuple[Dict[str, Dict[str, Any]], bool, bool]:
+    """Probe dependencies once.
 
-    Performs dependency checks for:
-    - Database connectivity
-    - Redis availability (if configured)
-    - Filesystem mount status
+    Returns (checks, serving_ok, fully_healthy).
 
-    Reports build/version info.
+    ``serving_ok`` covers only what a replica needs in order to answer
+    requests — the database and the filesystem. Redis is deliberately excluded:
+    it is an optional accelerator (rate limits, idempotency, caches all fall
+    back), so a Redis outage must not make every replica fail its readiness
+    probe and drain the entire fleet. It still shows up as degraded in the body
+    and in ``fully_healthy`` for monitoring.
     """
     from liminallm.service.runtime import get_runtime
 
     checks: Dict[str, Dict[str, Any]] = {}
-    overall_healthy = True
-
-    # Version/build info per SPEC §18
-    version_info = {
-        "version": __version__,
-        "build": __build__,
-    }
 
     async def _run_bounded(label: str, func) -> bool:
         try:
@@ -466,13 +460,12 @@ async def health() -> Dict[str, Any]:
 
     if not checks.get("database"):
         checks["database"] = {"status": "healthy" if db_ok else "unhealthy"}
-    overall_healthy = overall_healthy and db_ok
 
-    # Redis check (if configured)
+    # Redis check (if configured). Never gates serving — see the docstring.
+    redis_ok = True
     if hasattr(runtime, "cache") and runtime.cache is not None:
         redis_ok = await _run_bounded("redis", runtime.cache.verify_connection)
         checks["redis"] = {"status": "healthy" if redis_ok else "unhealthy", "degraded": not redis_ok}
-        overall_healthy = overall_healthy and redis_ok
     else:
         checks["redis"] = {"status": "not_configured"}
 
@@ -491,17 +484,51 @@ async def health() -> Dict[str, Any]:
 
         fs_ok = await _run_bounded("filesystem", _fs_probe)
         checks["filesystem"] = {"status": "healthy" if fs_ok else "unhealthy"}
-        overall_healthy = overall_healthy and fs_ok
     else:
+        fs_ok = True
         checks["filesystem"] = {"status": "not_configured"}
 
-    status = "healthy" if overall_healthy else "unhealthy"
+    serving_ok = db_ok and fs_ok
+    return checks, serving_ok, serving_ok and redis_ok
+
+
+def _health_body(checks: Dict[str, Dict[str, Any]], healthy: bool) -> Dict[str, Any]:
     return {
-        "status": status,
+        "status": "healthy" if healthy else "unhealthy",
         "checks": checks,
-        **version_info,
+        "version": __version__,
+        "build": __build__,
         "timestamp": datetime.utcnow().isoformat(),
     }
+
+
+@app.get("/healthz")
+async def health() -> Dict[str, Any]:
+    """Human/monitoring health report. Always HTTP 200.
+
+    Reports database, Redis, and filesystem state plus build info. Kept at 200
+    regardless of status so scrapers and the settings UI can always read the
+    body; load balancers should check /readyz instead.
+    """
+    checks, _serving_ok, fully_healthy = await _dependency_checks()
+    return _health_body(checks, fully_healthy)
+
+
+@app.get("/readyz")
+async def readiness() -> Response:
+    """Load-balancer readiness probe: 200 when this replica can serve, else 503.
+
+    /healthz always returns 200 by design, which means an LB checking it can
+    never drain a broken replica. This one answers with a status code, and only
+    fails on the dependencies that actually stop the replica from working —
+    a Redis outage reports as degraded but stays ready, since every Redis-backed
+    feature has a fallback.
+    """
+    checks, serving_ok, fully_healthy = await _dependency_checks()
+    return JSONResponse(
+        _health_body(checks, fully_healthy),
+        status_code=200 if serving_ok else 503,
+    )
 
 
 @app.get("/metrics", response_class=Response)

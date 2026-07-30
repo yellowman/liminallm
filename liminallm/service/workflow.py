@@ -6,6 +6,7 @@ import copy
 import json
 import math
 import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -2272,7 +2273,16 @@ class WorkflowEngine:
         if session.get("workdir") is None:
             attachments = self._conversation_attachments(conversation_id, user_id)
             names = [a.get("name") for a in attachments if a.get("name")]
-            scratch = Path(fs_root) / "tmp" / "interpreter"
+            # Node-local, NOT under shared_fs_root: these session directories
+            # hold throwaway copies of the attachments (up to 64MB each) and
+            # exist only for the duration of one tool call. Putting them on
+            # shared storage would make every run_python call write tens of
+            # megabytes over NFS/EFS for no benefit. Only *published* artifacts
+            # go to the user's (shared) file area.
+            scratch = Path(
+                getattr(self.settings, "interpreter_scratch_dir", None)
+                or tempfile.gettempdir()
+            ) / "liminallm-interpreter"
             scratch.mkdir(parents=True, exist_ok=True)
             session["workdir"] = interpreter.prepare_workdir(
                 str(scratch), str(files_dir), names

@@ -198,3 +198,109 @@ async def _collect(engine):
             tenant_id=None,
         )
     ]
+
+
+# ---------------------------------------------------------------------------
+# Multi-replica readiness: the LB must be able to drain a broken replica, and
+# an optional-dependency outage must not drain the whole fleet
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def app_client():
+    from fastapi.testclient import TestClient
+
+    from liminallm import app as app_module
+
+    return TestClient(app_module.app)
+
+
+def test_healthz_stays_200_for_monitoring(app_client):
+    resp = app_client.get("/healthz")
+    assert resp.status_code == 200
+    assert "checks" in resp.json()
+
+
+def test_readyz_reports_ready_when_serving(app_client):
+    resp = app_client.get("/readyz")
+    assert resp.status_code == 200
+
+
+def test_readyz_returns_503_when_the_database_is_down(app_client, monkeypatch):
+    """/healthz is always 200, so an LB checking it can never drain a replica."""
+    from liminallm.service.runtime import get_runtime
+
+    runtime = get_runtime()
+
+    def _boom():
+        raise RuntimeError("database unreachable")
+
+    monkeypatch.setattr(runtime.store, "verify_connection", _boom, raising=False)
+    resp = app_client.get("/readyz")
+    assert resp.status_code == 503
+    assert resp.json()["checks"]["database"]["status"] == "unhealthy"
+    # The monitoring endpoint still answers 200 with the detail.
+    assert app_client.get("/healthz").status_code == 200
+
+
+def test_redis_outage_reports_degraded_but_stays_ready(app_client, monkeypatch):
+    """Redis is optional, so losing it must not fail every replica's readiness."""
+    from liminallm.service.runtime import get_runtime
+
+    runtime = get_runtime()
+
+    class _DeadCache:
+        def verify_connection(self):
+            raise RuntimeError("redis unreachable")
+
+    monkeypatch.setattr(runtime, "cache", _DeadCache(), raising=False)
+    resp = app_client.get("/readyz")
+    assert resp.status_code == 200, "a Redis blip must not drain the fleet"
+    body = resp.json()
+    assert body["checks"]["redis"]["degraded"] is True
+    assert body["status"] == "unhealthy"  # surfaced for monitoring
+
+
+def test_load_balancer_health_check_paths_are_real(app_client):
+    """The LB checked /v1/health, which the app never served (404 -> all down).
+
+    Behaviour-based on purpose: it asks the app whether the configured probe
+    path actually answers, rather than trusting a route-table introspection.
+    """
+    import re
+    from pathlib import Path
+
+    configured = re.findall(
+        r'check http\s+"([^"]+)"', Path("deploy/openbsd/relayd.conf").read_text()
+    )
+    assert configured, "relayd.conf should configure a health check"
+    for path in configured:
+        status = app_client.get(path).status_code
+        assert status != 404, f"relayd checks {path}, which the app does not serve"
+        assert status == 200, f"{path} returned {status}; relayd expects 200 when healthy"
+
+
+def test_old_health_path_is_gone_from_deploy_configs():
+    from pathlib import Path
+
+    for config in ("deploy/openbsd/relayd.conf", "deploy/openbsd/httpd.conf"):
+        assert "/v1/health" not in Path(config).read_text(), config
+
+
+def test_interpreter_scratch_is_not_on_shared_storage(tmp_path, monkeypatch):
+    """Session dirs are throwaway copies; shared storage would be pure overhead."""
+    from liminallm.service.runtime import get_runtime
+
+    runtime = get_runtime()
+    engine = runtime.workflow
+    shared = tmp_path / "shared"
+    (shared / "users" / "u1" / "files").mkdir(parents=True)
+    monkeypatch.setattr(engine.settings, "shared_fs_root", str(shared), raising=False)
+
+    session: dict = {}
+    engine._run_python_tool(
+        "print('hi')", conversation_id=None, user_id="u1", session=session
+    )
+    workdir = session.get("workdir")
+    assert workdir, "the tool should have created a session dir"
+    assert str(shared) not in workdir, f"session dir landed on shared storage: {workdir}"

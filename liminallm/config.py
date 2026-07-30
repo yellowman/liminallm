@@ -462,6 +462,15 @@ class Settings(BaseModel):
         "TOOL_FETCH_TIMEOUT",
         description="Total timeout (seconds) for tool HTTP fetches",
     )
+    interpreter_scratch_dir: str | None = env_field(
+        None,
+        "INTERPRETER_SCRATCH_DIR",
+        description=(
+            "Node-local directory for code-interpreter session dirs. Defaults "
+            "to the system temp dir. Must NOT be on shared storage: these hold "
+            "throwaway copies of attachments for one tool call."
+        ),
+    )
     # Web tools (SPEC §18). Browsing is enabled by default but constrained:
     # SSRF protection is always on, and search stays inert until a provider and
     # its key are configured.
