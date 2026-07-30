@@ -317,3 +317,65 @@ def test_chat_without_attachments_uses_the_normal_workflow(client, user):
     assert resp.status_code == 200, resp.json()
     # No attachment agent, so no tool-result echo.
     assert "Tool results" not in resp.json()["data"]["content"]
+
+
+# ---------------------------------------------------------------------------
+# Streaming: tool rounds first, then a token-streamed answer
+# ---------------------------------------------------------------------------
+
+
+async def _collect_stream(engine, **kwargs):
+    return [event async for event in engine.run_streaming(**kwargs)]
+
+
+def test_streaming_agent_emits_tool_traces_then_tokens(client, user, tool_calling_backend):
+    """The attachment answer must stream, not arrive in one lump."""
+    import asyncio
+
+    from liminallm.service.runtime import get_runtime
+
+    conv = make_conversation(client, user)
+    upload(
+        client, user, "corpus.md",
+        ("turbine maintenance notes. " * 900).encode(), "text/markdown",
+        conversation_id=conv,
+    )
+
+    runtime = get_runtime()
+    me = client.get("/v1/me", headers=user).json()["data"]
+    events = asyncio.run(
+        _collect_stream(
+            runtime.workflow,
+            workflow_id=None,
+            conversation_id=conv,
+            user_message="What do the notes say about turbines?",
+            context_id=None,
+            user_id=me["id"],
+            tenant_id=me.get("tenant_id"),
+        )
+    )
+    kinds = [e["event"] for e in events]
+
+    # Tool activity is announced before the answer streams.
+    tool_traces = [
+        e for e in events if e["event"] == "trace" and (e.get("data") or {}).get("tool")
+    ]
+    assert tool_traces, kinds
+    assert {t["data"]["tool"] for t in tool_traces} <= {"file_search", "run_python"}
+
+    tokens = [e for e in events if e["event"] == "token"]
+    assert len(tokens) > 1, f"expected a token stream, got {len(tokens)}"
+
+    first_token_at = kinds.index("token")
+    first_trace_at = next(
+        i for i, e in enumerate(events)
+        if e["event"] == "trace" and (e.get("data") or {}).get("tool")
+    )
+    assert first_trace_at < first_token_at, "tools must run before the answer streams"
+
+    done = events[-1]
+    assert done["event"] == "message_done"
+    assert done["data"]["content"] == "".join(t["data"] for t in tokens)
+    # Citations and the tool list survive the streaming path.
+    assert done["data"]["context_snippets"]
+    assert [c["tool"] for c in done["data"]["workflow_trace"][0]["tool_calls"]]

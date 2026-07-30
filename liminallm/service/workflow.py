@@ -858,21 +858,45 @@ class WorkflowEngine:
             node_type = node.get("type", "tool_call")
             tool_name = node.get("tool", "")
 
-            # Handle streaming for LLM-based tools
-            if node_type == "tool_call" and tool_name in {"llm.generic", "llm.generic_chat_v1"}:
-                # Stream tokens from LLM
-                async for event in self._stream_llm_node(
-                    node,
-                    user_message=user_message,
-                    context_id=context_id,
-                    adapters=adapters,
-                    history=history,
-                    vars_scope=vars_scope,
-                    user_id=user_id,
-                    tenant_id=tenant_id,
-                    cancel_event=cancel_event,
-                ):
+            # Handle streaming for LLM-based tools. The attachment agent streams
+            # too: its tool rounds emit trace events, then the answer streams.
+            if node_type == "tool_call" and tool_name in {
+                "llm.generic",
+                "llm.generic_chat_v1",
+                "agent.files_v1",
+            }:
+                node_stream = (
+                    self._stream_agent_files_node(
+                        node,
+                        user_message=user_message,
+                        context_id=context_id,
+                        conversation_id=conversation_id,
+                        adapters=adapters,
+                        history=history,
+                        vars_scope=vars_scope,
+                        user_id=user_id,
+                        tenant_id=tenant_id,
+                        cancel_event=cancel_event,
+                    )
+                    if tool_name == "agent.files_v1"
+                    else self._stream_llm_node(
+                        node,
+                        user_message=user_message,
+                        context_id=context_id,
+                        adapters=adapters,
+                        history=history,
+                        vars_scope=vars_scope,
+                        user_id=user_id,
+                        tenant_id=tenant_id,
+                        cancel_event=cancel_event,
+                    )
+                )
+                async for event in node_stream:
                     if event["event"] == "token":
+                        yield event
+                    elif event["event"] == "trace":
+                        # Tool-activity notices from the attachment agent pass
+                        # straight through for the UI to display.
                         yield event
                     elif event["event"] == "message_done":
                         # Update state from completed message
@@ -880,15 +904,22 @@ class WorkflowEngine:
                         content = data.get("content", "")
                         node_usage = data.get("usage", {})
                         usage = self._merge_usage(usage, node_usage)
-                        self._append_trace(
-                            workflow_trace,
-                            {
-                                "node": node_id,
-                                "status": "ok",
-                                "content": content,
-                                "usage": node_usage,
-                            },
-                        )
+                        for snippet in data.get("context_snippets") or []:
+                            if (
+                                snippet not in context_seen
+                                and len(context_snippets) < MAX_CONTEXT_SNIPPETS
+                            ):
+                                context_seen.add(snippet)
+                                context_snippets.append(snippet)
+                        entry: Dict[str, Any] = {
+                            "node": node_id,
+                            "status": "ok",
+                            "content": content,
+                            "usage": node_usage,
+                        }
+                        if data.get("tool_calls"):
+                            entry["tool_calls"] = data["tool_calls"]
+                        self._append_trace(workflow_trace, entry)
                         # Emit trace event
                         yield {"event": "trace", "data": {"workflow_trace": workflow_trace[-1]}}
                     elif event["event"] == "error":
@@ -2260,6 +2291,250 @@ class WorkflowEngine:
             interpreter.cleanup_workdir(session.get("workdir"))
         return {"content": output, "usage": {}}
 
+    def _build_agent_context(
+        self,
+        message: str,
+        attachments: List[dict],
+        history: List[Any],
+        user_id: Optional[str],
+    ) -> Tuple[List[dict], List[dict], str]:
+        """Messages, offered tools, and the preamble for an attachment turn."""
+        fs_root = getattr(self.settings, "shared_fs_root", "/srv/liminallm")
+        preamble = attachments_service.build_attachment_preamble(
+            attachments, fs_root=fs_root, user_id=user_id or ""
+        )
+        tools: List[dict] = []
+        if any(a.get("searchable") for a in attachments):
+            tools.append(self.FILE_SEARCH_SCHEMA)
+        if any(a.get("analyzable") for a in attachments):
+            tools.append(self.RUN_PYTHON_SCHEMA)
+
+        messages: List[dict] = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a concise assistant. Answer using the attached "
+                    "files. When you use a file, name it in your answer.\n\n"
+                    + preamble
+                ),
+            }
+        ]
+        for msg in history or []:
+            role = getattr(msg, "role", None)
+            content = getattr(msg, "content", None)
+            if role in {"user", "assistant"} and content:
+                messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": message})
+        return messages, tools, preamble
+
+    def _execute_agent_tool(
+        self,
+        name: str,
+        args: Dict[str, Any],
+        *,
+        conversation_id: Optional[str],
+        context_id: Optional[str],
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+        session: dict,
+        snippets: List[str],
+        fallback_query: str,
+    ) -> str:
+        """Run one model-requested tool and return its text result."""
+        if name == "file_search":
+            result, found = self._run_file_search(
+                str(args.get("query") or fallback_query),
+                int(args.get("limit") or 4),
+                conversation_id=conversation_id,
+                context_id=context_id,
+                user_id=user_id,
+                tenant_id=tenant_id,
+            )
+            snippets.extend(found)
+            return result
+        if name == "run_python":
+            return self._run_python_tool(
+                str(args.get("code") or ""),
+                conversation_id=conversation_id,
+                user_id=user_id,
+                session=session,
+            )
+        return f"unknown tool '{name}'"
+
+    @staticmethod
+    def _parse_tool_arguments(call: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            args = json.loads(call.get("arguments") or "{}")
+        except (TypeError, ValueError):
+            return {}
+        return args if isinstance(args, dict) else {}
+
+    async def _stream_agent_files_node(
+        self,
+        node: Dict[str, Any],
+        *,
+        user_message: str,
+        context_id: Optional[str],
+        conversation_id: Optional[str],
+        adapters: List[dict],
+        history: List[Any],
+        vars_scope: Dict[str, Any],
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+        cancel_event: Optional[asyncio.Event] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Attachment agent with a streamed final answer.
+
+        The tool-calling rounds run to completion first (they return function
+        calls, not prose), each emitting a trace event so the UI can say what
+        the model is doing; the answer itself is then streamed token by token.
+        """
+        inputs = self._resolve_inputs(node.get("inputs", {}), user_message, vars_scope)
+        message = inputs.get("message") or user_message or ""
+        attachments = self._conversation_attachments(conversation_id, user_id)
+
+        if not attachments or not self.llm.supports_tools:
+            async for event in self._stream_llm_node(
+                node,
+                user_message=user_message,
+                context_id=context_id,
+                adapters=adapters,
+                history=history,
+                vars_scope=vars_scope,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                cancel_event=cancel_event,
+            ):
+                yield event
+            return
+
+        messages, tools, _ = self._build_agent_context(
+            message, attachments, history, user_id
+        )
+        session: dict = {}
+        snippets: List[str] = []
+        tool_trace: List[dict] = []
+        usage: Dict[str, Any] = {}
+        deadline = time.monotonic() + self.AGENT_DEADLINE_SECONDS
+
+        def _turn(msgs: List[dict], offer: List[dict]) -> dict:
+            with tool_network_guard(self.tool_network_policy):
+                return self.llm.generate_with_tools(
+                    msgs, offer, adapters, user_id=user_id
+                )
+
+        def _run_tool(name: str, args: Dict[str, Any]) -> str:
+            with tool_network_guard(self.tool_network_policy):
+                return self._execute_agent_tool(
+                    name,
+                    args,
+                    conversation_id=conversation_id,
+                    context_id=context_id,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    session=session,
+                    snippets=snippets,
+                    fallback_query=message,
+                )
+
+        try:
+            # Tool rounds. One round is always reserved for the streamed answer.
+            for _ in range(max(0, self.MAX_AGENT_ROUNDS - 1)):
+                if cancel_event and cancel_event.is_set():
+                    yield {"event": "cancel_ack", "data": {}}
+                    return
+                if time.monotonic() > deadline:
+                    break
+                response = await asyncio.to_thread(_turn, messages, tools)
+                usage = self._merge_usage(usage, response.get("usage") or {})
+                calls = response.get("tool_calls") or []
+                if not calls:
+                    # The model answered without tools; keep its message out of
+                    # the history so the streamed turn produces the text.
+                    break
+                messages.append(
+                    response.get("assistant_message")
+                    or {"role": "assistant", "content": response.get("content") or ""}
+                )
+                for call in calls:
+                    name = call.get("name") or ""
+                    args = self._parse_tool_arguments(call)
+                    # Tell the client what is happening before the slow part.
+                    yield {"event": "trace", "data": {"tool": name, "status": "running"}}
+                    result = await asyncio.to_thread(_run_tool, name, args)
+                    tool_trace.append({"tool": name, "arguments": args})
+                    self.logger.info(
+                        "attachment_tool_called",
+                        tool=name,
+                        conversation_id=conversation_id,
+                        user_id=user_id,
+                        streaming=True,
+                    )
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.get("id") or name,
+                            "name": name,
+                            "content": result,
+                        }
+                    )
+
+            # Final turn: no tools offered, so the model must answer — streamed.
+            content_parts: List[str] = []
+            stream = await asyncio.to_thread(
+                self.llm.stream_messages, messages, adapters, user_id=user_id
+            )
+            for event in stream:
+                if cancel_event and cancel_event.is_set():
+                    yield {"event": "cancel_ack", "data": {}}
+                    return
+                kind = event.get("event")
+                if kind == "token":
+                    content_parts.append(str(event.get("data") or ""))
+                    yield event
+                elif kind == "message_done":
+                    data = event.get("data") or {}
+                    usage = self._merge_usage(usage, data.get("usage") or {})
+                    if data.get("content"):
+                        content_parts = [str(data["content"])]
+                elif kind == "error":
+                    yield event
+                    return
+                await asyncio.sleep(0)
+            content = "".join(content_parts)
+        except Exception as exc:  # noqa: BLE001 - degrade to a plain answer
+            self.logger.warning(
+                "attachment_agent_stream_failed",
+                conversation_id=conversation_id,
+                error=str(exc),
+            )
+            async for event in self._stream_llm_node(
+                node,
+                user_message=user_message,
+                context_id=context_id,
+                adapters=adapters,
+                history=history,
+                vars_scope=vars_scope,
+                user_id=user_id,
+                tenant_id=tenant_id,
+                cancel_event=cancel_event,
+            ):
+                yield event
+            return
+        finally:
+            interpreter.cleanup_workdir(session.get("workdir"))
+
+        yield {
+            "event": "message_done",
+            "data": {
+                "content": content,
+                "usage": usage,
+                "context_snippets": snippets,
+                "tool_calls": tool_trace,
+                "artifacts": session.get("artifacts", []),
+            },
+        }
+
     def _tool_agent_files(
         self,
         inputs: Dict[str, Any],
@@ -2301,24 +2576,9 @@ class WorkflowEngine:
                 result.setdefault("context_snippets", []).insert(0, preamble)
             return result
 
-        tools = []
-        if any(a.get("searchable") for a in attachments):
-            tools.append(self.FILE_SEARCH_SCHEMA)
-        if any(a.get("analyzable") for a in attachments):
-            tools.append(self.RUN_PYTHON_SCHEMA)
-
-        system = (
-            "You are a concise assistant. Answer using the attached files. "
-            "When you use a file, name it in your answer.\n\n" + preamble
+        messages, tools, _ = self._build_agent_context(
+            message, attachments, history, user_id
         )
-        messages: List[dict] = [{"role": "system", "content": system}]
-        for msg in history or []:
-            role = getattr(msg, "role", None)
-            content = getattr(msg, "content", None)
-            if role in {"user", "assistant"} and content:
-                messages.append({"role": role, "content": content})
-        messages.append({"role": "user", "content": message})
-
         session: dict = {}
         snippets: List[str] = []
         tool_trace: List[dict] = []
@@ -2348,31 +2608,18 @@ class WorkflowEngine:
                 )
                 for call in calls:
                     name = call.get("name") or ""
-                    try:
-                        args = json.loads(call.get("arguments") or "{}")
-                    except (TypeError, ValueError):
-                        args = {}
-                    if not isinstance(args, dict):
-                        args = {}
-                    if name == "file_search":
-                        result, found = self._run_file_search(
-                            str(args.get("query") or message),
-                            int(args.get("limit") or 4),
-                            conversation_id=conversation_id,
-                            context_id=context_id,
-                            user_id=user_id,
-                            tenant_id=tenant_id,
-                        )
-                        snippets.extend(found)
-                    elif name == "run_python":
-                        result = self._run_python_tool(
-                            str(args.get("code") or ""),
-                            conversation_id=conversation_id,
-                            user_id=user_id,
-                            session=session,
-                        )
-                    else:
-                        result = f"unknown tool '{name}'"
+                    args = self._parse_tool_arguments(call)
+                    result = self._execute_agent_tool(
+                        name,
+                        args,
+                        conversation_id=conversation_id,
+                        context_id=context_id,
+                        user_id=user_id,
+                        tenant_id=tenant_id,
+                        session=session,
+                        snippets=snippets,
+                        fallback_query=message,
+                    )
                     tool_trace.append({"tool": name, "arguments": args})
                     self.logger.info(
                         "attachment_tool_called",

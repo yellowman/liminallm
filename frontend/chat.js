@@ -1844,17 +1844,33 @@ const scrollToBottom = () => {
   if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
 };
 
-// Three pulsing dots shown between sending a message and the first token.
+// Three pulsing dots shown between sending a message and the first token,
+// optionally labelled with what the model is currently doing.
 let typingEl = null;
 
-const showTypingIndicator = () => {
-  if (typingEl || !messagesEl) return;
-  typingEl = document.createElement('div');
-  typingEl.className = 'message assistant typing';
-  typingEl.innerHTML =
-    '<div class="bubble"><span class="typing-dots"><span></span><span></span><span></span></span></div>';
-  messagesEl.appendChild(typingEl);
+const TOOL_ACTIVITY_LABELS = {
+  file_search: 'Searching your files',
+  run_python: 'Running code',
+};
+
+const showTypingIndicator = (label = '') => {
+  if (!messagesEl) return;
+  if (!typingEl) {
+    typingEl = document.createElement('div');
+    typingEl.className = 'message assistant typing';
+    typingEl.innerHTML =
+      '<div class="bubble"><span class="typing-dots"><span></span><span></span><span></span></span>' +
+      '<span class="typing-label"></span></div>';
+    messagesEl.appendChild(typingEl);
+  }
+  const labelEl = typingEl.querySelector('.typing-label');
+  if (labelEl) labelEl.textContent = label;
   scrollToBottom();
+};
+
+// Tool activity arrives as trace events while the model works.
+const showToolActivity = (tool) => {
+  showTypingIndicator(`${TOOL_ACTIVITY_LABELS[tool] || tool}...`);
 };
 
 const hideTypingIndicator = () => {
@@ -2042,8 +2058,13 @@ const sendMessage = async (event) => {
                 break;
 
               case 'trace':
-                // Optional: Could show trace info in UI
-                console.debug('Workflow trace:', msg.data);
+                // The attachment agent reports each tool it runs, so the
+                // indicator can say what is happening during the slow part.
+                if (msg.data?.tool && !streamingMsg) {
+                  showToolActivity(msg.data.tool);
+                } else {
+                  console.debug('Workflow trace:', msg.data);
+                }
                 break;
 
               case 'message_done':

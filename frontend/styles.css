@@ -1155,6 +1155,23 @@ button.minor:hover {
   padding: 4px 0;
 }
 
+.message.typing .bubble {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.typing-label {
+  font-family: var(--font);
+  font-size: 12.5px;
+  color: var(--text-muted);
+  letter-spacing: 0.01em;
+}
+
+.typing-label:empty {
+  display: none;
+}
+
 .typing-dots {
   display: inline-flex;
   gap: 5px;

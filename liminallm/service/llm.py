@@ -109,6 +109,22 @@ class LLMService:
             user_id=user_id,
         )
 
+    def stream_messages(
+        self,
+        messages: List[dict],
+        adapters: Optional[List[dict]] = None,
+        *,
+        user_id: Optional[str] = None,
+    ) -> Iterator[dict]:
+        """Stream a reply for a caller-built message list.
+
+        Used by the attachment agent to stream its final answer after the
+        tool-calling rounds have assembled the message history.
+        """
+        return self.backend.generate_stream(
+            messages, self._normalize_adapters(adapters or []), user_id=user_id
+        )
+
     def generate_stream(
         self,
         prompt: str,
