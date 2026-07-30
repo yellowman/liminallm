@@ -122,6 +122,7 @@ from liminallm.service.attachments import (
     record_attachment,
 )
 from liminallm.service.auth import AuthContext
+from liminallm.service import labels
 from liminallm.service.errors import BadRequestError, NotFoundError
 from liminallm.service.sandbox import SandboxError
 from liminallm.service.fs import (
@@ -817,6 +818,62 @@ def _get_pagination_settings(runtime) -> dict:
         # Keep conversation pagination consistent with general defaults (SPEC pagination guidance)
         "default_conversations_limit": sys_settings.get("default_conversations_limit", 100),
     }
+
+
+# Background label tasks, held so they are not garbage-collected mid-flight.
+_LABEL_TASKS: set[asyncio.Task] = set()
+
+
+def _schedule_turn_labels(
+    runtime,
+    *,
+    conversation_id: str,
+    user_id: str,
+    user_message_id: Optional[str],
+    user_content: str,
+    assistant_content: str,
+    set_title: bool,
+) -> None:
+    """Label a finished turn (and title a new conversation) off the hot path.
+
+    A quick model call, scheduled after the reply is already on its way, so
+    describing the turn never delays the answer. Failures are logged and
+    dropped: labels are cosmetic and the heuristic fallback already applies.
+    """
+
+    async def _run() -> None:
+        try:
+            if user_message_id:
+                label = await asyncio.to_thread(
+                    labels.describe_turn, runtime.llm, user_content, assistant_content
+                )
+                await asyncio.to_thread(
+                    runtime.store.update_message_meta,
+                    user_message_id,
+                    user_id=user_id,
+                    patch={"turn_label": label},
+                )
+            if set_title:
+                title = await asyncio.to_thread(
+                    labels.describe_conversation, runtime.llm, user_content
+                )
+                await asyncio.to_thread(
+                    runtime.store.set_conversation_title,
+                    conversation_id,
+                    user_id=user_id,
+                    title=title,
+                )
+        except Exception as exc:  # noqa: BLE001 - never surface to the user
+            logger.warning(
+                "turn_labeling_failed", conversation_id=conversation_id, error=str(exc)
+            )
+
+    try:
+        task = asyncio.create_task(_run())
+    except RuntimeError:
+        return  # no running loop (sync test context): skip labelling
+    _LABEL_TASKS.add(task)
+    task.add_done_callback(_LABEL_TASKS.discard)
 
 
 def _generate_conversation_title(message: str, max_length: int = 50) -> str:
@@ -1868,7 +1925,7 @@ async def chat(
                 user_content_struct = normalize_content_struct(
                     body.message.content_struct, user_content
                 )
-                runtime.store.append_message(
+                user_msg = runtime.store.append_message(
                     conversation_id,
                     sender="user",
                     role="user",
@@ -1876,6 +1933,8 @@ async def chat(
                     meta=voice_meta or None,
                     content_struct=user_content_struct,
                 )
+                # A new conversation gets its real title from the same pass.
+                needs_title = not body.conversation_id
                 orchestration = await runtime.workflow.run(
                     body.workflow_id,
                     conversation_id,
@@ -1920,6 +1979,15 @@ async def chat(
                     context_snippets=orchestration_dict.get("context_snippets", []),
                     routing_trace=orchestration_dict.get("routing_trace", []),
                     workflow_trace=orchestration_dict.get("workflow_trace", []),
+                )
+                _schedule_turn_labels(
+                    runtime,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    user_message_id=getattr(user_msg, "id", None),
+                    user_content=user_content,
+                    assistant_content=assistant_content,
+                    set_title=needs_title,
                 )
                 envelope = Envelope(
                     status="ok", data=resp.model_dump(), request_id=idem.request_id
@@ -4596,10 +4664,12 @@ async def websocket_chat(ws: WebSocket):
             workflow_slot_acquired = True
 
         convo_id = init.get("conversation_id")
+        needs_title = not convo_id
         if convo_id:
             conversation = _get_owned_conversation(runtime, convo_id, auth_ctx)
         else:
-            # Generate title from first message for new conversations
+            # Placeholder title; a model-written one replaces it once the turn
+            # completes (see _schedule_turn_labels).
             user_message = init.get("message", "")
             auto_title = _generate_conversation_title(user_message)
             conversation = runtime.store.create_conversation(
@@ -4609,7 +4679,7 @@ async def websocket_chat(ws: WebSocket):
         context_id = init.get("context_id") or conversation.active_context_id
         if context_id:
             _get_owned_context(runtime, context_id, auth_ctx)
-        runtime.store.append_message(
+        ws_user_msg = runtime.store.append_message(
             convo_id, sender="user", role="user", content=init.get("message", "")
         )
 
@@ -4756,6 +4826,16 @@ async def websocket_chat(ws: WebSocket):
                 request_id=request_id,
             )
             await _store_idempotency_result("chat:ws", user_id, idempotency_key, envelope)
+
+            _schedule_turn_labels(
+                runtime,
+                conversation_id=convo_id,
+                user_id=user_id,
+                user_message_id=getattr(ws_user_msg, "id", None),
+                user_content=init.get("message", ""),
+                assistant_content=assistant_content,
+                set_title=needs_title,
+            )
 
             # Send final event with message_id and conversation_id to client
             # SPEC §18: Valid events are token, message_done, error, cancel_ack, trace

@@ -883,6 +883,154 @@ button.minor:hover {
   letter-spacing: 0.06em;
 }
 
+/* =========================================================================
+   Turn navigator — tick marks at the right edge that expand into a jump list
+   ========================================================================= */
+.turn-rail {
+  position: fixed;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 20;
+  padding: 10px 12px 10px 24px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.turn-rail-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 7px;
+  max-height: 60vh;
+  overflow-y: auto;
+  /* No scrollbar at rest; the expanded panel gets one only if needed. */
+  scrollbar-width: none;
+}
+
+.turn-rail-inner::-webkit-scrollbar {
+  width: 0;
+}
+
+.turn-tick {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font);
+  font-size: 12.5px;
+  text-align: right;
+  cursor: pointer;
+}
+
+.tick-mark {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 1.5px;
+  border-radius: 1px;
+  background: var(--border-strong);
+  transition: background 0.15s ease, width 0.15s ease, height 0.15s ease;
+}
+
+.turn-tick.active .tick-mark {
+  width: 24px;
+  height: 2.5px;
+  background: var(--text);
+}
+
+/* The labels exist for screen readers and for the expanded state, but take up
+   no space until the rail is hovered or focused. */
+.tick-label {
+  max-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  opacity: 0;
+  transition: max-width 0.18s ease, opacity 0.18s ease;
+}
+
+.turn-rail:hover,
+.turn-rail:focus-within {
+  padding-left: 12px;
+}
+
+.turn-rail:hover .turn-rail-inner,
+.turn-rail:focus-within .turn-rail-inner {
+  /* Explicit width so the descriptions read in full rather than ellipsing. */
+  width: 264px;
+  align-items: stretch;
+  gap: 2px;
+  padding: 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 8px 28px rgba(16, 20, 28, 0.14);
+  scrollbar-width: thin;
+}
+
+.turn-rail:hover .turn-tick,
+.turn-rail:focus-within .turn-tick {
+  padding: 5px 8px;
+  border-radius: 6px;
+  text-align: left;
+  justify-content: flex-start;
+  /* The bars are the collapsed representation of the label — once the text is
+     showing they are redundant, so they collapse away entirely. */
+  gap: 0;
+}
+
+.turn-rail:hover .tick-mark,
+.turn-rail:focus-within .tick-mark {
+  width: 0;
+  height: 0;
+  opacity: 0;
+  transition: width 0.15s ease, opacity 0.12s ease, height 0.15s ease;
+}
+
+.turn-rail:hover .tick-label,
+.turn-rail:focus-within .tick-label {
+  /* Wrap rather than ellipse: a jump list is useless if you can't read it. */
+  max-width: 240px;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  line-height: 1.35;
+  opacity: 1;
+}
+
+.turn-rail:hover .turn-tick:hover,
+.turn-rail:focus-within .turn-tick:focus-visible {
+  background: var(--panel-muted);
+  color: var(--text);
+}
+
+.turn-rail:hover .turn-tick.active,
+.turn-rail:focus-within .turn-tick.active {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* Brief highlight on the turn you jumped to */
+.message.turn-flash .bubble {
+  animation: turn-flash 1.2s ease-out;
+}
+
+@keyframes turn-flash {
+  0% { background: var(--accent-light); }
+  100% { background: inherit; }
+}
+
+@media (max-width: 1080px) {
+  .turn-rail {
+    display: none;
+  }
+}
+
 /* Prompt-injection notice on an answer that read untrusted web content */
 .msg-warning {
   margin-top: 8px;

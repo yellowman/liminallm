@@ -1327,9 +1327,17 @@ const fetchConversations = async () => {
     );
     state.conversations = envelope.data?.items || [];
     renderConversationList();
+    syncConversationTitle();
   } catch (err) {
     console.warn('Failed to fetch conversations:', err.message);
   }
+};
+
+// Keep the header in step with the (possibly just-generated) title.
+const syncConversationTitle = () => {
+  if (!conversationLabel || !state.conversationId) return;
+  const active = (state.conversations || []).find((c) => c.id === state.conversationId);
+  if (active?.title) conversationLabel.textContent = active.title;
 };
 
 const renderConversationList = () => {
@@ -1417,12 +1425,118 @@ const setConversation = (id) => {
     renderAttachmentChips();
   }
   state.conversationId = id;
-  if (conversationLabel) conversationLabel.textContent = id ? `Conversation ${id.slice(0, 8)}...` : 'New conversation';
+  if (conversationLabel) {
+    // Never show a raw UUID: use the generated title once we know it.
+    const known = (state.conversations || []).find((c) => c.id === id);
+    conversationLabel.textContent = known?.title || (id ? 'Untitled conversation' : 'New conversation');
+  }
   updateShareButton();
   if (!id) {
     state.lastAssistant = null;
     renderPreferencePanel();
   }
+};
+
+// =============================================================================
+// Turn navigator — a rail of tick marks on the right, one per turn. At rest it
+// is just the ticks; hovering or focusing it expands into a list of the
+// model-written turn descriptions, and picking one jumps to that turn.
+// =============================================================================
+
+const turnRailEl = $('turn-rail');
+const turnRailInnerEl = $('turn-rail-inner');
+
+const renderTurnRail = () => {
+  if (!turnRailInnerEl || !messagesEl) return;
+  const turns = [...messagesEl.querySelectorAll('.message.user')];
+  turnRailEl?.classList.toggle('hidden', turns.length < 2);
+  if (turns.length < 2) {
+    turnRailInnerEl.innerHTML = '';
+    return;
+  }
+  turnRailInnerEl.innerHTML = turns
+    .map((el, i) => {
+      // Prefer the generated description; fall back to the message itself so
+      // the list is never empty while labels are still being written.
+      const label = el.dataset.turnLabel || (el.dataset.raw || '').trim() || `Turn ${i + 1}`;
+      return `<button type="button" class="turn-tick" data-turn-index="${i}" title="${escapeAttr(label)}">
+        <span class="tick-mark" aria-hidden="true"></span>
+        <span class="tick-label">${escapeHtml(label)}</span>
+      </button>`;
+    })
+    .join('');
+  highlightActiveTurn();
+};
+
+// Mark the turn nearest the top of the reading area as current.
+const highlightActiveTurn = () => {
+  if (!turnRailInnerEl || !messagesEl) return;
+  const turns = [...messagesEl.querySelectorAll('.message.user')];
+  if (!turns.length) return;
+  const anchor = messagesEl.getBoundingClientRect().top + 80;
+  let active = 0;
+  turns.forEach((el, i) => {
+    if (el.getBoundingClientRect().top <= anchor) active = i;
+  });
+  turnRailInnerEl.querySelectorAll('.turn-tick').forEach((tick, i) => {
+    tick.classList.toggle('active', i === active);
+  });
+};
+
+/**
+ * Turn descriptions and the conversation title are written by a background
+ * model pass just after a reply, so fetch them once things settle and patch
+ * them in without re-rendering the bubbles (which would flicker).
+ */
+const refreshTurnLabels = async () => {
+  if (!state.accessToken || !state.conversationId) return;
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/conversations/${state.conversationId}/messages?limit=100`,
+      { headers: headers() },
+      'Failed to refresh labels'
+    );
+    // Match positionally, not by id: messages appended live during a send have
+    // no data-id (only history-rendered ones do), but the order is the same.
+    const userMessages = (envelope.data?.messages || [])
+      .filter((m) => m.role === 'user')
+      .sort((a, b) => (a.seq || 0) - (b.seq || 0));
+    const rendered = [...(messagesEl?.querySelectorAll('.message.user') || [])];
+    let patched = false;
+    rendered.forEach((el, i) => {
+      const label = userMessages[i]?.meta?.turn_label;
+      if (label && el.dataset.turnLabel !== label) {
+        el.dataset.turnLabel = label;
+        patched = true;
+      }
+    });
+    if (patched) renderTurnRail();
+  } catch {
+    /* labels are cosmetic */
+  }
+};
+
+const initTurnRail = () => {
+  if (!turnRailInnerEl || !messagesEl) return;
+
+  turnRailInnerEl.addEventListener('click', (e) => {
+    const tick = e.target.closest('.turn-tick');
+    if (!tick) return;
+    const turns = [...messagesEl.querySelectorAll('.message.user')];
+    const target = turns[Number(tick.dataset.turnIndex)];
+    if (target) {
+      target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      target.classList.add('turn-flash');
+      setTimeout(() => target.classList.remove('turn-flash'), 1200);
+    }
+    // A pointer click is "I'm done here": drop focus so the rail collapses back
+    // to bars. Keyboard activation (detail === 0) keeps focus, so the list stays
+    // open for continued arrow-key navigation.
+    if (e.detail > 0) tick.blur();
+  });
+
+  messagesEl.addEventListener('scroll', debounce(highlightActiveTurn, 60));
+  window.addEventListener('scroll', debounce(highlightActiveTurn, 60), { passive: true });
 };
 
 // =============================================================================
@@ -1633,10 +1747,12 @@ const renderMessages = (messages) => {
   if (!messages.length) {
     messagesEl.innerHTML = '';
     updateEmptyState();
+    renderTurnRail();
     return;
   }
 
   messagesEl.innerHTML = messages.map((m) => renderMessage(m)).join('');
+  renderTurnRail();
 
   const lastAssistant = messages.filter((m) => m.role === 'assistant').pop();
   if (lastAssistant) {
@@ -1703,8 +1819,11 @@ const renderMessage = (m) => {
     `;
   }
 
+  // The turn description (written by a quick model pass) rides on the user
+  // message's meta and feeds the turn navigator.
+  const turnLabel = m.meta?.turn_label ? ` data-turn-label="${escapeAttr(m.meta.turn_label)}"` : '';
   return `
-    <div class="message ${role}" data-id="${escapeHtml(m.id || '')}" data-raw="${escapeAttr(m.content || '')}">
+    <div class="message ${role}" data-id="${escapeHtml(m.id || '')}" data-raw="${escapeAttr(m.content || '')}"${turnLabel}>
       <div class="role">${role}</div>
       <div>
         <div class="bubble">${content}</div>
@@ -2270,6 +2389,9 @@ const sendMessage = async (event) => {
     hideTypingIndicator();
     toggleButtonBusy(sendBtn, false, 'Send');
     updateStreamingUI(false);
+    renderTurnRail();
+    // The labelling pass runs server-side after the reply; give it a moment.
+    setTimeout(refreshTurnLabels, 2500);
   }
 };
 
@@ -4831,6 +4953,7 @@ const init = async () => {
   initCollapsibleSections();
   initEventListeners();
   initComposerAttachments();
+  initTurnRail();
   updateAuthUI();
   updateShareButton();
   updateDraftIndicator();

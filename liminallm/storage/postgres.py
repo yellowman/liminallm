@@ -1726,6 +1726,32 @@ class PostgresStore:
             meta=raw_meta,
         )
 
+    def set_conversation_title(
+        self, conversation_id: str, *, user_id: str, title: str
+    ) -> Optional[Conversation]:
+        """Rename a conversation; owner-only."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "UPDATE conversation SET title = %s, updated_at = %s "
+                "WHERE id = %s AND user_id = %s RETURNING id",
+                (title, datetime.utcnow(), conversation_id, user_id),
+            ).fetchone()
+        return self.get_conversation(conversation_id) if row else None
+
+    def update_message_meta(
+        self, message_id: str, *, user_id: str, patch: dict
+    ) -> Optional[Any]:
+        """Shallow-merge keys into a message's meta; owner-only."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "UPDATE message m SET meta = COALESCE(m.meta, '{}'::jsonb) || %s::jsonb "
+                "WHERE m.id = %s AND EXISTS ("
+                "  SELECT 1 FROM conversation c WHERE c.id = m.conversation_id AND c.user_id = %s"
+                ") RETURNING m.id",
+                (json.dumps(patch), message_id, user_id),
+            ).fetchone()
+        return row or None
+
     def merge_conversation_meta(
         self, conversation_id: str, *, user_id: str, patch: dict
     ) -> Optional[Conversation]:

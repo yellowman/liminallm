@@ -634,6 +634,35 @@ class MemoryStore:
             self._persist_state()
             return conv
 
+    def set_conversation_title(
+        self, conversation_id: str, *, user_id: str, title: str
+    ) -> Optional[Conversation]:
+        """Rename a conversation; owner-only."""
+        with self._data_lock:
+            conv = self.conversations.get(conversation_id)
+            if not conv or conv.user_id != user_id:
+                return None
+            conv.title = title
+            conv.updated_at = datetime.utcnow()
+            self._persist_state()
+            return conv
+
+    def update_message_meta(
+        self, message_id: str, *, user_id: str, patch: Dict
+    ) -> Optional[Message]:
+        """Shallow-merge keys into a message's meta; owner-only."""
+        with self._data_lock:
+            for conversation_id, messages in self.messages.items():
+                conv = self.conversations.get(conversation_id)
+                if not conv or conv.user_id != user_id:
+                    continue
+                for message in messages:
+                    if message.id == message_id:
+                        message.meta = {**(message.meta or {}), **patch}
+                        self._persist_state()
+                        return message
+            return None
+
     def set_conversation_public(
         self, conversation_id: str, *, user_id: str, public: bool
     ) -> Optional[Conversation]:

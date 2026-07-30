@@ -2308,10 +2308,11 @@ class WorkflowEngine:
             "proxy": getattr(settings, "tool_network_proxy_url", None),
         }
 
-    def _run_web_search(self, query: str, limit: int) -> str:
+    def _run_web_search(self, query: str, limit: int) -> Tuple[str, List[dict]]:
+        """Search the web. Returns (wrapped_results, injection_findings)."""
         cfg = self._web_settings()
         if not cfg["enabled"]:
-            return "Web access is disabled on this deployment."
+            return ("Web access is disabled on this deployment.", [])
         try:
             results = web.search_web(
                 query,
@@ -2323,9 +2324,14 @@ class WorkflowEngine:
                 proxy=cfg["proxy"],
             )
         except web.WebFetchError as exc:
-            return f"Search failed: {exc}"
-        self.logger.info("web_search_performed", results=len(results))
-        return web.format_search_results(query, results)
+            return (f"Search failed: {exc}", [])
+        text, findings = web.format_search_results(query, results)
+        self.logger.info(
+            "web_search_performed",
+            results=len(results),
+            injection_findings=len(findings),
+        )
+        return (text, findings)
 
     def _run_web_fetch(self, url: str) -> Tuple[str, List[dict]]:
         """Fetch a page as untrusted data. Returns (wrapped_text, findings)."""
@@ -2368,9 +2374,11 @@ class WorkflowEngine:
     ) -> Dict[str, Any]:
         """Direct-invocable web search (also used by the agent loop)."""
         query = inputs.get("query") or inputs.get("message") or user_message or ""
+        text, findings = self._run_web_search(query, int(inputs.get("limit") or 5))
         return {
-            "content": self._run_web_search(query, int(inputs.get("limit") or 5)),
+            "content": text,
             "usage": {},
+            "injection_findings": [f["type"] for f in findings],
         }
 
     def _tool_web_fetch(
@@ -2529,9 +2537,14 @@ class WorkflowEngine:
                 session=session,
             )
         if name == "web_search":
-            return self._run_web_search(
+            text, findings = self._run_web_search(
                 str(args.get("query") or fallback_query), int(args.get("limit") or 5)
             )
+            if findings:
+                session.setdefault("injection_findings", []).extend(
+                    f["type"] for f in findings
+                )
+            return text
         if name == "web_fetch":
             text, findings = self._run_web_fetch(str(args.get("url") or ""))
             if findings:
