@@ -12,7 +12,7 @@ The more we can achieve with proper structure and well-architected design, the b
 Planning and careful use of resources is of the utmost importance. Use constraints with all subagents in planning and preparation to get better results. Think before acting, and scope work appropriately.
 
 ### Prompt Budget
-Every token of model-facing prompt text (system instructions, tool descriptions, preambles, envelopes) is paid on every call and displaces reasoning about the user's problem. State each rule exactly once, in the place closest to what it governs — e.g. the untrusted-data rule lives in the envelope that wraps each payload, and everything else points to it. No boilerplate; no copyright language.
+Model-facing prompt text is paid on every call — keep the wording tight. But this app exists to make weak local models perform well, and weak models drop a rule stated once: safety-critical rules (the untrusted-data/injection rule especially) are deliberately repeated across the system prompt, the tool descriptions, and the payload envelope. Tighten phrasing, never the repetition. No boilerplate; no copyright language.
 
 ## Security Guidelines
 
