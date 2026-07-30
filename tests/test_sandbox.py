@@ -55,3 +55,46 @@ def test_run_in_sandbox_does_not_limit_parent_process():
     before = resource.getrlimit(resource.RLIMIT_AS)
     run_in_sandbox(math.factorial, 5, config=SandboxConfig(max_memory_mb=64), timeout=60)
     assert resource.getrlimit(resource.RLIMIT_AS) == before
+
+
+def test_infrastructure_hosts_are_connectable_with_empty_allowlist():
+    """An empty TOOL_NETWORK_ALLOWLIST must not block the model provider.
+
+    Tool handlers that call the LLM open sockets inside the network guard, so
+    without this the default configuration blocked the model itself.
+    """
+    from liminallm.service.sandbox import build_tool_network_policy
+
+    policy = build_tool_network_policy(
+        allowlist=[], proxy_url=None, infrastructure_hosts=["api.example.com"]
+    )
+    assert policy.connection_allowlist() == ["api.example.com"]
+
+
+def test_infrastructure_hosts_are_not_tool_fetch_targets():
+    """Infrastructure is connectable but never fetchable by a tool."""
+    from liminallm.service.sandbox import AllowlistedFetcher, SandboxError, build_tool_network_policy
+
+    policy = build_tool_network_policy(
+        allowlist=[], proxy_url=None, infrastructure_hosts=["api.example.com"]
+    )
+    with pytest.raises(SandboxError):
+        AllowlistedFetcher(policy).request("GET", "https://api.example.com/v1/models")
+
+
+def test_guard_allows_resolved_ip_of_an_allowlisted_host(monkeypatch):
+    """HTTP clients connect to an address, not a name.
+
+    urllib3/httpx resolve DNS themselves, so the guard is handed an IP literal;
+    comparing only against hostnames rejected every real connection.
+    """
+    from liminallm.service import sandbox as sb
+
+    policy = sb.build_tool_network_policy(
+        allowlist=["files.example.com"], proxy_url=None
+    )
+    monkeypatch.setattr(sb, "_resolve_host_ips", lambda host: frozenset({"203.0.113.7"}))
+    with sb.tool_network_guard(policy):
+        sb._enforce_network_allowlist("203.0.113.7")  # must not raise
+        with pytest.raises(sb.SandboxError):
+            sb._enforce_network_allowlist("198.51.100.9")

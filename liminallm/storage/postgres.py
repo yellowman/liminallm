@@ -1726,20 +1726,28 @@ class PostgresStore:
             meta=raw_meta,
         )
 
-    def set_conversation_public(
-        self, conversation_id: str, *, user_id: str, public: bool
+    def merge_conversation_meta(
+        self, conversation_id: str, *, user_id: str, patch: dict
     ) -> Optional[Conversation]:
-        """Toggle a conversation's public sharing flag; owner-only."""
+        """Shallow-merge keys into a conversation's meta; owner-only."""
         now = datetime.utcnow()
         with self._connect() as conn:
             row = conn.execute(
                 "UPDATE conversation SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
                 "updated_at = %s WHERE id = %s AND user_id = %s RETURNING id",
-                (json.dumps({"public": bool(public)}), now, conversation_id, user_id),
+                (json.dumps(patch), now, conversation_id, user_id),
             ).fetchone()
         if not row:
             return None
         return self.get_conversation(conversation_id)
+
+    def set_conversation_public(
+        self, conversation_id: str, *, user_id: str, public: bool
+    ) -> Optional[Conversation]:
+        """Toggle a conversation's public sharing flag; owner-only."""
+        return self.merge_conversation_meta(
+            conversation_id, user_id=user_id, patch={"public": bool(public)}
+        )
 
     def get_public_conversation(self, conversation_id: str) -> Optional[Conversation]:
         """Fetch a conversation only if it has been explicitly made public."""

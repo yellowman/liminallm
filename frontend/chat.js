@@ -77,6 +77,8 @@ const createState = (storage) => {
     role: storage.read('role'),
     userId: storage.read('userId'),
     conversationId: storage.read('conversationId'),
+    conversationPublic: false,
+    attachments: [],
     lastAssistant: null,
     contexts: [],
     artifacts: [],
@@ -1382,6 +1384,7 @@ const loadConversation = async (conversationId) => {
     if (conversationLabel) conversationLabel.textContent = convo.title || 'Conversation';
     state.conversationPublic = Boolean(convo.public);
     updateShareButton();
+    fetchAttachments();
 
     const messagesEnvelope = await requestEnvelope(
       `${apiBase}/conversations/${conversationId}/messages?limit=100`,
@@ -1408,7 +1411,11 @@ const loadConversation = async (conversationId) => {
 const setConversation = (id) => {
   // A different (or new) conversation starts from the private default until
   // loadConversation reports otherwise.
-  if (id !== state.conversationId) state.conversationPublic = false;
+  if (id !== state.conversationId) {
+    state.conversationPublic = false;
+    state.attachments = [];
+    renderAttachmentChips();
+  }
   state.conversationId = id;
   if (conversationLabel) conversationLabel.textContent = id ? `Conversation ${id.slice(0, 8)}...` : 'New conversation';
   updateShareButton();
@@ -1416,6 +1423,142 @@ const setConversation = (id) => {
     state.lastAssistant = null;
     renderPreferencePanel();
   }
+};
+
+// =============================================================================
+// Composer attachments — drop a file in the composer and it is usable in this
+// chat immediately. No context to create or select: the server classifies the
+// file and the model reaches it inline, via file_search, or via run_python.
+// =============================================================================
+
+const renderAttachmentChips = () => {
+  const wrap = $('attachment-chips');
+  if (!wrap) return;
+  const items = state.attachments || [];
+  wrap.innerHTML = items
+    .map((a) => {
+      const how = a.inline
+        ? 'in prompt'
+        : a.searchable
+          ? 'searchable'
+          : 'code';
+      return `<span class="attachment-chip" title="${escapeAttr(a.name)} · ${how}">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/>
+        </svg>
+        <span class="chip-name">${escapeHtml(a.name)}</span>
+        <span class="chip-kind">${how}</span>
+      </span>`;
+    })
+    .join('');
+};
+
+const fetchAttachments = async () => {
+  if (!state.accessToken || !state.conversationId) {
+    state.attachments = [];
+    renderAttachmentChips();
+    return;
+  }
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/conversations/${state.conversationId}/attachments`,
+      { headers: headers() },
+      'Failed to load attachments'
+    );
+    state.attachments = envelope.data?.items || [];
+  } catch {
+    state.attachments = [];
+  }
+  renderAttachmentChips();
+};
+
+/**
+ * Attach a file to the current conversation, creating the conversation first
+ * if the user has not sent anything yet (so a file can start a chat).
+ */
+const attachFileToConversation = async (file) => {
+  if (!state.accessToken) {
+    showStatus('Sign in to attach files.', true);
+    return;
+  }
+  if (!file) return;
+
+  const check = validateUploadFile(file);
+  if (!check.ok) {
+    showStatus(check.message, true);
+    return;
+  }
+
+  try {
+    showStatus(`Attaching ${file.name}...`);
+    if (!state.conversationId) {
+      const created = await requestEnvelope(
+        `${apiBase}/conversations`,
+        { method: 'POST', headers: headers(), body: JSON.stringify({ title: file.name }) },
+        'Failed to start conversation'
+      );
+      setConversation(created.data?.id);
+    }
+
+    const form = new FormData();
+    form.append('file', file);
+    form.append('conversation_id', state.conversationId);
+    const envelope = await requestEnvelope(
+      `${apiBase}/files/upload`,
+      // authHeaders (not headers) so the browser sets the multipart boundary.
+      { method: 'POST', headers: authHeaders(), body: form },
+      'Attach failed'
+    );
+
+    const attachment = envelope.data?.attachment;
+    if (attachment) {
+      state.attachments = [
+        ...(state.attachments || []).filter((a) => a.name !== attachment.name),
+        attachment,
+      ];
+      renderAttachmentChips();
+    }
+    const how = attachment?.inline
+      ? 'included in the prompt'
+      : attachment?.searchable
+        ? `indexed for search (${envelope.data?.chunk_count || 0} chunks)`
+        : 'available to the code interpreter';
+    showStatus(`Attached ${file.name} — ${how}. Ask about it.`);
+    fetchConversations();
+  } catch (err) {
+    showStatus(err.message, true);
+  }
+};
+
+const initComposerAttachments = () => {
+  const fileInput = $('composer-file');
+  const dropZone = $('composer-drop');
+
+  $('attach-btn')?.addEventListener('click', () => fileInput?.click());
+  fileInput?.addEventListener('change', async () => {
+    const file = fileInput.files?.[0];
+    fileInput.value = '';
+    await attachFileToConversation(file);
+  });
+
+  if (!dropZone) return;
+  ['dragenter', 'dragover'].forEach((evt) =>
+    dropZone.addEventListener(evt, (e) => {
+      e.preventDefault();
+      dropZone.classList.add('drag-over');
+    })
+  );
+  ['dragleave', 'drop'].forEach((evt) =>
+    dropZone.addEventListener(evt, (e) => {
+      e.preventDefault();
+      if (evt === 'dragleave' && dropZone.contains(e.relatedTarget)) return;
+      dropZone.classList.remove('drag-over');
+    })
+  );
+  dropZone.addEventListener('drop', async (e) => {
+    const file = e.dataTransfer?.files?.[0];
+    if (file) await attachFileToConversation(file);
+  });
 };
 
 // =============================================================================
@@ -1605,6 +1748,19 @@ const appendMessage = (role, content, meta = '') => {
   }
   updateEmptyState();
   return wrapper;
+};
+
+// Names of the tools the model called for a reply, for the message meta line.
+// A node's extra result keys land under `outputs`, so check both places.
+const toolNamesFromTrace = (trace) => {
+  const names = [];
+  for (const entry of Array.isArray(trace) ? trace : []) {
+    const calls = [...(entry?.tool_calls || []), ...(entry?.outputs?.tool_calls || [])];
+    for (const call of calls) {
+      if (call?.tool && !names.includes(call.tool)) names.push(call.tool);
+    }
+  }
+  return names;
 };
 
 // Only auto-scroll while the reader is already at the bottom, so scrolling
@@ -1897,9 +2053,22 @@ const sendMessage = async (event) => {
                 // the send button disabled forever after a streamed reply.)
                 messageDoneReceived = true;
                 messageDoneData = { ...messageDoneData, ...(msg.data || {}) };
+                // Attachment answers come from a tool-calling node, which
+                // returns the whole reply at once rather than as tokens — so
+                // create the message here if no token ever arrived.
+                if (!streamingMsg && messageDoneData.content) {
+                  hideTypingIndicator();
+                  streamingMsg = createStreamingMessage('assistant');
+                  streamingMsg.update(messageDoneData.content);
+                  showStatus('');
+                }
                 if (streamingMsg) {
                   const adapters = (messageDoneData.adapters || []).map(a => a?.name || a?.id || a).filter(Boolean);
-                  streamingMsg.finalize(adapters.length ? `Adapters: ${adapters.join(', ')}` : '');
+                  const tools = toolNamesFromTrace(messageDoneData.workflow_trace);
+                  const bits = [];
+                  if (tools.length) bits.push(`Used: ${tools.join(', ')}`);
+                  if (adapters.length) bits.push(`Adapters: ${adapters.join(', ')}`);
+                  streamingMsg.finalize(bits.join(' · '));
                 }
                 // Older servers relayed an interim message_done without IDs
                 // before the persisted one; only settle once we have the
@@ -4609,6 +4778,7 @@ const init = async () => {
   initTabs();
   initCollapsibleSections();
   initEventListeners();
+  initComposerAttachments();
   updateAuthUI();
   updateShareButton();
   updateDraftIndicator();

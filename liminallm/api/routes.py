@@ -114,6 +114,13 @@ from liminallm.service.archive import (
     extract_archive_sandboxed,
     is_archive_filename,
 )
+from liminallm.service.attachments import (
+    classify_attachment,
+    ensure_conversation_context,
+    is_auto_context,
+    list_attachments,
+    record_attachment,
+)
 from liminallm.service.auth import AuthContext
 from liminallm.service.errors import BadRequestError, NotFoundError
 from liminallm.service.sandbox import SandboxError
@@ -3200,10 +3207,19 @@ async def get_file_limits(principal: AuthContext = Depends(get_user)):
 async def upload_file(
     file: UploadFile = File(...),
     context_id: Optional[str] = Form(None, max_length=255),
+    conversation_id: Optional[str] = Form(None, max_length=255),
     chunk_size: Optional[int] = Form(None, ge=64, le=4000),
     principal: AuthContext = Depends(get_user),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
+    """Upload a file, optionally attaching it to a conversation.
+
+    With `conversation_id` the file becomes usable in that chat immediately —
+    small text files are injected into the prompt, larger documents are chunked
+    into the conversation's implicit context for the model's file_search tool,
+    and everything is readable from the code interpreter. No context needs to
+    be created or selected by the user.
+    """
     import re
 
     runtime = get_runtime()
@@ -3306,6 +3322,8 @@ async def upload_file(
             prior_checksum = prior_entry
         # Archives are binary; they are stored but never text-ingested.
         # POST /files/{name}/extract expands them (with ingestion) instead.
+        # (Attaching an archive to a conversation is fine — it is handed to the
+        # code interpreter, never chunked, so context_id stays unset below.)
         if context_id and is_archive_filename(safe_filename):
             raise _http_error(
                 "validation_error",
@@ -3313,6 +3331,43 @@ async def upload_file(
                 "then extract",
                 status_code=400,
             )
+
+        # Attach-to-conversation: classify the file, and route searchable ones
+        # into the conversation's implicit context so file_search can find them.
+        attachment_caps: Optional[dict] = None
+        if conversation_id and not context_id:
+            _get_owned_conversation(runtime, conversation_id, principal)
+            attachment_caps = classify_attachment(safe_filename, len(contents))
+            if attachment_caps["searchable"]:
+                context_id = ensure_conversation_context(
+                    runtime.store,
+                    user_id=principal.user_id,
+                    conversation_id=conversation_id,
+                ).id
+
+        def _record(chunks: Optional[int]) -> Optional[dict]:
+            """Persist the attachment record on the conversation."""
+            if not (conversation_id and attachment_caps):
+                return None
+            records = record_attachment(
+                runtime.store,
+                conversation_id=conversation_id,
+                user_id=principal.user_id,
+                name=safe_filename,
+                size=len(contents),
+                capabilities=attachment_caps,
+                chunk_count=chunks,
+            )
+            logger.info(
+                "conversation_attachment_added",
+                user_id=principal.user_id,
+                conversation_id=conversation_id,
+                filename=safe_filename,
+                inline=attachment_caps["inline"],
+                searchable=attachment_caps["searchable"],
+                analyzable=attachment_caps["analyzable"],
+            )
+            return next((r for r in records if r.get("name") == safe_filename), None)
         if dest_path.exists() and prior_checksum == checksum:
             chunk_count = None
             if context_id and context_id not in prior_contexts:
@@ -3332,7 +3387,10 @@ async def upload_file(
                         "file_checksum_manifest_write_failed", path=str(manifest_path)
                     )
             resp = FileUploadResponse(
-                fs_path=safe_filename, context_id=context_id, chunk_count=chunk_count
+                fs_path=safe_filename,
+                context_id=context_id,
+                chunk_count=chunk_count,
+                attachment=_record(chunk_count),
             )
             envelope = Envelope(status="ok", data=resp, request_id=idem.request_id)
             await idem.store_result(envelope)
@@ -3369,11 +3427,33 @@ async def upload_file(
 
         # Update idempotency with final result
         resp = FileUploadResponse(
-            fs_path=safe_filename, context_id=context_id, chunk_count=chunk_count
+            fs_path=safe_filename,
+            context_id=context_id,
+            chunk_count=chunk_count,
+            attachment=_record(chunk_count),
         )
         envelope = Envelope(status="ok", data=resp, request_id=idem.request_id)
         await idem.store_result(envelope)
         return envelope
+
+
+@router.get(
+    "/conversations/{conversation_id}/attachments", response_model=Envelope, tags=["conversations"]
+)
+async def list_conversation_attachments(
+    conversation_id: str = Path(..., max_length=255),
+    principal: AuthContext = Depends(get_user),
+):
+    """Files attached to a conversation, with how the model can reach each."""
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        60,
+    )
+    conversation = _get_owned_conversation(runtime, conversation_id, principal)
+    return Envelope(status="ok", data={"items": list_attachments(conversation)})
 
 
 # =========================================================================
@@ -4102,6 +4182,9 @@ async def list_contexts(
         cursor=cursor,
         include_sentinel=True,
     )
+    # Per-conversation attachment contexts are an implementation detail of the
+    # attach-to-conversation flow; they never appear in the contexts UI.
+    contexts = [c for c in contexts if not is_auto_context(c)]
     has_next = len(contexts) > resolved_page_size
     page_contexts = contexts[:resolved_page_size]
     next_cursor = None
@@ -4681,6 +4764,10 @@ async def websocket_chat(ws: WebSocket):
                 "data": {
                     "message_id": assistant_msg.id,
                     "conversation_id": convo_id,
+                    # The full reply, so a client that received no token events
+                    # can still render it. Tool-calling nodes (the attachment
+                    # agent) return their answer at once rather than streaming.
+                    "content": assistant_content,
                     "adapters": adapter_names,
                     "adapter_gates": orchestration_dict.get("adapter_gates", []),
                     "usage": orchestration_dict.get("usage", {}),

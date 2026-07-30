@@ -718,6 +718,9 @@ class FileUploadResponse(BaseModel):
     fs_path: str
     context_id: Optional[str] = None
     chunk_count: Optional[int] = None
+    # Set when the upload was attached to a conversation: how the model can
+    # reach this file (inline / searchable / analyzable).
+    attachment: Optional[dict[str, Any]] = None
 
 
 class PreferenceEventRequest(BaseModel):

@@ -447,6 +447,29 @@ def get_default_chat_workflow_schema() -> dict:
     }
 
 
+def get_default_attachment_workflow_schema() -> dict:
+    """Workflow used when the conversation has attachments.
+
+    A single agent node: the model sees the attachment list (with small text
+    files inlined) and decides for itself whether to search them or run code,
+    so no intent classification is needed.
+    """
+    return {
+        "kind": "workflow.chat",
+        "entrypoint": "files",
+        "nodes": [
+            {
+                "id": "files",
+                "type": "tool_call",
+                "tool": "agent.files_v1",
+                "inputs": {"message": "${input.message}"},
+                "next": "end",
+            },
+            {"id": "end", "type": "end"},
+        ],
+    }
+
+
 def get_default_tool_specs() -> List[dict]:
     """Generate default tool specifications.
 
@@ -484,6 +507,40 @@ def get_default_tool_specs() -> List[dict]:
             "description": "Code editing and generation agent.",
             "inputs": {"message": {"type": "string"}},
             "handler": "agent.code_v1",
+        },
+        {
+            "kind": "tool.spec",
+            "name": "agent.files_v1",
+            "description": (
+                "Answers using the conversation's attachments. The model calls "
+                "file_search and run_python itself, as many times as it needs."
+            ),
+            "inputs": {"message": {"type": "string"}},
+            "handler": "agent.files_v1",
+            # Multiple model round-trips plus sandboxed code; the engine caps
+            # this at MAX_NODE_TIMEOUT_SECONDS anyway.
+            "timeout_seconds": 60,
+        },
+        {
+            "kind": "tool.spec",
+            "name": "file.search_v1",
+            "description": "Search the conversation's attached files for relevant excerpts.",
+            "inputs": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "optional": True},
+            },
+            "handler": "file.search_v1",
+        },
+        {
+            "kind": "tool.spec",
+            "name": "code.python_v1",
+            "description": (
+                "Run Python in a resource-limited sandbox whose working "
+                "directory holds copies of the conversation's attachments."
+            ),
+            "inputs": {"code": {"type": "string"}},
+            "handler": "code.python_v1",
+            "timeout_seconds": 30,
         },
     ]
 

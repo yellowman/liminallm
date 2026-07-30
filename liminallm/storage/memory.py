@@ -621,20 +621,26 @@ class MemoryStore:
                 return None
             return conv
 
-    def set_conversation_public(
-        self, conversation_id: str, *, user_id: str, public: bool
+    def merge_conversation_meta(
+        self, conversation_id: str, *, user_id: str, patch: Dict
     ) -> Optional[Conversation]:
-        """Toggle a conversation's public sharing flag; owner-only."""
+        """Shallow-merge keys into a conversation's meta; owner-only."""
         with self._data_lock:
             conv = self.conversations.get(conversation_id)
             if not conv or conv.user_id != user_id:
                 return None
-            meta = dict(conv.meta or {})
-            meta["public"] = bool(public)
-            conv.meta = meta
+            conv.meta = {**(conv.meta or {}), **patch}
             conv.updated_at = datetime.utcnow()
             self._persist_state()
             return conv
+
+    def set_conversation_public(
+        self, conversation_id: str, *, user_id: str, public: bool
+    ) -> Optional[Conversation]:
+        """Toggle a conversation's public sharing flag; owner-only."""
+        return self.merge_conversation_meta(
+            conversation_id, user_id=user_id, patch={"public": bool(public)}
+        )
 
     def get_public_conversation(self, conversation_id: str) -> Optional[Conversation]:
         """Fetch a conversation only if it has been explicitly made public."""

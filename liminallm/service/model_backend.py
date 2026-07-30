@@ -302,6 +302,61 @@ class StubBackend:
             "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
         }
 
+    def generate_with_tools(
+        self,
+        messages: List[dict],
+        tools: List[dict],
+        adapters: List[dict],
+        *,
+        user_id: Optional[str] = None,
+    ) -> dict:
+        """Deterministic tool-calling stand-in for tests.
+
+        Calls each offered tool exactly once (in order) before answering, so
+        the agent loop is exercised end to end without a live model.
+        """
+        called = {
+            m.get("name")
+            for m in messages
+            if m.get("role") == "tool" and m.get("name")
+        }
+        for tool in tools or []:
+            fn = (tool or {}).get("function") or {}
+            name = fn.get("name")
+            if not name or name in called:
+                continue
+            last_user = next(
+                (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"),
+                "",
+            )
+            args = {"query": last_user} if name == "file_search" else {}
+            if name == "run_python":
+                args = {"code": "import os\nprint(sorted(os.listdir('.')))"}
+            return {
+                "content": "",
+                "tool_calls": [{"id": f"stub-{name}", "name": name, "arguments": json.dumps(args)}],
+                "assistant_message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": f"stub-{name}",
+                            "type": "function",
+                            "function": {"name": name, "arguments": json.dumps(args)},
+                        }
+                    ],
+                },
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            }
+        tool_outputs = [m.get("content", "") for m in messages if m.get("role") == "tool"]
+        summary = " | ".join(o[:120] for o in tool_outputs if o)
+        return {
+            "content": f"{self.STUB_RESPONSE} Tool results: {summary}" if summary else self.STUB_RESPONSE,
+            "tool_calls": [],
+            "assistant_message": {"role": "assistant", "content": self.STUB_RESPONSE},
+            "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+        }
+
     def generate_stream(
         self,
         messages: List[dict],
@@ -498,6 +553,92 @@ class ApiAdapterBackend:
                 "completion_tokens": max(5, min(20, len(fallback.split()))),
             },
             "adapters_applied": processed["applied"],
+        }
+
+    @property
+    def supports_tools(self) -> bool:
+        """True only when a real client is configured to receive tool calls."""
+        self._ensure_client()
+        return self.client is not None
+
+    def generate_with_tools(
+        self,
+        messages: List[dict],
+        tools: List[dict],
+        adapters: List[dict],
+        *,
+        user_id: Optional[str] = None,
+    ) -> dict:
+        """One turn of an OpenAI-style tool-calling exchange.
+
+        Returns the assistant's content, any tool calls it requested, and the
+        raw assistant message to append before sending tool results back — the
+        caller drives the loop.
+        """
+        self._ensure_client()
+        if not self.client:
+            raise RuntimeError("tool calling requires a configured API client")
+
+        processed = self._process_adapters_for_provider(adapters or [])
+        augmented = self._inject_adapter_prompts(
+            messages, processed["prompt_injections"]
+        )
+        extra_body = self._with_reasoning_effort(processed["extra_body"])
+        completion = self.client.chat.completions.create(
+            model=processed["model"],
+            messages=augmented,
+            tools=tools,
+            tool_choice="auto",
+            temperature=0.2,
+            extra_body=extra_body,
+        )
+        choices = getattr(completion, "choices", None) or []
+        first = next(iter(choices), None)
+        message = getattr(first, "message", None) if first else None
+        raw_calls = list(getattr(message, "tool_calls", None) or []) if message else []
+        tool_calls = [
+            {
+                "id": getattr(tc, "id", "") or "",
+                "name": getattr(getattr(tc, "function", None), "name", "") or "",
+                "arguments": getattr(getattr(tc, "function", None), "arguments", "") or "{}",
+            }
+            for tc in raw_calls
+        ]
+        # Round-trip the provider's own serialization so vendor extras survive.
+        # Gemini attaches a `thought_signature` to each tool call inside
+        # extra_content and rejects the follow-up request (400) if it is missing,
+        # so a hand-rebuilt assistant message breaks multi-turn tool calling.
+        assistant_message: Dict[str, Any] = {}
+        if message is not None and hasattr(message, "model_dump"):
+            try:
+                assistant_message = message.model_dump(exclude_none=True)
+            except Exception:  # pragma: no cover - defensive
+                assistant_message = {}
+        if not assistant_message:
+            assistant_message = {
+                "role": "assistant",
+                "content": getattr(message, "content", None) if message else None,
+            }
+            if tool_calls:
+                assistant_message["tool_calls"] = [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                    }
+                    for tc in tool_calls
+                ]
+        assistant_message.setdefault("role", "assistant")
+        usage_obj = getattr(completion, "usage", None)
+        return {
+            "content": (getattr(message, "content", None) if message else None) or "",
+            "tool_calls": tool_calls,
+            "assistant_message": assistant_message,
+            "usage": {
+                "prompt_tokens": getattr(usage_obj, "prompt_tokens", 0),
+                "completion_tokens": getattr(usage_obj, "completion_tokens", 0),
+                "total_tokens": getattr(usage_obj, "total_tokens", 0),
+            },
         }
 
     def generate_stream(

@@ -75,6 +75,40 @@ class LLMService:
         )
         return self.backend.generate(messages, normalized_adapters, user_id=user_id)
 
+    @property
+    def supports_tools(self) -> bool:
+        """Whether the active backend can do model-initiated tool calls.
+
+        A backend may implement the method but still be unusable (no API key,
+        so no client); it reports that through its own ``supports_tools``.
+        """
+        if not callable(getattr(self.backend, "generate_with_tools", None)):
+            return False
+        backend_flag = getattr(self.backend, "supports_tools", None)
+        return bool(backend_flag) if backend_flag is not None else True
+
+    def generate_with_tools(
+        self,
+        messages: List[dict],
+        tools: List[dict],
+        adapters: Optional[List[dict]] = None,
+        *,
+        user_id: Optional[str] = None,
+    ) -> dict:
+        """One tool-calling turn over a caller-built message list.
+
+        Unlike generate(), the caller owns the messages so it can append tool
+        results and iterate.
+        """
+        if not self.supports_tools:
+            raise RuntimeError("active backend does not support tool calling")
+        return self.backend.generate_with_tools(
+            messages,
+            tools,
+            self._normalize_adapters(adapters or []),
+            user_id=user_id,
+        )
+
     def generate_stream(
         self,
         prompt: str,

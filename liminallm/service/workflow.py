@@ -3,10 +3,14 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import copy
+import json
 import math
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlparse
 from typing import (
     Any,
     AsyncIterator,
@@ -30,6 +34,8 @@ from liminallm.service.embeddings import (
     ensure_embedding_dim,
     validated_embedding,
 )
+from liminallm.service import attachments as attachments_service
+from liminallm.service import interpreter
 from liminallm.service.errors import BadRequestError
 from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
@@ -47,6 +53,7 @@ from liminallm.service.tokenizer_utils import (
     MAX_GENERATION_TOKENS,
     estimate_token_count,
 )
+from liminallm.storage.common import get_default_attachment_workflow_schema
 from liminallm.storage.memory import MemoryStore
 from liminallm.storage.models import Message
 from liminallm.storage.postgres import PostgresStore
@@ -143,6 +150,8 @@ class WorkflowEngine:
         self.logger = get_logger(__name__)
         self.tool_registry = self._build_tool_registry()
         self.cache = cache
+        # Retained for tools that need filesystem paths (attachments, interpreter).
+        self.settings = settings
         self.tool_network_policy: ToolNetworkPolicy = build_tool_network_policy(
             allowlist=(settings.tool_network_allowlist if settings else []),
             proxy_url=settings.tool_network_proxy_url if settings else None,
@@ -150,6 +159,11 @@ class WorkflowEngine:
                 settings.tool_fetch_connect_timeout if settings else 10.0
             ),
             total_timeout=settings.tool_fetch_timeout if settings else 30.0,
+            # Tool handlers that call the model (every LLM tool) open sockets
+            # inside the network guard. Without the provider host here, an
+            # empty TOOL_NETWORK_ALLOWLIST — the default — blocks the model
+            # itself, not just tool fetches.
+            infrastructure_hosts=self._model_provider_hosts(),
         )
         self.tool_fetcher = AllowlistedFetcher(self.tool_network_policy)
         # Issue 48.6: Configurable worker pool with bounds
@@ -478,7 +492,13 @@ class WorkflowEngine:
         if workflow_id:
             workflow_schema = self.store.get_latest_workflow(workflow_id)
         if not workflow_schema:
-            workflow_schema = self._default_workflow()
+            # A conversation with attachments routes to the attachment agent, so
+            # uploading a file is all the user has to do — no context to pick
+            # and no workflow to choose.
+            if self._conversation_attachments(conversation_id, user_id):
+                workflow_schema = get_default_attachment_workflow_schema()
+            else:
+                workflow_schema = self._default_workflow()
 
         # SPEC §9: workflow-level timeout_ms caps total wall clock
         workflow_timeout_ms = workflow_schema.get(
@@ -760,7 +780,13 @@ class WorkflowEngine:
         if workflow_id:
             workflow_schema = self.store.get_latest_workflow(workflow_id)
         if not workflow_schema:
-            workflow_schema = self._default_workflow()
+            # A conversation with attachments routes to the attachment agent, so
+            # uploading a file is all the user has to do — no context to pick
+            # and no workflow to choose.
+            if self._conversation_attachments(conversation_id, user_id):
+                workflow_schema = get_default_attachment_workflow_schema()
+            else:
+                workflow_schema = self._default_workflow()
 
         workflow_timeout_ms = workflow_schema.get(
             "timeout_ms", DEFAULT_WORKFLOW_TIMEOUT_MS
@@ -1500,6 +1526,33 @@ class WorkflowEngine:
                 continue
         return deserialized
 
+    def _model_provider_hosts(self) -> List[str]:
+        """Hosts the configured model backend needs to reach.
+
+        Includes any HTTP(S) proxy from the environment: when one is set, the
+        SDK's socket actually connects to the proxy, so the provider hostname
+        alone is not enough to let the call through.
+        """
+        hosts: List[str] = []
+        backend = getattr(self.llm, "backend", None)
+        if backend is not None:
+            base_url = getattr(backend, "_base_url", None)
+            if base_url:
+                host = urlparse(str(base_url)).hostname
+                if host:
+                    hosts.append(host)
+            elif hasattr(backend, "client"):
+                # No base_url means the OpenAI SDK's own default endpoint.
+                hosts.append("api.openai.com")
+        for var in ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"):
+            raw = os.getenv(var)
+            if not raw:
+                continue
+            parsed = urlparse(raw if "://" in raw else f"http://{raw}")
+            if parsed.hostname:
+                hosts.append(parsed.hostname)
+        return list(dict.fromkeys(hosts))
+
     def _build_tool_registry(self) -> Dict[str, dict]:
         registry: Dict[str, dict] = {}
         if hasattr(self.store, "list_artifacts"):
@@ -1998,7 +2051,370 @@ class WorkflowEngine:
             "rag.answer_with_context_v1": self._tool_rag_answer,
             "llm.intent_classifier_v1": self._tool_intent_classifier,
             "agent.code_v1": self._tool_agent_code,
+            "agent.files_v1": self._tool_agent_files,
+            "file.search_v1": self._tool_file_search,
+            "code.python_v1": self._tool_code_python,
             "workflow.end": self._tool_end,
+        }
+
+    # ------------------------------------------------------------------
+    # Attachment tools the model can call for itself
+    # ------------------------------------------------------------------
+
+    # Schemas advertised to the model (OpenAI function-calling format).
+    FILE_SEARCH_SCHEMA = {
+        "type": "function",
+        "function": {
+            "name": "file_search",
+            "description": (
+                "Search the files attached to this conversation and return the "
+                "most relevant excerpts with their file names. Call it more "
+                "than once, rephrasing the query, if the first results are "
+                "not enough."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "What to look for, in natural language.",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Maximum excerpts to return (1-10).",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    }
+
+    RUN_PYTHON_SCHEMA = {
+        "type": "function",
+        "function": {
+            "name": "run_python",
+            "description": (
+                "Run Python 3 in a sandbox whose working directory contains "
+                "the attached files. Use it to unzip archives, parse CSV/JSON, "
+                "and compute results. print() what you need to see. The "
+                "standard library is available; there is no network access."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "code": {"type": "string", "description": "Python source to execute."}
+                },
+                "required": ["code"],
+            },
+        },
+    }
+
+    MAX_AGENT_ROUNDS = 3
+    # Leave headroom under the node timeout for the final model turn.
+    AGENT_DEADLINE_SECONDS = 45.0
+    PYTHON_TOOL_TIMEOUT = 12.0
+
+    def _conversation_attachments(
+        self, conversation_id: Optional[str], user_id: Optional[str]
+    ) -> List[dict]:
+        if not conversation_id or not user_id:
+            return []
+        try:
+            conversation = self.store.get_conversation(conversation_id, user_id=user_id)
+        except Exception:
+            return []
+        return attachments_service.list_attachments(conversation) if conversation else []
+
+    def _attachment_context_ids(
+        self, conversation_id: Optional[str], user_id: Optional[str]
+    ) -> Optional[List[str]]:
+        if not conversation_id or not user_id:
+            return None
+        ctx_id = attachments_service.find_conversation_context_id(
+            self.store, user_id=user_id, conversation_id=conversation_id
+        )
+        return [ctx_id] if ctx_id else None
+
+    def _run_file_search(
+        self,
+        query: str,
+        limit: int,
+        *,
+        conversation_id: Optional[str],
+        context_id: Optional[str],
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+    ) -> Tuple[str, List[str]]:
+        """Retrieve excerpts for a model-supplied query. Returns (text, snippets)."""
+        ctx_ids = self._attachment_context_ids(conversation_id, user_id) or []
+        if context_id:
+            allowed = self._validate_context_scope(
+                [context_id], user_id=user_id, tenant_id=tenant_id
+            )
+            ctx_ids = list(dict.fromkeys(ctx_ids + (allowed or [])))
+        if not ctx_ids:
+            return ("No searchable files are attached to this conversation.", [])
+        chunks = self.rag.retrieve(
+            ctx_ids,
+            query,
+            limit=max(1, min(10, limit or 4)),
+            user_id=user_id,
+            tenant_id=tenant_id,
+        )
+        if not chunks:
+            return (f"No excerpts matched '{query}'.", [])
+        rendered = []
+        snippets = []
+        for chunk in chunks:
+            source = Path((chunk.meta or {}).get("source_path") or "attachment").name
+            rendered.append(f"[{source}]\n{chunk.content}")
+            snippets.append(chunk.content)
+        return ("\n\n".join(rendered), snippets)
+
+    def _run_python_tool(
+        self,
+        code: str,
+        *,
+        conversation_id: Optional[str],
+        user_id: Optional[str],
+        session: dict,
+    ) -> str:
+        """Execute model-written Python against the conversation's attachments."""
+        if not user_id:
+            return "Python execution requires an authenticated user."
+        fs_root = getattr(self.settings, "shared_fs_root", "/srv/liminallm")
+        files_dir = attachments_service.user_files_dir(fs_root, user_id)
+        if session.get("workdir") is None:
+            attachments = self._conversation_attachments(conversation_id, user_id)
+            names = [a.get("name") for a in attachments if a.get("name")]
+            scratch = Path(fs_root) / "tmp" / "interpreter"
+            scratch.mkdir(parents=True, exist_ok=True)
+            session["workdir"] = interpreter.prepare_workdir(
+                str(scratch), str(files_dir), names
+            )
+        result = interpreter.run_python_sandboxed(
+            code, workdir=session["workdir"], timeout=self.PYTHON_TOOL_TIMEOUT
+        )
+        published = interpreter.publish_artifacts(
+            session["workdir"], str(files_dir), result.get("created_files") or []
+        )
+        parts = []
+        if result.get("stdout"):
+            parts.append(f"stdout:\n{result['stdout']}")
+        if result.get("stderr"):
+            parts.append(f"stderr:\n{result['stderr']}")
+        if published:
+            session.setdefault("artifacts", []).extend(published)
+            parts.append(f"files written (saved to the user's files): {', '.join(published)}")
+        if not parts:
+            parts.append("(the code produced no output — remember to print())")
+        return "\n\n".join(parts)
+
+    def _tool_file_search(
+        self,
+        inputs: Dict[str, Any],
+        adapters: List[dict],
+        history: List[Any],
+        context_id: Optional[str],
+        conversation_id: Optional[str],
+        user_message: str,
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """Direct-invocable form of file_search (also used by the agent loop)."""
+        query = inputs.get("query") or inputs.get("message") or user_message or ""
+        text, snippets = self._run_file_search(
+            query,
+            int(inputs.get("limit") or 4),
+            conversation_id=conversation_id,
+            context_id=context_id,
+            user_id=user_id,
+            tenant_id=tenant_id,
+        )
+        return {"content": text, "usage": {}, "context_snippets": snippets}
+
+    def _tool_code_python(
+        self,
+        inputs: Dict[str, Any],
+        adapters: List[dict],
+        history: List[Any],
+        context_id: Optional[str],
+        conversation_id: Optional[str],
+        user_message: str,
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """Direct-invocable form of run_python (also used by the agent loop)."""
+        code = inputs.get("code") or ""
+        if not code:
+            return {"status": "error", "content": "no code supplied", "usage": {}}
+        session: dict = {}
+        try:
+            output = self._run_python_tool(
+                code,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                session=session,
+            )
+        finally:
+            interpreter.cleanup_workdir(session.get("workdir"))
+        return {"content": output, "usage": {}}
+
+    def _tool_agent_files(
+        self,
+        inputs: Dict[str, Any],
+        adapters: List[dict],
+        history: List[Any],
+        context_id: Optional[str],
+        conversation_id: Optional[str],
+        user_message: str,
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """Answer using the conversation's attachments, model-driven.
+
+        Small text files are already in the prompt; for anything else the model
+        decides whether to search or to run code, and may do both, repeatedly.
+        Falls back to push-style retrieval when the backend cannot call tools.
+        """
+        message = inputs.get("message") or user_message or ""
+        attachments = self._conversation_attachments(conversation_id, user_id)
+        fs_root = getattr(self.settings, "shared_fs_root", "/srv/liminallm")
+        preamble = attachments_service.build_attachment_preamble(
+            attachments, fs_root=fs_root, user_id=user_id or ""
+        )
+
+        if not attachments or not self.llm.supports_tools:
+            # No attachments, or a backend without tool calling: keep the
+            # existing behaviour rather than degrading the answer.
+            result = self._tool_llm_generic(
+                {**inputs, "message": message},
+                adapters,
+                history,
+                context_id,
+                conversation_id,
+                user_message,
+                user_id,
+                tenant_id,
+            )
+            if preamble:
+                result.setdefault("context_snippets", []).insert(0, preamble)
+            return result
+
+        tools = []
+        if any(a.get("searchable") for a in attachments):
+            tools.append(self.FILE_SEARCH_SCHEMA)
+        if any(a.get("analyzable") for a in attachments):
+            tools.append(self.RUN_PYTHON_SCHEMA)
+
+        system = (
+            "You are a concise assistant. Answer using the attached files. "
+            "When you use a file, name it in your answer.\n\n" + preamble
+        )
+        messages: List[dict] = [{"role": "system", "content": system}]
+        for msg in history or []:
+            role = getattr(msg, "role", None)
+            content = getattr(msg, "content", None)
+            if role in {"user", "assistant"} and content:
+                messages.append({"role": role, "content": content})
+        messages.append({"role": "user", "content": message})
+
+        session: dict = {}
+        snippets: List[str] = []
+        tool_trace: List[dict] = []
+        usage: Dict[str, Any] = {}
+        content = ""
+        deadline = time.monotonic() + self.AGENT_DEADLINE_SECONDS
+
+        try:
+            for round_index in range(self.MAX_AGENT_ROUNDS):
+                # Withhold the tools on the last permitted round (or once the
+                # budget is spent) so the model has to produce a final answer.
+                out_of_time = time.monotonic() > deadline
+                offer = [] if (out_of_time or round_index == self.MAX_AGENT_ROUNDS - 1) else tools
+                response = self.llm.generate_with_tools(
+                    messages, offer, adapters, user_id=user_id
+                )
+                for key, value in (response.get("usage") or {}).items():
+                    if isinstance(value, int):
+                        usage[key] = usage.get(key, 0) + value
+                calls = response.get("tool_calls") or []
+                content = response.get("content") or content
+                if not calls:
+                    break
+                messages.append(
+                    response.get("assistant_message")
+                    or {"role": "assistant", "content": content}
+                )
+                for call in calls:
+                    name = call.get("name") or ""
+                    try:
+                        args = json.loads(call.get("arguments") or "{}")
+                    except (TypeError, ValueError):
+                        args = {}
+                    if not isinstance(args, dict):
+                        args = {}
+                    if name == "file_search":
+                        result, found = self._run_file_search(
+                            str(args.get("query") or message),
+                            int(args.get("limit") or 4),
+                            conversation_id=conversation_id,
+                            context_id=context_id,
+                            user_id=user_id,
+                            tenant_id=tenant_id,
+                        )
+                        snippets.extend(found)
+                    elif name == "run_python":
+                        result = self._run_python_tool(
+                            str(args.get("code") or ""),
+                            conversation_id=conversation_id,
+                            user_id=user_id,
+                            session=session,
+                        )
+                    else:
+                        result = f"unknown tool '{name}'"
+                    tool_trace.append({"tool": name, "arguments": args})
+                    self.logger.info(
+                        "attachment_tool_called",
+                        tool=name,
+                        conversation_id=conversation_id,
+                        user_id=user_id,
+                        round=round_index,
+                    )
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.get("id") or name,
+                            "name": name,
+                            "content": result,
+                        }
+                    )
+        except Exception as exc:  # noqa: BLE001 - degrade, don't fail the chat
+            self.logger.warning(
+                "attachment_agent_failed",
+                conversation_id=conversation_id,
+                error=str(exc),
+            )
+            if not content:
+                return self._tool_llm_generic(
+                    {**inputs, "message": message},
+                    adapters,
+                    history,
+                    context_id,
+                    conversation_id,
+                    user_message,
+                    user_id,
+                    tenant_id,
+                )
+        finally:
+            interpreter.cleanup_workdir(session.get("workdir"))
+
+        return {
+            "content": content or "I could not derive an answer from the attached files.",
+            "usage": usage,
+            "context_snippets": snippets,
+            "tool_calls": tool_trace,
+            "artifacts": session.get("artifacts", []),
         }
 
     def _resolve_context_ids(

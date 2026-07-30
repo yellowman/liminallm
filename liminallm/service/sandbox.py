@@ -20,6 +20,7 @@ import resource
 import socket
 import tempfile
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -318,18 +319,26 @@ class ToolNetworkPolicy:
     proxy_url: Optional[str] = None
     connect_timeout: float = 10.0
     total_timeout: float = 30.0
+    # Hosts the service itself must reach to function — the configured model
+    # provider, above all. These are infrastructure, not tool fetch targets:
+    # they are connectable (so provider calls inside a tool handler work) but
+    # never appear in `allowlist`, so a tool cannot fetch from them.
+    infrastructure_hosts: list[str] = field(default_factory=list)
 
     def connection_allowlist(self) -> list[str]:
-        """Hosts the sandbox may connect to for outbound requests.
+        """Hosts the sandbox may open sockets to.
 
-        If a proxy is configured, only the proxy host is reachable; otherwise
-        the target allowlist is used directly.
+        If a proxy is configured, tool traffic must go through it; otherwise
+        the target allowlist applies. Infrastructure hosts are always
+        connectable, since blocking them would break the model backend.
         """
 
         if self.proxy_url:
             parsed = urlparse(self.proxy_url)
-            return [h for h in [parsed.hostname] if h]
-        return list(self.allowlist)
+            hosts = [h for h in [parsed.hostname] if h]
+        else:
+            hosts = list(self.allowlist)
+        return hosts + [h for h in self.infrastructure_hosts if h]
 
 
 def _normalize_allowlist(entries: Sequence[str] | None) -> list[str]:
@@ -347,6 +356,7 @@ def build_tool_network_policy(
     proxy_url: Optional[str],
     connect_timeout: float = 10.0,
     total_timeout: float = 30.0,
+    infrastructure_hosts: Sequence[str] | None = None,
 ) -> ToolNetworkPolicy:
     """Create a normalized ToolNetworkPolicy from raw values."""
 
@@ -355,6 +365,7 @@ def build_tool_network_policy(
         proxy_url=proxy_url,
         connect_timeout=connect_timeout,
         total_timeout=total_timeout,
+        infrastructure_hosts=_normalize_allowlist(list(infrastructure_hosts or [])),
     )
 
 
@@ -384,6 +395,26 @@ def _host_matches_allowlist(host: str, allowlist: Sequence[str]) -> bool:
     return False
 
 
+_DNS_CACHE: dict[str, tuple[float, frozenset[str]]] = {}
+_DNS_CACHE_TTL = 60.0
+
+
+def _resolve_host_ips(host: str) -> frozenset[str]:
+    """Addresses ``host`` currently resolves to, cached briefly."""
+    now = time.monotonic()
+    cached = _DNS_CACHE.get(host)
+    if cached and now - cached[0] < _DNS_CACHE_TTL:
+        return cached[1]
+    try:
+        ips = frozenset(
+            info[4][0] for info in socket.getaddrinfo(host, None) if info[4]
+        )
+    except OSError:
+        ips = frozenset()
+    _DNS_CACHE[host] = (now, ips)
+    return ips
+
+
 def _enforce_network_allowlist(host: str) -> None:
     policy: ToolNetworkPolicy | None = getattr(_NETWORK_POLICY_STATE, "policy", None)
     if not policy:
@@ -393,8 +424,25 @@ def _enforce_network_allowlist(host: str) -> None:
     if not allowed_hosts:
         raise SandboxError("Tool network access disabled (empty allowlist)")
 
-    if not _host_matches_allowlist(host, allowed_hosts):
+    if _host_matches_allowlist(host, allowed_hosts):
+        return
+
+    # HTTP clients (httpx, urllib3) resolve DNS themselves and then connect to
+    # an address, so the guard is handed an IP literal rather than the name the
+    # allowlist is written in. Compare against what the allowlisted names
+    # resolve to; anything else is refused.
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
         raise SandboxError(f"Egress host '{host}' is not allowlisted for tools")
+
+    for entry in allowed_hosts:
+        if entry.startswith("*.") or "/" in entry:
+            continue  # wildcards and CIDRs are handled by the name/CIDR match
+        if host in _resolve_host_ips(entry):
+            return
+
+    raise SandboxError(f"Egress address '{host}' is not allowlisted for tools")
 
 
 _ORIGINAL_CREATE_CONNECTION = socket.create_connection

@@ -266,9 +266,16 @@
               <div id="messages-empty" class="empty">Start a new thread to see your conversation history here.</div>
 
               <form id="chat-form">
-                <div class="field textarea-wrap">
+                <div id="attachment-chips" class="attachment-chips"></div>
+                <div class="field textarea-wrap" id="composer-drop">
                   <label for="message-input" class="sr-only">Message</label>
-                  <textarea id="message-input" placeholder="Ask anything..." rows="3"></textarea>
+                  <textarea id="message-input" placeholder="Ask anything, or drop a file here..." rows="3"></textarea>
+                  <button type="button" class="attach-btn" id="attach-btn" aria-label="Attach a file" title="Attach a file">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                    </svg>
+                  </button>
+                  <input type="file" id="composer-file" class="hidden" />
                   <div class="draft-indicator" id="draft-indicator"></div>
                 </div>
                 <div id="chat-actions">
