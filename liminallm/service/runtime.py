@@ -11,6 +11,7 @@ from urllib.parse import urlparse, urlunparse
 from liminallm.config import get_settings, reset_settings_cache
 from liminallm.logging import get_logger
 from liminallm.service.auth import AuthService
+from liminallm.service.cluster import AdvisoryLock, ClusterBus
 from liminallm.service.clustering import SemanticClusterer
 from liminallm.service.config_ops import ConfigOpsService
 from liminallm.service.email import EmailService
@@ -203,6 +204,17 @@ class Runtime:
             from_name=email_from_name,
             base_url=app_base_url,
         )
+        # Cross-replica coordination. Both primitives are best-effort and
+        # neither makes Redis required: the bus falls back to Postgres
+        # LISTEN/NOTIFY, and a single-process deployment gets local semantics.
+        db_url = None if self.settings.use_memory_store else self.settings.database_url
+        self.bus = ClusterBus(
+            redis_url=self.settings.redis_url if self.cache is not None else None,
+            database_url=db_url,
+            backend=self.settings.cluster_bus_backend,
+        )
+        self.leader_lock = AdvisoryLock(db_url)
+
         # Training worker for background job processing
         poll_interval = sys_settings.get(
             "training_worker_poll_interval", self.settings.training_worker_poll_interval
@@ -212,6 +224,7 @@ class Runtime:
             training_service=self.training,
             clusterer=self.clusterer,
             poll_interval=poll_interval,
+            leader_lock=self.leader_lock,
         )
         self._local_idempotency: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         self._local_idempotency_lock = asyncio.Lock()
@@ -441,6 +454,10 @@ class Runtime:
         if getattr(self, "training_worker", None):
             with contextlib.suppress(Exception):
                 await self.training_worker.stop()
+
+        if getattr(self, "bus", None):
+            with contextlib.suppress(Exception):
+                await self.bus.stop()
 
         if getattr(self, "workflow", None):
             with contextlib.suppress(Exception):

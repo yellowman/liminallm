@@ -63,6 +63,15 @@ async def lifespan(app: FastAPI):
 
     try:
         runtime = get_runtime()
+        # Cross-replica coordination: lets POST /chat/cancel reach the worker
+        # holding the stream's WebSocket instead of only stopping local ones.
+        try:
+            from liminallm.api.routes import CANCEL_CHANNEL, handle_remote_cancel
+
+            runtime.bus.subscribe(CANCEL_CHANNEL, handle_remote_cancel)
+            await runtime.bus.start()
+        except Exception as exc:  # coordination is optional; keep serving
+            logger.warning("cluster_bus_start_failed", error=str(exc))
         # Check training_worker_enabled from DB settings (falls back to env var)
         training_worker_enabled = runtime.settings.training_worker_enabled
         if hasattr(runtime.store, "get_system_settings"):
@@ -487,6 +496,14 @@ async def _dependency_checks() -> tuple[Dict[str, Dict[str, Any]], bool, bool]:
     else:
         fs_ok = True
         checks["filesystem"] = {"status": "not_configured"}
+
+    # Reported, never gating: the cluster bus only affects cross-replica
+    # cancellation, and "local" is the right answer for a single process.
+    bus = getattr(runtime, "bus", None)
+    checks["cluster_bus"] = {
+        "status": "healthy",
+        "backend": getattr(bus, "backend", "local"),
+    }
 
     serving_ok = db_ok and fs_ok
     return checks, serving_ok, serving_ok and redis_ok

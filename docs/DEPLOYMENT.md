@@ -18,6 +18,7 @@ set env vars before boot:
 - secrets: `JWT_SECRET` (required), `JWT_ISSUER`/`JWT_AUDIENCE` (optional defaults exist).
 - model backend: `MODEL_BACKEND` (defaults to `openai`), `MODEL_PATH` for local base models, adapter keys like `OPENAI_ADAPTER_API_KEY`/`OPENAI_ADAPTER_BASE_URL`, optional `VOICE_*`.
 - routing/limits: `CHAT_RATE_LIMIT_PER_MINUTE`, `RESET_RATE_LIMIT_PER_MINUTE`.
+- multi-replica: `CLUSTER_BUS_BACKEND` (`auto` by default; see running multiple replicas below).
 - smtp/oauth: `SMTP_*`, `OAUTH_*` if needed.
 - ports: `HOST_PORT` (compose host), `PORT` (app listen).
 
@@ -348,11 +349,22 @@ make qa-unit
 - when sending requests, set `base_model` to the foundation you want and `adapter_id`/`adapter_mode` to pick the adapter path (local weights, provider-hosted adapters, or prompt patching).
 
 ## ops & safety defaults (from the spec)
-- observability: metrics and traces should include chat latency/error rates, adapter usage, preference/training counts, and workflow node timings; health checks live at `/healthz` and probe postgres, redis, and filesystem mounts.
+- observability: metrics and traces should include chat latency/error rates, adapter usage, preference/training counts, and workflow node timings; `/healthz` always answers 200 with a per-dependency breakdown (postgres, redis, filesystem) for humans and dashboards, while `/readyz` is the load balancer probe and returns 503 when postgres or the filesystem is unusable.
 - retention: metrics 7–14d, logs 30–90d with payload sampling and pii minimization.
 - alerts: latency slo breaches, adapter cache miss spikes (>20%), training failure bursts, ingestion lag over an hour.
 - backups: nightly postgres logical backup kept 7d; weekly filesystem snapshot pointers kept 4 weeks; redis is treated as ephemeral (state is recreated from postgres + filesystem artifacts).
 - safety rails: content safety classifier on user/assistant text; preference events and training skip disallowed content.
+
+## running multiple replicas
+scale out by running the same image behind a load balancer. postgres and `SHARED_FS_ROOT` are the shared state; nothing in the app assumes it is the only process.
+
+- **probes**: point the balancer at `/readyz`, not `/healthz`. `/readyz` fails a node whose database or filesystem is gone; redis is deliberately excluded so a redis outage degrades every node instead of draining the whole fleet.
+- **shared filesystem**: every replica must mount the *same* `SHARED_FS_ROOT` (nfs/efs or equivalent). adapters, artifacts, and user uploads are written by whichever node handled the request and read by any other.
+- **node-local scratch**: `INTERPRETER_SCRATCH_DIR` must stay off shared storage — it holds throwaway per-tool-call copies and defaults to the system temp dir.
+- **sessions/routing**: sticky sessions are not required. websockets are per-connection, and `POST /chat/cancel` reaches the replica holding the stream over the cluster bus, so a stop button works no matter which node the request lands on.
+- **cluster bus**: `CLUSTER_BUS_BACKEND=auto` (default) uses redis pub/sub when redis is reachable and otherwise falls back to postgres `LISTEN`/`NOTIFY`, which is why redis stays optional. force one with `redis`/`postgres`, or set `local` for a single-process deployment to skip peer coordination entirely. the bus is best-effort: if it is down, cancellation falls back to local-only behavior and nothing else changes.
+- **background work**: periodic clustering and adapter-prune proposals take a postgres advisory lock, so they run once per interval cluster-wide rather than once per replica. training jobs need no lock — claiming a job is an atomic conditional update, so exactly one replica wins each one.
+- **workers per node**: with `MODEL_BACKEND=local_gpu_lora` keep `--workers 1` per gpu and scale by adding nodes; api backends scale fine with several workers per node.
 
 ## configuration management expectations
 - principle: most runtime knobs live in the database and are editable via the admin ui (`/admin`) instead of env vars.

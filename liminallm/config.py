@@ -471,6 +471,16 @@ class Settings(BaseModel):
             "throwaway copies of attachments for one tool call."
         ),
     )
+    cluster_bus_backend: str = env_field(
+        "auto",
+        "CLUSTER_BUS_BACKEND",
+        description=(
+            "Transport for cross-replica coordination (cancelling a stream "
+            "owned by another worker): auto | redis | postgres | local. 'auto' "
+            "prefers Redis and falls back to Postgres LISTEN/NOTIFY, so Redis "
+            "stays optional; 'local' disables peer coordination entirely."
+        ),
+    )
     # Web tools (SPEC §18). Browsing is enabled by default but constrained:
     # SSRF protection is always on, and search stays inert until a provider and
     # its key are configured.
