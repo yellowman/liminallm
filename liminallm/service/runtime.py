@@ -208,10 +208,20 @@ class Runtime:
         # neither makes Redis required: the bus falls back to Postgres
         # LISTEN/NOTIFY, and a single-process deployment gets local semantics.
         db_url = None if self.settings.use_memory_store else self.settings.database_url
+        # The cache object is the signal that Redis really exists here (the
+        # setting has a localhost default even on redis-less deployments) —
+        # but an explicit backend=redis is the operator's word over that
+        # heuristic, e.g. when Redis was briefly down at boot.
+        bus_backend = self.settings.cluster_bus_backend
+        bus_redis_url = (
+            self.settings.redis_url
+            if (self.cache is not None or bus_backend == "redis")
+            else None
+        )
         self.bus = ClusterBus(
-            redis_url=self.settings.redis_url if self.cache is not None else None,
+            redis_url=bus_redis_url,
             database_url=db_url,
-            backend=self.settings.cluster_bus_backend,
+            backend=bus_backend,
         )
         self.leader_lock = AdvisoryLock(db_url)
 

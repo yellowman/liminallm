@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import posixpath
 import re
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -486,10 +488,16 @@ async def _dependency_checks() -> tuple[Dict[str, Dict[str, Any]], bool, bool]:
         def _fs_probe() -> None:
             if not fs_path.exists() or not fs_path.is_dir():
                 raise FileNotFoundError(fs_path)
-            health_file = fs_path / ".health_check"
-            health_file.write_text(datetime.utcnow().isoformat())
-            health_file.read_text()
-            health_file.unlink(missing_ok=True)
+            # Unique name per probe: SHARED_FS_ROOT is shared across replicas,
+            # and concurrent probes racing on one fixed filename made read_text
+            # hit another probe's unlink — a spurious 503 that drained healthy
+            # replicas.
+            health_file = fs_path / f".health_check-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+            try:
+                health_file.write_text(datetime.utcnow().isoformat())
+                health_file.read_text()
+            finally:
+                health_file.unlink(missing_ok=True)
 
         fs_ok = await _run_bounded("filesystem", _fs_probe)
         checks["filesystem"] = {"status": "healthy" if fs_ok else "unhealthy"}
@@ -501,7 +509,7 @@ async def _dependency_checks() -> tuple[Dict[str, Dict[str, Any]], bool, bool]:
     # cancellation, and "local" is the right answer for a single process.
     bus = getattr(runtime, "bus", None)
     checks["cluster_bus"] = {
-        "status": "healthy",
+        "status": "healthy" if getattr(bus, "connected", True) else "degraded",
         "backend": getattr(bus, "backend", "local"),
     }
 

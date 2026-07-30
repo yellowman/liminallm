@@ -9,6 +9,7 @@ operator actually gets when Redis is absent.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 
@@ -403,6 +404,137 @@ async def test_prune_scan_is_leader_gated():
     worker._last_prune_run = 0.0
     await worker._maybe_recommend_adapter_pruning()
     assert calls == [1]
+
+
+# --------------------------------------------------------------------------
+# Review fixes: transports must recover, forced backends must not substitute
+
+
+async def test_forced_redis_never_substitutes_postgres():
+    """backend=redis is a promise: dead Redis degrades to local, not postgres."""
+    bus = ClusterBus(
+        redis_url="redis://127.0.0.1:1/0",
+        database_url="postgresql://postgres@127.0.0.1:5432/liminallm",
+        backend="redis",
+    )
+    called = []
+    bus._start_postgres = lambda: called.append(1) or True
+    await bus.start()
+    try:
+        assert bus.backend == "local"
+        assert called == []
+    finally:
+        await bus.stop()
+
+
+class _FlakyListenConn:
+    """First connection dies mid-listen; the replacement delivers a notify."""
+
+    class _Notify:
+        payload = json.dumps({"ch": "chat.cancel", "node": "peer", "data": {"n": 1}})
+
+    def __init__(self, fail_once_holder, stop_event):
+        self._fail = fail_once_holder
+        self._stop = stop_event
+        self.closed = False
+
+    def notifies(self, timeout=None):
+        if self._fail["remaining"] > 0:
+            self._fail["remaining"] -= 1
+            raise ConnectionError("server closed the connection unexpectedly")
+        if not self._fail["delivered"]:
+            self._fail["delivered"] = True
+            yield self._Notify()
+        else:
+            self._stop.set()  # test is done; let the loop exit
+
+    def close(self):
+        self.closed = True
+
+
+async def test_pg_listen_loop_reconnects_after_connection_death():
+    bus = ClusterBus(database_url="postgresql://unused/db")
+    bus._loop = asyncio.get_running_loop()
+    state = {"remaining": 1, "delivered": False}
+    connects = []
+
+    def fake_connect():
+        connects.append(1)
+        return _FlakyListenConn(state, bus._pg_stop)
+
+    bus._pg_connect_listen = fake_connect
+    received = asyncio.Event()
+
+    async def handler(data):
+        received.set()
+        return None
+
+    bus.subscribe("chat.cancel", handler)
+    first_conn = fake_connect()
+    thread = __import__("threading").Thread(
+        target=bus._pg_listen_loop, args=(first_conn,), daemon=True
+    )
+    thread.start()
+    await asyncio.wait_for(received.wait(), timeout=10.0)
+    bus._pg_stop.set()
+    await asyncio.to_thread(thread.join, 5.0)
+    # Died once, reconnected at least once, and the notify got through.
+    assert len(connects) >= 2
+    assert bus._connected is True
+
+
+async def test_redis_reader_survives_a_dropped_connection():
+    bus = ClusterBus(redis_url="redis://unused/0")
+    bus.backend = "redis"
+    dispatched = asyncio.Event()
+
+    async def handler(data):
+        dispatched.set()
+        return None
+
+    bus.subscribe("chat.cancel", handler)
+    frame = json.dumps({"ch": "chat.cancel", "node": "peer", "data": {}})
+
+    class FlakyPubSub:
+        def __init__(self):
+            self.calls = 0
+
+        async def listen(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise ConnectionError("connection lost")
+            yield {"type": "message", "data": frame}
+            await asyncio.sleep(3600)  # hold the stream open until cancelled
+
+    bus._pubsub = FlakyPubSub()
+    reader = asyncio.create_task(bus._redis_reader())
+    try:
+        await asyncio.wait_for(dispatched.wait(), timeout=10.0)
+        assert bus._pubsub.calls == 2
+        assert bus._connected is True
+    finally:
+        reader.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await reader
+
+
+async def test_concurrent_fs_probes_do_not_starve_each_other():
+    """Shared-filename health probes 503'd healthy replicas; names are unique now."""
+    from liminallm import app as app_module
+
+    results = await asyncio.gather(
+        *[app_module._dependency_checks() for _ in range(8)]
+    )
+    assert all(serving_ok for _, serving_ok, _ in results)
+
+
+def test_connected_property_tracks_transport():
+    bus = ClusterBus()
+    assert bus.connected is True  # local: trivially connected
+    bus.backend = "postgres"
+    assert bus.connected is False
+    bus._connected = True
+    assert bus.connected is True
 
 
 # --------------------------------------------------------------------------

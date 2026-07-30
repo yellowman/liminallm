@@ -39,6 +39,10 @@ logger = get_logger(__name__)
 BUS_CHANNEL = "liminallm_bus"
 # NOTIFY payloads are capped at 8000 bytes by Postgres; stay well under it.
 MAX_PAYLOAD_BYTES = 6000
+# Bound every fresh connection: an unreachable coordination host must degrade
+# a request, not hang it for the TCP stack's idea of forever.
+CONNECT_TIMEOUT_SECONDS = 5
+_RECONNECT_MAX_BACKOFF = 30.0
 _ACK = "__ack__"
 
 Handler = Callable[[Dict[str, Any]], Awaitable[Optional[Dict[str, Any]]]]
@@ -76,6 +80,7 @@ class ClusterBus:
         self._handlers: Dict[str, Handler] = {}
         self._pending: Dict[str, asyncio.Future] = {}
         self._started = False
+        self._connected = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         # Redis backend state
         self._redis = None
@@ -104,11 +109,19 @@ class ClusterBus:
             if wanted in {"auto", "redis"} and self._redis_url:
                 if await self._start_redis():
                     self.backend = "redis"
-            if self.backend == "local" and wanted in {"auto", "redis", "postgres"}:
+            # A forced backend is a promise, not a preference: "redis" that
+            # can't connect degrades to local rather than silently becoming
+            # postgres. Only "auto" falls through.
+            if self.backend == "local" and wanted in {"auto", "postgres"}:
                 if self._database_url and await asyncio.to_thread(self._start_postgres):
                     self.backend = "postgres"
         self._started = True
         logger.info("cluster_bus_started", backend=self.backend, node_id=self.node_id)
+
+    @property
+    def connected(self) -> bool:
+        """True when the transport is live (trivially true with no peers)."""
+        return self.backend == "local" or self._connected
 
     async def stop(self) -> None:
         self._started = False
@@ -137,6 +150,7 @@ class ClusterBus:
                 future.cancel()
         self._pending.clear()
         self.backend = "local"
+        self._connected = False
 
     # -- public API --------------------------------------------------------
 
@@ -244,11 +258,16 @@ class ClusterBus:
         try:
             import redis.asyncio as aioredis
 
-            redis = aioredis.from_url(self._redis_url, decode_responses=True)
+            redis = aioredis.from_url(
+                self._redis_url,
+                decode_responses=True,
+                socket_connect_timeout=CONNECT_TIMEOUT_SECONDS,
+            )
             pubsub = redis.pubsub(ignore_subscribe_messages=True)
             await pubsub.subscribe(BUS_CHANNEL)
             self._redis = redis
             self._pubsub = pubsub
+            self._connected = True
             self._reader = asyncio.create_task(self._redis_reader())
             return True
         except Exception as exc:
@@ -261,27 +280,52 @@ class ClusterBus:
             return False
 
     async def _redis_reader(self) -> None:
+        """Consume the pubsub stream, resubscribing after transport drops.
+
+        redis-py re-registers this pubsub's channels when the connection comes
+        back, so recovery is just calling listen() again; without this loop a
+        single dropped connection silently ended cross-replica coordination
+        for the life of the process.
+        """
         assert self._pubsub is not None
-        try:
-            async for message in self._pubsub.listen():
-                if message and message.get("type") == "message":
-                    await self._dispatch(message.get("data") or "")
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning("cluster_bus_redis_reader_stopped", error=str(exc))
+        backoff = 1.0
+        while True:
+            try:
+                self._connected = True
+                async for message in self._pubsub.listen():
+                    backoff = 1.0
+                    if message and message.get("type") == "message":
+                        await self._dispatch(message.get("data") or "")
+                return  # stream closed cleanly (stop())
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._connected = False
+                logger.warning("cluster_bus_redis_reader_error", error=str(exc))
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, _RECONNECT_MAX_BACKOFF)
 
     # -- postgres backend --------------------------------------------------
 
+    def _pg_connect_listen(self):
+        """Fresh LISTENing connection (separate method so tests can fake it)."""
+        import psycopg
+
+        conn = psycopg.connect(
+            self._database_url,
+            autocommit=True,
+            connect_timeout=CONNECT_TIMEOUT_SECONDS,
+        )
+        conn.execute(f"LISTEN {BUS_CHANNEL}")
+        return conn
+
     def _start_postgres(self) -> bool:
         try:
-            import psycopg
-
-            conn = psycopg.connect(self._database_url, autocommit=True)
-            conn.execute(f"LISTEN {BUS_CHANNEL}")
+            conn = self._pg_connect_listen()
         except Exception as exc:
             logger.warning("cluster_bus_postgres_unavailable", error=str(exc))
             return False
+        self._connected = True
         self._pg_stop.clear()
         self._pg_thread = threading.Thread(
             target=self._pg_listen_loop,
@@ -293,9 +337,29 @@ class ClusterBus:
         return True
 
     def _pg_listen_loop(self, conn) -> None:
+        """Consume NOTIFYs, replacing the connection when it dies.
+
+        A Postgres restart kills the LISTEN session; retrying notifies() on
+        the dead connection would just raise every second forever, so on error
+        the connection is rebuilt (with backoff) and LISTEN re-issued.
+        """
         loop = self._loop
+        backoff = 1.0
         try:
             while not self._pg_stop.is_set():
+                if conn is None:
+                    try:
+                        conn = self._pg_connect_listen()
+                        self._connected = True
+                        backoff = 1.0
+                        logger.info("cluster_bus_listen_reconnected")
+                    except Exception as exc:
+                        logger.warning(
+                            "cluster_bus_listen_reconnect_failed", error=str(exc)
+                        )
+                        self._pg_stop.wait(backoff)
+                        backoff = min(backoff * 2, _RECONNECT_MAX_BACKOFF)
+                        continue
                 try:
                     for notify in conn.notifies(timeout=1.0):
                         if loop is not None and not loop.is_closed():
@@ -304,14 +368,20 @@ class ClusterBus:
                             )
                         if self._pg_stop.is_set():
                             break
+                    backoff = 1.0
                 except Exception as exc:
                     if self._pg_stop.is_set():
                         break
+                    self._connected = False
                     logger.warning("cluster_bus_listen_error", error=str(exc))
+                    with contextlib.suppress(Exception):
+                        conn.close()
+                    conn = None
                     self._pg_stop.wait(1.0)
         finally:
-            with contextlib.suppress(Exception):
-                conn.close()
+            if conn is not None:
+                with contextlib.suppress(Exception):
+                    conn.close()
 
     def _pg_notify(self, payload: str) -> bool:
         import psycopg
@@ -321,7 +391,9 @@ class ClusterBus:
                 try:
                     if self._pg_notify_conn is None or self._pg_notify_conn.closed:
                         self._pg_notify_conn = psycopg.connect(
-                            self._database_url, autocommit=True
+                            self._database_url,
+                            autocommit=True,
+                            connect_timeout=CONNECT_TIMEOUT_SECONDS,
                         )
                     self._pg_notify_conn.execute(
                         "SELECT pg_notify(%s, %s)", (BUS_CHANNEL, payload)
@@ -380,7 +452,11 @@ class AdvisoryLock:
     def _pg_try_lock(self, name: str):
         import psycopg
 
-        conn = psycopg.connect(self._database_url, autocommit=True)
+        conn = psycopg.connect(
+            self._database_url,
+            autocommit=True,
+            connect_timeout=CONNECT_TIMEOUT_SECONDS,
+        )
         try:
             row = conn.execute(
                 "SELECT pg_try_advisory_lock(%s)", (_lock_key(name),)
