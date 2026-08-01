@@ -6,6 +6,7 @@ api backends (remote inference). you can run them side by side.
 
 ## prerequisites
 - runtime: python 3.11+.
+- optional ocr: `tesseract-ocr` (apt/brew) plus `pip install 'liminallm[ocr]'` lets uploaded images and scanned pdfs be read locally; without it, image reading falls back to the model's vision when the backend is multimodal.
 - datastores: postgres 16 with `vector` + `citext`; redis 7 with auth.
 - filesystem: writable `SHARED_FS_ROOT` (defaults to `/srv/liminallm`) for adapters, artifacts, and user files.
 - gpu/tpu: only if `MODEL_BACKEND=local_gpu_lora` (nvidia cuda/cuDNN for jax gpu builds; amd/rocm if you build your own wheel).

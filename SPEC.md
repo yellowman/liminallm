@@ -1796,12 +1796,18 @@ three tiers, from transient to permanent:
    an uploaded file's text into a note (title from filename, provenance +
    extraction method in `meta`, 64kb cap with `truncated` flagged). the
    shared extractor (`service/extract.py`, also used by rag ingestion) tiers
-   cheapest-first: text bytes decode; pdfs go through pypdf; images are
-   transcribed by the configured model when it is multimodal (gemini,
-   gpt-4o class — one bounded vision call, image framed as DATA to read).
-   files nothing can read are refused with the reason, never stored as
-   garbage. from then on it is ordinary vault material: searchable mid-chat,
-   swept by the witness.
+   cheapest and most faithful first: text bytes decode; pdfs with a text
+   layer go through pypdf; images — and scanned pdfs via their embedded page
+   images — try ocr software first (tesseract, auto-detected, optional
+   `liminallm[ocr]` extra; deterministic and quotes rather than
+   paraphrases), then fall back to the configured model's vision (one
+   bounded call, image framed as DATA to read). vision capability is probed
+   per backend, never assumed from backend type: an api backend uses
+   openai-compatible content parts, and a local multimodal model plugs in by
+   implementing `transcribe_image` on its backend. files nothing can read
+   are refused with the reason and the remedy, never stored as garbage.
+   from then on it is ordinary vault material: searchable mid-chat, swept by
+   the witness.
 
 the rule: **per-chat grounding is automatic; permanent cross-chat memory is a
 decision.** silently promoting every upload into a global corpus would make

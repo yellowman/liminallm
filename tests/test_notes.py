@@ -640,3 +640,104 @@ def test_rag_ingest_skips_unextractable_but_reads_pdfs(tmp_path):
     junk.write_bytes(b"\xff\xd8\xff\xe0" + bytes(range(256)) * 8)
     with pytest.raises(ExtractError):
         extract_text(junk)  # no llm passed: vision unavailable
+
+
+# ---------------------------------------------------------------------------
+# OCR tier: tesseract first, vision second, refusal only when nothing can read
+
+_HAS_OCR = __import__("liminallm.service.extract", fromlist=["x"]).ocr_available()
+
+
+def _text_image_bytes(phrase="MEAT IS OPTIONAL AFTER ALL", fmt="PNG"):
+    import io as _io
+
+    from PIL import Image, ImageDraw
+
+    img = Image.new("RGB", (900, 160), "white")
+    draw = ImageDraw.Draw(img)
+    try:
+        from PIL import ImageFont
+
+        font = ImageFont.load_default(size=48)
+    except Exception:
+        font = None
+    draw.text((30, 50), phrase, fill="black", font=font)
+    buf = _io.BytesIO()
+    img.save(buf, format=fmt)
+    return buf.getvalue()
+
+
+@pytest.mark.skipif(not _HAS_OCR, reason="tesseract not installed")
+def test_image_with_text_is_ocrd_not_sent_to_the_model(client, auth_headers):
+    runtime, _ = _drop_upload(
+        client, auth_headers, "sign.png", _text_image_bytes()
+    )
+
+    def must_not_be_called(*a, **kw):  # OCR should win; vision stays unused
+        raise AssertionError("vision called although OCR could read the image")
+
+    runtime.llm.transcribe_image = must_not_be_called
+    try:
+        resp = client.post(
+            "/v1/notes/from-file", headers=auth_headers, json={"name": "sign.png"}
+        )
+    finally:
+        del runtime.llm.transcribe_image
+    assert resp.status_code == 201, resp.text
+    made = resp.json()["data"]
+    assert made["method"] == "ocr"
+    note = runtime.store.get_note(made["id"])
+    assert "MEAT" in note.content.upper()
+
+
+@pytest.mark.skipif(not _HAS_OCR, reason="tesseract not installed")
+def test_photo_falls_back_to_vision_when_ocr_finds_nothing(
+    client, auth_headers, monkeypatch
+):
+    import io as _io
+
+    from PIL import Image
+
+    img = Image.new("RGB", (200, 200), (37, 90, 141))  # featureless: no text
+    buf = _io.BytesIO()
+    img.save(buf, format="PNG")
+    runtime, _ = _drop_upload(client, auth_headers, "photo.png", buf.getvalue())
+    monkeypatch.setattr(
+        runtime.llm,
+        "transcribe_image",
+        lambda b, m, *, prompt: "A flat blue-grey rectangle.",
+        raising=False,
+    )
+    resp = client.post(
+        "/v1/notes/from-file", headers=auth_headers, json={"name": "photo.png"}
+    )
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["data"]["method"] == "vision"
+
+
+@pytest.mark.skipif(not _HAS_OCR, reason="tesseract not installed")
+def test_scanned_pdf_is_read_page_by_page(client, auth_headers):
+    import io as _io
+
+    from PIL import Image
+
+    # Pillow writes an image-only pdf: exactly what a scanner produces.
+    img = Image.open(_io.BytesIO(_text_image_bytes("SCANNED CLAIM ABOUT PROTEIN")))
+    buf = _io.BytesIO()
+    img.convert("RGB").save(buf, format="PDF")
+    runtime, _ = _drop_upload(client, auth_headers, "scan.pdf", buf.getvalue())
+    resp = client.post(
+        "/v1/notes/from-file", headers=auth_headers, json={"name": "scan.pdf"}
+    )
+    assert resp.status_code == 201, resp.text
+    made = resp.json()["data"]
+    assert made["method"] == "pdf-ocr"
+    note = runtime.store.get_note(made["id"])
+    assert "SCANNED" in note.content.upper()
+
+
+def test_refusal_names_both_remedies():
+    from liminallm.service.extract import _NO_READER_REMEDY
+
+    assert "tesseract" in _NO_READER_REMEDY
+    assert "multimodal" in _NO_READER_REMEDY

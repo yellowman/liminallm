@@ -128,15 +128,22 @@ class LLMService:
     def transcribe_image(self, image_bytes: bytes, mime: str, *, prompt: str) -> str:
         """One vision call: read an image with the configured model.
 
-        Works with any OpenAI-compatible multimodal backend (content parts
-        pass through the client untouched). Backends without a real client —
-        stub, local JAX — raise NotImplementedError so callers can refuse
-        cleanly instead of hallucinating a transcription.
+        Capability is probed, never assumed from backend type: a backend that
+        implements its own ``transcribe_image`` (a local multimodal model —
+        PaliGemma/LLaVA class — would) is used directly; otherwise any
+        OpenAI-compatible client gets the standard content-parts message.
+        Backends with neither raise NotImplementedError so callers can refuse
+        cleanly instead of hallucinating a transcription. (Today's local JAX
+        stack is a text LM + tokenizer, so it lands in that last bucket until
+        someone loads a vision tower and implements the hook.)
         """
         import base64
 
+        backend_hook = getattr(self.backend, "transcribe_image", None)
+        if callable(backend_hook):
+            return backend_hook(image_bytes, mime, prompt=prompt) or ""
         if getattr(self.backend, "client", None) is None:
-            raise NotImplementedError("backend has no vision-capable client")
+            raise NotImplementedError("backend cannot read images")
         data_url = (
             f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
         )

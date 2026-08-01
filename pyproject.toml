@@ -28,6 +28,12 @@ requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project.optional-dependencies]
+ocr = [
+  # Plus the tesseract-ocr system package (apt/brew). Auto-detected at
+  # runtime; without it, image extraction falls back to model vision.
+  "pytesseract>=0.3.10",
+  "Pillow>=10.0",
+]
 dev = [
   "pytest>=8.0",
   "pytest-cov>=4.1",
