@@ -471,6 +471,15 @@ class Settings(BaseModel):
             "throwaway copies of attachments for one tool call."
         ),
     )
+    extract_readers: str = env_field(
+        "ocr,vision",
+        "EXTRACT_READERS",
+        description=(
+            "Ordered roster of image readers for uploads/scanned pdfs. "
+            "Built-ins: ocr (tesseract), vision (the model backend). New "
+            "readers register via extract.register_reader."
+        ),
+    )
     notes_enabled: bool = env_field(
         True,
         "NOTES_ENABLED",

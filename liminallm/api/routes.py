@@ -2377,7 +2377,12 @@ async def note_from_file(
         raise _http_error("not_found", "file not found", status_code=404)
     try:
         extracted = await asyncio.to_thread(
-            extract_service.extract_text, path, llm=runtime.llm
+            extract_service.extract_text,
+            path,
+            llm=runtime.llm,
+            readers=extract_service.parse_reader_order(
+                getattr(runtime.settings, "extract_readers", None)
+            ),
         )
     except extract_service.ExtractError as exc:
         raise _http_error("bad_request", exc.reason, status_code=400)

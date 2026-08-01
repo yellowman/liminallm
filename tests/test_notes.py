@@ -741,3 +741,85 @@ def test_refusal_names_both_remedies():
 
     assert "tesseract" in _NO_READER_REMEDY
     assert "multimodal" in _NO_READER_REMEDY
+
+
+# ---------------------------------------------------------------------------
+# Reader roster: order is config, readers are a registry
+
+
+def test_reader_order_is_respected(monkeypatch):
+    from liminallm.service import extract
+
+    calls = []
+
+    def loud(name, result):
+        def reader(data, mime, llm):
+            calls.append(name)
+            return result
+        return reader
+
+    monkeypatch.setitem(extract._READERS, "first", (loud("first", None), "ocr"))
+    monkeypatch.setitem(
+        extract._READERS, "second", (loud("second", "A deliberate reading."), "vision")
+    )
+    text, method = extract._image_bytes_to_text(
+        b"x", "image/png", None, ("first", "second")
+    )
+    assert (text, method) == ("A deliberate reading.", "second")
+    assert calls == ["first", "second"]
+
+
+def test_unknown_reader_is_skipped_not_fatal(monkeypatch):
+    from liminallm.service import extract
+
+    monkeypatch.setitem(
+        extract._READERS, "real", (lambda d, m, l: "x" * 40, "ocr")
+    )
+    text, method = extract._image_bytes_to_text(
+        b"x", "image/png", None, ("loom-ocr-not-yet", "real")
+    )
+    assert method == "real"
+
+
+def test_reader_failure_falls_through_then_surfaces(monkeypatch):
+    from liminallm.service import extract
+
+    def broken(data, mime, llm):
+        raise RuntimeError("provider 500")
+
+    monkeypatch.setitem(extract._READERS, "flaky", (broken, "vision"))
+    monkeypatch.setitem(
+        extract._READERS, "backup", (lambda d, m, l: "y" * 40, "ocr")
+    )
+    # Failure then success: the roster keeps walking.
+    text, method = extract._image_bytes_to_text(
+        b"x", "image/png", None, ("flaky", "backup")
+    )
+    assert method == "backup"
+    # Failure with nothing after it: the error is surfaced, not swallowed.
+    with pytest.raises(extract.ExtractError, match="provider 500"):
+        extract._image_bytes_to_text(b"x", "image/png", None, ("flaky",))
+
+
+def test_register_reader_is_the_extension_point():
+    from liminallm.service import extract
+
+    def loom_reader(data, mime, llm):
+        return "READ ON LOOM"
+
+    extract.register_reader("loom-test", loom_reader, kind="vision")
+    try:
+        text, method = extract._image_bytes_to_text(
+            b"x", "image/png", None, ("loom-test",)
+        )
+        assert (text, method) == ("READ ON LOOM", "loom-test")
+    finally:
+        extract._READERS.pop("loom-test", None)
+
+
+def test_parse_reader_order():
+    from liminallm.service.extract import DEFAULT_READER_ORDER, parse_reader_order
+
+    assert parse_reader_order("vision, ocr") == ("vision", "ocr")
+    assert parse_reader_order("") == DEFAULT_READER_ORDER
+    assert parse_reader_order(None) == DEFAULT_READER_ORDER

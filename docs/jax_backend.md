@@ -40,3 +40,25 @@ The `TrainingService` now performs a usable JAX+Optax fine-tuning cycle for LoRA
 - **Checkpoints and persistence:** Each optimizer step writes a checkpoint under the adapter version's `checkpoints/` directory and rewrites `params.json` with the trained weights so `local_gpu_lora` reloads the latest adapter artifacts immediately. A `latest` symlink is refreshed after every successful run.
 
 With these pieces, `local_gpu_lora` mirrors the repository's data-driven kernel expectations while remaining lightweight and test-friendly.
+
+## hardware targets (pjrt)
+
+The backend places arrays on "the first available JAX device" and otherwise
+never names hardware — deliberately. JAX reaches accelerators through PJRT
+plugins, so CPU, CUDA, TPU, and any third-party PJRT plugin all look the same
+from this code.
+
+That includes the in-house **loom FPGA**: once its PJRT plugin lands (expected
+soon), pointing JAX at it makes `local_gpu_lora` inference and LoRA training
+run on loom with no changes here. Two follow-ups become interesting at that
+point:
+
+- a multimodal model hosted on loom can implement `transcribe_image` on the
+  backend, which plugs it straight into the upload/scanned-pdf extraction
+  ladder (see `service/extract.py` — readers are a registry, `EXTRACT_READERS`
+  orders them);
+- a small dedicated OCR model on loom can register as an extraction reader
+  outright, sitting between tesseract and full model vision in cost.
+
+Until the plugin exists, none of this is wired: the local backend remains a
+text LM + tokenizer and image reading is tesseract and/or API-backend vision.

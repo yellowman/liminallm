@@ -48,6 +48,7 @@ Router Updates ← Adapter Training ← Promotion Decision
   - when a position has moved, the report shows the trail: the chain of links between the two thoughts, with dates
   - a vault-wide sweep runs the same process over the strongest pairs across everything you’ve written
   - uploaded files stay chat-scoped by default; a file joins the vault only when you promote it (one click), because permanent cross-chat memory should be a decision, not a side effect
+  - promoted pdfs and images get fleeced for content: text layer → pypdf, images and scans → ocr, then model vision. install `tesseract-ocr` + `pip install 'liminallm[ocr]'` — technically optional, practically required
 
 - **small kernel, big data**
   - kernel only knows how to:

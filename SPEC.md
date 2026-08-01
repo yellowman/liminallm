@@ -1798,13 +1798,19 @@ three tiers, from transient to permanent:
    shared extractor (`service/extract.py`, also used by rag ingestion) tiers
    cheapest and most faithful first: text bytes decode; pdfs with a text
    layer go through pypdf; images — and scanned pdfs via their embedded page
-   images — try ocr software first (tesseract, auto-detected, optional
-   `liminallm[ocr]` extra; deterministic and quotes rather than
-   paraphrases), then fall back to the configured model's vision (one
-   bounded call, image framed as DATA to read). vision capability is probed
-   per backend, never assumed from backend type: an api backend uses
-   openai-compatible content parts, and a local multimodal model plugs in by
-   implementing `transcribe_image` on its backend. files nothing can read
+   images — walk a configurable reader roster (`EXTRACT_READERS`, default
+   `ocr,vision`). readers are a registry (`extract.register_reader`), so
+   another ocr engine, a dedicated ocr model, or a model on new hardware
+   (e.g. a loom-hosted reader once its pjrt plugin lands — see
+   docs/jax_backend.md) is a registration, not a rewrite. built-ins: `ocr` =
+   tesseract (auto-detected, `liminallm[ocr]` extra; technically optional,
+   practically required — deterministic, free per call, quotes rather than
+   paraphrases) and `vision` = the configured model (one bounded call, image
+   framed as DATA to read; capability probed per backend, never assumed —
+   api backends use openai-compatible content parts, a local multimodal
+   model implements `transcribe_image`). "ocr"-kind readers yield to the
+   next reader when they find less than a document's worth of text; "vision"
+   readers are deliberate readings, accepted as-is. files nothing can read
    are refused with the reason and the remedy, never stored as garbage.
    from then on it is ordinary vault material: searchable mid-chat, swept by
    the witness.

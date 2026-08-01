@@ -87,7 +87,13 @@ def _run_ocr(image_bytes: bytes) -> str:
         return pytesseract.image_to_string(img) or ""
 
 
-def _vision_transcribe(image_bytes: bytes, mime: str, llm: Any) -> Optional[str]:
+def _reader_tesseract(image_bytes: bytes, mime: str, llm: Any) -> Optional[str]:
+    if not ocr_available():
+        return None
+    return _run_ocr(image_bytes)
+
+
+def _reader_vision(image_bytes: bytes, mime: str, llm: Any) -> Optional[str]:
     """Model-read text, or None when this deployment's model cannot see."""
     if llm is None or not callable(getattr(llm, "transcribe_image", None)):
         return None
@@ -95,38 +101,76 @@ def _vision_transcribe(image_bytes: bytes, mime: str, llm: Any) -> Optional[str]
         text = llm.transcribe_image(image_bytes, mime, prompt=_TRANSCRIBE_PROMPT)
     except NotImplementedError:
         return None
-    except Exception as exc:  # noqa: BLE001 - provider errors are not our bug
-        raise ExtractError(f"image transcription failed: {exc}")
     return (text or "").strip() or None
 
 
-def _image_bytes_to_text(
-    image_bytes: bytes, mime: str, llm: Any
-) -> Tuple[str, str]:
-    """(text, mechanism) for one image: ocr, then vision, then scraps.
+# The reader roster. Each reader is (fn, kind): "ocr" readers quote the
+# document, so short output means "not a document" and the ladder continues;
+# "vision" readers produce a deliberate reading, accepted as-is. Register new
+# readers (another OCR engine, a dedicated OCR model, a model on new hardware)
+# instead of editing the ladder.
+Reader = Any  # Callable[[bytes, str, Any], Optional[str]]
+_READERS: Dict[str, Tuple[Reader, str]] = {}
 
-    OCR wins when it finds a document's worth of text — it is deterministic,
-    local, and quotes rather than paraphrases. Photos and diagrams (OCR finds
-    almost nothing) go to the model if it can see. OCR scraps are still
-    better than a refusal when they're all there is.
+
+def register_reader(name: str, fn: Reader, *, kind: str = "ocr") -> None:
+    _READERS[name] = (fn, kind)
+
+
+register_reader("ocr", _reader_tesseract, kind="ocr")
+register_reader("vision", _reader_vision, kind="vision")
+
+DEFAULT_READER_ORDER = ("ocr", "vision")
+
+
+def parse_reader_order(spec: Optional[str]) -> Tuple[str, ...]:
+    names = tuple(s.strip() for s in (spec or "").split(",") if s.strip())
+    return names or DEFAULT_READER_ORDER
+
+
+def _image_bytes_to_text(
+    image_bytes: bytes,
+    mime: str,
+    llm: Any,
+    order: Optional[Tuple[str, ...]] = None,
+) -> Tuple[str, str]:
+    """(text, reader_name) for one image, walking the configured roster.
+
+    Default order is ocr-then-vision: OCR is deterministic, local, and quotes
+    rather than paraphrases, so it wins when it finds a document's worth of
+    text; photos and diagrams fall through to a reader that can see. Scraps
+    from a quoting reader still beat a refusal when they're all there is.
     """
-    ocr_text = ""
-    if ocr_available():
+    scraps: Optional[Tuple[str, str]] = None
+    last_error: Optional[str] = None
+    for name in order or DEFAULT_READER_ORDER:
+        entry = _READERS.get(name)
+        if entry is None:
+            logger.warning("unknown_extract_reader", reader=name)
+            continue
+        fn, kind = entry
         try:
-            ocr_text = _run_ocr(image_bytes).strip()
-        except Exception as exc:  # noqa: BLE001 - bad image data, not our bug
-            logger.debug("ocr_failed", error=str(exc))
-    if len(ocr_text) >= OCR_MIN_CHARS:
-        return ocr_text, "ocr"
-    vision_text = _vision_transcribe(image_bytes, mime, llm)
-    if vision_text:
-        return vision_text, "vision"
-    if ocr_text:
-        return ocr_text, "ocr"
+            text = (fn(image_bytes, mime, llm) or "").strip()
+        except Exception as exc:  # noqa: BLE001 - keep walking the roster
+            last_error = f"{name}: {exc}"
+            logger.warning("extract_reader_failed", reader=name, error=str(exc))
+            continue
+        if not text:
+            continue
+        if kind == "vision" or len(text) >= OCR_MIN_CHARS:
+            return text, name
+        if scraps is None:
+            scraps = (text, name)
+    if scraps:
+        return scraps
+    if last_error:
+        raise ExtractError(f"could not read this image ({last_error})")
     raise ExtractError(f"no way to read this image: {_NO_READER_REMEDY}")
 
 
-def _extract_pdf(path: Path, llm: Any) -> Tuple[str, str]:
+def _extract_pdf(
+    path: Path, llm: Any, order: Optional[Tuple[str, ...]] = None
+) -> Tuple[str, str]:
     try:
         from pypdf import PdfReader
     except ImportError:
@@ -146,7 +190,9 @@ def _extract_pdf(path: Path, llm: Any) -> Tuple[str, str]:
     try:
         for page in reader.pages[:MAX_SCANNED_PAGES]:
             for image in page.images:
-                page_text, mech = _image_bytes_to_text(image.data, "image/png", llm)
+                page_text, mech = _image_bytes_to_text(
+                    image.data, "image/png", llm, order
+                )
                 page_texts.append(page_text)
                 mechanism = mechanism or mech
                 break  # one image per scanned page is the norm
@@ -167,25 +213,28 @@ def _extract_pdf(path: Path, llm: Any) -> Tuple[str, str]:
     return text, f"pdf-{mechanism}"
 
 
-def extract_text(path: Path, *, llm: Any = None) -> Dict[str, Any]:
+def extract_text(
+    path: Path, *, llm: Any = None, readers: Optional[Tuple[str, ...]] = None
+) -> Dict[str, Any]:
     """Best-effort text from a file: {text, method} or ExtractError.
 
-    method is "text", "pdf", "ocr", "vision", "pdf-ocr", or "pdf-vision" so
-    callers can tell the user how the content was obtained — an OCR or vision
-    result is a reading of the file, not a copy of it.
+    method is "text", "pdf", a reader name ("ocr", "vision", ...), or
+    "pdf-<reader>" so callers can tell the user how the content was obtained —
+    an OCR or vision result is a reading of the file, not a copy of it.
+    ``readers`` overrides the image-reading roster order (EXTRACT_READERS).
     """
     if path.stat().st_size > MAX_EXTRACT_BYTES:
         raise ExtractError("file is too large to extract")
     suffix = path.suffix.lower()
     if suffix == ".pdf":
-        text, method = _extract_pdf(path, llm)
+        text, method = _extract_pdf(path, llm, readers)
         return {"text": text, "method": method}
     if suffix in IMAGE_EXTENSIONS:
         data = path.read_bytes()
         if len(data) > MAX_IMAGE_BYTES:
             raise ExtractError("image is too large to read")
         mime = _IMAGE_MIME.get(suffix, "image/png")
-        text, method = _image_bytes_to_text(data, mime, llm)
+        text, method = _image_bytes_to_text(data, mime, llm, readers)
         return {"text": text, "method": method}
     text = path.read_bytes().decode("utf-8", errors="replace")
     if looks_binary(text):
