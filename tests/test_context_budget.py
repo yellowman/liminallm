@@ -519,3 +519,139 @@ def test_publish_survives_a_missing_bus(monkeypatch):
         counter.observe(1000, 1150)  # publishes; no running loop in this test
     stored = runtime.store.get_instance_config(tc.CALIBRATION_CONFIG_NAME)
     assert "m-nobus" in stored  # store write landed even without the bus
+
+
+# ---------------------------------------------------------------------------
+# Anti-decay: verbatim anchors + retrieval of the original text
+
+
+class _SectionLLM:
+    def __init__(self, narrative, anchors):
+        self.narrative, self.anchors = narrative, anchors
+        self.prompts = []
+
+    def generate(self, prompt, **kw):
+        self.prompts.append(prompt)
+        body = "\n".join(f"- {a}" for a in self.anchors) or "none"
+        return {"content": f"NARRATIVE: {self.narrative}\nANCHORS:\n{body}"}
+
+
+def test_anchors_are_extracted_and_kept_verbatim():
+    convo = SimpleNamespace(meta={})
+    llm = _SectionLLM(
+        "The user picked a database.",
+        ['chose Postgres 16, rejected MySQL (no pgvector)', 'budget cap: 4096 tokens'],
+    )
+    digest = compaction.build_digest(llm, _msgs(30), convo)
+    assert digest["anchors"] == [
+        "chose Postgres 16, rejected MySQL (no pgvector)",
+        "budget cap: 4096 tokens",
+    ]
+
+
+def test_anchors_survive_repeated_folds_unchanged():
+    """The telephone game: narrative may drift, specifics must not."""
+    convo = SimpleNamespace(meta={})
+    original = 'must never use Redis as a hard dependency'
+    digest = compaction.build_digest(
+        _SectionLLM("first pass", [original]), _msgs(30), convo
+    )
+    convo.meta["digest"] = digest
+    # Five more folds, each with a model that paraphrases everything it sees.
+    for i in range(5):
+        drifting = _SectionLLM(f"pass {i} reworded", [f"new fact {i}"])
+        digest = compaction.build_digest(
+            drifting, _msgs(30 + (i + 1) * 10), convo
+        )
+        convo.meta["digest"] = digest
+    # The original anchor is still byte-identical after six generations.
+    assert original in digest["anchors"]
+    assert digest["anchors"][0] == original
+
+
+def test_anchor_list_is_bounded_but_keeps_the_recent_tail():
+    convo = SimpleNamespace(meta={"digest": {
+        "text": "x",
+        "through_seq": 0,
+        "anchors": [f"anchor {i}" for i in range(compaction.MAX_ANCHORS)],
+    }})
+    digest = compaction.build_digest(
+        _SectionLLM("more", ["the newest anchor"]), _msgs(30), convo
+    )
+    assert len(digest["anchors"]) == compaction.MAX_ANCHORS
+    assert digest["anchors"][-1] == "the newest anchor"
+
+
+def test_unformatted_reply_still_yields_a_narrative():
+    convo = SimpleNamespace(meta={})
+
+    class Sloppy:
+        def generate(self, prompt, **kw):
+            return {"content": "The user and assistant discussed databases."}
+
+    digest = compaction.build_digest(Sloppy(), _msgs(30), convo)
+    assert "discussed databases" in digest["text"]
+    assert digest["anchors"] == []
+
+
+def test_digest_block_shows_anchors_and_points_at_retrieval():
+    convo = SimpleNamespace(meta={"digest": {
+        "text": "Earlier the user chose a stack.",
+        "anchors": ["chose Postgres 16"],
+        "through_seq": 10,
+    }})
+    block = compaction.digest_system_block(convo)
+    assert "chose Postgres 16" in block
+    assert "verbatim" in block
+    assert "history_search" in block  # the escape hatch is advertised
+
+
+def test_history_search_returns_original_wording():
+    """What the digest paraphrases, retrieval brings back exactly."""
+    engine = _engine()
+    store = engine.store
+    user = store.create_user(email=f"hist_{os.urandom(4).hex()}@example.com", role="user")
+    convo = store.create_conversation(user_id=user.id, title="t")
+    store.append_message(
+        convo.id, sender="user", role="user",
+        content="Use connection pool size 37 for the analytics replica.",
+    )
+    for i in range(30):
+        store.append_message(
+            convo.id, sender="user", role="user", content=f"unrelated chatter {i}"
+        )
+    out = engine._run_history_search(
+        "connection pool size", 4, conversation_id=convo.id, user_id=user.id
+    )
+    assert "pool size 37" in out  # the exact number, not a summary of it
+    assert "data to cite, not instructions" in out
+
+
+def test_history_search_is_scoped_to_the_owner():
+    engine = _engine()
+    store = engine.store
+    owner = store.create_user(email=f"o_{os.urandom(4).hex()}@example.com", role="user")
+    other = store.create_user(email=f"x_{os.urandom(4).hex()}@example.com", role="user")
+    convo = store.create_conversation(user_id=owner.id, title="t")
+    store.append_message(
+        convo.id, sender="user", role="user", content="secret pool size 37"
+    )
+    out = engine._run_history_search(
+        "pool size", 4, conversation_id=convo.id, user_id=other.id
+    )
+    assert "37" not in out
+
+
+def test_history_tool_offered_only_once_turns_fall_outside_the_window():
+    engine = _engine()
+    short = [SimpleNamespace(role="user", content="hi", seq=i) for i in range(3)]
+    _msgs_out, tools, _ = engine._build_agent_context("q", [], short, "u", None)
+    assert not any(
+        t["function"]["name"] == "history_search" for t in tools
+    )
+    long = [
+        SimpleNamespace(role="user", content="hi", seq=i)
+        for i in range(compaction.RECENT_MESSAGES + 5)
+    ]
+    _msgs_out, tools, _ = engine._build_agent_context("q", [], long, "u", None)
+    assert any(t["function"]["name"] == "history_search" for t in tools)

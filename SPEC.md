@@ -1925,6 +1925,30 @@ less precisely" instead of "forgets entirely".
   depend on redis being up, which made "why did it forget that"
   unreproducible.
 
+### 20.3 compaction is lossy — so it is not the only mechanism
+
+a rolling digest re-summarizes its own previous output, which decays: each
+fold paraphrases the paraphrase, and specifics (chosen values, hard
+constraints, identifiers) go first. three mitigations, in order of
+importance:
+
+1. **nothing is ever actually lost.** every message stays in postgres
+   verbatim. the digest is a *view*, not a replacement — "losing detail"
+   only ever means losing it from the model's current view.
+2. **verbatim anchors.** the digest call returns two sections: a NARRATIVE
+   (re-summarized each fold) and ANCHORS — one specific per line, quoted
+   exactly. anchors are carried forward **byte-identical** on every fold,
+   never re-summarized, so they cannot drift through generations of
+   paraphrase. bounded at 40 (oldest dropped, and logged, never silently).
+3. **retrieval beats summary.** `history_search` returns earlier turns of
+   this conversation verbatim (bm25 over the conversation's own messages,
+   so no embeddings required). it is offered exactly when turns have fallen
+   outside the verbatim window, and the digest block itself tells the model
+   the summary is lossy and to call the tool for exact wording.
+
+the resulting division of labour: **narrative for continuity, anchors for
+what must not drift, retrieval for everything else.**
+
 ### 20.4 token counting
 
 budget math is only as good as the count. resolution per backend:
