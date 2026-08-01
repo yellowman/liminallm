@@ -3273,11 +3273,12 @@ const handleFileAction = async (event) => {
       const note = await notesApi('/notes/from-file', {
         method: 'POST', body: JSON.stringify({ name: filename }),
       });
-      const HOW = {
-        vision: ' (read by the model)', 'pdf-vision': ' (pages read by the model)',
-        ocr: ' (ocr)', 'pdf-ocr': ' (scanned pages ocr’d)', pdf: ' (text extracted)',
-      };
-      const how = HOW[note.method] || '';
+      // Methods compose: "pdf+ocr" = text pages plus ocr'd image pages,
+      // "docx-vision" = a doc whose only content was images the model read.
+      const m = note.method || '';
+      const how = m.includes('vision') ? (m.includes('+') ? ' (text + model-read images)' : ' (read by the model)')
+        : m.includes('ocr') ? (m.includes('+') ? ' (text + ocr’d images)' : ' (ocr)')
+        : m === 'pdf' || m === 'docx' || m === 'odt' ? ' (text extracted)' : '';
       showStatus(`Added to vault as "${note.title}"${how}${note.truncated ? ', truncated' : ''}`);
     } catch (err) {
       showStatus(err.message || 'Could not add to vault', true);

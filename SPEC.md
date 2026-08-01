@@ -1798,10 +1798,15 @@ three tiers, from transient to permanent:
    shared extractor (`service/extract.py`, also used by rag ingestion) tiers
    cheapest and most faithful first: text bytes decode; `.docx`/`.odt`
    extract natively (stdlib zip+xml with a decompression budget; legacy
-   `.doc` refused with a save-as remedy); pdfs with a text layer go through
-   pypdf, and scanned pdfs are rasterized page-by-page via poppler when
-   present (reads jbig2/ccitt scans; embedded-image extraction is the
-   poppler-less fallback); images (png/jpg incl. cmyk/webp/gif/tiff incl.
+   `.doc` refused with a save-as remedy); pdfs go through pypdf. containers
+   are text, image, or both — decided per page/attachment, same rule for
+   pdf and docx/odt alike: a pdf page whose text layer holds no real words
+   is rasterized via poppler when present (reads jbig2/ccitt scans;
+   embedded-image extraction is the poppler-less fallback) and spliced back
+   beside the text pages; a doc's content-bearing embedded images (size
+   floor drops logos/bullets) are read the same way and land beside the
+   typed paragraphs. methods compose accordingly: `pdf+ocr`, `docx-vision`,
+   etc. images (png/jpg incl. cmyk/webp/gif/tiff incl.
    multi-page/bmp — pillow normalizes all of them to what tesseract expects) — and scanned pdfs via their embedded page
    images — walk a configurable reader roster (`EXTRACT_READERS`, default
    `ocr,vision`). readers are a registry (`extract.register_reader`), so

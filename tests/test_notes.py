@@ -960,8 +960,99 @@ def test_scanned_pdf_rasterizes_through_poppler(tmp_path):
     img = Image.open(_io.BytesIO(_text_image_bytes("RASTERIZED SCAN CLAIM")))
     path = tmp_path / "scan.pdf"
     img.convert("RGB").save(path, format="PDF")
-    pages = extract._rasterize_pdf(path, 10)
+    pages = extract._rasterize_pdf(path, 1, 10)
     assert len(pages) == 1 and pages[0][:8] == b"\x89PNG\r\n\x1a\n"
     result = extract.extract_text(path)
     assert result["method"] == "pdf-ocr"
     assert "RASTERIZED" in result["text"].upper()
+
+
+# ---------------------------------------------------------------------------
+# Containers are text, image, or both — decided per page/attachment
+
+
+@pytest.mark.skipif(not _HAS_OCR, reason="tesseract not installed")
+def test_docx_with_embedded_image_reads_both(client, auth_headers):
+    import io as _io
+    import zipfile
+
+    base = _docx_bytes(["Typed paragraph about protein."])
+    buf = _io.BytesIO(base)
+    with zipfile.ZipFile(buf, "a") as z:
+        z.writestr(
+            "word/media/image1.png",
+            _text_image_bytes("PASTED WHITEBOARD REBUTTAL"),
+        )
+    runtime, _ = _drop_upload(client, auth_headers, "mixed.docx", buf.getvalue())
+    resp = client.post(
+        "/v1/notes/from-file", headers=auth_headers, json={"name": "mixed.docx"}
+    )
+    assert resp.status_code == 201, resp.text
+    made = resp.json()["data"]
+    assert made["method"] == "docx+ocr"
+    note = runtime.store.get_note(made["id"])
+    assert "Typed paragraph" in note.content
+    assert "WHITEBOARD" in note.content.upper()
+
+
+@pytest.mark.skipif(not _HAS_OCR, reason="tesseract not installed")
+def test_image_only_docx_is_still_readable(tmp_path):
+    import io as _io
+    import zipfile
+
+    from liminallm.service.extract import extract_text
+
+    buf = _io.BytesIO(_docx_bytes([]))
+    with zipfile.ZipFile(buf, "a") as z:
+        z.writestr(
+            "word/media/image1.png", _text_image_bytes("ONLY AN IMAGE HERE")
+        )
+    path = tmp_path / "imageonly.docx"
+    path.write_bytes(buf.getvalue())
+    result = extract_text(path)
+    assert result["method"] == "docx-ocr"
+    assert "ONLY AN IMAGE" in result["text"].upper()
+
+
+def test_decorative_images_are_skipped(tmp_path):
+    import io as _io
+    import zipfile
+
+    from liminallm.service.extract import extract_text
+
+    buf = _io.BytesIO(_docx_bytes(["Real text."]))
+    with zipfile.ZipFile(buf, "a") as z:
+        z.writestr("word/media/image1.png", b"\x89PNG tiny-logo")  # < floor
+    path = tmp_path / "logo.docx"
+    path.write_bytes(buf.getvalue())
+    result = extract_text(path)
+    assert result["method"] == "docx"  # no reader spend on decoration
+    assert "Real text." in result["text"]
+
+
+@pytest.mark.skipif(not _HAS_OCR, reason="tesseract not installed")
+def test_mixed_pdf_splices_ocr_pages_between_text_pages(tmp_path):
+    import io as _io
+
+    from PIL import Image
+    from pypdf import PdfWriter
+
+    from liminallm.service.extract import extract_text
+
+    text_pdf = tmp_path / "text.pdf"
+    text_pdf.write_bytes(_mini_pdf_bytes("Typed page: protein is flexible."))
+    img = Image.open(_io.BytesIO(_text_image_bytes("SCANNED PAGE DISAGREES")))
+    scan_pdf = tmp_path / "scan.pdf"
+    img.convert("RGB").save(scan_pdf, format="PDF")
+
+    merged = tmp_path / "mixed.pdf"
+    writer = PdfWriter()
+    for part in (text_pdf, scan_pdf):
+        writer.append(str(part))
+    with open(merged, "wb") as fh:
+        writer.write(fh)
+
+    result = extract_text(merged)
+    assert result["method"] == "pdf+ocr"
+    assert "Typed page" in result["text"]
+    assert "SCANNED PAGE" in result["text"].upper()
