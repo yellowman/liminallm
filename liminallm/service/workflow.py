@@ -1515,7 +1515,17 @@ class WorkflowEngine:
         """Enforce the model-derived token budget by pruning context/history."""
 
         budget = self.prompt_budget()
-        total = estimate_token_count(prompt)
+
+        # Count the way the serving model counts: exact where we own the
+        # tokenizer, calibrated from provider-reported usage otherwise.
+        counter = None
+        try:
+            getter = getattr(self.llm, "token_counter", None)
+            counter = getter() if callable(getter) else None
+        except Exception:  # noqa: BLE001 - counting must never block a turn
+            counter = None
+        count = counter.count if counter else estimate_token_count
+        total = count(prompt)
 
         def _content_from_history(entry: Any) -> str:
             if isinstance(entry, dict):
@@ -1529,14 +1539,14 @@ class WorkflowEngine:
         for entry in history or []:
             content = _content_from_history(entry)
             normalized_history.append(entry)
-            token_count = estimate_token_count(content)
+            token_count = count(content)
             history_tokens.append(token_count)
             total += token_count
 
         context_tokens: list[int] = []
         normalized_context = list(context_snippets or [])
         for snippet in normalized_context:
-            token_count = estimate_token_count(snippet)
+            token_count = count(snippet)
             context_tokens.append(token_count)
             total += token_count
 
@@ -3189,11 +3199,39 @@ class WorkflowEngine:
                 context_snippets=context_snippets,
                 history=history,
             )
+        # The provider just told us exactly how many prompt tokens it counted;
+        # that is ground truth for calibrating our estimate.
+        self._calibrate_from_usage(message, context_snippets, history, resp.get("usage"))
         return {
             "content": resp["content"],
             "usage": resp["usage"],
             "context_snippets": context_snippets,
         }
+
+    def _calibrate_from_usage(
+        self,
+        prompt: str,
+        context_snippets: List[str],
+        history: List[Any],
+        usage: Any,
+    ) -> None:
+        """Feed provider-reported prompt_tokens back into the counter."""
+        observer = getattr(self.llm, "observe_usage", None)
+        if not callable(observer):
+            return
+        try:
+            counter = self.llm.token_counter()
+            estimated = counter.count(prompt or "")
+            for snippet in context_snippets or []:
+                estimated += counter.count(snippet)
+            for entry in history or []:
+                content = getattr(entry, "content", None) or (
+                    entry.get("content") if isinstance(entry, dict) else ""
+                )
+                estimated += counter.count(str(content or ""))
+            observer(estimated, usage)
+        except Exception as exc:  # noqa: BLE001 - calibration is optional
+            self.logger.debug("token_calibration_skipped", error=str(exc))
 
     def _tool_rag_answer(
         self,

@@ -277,3 +277,155 @@ def test_live_gemini_probe_reports_real_window():
         api_key=LIVE_KEY,
     )
     assert window and window > 100_000
+
+
+# ---------------------------------------------------------------------------
+# Token counting: exact where we own the tokenizer, calibrated elsewhere
+
+
+def test_heuristic_no_longer_undercounts_cjk():
+    from liminallm.service.token_counting import heuristic_token_count
+    from liminallm.service.tokenizer_utils import estimate_token_count
+
+    cjk = "这是一段中文文本用来测试分词计数" * 5
+    # The old estimator billed CJK at ~4 chars/token; real tokenizers are
+    # closer to 1, so it undercounted by ~4x — the dangerous direction.
+    assert heuristic_token_count(cjk) > estimate_token_count(cjk) * 2
+    assert heuristic_token_count(cjk) >= len(cjk.strip()) * 0.9
+
+
+def test_local_tokenizer_is_used_and_is_exact():
+    """Local JAX owns the checkpoint's tokenizer: counting is exact, offline."""
+    from liminallm.service.token_counting import TokenCounter
+
+    class FakeHFTokenizer:
+        def encode(self, text):
+            return list(range(len(text.split()) * 2))  # 2 tokens per word
+
+    counter = TokenCounter(model="local-ckpt", tokenizer=FakeHFTokenizer())
+    assert counter.method == "hf:local-ckpt"
+    assert counter.exact is True
+    assert counter.count("one two three") == 6  # exact, not estimated
+
+
+def test_local_backend_exposes_its_tokenizer_eagerly(tmp_path, monkeypatch):
+    """The lazy tokenizer must be forced, or turn one caches 'heuristic'."""
+    from liminallm.service.model_backend import LocalJaxLoRABackend
+
+    backend = LocalJaxLoRABackend(str(tmp_path), fs_root=str(tmp_path))
+    calls = []
+
+    def fake_ensure():
+        calls.append(1)
+        backend._tokenizer = type("T", (), {"encode": lambda self, t: [0] * len(t)})()
+
+    monkeypatch.setattr(backend, "_ensure_tokenizer", fake_ensure)
+    assert backend.get_tokenizer() is not None
+    assert calls == [1]
+
+
+def test_counter_falls_back_when_tokenizer_unusable():
+    from liminallm.service.token_counting import TokenCounter
+
+    class Broken:
+        def encode(self, text):
+            raise RuntimeError("corrupt vocab")
+
+    counter = TokenCounter(model="whatever", tokenizer=Broken())
+    assert counter.method == "heuristic"
+    assert counter.count("some text here") > 0  # still counts
+
+
+def test_calibration_converges_on_provider_truth():
+    from liminallm.service.token_counting import TokenCounter
+
+    counter = TokenCounter(model="gemini-flash-latest")
+    assert counter.exact is False
+    text = "word " * 2000
+    baseline = counter.count(text)
+    # The provider reports 30% more tokens than we estimated, repeatedly.
+    for _ in range(30):
+        counter.observe(baseline, int(baseline * 1.3))
+    assert 1.2 < counter.factor < 1.4
+    assert counter.count(text) > baseline  # estimate moved toward truth
+
+
+def test_calibration_ignores_outliers_and_tiny_prompts():
+    from liminallm.service.token_counting import TokenCounter
+
+    counter = TokenCounter(model="gemini-flash-latest")
+    counter.observe(1000, 50_000)  # absurd ratio: tool results, not our text
+    assert counter.factor == 1.0
+    counter.observe(5, 400)  # tiny prompt: fixed overhead dominates
+    assert counter.factor == 1.0
+    assert counter.observations == 0
+
+
+def test_exact_counters_ignore_calibration():
+    from liminallm.service.token_counting import TokenCounter
+
+    class Exact:
+        def encode(self, text):
+            return [0] * len(text.split())
+
+    counter = TokenCounter(model="m", tokenizer=Exact())
+    counter.observe(1000, 1500)
+    assert counter.factor == 1.0  # never second-guess an exact tokenizer
+
+
+def test_message_overhead_is_counted():
+    from liminallm.service.token_counting import MESSAGE_OVERHEAD_TOKENS, TokenCounter
+
+    counter = TokenCounter(model="unknown")
+    messages = [{"role": "system", "content": "a"}, {"role": "user", "content": "b"}]
+    assert counter.count_messages(messages) >= 2 * MESSAGE_OVERHEAD_TOKENS
+    # Multimodal parts: text counts, image parts don't explode
+    multimodal = [{"role": "user", "content": [
+        {"type": "text", "text": "describe"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+    ]}]
+    assert counter.count_messages(multimodal) < 50
+
+
+def test_budget_uses_the_counter(monkeypatch):
+    engine = _engine()
+    engine._budget_cache = None
+    seen = {"calls": 0}
+
+    class CountingCounter:
+        exact = True
+
+        def count(self, text):
+            seen["calls"] += 1
+            return len(text.split())
+
+    monkeypatch.setattr(
+        engine.llm, "token_counter", lambda: CountingCounter(), raising=False
+    )
+    monkeypatch.setattr(engine.llm, "context_window", lambda: 8192, raising=False)
+    engine._apply_prompt_budget("hello world", ["ctx"], [])
+    assert seen["calls"] >= 2  # prompt and context both counted
+
+
+# ---------------------------------------------------------------------------
+# Model-specific hazards
+
+
+def test_reasoning_models_get_no_temperature():
+    from liminallm.service import model_backend as mb
+
+    backend = mb.ApiAdapterBackend("gpt-4o-mini", adapter_mode="openai", api_key=None)
+    assert backend._sampling_params("gpt-4o-mini") == {"temperature": 0.2}
+    # o-series/gpt-5/gemini-3 reject a caller temperature with a 400.
+    for model in ("o1-mini", "o3", "gpt-5.2", "gemini-3-pro"):
+        assert backend._sampling_params(model) == {}, model
+
+
+def test_single_message_cap_allows_long_pastes():
+    from liminallm.api.schemas import ChatMessage
+
+    # ~10k tokens: rejected by the old 4096 cap, fine for any modern model.
+    long_paste = "word " * 10_000
+    ChatMessage(role="user", content=long_paste)
+    with pytest.raises(Exception):
+        ChatMessage(role="user", content="word " * 300_000)

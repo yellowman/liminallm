@@ -10,6 +10,11 @@ logger = get_logger(__name__)
 
 DEFAULT_VOCAB_SIZE = 32000
 MAX_GENERATION_TOKENS = 4096
+# Sanity ceiling for a single inbound message. Not a model budget — that is
+# derived per model in the workflow, which can prune; validation can only
+# reject, so this is generous enough to accept a pasted document on a
+# large-window model and still stop absurd payloads.
+MAX_SINGLE_MESSAGE_TOKENS = 200_000
 
 
 def estimate_token_count(text: str) -> int:

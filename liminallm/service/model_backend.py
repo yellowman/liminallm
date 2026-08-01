@@ -395,6 +395,14 @@ class StubBackend:
 
 DEFAULT_CONTEXT_WINDOW = 8192
 
+# Models that reject a caller-supplied temperature (400, whole request fails).
+_REASONING_PREFIXES = ("o1", "o3", "o4", "gpt-5", "gemini-3")
+
+
+def is_reasoning_model(model: str) -> bool:
+    lowered = (model or "").lower()
+    return any(lowered.startswith(prefix) for prefix in _REASONING_PREFIXES)
+
 # Longest-prefix wins. Values are input windows, deliberately the safe
 # published number rather than any beta/extended tier.
 KNOWN_CONTEXT_WINDOWS: List[Tuple[str, int]] = [
@@ -670,6 +678,19 @@ class ApiAdapterBackend:
             return extra_body
         return {**(extra_body or {}), "reasoning_effort": self._reasoning_effort}
 
+    def _sampling_params(self, model: str) -> dict:
+        """Sampling args this model will accept.
+
+        Reasoning models (OpenAI o-series, gpt-5, and Gemini 3 through the
+        compat endpoint) reject any temperature other than the default and
+        fail the whole request with a 400. Omitting the parameter is the
+        portable choice: every model has a sane default, and only these
+        models treat setting it as an error.
+        """
+        if is_reasoning_model(model):
+            return {}
+        return {"temperature": 0.2}
+
     def generate(
         self,
         messages: List[dict],
@@ -694,8 +715,8 @@ class ApiAdapterBackend:
             completion = self.client.chat.completions.create(
                 model=target_model,
                 messages=augmented_messages,
-                temperature=0.2,
                 extra_body=extra_body,
+                **self._sampling_params(target_model),
             )
             choices = getattr(completion, "choices", None) or []
             first_choice = next(iter(choices), None)
@@ -760,7 +781,7 @@ class ApiAdapterBackend:
             messages=augmented,
             tools=tools,
             tool_choice="auto",
-            temperature=0.2,
+            **self._sampling_params(processed["model"]),
             extra_body=extra_body,
         )
         choices = getattr(completion, "choices", None) or []
@@ -841,7 +862,7 @@ class ApiAdapterBackend:
                 stream = self.client.chat.completions.create(
                     model=target_model,
                     messages=augmented_messages,
-                    temperature=0.2,
+                    **self._sampling_params(target_model),
                     extra_body=extra_body,
                     stream=True,
                 )
@@ -1217,6 +1238,16 @@ class LocalJaxLoRABackend:
         self._jax = jax
         self._jnp = jnp
         self._rng = jax.random.PRNGKey(0)
+
+    def get_tokenizer(self):
+        """The checkpoint's own tokenizer, loading it if needed.
+
+        This is the same tokenizer used to encode prompts for generation, so
+        anything counting with it counts exactly what the model will see —
+        no vendor library, no network, no estimate.
+        """
+        self._ensure_tokenizer()
+        return self._tokenizer
 
     def _ensure_tokenizer(self):
         if self._tokenizer is not None or self._tokenizer_error is not None:

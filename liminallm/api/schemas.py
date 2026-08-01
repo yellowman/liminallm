@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from liminallm.service.tokenizer_utils import (
     MAX_GENERATION_TOKENS,
+    MAX_SINGLE_MESSAGE_TOKENS,
     estimate_token_count,
 )
 
@@ -381,9 +382,14 @@ class ChatMessage(BaseModel):
     @field_validator("content")
     @classmethod
     def _validate_token_budget(cls, value: str) -> str:
-        if estimate_token_count(value) > MAX_GENERATION_TOKENS:
+        # A sanity cap on one message, not the model's budget: capping at
+        # MAX_GENERATION_TOKENS rejected long pastes that a million-token
+        # model handles easily. The real budget is enforced per model in the
+        # workflow, which can prune; validation can only reject.
+        if estimate_token_count(value) > MAX_SINGLE_MESSAGE_TOKENS:
             raise ValueError(
-                f"message exceeds maximum token budget of {MAX_GENERATION_TOKENS}"
+                f"message exceeds the single-message limit of "
+                f"{MAX_SINGLE_MESSAGE_TOKENS} tokens"
             )
         return value
 

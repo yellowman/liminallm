@@ -1924,3 +1924,40 @@ less precisely" instead of "forgets entirely".
   conversation on a cache miss (the old behavior) made the model's memory
   depend on redis being up, which made "why did it forget that"
   unreproducible.
+
+### 20.4 token counting
+
+budget math is only as good as the count. resolution per backend:
+
+- **exact where we own the tokenizer.** `local_gpu_lora` already loads the
+  checkpoint's own HF tokenizer for generation; the counter uses that same
+  object, so counting is exact, offline, and free. it is forced eagerly —
+  the tokenizer loads lazily, and reading it before first generate would
+  cache a "heuristic" decision forever.
+- **calibrated from ground truth otherwise.** every provider returns
+  `usage.prompt_tokens` for the prompt just sent. feeding that back
+  (`TokenCounter.observe`) maintains a per-model correction factor (ema,
+  outliers and sub-200-token prompts ignored) that converges on the real
+  tokenizer for the traffic this deployment sends. this works for gemini,
+  claude, glm — none of which a vendor bpe library can count.
+- **tiktoken is an optional extra, never a dependency.** it downloads bpe
+  files on first use, which locked-down deployments block; it is used only
+  when already installed with data cached locally, and only for openai-family
+  ids where it is actually correct.
+- the uncalibrated heuristic splits by script (cjk bills ~1 token/char, the
+  old estimator undercounted it ~4x) and over-counts on purpose:
+  over-counting prunes a turn early, under-counting overruns the model.
+
+### 20.5 other model-specific hazards
+
+- **temperature**: reasoning models (o-series, gpt-5, gemini 3) reject a
+  caller-supplied temperature with a 400 that fails the whole request. the
+  parameter is omitted for them (`is_reasoning_model`); every model has a
+  sane default, so omission is the portable choice.
+- **single-message validation** is a dos ceiling
+  (`MAX_SINGLE_MESSAGE_TOKENS`), not a model budget. it previously reused
+  the 4096 generation constant, which rejected a pasted document that a
+  large-window model handles trivially. validation can only reject; the
+  model budget is enforced in the workflow, which can prune.
+- **embedding spaces** are already keyed by `embedding_model_id` when
+  retrieving chunks, so switching embedding models cannot mix vector spaces.

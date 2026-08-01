@@ -125,6 +125,35 @@ class LLMService:
             messages, self._normalize_adapters(adapters or []), user_id=user_id
         )
 
+    def token_counter(self):
+        """Counter for the serving model: exact when we own its tokenizer."""
+        from liminallm.service.token_counting import counter_for
+
+        model = (
+            getattr(self.backend, "adapter_server_model", None)
+            or getattr(self.backend, "base_model", None)
+            or ""
+        )
+        # Local backends load their tokenizer lazily; force it, or the first
+        # turn would resolve to the heuristic and cache that decision.
+        tokenizer = None
+        getter = getattr(self.backend, "get_tokenizer", None)
+        if callable(getter):
+            try:
+                tokenizer = getter()
+            except Exception as exc:  # noqa: BLE001 - fall back to estimate
+                logger.debug("tokenizer_unavailable", error=str(exc))
+        return counter_for(model, tokenizer=tokenizer)
+
+    def observe_usage(self, estimated_prompt_tokens: int, usage: Any) -> None:
+        """Feed a provider's reported prompt_tokens back into calibration."""
+        try:
+            actual = int((usage or {}).get("prompt_tokens") or 0)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if actual > 0:
+            self.token_counter().observe(estimated_prompt_tokens, actual)
+
     def context_window(self) -> int:
         """The serving model's input window (probed/table/config, see backend)."""
         from liminallm.service.model_backend import DEFAULT_CONTEXT_WINDOW
