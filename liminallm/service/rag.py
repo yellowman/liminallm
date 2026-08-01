@@ -435,7 +435,18 @@ class RAGService:
     def ingest_file(
         self, context_id: str, path: str, chunk_size: Optional[int] = None
     ) -> int:
-        data = Path(path).read_text(encoding="utf-8", errors="ignore")
+        # Route through the shared extractor: read_text() on a PDF "succeeds"
+        # and fills the index with stripped-binary garbage that then wins
+        # similarity searches. Better to skip a file than to poison retrieval.
+        from liminallm.service.extract import ExtractError, extract_text
+
+        try:
+            data = extract_text(Path(path))["text"]
+        except ExtractError as exc:
+            logger.warning(
+                "ingest_file_skipped", path=str(path), reason=exc.reason
+            )
+            return 0
         return self.ingest_text(
             context_id, data, chunk_size=chunk_size, source_path=path
         )

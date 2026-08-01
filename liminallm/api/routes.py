@@ -127,6 +127,7 @@ from liminallm.service.attachments import (
     record_attachment,
 )
 from liminallm.service.auth import AuthContext
+from liminallm.service import extract as extract_service
 from liminallm.service import labels
 from liminallm.service import notes as notes_service
 from liminallm.storage.errors import ConstraintViolation
@@ -2375,15 +2376,19 @@ async def note_from_file(
     if not path or not path.is_file():
         raise _http_error("not_found", "file not found", status_code=404)
     try:
-        raw = path.read_bytes()[: notes_service.NOTE_FROM_FILE_MAX_BYTES]
-        text = raw.decode("utf-8", errors="replace")
+        extracted = await asyncio.to_thread(
+            extract_service.extract_text, path, llm=runtime.llm
+        )
+    except extract_service.ExtractError as exc:
+        raise _http_error("bad_request", exc.reason, status_code=400)
     except OSError:
         raise _http_error("bad_request", "file is not readable", status_code=400)
-    if notes_service.looks_binary(text):
-        raise _http_error(
-            "bad_request", "binary files cannot become notes", status_code=400
+    text = extracted["text"]
+    truncated = len(text.encode("utf-8")) > notes_service.NOTE_FROM_FILE_MAX_BYTES
+    if truncated:
+        text = text.encode("utf-8")[: notes_service.NOTE_FROM_FILE_MAX_BYTES].decode(
+            "utf-8", errors="ignore"
         )
-    truncated = path.stat().st_size > notes_service.NOTE_FROM_FILE_MAX_BYTES
 
     base_title = notes_service.normalize_title(FilePath(body.name).stem) or "Imported file"
     title = base_title
@@ -2400,6 +2405,9 @@ async def note_from_file(
                 "source": "upload",
                 "filename": body.name,
                 "truncated": truncated,
+                # "pdf"/"vision" tell the reader this is an extraction of the
+                # file, not the file itself.
+                "method": extracted["method"],
             },
         )
     except ConstraintViolation:
@@ -2407,7 +2415,14 @@ async def note_from_file(
             "conflict", "a note with this title already exists", status_code=409
         )
     _save_note_graph(runtime, principal, note)
-    return Envelope(status="ok", data={**_note_payload(note, content=False), "truncated": truncated})
+    return Envelope(
+        status="ok",
+        data={
+            **_note_payload(note, content=False),
+            "truncated": truncated,
+            "method": extracted["method"],
+        },
+    )
 
 
 @router.post("/notes/{note_id}/witness", response_model=Envelope, tags=["notes"])

@@ -1792,10 +1792,15 @@ three tiers, from transient to permanent:
    the file to this conversation.
 2. **knowledge contexts** (deliberate): notebooklm-style corpora bound to
    chats by choice. scope: wherever the user binds them.
-3. **the vault** (deliberate, one click): `POST /v1/notes/from-file` copies an
-   uploaded file's text into a note (title from filename, provenance in
-   `meta.source/filename`, 64kb cap with `truncated` flagged, binary
-   rejected). from then on it is ordinary vault material: searchable mid-chat,
+3. **the vault** (deliberate, one click): `POST /v1/notes/from-file` extracts
+   an uploaded file's text into a note (title from filename, provenance +
+   extraction method in `meta`, 64kb cap with `truncated` flagged). the
+   shared extractor (`service/extract.py`, also used by rag ingestion) tiers
+   cheapest-first: text bytes decode; pdfs go through pypdf; images are
+   transcribed by the configured model when it is multimodal (gemini,
+   gpt-4o class — one bounded vision call, image framed as DATA to read).
+   files nothing can read are refused with the reason, never stored as
+   garbage. from then on it is ordinary vault material: searchable mid-chat,
    swept by the witness.
 
 the rule: **per-chat grounding is automatic; permanent cross-chat memory is a

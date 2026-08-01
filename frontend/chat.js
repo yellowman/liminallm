@@ -3273,7 +3273,9 @@ const handleFileAction = async (event) => {
       const note = await notesApi('/notes/from-file', {
         method: 'POST', body: JSON.stringify({ name: filename }),
       });
-      showStatus(`Added to vault as "${note.title}"${note.truncated ? ' (truncated)' : ''}`);
+      const how = note.method === 'vision' ? ' (read by the model)'
+        : note.method === 'pdf' ? ' (text extracted)' : '';
+      showStatus(`Added to vault as "${note.title}"${how}${note.truncated ? ', truncated' : ''}`);
     } catch (err) {
       showStatus(err.message || 'Could not add to vault', true);
     }

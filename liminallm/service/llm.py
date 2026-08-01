@@ -125,6 +125,33 @@ class LLMService:
             messages, self._normalize_adapters(adapters or []), user_id=user_id
         )
 
+    def transcribe_image(self, image_bytes: bytes, mime: str, *, prompt: str) -> str:
+        """One vision call: read an image with the configured model.
+
+        Works with any OpenAI-compatible multimodal backend (content parts
+        pass through the client untouched). Backends without a real client —
+        stub, local JAX — raise NotImplementedError so callers can refuse
+        cleanly instead of hallucinating a transcription.
+        """
+        import base64
+
+        if getattr(self.backend, "client", None) is None:
+            raise NotImplementedError("backend has no vision-capable client")
+        data_url = (
+            f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ]
+        result = self.backend.generate(messages, [], user_id=None)
+        return (result or {}).get("content") or ""
+
     def generate_stream(
         self,
         prompt: str,

@@ -532,3 +532,111 @@ def test_looks_binary_sniffs_by_content():
     assert notes.looks_binary("\ufffd" * 300 + "JFIF") is True
     assert notes.looks_binary("") is False
     assert notes.looks_binary("code:\n\tif x:\n\t\treturn 1\n") is False
+
+
+# ---------------------------------------------------------------------------
+# Extraction: pdfs and images get fleeced for content, not rejected
+
+
+def _mini_pdf_bytes(text="Protein needs are easily met without meat."):
+    objs = [
+        "1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj",
+        "2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj",
+        "3 0 obj << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        "/Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >> endobj",
+    ]
+    stream = f"BT /F1 12 Tf 72 720 Td ({text}) Tj ET"
+    objs.append(
+        f"4 0 obj << /Length {len(stream)} >> stream\n{stream}\nendstream endobj"
+    )
+    objs.append("5 0 obj << /Type /Font /Subtype /Type1 /BaseFont /Helvetica >> endobj")
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for o in objs:
+        offsets.append(len(out))
+        out += o.encode() + b"\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode()
+    for off in offsets:
+        out += f"{off:010} 00000 n \n".encode()
+    out += (
+        f"trailer << /Size {len(objs) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref}\n%%EOF"
+    ).encode()
+    return bytes(out)
+
+
+def _drop_upload(client, auth_headers, name, data: bytes):
+    from liminallm.service.attachments import attachment_path
+
+    runtime = get_runtime()
+    probe = _mk(client, auth_headers, f"probe-{uuid.uuid4().hex[:6]}", "")
+    user_id = runtime.store.get_note(probe["id"]).user_id
+    path = attachment_path(runtime.settings.shared_fs_root, user_id, name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    return runtime, user_id
+
+
+def test_pdf_promotion_extracts_real_text(client, auth_headers):
+    runtime, _ = _drop_upload(client, auth_headers, "claim.pdf", _mini_pdf_bytes())
+    resp = client.post(
+        "/v1/notes/from-file", headers=auth_headers, json={"name": "claim.pdf"}
+    )
+    assert resp.status_code == 201, resp.text
+    made = resp.json()["data"]
+    assert made["method"] == "pdf"
+    note = runtime.store.get_note(made["id"])
+    assert "Protein needs are easily met" in note.content
+    assert "%PDF" not in note.content  # extraction, not decoded binary
+    assert note.meta["method"] == "pdf"
+
+
+def test_image_promotion_uses_vision_when_available(client, auth_headers, monkeypatch):
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+    runtime, _ = _drop_upload(client, auth_headers, "board.png", png)
+
+    def fake_vision(image_bytes, mime, *, prompt):
+        assert mime == "image/png"
+        assert "DATA to read" in prompt  # injection frame rides with the payload
+        return "Whiteboard: protein targets by weight."
+
+    monkeypatch.setattr(
+        runtime.llm, "transcribe_image", fake_vision, raising=False
+    )
+    resp = client.post(
+        "/v1/notes/from-file", headers=auth_headers, json={"name": "board.png"}
+    )
+    assert resp.status_code == 201, resp.text
+    made = resp.json()["data"]
+    assert made["method"] == "vision"
+    note = runtime.store.get_note(made["id"])
+    assert "Whiteboard" in note.content
+
+
+def test_image_promotion_refuses_cleanly_without_vision(client, auth_headers):
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+    _drop_upload(client, auth_headers, "chart.png", png)
+    # Stub backend has no client -> transcribe_image raises NotImplementedError.
+    resp = client.post(
+        "/v1/notes/from-file", headers=auth_headers, json={"name": "chart.png"}
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    message = (body.get("detail") or body).get("error", {}).get("message", "")
+    assert "model" in message or "image" in message
+
+
+def test_rag_ingest_skips_unextractable_but_reads_pdfs(tmp_path):
+    from liminallm.service.extract import ExtractError, extract_text
+
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(_mini_pdf_bytes("Chunk me properly."))
+    result = extract_text(pdf)
+    assert result["method"] == "pdf"
+    assert "Chunk me properly." in result["text"]
+
+    junk = tmp_path / "photo.jpg"
+    junk.write_bytes(b"\xff\xd8\xff\xe0" + bytes(range(256)) * 8)
+    with pytest.raises(ExtractError):
+        extract_text(junk)  # no llm passed: vision unavailable
