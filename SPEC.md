@@ -1865,3 +1865,62 @@ system settings (databased-managed feature flag). when off: all `/v1/notes/*`
 routes return 403 `notes_disabled`, the `note_search` tool is never offered,
 and the front-end hides the notes tab on first contact. precedence follows the
 platform rule: admin override > env var > code default.
+
+---
+
+## 20. context window, budget, and compaction
+
+### 20.1 the window is discovered, not assumed
+
+the prompt budget must come from the model actually serving requests. a
+constant (the old `MAX_GENERATION_TOKENS = 4096` used as a whole-prompt cap)
+is wrong in both directions: it wastes 99% of a million-token gemini window
+and overruns a small local checkpoint. resolution order, most authoritative
+first:
+
+1. **admin override / env**: `model_context_window` system setting, else
+   `MODEL_CONTEXT_WINDOW`. set this when discovery guesses wrong.
+2. **provider probe** (5s, best-effort, never raises): gemini's native
+   `models/{id}` states `inputTokenLimit`; self-hosted openai-compatible
+   servers (vllm, lorax, lm studio) expose `max_model_len` /
+   `context_length` in `/models`. a probe result outranks the table because
+   a local server may serve a small window under a big-model name.
+3. **known-family table** (`KNOWN_CONTEXT_WINDOWS`, longest prefix wins).
+4. **`DEFAULT_CONTEXT_WINDOW = 8192`** — conservative, so an unknown model
+   degrades to "less context", never to overrun.
+
+local jax takes `min(config.json max_position_embeddings, max_seq_len)`: the
+checkpoint's trained positions and the serving cap, whichever binds.
+
+### 20.2 budget
+
+`prompt_budget = window − MAX_GENERATION_TOKENS`, floored at 2048 so the
+reply always has room. resolved per turn, cached 60s so admin changes apply
+without a restart. every prompt-assembling path enforces it — including the
+attachment agent, whose 32kb inlined preamble previously bypassed budgeting
+entirely.
+
+pruning order when over budget: retrieved context from the least-relevant
+end, then oldest history. the digest snippet is inserted **first** so it
+survives pruning longest — losing the summary of everything older is worse
+than losing one retrieved chunk.
+
+### 20.3 compaction (rolling digest)
+
+recent turns are sent verbatim (`RECENT_MESSAGES = 20`); older turns are
+folded into a digest stored on `conversation.meta.digest` and prepended as a
+labeled record. this is what makes long conversations degrade to "remembers
+less precisely" instead of "forgets entirely".
+
+- the digest is built off the hot path (same discipline as turn labels),
+  merges the previous digest with only messages newer than its
+  `through_seq`, and never re-summarizes covered turns.
+- digest input is prior conversation text — including anything a user
+  pasted — so it is framed as DATA to summarize and the injected block is
+  labeled a record, not instructions.
+- failure leaves the previous digest in place; a missing digest costs
+  precision, never correctness, because the recent window is always sent.
+- the history window is identical warm or cold. loading the *entire*
+  conversation on a cache miss (the old behavior) made the model's memory
+  depend on redis being up, which made "why did it forget that"
+  unreproducible.

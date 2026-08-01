@@ -50,6 +50,11 @@ Router Updates ← Adapter Training ← Promotion Decision
   - uploaded files stay chat-scoped by default; a file joins the vault only when you promote it (one click), because permanent cross-chat memory should be a decision, not a side effect
   - promoted pdfs and images get fleeced for content: text layer → pypdf, images and scans → ocr, then model vision. install `tesseract-ocr` + `pip install 'liminallm[ocr]'` — technically optional, practically required
 
+- **context that fits the model you actually run**
+  - the prompt budget comes from the serving model's real window — asked of the provider (gemini and vllm both report it), else a known-family table, else a conservative default; `MODEL_CONTEXT_WINDOW` overrides when discovery guesses wrong
+  - recent turns go verbatim; older ones are folded into a rolling digest kept on the conversation, so a long chat degrades to “remembers less precisely” instead of “forgets entirely”
+  - the digest is written off the hot path and never blocks a reply; the window is the same whether redis is up or down
+
 - **small kernel, big data**
   - kernel only knows how to:
     - auth users

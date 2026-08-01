@@ -127,6 +127,7 @@ from liminallm.service.attachments import (
     record_attachment,
 )
 from liminallm.service.auth import AuthContext
+from liminallm.service import compaction
 from liminallm.service import extract as extract_service
 from liminallm.service import labels
 from liminallm.service import notes as notes_service
@@ -915,6 +916,59 @@ def _schedule_turn_labels(
         task = asyncio.create_task(_run())
     except RuntimeError:
         return  # no running loop (sync test context): skip labelling
+    _LABEL_TASKS.add(task)
+    task.add_done_callback(_LABEL_TASKS.discard)
+
+
+def _schedule_conversation_digest(
+    runtime, *, conversation_id: str, user_id: str
+) -> None:
+    """Fold turns older than the window into a digest, off the hot path.
+
+    Same discipline as turn labels: scheduled after the reply is on its way,
+    failures logged and dropped. A missing digest costs precision, never
+    correctness — the recent window is always sent verbatim.
+    """
+
+    async def _run() -> None:
+        try:
+            conversation = await asyncio.to_thread(
+                runtime.store.get_conversation, conversation_id, user_id=user_id
+            )
+            if not conversation:
+                return
+            history = await asyncio.to_thread(
+                runtime.store.list_messages, conversation_id, user_id=user_id
+            )
+            if not compaction.needs_digest(history, conversation):
+                return
+            digest = await asyncio.to_thread(
+                compaction.build_digest, runtime.llm, history, conversation
+            )
+            if not digest:
+                return
+            await asyncio.to_thread(
+                runtime.store.merge_conversation_meta,
+                conversation_id,
+                {"digest": digest},
+            )
+            logger.info(
+                "conversation_digested",
+                conversation_id=conversation_id,
+                messages=digest.get("messages"),
+                tokens=digest.get("tokens"),
+            )
+        except Exception as exc:  # noqa: BLE001 - never surface to the user
+            logger.warning(
+                "conversation_digest_failed",
+                conversation_id=conversation_id,
+                error=str(exc),
+            )
+
+    try:
+        task = asyncio.create_task(_run())
+    except RuntimeError:
+        return  # no running loop (sync test context)
     _LABEL_TASKS.add(task)
     task.add_done_callback(_LABEL_TASKS.discard)
 
@@ -2031,6 +2085,9 @@ async def chat(
                     user_content=user_content,
                     assistant_content=assistant_content,
                     set_title=needs_title,
+                )
+                _schedule_conversation_digest(
+                    runtime, conversation_id=conversation_id, user_id=user_id
                 )
                 envelope = Envelope(
                     status="ok", data=resp.model_dump(), request_id=idem.request_id
@@ -5204,6 +5261,9 @@ async def websocket_chat(ws: WebSocket):
                 user_content=init.get("message", ""),
                 assistant_content=assistant_content,
                 set_title=needs_title,
+            )
+            _schedule_conversation_digest(
+                runtime, conversation_id=convo_id, user_id=user_id
             )
 
             # Send final event with message_id and conversation_id to client

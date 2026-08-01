@@ -471,6 +471,15 @@ class Settings(BaseModel):
             "throwaway copies of attachments for one tool call."
         ),
     )
+    model_context_window: int = env_field(
+        0,
+        "MODEL_CONTEXT_WINDOW",
+        description=(
+            "Input window of the serving model, in tokens. 0 = discover: ask "
+            "the provider, else a known-family table, else 8192. Set this "
+            "when discovery guesses wrong for your deployment."
+        ),
+    )
     extract_readers: str = env_field(
         "ocr,vision",
         "EXTRACT_READERS",
@@ -865,6 +874,7 @@ SYSTEM_SETTINGS_DEFAULTS: dict = {
     "allow_signup": True,
     "training_worker_enabled": True,
     "notes_enabled": True,
+    "model_context_window": 0,
     "training_worker_poll_interval": 60,
     # SMTP
     "smtp_host": "",

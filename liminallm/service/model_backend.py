@@ -287,6 +287,7 @@ class StubBackend:
     """
 
     mode = "stub"
+    context_window = 8192
 
     STUB_RESPONSE = "This is a stub response for testing purposes."
 
@@ -379,6 +380,147 @@ class StubBackend:
         }
 
 
+# ---------------------------------------------------------------------------
+# Context-window discovery
+#
+# The prompt budget must come from the model actually serving requests, not a
+# constant. Resolution, most authoritative first:
+#   1. an explicit override (admin setting / MODEL_CONTEXT_WINDOW) — handled
+#      by the caller, not here;
+#   2. asking the provider (Gemini's models endpoint states inputTokenLimit;
+#      self-hosted OpenAI-compatible servers like vLLM/LoRAX put
+#      max_model_len/context_length in /models);
+#   3. a table of well-known model families (prefix-matched);
+#   4. a conservative default.
+
+DEFAULT_CONTEXT_WINDOW = 8192
+
+# Longest-prefix wins. Values are input windows, deliberately the safe
+# published number rather than any beta/extended tier.
+KNOWN_CONTEXT_WINDOWS: List[Tuple[str, int]] = [
+    ("gemini-1.5-pro", 2_000_000),
+    ("gemini", 1_000_000),
+    ("gpt-4.1", 1_000_000),
+    ("gpt-5", 400_000),
+    ("gpt-4o", 128_000),
+    ("chatgpt-4o", 128_000),
+    ("gpt-4-turbo", 128_000),
+    ("gpt-4", 8_192),
+    ("gpt-3.5-turbo", 16_385),
+    ("o1", 200_000),
+    ("o3", 200_000),
+    ("o4", 200_000),
+    ("claude", 200_000),
+    ("llama-3.1", 131_072),
+    ("llama-3.2", 131_072),
+    ("llama-3.3", 131_072),
+    ("llama-4", 131_072),
+    ("glm", 128_000),
+    ("deepseek", 64_000),
+    ("qwen", 32_768),
+    ("mistral", 32_768),
+]
+
+
+def context_window_from_table(model_id: str) -> Optional[int]:
+    """Longest matching family prefix, or None for an unknown model."""
+    lowered = (model_id or "").lower()
+    best: Optional[Tuple[str, int]] = None
+    for prefix, window in KNOWN_CONTEXT_WINDOWS:
+        if lowered.startswith(prefix) and (best is None or len(prefix) > len(best[0])):
+            best = (prefix, window)
+    return best[1] if best else None
+
+
+# Keys self-hosted OpenAI-compatible servers use for the model's window.
+_WINDOW_KEYS = (
+    "max_model_len", "context_length", "max_context_length",
+    "context_window", "n_ctx", "inputTokenLimit", "input_token_limit",
+)
+
+
+def _window_from_json(payload: Any) -> Optional[int]:
+    """Depth-limited scan of a /models-style payload for a window field."""
+    def scan(node: Any, depth: int) -> Optional[int]:
+        if depth > 3 or not isinstance(node, (dict, list)):
+            return None
+        if isinstance(node, dict):
+            for key in _WINDOW_KEYS:
+                value = node.get(key)
+                if isinstance(value, int) and value > 0:
+                    return value
+                if isinstance(value, str) and value.isdigit():
+                    return int(value)
+            for value in node.values():
+                found = scan(value, depth + 1)
+                if found:
+                    return found
+        else:
+            for item in node[:5]:
+                found = scan(item, depth + 1)
+                if found:
+                    return found
+        return None
+
+    return scan(payload, 0)
+
+
+def probe_context_window(
+    *, provider: str, model: str, base_url: Optional[str], api_key: Optional[str]
+) -> Optional[int]:
+    """Ask the serving endpoint for the model's window; None when it won't say.
+
+    Best-effort by design: 5s timeout, any failure returns None and the
+    caller falls back to the table. Never raises.
+    """
+    import httpx
+
+    try:
+        if provider in {"gemini", "google", "vertex"} and api_key:
+            # The OpenAI-compat base_url nests under /v1beta/openai; the
+            # native models endpoint (which states inputTokenLimit) is a
+            # sibling of that prefix.
+            root = "https://generativelanguage.googleapis.com/v1beta"
+            if base_url and "/v1beta" in base_url:
+                root = base_url.split("/v1beta")[0] + "/v1beta"
+            resp = httpx.get(
+                f"{root}/models/{model}",
+                headers={"x-goog-api-key": api_key},
+                timeout=5.0,
+            )
+            if resp.status_code == 200:
+                return _window_from_json(resp.json())
+            return None
+        if base_url:
+            # Self-hosted OpenAI-compatible servers (vLLM, LoRAX, LM Studio)
+            # often expose the window in their models listing.
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+            for url in (f"{base_url.rstrip('/')}/models/{model}",
+                        f"{base_url.rstrip('/')}/models"):
+                resp = httpx.get(url, headers=headers, timeout=5.0)
+                if resp.status_code == 200:
+                    window = _window_from_json(resp.json())
+                    if window:
+                        return window
+    except Exception as exc:  # noqa: BLE001 - probing must never break serving
+        logger.debug("context_window_probe_failed", error=str(exc))
+    return None
+
+
+def context_window_from_model_dir(model_dir: str | Path) -> Optional[int]:
+    """Local HF-style checkout: the window lives in config.json."""
+    try:
+        config = json.loads((Path(model_dir) / "config.json").read_text())
+    except Exception:  # noqa: BLE001 - missing/unparseable config
+        return None
+    for key in ("max_position_embeddings", "n_positions", "seq_length",
+                "max_seq_len", "model_max_length"):
+        value = config.get(key)
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
+
+
 class ApiAdapterBackend:
     """Backend that targets external APIs with capability-aware adapter handling.
 
@@ -429,6 +571,35 @@ class ApiAdapterBackend:
         # Infer provider from adapter_mode if not specified
         self.provider = provider or self._infer_provider(adapter_mode)
         self.capabilities = get_provider_capabilities(self.provider)
+        self._context_window: Optional[int] = None
+
+    @property
+    def context_window(self) -> int:
+        """The serving model's input window: probed, else table, else default.
+
+        Resolved once and cached; a wrong guess here misprices every budget
+        decision, so the provider's own answer outranks the table.
+        """
+        if self._context_window is None:
+            model = self.adapter_server_model or self.base_model
+            window = probe_context_window(
+                provider=self.provider,
+                model=model,
+                base_url=self._base_url,
+                api_key=self._active_api_key or self._api_key,
+            )
+            source = "probe"
+            if not window:
+                window = context_window_from_table(model)
+                source = "table"
+            if not window:
+                window, source = DEFAULT_CONTEXT_WINDOW, "default"
+            self._context_window = window
+            logger.info(
+                "model_context_window_resolved",
+                model=model, window=window, source=source,
+            )
+        return self._context_window
 
     def _safe_float(self, value: Any, default: float = 1.0, *, context: str = "") -> float:
         """Coerce adapter weights to float with defensive fallback.
@@ -1018,6 +1189,12 @@ class LocalJaxLoRABackend:
         self.mode = "local_lora"
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
+        # The checkpoint's config states its trained positions; max_seq_len is
+        # the serving cap. The window is whichever is smaller and known.
+        discovered = context_window_from_model_dir(base_model)
+        self.context_window = (
+            min(discovered, max_seq_len) if discovered else max_seq_len
+        ) or DEFAULT_CONTEXT_WINDOW
         self.default_vocab_size = DEFAULT_VOCAB_SIZE
         self._base_vocab_size = DEFAULT_VOCAB_SIZE
         self._adapter_vocab_size: Optional[int] = None

@@ -125,6 +125,18 @@ class LLMService:
             messages, self._normalize_adapters(adapters or []), user_id=user_id
         )
 
+    def context_window(self) -> int:
+        """The serving model's input window (probed/table/config, see backend)."""
+        from liminallm.service.model_backend import DEFAULT_CONTEXT_WINDOW
+
+        try:
+            window = getattr(self.backend, "context_window", None)
+            if isinstance(window, int) and window > 0:
+                return window
+        except Exception as exc:  # noqa: BLE001 - discovery must not break chat
+            logger.warning("context_window_resolution_failed", error=str(exc))
+        return DEFAULT_CONTEXT_WINDOW
+
     def transcribe_image(self, image_bytes: bytes, mime: str, *, prompt: str) -> str:
         """One vision call: read an image with the configured model.
 
