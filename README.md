@@ -41,6 +41,14 @@ Router Updates ← Adapter Training ← Promotion Decision
   - ingestion → chunking → embeddings in postgres (pgvector)
   - notebooklm-style: bind “contexts” (collections of files/folders) to a chat and ask questions grounded in that corpus
 
+- **a notes vault with a witness**
+  - notes link to each other with `[[title]]`; links become a graph you can see
+  - the model can search your vault mid-chat (`note_search`) and cite what you once wrote
+  - the witness puts two dated notes side by side and asks how they relate — agrees, contradicts, or the position quietly moved. contradiction isn’t the goal; it’s one honest result of the process
+  - when a position has moved, the report shows the trail: the chain of links between the two thoughts, with dates
+  - a vault-wide sweep runs the same process over the strongest pairs across everything you’ve written
+  - uploaded files stay chat-scoped by default; a file joins the vault only when you promote it (one click), because permanent cross-chat memory should be a decision, not a side effect
+
 - **small kernel, big data**
   - kernel only knows how to:
     - auth users

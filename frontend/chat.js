@@ -3222,6 +3222,7 @@ const renderFilesList = (files, total, hasNext) => {
       </div>
       <div class="file-actions">
         ${isArchiveName(file.name) ? '<button type="button" class="download-btn" data-action="extract">Extract</button>' : ''}
+        <button type="button" class="download-btn" data-action="vault" title="Copy this file's text into your notes vault">Vault</button>
         <button type="button" class="download-btn" data-action="download">Download</button>
         <button type="button" class="delete-btn" data-action="delete">Delete</button>
       </div>
@@ -3267,6 +3268,15 @@ const handleFileAction = async (event) => {
     await deleteFile(filename);
   } else if (action === 'extract') {
     await extractFile(filename, target);
+  } else if (action === 'vault') {
+    try {
+      const note = await notesApi('/notes/from-file', {
+        method: 'POST', body: JSON.stringify({ name: filename }),
+      });
+      showStatus(`Added to vault as "${note.title}"${note.truncated ? ' (truncated)' : ''}`);
+    } catch (err) {
+      showStatus(err.message || 'Could not add to vault', true);
+    }
   }
 };
 
@@ -4961,7 +4971,8 @@ const notesState = {
   currentId: null,
   dirty: false,
   graph: null,         // {nodes, edges} when the graph view is open
-  contradicted: new Set(), // note ids flagged by the witness this session
+  contradicted: new Set(), // note ids the witness flagged as contradicting
+  evolved: new Set(),      // note ids whose position moved
   searchTimer: null,
 };
 
@@ -4987,7 +4998,7 @@ const renderNoteList = () => {
   const list = $('note-list');
   if (!list) return;
   list.innerHTML = notesState.notes.map((n) => `
-    <li class="note-item${n.id === notesState.currentId ? ' active' : ''}${notesState.contradicted.has(n.id) ? ' contradicted' : ''}" data-id="${escapeAttr(n.id)}">
+    <li class="note-item${n.id === notesState.currentId ? ' active' : ''}${notesState.contradicted.has(n.id) ? ' contradicted' : notesState.evolved.has(n.id) ? ' evolved' : ''}" data-id="${escapeAttr(n.id)}">
       <span class="note-item-title">${escapeHtml(n.title)}</span>
       <span class="note-item-date">${new Date(n.updated_at).toLocaleDateString()}</span>
     </li>`).join('');
@@ -5002,6 +5013,9 @@ const fetchNotes = async () => {
     renderNoteList();
     $('notes-empty')?.classList.toggle('hidden', notesState.notes.length > 0 || !!notesState.currentId);
   } catch (err) {
+    if (String(err.message || '').includes('disabled')) {
+      document.querySelector('[data-tab="notes-tab"]')?.classList.add('hidden');
+    }
     console.warn('notes fetch failed', err);
   }
 };
@@ -5010,6 +5024,7 @@ const showNoteEditor = (show) => {
   $('note-editor')?.classList.toggle('hidden', !show);
   $('notes-empty')?.classList.toggle('hidden', show || notesState.notes.length > 0);
   $('note-graph-wrap')?.classList.add('hidden');
+  $('note-sweep-wrap')?.classList.add('hidden');
 };
 
 const openNote = async (noteId) => {
@@ -5110,28 +5125,77 @@ const runWitness = async () => {
     const report = await notesApi(`/notes/${encodeURIComponent(notesState.currentId)}/witness`, {
       method: 'POST', body: JSON.stringify({}),
     });
-    const rows = (report.findings || []).map((f) => {
+    const rows = (report.findings || []).map((f) => witnessRowHtml(f, f.note_id, f.title, f.days_apart));
+    (report.findings || []).forEach((f) => {
       if (f.verdict === 'CONTRADICTS') notesState.contradicted.add(f.note_id);
-      const cls = f.verdict === 'CONTRADICTS' ? 'contradicts' : f.verdict === 'AGREES' ? 'agrees' : 'unrelated';
-      const path = f.path_titles
-        ? `<div class="witness-path">${f.path_titles.map((t) => escapeHtml(t)).join(' → ')}</div>` : '';
-      return `<div class="witness-row ${cls}">
-        <span class="witness-verdict">${f.verdict}</span>
-        <a href="#" class="wikilink" data-note-id="${escapeAttr(f.note_id)}">${escapeHtml(f.title)}</a>
-        <span class="muted">${f.days_apart} days apart</span>
-        ${f.reason ? `<div class="witness-reason">${escapeHtml(f.reason)}</div>` : ''}
-        ${path}
-      </div>`;
+      if (f.verdict === 'EVOLVES') notesState.evolved.add(f.note_id);
     });
     if (notesState.contradicted.size) notesState.contradicted.add(report.note_id);
     box.innerHTML = report.checked === 0
       ? '<div class="muted">Nothing in the vault is close enough to compare yet.</div>'
-      : `<div class="witness-summary">${report.contradictions
-          ? `${report.contradictions} of your ${report.checked} nearest notes disagree with this one.`
-          : `Checked against ${report.checked} nearest notes — no contradictions found.`}</div>${rows.join('')}`;
+      : `<div class="witness-summary">${witnessSummaryText(report, report.checked)}</div>${rows.join('')}`;
     renderNoteList();
   } catch (err) {
     box.innerHTML = `<div class="muted">${escapeHtml(err.message || 'Witness unavailable')}</div>`;
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+const VERDICT_CLASS = { CONTRADICTS: 'contradicts', EVOLVES: 'evolves', AGREES: 'agrees', UNRELATED: 'unrelated' };
+
+// The process is comparison; the summary reports whatever fell out of it.
+const witnessSummaryText = (report, checked) => {
+  const parts = [];
+  if (report.contradictions) parts.push(`${report.contradictions} contradiction${report.contradictions > 1 ? 's' : ''}`);
+  if (report.evolutions) parts.push(`${report.evolutions} position${report.evolutions > 1 ? 's' : ''} that moved`);
+  return parts.length
+    ? `Compared ${checked} pairs of thoughts: ${parts.join(', ')}.`
+    : `Compared ${checked} pairs of thoughts — your thinking holds together.`;
+};
+
+const witnessRowHtml = (f, noteId, title, daysApart) => {
+  const cls = VERDICT_CLASS[f.verdict] || 'unrelated';
+  const path = f.path_titles
+    ? `<div class="witness-path">${f.path_titles.map((t) => escapeHtml(t)).join(' → ')}</div>` : '';
+  return `<div class="witness-row ${cls}">
+    <span class="witness-verdict">${f.verdict}</span>
+    <a href="#" class="wikilink" data-note-id="${escapeAttr(noteId)}">${escapeHtml(title)}</a>
+    <span class="muted">${daysApart} days apart</span>
+    ${f.reason ? `<div class="witness-reason">${escapeHtml(f.reason)}</div>` : ''}
+    ${path}
+  </div>`;
+};
+
+const runVaultSweep = async () => {
+  const wrap = $('note-sweep-wrap');
+  const btn = $('note-sweep-btn');
+  if (!wrap || !btn) return;
+  $('note-editor')?.classList.add('hidden');
+  $('note-graph-wrap')?.classList.add('hidden');
+  $('notes-empty')?.classList.add('hidden');
+  wrap.classList.remove('hidden');
+  btn.disabled = true;
+  wrap.innerHTML = '<div class="muted" style="padding:24px">The witness is reading the whole vault…</div>';
+  try {
+    const report = await notesApi('/notes/sweep', { method: 'POST', body: JSON.stringify({}) });
+    report.findings.forEach((f) => {
+      if (f.verdict === 'CONTRADICTS') { notesState.contradicted.add(f.a.id); notesState.contradicted.add(f.b.id); }
+      if (f.verdict === 'EVOLVES') { notesState.evolved.add(f.a.id); notesState.evolved.add(f.b.id); }
+    });
+    const coverage = report.notes_scanned >= report.notes_cap || report.judged >= report.judgment_cap
+      ? `<div class="muted small">Bounded pass: scanned ${report.notes_scanned} notes, judged the strongest ${report.judged} of ${report.pairs_considered} candidate pairs.</div>`
+      : '';
+    const rows = report.findings.map((f) => witnessRowHtml(
+      f, f.b.id, `${f.a.title} ↔ ${f.b.title}`, f.days_apart));
+    wrap.innerHTML = `<div class="note-sweep">
+      <div class="witness-summary">${witnessSummaryText(report, report.judged)}</div>
+      ${coverage}
+      ${rows.join('') || '<div class="muted">No two notes were close enough to compare.</div>'}
+    </div>`;
+    renderNoteList();
+  } catch (err) {
+    wrap.innerHTML = `<div class="muted" style="padding:24px">${escapeHtml(err.message || 'Sweep unavailable')}</div>`;
   } finally {
     btn.disabled = false;
   }
@@ -5163,6 +5227,7 @@ const drawNoteGraph = async () => {
   if (!wrap || !canvas) return;
   $('note-editor')?.classList.add('hidden');
   $('notes-empty')?.classList.add('hidden');
+  $('note-sweep-wrap')?.classList.add('hidden');
   wrap.classList.remove('hidden');
   const data = await notesApi('/notes/graph').catch(() => null);
   if (!data) return;
@@ -5222,6 +5287,7 @@ const drawNoteGraph = async () => {
       const r = 4 + Math.min(n.degree || 0, 12);
       ctx.beginPath();
       ctx.fillStyle = notesState.contradicted.has(n.id) ? '#c0392b'
+        : notesState.evolved.has(n.id) ? '#c07d10'
         : n.id === notesState.currentId ? (styles.getPropertyValue('--accent') || '#4a6fa5') : '#8a8f98';
       ctx.arc(n.x, n.y, r, 0, Math.PI * 2); ctx.fill();
       if ((n.degree || 0) > 2 || nodes.length <= 30) {
@@ -5260,6 +5326,7 @@ const initNotes = () => {
   $('note-preview-btn')?.addEventListener('click', () =>
     setNotePreview($('note-preview')?.classList.contains('hidden')));
   $('note-graph-btn')?.addEventListener('click', drawNoteGraph);
+  $('note-sweep-btn')?.addEventListener('click', runVaultSweep);
   $('note-content')?.addEventListener('input', () => { notesState.dirty = true; });
   $('note-title')?.addEventListener('input', () => { notesState.dirty = true; });
   $('note-content')?.addEventListener('keydown', (e) => {

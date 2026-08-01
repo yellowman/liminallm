@@ -951,3 +951,9 @@ class NoteWitnessRequest(BaseModel):
     """Ask the witness to check a note against the rest of the vault."""
 
     limit: int = Field(6, ge=1, le=6)
+
+
+class NoteFromFileRequest(BaseModel):
+    """Promote an uploaded file into the vault as a note."""
+
+    name: str = Field(..., min_length=1, max_length=512)

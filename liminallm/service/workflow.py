@@ -2489,6 +2489,17 @@ class WorkflowEngine:
             interpreter.cleanup_workdir(session.get("workdir"))
         return {"content": output, "usage": {}}
 
+    def _notes_enabled(self) -> bool:
+        """Admin override > env var > default (on)."""
+        enabled = getattr(self.settings, "notes_enabled", True) if self.settings else True
+        getter = getattr(self.store, "get_system_settings_overrides", None)
+        if callable(getter):
+            try:
+                enabled = (getter() or {}).get("notes_enabled", enabled)
+            except Exception:  # noqa: BLE001
+                pass
+        return bool(enabled)
+
     def _tool_note_search(
         self,
         inputs: Dict[str, Any],
@@ -2502,7 +2513,7 @@ class WorkflowEngine:
     ) -> Dict[str, Any]:
         """Direct-invocable notes search (also reachable from the agent loop)."""
         query = inputs.get("query") or inputs.get("message") or user_message or ""
-        if not user_id:
+        if not user_id or not self._notes_enabled():
             return {"content": "No notes available.", "usage": {}}
         results = notes_service.search_notes(
             self.store,
@@ -2535,8 +2546,8 @@ class WorkflowEngine:
             tools.append(self.WEB_FETCH_SCHEMA)
             if web_cfg["provider"] not in ("", "none"):
                 tools.append(self.WEB_SEARCH_SCHEMA)
-        # Only pay for the schema when there is a vault to search.
-        if user_id and getattr(self.store, "count_notes", None):
+        # Only pay for the schema when notes are enabled AND there is a vault.
+        if user_id and self._notes_enabled() and getattr(self.store, "count_notes", None):
             try:
                 if self.store.count_notes(user_id) > 0:
                     tools.append(self.NOTE_SEARCH_SCHEMA)

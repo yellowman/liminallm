@@ -347,7 +347,10 @@
                 <ul id="note-list" class="note-list" aria-label="Notes"></ul>
                 <div class="notes-side-foot">
                   <span id="note-count" class="muted"></span>
-                  <button class="minor" id="note-graph-btn">Graph</button>
+                  <span class="pill-row">
+                    <button class="minor" id="note-sweep-btn" title="Have the witness compare the strongest pairs across the whole vault">Sweep</button>
+                    <button class="minor" id="note-graph-btn">Graph</button>
+                  </span>
                 </div>
               </aside>
               <div class="notes-main">
@@ -368,10 +371,11 @@
                 </div>
                 <div id="note-graph-wrap" class="note-graph-wrap hidden">
                   <canvas id="note-graph"></canvas>
-                  <div class="note-graph-hint muted">Drag to pan · click a note to open it · red = contradictions found this session</div>
+                  <div class="note-graph-hint muted">click a note to open it · red = contradiction, amber = a position that moved (this session)</div>
                 </div>
+                <div id="note-sweep-wrap" class="note-sweep-wrap hidden"></div>
                 <div id="notes-empty" class="notes-empty">
-                  <p class="muted">A note becomes a node. <code>[[Links]]</code> become edges.<br/>The Witness reads the graph and tells you when you have changed your mind.</p>
+                  <p class="muted">A note becomes a node. <code>[[Links]]</code> become edges.<br/>The Witness compares your thoughts across time — wherever that process leads.</p>
                 </div>
               </div>
             </div>

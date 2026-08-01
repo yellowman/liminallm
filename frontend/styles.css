@@ -2664,3 +2664,25 @@ button.minor:hover {
   .notes-panel { flex-direction: column; }
   .notes-side { width: 100%; border-right: none; border-bottom: 1px solid var(--border); max-height: 40vh; }
 }
+
+/* Witness reframe: movement, not just contradiction */
+.note-item.evolved .note-item-title { color: #c07d10; }
+
+.witness-row.evolves {
+  border-left-color: #c07d10;
+  background: #fdf6e8;
+}
+
+.witness-row.evolves .witness-verdict { color: #c07d10; }
+
+.note-sweep-wrap {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.note-sweep {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px 20px;
+}

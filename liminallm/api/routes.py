@@ -74,6 +74,7 @@ from liminallm.api.schemas import (
     MFAStatusResponse,
     MFAVerifyRequest,
     NoteCreateRequest,
+    NoteFromFileRequest,
     NoteSearchRequest,
     NoteUpdateRequest,
     NoteWitnessRequest,
@@ -2131,6 +2132,20 @@ async def cancel_chat(
 # Notes vault (SPEC: linked notes + the witness)
 
 
+def _require_notes_enabled(runtime) -> None:
+    """Admin override > env var > default (on)."""
+    enabled = getattr(runtime.settings, "notes_enabled", True)
+    getter = getattr(runtime.store, "get_system_settings_overrides", None)
+    if callable(getter):
+        try:
+            overrides = getter() or {}
+            enabled = overrides.get("notes_enabled", enabled)
+        except Exception:  # noqa: BLE001 - settings read is best-effort
+            pass
+    if not enabled:
+        raise _http_error("notes_disabled", "the notes vault is disabled", status_code=403)
+
+
 def _get_owned_note(runtime, note_id: str, principal: AuthContext):
     note = runtime.store.get_note(note_id, user_id=principal.user_id)
     if not note:
@@ -2167,6 +2182,7 @@ def _save_note_graph(runtime, principal: AuthContext, note) -> None:
 @router.post("/notes", response_model=Envelope, status_code=201, tags=["notes"])
 async def create_note(body: NoteCreateRequest, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
+    _require_notes_enabled(runtime)
     title = notes_service.normalize_title(body.title)
     if not title:
         raise _http_error("bad_request", "title required", status_code=400)
@@ -2187,6 +2203,7 @@ async def list_notes(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
+    _require_notes_enabled(runtime)
     notes = runtime.store.list_notes(
         principal.user_id, limit=min(max(limit, 1), 500), offset=max(offset, 0)
     )
@@ -2203,6 +2220,7 @@ async def list_notes(
 async def notes_graph(principal: AuthContext = Depends(get_user)):
     """Nodes and edges of the user's vault, for the graph view."""
     runtime = get_runtime()
+    _require_notes_enabled(runtime)
     notes = runtime.store.list_notes(principal.user_id, limit=10_000)
     edges = runtime.store.list_note_edges(principal.user_id)
     degree: dict[str, int] = {}
@@ -2224,6 +2242,7 @@ async def notes_graph(principal: AuthContext = Depends(get_user)):
 @router.get("/notes/{note_id}", response_model=Envelope, tags=["notes"])
 async def get_note(note_id: str, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
+    _require_notes_enabled(runtime)
     note = _get_owned_note(runtime, note_id, principal)
     links = [
         _note_payload(n, content=False)
@@ -2252,6 +2271,7 @@ async def update_note(
     note_id: str, body: NoteUpdateRequest, principal: AuthContext = Depends(get_user)
 ):
     runtime = get_runtime()
+    _require_notes_enabled(runtime)
     _get_owned_note(runtime, note_id, principal)
     title = notes_service.normalize_title(body.title) if body.title else None
     try:
@@ -2267,6 +2287,7 @@ async def update_note(
 @router.delete("/notes/{note_id}", response_model=Envelope, tags=["notes"])
 async def delete_note(note_id: str, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
+    _require_notes_enabled(runtime)
     _get_owned_note(runtime, note_id, principal)
     runtime.store.delete_note(note_id)
     return Envelope(status="ok", data={"deleted": True})
@@ -2277,6 +2298,7 @@ async def search_notes(
     body: NoteSearchRequest, principal: AuthContext = Depends(get_user)
 ):
     runtime = get_runtime()
+    _require_notes_enabled(runtime)
     results = notes_service.search_notes(
         runtime.store,
         getattr(runtime, "embeddings", None),
@@ -2299,6 +2321,84 @@ async def search_notes(
     )
 
 
+@router.post("/notes/sweep", response_model=Envelope, tags=["notes"])
+async def sweep_vault(principal: AuthContext = Depends(get_user)):
+    """Run the witness across the whole vault: the strongest pairs, judged.
+
+    Deliberately expensive (up to 30 model calls), so the rate limit is
+    stricter than the per-note witness.
+    """
+    runtime = get_runtime()
+    _require_notes_enabled(runtime)
+    await _enforce_rate_limit(
+        runtime, f"notes_sweep:{principal.user_id}", limit=2, window_seconds=600
+    )
+    report = await asyncio.to_thread(
+        notes_service.vault_sweep,
+        runtime.store,
+        getattr(runtime, "embeddings", None),
+        runtime.llm,
+        principal.user_id,
+    )
+    return Envelope(status="ok", data=report)
+
+
+@router.post("/notes/from-file", response_model=Envelope, status_code=201, tags=["notes"])
+async def note_from_file(
+    body: NoteFromFileRequest, principal: AuthContext = Depends(get_user)
+):
+    """Promote an uploaded file into the vault, explicitly.
+
+    Per-conversation RAG over uploads is automatic; joining the user's
+    permanent cross-conversation corpus is a deliberate act. This endpoint is
+    that act: it copies the file's text into a note (provenance in meta), so
+    the witness and note_search treat it like anything else the user wrote.
+    """
+    runtime = get_runtime()
+    _require_notes_enabled(runtime)
+    from liminallm.service.attachments import attachment_path
+
+    path = attachment_path(
+        runtime.settings.shared_fs_root, principal.user_id, body.name
+    )
+    if not path or not path.is_file():
+        raise _http_error("not_found", "file not found", status_code=404)
+    try:
+        raw = path.read_bytes()[: notes_service.NOTE_FROM_FILE_MAX_BYTES]
+        text = raw.decode("utf-8", errors="replace")
+    except OSError:
+        raise _http_error("bad_request", "file is not readable", status_code=400)
+    if "\x00" in text[:1024]:
+        raise _http_error(
+            "bad_request", "binary files cannot become notes", status_code=400
+        )
+    truncated = path.stat().st_size > notes_service.NOTE_FROM_FILE_MAX_BYTES
+
+    base_title = notes_service.normalize_title(FilePath(body.name).stem) or "Imported file"
+    title = base_title
+    for suffix in range(2, 20):
+        if not runtime.store.get_note_by_title(principal.user_id, title):
+            break
+        title = f"{base_title} ({suffix})"
+    try:
+        note = runtime.store.create_note(
+            principal.user_id,
+            title,
+            text,
+            meta={
+                "source": "upload",
+                "filename": body.name,
+                "truncated": truncated,
+            },
+        )
+    except ConstraintViolation:
+        raise _http_error(
+            "conflict", "a note with this title already exists", status_code=409
+        )
+    _save_note_graph(runtime, principal, note)
+    return Envelope(status="ok", data={**_note_payload(note, content=False), "truncated": truncated})
+
+
 @router.post("/notes/{note_id}/witness", response_model=Envelope, tags=["notes"])
 async def witness_note(
     note_id: str,
@@ -2307,6 +2407,7 @@ async def witness_note(
 ):
     """Judge this note against the vault: one model call per candidate."""
     runtime = get_runtime()
+    _require_notes_enabled(runtime)
     note = _get_owned_note(runtime, note_id, principal)
     await _enforce_rate_limit(
         runtime, f"notes_witness:{principal.user_id}", limit=5, window_seconds=60

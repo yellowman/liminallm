@@ -471,6 +471,14 @@ class Settings(BaseModel):
             "throwaway copies of attachments for one tool call."
         ),
     )
+    notes_enabled: bool = env_field(
+        True,
+        "NOTES_ENABLED",
+        description=(
+            "Notes vault + witness. Admin-overridable via system settings; "
+            "when off, notes routes and the note_search tool disappear."
+        ),
+    )
     cluster_bus_backend: str = env_field(
         "auto",
         "CLUSTER_BUS_BACKEND",
@@ -847,6 +855,7 @@ SYSTEM_SETTINGS_DEFAULTS: dict = {
     "enable_mfa": True,
     "allow_signup": True,
     "training_worker_enabled": True,
+    "notes_enabled": True,
     "training_worker_poll_interval": 60,
     # SMTP
     "smtp_host": "",
