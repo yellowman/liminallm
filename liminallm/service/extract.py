@@ -13,6 +13,19 @@ deployment read?" has a single answer. Tiers, cheapest and most faithful first:
 
 A file nothing can read is refused with the reason and the remedy, never
 stored as garbage.
+
+Security model: every parser here — Pillow's C decoders, pypdf, expat,
+tesseract+leptonica, poppler — is treated as compromisable, because uploads
+are attacker-controlled bytes and these libraries have long CVE histories.
+All parsing therefore runs in a disposable rlimited child process
+(service/sandbox.py): memory/CPU/file-size caps, wall-clock kill, and a hard
+pixel ceiling against decompression bombs. Model vision never runs in that
+child — it needs the network — but it also never parses: the child hands
+already-extracted image bytes back across the pipe and the parent sends them
+to the provider. Honest limit: the child shares the server's UID, so this
+converts "API-process compromise" into "compromise of a short-lived capped
+process", not into nothing — run the whole app in a container/VM for the
+outer wall, as the interpreter docs already recommend.
 """
 
 from __future__ import annotations
@@ -25,8 +38,34 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from liminallm.logging import get_logger
 from liminallm.service.notes import looks_binary
+from liminallm.service.sandbox import SandboxConfig, SandboxError, run_in_sandbox
 
 logger = get_logger(__name__)
+
+# Sandbox budget for one extraction. Image decode needs headroom; a parser
+# that wants more than this is parsing something hostile.
+EXTRACT_MEMORY_MB = 1024
+EXTRACT_CPU_SECONDS = 60
+EXTRACT_FILE_SIZE_MB = 64  # pdftoppm page PNGs; inherited by grandchildren
+EXTRACT_WALL_SECONDS = 90.0
+# Decompression-bomb ceiling: a PNG header claiming more pixels than this
+# raises inside the child instead of allocating gigabytes. 64MP ≈ 8k×8k.
+MAX_IMAGE_PIXELS = 64_000_000
+
+# Slots where an image awaits the parent's vision pass. Private-use-area
+# markers; any occurrence in *extracted* text is stripped first so file
+# content can't forge or corrupt a slot.
+_PH_OPEN = "\ue000"
+_PH_CLOSE = "\ue001"
+_PH_RE = re.compile(f"{_PH_OPEN}(\\d+){_PH_CLOSE}")
+
+
+def _strip_markers(text: str) -> str:
+    return text.replace(_PH_OPEN, "").replace(_PH_CLOSE, "")
+
+
+def _placeholder(index: int) -> str:
+    return f"{_PH_OPEN}{index}{_PH_CLOSE}"
 
 IMAGE_EXTENSIONS = {
     ".png", ".jpg", ".jpeg", ".webp", ".gif", ".tif", ".tiff", ".bmp",
@@ -160,13 +199,19 @@ def _image_bytes_to_text(
     mime: str,
     llm: Any,
     order: Optional[Tuple[str, ...]] = None,
-) -> Tuple[str, str]:
+    pending: Optional[List[Dict[str, str]]] = None,
+) -> Tuple[str, Optional[str]]:
     """(text, reader_name) for one image, walking the configured roster.
 
     Default order is ocr-then-vision: OCR is deterministic, local, and quotes
     rather than paraphrases, so it wins when it finds a document's worth of
     text; photos and diagrams fall through to a reader that can see. Scraps
     from a quoting reader still beat a refusal when they're all there is.
+
+    When ``pending`` is given (the sandboxed child, where no reader with
+    network access may run), an image the local readers can't do justice to is
+    parked there and a placeholder slot returned; the parent's vision pass
+    fills or drops the slot.
     """
     scraps: Optional[Tuple[str, str]] = None
     last_error: Optional[str] = None
@@ -177,7 +222,7 @@ def _image_bytes_to_text(
             continue
         fn, kind = entry
         try:
-            text = (fn(image_bytes, mime, llm) or "").strip()
+            text = _strip_markers((fn(image_bytes, mime, llm) or "").strip())
         except Exception as exc:  # noqa: BLE001 - keep walking the roster
             last_error = f"{name}: {exc}"
             logger.warning("extract_reader_failed", reader=name, error=str(exc))
@@ -188,6 +233,20 @@ def _image_bytes_to_text(
             return text, name
         if scraps is None:
             scraps = (text, name)
+    if pending is not None and len(pending) < MAX_SCANNED_PAGES:
+        import base64
+
+        # Scraps ride along so the parent can fall back to them if vision
+        # can't fill the slot — same last-resort semantics as in-process.
+        pending.append(
+            {
+                "b64": base64.b64encode(image_bytes).decode("ascii"),
+                "mime": mime,
+                "scraps": scraps[0] if scraps else "",
+                "scraps_reader": scraps[1] if scraps else "",
+            }
+        )
+        return _placeholder(len(pending) - 1), None
     if scraps:
         return scraps
     if last_error:
@@ -219,7 +278,7 @@ def _rasterize_pdf(path: Path, first: int, last: int) -> list[bytes]:
             ],
             check=True,
             capture_output=True,
-            timeout=120,
+            timeout=60,  # under EXTRACT_WALL_SECONDS so the child dies first
         )
         pages = sorted(
             Path(tmpdir).glob("page-*.png"),
@@ -248,8 +307,11 @@ def _pdf_page_image(path: Path, reader, index: int) -> Optional[bytes]:
 
 
 def _extract_pdf(
-    path: Path, llm: Any, order: Optional[Tuple[str, ...]] = None
-) -> Tuple[str, str]:
+    path: Path,
+    llm: Any,
+    order: Optional[Tuple[str, ...]] = None,
+    pending: Optional[List[Dict[str, str]]] = None,
+) -> Tuple[str, Optional[str], bool]:
     try:
         from pypdf import PdfReader
     except ImportError:
@@ -272,6 +334,7 @@ def _extract_pdf(
         return sum(1 for w in s.split() if any(c.isalpha() for c in w)) < 2
 
     image_pages = [i for i, s in enumerate(page_strings) if _wordless(s)]
+    page_strings = [_strip_markers(s) for s in page_strings]
     mechanism = None
     read_count = 0
     for index in image_pages:
@@ -282,7 +345,7 @@ def _extract_pdf(
             continue
         try:
             page_text, mech = _image_bytes_to_text(
-                image_bytes, "image/png", llm, order
+                image_bytes, "image/png", llm, order, pending
             )
         except ExtractError as exc:
             logger.debug("pdf_page_unreadable", page=index, reason=exc.reason)
@@ -291,20 +354,19 @@ def _extract_pdf(
         mechanism = mechanism or mech
         read_count += 1
 
+    had_text = any(
+        s.strip() for i, s in enumerate(page_strings) if i not in image_pages
+    )
     text = "\n\n".join(s for s in page_strings if s.strip())
     if len(image_pages) > MAX_SCANNED_PAGES and read_count:
         text += (
             f"\n\n[read first {read_count} of {len(image_pages)} image pages]"
         )
-    if not text.strip():
+    if not text.strip() and not pending:
         raise ExtractError(
             f"the pdf has no extractable text (scanned?): {_NO_READER_REMEDY}"
         )
-    if mechanism is None:
-        return text, "pdf"
-    if len(image_pages) == len(page_strings):
-        return text, f"pdf-{mechanism}"
-    return text, f"pdf+{mechanism}"
+    return text, mechanism, had_text
 
 
 def _read_zipped_xml(path: Path, member: str) -> bytes:
@@ -378,8 +440,11 @@ def _doc_embedded_images(path: Path, suffix: str) -> Tuple[List[Tuple[str, bytes
 
 
 def _extract_doc(
-    path: Path, llm: Any, order: Optional[Tuple[str, ...]] = None
-) -> Tuple[str, str]:
+    path: Path,
+    llm: Any,
+    order: Optional[Tuple[str, ...]] = None,
+    pending: Optional[List[Dict[str, str]]] = None,
+) -> Tuple[str, Optional[str], bool]:
     """Text of a docx/odt: the XML pass plus its content-bearing images.
 
     Same rule as pdfs — a document is text, image, or both. The pasted
@@ -393,6 +458,7 @@ def _extract_doc(
     else:  # .odt
         xml = _read_zipped_xml(path, "content.xml")
         text = _paragraphs_from_xml(xml, {f"{_ODT_NS}p", f"{_ODT_NS}h"})
+    text = _strip_markers(text)
 
     images, eligible = _doc_embedded_images(path, suffix)
     image_texts: List[str] = []
@@ -400,7 +466,7 @@ def _extract_doc(
     for i, (name, data) in enumerate(images):
         mime = _IMAGE_MIME.get(Path(name).suffix.lower(), "image/png")
         try:
-            image_text, mech = _image_bytes_to_text(data, mime, llm, order)
+            image_text, mech = _image_bytes_to_text(data, mime, llm, order, pending)
         except ExtractError as exc:
             logger.debug("doc_image_unreadable", name=name, reason=exc.reason)
             continue
@@ -412,48 +478,176 @@ def _extract_doc(
     combined = "\n\n".join(parts)
     if eligible > MAX_SCANNED_PAGES and image_texts:
         combined += f"\n\n[read first {len(images)} of {eligible} images]"
-    if not combined.strip():
+    if not combined.strip() and not pending:
         detail = f": {_NO_READER_REMEDY}" if eligible else ""
         raise ExtractError(f"the document contains no extractable text{detail}")
-    kind = suffix.lstrip(".")
-    if mechanism is None:
-        return combined, kind
-    if not text.strip():
-        return combined, f"{kind}-{mechanism}"
-    return combined, f"{kind}+{mechanism}"
+    return combined, mechanism, bool(text.strip())
 
 
-def extract_text(
-    path: Path, *, llm: Any = None, readers: Optional[Tuple[str, ...]] = None
+def _compose_method(container: str, mech: Optional[str], had_text: bool) -> str:
+    if container == "text":
+        return "text"
+    if container == "image":
+        return mech or "unread"
+    if mech is None:
+        return container
+    return f"{container}{'+' if had_text else '-'}{mech}"
+
+
+def _parse(
+    path: Path,
+    llm: Any,
+    order: Optional[Tuple[str, ...]],
+    pending: Optional[List[Dict[str, str]]],
 ) -> Dict[str, Any]:
-    """Best-effort text from a file: {text, method} or ExtractError.
-
-    method is "text", "pdf", a reader name ("ocr", "vision", ...), or
-    "pdf-<reader>" so callers can tell the user how the content was obtained —
-    an OCR or vision result is a reading of the file, not a copy of it.
-    ``readers`` overrides the image-reading roster order (EXTRACT_READERS).
-    """
+    """Route by format; returns {text, container, mech, had_text}."""
     if path.stat().st_size > MAX_EXTRACT_BYTES:
         raise ExtractError("file is too large to extract")
     suffix = path.suffix.lower()
     if suffix in DOC_EXTENSIONS:
-        text, method = _extract_doc(path, llm, readers)
-        return {"text": text, "method": method}
+        text, mech, had_text = _extract_doc(path, llm, order, pending)
+        return {
+            "text": text, "container": suffix.lstrip("."),
+            "mech": mech, "had_text": had_text,
+        }
     if suffix == ".doc":
         raise ExtractError(
             "legacy .doc is not supported — save it as .docx or pdf first"
         )
     if suffix == ".pdf":
-        text, method = _extract_pdf(path, llm, readers)
-        return {"text": text, "method": method}
+        text, mech, had_text = _extract_pdf(path, llm, order, pending)
+        return {"text": text, "container": "pdf", "mech": mech, "had_text": had_text}
     if suffix in IMAGE_EXTENSIONS:
         data = path.read_bytes()
         if len(data) > MAX_IMAGE_BYTES:
             raise ExtractError("image is too large to read")
         mime = _IMAGE_MIME.get(suffix, "image/png")
-        text, method = _image_bytes_to_text(data, mime, llm, readers)
-        return {"text": text, "method": method}
-    text = path.read_bytes().decode("utf-8", errors="replace")
+        text, mech = _image_bytes_to_text(data, mime, llm, order, pending)
+        return {"text": text, "container": "image", "mech": mech, "had_text": False}
+    text = _strip_markers(path.read_bytes().decode("utf-8", errors="replace"))
     if looks_binary(text):
         raise ExtractError("binary files cannot become notes")
-    return {"text": text, "method": "text"}
+    return {"text": text, "container": "text", "mech": None, "had_text": True}
+
+
+def _sandboxed_parse(
+    path_str: str, order: Optional[Tuple[str, ...]], want_pending: bool
+) -> Dict[str, Any]:
+    """Child-process entry: all parsing of untrusted bytes happens here.
+
+    Runs under rlimits with no llm object in scope — images the local readers
+    can't do justice to come back as pending slots for the parent's vision
+    pass. Custom readers for the child register via EXTRACT_READER_PLUGINS
+    (comma-separated module paths imported here; the parent's runtime
+    registrations don't survive the spawn).
+    """
+    import importlib
+    import os
+
+    try:
+        from PIL import Image
+
+        # Hard ceiling instead of Pillow's warn-then-allocate default: a
+        # forged header claiming gigapixels raises before it costs memory.
+        Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+    except ImportError:
+        pass
+    for module in os.environ.get("EXTRACT_READER_PLUGINS", "").split(","):
+        if module.strip():
+            try:
+                importlib.import_module(module.strip())
+            except Exception as exc:  # noqa: BLE001 - plugin, not core
+                logger.warning(
+                    "extract_plugin_import_failed", module=module, error=str(exc)
+                )
+    pending: Optional[List[Dict[str, str]]] = [] if want_pending else None
+    result = _parse(Path(path_str), None, order, pending)
+    result["pending"] = pending or []
+    return result
+
+
+def extract_text(
+    path: Path,
+    *,
+    llm: Any = None,
+    readers: Optional[Tuple[str, ...]] = None,
+    sandbox: bool = True,
+) -> Dict[str, Any]:
+    """Best-effort text from a file: {text, method} or ExtractError.
+
+    method is "text", "pdf", a reader name ("ocr", "vision", ...), or a
+    composite ("pdf+ocr", "docx-vision") so callers can tell the user how the
+    content was obtained — an OCR or vision result is a reading of the file,
+    not a copy of it. ``readers`` overrides the roster order (EXTRACT_READERS).
+
+    All parsing runs in a disposable rlimited child (assume the parsers are
+    compromisable); the model's vision pass runs here in the parent on bytes
+    the child handed back, because vision needs the network but never parses.
+    ``sandbox=False`` is for tests and debugging only.
+    """
+    order = tuple(readers) if readers else DEFAULT_READER_ORDER
+    if not sandbox:
+        result = _parse(path, llm, order, pending=None)
+        return {
+            "text": result["text"],
+            "method": _compose_method(
+                result["container"], result["mech"], result["had_text"]
+            ),
+        }
+
+    vision_capable = llm is not None and callable(
+        getattr(llm, "transcribe_image", None)
+    )
+    want_pending = "vision" in order and vision_capable
+    try:
+        result = run_in_sandbox(
+            _sandboxed_parse,
+            str(path),
+            order,
+            want_pending,
+            config=SandboxConfig(
+                max_memory_mb=EXTRACT_MEMORY_MB,
+                max_cpu_seconds=EXTRACT_CPU_SECONDS,
+                max_file_size_mb=EXTRACT_FILE_SIZE_MB,
+            ),
+            timeout=EXTRACT_WALL_SECONDS,
+        )
+    except ExtractError:
+        raise
+    except SandboxError as exc:
+        raise ExtractError(
+            f"extraction aborted (resource limit or timeout): {exc}"
+        )
+
+    text = result["text"]
+    mech = result["mech"]
+    fill_mech: Optional[str] = None
+    for i, entry in enumerate(result.get("pending", [])):
+        import base64
+
+        fill = ""
+        try:
+            vision_text = _reader_vision(
+                base64.b64decode(entry["b64"]), entry["mime"], llm
+            )
+        except Exception as exc:  # noqa: BLE001 - provider failure, use scraps
+            logger.warning("vision_fill_failed", error=str(exc))
+            vision_text = None
+        if vision_text:
+            fill = _strip_markers(vision_text)
+            fill_mech = fill_mech or "vision"
+        elif entry.get("scraps"):
+            fill = entry["scraps"]
+            fill_mech = fill_mech or entry.get("scraps_reader") or "ocr"
+        text = text.replace(_placeholder(i), fill)
+
+    text = _PH_RE.sub("", text)
+    text = re.sub(r"\[image \d+\]\n?(?=\n|$)", "", text).strip()
+    if not text:
+        raise ExtractError(f"could not read this file: {_NO_READER_REMEDY}")
+    return {
+        "text": text,
+        "method": _compose_method(
+            result["container"], mech or fill_mech, result["had_text"]
+        ),
+    }

@@ -1056,3 +1056,88 @@ def test_mixed_pdf_splices_ocr_pages_between_text_pages(tmp_path):
     assert result["method"] == "pdf+ocr"
     assert "Typed page" in result["text"]
     assert "SCANNED PAGE" in result["text"].upper()
+
+
+# ---------------------------------------------------------------------------
+# Extraction is sandboxed: parsers are assumed compromisable
+
+
+def test_decompression_bomb_is_refused_not_allocated(tmp_path):
+    import struct
+    import zlib
+
+    from liminallm.service.extract import ExtractError, extract_text
+
+    # A valid tiny PNG whose IHDR claims 50000x50000 (2.5 gigapixels). An
+    # unguarded decoder allocates ~10GB; the sandboxed child's pixel ceiling
+    # raises instead.
+    import io as _io
+
+    from PIL import Image
+
+    buf = _io.BytesIO()
+    Image.new("RGB", (4, 4), "white").save(buf, format="PNG")
+    data = bytearray(buf.getvalue())
+    ihdr_at = data.index(b"IHDR")
+    struct.pack_into(">II", data, ihdr_at + 4, 50_000, 50_000)
+    crc = zlib.crc32(bytes(data[ihdr_at:ihdr_at + 17]))
+    struct.pack_into(">I", data, ihdr_at + 17, crc)
+    path = tmp_path / "bomb.png"
+    path.write_bytes(bytes(data))
+
+    with pytest.raises(ExtractError):
+        extract_text(path)  # sandboxed by default; must return, not OOM
+
+
+def test_sandbox_failure_maps_to_extract_error(tmp_path, monkeypatch):
+    from liminallm.service import extract
+    from liminallm.service.sandbox import SandboxError
+
+    def exploded(*args, **kwargs):
+        raise SandboxError("wall clock exceeded")
+
+    monkeypatch.setattr(extract, "run_in_sandbox", exploded)
+    path = tmp_path / "x.pdf"
+    path.write_bytes(b"%PDF-1.4 whatever")
+    with pytest.raises(extract.ExtractError, match="aborted"):
+        extract.extract_text(path)
+
+
+def test_placeholder_markers_in_content_cannot_forge_slots(tmp_path):
+    from liminallm.service.extract import extract_text
+
+    path = tmp_path / "sneaky.txt"
+    path.write_text("before 0 after  stray  end")
+    result = extract_text(path)
+    assert "" not in result["text"] and "" not in result["text"]
+    assert "before" in result["text"] and "end" in result["text"]
+
+
+def test_parsing_happens_in_a_different_process(tmp_path):
+    import os
+
+    from liminallm.service import extract
+
+    pid_file = tmp_path / "pid"
+
+    def pid_reader(data, mime, llm):
+        pid_file.write_text(str(os.getpid()))
+        return "x" * 40
+
+    extract.register_reader("pidprobe", pid_reader, kind="ocr")
+    try:
+        path = tmp_path / "img.png"
+        path.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 64)
+        # Unsandboxed: the probe runs here and records our pid.
+        result = extract.extract_text(
+            path, readers=("pidprobe",), sandbox=False
+        )
+        assert result["method"] == "pidprobe"
+        assert int(pid_file.read_text()) == os.getpid()
+        # Sandboxed: the child imports extract fresh, so the runtime-registered
+        # probe is absent — proof the parse ran in another interpreter (plugins
+        # for the child register via EXTRACT_READER_PLUGINS instead).
+        with pytest.raises(extract.ExtractError):
+            extract.extract_text(path, readers=("pidprobe",))
+    finally:
+        extract._READERS.pop("pidprobe", None)

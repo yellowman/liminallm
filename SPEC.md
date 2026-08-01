@@ -1825,6 +1825,21 @@ three tiers, from transient to permanent:
    from then on it is ordinary vault material: searchable mid-chat, swept by
    the witness.
 
+   **extraction is sandboxed, parsers assumed compromisable.** uploads are
+   attacker-controlled bytes and every parser in the ladder — pillow's c
+   decoders, pypdf, expat, tesseract+leptonica, poppler — has a cve history.
+   all parsing runs in a disposable rlimited child (service/sandbox.py:
+   memory/cpu/file-size caps inherited by tesseract/pdftoppm grandchildren,
+   wall-clock kill, hard pixel ceiling so decompression bombs raise instead
+   of allocating). the model's vision pass never runs in that child — it
+   needs the network, but it never parses: the child hands extracted image
+   bytes back over the pipe as pending slots (private-use-area markers,
+   stripped from all extracted content so a file can't forge a slot) and the
+   parent fills them. honest limit: the child shares the server's uid — this
+   converts api-process compromise into compromise of a short-lived capped
+   process, not into nothing; the container/vm recommendation from the
+   interpreter section is the outer wall.
+
 the rule: **per-chat grounding is automatic; permanent cross-chat memory is a
 decision.** silently promoting every upload into a global corpus would make
 old files bleed into unrelated conversations and turn a one-off "summarize
