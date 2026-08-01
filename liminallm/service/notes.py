@@ -173,10 +173,15 @@ def search_notes(
     bm25 = compute_bm25_scores(tokenize_text(query), corpus)
     max_bm25 = max(bm25) if bm25 and max(bm25) > 0 else 1.0
 
-    query_vec = embed_note(embeddings, query, "") if embeddings else None
+    # Cosine joins the score only when embeddings are real: hash-vector
+    # cosine is noise, and noise at 40% weight is worse than BM25 alone.
+    semantic = bool(getattr(embeddings, "is_semantic", False))
+    query_vec = embed_note(embeddings, query, "") if (embeddings and semantic) else None
     scored: List[Tuple[Any, float]] = []
     for i, note in enumerate(notes):
-        score = 0.6 * (bm25[i] / max_bm25)
+        # BM25 carries the whole score without a real encoder; with one,
+        # meaning gets 40% so a note can match on sense, not just words.
+        score = (0.6 if query_vec else 1.0) * (bm25[i] / max_bm25)
         if query_vec and note.embedding:
             score += 0.4 * max(0.0, cosine_similarity(query_vec, note.embedding))
         if score > 0.0:

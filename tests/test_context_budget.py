@@ -788,3 +788,185 @@ def test_history_budget_scales_with_the_model_window(monkeypatch):
     monkeypatch.setattr(engine.settings, "history_budget_fraction", 0.9)
     engine._budget_cache = None
     assert engine.history_budget() > small
+
+
+# ---------------------------------------------------------------------------
+# Semantic recall: meaning beats keywords, but only with a real encoder
+
+
+class _FakeSemanticEmbeddings:
+    """A tiny 'semantic' space: vectors by topic, not by shared words."""
+
+    is_semantic = True
+    model_id = "fake-embed-3"
+
+    _TOPICS = {
+        "database": [1.0, 0.0, 0.0],
+        "postgres": [0.95, 0.05, 0.0],
+        "pooling": [0.9, 0.1, 0.0],
+        "weather": [0.0, 1.0, 0.0],
+        "rain": [0.0, 0.95, 0.05],
+        "bike": [0.0, 0.0, 1.0],
+    }
+
+    def embed(self, text):
+        vec = [0.0, 0.0, 0.0]
+        low = text.lower()
+        for word, v in self._TOPICS.items():
+            if word in low:
+                vec = [a + b for a, b in zip(vec, v)]
+        norm = sum(x * x for x in vec) ** 0.5 or 1.0
+        return [x / norm for x in vec]
+
+
+def test_semantic_recall_finds_meaning_without_shared_words():
+    older = [
+        SimpleNamespace(role="user", content=f"chatter about rain and weather {i}",
+                        seq=i, meta={})
+        for i in range(20)
+    ]
+    # The relevant turn shares NO words with the query — only meaning.
+    older[6] = SimpleNamespace(
+        role="assistant",
+        content="agreed, we'll run Postgres with connection pooling",
+        seq=6, meta={},
+    )
+    emb = _FakeSemanticEmbeddings()
+    turns = compaction.recall_turns(
+        older, "which database did we choose?",
+        budget_tokens=500, count=_count_words, embeddings=emb,
+    )
+    assert any("Postgres" in t.content for t in turns)
+
+
+def test_bm25_alone_misses_what_semantic_catches():
+    older = [
+        SimpleNamespace(role="user", content=f"rain and weather {i}", seq=i, meta={})
+        for i in range(20)
+    ]
+    older[6] = SimpleNamespace(
+        role="assistant", content="agreed, Postgres with pooling", seq=6, meta={}
+    )
+    # No embeddings: keyword overlap between "database" and "Postgres" is zero.
+    bm25_turns = compaction.recall_turns(
+        older, "which database did we choose?",
+        budget_tokens=500, count=_count_words, embeddings=None,
+    )
+    assert not any("Postgres" in t.content for t in bm25_turns)
+
+
+def test_hash_embeddings_never_pollute_the_score():
+    from liminallm.service.embeddings import EmbeddingsService, deterministic_embedding
+
+    hashed = EmbeddingsService("hash", encoder=deterministic_embedding)  # semantic=False
+    older = [SimpleNamespace(role="user", content=f"turn {i}", seq=i, meta={})
+             for i in range(10)]
+    # Must behave identically to embeddings=None — hash cosine is noise.
+    with_hash = compaction.rank_turns(older, "turn 3", embeddings=hashed)
+    without = compaction.rank_turns(older, "turn 3", embeddings=None)
+    assert with_hash == without
+
+
+def test_semantic_rerank_is_cost_bounded(monkeypatch):
+    calls = {"n": 0}
+
+    class Counting(_FakeSemanticEmbeddings):
+        def embed(self, text):
+            calls["n"] += 1
+            return super().embed(text)
+
+    older = [SimpleNamespace(role="user", content=f"weather note {i}", seq=i, meta={})
+             for i in range(200)]
+    compaction.recall_turns(
+        older, "weather", budget_tokens=500, count=_count_words,
+        embeddings=Counting(),
+    )
+    # 1 query embed + at most SEMANTIC_RERANK_CANDIDATES turn embeds — never 200.
+    assert calls["n"] <= compaction.SEMANTIC_RERANK_CANDIDATES + 1
+
+
+def test_persisted_embeddings_are_used_and_free(monkeypatch):
+    class Counting(_FakeSemanticEmbeddings):
+        def __init__(self):
+            self.turn_embeds = 0
+
+        def embed(self, text):
+            # Count only turn embeds, not the single query embed.
+            if "?" not in text:
+                self.turn_embeds += 1
+            return super().embed(text)
+
+    emb = Counting()
+    older = []
+    for i in range(20):
+        content = "Postgres pooling" if i == 6 else f"weather {i}"
+        older.append(SimpleNamespace(
+            role="user", content=content, seq=i,
+            meta={"embedding": emb.embed(content)},  # pre-persisted
+        ))
+    emb.turn_embeds = 0  # reset after setup
+    turns = compaction.recall_turns(
+        older, "which database?", budget_tokens=500, count=_count_words,
+        embeddings=emb,
+    )
+    assert emb.turn_embeds == 0  # persisted vectors reused, nothing re-embedded
+    assert any("Postgres" in t.content for t in turns)
+
+
+def test_embeddings_service_flags_semantic_honestly():
+    from liminallm.service.embeddings import (
+        EmbeddingsService, deterministic_embedding, make_provider_encoder,
+    )
+
+    assert EmbeddingsService("hash").is_semantic is False
+
+    class FakeClient:
+        class embeddings:
+            @staticmethod
+            def create(model, input):
+                return SimpleNamespace(data=[SimpleNamespace(embedding=[0.1, 0.2, 0.3])])
+
+    real = EmbeddingsService(
+        "text-embedding-3-small",
+        encoder=make_provider_encoder(FakeClient(), "text-embedding-3-small"),
+        semantic=True,
+    )
+    assert real.is_semantic is True
+    assert real.embed("hello") == [0.1, 0.2, 0.3]
+
+
+def test_provider_encoder_falls_back_on_failure():
+    from liminallm.service.embeddings import make_provider_encoder
+
+    class BrokenClient:
+        class embeddings:
+            @staticmethod
+            def create(model, input):
+                raise RuntimeError("provider 500")
+
+    encode = make_provider_encoder(BrokenClient(), "m")
+    vec = encode("some text")  # falls back to deterministic, does not raise
+    assert isinstance(vec, list) and len(vec) > 0
+
+
+def test_backfill_persists_embeddings_for_a_real_encoder():
+    from liminallm.api import routes
+
+    runtime = get_runtime()
+    store = runtime.store
+    user = store.create_user(
+        email=f"bf_{os.urandom(4).hex()}@example.com", role="user"
+    )
+    convo = store.create_conversation(user_id=user.id, title="t")
+    m = store.append_message(
+        convo.id, sender="user", role="user", content="Postgres and pooling"
+    )
+    orig = runtime.embeddings
+    runtime.embeddings = _FakeSemanticEmbeddings()
+    try:
+        history = store.list_messages(convo.id, user_id=user.id)
+        routes._backfill_message_embeddings(runtime, history, user.id)
+    finally:
+        runtime.embeddings = orig
+    refreshed = store.list_messages(convo.id, user_id=user.id)
+    assert compaction._message_embedding(refreshed[0]) is not None

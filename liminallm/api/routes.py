@@ -920,6 +920,45 @@ def _schedule_turn_labels(
     task.add_done_callback(_LABEL_TASKS.discard)
 
 
+_EMBED_BACKFILL_PER_PASS = 30
+
+
+def _backfill_message_embeddings(runtime, history, user_id: str) -> None:
+    """Persist per-turn embeddings for semantic recall (off the hot path).
+
+    A real encoder only; skips turns already embedded; bounded so one pass
+    can't stall on a huge backlog (the next turn's pass continues it).
+    """
+    embeddings = getattr(runtime, "embeddings", None)
+    if embeddings is None or not getattr(embeddings, "is_semantic", False):
+        return
+    updater = getattr(runtime.store, "update_message_meta", None)
+    if not callable(updater):
+        return
+    done = 0
+    for msg in history:
+        if done >= _EMBED_BACKFILL_PER_PASS:
+            break
+        if compaction._message_embedding(msg) is not None:
+            continue
+        content = str(getattr(msg, "content", "") or "").strip()
+        if not content:
+            continue
+        try:
+            vector = embeddings.embed(content)
+            updater(
+                msg.id,
+                user_id=user_id,
+                patch={"embedding": vector, "embedding_model": embeddings.model_id},
+            )
+            done += 1
+        except Exception as exc:  # noqa: BLE001 - backfill is best-effort
+            logger.debug("message_embedding_backfill_failed", error=str(exc))
+            break
+    if done:
+        logger.info("message_embeddings_backfilled", count=done)
+
+
 def _schedule_conversation_digest(
     runtime, *, conversation_id: str, user_id: str
 ) -> None:
@@ -939,6 +978,12 @@ def _schedule_conversation_digest(
                 return
             history = await asyncio.to_thread(
                 runtime.store.list_messages, conversation_id, user_id=user_id
+            )
+            # Backfill message embeddings so semantic recall reads persisted
+            # vectors on the hot path instead of embedding turns live. Only
+            # runs with a real encoder; bounded per pass.
+            await asyncio.to_thread(
+                _backfill_message_embeddings, runtime, history, user_id
             )
             # Digest exactly what falls outside the model's verbatim window —
             # the same budget boundary the workflow serves with.

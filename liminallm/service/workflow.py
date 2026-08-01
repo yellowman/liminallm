@@ -1589,6 +1589,7 @@ class WorkflowEngine:
             message,
             budget_tokens=int(self.history_budget() * min(fraction, 0.9)),
             count=self._count_fn(),
+            embeddings=self.embeddings,  # hybrid when real, BM25 when hash
         )
         return compaction.recall_block(turns)
 

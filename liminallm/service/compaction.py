@@ -225,26 +225,111 @@ RECALL_HEADER = (
 )
 
 
+def _normalized_scores(raw: List[float]) -> List[float]:
+    """Scale scores to [0,1] by their own max, so signals blend fairly."""
+    top = max(raw) if raw else 0.0
+    if top <= 0:
+        return [0.0] * len(raw)
+    return [max(0.0, s) / top for s in raw]
+
+
+# How many top-BM25 turns get the expensive semantic rerank. Bounds provider
+# embedding calls per recall to at most this many on-demand embeds, so the
+# hot path cost is fixed regardless of conversation length.
+SEMANTIC_RERANK_CANDIDATES = 20
+
+
+def _message_embedding(msg: Any) -> Optional[List[float]]:
+    """A turn's persisted embedding, if the digest backfill has reached it."""
+    meta = getattr(msg, "meta", None)
+    if isinstance(meta, dict):
+        vec = meta.get("embedding")
+        if isinstance(vec, list) and vec:
+            return vec
+    return None
+
+
+def rank_turns(
+    older: List[Any],
+    query: str,
+    *,
+    embeddings=None,
+    semantic_weight: float = 0.6,
+    max_embed: int = SEMANTIC_RERANK_CANDIDATES,
+) -> List[float]:
+    """Relevance score per older turn: hybrid semantic+BM25, or BM25 alone.
+
+    Meaning beats keywords — "what did we pick for the database" should find
+    a turn that says "let's go with Postgres" though it shares no content
+    words. When a real encoder is present (``embeddings.is_semantic``), the
+    top BM25 candidates are reranked by semantic similarity and the two are
+    blended, so exact terms (identifiers, numbers) still pull their weight.
+    Without a real encoder, BM25 alone — hash-embedding cosine is noise and
+    must never enter a score.
+
+    Cost is bounded: cheap BM25 ranks everything, and at most ``max_embed``
+    un-persisted candidate turns are embedded on demand. Persisted message
+    embeddings (from the background backfill) are free.
+    """
+    from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
+
+    corpus = [tokenize_text(str(getattr(m, "content", "") or "")) for m in older]
+    bm25 = _normalized_scores(compute_bm25_scores(tokenize_text(query), corpus))
+
+    if embeddings is None or not getattr(embeddings, "is_semantic", False):
+        return bm25
+
+    from liminallm.service.embeddings import cosine_similarity
+
+    try:
+        query_vec = embeddings.embed(query)
+    except Exception as exc:  # noqa: BLE001 - degrade to bm25
+        logger.warning("recall_query_embed_failed", error=str(exc))
+        return bm25
+
+    # Semantic reranks only the strongest BM25 candidates (plus any turn that
+    # already carries a persisted embedding, which is free to score).
+    order = sorted(range(len(older)), key=lambda i: bm25[i], reverse=True)
+    budget = max_embed
+    sem_raw = [0.0] * len(older)
+    for i in order:
+        vec = _message_embedding(older[i])
+        if vec is None:
+            if budget <= 0 and bm25[i] == 0:
+                continue  # nothing cheap left to justify an embed
+            if budget <= 0:
+                continue
+            try:
+                vec = embeddings.embed(str(getattr(older[i], "content", "") or ""))
+                budget -= 1
+            except Exception:  # noqa: BLE001
+                vec = None
+        if vec:
+            sem_raw[i] = cosine_similarity(query_vec, vec)
+    semantic = _normalized_scores(sem_raw)
+
+    w = min(max(semantic_weight, 0.0), 1.0)
+    return [w * s + (1 - w) * b for s, b in zip(semantic, bm25)]
+
+
 def recall_turns(
     older: List[Any],
     query: str,
     *,
     budget_tokens: int,
     count=None,
+    embeddings=None,
     max_turns: int = RECALL_MAX_TURNS,
 ) -> List[Any]:
     """Older turns most relevant to ``query``, within the recall budget.
 
-    BM25 over the conversation's own messages — no embeddings required, so it
-    works on every deployment. Returned in chronological order.
+    Ranking is hybrid semantic+BM25 when a real encoder is available, BM25
+    alone otherwise (see ``rank_turns``). Returned in chronological order.
     """
     if not older or not query.strip() or budget_tokens <= 0:
         return []
-    from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
-
     counter = count or estimate_token_count
-    corpus = [tokenize_text(str(getattr(m, "content", "") or "")) for m in older]
-    scores = compute_bm25_scores(tokenize_text(query), corpus)
+    scores = rank_turns(older, query, embeddings=embeddings)
     ranked = sorted(
         ((score, i) for i, score in enumerate(scores) if score > 0),
         reverse=True,

@@ -1960,12 +1960,26 @@ model window:
    prompt budget; floor of 4 turns). on a large-window model turns stay
    verbatim until the window actually pressures; on a small one digestion
    starts early. the boundary is tokens, never a message count.
-2. **recall** — older turns chosen by bm25 relevance to the message being
+2. **recall** — older turns chosen by relevance to the message being
    answered, restored verbatim from the permanent transcript, in
    chronological order, within `HISTORY_RECALL_FRACTION` (default 0.25) of
-   the history budget. recency is one relevance signal, not the whole
-   policy: a decision from turn 3 competes for window space on merit when
-   the current question touches it. 0 disables.
+   the history budget. ranking is **hybrid semantic + bm25** when a real
+   embedding encoder is configured, bm25 alone otherwise. semantic wins the
+   cases keywords miss: "which database did we pick" finds "let's go with
+   postgres" though they share no words; bm25 keeps exact terms (ids,
+   numbers) weighted. cost is bounded — cheap bm25 ranks everything, and
+   only the top ~20 candidates get the embedding rerank; per-turn
+   embeddings are persisted by a background backfill so the hot path reads
+   vectors rather than computing them. recency is one relevance signal, not
+   the whole policy: a decision from turn 3 competes for window space on
+   merit when the current question touches it. 0 disables.
+
+   the encoder is real when the model backend has an openai-compatible
+   `/embeddings` client (openai, gemini-compat, self-hosted); otherwise the
+   kernel's deterministic hash embedding is used and `is_semantic` is false.
+   that flag is load-bearing: hash-embedding cosine is noise, so every
+   consumer that blends cosine into a ranking checks it and falls back to
+   bm25 rather than letting noise pollute a real score.
 3. **digest + anchors** — connective tissue for everything neither tail
    nor recall carries.
 

@@ -16,7 +16,7 @@ from liminallm.service.cluster import AdvisoryLock, ClusterBus
 from liminallm.service.clustering import SemanticClusterer
 from liminallm.service.config_ops import ConfigOpsService
 from liminallm.service.email import EmailService
-from liminallm.service.embeddings import EmbeddingsService
+from liminallm.service.embeddings import EmbeddingsService, make_provider_encoder
 from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
 from liminallm.service.router import RouterEngine
@@ -354,7 +354,6 @@ class Runtime:
             }
         }
         self.router = RouterEngine(cache=self.cache, backend_mode=self.backend_mode)
-        self.embeddings = EmbeddingsService(embedding_model_id)
         self.llm = LLMService(
             base_model=self.resolved_base_model,
             backend_mode=self.backend_mode,
@@ -363,6 +362,25 @@ class Runtime:
             base_url=self.settings.adapter_openai_base_url,
             adapter_server_model=self.settings.adapter_server_model,
             fs_root=self.settings.shared_fs_root,
+        )
+        # Real embeddings when the backend has an OpenAI-compatible client
+        # (its /embeddings endpoint serves OpenAI, Gemini-compat, and
+        # self-hosted alike). Without one, the deterministic hash keeps the
+        # kernel self-contained — and is_semantic=False tells every consumer
+        # that cosine over those vectors is noise, so rankings stay BM25-only.
+        embed_client = getattr(self.llm.backend, "client", None)
+        if embed_client is not None and hasattr(embed_client, "embeddings"):
+            self.embeddings = EmbeddingsService(
+                embedding_model_id,
+                encoder=make_provider_encoder(embed_client, embedding_model_id),
+                semantic=True,
+            )
+        else:
+            self.embeddings = EmbeddingsService(embedding_model_id)
+        logger.info(
+            "embeddings_configured",
+            model=embedding_model_id,
+            semantic=self.embeddings.is_semantic,
         )
         self.rag = RAGService(
             self.store,
