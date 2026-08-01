@@ -32,8 +32,9 @@ from liminallm.service.fs import PathTraversalError, safe_join
 TEXT_EXTENSIONS = {
     ".txt", ".md", ".markdown", ".json", ".csv", ".tsv", ".yaml", ".yml",
 }
-# Formats worth chunking but not injecting verbatim.
-DOCUMENT_EXTENSIONS = {".pdf"}
+# Formats worth chunking but not injecting verbatim; the shared extractor
+# (service/extract.py) knows how to read each of these.
+DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".odt"}
 # Formats the model should reach for the interpreter to parse.
 DATA_EXTENSIONS = {".csv", ".tsv", ".json"} | set(ARCHIVE_SUFFIXES)
 

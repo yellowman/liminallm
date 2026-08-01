@@ -7,6 +7,7 @@ api backends (remote inference). you can run them side by side.
 ## prerequisites
 - runtime: python 3.11+.
 - ocr: `tesseract-ocr` (apt/brew) plus `pip install 'liminallm[ocr]'`. technically optional, practically required: it is what lets uploaded images and scanned pdfs be read locally — deterministic, free per call, and it quotes documents instead of paraphrasing them. without it every image read costs a model vision call (and a text-only backend can't read images at all). install it unless you have a reason not to.
+- pdf rasterization: `poppler-utils` (apt/brew), auto-detected. scanned pdfs are rendered page-by-page through `pdftoppm` before ocr, which reads anything a viewer could show — jbig2 and ccitt fax compression included; without poppler, only pdfs whose embedded page images pypdf can decode are readable. pillow is the converter for images themselves: png/jpg (cmyk included)/webp/gif/tiff (multi-page)/bmp all normalize to what tesseract expects. `.docx`/`.odt` extract natively (stdlib zip+xml, no ocr involved); legacy `.doc` is refused with a save-as suggestion.
 - image reader order is configurable via `EXTRACT_READERS` (default `ocr,vision`); new readers — another ocr engine, a dedicated ocr model, a model on new hardware — register via `extract.register_reader` without touching the ladder.
 - datastores: postgres 16 with `vector` + `citext`; redis 7 with auth.
 - filesystem: writable `SHARED_FS_ROOT` (defaults to `/srv/liminallm`) for adapters, artifacts, and user files.

@@ -27,14 +27,24 @@ from liminallm.service.notes import looks_binary
 
 logger = get_logger(__name__)
 
-IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+IMAGE_EXTENSIONS = {
+    ".png", ".jpg", ".jpeg", ".webp", ".gif", ".tif", ".tiff", ".bmp",
+}
 _IMAGE_MIME = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".webp": "image/webp",
     ".gif": "image/gif",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".bmp": "image/bmp",
 }
+# Word-processor formats extracted natively (zip + xml, stdlib only).
+DOC_EXTENSIONS = {".docx", ".odt"}
+# Guard against zip bombs hiding in document archives: never inflate more
+# than this much XML (mirrors service/archive.py's budget ethos).
+MAX_DOC_XML_BYTES = 50 * 1024 * 1024
 MAX_EXTRACT_BYTES = 20 * 1024 * 1024  # PDFs/images read whole, bounded
 MAX_IMAGE_BYTES = 8 * 1024 * 1024     # data-URL payload ceiling
 
@@ -80,11 +90,23 @@ def ocr_available() -> bool:
 
 
 def _run_ocr(image_bytes: bytes) -> str:
-    import pytesseract
-    from PIL import Image
+    """OCR any PIL-openable image; PIL is the converter tesseract rides on.
 
+    Modes tesseract mishandles (CMYK jpegs, 16-bit or palette images) are
+    normalized to RGB first, and multi-frame TIFFs — a scanner's native
+    output — are read frame by frame under the page cap.
+    """
+    import pytesseract
+    from PIL import Image, ImageSequence
+
+    texts: list[str] = []
     with Image.open(io.BytesIO(image_bytes)) as img:
-        return pytesseract.image_to_string(img) or ""
+        for i, frame in enumerate(ImageSequence.Iterator(img)):
+            if i >= MAX_SCANNED_PAGES:
+                break
+            page = frame if frame.mode in ("RGB", "L") else frame.convert("RGB")
+            texts.append(pytesseract.image_to_string(page) or "")
+    return "\n\n".join(t for t in texts if t.strip())
 
 
 def _reader_tesseract(image_bytes: bytes, mime: str, llm: Any) -> Optional[str]:
@@ -168,6 +190,41 @@ def _image_bytes_to_text(
     raise ExtractError(f"no way to read this image: {_NO_READER_REMEDY}")
 
 
+def rasterizer_available() -> bool:
+    return shutil.which("pdftoppm") is not None
+
+
+def _rasterize_pdf(path: Path, max_pages: int) -> list[bytes]:
+    """Render PDF pages to PNGs with poppler.
+
+    Rasterization reads any page a viewer could show — JBIG2, CCITT fax, and
+    vector-only pages included — where embedded-image extraction only works
+    when pypdf can decode the page's stored image stream.
+    """
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        prefix = Path(tmpdir) / "page"
+        subprocess.run(
+            [
+                "pdftoppm", "-png", "-r", "200",
+                "-f", "1", "-l", str(max_pages),
+                str(path), str(prefix),
+            ],
+            check=True,
+            capture_output=True,
+            timeout=120,
+        )
+        pages = sorted(
+            Path(tmpdir).glob("page-*.png"),
+            # pdftoppm zero-pads only when needed; sort numerically so
+            # page-10 doesn't land between page-1 and page-2.
+            key=lambda p: int(p.stem.rsplit("-", 1)[-1]),
+        )
+        return [p.read_bytes() for p in pages]
+
+
 def _extract_pdf(
     path: Path, llm: Any, order: Optional[Tuple[str, ...]] = None
 ) -> Tuple[str, str]:
@@ -183,26 +240,39 @@ def _extract_pdf(
     text = "\n\n".join(p.strip() for p in pages if p.strip())
     if text.strip():
         return text, "pdf"
-    # No text layer — a scanned document. Its pages are embedded images;
-    # read them with the same ocr-then-vision ladder.
+    # No text layer — a scanned document. Prefer rasterizing pages (reads
+    # anything a viewer could show, JBIG2/CCITT scans included); fall back to
+    # embedded page images when poppler is absent. Either way each page image
+    # goes through the same reader roster.
+    page_images: list[bytes] = []
+    if rasterizer_available():
+        try:
+            page_images = _rasterize_pdf(path, MAX_SCANNED_PAGES)
+        except Exception as exc:  # noqa: BLE001 - fall back to embedded images
+            logger.warning("pdf_rasterize_failed", error=str(exc))
+    if not page_images:
+        try:
+            for page in reader.pages[:MAX_SCANNED_PAGES]:
+                for image in page.images:
+                    page_images.append(image.data)
+                    break  # one image per scanned page is the norm
+        except Exception as exc:  # noqa: BLE001 - image decode within the pdf
+            logger.debug("scanned_pdf_image_failed", error=str(exc))
+
     page_texts: list[str] = []
     mechanism = None
     try:
-        for page in reader.pages[:MAX_SCANNED_PAGES]:
-            for image in page.images:
-                page_text, mech = _image_bytes_to_text(
-                    image.data, "image/png", llm, order
-                )
-                page_texts.append(page_text)
-                mechanism = mechanism or mech
-                break  # one image per scanned page is the norm
+        for image_bytes in page_images:
+            page_text, mech = _image_bytes_to_text(
+                image_bytes, "image/png", llm, order
+            )
+            page_texts.append(page_text)
+            mechanism = mechanism or mech
     except ExtractError:
         raise ExtractError(
             f"the pdf has no text layer and its pages could not be read: "
             f"{_NO_READER_REMEDY}"
         )
-    except Exception as exc:  # noqa: BLE001 - image decode within the pdf
-        logger.debug("scanned_pdf_image_failed", error=str(exc))
     if not page_texts:
         raise ExtractError(
             f"the pdf has no extractable text (scanned?): {_NO_READER_REMEDY}"
@@ -211,6 +281,54 @@ def _extract_pdf(
     if len(reader.pages) > MAX_SCANNED_PAGES:
         text += f"\n\n[read first {MAX_SCANNED_PAGES} of {len(reader.pages)} pages]"
     return text, f"pdf-{mechanism}"
+
+
+def _read_zipped_xml(path: Path, member: str) -> bytes:
+    import zipfile
+
+    try:
+        with zipfile.ZipFile(path) as archive:
+            info = archive.getinfo(member)
+            if info.file_size > MAX_DOC_XML_BYTES:
+                raise ExtractError("document xml is implausibly large")
+            return archive.read(member)
+    except ExtractError:
+        raise
+    except (zipfile.BadZipFile, KeyError, OSError) as exc:
+        raise ExtractError(f"could not parse document: {exc}")
+
+
+def _paragraphs_from_xml(xml: bytes, para_tags: set) -> str:
+    from xml.etree import ElementTree
+
+    # Stdlib ElementTree does not resolve external entities, and modern expat
+    # bounds entity amplification; the size guard above bounds the rest.
+    try:
+        root = ElementTree.fromstring(xml)
+    except ElementTree.ParseError as exc:
+        raise ExtractError(f"could not parse document xml: {exc}")
+    paragraphs = [
+        "".join(para.itertext())
+        for para in root.iter()
+        if para.tag in para_tags
+    ]
+    return "\n\n".join(p for p in paragraphs if p.strip())
+
+
+_DOCX_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+_ODT_NS = "{urn:oasis:names:tc:opendocument:xmlns:text:1.0}"
+
+
+def _extract_doc(path: Path) -> str:
+    if path.suffix.lower() == ".docx":
+        xml = _read_zipped_xml(path, "word/document.xml")
+        text = _paragraphs_from_xml(xml, {f"{_DOCX_NS}p"})
+    else:  # .odt
+        xml = _read_zipped_xml(path, "content.xml")
+        text = _paragraphs_from_xml(xml, {f"{_ODT_NS}p", f"{_ODT_NS}h"})
+    if not text.strip():
+        raise ExtractError("the document contains no extractable text")
+    return text
 
 
 def extract_text(
@@ -226,6 +344,12 @@ def extract_text(
     if path.stat().st_size > MAX_EXTRACT_BYTES:
         raise ExtractError("file is too large to extract")
     suffix = path.suffix.lower()
+    if suffix in DOC_EXTENSIONS:
+        return {"text": _extract_doc(path), "method": suffix.lstrip(".")}
+    if suffix == ".doc":
+        raise ExtractError(
+            "legacy .doc is not supported — save it as .docx or pdf first"
+        )
     if suffix == ".pdf":
         text, method = _extract_pdf(path, llm, readers)
         return {"text": text, "method": method}

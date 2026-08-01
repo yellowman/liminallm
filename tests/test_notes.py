@@ -823,3 +823,145 @@ def test_parse_reader_order():
     assert parse_reader_order("vision, ocr") == ("vision", "ocr")
     assert parse_reader_order("") == DEFAULT_READER_ORDER
     assert parse_reader_order(None) == DEFAULT_READER_ORDER
+
+
+# ---------------------------------------------------------------------------
+# Format conversion: everything becomes something tesseract (or ET) can read
+
+
+def _docx_bytes(paragraphs):
+    import io as _io
+    import zipfile
+
+    w = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+    body = "".join(
+        f"<w:p><w:r><w:t>{p}</w:t></w:r></w:p>" for p in paragraphs
+    )
+    doc = f'<?xml version="1.0"?><w:document xmlns:w="{w}"><w:body>{body}</w:body></w:document>'
+    buf = _io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr(
+            "[Content_Types].xml",
+            '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>',
+        )
+        z.writestr("word/document.xml", doc)
+    return buf.getvalue()
+
+
+def _odt_bytes(paragraphs):
+    import io as _io
+    import zipfile
+
+    t = "urn:oasis:names:tc:opendocument:xmlns:text:1.0"
+    body = "".join(f'<text:p>{p}</text:p>' for p in paragraphs)
+    doc = (
+        f'<?xml version="1.0"?><office:document-content '
+        f'xmlns:office="urn:oasis:names:tc:opendocument:xmlns:office:1.0" '
+        f'xmlns:text="{t}"><office:body><office:text>{body}'
+        f"</office:text></office:body></office:document-content>"
+    )
+    buf = _io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as z:
+        z.writestr("mimetype", "application/vnd.oasis.opendocument.text")
+        z.writestr("content.xml", doc)
+    return buf.getvalue()
+
+
+def test_docx_extracts_natively(client, auth_headers):
+    runtime, _ = _drop_upload(
+        client, auth_headers, "position.docx",
+        _docx_bytes(["Meat is required for protein.", "This is paragraph two."]),
+    )
+    resp = client.post(
+        "/v1/notes/from-file", headers=auth_headers, json={"name": "position.docx"}
+    )
+    assert resp.status_code == 201, resp.text
+    made = resp.json()["data"]
+    assert made["method"] == "docx"
+    note = runtime.store.get_note(made["id"])
+    assert "Meat is required" in note.content
+    assert "paragraph two" in note.content
+
+
+def test_odt_extracts_natively(tmp_path):
+    from liminallm.service.extract import extract_text
+
+    path = tmp_path / "claim.odt"
+    path.write_bytes(_odt_bytes(["Plants suffice entirely."]))
+    result = extract_text(path)
+    assert result["method"] == "odt"
+    assert "Plants suffice" in result["text"]
+
+
+def test_legacy_doc_refused_with_remedy(tmp_path):
+    from liminallm.service.extract import ExtractError, extract_text
+
+    path = tmp_path / "old.doc"
+    path.write_bytes(b"\xd0\xcf\x11\xe0" + b"\x00" * 64)  # OLE header
+    with pytest.raises(ExtractError, match="docx or pdf"):
+        extract_text(path)
+
+
+@pytest.mark.skipif(not _HAS_OCR, reason="tesseract not installed")
+def test_cmyk_jpeg_is_normalized_before_ocr(tmp_path):
+    import io as _io
+
+    from PIL import Image, ImageDraw
+
+    from liminallm.service.extract import extract_text
+
+    img = Image.new("CMYK", (900, 160), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+    from PIL import ImageFont
+
+    draw.text((30, 50), "CMYK PRESS PROOF TEXT", fill=(0, 0, 0, 255),
+              font=ImageFont.load_default(size=48))
+    path = tmp_path / "proof.jpg"
+    buf = _io.BytesIO()
+    img.save(buf, format="JPEG")
+    path.write_bytes(buf.getvalue())
+    result = extract_text(path)
+    assert result["method"] == "ocr"
+    assert "CMYK" in result["text"].upper() or "PROOF" in result["text"].upper()
+
+
+@pytest.mark.skipif(not _HAS_OCR, reason="tesseract not installed")
+def test_multiframe_tiff_reads_every_page(tmp_path):
+    import io as _io
+
+    from PIL import Image
+
+    from liminallm.service.extract import extract_text
+
+    f1 = Image.open(_io.BytesIO(_text_image_bytes("TIFF PAGE ONE CLAIM")))
+    f2 = Image.open(_io.BytesIO(_text_image_bytes("TIFF PAGE TWO REBUTTAL")))
+    path = tmp_path / "scan.tiff"
+    f1.save(path, format="TIFF", save_all=True, append_images=[f2])
+    result = extract_text(path)
+    assert result["method"] == "ocr"
+    upper = result["text"].upper()
+    assert "PAGE ONE" in upper and "PAGE TWO" in upper
+
+
+@pytest.mark.skipif(
+    not _HAS_OCR
+    or not __import__(
+        "liminallm.service.extract", fromlist=["x"]
+    ).rasterizer_available(),
+    reason="tesseract or poppler not installed",
+)
+def test_scanned_pdf_rasterizes_through_poppler(tmp_path):
+    import io as _io
+
+    from PIL import Image
+
+    from liminallm.service import extract
+
+    img = Image.open(_io.BytesIO(_text_image_bytes("RASTERIZED SCAN CLAIM")))
+    path = tmp_path / "scan.pdf"
+    img.convert("RGB").save(path, format="PDF")
+    pages = extract._rasterize_pdf(path, 10)
+    assert len(pages) == 1 and pages[0][:8] == b"\x89PNG\r\n\x1a\n"
+    result = extract.extract_text(path)
+    assert result["method"] == "pdf-ocr"
+    assert "RASTERIZED" in result["text"].upper()
