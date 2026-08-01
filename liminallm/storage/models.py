@@ -286,3 +286,15 @@ class UserMFAConfig:
     enabled: bool = False
     created_at: datetime = field(default_factory=datetime.utcnow)
     meta: Dict | None = None
+
+
+@dataclass
+class Note:
+    id: str
+    user_id: str
+    title: str
+    content: str = ""
+    embedding: List[float] | None = None
+    created_at: datetime = field(default_factory=datetime.utcnow)
+    updated_at: datetime = field(default_factory=datetime.utcnow)
+    meta: Dict | None = None

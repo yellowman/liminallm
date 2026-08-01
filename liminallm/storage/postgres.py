@@ -57,6 +57,7 @@ from liminallm.storage.models import (
     KnowledgeChunk,
     KnowledgeContext,
     Message,
+    Note,
     PreferenceEvent,
     SemanticCluster,
     Session,
@@ -1658,6 +1659,224 @@ class PostgresStore:
                 (serialized_meta, session_id),
             )
         self._update_cached_session(session_id, meta=meta)
+
+    # notes vault
+    @staticmethod
+    def _row_to_note(row: dict) -> Note:
+        embedding = row.get("embedding")
+        if isinstance(embedding, str):
+            embedding = json.loads(embedding)
+        meta = row.get("meta")
+        if isinstance(meta, str):
+            meta = json.loads(meta)
+        return Note(
+            id=str(row["id"]),
+            user_id=str(row["user_id"]),
+            title=row["title"],
+            content=row.get("content") or "",
+            embedding=embedding,
+            created_at=row.get("created_at"),
+            updated_at=row.get("updated_at"),
+            meta=meta or {},
+        )
+
+    def create_note(
+        self,
+        user_id: str,
+        title: str,
+        content: str = "",
+        embedding: Optional[List[float]] = None,
+        meta: Optional[dict] = None,
+    ) -> Note:
+        note_id = str(uuid.uuid4())
+        now = datetime.utcnow()
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO note (id, user_id, title, content, embedding, created_at, updated_at, meta)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        note_id,
+                        user_id,
+                        title,
+                        content,
+                        json.dumps(embedding) if embedding else None,
+                        now,
+                        now,
+                        json.dumps(meta) if meta else None,
+                    ),
+                )
+        except errors.UniqueViolation:
+            raise ConstraintViolation("note title already exists", {"field": "title"})
+        except errors.ForeignKeyViolation:
+            raise ConstraintViolation("note owner missing", {"user_id": user_id})
+        return Note(
+            id=note_id,
+            user_id=user_id,
+            title=title,
+            content=content,
+            embedding=list(embedding) if embedding else None,
+            created_at=now,
+            updated_at=now,
+            meta=meta or {},
+        )
+
+    def update_note(
+        self,
+        note_id: str,
+        *,
+        title: Optional[str] = None,
+        content: Optional[str] = None,
+        embedding: Optional[List[float]] = None,
+    ) -> Optional[Note]:
+        sets = ["updated_at = %s"]
+        params: list = [datetime.utcnow()]
+        if title is not None:
+            sets.append("title = %s")
+            params.append(title)
+        if content is not None:
+            sets.append("content = %s")
+            params.append(content)
+        if embedding is not None:
+            sets.append("embedding = %s")
+            params.append(json.dumps(embedding))
+        params.append(note_id)
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    f"UPDATE note SET {', '.join(sets)} WHERE id = %s RETURNING *",
+                    params,
+                ).fetchone()
+        except errors.UniqueViolation:
+            raise ConstraintViolation("note title already exists", {"field": "title"})
+        return self._row_to_note(row) if row else None
+
+    def update_note_meta(self, note_id: str, meta_patch: dict) -> Optional[Note]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                UPDATE note
+                SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb
+                WHERE id = %s
+                RETURNING *
+                """,
+                (json.dumps(meta_patch), note_id),
+            ).fetchone()
+        return self._row_to_note(row) if row else None
+
+    def delete_note(self, note_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "DELETE FROM note WHERE id = %s RETURNING id", (note_id,)
+            ).fetchone()
+        return row is not None
+
+    def get_note(self, note_id: str, user_id: Optional[str] = None) -> Optional[Note]:
+        with self._connect() as conn:
+            if user_id:
+                row = conn.execute(
+                    "SELECT * FROM note WHERE id = %s AND user_id = %s",
+                    (note_id, user_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM note WHERE id = %s", (note_id,)
+                ).fetchone()
+        return self._row_to_note(row) if row else None
+
+    def get_note_by_title(self, user_id: str, title: str) -> Optional[Note]:
+        key = " ".join(str(title or "").split())
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM note WHERE user_id = %s AND lower(title) = lower(%s)",
+                (user_id, key),
+            ).fetchone()
+        return self._row_to_note(row) if row else None
+
+    def list_notes(
+        self, user_id: str, limit: int = 200, offset: int = 0
+    ) -> List[Note]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM note WHERE user_id = %s
+                ORDER BY updated_at DESC LIMIT %s OFFSET %s
+                """,
+                (user_id, limit, offset),
+            ).fetchall()
+        return [self._row_to_note(r) for r in rows]
+
+    def count_notes(self, user_id: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT count(*) AS n FROM note WHERE user_id = %s", (user_id,)
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def set_note_links(self, src_note_id: str, dst_note_ids: List[str]) -> None:
+        deduped: List[str] = []
+        for dst in dst_note_ids:
+            if dst != src_note_id and dst not in deduped:
+                deduped.append(dst)
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM note_link WHERE src_note_id = %s", (src_note_id,)
+            )
+            for dst in deduped:
+                # Racing a concurrent delete of the target is fine: skip it.
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO note_link (src_note_id, dst_note_id)
+                        VALUES (%s, %s) ON CONFLICT DO NOTHING
+                        """,
+                        (src_note_id, dst),
+                    )
+                except errors.ForeignKeyViolation:
+                    pass
+
+    def list_note_links_from(self, note_id: str) -> List[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT dst_note_id FROM note_link WHERE src_note_id = %s",
+                (note_id,),
+            ).fetchall()
+        return [str(r["dst_note_id"]) for r in rows]
+
+    def list_backlinks(self, note_id: str) -> List[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT src_note_id FROM note_link WHERE dst_note_id = %s",
+                (note_id,),
+            ).fetchall()
+        return [str(r["src_note_id"]) for r in rows]
+
+    def list_note_edges(self, user_id: str) -> List[tuple[str, str]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT l.src_note_id, l.dst_note_id
+                FROM note_link l JOIN note n ON n.id = l.src_note_id
+                WHERE n.user_id = %s
+                """,
+                (user_id,),
+            ).fetchall()
+        return [(str(r["src_note_id"]), str(r["dst_note_id"])) for r in rows]
+
+    def find_notes_with_dangling_link(
+        self, user_id: str, title_key: str
+    ) -> List[Note]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM note
+                WHERE user_id = %s AND meta->'dangling' ? %s
+                """,
+                (user_id, title_key),
+            ).fetchall()
+        return [self._row_to_note(r) for r in rows]
 
     # conversations
     def create_conversation(

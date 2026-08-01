@@ -61,6 +61,7 @@ from liminallm.storage.models import (
     KnowledgeChunk,
     KnowledgeContext,
     Message,
+    Note,
     PreferenceEvent,
     SemanticCluster,
     Session,
@@ -91,6 +92,8 @@ class MemoryStore:
         self.sessions: Dict[str, Session] = {}
         self.conversations: Dict[str, Conversation] = {}
         self.messages: Dict[str, List[Message]] = {}
+        self.notes: Dict[str, Note] = {}
+        self.note_links: Dict[str, List[str]] = {}
         self.credentials: Dict[str, tuple[str, str]] = {}
         self.providers: List[UserAuthProvider] = []
         self.artifacts: Dict[str, Artifact] = {}
@@ -579,6 +582,148 @@ class MemoryStore:
                 return
             sess.mfa_verified = True
             self._persist_state()
+
+    # notes vault
+    def create_note(
+        self,
+        user_id: str,
+        title: str,
+        content: str = "",
+        embedding: Optional[List[float]] = None,
+        meta: Optional[Dict] = None,
+    ) -> Note:
+        with self._data_lock:
+            if user_id not in self.users:
+                raise ConstraintViolation("note owner missing", {"user_id": user_id})
+            key = title.lower()
+            for note in self.notes.values():
+                if note.user_id == user_id and note.title.lower() == key:
+                    raise ConstraintViolation(
+                        "note title already exists", {"field": "title"}
+                    )
+            now = datetime.utcnow()
+            note = Note(
+                id=str(uuid.uuid4()),
+                user_id=user_id,
+                title=title,
+                content=content,
+                embedding=list(embedding) if embedding else None,
+                created_at=now,
+                updated_at=now,
+                meta=dict(meta) if meta else {},
+            )
+            self.notes[note.id] = note
+            self.note_links[note.id] = []
+            self._persist_state()
+            return note
+
+    def update_note(
+        self,
+        note_id: str,
+        *,
+        title: Optional[str] = None,
+        content: Optional[str] = None,
+        embedding: Optional[List[float]] = None,
+    ) -> Optional[Note]:
+        with self._data_lock:
+            note = self.notes.get(note_id)
+            if not note:
+                return None
+            if title is not None and title.lower() != note.title.lower():
+                for other in self.notes.values():
+                    if (
+                        other.id != note_id
+                        and other.user_id == note.user_id
+                        and other.title.lower() == title.lower()
+                    ):
+                        raise ConstraintViolation(
+                            "note title already exists", {"field": "title"}
+                        )
+            if title is not None:
+                note.title = title
+            if content is not None:
+                note.content = content
+            if embedding is not None:
+                note.embedding = list(embedding)
+            note.updated_at = datetime.utcnow()
+            self._persist_state()
+            return note
+
+    def update_note_meta(self, note_id: str, meta_patch: Dict) -> Optional[Note]:
+        with self._data_lock:
+            note = self.notes.get(note_id)
+            if not note:
+                return None
+            note.meta = {**(note.meta or {}), **meta_patch}
+            self._persist_state()
+            return note
+
+    def delete_note(self, note_id: str) -> bool:
+        with self._data_lock:
+            if note_id not in self.notes:
+                return False
+            self.notes.pop(note_id)
+            self.note_links.pop(note_id, None)
+            for src, dsts in self.note_links.items():
+                self.note_links[src] = [d for d in dsts if d != note_id]
+            self._persist_state()
+            return True
+
+    def get_note(self, note_id: str, user_id: Optional[str] = None) -> Optional[Note]:
+        note = self.notes.get(note_id)
+        if note and user_id and note.user_id != user_id:
+            return None
+        return note
+
+    def get_note_by_title(self, user_id: str, title: str) -> Optional[Note]:
+        key = " ".join(str(title or "").split()).lower()
+        for note in self.notes.values():
+            if note.user_id == user_id and note.title.lower() == key:
+                return note
+        return None
+
+    def list_notes(
+        self, user_id: str, limit: int = 200, offset: int = 0
+    ) -> List[Note]:
+        notes = [n for n in self.notes.values() if n.user_id == user_id]
+        notes.sort(key=lambda n: n.updated_at, reverse=True)
+        return notes[offset : offset + limit]
+
+    def count_notes(self, user_id: str) -> int:
+        return sum(1 for n in self.notes.values() if n.user_id == user_id)
+
+    def set_note_links(self, src_note_id: str, dst_note_ids: List[str]) -> None:
+        with self._data_lock:
+            deduped: List[str] = []
+            for dst in dst_note_ids:
+                if dst != src_note_id and dst in self.notes and dst not in deduped:
+                    deduped.append(dst)
+            self.note_links[src_note_id] = deduped
+            self._persist_state()
+
+    def list_note_links_from(self, note_id: str) -> List[str]:
+        return list(self.note_links.get(note_id, []))
+
+    def list_backlinks(self, note_id: str) -> List[str]:
+        return [src for src, dsts in self.note_links.items() if note_id in dsts]
+
+    def list_note_edges(self, user_id: str) -> List[tuple[str, str]]:
+        edges: List[tuple[str, str]] = []
+        for src, dsts in self.note_links.items():
+            note = self.notes.get(src)
+            if not note or note.user_id != user_id:
+                continue
+            edges.extend((src, dst) for dst in dsts)
+        return edges
+
+    def find_notes_with_dangling_link(
+        self, user_id: str, title_key: str
+    ) -> List[Note]:
+        return [
+            n
+            for n in self.notes.values()
+            if n.user_id == user_id and title_key in (n.meta or {}).get("dangling", [])
+        ]
 
     # chat
     def create_conversation(
@@ -2066,6 +2211,10 @@ class MemoryStore:
                 self._serialize_adapter_router_state(s)
                 for s in self.adapter_router_state.values()
             ],
+            "notes": [self._serialize_note(n) for n in self.notes.values()],
+            "note_links": {
+                src: dsts for src, dsts in self.note_links.items() if dsts
+            },
         }
         path = self._state_path()
         try:
@@ -2103,6 +2252,14 @@ class MemoryStore:
         for msg_data in data.get("messages", []):
             msg = self._deserialize_message(msg_data)
             self.messages.setdefault(msg.conversation_id, []).append(msg)
+        self.notes = {
+            n["id"]: self._deserialize_note(n) for n in data.get("notes", [])
+        }
+        self.note_links = {
+            src: [d for d in dsts if d in self.notes]
+            for src, dsts in (data.get("note_links") or {}).items()
+            if src in self.notes
+        }
         for convo_messages in self.messages.values():
             convo_messages.sort(key=lambda m: m.seq)
         self.artifacts = {
@@ -2252,6 +2409,30 @@ class MemoryStore:
             tenant_id=data.get("tenant_id", "public"),
             meta=data.get("meta"),
             allow_expired=True,
+        )
+
+    def _serialize_note(self, note: Note) -> dict:
+        return {
+            "id": note.id,
+            "user_id": note.user_id,
+            "title": note.title,
+            "content": note.content,
+            "embedding": note.embedding,
+            "created_at": self._serialize_datetime(note.created_at),
+            "updated_at": self._serialize_datetime(note.updated_at),
+            "meta": note.meta,
+        }
+
+    def _deserialize_note(self, data: dict) -> Note:
+        return Note(
+            id=data["id"],
+            user_id=data["user_id"],
+            title=data["title"],
+            content=data.get("content", ""),
+            embedding=data.get("embedding"),
+            created_at=self._deserialize_datetime(data["created_at"]),
+            updated_at=self._deserialize_datetime(data["updated_at"]),
+            meta=data.get("meta"),
         )
 
     def _serialize_conversation(self, conversation: Conversation) -> dict:

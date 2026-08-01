@@ -924,3 +924,30 @@ class WorkflowListResponse(BaseModel):
     items: List[ArtifactResponse]
     next_page: Optional[int] = None
     page_size: int = 50
+
+
+class NoteCreateRequest(BaseModel):
+    """Create a note in the user's vault."""
+
+    title: str = Field(..., min_length=1, max_length=200)
+    content: str = Field("", max_length=200_000)
+
+
+class NoteUpdateRequest(BaseModel):
+    """Patch a note; omitted fields are left alone."""
+
+    title: Optional[str] = Field(None, min_length=1, max_length=200)
+    content: Optional[str] = Field(None, max_length=200_000)
+
+
+class NoteSearchRequest(BaseModel):
+    """Search the vault."""
+
+    query: str = Field(..., min_length=1, max_length=2000)
+    limit: int = Field(8, ge=1, le=25)
+
+
+class NoteWitnessRequest(BaseModel):
+    """Ask the witness to check a note against the rest of the vault."""
+
+    limit: int = Field(6, ge=1, le=6)

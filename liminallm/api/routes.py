@@ -73,6 +73,10 @@ from liminallm.api.schemas import (
     MFARequest,
     MFAStatusResponse,
     MFAVerifyRequest,
+    NoteCreateRequest,
+    NoteSearchRequest,
+    NoteUpdateRequest,
+    NoteWitnessRequest,
     OAuthStartRequest,
     OAuthStartResponse,
     PasswordChangeRequest,
@@ -123,6 +127,8 @@ from liminallm.service.attachments import (
 )
 from liminallm.service.auth import AuthContext
 from liminallm.service import labels
+from liminallm.service import notes as notes_service
+from liminallm.storage.errors import ConstraintViolation
 from liminallm.service.upload_policy import ALLOWED_UPLOAD_EXTENSIONS
 from liminallm.service.errors import BadRequestError, NotFoundError
 from liminallm.service.sandbox import SandboxError
@@ -2119,6 +2125,202 @@ async def cancel_chat(
             message="Request not found or already completed",
         ).model_dump(),
     )
+
+
+# ---------------------------------------------------------------------------
+# Notes vault (SPEC: linked notes + the witness)
+
+
+def _get_owned_note(runtime, note_id: str, principal: AuthContext):
+    note = runtime.store.get_note(note_id, user_id=principal.user_id)
+    if not note:
+        raise _http_error("not_found", "note not found", status_code=404)
+    return note
+
+
+def _note_payload(note, *, content: bool = True) -> dict:
+    payload = {
+        "id": note.id,
+        "title": note.title,
+        "created_at": note.created_at.isoformat(),
+        "updated_at": note.updated_at.isoformat(),
+    }
+    if content:
+        payload["content"] = note.content
+    return payload
+
+
+def _save_note_graph(runtime, principal: AuthContext, note) -> None:
+    """Re-derive links + embedding after any content change."""
+    dangling = notes_service.resolve_links(
+        runtime.store, principal.user_id, note.id, note.content
+    )
+    runtime.store.update_note_meta(note.id, {"dangling": dangling})
+    embedding = notes_service.embed_note(
+        getattr(runtime, "embeddings", None), note.title, note.content
+    )
+    if embedding:
+        runtime.store.update_note(note.id, embedding=embedding)
+    notes_service.connect_dangling_links(runtime.store, principal.user_id, note)
+
+
+@router.post("/notes", response_model=Envelope, status_code=201, tags=["notes"])
+async def create_note(body: NoteCreateRequest, principal: AuthContext = Depends(get_user)):
+    runtime = get_runtime()
+    title = notes_service.normalize_title(body.title)
+    if not title:
+        raise _http_error("bad_request", "title required", status_code=400)
+    try:
+        note = runtime.store.create_note(principal.user_id, title, body.content)
+    except ConstraintViolation:
+        raise _http_error(
+            "conflict", "a note with this title already exists", status_code=409
+        )
+    _save_note_graph(runtime, principal, note)
+    return Envelope(status="ok", data=_note_payload(note))
+
+
+@router.get("/notes", response_model=Envelope, tags=["notes"])
+async def list_notes(
+    limit: int = 200,
+    offset: int = 0,
+    principal: AuthContext = Depends(get_user),
+):
+    runtime = get_runtime()
+    notes = runtime.store.list_notes(
+        principal.user_id, limit=min(max(limit, 1), 500), offset=max(offset, 0)
+    )
+    return Envelope(
+        status="ok",
+        data={
+            "notes": [_note_payload(n, content=False) for n in notes],
+            "total": runtime.store.count_notes(principal.user_id),
+        },
+    )
+
+
+@router.get("/notes/graph", response_model=Envelope, tags=["notes"])
+async def notes_graph(principal: AuthContext = Depends(get_user)):
+    """Nodes and edges of the user's vault, for the graph view."""
+    runtime = get_runtime()
+    notes = runtime.store.list_notes(principal.user_id, limit=10_000)
+    edges = runtime.store.list_note_edges(principal.user_id)
+    degree: dict[str, int] = {}
+    for src, dst in edges:
+        degree[src] = degree.get(src, 0) + 1
+        degree[dst] = degree.get(dst, 0) + 1
+    return Envelope(
+        status="ok",
+        data={
+            "nodes": [
+                {**_note_payload(n, content=False), "degree": degree.get(n.id, 0)}
+                for n in notes
+            ],
+            "edges": [{"src": src, "dst": dst} for src, dst in edges],
+        },
+    )
+
+
+@router.get("/notes/{note_id}", response_model=Envelope, tags=["notes"])
+async def get_note(note_id: str, principal: AuthContext = Depends(get_user)):
+    runtime = get_runtime()
+    note = _get_owned_note(runtime, note_id, principal)
+    links = [
+        _note_payload(n, content=False)
+        for nid in runtime.store.list_note_links_from(note.id)
+        if (n := runtime.store.get_note(nid))
+    ]
+    backlinks = [
+        _note_payload(n, content=False)
+        for nid in runtime.store.list_backlinks(note.id)
+        if (n := runtime.store.get_note(nid))
+    ]
+    dangling = (note.meta or {}).get("dangling", [])
+    return Envelope(
+        status="ok",
+        data={
+            **_note_payload(note),
+            "links": links,
+            "backlinks": backlinks,
+            "dangling": dangling,
+        },
+    )
+
+
+@router.patch("/notes/{note_id}", response_model=Envelope, tags=["notes"])
+async def update_note(
+    note_id: str, body: NoteUpdateRequest, principal: AuthContext = Depends(get_user)
+):
+    runtime = get_runtime()
+    _get_owned_note(runtime, note_id, principal)
+    title = notes_service.normalize_title(body.title) if body.title else None
+    try:
+        note = runtime.store.update_note(note_id, title=title, content=body.content)
+    except ConstraintViolation:
+        raise _http_error(
+            "conflict", "a note with this title already exists", status_code=409
+        )
+    _save_note_graph(runtime, principal, note)
+    return Envelope(status="ok", data=_note_payload(note))
+
+
+@router.delete("/notes/{note_id}", response_model=Envelope, tags=["notes"])
+async def delete_note(note_id: str, principal: AuthContext = Depends(get_user)):
+    runtime = get_runtime()
+    _get_owned_note(runtime, note_id, principal)
+    runtime.store.delete_note(note_id)
+    return Envelope(status="ok", data={"deleted": True})
+
+
+@router.post("/notes/search", response_model=Envelope, tags=["notes"])
+async def search_notes(
+    body: NoteSearchRequest, principal: AuthContext = Depends(get_user)
+):
+    runtime = get_runtime()
+    results = notes_service.search_notes(
+        runtime.store,
+        getattr(runtime, "embeddings", None),
+        principal.user_id,
+        body.query,
+        limit=body.limit,
+    )
+    return Envelope(
+        status="ok",
+        data={
+            "results": [
+                {
+                    **_note_payload(note, content=False),
+                    "score": round(float(score), 4),
+                    "excerpt": " ".join(note.content.split())[:300],
+                }
+                for note, score in results
+            ]
+        },
+    )
+
+
+@router.post("/notes/{note_id}/witness", response_model=Envelope, tags=["notes"])
+async def witness_note(
+    note_id: str,
+    body: NoteWitnessRequest,
+    principal: AuthContext = Depends(get_user),
+):
+    """Judge this note against the vault: one model call per candidate."""
+    runtime = get_runtime()
+    note = _get_owned_note(runtime, note_id, principal)
+    await _enforce_rate_limit(
+        runtime, f"notes_witness:{principal.user_id}", limit=5, window_seconds=60
+    )
+    report = await asyncio.to_thread(
+        notes_service.witness_report,
+        runtime.store,
+        getattr(runtime, "embeddings", None),
+        runtime.llm,
+        principal.user_id,
+        note,
+        limit=body.limit,
+    )
+    return Envelope(status="ok", data=report)
 
 
 @router.post("/preferences", response_model=Envelope, tags=["preferences"])

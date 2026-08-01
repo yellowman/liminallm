@@ -341,6 +341,7 @@ class Runtime:
             self.rag,
             cache=self.cache,
             settings=self.settings,
+            embeddings=self.embeddings,
         )
         self.config_ops = ConfigOpsService(
             self.store, self.llm, self.router, self.training

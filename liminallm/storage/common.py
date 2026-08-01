@@ -558,6 +558,19 @@ def get_default_tool_specs() -> List[dict]:
         },
         {
             "kind": "tool.spec",
+            "name": "notes.search_v1",
+            "description": (
+                "Search the user's notes vault; returns titles, dates, and "
+                "excerpts as data to cite."
+            ),
+            "inputs": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "optional": True},
+            },
+            "handler": "notes.search_v1",
+        },
+        {
+            "kind": "tool.spec",
             "name": "code.python_v1",
             "description": (
                 "Run Python in a resource-limited sandbox whose working "
