@@ -1804,7 +1804,19 @@ old files bleed into unrelated conversations and turn a one-off "summarize
 this" into standing memory the user never asked for. the vault IS the central
 cross-conversation repo — there is deliberately no second one.
 
-### 19.6 activation
+### 19.6 future: sweep report archive (not yet built)
+
+sweep and witness reports are currently ephemeral — returned to the caller,
+rendered in the ui, gone on reload; the red/amber markings live for the
+session only, and re-running a sweep re-spends its model calls. we may want to
+archive sweep reports: a small table (`sweep_report(id, user_id, created_at,
+report jsonb)`) would give a "what moved this year" ledger, let the ui replay
+the last sweep for free, and let a future scheduled sweep (leader-locked like
+other periodic work) diff against the previous run instead of re-judging
+unchanged pairs. nothing in the current shape blocks this — reports are
+already self-contained json.
+
+### 19.7 activation
 
 `notes_enabled` — code default on; env `NOTES_ENABLED`; admin override via
 system settings (databased-managed feature flag). when off: all `/v1/notes/*`

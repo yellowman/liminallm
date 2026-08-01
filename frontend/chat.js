@@ -4989,10 +4989,13 @@ const notesApi = async (path, options = {}) => {
   return body.data;
 };
 
-// [[Title]] → clickable wikilink. Runs on rendered (already-escaped) HTML.
+// [[Title]] → clickable wikilink. Runs on rendered (already-escaped) HTML;
+// code blocks are left alone — [[x]] in code is code.
 const linkifyWikiLinks = (html) =>
-  html.replace(/\[\[([^\[\]\n]{1,200})\]\]/g, (_m, title) =>
-    `<a href="#" class="wikilink" data-note-title="${escapeAttr(title.trim())}">${title.trim()}</a>`);
+  html.split(/(<pre[\s\S]*?<\/pre>|<code[\s\S]*?<\/code>)/g)
+    .map((seg, i) => (i % 2 ? seg : seg.replace(/\[\[([^\[\]\n]{1,200})\]\]/g, (_m, title) =>
+      `<a href="#" class="wikilink" data-note-title="${escapeAttr(title.trim())}">${title.trim()}</a>`)))
+    .join('');
 
 const renderNoteList = () => {
   const list = $('note-list');

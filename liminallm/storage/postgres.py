@@ -1824,18 +1824,18 @@ class PostgresStore:
             conn.execute(
                 "DELETE FROM note_link WHERE src_note_id = %s", (src_note_id,)
             )
-            for dst in deduped:
-                # Racing a concurrent delete of the target is fine: skip it.
-                try:
-                    conn.execute(
-                        """
-                        INSERT INTO note_link (src_note_id, dst_note_id)
-                        VALUES (%s, %s) ON CONFLICT DO NOTHING
-                        """,
-                        (src_note_id, dst),
-                    )
-                except errors.ForeignKeyViolation:
-                    pass
+            if deduped:
+                # Insert-where-exists instead of catching FK violations: a
+                # caught violation still aborts the transaction, which would
+                # silently drop every link after the first bad target.
+                conn.execute(
+                    """
+                    INSERT INTO note_link (src_note_id, dst_note_id)
+                    SELECT %s, n.id FROM note n WHERE n.id = ANY(%s::uuid[])
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (src_note_id, deduped),
+                )
 
     def list_note_links_from(self, note_id: str) -> List[str]:
         with self._connect() as conn:

@@ -95,6 +95,34 @@ def resolve_links(store, user_id: str, note_id: str, content: str) -> List[str]:
     return dangling
 
 
+def reresolve_note_sources(store, user_id: str, source_ids: List[str]) -> None:
+    """Re-derive links for notes whose text may now point elsewhere.
+
+    A rename or delete changes what other notes' [[links]] resolve to; their
+    stored edges and dangling lists must be rebuilt from their content, or the
+    graph quietly keeps edges to a title that no longer exists.
+    """
+    for src_id in source_ids:
+        src = store.get_note(src_id)
+        if not src or src.user_id != user_id:
+            continue
+        dangling = resolve_links(store, user_id, src.id, src.content)
+        store.update_note_meta(src.id, {"dangling": dangling})
+
+
+def looks_binary(text: str) -> bool:
+    """Content-based sniff: NULs, control chars, or decode-replacement soup."""
+    sample = text[:4096]
+    if not sample:
+        return False
+    if "\x00" in sample:
+        return True
+    control = sum(1 for ch in sample if ord(ch) < 32 and ch not in "\t\n\r\f")
+    return (control / len(sample) > 0.05) or (
+        sample.count("�") / len(sample) > 0.05
+    )
+
+
 def connect_dangling_links(store, user_id: str, new_note) -> int:
     """When a note is created, wire up older notes that already linked to it."""
     key = normalize_title(new_note.title).lower()

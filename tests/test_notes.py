@@ -480,3 +480,55 @@ def test_memory_store_duplicate_title_raises(tmp_path):
     store.create_note(user.id, "Once")
     with pytest.raises(ConstraintViolation):
         store.create_note(user.id, "once")
+
+
+# ---------------------------------------------------------------------------
+# Audit fixes: graph self-consistency on rename/delete, binary sniff
+
+
+def test_rename_releases_stale_edges_and_allows_reconnection(client, auth_headers):
+    a = _mk(client, auth_headers, "Alpha", "the original")
+    b = _mk(client, auth_headers, "Beta", "points at [[Alpha]]")
+    client.patch(
+        f"/v1/notes/{a['id']}", headers=auth_headers, json={"title": "Alcove"}
+    )
+    # Beta's text says [[Alpha]]; the edge to the renamed note must be gone
+    # and the dangling title recorded.
+    detail = client.get(f"/v1/notes/{b['id']}", headers=auth_headers).json()["data"]
+    assert detail["links"] == []
+    assert detail["dangling"] == ["alpha"]
+    # A brand-new "Alpha" claims those references.
+    fresh = _mk(client, auth_headers, "Alpha", "the replacement")
+    detail = client.get(f"/v1/notes/{b['id']}", headers=auth_headers).json()["data"]
+    assert [l["id"] for l in detail["links"]] == [fresh["id"]]
+
+
+def test_case_only_rename_keeps_edges(client, auth_headers):
+    a = _mk(client, auth_headers, "alpha", "lowercase")
+    b = _mk(client, auth_headers, "Beta", "[[alpha]]")
+    client.patch(
+        f"/v1/notes/{a['id']}", headers=auth_headers, json={"title": "Alpha"}
+    )
+    detail = client.get(f"/v1/notes/{b['id']}", headers=auth_headers).json()["data"]
+    assert [l["id"] for l in detail["links"]] == [a["id"]]
+
+
+def test_delete_records_dangling_so_recreation_reconnects(client, auth_headers):
+    a = _mk(client, auth_headers, "Alpha", "doomed")
+    b = _mk(client, auth_headers, "Beta", "[[Alpha]] forever")
+    client.delete(f"/v1/notes/{a['id']}", headers=auth_headers)
+    detail = client.get(f"/v1/notes/{b['id']}", headers=auth_headers).json()["data"]
+    assert detail["links"] == [] and detail["dangling"] == ["alpha"]
+    reborn = _mk(client, auth_headers, "Alpha", "back again")
+    detail = client.get(f"/v1/notes/{b['id']}", headers=auth_headers).json()["data"]
+    assert [l["id"] for l in detail["links"]] == [reborn["id"]]
+
+
+def test_looks_binary_sniffs_by_content():
+    assert notes.looks_binary("plain prose with\nnewlines and\ttabs") is False
+    assert notes.looks_binary("nul\x00byte") is True
+    assert notes.looks_binary("\x01\x02\x03" * 200 + "some text") is True
+    # Decode-replacement soup (what a JPEG becomes under errors="replace").
+    assert notes.looks_binary("\ufffd" * 300 + "JFIF") is True
+    assert notes.looks_binary("") is False
+    assert notes.looks_binary("code:\n\tif x:\n\t\treturn 1\n") is False

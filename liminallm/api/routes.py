@@ -2272,7 +2272,8 @@ async def update_note(
 ):
     runtime = get_runtime()
     _require_notes_enabled(runtime)
-    _get_owned_note(runtime, note_id, principal)
+    existing = _get_owned_note(runtime, note_id, principal)
+    old_title = existing.title
     title = notes_service.normalize_title(body.title) if body.title else None
     try:
         note = runtime.store.update_note(note_id, title=title, content=body.content)
@@ -2281,6 +2282,12 @@ async def update_note(
             "conflict", "a note with this title already exists", status_code=409
         )
     _save_note_graph(runtime, principal, note)
+    if title and title.lower() != old_title.lower():
+        # [[Old Title]] in other notes no longer resolves here; rebuild their
+        # edges from their text so the graph matches what the notes say.
+        notes_service.reresolve_note_sources(
+            runtime.store, principal.user_id, runtime.store.list_backlinks(note.id)
+        )
     return Envelope(status="ok", data=_note_payload(note))
 
 
@@ -2289,7 +2296,11 @@ async def delete_note(note_id: str, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     _require_notes_enabled(runtime)
     _get_owned_note(runtime, note_id, principal)
+    sources = runtime.store.list_backlinks(note_id)
     runtime.store.delete_note(note_id)
+    # Sources' [[links]] to this title now dangle; record that, so recreating
+    # the title later reconnects them.
+    notes_service.reresolve_note_sources(runtime.store, principal.user_id, sources)
     return Envelope(status="ok", data={"deleted": True})
 
 
@@ -2368,7 +2379,7 @@ async def note_from_file(
         text = raw.decode("utf-8", errors="replace")
     except OSError:
         raise _http_error("bad_request", "file is not readable", status_code=400)
-    if "\x00" in text[:1024]:
+    if notes_service.looks_binary(text):
         raise _http_error(
             "bad_request", "binary files cannot become notes", status_code=400
         )
