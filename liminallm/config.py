@@ -471,6 +471,24 @@ class Settings(BaseModel):
             "throwaway copies of attachments for one tool call."
         ),
     )
+    history_budget_fraction: float = env_field(
+        0.5,
+        "HISTORY_BUDGET_FRACTION",
+        description=(
+            "Share of the prompt budget kept as verbatim recent turns "
+            "(0.1-0.9). The rest is left for system blocks, RAG, attachments, "
+            "and the new message."
+        ),
+    )
+    history_recall_fraction: float = env_field(
+        0.25,
+        "HISTORY_RECALL_FRACTION",
+        description=(
+            "Share of the history budget spent recalling older turns picked "
+            "by relevance to the current message — the window is assembled, "
+            "not just a recency prefix. 0 disables recall."
+        ),
+    )
     model_context_window: int = env_field(
         0,
         "MODEL_CONTEXT_WINDOW",

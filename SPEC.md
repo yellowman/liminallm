@@ -1949,6 +1949,29 @@ importance:
 the resulting division of labour: **narrative for continuity, anchors for
 what must not drift, retrieval for everything else.**
 
+**the window is assembled, not a recency prefix.** chatgpt/claude-style
+compaction (summarize what fell off the recency window) is an efficiency
+mechanism and the fallback shape here — not the model. each turn's context
+is assembled from three sources, all budget-derived from the discovered
+model window:
+
+1. **verbatim tail** — the longest suffix of recent turns that fits
+   `history_budget` (= `HISTORY_BUDGET_FRACTION`, default 0.5, of the
+   prompt budget; floor of 4 turns). on a large-window model turns stay
+   verbatim until the window actually pressures; on a small one digestion
+   starts early. the boundary is tokens, never a message count.
+2. **recall** — older turns chosen by bm25 relevance to the message being
+   answered, restored verbatim from the permanent transcript, in
+   chronological order, within `HISTORY_RECALL_FRACTION` (default 0.25) of
+   the history budget. recency is one relevance signal, not the whole
+   policy: a decision from turn 3 competes for window space on merit when
+   the current question touches it. 0 disables.
+3. **digest + anchors** — connective tissue for everything neither tail
+   nor recall carries.
+
+pruning order under pressure: recall drops before the digest, the digest
+before the verbatim tail — optional context yields to essential context.
+
 ### 20.4 token counting
 
 budget math is only as good as the count. resolution per backend:

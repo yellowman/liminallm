@@ -1133,6 +1133,11 @@ class WorkflowEngine:
         digest = self._digest_snippet(conversation_id)
         if digest:
             context_snippets.insert(0, digest)
+        # Assembled window: relevance-recalled turns ride behind the digest;
+        # both are snippets, so the pruner drops them before the verbatim tail.
+        recall = self._recall_snippet(conversation_id, user_id, message or "", history)
+        if recall:
+            context_snippets.insert(1 if digest else 0, recall)
         context_snippets, history = self._apply_prompt_budget(
             message or "", context_snippets, history
         )
@@ -1447,11 +1452,52 @@ class WorkflowEngine:
         # Same window whether the cache is warm or cold. Loading the whole
         # conversation on a cache miss made the model's memory depend on
         # Redis being up, which made "why did it forget that" unreproducible.
+        # The window is the model's token budget, not a message count: fetch
+        # a bounded page, then keep the longest verbatim tail that fits.
         history = self.store.list_messages(  # type: ignore[attr-defined]
-            conversation_id, limit=compaction.RECENT_MESSAGES, user_id=user_id
+            conversation_id, limit=self.MAX_HISTORY_FETCH, user_id=user_id
+        )
+        _older, history = compaction.split_history(
+            history,
+            keep_tokens=self.history_budget(),
+            count=self._count_fn(),
         )
         await self.cache_conversation_state(conversation_id, history)
         return history
+
+    # More messages than any window realistically holds verbatim; a bound so
+    # a years-long conversation is never loaded whole just to be trimmed.
+    MAX_HISTORY_FETCH = 500
+
+    def _count_fn(self):
+        """The serving model's token counter, or the estimator."""
+        try:
+            getter = getattr(self.llm, "token_counter", None)
+            counter = getter() if callable(getter) else None
+            if counter is not None:
+                return counter.count
+        except Exception:  # noqa: BLE001 - counting must never block a turn
+            pass
+        return estimate_token_count
+
+    def history_budget(self) -> int:
+        """Tokens of history kept verbatim: a share of the prompt budget.
+
+        Compaction keeps the window full of relevant information — on a
+        large-window model turns stay verbatim until the window pressures,
+        on a small one digestion starts early. The share leaves room for
+        system blocks, RAG snippets, attachments, and the new message.
+        """
+        fraction = 0.5
+        if self.settings:
+            try:
+                configured = float(
+                    getattr(self.settings, "history_budget_fraction", 0.5) or 0.5
+                )
+                fraction = min(max(configured, 0.1), 0.9)
+            except (TypeError, ValueError):
+                pass
+        return max(int(self.prompt_budget() * fraction), 1024)
 
     # Prompt budget = model window − output reserve, floored. Cached briefly
     # so admin overrides apply without a restart but each turn doesn't pay a
@@ -1493,6 +1539,58 @@ class WorkflowEngine:
         budget = max(window - MAX_GENERATION_TOKENS, self.MIN_PROMPT_BUDGET)
         self._budget_cache = (budget, now)
         return budget
+
+    def _recall_snippet(
+        self,
+        conversation_id: Optional[str],
+        user_id: Optional[str],
+        message: str,
+        history: List[Any],
+    ) -> Optional[str]:
+        """Older turns relevant to this message, restored verbatim.
+
+        The window is assembled per turn, not just a recency prefix: turns
+        outside the verbatim tail compete on relevance to what is being asked
+        right now, and the winners come back exactly as written.
+        """
+        if not conversation_id or not (message or "").strip():
+            return None
+        fraction = 0.25
+        if self.settings:
+            try:
+                fraction = float(
+                    getattr(self.settings, "history_recall_fraction", 0.25) or 0
+                )
+            except (TypeError, ValueError):
+                fraction = 0.25
+        if fraction <= 0:
+            return None
+        if not hasattr(self.store, "list_messages"):
+            return None
+        try:
+            full = self.store.list_messages(
+                conversation_id, limit=self.MAX_HISTORY_FETCH, user_id=user_id
+            )
+        except Exception as exc:  # noqa: BLE001 - recall is an accelerant
+            self.logger.debug("recall_fetch_failed", error=str(exc))
+            return None
+        in_tail = {id(m) for m in history or []}
+        tail_seqs = {
+            getattr(m, "seq", None) for m in history or []
+        } - {None}
+        older = [
+            m for m in full
+            if id(m) not in in_tail and getattr(m, "seq", None) not in tail_seqs
+        ]
+        if not older:
+            return None
+        turns = compaction.recall_turns(
+            older,
+            message,
+            budget_tokens=int(self.history_budget() * min(fraction, 0.9)),
+            count=self._count_fn(),
+        )
+        return compaction.recall_block(turns)
 
     def _digest_snippet(self, conversation_id: Optional[str]) -> Optional[str]:
         """The conversation's rolling digest, as a context snippet."""
@@ -1591,7 +1689,7 @@ class WorkflowEngine:
     ) -> None:
         if not conversation_id or not self.cache:
             return
-        serialized = self._serialize_messages(history[-compaction.RECENT_MESSAGES:])
+        serialized = self._serialize_messages(history)  # already budget-trimmed
         await self.cache.set_conversation_summary(
             conversation_id,
             {
@@ -2615,7 +2713,9 @@ class WorkflowEngine:
             return "Could not read earlier turns."
         # Only the span the model can no longer see verbatim is worth
         # returning; the recent window is already in the prompt.
-        older, _recent = compaction.split_history(history)
+        older, _recent = compaction.split_history(
+            history, keep_tokens=self.history_budget(), count=self._count_fn()
+        )
         if not older:
             return "No earlier turns beyond what is already in context."
         corpus = [
@@ -2699,7 +2799,12 @@ class WorkflowEngine:
                 tools.append(self.WEB_SEARCH_SCHEMA)
         # Offer history retrieval exactly when the digest is standing in for
         # turns the model can no longer read — the summary says to call it.
-        if len(history or []) >= compaction.RECENT_MESSAGES:
+        older_span, _ = compaction.split_history(
+            list(history or []),
+            keep_tokens=self.history_budget(),
+            count=self._count_fn(),
+        )
+        if older_span or len(history or []) >= self.MAX_HISTORY_FETCH:
             tools.append(self.HISTORY_SEARCH_SCHEMA)
         # Only pay for the schema when notes are enabled AND there is a vault.
         if user_id and self._notes_enabled() and getattr(self.store, "count_notes", None):
@@ -2732,6 +2837,9 @@ class WorkflowEngine:
         digest = self._digest_snippet(conversation_id)
         if digest:
             system_content += f"\n\n{digest}"
+        recall = self._recall_snippet(conversation_id, user_id, message, list(history or []))
+        if recall:
+            system_content += f"\n\n{recall}"
         _, history = self._apply_prompt_budget(
             f"{system_content}\n{message}", [], list(history or [])
         )
@@ -3266,6 +3374,11 @@ class WorkflowEngine:
         digest = self._digest_snippet(conversation_id)
         if digest:
             context_snippets.insert(0, digest)
+        # Assembled window: relevance-recalled turns ride behind the digest;
+        # both are snippets, so the pruner drops them before the verbatim tail.
+        recall = self._recall_snippet(conversation_id, user_id, message or "", history)
+        if recall:
+            context_snippets.insert(1 if digest else 0, recall)
         context_snippets, history = self._apply_prompt_budget(
             message, context_snippets, history
         )

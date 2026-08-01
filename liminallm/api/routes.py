@@ -940,10 +940,19 @@ def _schedule_conversation_digest(
             history = await asyncio.to_thread(
                 runtime.store.list_messages, conversation_id, user_id=user_id
             )
-            if not compaction.needs_digest(history, conversation):
+            # Digest exactly what falls outside the model's verbatim window —
+            # the same budget boundary the workflow serves with.
+            keep_tokens = runtime.workflow.history_budget()
+            count = runtime.workflow._count_fn()
+            if not compaction.needs_digest(
+                history, conversation, keep_tokens=keep_tokens, count=count
+            ):
                 return
             digest = await asyncio.to_thread(
-                compaction.build_digest, runtime.llm, history, conversation
+                lambda: compaction.build_digest(
+                    runtime.llm, history, conversation,
+                    keep_tokens=keep_tokens, count=count,
+                )
             )
             if not digest:
                 return

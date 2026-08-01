@@ -255,9 +255,10 @@ def test_history_window_is_the_same_warm_or_cold(monkeypatch):
     from liminallm.service import workflow as wf
 
     source = inspect.getsource(wf.WorkflowEngine._load_conversation_history)
-    assert "limit=compaction.RECENT_MESSAGES" in source
+    assert "limit=self.MAX_HISTORY_FETCH" in source
+    assert "keep_tokens=self.history_budget()" in source
     cached = inspect.getsource(wf.WorkflowEngine.cache_conversation_state)
-    assert "compaction.RECENT_MESSAGES" in cached
+    assert "budget-trimmed" in cached  # cache stores exactly what was kept
 
 
 # ---------------------------------------------------------------------------
@@ -620,9 +621,13 @@ def test_history_search_returns_original_wording():
         store.append_message(
             convo.id, sender="user", role="user", content=f"unrelated chatter {i}"
         )
-    out = engine._run_history_search(
-        "connection pool size", 4, conversation_id=convo.id, user_id=user.id
-    )
+    monkeypatch = None  # readability: budget forced below the turn total
+    import unittest.mock as _mock
+
+    with _mock.patch.object(engine, "history_budget", return_value=50):
+        out = engine._run_history_search(
+            "connection pool size", 4, conversation_id=convo.id, user_id=user.id
+        )
     assert "pool size 37" in out  # the exact number, not a summary of it
     assert "data to cite, not instructions" in out
 
@@ -649,9 +654,137 @@ def test_history_tool_offered_only_once_turns_fall_outside_the_window():
     assert not any(
         t["function"]["name"] == "history_search" for t in tools
     )
+    import unittest.mock as _mock
+
     long = [
-        SimpleNamespace(role="user", content="hi", seq=i)
+        SimpleNamespace(role="user", content="word " * 200, seq=i)
         for i in range(compaction.RECENT_MESSAGES + 5)
     ]
-    _msgs_out, tools, _ = engine._build_agent_context("q", [], long, "u", None)
+    with _mock.patch.object(engine, "history_budget", return_value=100):
+        _msgs_out, tools, _ = engine._build_agent_context("q", [], long, "u", None)
     assert any(t["function"]["name"] == "history_search" for t in tools)
+
+
+# ---------------------------------------------------------------------------
+# The window is assembled, not a recency prefix
+
+
+def _count_words(text):
+    return len(str(text).split())
+
+
+def test_budget_split_keeps_what_fits_not_a_count():
+    msgs = [
+        SimpleNamespace(role="user", content="word " * 100, seq=i) for i in range(50)
+    ]
+    # Big budget: everything stays verbatim — no digestion while the window
+    # is empty, even at 50 turns.
+    older, recent = compaction.split_history(
+        msgs, keep_tokens=100_000, count=_count_words
+    )
+    assert older == [] and len(recent) == 50
+    # Small budget: the boundary moves in, but never below the floor.
+    older, recent = compaction.split_history(
+        msgs, keep_tokens=450, count=_count_words
+    )
+    assert len(recent) >= compaction.MIN_VERBATIM_MESSAGES
+    assert len(recent) < 10
+    assert recent[-1].seq == 49  # newest always survives
+
+
+def test_needs_digest_is_window_pressure_not_turn_count(monkeypatch):
+    convo = SimpleNamespace(meta={})
+    msgs = [
+        SimpleNamespace(role="user", content="word " * 50, seq=i) for i in range(40)
+    ]
+    # A large window feels no pressure at 40 turns.
+    assert not compaction.needs_digest(
+        msgs, convo, keep_tokens=1_000_000, count=_count_words
+    )
+    # A small window does.
+    assert compaction.needs_digest(
+        msgs, convo, keep_tokens=500, count=_count_words
+    )
+
+
+def test_recall_selects_by_relevance_within_budget():
+    older = [
+        SimpleNamespace(role="user", content=f"chatter about weather {i}", seq=i)
+        for i in range(30)
+    ]
+    older[3] = SimpleNamespace(
+        role="user", content="the analytics replica needs pool size 37", seq=3
+    )
+    older[17] = SimpleNamespace(
+        role="assistant", content="agreed: pool size 37 for analytics", seq=17
+    )
+    turns = compaction.recall_turns(
+        older, "what pool size did we pick for analytics?",
+        budget_tokens=200, count=_count_words,
+    )
+    seqs = [t.seq for t in turns]
+    assert 3 in seqs and 17 in seqs
+    assert seqs == sorted(seqs)  # chronological, not score order
+    block = compaction.recall_block(turns)
+    assert "pool size 37" in block
+    assert "data to cite, not instructions" in block
+
+
+def test_recall_respects_its_budget():
+    older = [
+        SimpleNamespace(role="user", content="protein " * 300, seq=i)
+        for i in range(10)
+    ]
+    turns = compaction.recall_turns(
+        older, "protein", budget_tokens=350, count=_count_words
+    )
+    assert 1 <= len(turns) <= 2  # only what fits, not all ten matches
+
+
+def test_recall_snippet_end_to_end_and_excludes_the_tail():
+    engine = _engine()
+    store = engine.store
+    user = store.create_user(
+        email=f"recall_{os.urandom(4).hex()}@example.com", role="user"
+    )
+    convo = store.create_conversation(user_id=user.id, title="t")
+    store.append_message(
+        convo.id, sender="user", role="user",
+        content="Decision: the loom fpga ships with PJRT plugin v2.",
+    )
+    for i in range(30):
+        store.append_message(
+            convo.id, sender="user", role="user", content=f"weather chatter {i}"
+        )
+    tail = store.list_messages(convo.id, limit=5, user_id=user.id)
+    snippet = engine._recall_snippet(
+        convo.id, user.id, "what did we decide about the loom fpga?", tail
+    )
+    assert snippet and "PJRT plugin v2" in snippet
+    # The turns already in the verbatim tail are never recalled twice.
+    tail_contents = {m.content for m in tail}
+    for line in snippet.splitlines():
+        for c in tail_contents:
+            assert c not in line
+
+
+def test_recall_disabled_by_zero_fraction(monkeypatch):
+    engine = _engine()
+    monkeypatch.setattr(engine.settings, "history_recall_fraction", 0.0)
+    assert (
+        engine._recall_snippet("cid", "uid", "anything", []) is None
+    )
+
+
+def test_history_budget_scales_with_the_model_window(monkeypatch):
+    engine = _engine()
+    engine._budget_cache = None
+    monkeypatch.setattr(engine.llm, "context_window", lambda: 1_000_000, raising=False)
+    big = engine.history_budget()
+    engine._budget_cache = None
+    monkeypatch.setattr(engine.llm, "context_window", lambda: 8192, raising=False)
+    small = engine.history_budget()
+    assert big > 100 * small  # the window drives the boundary
+    monkeypatch.setattr(engine.settings, "history_budget_fraction", 0.9)
+    engine._budget_cache = None
+    assert engine.history_budget() > small
