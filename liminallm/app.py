@@ -69,8 +69,26 @@ async def lifespan(app: FastAPI):
         # holding the stream's WebSocket instead of only stopping local ones.
         try:
             from liminallm.api.routes import CANCEL_CHANNEL, handle_remote_cancel
+            from liminallm.service import token_counting
 
             runtime.bus.subscribe(CANCEL_CHANNEL, handle_remote_cancel)
+
+            async def _apply_calibration(data: dict):
+                """A peer learned a better token factor; adopt it."""
+                model = str(data.get("model") or "")
+                try:
+                    factor = float(data.get("factor") or 0)
+                except (TypeError, ValueError):
+                    return None
+                if factor > 0:
+                    token_counting.apply_shared_factor(
+                        model, factor, int(data.get("observations") or 0)
+                    )
+                return None  # broadcast, not a request: never ack
+
+            runtime.bus.subscribe(
+                token_counting.CALIBRATION_CHANNEL, _apply_calibration
+            )
             await runtime.bus.start()
         except Exception as exc:  # coordination is optional; keep serving
             logger.warning("cluster_bus_start_failed", error=str(exc))

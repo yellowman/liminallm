@@ -11,6 +11,7 @@ from urllib.parse import urlparse, urlunparse
 from liminallm.config import get_settings, reset_settings_cache
 from liminallm.logging import get_logger
 from liminallm.service.auth import AuthService
+from liminallm.service import token_counting
 from liminallm.service.cluster import AdvisoryLock, ClusterBus
 from liminallm.service.clustering import SemanticClusterer
 from liminallm.service.config_ops import ConfigOpsService
@@ -224,6 +225,7 @@ class Runtime:
             backend=bus_backend,
         )
         self.leader_lock = AdvisoryLock(db_url)
+        self._install_calibration_sharing()
 
         # Training worker for background job processing
         poll_interval = sys_settings.get(
@@ -261,6 +263,50 @@ class Runtime:
             voice_configured=self.voice.is_configured,
             mfa_enabled=mfa_enabled,
         )
+
+    def _install_calibration_sharing(self) -> None:
+        """Share learned token-calibration factors across replicas.
+
+        Durable in the store (survives restart, works with Redis absent) and
+        broadcast on the cluster bus so peers converge immediately instead of
+        each re-learning the same factor. Entirely best-effort: without it
+        calibration is per-process, which is correct but slower.
+        """
+        store = self.store
+
+        def load(model: str):
+            getter = getattr(store, "get_instance_config", None)
+            if not callable(getter):
+                return None
+            entry = (getter(token_counting.CALIBRATION_CONFIG_NAME) or {}).get(model)
+            if isinstance(entry, dict):
+                return entry.get("factor")
+            return entry if isinstance(entry, (int, float)) else None
+
+        def publish(model: str, factor: float, observations: int) -> None:
+            merger = getattr(store, "merge_instance_config", None)
+            if callable(merger):
+                merger(
+                    token_counting.CALIBRATION_CONFIG_NAME,
+                    {model: {"factor": round(factor, 4), "observations": observations}},
+                )
+            bus = getattr(self, "bus", None)
+            if bus is None:
+                return
+            payload = {
+                "model": model,
+                "factor": round(factor, 4),
+                "observations": observations,
+            }
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return  # no loop (sync context): the store write already landed
+            loop.create_task(
+                bus.publish(token_counting.CALIBRATION_CHANNEL, payload)
+            )
+
+        token_counting.install_sharing(load=load, publish=publish)
 
     def _system_settings_overrides(self) -> dict:
         """Explicitly stored admin settings only, without defaults merged in.

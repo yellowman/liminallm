@@ -197,6 +197,45 @@ class TokenCounter:
                 "token_calibration_updated",
                 model=self.model, factor=round(factor, 3), observations=observations,
             )
+        if _PUBLISH_HOOK and observations % PUBLISH_EVERY == 0:
+            try:
+                _PUBLISH_HOOK(self.model, factor, observations)
+            except Exception as exc:  # noqa: BLE001 - sharing is optional
+                logger.debug("token_calibration_publish_failed", error=str(exc))
+
+    def adopt(self, factor: float, observations: int = 0) -> None:
+        """Take a factor learned elsewhere (peer replica or prior run).
+
+        Ignored when counting is exact, and clamped like any observation: a
+        peer's value is evidence, not gospel.
+        """
+        if self.exact or not (_MIN_FACTOR <= factor <= _MAX_FACTOR):
+            return
+        with self._lock:
+            self.factor = factor
+            # Keep the larger history so a fresh replica doesn't publish over
+            # a well-calibrated peer on its tenth observation.
+            self.observations = max(self.observations, observations)
+
+
+# Cluster-shared calibration. The runtime installs these hooks; without them
+# calibration is per-process (correct, just slower to converge and forgotten
+# on restart). Kept as hooks so this module has no storage dependency.
+_LOAD_HOOK: Optional[Callable[[str], Optional[float]]] = None
+_PUBLISH_HOOK: Optional[Callable[[str, float, int], None]] = None
+# Publish every N observations: often enough to share quickly, rarely enough
+# that a busy replica isn't writing on every turn.
+PUBLISH_EVERY = 10
+
+CALIBRATION_CONFIG_NAME = "token_calibration"
+CALIBRATION_CHANNEL = "tokens.calibration"
+
+
+def install_sharing(load=None, publish=None) -> None:
+    """Wire cluster-shared calibration (loader and publisher)."""
+    global _LOAD_HOOK, _PUBLISH_HOOK
+    _LOAD_HOOK = load
+    _PUBLISH_HOOK = publish
 
 
 _COUNTERS: dict[str, TokenCounter] = {}
@@ -211,7 +250,26 @@ def counter_for(model: str = "", tokenizer: Any = None) -> TokenCounter:
         if counter is None:
             counter = TokenCounter(model=model, tokenizer=tokenizer)
             _COUNTERS[key] = counter
+            if _LOAD_HOOK and not counter.exact:
+                try:
+                    shared = _LOAD_HOOK(key)
+                    if shared:
+                        counter.adopt(float(shared))
+                        logger.info(
+                            "token_calibration_adopted",
+                            model=key, factor=round(float(shared), 3),
+                        )
+                except Exception as exc:  # noqa: BLE001 - sharing is optional
+                    logger.debug("token_calibration_load_failed", error=str(exc))
         return counter
+
+
+def apply_shared_factor(model: str, factor: float, observations: int = 0) -> None:
+    """Apply a peer's calibration to the local counter for ``model``."""
+    with _COUNTERS_LOCK:
+        counter = _COUNTERS.get(model or "default")
+    if counter is not None:
+        counter.adopt(factor, observations)
 
 
 def reset_counters_for_tests() -> None:

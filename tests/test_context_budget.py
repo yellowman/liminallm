@@ -429,3 +429,93 @@ def test_single_message_cap_allows_long_pastes():
     ChatMessage(role="user", content=long_paste)
     with pytest.raises(Exception):
         ChatMessage(role="user", content="word " * 300_000)
+
+
+# ---------------------------------------------------------------------------
+# Shared calibration across replicas
+
+
+@pytest.fixture(autouse=True)
+def _clean_counters():
+    from liminallm.service import token_counting
+
+    token_counting.reset_counters_for_tests()
+    yield
+    token_counting.install_sharing(None, None)
+    token_counting.reset_counters_for_tests()
+
+
+def test_learned_factor_is_published_and_adopted():
+    from liminallm.service import token_counting as tc
+
+    published = []
+    shared = {"m1": 1.35}
+    tc.install_sharing(
+        load=lambda model: shared.get(model),
+        publish=lambda m, f, o: published.append((m, round(f, 3), o)),
+    )
+    # A fresh replica adopts what a peer already learned.
+    counter = tc.counter_for("m1")
+    assert counter.factor == 1.35
+
+    # And publishes its own progress on the cadence, not every turn.
+    other = tc.counter_for("m2")
+    for _ in range(tc.PUBLISH_EVERY - 1):
+        other.observe(1000, 1200)
+    assert published == []
+    other.observe(1000, 1200)
+    assert len(published) == 1 and published[0][0] == "m2"
+
+
+def test_apply_shared_factor_updates_a_live_counter():
+    from liminallm.service import token_counting as tc
+
+    counter = tc.counter_for("gemini-flash-latest")
+    assert counter.factor == 1.0
+    tc.apply_shared_factor("gemini-flash-latest", 1.4, observations=50)
+    assert counter.factor == 1.4
+    assert counter.observations == 50
+    # Out-of-range peer values are evidence, not gospel.
+    tc.apply_shared_factor("gemini-flash-latest", 99.0)
+    assert counter.factor == 1.4
+
+
+def test_exact_counters_ignore_shared_factors():
+    from liminallm.service import token_counting as tc
+
+    class Exact:
+        def encode(self, text):
+            return [0] * len(text.split())
+
+    counter = tc.counter_for("local-ckpt", tokenizer=Exact())
+    tc.apply_shared_factor("local-ckpt", 1.9)
+    assert counter.factor == 1.0  # never override an exact tokenizer
+
+
+def test_calibration_round_trips_through_the_store():
+    """Durability: a restart re-reads what previous runs learned."""
+    from liminallm.service import token_counting as tc
+
+    store = get_runtime().store
+    store.merge_instance_config(
+        tc.CALIBRATION_CONFIG_NAME, {"m9": {"factor": 1.22, "observations": 40}}
+    )
+    entry = store.get_instance_config(tc.CALIBRATION_CONFIG_NAME)["m9"]
+    assert entry["factor"] == 1.22
+
+    get_runtime()._install_calibration_sharing()
+    counter = tc.counter_for("m9")
+    assert round(counter.factor, 2) == 1.22
+
+
+def test_publish_survives_a_missing_bus(monkeypatch):
+    """Sharing is best-effort: no loop, no bus, still no exception."""
+    from liminallm.service import token_counting as tc
+
+    runtime = get_runtime()
+    runtime._install_calibration_sharing()
+    counter = tc.counter_for("m-nobus")
+    for _ in range(tc.PUBLISH_EVERY):
+        counter.observe(1000, 1150)  # publishes; no running loop in this test
+    stored = runtime.store.get_instance_config(tc.CALIBRATION_CONFIG_NAME)
+    assert "m-nobus" in stored  # store write landed even without the bus

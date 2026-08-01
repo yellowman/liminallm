@@ -3091,6 +3091,47 @@ class PostgresStore:
                 return {}
         return raw_config if isinstance(raw_config, dict) else {}
 
+    def get_instance_config(self, name: str) -> dict:
+        """Read a named JSONB blob from instance_config ({} when absent)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT config FROM instance_config WHERE name = %s", (name,)
+            ).fetchone()
+        if not row:
+            return {}
+        config = row.get("config")
+        if isinstance(config, str):
+            try:
+                config = json.loads(config)
+            except Exception:  # noqa: BLE001
+                return {}
+        return config if isinstance(config, dict) else {}
+
+    def merge_instance_config(self, name: str, patch: dict) -> dict:
+        """Merge keys into a named blob atomically; returns the merged dict."""
+        with self._connect() as conn, conn.transaction():
+            row = conn.execute(
+                "SELECT config FROM instance_config WHERE name = %s FOR UPDATE",
+                (name,),
+            ).fetchone()
+            current = row.get("config") if row else {}
+            if isinstance(current, str):
+                try:
+                    current = json.loads(current)
+                except Exception:  # noqa: BLE001
+                    current = {}
+            merged = {**(current if isinstance(current, dict) else {}), **patch}
+            conn.execute(
+                """
+                INSERT INTO instance_config (name, config, created_at, updated_at)
+                VALUES (%s, %s, now(), now())
+                ON CONFLICT (name) DO UPDATE
+                SET config = EXCLUDED.config, updated_at = now()
+                """,
+                (name, json.dumps(merged)),
+            )
+        return merged
+
     def set_system_settings(self, settings: dict) -> dict:
         """Update admin-managed system settings.
 

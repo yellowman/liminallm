@@ -1947,6 +1947,16 @@ budget math is only as good as the count. resolution per backend:
 - the uncalibrated heuristic splits by script (cjk bills ~1 token/char, the
   old estimator undercounted it ~4x) and over-counts on purpose:
   over-counting prunes a turn early, under-counting overruns the model.
+- **calibration is shared across replicas.** learned factors persist in
+  `instance_config` under `token_calibration` (durable across restarts,
+  works with redis absent) and are broadcast on the cluster bus so peers
+  adopt them immediately instead of each re-learning the same number.
+  publishing is debounced (every 10 observations), adopted factors are
+  clamped like any observation, a peer's observation count is merged with
+  `max()` so a fresh replica cannot publish over a well-calibrated one, and
+  exact counters ignore shared factors entirely. entirely best-effort:
+  without the bus the store write still lands, and without either,
+  calibration is per-process — correct, just slower to converge.
 
 ### 20.5 other model-specific hazards
 

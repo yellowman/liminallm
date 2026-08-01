@@ -1715,6 +1715,20 @@ class MemoryStore:
         self._persist_state()
         return dict(self.runtime_config)
 
+    def get_instance_config(self, name: str) -> dict:
+        """Named JSONB-equivalent blob ({} when absent)."""
+        with self._data_lock:
+            blob = getattr(self, "_instance_config", {}).get(name)
+            return dict(blob) if isinstance(blob, dict) else {}
+
+    def merge_instance_config(self, name: str, patch: dict) -> dict:
+        with self._data_lock:
+            if not hasattr(self, "_instance_config"):
+                self._instance_config: Dict[str, dict] = {}
+            merged = {**self._instance_config.get(name, {}), **patch}
+            self._instance_config[name] = merged
+            return dict(merged)
+
     def get_system_settings(self) -> dict:
         """Get admin-managed system settings.
 
