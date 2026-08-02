@@ -1,6 +1,7 @@
 import pytest
 
-from liminallm.api.routes import Envelope, IdempotencyGuard
+from liminallm.api.idempotency import IdempotencyGuard
+from liminallm.api.schemas import Envelope
 from liminallm.service.runtime import _get_cached_idempotency_record, get_runtime
 
 

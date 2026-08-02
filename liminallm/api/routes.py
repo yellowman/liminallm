@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import hashlib
 import json
 import math
 import mimetypes
 import shutil
 from contextlib import suppress
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path as FilePath
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 from uuid import uuid4
 
 from fastapi import (
@@ -31,6 +32,15 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 
+from liminallm.api import idempotency
+from liminallm.api.errors import http_error
+from liminallm.api.limits import (
+    client_ip,
+    enforce,
+    enforce_per_plan,
+    plan_upload_limit,
+    rate_limit,
+)
 from liminallm.api.schemas import (
     AdminCreateUserRequest,
     AdminCreateUserResponse,
@@ -110,7 +120,7 @@ from liminallm.config import (
 )
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
-from liminallm.service import compaction, labels
+from liminallm.service import admission, cancellation, turn_effects
 from liminallm.service import extract as extract_service
 from liminallm.service import notes as notes_service
 from liminallm.service.archive import (
@@ -134,13 +144,7 @@ from liminallm.service.fs import (
     safe_join,
     validate_signed_url,
 )
-from liminallm.service.runtime import (
-    IDEMPOTENCY_TTL_SECONDS,
-    _acquire_idempotency_slot,
-    _set_cached_idempotency_record,
-    check_rate_limit,
-    get_runtime,
-)
+from liminallm.service.runtime import get_runtime
 from liminallm.service.sandbox import SandboxError
 from liminallm.service.upload_policy import ALLOWED_UPLOAD_EXTENSIONS
 from liminallm.storage.cursors import (
@@ -159,283 +163,6 @@ logger = get_logger(__name__)
 
 router = APIRouter(prefix="/v1")
 
-# Registry for active streaming requests - maps request_id to (cancel_event, timestamp, user_id)
-# Used by POST /chat/cancel to cancel in-progress streaming requests per SPEC §18
-# Issue 23.2: Added timestamp tracking for TTL-based cleanup
-# Issue 50.5: Added user_id for ownership validation to prevent cross-user cancellation
-_active_requests: Dict[str, tuple[asyncio.Event, datetime, str]] = {}
-# Logical cluster-bus channel used to reach the replica that owns a request
-CANCEL_CHANNEL = "chat.cancel"
-# Issue 28.2: Lazily initialize asyncio.Lock to avoid "no running event loop" errors
-# at module import time. The lock is created on first use when an event loop exists.
-_active_requests_lock: Optional[asyncio.Lock] = None
-_active_requests_last_cleanup = datetime.now(timezone.utc)
-# Maximum age for active requests before they're considered stale (30 minutes)
-_ACTIVE_REQUEST_TTL_SECONDS = 30 * 60
-
-
-def _get_active_requests_lock() -> asyncio.Lock:
-    """Get or create the asyncio lock for _active_requests (Issue 28.2).
-
-    Lazily initializes the lock on first use to ensure an event loop exists.
-    """
-    global _active_requests_lock
-    if _active_requests_lock is None:
-        _active_requests_lock = asyncio.Lock()
-    return _active_requests_lock
-
-
-async def _cleanup_stale_active_requests() -> int:
-    """Remove stale entries from _active_requests (Issue 23.2).
-
-    Called periodically during register/unregister to prevent unbounded growth.
-    """
-    global _active_requests_last_cleanup
-    now = datetime.now(timezone.utc)
-
-    # Only run cleanup every 5 minutes to avoid performance overhead
-    if (now - _active_requests_last_cleanup).total_seconds() < 300:
-        return 0
-
-    _active_requests_last_cleanup = now
-    threshold = now - timedelta(seconds=_ACTIVE_REQUEST_TTL_SECONDS)
-    stale_keys = [
-        req_id for req_id, (_, created_at, _) in _active_requests.items()
-        if created_at < threshold
-    ]
-
-    for req_id in stale_keys:
-        event, _, _ = _active_requests.pop(req_id, (None, None, None))
-        if event and not event.is_set():
-            event.set()  # Cancel any stale request
-
-    if stale_keys:
-        logger.warning(
-            "active_requests_stale_cleanup",
-            cleaned=len(stale_keys),
-            remaining=len(_active_requests),
-        )
-    return len(stale_keys)
-
-
-async def _register_cancel_event(request_id: str, cancel_event: asyncio.Event, user_id: str) -> None:
-    """Register a cancel event for an active streaming request.
-
-    Args:
-        request_id: Unique request identifier
-        cancel_event: Event to signal cancellation
-        user_id: Owner of this request (Issue 50.5 - for ownership validation)
-    """
-    async with _get_active_requests_lock():
-        _active_requests[request_id] = (cancel_event, datetime.now(timezone.utc), user_id)
-        # Periodic cleanup to prevent unbounded growth (Issue 23.2)
-        await _cleanup_stale_active_requests()
-
-
-async def _unregister_cancel_event(request_id: str) -> None:
-    """Unregister a cancel event when request completes."""
-    async with _get_active_requests_lock():
-        _active_requests.pop(request_id, None)
-        await _cleanup_stale_active_requests()
-
-
-async def _cancel_request(request_id: str, user_id: str) -> tuple[bool, str]:
-    """Cancel an active request, wherever in the cluster it is running.
-
-    The cancel event lives in the process holding that request's WebSocket, so
-    a multi-replica deployment can only stop 1/N of streams locally. When the
-    request is unknown here we ask the other replicas over the cluster bus and
-    return the owner's verdict; silence means no replica owns it.
-    """
-    cancelled, reason = await _cancel_request_local(request_id, user_id)
-    if reason != "request_not_found":
-        return cancelled, reason
-    return await _cancel_request_remote(request_id, user_id)
-
-
-async def _cancel_request_local(request_id: str, user_id: str) -> tuple[bool, str]:
-    """Cancel a request owned by this process, validating ownership.
-
-    Args:
-        request_id: The request to cancel
-        user_id: The user attempting to cancel (must be request owner)
-
-    Returns:
-        Tuple of (cancelled: bool, reason: str)
-    """
-    async with _get_active_requests_lock():
-        entry = _active_requests.get(request_id)
-        if not entry:
-            return False, "request_not_found"
-        cancel_event, _, owner_id = entry
-        # Issue 50.5: Validate ownership to prevent cross-user cancellation attacks
-        if owner_id != user_id:
-            logger.warning(
-                "cancel_request_ownership_mismatch",
-                request_id=request_id,
-                owner_id=owner_id,
-                requester_id=user_id,
-            )
-            return False, "not_owner"
-        if not cancel_event.is_set():
-            cancel_event.set()
-            return True, "cancelled"
-        return False, "already_cancelled"
-
-
-async def _cancel_request_remote(request_id: str, user_id: str) -> tuple[bool, str]:
-    """Ask peer replicas to cancel a request this process doesn't own."""
-    bus = getattr(get_runtime(), "bus", None)
-    if bus is None:
-        return False, "request_not_found"
-    try:
-        ack = await bus.request(
-            CANCEL_CHANNEL, {"request_id": request_id, "user_id": user_id}
-        )
-    except Exception as exc:  # never let coordination break the endpoint
-        logger.warning("cancel_request_bus_failed", request_id=request_id, error=str(exc))
-        return False, "request_not_found"
-    if not ack:
-        return False, "request_not_found"
-    reason = str(ack.get("reason") or "request_not_found")
-    return bool(ack.get("cancelled")), reason
-
-
-async def handle_remote_cancel(data: dict) -> Optional[dict]:
-    """Cluster-bus handler: cancel locally, or stay silent if we don't own it.
-
-    Only the owning replica answers, so the asking replica can distinguish
-    "cancelled" / "not_owner" / "already_cancelled" from "nobody has it".
-
-    The user_id in the frame was authenticated by the peer replica that took
-    the request; ownership is still re-checked here, so the trust boundary is
-    the coordination datastore (Redis/Postgres), not the caller.
-    """
-    request_id = str(data.get("request_id") or "")
-    user_id = str(data.get("user_id") or "")
-    if not request_id or not user_id:
-        return None
-    cancelled, reason = await _cancel_request_local(request_id, user_id)
-    if reason == "request_not_found":
-        return None
-    return {"cancelled": cancelled, "reason": reason}
-
-
-def _http_error(
-    code: str, message: str, status_code: int, details: Optional[dict | str] = None
-) -> HTTPException:
-    payload: dict[str, object] = {
-        "status": "error",
-        "error": {"code": code, "message": message},
-    }
-    if details is not None:
-        payload["error"]["details"] = details  # type: ignore[index]
-    return HTTPException(status_code=status_code, detail=payload)
-
-
-def _client_ip(request: Optional[Request]) -> str:
-    """Best-effort client IP for keying unauthenticated rate limits.
-
-    Prevents a single client from exhausting a globally-shared limit (password
-    reset, email verification, OAuth) for every other user on the platform.
-    """
-    if request is None or request.client is None:
-        return "unknown"
-    return request.client.host
-
-
-class IdempotencyGuard:
-    def __init__(
-        self,
-        route: str,
-        user_id: str,
-        idempotency_key: Optional[str],
-        *,
-        require: bool = False,
-    ):
-        self.route = route
-        self.user_id = user_id
-        self.idempotency_key = idempotency_key
-        self.require = require
-        self.request_id: Optional[str] = None
-        self.cached: Optional[Envelope] = None
-        self._stored = False
-
-    async def __aenter__(self) -> "IdempotencyGuard":
-        self.request_id = self.request_id or str(uuid4())
-        self.request_id, self.cached = await _resolve_idempotency(
-            self.route,
-            self.user_id,
-            self.idempotency_key,
-            require=self.require,
-            request_id=self.request_id,
-        )
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb) -> bool:
-        if exc and not self._stored and self.request_id:
-            await _store_idempotency_result(
-                self.route,
-                self.user_id,
-                self.idempotency_key,
-                Envelope(
-                    status="error",
-                    error={"code": "server_error", "message": str(exc)},
-                    request_id=self.request_id,
-                ),
-                status="failed",
-            )
-            self._stored = True
-        return False
-
-    async def store_result(
-        self, envelope: Envelope, *, status: str = "completed"
-    ) -> None:
-        """Store result in idempotency cache.
-
-        Args:
-            envelope: Response envelope to store
-            status: Status to record. Only "completed" marks the operation as
-                    fully done - intermediate statuses like "processing" still
-                    allow error recording via __aexit__.
-        """
-        await _store_idempotency_result(
-            self.route, self.user_id, self.idempotency_key, envelope, status=status
-        )
-        # Only mark as stored for final states to allow error recording for intermediate states
-        if status in {"completed", "failed"}:
-            self._stored = True
-
-    async def store_error(self, message: str) -> None:
-        if not self.request_id:
-            return
-        await self.store_result(
-            Envelope(
-                status="error",
-                error={"code": "server_error", "message": message},
-                request_id=self.request_id,
-            ),
-            status="failed",
-        )
-
-
-class RateLimitInfo:
-    """Rate limit state for adding response headers."""
-
-    __slots__ = ("limit", "remaining", "reset_seconds")
-
-    def __init__(self, limit: int, remaining: int, reset_seconds: int):
-        self.limit = limit
-        self.remaining = remaining
-        self.reset_seconds = reset_seconds
-
-    def apply_headers(self, response: Response) -> None:
-        """Apply rate limit headers to response per IETF draft-polli-ratelimit-headers."""
-        response.headers["X-RateLimit-Limit"] = str(self.limit)
-        response.headers["X-RateLimit-Remaining"] = str(max(0, self.remaining))
-        response.headers["X-RateLimit-Reset"] = str(self.reset_seconds)
-
-
 def _get_system_settings(runtime) -> dict:
     """Get admin-managed system settings from database.
 
@@ -443,323 +170,6 @@ def _get_system_settings(runtime) -> dict:
     Uses SYSTEM_SETTINGS_DEFAULTS from config.py as single source of truth.
     """
     return {**SYSTEM_SETTINGS_DEFAULTS, **(runtime.store.get_system_settings() or {})}
-
-
-def _get_plan_rate_multiplier(runtime, plan_tier: str) -> float:
-    """Get rate limit multiplier for a user's plan tier (SPEC §18).
-
-    Args:
-        runtime: Application runtime context
-        plan_tier: User's plan tier (free, paid, enterprise)
-
-    Returns:
-        Multiplier to apply to base rate limits
-    """
-    settings = runtime.settings
-    multipliers = {
-        "free": settings.rate_limit_multiplier_free,
-        "paid": settings.rate_limit_multiplier_paid,
-        "enterprise": settings.rate_limit_multiplier_enterprise,
-    }
-    return multipliers.get(plan_tier, 1.0)
-
-
-def _get_plan_upload_limit(runtime, plan_tier: str) -> int:
-    """Get per-plan file upload size limit (SPEC §18).
-
-    Args:
-        runtime: Application runtime context
-        plan_tier: User's plan tier (free, paid, enterprise)
-
-    Returns:
-        Maximum upload size in bytes for the user's plan
-    """
-    # SPEC §18: "free: 25MB/file, paid: 200MB/file"
-    # Enterprise gets same as paid by default
-    limits = {
-        "free": 25 * 1024 * 1024,        # 25MB
-        "paid": 200 * 1024 * 1024,       # 200MB
-        "enterprise": 200 * 1024 * 1024, # 200MB
-    }
-    return limits.get(plan_tier, limits["free"])
-
-
-#: Named rate-limit policies: setting that carries the limit, and the window.
-#: Endpoints name a policy instead of restating the settings lookup, the window
-#: and the key format — the same six lines appeared fifty-seven times, and a
-#: paragraph repeated that often is one an endpoint can be written without.
-_RATE_POLICIES: dict[str, tuple[str, str | int]] = {
-    "read": ("read_rate_limit_per_minute", 60),
-    "write": ("write_rate_limit_per_minute", 60),
-    "chat": ("chat_rate_limit_per_minute", "chat_rate_limit_window_seconds"),
-    "admin:read": ("admin_rate_limit_per_minute", "admin_rate_limit_window_seconds"),
-    "admin:write": ("admin_rate_limit_per_minute", "admin_rate_limit_window_seconds"),
-    "mfa": ("mfa_rate_limit_per_minute", 60),
-    "configops": ("configops_rate_limit_per_hour", 3600),
-    "signup": ("signup_rate_limit_per_minute", 60),
-    "login": ("login_rate_limit_per_minute", 60),
-    "reset": ("reset_rate_limit_per_minute", 60),
-    "refresh": ("refresh_rate_limit_per_minute", "refresh_rate_limit_window_seconds"),
-    "files:upload": ("files_upload_rate_limit_per_minute", 60),
-    "websocket:connect": ("websocket_connect_rate_limit_per_minute", 60),
-}
-
-
-async def _limit(
-    runtime,
-    policy: str,
-    subject: str,
-    *,
-    response: Optional[Response] = None,
-    cost: int = 1,
-) -> RateLimitInfo:
-    """Apply a named rate-limit policy to a subject (user id, email, IP).
-
-    `subject` is whatever the limit is per: usually principal.user_id, but an
-    email for signup and an address for anonymous flows.
-    """
-    limit_attr, window = _RATE_POLICIES[policy]
-    window_seconds = (
-        window if isinstance(window, int) else getattr(runtime.settings, window)
-    )
-    return await _enforce_rate_limit(
-        runtime,
-        f"{policy}:{subject}",
-        getattr(runtime.settings, limit_attr),
-        window_seconds,
-        response=response,
-        cost=cost,
-    )
-
-
-async def _enforce_rate_limit(
-    runtime,
-    key: str,
-    limit: int,
-    window_seconds: int,
-    *,
-    response: Optional[Response] = None,
-    cost: int = 1,
-) -> RateLimitInfo:
-    """Enforce rate limit and optionally apply headers to response.
-
-    Args:
-        runtime: Application runtime context
-        key: Rate limit key (e.g., "chat:{user_id}")
-        limit: Maximum requests allowed in window
-        window_seconds: Rate limit window in seconds
-        response: Optional response to add rate limit headers to
-
-    Returns:
-        RateLimitInfo with current rate limit state
-
-    Raises:
-        HTTPException with 429 if rate limit exceeded
-    """
-    # limit <= 0 means "disabled/unlimited" per the admin-settings contract, and
-    # check_rate_limit() honors that. Do NOT clamp to 1 here — that would turn
-    # an operator's "unlimited" into the strictest possible limit.
-    if window_seconds <= 0:
-        logger.warning("invalid_rate_limit_window", key=key, window_seconds=window_seconds)
-        window_seconds = 60  # Default to 1 minute window
-
-    allowed, remaining, reset_after = await check_rate_limit(
-        runtime, key, limit, window_seconds, return_remaining=True, cost=cost
-    )
-    # Use calculated reset time when available to avoid leaking window details on failures (Issue 77.8)
-    reset_seconds = reset_after if reset_after is not None else window_seconds
-    info = RateLimitInfo(limit, remaining, reset_seconds)
-
-    if response is not None:
-        info.apply_headers(response)
-
-    if not allowed:
-        raise _http_error("rate_limited", "rate limit exceeded", status_code=429)
-
-    return info
-
-
-async def _enforce_rate_limit_per_plan(
-    runtime,
-    key: str,
-    base_limit: int,
-    window_seconds: int,
-    plan_tier: str,
-    *,
-    response: Optional[Response] = None,
-) -> RateLimitInfo:
-    """Enforce rate limit adjusted for user's plan tier (SPEC §18).
-
-    Args:
-        runtime: Application runtime context
-        key: Rate limit key (e.g., "chat:{user_id}")
-        base_limit: Base rate limit (will be multiplied by plan tier)
-        window_seconds: Rate limit window in seconds
-        plan_tier: User's plan tier for multiplier lookup
-        response: Optional response to add rate limit headers to
-
-    Returns:
-        RateLimitInfo with current rate limit state
-
-    Raises:
-        HTTPException with 429 if rate limit exceeded
-    """
-    multiplier = _get_plan_rate_multiplier(runtime, plan_tier)
-    adjusted_limit = int(base_limit * multiplier)
-    return await _enforce_rate_limit(runtime, key, adjusted_limit, window_seconds, response=response)
-
-
-async def _acquire_workflow_slot(runtime, user_id: str) -> bool:
-    """Acquire a workflow concurrency slot (SPEC §18: max 3 per user).
-
-    Args:
-        runtime: Application runtime context
-        user_id: User ID
-
-    Returns:
-        True if slot acquired, raises 409 if at capacity
-
-    Raises:
-        HTTPException with 409 if concurrency cap exceeded
-    """
-    if not runtime.cache:
-        # Without Redis, we can't track concurrency - allow the request
-        return True
-
-    max_workflows = runtime.settings.max_concurrent_workflows
-    acquired, current = await runtime.cache.acquire_concurrency_slot(
-        "workflow",
-        user_id,
-        max_workflows,
-    )
-    if not acquired:
-        raise _http_error(
-            "busy",
-            f"concurrent workflow limit ({max_workflows}) exceeded",
-            status_code=409,
-        )
-    return True
-
-
-async def _release_workflow_slot(runtime, user_id: str) -> None:
-    """Release a workflow concurrency slot."""
-    if runtime.cache:
-        await runtime.cache.release_concurrency_slot("workflow", user_id)
-
-
-async def _acquire_inference_slot(runtime, user_id: str) -> bool:
-    """Acquire an inference concurrency slot (SPEC §18: max 2 per user).
-
-    Args:
-        runtime: Application runtime context
-        user_id: User ID
-
-    Returns:
-        True if slot acquired, raises 409 if at capacity
-
-    Raises:
-        HTTPException with 409 if concurrency cap exceeded
-    """
-    if not runtime.cache:
-        return True
-
-    max_inference = runtime.settings.max_concurrent_inference
-    acquired, current = await runtime.cache.acquire_concurrency_slot(
-        "inference",
-        user_id,
-        max_inference,
-    )
-    if not acquired:
-        raise _http_error(
-            "busy",
-            f"concurrent inference limit ({max_inference}) exceeded",
-            status_code=409,
-        )
-    return True
-
-
-async def _release_inference_slot(runtime, user_id: str) -> None:
-    """Release an inference concurrency slot."""
-    if runtime.cache:
-        await runtime.cache.release_concurrency_slot("inference", user_id)
-
-
-async def _resolve_idempotency(
-    route: str,
-    user_id: str,
-    idempotency_key: Optional[str],
-    *,
-    require: bool = False,
-    request_id: Optional[str] = None,
-) -> tuple[str, Optional[Envelope]]:
-    """Resolve idempotency key using atomic acquisition (Issue 19.4).
-
-    Uses SETNX pattern to atomically claim idempotency slot and prevent race conditions
-    where concurrent requests with the same key could both start processing.
-    """
-    request_id = request_id or str(uuid4())
-    runtime = get_runtime()
-    if not idempotency_key:
-        if require:
-            raise _http_error(
-                "validation_error", "Idempotency-Key header required", status_code=400
-            )
-        return request_id, None
-
-    # Attempt atomic acquisition of idempotency slot (Issue 19.4)
-    in_progress_record = {
-        "status": "in_progress",
-        "request_id": request_id,
-        "started_at": datetime.now(timezone.utc).isoformat(),
-    }
-    acquired, existing_record = await _acquire_idempotency_slot(
-        runtime,
-        route,
-        user_id,
-        idempotency_key,
-        in_progress_record,
-        ttl_seconds=IDEMPOTENCY_TTL_SECONDS,
-    )
-
-    if acquired:
-        # We successfully claimed the slot
-        return request_id, None
-
-    # Slot was not acquired. A prior "failed" record is reclaimed atomically
-    # inside _acquire_idempotency_slot (so acquired would be True), meaning a
-    # non-acquired record here is either in progress or a completed result.
-    if existing_record:
-        status = existing_record.get("status")
-        if status == "completed" and existing_record.get("response"):
-            # Replay only successful results so duplicate side effects are avoided.
-            response_payload = existing_record.get("response", {})
-            if "request_id" not in response_payload:
-                response_payload["request_id"] = existing_record.get("request_id", request_id)
-            return existing_record.get("request_id", request_id), Envelope(**response_payload)
-
-    # In progress (or any other non-completed state) - treat as conflict.
-    raise _http_error("conflict", "request in progress", status_code=409)
-
-
-async def _store_idempotency_result(
-    route: str,
-    user_id: str,
-    idempotency_key: Optional[str],
-    envelope: Envelope,
-    status: str = "completed",
-) -> None:
-    if not idempotency_key:
-        return
-    runtime = get_runtime()
-    payload = envelope.model_dump()
-    await _set_cached_idempotency_record(
-        runtime,
-        route,
-        user_id,
-        idempotency_key,
-        {"status": status, "request_id": envelope.request_id, "response": payload},
-        ttl_seconds=IDEMPOTENCY_TTL_SECONDS,
-    )
 
 
 async def get_user(
@@ -776,7 +186,7 @@ async def get_user(
         tenant_hint=x_tenant_id,
     )
     if not ctx:
-        raise _http_error("unauthorized", "invalid session", status_code=401)
+        raise http_error("unauthorized", "invalid session", status_code=401)
     return ctx
 
 
@@ -795,7 +205,7 @@ async def get_admin_user(
         required_role="admin",
     )
     if not ctx:
-        raise _http_error("forbidden", "admin access required", status_code=403)
+        raise http_error("forbidden", "admin access required", status_code=403)
     return ctx
 
 
@@ -806,7 +216,7 @@ def _get_owned_conversation(
         conversation_id, user_id=principal.user_id
     )
     if not conversation:
-        raise _http_error("not_found", "conversation not found", status_code=404)
+        raise http_error("not_found", "conversation not found", status_code=404)
     return conversation
 
 
@@ -828,9 +238,9 @@ def _get_owned_context(
 ) -> KnowledgeContext:
     ctx = runtime.store.get_context(context_id)
     if not ctx:
-        raise _http_error("not_found", "context not found", status_code=404)
+        raise http_error("not_found", "context not found", status_code=404)
     if ctx.owner_user_id != principal.user_id:
-        raise _http_error(
+        raise http_error(
             "forbidden", "context is owned by another user", status_code=403
         )
     return ctx
@@ -839,14 +249,14 @@ def _get_owned_context(
 def _get_owned_artifact(runtime, artifact_id: str, principal: AuthContext):
     artifact = runtime.store.get_artifact(artifact_id)
     if not artifact:
-        raise _http_error("not_found", "artifact not found", status_code=404)
+        raise http_error("not_found", "artifact not found", status_code=404)
     if artifact.owner_user_id and artifact.owner_user_id != principal.user_id:
         if principal.role != "admin":
-            raise _http_error(
+            raise http_error(
                 "forbidden", "artifact is owned by another user", status_code=403
             )
     if not artifact.owner_user_id and principal.role != "admin":
-        raise _http_error(
+        raise http_error(
             "forbidden", "artifact access requires admin privileges", status_code=403
         )
     return artifact
@@ -885,197 +295,6 @@ def _get_pagination_settings(runtime) -> dict:
         # Keep conversation pagination consistent with general defaults (SPEC pagination guidance)
         "default_conversations_limit": settings.default_conversations_limit,
     }
-
-
-# Background label tasks, held so they are not garbage-collected mid-flight.
-_LABEL_TASKS: set[asyncio.Task] = set()
-
-
-def _schedule_turn_labels(
-    runtime,
-    *,
-    conversation_id: str,
-    user_id: str,
-    user_message_id: Optional[str],
-    user_content: str,
-    assistant_content: str,
-    set_title: bool,
-) -> None:
-    """Label a finished turn (and title a new conversation) off the hot path.
-
-    A quick model call, scheduled after the reply is already on its way, so
-    describing the turn never delays the answer. Failures are logged and
-    dropped: labels are cosmetic and the heuristic fallback already applies.
-    """
-
-    async def _run() -> None:
-        try:
-            if user_message_id:
-                label = await asyncio.to_thread(
-                    labels.describe_turn, runtime.llm, user_content, assistant_content
-                )
-                await asyncio.to_thread(
-                    runtime.store.update_message_meta,
-                    user_message_id,
-                    user_id=user_id,
-                    patch={"turn_label": label},
-                )
-            if set_title:
-                title = await asyncio.to_thread(
-                    labels.describe_conversation, runtime.llm, user_content
-                )
-                await asyncio.to_thread(
-                    runtime.store.set_conversation_title,
-                    conversation_id,
-                    user_id=user_id,
-                    title=title,
-                )
-        except Exception as exc:  # noqa: BLE001 - never surface to the user
-            logger.warning(
-                "turn_labeling_failed", conversation_id=conversation_id, error=str(exc)
-            )
-
-    try:
-        task = asyncio.create_task(_run())
-    except RuntimeError:
-        return  # no running loop (sync test context): skip labelling
-    _LABEL_TASKS.add(task)
-    task.add_done_callback(_LABEL_TASKS.discard)
-
-
-_EMBED_BACKFILL_PER_PASS = 30
-
-
-def _backfill_message_embeddings(runtime, history, user_id: str) -> None:
-    """Persist per-turn embeddings for semantic recall (off the hot path).
-
-    A real encoder only; skips turns already embedded; bounded so one pass
-    can't stall on a huge backlog (the next turn's pass continues it).
-    """
-    embeddings = getattr(runtime, "embeddings", None)
-    if embeddings is None or not getattr(embeddings, "is_semantic", False):
-        return
-    updater = getattr(runtime.store, "update_message_meta", None)
-    if not callable(updater):
-        return
-    done = 0
-    for msg in history:
-        if done >= _EMBED_BACKFILL_PER_PASS:
-            break
-        if compaction._message_embedding(msg, embeddings.model_id) is not None:
-            continue
-        content = str(getattr(msg, "content", "") or "").strip()
-        if not content:
-            continue
-        try:
-            vector = embeddings.embed(content)
-            updater(
-                msg.id,
-                user_id=user_id,
-                patch={"embedding": vector, "embedding_model": embeddings.model_id},
-            )
-            done += 1
-        except Exception as exc:  # noqa: BLE001 - backfill is best-effort
-            logger.debug("message_embedding_backfill_failed", error=str(exc))
-            break
-    if done:
-        logger.info("message_embeddings_backfilled", count=done)
-
-
-def _schedule_conversation_digest(
-    runtime, *, conversation_id: str, user_id: str
-) -> None:
-    """Fold turns older than the window into a digest, off the hot path.
-
-    Same discipline as turn labels: scheduled after the reply is on its way,
-    failures logged and dropped. A missing digest costs precision, never
-    correctness — the recent window is always sent verbatim.
-    """
-
-    async def _run() -> None:
-        try:
-            conversation = await asyncio.to_thread(
-                runtime.store.get_conversation, conversation_id, user_id=user_id
-            )
-            if not conversation:
-                return
-            history = await asyncio.to_thread(
-                runtime.store.list_messages, conversation_id, user_id=user_id
-            )
-            # Backfill message embeddings so semantic recall reads persisted
-            # vectors on the hot path instead of embedding turns live. Only
-            # runs with a real encoder; bounded per pass.
-            await asyncio.to_thread(
-                _backfill_message_embeddings, runtime, history, user_id
-            )
-            # Digest exactly what falls outside the model's verbatim window —
-            # the same budget boundary the workflow serves with.
-            keep_tokens = runtime.workflow.history_budget()
-            count = runtime.workflow._count_fn()
-            if not compaction.needs_digest(
-                history, conversation, keep_tokens=keep_tokens, count=count
-            ):
-                return
-            digest = await asyncio.to_thread(
-                lambda: compaction.build_digest(
-                    runtime.llm, history, conversation,
-                    keep_tokens=keep_tokens, count=count,
-                )
-            )
-            if not digest:
-                return
-            await asyncio.to_thread(
-                runtime.store.merge_conversation_meta,
-                conversation_id,
-                {"digest": digest},
-            )
-            logger.info(
-                "conversation_digested",
-                conversation_id=conversation_id,
-                messages=digest.get("messages"),
-                tokens=digest.get("tokens"),
-            )
-        except Exception as exc:  # noqa: BLE001 - never surface to the user
-            logger.warning(
-                "conversation_digest_failed",
-                conversation_id=conversation_id,
-                error=str(exc),
-            )
-
-    try:
-        task = asyncio.create_task(_run())
-    except RuntimeError:
-        return  # no running loop (sync test context)
-    _LABEL_TASKS.add(task)
-    task.add_done_callback(_LABEL_TASKS.discard)
-
-
-def _generate_conversation_title(message: str, max_length: int = 50) -> str:
-    """Generate a conversation title from the first message.
-
-    Creates a human-readable title by truncating the message content.
-    Preserves word boundaries where possible.
-    """
-    if not message:
-        return "New conversation"
-
-    # Clean up whitespace
-    cleaned = " ".join(message.split())
-
-    # Handle whitespace-only input after cleanup
-    if not cleaned:
-        return "New conversation"
-
-    if len(cleaned) <= max_length:
-        return cleaned
-
-    # Truncate at word boundary if possible
-    truncated = cleaned[:max_length]
-    last_space = truncated.rfind(" ")
-    if last_space > max_length // 2:
-        truncated = truncated[:last_space]
-
-    return truncated.rstrip(".,!?;:") + "..."
 
 
 def _apply_session_cookies(
@@ -1140,8 +359,8 @@ async def signup(body: SignupRequest, response: Response):
     """
     runtime = get_runtime()
     if not runtime.settings.allow_signup:
-        raise _http_error("forbidden", "signup disabled", status_code=403)
-    await _limit(runtime, "signup", body.email.lower())
+        raise http_error("forbidden", "signup disabled", status_code=403)
+    await rate_limit(runtime, "signup", body.email.lower())
     # Issue 35.2/53.2: Per CLAUDE.md, derive tenant_id from server config, not user input
     # This prevents tenant spoofing attacks where users register in arbitrary tenants
     user, session, tokens = await runtime.auth.signup(
@@ -1185,7 +404,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
         429: If rate limit exceeded for this email
     """
     runtime = get_runtime()
-    await _limit(runtime, "login", body.email.lower())
+    await rate_limit(runtime, "login", body.email.lower())
     # Bug fix: Pass user_agent and ip_addr for session metadata
     user_agent = request.headers.get("user-agent")
     ip_addr = request.client.host if request.client else None
@@ -1202,7 +421,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
     )
     if not user or not session:
         logger.warning("login_failed", email=body.email, ip=ip_addr)
-        raise _http_error("unauthorized", "invalid credentials", status_code=401)
+        raise http_error("unauthorized", "invalid credentials", status_code=401)
     logger.info("user_login_completed", user_id=user.id, ip=ip_addr)
     _apply_session_cookies(
         response,
@@ -1239,9 +458,9 @@ async def oauth_start(
     """
     runtime = get_runtime()
     # Rate limit OAuth start per client to prevent state token exhaustion
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
-        f"oauth:start:{provider}:{_client_ip(request)}",
+        f"oauth:start:{provider}:{client_ip(request)}",
         limit=20,
         window_seconds=60,
     )
@@ -1254,7 +473,7 @@ async def oauth_start(
     except ValueError as exc:
         # Unsupported or unconfigured provider is a client-visible condition,
         # not a server fault.
-        raise _http_error("invalid_request", str(exc), status_code=400)
+        raise http_error("invalid_request", str(exc), status_code=400)
     return Envelope(
         status="ok",
         data=OAuthStartResponse(
@@ -1285,9 +504,9 @@ async def oauth_callback(
     """
     runtime = get_runtime()
     # Rate limit OAuth callback per client to prevent code brute-forcing
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
-        f"oauth:callback:{provider}:{_client_ip(request)}",
+        f"oauth:callback:{provider}:{client_ip(request)}",
         limit=10,
         window_seconds=60,
     )
@@ -1296,7 +515,7 @@ async def oauth_callback(
         provider, code, state
     )
     if not user or not session:
-        raise _http_error("unauthorized", "oauth verification failed", status_code=401)
+        raise http_error("unauthorized", "oauth verification failed", status_code=401)
     _apply_session_cookies(
         response,
         session,
@@ -1332,7 +551,7 @@ async def refresh_tokens(
     runtime = get_runtime()
     tenant_hint = body.tenant_id or x_tenant_id
     client_ip = request.client.host if request.client else "unknown"
-    await _limit(runtime, "refresh", client_ip)
+    await rate_limit(runtime, "refresh", client_ip)
     user, session, tokens = await runtime.auth.refresh_tokens(
         body.refresh_token, tenant_hint=tenant_hint
     )
@@ -1342,7 +561,7 @@ async def refresh_tokens(
             tenant_hint=tenant_hint,
             has_header=bool(authorization),
         )
-        raise _http_error("unauthorized", "invalid refresh", status_code=401)
+        raise http_error("unauthorized", "invalid refresh", status_code=401)
     _apply_session_cookies(
         response,
         session,
@@ -1378,13 +597,13 @@ async def admin_list_users(
         List of users with their roles and metadata.
     """
     runtime = get_runtime()
-    await _limit(runtime, "admin:read", principal.user_id)
+    await rate_limit(runtime, "admin:read", principal.user_id)
     paging = _get_pagination_settings(runtime)
     resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"])
     # Admin can only see users in their own tenant (prevent cross-tenant access)
     target_tenant = tenant_id or principal.tenant_id
     if target_tenant != principal.tenant_id:
-        raise _http_error(
+        raise http_error(
             "forbidden", "cannot access other tenant users", status_code=403
         )
     users = runtime.auth.list_users(tenant_id=target_tenant, limit=resolved_limit)
@@ -1398,7 +617,7 @@ async def admin_create_user(
     body: AdminCreateUserRequest, principal: AuthContext = Depends(get_admin_user)
 ):
     runtime = get_runtime()
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
         f"admin:create_user:{principal.user_id}",
         runtime.settings.admin_rate_limit_per_minute,
@@ -1406,7 +625,7 @@ async def admin_create_user(
     )
     target_tenant = body.tenant_id or principal.tenant_id
     if target_tenant != principal.tenant_id:
-        raise _http_error(
+        raise http_error(
             "forbidden", "cannot create users in other tenant", status_code=403
         )
     user, password = await runtime.auth.admin_create_user(
@@ -1443,7 +662,7 @@ async def admin_set_role(
     principal: AuthContext = Depends(get_admin_user),
 ):
     runtime = get_runtime()
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
         f"admin:set_role:{principal.user_id}",
         runtime.settings.admin_rate_limit_per_minute,
@@ -1454,7 +673,7 @@ async def admin_set_role(
     if not target_user:
         raise NotFoundError("user not found", detail={"user_id": user_id})
     if target_user.tenant_id != principal.tenant_id:
-        raise _http_error(
+        raise http_error(
             "forbidden", "cannot modify users in other tenant", status_code=403
         )
     # Issue 22.1: set_user_role is now async to revoke sessions on role change
@@ -1479,7 +698,7 @@ async def admin_delete_user(
     user_id: str, principal: AuthContext = Depends(get_admin_user)
 ):
     runtime = get_runtime()
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
         f"admin:delete_user:{principal.user_id}",
         runtime.settings.admin_rate_limit_per_minute,
@@ -1490,7 +709,7 @@ async def admin_delete_user(
     if not target_user:
         raise NotFoundError("user not found", detail={"user_id": user_id})
     if target_user.tenant_id != principal.tenant_id:
-        raise _http_error(
+        raise http_error(
             "forbidden", "cannot delete users in other tenant", status_code=403
         )
     target_email = target_user.email  # Capture before deletion
@@ -1511,7 +730,7 @@ async def admin_delete_user(
 @router.get("/admin/adapters", response_model=Envelope, tags=["admin"])
 async def admin_list_adapters(principal: AuthContext = Depends(get_admin_user)):
     runtime = get_runtime()
-    await _limit(runtime, "admin:read", principal.user_id)
+    await rate_limit(runtime, "admin:read", principal.user_id)
     # Filter adapters by tenant to prevent cross-tenant data exposure
     adapters = list(runtime.store.list_artifacts(
         type_filter="adapter", tenant_id=principal.tenant_id
@@ -1551,7 +770,7 @@ async def admin_inspect_objects(
     principal: AuthContext = Depends(get_admin_user),
 ):
     runtime = get_runtime()
-    await _limit(runtime, "admin:read", principal.user_id)
+    await rate_limit(runtime, "admin:read", principal.user_id)
     paging = _get_pagination_settings(runtime)
     resolved_limit = min(limit or paging["default_conversations_limit"], paging["max_page_size"])
     details = runtime.store.inspect_state(
@@ -1569,7 +788,7 @@ async def request_mfa(body: MFARequest, request: Request):
     client_ip = request.client.host if request.client else "unknown"
     session_cookie = request.cookies.get("session_id")
     # Issue 50.1: Rate limit per IP first to prevent session enumeration attacks
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
         f"mfa:request:ip:{client_ip}",
         runtime.settings.mfa_rate_limit_per_minute,
@@ -1581,13 +800,13 @@ async def request_mfa(body: MFARequest, request: Request):
             ip=client_ip,
             cookie_present=bool(session_cookie),
         )
-        raise _http_error("unauthorized", "invalid session", status_code=401)
+        raise http_error("unauthorized", "invalid session", status_code=401)
     auth_ctx = await runtime.auth.resolve_session(
         body.session_id, allow_pending_mfa=True
     )
     if not auth_ctx:
         logger.warning("mfa_request_invalid_session", ip=client_ip)
-        raise _http_error("unauthorized", "invalid session", status_code=401)
+        raise http_error("unauthorized", "invalid session", status_code=401)
     # Issue 50.1: Validate session IP matches requester IP for security
     session = runtime.store.get_session(body.session_id)
     if session and session.ip_addr and str(session.ip_addr) != client_ip:
@@ -1597,8 +816,8 @@ async def request_mfa(body: MFARequest, request: Request):
             session_ip=str(session.ip_addr),
             request_ip=client_ip,
         )
-        raise _http_error("unauthorized", "session bound to different IP", status_code=401)
-    await _enforce_rate_limit(
+        raise http_error("unauthorized", "session bound to different IP", status_code=401)
+    await enforce(
         runtime,
         f"mfa:request:{auth_ctx.user_id}",
         runtime.settings.mfa_rate_limit_per_minute,
@@ -1615,7 +834,7 @@ async def verify_mfa(body: MFAVerifyRequest, request: Request, response: Respons
     client_ip = request.client.host if request.client else "unknown"
     session_cookie = request.cookies.get("session_id")
     # Issue 50.2: Rate limit per IP first to prevent brute force attacks
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
         f"mfa:verify:ip:{client_ip}",
         runtime.settings.mfa_rate_limit_per_minute,
@@ -1627,13 +846,13 @@ async def verify_mfa(body: MFAVerifyRequest, request: Request, response: Respons
             ip=client_ip,
             cookie_present=bool(session_cookie),
         )
-        raise _http_error("unauthorized", "invalid session", status_code=401)
+        raise http_error("unauthorized", "invalid session", status_code=401)
     auth_ctx = await runtime.auth.resolve_session(
         body.session_id, allow_pending_mfa=True
     )
     if not auth_ctx:
         logger.warning("mfa_verify_invalid_session", ip=client_ip)
-        raise _http_error("unauthorized", "invalid session", status_code=401)
+        raise http_error("unauthorized", "invalid session", status_code=401)
     # Issue 50.2: Validate session IP matches requester IP for security
     session = runtime.store.get_session(body.session_id)
     if session and session.ip_addr and str(session.ip_addr) != client_ip:
@@ -1644,8 +863,8 @@ async def verify_mfa(body: MFAVerifyRequest, request: Request, response: Respons
             request_ip=client_ip,
             user_id=auth_ctx.user_id,
         )
-        raise _http_error("unauthorized", "session bound to different IP", status_code=401)
-    await _enforce_rate_limit(
+        raise http_error("unauthorized", "session bound to different IP", status_code=401)
+    await enforce(
         runtime,
         f"mfa:verify:{auth_ctx.user_id}",
         runtime.settings.mfa_rate_limit_per_minute,
@@ -1656,7 +875,7 @@ async def verify_mfa(body: MFAVerifyRequest, request: Request, response: Respons
     )
     if not ok:
         logger.warning("mfa_verify_failed", user_id=auth_ctx.user_id, ip=client_ip)
-        raise _http_error("unauthorized", "invalid mfa", status_code=401)
+        raise http_error("unauthorized", "invalid mfa", status_code=401)
     user, session, tokens = runtime.auth.issue_tokens_for_session(body.session_id)
     resp: dict = {"status": "verified"}
     if user and session:
@@ -1686,7 +905,7 @@ async def verify_mfa(body: MFAVerifyRequest, request: Request, response: Respons
 async def get_mfa_status(principal: AuthContext = Depends(get_user)):
     """Get the current MFA status for the authenticated user."""
     runtime = get_runtime()
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
         f"mfa:status:{principal.user_id}",
         runtime.settings.read_rate_limit_per_minute,
@@ -1706,7 +925,7 @@ async def get_mfa_status(principal: AuthContext = Depends(get_user)):
 async def disable_mfa(body: MFADisableRequest, principal: AuthContext = Depends(get_user)):
     """Disable MFA for the authenticated user. Requires current TOTP code."""
     runtime = get_runtime()
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
         f"mfa:disable:{principal.user_id}",
         runtime.settings.mfa_rate_limit_per_minute,
@@ -1714,10 +933,10 @@ async def disable_mfa(body: MFADisableRequest, principal: AuthContext = Depends(
     )
     mfa_cfg = runtime.store.get_user_mfa_secret(principal.user_id)
     if not mfa_cfg or not mfa_cfg.enabled:
-        raise _http_error("validation_error", "MFA not enabled", status_code=400)
+        raise http_error("validation_error", "MFA not enabled", status_code=400)
     # Verify the code before disabling
     if not runtime.auth._verify_totp(mfa_cfg.secret, body.code):
-        raise _http_error("unauthorized", "invalid MFA code", status_code=401)
+        raise http_error("unauthorized", "invalid MFA code", status_code=401)
     # Disable MFA by setting enabled=False
     runtime.store.set_user_mfa_secret(principal.user_id, mfa_cfg.secret, enabled=False)
 
@@ -1732,7 +951,7 @@ async def disable_mfa(body: MFADisableRequest, principal: AuthContext = Depends(
 @router.post("/auth/reset/request", response_model=Envelope, tags=["auth"])
 async def request_reset(body: PasswordResetRequest):
     runtime = get_runtime()
-    await _limit(runtime, "reset", body.email.lower())
+    await rate_limit(runtime, "reset", body.email.lower())
     # Check if user exists before generating token (don't reveal if user exists)
     user = runtime.store.get_user_by_email(body.email)
     if user:
@@ -1748,15 +967,15 @@ async def confirm_reset(body: PasswordResetConfirm, request: Request):
     runtime = get_runtime()
     # Rate limit per client to prevent token brute-forcing without letting one
     # client lock out password reset for everyone.
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
-        f"reset:confirm:{_client_ip(request)}",
+        f"reset:confirm:{client_ip(request)}",
         limit=5,
         window_seconds=300,
     )
     ok = await runtime.auth.complete_password_reset(body.token, body.new_password)
     if not ok:
-        raise _http_error("validation_error", "invalid token", status_code=400)
+        raise http_error("validation_error", "invalid token", status_code=400)
     return Envelope(status="ok", data={"status": "reset"})
 
 
@@ -1767,10 +986,10 @@ async def get_current_user(principal: AuthContext = Depends(get_user)):
     Returns user details including email verification status.
     """
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
     user = runtime.store.get_user(principal.user_id)
     if not user:
-        raise _http_error("not_found", "user not found", status_code=404)
+        raise http_error("not_found", "user not found", status_code=404)
     return Envelope(
         status="ok",
         data=UserResponse(
@@ -1794,7 +1013,7 @@ async def get_user_settings(principal: AuthContext = Depends(get_user)):
     Returns user preferences like locale, timezone, voice settings.
     """
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
     settings = runtime.store.get_user_settings(principal.user_id)
     if not settings:
         # Return empty settings if none exist
@@ -1824,7 +1043,7 @@ async def update_user_settings(
     Only provided fields will be updated; omitted fields remain unchanged.
     """
     runtime = get_runtime()
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
         f"write:{principal.user_id}",
         runtime.settings.chat_rate_limit_per_minute,
@@ -1854,7 +1073,7 @@ async def update_user_settings(
 async def request_email_verification(principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
     # Rate limit to prevent email spam
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
         f"verify:request:{principal.user_id}",
         limit=5,
@@ -1862,7 +1081,7 @@ async def request_email_verification(principal: AuthContext = Depends(get_user))
     )
     user = runtime.store.get_user(principal.user_id)
     if not user:
-        raise _http_error("not_found", "user not found", status_code=404)
+        raise http_error("not_found", "user not found", status_code=404)
     token = await runtime.auth.request_email_verification(user)
     # Run blocking SMTP in thread to avoid blocking event loop
     await asyncio.to_thread(runtime.email.send_email_verification, user.email, token)
@@ -1874,15 +1093,15 @@ async def verify_email(body: EmailVerificationRequest, request: Request):
     runtime = get_runtime()
     # Rate limit per client to prevent token brute-forcing without letting one
     # client block email verification platform-wide.
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
-        f"verify:email:{_client_ip(request)}",
+        f"verify:email:{client_ip(request)}",
         limit=10,
         window_seconds=300,
     )
     ok = await runtime.auth.complete_email_verification(body.token)
     if not ok:
-        raise _http_error("validation_error", "invalid token", status_code=400)
+        raise http_error("validation_error", "invalid token", status_code=400)
     return Envelope(status="ok", data={"status": "verified"})
 
 
@@ -1896,7 +1115,7 @@ async def change_password(
     Requires the current password for verification.
     """
     runtime = get_runtime()
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
         f"password:change:{principal.user_id}",
         limit=5,
@@ -1905,7 +1124,7 @@ async def change_password(
 
     # Verify current password
     if not runtime.auth.verify_password(principal.user_id, body.current_password):
-        raise _http_error("unauthorized", "current password is incorrect", status_code=401)
+        raise http_error("unauthorized", "current password is incorrect", status_code=401)
 
     # Save new password
     runtime.auth.save_password(principal.user_id, body.new_password)
@@ -1934,20 +1153,20 @@ async def logout(
     runtime = get_runtime()
     # By address: logout takes an unauthenticated session id, so an attacker
     # could otherwise walk guesses at it to revoke other people's sessions.
-    await _limit(runtime, "write", _client_ip(request))
+    await rate_limit(runtime, "write", client_ip(request))
     if authorization or session_id:
         ctx = await runtime.auth.authenticate(
             authorization, session_id, allow_pending_mfa=True
         )
         if not ctx:
-            raise _http_error("unauthorized", "invalid session", status_code=401)
+            raise http_error("unauthorized", "invalid session", status_code=401)
         # SECURITY: Only allow revoking the authenticated user's own session
         target_session = session_id or ctx.session_id
         if target_session and target_session != ctx.session_id:
             # Verify session ownership before revoking
             sess = runtime.store.get_session(target_session)
             if not sess or sess.user_id != ctx.user_id:
-                raise _http_error("forbidden", "cannot revoke other user sessions", status_code=403)
+                raise http_error("forbidden", "cannot revoke other user sessions", status_code=403)
         if target_session:
             await runtime.auth.revoke(target_session)
             # Issue 51.9: Audit logging for session revocation (SOC2 compliance)
@@ -1997,14 +1216,14 @@ async def chat(
     )
 
     # SPEC §18: Accept Idempotency-Key when provided (optional)
-    async with IdempotencyGuard(
+    async with idempotency.IdempotencyGuard(
         "chat", user_id, idempotency_key, require=False
     ) as idem:
         if idem.cached:
             return idem.cached
 
         # SPEC §18: Per-plan adjustable rate limits
-        await _enforce_rate_limit_per_plan(
+        await enforce_per_plan(
             runtime,
             f"chat:{user_id}",
             runtime.settings.chat_rate_limit_per_minute,
@@ -2012,150 +1231,142 @@ async def chat(
             plan_tier,
         )
 
-        # SPEC §18: Concurrency caps - limit decode pressure per user
-        await _acquire_inference_slot(runtime, user_id)
-        try:
-            await _acquire_workflow_slot(runtime, user_id)
-            try:
-                conversation: Conversation | None = None
-                context_id = body.context_id
-                validated_context_id: str | None = None
-                if body.conversation_id:
-                    conversation = _get_owned_conversation(
-                        runtime, body.conversation_id, principal
-                    )
-                else:
-                    if context_id:
-                        _get_owned_context(runtime, context_id, principal)
-                        validated_context_id = context_id
-                    # Generate title from first message for new conversations
-                    auto_title = _generate_conversation_title(body.message.content)
-                    conversation = runtime.store.create_conversation(
-                        user_id=user_id, active_context_id=body.context_id, title=auto_title
-                    )
-                conversation_id = conversation.id
-                context_id = context_id or conversation.active_context_id
-                if context_id and context_id != validated_context_id:
+        # SPEC §18: concurrency caps - limit decode pressure per user. The same
+        # slots the streaming path takes, named once in service.admission.
+        async with admission.slots(runtime, user_id, *admission.CHAT_SLOTS):
+            conversation: Conversation | None = None
+            context_id = body.context_id
+            validated_context_id: str | None = None
+            if body.conversation_id:
+                conversation = _get_owned_conversation(
+                    runtime, body.conversation_id, principal
+                )
+            else:
+                if context_id:
                     _get_owned_context(runtime, context_id, principal)
-                user_content = body.message.content
-                voice_meta: dict = {}
-                if body.message.mode == "voice":
-                    try:
-                        audio_bytes = base64.b64decode(body.message.content)
-                    except Exception as exc:
-                        raise _http_error(
-                            "validation_error",
-                            "invalid base64-encoded audio payload",
-                            status_code=400,
-                        ) from exc
-                    transcript = await runtime.voice.transcribe(audio_bytes, user_id=user_id) or {}
-                    user_content = transcript.get("transcript") or transcript.get("text")
-                    if not user_content:
-                        raise _http_error(
-                            "validation_error", "unable to transcribe audio", status_code=400
-                        )
-                    voice_meta = {"mode": "voice", "transcript": transcript}
-                user_content_struct = normalize_content_struct(
-                    body.message.content_struct, user_content
+                    validated_context_id = context_id
+                # Generate title from first message for new conversations
+                auto_title = turn_effects.conversation_title(body.message.content)
+                conversation = runtime.store.create_conversation(
+                    user_id=user_id, active_context_id=body.context_id, title=auto_title
                 )
-                user_msg = runtime.store.append_message(
-                    conversation_id,
-                    sender="user",
-                    role="user",
-                    content=user_content,
-                    meta=voice_meta or None,
-                    content_struct=user_content_struct,
-                )
-                # A new conversation gets its real title from the same pass.
-                needs_title = not body.conversation_id
-                orchestration = await runtime.workflow.run(
-                    body.workflow_id,
-                    conversation_id,
-                    user_content,
-                    context_id,
-                    user_id,
-                    tenant_id=principal.tenant_id,
-                )
-                orchestration_dict: dict[str, Any] = (
-                    orchestration if isinstance(orchestration, dict) else {}
-                )
-                usage: dict[str, Any] = orchestration_dict.get("usage") or {}
-                adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
-                assistant_content_struct = normalize_content_struct(
-                    orchestration_dict.get("content_struct"),
-                    orchestration_dict.get("content"),
-                )
-                assistant_content = orchestration_dict.get("content", "No response generated.")
-                assistant_msg = runtime.store.append_message(
-                    conversation_id,
-                    sender="assistant",
-                    role="assistant",
-                    content=assistant_content,
-                    content_struct=assistant_content_struct,
-                    meta={
-                        "adapters": orchestration_dict.get("adapters", []),
-                        "adapter_gates": orchestration_dict.get("adapter_gates", []),
-                        "routing_trace": orchestration_dict.get("routing_trace", []),
-                        "workflow_trace": orchestration_dict.get("workflow_trace", []),
-                        "usage": usage,
-                    },
-                )
-                resp = ChatResponse(
-                    message_id=assistant_msg.id,
-                    conversation_id=conversation_id,
-                    content=assistant_msg.content,
-                    content_struct=assistant_msg.content_struct,
-                    workflow_id=body.workflow_id,
-                    adapters=adapter_names,
-                    adapter_gates=orchestration_dict.get("adapter_gates", []),
-                    usage=usage,
-                    context_snippets=orchestration_dict.get("context_snippets", []),
-                    routing_trace=orchestration_dict.get("routing_trace", []),
-                    workflow_trace=orchestration_dict.get("workflow_trace", []),
-                )
-                _schedule_turn_labels(
-                    runtime,
-                    conversation_id=conversation_id,
-                    user_id=user_id,
-                    user_message_id=getattr(user_msg, "id", None),
-                    user_content=user_content,
-                    assistant_content=assistant_content,
-                    set_title=needs_title,
-                )
-                _schedule_conversation_digest(
-                    runtime, conversation_id=conversation_id, user_id=user_id
-                )
-                envelope = Envelope(
-                    status="ok", data=resp.model_dump(), request_id=idem.request_id
-                )
-                logger.info(
-                    "chat_response",
-                    user_id=user_id,
-                    conversation_id=conversation_id,
-                    context_id=context_id,
-                    workflow_id=body.workflow_id,
-                    adapters=adapter_names,
-                    total_tokens=usage.get("total_tokens"),
-                    prompt_tokens=usage.get("prompt_tokens"),
-                    completion_tokens=usage.get("completion_tokens"),
-                    request_id=idem.request_id,
-                )
-                if runtime.cache:
-                    # Issue 38.4: Add limit to prevent unbounded memory usage
-                    # Use reasonable limit for conversation context caching
-                    paging = _get_pagination_settings(runtime)
-                    history = runtime.store.list_messages(
-                        conversation_id, limit=paging["max_page_size"], user_id=principal.user_id
+            conversation_id = conversation.id
+            context_id = context_id or conversation.active_context_id
+            if context_id and context_id != validated_context_id:
+                _get_owned_context(runtime, context_id, principal)
+            user_content = body.message.content
+            voice_meta: dict = {}
+            if body.message.mode == "voice":
+                try:
+                    audio_bytes = base64.b64decode(body.message.content)
+                except Exception as exc:
+                    raise http_error(
+                        "validation_error",
+                        "invalid base64-encoded audio payload",
+                        status_code=400,
+                    ) from exc
+                transcript = await runtime.voice.transcribe(audio_bytes, user_id=user_id) or {}
+                user_content = transcript.get("transcript") or transcript.get("text")
+                if not user_content:
+                    raise http_error(
+                        "validation_error", "unable to transcribe audio", status_code=400
                     )
-                    await runtime.workflow.cache_conversation_state(conversation_id, history)
-                await idem.store_result(envelope)
-                return envelope
-            finally:
-                # Always release workflow slot, even on error
-                await _release_workflow_slot(runtime, user_id)
-        finally:
-            # SPEC §18: Ensure inference slots are returned promptly
-            await _release_inference_slot(runtime, user_id)
+                voice_meta = {"mode": "voice", "transcript": transcript}
+            user_content_struct = normalize_content_struct(
+                body.message.content_struct, user_content
+            )
+            user_msg = runtime.store.append_message(
+                conversation_id,
+                sender="user",
+                role="user",
+                content=user_content,
+                meta=voice_meta or None,
+                content_struct=user_content_struct,
+            )
+            # A new conversation gets its real title from the same pass.
+            needs_title = not body.conversation_id
+            orchestration = await runtime.workflow.run(
+                body.workflow_id,
+                conversation_id,
+                user_content,
+                context_id,
+                user_id,
+                tenant_id=principal.tenant_id,
+            )
+            orchestration_dict: dict[str, Any] = (
+                orchestration if isinstance(orchestration, dict) else {}
+            )
+            usage: dict[str, Any] = orchestration_dict.get("usage") or {}
+            adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
+            assistant_content_struct = normalize_content_struct(
+                orchestration_dict.get("content_struct"),
+                orchestration_dict.get("content"),
+            )
+            assistant_content = orchestration_dict.get("content", "No response generated.")
+            assistant_msg = runtime.store.append_message(
+                conversation_id,
+                sender="assistant",
+                role="assistant",
+                content=assistant_content,
+                content_struct=assistant_content_struct,
+                meta={
+                    "adapters": orchestration_dict.get("adapters", []),
+                    "adapter_gates": orchestration_dict.get("adapter_gates", []),
+                    "routing_trace": orchestration_dict.get("routing_trace", []),
+                    "workflow_trace": orchestration_dict.get("workflow_trace", []),
+                    "usage": usage,
+                },
+            )
+            resp = ChatResponse(
+                message_id=assistant_msg.id,
+                conversation_id=conversation_id,
+                content=assistant_msg.content,
+                content_struct=assistant_msg.content_struct,
+                workflow_id=body.workflow_id,
+                adapters=adapter_names,
+                adapter_gates=orchestration_dict.get("adapter_gates", []),
+                usage=usage,
+                context_snippets=orchestration_dict.get("context_snippets", []),
+                routing_trace=orchestration_dict.get("routing_trace", []),
+                workflow_trace=orchestration_dict.get("workflow_trace", []),
+            )
+            turn_effects.schedule_turn_labels(
+                runtime,
+                conversation_id=conversation_id,
+                user_id=user_id,
+                user_message_id=getattr(user_msg, "id", None),
+                user_content=user_content,
+                assistant_content=assistant_content,
+                set_title=needs_title,
+            )
+            turn_effects.schedule_conversation_digest(
+                runtime, conversation_id=conversation_id, user_id=user_id
+            )
+            envelope = Envelope(
+                status="ok", data=resp.model_dump(), request_id=idem.request_id
+            )
+            logger.info(
+                "chat_response",
+                user_id=user_id,
+                conversation_id=conversation_id,
+                context_id=context_id,
+                workflow_id=body.workflow_id,
+                adapters=adapter_names,
+                total_tokens=usage.get("total_tokens"),
+                prompt_tokens=usage.get("prompt_tokens"),
+                completion_tokens=usage.get("completion_tokens"),
+                request_id=idem.request_id,
+            )
+            if runtime.cache:
+                # Issue 38.4: Add limit to prevent unbounded memory usage
+                # Use reasonable limit for conversation context caching
+                paging = _get_pagination_settings(runtime)
+                history = runtime.store.list_messages(
+                    conversation_id, limit=paging["max_page_size"], user_id=principal.user_id
+                )
+                await runtime.workflow.cache_conversation_state(conversation_id, history)
+            await idem.store_result(envelope)
+            return envelope
     # Exceptions bubble through the guard which records failed states
 
 
@@ -2176,7 +1387,7 @@ async def cancel_chat(
     runtime = get_runtime()
 
     # Rate limit cancellation requests (5 per minute per user)
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
         f"chat_cancel:{principal.user_id}",
         limit=5,
@@ -2186,7 +1397,7 @@ async def cancel_chat(
     request_id = body.request_id
 
     # Try to cancel in-memory active request (Issue 50.5: validates ownership)
-    cancelled, reason = await _cancel_request(request_id, principal.user_id)
+    cancelled, reason = await cancellation.cancel(request_id, principal.user_id)
 
     if cancelled:
         logger.info("chat_request_cancelled", request_id=request_id, user_id=principal.user_id)
@@ -2201,7 +1412,7 @@ async def cancel_chat(
 
     # Issue 50.5: Return 403 if user doesn't own the request
     if reason == "not_owner":
-        raise _http_error(
+        raise http_error(
             "forbidden", "cannot cancel requests owned by other users", status_code=403
         )
 
@@ -2229,13 +1440,13 @@ async def cancel_chat(
 def _require_notes_enabled(runtime) -> None:
     """403 when the vault is switched off. settings carries the admin value."""
     if not runtime.settings.notes_enabled:
-        raise _http_error("notes_disabled", "the notes vault is disabled", status_code=403)
+        raise http_error("notes_disabled", "the notes vault is disabled", status_code=403)
 
 
 def _get_owned_note(runtime, note_id: str, principal: AuthContext):
     note = runtime.store.get_note(note_id, user_id=principal.user_id)
     if not note:
-        raise _http_error("not_found", "note not found", status_code=404)
+        raise http_error("not_found", "note not found", status_code=404)
     return note
 
 
@@ -2268,15 +1479,15 @@ def _save_note_graph(runtime, principal: AuthContext, note) -> None:
 @router.post("/notes", response_model=Envelope, status_code=201, tags=["notes"])
 async def create_note(body: NoteCreateRequest, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
-    await _limit(runtime, "write", principal.user_id)
+    await rate_limit(runtime, "write", principal.user_id)
     _require_notes_enabled(runtime)
     title = notes_service.normalize_title(body.title)
     if not title:
-        raise _http_error("bad_request", "title required", status_code=400)
+        raise http_error("bad_request", "title required", status_code=400)
     try:
         note = runtime.store.create_note(principal.user_id, title, body.content)
     except ConstraintViolation:
-        raise _http_error(
+        raise http_error(
             "conflict", "a note with this title already exists", status_code=409
         )
     _save_note_graph(runtime, principal, note)
@@ -2290,7 +1501,7 @@ async def list_notes(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
     _require_notes_enabled(runtime)
     notes = runtime.store.list_notes(
         principal.user_id, limit=min(max(limit, 1), 500), offset=max(offset, 0)
@@ -2308,7 +1519,7 @@ async def list_notes(
 async def notes_graph(principal: AuthContext = Depends(get_user)):
     """Nodes and edges of the user's vault, for the graph view."""
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
     _require_notes_enabled(runtime)
     notes = runtime.store.list_notes(principal.user_id, limit=10_000)
     edges = runtime.store.list_note_edges(principal.user_id)
@@ -2334,7 +1545,7 @@ async def list_sweep_reports(
 ):
     """Past sweep reports, newest first — replay without re-spending calls."""
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
     _require_notes_enabled(runtime)
     lister = getattr(runtime.store, "list_sweep_reports", None)
     if not callable(lister):
@@ -2359,7 +1570,7 @@ async def list_sweep_reports(
 @router.get("/notes/{note_id}", response_model=Envelope, tags=["notes"])
 async def get_note(note_id: str, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
     _require_notes_enabled(runtime)
     note = _get_owned_note(runtime, note_id, principal)
     links = [
@@ -2389,7 +1600,7 @@ async def update_note(
     note_id: str, body: NoteUpdateRequest, principal: AuthContext = Depends(get_user)
 ):
     runtime = get_runtime()
-    await _limit(runtime, "write", principal.user_id)
+    await rate_limit(runtime, "write", principal.user_id)
     _require_notes_enabled(runtime)
     existing = _get_owned_note(runtime, note_id, principal)
     old_title = existing.title
@@ -2397,7 +1608,7 @@ async def update_note(
     try:
         note = runtime.store.update_note(note_id, title=title, content=body.content)
     except ConstraintViolation:
-        raise _http_error(
+        raise http_error(
             "conflict", "a note with this title already exists", status_code=409
         )
     _save_note_graph(runtime, principal, note)
@@ -2413,7 +1624,7 @@ async def update_note(
 @router.delete("/notes/{note_id}", response_model=Envelope, tags=["notes"])
 async def delete_note(note_id: str, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
-    await _limit(runtime, "write", principal.user_id)
+    await rate_limit(runtime, "write", principal.user_id)
     _require_notes_enabled(runtime)
     _get_owned_note(runtime, note_id, principal)
     sources = runtime.store.list_backlinks(note_id)
@@ -2429,7 +1640,7 @@ async def search_notes(
     body: NoteSearchRequest, principal: AuthContext = Depends(get_user)
 ):
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
     _require_notes_enabled(runtime)
     results = notes_service.search_notes(
         runtime.store,
@@ -2462,7 +1673,7 @@ async def sweep_vault(principal: AuthContext = Depends(get_user)):
     """
     runtime = get_runtime()
     _require_notes_enabled(runtime)
-    await _enforce_rate_limit(
+    await enforce(
         runtime, f"notes_sweep:{principal.user_id}", limit=2, window_seconds=600
     )
     report = await asyncio.to_thread(
@@ -2497,7 +1708,7 @@ async def note_from_file(
     the witness and note_search treat it like anything else the user wrote.
     """
     runtime = get_runtime()
-    await _limit(runtime, "write", principal.user_id)
+    await rate_limit(runtime, "write", principal.user_id)
     _require_notes_enabled(runtime)
     from liminallm.service.attachments import attachment_path
 
@@ -2505,7 +1716,7 @@ async def note_from_file(
         runtime.settings.shared_fs_root, principal.user_id, body.name
     )
     if not path or not path.is_file():
-        raise _http_error("not_found", "file not found", status_code=404)
+        raise http_error("not_found", "file not found", status_code=404)
     try:
         extracted = await asyncio.to_thread(
             extract_service.extract_text,
@@ -2516,9 +1727,9 @@ async def note_from_file(
             ),
         )
     except extract_service.ExtractError as exc:
-        raise _http_error("bad_request", exc.reason, status_code=400)
+        raise http_error("bad_request", exc.reason, status_code=400)
     except OSError:
-        raise _http_error("bad_request", "file is not readable", status_code=400)
+        raise http_error("bad_request", "file is not readable", status_code=400)
     text = extracted["text"]
     truncated = len(text.encode("utf-8")) > notes_service.NOTE_FROM_FILE_MAX_BYTES
     if truncated:
@@ -2547,7 +1758,7 @@ async def note_from_file(
             },
         )
     except ConstraintViolation:
-        raise _http_error(
+        raise http_error(
             "conflict", "a note with this title already exists", status_code=409
         )
     _save_note_graph(runtime, principal, note)
@@ -2571,7 +1782,7 @@ async def witness_note(
     runtime = get_runtime()
     _require_notes_enabled(runtime)
     note = _get_owned_note(runtime, note_id, principal)
-    await _enforce_rate_limit(
+    await enforce(
         runtime, f"notes_witness:{principal.user_id}", limit=5, window_seconds=60
     )
     report = await asyncio.to_thread(
@@ -2599,7 +1810,7 @@ async def record_preference(
     runtime = get_runtime()
 
     # Rate limit preference recording (triggers expensive clustering operations)
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
         f"preferences:{principal.user_id}",
         limit=30,
@@ -2658,7 +1869,7 @@ async def record_routing_feedback(
     runtime = get_runtime()
 
     # Rate limit routing feedback (shares limit with general preferences)
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
         f"preferences:{principal.user_id}",
         limit=30,
@@ -2701,7 +1912,7 @@ async def preference_insights(
     runtime = get_runtime()
 
     # Rate limit insights queries
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
         f"preferences_insights:{principal.user_id}",
         limit=60,
@@ -2742,7 +1953,7 @@ async def list_artifacts(
         Paginated list of artifacts with metadata.
     """
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
     paging = _get_pagination_settings(runtime)
     kind_filter = kind or (type if type and "." in type else None)
     type_filter = type if type and "." not in type else None
@@ -2813,7 +2024,7 @@ async def get_artifact(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
     artifact = _get_owned_artifact(runtime, artifact_id, principal)
     current_version = runtime.store.get_artifact_current_version(artifact_id)
     resp = ArtifactResponse(
@@ -2839,7 +2050,7 @@ async def list_tool_specs(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
     resolved_page_size = min(max(page_size, 1), 200)
     artifacts = list(runtime.store.list_artifacts(
         type_filter="tool",
@@ -2884,7 +2095,7 @@ async def get_tool_spec(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
     artifact = _get_owned_artifact(runtime, artifact_id, principal)
     if not (
         isinstance(artifact.schema, dict) and artifact.schema.get("kind") == "tool.spec"
@@ -2914,7 +2125,7 @@ async def list_workflows(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
     resolved_page_size = min(max(page_size, 1), 200)
     artifacts = list(runtime.store.list_artifacts(
         type_filter="workflow",
@@ -2960,7 +2171,7 @@ async def list_artifact_versions(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
     paging = _get_pagination_settings(runtime)
     resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"])
     # Verify ownership before listing versions
@@ -2997,9 +2208,9 @@ async def invoke_tool(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     runtime = get_runtime()
-    await _limit(runtime, "write", principal.user_id)
+    await rate_limit(runtime, "write", principal.user_id)
     # SPEC §18: Accept Idempotency-Key when provided (optional)
-    async with IdempotencyGuard(
+    async with idempotency.IdempotencyGuard(
         f"tools:{tool_id}:invoke", principal.user_id, idempotency_key, require=False
     ) as idem:
         if idem.cached:
@@ -3040,9 +2251,9 @@ async def create_artifact(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     runtime = get_runtime()
-    await _limit(runtime, "write", principal.user_id)
+    await rate_limit(runtime, "write", principal.user_id)
     # SPEC §18: Accept Idempotency-Key when provided (optional)
-    async with IdempotencyGuard(
+    async with idempotency.IdempotencyGuard(
         "artifacts:create", principal.user_id, idempotency_key, require=False
     ) as idem:
         if idem.cached:
@@ -3239,7 +2450,7 @@ async def patch_artifact(
     - Legacy format: {"schema": {...}, "description": "..."} (for backward compatibility)
     """
     runtime = get_runtime()
-    await _limit(runtime, "write", principal.user_id)
+    await rate_limit(runtime, "write", principal.user_id)
     current = _get_owned_artifact(runtime, artifact_id, principal)
 
     normalized = body.get_normalized_patch()
@@ -3298,7 +2509,7 @@ async def propose_patch(
 ):
     runtime = get_runtime()
     # Rate limit configops per SPEC §18: 30 req/hour
-    await _limit(runtime, "configops", principal.user_id)
+    await rate_limit(runtime, "configops", principal.user_id)
     proposer = "human_admin" if principal.role == "admin" else "user"
     audit = runtime.store.record_config_patch(
         artifact_id=body.artifact_id,
@@ -3327,7 +2538,7 @@ async def list_config_patches(
 ):
     runtime = get_runtime()
     # Rate limit configops per SPEC §18: 30 req/hour
-    await _limit(runtime, "configops", principal.user_id)
+    await rate_limit(runtime, "configops", principal.user_id)
     patches = runtime.store.list_config_patches(status)
     items = [
         ConfigPatchAuditResponse(
@@ -3355,7 +2566,7 @@ async def decide_config_patch(
 ):
     runtime = get_runtime()
     # Rate limit configops per SPEC §18: 30 req/hour
-    await _limit(runtime, "configops", principal.user_id)
+    await rate_limit(runtime, "configops", principal.user_id)
     decision = runtime.config_ops.decide_patch(patch_id, body.decision, body.reason)
     resp = ConfigPatchAuditResponse(
         id=decision.id,
@@ -3379,7 +2590,7 @@ async def apply_config_patch(
 ):
     runtime = get_runtime()
     # Rate limit configops per SPEC §18: 30 req/hour
-    await _limit(runtime, "configops", principal.user_id)
+    await rate_limit(runtime, "configops", principal.user_id)
     result = runtime.config_ops.apply_patch(
         patch_id, approver_user_id=principal.user_id
     )
@@ -3409,7 +2620,7 @@ async def auto_patch(
 ):
     runtime = get_runtime()
     # Rate limit configops per SPEC §18: 30 req/hour
-    await _limit(runtime, "configops", principal.user_id)
+    await rate_limit(runtime, "configops", principal.user_id)
     audit = runtime.config_ops.auto_generate_patch(
         body.artifact_id, principal.user_id, goal=body.goal
     )
@@ -3432,7 +2643,7 @@ async def auto_patch(
 async def get_config(principal: AuthContext = Depends(get_admin_user)):
     """Expose runtime configuration for the admin console."""
     runtime = get_runtime()
-    await _limit(runtime, "admin:read", principal.user_id)
+    await rate_limit(runtime, "admin:read", principal.user_id)
 
     def _sanitize_dict(data: dict) -> dict:
         """Recursively sanitize sensitive fields in config dictionaries."""
@@ -3495,7 +2706,7 @@ async def get_system_settings(principal: AuthContext = Depends(get_admin_user)):
     multipliers that can be modified via the admin UI.
     """
     runtime = get_runtime()
-    await _limit(runtime, "admin:read", principal.user_id)
+    await rate_limit(runtime, "admin:read", principal.user_id)
     return Envelope(status="ok", data=runtime.store.get_system_settings())
 
 
@@ -3510,7 +2721,7 @@ async def get_system_settings_schema(
     console, and the control's limits are the ones the API enforces.
     """
     runtime = get_runtime()
-    await _limit(runtime, "admin:read", principal.user_id)
+    await rate_limit(runtime, "admin:read", principal.user_id)
     stored = runtime.store.get_system_settings_overrides()
     fields = managed_settings_schema()
     for entry in fields:
@@ -3559,7 +2770,7 @@ async def update_system_settings(
     - Tenant: default_tenant_id ("public"), jwt_issuer ("liminallm"), jwt_audience ("liminal-clients")
     """
     runtime = get_runtime()
-    await _limit(runtime, "admin:write", principal.user_id)
+    await rate_limit(runtime, "admin:write", principal.user_id)
 
     # A blank secret means the operator did not retype it, not that they want
     # it cleared. The console cannot show the current value, so it cannot
@@ -3579,7 +2790,7 @@ async def update_system_settings(
         body, runtime.store.get_system_settings_raw()
     )
     if errors:
-        raise _http_error(
+        raise http_error(
             "validation_error",
             "; ".join(f"{key}: {message}" for key, message in sorted(errors.items())),
             status_code=400,
@@ -3613,7 +2824,7 @@ async def update_system_settings(
                 admin_user_id=principal.user_id,
                 error=str(exc),
             )
-            raise _http_error(
+            raise http_error(
                 "server_error",
                 "Settings were saved but the model services failed to reload; the "
                 "previous backend remains active. Retry, or restart to apply them.",
@@ -3644,14 +2855,14 @@ async def patch_system_settings(
 @router.get("/files/limits", response_model=Envelope, tags=["files"])
 async def get_file_limits(principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
     # Issue 4.3: Return per-plan upload limits (SPEC §18)
     user = runtime.store.get_user(principal.user_id)
     plan_tier = user.plan_tier if user else "free"
     return Envelope(
         status="ok",
         data={
-            "max_upload_bytes": _get_plan_upload_limit(runtime, plan_tier),
+            "max_upload_bytes": plan_upload_limit(runtime, plan_tier),
             "plan_tier": plan_tier,
             "allowed_extensions": sorted(ALLOWED_UPLOAD_EXTENSIONS),
         },
@@ -3679,7 +2890,7 @@ async def upload_file(
 
     runtime = get_runtime()
     # SPEC §18: Accept Idempotency-Key when provided (optional)
-    async with IdempotencyGuard(
+    async with idempotency.IdempotencyGuard(
         "files:upload", principal.user_id, idempotency_key, require=False
     ) as idem:
         if idem.cached:
@@ -3694,7 +2905,7 @@ async def upload_file(
             safe_filename = "untitled"
         ext = FilePath(safe_filename).suffix.lower()
         if ext not in ALLOWED_UPLOAD_EXTENSIONS:
-            raise _http_error(
+            raise http_error(
                 "validation_error",
                 f"unsupported file extension: {ext or 'none'}",
                 status_code=400,
@@ -3708,7 +2919,7 @@ async def upload_file(
         # Issue 4.3: Enforce per-plan file size limits (SPEC §18)
         user = runtime.store.get_user(principal.user_id)
         plan_tier = user.plan_tier if user else "free"
-        max_bytes = max(1, _get_plan_upload_limit(runtime, plan_tier))
+        max_bytes = max(1, plan_upload_limit(runtime, plan_tier))
         # Rate limit before buffering the entire payload to avoid pre-limit memory spikes
         declared_size = None
         if file.headers:
@@ -3723,7 +2934,7 @@ async def upload_file(
         approx_cost = (
             max(1, math.ceil(declared_size / (256 * 1024))) if declared_size else 1
         )
-        await _enforce_rate_limit(
+        await enforce(
             runtime,
             f"files:upload:{principal.user_id}",
             runtime.settings.files_upload_rate_limit_per_minute,
@@ -3733,7 +2944,7 @@ async def upload_file(
         contents = await file.read(max_bytes + 1)
         actual_cost = max(1, math.ceil(len(contents) / (256 * 1024)))
         if actual_cost > approx_cost:
-            await _enforce_rate_limit(
+            await enforce(
                 runtime,
                 f"files:upload:{principal.user_id}",
                 runtime.settings.files_upload_rate_limit_per_minute,
@@ -3741,10 +2952,10 @@ async def upload_file(
                 cost=actual_cost - approx_cost,
             )
         if len(contents) > max_bytes:
-            raise _http_error("validation_error", f"file too large (max {max_bytes // 1024 // 1024}MB for {plan_tier} plan)", status_code=413)
+            raise http_error("validation_error", f"file too large (max {max_bytes // 1024 // 1024}MB for {plan_tier} plan)", status_code=413)
         detected_mime = file.content_type or mimetypes.guess_type(safe_filename)[0]
         if not detected_mime or detected_mime == "application/octet-stream":
-            raise _http_error("validation_error", "unknown or unsupported MIME type", status_code=400)
+            raise http_error("validation_error", "unknown or unsupported MIME type", status_code=400)
         checksum = hashlib.sha256(contents).hexdigest()
         dest_path = safe_join(dest_dir, safe_filename)
         resolved_dest = dest_path.resolve()
@@ -3752,7 +2963,7 @@ async def upload_file(
             dest_dir.resolve() not in resolved_dest.parents
             and dest_dir.resolve() != resolved_dest
         ):
-            raise _http_error("validation_error", "invalid file path", status_code=400)
+            raise http_error("validation_error", "invalid file path", status_code=400)
         dest_path.parent.mkdir(parents=True, exist_ok=True)
 
         manifest_path = dest_dir / ".checksums.json"
@@ -3780,7 +2991,7 @@ async def upload_file(
         # (Attaching an archive to a conversation is fine — it is handed to the
         # code interpreter, never chunked, so context_id stays unset below.)
         if context_id and is_archive_filename(safe_filename):
-            raise _http_error(
+            raise http_error(
                 "validation_error",
                 "archives cannot be ingested directly; upload without context_id, "
                 "then extract",
@@ -3901,7 +3112,7 @@ async def list_conversation_attachments(
 ):
     """Files attached to a conversation, with how the model can reach each."""
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
     conversation = _get_owned_conversation(runtime, conversation_id, principal)
     return Envelope(status="ok", data={"items": list_attachments(conversation)})
 
@@ -3922,7 +3133,7 @@ async def list_files(
     SPEC §13.3: GET /v1/files - list user files (paginated)
     """
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
     # Get user's file directory
     files_dir = (
         FilePath(runtime.settings.shared_fs_root)
@@ -3995,7 +3206,7 @@ async def get_file_download_url(
     set to prevent inline execution.
     """
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
 
     # Verify file exists
     files_dir = (
@@ -4007,11 +3218,11 @@ async def get_file_download_url(
     try:
         file_path = safe_join(files_dir, filename)
     except PathTraversalError:
-        raise _http_error("validation_error", "invalid filename", status_code=400)
+        raise http_error("validation_error", "invalid filename", status_code=400)
 
     # Hidden files are internal bookkeeping; report them as absent.
     if _is_hidden_relpath(filename) or not file_path.exists() or not file_path.is_file():
-        raise _http_error("not_found", "file not found", status_code=404)
+        raise http_error("not_found", "file not found", status_code=404)
 
     # Generate signed URL with 10-minute expiry
     signed_url = generate_signed_url(
@@ -4044,7 +3255,7 @@ async def download_file(
     set to prevent inline execution.
     """
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
 
     # Validate signed URL
     is_valid, error_msg = validate_signed_url(
@@ -4056,7 +3267,7 @@ async def download_file(
     )
 
     if not is_valid:
-        raise _http_error("unauthorized", error_msg or "invalid signature", status_code=401)
+        raise http_error("unauthorized", error_msg or "invalid signature", status_code=401)
 
     # Build file path and validate
     files_dir = (
@@ -4068,10 +3279,10 @@ async def download_file(
     try:
         file_path = safe_join(files_dir, path)
     except PathTraversalError:
-        raise _http_error("validation_error", "invalid file path", status_code=400)
+        raise http_error("validation_error", "invalid file path", status_code=400)
 
     if not file_path.exists() or not file_path.is_file():
-        raise _http_error("not_found", "file not found", status_code=404)
+        raise http_error("not_found", "file not found", status_code=404)
 
     # Determine content type
     content_type, _ = mimetypes.guess_type(str(file_path))
@@ -4099,7 +3310,7 @@ async def delete_file(
 ):
     """Delete a user's file, or a folder produced by archive extraction."""
     runtime = get_runtime()
-    await _limit(runtime, "write", principal.user_id)
+    await rate_limit(runtime, "write", principal.user_id)
 
     files_dir = (
         FilePath(runtime.settings.shared_fs_root)
@@ -4110,7 +3321,7 @@ async def delete_file(
     try:
         file_path = safe_join(files_dir, filename)
     except PathTraversalError:
-        raise _http_error("validation_error", "invalid filename", status_code=400)
+        raise http_error("validation_error", "invalid filename", status_code=400)
 
     # Hidden files are internal bookkeeping (upload strips leading dots, so a
     # user can never own one); report them as absent rather than deletable.
@@ -4120,7 +3331,7 @@ async def delete_file(
         or not file_path.exists()
         or file_path == files_dir.resolve()
     ):
-        raise _http_error("not_found", "file not found", status_code=404)
+        raise http_error("not_found", "file not found", status_code=404)
 
     # Delete file, or an extracted-archive folder recursively
     if file_path.is_dir():
@@ -4159,7 +3370,7 @@ async def extract_uploaded_archive(
     files can optionally be ingested into a knowledge context.
     """
     runtime = get_runtime()
-    await _limit(runtime, "write", principal.user_id)
+    await rate_limit(runtime, "write", principal.user_id)
 
     files_dir = (
         FilePath(runtime.settings.shared_fs_root)
@@ -4170,15 +3381,15 @@ async def extract_uploaded_archive(
     try:
         archive_path = safe_join(files_dir, filename)
     except PathTraversalError:
-        raise _http_error("validation_error", "invalid filename", status_code=400)
+        raise http_error("validation_error", "invalid filename", status_code=400)
     if (
         _is_hidden_relpath(filename)
         or not archive_path.exists()
         or not archive_path.is_file()
     ):
-        raise _http_error("not_found", "file not found", status_code=404)
+        raise http_error("not_found", "file not found", status_code=404)
     if not is_archive_filename(filename):
-        raise _http_error(
+        raise http_error(
             "validation_error",
             "not an archive (.zip, .tar, .tar.gz, .tgz, .gz)",
             status_code=400,
@@ -4189,9 +3400,9 @@ async def extract_uploaded_archive(
     try:
         dest_path = safe_join(files_dir, dest_rel.as_posix())
     except PathTraversalError:
-        raise _http_error("validation_error", "invalid filename", status_code=400)
+        raise http_error("validation_error", "invalid filename", status_code=400)
     if dest_path.exists():
-        raise _http_error(
+        raise http_error(
             "conflict",
             f"'{dest_rel.as_posix()}' already exists; delete it first",
             status_code=409,
@@ -4201,7 +3412,7 @@ async def extract_uploaded_archive(
     # total = 10x upload limit. Ratio and entry caps stop crafted bombs.
     user = runtime.store.get_user(principal.user_id)
     plan_tier = user.plan_tier if user else "free"
-    member_bytes = max(1, _get_plan_upload_limit(runtime, plan_tier))
+    member_bytes = max(1, plan_upload_limit(runtime, plan_tier))
     limits = {
         "max_entries": 1000,
         "max_member_bytes": member_bytes,
@@ -4214,7 +3425,7 @@ async def extract_uploaded_archive(
             extract_archive_sandboxed, str(archive_path), str(dest_path), limits
         )
     except ArchiveExtractionError as exc:
-        raise _http_error("validation_error", str(exc), status_code=413)
+        raise http_error("validation_error", str(exc), status_code=413)
     except SandboxError as exc:
         logger.warning(
             "archive_extraction_sandbox_failed",
@@ -4222,7 +3433,7 @@ async def extract_uploaded_archive(
             filename=filename,
             error=str(exc),
         )
-        raise _http_error(
+        raise http_error(
             "validation_error", f"extraction failed: {exc}", status_code=422
         )
 
@@ -4266,7 +3477,7 @@ async def list_messages(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
     paging = _get_pagination_settings(runtime)
     resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"])
     _get_owned_conversation(runtime, conversation_id, principal)
@@ -4306,12 +3517,12 @@ async def create_conversation(
     with messages via the chat endpoint.
     """
     runtime = get_runtime()
-    async with IdempotencyGuard(
+    async with idempotency.IdempotencyGuard(
         "conversations:create", principal.user_id, idempotency_key, require=False
     ) as idem:
         if idem.cached:
             return idem.cached
-        await _limit(runtime, "write", principal.user_id)
+        await rate_limit(runtime, "write", principal.user_id)
         # Validate context_id if provided
         if body.context_id:
             _get_owned_context(runtime, body.context_id, principal)
@@ -4342,7 +3553,7 @@ async def list_conversations(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
     paging = _get_pagination_settings(runtime)
     resolved_limit = min(limit or paging["default_conversations_limit"], paging["max_page_size"])
     # Fetch one extra to determine if more items exist
@@ -4384,7 +3595,7 @@ async def get_conversation(
     Only the conversation owner can access it.
     """
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
     conversation = _get_owned_conversation(runtime, conversation_id, principal)
     return Envelope(
         status="ok",
@@ -4414,7 +3625,7 @@ async def share_conversation(
     read-only /share/{id} page and unpublish it again at any time.
     """
     runtime = get_runtime()
-    await _limit(runtime, "write", principal.user_id)
+    await rate_limit(runtime, "write", principal.user_id)
     conversation = runtime.store.set_conversation_public(
         conversation_id, user_id=principal.user_id, public=body.public
     )
@@ -4454,7 +3665,7 @@ async def list_public_conversations(
 ):
     """Directory of publicly shared conversations (unauthenticated)."""
     runtime = get_runtime()
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
         "public:read",
         runtime.settings.read_rate_limit_per_minute,
@@ -4490,7 +3701,7 @@ async def get_public_conversation(
     adapter traces, and owner identity stay private.
     """
     runtime = get_runtime()
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
         "public:read",
         runtime.settings.read_rate_limit_per_minute,
@@ -4527,9 +3738,9 @@ async def create_context(
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     runtime = get_runtime()
-    await _limit(runtime, "write", principal.user_id)
+    await rate_limit(runtime, "write", principal.user_id)
     # SPEC §18: Accept Idempotency-Key when provided (optional)
-    async with IdempotencyGuard(
+    async with idempotency.IdempotencyGuard(
         "contexts:create", principal.user_id, idempotency_key, require=False
     ) as idem:
         if idem.cached:
@@ -4573,7 +3784,7 @@ async def list_contexts(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
     paging = _get_pagination_settings(runtime)
     effective_page_size = page_size or limit or paging["default_page_size"]
     resolved_page_size = min(max(effective_page_size, 1), paging["max_page_size"])
@@ -4632,7 +3843,7 @@ async def list_chunks(
     principal: AuthContext = Depends(get_user),
 ):
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
     paging = _get_pagination_settings(runtime)
     effective_page_size = page_size or limit or paging["default_page_size"]
     resolved_page_size = min(max(effective_page_size, 1), paging["max_page_size"])
@@ -4647,7 +3858,7 @@ async def list_chunks(
     )
     for ch in chunks:
         if ch.id is None:
-            raise _http_error(
+            raise http_error(
                 "server_error", "chunk id missing for context", status_code=500
             )
     has_next = len(chunks) > resolved_page_size
@@ -4692,7 +3903,7 @@ async def add_context_source(
     that can be retrieved during RAG queries.
     """
     runtime = get_runtime()
-    await _limit(runtime, "write", principal.user_id)
+    await rate_limit(runtime, "write", principal.user_id)
 
     # SECURITY: Validate path to prevent path traversal attacks (Issue 14.1)
     # Per SPEC §18: "all filesystem paths resolved via safe_join(base=/users/{user_id}, relative)"
@@ -4734,7 +3945,7 @@ async def add_context_source(
             },
         )
 
-    async with IdempotencyGuard(
+    async with idempotency.IdempotencyGuard(
         "context_sources:create", principal.user_id, idempotency_key, require=False
     ) as idem:
         if idem.cached:
@@ -4771,7 +3982,7 @@ async def add_context_source(
                 runtime.store.delete_context_source(source.id)
             except Exception:
                 pass  # Best effort cleanup
-            raise _http_error(
+            raise http_error(
                 "ingest_failed",
                 f"Failed to index source: {exc}",
                 status_code=500,
@@ -4799,7 +4010,7 @@ async def list_context_sources(
 ):
     """List all source paths for a knowledge context."""
     runtime = get_runtime()
-    await _limit(runtime, "read", principal.user_id)
+    await rate_limit(runtime, "read", principal.user_id)
 
     # Verify context ownership
     _get_owned_context(runtime, context_id, principal)
@@ -4824,7 +4035,7 @@ async def transcribe_voice(
 ):
     runtime = get_runtime()
     # Rate limit voice transcription (resource-intensive)
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
         f"voice:transcribe:{principal.user_id}",
         runtime.settings.chat_rate_limit_per_minute,  # Use chat rate limit as default
@@ -4834,7 +4045,7 @@ async def transcribe_voice(
     max_audio_bytes = 10 * 1024 * 1024
     audio_bytes = await file.read(max_audio_bytes + 1)
     if len(audio_bytes) > max_audio_bytes:
-        raise _http_error(
+        raise http_error(
             "validation_error", "audio file too large (max 10MB)", status_code=413
         )
     result = await runtime.voice.transcribe(audio_bytes, user_id=principal.user_id)
@@ -4847,7 +4058,7 @@ async def synthesize_voice(
 ):
     runtime = get_runtime()
     # Rate limit voice synthesis (resource-intensive)
-    await _enforce_rate_limit(
+    await enforce(
         runtime,
         f"voice:synthesize:{principal.user_id}",
         runtime.settings.chat_rate_limit_per_minute,  # Use chat rate limit as default
@@ -4855,7 +4066,7 @@ async def synthesize_voice(
     )
     # Limit text length to prevent resource exhaustion
     if len(body.text) > 5000:
-        raise _http_error(
+        raise http_error(
             "validation_error",
             "text too long for synthesis (max 5000 chars)",
             status_code=400,
@@ -4871,17 +4082,11 @@ async def websocket_chat(ws: WebSocket):
     """Handle WebSocket chat connections for streaming responses."""
     runtime = get_runtime()
     client_host = ws.client.host if ws.client else "unknown"
-    connect_limit = _get_system_settings(runtime).get(
-        "websocket_connect_rate_limit_per_minute", 30
-    )
-    allowed, _, _ = await check_rate_limit(
-        runtime,
-        f"ws:connect:{client_host}",
-        connect_limit,
-        60,
-        return_remaining=True,
-    )
-    if not allowed:
+    # The declared policy, not a second lookup with its own hardcoded default —
+    # that copy ignored the admin's setting whenever it was left unset.
+    try:
+        await rate_limit(runtime, "websocket:connect", client_host)
+    except HTTPException:
         await ws.accept()
         await ws.close(code=4429)
         return
@@ -4891,8 +4096,7 @@ async def websocket_chat(ws: WebSocket):
     # Generate request_id immediately to ensure traceability even on early errors
     request_id: str = str(uuid4())
     convo_id: Optional[str] = None
-    workflow_slot_acquired: bool = False
-    ws_connection_slot_acquired: bool = False
+    held_slots: list[str] = []
     try:
         init = await ws.receive_json()
         idempotency_key = init.get("idempotency_key")
@@ -4923,32 +4127,24 @@ async def websocket_chat(ws: WebSocket):
         user_id = auth_ctx.user_id
 
         # Issue 5.2: Per-user WebSocket connection limits
-        if runtime.cache:
-            max_ws_connections = runtime.settings.max_websocket_connections_per_user
-            acquired, _ = await runtime.cache.acquire_concurrency_slot(
-                "websocket",
-                user_id,
-                max_ws_connections,
-            )
-            if not acquired:
-                await ws.send_json({
-                    "event": "error",
-                    "data": {
-                        "error": "connection_limit",
-                        "message": f"concurrent WebSocket connection limit ({max_ws_connections}) exceeded",
-                    },
-                    "request_id": request_id,
-                })
-                await ws.close(code=4429)  # Custom code for "too many connections"
-                return
-            ws_connection_slot_acquired = True
+        try:
+            await admission.acquire(runtime, "websocket", user_id)
+        except admission.AtCapacity as exc:
+            await ws.send_json({
+                "event": "error",
+                "data": {"error": "connection_limit", "message": exc.message},
+                "request_id": request_id,
+            })
+            await ws.close(code=4429)  # Custom code for "too many connections"
+            return
+        held_slots.append("websocket")
 
         # Get user's plan tier for per-plan rate limits (SPEC §18)
         user = runtime.store.get_user(user_id)
         plan_tier = user.plan_tier if user else "free"
 
         # SPEC §18: Accept Idempotency-Key when provided (optional)
-        request_id, cached = await _resolve_idempotency(
+        request_id, cached = await idempotency.resolve(
             "chat:ws", user_id, idempotency_key, require=False, request_id=request_id
         )
         if cached:
@@ -4956,7 +4152,7 @@ async def websocket_chat(ws: WebSocket):
             return
 
         # SPEC §18: Per-plan adjustable rate limits
-        await _enforce_rate_limit_per_plan(
+        await enforce_per_plan(
             runtime,
             f"chat:{user_id}",
             runtime.settings.chat_rate_limit_per_minute,
@@ -4964,27 +4160,22 @@ async def websocket_chat(ws: WebSocket):
             plan_tier,
         )
 
-        # SPEC §18: Concurrency cap - max 3 concurrent workflows per user
-        # Check if we can acquire a slot; if not, close with 409-equivalent code
-        if runtime.cache:
-            max_workflows = runtime.settings.max_concurrent_workflows
-            acquired, _ = await runtime.cache.acquire_concurrency_slot(
-                "workflow",
-                user_id,
-                max_workflows,
-            )
-            if not acquired:
+        # SPEC §18: concurrency caps. CHAT_SLOTS is what a turn costs on either
+        # transport; this path used to take the workflow slot alone and skip the
+        # inference cap entirely, which made max_concurrent_inference a setting
+        # that only applied to the endpoint the UI does not use.
+        for kind in admission.CHAT_SLOTS:
+            try:
+                await admission.acquire(runtime, kind, user_id)
+            except admission.AtCapacity as exc:
                 await ws.send_json({
                     "event": "error",
-                    "data": {
-                        "error": "busy",
-                        "message": f"concurrent workflow limit ({max_workflows}) exceeded",
-                    },
+                    "data": {"error": "busy", "message": exc.message},
                     "request_id": request_id,
                 })
                 await ws.close(code=4409)  # Custom code for "busy"
                 return
-            workflow_slot_acquired = True
+            held_slots.append(kind)
 
         convo_id = init.get("conversation_id")
         needs_title = not convo_id
@@ -4994,7 +4185,7 @@ async def websocket_chat(ws: WebSocket):
             # Placeholder title; a model-written one replaces it once the turn
             # completes (see _schedule_turn_labels).
             user_message = init.get("message", "")
-            auto_title = _generate_conversation_title(user_message)
+            auto_title = turn_effects.conversation_title(user_message)
             conversation = runtime.store.create_conversation(
                 user_id=user_id, title=auto_title
             )
@@ -5014,7 +4205,7 @@ async def websocket_chat(ws: WebSocket):
             cancel_event = asyncio.Event()
             # Register cancel event so POST /chat/cancel can cancel this request
             # Issue 50.5: Include user_id for ownership validation
-            await _register_cancel_event(request_id, cancel_event, user_id)
+            await cancellation.register(request_id, cancel_event, user_id)
             # Issue 38.5: Use list for O(n) token accumulation instead of string += O(n²)
             content_tokens: list[str] = []
             orchestration_dict: dict[str, Any] = {}
@@ -5097,13 +4288,13 @@ async def websocket_chat(ws: WebSocket):
                 cancel_listener.cancel()
                 with suppress(asyncio.CancelledError):
                     await cancel_listener
-                await _unregister_cancel_event(request_id)
+                await cancellation.unregister(request_id)
                 return
             finally:
                 cancel_listener.cancel()
                 with suppress(asyncio.CancelledError):
                     await cancel_listener
-                await _unregister_cancel_event(request_id)
+                await cancellation.unregister(request_id)
 
             # Save assistant message after streaming completes (only if successful)
             if cancel_event.is_set() or not message_done_received:
@@ -5148,9 +4339,9 @@ async def websocket_chat(ws: WebSocket):
                 ).model_dump(),
                 request_id=request_id,
             )
-            await _store_idempotency_result("chat:ws", user_id, idempotency_key, envelope)
+            await idempotency.store("chat:ws", user_id, idempotency_key, envelope)
 
-            _schedule_turn_labels(
+            turn_effects.schedule_turn_labels(
                 runtime,
                 conversation_id=convo_id,
                 user_id=user_id,
@@ -5159,7 +4350,7 @@ async def websocket_chat(ws: WebSocket):
                 assistant_content=assistant_content,
                 set_title=needs_title,
             )
-            _schedule_conversation_digest(
+            turn_effects.schedule_conversation_digest(
                 runtime, conversation_id=convo_id, user_id=user_id
             )
 
@@ -5234,7 +4425,7 @@ async def websocket_chat(ws: WebSocket):
                 ).model_dump(),
                 request_id=request_id,
             )
-            await _store_idempotency_result("chat:ws", user_id, idempotency_key, envelope)
+            await idempotency.store("chat:ws", user_id, idempotency_key, envelope)
             await ws.send_json(envelope.model_dump())
     except HTTPException as exc:
         detail = exc.detail if isinstance(exc.detail, dict) else None
@@ -5247,7 +4438,7 @@ async def websocket_chat(ws: WebSocket):
             status="error", error=error_payload, request_id=request_id
         )
         if user_id:
-            await _store_idempotency_result(
+            await idempotency.store(
                 "chat:ws", user_id, idempotency_key, error_env, status="failed"
             )
         await ws.send_json(error_env.model_dump())
@@ -5287,7 +4478,7 @@ async def websocket_chat(ws: WebSocket):
             request_id=request_id,
         )
         if user_id:
-            await _store_idempotency_result(
+            await idempotency.store(
                 "chat:ws", user_id, idempotency_key, error_env, status="failed"
             )
         # Send error envelope to client before closing
@@ -5299,8 +4490,6 @@ async def websocket_chat(ws: WebSocket):
         await ws.close(code=1011)
     finally:
         # Always release slots, even on error
-        if workflow_slot_acquired and user_id and runtime.cache:
-            await runtime.cache.release_concurrency_slot("workflow", user_id)
-        # Issue 5.2: Release WebSocket connection slot
-        if ws_connection_slot_acquired and user_id and runtime.cache:
-            await runtime.cache.release_concurrency_slot("websocket", user_id)
+        for kind in reversed(held_slots):
+            with contextlib.suppress(Exception):
+                await admission.release(runtime, kind, user_id)

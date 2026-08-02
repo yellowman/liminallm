@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 from liminallm.logging import get_logger
 from liminallm.service import notes as notes_service
-from liminallm.service.cluster import AdvisoryLock
+from liminallm.service.replication import AdvisoryLock
 
 if TYPE_CHECKING:
     from liminallm.service.clustering import SemanticClusterer

@@ -20,7 +20,8 @@ from fastapi.testclient import TestClient
 
 from liminallm import app as app_module
 from liminallm.api import routes
-from liminallm.service.cluster import (
+from liminallm.service import cancellation
+from liminallm.service.replication import (
     MAX_PAYLOAD_BYTES,
     AdvisoryLock,
     ClusterBus,
@@ -239,41 +240,41 @@ async def test_cancel_reaches_the_replica_holding_the_stream():
     """The cancel event lives in one process; the other must still stop it."""
     worker_a, worker_b = PairedBus("a"), PairedBus("b")
     pair(worker_a, worker_b)
-    worker_b.subscribe(routes.CANCEL_CHANNEL, routes.handle_remote_cancel)
+    worker_b.subscribe(cancellation.CANCEL_CHANNEL, cancellation.handle_remote_cancel)
 
     event = asyncio.Event()
-    await routes._register_cancel_event("req-remote", event, "user-1")
+    await cancellation.register("req-remote", event, "user-1")
     try:
         # worker_a doesn't know the request; ask the cluster.
         ack = await worker_a.request(
-            routes.CANCEL_CHANNEL,
+            cancellation.CANCEL_CHANNEL,
             {"request_id": "req-remote", "user_id": "user-1"},
             timeout=2.0,
         )
         assert ack == {"cancelled": True, "reason": "cancelled"}
         assert event.is_set()
     finally:
-        await routes._unregister_cancel_event("req-remote")
+        await cancellation.unregister("req-remote")
 
 
 async def test_remote_cancel_still_enforces_ownership():
     event = asyncio.Event()
-    await routes._register_cancel_event("req-owned", event, "owner-user")
+    await cancellation.register("req-owned", event, "owner-user")
     try:
-        reply = await routes.handle_remote_cancel(
+        reply = await cancellation.handle_remote_cancel(
             {"request_id": "req-owned", "user_id": "attacker-user"}
         )
         assert reply == {"cancelled": False, "reason": "not_owner"}
         assert not event.is_set()
     finally:
-        await routes._unregister_cancel_event("req-owned")
+        await cancellation.unregister("req-owned")
 
 
 async def test_remote_cancel_stays_silent_for_unknown_request():
-    assert await routes.handle_remote_cancel(
+    assert await cancellation.handle_remote_cancel(
         {"request_id": "never-existed", "user_id": "u"}
     ) is None
-    assert await routes.handle_remote_cancel({}) is None
+    assert await cancellation.handle_remote_cancel({}) is None
 
 
 async def test_cancel_request_prefers_local_and_skips_the_bus():
@@ -282,16 +283,16 @@ async def test_cancel_request_prefers_local_and_skips_the_bus():
             raise AssertionError("local hit should not consult the bus")
 
     event = asyncio.Event()
-    await routes._register_cancel_event("req-local", event, "user-1")
+    await cancellation.register("req-local", event, "user-1")
     runtime = routes.get_runtime()
     original = runtime.bus
     runtime.bus = ExplodingBus()
     try:
-        cancelled, reason = await routes._cancel_request("req-local", "user-1")
+        cancelled, reason = await cancellation.cancel("req-local", "user-1")
         assert (cancelled, reason) == (True, "cancelled")
     finally:
         runtime.bus = original
-        await routes._unregister_cancel_event("req-local")
+        await cancellation.unregister("req-local")
 
 
 async def test_cancel_endpoint_reports_the_remote_verdict(monkeypatch):
@@ -299,14 +300,14 @@ async def test_cancel_endpoint_reports_the_remote_verdict(monkeypatch):
 
     class OwnerElsewhere:
         async def request(self, channel, data, **kw):
-            assert channel == routes.CANCEL_CHANNEL
+            assert channel == cancellation.CANCEL_CHANNEL
             return {"cancelled": False, "reason": "not_owner"}
 
     runtime = routes.get_runtime()
     original = runtime.bus
     runtime.bus = OwnerElsewhere()
     try:
-        cancelled, reason = await routes._cancel_request("req-elsewhere", "user-1")
+        cancelled, reason = await cancellation.cancel("req-elsewhere", "user-1")
         assert (cancelled, reason) == (False, "not_owner")
     finally:
         runtime.bus = original
@@ -321,7 +322,7 @@ async def test_bus_failure_does_not_break_cancel():
     original = runtime.bus
     runtime.bus = BrokenBus()
     try:
-        cancelled, reason = await routes._cancel_request("req-x", "user-1")
+        cancelled, reason = await cancellation.cancel("req-x", "user-1")
         assert (cancelled, reason) == (False, "request_not_found")
     finally:
         runtime.bus = original
@@ -574,17 +575,17 @@ async def _round_trip_over(**kw) -> None:
     """Two replicas, one live transport, one real cancel event."""
     asker = ClusterBus(node_id="live-asker", **kw)
     owner = ClusterBus(node_id="live-owner", **kw)
-    owner.subscribe(routes.CANCEL_CHANNEL, routes.handle_remote_cancel)
+    owner.subscribe(cancellation.CANCEL_CHANNEL, cancellation.handle_remote_cancel)
     await asker.start()
     await owner.start()
     assert asker.backend != "local" and owner.backend != "local"
     await asyncio.sleep(0.3)  # let LISTEN / SUBSCRIBE settle
 
     event = asyncio.Event()
-    await routes._register_cancel_event("live-req", event, "user-1")
+    await cancellation.register("live-req", event, "user-1")
     try:
         ack = await asker.request(
-            routes.CANCEL_CHANNEL,
+            cancellation.CANCEL_CHANNEL,
             {"request_id": "live-req", "user_id": "user-1"},
             timeout=5.0,
         )
@@ -592,13 +593,13 @@ async def _round_trip_over(**kw) -> None:
         assert event.is_set()
 
         unowned = await asker.request(
-            routes.CANCEL_CHANNEL,
+            cancellation.CANCEL_CHANNEL,
             {"request_id": "not-here", "user_id": "user-1"},
             timeout=1.0,
         )
         assert unowned is None
     finally:
-        await routes._unregister_cancel_event("live-req")
+        await cancellation.unregister("live-req")
         await asker.stop()
         await owner.stop()
 

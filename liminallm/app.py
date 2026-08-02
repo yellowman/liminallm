@@ -68,10 +68,11 @@ async def lifespan(app: FastAPI):
         # Cross-replica coordination: lets POST /chat/cancel reach the worker
         # holding the stream's WebSocket instead of only stopping local ones.
         try:
-            from liminallm.api.routes import CANCEL_CHANNEL, handle_remote_cancel
-            from liminallm.service import token_counting
+            from liminallm.service import cancellation, token_counting
 
-            runtime.bus.subscribe(CANCEL_CHANNEL, handle_remote_cancel)
+            runtime.bus.subscribe(
+                cancellation.CANCEL_CHANNEL, cancellation.handle_remote_cancel
+            )
 
             async def _apply_calibration(data: dict):
                 """A peer learned a better token factor; adopt it."""

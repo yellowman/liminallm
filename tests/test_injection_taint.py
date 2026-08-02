@@ -136,7 +136,7 @@ async def test_sweep_is_a_noop_without_a_real_encoder(tmp_path):
 
 
 async def test_sweep_is_leader_locked(tmp_path):
-    from liminallm.service.cluster import AdvisoryLock
+    from liminallm.service.replication import AdvisoryLock
     from tests.pgharness import get_test_store
 
     store = get_test_store()

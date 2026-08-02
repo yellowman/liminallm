@@ -17,6 +17,7 @@ from liminallm.service.model_backend import (
 )
 from liminallm.service.runtime import get_runtime
 from liminallm.service.tokenizer_utils import MAX_GENERATION_TOKENS
+from liminallm.service import turn_effects
 
 
 # ---------------------------------------------------------------------------
@@ -965,7 +966,7 @@ def test_backfill_persists_embeddings_for_a_real_encoder():
     runtime.embeddings = _FakeSemanticEmbeddings()
     try:
         history = store.list_messages(convo.id, user_id=user.id)
-        routes._backfill_message_embeddings(runtime, history, user.id)
+        turn_effects.backfill_message_embeddings(runtime, history, user.id)
     finally:
         runtime.embeddings = orig
     refreshed = store.list_messages(convo.id, user_id=user.id)

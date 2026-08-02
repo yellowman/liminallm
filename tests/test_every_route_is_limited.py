@@ -43,7 +43,7 @@ def _enforces_a_limit(fn) -> bool:
         source = inspect.getsource(fn)
     except OSError:  # pragma: no cover - source always available in-tree
         return False
-    return bool(re.search(r"await _limit\(|_enforce_rate_limit", source))
+    return bool(re.search(r"await rate_limit\(|await enforce\(|await enforce_per_plan\(", source))
 
 
 @pytest.mark.parametrize(
@@ -55,17 +55,17 @@ def test_route_enforces_a_rate_limit(route):
         pytest.skip("exempt by name")
     assert _enforces_a_limit(route.endpoint), (
         f"{name} ({','.join(sorted(route.methods))} {route.path}) enforces no "
-        f"rate limit. Add `await _limit(runtime, \"<policy>\", subject)`, or "
+        f"rate limit. Add `await rate_limit(runtime, \"<policy>\", subject)`, or "
         f"add it to EXEMPT with a reason."
     )
 
 
 def test_every_policy_names_a_real_setting():
     """A policy pointing at a missing setting fails only when that route is hit."""
-    from liminallm.api.routes import _RATE_POLICIES
+    from liminallm.api.limits import RATE_POLICIES
     from liminallm.config import Settings
 
-    for policy, (limit_attr, window) in _RATE_POLICIES.items():
+    for policy, (limit_attr, window) in RATE_POLICIES.items():
         assert hasattr(Settings, "model_fields") and limit_attr in Settings.model_fields, (
             f"{policy} -> {limit_attr}"
         )

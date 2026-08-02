@@ -11,7 +11,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, List, Optional, Protocol, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -20,8 +20,11 @@ from argon2.exceptions import InvalidHash, VerifyMismatchError
 
 from liminallm.config import Settings
 from liminallm.logging import get_logger
-from liminallm.storage.models import Session, User, UserMFAConfig
+from liminallm.storage.models import Session, User
 from liminallm.storage.redis_cache import RedisCache
+
+if TYPE_CHECKING:  # PostgresStore imports from service/, so keep this type-only.
+    from liminallm.storage.postgres import PostgresStore
 
 # OAuth provider configurations
 OAUTH_PROVIDERS = {
@@ -48,64 +51,6 @@ OAUTH_PROVIDERS = {
 logger = get_logger(__name__)
 
 
-class AuthStore(Protocol):
-    def create_user(
-        self,
-        email: str,
-        handle: Optional[str] = None,
-        *,
-        tenant_id: str,
-        role: str = "user",
-        plan_tier: str = "free",
-        is_active: bool = True,
-        meta: Optional[dict] = None,
-    ) -> User: ...
-
-    def save_password(
-        self, user_id: str, password_hash: str, password_algo: str
-    ) -> None: ...
-
-    def get_password_record(self, user_id: str) -> Optional[tuple[str, str]]: ...
-
-    def set_user_mfa_secret(
-        self, user_id: str, secret: str, enabled: bool = False
-    ) -> UserMFAConfig: ...
-
-    def get_user_mfa_secret(self, user_id: str) -> Optional[UserMFAConfig]: ...
-
-    def create_session(
-        self,
-        user_id: str,
-        ttl_minutes: int = 60 * 24,
-        user_agent: str | None = None,
-        ip_addr: str | None = None,
-        *,
-        mfa_required: bool = False,
-        tenant_id: str = "public",
-        meta: Optional[dict] = None,
-    ) -> Session: ...
-
-    def get_session(self, session_id: str) -> Optional[Session]: ...
-
-    def set_session_meta(self, session_id: str, meta: dict) -> None: ...
-
-    def revoke_session(self, session_id: str) -> None: ...
-
-    def mark_session_verified(self, session_id: str) -> None: ...
-
-    def get_user_by_email(self, email: str) -> Optional[User]: ...
-
-    def get_user(self, user_id: str) -> Optional[User]: ...
-
-    def update_user_role(self, user_id: str, role: str) -> Optional[User]: ...
-
-    def delete_user(self, user_id: str) -> bool: ...
-
-    def list_users(
-        self, tenant_id: Optional[str] = None, limit: int = 100
-    ) -> List[User]: ...
-
-
 @dataclass
 class AuthContext:
     user_id: str
@@ -115,17 +60,17 @@ class AuthContext:
 
 
 class AuthService:
-    """Session, JWT, and MFA handling for both persistent and in-memory modes."""
+    """Session, JWT, and MFA handling, backed by the store."""
 
     def __init__(
         self,
-        store: AuthStore,
+        store: "PostgresStore",
         cache: Optional[RedisCache],
         settings: Settings,
         *,
         mfa_enabled: bool = True,
     ) -> None:
-        self.store: AuthStore = store
+        self.store = store
         self.cache = cache
         self.settings = settings
         # Issue 28.4: Thread-safe lock for mutable state dictionaries

@@ -20,13 +20,13 @@ from liminallm.config import (
 from liminallm.logging import get_logger
 from liminallm.service import token_counting
 from liminallm.service.auth import AuthService
-from liminallm.service.cluster import AdvisoryLock, ClusterBus
 from liminallm.service.clustering import SemanticClusterer
 from liminallm.service.config_ops import ConfigOpsService
 from liminallm.service.email import EmailService
 from liminallm.service.embeddings import EmbeddingsService, make_provider_encoder
 from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
+from liminallm.service.replication import AdvisoryLock, ClusterBus
 from liminallm.service.router import RouterEngine
 from liminallm.service.training import TrainingService
 from liminallm.service.training_worker import TrainingWorker
