@@ -143,30 +143,80 @@ app = FastAPI(title="LiminalLM Kernel", version=__version__, lifespan=lifespan)
 _CSRF_SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
 
 
+#: Local dev hosts, used when nothing is configured. Never a wildcard: with
+#: credentials allowed, a wildcard is an open door.
+_DEFAULT_ORIGINS = [
+    "http://localhost",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
+]
+
+
+def _cors_policy() -> tuple:
+    """The origins and credentials flag currently in force.
+
+    Prefers the running instance's settings — which carry what an admin saved —
+    and falls back to the environment before the runtime exists (import time,
+    and tests that construct the app directly).
+    """
+    try:
+        from liminallm.service import runtime as runtime_module
+
+        settings = getattr(runtime_module.runtime, "settings", None)
+    except Exception:  # noqa: BLE001 - no runtime yet is the normal early case
+        settings = None
+    if settings is None:
+        settings = Settings.from_env()
+    return (
+        tuple(settings.cors_allow_origins or _DEFAULT_ORIGINS),
+        bool(settings.cors_allow_credentials),
+    )
+
+
 def _allowed_origins() -> List[str]:
-    # Read current settings rather than the import-time snapshot so the
-    # configured CORS_ALLOW_ORIGINS is honored (and testable).
-    settings = Settings.from_env()
-    if settings.cors_allow_origins:
-        return settings.cors_allow_origins
-    # Default to common local dev hosts; avoid wildcard when credentials are enabled.
-    return [
-        "http://localhost",
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:5173",
-    ]
+    return list(_cors_policy()[0])
 
 
 def _allow_credentials() -> bool:
-    return Settings.from_env().cors_allow_credentials
+    return _cors_policy()[1]
+
+
+class DynamicCORSMiddleware:
+    """Starlette's CORS implementation, rebuilt when the policy changes.
+
+    CORSMiddleware fixes its origins at construction, which used to mean the
+    allowlist was whatever the environment said when the process started.
+    Origins are an admin-managed setting now, so this re-reads the policy per
+    request and rebuilds the inner middleware only when it actually differs —
+    reusing Starlette's implementation rather than reimplementing CORS, which
+    is not a thing to get subtly wrong.
+    """
+
+    def __init__(self, app, **static):
+        self.app = app
+        self._static = static
+        self._policy = None
+        self._inner = None
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        policy = _cors_policy()
+        if policy != self._policy or self._inner is None:
+            self._policy = policy
+            self._inner = CORSMiddleware(
+                self.app,
+                allow_origins=list(policy[0]),
+                allow_credentials=policy[1],
+                **self._static,
+            )
+        return await self._inner(scope, receive, send)
 
 
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_allowed_origins(),
-    allow_credentials=_allow_credentials(),
+    DynamicCORSMiddleware,
     # Restrict to only required HTTP methods
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     # Restrict to only required headers

@@ -53,19 +53,25 @@ def test_admin_only_settings_have_no_env_var():
 
 def test_defaults_are_serialisable_as_the_admin_api_sends_them():
     """Enums and None do not survive a JSON round trip through the admin form."""
+    import json
+
     for name, value in SYSTEM_SETTINGS_DEFAULTS.items():
         assert not isinstance(value, Enum), name
         assert value is not None, name
-        assert isinstance(value, (str, int, float, bool)), (name, type(value))
+        json.dumps(value)  # lists are fine; an Enum or a set is not
 
 
 def test_the_database_is_not_seeded_with_defaults(store):
     """A shipped default must never look like an explicit admin override.
 
-    Seeding them made every default outrank the operator's environment, which
-    is how notes_enabled once ignored its own env var.
+    Seeding them made every default outrank everything else, which is how
+    notes_enabled once ignored the value it was given.
     """
-    assert store.get_system_settings_overrides() == {}
+    from liminallm.service.runtime import Runtime
+
+    stored = set(store.get_system_settings_overrides())
+    # The signing key writes itself on first boot; nothing else should be here.
+    assert stored <= Runtime.GENERATED_SETTINGS
     # ...while the merged view still answers for every setting.
     merged = store.get_system_settings()
     for name in SYSTEM_SETTINGS_DEFAULTS:

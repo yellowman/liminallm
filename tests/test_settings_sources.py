@@ -21,36 +21,20 @@ from liminallm.service.runtime import get_runtime, reset_runtime_for_tests
 # Env vars are a standing invitation to configure per-container. Each name here
 # is a deliberate exception; adding one should be a decision, not a reflex.
 EXPECTED_ENV_SETTINGS = {
-    # bootstrap: needed before the database is reachable, or machine-scoped
+    # The one that cannot come from the database, because it is how you reach
+    # the database.
     "database_url",
-    "redis_url",
-    "shared_fs_root",
-    "test_mode",
-    "allow_redis_fallback_dev",
-    "embedding_vector_dim",
+    # Not configuration: the build stamps this, nobody tunes it.
     "build_sha",
-    "cluster_bus_backend",
-    "interpreter_scratch_dir",
-    # secrets
-    "jwt_secret",
-    "adapter_openai_api_key",
-    "voice_api_key",
-    "oauth_google_client_id",
-    "oauth_google_client_secret",
-    "oauth_github_client_id",
-    "oauth_github_client_secret",
-    "oauth_microsoft_client_id",
-    "oauth_microsoft_client_secret",
-    "smtp_password",
-    "web_search_api_key",
-    # security controls: an admin session must not widen these from a web form
-    "cors_allow_origins",
-    "cors_allow_credentials",
-    "enable_hsts",
-    "tool_network_allowlist",
-    "web_fetch_allow_private",
-    "smtp_allow_insecure",
-    # imports Python modules; settable from the UI would mean RCE
+    # The test harness tells the process it is a test before anything else
+    # happens, and it must not be flippable from a web form.
+    "test_mode",
+    # A property of the schema that was applied, not of the running app;
+    # scripts/migrate.sh needs the same value.
+    "embedding_vector_dim",
+    # Imports Python modules. Settable from the admin console would mean
+    # remote code execution, which is the one thing genuinely too hot for a
+    # row in a table.
     "extract_reader_plugins",
 }
 
@@ -86,8 +70,8 @@ def test_a_managed_setting_does_not_absorb_a_matching_env_var(monkeypatch):
 
 
 def test_env_settings_still_read_the_environment(monkeypatch):
-    monkeypatch.setenv("SHARED_FS_ROOT", "/tmp/from-env")
-    assert Settings.from_env().shared_fs_root == "/tmp/from-env"
+    monkeypatch.setenv("DATABASE_URL", "postgresql://from-env/db")
+    assert Settings.from_env().database_url == "postgresql://from-env/db"
 
 
 class TestOverlay:
@@ -102,11 +86,11 @@ class TestOverlay:
         assert not hasattr(merged, "not_a_setting")
 
     def test_env_only_settings_cannot_be_overridden_from_the_database(self):
-        """Otherwise anyone who can write instance_config can widen CORS."""
+        """extract_reader_plugins imports code; a row must not be able to."""
         merged = apply_managed_settings(
-            Settings(), {"cors_allow_origins": ["https://evil.example"]}
+            Settings(), {"extract_reader_plugins": "evil.module"}
         )
-        assert "https://evil.example" not in merged.cors_allow_origins
+        assert merged.extract_reader_plugins == ""
 
     def test_one_bad_value_does_not_discard_the_good_ones(self):
         """A bad row must not make the instance unbootable — the admin UI that
@@ -135,9 +119,8 @@ class TestFirstBootSeed:
     def test_seeds_managed_settings_on_a_fresh_instance(self, monkeypatch):
         runtime = self._boot(monkeypatch, json.dumps({"model_path": "seeded-model"}))
         assert runtime.settings.model_path == "seeded-model"
-        assert runtime.store.get_system_settings_overrides() == {
-            "model_path": "seeded-model"
-        }
+        stored = runtime.store.get_system_settings_overrides()
+        assert stored["model_path"] == "seeded-model"
 
     def test_does_not_overwrite_what_an_admin_already_saved(self, monkeypatch):
         """A stale container env must not silently revert an operator."""
@@ -156,8 +139,11 @@ class TestFirstBootSeed:
 
     def test_env_only_settings_cannot_be_seeded(self, monkeypatch):
         """The seed writes to the database; env-only settings do not live there."""
-        runtime = self._boot(monkeypatch, json.dumps({"jwt_secret": "hijack"}))
-        assert "jwt_secret" not in runtime.store.get_system_settings_overrides()
+        runtime = self._boot(
+            monkeypatch, json.dumps({"extract_reader_plugins": "evil.module"})
+        )
+        stored = runtime.store.get_system_settings_overrides()
+        assert "extract_reader_plugins" not in stored
 
     @pytest.mark.parametrize("bad", ["not json at all", "[1, 2, 3]", "null"])
     def test_malformed_seed_does_not_block_boot(self, monkeypatch, bad):
@@ -165,9 +151,11 @@ class TestFirstBootSeed:
         assert runtime.settings.model_path == "gpt-4o-mini"
 
     def test_absent_seed_is_the_normal_case(self, monkeypatch):
+        """A fresh instance stores only its generated signing key."""
         monkeypatch.delenv("INSTANCE_SETTINGS_JSON", raising=False)
         reset_runtime_for_tests()
-        assert get_runtime().store.get_system_settings_overrides() == {}
+        stored = get_runtime().store.get_system_settings_overrides()
+        assert set(stored) == {"jwt_secret"}
 
 
 def test_no_stray_env_var_reads_outside_config(monkeypatch):

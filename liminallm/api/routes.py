@@ -104,6 +104,8 @@ from liminallm.api.schemas import (
 from liminallm.config import (
     SYSTEM_SETTINGS_DEFAULTS,
     get_settings,
+    managed_settings_schema,
+    secret_setting_names,
     validate_managed_settings,
 )
 from liminallm.content_struct import normalize_content_struct
@@ -3543,6 +3545,36 @@ async def get_system_settings(principal: AuthContext = Depends(get_admin_user)):
     return Envelope(status="ok", data=runtime.store.get_system_settings())
 
 
+@router.get("/admin/settings/schema", response_model=Envelope, tags=["admin"])
+async def get_system_settings_schema(
+    principal: AuthContext = Depends(get_admin_user),
+):
+    """Describe every managed setting: type, bounds, choices, default, group.
+
+    The admin console renders itself from this rather than hard-coding the
+    field list, so a setting cannot exist in the model and be missing from the
+    console, and the control's limits are the ones the API enforces.
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"admin:read:{principal.user_id}",
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
+    )
+    stored = runtime.store.get_system_settings_overrides()
+    fields = managed_settings_schema()
+    for entry in fields:
+        # "Changed from the shipped default" is what an operator wants to see
+        # at a glance; it is also what actually lives in the database.
+        entry["overridden"] = entry["name"] in stored
+        if entry.get("secret"):
+            # Whether a secret is set is useful; its value never leaves here.
+            entry["default"] = ""
+            entry["is_set"] = bool(stored.get(entry["name"]))
+    return Envelope(status="ok", data={"fields": fields})
+
+
 @router.put("/admin/settings", response_model=Envelope, tags=["admin"])
 async def update_system_settings(
     body: dict,
@@ -3585,9 +3617,23 @@ async def update_system_settings(
         runtime.settings.admin_rate_limit_window_seconds,
     )
 
+    # A blank secret means the operator did not retype it, not that they want
+    # it cleared. The console cannot show the current value, so it cannot
+    # round-trip one either.
+    secrets = secret_setting_names()
+    body = {
+        key: value
+        for key, value in body.items()
+        if not (key in secrets and value == "")
+    }
+    if not body:
+        return Envelope(status="ok", data=runtime.store.get_system_settings())
+
     # Types, bounds and allowed values are declared on the Settings fields;
     # this checks the patch against them rather than restating them here.
-    errors = validate_managed_settings(body)
+    errors = validate_managed_settings(
+        body, runtime.store.get_system_settings_raw()
+    )
     if errors:
         raise _http_error(
             "validation_error",

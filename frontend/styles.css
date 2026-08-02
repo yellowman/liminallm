@@ -2686,3 +2686,103 @@ button.minor:hover {
   gap: 8px;
   padding: 16px 20px;
 }
+
+/* ---------------------------------------------------------------------------
+   Admin settings console. The form is generated from the settings schema, so
+   these style whatever the server describes rather than a fixed field list.
+   --------------------------------------------------------------------------- */
+
+.settings-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  margin: 10px 0 16px;
+}
+
+.settings-toolbar input[type="search"] {
+  flex: 1 1 220px;
+  min-width: 0;
+  height: var(--ctl-h);
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  font-size: 13.5px;
+}
+
+.inline-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.inline-check input[type="checkbox"] {
+  width: 15px;
+  accent-color: var(--accent);
+}
+
+.setting-row {
+  /* Room for the dirty marker so rows do not shift when one appears. */
+  border-left: 2px solid transparent;
+  padding-left: 10px;
+  margin-left: -12px;
+}
+
+.setting-row.is-dirty {
+  border-left-color: var(--accent);
+}
+
+.setting-row.has-error input,
+.setting-row.has-error select {
+  border-color: var(--danger, #b3261e);
+}
+
+.field-error {
+  font-size: 12px;
+  color: var(--danger, #b3261e);
+}
+
+.setting-row .badge {
+  margin-left: 8px;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--muted);
+  vertical-align: middle;
+}
+
+.settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid var(--border);
+}
+
+.settings-actions button[disabled] {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+#settings-form h4 {
+  margin: 22px 0 10px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+
+#settings-form h4:first-child {
+  margin-top: 0;
+}

@@ -11,7 +11,7 @@ api backends (remote inference). you can run them side by side.
 - pdf rasterization: `poppler-utils` (apt/brew), auto-detected. scanned pdfs are rendered page-by-page through `pdftoppm` before ocr, which reads anything a viewer could show — jbig2 and ccitt fax compression included; without poppler, only pdfs whose embedded page images pypdf can decode are readable. pillow is the converter for images themselves: png/jpg (cmyk included)/webp/gif/tiff (multi-page)/bmp all normalize to what tesseract expects. `.docx`/`.odt` extract natively (stdlib zip+xml, no ocr involved); legacy `.doc` is refused with a save-as suggestion.
 - image reader order is configurable via `EXTRACT_READERS` (default `ocr,vision`); new readers — another ocr engine, a dedicated ocr model, a model on new hardware — register via `extract.register_reader` without touching the ladder.
 - datastores: postgres 16 with `vector` + `citext`; redis 7 with auth.
-- filesystem: writable `SHARED_FS_ROOT` (defaults to `/srv/liminallm`) for adapters, artifacts, and user files.
+- filesystem: a writable path for adapters, artifacts, and user files. set `shared_fs_root` in the admin console; defaults to `/srv/liminallm`.
 - gpu/tpu: only if `MODEL_BACKEND=local_gpu_lora` (nvidia cuda/cuDNN for jax gpu builds; amd/rocm if you build your own wheel).
 - tls/reverse proxy: optional but recommended; an nginx template ships in-repo.
 
@@ -19,8 +19,8 @@ api backends (remote inference). you can run them side by side.
 set env vars before boot:
 - database: `DATABASE_URL` (example: `postgresql://liminallm:<password>@postgres:5432/liminallm`).
 - redis: `REDIS_URL` (example: `redis://:<password>@redis:6379/0`).
-- secrets: `JWT_SECRET` (required), `JWT_ISSUER`/`JWT_AUDIENCE` (optional defaults exist).
-- model backend: `MODEL_BACKEND` (defaults to `openai`), `MODEL_PATH` for local base models, adapter keys like `OPENAI_ADAPTER_API_KEY`/`OPENAI_ADAPTER_BASE_URL`, optional `VOICE_*`.
+- secrets and settings: all in the database, edited from the admin console at `/admin.html`. the signing key generates itself on first boot; smtp and provider credentials are set (and rotated) there, write-only.
+- model backend, model path, provider keys and voice settings: all in the admin console.
 - routing/limits: `CHAT_RATE_LIMIT_PER_MINUTE`, `RESET_RATE_LIMIT_PER_MINUTE`.
 - multi-replica: `CLUSTER_BUS_BACKEND` (`auto` by default; see running multiple replicas below).
 - smtp/oauth: `SMTP_*`, `OAUTH_*` if needed.
@@ -42,7 +42,7 @@ data directories under `SHARED_FS_ROOT` must be writable:
 7. smoke test: `curl http://localhost:8000/healthz` returns `"ok"`; hit `/` for chat ui, `/admin` for admin-only controls.
 
 ## option a: docker compose (fast path)
-1. export secrets/passwords (`POSTGRES_PASSWORD`, `REDIS_PASSWORD`, `JWT_SECRET`, provider keys).
+1. export `DATABASE_URL` (and `POSTGRES_PASSWORD` for the container). everything else is configured from the admin console after first boot, or seeded with `INSTANCE_SETTINGS_JSON`.
 2. `docker compose up -d` (add `--profile production nginx` to enable the bundled reverse proxy). builds the app, brings postgres + pgvector, and secures redis with password auth.
 3. health: `curl http://localhost:${HOST_PORT:-8000}/healthz` should yield `"ok"`.
 4. persistence: app data in `liminallm-data`, postgres in `postgres-data`, redis in `redis-data`; migrations from `sql/` apply on first boot.
@@ -137,8 +137,7 @@ pip install -e ".[dev]"
 # create environment file
 sudo tee /srv/liminallm/.env << 'EOF'
 # Core
-JWT_SECRET="your-32-character-secure-secret-key-here!"
-SHARED_FS_ROOT="/srv/liminallm"
+# the signing key and the filesystem root are database settings now
 
 # Database
 DATABASE_URL="postgresql://liminallm:your-secure-password@localhost:5432/liminallm"
@@ -300,8 +299,6 @@ postgres is required — it is the only store. redis is optional; without it rat
 limits, idempotency durability and caches fall back to in-process state:
 
 ```bash
-export JWT_SECRET="Test-Secret-Key-4-Testing-Only!"
-export SHARED_FS_ROOT="/tmp/liminallm"
 export DATABASE_URL="postgresql://postgres:postgres@localhost:5432/liminallm"
 export ALLOW_REDIS_FALLBACK_DEV=true
 export TEST_MODE=true
@@ -375,7 +372,7 @@ scale out by running the same image behind a load balancer. postgres and `SHARED
 ## configuration management expectations
 - principle: most runtime knobs live in the database and are editable via the admin ui (`/admin`) instead of env vars.
 - database-managed settings include session rotation, concurrency caps, rate limits, pagination defaults, token ttls, feature flags (mfa/signup), training worker toggles, smtp/oauth and url settings, voice defaults, model backend/path, rag mode, embedding model id, and tenant/jwt claims.
-- environment-only settings are reserved for infra/bootstrap secrets: `DATABASE_URL`, `REDIS_URL`, `JWT_SECRET`, provider api keys, and the minimal env overrides noted in the config cheatsheet above.
+- environment holds `DATABASE_URL` and four things that are not settings (`BUILD_SHA`, `TEST_MODE`, `EMBEDDING_VECTOR_DIM`, `EXTRACT_READER_PLUGINS`). everything else is in the database, so replicas cannot disagree and nothing needs a redeploy to change. see `docs/CONFIGURATION.md`.
 
 ## reverse proxy + os notes
 - nginx config sits at `nginx.conf`; enable the compose `nginx` service with the `production` profile or adapt for your host tls.

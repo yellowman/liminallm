@@ -60,6 +60,44 @@ def store():
     return get_test_store()
 
 
+@pytest.fixture
+def client():
+    from fastapi.testclient import TestClient
+
+    from liminallm import app as app_module
+
+    return TestClient(app_module.app)
+
+
+def _signup(client, prefix, *, admin=False):
+    import uuid
+
+    from liminallm.service.runtime import get_runtime
+
+    email = f"{prefix}_{uuid.uuid4().hex[:8]}@example.com"
+    password = "TestPassword123!"
+    resp = client.post("/v1/auth/signup", json={"email": email, "password": password})
+    assert resp.status_code == 201, resp.text
+    if admin:
+        get_runtime().store.update_user_role(resp.json()["data"]["user_id"], role="admin")
+        # Re-login: the role is in the token, so the signup one is stale.
+        resp = client.post(
+            "/v1/auth/login", json={"email": email, "password": password}
+        )
+        assert resp.status_code == 200, resp.text
+    return {"Authorization": f"Bearer {resp.json()['data']['access_token']}"}
+
+
+@pytest.fixture
+def auth_headers(client):
+    return _signup(client, "user")
+
+
+@pytest.fixture
+def admin_headers(client):
+    return _signup(client, "admin", admin=True)
+
+
 def _truncate_all() -> None:
     """Wipe every table between tests.
 

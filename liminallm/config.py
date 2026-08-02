@@ -2,18 +2,20 @@ from __future__ import annotations
 
 import json
 import os
-import secrets
+import secrets as secrets_module
 import string
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path
-from typing import Any, Literal, Optional
+from functools import lru_cache
+from types import UnionType
+from typing import Annotated, Any, Literal, Optional, Union, get_args, get_origin
 
 from dotenv import dotenv_values
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    TypeAdapter,
     ValidationError,
     field_validator,
     model_validator,
@@ -348,6 +350,28 @@ def env_field(default: Any, env: str, **kwargs):
     return Field(default, json_schema_extra=extra, **kwargs)
 
 
+def secret_field(default: Any = "", **kwargs):
+    """A managed setting whose value is never read back out.
+
+    Stored in the database like any other managed setting — an operator can
+    rotate an SMTP password without a redeploy — but it is redacted from every
+    read path: GET /admin/settings returns it as an empty string, and the
+    console renders a write-only control that submits only when the operator
+    types something.
+
+    That redaction is the whole reason this is a separate kind. The settings
+    endpoint returns the merged dict verbatim, so a secret stored as an
+    ordinary managed_field would be echoed back to every admin, into logs, and
+    into anything that captures a response body.
+
+    Not for bootstrap secrets. JWT_SECRET and DATABASE_URL are needed before
+    the database can be read at all, so they stay env_field.
+    """
+    extra = kwargs.pop("json_schema_extra", {}) or {}
+    extra = {**extra, "admin": True, "secret": True}
+    return Field(default, json_schema_extra=extra, **kwargs)
+
+
 def managed_field(default: Any, **kwargs):
     """A setting that lives in the database, editable from the admin UI.
 
@@ -372,8 +396,14 @@ class Settings(BaseModel):
     database_url: str = env_field(
         "postgresql://localhost:5432/liminallm", "DATABASE_URL"
     )
-    redis_url: str = env_field("redis://localhost:6379/0", "REDIS_URL")
-    shared_fs_root: str = env_field("/srv/liminallm", "SHARED_FS_ROOT")
+    redis_url: str = managed_field(
+        "redis://localhost:6379/0",
+        description=(
+            "Redis DSN. Optional: without it, rate limits, idempotency "
+            "durability and caches fall back to in-process state."
+        ),
+    )
+    shared_fs_root: str = managed_field("/srv/liminallm")
     tmp_cleanup_interval_seconds: int = managed_field(
         86400,
         description="How often to sweep per-user tmp scratch directories (seconds)",
@@ -388,11 +418,21 @@ class Settings(BaseModel):
     model_backend: ModelBackend | None = managed_field(
         ModelBackend.OPENAI, description="Model backend (overridable via admin UI)",
     )
-    adapter_openai_api_key: str | None = env_field(None, "OPENAI_ADAPTER_API_KEY")
-    adapter_openai_base_url: str | None = managed_field(None)
-    adapter_server_model: str | None = managed_field(None)
+    adapter_openai_api_key: str = secret_field(
+        description="API key for the model provider. Write-only.",
+    )
+    adapter_openai_base_url: str | None = managed_field(
+        None,
+        description="Base URL override for an OpenAI-compatible endpoint. Blank uses the provider default.",
+    )
+    adapter_server_model: str | None = managed_field(
+        None,
+        description="Model name to send when pointing at an adapter server",
+    )
     # Voice service settings
-    voice_api_key: str | None = env_field(None, "VOICE_API_KEY")
+    voice_api_key: str = secret_field(
+        description="API key for transcription and synthesis. Write-only.",
+    )
     # Literal, not str: the allowed values are part of the setting, and
     # declaring them here means the admin API validates against the same list
     # the admin UI renders as a dropdown.
@@ -408,12 +448,24 @@ class Settings(BaseModel):
         "alloy", "echo", "fable", "onyx", "nova", "shimmer"
     ] = managed_field("alloy", description="Default voice")
     # OAuth settings
-    oauth_google_client_id: str | None = env_field(None, "OAUTH_GOOGLE_CLIENT_ID")
-    oauth_google_client_secret: str | None = env_field(None, "OAUTH_GOOGLE_CLIENT_SECRET")
-    oauth_github_client_id: str | None = env_field(None, "OAUTH_GITHUB_CLIENT_ID")
-    oauth_github_client_secret: str | None = env_field(None, "OAUTH_GITHUB_CLIENT_SECRET")
-    oauth_microsoft_client_id: str | None = env_field(None, "OAUTH_MICROSOFT_CLIENT_ID")
-    oauth_microsoft_client_secret: str | None = env_field(None, "OAUTH_MICROSOFT_CLIENT_SECRET")
+    oauth_google_client_id: str = managed_field(
+        "", description="OAuth client ID for google (not a secret)",
+    )
+    oauth_google_client_secret: str = secret_field(
+        description="OAuth client secret for google. Write-only.",
+    )
+    oauth_github_client_id: str = managed_field(
+        "", description="OAuth client ID for github (not a secret)",
+    )
+    oauth_github_client_secret: str = secret_field(
+        description="OAuth client secret for github. Write-only.",
+    )
+    oauth_microsoft_client_id: str = managed_field(
+        "", description="OAuth client ID for microsoft (not a secret)",
+    )
+    oauth_microsoft_client_secret: str = secret_field(
+        description="OAuth client secret for microsoft. Write-only.",
+    )
     oauth_redirect_uri: str | None = managed_field(
         None, description="OAuth redirect URI (overridable via admin UI)",
     )
@@ -427,15 +479,14 @@ class Settings(BaseModel):
     smtp_user: str | None = managed_field(
         None, description="SMTP username (overridable via admin UI)",
     )
-    smtp_password: str | None = env_field(
-        None, "SMTP_PASSWORD", description="SMTP password (overridable via admin UI)",
+    smtp_password: str = secret_field(
+        description="SMTP password. Write-only: saved, never shown again.",
     )
     smtp_use_tls: bool = managed_field(
         True, description="Use TLS for SMTP (overridable via admin UI)",
     )
-    smtp_allow_insecure: bool = env_field(
+    smtp_allow_insecure: bool = managed_field(
         False,
-        "SMTP_ALLOW_INSECURE",
         description="Allow plaintext SMTP when explicitly enabled (overridable via admin UI)",
     )
     email_from_address: str | None = managed_field(
@@ -457,7 +508,7 @@ class Settings(BaseModel):
         description="Allow new user signups (overridable via admin UI)",
     )
     build_sha: str = env_field("dev", "BUILD_SHA")
-    cors_allow_origins: list[str] = env_field(
+    cors_allow_origins: list[str] = managed_field(
         [
             "http://localhost",
             "http://localhost:3000",
@@ -465,20 +516,22 @@ class Settings(BaseModel):
             "http://127.0.0.1:3000",
             "http://127.0.0.1:5173",
         ],
-        "CORS_ALLOW_ORIGINS",
-        description="Comma-separated CORS origins (overridable via admin UI)",
+        description="Browser origins allowed to call this API",
     )
-    cors_allow_credentials: bool = env_field(False, "CORS_ALLOW_CREDENTIALS")
-    enable_hsts: bool = env_field(False, "ENABLE_HSTS")
-    allow_redis_fallback_dev: bool = env_field(False, "ALLOW_REDIS_FALLBACK_DEV")
+    cors_allow_credentials: bool = managed_field(
+        False, description="Allow cookies on cross-origin requests",
+    )
+    enable_hsts: bool = managed_field(
+        False, description="Send Strict-Transport-Security. Turn on once TLS is in front.",
+    )
+    allow_redis_fallback_dev: bool = managed_field(False)
     test_mode: bool = env_field(
         False,
         "TEST_MODE",
         description="Toggle deterministic testing behaviors; required for CI pathways described in SPEC §14.",
     )
-    tool_network_allowlist: list[str] = env_field(
+    tool_network_allowlist: list[str] = managed_field(
         ["api.openai.com"],
-        "TOOL_NETWORK_ALLOWLIST",
         description="Allowlisted hostnames/CIDRs for tool egress (SPEC §18)",
     )
     tool_network_proxy_url: str | None = managed_field(
@@ -493,9 +546,8 @@ class Settings(BaseModel):
         30.0,
         description="Total timeout (seconds) for tool HTTP fetches",
     )
-    interpreter_scratch_dir: str | None = env_field(
+    interpreter_scratch_dir: str | None = managed_field(
         None,
-        "INTERPRETER_SCRATCH_DIR",
         description=(
             "Node-local directory for code-interpreter session dirs. Defaults "
             "to the system temp dir. Must NOT be on shared storage: these hold "
@@ -573,9 +625,8 @@ class Settings(BaseModel):
             "when off, notes routes and the note_search tool disappear."
         ),
     )
-    cluster_bus_backend: str = env_field(
+    cluster_bus_backend: str = managed_field(
         "auto",
-        "CLUSTER_BUS_BACKEND",
         description=(
             "Transport for cross-replica coordination (cancelling a stream "
             "owned by another worker): auto | redis | postgres | local. 'auto' "
@@ -594,10 +645,8 @@ class Settings(BaseModel):
         "none",
         description="Search backend: none | brave | tavily | google_cse | duckduckgo",
     )
-    web_search_api_key: str | None = env_field(
-        None,
-        "WEB_SEARCH_API_KEY",
-        description="API key for the configured web search provider",
+    web_search_api_key: str = secret_field(
+        description="API key for the search provider. Write-only.",
     )
     web_search_engine_id: str | None = managed_field(
         None,
@@ -615,9 +664,8 @@ class Settings(BaseModel):
         le=64 * 1024 * 1024,
         description="Maximum bytes read from a fetched page",
     )
-    web_fetch_allow_private: bool = env_field(
+    web_fetch_allow_private: bool = managed_field(
         False,
-        "WEB_FETCH_ALLOW_PRIVATE",
         description=(
             "TEST ONLY: permit fetching private/loopback addresses. Disables "
             "SSRF protection — never enable in production."
@@ -627,7 +675,13 @@ class Settings(BaseModel):
         True,
         description="Enable multi-factor authentication (overridable via admin UI)",
     )
-    jwt_secret: str = env_field(None, "JWT_SECRET", validate_default=True)
+    jwt_secret: str = secret_field(
+        "",
+        description=(
+            "Token signing key. Generated on first boot if empty. Rotating it "
+            "signs out every session."
+        ),
+    )
     jwt_issuer: str = managed_field(
         "liminallm",
         description="JWT issuer (overridable via admin UI)",
@@ -751,46 +805,142 @@ class Settings(BaseModel):
     # site, for four keys the admin API would then reject as unknown.
     # Session windows. A one-minute floor: a zero would log everyone out on
     # arrival, and there is no reading of "0 minutes" that anyone wants.
-    session_ttl_minutes_web: int = managed_field(60 * 24 * 7, ge=1)
-    session_ttl_minutes_mobile: int = managed_field(60 * 24, ge=1)
-    refresh_token_ttl_minutes_web: int = managed_field(60 * 24 * 7, ge=1)
-    refresh_token_ttl_minutes_mobile: int = managed_field(60 * 24, ge=1)
-    session_rotation_hours: int = managed_field(24, ge=1)
-    session_rotation_grace_seconds: int = managed_field(300, ge=0)
+    session_ttl_minutes_web: int = managed_field(
+        60 * 24 * 7, ge=1,
+        description="How long a browser session stays valid (SPEC §18: 7 days)",
+    )
+    session_ttl_minutes_mobile: int = managed_field(
+        60 * 24, ge=1,
+        description="How long a mobile session stays valid (SPEC §18: 1 day)",
+    )
+    refresh_token_ttl_minutes_web: int = managed_field(
+        60 * 24 * 7, ge=1,
+        description="Refresh window for browser sessions; match the session TTL",
+    )
+    refresh_token_ttl_minutes_mobile: int = managed_field(
+        60 * 24, ge=1,
+        description="Refresh window for mobile sessions; match the session TTL",
+    )
+    session_rotation_hours: int = managed_field(
+        24, ge=1,
+        description="Re-issue a session's tokens after this long of continuous use",
+    )
+    session_rotation_grace_seconds: int = managed_field(
+        300, ge=0,
+        description="How long the previous token still works after a rotation, so an in-flight request does not 401",
+    )
     # Concurrency: at least one, or the instance accepts work it will never run.
-    max_concurrent_workflows: int = managed_field(3, ge=1)
-    max_concurrent_inference: int = managed_field(2, ge=1)
+    max_concurrent_workflows: int = managed_field(
+        3, ge=1,
+        description="Workflows running at once per instance. Raising it costs memory, not just CPU.",
+    )
+    max_concurrent_inference: int = managed_field(
+        2, ge=1,
+        description="Model calls in flight at once. Keep at or below what the provider will accept.",
+    )
     # Rate limit multipliers. Positive: a zero multiplier would silently make
     # every limit "0 requests" for that tier rather than disabling anything.
-    rate_limit_multiplier_free: float = managed_field(1.0, gt=0)
-    rate_limit_multiplier_paid: float = managed_field(2.0, gt=0)
-    rate_limit_multiplier_enterprise: float = managed_field(5.0, gt=0)
+    rate_limit_multiplier_free: float = managed_field(
+        1.0, gt=0,
+        description="Rate limits are multiplied by this for free-tier users",
+    )
+    rate_limit_multiplier_paid: float = managed_field(
+        2.0, gt=0,
+        description="Rate limits are multiplied by this for paid users",
+    )
+    rate_limit_multiplier_enterprise: float = managed_field(
+        5.0, gt=0,
+        description="Rate limits are multiplied by this for enterprise users",
+    )
     # Rate limits. 0 means unlimited, which is why these floor at 0 rather
     # than 1 — an operator turning one off is a legitimate choice.
-    chat_rate_limit_per_minute: int = managed_field(60, ge=0)
-    chat_rate_limit_window_seconds: int = managed_field(60, ge=1)
-    login_rate_limit_per_minute: int = managed_field(10, ge=0)
-    refresh_rate_limit_per_minute: int = managed_field(20, ge=0)
-    refresh_rate_limit_window_seconds: int = managed_field(60, ge=1)
-    signup_rate_limit_per_minute: int = managed_field(5, ge=0)
-    reset_rate_limit_per_minute: int = managed_field(5, ge=0)
-    mfa_rate_limit_per_minute: int = managed_field(5, ge=0)
-    admin_rate_limit_per_minute: int = managed_field(30, ge=0)
-    admin_rate_limit_window_seconds: int = managed_field(60, ge=1)
-    files_upload_rate_limit_per_minute: int = managed_field(10, ge=0)
-    websocket_connect_rate_limit_per_minute: int = managed_field(30, ge=0)
-    configops_rate_limit_per_hour: int = managed_field(30, ge=0)
-    read_rate_limit_per_minute: int = managed_field(120, ge=0)
-    write_rate_limit_per_minute: int = managed_field(60, ge=0)
-    max_websocket_connections_per_user: int = managed_field(5, ge=1)
+    chat_rate_limit_per_minute: int = managed_field(
+        60, ge=0,
+        description="Chat requests allowed per window. 0 disables the limit.",
+    )
+    chat_rate_limit_window_seconds: int = managed_field(
+        60, ge=1,
+        description="Length of the chat rate-limit window",
+    )
+    login_rate_limit_per_minute: int = managed_field(
+        10, ge=0,
+        description="Login attempts per minute per client. Low values slow credential stuffing.",
+    )
+    refresh_rate_limit_per_minute: int = managed_field(
+        20, ge=0,
+        description="Token refreshes allowed per window",
+    )
+    refresh_rate_limit_window_seconds: int = managed_field(
+        60, ge=1,
+        description="Length of the token-refresh window",
+    )
+    signup_rate_limit_per_minute: int = managed_field(
+        5, ge=0,
+        description="New accounts per minute per client",
+    )
+    reset_rate_limit_per_minute: int = managed_field(
+        5, ge=0,
+        description="Password-reset requests per minute per client",
+    )
+    mfa_rate_limit_per_minute: int = managed_field(
+        5, ge=0,
+        description="MFA attempts per minute. Low values slow code guessing.",
+    )
+    admin_rate_limit_per_minute: int = managed_field(
+        30, ge=0,
+        description="Admin API calls per window",
+    )
+    admin_rate_limit_window_seconds: int = managed_field(
+        60, ge=1,
+        description="Length of the admin rate-limit window",
+    )
+    files_upload_rate_limit_per_minute: int = managed_field(
+        10, ge=0,
+        description="Uploads per minute per user",
+    )
+    websocket_connect_rate_limit_per_minute: int = managed_field(
+        30, ge=0,
+        description="Websocket connection attempts per minute per user",
+    )
+    configops_rate_limit_per_hour: int = managed_field(
+        30, ge=0,
+        description="ConfigOps patch proposals per hour",
+    )
+    read_rate_limit_per_minute: int = managed_field(
+        120, ge=0,
+        description="Read requests per minute per user. 0 disables the limit.",
+    )
+    write_rate_limit_per_minute: int = managed_field(
+        60, ge=0,
+        description="Write requests per minute per user. 0 disables the limit.",
+    )
+    max_websocket_connections_per_user: int = managed_field(
+        5, ge=1,
+        description="Simultaneous websockets one user may hold",
+    )
     # Pagination. Capped so a page size cannot be set to something that reads
     # the whole table into memory.
-    default_page_size: int = managed_field(100, ge=1, le=1000)
-    max_page_size: int = managed_field(500, ge=1, le=1000)
-    default_conversations_limit: int = managed_field(50, ge=1, le=1000)
+    default_page_size: int = managed_field(
+        100, ge=1, le=1000,
+        description="Items per page when a request does not ask for a size",
+    )
+    max_page_size: int = managed_field(
+        500, ge=1, le=1000,
+        description="Largest page a caller may request",
+    )
+    default_conversations_limit: int = managed_field(
+        50, ge=1, le=1000,
+        description="Conversations returned when no limit is given",
+    )
     # Files
-    max_upload_bytes: int = managed_field(10485760, ge=1024)
-    rag_chunk_size: int = managed_field(400, ge=64, le=4000)
+    max_upload_bytes: int = managed_field(
+        10485760, ge=1024,
+        description="Largest single upload accepted, in bytes",
+    )
+    rag_chunk_size: int = managed_field(
+        400, ge=64, le=4000,
+        description="Tokens per knowledge chunk. Changing this rebuilds the model services and only affects newly ingested content.",
+    )
 
     @field_validator("cors_allow_origins", mode="before")
     @classmethod
@@ -886,85 +1036,34 @@ class Settings(BaseModel):
             return [v.strip() for v in value.split(",") if v.strip()]
         return list(value)
 
-    @field_validator("jwt_secret", mode="before")
+    @field_validator("jwt_secret")
     @classmethod
-    def _ensure_jwt_secret(cls, value: str | None) -> str:
-        def _validate_secret(secret: str) -> str:
-            secret = secret.strip()
-            if len(secret) < 32:
-                raise ValueError("JWT_SECRET must be at least 32 characters long")
-
-            character_classes = [
-                any(ch.islower() for ch in secret),
-                any(ch.isupper() for ch in secret),
-                any(ch.isdigit() for ch in secret),
-                any(ch in string.punctuation for ch in secret),
-            ]
-            if sum(character_classes) < 3 or len(set(secret)) < 10:
-                raise ValueError(
-                    "JWT_SECRET must mix character classes and contain sufficient unique characters",
-                )
-            return secret
-
-        if value:
-            return _validate_secret(value)
-        # Persist a generated JWT secret so tokens remain valid across restarts
-        fs_root = Path(os.getenv("SHARED_FS_ROOT", "/srv/liminallm"))
-        secret_path = fs_root / ".jwt_secret"
-
-        # Create directory with restrictive permissions
-        try:
-            fs_root.mkdir(parents=True, exist_ok=True)
-            # Ensure directory has restrictive permissions
-            os.chmod(fs_root, 0o700)
-        except PermissionError:
-            # Directory may already exist with different permissions (e.g., in container)
-            pass
-        except Exception as exc:
-            logger.warning(
-                "jwt_secret_dir_setup",
-                error=str(exc),
-                path=str(fs_root),
-                message="Could not set directory permissions",
+    def _check_jwt_secret(cls, value: str) -> str:
+        """Reject a weak key. An empty one means "generate me" (see runtime)."""
+        if not value:
+            return value
+        secret = value.strip()
+        if len(secret) < 32:
+            raise ValueError("jwt_secret must be at least 32 characters long")
+        classes = [
+            any(ch.islower() for ch in secret),
+            any(ch.isupper() for ch in secret),
+            any(ch.isdigit() for ch in secret),
+            any(ch in string.punctuation for ch in secret),
+        ]
+        if sum(classes) < 3 or len(set(secret)) < 10:
+            raise ValueError(
+                "jwt_secret must mix character classes and contain enough "
+                "unique characters"
             )
+        return secret
 
-        if secret_path.exists() and not secret_path.is_symlink():
-            try:
-                persisted = secret_path.read_text().strip()
-                if persisted:
-                    return _validate_secret(persisted)
-            except Exception as exc:
-                logger.error(
-                    "jwt_secret_read_failed", error=str(exc), path=str(secret_path)
-                )
 
-        generated = _validate_secret(secrets.token_urlsafe(64))
-        try:
-            # Use atomic write pattern: write to temp file then rename
-            import tempfile
-            fd, tmp_path = tempfile.mkstemp(
-                dir=str(fs_root), prefix=".jwt_secret_", suffix=".tmp"
-            )
-            try:
-                os.write(fd, generated.encode())
-                os.fchmod(fd, 0o600)  # Set permissions before closing
-            finally:
-                os.close(fd)
-            os.rename(tmp_path, str(secret_path))
-        except Exception as exc:
-            # Clean up temp file if it exists
-            try:
-                if "tmp_path" in locals():
-                    os.unlink(tmp_path)
-            except Exception:
-                pass
-            logger.error(
-                "jwt_secret_persist_failed", error=str(exc), path=str(secret_path)
-            )
-            raise RuntimeError(
-                "Unable to persist JWT secret; set JWT_SECRET env var or make SHARED_FS_ROOT writable"
-            ) from exc
-        return generated
+def generate_jwt_secret() -> str:
+    """A signing key that satisfies _check_jwt_secret."""
+    alphabet = string.ascii_letters + string.digits + "!@#$%^&*-_=+"
+    return "".join(secrets_module.choice(alphabet) for _ in range(64))
+
 
 
 def _admin_defaults_from_settings() -> dict:
@@ -993,22 +1092,160 @@ def _admin_defaults_from_settings() -> dict:
 # never masquerades as an explicit override.
 SYSTEM_SETTINGS_DEFAULTS: dict = _admin_defaults_from_settings()
 
+def secret_setting_names() -> set[str]:
+    """Managed settings that must never be returned by a read."""
+    return {
+        name
+        for name, field in Settings.model_fields.items()
+        if isinstance(field.json_schema_extra, dict)
+        and field.json_schema_extra.get("secret")
+    }
+
+
+def redact_secrets(settings: dict) -> dict:
+    """Blank every secret in a settings dict before it leaves the process."""
+    hidden = secret_setting_names()
+    return {k: ("" if k in hidden else v) for k, v in settings.items()}
+
+
 def managed_setting_names() -> set[str]:
     """Names an admin is allowed to write."""
     return set(SYSTEM_SETTINGS_DEFAULTS)
 
 
-def validate_managed_settings(patch: dict) -> dict[str, str]:
+# Admin console grouping. A table rather than a `group=` on all 78 fields:
+# the same information, in one place you can read top to bottom, and a new
+# setting that matches no rule still shows up (under "Other") instead of
+# vanishing from the console.
+_SETTING_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Model", ("model_path", "model_backend", "model_context_window",
+               "model_reasoning_effort", "default_adapter_mode",
+               "adapter_openai_base_url", "adapter_server_model")),
+    ("Retrieval", ("rag_mode", "rag_chunk_size", "embedding_model_id",
+                   "history_budget_fraction", "history_recall_fraction")),
+    ("Features", ("notes_enabled", "allow_signup", "enable_mfa",
+                  "web_tools_enabled", "extract_readers")),
+    ("Web tools", ("web_search_provider", "web_search_engine_id",
+                   "web_fetch_timeout", "web_fetch_max_bytes",
+                   "tool_fetch_timeout", "tool_fetch_connect_timeout",
+                   "tool_network_proxy_url")),
+    ("Sessions & tokens", ("session_", "access_token_", "refresh_token_")),
+    ("Rate limits", ("rate_limit_", "_rate_limit_")),
+    ("Concurrency", ("max_concurrent_", "max_websocket_")),
+    ("Pagination", ("default_page_size", "max_page_size",
+                    "default_conversations_limit")),
+    ("Files", ("max_upload_bytes", "tmp_")),
+    ("Training", ("training_", "max_active_training_jobs")),
+    ("Email", ("smtp_", "email_from_")),
+    ("Voice", ("voice_",)),
+    ("URLs & identity", ("app_base_url", "oauth_redirect_uri",
+                         "default_tenant_id", "jwt_")),
+    ("Operations", ("settings_watch_interval_seconds",)),
+)
+
+# Changing one of these rebuilds the model service stack, which takes a moment
+# and briefly interrupts in-flight work. The console says so before you save.
+MODEL_AFFECTING_SETTINGS = frozenset({
+    "model_backend",
+    "model_path",
+    "default_adapter_mode",
+    "rag_mode",
+    "embedding_model_id",
+    "rag_chunk_size",
+})
+
+
+def _group_for(name: str) -> str:
+    for label, patterns in _SETTING_GROUPS:
+        for pattern in patterns:
+            if name == pattern or (pattern.endswith("_") and pattern in name):
+                return label
+    return "Other"
+
+
+def managed_settings_schema() -> list[dict]:
+    """Describe every managed setting well enough to render a form for it.
+
+    The admin console builds itself from this. It used to hand-mirror the
+    field list — every setting written out twice in JavaScript plus a block of
+    HTML — which is why thirty settings had no control at all and one that had
+    since become env-only was still being posted, failing every save.
+    """
+    described: list[dict] = []
+    for name, field in Settings.model_fields.items():
+        extra = field.json_schema_extra or {}
+        if not (isinstance(extra, dict) and extra.get("admin")):
+            continue
+        entry: dict[str, Any] = {
+            "name": name,
+            "secret": bool(extra.get("secret")),
+            "group": _group_for(name),
+            "description": field.description or "",
+            "default": SYSTEM_SETTINGS_DEFAULTS[name],
+            "reloads_model": name in MODEL_AFFECTING_SETTINGS,
+        }
+        annotation = field.annotation
+        # Unwrap Optional[...]: several of these are `Enum | None`, and an
+        # annotation that is a union hides the enum from a naive issubclass.
+        if get_origin(annotation) is UnionType or get_origin(annotation) is Union:
+            candidates = [a for a in get_args(annotation) if a is not type(None)]
+            if len(candidates) == 1:
+                annotation = candidates[0]
+        choices = get_args(annotation) if get_origin(annotation) is Literal else ()
+        if isinstance(annotation, type) and issubclass(annotation, Enum):
+            choices = tuple(member.value for member in annotation)
+        if choices:
+            entry["type"] = "choice"
+            entry["choices"] = [str(choice) for choice in choices]
+        elif entry["default"] is True or entry["default"] is False:
+            entry["type"] = "bool"
+        elif isinstance(entry["default"], int):
+            entry["type"] = "int"
+        elif isinstance(entry["default"], float):
+            entry["type"] = "float"
+        else:
+            entry["type"] = "text"
+        for constraint in field.metadata:
+            for attr, key in (
+                ("ge", "min"), ("gt", "exclusive_min"),
+                ("le", "max"), ("lt", "exclusive_max"),
+            ):
+                value = getattr(constraint, attr, None)
+                if value is not None:
+                    entry[key] = value
+        described.append(entry)
+    order = [label for label, _ in _SETTING_GROUPS] + ["Other"]
+    described.sort(key=lambda item: (order.index(item["group"]), item["name"]))
+    return described
+
+
+@lru_cache(maxsize=None)
+def _field_adapter(name: str) -> TypeAdapter:
+    """Validate one field's type and bounds, without the model's own rules.
+
+    Constructing a whole Settings to check a single field runs the model-level
+    validators too, which then complain about fields the admin never touched
+    (setting an SMTP host would report a missing password before the merged
+    view was even considered). Those rules belong to the second pass.
+    """
+    field = Settings.model_fields[name]
+    if not field.metadata:
+        return TypeAdapter(field.annotation)
+    return TypeAdapter(Annotated[tuple([field.annotation, *field.metadata])])
+
+
+def validate_managed_settings(patch: dict, current: dict | None = None) -> dict[str, str]:
     """Check an admin's patch against the Settings model itself.
 
     Returns {field: message} for whatever failed, empty when the patch is
     good. Types, bounds and allowed values are declared once, on the fields;
     re-stating them in the API is how the two end up disagreeing, and the one
-    that would be wrong is the API — the model is what the code actually runs
-    against.
+    that would be wrong is the API — the model is what the code runs against.
 
-    Fields are checked one at a time so the response names every problem
-    rather than only the first.
+    Two passes. Per-field first, so the response names every bad field rather
+    than only the first. Then the patch applied to the current settings as a
+    whole, because some rules span fields (SMTP needs a password once a host
+    is set) and cannot be judged one field at a time.
     """
     errors: dict[str, str] = {}
     for key, value in patch.items():
@@ -1016,13 +1253,26 @@ def validate_managed_settings(patch: dict) -> dict[str, str]:
             errors[key] = "not a managed setting"
             continue
         try:
-            Settings(**{key: value})
+            _field_adapter(key).validate_python(value)
         except ValidationError as exc:
-            detail = exc.errors()[0]
-            message = detail.get("msg", "invalid value")
-            # Pydantic prefixes its type errors; the field name is already the
-            # dict key, so the prefix is noise in a per-field message.
-            errors[key] = message.replace("Value error, ", "")
+            errors[key] = exc.errors()[0].get("msg", "invalid value")
+    if errors:
+        return errors
+
+    merged = {**(current or {}), **patch}
+    merged = {k: v for k, v in merged.items() if k in SYSTEM_SETTINGS_DEFAULTS}
+    try:
+        Settings(**merged)
+    except ValidationError as exc:
+        for detail in exc.errors():
+            # A cross-field rule names no single field; attribute it to one the
+            # admin actually touched so the console can point at a control.
+            field = str(detail["loc"][0]) if detail.get("loc") else ""
+            if field not in patch:
+                field = next(iter(patch), "settings")
+            errors[field] = detail.get("msg", "invalid value").replace(
+                "Value error, ", ""
+            )
     return errors
 
 

@@ -16,7 +16,7 @@ from psycopg.adapt import Loader
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-from liminallm.config import SYSTEM_SETTINGS_DEFAULTS
+from liminallm.config import SYSTEM_SETTINGS_DEFAULTS, redact_secrets
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service.artifact_validation import (
@@ -3182,6 +3182,14 @@ class PostgresStore:
         """
         # Always merge stored overrides over defaults so callers get a complete,
         # current settings dict even when the row is partial, absent, or corrupt.
+        # Secrets are blanked: this feeds the admin API, and a value that is
+        # echoed back to every admin and into every log is not a secret.
+        return redact_secrets(
+            {**SYSTEM_SETTINGS_DEFAULTS, **self._get_stored_system_settings()}
+        )
+
+    def get_system_settings_raw(self) -> dict:
+        """Merged settings including secrets. For the runtime, not the API."""
         return {**SYSTEM_SETTINGS_DEFAULTS, **self._get_stored_system_settings()}
 
     def get_system_settings_overrides(self) -> dict:

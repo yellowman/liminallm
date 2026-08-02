@@ -48,8 +48,6 @@ pip install -e ".[dev]"
 TEST_MODE=true pytest tests/ -v
 
 # 3. Start server for manual testing (needs a running database)
-export JWT_SECRET="Test-Secret-Key-4-Testing-Only-Do-Not-Use-In-Production!"
-export SHARED_FS_ROOT="/tmp/liminallm-data"
 export DATABASE_URL="postgresql://postgres:postgres@localhost:5432/liminallm"
 export ALLOW_REDIS_FALLBACK_DEV=true
 export TEST_MODE=true
@@ -85,8 +83,6 @@ TEST_MODE=true python -m pytest tests/ -v
 
 ```bash
 # Start server
-export JWT_SECRET="Test-Secret-Key-4-Testing-Only-Do-Not-Use-In-Production!"
-export SHARED_FS_ROOT="/tmp/liminallm-data"
 export DATABASE_URL="postgresql://postgres:postgres@localhost:5432/liminallm"
 export ALLOW_REDIS_FALLBACK_DEV=true
 export TEST_MODE=true
@@ -340,7 +336,6 @@ pytest tests/test_post_smoke.py -v
 
 ```bash
 # Use a complex secret with mixed character classes
-export JWT_SECRET="Test-Secret-Key-4-Testing-Only-Do-Not-Use-In-Production!"
 ```
 
 ### Rate limiting in tests

@@ -78,7 +78,6 @@ For integration tests with a real database:
 ```bash
 export DATABASE_URL="postgresql://user:pass@localhost:5432/liminallm_test"
 export REDIS_URL="redis://localhost:6379/1"
-export JWT_SECRET="Test-JWT-Secret-For-QA-Environment-Only-32chars!"
 ```
 
 ## Bootstrap Admin User
@@ -158,7 +157,6 @@ scripts/
 The test JWT secret must contain uppercase, lowercase, digits, and special characters:
 
 ```bash
-export JWT_SECRET="Test-Secret-Key-4-Testing-Only-Do-Not-Use-In-Production!"
 ```
 
 ### Redis connection errors in tests

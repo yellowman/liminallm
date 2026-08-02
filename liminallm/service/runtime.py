@@ -13,6 +13,7 @@ from urllib.parse import urlparse, urlunparse
 from liminallm.config import (
     SYSTEM_SETTINGS_DEFAULTS,
     apply_managed_settings,
+    generate_jwt_secret,
     get_settings,
     reset_settings_cache,
 )
@@ -97,6 +98,14 @@ class Runtime:
             )
             raise
 
+        # Everything below is configured from the database, so resolve the
+        # settings before building anything that depends on them.
+        # Order matters: the seed only applies to an unconfigured instance, and
+        # the generated signing key would otherwise make it look configured.
+        self._seed_settings_from_env()
+        self._ensure_signing_key()
+        self.refresh_settings()
+
         self.cache = None
         redis_error: Exception | None = None
         if self.settings.redis_url:
@@ -139,33 +148,13 @@ class Runtime:
         # model_backend/model_path without restarting the process.
         self._build_model_services()
 
-        # self.settings now carries the admin-managed values (refreshed inside
-        # _build_model_services), so these are plain reads.
-        settings = self.settings
-        self.voice = VoiceService(
-            settings.shared_fs_root,
-            api_key=settings.voice_api_key,
-            transcription_model=settings.voice_transcription_model,
-            synthesis_model=settings.voice_synthesis_model,
-            default_voice=settings.voice_default_voice,
-        )
         self.auth = AuthService(
             self.store,
             self.cache,
-            settings,
-            mfa_enabled=settings.enable_mfa,
+            self.settings,
+            mfa_enabled=self.settings.enable_mfa,
         )
-        self.email = EmailService(
-            smtp_host=settings.smtp_host,
-            smtp_port=settings.smtp_port,
-            smtp_user=settings.smtp_user,
-            smtp_password=settings.smtp_password,
-            smtp_use_tls=settings.smtp_use_tls,
-            smtp_allow_insecure=settings.smtp_allow_insecure,
-            from_email=settings.email_from_address,
-            from_name=settings.email_from_name,
-            base_url=settings.app_base_url,
-        )
+        self._build_credentialed_services()
         # Cross-replica coordination. Both primitives are best-effort and
         # neither makes Redis required: the bus falls back to Postgres
         # LISTEN/NOTIFY, and a single-process deployment gets local semantics.
@@ -278,6 +267,9 @@ class Runtime:
             logger.warning("settings_overrides_read_failed", error=str(exc))
             return {}
 
+    #: Written by the instance itself, not chosen by anyone.
+    GENERATED_SETTINGS = frozenset({"jwt_secret"})
+
     def _seed_settings_from_env(self) -> None:
         """Apply INSTANCE_SETTINGS_JSON on first boot, once.
 
@@ -308,13 +300,65 @@ class Runtime:
         if not seed:
             return
         try:
-            if self._system_settings_overrides():
+            # "Configured" means an operator chose something. The signing key
+            # writes itself on first boot, so it does not count.
+            chosen = set(self._system_settings_overrides()) - self.GENERATED_SETTINGS
+            if chosen:
                 logger.info("instance_settings_seed_skipped_already_configured")
                 return
             self.store.merge_instance_config("system_settings", seed)
             logger.info("instance_settings_seeded", settings=sorted(seed))
         except Exception as exc:  # noqa: BLE001 - a failed seed must not block boot
             logger.warning("instance_settings_seed_failed", error=str(exc))
+
+    def _ensure_signing_key(self) -> None:
+        """Put a signing key in the database on first boot.
+
+        It used to be generated into a file under shared_fs_root, which no
+        longer works: that path is itself a database setting now. Storing the
+        key alongside it also fixes a quieter problem — every replica that
+        could not read the file generated its own, so tokens issued by one
+        worker were rejected by the next.
+        """
+        try:
+            stored = self._system_settings_overrides()
+            if stored.get("jwt_secret"):
+                return
+            self.store.merge_instance_config(
+                "system_settings", {"jwt_secret": generate_jwt_secret()}
+            )
+            logger.info("jwt_secret_generated")
+        except Exception as exc:  # noqa: BLE001 - surfaced by the auth service
+            logger.error("jwt_secret_generation_failed", error=str(exc))
+
+    def _build_credentialed_services(self) -> None:
+        """(Re)build the services that capture credentials at construction.
+
+        Both take their configuration as constructor arguments, so handing them
+        a new settings object is not enough — rotating an SMTP password would
+        update self.settings and change nothing about the mail that gets sent.
+        Neither opens a connection when constructed, so rebuilding is cheap and
+        a rotation applies to the next message rather than the next restart.
+        """
+        settings = self.settings
+        self.voice = VoiceService(
+            settings.shared_fs_root,
+            api_key=settings.voice_api_key,
+            transcription_model=settings.voice_transcription_model,
+            synthesis_model=settings.voice_synthesis_model,
+            default_voice=settings.voice_default_voice,
+        )
+        self.email = EmailService(
+            smtp_host=settings.smtp_host,
+            smtp_port=settings.smtp_port,
+            smtp_user=settings.smtp_user,
+            smtp_password=settings.smtp_password,
+            smtp_use_tls=settings.smtp_use_tls,
+            smtp_allow_insecure=settings.smtp_allow_insecure,
+            from_email=settings.email_from_address,
+            from_name=settings.email_from_name,
+            base_url=settings.app_base_url,
+        )
 
     def refresh_settings(self) -> None:
         """Rebuild self.settings from the declared defaults plus what is stored.
@@ -324,7 +368,6 @@ class Runtime:
         the default out a third time inline; they disagreed, and nothing
         noticed.
         """
-        self._seed_settings_from_env()
         self.settings = apply_managed_settings(
             get_settings(), self._system_settings_overrides()
         )
@@ -332,10 +375,14 @@ class Runtime:
         # read attributes off it, so handing them the new one is enough — and
         # without this an admin's change would not reach a running auth or
         # email service until the process restarted.
-        for service in ("auth", "email", "voice", "workflow", "training"):
+        for service in ("auth", "workflow", "training"):
             existing = getattr(self, service, None)
             if existing is not None and hasattr(existing, "settings"):
                 existing.settings = self.settings
+        # These capture their configuration rather than reading it, so they
+        # have to be rebuilt for a change to reach them.
+        if getattr(self, "email", None) is not None:
+            self._build_credentialed_services()
 
     def _build_model_services(self) -> None:
         """Construct all backend-dependent services from system settings.

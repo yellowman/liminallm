@@ -60,10 +60,32 @@ def test_allowed_origins_default(monkeypatch):
     assert "http://127.0.0.1:5173" in origins
 
 
-def test_allowed_origins_override(monkeypatch):
-    monkeypatch.setenv("CORS_ALLOW_ORIGINS", "https://example.com, https://demo.local")
-    origins = app_module._allowed_origins()
-    assert origins == ["https://example.com", "https://demo.local"]
+def test_allowed_origins_come_from_the_running_instance(monkeypatch):
+    """CORS is admin-managed now, so the allowlist follows the settings the
+    instance is actually running with rather than the process environment."""
+    from types import SimpleNamespace
+
+    from liminallm.service import runtime as runtime_module
+
+    monkeypatch.setattr(
+        runtime_module,
+        "runtime",
+        SimpleNamespace(
+            settings=SimpleNamespace(
+                cors_allow_origins=["https://example.com", "https://demo.local"],
+                cors_allow_credentials=False,
+            )
+        ),
+    )
+    assert app_module._allowed_origins() == [
+        "https://example.com",
+        "https://demo.local",
+    ]
+
+
+def test_allowed_origins_never_default_to_a_wildcard():
+    """With credentials allowed, a wildcard is an open door."""
+    assert "*" not in app_module._DEFAULT_ORIGINS
 
 
 def test_envelope_status_validation():

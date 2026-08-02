@@ -189,8 +189,6 @@ rate limits, idempotency durability and caches fall back to in-process state.
 pip install -e ".[dev]"
 
 # Set required environment variables
-export JWT_SECRET="YourSecure-JWT-Secret-With-32-Characters!"
-export SHARED_FS_ROOT="/tmp/liminallm"
 export DATABASE_URL="postgresql://postgres:postgres@localhost:5432/liminallm"
 export TEST_MODE=true
 
@@ -229,8 +227,6 @@ sudo chown -R $USER:$USER /srv/liminallm
 # 5. Set environment variables
 export DATABASE_URL="postgresql://liminallm:yourpassword@localhost:5432/liminallm"
 export REDIS_URL="redis://localhost:6379/0"
-export JWT_SECRET="YourSecure-JWT-Secret-With-32-Characters!"
-export SHARED_FS_ROOT="/srv/liminallm"
 
 # 6. Run database migrations
 ./scripts/migrate.sh
@@ -388,19 +384,22 @@ Run the automated smoke test:
 - “Adapter-ID adapters” (multi-LoRA / adapter servers) surface `adapter_id` parameters on Together AI Serverless Multi-LoRA, LoRAX-style servers, or SageMaker adapter inference components. The backend keeps the base model string and passes `adapter_id` for one-or-more adapters per request when supported.
 - Hybrid patterns (local adapter-enabled “controller” + external API “executor”) flow through the same artifacts: the controller uses a local LoRA backend to plan, then the API backend executes with prompt or remote-model adapters.
 
-2. **configure env** — secrets and bootstrap only
-   - `DATABASE_URL` – postgres dsn
-   - `REDIS_URL` – redis dsn (optional; without it, rate limits and caches are in-process)
-   - `SHARED_FS_ROOT` – filesystem root path
-   - `JWT_SECRET` – signing key; generated into `SHARED_FS_ROOT` if unset
-   - `OPENAI_ADAPTER_API_KEY` – API key (leave unset to use the echo fallback)
-   - `EMBEDDING_VECTOR_DIM` – must match the width `sql/schema.sql` was applied with
-   - `TEST_MODE` – relaxes security for test harnesses
+2. **configure env** — one variable
+   - `DATABASE_URL` – postgres dsn. that is the configuration.
 
-   everything else — model path and backend, rag mode, rate limits, notes,
-   web tools, ttls — lives in the database and is edited from the admin
-   console. see `docs/CONFIGURATION.md`. for declarative deploys, seed them on
-   first boot with `INSTANCE_SETTINGS_JSON='{"model_backend": "stub"}'`.
+   four others exist and none of them are settings you tune: `BUILD_SHA`
+   (stamped by the build), `TEST_MODE` (the test harness),
+   `EMBEDDING_VECTOR_DIM` (a property of the schema you applied, shared with
+   `scripts/migrate.sh`), and `EXTRACT_READER_PLUGINS` (imports python
+   modules, so making it settable from a web form would mean remote code
+   execution).
+
+   everything else — the model, credentials, rate limits, ttls, cors, smtp,
+   the signing key — lives in the database and is edited from the admin
+   console at `/admin.html`, applied to every replica without a restart.
+   changing an smtp password should not require redeploying the app. for
+   declarative deploys, seed on first boot with
+   `INSTANCE_SETTINGS_JSON='{"model_backend": "stub"}'`.
 
 3. **migrate db**
    - run the alembic / migration tool to create tables described in the spec.

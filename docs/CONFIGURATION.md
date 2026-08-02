@@ -58,20 +58,34 @@ Used for deployment-level configuration that's visible but not directly editable
 
 ## Where a setting comes from
 
-Two kinds of setting, and the distinction is the whole design:
+Almost everything lives in the database. A setting in an environment variable
+is a value that differs per container, cannot be seen from inside the running
+system, cannot be changed without a redeploy, and is invisible to the console
+that claims to manage it. Restarting the application to change an SMTP
+password is the wrong answer.
 
-**Environment** — secrets and bootstrap, nothing else. API keys, the JWT
-signing key, `DATABASE_URL`, and things that describe the machine rather than
-the install (`SHARED_FS_ROOT`, `EMBEDDING_VECTOR_DIM`, `TEST_MODE`). Declared
-with `env_field`. Security controls live here too, deliberately: CORS, HSTS,
-the SSRF allowlist, the SMTP downgrade flag. Those decide who may reach the
-instance and who it will talk to, and an admin session should not be able to
-widen them from a web form.
+**Environment** — five variables, and only the first is configuration:
 
-**Database** — everything else. Declared with `managed_field`, edited from the
-admin console, and identical across replicas. Configuration that *can* live in
-the database belongs there: it is auditable, it changes without a restart, and
-one container cannot quietly disagree with another.
+| Variable | Why it cannot live in the database |
+|---|---|
+| `DATABASE_URL` | It is how you reach the database |
+| `BUILD_SHA` | Stamped by the build; provenance, not a setting |
+| `TEST_MODE` | The harness tells the process it is a test before anything else, and it must not be flippable from a web form |
+| `EMBEDDING_VECTOR_DIM` | A property of the schema that was applied; `scripts/migrate.sh` needs the same value |
+| `EXTRACT_READER_PLUGINS` | Imports Python modules — settable from the console would mean remote code execution |
+
+**Database** — everything else, declared with `managed_field` and edited from
+the admin console.
+
+**Database, write-only** — credentials, declared with `secret_field`: the SMTP
+password, provider API keys, OAuth client secrets, and the JWT signing key.
+Stored like any other setting so they can be rotated from the console, but
+redacted from every read: `GET /admin/settings` returns them empty, the schema
+endpoint reports only whether one is set, and a blank field on save means "not
+retyped", never "erase it". The signing key generates itself on first boot —
+which also fixed a quieter problem, since it used to be generated per process
+into a file, so a replica that could not read that file rejected tokens the
+others had issued.
 
 ```
 managed_field default  ->  what an admin saved  ->  runtime.settings
@@ -81,12 +95,27 @@ managed_field default  ->  what an admin saved  ->  runtime.settings
 `Runtime.refresh_settings()` builds that overlay once. Request handlers read
 plain attributes off `runtime.settings`; they do not merge dicts and they do
 not query the database per request. The settings watcher re-runs the overlay
-when another worker writes a change, so a value edited in the admin UI reaches
-every replica within `settings_watch_interval_seconds`.
+when another worker writes a change, so an edit reaches every replica within
+`settings_watch_interval_seconds`. Services that capture configuration at
+construction — the mailer and the voice service — are rebuilt, because handing
+them a new settings object would not change the mail they send.
 
 Nothing seeds the defaults into the database. A stored value means an admin
-chose it; a shipped default that had been written to the table would be
-indistinguishable from a choice, and would silently outrank anything else.
+chose it; a shipped default written to the table would be indistinguishable
+from a choice and would silently outrank everything else.
+
+## Adding a setting
+
+Declare it once, on `Settings` in `liminallm/config.py`:
+
+```python
+my_setting: int = managed_field(30, ge=1, le=600, description="What it does")
+```
+
+The bounds go on the field, not in the code that reads it: the admin API
+validates against them, and the console renders a control that already
+enforces them. The console builds itself from
+`GET /v1/admin/settings/schema`, so there is nothing to add to the frontend.
 
 ### Declarative deploys
 
