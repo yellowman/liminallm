@@ -314,8 +314,8 @@ def test_vault_sweep_judges_strongest_pairs(client, auth_headers):
             return {"content": "UNRELATED."}
 
     judge = Judge()
-    # The memory store persists across per-test runtime resets, so "first
-    # note in the dict" may belong to an earlier test's user — anchor instead.
+    # Anchor on a known note rather than "the first one": the sweep is
+    # per-user, so it needs this note's owner specifically.
     user_id = runtime.store.get_note(anchor["id"]).user_id
     report = notes.vault_sweep(
         runtime.store, getattr(runtime, "embeddings", None), judge, user_id

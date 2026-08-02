@@ -4,9 +4,11 @@ This document describes how to set up and run tests for LiminalLM.
 
 ## Quick Start
 
-### Unit Tests (In-Memory)
+### Running the suite
 
-Run unit tests with the in-memory store (no external dependencies):
+The suite starts its own throwaway Postgres cluster (`tests/pgharness.py`)
+and applies `sql/schema.sql` to it, so tests exercise the same store
+production runs. Nothing to set up:
 
 ```bash
 ./scripts/run_tests.sh
@@ -15,8 +17,12 @@ Run unit tests with the in-memory store (no external dependencies):
 Or with pytest directly:
 
 ```bash
-TEST_MODE=true USE_MEMORY_STORE=true pytest tests/
+TEST_MODE=true pytest tests/
 ```
+
+To reuse an existing database instead of starting one, point
+`TEST_DATABASE_URL` at it. It needs the `vector` extension available —
+the schema declares a `VECTOR` column.
 
 ### Integration Tests with Docker
 
@@ -60,9 +66,10 @@ Regular test users are created dynamically during tests.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TEST_MODE` | `false` | Enables test mode (relaxed security, in-memory fallback) |
-| `USE_MEMORY_STORE` | `false` | Use in-memory store instead of PostgreSQL |
-| `ALLOW_REDIS_FALLBACK_DEV` | `false` | Allow in-memory cache when Redis unavailable |
+| `TEST_MODE` | `false` | Enables test mode (relaxed security, in-process fallbacks) |
+| `TEST_DATABASE_URL` | _(unset)_ | Reuse this database instead of starting a scratch cluster |
+| `EMBEDDING_VECTOR_DIM` | `1536` | Vector width; the suite pins `64` to match the hash encoder |
+| `ALLOW_REDIS_FALLBACK_DEV` | `false` | Allow in-process cache when Redis unavailable |
 
 ### Test Database
 

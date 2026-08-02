@@ -179,9 +179,10 @@ This automatically:
 
 For running directly on a Linux host without containers.
 
-#### Quick Start (In-Memory Mode)
+#### Quick Start (Native)
 
-For development and testing without external dependencies:
+Postgres is required — it is the only store. Redis is optional; without it,
+rate limits, idempotency durability and caches fall back to in-process state.
 
 ```bash
 # Install dependencies
@@ -449,7 +450,7 @@ MIT
 See `TESTING.md` for comprehensive testing documentation.
 
 ```bash
-# Quick test (in-memory, no external dependencies)
+# The suite starts its own throwaway Postgres; no setup needed
 ./scripts/run_tests.sh
 
 # Full integration test with Docker

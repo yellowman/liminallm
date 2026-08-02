@@ -628,5 +628,5 @@ def test_runtime_exposes_coordination_primitives():
     runtime = routes.get_runtime()
     assert isinstance(runtime.bus, ClusterBus)
     assert isinstance(runtime.leader_lock, AdvisoryLock)
-    # Memory store means no Postgres to coordinate through.
+    # The worker coordinates through the runtime's lock, not one of its own.
     assert runtime.training_worker.leader_lock is runtime.leader_lock
