@@ -19,13 +19,6 @@ const sessionStorageKey = (key) => `liminal.${key}`;
 const readSession = (key) => sessionStorage.getItem(sessionStorageKey(key));
 
 // XSS protection: escape HTML entities
-const escapeHtml = (str) => {
-  if (str == null) return '';
-  const text = String(str);
-  const div = document.createElement('div');
-  div.textContent = text;
-  return div.innerHTML;
-};
 const writeSession = (key, value) => {
   if (value) {
     sessionStorage.setItem(sessionStorageKey(key), value);
@@ -45,69 +38,7 @@ const state = {
 const defaultPatchStatuses = new Set(['pending', 'approved', 'rejected', 'applied']);
 let knownPatchStatuses = new Set(defaultPatchStatuses);
 
-const randomIdempotencyKey = () => {
-  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
-  // Fallback using crypto.getRandomValues() - cryptographically secure, broader browser support
-  if (window.crypto?.getRandomValues) {
-    const bytes = new Uint8Array(16);
-    window.crypto.getRandomValues(bytes);
-    bytes[6] = (bytes[6] & 0x0f) | 0x40; // UUID v4 version
-    bytes[8] = (bytes[8] & 0x3f) | 0x80; // UUID v4 variant
-    const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
-    return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
-  }
-  // Ultimate fallback for ancient browsers without crypto support
-  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-};
-
 // Double-submit CSRF: echo the JS-readable csrf_token cookie on mutating requests.
-const getCsrfToken = () => {
-  const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
-  return match ? decodeURIComponent(match[1]) : null;
-};
-
-const headers = (idempotencyKey) => {
-  const h = { 'Content-Type': 'application/json' };
-  if (state.accessToken) h['Authorization'] = `Bearer ${state.accessToken}`;
-  if (state.tenantId) h['X-Tenant-ID'] = state.tenantId;
-  if (state.sessionId) h['session_id'] = state.sessionId;
-  const csrf = getCsrfToken();
-  if (csrf) h['X-CSRF-Token'] = csrf;
-  h['Idempotency-Key'] = idempotencyKey || randomIdempotencyKey();
-  return h;
-};
-
-const fetchWithRetry = async (url, options, retries = 3, backoffMs = 400) => {
-  let lastError;
-  for (let attempt = 0; attempt <= retries; attempt += 1) {
-    try {
-      const resp = await fetch(url, options);
-      // Don't retry client errors (4xx) - they won't succeed on retry
-      if (resp.status >= 400 && resp.status < 500) {
-        return resp;
-      }
-      // Only retry on server errors (5xx) or network failures
-      if (!resp.ok && resp.status >= 500) {
-        lastError = new Error(`Server error: ${resp.status}`);
-        if (attempt === retries) return resp;
-        const delay = backoffMs * Math.pow(2, attempt);
-        await new Promise((resolve) => setTimeout(resolve, delay));
-        continue;
-      }
-      return resp;
-    } catch (err) {
-      // Network error - retry
-      lastError = err;
-      if (attempt === retries) break;
-      const delay = backoffMs * Math.pow(2, attempt);
-      await new Promise((resolve) => setTimeout(resolve, delay));
-    }
-  }
-  const attempts = retries + 1;
-  const label = attempts === 1 ? 'attempt' : 'attempts';
-  throw new Error(`Request failed after ${attempts} ${label}: ${lastError?.message || 'unknown error'}`);
-};
-
 const showError = (msg) => {
   if (!errorEl) return;
   errorEl.textContent = msg;
@@ -157,46 +88,9 @@ const gatekeep = () => {
   return true;
 };
 
-const extractError = (payload, fallback) => {
-  const detail = payload?.detail || payload?.error || payload;
-  if (typeof detail === 'string') return detail.trim() || fallback;
-  if (detail?.message) return detail.message;
-  if (detail?.error?.message) return detail.error.message;
-  return fallback;
-};
-
 // The API puts structured problems (e.g. which settings were rejected and why)
 // under error.details. Flattening a response to its message string throws that
 // away, and it is exactly what a form needs to mark the offending field.
-const extractErrorDetails = (payload) => {
-  const detail = payload?.detail || payload;
-  return detail?.error?.details ?? detail?.details ?? null;
-};
-
-const requestEnvelope = async (url, options, fallbackMessage) => {
-  const resp = await fetchWithRetry(url, options);
-  const text = await resp.text();
-  const trimmed = text.trim();
-  let payload;
-  if (trimmed) {
-    try {
-      payload = JSON.parse(trimmed);
-    } catch (err) {
-      if (!resp.ok) throw new Error(fallbackMessage || resp.statusText || 'Request failed');
-      throw err;
-    }
-  }
-  if (!resp.ok) {
-    const error = new Error(
-      extractError(payload ?? trimmed, fallbackMessage || 'Request failed')
-    );
-    error.status = resp.status;
-    error.details = extractErrorDetails(payload);
-    throw error;
-  }
-  return payload ?? {};
-};
-
 const setPatchStatusOptions = (statuses = []) => {
   knownPatchStatuses = new Set([...defaultPatchStatuses, ...statuses.map((s) => (s || '').toLowerCase())]);
   if (!patchStatusOptions) return;

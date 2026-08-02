@@ -234,11 +234,11 @@ class TestConsoleSource:
         assert "/admin/settings/schema" in script
 
     def test_field_errors_are_surfaced_per_control(self):
-        script = (FRONTEND / "admin.js").read_text()
-        # requestEnvelope flattened responses to a message string, so the
-        # API's per-field detail could never reach the form.
-        assert "extractErrorDetails" in script
-        assert "setFieldError" in script
+        # requestEnvelope flattened responses to a message string, so the API's
+        # per-field detail could never reach the form. The extraction now lives
+        # in common.js, shared with the chat page, which had the same gap.
+        assert "extractErrorDetails" in (FRONTEND / "common.js").read_text()
+        assert "setFieldError" in (FRONTEND / "admin.js").read_text()
 
     def test_unsaved_changes_are_guarded(self):
         script = (FRONTEND / "admin.js").read_text()
