@@ -458,11 +458,11 @@ def _get_plan_rate_multiplier(runtime, plan_tier: str) -> float:
     Returns:
         Multiplier to apply to base rate limits
     """
-    sys_settings = _get_system_settings(runtime)
+    settings = runtime.settings
     multipliers = {
-        "free": sys_settings.get("rate_limit_multiplier_free", 1.0),
-        "paid": sys_settings.get("rate_limit_multiplier_paid", 2.0),
-        "enterprise": sys_settings.get("rate_limit_multiplier_enterprise", 5.0),
+        "free": settings.rate_limit_multiplier_free,
+        "paid": settings.rate_limit_multiplier_paid,
+        "enterprise": settings.rate_limit_multiplier_enterprise,
     }
     return multipliers.get(plan_tier, 1.0)
 
@@ -488,17 +488,12 @@ def _get_plan_upload_limit(runtime, plan_tier: str) -> int:
 
 
 def _get_rate_limit(runtime, key: str) -> int:
-    """Get rate limit value from database settings.
+    """Read a rate limit off the effective settings.
 
-    Args:
-        runtime: Application runtime context
-        key: Rate limit key (e.g., "chat_rate_limit_per_minute")
-
-    Returns:
-        Rate limit value from database or default
+    runtime.settings already carries what the admin saved, so this needs no
+    database round trip — and it used to make one per request.
     """
-    sys_settings = _get_system_settings(runtime)
-    return sys_settings.get(key, 60)
+    return int(getattr(runtime.settings, key))
 
 
 async def _enforce_rate_limit(
@@ -595,8 +590,7 @@ async def _acquire_workflow_slot(runtime, user_id: str) -> bool:
         # Without Redis, we can't track concurrency - allow the request
         return True
 
-    sys_settings = _get_system_settings(runtime)
-    max_workflows = sys_settings.get("max_concurrent_workflows", 3)
+    max_workflows = runtime.settings.max_concurrent_workflows
     acquired, current = await runtime.cache.acquire_concurrency_slot(
         "workflow",
         user_id,
@@ -633,8 +627,7 @@ async def _acquire_inference_slot(runtime, user_id: str) -> bool:
     if not runtime.cache:
         return True
 
-    sys_settings = _get_system_settings(runtime)
-    max_inference = sys_settings.get("max_concurrent_inference", 2)
+    max_inference = runtime.settings.max_concurrent_inference
     acquired, current = await runtime.cache.acquire_concurrency_slot(
         "inference",
         user_id,
@@ -849,12 +842,12 @@ def _get_pagination_settings(runtime) -> dict:
 
     Returns dict with: default_page_size, max_page_size, default_conversations_limit
     """
-    sys_settings = _get_system_settings(runtime)
+    settings = runtime.settings
     return {
-        "default_page_size": sys_settings.get("default_page_size", 100),
-        "max_page_size": sys_settings.get("max_page_size", 500),
+        "default_page_size": settings.default_page_size,
+        "max_page_size": settings.max_page_size,
         # Keep conversation pagination consistent with general defaults (SPEC pagination guidance)
-        "default_conversations_limit": sys_settings.get("default_conversations_limit", 100),
+        "default_conversations_limit": settings.default_conversations_limit,
     }
 
 
@@ -1074,8 +1067,7 @@ def _apply_session_cookies(
         # Get refresh TTL from database settings if not provided
         if refresh_ttl_minutes is None:
             runtime = get_runtime()
-            sys_settings = _get_system_settings(runtime)
-            refresh_ttl_minutes = sys_settings.get("refresh_token_ttl_minutes", 1440)
+            refresh_ttl_minutes = runtime.settings.refresh_token_ttl_minutes
         response.set_cookie(
             "refresh_token",
             refresh_token,
@@ -1111,8 +1103,7 @@ async def signup(body: SignupRequest, response: Response):
         429: If rate limit exceeded for this email
     """
     runtime = get_runtime()
-    sys_settings = _get_system_settings(runtime)
-    if not sys_settings.get("allow_signup", True):
+    if not runtime.settings.allow_signup:
         raise _http_error("forbidden", "signup disabled", status_code=403)
     await _enforce_rate_limit(
         runtime,
@@ -3609,12 +3600,11 @@ async def update_system_settings(
     - Tenant: default_tenant_id ("public"), jwt_issuer ("liminallm"), jwt_audience ("liminal-clients")
     """
     runtime = get_runtime()
-    sys_settings = _get_system_settings(runtime)
     await _enforce_rate_limit(
         runtime,
         f"admin:write:{principal.user_id}",
-        sys_settings.get("admin_rate_limit_per_minute", 30),
-        sys_settings.get("admin_rate_limit_window_seconds", 60),
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
     )
 
     # Validate settings
@@ -5109,8 +5099,7 @@ async def websocket_chat(ws: WebSocket):
 
         # Issue 5.2: Per-user WebSocket connection limits
         if runtime.cache:
-            sys_settings = _get_system_settings(runtime)
-            max_ws_connections = sys_settings.get("max_websocket_connections_per_user", 5)
+            max_ws_connections = runtime.settings.max_websocket_connections_per_user
             acquired, _ = await runtime.cache.acquire_concurrency_slot(
                 "websocket",
                 user_id,
@@ -5153,8 +5142,7 @@ async def websocket_chat(ws: WebSocket):
         # SPEC §18: Concurrency cap - max 3 concurrent workflows per user
         # Check if we can acquire a slot; if not, close with 409-equivalent code
         if runtime.cache:
-            sys_settings = _get_system_settings(runtime)
-            max_workflows = sys_settings.get("max_concurrent_workflows", 3)
+            max_workflows = runtime.settings.max_concurrent_workflows
             acquired, _ = await runtime.cache.acquire_concurrency_slot(
                 "workflow",
                 user_id,

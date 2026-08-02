@@ -56,36 +56,53 @@ Used for deployment-level configuration that's visible but not directly editable
 - Adapter mode
 - RAG mode
 
-## Resolution Order
+## Where a setting comes from
 
-When the runtime initializes, settings are resolved in this order:
+Two kinds of setting, and the distinction is the whole design:
 
-1. **Database (system_settings)** - highest priority
-2. **Environment variables** - fallback if not in database
+**Environment** — secrets and bootstrap, nothing else. API keys, the JWT
+signing key, `DATABASE_URL`, and things that describe the machine rather than
+the install (`SHARED_FS_ROOT`, `EMBEDDING_VECTOR_DIM`, `TEST_MODE`). Declared
+with `env_field`. Security controls live here too, deliberately: CORS, HSTS,
+the SSRF allowlist, the SMTP downgrade flag. Those decide who may reach the
+instance and who it will talk to, and an admin session should not be able to
+widen them from a web form.
 
-```python
-# Example from runtime.py
-model_path = sys_settings.get("model_path") or self.settings.model_path
+**Database** — everything else. Declared with `managed_field`, edited from the
+admin console, and identical across replicas. Configuration that *can* live in
+the database belongs there: it is auditable, it changes without a restart, and
+one container cannot quietly disagree with another.
+
+```
+managed_field default  ->  what an admin saved  ->  runtime.settings
+     (shipped)              (instance_config)        (what code reads)
 ```
 
-### Bootstrap Sync for MODEL_BACKEND
+`Runtime.refresh_settings()` builds that overlay once. Request handlers read
+plain attributes off `runtime.settings`; they do not merge dicts and they do
+not query the database per request. The settings watcher re-runs the overlay
+when another worker writes a change, so a value edited in the admin UI reaches
+every replica within `settings_watch_interval_seconds`.
 
-Because system_settings takes precedence over environment variables, the `MODEL_BACKEND`
-env var would normally be ignored if the database has a default value (e.g., "openai").
+Nothing seeds the defaults into the database. A stored value means an admin
+chose it; a shipped default that had been written to the table would be
+indistinguishable from a choice, and would silently outrank anything else.
 
-To ensure environment variables work as expected during initial setup or testing,
-`scripts/bootstrap_admin.py` syncs `MODEL_BACKEND` from the environment to system_settings:
+### Declarative deploys
 
-```python
-# During bootstrap, if MODEL_BACKEND env var is set, write it to system_settings
-desired_backend = os.environ.get("MODEL_BACKEND")
-if desired_backend:
-    runtime.store.set_system_settings({"model_backend": desired_backend})
+Managed settings have no environment variables, which would leave a
+compose/k8s deploy unable to configure anything without a human opening the
+admin UI. `INSTANCE_SETTINGS_JSON` is the one seam:
+
+```yaml
+environment:
+  INSTANCE_SETTINGS_JSON: '{"model_backend": "stub", "notes_enabled": false}'
 ```
 
-This is particularly useful for:
-- **Testing**: Set `MODEL_BACKEND=stub` to use deterministic canned responses
-- **CI pipelines**: Override the default backend without modifying the database manually
+It is a *seed*, not an override: it is applied only when no admin has saved
+anything yet. Once a value is in the database it wins, so a stale container
+env cannot quietly revert what an operator changed. Unknown keys are logged
+and dropped, and a malformed value never blocks boot.
 
 ## Admin UI Workflow
 

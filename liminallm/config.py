@@ -10,7 +10,14 @@ from pathlib import Path
 from typing import Any, Optional
 
 from dotenv import dotenv_values
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from liminallm.logging import get_logger
 
@@ -319,15 +326,43 @@ def resolve_provider_endpoint(mode: str) -> Optional[dict[str, Optional[str]]]:
     return PROVIDER_ENDPOINTS.get((mode or "").lower())
 
 
-def env_field(default: Any, env: str, *, admin: bool = False, **kwargs):
-    """Declare a setting once.
+def env_field(default: Any, env: str, **kwargs):
+    """A setting that can only come from the environment.
 
-    `admin=True` also exposes it in the admin UI, and its default flows into
-    SYSTEM_SETTINGS_DEFAULTS below. Declaring the default in both places is how
-    the two drift: nine of them already disagreed before this was derived.
+    Reserved for two cases, and no others:
+
+    * secrets — API keys, client secrets, the JWT signing key;
+    * bootstrap — anything needed before the database is reachable, or that
+      describes the machine rather than the install (where the data lives, how
+      wide the vector column is, whether this is a test process).
+
+    Security controls also live here on purpose: CORS, HSTS, the SSRF
+    allowlist, the SMTP downgrade flag. Those decide who may reach the instance
+    and who it will talk to; an admin session should not be able to widen them
+    from a web form.
+
+    Everything else is a managed_field.
     """
     extra = kwargs.pop("json_schema_extra", {}) or {}
-    extra = {**extra, "env": env, "admin": admin}
+    extra = {**extra, "env": env, "admin": False}
+    return Field(default, json_schema_extra=extra, **kwargs)
+
+
+def managed_field(default: Any, **kwargs):
+    """A setting that lives in the database, editable from the admin UI.
+
+    No environment variable. Configuration that *can* live in the database
+    belongs there: it is auditable, it changes without a restart, and every
+    replica sees the same value. An env var for it means a setting that can
+    differ per container and cannot be inspected or changed from inside the
+    running system.
+
+    The default written here is the shipped default, and it is written exactly
+    once — SYSTEM_SETTINGS_DEFAULTS is derived from these fields. For
+    declarative deploys, INSTANCE_SETTINGS_JSON seeds them on first boot.
+    """
+    extra = kwargs.pop("json_schema_extra", {}) or {}
+    extra = {**extra, "admin": True}
     return Field(default, json_schema_extra=extra, **kwargs)
 
 
@@ -339,43 +374,36 @@ class Settings(BaseModel):
     )
     redis_url: str = env_field("redis://localhost:6379/0", "REDIS_URL")
     shared_fs_root: str = env_field("/srv/liminallm", "SHARED_FS_ROOT")
-    tmp_cleanup_interval_seconds: int = env_field(
+    tmp_cleanup_interval_seconds: int = managed_field(
         86400,
-        "TMP_CLEANUP_INTERVAL_SECONDS",
         description="How often to sweep per-user tmp scratch directories (seconds)",
     )
-    tmp_max_age_hours: int = env_field(
+    tmp_max_age_hours: int = managed_field(
         24,
-        "TMP_MAX_AGE_HOURS",
         description="Delete tmp scratch files older than this many hours",
     )
-    model_path: str = env_field(
-        "gpt-4o-mini", "MODEL_PATH", description="Model path (overridable via admin UI)",
-        admin=True,
+    model_path: str = managed_field(
+        "gpt-4o-mini", description="Model path (overridable via admin UI)",
     )
-    model_backend: ModelBackend | None = env_field(
-        ModelBackend.OPENAI, "MODEL_BACKEND", description="Model backend (overridable via admin UI)",
-        admin=True,
+    model_backend: ModelBackend | None = managed_field(
+        ModelBackend.OPENAI, description="Model backend (overridable via admin UI)",
     )
     adapter_openai_api_key: str | None = env_field(None, "OPENAI_ADAPTER_API_KEY")
-    adapter_openai_base_url: str | None = env_field(None, "OPENAI_ADAPTER_BASE_URL")
-    adapter_server_model: str | None = env_field(None, "ADAPTER_SERVER_MODEL")
+    adapter_openai_base_url: str | None = managed_field(None)
+    adapter_server_model: str | None = managed_field(None)
     # Voice service settings
     voice_api_key: str | None = env_field(None, "VOICE_API_KEY")
-    voice_transcription_model: str = env_field(
-        "whisper-1", "VOICE_TRANSCRIPTION_MODEL",
+    voice_transcription_model: str = managed_field(
+        "whisper-1",
         description="Transcription model (overridable via admin UI)",
-        admin=True,
     )
-    voice_synthesis_model: str = env_field(
-        "tts-1", "VOICE_SYNTHESIS_MODEL",
+    voice_synthesis_model: str = managed_field(
+        "tts-1",
         description="Synthesis model (overridable via admin UI)",
-        admin=True,
     )
-    voice_default_voice: str = env_field(
-        "alloy", "VOICE_DEFAULT_VOICE",
+    voice_default_voice: str = managed_field(
+        "alloy",
         description="Default voice (overridable via admin UI)",
-        admin=True,
     )
     # OAuth settings
     oauth_google_client_id: str | None = env_field(None, "OAUTH_GOOGLE_CLIENT_ID")
@@ -384,61 +412,47 @@ class Settings(BaseModel):
     oauth_github_client_secret: str | None = env_field(None, "OAUTH_GITHUB_CLIENT_SECRET")
     oauth_microsoft_client_id: str | None = env_field(None, "OAUTH_MICROSOFT_CLIENT_ID")
     oauth_microsoft_client_secret: str | None = env_field(None, "OAUTH_MICROSOFT_CLIENT_SECRET")
-    oauth_redirect_uri: str | None = env_field(
-        None, "OAUTH_REDIRECT_URI", description="OAuth redirect URI (overridable via admin UI)",
-        admin=True,
+    oauth_redirect_uri: str | None = managed_field(
+        None, description="OAuth redirect URI (overridable via admin UI)",
     )
     # Email service settings (env vars are fallbacks - prefer admin UI)
-    smtp_host: str | None = env_field(
-        None, "SMTP_HOST", description="SMTP server host (overridable via admin UI)",
-        admin=True,
+    smtp_host: str | None = managed_field(
+        None, description="SMTP server host (overridable via admin UI)",
     )
-    smtp_port: int = env_field(
-        587, "SMTP_PORT", description="SMTP server port (overridable via admin UI)",
-        admin=True,
+    smtp_port: int = managed_field(
+        587, description="SMTP server port (overridable via admin UI)",
     )
-    smtp_user: str | None = env_field(
-        None, "SMTP_USER", description="SMTP username (overridable via admin UI)",
-        admin=True,
+    smtp_user: str | None = managed_field(
+        None, description="SMTP username (overridable via admin UI)",
     )
     smtp_password: str | None = env_field(
         None, "SMTP_PASSWORD", description="SMTP password (overridable via admin UI)",
-        admin=True,
     )
-    smtp_use_tls: bool = env_field(
-        True, "SMTP_USE_TLS", description="Use TLS for SMTP (overridable via admin UI)",
-        admin=True,
+    smtp_use_tls: bool = managed_field(
+        True, description="Use TLS for SMTP (overridable via admin UI)",
     )
     smtp_allow_insecure: bool = env_field(
         False,
         "SMTP_ALLOW_INSECURE",
         description="Allow plaintext SMTP when explicitly enabled (overridable via admin UI)",
-        admin=True,
     )
-    email_from_address: str | None = env_field(
-        None, "EMAIL_FROM_ADDRESS", description="Email from address (overridable via admin UI)",
-        admin=True,
+    email_from_address: str | None = managed_field(
+        None, description="Email from address (overridable via admin UI)",
     )
-    email_from_name: str = env_field(
-        "LiminalLM", "EMAIL_FROM_NAME", description="Email from name (overridable via admin UI)",
-        admin=True,
+    email_from_name: str = managed_field(
+        "LiminalLM", description="Email from name (overridable via admin UI)",
     )
-    app_base_url: str = env_field(
-        "http://localhost:8000", "APP_BASE_URL",
+    app_base_url: str = managed_field(
+        "http://localhost:8000",
         description="Application base URL (overridable via admin UI)",
-        admin=True,
     )
-    default_adapter_mode: AdapterMode = env_field(
+    default_adapter_mode: AdapterMode = managed_field(
         AdapterMode.HYBRID,
-        "DEFAULT_ADAPTER_MODE",
         description="Default mode for new adapters: local, remote, prompt, or hybrid (overridable via admin UI)",
-        admin=True,
     )
-    allow_signup: bool = env_field(
+    allow_signup: bool = managed_field(
         True,
-        "ALLOW_SIGNUP",
         description="Allow new user signups (overridable via admin UI)",
-        admin=True,
     )
     build_sha: str = env_field("dev", "BUILD_SHA")
     cors_allow_origins: list[str] = env_field(
@@ -465,19 +479,16 @@ class Settings(BaseModel):
         "TOOL_NETWORK_ALLOWLIST",
         description="Allowlisted hostnames/CIDRs for tool egress (SPEC §18)",
     )
-    tool_network_proxy_url: str | None = env_field(
+    tool_network_proxy_url: str | None = managed_field(
         None,
-        "TOOL_NETWORK_PROXY_URL",
         description="Proxy URL tools must use for outbound HTTP(S) fetches",
     )
-    tool_fetch_connect_timeout: float = env_field(
+    tool_fetch_connect_timeout: float = managed_field(
         10.0,
-        "TOOL_FETCH_CONNECT_TIMEOUT",
         description="Connect timeout (seconds) for tool HTTP fetches",
     )
-    tool_fetch_timeout: float = env_field(
+    tool_fetch_timeout: float = managed_field(
         30.0,
-        "TOOL_FETCH_TIMEOUT",
         description="Total timeout (seconds) for tool HTTP fetches",
     )
     interpreter_scratch_dir: str | None = env_field(
@@ -489,18 +500,16 @@ class Settings(BaseModel):
             "throwaway copies of attachments for one tool call."
         ),
     )
-    history_budget_fraction: float = env_field(
+    history_budget_fraction: float = managed_field(
         0.5,
-        "HISTORY_BUDGET_FRACTION",
         description=(
             "Share of the prompt budget kept as verbatim recent turns "
             "(0.1-0.9). The rest is left for system blocks, RAG, attachments, "
             "and the new message."
         ),
     )
-    history_recall_fraction: float = env_field(
+    history_recall_fraction: float = managed_field(
         0.25,
-        "HISTORY_RECALL_FRACTION",
         description=(
             "Share of the history budget spent recalling older turns picked "
             "by relevance to the current message — the window is assembled, "
@@ -518,33 +527,44 @@ class Settings(BaseModel):
             "migrations and re-embedding."
         ),
     )
-    model_context_window: int = env_field(
+    model_reasoning_effort: str = managed_field(
+        "",
+        description=(
+            "Thinking budget for reasoning models: low | medium | high, or "
+            "none to disable. Empty means omit the parameter entirely."
+        ),
+    )
+    model_context_window: int = managed_field(
         0,
-        "MODEL_CONTEXT_WINDOW",
         description=(
             "Input window of the serving model, in tokens. 0 = discover: ask "
             "the provider, else a known-family table, else 8192. Set this "
             "when discovery guesses wrong for your deployment."
         ),
-        admin=True,
     )
-    extract_readers: str = env_field(
+    extract_reader_plugins: str = env_field(
+        "",
+        "EXTRACT_READER_PLUGINS",
+        description=(
+            "Comma-separated Python modules to import for extra extract "
+            "readers. Env-only on purpose: this imports code, so an admin who "
+            "could set it from the UI would have remote code execution."
+        ),
+    )
+    extract_readers: str = managed_field(
         "ocr,vision",
-        "EXTRACT_READERS",
         description=(
             "Ordered roster of image readers for uploads/scanned pdfs. "
             "Built-ins: ocr (tesseract), vision (the model backend). New "
             "readers register via extract.register_reader."
         ),
     )
-    notes_enabled: bool = env_field(
+    notes_enabled: bool = managed_field(
         True,
-        "NOTES_ENABLED",
         description=(
             "Notes vault + witness. Admin-overridable via system settings; "
             "when off, notes routes and the note_search tool disappear."
         ),
-        admin=True,
     )
     cluster_bus_backend: str = env_field(
         "auto",
@@ -559,14 +579,12 @@ class Settings(BaseModel):
     # Web tools (SPEC §18). Browsing is enabled by default but constrained:
     # SSRF protection is always on, and search stays inert until a provider and
     # its key are configured.
-    web_tools_enabled: bool = env_field(
+    web_tools_enabled: bool = managed_field(
         True,
-        "WEB_TOOLS_ENABLED",
         description="Allow the model to call web_search / web_fetch",
     )
-    web_search_provider: str = env_field(
+    web_search_provider: str = managed_field(
         "none",
-        "WEB_SEARCH_PROVIDER",
         description="Search backend: none | brave | tavily | google_cse | duckduckgo",
     )
     web_search_api_key: str | None = env_field(
@@ -574,19 +592,16 @@ class Settings(BaseModel):
         "WEB_SEARCH_API_KEY",
         description="API key for the configured web search provider",
     )
-    web_search_engine_id: str | None = env_field(
+    web_search_engine_id: str | None = managed_field(
         None,
-        "WEB_SEARCH_ENGINE_ID",
         description="Search engine ID (google_cse only)",
     )
-    web_fetch_timeout: float = env_field(
+    web_fetch_timeout: float = managed_field(
         15.0,
-        "WEB_FETCH_TIMEOUT",
         description="Total timeout (seconds) for a web page fetch",
     )
-    web_fetch_max_bytes: int = env_field(
+    web_fetch_max_bytes: int = managed_field(
         2 * 1024 * 1024,
-        "WEB_FETCH_MAX_BYTES",
         description="Maximum bytes read from a fetched page",
     )
     web_fetch_allow_private: bool = env_field(
@@ -597,49 +612,38 @@ class Settings(BaseModel):
             "SSRF protection — never enable in production."
         ),
     )
-    enable_mfa: bool = env_field(
+    enable_mfa: bool = managed_field(
         True,
-        "ENABLE_MFA",
         description="Enable multi-factor authentication (overridable via admin UI)",
-        admin=True,
     )
     jwt_secret: str = env_field(None, "JWT_SECRET", validate_default=True)
-    jwt_issuer: str = env_field(
-        "liminallm", "JWT_ISSUER",
+    jwt_issuer: str = managed_field(
+        "liminallm",
         description="JWT issuer (overridable via admin UI)",
-        admin=True,
     )
-    jwt_audience: str = env_field(
-        "liminal-clients", "JWT_AUDIENCE",
+    jwt_audience: str = managed_field(
+        "liminal-clients",
         description="JWT audience (overridable via admin UI)",
-        admin=True,
     )
-    access_token_ttl_minutes: int = env_field(
+    access_token_ttl_minutes: int = managed_field(
         30,
-        "ACCESS_TOKEN_TTL_MINUTES",
         description="Access token TTL in minutes (overridable via admin UI)",
-        admin=True,
     )
-    refresh_token_ttl_minutes: int = env_field(
+    refresh_token_ttl_minutes: int = managed_field(
         24 * 60,
-        "REFRESH_TOKEN_TTL_MINUTES",
         description="Refresh token TTL in minutes (overridable via admin UI)",
-        admin=True,
     )
-    default_tenant_id: str = env_field(
-        "public", "DEFAULT_TENANT_ID",
+    default_tenant_id: str = managed_field(
+        "public",
         description="Default tenant ID (overridable via admin UI)",
-        admin=True,
     )
-    rag_mode: RagMode = env_field(
-        RagMode.PGVECTOR, "RAG_MODE",
+    rag_mode: RagMode = managed_field(
+        RagMode.PGVECTOR,
         description="RAG mode: pgvector or memory (overridable via admin UI)",
-        admin=True,
     )
-    embedding_model_id: str = env_field(
-        "text-embedding", "EMBEDDING_MODEL_ID",
+    embedding_model_id: str = managed_field(
+        "text-embedding",
         description="Embedding model ID (overridable via admin UI)",
-        admin=True,
     )
 
     # NOTE: The following operational settings have been moved to database-managed
@@ -689,35 +693,28 @@ class Settings(BaseModel):
     # - default_tenant_id, jwt_issuer, jwt_audience
 
     # Training worker settings (env vars are fallbacks - prefer admin UI)
-    training_worker_enabled: bool = env_field(
+    training_worker_enabled: bool = managed_field(
         True,
-        "TRAINING_WORKER_ENABLED",
         description="Enable background training job worker (overridable via admin UI)",
-        admin=True,
     )
-    training_worker_poll_interval: int = env_field(
+    training_worker_poll_interval: int = managed_field(
         60,
-        "TRAINING_WORKER_POLL_INTERVAL",
         description="Training worker poll interval in seconds (overridable via admin UI)",
-        admin=True,
     )
-    settings_watch_interval_seconds: int = env_field(
+    settings_watch_interval_seconds: int = managed_field(
         10,
-        "SETTINGS_WATCH_INTERVAL_SECONDS",
         description=(
             "How often each worker checks for admin settings changes and "
             "reloads its model services (cross-process consistency across "
             "multiple Uvicorn workers)"
         ),
     )
-    max_active_training_jobs: int = env_field(
+    max_active_training_jobs: int = managed_field(
         10,
-        "MAX_ACTIVE_TRAINING_JOBS",
         description="Global cap on simultaneously active training jobs",
     )
-    training_distillation_enabled: bool = env_field(
+    training_distillation_enabled: bool = managed_field(
         False,
-        "TRAINING_DISTILLATION",
         description=(
             "Distill preference-event targets through the configured LLM "
             "(teacher) before adapter training (SPEC §7.5)"
@@ -725,6 +722,53 @@ class Settings(BaseModel):
     )
 
     model_config = ConfigDict(extra="ignore")
+
+
+    # ------------------------------------------------------------------
+    # Operational limits. Managed like everything else — an operator tunes
+    # these from the admin UI while the instance is running, which is exactly
+    # when you find out a rate limit is wrong.
+    # ------------------------------------------------------------------
+    # Session & concurrency
+    # Device-specific windows (SPEC §18: 7d web, 1d mobile). Read by auth.py,
+    # which used to carry its own copy of these defaults — a fourth declaration
+    # site, for four keys the admin API would then reject as unknown.
+    session_ttl_minutes_web: int = managed_field(60 * 24 * 7)
+    session_ttl_minutes_mobile: int = managed_field(60 * 24)
+    refresh_token_ttl_minutes_web: int = managed_field(60 * 24 * 7)
+    refresh_token_ttl_minutes_mobile: int = managed_field(60 * 24)
+    session_rotation_hours: int = managed_field(24)
+    session_rotation_grace_seconds: int = managed_field(300)
+    max_concurrent_workflows: int = managed_field(3)
+    max_concurrent_inference: int = managed_field(2)
+    # Rate limit multipliers
+    rate_limit_multiplier_free: float = managed_field(1.0)
+    rate_limit_multiplier_paid: float = managed_field(2.0)
+    rate_limit_multiplier_enterprise: float = managed_field(5.0)
+    # Rate limits (0 = disabled/unlimited)
+    chat_rate_limit_per_minute: int = managed_field(60)
+    chat_rate_limit_window_seconds: int = managed_field(60)
+    login_rate_limit_per_minute: int = managed_field(10)
+    refresh_rate_limit_per_minute: int = managed_field(20)
+    refresh_rate_limit_window_seconds: int = managed_field(60)
+    signup_rate_limit_per_minute: int = managed_field(5)
+    reset_rate_limit_per_minute: int = managed_field(5)
+    mfa_rate_limit_per_minute: int = managed_field(5)
+    admin_rate_limit_per_minute: int = managed_field(30)
+    admin_rate_limit_window_seconds: int = managed_field(60)
+    files_upload_rate_limit_per_minute: int = managed_field(10)
+    websocket_connect_rate_limit_per_minute: int = managed_field(30)
+    configops_rate_limit_per_hour: int = managed_field(30)
+    read_rate_limit_per_minute: int = managed_field(120)
+    write_rate_limit_per_minute: int = managed_field(60)
+    max_websocket_connections_per_user: int = managed_field(5)
+    # Pagination
+    default_page_size: int = managed_field(100)
+    max_page_size: int = managed_field(500)
+    default_conversations_limit: int = managed_field(50)
+    # Files
+    max_upload_bytes: int = managed_field(10485760)
+    rag_chunk_size: int = managed_field(400)
 
     @field_validator("cors_allow_origins", mode="before")
     @classmethod
@@ -767,12 +811,21 @@ class Settings(BaseModel):
 
     @classmethod
     def from_env(cls) -> "Settings":
+        """Read the env-only settings. Managed settings keep their defaults.
+
+        Only fields declared with env_field are read from the environment. A
+        managed_field has no env var by design, and must not acquire one by
+        accident through a name-matching fallback — that would resurrect the
+        per-container configuration this split exists to remove. Managed values
+        come from the database; see Runtime.effective_settings.
+        """
         env_file_values = dotenv_values(".env")
         merged: dict[str, str] = {}
         for name, field in cls.model_fields.items():
             extra = field.json_schema_extra or {}
-            env_key = extra.get("env") if isinstance(extra, dict) else None
-            env_name = env_key or name.upper()
+            env_name = extra.get("env") if isinstance(extra, dict) else None
+            if not env_name:
+                continue
             if env_name in os.environ:
                 merged[name] = os.environ[env_name]
             elif env_name in env_file_values:
@@ -892,53 +945,11 @@ class Settings(BaseModel):
         return generated
 
 
-# Admin-managed settings that have no environment variable: operational limits
-# an operator tunes from the UI, not from the process environment. Settings that
-# DO have an env var are declared once on Settings above with `admin=True` and
-# merged in below — declaring a default in two places is how the two drift.
-_ADMIN_ONLY_DEFAULTS: dict = {
-    # Session & concurrency
-    "session_rotation_hours": 24,
-    "session_rotation_grace_seconds": 300,
-    "max_concurrent_workflows": 3,
-    "max_concurrent_inference": 2,
-    # Rate limit multipliers
-    "rate_limit_multiplier_free": 1.0,
-    "rate_limit_multiplier_paid": 2.0,
-    "rate_limit_multiplier_enterprise": 5.0,
-    # Rate limits (0 = disabled/unlimited)
-    "chat_rate_limit_per_minute": 60,
-    "chat_rate_limit_window_seconds": 60,
-    "login_rate_limit_per_minute": 10,
-    "refresh_rate_limit_per_minute": 20,
-    "refresh_rate_limit_window_seconds": 60,
-    "signup_rate_limit_per_minute": 5,
-    "reset_rate_limit_per_minute": 5,
-    "mfa_rate_limit_per_minute": 5,
-    "admin_rate_limit_per_minute": 30,
-    "admin_rate_limit_window_seconds": 60,
-    "files_upload_rate_limit_per_minute": 10,
-    "websocket_connect_rate_limit_per_minute": 30,
-    "configops_rate_limit_per_hour": 30,
-    "read_rate_limit_per_minute": 120,
-    "write_rate_limit_per_minute": 60,
-    "max_websocket_connections_per_user": 5,
-    # Pagination
-    "default_page_size": 100,
-    "max_page_size": 500,
-    "default_conversations_limit": 50,
-    # Files
-    "max_upload_bytes": 10485760,
-    "rag_chunk_size": 400,
-}
-
-
 def _admin_defaults_from_settings() -> dict:
-    """Defaults for every Settings field declared with `admin=True`.
+    """Shipped defaults for every managed_field, as the admin API sends them.
 
-    Serialised the way the admin API and the database carry them: enums become
-    their values, and an unset string becomes "" rather than None, because the
-    admin form posts an empty box, not a null.
+    Enums become their values and an unset value becomes "" rather than None,
+    because the admin form posts an empty box, not a null.
     """
     derived: dict = {}
     for name, field in Settings.model_fields.items():
@@ -954,13 +965,11 @@ def _admin_defaults_from_settings() -> dict:
     return derived
 
 
-# Every admin-managed setting and its shipped default. The store merges this
-# under whatever an admin actually saved; nothing seeds it into the database,
-# so a default never masquerades as an explicit override.
-SYSTEM_SETTINGS_DEFAULTS: dict = {
-    **_ADMIN_ONLY_DEFAULTS,
-    **_admin_defaults_from_settings(),
-}
+# Every admin-managed setting and its shipped default, derived from the one
+# place each is declared. The store merges this under whatever an admin
+# actually saved; nothing seeds it into the database, so a shipped default
+# never masquerades as an explicit override.
+SYSTEM_SETTINGS_DEFAULTS: dict = _admin_defaults_from_settings()
 
 # Derived validation sets for admin settings API
 SYSTEM_SETTINGS_INT_KEYS = {
@@ -988,6 +997,44 @@ SYSTEM_SETTINGS_RATE_LIMIT_KEYS = {
     k for k in SYSTEM_SETTINGS_DEFAULTS.keys()
     if k.endswith("_per_minute") or k.endswith("_per_hour")
 }
+
+
+def apply_managed_settings(base: Settings, stored: dict) -> Settings:
+    """Overlay the admin-managed values a store handed back onto `base`.
+
+    The result is what the rest of the code should read: one object where every
+    setting already answers correctly, instead of sixty call sites each doing
+    `stored.get("x", <default written out a third time>)`.
+
+    Values that fail validation are dropped with a warning rather than taking
+    the process down — a bad row in instance_config must not make the instance
+    unbootable, since the admin UI that would fix it is served by this process.
+    """
+    if not stored:
+        return base
+    managed = {
+        name
+        for name, field in Settings.model_fields.items()
+        if isinstance(field.json_schema_extra, dict)
+        and field.json_schema_extra.get("admin")
+    }
+    updates = {k: v for k, v in stored.items() if k in managed}
+    if not updates:
+        return base
+    try:
+        return base.model_copy(update=Settings(**updates).model_dump(include=set(updates)))
+    except ValidationError as exc:
+        logger.warning("managed_settings_invalid", error=str(exc))
+    # One bad value should not discard the good ones: apply them one at a time.
+    resolved = base
+    for key, value in updates.items():
+        try:
+            resolved = resolved.model_copy(
+                update=Settings(**{key: value}).model_dump(include={key})
+            )
+        except ValidationError:
+            logger.warning("managed_setting_invalid", setting=key)
+    return resolved
 
 
 def get_settings() -> Settings:

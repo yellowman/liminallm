@@ -388,17 +388,19 @@ Run the automated smoke test:
 - “Adapter-ID adapters” (multi-LoRA / adapter servers) surface `adapter_id` parameters on Together AI Serverless Multi-LoRA, LoRAX-style servers, or SageMaker adapter inference components. The backend keeps the base model string and passes `adapter_id` for one-or-more adapters per request when supported.
 - Hybrid patterns (local adapter-enabled “controller” + external API “executor”) flow through the same artifacts: the controller uses a local LoRA backend to plan, then the API backend executes with prompt or remote-model adapters.
 
-2. **configure env**
+2. **configure env** — secrets and bootstrap only
    - `DATABASE_URL` – postgres dsn
-   - `REDIS_URL` – redis dsn
+   - `REDIS_URL` – redis dsn (optional; without it, rate limits and caches are in-process)
    - `SHARED_FS_ROOT` – filesystem root path
-   - `MODEL_PATH` – model identifier for cloud mode (default `gpt-4o-mini`) or filesystem path when using an adapter server
-   - `OPENAI_ADAPTER_API_KEY` – OpenAI plug API key (leave unset to use the echo fallback)
-   - `OPENAI_ADAPTER_BASE_URL` – optional base URL override when pointing at an OpenAI-compatible endpoint
-   - `ADAPTER_SERVER_MODEL` – model name when pointing at an OpenAI-compatible adapter server
-   - `TEST_MODE` – set to `true` to allow Redis-free test harnesses (rate limits, idempotency durability, and caches are disabled)
-   - `RAG_CHUNK_SIZE` – default character window for knowledge ingestion; overrides can be provided per request
-   - `RAG_MODE` – `pgvector` (default) uses the database index; `local_hybrid` forces the in-process BM25+cosine fallback for dev/test
+   - `JWT_SECRET` – signing key; generated into `SHARED_FS_ROOT` if unset
+   - `OPENAI_ADAPTER_API_KEY` – API key (leave unset to use the echo fallback)
+   - `EMBEDDING_VECTOR_DIM` – must match the width `sql/schema.sql` was applied with
+   - `TEST_MODE` – relaxes security for test harnesses
+
+   everything else — model path and backend, rag mode, rate limits, notes,
+   web tools, ttls — lives in the database and is edited from the admin
+   console. see `docs/CONFIGURATION.md`. for declarative deploys, seed them on
+   first boot with `INSTANCE_SETTINGS_JSON='{"model_backend": "stub"}'`.
 
 3. **migrate db**
    - run the alembic / migration tool to create tables described in the spec.

@@ -44,29 +44,9 @@ async def bootstrap_admin(email: str, password: str, dry_run: bool = False) -> d
         dict with user_id, email, and status ('created' or 'updated')
     """
     # Import here to avoid loading config before env vars are set
-    from liminallm.config import ModelBackend
     from liminallm.service.runtime import get_runtime
 
     runtime = get_runtime()
-
-    # Sync MODEL_BACKEND env var to system_settings (if set)
-    # This ensures runtime uses the env value instead of DB default
-    desired_backend = os.environ.get("MODEL_BACKEND")
-    if desired_backend and not dry_run:
-        # Validate backend is a known value
-        valid_backends = {b.value for b in ModelBackend}
-        if desired_backend.lower() not in valid_backends:
-            print(f"Warning: MODEL_BACKEND={desired_backend} is not a known backend")
-            print(f"Valid backends: {', '.join(sorted(valid_backends))}")
-        else:
-            current_settings = runtime.store.get_system_settings() or {}
-            if current_settings.get("model_backend") != desired_backend:
-                # Persist ONLY the changed key. get_system_settings() returns
-                # defaults merged with overrides, so writing the whole dict back
-                # would bake every default in as an override and block future
-                # default changes (set_system_settings stores overrides only).
-                runtime.store.set_system_settings({"model_backend": desired_backend})
-                print(f"Set system_settings.model_backend = {desired_backend}")
 
     # Check if user already exists
     existing_user = runtime.store.get_user_by_email(email)

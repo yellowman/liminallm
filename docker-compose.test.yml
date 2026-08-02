@@ -55,7 +55,7 @@ services:
       ADMIN_EMAIL: admin@test.local
       ADMIN_PASSWORD: TestAdmin123!
       # Model backend (use stub for deterministic testing without real LLM)
-      MODEL_BACKEND: stub
+      INSTANCE_SETTINGS_JSON: '{"model_backend": "stub"}'
       # Disable email verification for easier testing
       REQUIRE_EMAIL_VERIFICATION: "false"
       # Disable MFA for easier testing
@@ -102,8 +102,8 @@ services:
       ADMIN_EMAIL: admin@test.local
       ADMIN_PASSWORD: TestAdmin123!
       SHARED_FS_ROOT: /srv/liminallm
-      # Sync MODEL_BACKEND to system_settings during bootstrap
-      MODEL_BACKEND: stub
+      # Seeded into the database on first boot; see config.managed_field
+      INSTANCE_SETTINGS_JSON: '{"model_backend": "stub"}'
     command: ["python", "/app/scripts/bootstrap_admin.py"]
     depends_on:
       migrate:

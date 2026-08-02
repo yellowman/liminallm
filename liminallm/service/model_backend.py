@@ -581,9 +581,7 @@ class ApiAdapterBackend:
         # via the OpenAI-compatible endpoint): "low" | "medium" | "high", or
         # "none" to disable where the provider allows it. Sent via extra_body
         # so older openai SDKs work; omitted entirely when unset.
-        self._reasoning_effort = (
-            reasoning_effort or os.getenv("MODEL_REASONING_EFFORT") or ""
-        ).strip().lower() or None
+        self._reasoning_effort = (reasoning_effort or "").strip().lower() or None
         # Env var consulted for credential rotation; provider-specific so that,
         # e.g., a Zhipu backend reads ZHIPU_API_KEY rather than OPENAI_API_KEY.
         self._api_key_env = api_key_env or "OPENAI_API_KEY"

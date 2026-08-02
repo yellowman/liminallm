@@ -552,6 +552,7 @@ def _sandboxed_parse(
         Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
     except ImportError:
         pass
+    # Env-only by design: this imports code. See config.extract_reader_plugins.
     for module in os.environ.get("EXTRACT_READER_PLUGINS", "").split(","):
         if module.strip():
             try:

@@ -257,42 +257,15 @@ class AuthService:
     def _generate_password(self) -> str:
         return base64.urlsafe_b64encode(os.urandom(12)).decode().rstrip("=")
 
-    def _get_system_settings(self) -> dict:
-        """Get admin-managed system settings from database.
-
-        Returns merged settings with defaults for any missing values.
-        """
-        db_settings = self.store.get_system_settings()
-        defaults = {
-            "session_rotation_hours": 24,
-            "session_rotation_grace_seconds": 300,
-            "access_token_ttl_minutes": 30,
-            "refresh_token_ttl_minutes": 1440,
-            # Device-specific session TTLs (SPEC §18: 7d web, 1d mobile)
-            "session_ttl_minutes_web": 60 * 24 * 7,
-            "session_ttl_minutes_mobile": 60 * 24,
-            # Device-specific refresh TTLs aligned with session windows
-            "refresh_token_ttl_minutes_web": 60 * 24 * 7,
-            "refresh_token_ttl_minutes_mobile": 60 * 24,
-        }
-        return {**defaults, **db_settings}
-
     def _get_session_ttl(self, device_type: str) -> int:
-        sys_settings = self._get_system_settings()
-        normalized = (device_type or "web").lower()
-        if normalized == "mobile":
-            return int(sys_settings.get("session_ttl_minutes_mobile", 60 * 24))
-        return int(sys_settings.get("session_ttl_minutes_web", 60 * 24 * 7))
+        if (device_type or "web").lower() == "mobile":
+            return int(self.settings.session_ttl_minutes_mobile)
+        return int(self.settings.session_ttl_minutes_web)
 
-    def _get_refresh_ttl(self, device_type: str, sys_settings: dict[str, Any]) -> int:
-        normalized = (device_type or "web").lower()
-        if normalized == "mobile":
-            return int(
-                sys_settings.get("refresh_token_ttl_minutes_mobile", 60 * 24)
-            )
-        return int(
-            sys_settings.get("refresh_token_ttl_minutes_web", 60 * 24 * 7)
-        )
+    def _get_refresh_ttl(self, device_type: str) -> int:
+        if (device_type or "web").lower() == "mobile":
+            return int(self.settings.refresh_token_ttl_minutes_mobile)
+        return int(self.settings.refresh_token_ttl_minutes_web)
 
     def _get_session_device(self, session: Session) -> str:
         meta = session.meta or {}
@@ -972,8 +945,7 @@ class AuthService:
             await self.cache.update_session_activity(sess.id)
             return None
 
-        sys_settings = self._get_system_settings()
-        rotation_hours = sys_settings.get("session_rotation_hours", 24)
+        rotation_hours = self.settings.session_rotation_hours
         rotation_threshold = timedelta(hours=rotation_hours)
         if self._now() - last_activity < rotation_threshold:
             return None
@@ -1024,7 +996,7 @@ class AuthService:
                 new_session.mfa_verified = True
 
             # Set up grace period mapping
-            grace_seconds = sys_settings.get("session_rotation_grace_seconds", 300)
+            grace_seconds = self.settings.session_rotation_grace_seconds
             await self.cache.set_session_rotation_grace(
                 sess.id,
                 new_session.id,
@@ -1451,14 +1423,13 @@ class AuthService:
         self, user: User, session: Session, *, device_type: Optional[str] = None
     ) -> dict[str, str]:
         now = self._now()
-        sys_settings = self._get_system_settings()
         access_exp = int(
             (
-                now + timedelta(minutes=sys_settings.get("access_token_ttl_minutes", 30))
+                now + timedelta(minutes=self.settings.access_token_ttl_minutes)
             ).timestamp()
         )
         device = (device_type or self._get_session_device(session)).lower()
-        refresh_ttl = self._get_refresh_ttl(device, sys_settings)
+        refresh_ttl = self._get_refresh_ttl(device)
         refresh_exp = int((now + timedelta(minutes=refresh_ttl)).timestamp())
         # SPEC §12.1: Generate JTIs for both tokens to support denylist on logout
         access_jti = str(uuid.uuid4())
@@ -1530,8 +1501,7 @@ class AuthService:
         if isinstance(exp, (int, float)):
             ttl = max(int(exp - self._now().timestamp()), 0)
         if ttl is None:
-            sys_settings = self._get_system_settings()
-            ttl = max(int(sys_settings.get("refresh_token_ttl_minutes", 1440) * 60), 0)
+            ttl = max(int(self.settings.refresh_token_ttl_minutes * 60), 0)
         if self.cache:
             try:
                 await self.cache.mark_refresh_revoked(jti, ttl)

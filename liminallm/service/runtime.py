@@ -3,12 +3,19 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import inspect
+import json
+import os
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple, Union
 from urllib.parse import urlparse, urlunparse
 
-from liminallm.config import get_settings, reset_settings_cache
+from liminallm.config import (
+    SYSTEM_SETTINGS_DEFAULTS,
+    apply_managed_settings,
+    get_settings,
+    reset_settings_cache,
+)
 from liminallm.logging import get_logger
 from liminallm.service import token_counting
 from liminallm.service.auth import AuthService
@@ -126,69 +133,38 @@ class Runtime:
                 ),
                 mode=fallback_mode,
             )
-        # Get system settings from DB early (falls back to env vars if not in DB)
-        sys_settings = self.store.get_system_settings() or {}
-
         # Build all backend-dependent services (router, llm, rag, training,
         # clusterer, workflow, config_ops). Extracted into a helper so
         # reload_model_services() can rebuild them when an admin changes
         # model_backend/model_path without restarting the process.
         self._build_model_services()
 
-        # Voice/email settings resolve from DB with env var fallback
-        voice_transcription_model = (
-            sys_settings.get("voice_transcription_model")
-            or self.settings.voice_transcription_model
-        )
-        voice_synthesis_model = (
-            sys_settings.get("voice_synthesis_model")
-            or self.settings.voice_synthesis_model
-        )
-        voice_default_voice = (
-            sys_settings.get("voice_default_voice") or self.settings.voice_default_voice
-        )
-        app_base_url = sys_settings.get("app_base_url") or self.settings.app_base_url
-
+        # self.settings now carries the admin-managed values (refreshed inside
+        # _build_model_services), so these are plain reads.
+        settings = self.settings
         self.voice = VoiceService(
-            self.settings.shared_fs_root,
-            api_key=self.settings.voice_api_key,
-            transcription_model=voice_transcription_model,
-            synthesis_model=voice_synthesis_model,
-            default_voice=voice_default_voice,
+            settings.shared_fs_root,
+            api_key=settings.voice_api_key,
+            transcription_model=settings.voice_transcription_model,
+            synthesis_model=settings.voice_synthesis_model,
+            default_voice=settings.voice_default_voice,
         )
-        # Use MFA setting from sys_settings (already fetched above)
-        mfa_enabled = sys_settings.get("enable_mfa", self.settings.enable_mfa)
         self.auth = AuthService(
             self.store,
             self.cache,
-            self.settings,
-            mfa_enabled=mfa_enabled,
-        )
-        # Get SMTP settings from sys_settings (falls back to env vars if not in DB)
-        smtp_host = sys_settings.get("smtp_host") or self.settings.smtp_host
-        smtp_port = sys_settings.get("smtp_port") or self.settings.smtp_port
-        smtp_user = sys_settings.get("smtp_user") or self.settings.smtp_user
-        smtp_password = sys_settings.get("smtp_password") or self.settings.smtp_password
-        smtp_use_tls = sys_settings.get("smtp_use_tls", self.settings.smtp_use_tls)
-        smtp_allow_insecure = sys_settings.get(
-            "smtp_allow_insecure", self.settings.smtp_allow_insecure
-        )
-        email_from_address = (
-            sys_settings.get("email_from_address") or self.settings.email_from_address
-        )
-        email_from_name = (
-            sys_settings.get("email_from_name") or self.settings.email_from_name
+            settings,
+            mfa_enabled=settings.enable_mfa,
         )
         self.email = EmailService(
-            smtp_host=smtp_host,
-            smtp_port=smtp_port,
-            smtp_user=smtp_user,
-            smtp_password=smtp_password,
-            smtp_use_tls=smtp_use_tls,
-            smtp_allow_insecure=smtp_allow_insecure,
-            from_email=email_from_address,
-            from_name=email_from_name,
-            base_url=app_base_url,
+            smtp_host=settings.smtp_host,
+            smtp_port=settings.smtp_port,
+            smtp_user=settings.smtp_user,
+            smtp_password=settings.smtp_password,
+            smtp_use_tls=settings.smtp_use_tls,
+            smtp_allow_insecure=settings.smtp_allow_insecure,
+            from_email=settings.email_from_address,
+            from_name=settings.email_from_name,
+            base_url=settings.app_base_url,
         )
         # Cross-replica coordination. Both primitives are best-effort and
         # neither makes Redis required: the bus falls back to Postgres
@@ -213,14 +189,11 @@ class Runtime:
         self._install_calibration_sharing()
 
         # Training worker for background job processing
-        poll_interval = sys_settings.get(
-            "training_worker_poll_interval", self.settings.training_worker_poll_interval
-        )
         self.training_worker = TrainingWorker(
             store=self.store,
             training_service=self.training,
             clusterer=self.clusterer,
-            poll_interval=poll_interval,
+            poll_interval=self.settings.training_worker_poll_interval,
             leader_lock=self.leader_lock,
             # Lets the worker re-embed vectors left behind by a previous
             # encoder; a hash encoder makes the sweep a no-op.
@@ -249,7 +222,7 @@ class Runtime:
             redis_enabled=self.cache is not None,
             email_configured=self.email.is_configured,
             voice_configured=self.voice.is_configured,
-            mfa_enabled=mfa_enabled,
+            mfa_enabled=self.settings.enable_mfa,
         )
 
     def _install_calibration_sharing(self) -> None:
@@ -293,12 +266,11 @@ class Runtime:
         token_counting.install_sharing(load=load, publish=publish)
 
     def _system_settings_overrides(self) -> dict:
-        """Explicitly stored admin settings only, without defaults merged in.
+        """Only what an admin actually saved, without defaults merged in.
 
-        get_system_settings() merges code defaults over the stored values, so
-        resolving model settings from it would let those defaults permanently
-        shadow MODEL_PATH / MODEL_BACKEND env vars the admin never overrode.
-        Precedence here is: admin override > env var > code default.
+        get_system_settings() merges the shipped defaults over the stored
+        values; overlaying that would make a default indistinguishable from a
+        choice. This returns the choices.
         """
         try:
             return self.store.get_system_settings_overrides() or {}
@@ -306,28 +278,78 @@ class Runtime:
             logger.warning("settings_overrides_read_failed", error=str(exc))
             return {}
 
+    def _seed_settings_from_env(self) -> None:
+        """Apply INSTANCE_SETTINGS_JSON on first boot, once.
+
+        Managed settings have no environment variables, which would otherwise
+        make a declarative deploy (compose, k8s) unable to configure anything
+        without a human opening the admin UI. This is the one seam: a JSON
+        object of managed settings, written to the database only when no admin
+        has saved anything yet. It is a seed, not an override — once a value is
+        in the database it is authoritative, so a stale container env cannot
+        quietly revert what an operator changed.
+        """
+        raw = os.environ.get("INSTANCE_SETTINGS_JSON")
+        if not raw:
+            return
+        try:
+            seed = json.loads(raw)
+        except ValueError as exc:
+            logger.error("instance_settings_seed_invalid_json", error=str(exc))
+            return
+        if not isinstance(seed, dict):
+            logger.error("instance_settings_seed_not_an_object")
+            return
+        known = set(SYSTEM_SETTINGS_DEFAULTS)
+        unknown = sorted(set(seed) - known)
+        if unknown:
+            logger.warning("instance_settings_seed_unknown_keys", keys=unknown)
+        seed = {k: v for k, v in seed.items() if k in known}
+        if not seed:
+            return
+        try:
+            if self._system_settings_overrides():
+                logger.info("instance_settings_seed_skipped_already_configured")
+                return
+            self.store.merge_instance_config("system_settings", seed)
+            logger.info("instance_settings_seeded", settings=sorted(seed))
+        except Exception as exc:  # noqa: BLE001 - a failed seed must not block boot
+            logger.warning("instance_settings_seed_failed", error=str(exc))
+
+    def refresh_settings(self) -> None:
+        """Rebuild self.settings from the declared defaults plus what is stored.
+
+        Everything downstream reads plain attributes off self.settings. Before
+        this, sixty call sites each merged the store's dict by hand and wrote
+        the default out a third time inline; they disagreed, and nothing
+        noticed.
+        """
+        self._seed_settings_from_env()
+        self.settings = apply_managed_settings(
+            get_settings(), self._system_settings_overrides()
+        )
+        # Services built earlier hold a reference to the old object. They only
+        # read attributes off it, so handing them the new one is enough — and
+        # without this an admin's change would not reach a running auth or
+        # email service until the process restarted.
+        for service in ("auth", "email", "voice", "workflow", "training"):
+            existing = getattr(self, service, None)
+            if existing is not None and hasattr(existing, "settings"):
+                existing.settings = self.settings
+
     def _build_model_services(self) -> None:
         """Construct all backend-dependent services from system settings.
 
         Shared by __init__ and reload_model_services so a runtime
         model_backend / model_path change takes effect without a restart.
         """
-        overrides = self._system_settings_overrides()
-        self.resolved_base_model = (
-            overrides.get("model_path") or self.settings.model_path
-        )
-        self.backend_mode = (
-            overrides.get("model_backend") or self.settings.model_backend
-        )
-        self.default_adapter_mode = (
-            overrides.get("default_adapter_mode")
-            or self.settings.default_adapter_mode
-        )
-        self.rag_mode = overrides.get("rag_mode") or self.settings.rag_mode
-        embedding_model_id = (
-            overrides.get("embedding_model_id") or self.settings.embedding_model_id
-        )
-        rag_chunk_size = overrides.get("rag_chunk_size") or 400
+        self.refresh_settings()
+        self.resolved_base_model = self.settings.model_path
+        self.backend_mode = self.settings.model_backend
+        self.default_adapter_mode = self.settings.default_adapter_mode
+        self.rag_mode = self.settings.rag_mode
+        embedding_model_id = self.settings.embedding_model_id
+        rag_chunk_size = self.settings.rag_chunk_size
         adapter_configs = {
             "openai": {
                 "api_key": self.settings.adapter_openai_api_key,
@@ -344,6 +366,7 @@ class Runtime:
             base_url=self.settings.adapter_openai_base_url,
             adapter_server_model=self.settings.adapter_server_model,
             fs_root=self.settings.shared_fs_root,
+            reasoning_effort=self.settings.model_reasoning_effort,
         )
         # Real embeddings when the backend has an OpenAI-compatible client
         # (its /embeddings endpoint serves OpenAI, Gemini-compat, and
@@ -381,14 +404,7 @@ class Runtime:
             # SPEC §7.5: the serving LLM doubles as distillation teacher when
             # enabled; targets are rewritten into clean exemplars pre-training.
             teacher=self.llm,
-            # Merge note: the polish branch read this from __init__'s
-            # sys_settings, which is out of scope here. `overrides` is the
-            # same source with the platform's precedence (admin > env >
-            # default), already resolved at the top of this method.
-            distillation_enabled=overrides.get(
-                "training_distillation_enabled",
-                self.settings.training_distillation_enabled,
-            ),
+            distillation_enabled=self.settings.training_distillation_enabled,
         )
         self.clusterer = SemanticClusterer(self.store, self.llm, self.training)
         self.workflow = WorkflowEngine(
@@ -409,17 +425,16 @@ class Runtime:
 
     def _model_signature(self) -> tuple:
         """Signature of the settings that affect the model service stack."""
-        overrides = self._system_settings_overrides()
+        effective = apply_managed_settings(
+            get_settings(), self._system_settings_overrides()
+        )
         return (
-            overrides.get("model_path") or self.settings.model_path,
-            str(overrides.get("model_backend") or self.settings.model_backend),
-            str(
-                overrides.get("default_adapter_mode")
-                or self.settings.default_adapter_mode
-            ),
-            str(overrides.get("rag_mode") or self.settings.rag_mode),
-            overrides.get("embedding_model_id") or self.settings.embedding_model_id,
-            overrides.get("rag_chunk_size") or 400,
+            effective.model_path,
+            str(effective.model_backend),
+            str(effective.default_adapter_mode),
+            str(effective.rag_mode),
+            effective.embedding_model_id,
+            effective.rag_chunk_size,
         )
 
     def _read_settings_version(self) -> Optional[str]:
@@ -442,8 +457,12 @@ class Runtime:
         if version is not None and version == self._applied_settings_version:
             return False
         target = self._model_signature()
+        # Pick up every managed setting, not just the model ones: a rate-limit
+        # or feature-flag change has to reach self.settings too, since that is
+        # now what request handlers read.
+        self.refresh_settings()
         # Record the version even when nothing model-relevant changed, so an
-        # unrelated settings write (e.g. a rate-limit tweak) isn't rechecked.
+        # unrelated settings write isn't rechecked.
         self._applied_settings_version = version
         if target != self._model_settings_signature:
             self.reload_model_services()
@@ -493,7 +512,7 @@ class Runtime:
                 logger.error(
                     "runtime_model_services_reload_failed",
                     model_backend=str(
-                        self._system_settings_overrides().get("model_backend")
+                        self.settings.model_backend
                     ),
                     error=str(exc),
                 )

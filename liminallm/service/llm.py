@@ -29,9 +29,11 @@ class LLMService:
         base_url: Optional[str] = None,
         adapter_server_model: Optional[str] = None,
         fs_root: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
         backend: Optional[ModelBackend] = None,
     ) -> None:
         self.base_model = base_model
+        self.reasoning_effort = reasoning_effort
         self.adapter_configs = adapter_configs or {}
         self.backend = backend or self._build_backend(
             backend_mode,
@@ -335,6 +337,7 @@ class LLMService:
                 adapter_server_model=adapter_server_model,
                 provider=provider,
                 api_key_env=api_key_env,
+                reasoning_effort=self.reasoning_effort,
             )
 
         # adapter_server and other adapter-id providers (azure, vertex, bedrock,
@@ -349,4 +352,5 @@ class LLMService:
             base_url=base_url,
             adapter_server_model=adapter_server_model,
             provider=provider,
+            reasoning_effort=self.reasoning_effort,
         )
