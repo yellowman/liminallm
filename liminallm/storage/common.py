@@ -121,21 +121,35 @@ def hybrid_search_chunks(
 
     # Compute semantic scores
     semantic_scores: List[float] = []
+    # Dimension is whatever the configured encoder produces (64-d for the hash
+    # fallback, 1536-d for a real provider). Pinning this to EMBEDDING_DIM
+    # made every real-encoder query fail validation and silently score 0,
+    # collapsing semantic search to BM25 — the exact failure the switch to
+    # real embeddings was meant to end. What must hold is that query and
+    # chunk come from the same space, so compare dimensions instead.
     try:
         normalized_query = (
-            validated_embedding(query_embedding, expected_dim=EMBEDDING_DIM, name="query_embedding")
+            validated_embedding(
+                query_embedding, expected_dim=len(query_embedding),
+                name="query_embedding",
+            )
             if query_embedding
             else []
         )
     except ValueError:
         normalized_query = []
+    query_dim = len(normalized_query)
     for ch in candidates:
         if not normalized_query or not ch.embedding:
             semantic_scores.append(0.0)
             continue
+        if len(ch.embedding) != query_dim:
+            # A chunk embedded by a different encoder: not comparable.
+            semantic_scores.append(0.0)
+            continue
         try:
             chunk_embedding = validated_embedding(
-                ch.embedding, expected_dim=EMBEDDING_DIM, name="chunk_embedding"
+                ch.embedding, expected_dim=query_dim, name="chunk_embedding"
             )
         except ValueError:
             semantic_scores.append(0.0)
@@ -447,6 +461,29 @@ def get_default_chat_workflow_schema() -> dict:
     }
 
 
+def get_default_attachment_workflow_schema() -> dict:
+    """Workflow used when the conversation has attachments.
+
+    A single agent node: the model sees the attachment list (with small text
+    files inlined) and decides for itself whether to search them or run code,
+    so no intent classification is needed.
+    """
+    return {
+        "kind": "workflow.chat",
+        "entrypoint": "files",
+        "nodes": [
+            {
+                "id": "files",
+                "type": "tool_call",
+                "tool": "agent.files_v1",
+                "inputs": {"message": "${input.message}"},
+                "next": "end",
+            },
+            {"id": "end", "type": "end"},
+        ],
+    }
+
+
 def get_default_tool_specs() -> List[dict]:
     """Generate default tool specifications.
 
@@ -484,6 +521,78 @@ def get_default_tool_specs() -> List[dict]:
             "description": "Code editing and generation agent.",
             "inputs": {"message": {"type": "string"}},
             "handler": "agent.code_v1",
+        },
+        {
+            "kind": "tool.spec",
+            "name": "agent.files_v1",
+            "description": (
+                "Answers using the conversation's attachments. The model calls "
+                "file_search and run_python itself, as many times as it needs."
+            ),
+            "inputs": {"message": {"type": "string"}},
+            "handler": "agent.files_v1",
+            # Multiple model round-trips plus sandboxed code; the engine caps
+            # this at MAX_NODE_TIMEOUT_SECONDS anyway.
+            "timeout_seconds": 60,
+        },
+        {
+            "kind": "tool.spec",
+            "name": "file.search_v1",
+            "description": "Search the conversation's attached files for relevant excerpts.",
+            "inputs": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "optional": True},
+            },
+            "handler": "file.search_v1",
+        },
+        {
+            "kind": "tool.spec",
+            "name": "web.search_v1",
+            "description": (
+                "Search the public web. Results are sanitized and scanned for "
+                "prompt injection before the model sees them."
+            ),
+            "inputs": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "optional": True},
+            },
+            "handler": "web.search_v1",
+            "timeout_seconds": 30,
+        },
+        {
+            "kind": "tool.spec",
+            "name": "web.fetch_v1",
+            "description": (
+                "Read a web page as untrusted data. Blocks private/reserved "
+                "addresses, strips hidden content, and redacts injections."
+            ),
+            "inputs": {"url": {"type": "string"}},
+            "handler": "web.fetch_v1",
+            "timeout_seconds": 30,
+        },
+        {
+            "kind": "tool.spec",
+            "name": "notes.search_v1",
+            "description": (
+                "Search the user's notes vault; returns titles, dates, and "
+                "excerpts as data to cite."
+            ),
+            "inputs": {
+                "query": {"type": "string"},
+                "limit": {"type": "integer", "optional": True},
+            },
+            "handler": "notes.search_v1",
+        },
+        {
+            "kind": "tool.spec",
+            "name": "code.python_v1",
+            "description": (
+                "Run Python in a resource-limited sandbox whose working "
+                "directory holds copies of the conversation's attachments."
+            ),
+            "inputs": {"code": {"type": "string"}},
+            "handler": "code.python_v1",
+            "timeout_seconds": 30,
         },
     ]
 

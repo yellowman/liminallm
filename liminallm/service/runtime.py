@@ -11,10 +11,12 @@ from urllib.parse import urlparse, urlunparse
 from liminallm.config import get_settings, reset_settings_cache
 from liminallm.logging import get_logger
 from liminallm.service.auth import AuthService
+from liminallm.service import token_counting
+from liminallm.service.cluster import AdvisoryLock, ClusterBus
 from liminallm.service.clustering import SemanticClusterer
 from liminallm.service.config_ops import ConfigOpsService
 from liminallm.service.email import EmailService
-from liminallm.service.embeddings import EmbeddingsService
+from liminallm.service.embeddings import EmbeddingsService, make_provider_encoder
 from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
 from liminallm.service.router import RouterEngine
@@ -146,7 +148,7 @@ class Runtime:
         # clusterer, workflow, config_ops). Extracted into a helper so
         # reload_model_services() can rebuild them when an admin changes
         # model_backend/model_path without restarting the process.
-        self._build_model_services(sys_settings)
+        self._build_model_services()
 
         # Voice/email settings resolve from DB with env var fallback
         voice_transcription_model = (
@@ -203,6 +205,28 @@ class Runtime:
             from_name=email_from_name,
             base_url=app_base_url,
         )
+        # Cross-replica coordination. Both primitives are best-effort and
+        # neither makes Redis required: the bus falls back to Postgres
+        # LISTEN/NOTIFY, and a single-process deployment gets local semantics.
+        db_url = None if self.settings.use_memory_store else self.settings.database_url
+        # The cache object is the signal that Redis really exists here (the
+        # setting has a localhost default even on redis-less deployments) —
+        # but an explicit backend=redis is the operator's word over that
+        # heuristic, e.g. when Redis was briefly down at boot.
+        bus_backend = self.settings.cluster_bus_backend
+        bus_redis_url = (
+            self.settings.redis_url
+            if (self.cache is not None or bus_backend == "redis")
+            else None
+        )
+        self.bus = ClusterBus(
+            redis_url=bus_redis_url,
+            database_url=db_url,
+            backend=bus_backend,
+        )
+        self.leader_lock = AdvisoryLock(db_url)
+        self._install_calibration_sharing()
+
         # Training worker for background job processing
         poll_interval = sys_settings.get(
             "training_worker_poll_interval", self.settings.training_worker_poll_interval
@@ -212,6 +236,7 @@ class Runtime:
             training_service=self.training,
             clusterer=self.clusterer,
             poll_interval=poll_interval,
+            leader_lock=self.leader_lock,
         )
         self._local_idempotency: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         self._local_idempotency_lock = asyncio.Lock()
@@ -239,27 +264,88 @@ class Runtime:
             mfa_enabled=mfa_enabled,
         )
 
-    def _build_model_services(self, sys_settings: dict) -> None:
+    def _install_calibration_sharing(self) -> None:
+        """Share learned token-calibration factors across replicas.
+
+        Durable in the store (survives restart, works with Redis absent) and
+        broadcast on the cluster bus so peers converge immediately instead of
+        each re-learning the same factor. Entirely best-effort: without it
+        calibration is per-process, which is correct but slower.
+        """
+        store = self.store
+
+        def load(model: str):
+            getter = getattr(store, "get_instance_config", None)
+            if not callable(getter):
+                return None
+            entry = (getter(token_counting.CALIBRATION_CONFIG_NAME) or {}).get(model)
+            if isinstance(entry, dict):
+                return entry.get("factor")
+            return entry if isinstance(entry, (int, float)) else None
+
+        def publish(model: str, factor: float, observations: int) -> None:
+            merger = getattr(store, "merge_instance_config", None)
+            if callable(merger):
+                merger(
+                    token_counting.CALIBRATION_CONFIG_NAME,
+                    {model: {"factor": round(factor, 4), "observations": observations}},
+                )
+            bus = getattr(self, "bus", None)
+            if bus is None:
+                return
+            payload = {
+                "model": model,
+                "factor": round(factor, 4),
+                "observations": observations,
+            }
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return  # no loop (sync context): the store write already landed
+            loop.create_task(
+                bus.publish(token_counting.CALIBRATION_CHANNEL, payload)
+            )
+
+        token_counting.install_sharing(load=load, publish=publish)
+
+    def _system_settings_overrides(self) -> dict:
+        """Explicitly stored admin settings only, without defaults merged in.
+
+        get_system_settings() merges code defaults over the stored values, so
+        resolving model settings from it would let those defaults permanently
+        shadow MODEL_PATH / MODEL_BACKEND env vars the admin never overrode.
+        Precedence here is: admin override > env var > code default.
+        """
+        getter = getattr(self.store, "get_system_settings_overrides", None)
+        if callable(getter):
+            try:
+                return getter() or {}
+            except Exception as exc:
+                logger.warning("settings_overrides_read_failed", error=str(exc))
+        return {}
+
+    def _build_model_services(self) -> None:
         """Construct all backend-dependent services from system settings.
 
         Shared by __init__ and reload_model_services so a runtime
         model_backend / model_path change takes effect without a restart.
         """
+        overrides = self._system_settings_overrides()
         self.resolved_base_model = (
-            sys_settings.get("model_path") or self.settings.model_path
+            overrides.get("model_path") or self.settings.model_path
         )
         self.backend_mode = (
-            sys_settings.get("model_backend") or self.settings.model_backend
+            overrides.get("model_backend") or self.settings.model_backend
         )
         self.default_adapter_mode = (
-            sys_settings.get("default_adapter_mode")
+            overrides.get("default_adapter_mode")
             or self.settings.default_adapter_mode
         )
-        self.rag_mode = sys_settings.get("rag_mode") or self.settings.rag_mode
+        self.rag_mode = overrides.get("rag_mode") or self.settings.rag_mode
         embedding_model_id = (
-            sys_settings.get("embedding_model_id") or self.settings.embedding_model_id
+            overrides.get("embedding_model_id") or self.settings.embedding_model_id
         )
-        rag_chunk_size = sys_settings.get("rag_chunk_size", 400)
+        rag_chunk_size = overrides.get("rag_chunk_size") or 400
         adapter_configs = {
             "openai": {
                 "api_key": self.settings.adapter_openai_api_key,
@@ -268,7 +354,6 @@ class Runtime:
             }
         }
         self.router = RouterEngine(cache=self.cache, backend_mode=self.backend_mode)
-        self.embeddings = EmbeddingsService(embedding_model_id)
         self.llm = LLMService(
             base_model=self.resolved_base_model,
             backend_mode=self.backend_mode,
@@ -277,6 +362,25 @@ class Runtime:
             base_url=self.settings.adapter_openai_base_url,
             adapter_server_model=self.settings.adapter_server_model,
             fs_root=self.settings.shared_fs_root,
+        )
+        # Real embeddings when the backend has an OpenAI-compatible client
+        # (its /embeddings endpoint serves OpenAI, Gemini-compat, and
+        # self-hosted alike). Without one, the deterministic hash keeps the
+        # kernel self-contained — and is_semantic=False tells every consumer
+        # that cosine over those vectors is noise, so rankings stay BM25-only.
+        embed_client = getattr(self.llm.backend, "client", None)
+        if embed_client is not None and hasattr(embed_client, "embeddings"):
+            self.embeddings = EmbeddingsService(
+                embedding_model_id,
+                encoder=make_provider_encoder(embed_client, embedding_model_id),
+                semantic=True,
+            )
+        else:
+            self.embeddings = EmbeddingsService(embedding_model_id)
+        logger.info(
+            "embeddings_configured",
+            model=embedding_model_id,
+            semantic=self.embeddings.is_semantic,
         )
         self.rag = RAGService(
             self.store,
@@ -301,26 +405,28 @@ class Runtime:
             self.rag,
             cache=self.cache,
             settings=self.settings,
+            embeddings=self.embeddings,
         )
         self.config_ops = ConfigOpsService(
             self.store, self.llm, self.router, self.training
         )
         # Record the model-affecting settings this stack was built from so a
         # watcher can tell whether a later settings write actually changed them.
-        self._model_settings_signature = self._model_signature(sys_settings)
+        self._model_settings_signature = self._model_signature()
 
-    def _model_signature(self, sys_settings: dict) -> tuple:
+    def _model_signature(self) -> tuple:
         """Signature of the settings that affect the model service stack."""
+        overrides = self._system_settings_overrides()
         return (
-            sys_settings.get("model_path") or self.settings.model_path,
-            str(sys_settings.get("model_backend") or self.settings.model_backend),
+            overrides.get("model_path") or self.settings.model_path,
+            str(overrides.get("model_backend") or self.settings.model_backend),
             str(
-                sys_settings.get("default_adapter_mode")
+                overrides.get("default_adapter_mode")
                 or self.settings.default_adapter_mode
             ),
-            str(sys_settings.get("rag_mode") or self.settings.rag_mode),
-            sys_settings.get("embedding_model_id") or self.settings.embedding_model_id,
-            sys_settings.get("rag_chunk_size", 400),
+            str(overrides.get("rag_mode") or self.settings.rag_mode),
+            overrides.get("embedding_model_id") or self.settings.embedding_model_id,
+            overrides.get("rag_chunk_size") or 400,
         )
 
     def _read_settings_version(self) -> Optional[str]:
@@ -345,10 +451,7 @@ class Runtime:
         version = self._read_settings_version()
         if version is not None and version == self._applied_settings_version:
             return False
-        sys_settings = {}
-        if hasattr(self.store, "get_system_settings"):
-            sys_settings = self.store.get_system_settings() or {}
-        target = self._model_signature(sys_settings)
+        target = self._model_signature()
         # Record the version even when nothing model-relevant changed, so an
         # unrelated settings write (e.g. a rate-limit tweak) isn't rechecked.
         self._applied_settings_version = version
@@ -389,12 +492,9 @@ class Runtime:
                 name: getattr(self, name, None) for name in self._MODEL_SERVICE_ATTRS
             }
             old_workflow = getattr(self, "workflow", None)
-            sys_settings = {}
-            if hasattr(self.store, "get_system_settings"):
-                sys_settings = self.store.get_system_settings() or {}
             version = self._read_settings_version()
             try:
-                self._build_model_services(sys_settings)
+                self._build_model_services()
             except Exception as exc:
                 # Restore the previous stack so a partial rebuild can't leave the
                 # runtime inconsistent, then let the caller surface the failure.
@@ -402,7 +502,9 @@ class Runtime:
                     setattr(self, name, value)
                 logger.error(
                     "runtime_model_services_reload_failed",
-                    model_backend=str(sys_settings.get("model_backend")),
+                    model_backend=str(
+                        self._system_settings_overrides().get("model_backend")
+                    ),
                     error=str(exc),
                 )
                 raise
@@ -427,6 +529,10 @@ class Runtime:
         if getattr(self, "training_worker", None):
             with contextlib.suppress(Exception):
                 await self.training_worker.stop()
+
+        if getattr(self, "bus", None):
+            with contextlib.suppress(Exception):
+                await self.bus.stop()
 
         if getattr(self, "workflow", None):
             with contextlib.suppress(Exception):

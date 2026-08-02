@@ -11,6 +11,9 @@ The more we can achieve with proper structure and well-architected design, the b
 ### Planning and Resource Management
 Planning and careful use of resources is of the utmost importance. Use constraints with all subagents in planning and preparation to get better results. Think before acting, and scope work appropriately.
 
+### Prompt Budget
+Model-facing prompt text is paid on every call — keep the wording tight. But this app exists to make weak local models perform well, and weak models drop a rule stated once: safety-critical rules (the untrusted-data/injection rule especially) are deliberately repeated across the system prompt, the tool descriptions, and the payload envelope. Tighten phrasing, never the repetition. No boilerplate; no copyright language.
+
 ## Security Guidelines
 
 ### Tenant Isolation

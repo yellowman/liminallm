@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import posixpath
 import re
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -63,6 +65,33 @@ async def lifespan(app: FastAPI):
 
     try:
         runtime = get_runtime()
+        # Cross-replica coordination: lets POST /chat/cancel reach the worker
+        # holding the stream's WebSocket instead of only stopping local ones.
+        try:
+            from liminallm.api.routes import CANCEL_CHANNEL, handle_remote_cancel
+            from liminallm.service import token_counting
+
+            runtime.bus.subscribe(CANCEL_CHANNEL, handle_remote_cancel)
+
+            async def _apply_calibration(data: dict):
+                """A peer learned a better token factor; adopt it."""
+                model = str(data.get("model") or "")
+                try:
+                    factor = float(data.get("factor") or 0)
+                except (TypeError, ValueError):
+                    return None
+                if factor > 0:
+                    token_counting.apply_shared_factor(
+                        model, factor, int(data.get("observations") or 0)
+                    )
+                return None  # broadcast, not a request: never ack
+
+            runtime.bus.subscribe(
+                token_counting.CALIBRATION_CHANNEL, _apply_calibration
+            )
+            await runtime.bus.start()
+        except Exception as exc:  # coordination is optional; keep serving
+            logger.warning("cluster_bus_start_failed", error=str(exc))
         # Check training_worker_enabled from DB settings (falls back to env var)
         training_worker_enabled = runtime.settings.training_worker_enabled
         if hasattr(runtime.store, "get_system_settings"):
@@ -232,7 +261,7 @@ async def add_security_headers(request, call_next):
     response.headers.setdefault("Referrer-Policy", "strict-origin-when-cross-origin")
     # Issue 52.3: Add Cache-Control header to prevent caching of API responses
     # API responses should not be cached by proxies/CDNs to prevent data leakage
-    if request.url.path.startswith("/v1/") or request.url.path in ("/healthz", "/metrics"):
+    if request.url.path.startswith("/v1/") or request.url.path in ("/healthz", "/readyz", "/metrics"):
         response.headers.setdefault("Cache-Control", "no-store, no-cache, must-revalidate, private")
     response.headers.setdefault(
         "Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=()"
@@ -326,6 +355,41 @@ async def serve_chat() -> FileResponse:
     return FileResponse(index)
 
 
+# Public share pages (SPEC §18): read-only views of conversations the owner
+# explicitly published. The directory and pages are noindex by default — both
+# via X-Robots-Tag here and robots.txt below — so shared chats don't end up
+# in search engines unless that policy is deliberately changed.
+_SHARE_NOINDEX = {"X-Robots-Tag": "noindex, nofollow"}
+
+
+def _serve_share_page() -> FileResponse:
+    share = STATIC_DIR / "share.html"
+    if not STATIC_DIR.exists() or not share.exists():
+        logger.warning("frontend_missing_share", share=str(share))
+        raise HTTPException(status_code=404, detail="share ui missing")
+    return FileResponse(share, headers=_SHARE_NOINDEX)
+
+
+@app.get("/share", response_class=FileResponse)
+async def serve_share_directory() -> FileResponse:
+    return _serve_share_page()
+
+
+@app.get("/share/{conversation_id}", response_class=FileResponse)
+async def serve_share_conversation(conversation_id: str) -> FileResponse:
+    # The id is resolved client-side from the URL; this route only serves the
+    # static page (and exists so deep links work), so the parameter is unused.
+    return _serve_share_page()
+
+
+@app.get("/robots.txt")
+async def serve_robots() -> Response:
+    return Response(
+        "User-agent: *\nDisallow: /share/\nDisallow: /share\n",
+        media_type="text/plain",
+    )
+
+
 # The admin page carries its own sign-in form and every API it calls enforces
 # the admin role server-side. Requiring admin auth to serve the static HTML
 # made the page unreachable: browser navigation sends no Authorization header,
@@ -381,27 +445,21 @@ async def serve_voice_file(user_id: str, filename: str, request: Request) -> Fil
 HEALTH_CHECK_TIMEOUT_SECONDS = 3
 
 
-@app.get("/healthz")
-async def health() -> Dict[str, Any]:
-    """Health check endpoint per SPEC §18.
+async def _dependency_checks() -> tuple[Dict[str, Dict[str, Any]], bool, bool]:
+    """Probe dependencies once.
 
-    Performs dependency checks for:
-    - Database connectivity
-    - Redis availability (if configured)
-    - Filesystem mount status
+    Returns (checks, serving_ok, fully_healthy).
 
-    Reports build/version info.
+    ``serving_ok`` covers only what a replica needs in order to answer
+    requests — the database and the filesystem. Redis is deliberately excluded:
+    it is an optional accelerator (rate limits, idempotency, caches all fall
+    back), so a Redis outage must not make every replica fail its readiness
+    probe and drain the entire fleet. It still shows up as degraded in the body
+    and in ``fully_healthy`` for monitoring.
     """
     from liminallm.service.runtime import get_runtime
 
     checks: Dict[str, Dict[str, Any]] = {}
-    overall_healthy = True
-
-    # Version/build info per SPEC §18
-    version_info = {
-        "version": __version__,
-        "build": __build__,
-    }
 
     async def _run_bounded(label: str, func) -> bool:
         try:
@@ -431,13 +489,12 @@ async def health() -> Dict[str, Any]:
 
     if not checks.get("database"):
         checks["database"] = {"status": "healthy" if db_ok else "unhealthy"}
-    overall_healthy = overall_healthy and db_ok
 
-    # Redis check (if configured)
+    # Redis check (if configured). Never gates serving — see the docstring.
+    redis_ok = True
     if hasattr(runtime, "cache") and runtime.cache is not None:
         redis_ok = await _run_bounded("redis", runtime.cache.verify_connection)
         checks["redis"] = {"status": "healthy" if redis_ok else "unhealthy", "degraded": not redis_ok}
-        overall_healthy = overall_healthy and redis_ok
     else:
         checks["redis"] = {"status": "not_configured"}
 
@@ -449,24 +506,72 @@ async def health() -> Dict[str, Any]:
         def _fs_probe() -> None:
             if not fs_path.exists() or not fs_path.is_dir():
                 raise FileNotFoundError(fs_path)
-            health_file = fs_path / ".health_check"
-            health_file.write_text(datetime.utcnow().isoformat())
-            health_file.read_text()
-            health_file.unlink(missing_ok=True)
+            # Unique name per probe: SHARED_FS_ROOT is shared across replicas,
+            # and concurrent probes racing on one fixed filename made read_text
+            # hit another probe's unlink — a spurious 503 that drained healthy
+            # replicas.
+            health_file = fs_path / f".health_check-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+            try:
+                health_file.write_text(datetime.utcnow().isoformat())
+                health_file.read_text()
+            finally:
+                health_file.unlink(missing_ok=True)
 
         fs_ok = await _run_bounded("filesystem", _fs_probe)
         checks["filesystem"] = {"status": "healthy" if fs_ok else "unhealthy"}
-        overall_healthy = overall_healthy and fs_ok
     else:
+        fs_ok = True
         checks["filesystem"] = {"status": "not_configured"}
 
-    status = "healthy" if overall_healthy else "unhealthy"
+    # Reported, never gating: the cluster bus only affects cross-replica
+    # cancellation, and "local" is the right answer for a single process.
+    bus = getattr(runtime, "bus", None)
+    checks["cluster_bus"] = {
+        "status": "healthy" if getattr(bus, "connected", True) else "degraded",
+        "backend": getattr(bus, "backend", "local"),
+    }
+
+    serving_ok = db_ok and fs_ok
+    return checks, serving_ok, serving_ok and redis_ok
+
+
+def _health_body(checks: Dict[str, Dict[str, Any]], healthy: bool) -> Dict[str, Any]:
     return {
-        "status": status,
+        "status": "healthy" if healthy else "unhealthy",
         "checks": checks,
-        **version_info,
+        "version": __version__,
+        "build": __build__,
         "timestamp": datetime.utcnow().isoformat(),
     }
+
+
+@app.get("/healthz")
+async def health() -> Dict[str, Any]:
+    """Human/monitoring health report. Always HTTP 200.
+
+    Reports database, Redis, and filesystem state plus build info. Kept at 200
+    regardless of status so scrapers and the settings UI can always read the
+    body; load balancers should check /readyz instead.
+    """
+    checks, _serving_ok, fully_healthy = await _dependency_checks()
+    return _health_body(checks, fully_healthy)
+
+
+@app.get("/readyz")
+async def readiness() -> Response:
+    """Load-balancer readiness probe: 200 when this replica can serve, else 503.
+
+    /healthz always returns 200 by design, which means an LB checking it can
+    never drain a broken replica. This one answers with a status code, and only
+    fails on the dependencies that actually stop the replica from working —
+    a Redis outage reports as degraded but stays ready, since every Redis-backed
+    feature has a fallback.
+    """
+    checks, serving_ok, fully_healthy = await _dependency_checks()
+    return JSONResponse(
+        _health_body(checks, fully_healthy),
+        status_code=200 if serving_ok else 503,
+    )
 
 
 @app.get("/metrics", response_class=Response)

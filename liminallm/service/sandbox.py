@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import ast
 import ipaddress
+import multiprocessing
 import operator
 import os
 import resource
 import socket
 import tempfile
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -317,18 +319,26 @@ class ToolNetworkPolicy:
     proxy_url: Optional[str] = None
     connect_timeout: float = 10.0
     total_timeout: float = 30.0
+    # Hosts the service itself must reach to function — the configured model
+    # provider, above all. These are infrastructure, not tool fetch targets:
+    # they are connectable (so provider calls inside a tool handler work) but
+    # never appear in `allowlist`, so a tool cannot fetch from them.
+    infrastructure_hosts: list[str] = field(default_factory=list)
 
     def connection_allowlist(self) -> list[str]:
-        """Hosts the sandbox may connect to for outbound requests.
+        """Hosts the sandbox may open sockets to.
 
-        If a proxy is configured, only the proxy host is reachable; otherwise
-        the target allowlist is used directly.
+        If a proxy is configured, tool traffic must go through it; otherwise
+        the target allowlist applies. Infrastructure hosts are always
+        connectable, since blocking them would break the model backend.
         """
 
         if self.proxy_url:
             parsed = urlparse(self.proxy_url)
-            return [h for h in [parsed.hostname] if h]
-        return list(self.allowlist)
+            hosts = [h for h in [parsed.hostname] if h]
+        else:
+            hosts = list(self.allowlist)
+        return hosts + [h for h in self.infrastructure_hosts if h]
 
 
 def _normalize_allowlist(entries: Sequence[str] | None) -> list[str]:
@@ -346,6 +356,7 @@ def build_tool_network_policy(
     proxy_url: Optional[str],
     connect_timeout: float = 10.0,
     total_timeout: float = 30.0,
+    infrastructure_hosts: Sequence[str] | None = None,
 ) -> ToolNetworkPolicy:
     """Create a normalized ToolNetworkPolicy from raw values."""
 
@@ -354,6 +365,7 @@ def build_tool_network_policy(
         proxy_url=proxy_url,
         connect_timeout=connect_timeout,
         total_timeout=total_timeout,
+        infrastructure_hosts=_normalize_allowlist(list(infrastructure_hosts or [])),
     )
 
 
@@ -383,6 +395,26 @@ def _host_matches_allowlist(host: str, allowlist: Sequence[str]) -> bool:
     return False
 
 
+_DNS_CACHE: dict[str, tuple[float, frozenset[str]]] = {}
+_DNS_CACHE_TTL = 60.0
+
+
+def _resolve_host_ips(host: str) -> frozenset[str]:
+    """Addresses ``host`` currently resolves to, cached briefly."""
+    now = time.monotonic()
+    cached = _DNS_CACHE.get(host)
+    if cached and now - cached[0] < _DNS_CACHE_TTL:
+        return cached[1]
+    try:
+        ips = frozenset(
+            info[4][0] for info in socket.getaddrinfo(host, None) if info[4]
+        )
+    except OSError:
+        ips = frozenset()
+    _DNS_CACHE[host] = (now, ips)
+    return ips
+
+
 def _enforce_network_allowlist(host: str) -> None:
     policy: ToolNetworkPolicy | None = getattr(_NETWORK_POLICY_STATE, "policy", None)
     if not policy:
@@ -392,8 +424,25 @@ def _enforce_network_allowlist(host: str) -> None:
     if not allowed_hosts:
         raise SandboxError("Tool network access disabled (empty allowlist)")
 
-    if not _host_matches_allowlist(host, allowed_hosts):
+    if _host_matches_allowlist(host, allowed_hosts):
+        return
+
+    # HTTP clients (httpx, urllib3) resolve DNS themselves and then connect to
+    # an address, so the guard is handed an IP literal rather than the name the
+    # allowlist is written in. Compare against what the allowlisted names
+    # resolve to; anything else is refused.
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
         raise SandboxError(f"Egress host '{host}' is not allowlisted for tools")
+
+    for entry in allowed_hosts:
+        if entry.startswith("*.") or "/" in entry:
+            continue  # wildcards and CIDRs are handled by the name/CIDR match
+        if host in _resolve_host_ips(entry):
+            return
+
+    raise SandboxError(f"Egress address '{host}' is not allowlisted for tools")
 
 
 _ORIGINAL_CREATE_CONNECTION = socket.create_connection
@@ -657,30 +706,99 @@ def sandbox_open(
     return SandboxedFileHandle(Path(path), mode, cfg)
 
 
+def _sandbox_entry(conn, func, args, kwargs, config) -> None:
+    """Child-process entrypoint: apply rlimits, run, ship the result back.
+
+    Exceptions are sent back as objects when picklable so callers can catch
+    their own error types; anything unpicklable degrades to a string.
+    """
+    try:
+        apply_resource_limits(config)
+        payload = (True, func(*args, **kwargs))
+    except BaseException as exc:  # noqa: BLE001 - report to parent, then exit
+        payload = (False, exc)
+    try:
+        conn.send(payload)
+    except Exception:
+        try:
+            conn.send((False, f"{type(payload[1]).__name__}: {payload[1]}"))
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
 def run_in_sandbox(
     func: Callable[..., T],
     *args: Any,
     config: Optional[SandboxConfig] = None,
+    timeout: Optional[float] = None,
     **kwargs: Any,
 ) -> T:
-    """Execute a function within sandbox constraints.
+    """Execute a function in a resource-limited child process.
 
-    This applies resource limits before executing the function.
-    Note: Resource limits persist until the process ends.
+    The rlimits (memory hard cap, CPU seconds, max file size, no core dumps)
+    are applied inside a spawned child so the API process itself is never
+    constrained — applying them in-process would permanently cripple the
+    server, which is why the old in-process variant was unusable. A
+    wall-clock timeout backstops the CPU rlimit and the child is killed on
+    overrun.
+
+    ``func`` and its arguments must be picklable (module-level function,
+    plain data args).
 
     Args:
         func: Function to execute
         *args: Positional arguments for function
         config: Sandbox configuration (uses default if None)
+        timeout: Wall-clock seconds before the child is killed
+                 (default: config.max_cpu_seconds + 15)
         **kwargs: Keyword arguments for function
 
     Returns:
         Function result
+
+    Raises:
+        SandboxError: on timeout or if the child dies without a result
+                      (e.g. killed by a resource limit)
+        The original exception, re-raised, when func itself failed
     """
     cfg = config or DEFAULT_SANDBOX_CONFIG
     ensure_scratch_dir(cfg)
-    apply_resource_limits(cfg)
-    return func(*args, **kwargs)
+    # spawn (not fork): forking a threaded server process risks deadlocks,
+    # and a fresh interpreter is the point of the isolation boundary.
+    ctx = multiprocessing.get_context("spawn")
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    proc = ctx.Process(
+        target=_sandbox_entry,
+        args=(child_conn, func, args, kwargs, cfg),
+        daemon=True,
+    )
+    proc.start()
+    child_conn.close()
+    wall_timeout = timeout if timeout is not None else cfg.max_cpu_seconds + 15
+    try:
+        if not parent_conn.poll(wall_timeout):
+            raise SandboxError(
+                f"sandboxed execution exceeded {wall_timeout:.0f}s wall clock"
+            )
+        try:
+            ok, payload = parent_conn.recv()
+        except EOFError as exc:
+            raise SandboxError(
+                "sandboxed process died before returning a result "
+                "(resource limit exceeded?)"
+            ) from exc
+    finally:
+        parent_conn.close()
+        if proc.is_alive():
+            proc.kill()
+        proc.join(5)
+    if not ok:
+        if isinstance(payload, BaseException):
+            raise payload
+        raise SandboxError(f"sandboxed execution failed: {payload}")
+    return payload
 
 
 # Cgroup v2 integration (when available)

@@ -75,6 +75,131 @@ class LLMService:
         )
         return self.backend.generate(messages, normalized_adapters, user_id=user_id)
 
+    @property
+    def supports_tools(self) -> bool:
+        """Whether the active backend can do model-initiated tool calls.
+
+        A backend may implement the method but still be unusable (no API key,
+        so no client); it reports that through its own ``supports_tools``.
+        """
+        if not callable(getattr(self.backend, "generate_with_tools", None)):
+            return False
+        backend_flag = getattr(self.backend, "supports_tools", None)
+        return bool(backend_flag) if backend_flag is not None else True
+
+    def generate_with_tools(
+        self,
+        messages: List[dict],
+        tools: List[dict],
+        adapters: Optional[List[dict]] = None,
+        *,
+        user_id: Optional[str] = None,
+    ) -> dict:
+        """One tool-calling turn over a caller-built message list.
+
+        Unlike generate(), the caller owns the messages so it can append tool
+        results and iterate.
+        """
+        if not self.supports_tools:
+            raise RuntimeError("active backend does not support tool calling")
+        return self.backend.generate_with_tools(
+            messages,
+            tools,
+            self._normalize_adapters(adapters or []),
+            user_id=user_id,
+        )
+
+    def stream_messages(
+        self,
+        messages: List[dict],
+        adapters: Optional[List[dict]] = None,
+        *,
+        user_id: Optional[str] = None,
+    ) -> Iterator[dict]:
+        """Stream a reply for a caller-built message list.
+
+        Used by the attachment agent to stream its final answer after the
+        tool-calling rounds have assembled the message history.
+        """
+        return self.backend.generate_stream(
+            messages, self._normalize_adapters(adapters or []), user_id=user_id
+        )
+
+    def token_counter(self):
+        """Counter for the serving model: exact when we own its tokenizer."""
+        from liminallm.service.token_counting import counter_for
+
+        model = (
+            getattr(self.backend, "adapter_server_model", None)
+            or getattr(self.backend, "base_model", None)
+            or ""
+        )
+        # Local backends load their tokenizer lazily; force it, or the first
+        # turn would resolve to the heuristic and cache that decision.
+        tokenizer = None
+        getter = getattr(self.backend, "get_tokenizer", None)
+        if callable(getter):
+            try:
+                tokenizer = getter()
+            except Exception as exc:  # noqa: BLE001 - fall back to estimate
+                logger.debug("tokenizer_unavailable", error=str(exc))
+        return counter_for(model, tokenizer=tokenizer)
+
+    def observe_usage(self, estimated_prompt_tokens: int, usage: Any) -> None:
+        """Feed a provider's reported prompt_tokens back into calibration."""
+        try:
+            actual = int((usage or {}).get("prompt_tokens") or 0)
+        except (AttributeError, TypeError, ValueError):
+            return
+        if actual > 0:
+            self.token_counter().observe(estimated_prompt_tokens, actual)
+
+    def context_window(self) -> int:
+        """The serving model's input window (probed/table/config, see backend)."""
+        from liminallm.service.model_backend import DEFAULT_CONTEXT_WINDOW
+
+        try:
+            window = getattr(self.backend, "context_window", None)
+            if isinstance(window, int) and window > 0:
+                return window
+        except Exception as exc:  # noqa: BLE001 - discovery must not break chat
+            logger.warning("context_window_resolution_failed", error=str(exc))
+        return DEFAULT_CONTEXT_WINDOW
+
+    def transcribe_image(self, image_bytes: bytes, mime: str, *, prompt: str) -> str:
+        """One vision call: read an image with the configured model.
+
+        Capability is probed, never assumed from backend type: a backend that
+        implements its own ``transcribe_image`` (a local multimodal model —
+        PaliGemma/LLaVA class — would) is used directly; otherwise any
+        OpenAI-compatible client gets the standard content-parts message.
+        Backends with neither raise NotImplementedError so callers can refuse
+        cleanly instead of hallucinating a transcription. (Today's local JAX
+        stack is a text LM + tokenizer, so it lands in that last bucket until
+        someone loads a vision tower and implements the hook.)
+        """
+        import base64
+
+        backend_hook = getattr(self.backend, "transcribe_image", None)
+        if callable(backend_hook):
+            return backend_hook(image_bytes, mime, prompt=prompt) or ""
+        if getattr(self.backend, "client", None) is None:
+            raise NotImplementedError("backend cannot read images")
+        data_url = (
+            f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
+        )
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": data_url}},
+                ],
+            }
+        ]
+        result = self.backend.generate(messages, [], user_id=None)
+        return (result or {}).get("content") or ""
+
     def generate_stream(
         self,
         prompt: str,

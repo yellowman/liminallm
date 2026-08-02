@@ -18,6 +18,7 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, List, Optional
 
 from liminallm.logging import get_logger
+from liminallm.service.cluster import AdvisoryLock
 
 if TYPE_CHECKING:
     from liminallm.service.clustering import SemanticClusterer
@@ -64,6 +65,7 @@ class TrainingWorker:
         cluster_user_limit: int = DEFAULT_CLUSTER_USER_LIMIT,
         cluster_event_limit: int = DEFAULT_CLUSTER_EVENT_LIMIT,
         adapter_prune_interval: int = DEFAULT_ADAPTER_PRUNE_INTERVAL_SECONDS,
+        leader_lock: Optional["AdvisoryLock"] = None,
     ) -> None:
         self.store = store
         self.training = training_service
@@ -76,6 +78,11 @@ class TrainingWorker:
         self.cluster_user_limit = cluster_user_limit
         self.cluster_event_limit = cluster_event_limit
         self.adapter_prune_interval = adapter_prune_interval
+        # Periodic clustering and prune proposals are cluster-wide work, not
+        # per-replica work: without this lock every replica repeats them.
+        # Queued jobs need no lock — claim_training_job() is an atomic
+        # conditional UPDATE, so exactly one replica wins each job.
+        self.leader_lock = leader_lock or AdvisoryLock(None)
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._last_cluster_run: float = 0.0
@@ -142,6 +149,14 @@ class TrainingWorker:
             return
 
         self._last_cluster_run = now
+        async with self.leader_lock.try_hold("training_worker:clustering") as leader:
+            if not leader:
+                logger.debug("periodic_clustering_skipped_not_leader")
+                return
+            await self._run_periodic_clustering()
+
+    async def _run_periodic_clustering(self) -> None:
+        assert self.clusterer is not None
         users = []
         if hasattr(self.store, "list_users"):
             users_raw = self.store.list_users(limit=self.cluster_user_limit)
@@ -185,6 +200,13 @@ class TrainingWorker:
             return
         self._last_prune_run = now
 
+        async with self.leader_lock.try_hold("training_worker:adapter_prune") as leader:
+            if not leader:
+                logger.debug("adapter_prune_skipped_not_leader")
+                return
+            await self._run_adapter_prune_scan()
+
+    async def _run_adapter_prune_scan(self) -> None:
         list_states = getattr(self.store, "list_adapter_router_state", None)
         record_patch = getattr(self.store, "record_config_patch", None)
         list_patches = getattr(self.store, "list_config_patches", None)

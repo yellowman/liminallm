@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from liminallm.service.tokenizer_utils import (
     MAX_GENERATION_TOKENS,
+    MAX_SINGLE_MESSAGE_TOKENS,
     estimate_token_count,
 )
 
@@ -381,9 +382,14 @@ class ChatMessage(BaseModel):
     @field_validator("content")
     @classmethod
     def _validate_token_budget(cls, value: str) -> str:
-        if estimate_token_count(value) > MAX_GENERATION_TOKENS:
+        # A sanity cap on one message, not the model's budget: capping at
+        # MAX_GENERATION_TOKENS rejected long pastes that a million-token
+        # model handles easily. The real budget is enforced per model in the
+        # workflow, which can prune; validation can only reject.
+        if estimate_token_count(value) > MAX_SINGLE_MESSAGE_TOKENS:
             raise ValueError(
-                f"message exceeds maximum token budget of {MAX_GENERATION_TOKENS}"
+                f"message exceeds the single-message limit of "
+                f"{MAX_SINGLE_MESSAGE_TOKENS} tokens"
             )
         return value
 
@@ -623,6 +629,12 @@ class ConversationSummary(BaseModel):
     title: Optional[str]
     status: str
     active_context_id: Optional[str]
+    # Sharing state (SPEC §18): conversations are private by default.
+    public: bool = False
+
+
+class ConversationShareRequest(BaseModel):
+    public: bool
 
 
 class ConversationListResponse(BaseModel):
@@ -712,6 +724,9 @@ class FileUploadResponse(BaseModel):
     fs_path: str
     context_id: Optional[str] = None
     chunk_count: Optional[int] = None
+    # Set when the upload was attached to a conversation: how the model can
+    # reach this file (inline / searchable / analyzable).
+    attachment: Optional[dict[str, Any]] = None
 
 
 class PreferenceEventRequest(BaseModel):
@@ -915,3 +930,36 @@ class WorkflowListResponse(BaseModel):
     items: List[ArtifactResponse]
     next_page: Optional[int] = None
     page_size: int = 50
+
+
+class NoteCreateRequest(BaseModel):
+    """Create a note in the user's vault."""
+
+    title: str = Field(..., min_length=1, max_length=200)
+    content: str = Field("", max_length=200_000)
+
+
+class NoteUpdateRequest(BaseModel):
+    """Patch a note; omitted fields are left alone."""
+
+    title: Optional[str] = Field(None, min_length=1, max_length=200)
+    content: Optional[str] = Field(None, max_length=200_000)
+
+
+class NoteSearchRequest(BaseModel):
+    """Search the vault."""
+
+    query: str = Field(..., min_length=1, max_length=2000)
+    limit: int = Field(8, ge=1, le=25)
+
+
+class NoteWitnessRequest(BaseModel):
+    """Ask the witness to check a note against the rest of the vault."""
+
+    limit: int = Field(6, ge=1, le=6)
+
+
+class NoteFromFileRequest(BaseModel):
+    """Promote an uploaded file into the vault as a note."""
+
+    name: str = Field(..., min_length=1, max_length=512)

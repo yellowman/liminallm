@@ -176,12 +176,12 @@ class ConfigOpsService:
         description = artifact.description or artifact.name
         goal_line = goal or "improve routing quality and adapter selection accuracy"
         return (
-            f"You are a config engineer. Given the artifact named '{artifact.name}' of type {artifact.type}, propose a JSON patch.\n"
+            f"You are a config engineer for the artifact '{artifact.name}' ({artifact.type}).\n"
             f"Artifact description: {description}\n"
             f"Existing schema (truncated to 2KB): {self._safe_truncate_json(artifact.schema, 2000)}\n"
             f"Goal: {goal_line}\n"
             f"Preference insights: {summary_blob}\n"
-            "Respond with JSON representing a JSON-patch style object."
+            "Respond with only a JSON-patch style object."
         )
 
     def _run_llm_for_patch(self, prompt: str) -> dict:

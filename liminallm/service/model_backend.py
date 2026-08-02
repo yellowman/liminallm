@@ -287,6 +287,7 @@ class StubBackend:
     """
 
     mode = "stub"
+    context_window = 8192
 
     STUB_RESPONSE = "This is a stub response for testing purposes."
 
@@ -299,6 +300,61 @@ class StubBackend:
     ) -> dict:
         return {
             "content": self.STUB_RESPONSE,
+            "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+        }
+
+    def generate_with_tools(
+        self,
+        messages: List[dict],
+        tools: List[dict],
+        adapters: List[dict],
+        *,
+        user_id: Optional[str] = None,
+    ) -> dict:
+        """Deterministic tool-calling stand-in for tests.
+
+        Calls each offered tool exactly once (in order) before answering, so
+        the agent loop is exercised end to end without a live model.
+        """
+        called = {
+            m.get("name")
+            for m in messages
+            if m.get("role") == "tool" and m.get("name")
+        }
+        for tool in tools or []:
+            fn = (tool or {}).get("function") or {}
+            name = fn.get("name")
+            if not name or name in called:
+                continue
+            last_user = next(
+                (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"),
+                "",
+            )
+            args = {"query": last_user} if name == "file_search" else {}
+            if name == "run_python":
+                args = {"code": "import os\nprint(sorted(os.listdir('.')))"}
+            return {
+                "content": "",
+                "tool_calls": [{"id": f"stub-{name}", "name": name, "arguments": json.dumps(args)}],
+                "assistant_message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "id": f"stub-{name}",
+                            "type": "function",
+                            "function": {"name": name, "arguments": json.dumps(args)},
+                        }
+                    ],
+                },
+                "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+            }
+        tool_outputs = [m.get("content", "") for m in messages if m.get("role") == "tool"]
+        summary = " | ".join(o[:120] for o in tool_outputs if o)
+        return {
+            "content": f"{self.STUB_RESPONSE} Tool results: {summary}" if summary else self.STUB_RESPONSE,
+            "tool_calls": [],
+            "assistant_message": {"role": "assistant", "content": self.STUB_RESPONSE},
             "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
         }
 
@@ -322,6 +378,155 @@ class StubBackend:
                 "usage": {"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
             },
         }
+
+
+# ---------------------------------------------------------------------------
+# Context-window discovery
+#
+# The prompt budget must come from the model actually serving requests, not a
+# constant. Resolution, most authoritative first:
+#   1. an explicit override (admin setting / MODEL_CONTEXT_WINDOW) — handled
+#      by the caller, not here;
+#   2. asking the provider (Gemini's models endpoint states inputTokenLimit;
+#      self-hosted OpenAI-compatible servers like vLLM/LoRAX put
+#      max_model_len/context_length in /models);
+#   3. a table of well-known model families (prefix-matched);
+#   4. a conservative default.
+
+DEFAULT_CONTEXT_WINDOW = 8192
+
+# Models that reject a caller-supplied temperature (400, whole request fails).
+_REASONING_PREFIXES = ("o1", "o3", "o4", "gpt-5", "gemini-3")
+
+
+def is_reasoning_model(model: str) -> bool:
+    lowered = (model or "").lower()
+    return any(lowered.startswith(prefix) for prefix in _REASONING_PREFIXES)
+
+# Longest-prefix wins. Values are input windows, deliberately the safe
+# published number rather than any beta/extended tier.
+KNOWN_CONTEXT_WINDOWS: List[Tuple[str, int]] = [
+    ("gemini-1.5-pro", 2_000_000),
+    ("gemini", 1_000_000),
+    ("gpt-4.1", 1_000_000),
+    ("gpt-5", 400_000),
+    ("gpt-4o", 128_000),
+    ("chatgpt-4o", 128_000),
+    ("gpt-4-turbo", 128_000),
+    ("gpt-4", 8_192),
+    ("gpt-3.5-turbo", 16_385),
+    ("o1", 200_000),
+    ("o3", 200_000),
+    ("o4", 200_000),
+    ("claude", 200_000),
+    ("llama-3.1", 131_072),
+    ("llama-3.2", 131_072),
+    ("llama-3.3", 131_072),
+    ("llama-4", 131_072),
+    ("glm", 128_000),
+    ("deepseek", 64_000),
+    ("qwen", 32_768),
+    ("mistral", 32_768),
+]
+
+
+def context_window_from_table(model_id: str) -> Optional[int]:
+    """Longest matching family prefix, or None for an unknown model."""
+    lowered = (model_id or "").lower()
+    best: Optional[Tuple[str, int]] = None
+    for prefix, window in KNOWN_CONTEXT_WINDOWS:
+        if lowered.startswith(prefix) and (best is None or len(prefix) > len(best[0])):
+            best = (prefix, window)
+    return best[1] if best else None
+
+
+# Keys self-hosted OpenAI-compatible servers use for the model's window.
+_WINDOW_KEYS = (
+    "max_model_len", "context_length", "max_context_length",
+    "context_window", "n_ctx", "inputTokenLimit", "input_token_limit",
+)
+
+
+def _window_from_json(payload: Any) -> Optional[int]:
+    """Depth-limited scan of a /models-style payload for a window field."""
+    def scan(node: Any, depth: int) -> Optional[int]:
+        if depth > 3 or not isinstance(node, (dict, list)):
+            return None
+        if isinstance(node, dict):
+            for key in _WINDOW_KEYS:
+                value = node.get(key)
+                if isinstance(value, int) and value > 0:
+                    return value
+                if isinstance(value, str) and value.isdigit():
+                    return int(value)
+            for value in node.values():
+                found = scan(value, depth + 1)
+                if found:
+                    return found
+        else:
+            for item in node[:5]:
+                found = scan(item, depth + 1)
+                if found:
+                    return found
+        return None
+
+    return scan(payload, 0)
+
+
+def probe_context_window(
+    *, provider: str, model: str, base_url: Optional[str], api_key: Optional[str]
+) -> Optional[int]:
+    """Ask the serving endpoint for the model's window; None when it won't say.
+
+    Best-effort by design: 5s timeout, any failure returns None and the
+    caller falls back to the table. Never raises.
+    """
+    import httpx
+
+    try:
+        if provider in {"gemini", "google", "vertex"} and api_key:
+            # The OpenAI-compat base_url nests under /v1beta/openai; the
+            # native models endpoint (which states inputTokenLimit) is a
+            # sibling of that prefix.
+            root = "https://generativelanguage.googleapis.com/v1beta"
+            if base_url and "/v1beta" in base_url:
+                root = base_url.split("/v1beta")[0] + "/v1beta"
+            resp = httpx.get(
+                f"{root}/models/{model}",
+                headers={"x-goog-api-key": api_key},
+                timeout=5.0,
+            )
+            if resp.status_code == 200:
+                return _window_from_json(resp.json())
+            return None
+        if base_url:
+            # Self-hosted OpenAI-compatible servers (vLLM, LoRAX, LM Studio)
+            # often expose the window in their models listing.
+            headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+            for url in (f"{base_url.rstrip('/')}/models/{model}",
+                        f"{base_url.rstrip('/')}/models"):
+                resp = httpx.get(url, headers=headers, timeout=5.0)
+                if resp.status_code == 200:
+                    window = _window_from_json(resp.json())
+                    if window:
+                        return window
+    except Exception as exc:  # noqa: BLE001 - probing must never break serving
+        logger.debug("context_window_probe_failed", error=str(exc))
+    return None
+
+
+def context_window_from_model_dir(model_dir: str | Path) -> Optional[int]:
+    """Local HF-style checkout: the window lives in config.json."""
+    try:
+        config = json.loads((Path(model_dir) / "config.json").read_text())
+    except Exception:  # noqa: BLE001 - missing/unparseable config
+        return None
+    for key in ("max_position_embeddings", "n_positions", "seq_length",
+                "max_seq_len", "model_max_length"):
+        value = config.get(key)
+        if isinstance(value, int) and value > 0:
+            return value
+    return None
 
 
 class ApiAdapterBackend:
@@ -349,6 +554,7 @@ class ApiAdapterBackend:
         adapter_server_model: Optional[str] = None,
         provider: Optional[str] = None,
         api_key_env: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> None:
         self.base_model = base_model
         self.adapter_server_model = adapter_server_model
@@ -356,6 +562,13 @@ class ApiAdapterBackend:
         self.mode = adapter_mode
         self._api_key = api_key
         self._base_url = base_url
+        # Thinking control for reasoning models (OpenAI o-series, Gemini 2.5/3
+        # via the OpenAI-compatible endpoint): "low" | "medium" | "high", or
+        # "none" to disable where the provider allows it. Sent via extra_body
+        # so older openai SDKs work; omitted entirely when unset.
+        self._reasoning_effort = (
+            reasoning_effort or os.getenv("MODEL_REASONING_EFFORT") or ""
+        ).strip().lower() or None
         # Env var consulted for credential rotation; provider-specific so that,
         # e.g., a Zhipu backend reads ZHIPU_API_KEY rather than OPENAI_API_KEY.
         self._api_key_env = api_key_env or "OPENAI_API_KEY"
@@ -366,6 +579,35 @@ class ApiAdapterBackend:
         # Infer provider from adapter_mode if not specified
         self.provider = provider or self._infer_provider(adapter_mode)
         self.capabilities = get_provider_capabilities(self.provider)
+        self._context_window: Optional[int] = None
+
+    @property
+    def context_window(self) -> int:
+        """The serving model's input window: probed, else table, else default.
+
+        Resolved once and cached; a wrong guess here misprices every budget
+        decision, so the provider's own answer outranks the table.
+        """
+        if self._context_window is None:
+            model = self.adapter_server_model or self.base_model
+            window = probe_context_window(
+                provider=self.provider,
+                model=model,
+                base_url=self._base_url,
+                api_key=self._active_api_key or self._api_key,
+            )
+            source = "probe"
+            if not window:
+                window = context_window_from_table(model)
+                source = "table"
+            if not window:
+                window, source = DEFAULT_CONTEXT_WINDOW, "default"
+            self._context_window = window
+            logger.info(
+                "model_context_window_resolved",
+                model=model, window=window, source=source,
+            )
+        return self._context_window
 
     def _safe_float(self, value: Any, default: float = 1.0, *, context: str = "") -> float:
         """Coerce adapter weights to float with defensive fallback.
@@ -430,6 +672,25 @@ class ApiAdapterBackend:
         # Default to openai-style for unknown modes
         return "openai"
 
+    def _with_reasoning_effort(self, extra_body: Optional[dict]) -> Optional[dict]:
+        """Merge the configured reasoning effort into the request extra_body."""
+        if not self._reasoning_effort:
+            return extra_body
+        return {**(extra_body or {}), "reasoning_effort": self._reasoning_effort}
+
+    def _sampling_params(self, model: str) -> dict:
+        """Sampling args this model will accept.
+
+        Reasoning models (OpenAI o-series, gpt-5, and Gemini 3 through the
+        compat endpoint) reject any temperature other than the default and
+        fail the whole request with a 400. Omitting the parameter is the
+        portable choice: every model has a sane default, and only these
+        models treat setting it as an error.
+        """
+        if is_reasoning_model(model):
+            return {}
+        return {"temperature": 0.2}
+
     def generate(
         self,
         messages: List[dict],
@@ -448,13 +709,14 @@ class ApiAdapterBackend:
 
         # Inject adapter prompts if any hybrid/prompt adapters
         augmented_messages = self._inject_adapter_prompts(messages, prompt_injections)
+        extra_body = self._with_reasoning_effort(extra_body)
 
         if self.client:
             completion = self.client.chat.completions.create(
                 model=target_model,
                 messages=augmented_messages,
-                temperature=0.2,
                 extra_body=extra_body,
+                **self._sampling_params(target_model),
             )
             choices = getattr(completion, "choices", None) or []
             first_choice = next(iter(choices), None)
@@ -485,6 +747,92 @@ class ApiAdapterBackend:
             "adapters_applied": processed["applied"],
         }
 
+    @property
+    def supports_tools(self) -> bool:
+        """True only when a real client is configured to receive tool calls."""
+        self._ensure_client()
+        return self.client is not None
+
+    def generate_with_tools(
+        self,
+        messages: List[dict],
+        tools: List[dict],
+        adapters: List[dict],
+        *,
+        user_id: Optional[str] = None,
+    ) -> dict:
+        """One turn of an OpenAI-style tool-calling exchange.
+
+        Returns the assistant's content, any tool calls it requested, and the
+        raw assistant message to append before sending tool results back — the
+        caller drives the loop.
+        """
+        self._ensure_client()
+        if not self.client:
+            raise RuntimeError("tool calling requires a configured API client")
+
+        processed = self._process_adapters_for_provider(adapters or [])
+        augmented = self._inject_adapter_prompts(
+            messages, processed["prompt_injections"]
+        )
+        extra_body = self._with_reasoning_effort(processed["extra_body"])
+        completion = self.client.chat.completions.create(
+            model=processed["model"],
+            messages=augmented,
+            tools=tools,
+            tool_choice="auto",
+            **self._sampling_params(processed["model"]),
+            extra_body=extra_body,
+        )
+        choices = getattr(completion, "choices", None) or []
+        first = next(iter(choices), None)
+        message = getattr(first, "message", None) if first else None
+        raw_calls = list(getattr(message, "tool_calls", None) or []) if message else []
+        tool_calls = [
+            {
+                "id": getattr(tc, "id", "") or "",
+                "name": getattr(getattr(tc, "function", None), "name", "") or "",
+                "arguments": getattr(getattr(tc, "function", None), "arguments", "") or "{}",
+            }
+            for tc in raw_calls
+        ]
+        # Round-trip the provider's own serialization so vendor extras survive.
+        # Gemini attaches a `thought_signature` to each tool call inside
+        # extra_content and rejects the follow-up request (400) if it is missing,
+        # so a hand-rebuilt assistant message breaks multi-turn tool calling.
+        assistant_message: Dict[str, Any] = {}
+        if message is not None and hasattr(message, "model_dump"):
+            try:
+                assistant_message = message.model_dump(exclude_none=True)
+            except Exception:  # pragma: no cover - defensive
+                assistant_message = {}
+        if not assistant_message:
+            assistant_message = {
+                "role": "assistant",
+                "content": getattr(message, "content", None) if message else None,
+            }
+            if tool_calls:
+                assistant_message["tool_calls"] = [
+                    {
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {"name": tc["name"], "arguments": tc["arguments"]},
+                    }
+                    for tc in tool_calls
+                ]
+        assistant_message.setdefault("role", "assistant")
+        usage_obj = getattr(completion, "usage", None)
+        return {
+            "content": (getattr(message, "content", None) if message else None) or "",
+            "tool_calls": tool_calls,
+            "assistant_message": assistant_message,
+            "usage": {
+                "prompt_tokens": getattr(usage_obj, "prompt_tokens", 0),
+                "completion_tokens": getattr(usage_obj, "completion_tokens", 0),
+                "total_tokens": getattr(usage_obj, "total_tokens", 0),
+            },
+        }
+
     def generate_stream(
         self,
         messages: List[dict],
@@ -507,13 +855,14 @@ class ApiAdapterBackend:
         extra_body = processed["extra_body"]
         prompt_injections = processed["prompt_injections"]
         augmented_messages = self._inject_adapter_prompts(messages, prompt_injections)
+        extra_body = self._with_reasoning_effort(extra_body)
 
         if self.client:
             try:
                 stream = self.client.chat.completions.create(
                     model=target_model,
                     messages=augmented_messages,
-                    temperature=0.2,
+                    **self._sampling_params(target_model),
                     extra_body=extra_body,
                     stream=True,
                 )
@@ -861,6 +1210,12 @@ class LocalJaxLoRABackend:
         self.mode = "local_lora"
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
+        # The checkpoint's config states its trained positions; max_seq_len is
+        # the serving cap. The window is whichever is smaller and known.
+        discovered = context_window_from_model_dir(base_model)
+        self.context_window = (
+            min(discovered, max_seq_len) if discovered else max_seq_len
+        ) or DEFAULT_CONTEXT_WINDOW
         self.default_vocab_size = DEFAULT_VOCAB_SIZE
         self._base_vocab_size = DEFAULT_VOCAB_SIZE
         self._adapter_vocab_size: Optional[int] = None
@@ -883,6 +1238,16 @@ class LocalJaxLoRABackend:
         self._jax = jax
         self._jnp = jnp
         self._rng = jax.random.PRNGKey(0)
+
+    def get_tokenizer(self):
+        """The checkpoint's own tokenizer, loading it if needed.
+
+        This is the same tokenizer used to encode prompts for generation, so
+        anything counting with it counts exactly what the model will see —
+        no vendor library, no network, no estimate.
+        """
+        self._ensure_tokenizer()
+        return self._tokenizer
 
     def _ensure_tokenizer(self):
         if self._tokenizer is not None or self._tokenizer_error is not None:

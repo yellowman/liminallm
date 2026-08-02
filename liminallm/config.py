@@ -462,6 +462,110 @@ class Settings(BaseModel):
         "TOOL_FETCH_TIMEOUT",
         description="Total timeout (seconds) for tool HTTP fetches",
     )
+    interpreter_scratch_dir: str | None = env_field(
+        None,
+        "INTERPRETER_SCRATCH_DIR",
+        description=(
+            "Node-local directory for code-interpreter session dirs. Defaults "
+            "to the system temp dir. Must NOT be on shared storage: these hold "
+            "throwaway copies of attachments for one tool call."
+        ),
+    )
+    history_budget_fraction: float = env_field(
+        0.5,
+        "HISTORY_BUDGET_FRACTION",
+        description=(
+            "Share of the prompt budget kept as verbatim recent turns "
+            "(0.1-0.9). The rest is left for system blocks, RAG, attachments, "
+            "and the new message."
+        ),
+    )
+    history_recall_fraction: float = env_field(
+        0.25,
+        "HISTORY_RECALL_FRACTION",
+        description=(
+            "Share of the history budget spent recalling older turns picked "
+            "by relevance to the current message — the window is assembled, "
+            "not just a recency prefix. 0 disables recall."
+        ),
+    )
+    model_context_window: int = env_field(
+        0,
+        "MODEL_CONTEXT_WINDOW",
+        description=(
+            "Input window of the serving model, in tokens. 0 = discover: ask "
+            "the provider, else a known-family table, else 8192. Set this "
+            "when discovery guesses wrong for your deployment."
+        ),
+    )
+    extract_readers: str = env_field(
+        "ocr,vision",
+        "EXTRACT_READERS",
+        description=(
+            "Ordered roster of image readers for uploads/scanned pdfs. "
+            "Built-ins: ocr (tesseract), vision (the model backend). New "
+            "readers register via extract.register_reader."
+        ),
+    )
+    notes_enabled: bool = env_field(
+        True,
+        "NOTES_ENABLED",
+        description=(
+            "Notes vault + witness. Admin-overridable via system settings; "
+            "when off, notes routes and the note_search tool disappear."
+        ),
+    )
+    cluster_bus_backend: str = env_field(
+        "auto",
+        "CLUSTER_BUS_BACKEND",
+        description=(
+            "Transport for cross-replica coordination (cancelling a stream "
+            "owned by another worker): auto | redis | postgres | local. 'auto' "
+            "prefers Redis and falls back to Postgres LISTEN/NOTIFY, so Redis "
+            "stays optional; 'local' disables peer coordination entirely."
+        ),
+    )
+    # Web tools (SPEC §18). Browsing is enabled by default but constrained:
+    # SSRF protection is always on, and search stays inert until a provider and
+    # its key are configured.
+    web_tools_enabled: bool = env_field(
+        True,
+        "WEB_TOOLS_ENABLED",
+        description="Allow the model to call web_search / web_fetch",
+    )
+    web_search_provider: str = env_field(
+        "none",
+        "WEB_SEARCH_PROVIDER",
+        description="Search backend: none | brave | tavily | google_cse | duckduckgo",
+    )
+    web_search_api_key: str | None = env_field(
+        None,
+        "WEB_SEARCH_API_KEY",
+        description="API key for the configured web search provider",
+    )
+    web_search_engine_id: str | None = env_field(
+        None,
+        "WEB_SEARCH_ENGINE_ID",
+        description="Search engine ID (google_cse only)",
+    )
+    web_fetch_timeout: float = env_field(
+        15.0,
+        "WEB_FETCH_TIMEOUT",
+        description="Total timeout (seconds) for a web page fetch",
+    )
+    web_fetch_max_bytes: int = env_field(
+        2 * 1024 * 1024,
+        "WEB_FETCH_MAX_BYTES",
+        description="Maximum bytes read from a fetched page",
+    )
+    web_fetch_allow_private: bool = env_field(
+        False,
+        "WEB_FETCH_ALLOW_PRIVATE",
+        description=(
+            "TEST ONLY: permit fetching private/loopback addresses. Disables "
+            "SSRF protection — never enable in production."
+        ),
+    )
     enable_mfa: bool = env_field(
         True,
         "ENABLE_MFA",
@@ -787,6 +891,8 @@ SYSTEM_SETTINGS_DEFAULTS: dict = {
     "enable_mfa": True,
     "allow_signup": True,
     "training_worker_enabled": True,
+    "notes_enabled": True,
+    "model_context_window": 0,
     "training_worker_poll_interval": 60,
     # SMTP
     "smtp_host": "",

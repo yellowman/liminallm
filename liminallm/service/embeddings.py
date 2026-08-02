@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import math
-from typing import Callable, Iterable, List
+from typing import Any, Callable, Iterable, List
+
+from liminallm.logging import get_logger
+
+logger = get_logger(__name__)
 
 # Fixed embedding size shared across routing/RAG/clustering
 EMBEDDING_DIM = 64
@@ -260,17 +264,55 @@ def validate_centroid(
     return normalize_vector(centroid)
 
 
+_EMBED_INPUT_MAX_CHARS = 8000
+
+
+def make_provider_encoder(client: Any, model_id: str) -> Callable[[str], List[float]]:
+    """Real embeddings through an OpenAI-compatible client.
+
+    Works for OpenAI, the Gemini compat endpoint, and self-hosted servers —
+    whichever client the model backend already holds. A provider failure
+    falls back to the deterministic hash vector, whose different dimension
+    makes cosine against real vectors return a neutral 0.0 instead of noise:
+    a failed embed quietly costs recall, never corrupts ranking.
+    """
+
+    def encode(text: str) -> List[float]:
+        try:
+            response = client.embeddings.create(
+                model=model_id, input=(text or "")[:_EMBED_INPUT_MAX_CHARS]
+            )
+            vector = list(response.data[0].embedding)
+            if vector:
+                return vector
+        except Exception as exc:  # noqa: BLE001 - degrade, never block
+            logger.warning(
+                "provider_embedding_failed", model=model_id, error=str(exc)[:200]
+            )
+        return deterministic_embedding(text)
+
+    return encode
+
+
 class EmbeddingsService:
-    """Wrapper for embedding providers with a stable model identifier."""
+    """Wrapper for embedding providers with a stable model identifier.
+
+    ``is_semantic`` is the honesty flag: the default encoder is a
+    deterministic hash whose cosine similarities are noise. Every consumer
+    that blends cosine into a ranking must check it — hash cosine polluting
+    a BM25 score is worse than BM25 alone.
+    """
 
     def __init__(
         self,
         model_id: str,
         *,
         encoder: Callable[[str], List[float]] = deterministic_embedding,
+        semantic: bool = False,
     ):
         self.model_id = model_id
         self._encoder = encoder
+        self.is_semantic = bool(semantic)
 
     def embed(self, text: str) -> List[float]:
         return self._encoder(text)

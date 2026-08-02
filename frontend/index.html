@@ -179,6 +179,7 @@
           <!-- Tab Navigation -->
           <nav class="tab-nav" id="main-tabs" aria-label="Main navigation">
             <button class="tab-btn active" data-tab="chat-tab" aria-selected="true">Chat</button>
+            <button class="tab-btn" data-tab="notes-tab" aria-selected="false">Notes</button>
             <button class="tab-btn" data-tab="contexts-tab" aria-selected="false">Contexts</button>
             <button class="tab-btn" data-tab="artifacts-tab" aria-selected="false">Artifacts</button>
             <button class="tab-btn" data-tab="tools-tab" aria-selected="false">Tools</button>
@@ -195,6 +196,7 @@
                   <span id="conversation-label">New conversation</span>
                 </div>
                 <div class="pill-row">
+                  <button class="ghost" id="share-btn" disabled>Share It</button>
                   <button class="ghost" id="new-thread">New thread</button>
                   <button class="minor" id="refresh-conversations">Refresh history</button>
                 </div>
@@ -264,10 +266,22 @@
               <div id="messages" aria-live="polite"></div>
               <div id="messages-empty" class="empty">Start a new thread to see your conversation history here.</div>
 
+              <!-- Turn navigator: tick marks that expand into a jump list -->
+              <nav id="turn-rail" class="turn-rail" aria-label="Jump to a turn in this conversation">
+                <div class="turn-rail-inner" id="turn-rail-inner"></div>
+              </nav>
+
               <form id="chat-form">
-                <div class="field textarea-wrap">
+                <div id="attachment-chips" class="attachment-chips"></div>
+                <div class="field textarea-wrap" id="composer-drop">
                   <label for="message-input" class="sr-only">Message</label>
-                  <textarea id="message-input" placeholder="Ask anything..." rows="3"></textarea>
+                  <textarea id="message-input" placeholder="Ask anything, or drop a file here..." rows="3"></textarea>
+                  <button type="button" class="attach-btn" id="attach-btn" aria-label="Attach a file" title="Attach a file">
+                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/>
+                    </svg>
+                  </button>
+                  <input type="file" id="composer-file" class="hidden" />
                   <div class="draft-indicator" id="draft-indicator"></div>
                 </div>
                 <div id="chat-actions">
@@ -321,6 +335,52 @@
           </section>
 
           <!-- Contexts Tab -->
+          <!-- Notes Tab: the vault -->
+          <section class="tab-panel" id="notes-tab" aria-label="Notes vault">
+            <div class="panel notes-panel">
+              <aside class="notes-side">
+                <div class="notes-side-head">
+                  <input type="search" id="note-search-input" placeholder="Search the vault…" autocomplete="off" />
+                  <button class="primary" id="note-new-btn" title="New note">+</button>
+                </div>
+                <div id="note-search-results" class="note-search-results hidden"></div>
+                <ul id="note-list" class="note-list" aria-label="Notes"></ul>
+                <div class="notes-side-foot">
+                  <span id="note-count" class="muted"></span>
+                  <span class="pill-row">
+                    <button class="minor" id="note-sweep-btn" title="Have the witness compare the strongest pairs across the whole vault">Sweep</button>
+                    <button class="minor" id="note-graph-btn">Graph</button>
+                  </span>
+                </div>
+              </aside>
+              <div class="notes-main">
+                <div id="note-editor" class="note-editor hidden">
+                  <div class="note-editor-head">
+                    <input type="text" id="note-title" placeholder="Title" maxlength="200" autocomplete="off" />
+                    <div class="pill-row">
+                      <button class="minor" id="note-preview-btn" aria-pressed="false">Preview</button>
+                      <button class="ghost" id="note-witness-btn" title="Check this note against the rest of the vault">Witness</button>
+                      <button class="primary" id="note-save-btn">Save</button>
+                      <button class="minor danger" id="note-delete-btn" title="Delete note">✕</button>
+                    </div>
+                  </div>
+                  <textarea id="note-content" placeholder="Write. Link with [[Title]]." spellcheck="true"></textarea>
+                  <div id="note-preview" class="note-preview markdown-body hidden"></div>
+                  <div id="note-meta" class="note-meta"></div>
+                  <div id="note-witness-results" class="note-witness hidden"></div>
+                </div>
+                <div id="note-graph-wrap" class="note-graph-wrap hidden">
+                  <canvas id="note-graph"></canvas>
+                  <div class="note-graph-hint muted">click a note to open it · red = contradiction, amber = a position that moved (this session)</div>
+                </div>
+                <div id="note-sweep-wrap" class="note-sweep-wrap hidden"></div>
+                <div id="notes-empty" class="notes-empty">
+                  <p class="muted">A note becomes a node. <code>[[Links]]</code> become edges.<br/>The Witness compares your thoughts across time — wherever that process leads.</p>
+                </div>
+              </div>
+            </div>
+          </section>
+
           <section class="tab-panel" id="contexts-tab" aria-label="Context management">
             <div class="panel">
               <div class="section-header">

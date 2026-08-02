@@ -64,7 +64,9 @@ const updateDraftIndicator = () => {
 // State management
 // =============================================================================
 
-const persistedKeys = ['accessToken', 'refreshToken', 'sessionId', 'tenantId', 'role', 'userId'];
+// conversationId shares the auth session's lifetime so a reload reopens the
+// active thread; logout (resetAuth) clears it along with the tokens.
+const persistedKeys = ['accessToken', 'refreshToken', 'sessionId', 'tenantId', 'role', 'userId', 'conversationId'];
 
 const createState = (storage) => {
   const backing = {
@@ -74,7 +76,9 @@ const createState = (storage) => {
     tenantId: storage.read('tenantId'),
     role: storage.read('role'),
     userId: storage.read('userId'),
-    conversationId: null,
+    conversationId: storage.read('conversationId'),
+    conversationPublic: false,
+    attachments: [],
     lastAssistant: null,
     contexts: [],
     artifacts: [],
@@ -132,109 +136,238 @@ const escapeHtml = (str) => {
   return div.innerHTML;
 };
 
-/**
- * Minimal, dependency-free markdown renderer for assistant messages.
- *
- * The input is HTML-escaped FIRST, then markdown constructs are rewritten
- * into a fixed set of safe tags, so message content can never inject markup.
- * Supports: fenced/inline code, bold, italic, strikethrough, http(s) links,
- * headings, ordered/unordered lists, blockquotes, tables, and rules.
- */
-const renderMarkdown = (raw) => {
-  // Strip NULs so message text can never reference the placeholder table.
-  let text = escapeHtml(String(raw || '').replace(/\u0000/g, ''));
+// escapeHtml leaves quotes alone (fine for text nodes); attribute values need
+// them encoded too.
+const escapeAttr = (str) => escapeHtml(str).replace(/"/g, '&quot;');
 
-  // Protect code from all later transforms.
-  const codeBlocks = [];
-  text = text.replace(/```([\w-]*)\n?([\s\S]*?)```/g, (m, lang, code) => {
-    codeBlocks.push(`<pre><code${lang ? ` class="lang-${escapeHtml(lang)}"` : ''}>${code.replace(/\n$/, '')}</code></pre>`);
-    return `\u0000B${codeBlocks.length - 1}\u0000`;
+// Copy-message button: overlapping-squares icon, swapped for a check when
+// the copy lands. Shown under every user and assistant message.
+const MSG_COPY_BUTTON_HTML =
+  '<button type="button" class="msg-copy" title="Copy message" aria-label="Copy message">' +
+  '<svg class="icon-copy" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<rect x="9" y="9" width="12" height="12" rx="2"></rect>' +
+  '<path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>' +
+  '<svg class="icon-check" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' +
+  '<polyline points="20 6 9 17 4 12"></polyline></svg>' +
+  '</button>';
+
+// =============================================================================
+// Markdown renderer — GitHub-flavored subset, dependency-free, escape-first.
+// The input is HTML-escaped FIRST, then markdown constructs are rewritten into
+// a fixed set of safe tags, so message content can never inject markup.
+// =============================================================================
+
+const MD_PH = String.fromCharCode(0);
+const MD_SLOT_RE = new RegExp('^' + MD_PH + 'B\\d+' + MD_PH + '$');
+const MD_RESTORE_RE = new RegExp(MD_PH + '[BI](\\d+)' + MD_PH, 'g');
+
+// Lightweight syntax highlighting: comments, strings, numbers, and keywords
+// are enough to make code read like GitHub without shipping a highlighter.
+const CODE_LANG_ALIASES = {
+  javascript: 'js', jsx: 'js', ts: 'js', tsx: 'js', typescript: 'js', node: 'js',
+  java: 'c', kotlin: 'c', swift: 'c', cpp: 'c', cc: 'c', h: 'c', cs: 'c', csharp: 'c', php: 'c', scala: 'c',
+  py: 'python', python3: 'python', rb: 'python', ruby: 'python',
+  sh: 'shell', bash: 'shell', zsh: 'shell', console: 'shell',
+  yml: 'shell', yaml: 'shell', toml: 'shell', ini: 'shell', dockerfile: 'shell', makefile: 'shell',
+  golang: 'go', rs: 'rust', postgres: 'sql', psql: 'sql', mysql: 'sql', sqlite: 'sql',
+};
+
+const CODE_PROFILES = {
+  js: { comments: 'slash', keywords: 'const let var function class return if else for while do switch case break continue new delete typeof instanceof void yield async await try catch finally throw import export from default extends super this in of static get set null undefined true false' },
+  c: { comments: 'slash', keywords: 'int long short char float double void bool unsigned signed struct enum union class interface public private protected static final const return if else for while do switch case break continue new delete this super try catch finally throw import package namespace using var val fun def true false null nullptr' },
+  go: { comments: 'slash', keywords: 'func package import type struct interface map chan go defer return if else for range switch case break continue fallthrough var const nil true false select goto' },
+  rust: { comments: 'slash', keywords: 'fn let mut pub struct enum impl trait use mod match if else for while loop return break continue crate super where async await move ref const static type dyn true false Some None Ok Err self Self' },
+  python: { comments: 'hash', keywords: 'def class return if elif else for while break continue import from as with try except finally raise pass lambda global nonlocal assert yield async await del not and or in is None True False self require puts nil end begin rescue module attr_accessor' },
+  shell: { comments: 'hash', keywords: 'if then else elif fi for in do done while until case esac function echo exit return local export readonly set unset shift source alias sudo cd true false' },
+  sql: { comments: 'dash', ignoreCase: true, keywords: 'select from where insert into values update set delete create table view index drop alter add column join left right inner outer full cross on as and or not null primary foreign key references default group by order asc desc limit offset having distinct union all exists between like ilike in is case when then else end begin commit rollback transaction returning with' },
+  json: { comments: null, keywords: 'true false null' },
+  css: { comments: 'block', keywords: '' },
+};
+
+const CODE_COMMENT_PATTERNS = {
+  slash: '\\/\\/[^\\n]*|\\/\\*[\\s\\S]*?\\*\\/',
+  hash: '#[^\\n]*',
+  dash: '--[^\\n]*',
+  block: '\\/\\*[\\s\\S]*?\\*\\/',
+};
+
+// `code` is already HTML-escaped; wrap tokens in spans without re-escaping.
+const highlightCode = (code, lang) => {
+  const profile = CODE_PROFILES[CODE_LANG_ALIASES[lang] || lang];
+  if (!profile) return code;
+  const comment = profile.comments ? `(?<com>${CODE_COMMENT_PATTERNS[profile.comments]})` : '(?<com>\\u0001)';
+  const string = '(?<str>"(?:\\\\.|[^"\\\\\\n])*"|\'(?:\\\\.|[^\'\\\\\\n])*\'|`(?:\\\\.|[^`\\\\])*`)';
+  const number = '(?<num>\\b(?:0[xX][0-9a-fA-F]+|\\d[\\d_]*(?:\\.\\d+)?(?:[eE][+-]?\\d+)?)\\b)';
+  const parts = [comment, string, number];
+  if (profile.keywords) {
+    parts.push(`(?<kw>\\b(?:${profile.keywords.trim().split(/\s+/).join('|')})\\b)`);
+  }
+  const re = new RegExp(parts.join('|'), profile.ignoreCase ? 'gi' : 'g');
+  return code.replace(re, (...args) => {
+    const g = args[args.length - 1];
+    if (g.com) return `<span class="tok-com">${g.com}</span>`;
+    if (g.str) return `<span class="tok-str">${g.str}</span>`;
+    if (g.num) return `<span class="tok-num">${g.num}</span>`;
+    return `<span class="tok-kw">${g.kw}</span>`;
   });
-  const inlineCode = [];
-  text = text.replace(/`([^`\n]+)`/g, (m, code) => {
-    inlineCode.push(`<code>${code}</code>`);
-    return `\u0000I${inlineCode.length - 1}\u0000`;
-  });
+};
 
-  // Inline formatting (operates on escaped text).
-  text = text
-    .replace(/!?\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
-    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/(^|[\s(])\*([^*\n]+)\*/gm, '$1<em>$2</em>')
-    .replace(/(^|[\s(])_([^_\n]+)_/gm, '$1<em>$2</em>')
-    .replace(/~~([^~\n]+)~~/g, '<del>$1</del>');
+const renderCodeBlock = (code, lang) => (
+  `<figure class="codeblock">` +
+  `<figcaption><span class="codeblock-lang">${lang || 'code'}</span>` +
+  `<button type="button" class="code-copy" aria-label="Copy code">Copy</button></figcaption>` +
+  `<pre><code${lang ? ` class="lang-${lang}"` : ''}>${highlightCode(code, lang)}</code></pre></figure>`
+);
 
-  // Block-level pass.
-  const lines = text.split('\n');
-  const out = [];
-  let i = 0;
-  const isTableSep = (l) => /^\s*\|?[\s:|-]+\|?\s*$/.test(l || '') && (l || '').includes('-');
-  const cells = (l) => l.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map((c) => c.trim());
+// Inline formatting; operates on escaped text after code has been stashed.
+// URL character classes exclude quotes so a crafted URL can never break out
+// of the href attribute (escapeHtml does not escape quotes).
+const applyInlineMarkdown = (text) => text
+  .replace(/!?\[([^\]\n]+)\]\((https?:\/\/[^)\s"']+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+  .replace(/(^|[\s(])(https?:\/\/[^\s"'<>]+[^\s"'<>.,;:!?)\]])/gm, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>')
+  .replace(/\*\*\*([^*\n]+)\*\*\*/g, '<strong><em>$1</em></strong>')
+  .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+  .replace(/(^|[\s(])\*([^*\n]+)\*/gm, '$1<em>$2</em>')
+  .replace(/__([^_\n]+)__/g, '<strong>$1</strong>')
+  .replace(/(^|[\s(])_([^_\n]+)_/gm, '$1<em>$2</em>')
+  .replace(/~~([^~\n]+)~~/g, '<del>$1</del>');
 
-  while (i < lines.length) {
-    const line = lines[i];
-    if (!line.trim()) { i += 1; continue; }
-    let match;
-    if (/^\u0000B\d+\u0000$/.test(line.trim())) {
-      out.push(line.trim());
-      i += 1;
-    } else if ((match = line.match(/^(#{1,4})\s+(.*)$/))) {
-      out.push(`<h${match[1].length + 2}>${match[2]}</h${match[1].length + 2}>`);
-      i += 1;
-    } else if (/^\s*([-*_])\s*\1\s*\1[\s\-*_]*$/.test(line)) {
-      out.push('<hr>');
-      i += 1;
-    } else if (/^&gt;\s?/.test(line)) {
-      const quote = [];
-      while (i < lines.length && /^&gt;\s?/.test(lines[i])) {
-        quote.push(lines[i].replace(/^&gt;\s?/, ''));
-        i += 1;
-      }
-      out.push(`<blockquote>${quote.join('<br>')}</blockquote>`);
-    } else if (/^\s*[-*+]\s+/.test(line)) {
-      const items = [];
-      while (i < lines.length && /^\s*[-*+]\s+/.test(lines[i])) {
-        items.push(`<li>${lines[i].replace(/^\s*[-*+]\s+/, '')}</li>`);
-        i += 1;
-      }
-      out.push(`<ul>${items.join('')}</ul>`);
-    } else if (/^\s*\d+\.\s+/.test(line)) {
-      const items = [];
-      while (i < lines.length && /^\s*\d+\.\s+/.test(lines[i])) {
-        items.push(`<li>${lines[i].replace(/^\s*\d+\.\s+/, '')}</li>`);
-        i += 1;
-      }
-      out.push(`<ol>${items.join('')}</ol>`);
-    } else if (line.includes('|') && isTableSep(lines[i + 1])) {
-      const header = cells(line);
-      i += 2;
-      const rows = [];
-      while (i < lines.length && lines[i].includes('|') && lines[i].trim()) {
-        rows.push(cells(lines[i]));
-        i += 1;
-      }
-      out.push(
-        `<table><thead><tr>${header.map((h) => `<th>${h}</th>`).join('')}</tr></thead>` +
-        `<tbody>${rows.map((r) => `<tr>${r.map((c) => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody></table>`
-      );
-    } else {
-      const para = [];
-      while (
-        i < lines.length && lines[i].trim() &&
-        !/^(#{1,4})\s|^&gt;\s?|^\s*[-*+]\s+|^\s*\d+\.\s+/.test(lines[i]) &&
-        !/^\u0000B\d+\u0000$/.test(lines[i].trim())
-      ) {
-        para.push(lines[i]);
-        i += 1;
-      }
-      out.push(`<p>${para.join('<br>')}</p>`);
+const MD_LIST_ITEM = /^(\s*)(?:([-*+])|(\d{1,9})[.)])\s+(.*)$/;
+const MD_HR = /^ {0,3}([-*_])( *\1){2,} *$/;
+const MD_TABLE_SEP = (l) => /^\s*\|?[\s:|-]+\|?\s*$/.test(l || '') && (l || '').includes('-');
+const mdCells = (l) => l.replace(/^\s*\|/, '').replace(/\|\s*$/, '').split('|').map((c) => c.trim());
+
+// Nested lists: items at the shallowest indent are siblings; deeper lines
+// belong to the item above them and are parsed recursively.
+const renderMdList = (lines, parseBlocks) => {
+  const first = lines[0].match(MD_LIST_ITEM);
+  const base = first[1].length;
+  const ordered = first[3] !== undefined;
+  const start = ordered ? parseInt(first[3], 10) : 1;
+  const items = [];
+  let cur = null;
+  for (const line of lines) {
+    const m = line.match(MD_LIST_ITEM);
+    if (m && m[1].length <= base) {
+      if (cur) items.push(cur);
+      cur = { text: m[4], sub: [] };
+    } else if (cur) {
+      cur.sub.push(line);
     }
   }
+  if (cur) items.push(cur);
+  const body = items.map(({ text, sub }) => {
+    let attrs = '';
+    const task = text.match(/^\[([ xX])\]\s+(.*)$/);
+    if (task) {
+      attrs = ' class="task"';
+      text = `<input type="checkbox" disabled${task[1] === ' ' ? '' : ' checked'}> ${task[2]}`;
+    }
+    return `<li${attrs}>${text}${sub.length ? parseBlocks(sub) : ''}</li>`;
+  }).join('');
+  return ordered
+    ? `<ol${start !== 1 ? ` start="${start}"` : ''}>${body}</ol>`
+    : `<ul>${body}</ul>`;
+};
 
-  let html = out.join('');
-  html = html.replace(/\u0000B(\d+)\u0000/g, (m, n) => codeBlocks[Number(n)]);
-  html = html.replace(/\u0000I(\d+)\u0000/g, (m, n) => inlineCode[Number(n)]);
-  return html;
+const renderMarkdown = (raw, opts = {}) => {
+  // Strip NULs so message text can never reference the placeholder table.
+  let src = String(raw || '').split(MD_PH).join('');
+  // While streaming, close a dangling fence so partial code renders as code.
+  if (opts.stream && ((src.match(/^\s*```/gm) || []).length % 2) === 1) src += '\n```';
+  let text = escapeHtml(src);
+
+  // Stash code and escaped punctuation so no later transform touches them.
+  // 'B' placeholders are block-level (kept out of <p>), 'I' are inline.
+  const slots = [];
+  const stash = (html, block) => MD_PH + (block ? 'B' : 'I') + (slots.push(html) - 1) + MD_PH;
+
+  text = text.replace(/```([^\n`]*)\n?([\s\S]*?)```/g, (m, info, code) => {
+    const lang = (info.trim().split(/\s+/)[0] || '').toLowerCase().replace(/[^a-z0-9+#-]/g, '');
+    return stash(renderCodeBlock(code.replace(/\n$/, ''), lang), true);
+  });
+  text = text.replace(/\\([\\`*_[\]()#+\-.!~|])/g, (m, ch) => stash(ch));
+  text = text.replace(/`([^`\n]+)`/g, (m, code) => stash(`<code>${code}</code>`));
+
+  text = applyInlineMarkdown(text);
+
+  const isBlockStart = (line, next) =>
+    !line || !line.trim() ||
+    /^(#{1,6})\s/.test(line) ||
+    /^ {0,3}&gt;/.test(line) ||
+    MD_LIST_ITEM.test(line) ||
+    MD_HR.test(line) ||
+    MD_SLOT_RE.test(line.trim()) ||
+    (line.includes('|') && MD_TABLE_SEP(next));
+
+  const parseBlocks = (lines) => {
+    const out = [];
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+      if (!line.trim()) { i += 1; continue; }
+      let m;
+      if (MD_SLOT_RE.test(line.trim())) {
+        out.push(line.trim());
+        i += 1;
+      } else if ((m = line.match(/^(#{1,6})\s+(.*?)\s*#*\s*$/))) {
+        const level = m[1].length;
+        out.push(`<h${level}>${m[2]}</h${level}>`);
+        i += 1;
+      } else if (MD_HR.test(line)) {
+        out.push('<hr>');
+        i += 1;
+      } else if (/^ {0,3}&gt;/.test(line)) {
+        const quote = [];
+        while (i < lines.length && /^ {0,3}&gt;/.test(lines[i])) {
+          quote.push(lines[i].replace(/^ {0,3}&gt; ?/, ''));
+          i += 1;
+        }
+        out.push(`<blockquote>${parseBlocks(quote)}</blockquote>`);
+      } else if (MD_LIST_ITEM.test(line)) {
+        const block = [];
+        while (
+          i < lines.length &&
+          (MD_LIST_ITEM.test(lines[i]) || /^\s+\S/.test(lines[i]) ||
+            (!lines[i].trim() && MD_LIST_ITEM.test(lines[i + 1] || '')))
+        ) {
+          if (lines[i].trim()) block.push(lines[i]);
+          i += 1;
+        }
+        out.push(renderMdList(block, parseBlocks));
+      } else if (line.includes('|') && MD_TABLE_SEP(lines[i + 1])) {
+        const header = mdCells(line);
+        const aligns = mdCells(lines[i + 1]).map((c) =>
+          c.startsWith(':') && c.endsWith(':') ? 'center' : c.endsWith(':') ? 'right' : c.startsWith(':') ? 'left' : ''
+        );
+        const attr = (j) => (aligns[j] ? ` style="text-align:${aligns[j]}"` : '');
+        i += 2;
+        const rows = [];
+        while (i < lines.length && lines[i].includes('|') && lines[i].trim()) {
+          const r = mdCells(lines[i]).slice(0, header.length);
+          while (r.length < header.length) r.push('');
+          rows.push(r);
+          i += 1;
+        }
+        out.push(
+          `<div class="table-wrap"><table><thead><tr>${header.map((h, j) => `<th${attr(j)}>${h}</th>`).join('')}</tr></thead>` +
+          `<tbody>${rows.map((r) => `<tr>${r.map((c, j) => `<td${attr(j)}>${c}</td>`).join('')}</tr>`).join('')}</tbody></table></div>`
+        );
+      } else {
+        const para = [line];
+        i += 1;
+        while (i < lines.length && !isBlockStart(lines[i], lines[i + 1])) {
+          para.push(lines[i]);
+          i += 1;
+        }
+        out.push(`<p>${para.join('<br>')}</p>`);
+      }
+    }
+    return out.join('');
+  };
+
+  return parseBlocks(text.split('\n'))
+    .replace(MD_RESTORE_RE, (m, n) => slots[Number(n)]);
 };
 
 // Citation modal for displaying source content
@@ -386,8 +519,15 @@ const conversationSearchEl = $('conversation-search');
 
 const DEFAULT_UPLOAD_BYTES = 10 * 1024 * 1024;
 let uploadLimitBytes = null;
-const ALLOWED_UPLOAD_TYPES = ['text/plain', 'text/markdown', 'application/pdf', 'application/json', 'text/csv'];
-const ALLOWED_UPLOAD_EXTENSIONS = ['.txt', '.md', '.markdown', '.pdf', '.json', '.csv', '.yaml', '.yml'];
+const ALLOWED_UPLOAD_TYPES = [
+  'text/plain', 'text/markdown', 'application/pdf', 'application/json', 'text/csv',
+  'application/zip', 'application/x-zip-compressed', 'application/gzip', 'application/x-gzip', 'application/x-tar',
+];
+const ALLOWED_UPLOAD_EXTENSIONS = ['.txt', '.md', '.markdown', '.pdf', '.json', '.csv', '.yaml', '.yml', '.zip', '.tar', '.tgz', '.gz'];
+const ARCHIVE_EXTENSIONS = ['.zip', '.tar', '.tgz', '.tar.gz', '.gz'];
+const isArchiveName = (name) => ARCHIVE_EXTENSIONS.some((ext) => name.toLowerCase().endsWith(ext));
+// Encode a relative path for a URL, keeping the / separators.
+const encodePath = (p) => p.split('/').map(encodeURIComponent).join('/');
 
 const getUploadLimit = () => uploadLimitBytes || DEFAULT_UPLOAD_BYTES;
 
@@ -610,7 +750,8 @@ const initTabs = () => {
 
       // Lazy-load the data behind the tab; login only preloads a subset.
       if (state.accessToken) {
-        if (tabId === 'contexts-tab') fetchContexts();
+        if (tabId === 'notes-tab') fetchNotes();
+        else if (tabId === 'contexts-tab') fetchContexts();
         else if (tabId === 'artifacts-tab') fetchArtifacts();
         else if (tabId === 'tools-tab') refreshToolsAndWorkflows();
         else if (tabId === 'insights-tab') fetchInsights();
@@ -1187,9 +1328,17 @@ const fetchConversations = async () => {
     );
     state.conversations = envelope.data?.items || [];
     renderConversationList();
+    syncConversationTitle();
   } catch (err) {
     console.warn('Failed to fetch conversations:', err.message);
   }
+};
+
+// Keep the header in step with the (possibly just-generated) title.
+const syncConversationTitle = () => {
+  if (!conversationLabel || !state.conversationId) return;
+  const active = (state.conversations || []).find((c) => c.id === state.conversationId);
+  if (active?.title) conversationLabel.textContent = active.title;
 };
 
 const renderConversationList = () => {
@@ -1227,7 +1376,7 @@ const renderConversationList = () => {
 };
 
 const loadConversation = async (conversationId) => {
-  if (!conversationId) return;
+  if (!conversationId) return false;
 
   state.conversationId = conversationId;
   state.lastAssistant = null;
@@ -1242,6 +1391,9 @@ const loadConversation = async (conversationId) => {
 
     const convo = envelope.data;
     if (conversationLabel) conversationLabel.textContent = convo.title || 'Conversation';
+    state.conversationPublic = Boolean(convo.public);
+    updateShareButton();
+    fetchAttachments();
 
     const messagesEnvelope = await requestEnvelope(
       `${apiBase}/conversations/${conversationId}/messages?limit=100`,
@@ -1257,18 +1409,328 @@ const loadConversation = async (conversationId) => {
     if (messageInput) {
       messageInput.value = getDraft(conversationId);
     }
+    return true;
   } catch (err) {
     showStatus(err.message, true);
     if (conversationLabel) conversationLabel.textContent = 'Error loading';
+    return false;
   }
 };
 
 const setConversation = (id) => {
+  // A different (or new) conversation starts from the private default until
+  // loadConversation reports otherwise.
+  if (id !== state.conversationId) {
+    state.conversationPublic = false;
+    state.attachments = [];
+    renderAttachmentChips();
+  }
   state.conversationId = id;
-  if (conversationLabel) conversationLabel.textContent = id ? `Conversation ${id.slice(0, 8)}...` : 'New conversation';
+  if (conversationLabel) {
+    // Never show a raw UUID: use the generated title once we know it.
+    const known = (state.conversations || []).find((c) => c.id === id);
+    conversationLabel.textContent = known?.title || (id ? 'Untitled conversation' : 'New conversation');
+  }
+  updateShareButton();
   if (!id) {
     state.lastAssistant = null;
     renderPreferencePanel();
+  }
+};
+
+// =============================================================================
+// Turn navigator — a rail of tick marks on the right, one per turn. At rest it
+// is just the ticks; hovering or focusing it expands into a list of the
+// model-written turn descriptions, and picking one jumps to that turn.
+// =============================================================================
+
+const turnRailEl = $('turn-rail');
+const turnRailInnerEl = $('turn-rail-inner');
+
+const renderTurnRail = () => {
+  if (!turnRailInnerEl || !messagesEl) return;
+  const turns = [...messagesEl.querySelectorAll('.message.user')];
+  turnRailEl?.classList.toggle('hidden', turns.length < 2);
+  if (turns.length < 2) {
+    turnRailInnerEl.innerHTML = '';
+    return;
+  }
+  turnRailInnerEl.innerHTML = turns
+    .map((el, i) => {
+      // Prefer the generated description; fall back to the message itself so
+      // the list is never empty while labels are still being written.
+      const label = el.dataset.turnLabel || (el.dataset.raw || '').trim() || `Turn ${i + 1}`;
+      return `<button type="button" class="turn-tick" data-turn-index="${i}" title="${escapeAttr(label)}">
+        <span class="tick-mark" aria-hidden="true"></span>
+        <span class="tick-label">${escapeHtml(label)}</span>
+      </button>`;
+    })
+    .join('');
+  highlightActiveTurn();
+};
+
+// Mark the turn nearest the top of the reading area as current.
+const highlightActiveTurn = () => {
+  if (!turnRailInnerEl || !messagesEl) return;
+  const turns = [...messagesEl.querySelectorAll('.message.user')];
+  if (!turns.length) return;
+  const anchor = messagesEl.getBoundingClientRect().top + 80;
+  let active = 0;
+  turns.forEach((el, i) => {
+    if (el.getBoundingClientRect().top <= anchor) active = i;
+  });
+  turnRailInnerEl.querySelectorAll('.turn-tick').forEach((tick, i) => {
+    tick.classList.toggle('active', i === active);
+  });
+};
+
+/**
+ * Turn descriptions and the conversation title are written by a background
+ * model pass just after a reply, so fetch them once things settle and patch
+ * them in without re-rendering the bubbles (which would flicker).
+ */
+const refreshTurnLabels = async () => {
+  if (!state.accessToken || !state.conversationId) return;
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/conversations/${state.conversationId}/messages?limit=100`,
+      { headers: headers() },
+      'Failed to refresh labels'
+    );
+    // Messages appended live during a send have no data-id (only
+    // history-rendered ones do), so fall back to positional matching — but
+    // align from the END, not the start: the API returns the newest page of
+    // messages, so when either side is truncated the two lists share their
+    // tail, not their head. Aligning from the start pinned label N onto turn 0.
+    const userMessages = (envelope.data?.messages || [])
+      .filter((m) => m.role === 'user')
+      .sort((a, b) => (a.seq || 0) - (b.seq || 0));
+    const rendered = [...(messagesEl?.querySelectorAll('.message.user') || [])];
+    const offset = rendered.length - userMessages.length;
+    let patched = false;
+    rendered.forEach((el, i) => {
+      const m = el.dataset.id
+        ? userMessages.find((x) => x.id === el.dataset.id)
+        : userMessages[i - offset];
+      const label = m?.meta?.turn_label;
+      if (label && el.dataset.turnLabel !== label) {
+        el.dataset.turnLabel = label;
+        patched = true;
+      }
+    });
+    if (patched) renderTurnRail();
+  } catch {
+    /* labels are cosmetic */
+  }
+};
+
+const initTurnRail = () => {
+  if (!turnRailInnerEl || !messagesEl) return;
+
+  turnRailInnerEl.addEventListener('click', (e) => {
+    const tick = e.target.closest('.turn-tick');
+    if (!tick) return;
+    const turns = [...messagesEl.querySelectorAll('.message.user')];
+    const target = turns[Number(tick.dataset.turnIndex)];
+    if (target) {
+      target.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      target.classList.add('turn-flash');
+      setTimeout(() => target.classList.remove('turn-flash'), 1200);
+    }
+    // A pointer click is "I'm done here": drop focus so the rail collapses back
+    // to bars. Keyboard activation (detail === 0) keeps focus, so the list stays
+    // open for continued arrow-key navigation.
+    if (e.detail > 0) tick.blur();
+  });
+
+  messagesEl.addEventListener('scroll', debounce(highlightActiveTurn, 60));
+  window.addEventListener('scroll', debounce(highlightActiveTurn, 60), { passive: true });
+};
+
+// =============================================================================
+// Composer attachments — drop a file in the composer and it is usable in this
+// chat immediately. No context to create or select: the server classifies the
+// file and the model reaches it inline, via file_search, or via run_python.
+// =============================================================================
+
+const renderAttachmentChips = () => {
+  const wrap = $('attachment-chips');
+  if (!wrap) return;
+  const items = state.attachments || [];
+  wrap.innerHTML = items
+    .map((a) => {
+      const how = a.inline
+        ? 'in prompt'
+        : a.searchable
+          ? 'searchable'
+          : 'code';
+      return `<span class="attachment-chip" title="${escapeAttr(a.name)} · ${how}">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/>
+        </svg>
+        <span class="chip-name">${escapeHtml(a.name)}</span>
+        <span class="chip-kind">${how}</span>
+      </span>`;
+    })
+    .join('');
+};
+
+const fetchAttachments = async () => {
+  if (!state.accessToken || !state.conversationId) {
+    state.attachments = [];
+    renderAttachmentChips();
+    return;
+  }
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/conversations/${state.conversationId}/attachments`,
+      { headers: headers() },
+      'Failed to load attachments'
+    );
+    state.attachments = envelope.data?.items || [];
+  } catch {
+    state.attachments = [];
+  }
+  renderAttachmentChips();
+};
+
+/**
+ * Attach a file to the current conversation, creating the conversation first
+ * if the user has not sent anything yet (so a file can start a chat).
+ */
+const attachFileToConversation = async (file) => {
+  if (!state.accessToken) {
+    showStatus('Sign in to attach files.', true);
+    return;
+  }
+  if (!file) return;
+
+  const check = validateUploadFile(file);
+  if (!check.ok) {
+    showStatus(check.message, true);
+    return;
+  }
+
+  try {
+    showStatus(`Attaching ${file.name}...`);
+    if (!state.conversationId) {
+      const created = await requestEnvelope(
+        `${apiBase}/conversations`,
+        { method: 'POST', headers: headers(), body: JSON.stringify({ title: file.name }) },
+        'Failed to start conversation'
+      );
+      setConversation(created.data?.id);
+    }
+
+    const form = new FormData();
+    form.append('file', file);
+    form.append('conversation_id', state.conversationId);
+    const envelope = await requestEnvelope(
+      `${apiBase}/files/upload`,
+      // authHeaders (not headers) so the browser sets the multipart boundary.
+      { method: 'POST', headers: authHeaders(), body: form },
+      'Attach failed'
+    );
+
+    const attachment = envelope.data?.attachment;
+    if (attachment) {
+      state.attachments = [
+        ...(state.attachments || []).filter((a) => a.name !== attachment.name),
+        attachment,
+      ];
+      renderAttachmentChips();
+    }
+    const how = attachment?.inline
+      ? 'included in the prompt'
+      : attachment?.searchable
+        ? `indexed for search (${envelope.data?.chunk_count || 0} chunks)`
+        : 'available to the code interpreter';
+    showStatus(`Attached ${file.name} — ${how}. Ask about it.`);
+    fetchConversations();
+  } catch (err) {
+    showStatus(err.message, true);
+  }
+};
+
+const initComposerAttachments = () => {
+  const fileInput = $('composer-file');
+  const dropZone = $('composer-drop');
+
+  $('attach-btn')?.addEventListener('click', () => fileInput?.click());
+  fileInput?.addEventListener('change', async () => {
+    const file = fileInput.files?.[0];
+    fileInput.value = '';
+    await attachFileToConversation(file);
+  });
+
+  if (!dropZone) return;
+  ['dragenter', 'dragover'].forEach((evt) =>
+    dropZone.addEventListener(evt, (e) => {
+      e.preventDefault();
+      dropZone.classList.add('drag-over');
+    })
+  );
+  ['dragleave', 'drop'].forEach((evt) =>
+    dropZone.addEventListener(evt, (e) => {
+      e.preventDefault();
+      if (evt === 'dragleave' && dropZone.contains(e.relatedTarget)) return;
+      dropZone.classList.remove('drag-over');
+    })
+  );
+  dropZone.addEventListener('drop', async (e) => {
+    const file = e.dataTransfer?.files?.[0];
+    if (file) await attachFileToConversation(file);
+  });
+};
+
+// =============================================================================
+// Conversation sharing (private by default; owner can publish to /share/{id})
+// =============================================================================
+
+const updateShareButton = () => {
+  const btn = $('share-btn');
+  if (!btn) return;
+  btn.disabled = !state.conversationId;
+  btn.textContent = state.conversationPublic ? 'Make Private' : 'Share It';
+  btn.title = state.conversationPublic
+    ? 'This conversation is public — click to make it private again'
+    : 'Publish this conversation to a public read-only page';
+  btn.classList.toggle('shared', Boolean(state.conversationPublic));
+};
+
+const toggleShareConversation = async () => {
+  if (!state.conversationId) {
+    showStatus('Start a conversation before sharing it.', true);
+    return;
+  }
+  const btn = $('share-btn');
+  const makePublic = !state.conversationPublic;
+  try {
+    toggleButtonBusy(btn, true, 'Working...');
+    const envelope = await requestEnvelope(
+      `${apiBase}/conversations/${state.conversationId}/share`,
+      { method: 'POST', headers: headers(), body: JSON.stringify({ public: makePublic }) },
+      'Sharing failed'
+    );
+    state.conversationPublic = Boolean(envelope.data?.public);
+    if (state.conversationPublic) {
+      const url = `${window.location.origin}${envelope.data.share_path}`;
+      let copied = false;
+      if (navigator.clipboard) {
+        try {
+          await navigator.clipboard.writeText(url);
+          copied = true;
+        } catch { /* clipboard unavailable */ }
+      }
+      showStatus(copied ? `Public link copied: ${url}` : `Public link: ${url}`);
+    } else {
+      showStatus('Conversation is private again.');
+    }
+  } catch (err) {
+    showStatus(err.message, true);
+  } finally {
+    toggleButtonBusy(btn, false);
+    updateShareButton();
   }
 };
 
@@ -1293,10 +1755,12 @@ const renderMessages = (messages) => {
   if (!messages.length) {
     messagesEl.innerHTML = '';
     updateEmptyState();
+    renderTurnRail();
     return;
   }
 
   messagesEl.innerHTML = messages.map((m) => renderMessage(m)).join('');
+  renderTurnRail();
 
   const lastAssistant = messages.filter((m) => m.role === 'assistant').pop();
   if (lastAssistant) {
@@ -1363,12 +1827,16 @@ const renderMessage = (m) => {
     `;
   }
 
+  // The turn description (written by a quick model pass) rides on the user
+  // message's meta and feeds the turn navigator.
+  const turnLabel = m.meta?.turn_label ? ` data-turn-label="${escapeAttr(m.meta.turn_label)}"` : '';
   return `
-    <div class="message ${role}" data-id="${escapeHtml(m.id || '')}">
+    <div class="message ${role}" data-id="${escapeHtml(m.id || '')}" data-raw="${escapeAttr(m.content || '')}"${turnLabel}>
       <div class="role">${role}</div>
       <div>
         <div class="bubble">${content}</div>
         ${citationsHtml}
+        <div class="msg-actions">${MSG_COPY_BUTTON_HTML}</div>
         ${metaBits.length ? `<div class="meta">${metaBits.join(' · ')}</div>` : ''}
       </div>
     </div>
@@ -1391,9 +1859,14 @@ const appendMessage = (role, content, meta = '') => {
   const metaEl = document.createElement('div');
   metaEl.className = 'meta';
   metaEl.textContent = meta;
+  wrapper.dataset.raw = content;
   wrapper.appendChild(roleEl);
   const contentWrap = document.createElement('div');
   contentWrap.appendChild(bubble);
+  const actionsEl = document.createElement('div');
+  actionsEl.className = 'msg-actions';
+  actionsEl.innerHTML = MSG_COPY_BUTTON_HTML;
+  contentWrap.appendChild(actionsEl);
   if (meta) contentWrap.appendChild(metaEl);
   wrapper.appendChild(contentWrap);
   if (messagesEl) {
@@ -1404,9 +1877,28 @@ const appendMessage = (role, content, meta = '') => {
   return wrapper;
 };
 
+// Names of the tools the model called for a reply, for the message meta line.
+// A node's extra result keys land under `outputs`, so check both places.
+const toolNamesFromTrace = (trace) => {
+  const names = [];
+  for (const entry of Array.isArray(trace) ? trace : []) {
+    const calls = [...(entry?.tool_calls || []), ...(entry?.outputs?.tool_calls || [])];
+    for (const call of calls) {
+      if (call?.tool && !names.includes(call.tool)) names.push(call.tool);
+    }
+  }
+  return names;
+};
+
+// Only auto-scroll while the reader is already at the bottom, so scrolling
+// up to reread earlier output is never fought by the stream.
+const isNearBottom = () =>
+  !messagesEl || messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 120;
+
 /**
  * Create a streaming message element that can be updated token-by-token.
- * Returns an object with update() and finalize() methods.
+ * Re-renders are batched per animation frame so fast token streams stay
+ * smooth, and a dangling code fence is auto-closed mid-stream.
  */
 const createStreamingMessage = (role) => {
   const wrapper = document.createElement('div');
@@ -1432,22 +1924,44 @@ const createStreamingMessage = (role) => {
   updateEmptyState();
 
   let content = '';
+  let frame = null;
+
+  const render = (final) => {
+    frame = null;
+    const stick = isNearBottom();
+    if (role === 'assistant') {
+      bubble.innerHTML = renderMarkdown(content, { stream: !final });
+    } else {
+      bubble.textContent = content;
+    }
+    if (stick) scrollToBottom();
+  };
 
   return {
     /** Append a token to the message */
     update(token) {
       content += token;
-      if (role === 'assistant') {
-        bubble.innerHTML = renderMarkdown(content);
-      } else {
-        bubble.textContent = content;
-      }
-      if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
+      if (!frame) frame = requestAnimationFrame(() => render(false));
     },
     /** Finalize the message with optional meta info */
     finalize(meta = '') {
+      if (frame) cancelAnimationFrame(frame);
+      render(true);
       wrapper.classList.remove('streaming');
+      // The copy affordance appears once the message is complete.
+      wrapper.dataset.raw = content;
+      const actionsEl = document.createElement('div');
+      actionsEl.className = 'msg-actions';
+      actionsEl.innerHTML = MSG_COPY_BUTTON_HTML;
+      contentWrap.insertBefore(actionsEl, metaEl);
       if (meta) metaEl.textContent = meta;
+    },
+    /** Show a warning banner above the message meta */
+    warn(text) {
+      const el = document.createElement('div');
+      el.className = 'msg-warning';
+      el.textContent = text;
+      contentWrap.insertBefore(el, metaEl);
     },
     /** Get the accumulated content */
     getContent() {
@@ -1462,6 +1976,57 @@ const createStreamingMessage = (role) => {
 
 const scrollToBottom = () => {
   if (messagesEl) messagesEl.scrollTop = messagesEl.scrollHeight;
+};
+
+// Three pulsing dots shown between sending a message and the first token,
+// optionally labelled with what the model is currently doing.
+let typingEl = null;
+
+const TOOL_ACTIVITY_LABELS = {
+  file_search: 'Searching your files',
+  run_python: 'Running code',
+  web_search: 'Searching the web',
+  web_fetch: 'Reading a web page',
+};
+
+// Injection attempts found in fetched pages, surfaced from the workflow trace.
+const injectionFindingsFromTrace = (trace) => {
+  const kinds = [];
+  for (const entry of Array.isArray(trace) ? trace : []) {
+    const found = [
+      ...(entry?.injection_findings || []),
+      ...(entry?.outputs?.injection_findings || []),
+    ];
+    for (const kind of found) if (!kinds.includes(kind)) kinds.push(kind);
+  }
+  return kinds;
+};
+
+const showTypingIndicator = (label = '') => {
+  if (!messagesEl) return;
+  if (!typingEl) {
+    typingEl = document.createElement('div');
+    typingEl.className = 'message assistant typing';
+    typingEl.innerHTML =
+      '<div class="bubble"><span class="typing-dots"><span></span><span></span><span></span></span>' +
+      '<span class="typing-label"></span></div>';
+    messagesEl.appendChild(typingEl);
+  }
+  const labelEl = typingEl.querySelector('.typing-label');
+  if (labelEl) labelEl.textContent = label;
+  scrollToBottom();
+};
+
+// Tool activity arrives as trace events while the model works.
+const showToolActivity = (tool) => {
+  showTypingIndicator(`${TOOL_ACTIVITY_LABELS[tool] || tool}...`);
+};
+
+const hideTypingIndicator = () => {
+  if (!typingEl) return;
+  typingEl.remove();
+  typingEl = null;
+  updateEmptyState();
 };
 
 // =============================================================================
@@ -1634,6 +2199,7 @@ const sendMessage = async (event) => {
               case 'token':
                 // Create streaming message on first token
                 if (!streamingMsg) {
+                  hideTypingIndicator();
                   streamingMsg = createStreamingMessage('assistant');
                   showStatus('');
                 }
@@ -1641,8 +2207,13 @@ const sendMessage = async (event) => {
                 break;
 
               case 'trace':
-                // Optional: Could show trace info in UI
-                console.debug('Workflow trace:', msg.data);
+                // The attachment agent reports each tool it runs, so the
+                // indicator can say what is happening during the slow part.
+                if (msg.data?.tool && !streamingMsg) {
+                  showToolActivity(msg.data.tool);
+                } else {
+                  console.debug('Workflow trace:', msg.data);
+                }
                 break;
 
               case 'message_done':
@@ -1652,9 +2223,31 @@ const sendMessage = async (event) => {
                 // the send button disabled forever after a streamed reply.)
                 messageDoneReceived = true;
                 messageDoneData = { ...messageDoneData, ...(msg.data || {}) };
+                // Attachment answers come from a tool-calling node, which
+                // returns the whole reply at once rather than as tokens — so
+                // create the message here if no token ever arrived.
+                if (!streamingMsg && messageDoneData.content) {
+                  hideTypingIndicator();
+                  streamingMsg = createStreamingMessage('assistant');
+                  streamingMsg.update(messageDoneData.content);
+                  showStatus('');
+                }
                 if (streamingMsg) {
                   const adapters = (messageDoneData.adapters || []).map(a => a?.name || a?.id || a).filter(Boolean);
-                  streamingMsg.finalize(adapters.length ? `Adapters: ${adapters.join(', ')}` : '');
+                  const tools = toolNamesFromTrace(messageDoneData.workflow_trace);
+                  const bits = [];
+                  if (tools.length) bits.push(`Used: ${tools.join(', ')}`);
+                  if (adapters.length) bits.push(`Adapters: ${adapters.join(', ')}`);
+                  streamingMsg.finalize(bits.join(' · '));
+                  // A page tried to hijack the model: say so where the user
+                  // reads the answer, not just in the server log.
+                  const injections = injectionFindingsFromTrace(messageDoneData.workflow_trace);
+                  if (injections.length) {
+                    streamingMsg.warn(
+                      `A fetched page attempted a prompt injection (${injections.join(', ')}). ` +
+                      'It was redacted — treat this answer with extra care.'
+                    );
+                  }
                 }
                 // Older servers relayed an interim message_done without IDs
                 // before the persisted one; only settle once we have the
@@ -1759,7 +2352,7 @@ const sendMessage = async (event) => {
     if (messageInput) messageInput.value = '';
     saveDraft(state.conversationId, '');
     appendMessage('user', content);
-    showStatus('Thinking...');
+    showTypingIndicator();
     updateStreamingUI(true);
 
     const data = await chatViaWebSocketStreaming().catch(async () => {
@@ -1771,6 +2364,10 @@ const sendMessage = async (event) => {
       );
       return envelope.data;
     });
+
+    // The indicator must be gone before the fallback check below, or the
+    // typing element would register as the last assistant message.
+    hideTypingIndicator();
 
     // Only call handleChatResponse for non-streaming or fallback responses
     // Streaming messages are already rendered by createStreamingMessage
@@ -1797,8 +2394,12 @@ const sendMessage = async (event) => {
   } catch (err) {
     showStatus(err.message, true);
   } finally {
+    hideTypingIndicator();
     toggleButtonBusy(sendBtn, false, 'Send');
     updateStreamingUI(false);
+    renderTurnRail();
+    // The labelling pass runs server-side after the reply; give it a moment.
+    setTimeout(refreshTurnLabels, 2500);
   }
 };
 
@@ -2620,6 +3221,8 @@ const renderFilesList = (files, total, hasNext) => {
         <div class="file-meta">${formatBytes(file.size)} · ${formatRelativeTime(file.modified_at)}</div>
       </div>
       <div class="file-actions">
+        ${isArchiveName(file.name) ? '<button type="button" class="download-btn" data-action="extract">Extract</button>' : ''}
+        <button type="button" class="download-btn" data-action="vault" title="Copy this file's text into your notes vault">Vault</button>
         <button type="button" class="download-btn" data-action="download">Download</button>
         <button type="button" class="delete-btn" data-action="delete">Delete</button>
       </div>
@@ -2663,6 +3266,50 @@ const handleFileAction = async (event) => {
     await downloadFile(filename);
   } else if (action === 'delete') {
     await deleteFile(filename);
+  } else if (action === 'extract') {
+    await extractFile(filename, target);
+  } else if (action === 'vault') {
+    try {
+      const note = await notesApi('/notes/from-file', {
+        method: 'POST', body: JSON.stringify({ name: filename }),
+      });
+      // Methods compose: "pdf+ocr" = text pages plus ocr'd image pages,
+      // "docx-vision" = a doc whose only content was images the model read.
+      const m = note.method || '';
+      const how = m.includes('vision') ? (m.includes('+') ? ' (text + model-read images)' : ' (read by the model)')
+        : m.includes('ocr') ? (m.includes('+') ? ' (text + ocr’d images)' : ' (ocr)')
+        : m === 'pdf' || m === 'docx' || m === 'odt' ? ' (text extracted)' : '';
+      showStatus(`Added to vault as "${note.title}"${how}${note.truncated ? ', truncated' : ''}`);
+    } catch (err) {
+      showStatus(err.message || 'Could not add to vault', true);
+    }
+  }
+};
+
+const extractFile = async (filename, button) => {
+  if (!state.accessToken) return;
+
+  try {
+    toggleButtonBusy(button, true, 'Extracting...');
+    if (fileUploadStatus) fileUploadStatus.textContent = `Extracting ${filename}...`;
+
+    const envelope = await requestEnvelope(
+      `${apiBase}/files/${encodePath(filename)}/extract`,
+      { method: 'POST', headers: headers() },
+      'Extraction failed'
+    );
+
+    const data = envelope.data || {};
+    const skipped = data.skipped?.length ? `, ${data.skipped.length} skipped` : '';
+    if (fileUploadStatus) {
+      fileUploadStatus.textContent =
+        `Extracted ${data.files?.length || 0} file(s) to ${data.extracted_to}/${skipped}`;
+    }
+    await fetchUserFiles();
+  } catch (err) {
+    if (fileUploadStatus) fileUploadStatus.textContent = err.message;
+  } finally {
+    toggleButtonBusy(button, false);
   }
 };
 
@@ -2672,7 +3319,7 @@ const downloadFile = async (filename) => {
   try {
     // Get signed download URL
     const envelope = await requestEnvelope(
-      `${apiBase}/files/${encodeURIComponent(filename)}/url`,
+      `${apiBase}/files/${encodePath(filename)}/url`,
       { headers: headers() },
       'Failed to get download URL'
     );
@@ -2709,7 +3356,7 @@ const deleteFile = async (filename) => {
 
   try {
     await requestEnvelope(
-      `${apiBase}/files/${encodeURIComponent(filename)}`,
+      `${apiBase}/files/${encodePath(filename)}`,
       {
         method: 'DELETE',
         headers: headers(),
@@ -4153,15 +4800,43 @@ const initEventListeners = () => {
   // Chat
   if (chatForm) chatForm.addEventListener('submit', sendMessage);
   $('message-input')?.addEventListener('input', handleMessageInputChange);
+  $('share-btn')?.addEventListener('click', toggleShareConversation);
   $('new-thread')?.addEventListener('click', newConversation);
   $('new-thread-secondary')?.addEventListener('click', newConversation);
   $('stop-stream-btn')?.addEventListener('click', cancelStreaming);
   $('new-conversation-btn')?.addEventListener('click', newConversation);
   $('refresh-conversations')?.addEventListener('click', fetchConversations);
 
-  // Citation click delegation (CSP-compliant instead of inline onclick)
+  // Citation + copy click delegation (CSP-compliant instead of inline onclick)
   if (messagesEl) {
     messagesEl.addEventListener('click', (e) => {
+      const msgCopy = e.target.closest('.msg-copy');
+      if (msgCopy) {
+        const msg = msgCopy.closest('.message');
+        const raw = msg?.dataset.raw || msg?.querySelector('.bubble')?.innerText || '';
+        if (raw && navigator.clipboard) {
+          navigator.clipboard.writeText(raw).then(() => {
+            msgCopy.classList.add('copied');
+            setTimeout(() => msgCopy.classList.remove('copied'), 1600);
+          }).catch(() => {});
+        }
+        return;
+      }
+      const copyBtn = e.target.closest('.code-copy');
+      if (copyBtn) {
+        const code = copyBtn.closest('.codeblock')?.querySelector('code');
+        if (code && navigator.clipboard) {
+          navigator.clipboard.writeText(code.textContent).then(() => {
+            copyBtn.textContent = 'Copied';
+            copyBtn.classList.add('copied');
+            setTimeout(() => {
+              copyBtn.textContent = 'Copy';
+              copyBtn.classList.remove('copied');
+            }, 1600);
+          }).catch(() => {});
+        }
+        return;
+      }
       const citationLink = e.target.closest('.citation-link');
       if (citationLink) {
         showCitationModal(citationLink);
@@ -4294,6 +4969,405 @@ const initEventListeners = () => {
 };
 
 // =============================================================================
+// Notes vault
+// =============================================================================
+
+const notesState = {
+  notes: [],           // list metadata, newest first
+  currentId: null,
+  dirty: false,
+  graph: null,         // {nodes, edges} when the graph view is open
+  contradicted: new Set(), // note ids the witness flagged as contradicting
+  evolved: new Set(),      // note ids whose position moved
+  searchTimer: null,
+};
+
+const notesApi = async (path, options = {}) => {
+  const resp = await fetchWithRetry(`${apiBase}${path}`, {
+    headers: headers(),
+    ...options,
+  });
+  const body = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const message = body?.error?.message || body?.detail?.error?.message || `Request failed (${resp.status})`;
+    throw new Error(message);
+  }
+  return body.data;
+};
+
+// [[Title]] → clickable wikilink. Runs on rendered (already-escaped) HTML;
+// code blocks are left alone — [[x]] in code is code.
+const linkifyWikiLinks = (html) =>
+  html.split(/(<pre[\s\S]*?<\/pre>|<code[\s\S]*?<\/code>)/g)
+    .map((seg, i) => (i % 2 ? seg : seg.replace(/\[\[([^\[\]\n]{1,200})\]\]/g, (_m, title) =>
+      `<a href="#" class="wikilink" data-note-title="${escapeAttr(title.trim())}">${title.trim()}</a>`)))
+    .join('');
+
+const renderNoteList = () => {
+  const list = $('note-list');
+  if (!list) return;
+  list.innerHTML = notesState.notes.map((n) => `
+    <li class="note-item${n.id === notesState.currentId ? ' active' : ''}${notesState.contradicted.has(n.id) ? ' contradicted' : notesState.evolved.has(n.id) ? ' evolved' : ''}" data-id="${escapeAttr(n.id)}">
+      <span class="note-item-title">${escapeHtml(n.title)}</span>
+      <span class="note-item-date">${new Date(n.updated_at).toLocaleDateString()}</span>
+    </li>`).join('');
+  const count = $('note-count');
+  if (count) count.textContent = notesState.notes.length ? `${notesState.notes.length} notes` : '';
+};
+
+const fetchNotes = async () => {
+  try {
+    const data = await notesApi('/notes?limit=500');
+    notesState.notes = data.notes || [];
+    renderNoteList();
+    $('notes-empty')?.classList.toggle('hidden', notesState.notes.length > 0 || !!notesState.currentId);
+  } catch (err) {
+    if (String(err.message || '').includes('disabled')) {
+      document.querySelector('[data-tab="notes-tab"]')?.classList.add('hidden');
+    }
+    console.warn('notes fetch failed', err);
+  }
+};
+
+const showNoteEditor = (show) => {
+  $('note-editor')?.classList.toggle('hidden', !show);
+  $('notes-empty')?.classList.toggle('hidden', show || notesState.notes.length > 0);
+  $('note-graph-wrap')?.classList.add('hidden');
+  $('note-sweep-wrap')?.classList.add('hidden');
+};
+
+const openNote = async (noteId) => {
+  try {
+    const note = await notesApi(`/notes/${encodeURIComponent(noteId)}`);
+    notesState.currentId = note.id;
+    notesState.dirty = false;
+    showNoteEditor(true);
+    $('note-title').value = note.title;
+    $('note-content').value = note.content;
+    setNotePreview(false);
+    $('note-witness-results')?.classList.add('hidden');
+    const meta = $('note-meta');
+    if (meta) {
+      const backlinks = (note.backlinks || []).map((b) =>
+        `<a href="#" class="wikilink" data-note-id="${escapeAttr(b.id)}">${escapeHtml(b.title)}</a>`).join(' · ');
+      const dangling = (note.dangling || []).map((t) => `<span class="dangling" title="No note with this title yet">[[${escapeHtml(t)}]]</span>`).join(' ');
+      meta.innerHTML = [
+        backlinks ? `<span class="muted">Linked from:</span> ${backlinks}` : '',
+        dangling ? `<span class="muted">Unresolved:</span> ${dangling}` : '',
+      ].filter(Boolean).join('<br/>');
+    }
+    renderNoteList();
+  } catch (err) {
+    showStatus(err.message || 'Could not open note', true);
+  }
+};
+
+const openNoteByTitle = async (title) => {
+  const existing = notesState.notes.find((n) => n.title.toLowerCase() === title.toLowerCase());
+  if (existing) return openNote(existing.id);
+  // Follow the Obsidian convention: clicking a dangling link creates the note.
+  try {
+    const note = await notesApi('/notes', { method: 'POST', body: JSON.stringify({ title, content: '' }) });
+    await fetchNotes();
+    await openNote(note.id);
+  } catch (err) {
+    showStatus(err.message || 'Could not create note', true);
+  }
+};
+
+const setNotePreview = (on) => {
+  const btn = $('note-preview-btn');
+  const preview = $('note-preview');
+  const textarea = $('note-content');
+  if (!btn || !preview || !textarea) return;
+  btn.setAttribute('aria-pressed', on ? 'true' : 'false');
+  btn.classList.toggle('active', on);
+  preview.classList.toggle('hidden', !on);
+  textarea.classList.toggle('hidden', on);
+  if (on) preview.innerHTML = linkifyWikiLinks(renderMarkdown(textarea.value));
+};
+
+const saveCurrentNote = async () => {
+  const title = $('note-title')?.value.trim();
+  const content = $('note-content')?.value ?? '';
+  if (!title) { showStatus('A note needs a title', true); return; }
+  try {
+    if (notesState.currentId) {
+      await notesApi(`/notes/${encodeURIComponent(notesState.currentId)}`, {
+        method: 'PATCH', body: JSON.stringify({ title, content }),
+      });
+    } else {
+      const note = await notesApi('/notes', { method: 'POST', body: JSON.stringify({ title, content }) });
+      notesState.currentId = note.id;
+    }
+    notesState.dirty = false;
+    await fetchNotes();
+    await openNote(notesState.currentId);
+    showStatus('Saved');
+  } catch (err) {
+    showStatus(err.message || 'Save failed', true);
+  }
+};
+
+const deleteCurrentNote = async () => {
+  if (!notesState.currentId) return;
+  try {
+    await notesApi(`/notes/${encodeURIComponent(notesState.currentId)}`, { method: 'DELETE' });
+    notesState.currentId = null;
+    showNoteEditor(false);
+    await fetchNotes();
+  } catch (err) {
+    showStatus(err.message || 'Delete failed', true);
+  }
+};
+
+const runWitness = async () => {
+  if (!notesState.currentId) return;
+  const box = $('note-witness-results');
+  const btn = $('note-witness-btn');
+  if (!box || !btn) return;
+  if (notesState.dirty) await saveCurrentNote();
+  btn.disabled = true;
+  box.classList.remove('hidden');
+  box.innerHTML = '<div class="muted">The witness is reading the vault…</div>';
+  try {
+    const report = await notesApi(`/notes/${encodeURIComponent(notesState.currentId)}/witness`, {
+      method: 'POST', body: JSON.stringify({}),
+    });
+    const rows = (report.findings || []).map((f) => witnessRowHtml(f, f.note_id, f.title, f.days_apart));
+    (report.findings || []).forEach((f) => {
+      if (f.verdict === 'CONTRADICTS') notesState.contradicted.add(f.note_id);
+      if (f.verdict === 'EVOLVES') notesState.evolved.add(f.note_id);
+    });
+    if (notesState.contradicted.size) notesState.contradicted.add(report.note_id);
+    box.innerHTML = report.checked === 0
+      ? '<div class="muted">Nothing in the vault is close enough to compare yet.</div>'
+      : `<div class="witness-summary">${witnessSummaryText(report, report.checked)}</div>${rows.join('')}`;
+    renderNoteList();
+  } catch (err) {
+    box.innerHTML = `<div class="muted">${escapeHtml(err.message || 'Witness unavailable')}</div>`;
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+const VERDICT_CLASS = { CONTRADICTS: 'contradicts', EVOLVES: 'evolves', AGREES: 'agrees', UNRELATED: 'unrelated' };
+
+// The process is comparison; the summary reports whatever fell out of it.
+const witnessSummaryText = (report, checked) => {
+  const parts = [];
+  if (report.contradictions) parts.push(`${report.contradictions} contradiction${report.contradictions > 1 ? 's' : ''}`);
+  if (report.evolutions) parts.push(`${report.evolutions} position${report.evolutions > 1 ? 's' : ''} that moved`);
+  return parts.length
+    ? `Compared ${checked} pairs of thoughts: ${parts.join(', ')}.`
+    : `Compared ${checked} pairs of thoughts — your thinking holds together.`;
+};
+
+const witnessRowHtml = (f, noteId, title, daysApart) => {
+  const cls = VERDICT_CLASS[f.verdict] || 'unrelated';
+  const path = f.path_titles
+    ? `<div class="witness-path">${f.path_titles.map((t) => escapeHtml(t)).join(' → ')}</div>` : '';
+  return `<div class="witness-row ${cls}">
+    <span class="witness-verdict">${f.verdict}</span>
+    <a href="#" class="wikilink" data-note-id="${escapeAttr(noteId)}">${escapeHtml(title)}</a>
+    <span class="muted">${daysApart} days apart</span>
+    ${f.reason ? `<div class="witness-reason">${escapeHtml(f.reason)}</div>` : ''}
+    ${path}
+  </div>`;
+};
+
+const runVaultSweep = async () => {
+  const wrap = $('note-sweep-wrap');
+  const btn = $('note-sweep-btn');
+  if (!wrap || !btn) return;
+  $('note-editor')?.classList.add('hidden');
+  $('note-graph-wrap')?.classList.add('hidden');
+  $('notes-empty')?.classList.add('hidden');
+  wrap.classList.remove('hidden');
+  btn.disabled = true;
+  wrap.innerHTML = '<div class="muted" style="padding:24px">The witness is reading the whole vault…</div>';
+  try {
+    const report = await notesApi('/notes/sweep', { method: 'POST', body: JSON.stringify({}) });
+    report.findings.forEach((f) => {
+      if (f.verdict === 'CONTRADICTS') { notesState.contradicted.add(f.a.id); notesState.contradicted.add(f.b.id); }
+      if (f.verdict === 'EVOLVES') { notesState.evolved.add(f.a.id); notesState.evolved.add(f.b.id); }
+    });
+    const coverage = report.notes_scanned >= report.notes_cap || report.judged >= report.judgment_cap
+      ? `<div class="muted small">Bounded pass: scanned ${report.notes_scanned} notes, judged the strongest ${report.judged} of ${report.pairs_considered} candidate pairs.</div>`
+      : '';
+    const rows = report.findings.map((f) => witnessRowHtml(
+      f, f.b.id, `${f.a.title} ↔ ${f.b.title}`, f.days_apart));
+    wrap.innerHTML = `<div class="note-sweep">
+      <div class="witness-summary">${witnessSummaryText(report, report.judged)}</div>
+      ${coverage}
+      ${rows.join('') || '<div class="muted">No two notes were close enough to compare.</div>'}
+    </div>`;
+    renderNoteList();
+  } catch (err) {
+    wrap.innerHTML = `<div class="muted" style="padding:24px">${escapeHtml(err.message || 'Sweep unavailable')}</div>`;
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+const runNoteSearch = async (query) => {
+  const box = $('note-search-results');
+  if (!box) return;
+  if (!query.trim()) { box.classList.add('hidden'); box.innerHTML = ''; return; }
+  try {
+    const data = await notesApi('/notes/search', { method: 'POST', body: JSON.stringify({ query, limit: 8 }) });
+    const results = data.results || [];
+    box.classList.remove('hidden');
+    box.innerHTML = results.length
+      ? results.map((r) => `<div class="note-search-hit" data-id="${escapeAttr(r.id)}">
+          <span class="note-item-title">${escapeHtml(r.title)}</span>
+          <span class="note-search-excerpt">${escapeHtml(r.excerpt || '')}</span>
+        </div>`).join('')
+      : '<div class="muted" style="padding:8px 10px">No matches.</div>';
+  } catch (err) {
+    console.warn('note search failed', err);
+  }
+};
+
+// --- graph: a small force layout, enough to see the shape of the vault ---
+const drawNoteGraph = async () => {
+  const wrap = $('note-graph-wrap');
+  const canvas = $('note-graph');
+  if (!wrap || !canvas) return;
+  $('note-editor')?.classList.add('hidden');
+  $('notes-empty')?.classList.add('hidden');
+  $('note-sweep-wrap')?.classList.add('hidden');
+  wrap.classList.remove('hidden');
+  const data = await notesApi('/notes/graph').catch(() => null);
+  if (!data) return;
+  const dpr = window.devicePixelRatio || 1;
+  const width = wrap.clientWidth, height = Math.max(wrap.clientHeight, 420);
+  canvas.width = width * dpr; canvas.height = height * dpr;
+  canvas.style.width = `${width}px`; canvas.style.height = `${height}px`;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+
+  const nodes = data.nodes.map((n, i) => ({
+    ...n,
+    x: width / 2 + Math.cos((i / Math.max(data.nodes.length, 1)) * Math.PI * 2) * Math.min(width, height) * 0.3,
+    y: height / 2 + Math.sin((i / Math.max(data.nodes.length, 1)) * Math.PI * 2) * Math.min(width, height) * 0.3,
+    vx: 0, vy: 0,
+  }));
+  const byId = new Map(nodes.map((n) => [n.id, n]));
+  const edges = data.edges.filter((e) => byId.has(e.src) && byId.has(e.dst));
+  notesState.graph = { nodes, edges, byId };
+
+  let ticks = 0;
+  const step = () => {
+    // Repulsion (O(n²) is fine at vault scale), springs along edges, mild centering.
+    for (const a of nodes) {
+      let fx = (width / 2 - a.x) * 0.002, fy = (height / 2 - a.y) * 0.002;
+      for (const b of nodes) {
+        if (a === b) continue;
+        const dx = a.x - b.x, dy = a.y - b.y;
+        const d2 = Math.max(dx * dx + dy * dy, 64);
+        const rep = 900 / d2;
+        fx += dx * rep / Math.sqrt(d2); fy += dy * rep / Math.sqrt(d2);
+      }
+      a.vx = (a.vx + fx) * 0.85; a.vy = (a.vy + fy) * 0.85;
+    }
+    for (const e of edges) {
+      const s = byId.get(e.src), t = byId.get(e.dst);
+      const dx = t.x - s.x, dy = t.y - s.y;
+      const dist = Math.max(Math.hypot(dx, dy), 1);
+      const pull = (dist - 90) * 0.004;
+      s.vx += dx / dist * pull; s.vy += dy / dist * pull;
+      t.vx -= dx / dist * pull; t.vy -= dy / dist * pull;
+    }
+    for (const n of nodes) {
+      n.x = Math.min(Math.max(n.x + n.vx, 20), width - 20);
+      n.y = Math.min(Math.max(n.y + n.vy, 20), height - 20);
+    }
+
+    ctx.clearRect(0, 0, width, height);
+    const styles = getComputedStyle(document.documentElement);
+    ctx.strokeStyle = styles.getPropertyValue('--border') || '#ddd';
+    ctx.lineWidth = 1;
+    for (const e of edges) {
+      const s = byId.get(e.src), t = byId.get(e.dst);
+      ctx.beginPath(); ctx.moveTo(s.x, s.y); ctx.lineTo(t.x, t.y); ctx.stroke();
+    }
+    for (const n of nodes) {
+      const r = 4 + Math.min(n.degree || 0, 12);
+      ctx.beginPath();
+      ctx.fillStyle = notesState.contradicted.has(n.id) ? '#c0392b'
+        : notesState.evolved.has(n.id) ? '#c07d10'
+        : n.id === notesState.currentId ? (styles.getPropertyValue('--accent') || '#4a6fa5') : '#8a8f98';
+      ctx.arc(n.x, n.y, r, 0, Math.PI * 2); ctx.fill();
+      if ((n.degree || 0) > 2 || nodes.length <= 30) {
+        ctx.fillStyle = styles.getPropertyValue('--fg-muted') || '#666';
+        ctx.font = '11px sans-serif';
+        ctx.fillText(n.title.slice(0, 24), n.x + r + 3, n.y + 3);
+      }
+    }
+    if (ticks++ < 180 && !wrap.classList.contains('hidden')) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+
+  canvas.onclick = (ev) => {
+    const rect = canvas.getBoundingClientRect();
+    const x = ev.clientX - rect.left, y = ev.clientY - rect.top;
+    const hit = nodes.find((n) => Math.hypot(n.x - x, n.y - y) < 14);
+    if (hit) openNote(hit.id);
+  };
+};
+
+const initNotes = () => {
+  $('note-new-btn')?.addEventListener('click', () => {
+    notesState.currentId = null;
+    notesState.dirty = false;
+    showNoteEditor(true);
+    $('note-title').value = '';
+    $('note-content').value = '';
+    $('note-meta').innerHTML = '';
+    $('note-witness-results')?.classList.add('hidden');
+    setNotePreview(false);
+    $('note-title').focus();
+  });
+  $('note-save-btn')?.addEventListener('click', saveCurrentNote);
+  $('note-delete-btn')?.addEventListener('click', deleteCurrentNote);
+  $('note-witness-btn')?.addEventListener('click', runWitness);
+  $('note-preview-btn')?.addEventListener('click', () =>
+    setNotePreview($('note-preview')?.classList.contains('hidden')));
+  $('note-graph-btn')?.addEventListener('click', drawNoteGraph);
+  $('note-sweep-btn')?.addEventListener('click', runVaultSweep);
+  $('note-content')?.addEventListener('input', () => { notesState.dirty = true; });
+  $('note-title')?.addEventListener('input', () => { notesState.dirty = true; });
+  $('note-content')?.addEventListener('keydown', (e) => {
+    if ((e.metaKey || e.ctrlKey) && e.key === 's') { e.preventDefault(); saveCurrentNote(); }
+  });
+  $('note-search-input')?.addEventListener('input', (e) => {
+    clearTimeout(notesState.searchTimer);
+    notesState.searchTimer = setTimeout(() => runNoteSearch(e.target.value), 250);
+  });
+  $('note-list')?.addEventListener('click', (e) => {
+    const item = e.target.closest('.note-item');
+    if (item) openNote(item.dataset.id);
+  });
+  $('note-search-results')?.addEventListener('click', (e) => {
+    const hit = e.target.closest('.note-search-hit');
+    if (hit) {
+      $('note-search-input').value = '';
+      $('note-search-results').classList.add('hidden');
+      openNote(hit.dataset.id);
+    }
+  });
+  // Wiki-links anywhere in the notes panel (preview, backlinks, witness rows).
+  $('notes-tab')?.addEventListener('click', (e) => {
+    const link = e.target.closest('.wikilink');
+    if (!link) return;
+    e.preventDefault();
+    if (link.dataset.noteId) openNote(link.dataset.noteId);
+    else if (link.dataset.noteTitle) openNoteByTitle(link.dataset.noteTitle);
+  });
+};
+
+// =============================================================================
 // Initialization
 // =============================================================================
 
@@ -4301,7 +5375,11 @@ const init = async () => {
   initTabs();
   initCollapsibleSections();
   initEventListeners();
+  initComposerAttachments();
+  initTurnRail();
+  initNotes();
   updateAuthUI();
+  updateShareButton();
   updateDraftIndicator();
   renderPreferencePanel();
   renderUploadHint();
@@ -4356,6 +5434,14 @@ const init = async () => {
       fetchEmailVerificationStatus(),
       fetchUserSettings(),
     ]);
+
+    // Reopen the thread that was active before the reload; if it no longer
+    // exists (deleted, or a stale id), fall back to a fresh conversation.
+    if (state.conversationId && !(await loadConversation(state.conversationId))) {
+      setConversation(null);
+      showStatus('');
+      if (messageInput) messageInput.value = getDraft(null);
+    }
   }
 
   updateEmptyState();

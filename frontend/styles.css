@@ -16,7 +16,13 @@
   --radius-sm: 8px;
   --ctl-h: 36px;
   --font: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  --font-serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, Cambria, "Times New Roman", serif;
   --font-mono: "SF Mono", "Fira Code", Consolas, monospace;
+  --code-bg: #f6f8fa;
+  --syn-kw: #cf222e;
+  --syn-str: #0a3069;
+  --syn-num: #0550ae;
+  --syn-com: #6e7781;
   --sidebar-width: 272px;
   --topbar-h: 56px;
   --content-max: 1100px;
@@ -506,12 +512,15 @@ button.minor:hover {
   border-color: var(--border);
 }
 
-/* Chat panel */
+/* Chat panel — a single reading column, measured like a magazine page */
 .chat-panel {
   display: flex;
   flex-direction: column;
   min-height: calc(100vh - 220px);
   gap: 10px;
+  max-width: 860px;
+  margin: 0 auto;
+  width: 100%;
 }
 
 .conversation-header {
@@ -546,36 +555,43 @@ button.minor:hover {
 #messages {
   flex: 1;
   overflow-y: auto;
-  padding: 8px 2px 12px;
+  padding: 18px 4px 24px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 26px;
   min-height: 200px;
+  scroll-behavior: smooth;
 }
 
 #messages-empty {
   align-items: center;
-  background: var(--panel-muted);
-  border: 1px dashed var(--border-strong);
-  border-radius: var(--radius-sm);
+  background: transparent;
+  border: none;
   color: var(--text-muted);
   display: flex;
-  font-size: 13px;
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-size: 15px;
   gap: 8px;
   justify-content: center;
-  padding: 14px;
+  padding: 44px 14px;
 }
 
 .message {
   display: flex;
   flex-direction: column;
   gap: 4px;
-  max-width: 82%;
+  max-width: 78%;
 }
 
 .message.user {
   align-self: flex-end;
   align-items: flex-end;
+}
+
+/* Assistant replies read as an open editorial column, not a bubble */
+.message.assistant {
+  max-width: 100%;
 }
 
 /* Role is conveyed by bubble alignment/color; keep the label for screen
@@ -603,45 +619,81 @@ button.minor:hover {
 
 .message.user .bubble {
   background: var(--panel-muted);
-  border-color: var(--panel-muted);
+  border: none;
+  border-radius: 16px 16px 4px 16px;
+  padding: 10px 16px;
+  font-size: 14.5px;
 }
 
-/* Assistant bubbles hold rendered markdown; the renderer controls breaks. */
+/* Assistant prose is set in serif, open on the page; the renderer controls
+   breaks, so pre-wrap is turned off. */
 .message.assistant .bubble {
   white-space: normal;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  padding: 0;
+  font-family: var(--font-serif);
+  font-size: 16px;
+  line-height: 1.68;
+  letter-spacing: 0.003em;
 }
 
 .bubble p {
-  margin: 0 0 8px;
+  margin: 0 0 14px;
 }
 
 .bubble p:last-child,
 .bubble ul:last-child,
 .bubble ol:last-child,
-.bubble pre:last-child,
-.bubble table:last-child,
-.bubble blockquote:last-child {
+.bubble blockquote:last-child,
+.bubble .codeblock:last-child,
+.bubble .table-wrap:last-child {
   margin-bottom: 0;
 }
 
+.bubble h1,
+.bubble h2,
 .bubble h3,
 .bubble h4,
 .bubble h5,
 .bubble h6 {
-  margin: 12px 0 6px;
+  margin: 22px 0 10px;
+  font-family: var(--font-serif);
   font-weight: 600;
-  line-height: 1.3;
+  line-height: 1.25;
+  letter-spacing: -0.01em;
   /* Panel headings are uppercase muted captions; markdown headings are not. */
   text-transform: none;
-  letter-spacing: normal;
   color: var(--text);
 }
 
-.bubble h3 { font-size: 15.5px; }
-.bubble h4 { font-size: 14.5px; }
-.bubble h5 { font-size: 14px; }
-.bubble h6 { font-size: 13.5px; }
+.bubble h1 {
+  font-size: 24px;
+  padding-bottom: 7px;
+  border-bottom: 1px solid var(--border);
+}
 
+.bubble h2 {
+  font-size: 20px;
+  padding-bottom: 5px;
+  border-bottom: 1px solid var(--border);
+}
+
+.bubble h3 { font-size: 17.5px; }
+.bubble h4 { font-size: 16px; }
+.bubble h5 { font-size: 15px; }
+
+.bubble h6 {
+  font-size: 12px;
+  font-family: var(--font);
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  color: var(--text-muted);
+}
+
+.bubble h1:first-child,
+.bubble h2:first-child,
 .bubble h3:first-child,
 .bubble h4:first-child,
 .bubble h5:first-child,
@@ -651,57 +703,140 @@ button.minor:hover {
 
 .bubble ul,
 .bubble ol {
-  margin: 4px 0 8px;
-  padding-left: 22px;
+  margin: 0 0 14px;
+  padding-left: 26px;
 }
 
 .bubble li {
-  margin: 2px 0;
+  margin: 4px 0;
+}
+
+.bubble li > ul,
+.bubble li > ol {
+  margin: 4px 0 0;
+}
+
+.bubble li > p {
+  margin: 4px 0;
+}
+
+.bubble li.task {
+  list-style: none;
+  margin-left: -20px;
+}
+
+.bubble li.task input {
+  accent-color: var(--accent);
+  margin: 0 6px 0 0;
+  vertical-align: -2px;
 }
 
 .bubble code {
-  background: var(--panel-muted);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 1px 5px;
+  background: rgba(129, 139, 152, 0.14);
+  border-radius: 5px;
+  padding: 2px 5px;
   font-family: var(--font-mono);
-  font-size: 12.5px;
+  font-size: 82%;
 }
 
-.bubble pre {
-  background: var(--panel-muted);
+/* Fenced code: a card with a language bar, copy button, and highlighting */
+.bubble .codeblock {
+  margin: 0 0 16px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 10px 12px;
-  margin: 8px 0;
+  overflow: hidden;
+  background: var(--code-bg);
+}
+
+.bubble .codeblock figcaption {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 5px 8px 5px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel-muted);
+}
+
+.codeblock-lang {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  text-transform: lowercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.code-copy {
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font);
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 3px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.code-copy:hover {
+  background: var(--border);
+  color: var(--text);
+}
+
+.code-copy.copied {
+  color: var(--accent-strong);
+}
+
+.bubble .codeblock pre {
+  margin: 0;
+  padding: 12px 14px;
   overflow-x: auto;
 }
 
 .bubble pre code {
   background: none;
   border: none;
+  border-radius: 0;
   padding: 0;
   font-size: 12.5px;
-  line-height: 1.5;
+  line-height: 1.6;
 }
 
+/* Syntax token palette (GitHub-light) */
+.tok-kw { color: var(--syn-kw); }
+.tok-str { color: var(--syn-str); }
+.tok-num { color: var(--syn-num); }
+.tok-com { color: var(--syn-com); font-style: italic; }
+
 .bubble blockquote {
-  border-left: 3px solid var(--border-strong);
-  margin: 8px 0;
-  padding: 2px 12px;
+  border-left: 3px solid var(--accent);
+  margin: 0 0 14px;
+  padding: 2px 18px;
   color: var(--text-muted);
+  font-style: italic;
+}
+
+.bubble blockquote p:last-child {
+  margin-bottom: 0;
+}
+
+.bubble .table-wrap {
+  overflow-x: auto;
+  margin: 0 0 16px;
 }
 
 .bubble table {
   border-collapse: collapse;
-  margin: 8px 0;
-  font-size: 13px;
+  font-family: var(--font);
+  font-size: 13.5px;
+  line-height: 1.5;
 }
 
 .bubble th,
 .bubble td {
   border: 1px solid var(--border);
-  padding: 5px 10px;
+  padding: 7px 12px;
   text-align: left;
 }
 
@@ -710,22 +845,290 @@ button.minor:hover {
   font-weight: 600;
 }
 
+.bubble tbody tr:nth-child(even) {
+  background: #fafbfc;
+}
+
 .bubble a {
   color: var(--accent-strong);
   text-decoration: underline;
-  text-underline-offset: 2px;
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
 }
 
+.bubble a:hover {
+  color: var(--accent);
+}
+
+/* Section break as an editorial dinkus rather than a rule */
 .bubble hr {
   border: none;
-  border-top: 1px solid var(--border);
-  margin: 10px 0;
+  margin: 24px 0;
+  text-align: center;
+}
+
+.bubble hr::after {
+  content: '\00B7 \00B7 \00B7';
+  color: var(--text-muted);
+  font-size: 16px;
+  letter-spacing: 10px;
 }
 
 .message .meta {
-  font-size: 11.5px;
+  font-size: 10.5px;
   color: var(--text-muted);
   padding: 0 2px;
+  margin-top: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+/* =========================================================================
+   Turn navigator — tick marks at the right edge that expand into a jump list
+   ========================================================================= */
+.turn-rail {
+  position: fixed;
+  right: 0;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 20;
+  padding: 10px 12px 10px 24px;
+  display: flex;
+  justify-content: flex-end;
+}
+
+.turn-rail-inner {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 7px;
+  max-height: 60vh;
+  overflow-y: auto;
+  /* No scrollbar at rest; the expanded panel gets one only if needed. */
+  scrollbar-width: none;
+}
+
+.turn-rail-inner::-webkit-scrollbar {
+  width: 0;
+}
+
+.turn-tick {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-family: var(--font);
+  font-size: 12.5px;
+  text-align: right;
+  cursor: pointer;
+}
+
+.tick-mark {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 1.5px;
+  border-radius: 1px;
+  background: var(--border-strong);
+  transition: background 0.15s ease, width 0.15s ease, height 0.15s ease;
+}
+
+.turn-tick.active .tick-mark {
+  width: 24px;
+  height: 2.5px;
+  background: var(--text);
+}
+
+/* The labels exist for screen readers and for the expanded state, but take up
+   no space until the rail is hovered or focused. */
+.tick-label {
+  max-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  opacity: 0;
+  transition: max-width 0.18s ease, opacity 0.18s ease;
+}
+
+.turn-rail:hover,
+.turn-rail:focus-within {
+  padding-left: 12px;
+}
+
+.turn-rail:hover .turn-rail-inner,
+.turn-rail:focus-within .turn-rail-inner {
+  /* Explicit width so the descriptions read in full rather than ellipsing. */
+  width: 264px;
+  align-items: stretch;
+  gap: 2px;
+  padding: 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 8px 28px rgba(16, 20, 28, 0.14);
+  scrollbar-width: thin;
+}
+
+.turn-rail:hover .turn-tick,
+.turn-rail:focus-within .turn-tick {
+  padding: 5px 8px;
+  border-radius: 6px;
+  text-align: left;
+  justify-content: flex-start;
+  /* The bars are the collapsed representation of the label — once the text is
+     showing they are redundant, so they collapse away entirely. */
+  gap: 0;
+}
+
+.turn-rail:hover .tick-mark,
+.turn-rail:focus-within .tick-mark {
+  width: 0;
+  height: 0;
+  opacity: 0;
+  transition: width 0.15s ease, opacity 0.12s ease, height 0.15s ease;
+}
+
+.turn-rail:hover .tick-label,
+.turn-rail:focus-within .tick-label {
+  /* Wrap rather than ellipse: a jump list is useless if you can't read it. */
+  max-width: 240px;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  line-height: 1.35;
+  opacity: 1;
+}
+
+.turn-rail:hover .turn-tick:hover,
+.turn-rail:focus-within .turn-tick:focus-visible {
+  background: var(--panel-muted);
+  color: var(--text);
+}
+
+.turn-rail:hover .turn-tick.active,
+.turn-rail:focus-within .turn-tick.active {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* Brief highlight on the turn you jumped to */
+.message.turn-flash .bubble {
+  animation: turn-flash 1.2s ease-out;
+}
+
+@keyframes turn-flash {
+  0% { background: var(--accent-light); }
+  100% { background: inherit; }
+}
+
+@media (max-width: 1080px) {
+  .turn-rail {
+    display: none;
+  }
+}
+
+/* Prompt-injection notice on an answer that read untrusted web content */
+.msg-warning {
+  margin-top: 8px;
+  padding: 8px 12px;
+  border-left: 3px solid var(--danger);
+  background: var(--danger-light);
+  border-radius: 4px;
+  font-family: var(--font);
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--danger);
+}
+
+/* Copy-message affordance: quiet until the message is hovered */
+.msg-actions {
+  display: flex;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.message.user .msg-actions {
+  justify-content: flex-end;
+}
+
+.msg-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  opacity: 0.45;
+  transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
+}
+
+.message:hover .msg-copy,
+.msg-copy:focus-visible {
+  opacity: 1;
+}
+
+.msg-copy:hover {
+  background: var(--panel-muted);
+  color: var(--text);
+}
+
+.msg-copy .icon-check {
+  display: none;
+}
+
+.msg-copy.copied {
+  color: var(--accent-strong);
+  opacity: 1;
+}
+
+.msg-copy.copied .icon-copy {
+  display: none;
+}
+
+.msg-copy.copied .icon-check {
+  display: inline;
+}
+
+/* Share button reflects the conversation's public state */
+#share-btn.shared {
+  border-color: var(--accent);
+  color: var(--accent-strong);
+}
+
+#share-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* Public share page */
+.share-brand {
+  font-weight: 600;
+  font-size: 15px;
+  letter-spacing: -0.01em;
+}
+
+.share-page #share-messages {
+  display: flex;
+  flex-direction: column;
+  gap: 26px;
+  padding: 18px 4px 24px;
+}
+
+.share-dir-item {
+  display: block;
+  text-decoration: none;
+  color: var(--text);
+  border: 1px solid var(--border);
+  margin-bottom: 8px;
 }
 
 /* Citation links */
@@ -888,21 +1291,67 @@ button.minor:hover {
   50% { opacity: 1; }
 }
 
-/* Streaming message style */
+/* Streaming message style: a soft caret rides the end of the text */
 .message.streaming .bubble::after {
   content: '';
   display: inline-block;
-  width: 6px;
-  height: 13px;
+  width: 3px;
+  height: 15px;
+  border-radius: 2px;
   background: var(--accent);
   margin-left: 3px;
-  animation: blink 0.7s step-end infinite;
-  vertical-align: text-bottom;
+  animation: caret 1s ease-in-out infinite;
+  vertical-align: -2px;
 }
 
-@keyframes blink {
+@keyframes caret {
   0%, 100% { opacity: 1; }
-  50% { opacity: 0; }
+  50% { opacity: 0.15; }
+}
+
+/* Typing indicator shown before the first token arrives */
+.message.typing .bubble {
+  background: transparent;
+  border: none;
+  padding: 4px 0;
+}
+
+.message.typing .bubble {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.typing-label {
+  font-family: var(--font);
+  font-size: 12.5px;
+  color: var(--text-muted);
+  letter-spacing: 0.01em;
+}
+
+.typing-label:empty {
+  display: none;
+}
+
+.typing-dots {
+  display: inline-flex;
+  gap: 5px;
+}
+
+.typing-dots span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  animation: typing-bounce 1.2s ease-in-out infinite;
+}
+
+.typing-dots span:nth-child(2) { animation-delay: 0.15s; }
+.typing-dots span:nth-child(3) { animation-delay: 0.3s; }
+
+@keyframes typing-bounce {
+  0%, 60%, 100% { opacity: 0.25; transform: translateY(0); }
+  30% { opacity: 1; transform: translateY(-3px); }
 }
 
 /* Draft indicator */
@@ -933,10 +1382,76 @@ button.minor:hover {
   width: 100%;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 10px 12px 30px;
+  padding: 10px 42px 30px 12px;
   font-size: 14px;
   line-height: 1.5;
   background: var(--panel);
+}
+
+/* Composer attachments: paperclip button + drop target + chips */
+.attach-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.attach-btn:hover {
+  background: var(--panel-muted);
+  color: var(--text);
+}
+
+#composer-drop.drag-over #message-input {
+  border-color: var(--accent);
+  background: var(--accent-light);
+}
+
+.attachment-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.attachment-chips:empty {
+  display: none;
+}
+
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 260px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--panel-muted);
+  font-size: 12px;
+}
+
+.attachment-chip .chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+
+.attachment-chip .chip-kind {
+  color: var(--text-muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
 
 #chat-actions {
@@ -1873,4 +2388,301 @@ button.minor:hover {
   height: 28px;
   padding: 0 12px;
   font-size: 12px;
+}
+
+/* =============================================================================
+   Notes vault
+   ============================================================================= */
+
+.notes-panel {
+  display: flex;
+  gap: 0;
+  min-height: 540px;
+  overflow: hidden;
+}
+
+.notes-side {
+  width: 264px;
+  flex-shrink: 0;
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+}
+
+.notes-side-head {
+  display: flex;
+  gap: 8px;
+  padding: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.notes-side-head input[type="search"] {
+  flex: 1;
+  min-width: 0;
+}
+
+#note-new-btn {
+  width: var(--ctl-h);
+  flex-shrink: 0;
+  font-size: 18px;
+  line-height: 1;
+}
+
+.note-search-results {
+  border-bottom: 1px solid var(--border);
+  max-height: 40%;
+  overflow-y: auto;
+  background: var(--panel-muted);
+}
+
+.note-search-hit {
+  padding: 8px 12px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.note-search-hit:hover { background: var(--accent-light); }
+
+.note-search-excerpt {
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.note-list {
+  list-style: none;
+  margin: 0;
+  padding: 6px;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.note-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.note-item:hover { background: var(--panel-muted); }
+.note-item.active { background: var(--accent-light); }
+.note-item.contradicted .note-item-title { color: var(--danger); }
+
+.note-item-title {
+  font-weight: 500;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.note-item-date {
+  font-size: 11px;
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.notes-side-foot {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.notes-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  position: relative;
+}
+
+.note-editor {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  padding: 16px 20px;
+  gap: 12px;
+}
+
+.note-editor-head {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+#note-title {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-serif);
+  font-size: 22px;
+  font-weight: 600;
+  border: none;
+  border-bottom: 1px solid transparent;
+  background: transparent;
+  padding: 4px 0;
+}
+
+#note-title:focus {
+  outline: none;
+  border-bottom-color: var(--accent);
+}
+
+#note-content {
+  flex: 1;
+  min-height: 300px;
+  resize: vertical;
+  font-family: var(--font-serif);
+  font-size: 16px;
+  line-height: 1.7;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  background: var(--panel);
+}
+
+.note-preview {
+  flex: 1;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  font-family: var(--font-serif);
+  font-size: 16px;
+  line-height: 1.7;
+}
+
+.wikilink {
+  color: var(--accent-strong);
+  text-decoration: none;
+  border-bottom: 1px dashed var(--accent);
+}
+
+.wikilink:hover { background: var(--accent-light); }
+
+.dangling {
+  color: var(--text-muted);
+  border-bottom: 1px dotted var(--border-strong);
+  font-size: 13px;
+}
+
+.note-meta {
+  font-size: 13px;
+  color: var(--text-muted);
+  line-height: 1.8;
+}
+
+/* The witness report */
+.note-witness {
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.witness-summary {
+  font-family: var(--font-serif);
+  font-size: 15px;
+  font-style: italic;
+}
+
+.witness-row {
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  border-left: 3px solid var(--border-strong);
+  background: var(--panel-muted);
+  font-size: 13px;
+}
+
+.witness-row.contradicts {
+  border-left-color: var(--danger);
+  background: var(--danger-light);
+}
+
+.witness-row.agrees { border-left-color: var(--accent); }
+
+.witness-verdict {
+  font-weight: 700;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  margin-right: 8px;
+}
+
+.witness-row.contradicts .witness-verdict { color: var(--danger); }
+.witness-row.agrees .witness-verdict { color: var(--accent-strong); }
+
+.witness-reason { margin-top: 4px; color: var(--text); }
+
+.witness-path {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
+/* Graph view */
+.note-graph-wrap {
+  flex: 1;
+  min-height: 460px;
+  position: relative;
+}
+
+#note-graph { display: block; width: 100%; height: 100%; }
+
+.note-graph-hint {
+  position: absolute;
+  bottom: 8px;
+  left: 12px;
+  font-size: 12px;
+}
+
+.notes-empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  font-family: var(--font-serif);
+  font-size: 15px;
+  line-height: 1.9;
+  padding: 40px;
+}
+
+@media (max-width: 800px) {
+  .notes-panel { flex-direction: column; }
+  .notes-side { width: 100%; border-right: none; border-bottom: 1px solid var(--border); max-height: 40vh; }
+}
+
+/* Witness reframe: movement, not just contradiction */
+.note-item.evolved .note-item-title { color: #c07d10; }
+
+.witness-row.evolves {
+  border-left-color: #c07d10;
+  background: #fdf6e8;
+}
+
+.witness-row.evolves .witness-verdict { color: #c07d10; }
+
+.note-sweep-wrap {
+  flex: 1;
+  overflow-y: auto;
+}
+
+.note-sweep {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 16px 20px;
 }

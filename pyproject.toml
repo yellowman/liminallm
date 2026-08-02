@@ -12,7 +12,8 @@ dependencies = [
   "python-dotenv>=1.0",
   "python-multipart>=0.0.9",
   "argon2-cffi>=21.3",
-  "psycopg[binary]>=3.1",
+  "psycopg[binary]>=3.2",
+  "pypdf>=4.0",
   "psycopg-pool>=3.2",
   "redis>=5.0",
   "openai>=1.30",
@@ -27,6 +28,12 @@ requires = ["setuptools>=61", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project.optional-dependencies]
+ocr = [
+  # Plus the tesseract-ocr system package (apt/brew). Auto-detected at
+  # runtime; without it, image extraction falls back to model vision.
+  "pytesseract>=0.3.10",
+  "Pillow>=10.0",
+]
 dev = [
   "pytest>=8.0",
   "pytest-cov>=4.1",

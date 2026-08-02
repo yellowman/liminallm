@@ -57,6 +57,7 @@ from liminallm.storage.models import (
     KnowledgeChunk,
     KnowledgeContext,
     Message,
+    Note,
     PreferenceEvent,
     SemanticCluster,
     Session,
@@ -1659,6 +1660,224 @@ class PostgresStore:
             )
         self._update_cached_session(session_id, meta=meta)
 
+    # notes vault
+    @staticmethod
+    def _row_to_note(row: dict) -> Note:
+        embedding = row.get("embedding")
+        if isinstance(embedding, str):
+            embedding = json.loads(embedding)
+        meta = row.get("meta")
+        if isinstance(meta, str):
+            meta = json.loads(meta)
+        return Note(
+            id=str(row["id"]),
+            user_id=str(row["user_id"]),
+            title=row["title"],
+            content=row.get("content") or "",
+            embedding=embedding,
+            created_at=row.get("created_at"),
+            updated_at=row.get("updated_at"),
+            meta=meta or {},
+        )
+
+    def create_note(
+        self,
+        user_id: str,
+        title: str,
+        content: str = "",
+        embedding: Optional[List[float]] = None,
+        meta: Optional[dict] = None,
+    ) -> Note:
+        note_id = str(uuid.uuid4())
+        now = datetime.utcnow()
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    """
+                    INSERT INTO note (id, user_id, title, content, embedding, created_at, updated_at, meta)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (
+                        note_id,
+                        user_id,
+                        title,
+                        content,
+                        json.dumps(embedding) if embedding else None,
+                        now,
+                        now,
+                        json.dumps(meta) if meta else None,
+                    ),
+                )
+        except errors.UniqueViolation:
+            raise ConstraintViolation("note title already exists", {"field": "title"})
+        except errors.ForeignKeyViolation:
+            raise ConstraintViolation("note owner missing", {"user_id": user_id})
+        return Note(
+            id=note_id,
+            user_id=user_id,
+            title=title,
+            content=content,
+            embedding=list(embedding) if embedding else None,
+            created_at=now,
+            updated_at=now,
+            meta=meta or {},
+        )
+
+    def update_note(
+        self,
+        note_id: str,
+        *,
+        title: Optional[str] = None,
+        content: Optional[str] = None,
+        embedding: Optional[List[float]] = None,
+    ) -> Optional[Note]:
+        sets = ["updated_at = %s"]
+        params: list = [datetime.utcnow()]
+        if title is not None:
+            sets.append("title = %s")
+            params.append(title)
+        if content is not None:
+            sets.append("content = %s")
+            params.append(content)
+        if embedding is not None:
+            sets.append("embedding = %s")
+            params.append(json.dumps(embedding))
+        params.append(note_id)
+        try:
+            with self._connect() as conn:
+                row = conn.execute(
+                    f"UPDATE note SET {', '.join(sets)} WHERE id = %s RETURNING *",
+                    params,
+                ).fetchone()
+        except errors.UniqueViolation:
+            raise ConstraintViolation("note title already exists", {"field": "title"})
+        return self._row_to_note(row) if row else None
+
+    def update_note_meta(self, note_id: str, meta_patch: dict) -> Optional[Note]:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                UPDATE note
+                SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb
+                WHERE id = %s
+                RETURNING *
+                """,
+                (json.dumps(meta_patch), note_id),
+            ).fetchone()
+        return self._row_to_note(row) if row else None
+
+    def delete_note(self, note_id: str) -> bool:
+        with self._connect() as conn:
+            row = conn.execute(
+                "DELETE FROM note WHERE id = %s RETURNING id", (note_id,)
+            ).fetchone()
+        return row is not None
+
+    def get_note(self, note_id: str, user_id: Optional[str] = None) -> Optional[Note]:
+        with self._connect() as conn:
+            if user_id:
+                row = conn.execute(
+                    "SELECT * FROM note WHERE id = %s AND user_id = %s",
+                    (note_id, user_id),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT * FROM note WHERE id = %s", (note_id,)
+                ).fetchone()
+        return self._row_to_note(row) if row else None
+
+    def get_note_by_title(self, user_id: str, title: str) -> Optional[Note]:
+        key = " ".join(str(title or "").split())
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM note WHERE user_id = %s AND lower(title) = lower(%s)",
+                (user_id, key),
+            ).fetchone()
+        return self._row_to_note(row) if row else None
+
+    def list_notes(
+        self, user_id: str, limit: int = 200, offset: int = 0
+    ) -> List[Note]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM note WHERE user_id = %s
+                ORDER BY updated_at DESC LIMIT %s OFFSET %s
+                """,
+                (user_id, limit, offset),
+            ).fetchall()
+        return [self._row_to_note(r) for r in rows]
+
+    def count_notes(self, user_id: str) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT count(*) AS n FROM note WHERE user_id = %s", (user_id,)
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def set_note_links(self, src_note_id: str, dst_note_ids: List[str]) -> None:
+        deduped: List[str] = []
+        for dst in dst_note_ids:
+            if dst != src_note_id and dst not in deduped:
+                deduped.append(dst)
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM note_link WHERE src_note_id = %s", (src_note_id,)
+            )
+            if deduped:
+                # Insert-where-exists instead of catching FK violations: a
+                # caught violation still aborts the transaction, which would
+                # silently drop every link after the first bad target.
+                conn.execute(
+                    """
+                    INSERT INTO note_link (src_note_id, dst_note_id)
+                    SELECT %s, n.id FROM note n WHERE n.id = ANY(%s::uuid[])
+                    ON CONFLICT DO NOTHING
+                    """,
+                    (src_note_id, deduped),
+                )
+
+    def list_note_links_from(self, note_id: str) -> List[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT dst_note_id FROM note_link WHERE src_note_id = %s",
+                (note_id,),
+            ).fetchall()
+        return [str(r["dst_note_id"]) for r in rows]
+
+    def list_backlinks(self, note_id: str) -> List[str]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT src_note_id FROM note_link WHERE dst_note_id = %s",
+                (note_id,),
+            ).fetchall()
+        return [str(r["src_note_id"]) for r in rows]
+
+    def list_note_edges(self, user_id: str) -> List[tuple[str, str]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT l.src_note_id, l.dst_note_id
+                FROM note_link l JOIN note n ON n.id = l.src_note_id
+                WHERE n.user_id = %s
+                """,
+                (user_id,),
+            ).fetchall()
+        return [(str(r["src_note_id"]), str(r["dst_note_id"])) for r in rows]
+
+    def find_notes_with_dangling_link(
+        self, user_id: str, title_key: str
+    ) -> List[Note]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM note
+                WHERE user_id = %s AND meta->'dangling' ? %s
+                """,
+                (user_id, title_key),
+            ).fetchall()
+        return [self._row_to_note(r) for r in rows]
+
     # conversations
     def create_conversation(
         self,
@@ -1725,6 +1944,76 @@ class PostgresStore:
             active_context_id=_row_value("active_context_id"),
             meta=raw_meta,
         )
+
+    def set_conversation_title(
+        self, conversation_id: str, *, user_id: str, title: str
+    ) -> Optional[Conversation]:
+        """Rename a conversation; owner-only."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "UPDATE conversation SET title = %s, updated_at = %s "
+                "WHERE id = %s AND user_id = %s RETURNING id",
+                (title, datetime.utcnow(), conversation_id, user_id),
+            ).fetchone()
+        return self.get_conversation(conversation_id) if row else None
+
+    def update_message_meta(
+        self, message_id: str, *, user_id: str, patch: dict
+    ) -> Optional[Any]:
+        """Shallow-merge keys into a message's meta; owner-only."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "UPDATE message m SET meta = COALESCE(m.meta, '{}'::jsonb) || %s::jsonb "
+                "WHERE m.id = %s AND EXISTS ("
+                "  SELECT 1 FROM conversation c WHERE c.id = m.conversation_id AND c.user_id = %s"
+                ") RETURNING m.id",
+                (json.dumps(patch), message_id, user_id),
+            ).fetchone()
+        return row or None
+
+    def merge_conversation_meta(
+        self, conversation_id: str, *, user_id: str, patch: dict
+    ) -> Optional[Conversation]:
+        """Shallow-merge keys into a conversation's meta; owner-only."""
+        now = datetime.utcnow()
+        with self._connect() as conn:
+            row = conn.execute(
+                "UPDATE conversation SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
+                "updated_at = %s WHERE id = %s AND user_id = %s RETURNING id",
+                (json.dumps(patch), now, conversation_id, user_id),
+            ).fetchone()
+        if not row:
+            return None
+        return self.get_conversation(conversation_id)
+
+    def set_conversation_public(
+        self, conversation_id: str, *, user_id: str, public: bool
+    ) -> Optional[Conversation]:
+        """Toggle a conversation's public sharing flag; owner-only."""
+        return self.merge_conversation_meta(
+            conversation_id, user_id=user_id, patch={"public": bool(public)}
+        )
+
+    def get_public_conversation(self, conversation_id: str) -> Optional[Conversation]:
+        """Fetch a conversation only if it has been explicitly made public."""
+        conv = self.get_conversation(conversation_id)
+        if conv and (conv.meta or {}).get("public"):
+            return conv
+        return None
+
+    def list_public_conversations(self, limit: int = 50) -> List[Conversation]:
+        """Public conversations, newest first, for the share directory."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM conversation WHERE (meta->>'public') = 'true' "
+                "ORDER BY updated_at DESC LIMIT %s",
+                (limit,),
+            ).fetchall()
+        ids = [
+            str(r["id"] if hasattr(r, "get") else r[0]) for r in rows
+        ]
+        found = (self.get_conversation(cid) for cid in ids)
+        return [c for c in found if c]
 
     def delete_conversation(
         self, conversation_id: str, *, user_id: Optional[str] = None
@@ -2751,6 +3040,14 @@ class PostgresStore:
         # current settings dict even when the row is partial, absent, or corrupt.
         return {**SYSTEM_SETTINGS_DEFAULTS, **self._get_stored_system_settings()}
 
+    def get_system_settings_overrides(self) -> dict:
+        """Explicitly stored admin settings only, no defaults merged in.
+
+        Lets the runtime give env vars precedence over code defaults for
+        settings the admin never actually overrode.
+        """
+        return dict(self._get_stored_system_settings())
+
     def get_system_settings_version(self) -> Optional[str]:
         """Return a token that changes whenever system settings are written.
 
@@ -2793,6 +3090,47 @@ class PostgresStore:
             except Exception:
                 return {}
         return raw_config if isinstance(raw_config, dict) else {}
+
+    def get_instance_config(self, name: str) -> dict:
+        """Read a named JSONB blob from instance_config ({} when absent)."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT config FROM instance_config WHERE name = %s", (name,)
+            ).fetchone()
+        if not row:
+            return {}
+        config = row.get("config")
+        if isinstance(config, str):
+            try:
+                config = json.loads(config)
+            except Exception:  # noqa: BLE001
+                return {}
+        return config if isinstance(config, dict) else {}
+
+    def merge_instance_config(self, name: str, patch: dict) -> dict:
+        """Merge keys into a named blob atomically; returns the merged dict."""
+        with self._connect() as conn, conn.transaction():
+            row = conn.execute(
+                "SELECT config FROM instance_config WHERE name = %s FOR UPDATE",
+                (name,),
+            ).fetchone()
+            current = row.get("config") if row else {}
+            if isinstance(current, str):
+                try:
+                    current = json.loads(current)
+                except Exception:  # noqa: BLE001
+                    current = {}
+            merged = {**(current if isinstance(current, dict) else {}), **patch}
+            conn.execute(
+                """
+                INSERT INTO instance_config (name, config, created_at, updated_at)
+                VALUES (%s, %s, now(), now())
+                ON CONFLICT (name) DO UPDATE
+                SET config = EXCLUDED.config, updated_at = now()
+                """,
+                (name, json.dumps(merged)),
+            )
+        return merged
 
     def set_system_settings(self, settings: dict) -> dict:
         """Update admin-managed system settings.

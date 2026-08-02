@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 import mimetypes
+import shutil
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path as FilePath
@@ -54,6 +55,7 @@ from liminallm.api.schemas import (
     ContextSourceRequest,
     ContextSourceResponse,
     ConversationListResponse,
+    ConversationShareRequest,
     ConversationMessagesResponse,
     ConversationSummary,
     CreateConversationRequest,
@@ -71,6 +73,11 @@ from liminallm.api.schemas import (
     MFARequest,
     MFAStatusResponse,
     MFAVerifyRequest,
+    NoteCreateRequest,
+    NoteFromFileRequest,
+    NoteSearchRequest,
+    NoteUpdateRequest,
+    NoteWitnessRequest,
     OAuthStartRequest,
     OAuthStartResponse,
     PasswordChangeRequest,
@@ -106,8 +113,28 @@ from liminallm.config import (
 )
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
+from liminallm.service.archive import (
+    ArchiveExtractionError,
+    archive_stem,
+    extract_archive_sandboxed,
+    is_archive_filename,
+)
+from liminallm.service.attachments import (
+    classify_attachment,
+    ensure_conversation_context,
+    is_auto_context,
+    list_attachments,
+    record_attachment,
+)
 from liminallm.service.auth import AuthContext
+from liminallm.service import compaction
+from liminallm.service import extract as extract_service
+from liminallm.service import labels
+from liminallm.service import notes as notes_service
+from liminallm.storage.errors import ConstraintViolation
+from liminallm.service.upload_policy import ALLOWED_UPLOAD_EXTENSIONS
 from liminallm.service.errors import BadRequestError, NotFoundError
+from liminallm.service.sandbox import SandboxError
 from liminallm.service.fs import (
     PathTraversalError,
     generate_signed_url,
@@ -130,23 +157,9 @@ from liminallm.storage.models import Conversation, KnowledgeContext, Session
 
 logger = get_logger(__name__)
 
-# File upload policy (SPEC §17): allowed extensions returned via /files/limits
-ALLOWED_UPLOAD_EXTENSIONS = {
-    ".txt",
-    ".md",
-    ".pdf",
-    ".json",
-    ".csv",
-    ".tsv",
-    ".png",
-    ".jpg",
-    ".jpeg",
-    ".gif",
-    ".webp",
-    ".mp3",
-    ".wav",
-    ".ogg",
-}
+# ALLOWED_UPLOAD_EXTENSIONS (SPEC §17) is imported above from
+# service.upload_policy so the tool sandbox can apply the same policy; it stays
+# importable from this module because callers and tests reference it here.
 
 router = APIRouter(prefix="/v1")
 
@@ -155,6 +168,8 @@ router = APIRouter(prefix="/v1")
 # Issue 23.2: Added timestamp tracking for TTL-based cleanup
 # Issue 50.5: Added user_id for ownership validation to prevent cross-user cancellation
 _active_requests: Dict[str, tuple[asyncio.Event, datetime, str]] = {}
+# Logical cluster-bus channel used to reach the replica that owns a request
+CANCEL_CHANNEL = "chat.cancel"
 # Issue 28.2: Lazily initialize asyncio.Lock to avoid "no running event loop" errors
 # at module import time. The lock is created on first use when an event loop exists.
 _active_requests_lock: Optional[asyncio.Lock] = None
@@ -229,7 +244,21 @@ async def _unregister_cancel_event(request_id: str) -> None:
 
 
 async def _cancel_request(request_id: str, user_id: str) -> tuple[bool, str]:
-    """Cancel an active request by request_id with ownership validation (Issue 50.5).
+    """Cancel an active request, wherever in the cluster it is running.
+
+    The cancel event lives in the process holding that request's WebSocket, so
+    a multi-replica deployment can only stop 1/N of streams locally. When the
+    request is unknown here we ask the other replicas over the cluster bus and
+    return the owner's verdict; silence means no replica owns it.
+    """
+    cancelled, reason = await _cancel_request_local(request_id, user_id)
+    if reason != "request_not_found":
+        return cancelled, reason
+    return await _cancel_request_remote(request_id, user_id)
+
+
+async def _cancel_request_local(request_id: str, user_id: str) -> tuple[bool, str]:
+    """Cancel a request owned by this process, validating ownership.
 
     Args:
         request_id: The request to cancel
@@ -256,6 +285,44 @@ async def _cancel_request(request_id: str, user_id: str) -> tuple[bool, str]:
             cancel_event.set()
             return True, "cancelled"
         return False, "already_cancelled"
+
+
+async def _cancel_request_remote(request_id: str, user_id: str) -> tuple[bool, str]:
+    """Ask peer replicas to cancel a request this process doesn't own."""
+    bus = getattr(get_runtime(), "bus", None)
+    if bus is None:
+        return False, "request_not_found"
+    try:
+        ack = await bus.request(
+            CANCEL_CHANNEL, {"request_id": request_id, "user_id": user_id}
+        )
+    except Exception as exc:  # never let coordination break the endpoint
+        logger.warning("cancel_request_bus_failed", request_id=request_id, error=str(exc))
+        return False, "request_not_found"
+    if not ack:
+        return False, "request_not_found"
+    reason = str(ack.get("reason") or "request_not_found")
+    return bool(ack.get("cancelled")), reason
+
+
+async def handle_remote_cancel(data: dict) -> Optional[dict]:
+    """Cluster-bus handler: cancel locally, or stay silent if we don't own it.
+
+    Only the owning replica answers, so the asking replica can distinguish
+    "cancelled" / "not_owner" / "already_cancelled" from "nobody has it".
+
+    The user_id in the frame was authenticated by the peer replica that took
+    the request; ownership is still re-checked here, so the trust boundary is
+    the coordination datastore (Redis/Postgres), not the caller.
+    """
+    request_id = str(data.get("request_id") or "")
+    user_id = str(data.get("user_id") or "")
+    if not request_id or not user_id:
+        return None
+    cancelled, reason = await _cancel_request_local(request_id, user_id)
+    if reason == "request_not_found":
+        return None
+    return {"cancelled": cancelled, "reason": reason}
 
 
 def _http_error(
@@ -795,6 +862,169 @@ def _get_pagination_settings(runtime) -> dict:
         # Keep conversation pagination consistent with general defaults (SPEC pagination guidance)
         "default_conversations_limit": sys_settings.get("default_conversations_limit", 100),
     }
+
+
+# Background label tasks, held so they are not garbage-collected mid-flight.
+_LABEL_TASKS: set[asyncio.Task] = set()
+
+
+def _schedule_turn_labels(
+    runtime,
+    *,
+    conversation_id: str,
+    user_id: str,
+    user_message_id: Optional[str],
+    user_content: str,
+    assistant_content: str,
+    set_title: bool,
+) -> None:
+    """Label a finished turn (and title a new conversation) off the hot path.
+
+    A quick model call, scheduled after the reply is already on its way, so
+    describing the turn never delays the answer. Failures are logged and
+    dropped: labels are cosmetic and the heuristic fallback already applies.
+    """
+
+    async def _run() -> None:
+        try:
+            if user_message_id:
+                label = await asyncio.to_thread(
+                    labels.describe_turn, runtime.llm, user_content, assistant_content
+                )
+                await asyncio.to_thread(
+                    runtime.store.update_message_meta,
+                    user_message_id,
+                    user_id=user_id,
+                    patch={"turn_label": label},
+                )
+            if set_title:
+                title = await asyncio.to_thread(
+                    labels.describe_conversation, runtime.llm, user_content
+                )
+                await asyncio.to_thread(
+                    runtime.store.set_conversation_title,
+                    conversation_id,
+                    user_id=user_id,
+                    title=title,
+                )
+        except Exception as exc:  # noqa: BLE001 - never surface to the user
+            logger.warning(
+                "turn_labeling_failed", conversation_id=conversation_id, error=str(exc)
+            )
+
+    try:
+        task = asyncio.create_task(_run())
+    except RuntimeError:
+        return  # no running loop (sync test context): skip labelling
+    _LABEL_TASKS.add(task)
+    task.add_done_callback(_LABEL_TASKS.discard)
+
+
+_EMBED_BACKFILL_PER_PASS = 30
+
+
+def _backfill_message_embeddings(runtime, history, user_id: str) -> None:
+    """Persist per-turn embeddings for semantic recall (off the hot path).
+
+    A real encoder only; skips turns already embedded; bounded so one pass
+    can't stall on a huge backlog (the next turn's pass continues it).
+    """
+    embeddings = getattr(runtime, "embeddings", None)
+    if embeddings is None or not getattr(embeddings, "is_semantic", False):
+        return
+    updater = getattr(runtime.store, "update_message_meta", None)
+    if not callable(updater):
+        return
+    done = 0
+    for msg in history:
+        if done >= _EMBED_BACKFILL_PER_PASS:
+            break
+        if compaction._message_embedding(msg, embeddings.model_id) is not None:
+            continue
+        content = str(getattr(msg, "content", "") or "").strip()
+        if not content:
+            continue
+        try:
+            vector = embeddings.embed(content)
+            updater(
+                msg.id,
+                user_id=user_id,
+                patch={"embedding": vector, "embedding_model": embeddings.model_id},
+            )
+            done += 1
+        except Exception as exc:  # noqa: BLE001 - backfill is best-effort
+            logger.debug("message_embedding_backfill_failed", error=str(exc))
+            break
+    if done:
+        logger.info("message_embeddings_backfilled", count=done)
+
+
+def _schedule_conversation_digest(
+    runtime, *, conversation_id: str, user_id: str
+) -> None:
+    """Fold turns older than the window into a digest, off the hot path.
+
+    Same discipline as turn labels: scheduled after the reply is on its way,
+    failures logged and dropped. A missing digest costs precision, never
+    correctness — the recent window is always sent verbatim.
+    """
+
+    async def _run() -> None:
+        try:
+            conversation = await asyncio.to_thread(
+                runtime.store.get_conversation, conversation_id, user_id=user_id
+            )
+            if not conversation:
+                return
+            history = await asyncio.to_thread(
+                runtime.store.list_messages, conversation_id, user_id=user_id
+            )
+            # Backfill message embeddings so semantic recall reads persisted
+            # vectors on the hot path instead of embedding turns live. Only
+            # runs with a real encoder; bounded per pass.
+            await asyncio.to_thread(
+                _backfill_message_embeddings, runtime, history, user_id
+            )
+            # Digest exactly what falls outside the model's verbatim window —
+            # the same budget boundary the workflow serves with.
+            keep_tokens = runtime.workflow.history_budget()
+            count = runtime.workflow._count_fn()
+            if not compaction.needs_digest(
+                history, conversation, keep_tokens=keep_tokens, count=count
+            ):
+                return
+            digest = await asyncio.to_thread(
+                lambda: compaction.build_digest(
+                    runtime.llm, history, conversation,
+                    keep_tokens=keep_tokens, count=count,
+                )
+            )
+            if not digest:
+                return
+            await asyncio.to_thread(
+                runtime.store.merge_conversation_meta,
+                conversation_id,
+                {"digest": digest},
+            )
+            logger.info(
+                "conversation_digested",
+                conversation_id=conversation_id,
+                messages=digest.get("messages"),
+                tokens=digest.get("tokens"),
+            )
+        except Exception as exc:  # noqa: BLE001 - never surface to the user
+            logger.warning(
+                "conversation_digest_failed",
+                conversation_id=conversation_id,
+                error=str(exc),
+            )
+
+    try:
+        task = asyncio.create_task(_run())
+    except RuntimeError:
+        return  # no running loop (sync test context)
+    _LABEL_TASKS.add(task)
+    task.add_done_callback(_LABEL_TASKS.discard)
 
 
 def _generate_conversation_title(message: str, max_length: int = 50) -> str:
@@ -1846,7 +2076,7 @@ async def chat(
                 user_content_struct = normalize_content_struct(
                     body.message.content_struct, user_content
                 )
-                runtime.store.append_message(
+                user_msg = runtime.store.append_message(
                     conversation_id,
                     sender="user",
                     role="user",
@@ -1854,6 +2084,8 @@ async def chat(
                     meta=voice_meta or None,
                     content_struct=user_content_struct,
                 )
+                # A new conversation gets its real title from the same pass.
+                needs_title = not body.conversation_id
                 orchestration = await runtime.workflow.run(
                     body.workflow_id,
                     conversation_id,
@@ -1898,6 +2130,18 @@ async def chat(
                     context_snippets=orchestration_dict.get("context_snippets", []),
                     routing_trace=orchestration_dict.get("routing_trace", []),
                     workflow_trace=orchestration_dict.get("workflow_trace", []),
+                )
+                _schedule_turn_labels(
+                    runtime,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    user_message_id=getattr(user_msg, "id", None),
+                    user_content=user_content,
+                    assistant_content=assistant_content,
+                    set_title=needs_title,
+                )
+                _schedule_conversation_digest(
+                    runtime, conversation_id=conversation_id, user_id=user_id
                 )
                 envelope = Envelope(
                     status="ok", data=resp.model_dump(), request_id=idem.request_id
@@ -1994,6 +2238,332 @@ async def cancel_chat(
             message="Request not found or already completed",
         ).model_dump(),
     )
+
+
+# ---------------------------------------------------------------------------
+# Notes vault (SPEC: linked notes + the witness)
+
+
+def _require_notes_enabled(runtime) -> None:
+    """Admin override > env var > default (on)."""
+    enabled = getattr(runtime.settings, "notes_enabled", True)
+    getter = getattr(runtime.store, "get_system_settings_overrides", None)
+    if callable(getter):
+        try:
+            overrides = getter() or {}
+            enabled = overrides.get("notes_enabled", enabled)
+        except Exception:  # noqa: BLE001 - settings read is best-effort
+            pass
+    if not enabled:
+        raise _http_error("notes_disabled", "the notes vault is disabled", status_code=403)
+
+
+def _get_owned_note(runtime, note_id: str, principal: AuthContext):
+    note = runtime.store.get_note(note_id, user_id=principal.user_id)
+    if not note:
+        raise _http_error("not_found", "note not found", status_code=404)
+    return note
+
+
+def _note_payload(note, *, content: bool = True) -> dict:
+    payload = {
+        "id": note.id,
+        "title": note.title,
+        "created_at": note.created_at.isoformat(),
+        "updated_at": note.updated_at.isoformat(),
+    }
+    if content:
+        payload["content"] = note.content
+    return payload
+
+
+def _save_note_graph(runtime, principal: AuthContext, note) -> None:
+    """Re-derive links + embedding after any content change."""
+    dangling = notes_service.resolve_links(
+        runtime.store, principal.user_id, note.id, note.content
+    )
+    runtime.store.update_note_meta(note.id, {"dangling": dangling})
+    embedding = notes_service.embed_note(
+        getattr(runtime, "embeddings", None), note.title, note.content
+    )
+    if embedding:
+        runtime.store.update_note(note.id, embedding=embedding)
+    notes_service.connect_dangling_links(runtime.store, principal.user_id, note)
+
+
+@router.post("/notes", response_model=Envelope, status_code=201, tags=["notes"])
+async def create_note(body: NoteCreateRequest, principal: AuthContext = Depends(get_user)):
+    runtime = get_runtime()
+    _require_notes_enabled(runtime)
+    title = notes_service.normalize_title(body.title)
+    if not title:
+        raise _http_error("bad_request", "title required", status_code=400)
+    try:
+        note = runtime.store.create_note(principal.user_id, title, body.content)
+    except ConstraintViolation:
+        raise _http_error(
+            "conflict", "a note with this title already exists", status_code=409
+        )
+    _save_note_graph(runtime, principal, note)
+    return Envelope(status="ok", data=_note_payload(note))
+
+
+@router.get("/notes", response_model=Envelope, tags=["notes"])
+async def list_notes(
+    limit: int = 200,
+    offset: int = 0,
+    principal: AuthContext = Depends(get_user),
+):
+    runtime = get_runtime()
+    _require_notes_enabled(runtime)
+    notes = runtime.store.list_notes(
+        principal.user_id, limit=min(max(limit, 1), 500), offset=max(offset, 0)
+    )
+    return Envelope(
+        status="ok",
+        data={
+            "notes": [_note_payload(n, content=False) for n in notes],
+            "total": runtime.store.count_notes(principal.user_id),
+        },
+    )
+
+
+@router.get("/notes/graph", response_model=Envelope, tags=["notes"])
+async def notes_graph(principal: AuthContext = Depends(get_user)):
+    """Nodes and edges of the user's vault, for the graph view."""
+    runtime = get_runtime()
+    _require_notes_enabled(runtime)
+    notes = runtime.store.list_notes(principal.user_id, limit=10_000)
+    edges = runtime.store.list_note_edges(principal.user_id)
+    degree: dict[str, int] = {}
+    for src, dst in edges:
+        degree[src] = degree.get(src, 0) + 1
+        degree[dst] = degree.get(dst, 0) + 1
+    return Envelope(
+        status="ok",
+        data={
+            "nodes": [
+                {**_note_payload(n, content=False), "degree": degree.get(n.id, 0)}
+                for n in notes
+            ],
+            "edges": [{"src": src, "dst": dst} for src, dst in edges],
+        },
+    )
+
+
+@router.get("/notes/{note_id}", response_model=Envelope, tags=["notes"])
+async def get_note(note_id: str, principal: AuthContext = Depends(get_user)):
+    runtime = get_runtime()
+    _require_notes_enabled(runtime)
+    note = _get_owned_note(runtime, note_id, principal)
+    links = [
+        _note_payload(n, content=False)
+        for nid in runtime.store.list_note_links_from(note.id)
+        if (n := runtime.store.get_note(nid))
+    ]
+    backlinks = [
+        _note_payload(n, content=False)
+        for nid in runtime.store.list_backlinks(note.id)
+        if (n := runtime.store.get_note(nid))
+    ]
+    dangling = (note.meta or {}).get("dangling", [])
+    return Envelope(
+        status="ok",
+        data={
+            **_note_payload(note),
+            "links": links,
+            "backlinks": backlinks,
+            "dangling": dangling,
+        },
+    )
+
+
+@router.patch("/notes/{note_id}", response_model=Envelope, tags=["notes"])
+async def update_note(
+    note_id: str, body: NoteUpdateRequest, principal: AuthContext = Depends(get_user)
+):
+    runtime = get_runtime()
+    _require_notes_enabled(runtime)
+    existing = _get_owned_note(runtime, note_id, principal)
+    old_title = existing.title
+    title = notes_service.normalize_title(body.title) if body.title else None
+    try:
+        note = runtime.store.update_note(note_id, title=title, content=body.content)
+    except ConstraintViolation:
+        raise _http_error(
+            "conflict", "a note with this title already exists", status_code=409
+        )
+    _save_note_graph(runtime, principal, note)
+    if title and title.lower() != old_title.lower():
+        # [[Old Title]] in other notes no longer resolves here; rebuild their
+        # edges from their text so the graph matches what the notes say.
+        notes_service.reresolve_note_sources(
+            runtime.store, principal.user_id, runtime.store.list_backlinks(note.id)
+        )
+    return Envelope(status="ok", data=_note_payload(note))
+
+
+@router.delete("/notes/{note_id}", response_model=Envelope, tags=["notes"])
+async def delete_note(note_id: str, principal: AuthContext = Depends(get_user)):
+    runtime = get_runtime()
+    _require_notes_enabled(runtime)
+    _get_owned_note(runtime, note_id, principal)
+    sources = runtime.store.list_backlinks(note_id)
+    runtime.store.delete_note(note_id)
+    # Sources' [[links]] to this title now dangle; record that, so recreating
+    # the title later reconnects them.
+    notes_service.reresolve_note_sources(runtime.store, principal.user_id, sources)
+    return Envelope(status="ok", data={"deleted": True})
+
+
+@router.post("/notes/search", response_model=Envelope, tags=["notes"])
+async def search_notes(
+    body: NoteSearchRequest, principal: AuthContext = Depends(get_user)
+):
+    runtime = get_runtime()
+    _require_notes_enabled(runtime)
+    results = notes_service.search_notes(
+        runtime.store,
+        getattr(runtime, "embeddings", None),
+        principal.user_id,
+        body.query,
+        limit=body.limit,
+    )
+    return Envelope(
+        status="ok",
+        data={
+            "results": [
+                {
+                    **_note_payload(note, content=False),
+                    "score": round(float(score), 4),
+                    "excerpt": " ".join(note.content.split())[:300],
+                }
+                for note, score in results
+            ]
+        },
+    )
+
+
+@router.post("/notes/sweep", response_model=Envelope, tags=["notes"])
+async def sweep_vault(principal: AuthContext = Depends(get_user)):
+    """Run the witness across the whole vault: the strongest pairs, judged.
+
+    Deliberately expensive (up to 30 model calls), so the rate limit is
+    stricter than the per-note witness.
+    """
+    runtime = get_runtime()
+    _require_notes_enabled(runtime)
+    await _enforce_rate_limit(
+        runtime, f"notes_sweep:{principal.user_id}", limit=2, window_seconds=600
+    )
+    report = await asyncio.to_thread(
+        notes_service.vault_sweep,
+        runtime.store,
+        getattr(runtime, "embeddings", None),
+        runtime.llm,
+        principal.user_id,
+    )
+    return Envelope(status="ok", data=report)
+
+
+@router.post("/notes/from-file", response_model=Envelope, status_code=201, tags=["notes"])
+async def note_from_file(
+    body: NoteFromFileRequest, principal: AuthContext = Depends(get_user)
+):
+    """Promote an uploaded file into the vault, explicitly.
+
+    Per-conversation RAG over uploads is automatic; joining the user's
+    permanent cross-conversation corpus is a deliberate act. This endpoint is
+    that act: it copies the file's text into a note (provenance in meta), so
+    the witness and note_search treat it like anything else the user wrote.
+    """
+    runtime = get_runtime()
+    _require_notes_enabled(runtime)
+    from liminallm.service.attachments import attachment_path
+
+    path = attachment_path(
+        runtime.settings.shared_fs_root, principal.user_id, body.name
+    )
+    if not path or not path.is_file():
+        raise _http_error("not_found", "file not found", status_code=404)
+    try:
+        extracted = await asyncio.to_thread(
+            extract_service.extract_text,
+            path,
+            llm=runtime.llm,
+            readers=extract_service.parse_reader_order(
+                getattr(runtime.settings, "extract_readers", None)
+            ),
+        )
+    except extract_service.ExtractError as exc:
+        raise _http_error("bad_request", exc.reason, status_code=400)
+    except OSError:
+        raise _http_error("bad_request", "file is not readable", status_code=400)
+    text = extracted["text"]
+    truncated = len(text.encode("utf-8")) > notes_service.NOTE_FROM_FILE_MAX_BYTES
+    if truncated:
+        text = text.encode("utf-8")[: notes_service.NOTE_FROM_FILE_MAX_BYTES].decode(
+            "utf-8", errors="ignore"
+        )
+
+    base_title = notes_service.normalize_title(FilePath(body.name).stem) or "Imported file"
+    title = base_title
+    for suffix in range(2, 20):
+        if not runtime.store.get_note_by_title(principal.user_id, title):
+            break
+        title = f"{base_title} ({suffix})"
+    try:
+        note = runtime.store.create_note(
+            principal.user_id,
+            title,
+            text,
+            meta={
+                "source": "upload",
+                "filename": body.name,
+                "truncated": truncated,
+                # "pdf"/"vision" tell the reader this is an extraction of the
+                # file, not the file itself.
+                "method": extracted["method"],
+            },
+        )
+    except ConstraintViolation:
+        raise _http_error(
+            "conflict", "a note with this title already exists", status_code=409
+        )
+    _save_note_graph(runtime, principal, note)
+    return Envelope(
+        status="ok",
+        data={
+            **_note_payload(note, content=False),
+            "truncated": truncated,
+            "method": extracted["method"],
+        },
+    )
+
+
+@router.post("/notes/{note_id}/witness", response_model=Envelope, tags=["notes"])
+async def witness_note(
+    note_id: str,
+    body: NoteWitnessRequest,
+    principal: AuthContext = Depends(get_user),
+):
+    """Judge this note against the vault: one model call per candidate."""
+    runtime = get_runtime()
+    _require_notes_enabled(runtime)
+    note = _get_owned_note(runtime, note_id, principal)
+    await _enforce_rate_limit(
+        runtime, f"notes_witness:{principal.user_id}", limit=5, window_seconds=60
+    )
+    report = await asyncio.to_thread(
+        notes_service.witness_report,
+        runtime.store,
+        getattr(runtime, "embeddings", None),
+        runtime.llm,
+        principal.user_id,
+        note,
+        limit=body.limit,
+    )
+    return Envelope(status="ok", data=report)
 
 
 @router.post("/preferences", response_model=Envelope, tags=["preferences"])
@@ -3185,10 +3755,19 @@ async def get_file_limits(principal: AuthContext = Depends(get_user)):
 async def upload_file(
     file: UploadFile = File(...),
     context_id: Optional[str] = Form(None, max_length=255),
+    conversation_id: Optional[str] = Form(None, max_length=255),
     chunk_size: Optional[int] = Form(None, ge=64, le=4000),
     principal: AuthContext = Depends(get_user),
     idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
+    """Upload a file, optionally attaching it to a conversation.
+
+    With `conversation_id` the file becomes usable in that chat immediately —
+    small text files are injected into the prompt, larger documents are chunked
+    into the conversation's implicit context for the model's file_search tool,
+    and everything is readable from the code interpreter. No context needs to
+    be created or selected by the user.
+    """
     import re
 
     runtime = get_runtime()
@@ -3289,6 +3868,54 @@ async def upload_file(
                 prior_contexts = set()
         elif isinstance(prior_entry, str):
             prior_checksum = prior_entry
+        # Archives are binary; they are stored but never text-ingested.
+        # POST /files/{name}/extract expands them (with ingestion) instead.
+        # (Attaching an archive to a conversation is fine — it is handed to the
+        # code interpreter, never chunked, so context_id stays unset below.)
+        if context_id and is_archive_filename(safe_filename):
+            raise _http_error(
+                "validation_error",
+                "archives cannot be ingested directly; upload without context_id, "
+                "then extract",
+                status_code=400,
+            )
+
+        # Attach-to-conversation: classify the file, and route searchable ones
+        # into the conversation's implicit context so file_search can find them.
+        attachment_caps: Optional[dict] = None
+        if conversation_id and not context_id:
+            _get_owned_conversation(runtime, conversation_id, principal)
+            attachment_caps = classify_attachment(safe_filename, len(contents))
+            if attachment_caps["searchable"]:
+                context_id = ensure_conversation_context(
+                    runtime.store,
+                    user_id=principal.user_id,
+                    conversation_id=conversation_id,
+                ).id
+
+        def _record(chunks: Optional[int]) -> Optional[dict]:
+            """Persist the attachment record on the conversation."""
+            if not (conversation_id and attachment_caps):
+                return None
+            records = record_attachment(
+                runtime.store,
+                conversation_id=conversation_id,
+                user_id=principal.user_id,
+                name=safe_filename,
+                size=len(contents),
+                capabilities=attachment_caps,
+                chunk_count=chunks,
+            )
+            logger.info(
+                "conversation_attachment_added",
+                user_id=principal.user_id,
+                conversation_id=conversation_id,
+                filename=safe_filename,
+                inline=attachment_caps["inline"],
+                searchable=attachment_caps["searchable"],
+                analyzable=attachment_caps["analyzable"],
+            )
+            return next((r for r in records if r.get("name") == safe_filename), None)
         if dest_path.exists() and prior_checksum == checksum:
             chunk_count = None
             if context_id and context_id not in prior_contexts:
@@ -3308,7 +3935,10 @@ async def upload_file(
                         "file_checksum_manifest_write_failed", path=str(manifest_path)
                     )
             resp = FileUploadResponse(
-                fs_path=safe_filename, context_id=context_id, chunk_count=chunk_count
+                fs_path=safe_filename,
+                context_id=context_id,
+                chunk_count=chunk_count,
+                attachment=_record(chunk_count),
             )
             envelope = Envelope(status="ok", data=resp, request_id=idem.request_id)
             await idem.store_result(envelope)
@@ -3345,11 +3975,33 @@ async def upload_file(
 
         # Update idempotency with final result
         resp = FileUploadResponse(
-            fs_path=safe_filename, context_id=context_id, chunk_count=chunk_count
+            fs_path=safe_filename,
+            context_id=context_id,
+            chunk_count=chunk_count,
+            attachment=_record(chunk_count),
         )
         envelope = Envelope(status="ok", data=resp, request_id=idem.request_id)
         await idem.store_result(envelope)
         return envelope
+
+
+@router.get(
+    "/conversations/{conversation_id}/attachments", response_model=Envelope, tags=["conversations"]
+)
+async def list_conversation_attachments(
+    conversation_id: str = Path(..., max_length=255),
+    principal: AuthContext = Depends(get_user),
+):
+    """Files attached to a conversation, with how the model can reach each."""
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"read:{principal.user_id}",
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        60,
+    )
+    conversation = _get_owned_conversation(runtime, conversation_id, principal)
+    return Envelope(status="ok", data={"items": list_attachments(conversation)})
 
 
 # =========================================================================
@@ -3388,20 +4040,25 @@ async def list_files(
             data={"files": [], "total": 0, "limit": limit or 50, "offset": offset},
         )
 
-    # List files with pagination. Hidden files are internal bookkeeping
-    # (e.g. the .checksums.json upload manifest) — uploads strip leading dots,
-    # so users can never own a dotfile here.
+    # List files with pagination, walking extracted-archive subdirectories.
+    # Hidden components are internal bookkeeping (e.g. the .checksums.json
+    # upload manifest) — uploads and extraction strip leading dots, so users
+    # can never own a dotfile here.
     all_files = []
     try:
-        for f in files_dir.iterdir():
-            if f.is_file() and not f.name.startswith("."):
-                stat = f.stat()
-                all_files.append({
-                    "name": f.name,
-                    "size": stat.st_size,
-                    "created_at": datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc).isoformat(),
-                    "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
-                })
+        for f in files_dir.rglob("*"):
+            if not f.is_file():
+                continue
+            rel = f.relative_to(files_dir)
+            if any(part.startswith(".") for part in rel.parts):
+                continue
+            stat = f.stat()
+            all_files.append({
+                "name": rel.as_posix(),
+                "size": stat.st_size,
+                "created_at": datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc).isoformat(),
+                "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+            })
     except PermissionError:
         logger.warning("files_list_permission_denied", user_id=principal.user_id)
         return Envelope(status="ok", data={"files": [], "total": 0, "limit": limit or 50, "offset": offset})
@@ -3425,9 +4082,14 @@ async def list_files(
     )
 
 
-@router.get("/files/{filename}/url", response_model=Envelope, tags=["files"])
+def _is_hidden_relpath(filename: str) -> bool:
+    """True when any component of a user-supplied relative path is hidden."""
+    return any(part.startswith(".") for part in FilePath(filename).parts)
+
+
+@router.get("/files/{filename:path}/url", response_model=Envelope, tags=["files"])
 async def get_file_download_url(
-    filename: str = Path(..., max_length=255, description="File name to download"),
+    filename: str = Path(..., max_length=512, description="File name to download"),
     principal: AuthContext = Depends(get_user),
 ):
     """Get a signed download URL for a file.
@@ -3456,7 +4118,7 @@ async def get_file_download_url(
         raise _http_error("validation_error", "invalid filename", status_code=400)
 
     # Hidden files are internal bookkeeping; report them as absent.
-    if filename.startswith(".") or not file_path.exists() or not file_path.is_file():
+    if _is_hidden_relpath(filename) or not file_path.exists() or not file_path.is_file():
         raise _http_error("not_found", "file not found", status_code=404)
 
     # Generate signed URL with 10-minute expiry
@@ -3537,12 +4199,12 @@ async def download_file(
     )
 
 
-@router.delete("/files/{filename}", response_model=Envelope, tags=["files"])
+@router.delete("/files/{filename:path}", response_model=Envelope, tags=["files"])
 async def delete_file(
-    filename: str = Path(..., max_length=255, description="File name to delete"),
+    filename: str = Path(..., max_length=512, description="File or folder to delete"),
     principal: AuthContext = Depends(get_user),
 ):
-    """Delete a user's file."""
+    """Delete a user's file, or a folder produced by archive extraction."""
     runtime = get_runtime()
     await _enforce_rate_limit(
         runtime,
@@ -3564,11 +4226,19 @@ async def delete_file(
 
     # Hidden files are internal bookkeeping (upload strips leading dots, so a
     # user can never own one); report them as absent rather than deletable.
-    if filename.startswith(".") or not file_path.exists() or not file_path.is_file():
+    # The files root itself is never deletable.
+    if (
+        _is_hidden_relpath(filename)
+        or not file_path.exists()
+        or file_path == files_dir.resolve()
+    ):
         raise _http_error("not_found", "file not found", status_code=404)
 
-    # Delete file
-    await asyncio.to_thread(file_path.unlink)
+    # Delete file, or an extracted-archive folder recursively
+    if file_path.is_dir():
+        await asyncio.to_thread(shutil.rmtree, file_path)
+    else:
+        await asyncio.to_thread(file_path.unlink)
 
     # Drop the file's entry from the checksum manifest so it doesn't go stale.
     manifest_path = files_dir / ".checksums.json"
@@ -3582,6 +4252,126 @@ async def delete_file(
 
     logger.info("file_deleted", user_id=principal.user_id, filename=filename)
     return Envelope(status="ok", data={"deleted": filename})
+
+
+@router.post("/files/{filename:path}/extract", response_model=Envelope, tags=["files"])
+async def extract_uploaded_archive(
+    filename: str = Path(..., max_length=512, description="Archive to extract"),
+    context_id: Optional[str] = Query(None, max_length=255),
+    chunk_size: Optional[int] = Query(None, ge=64, le=4000),
+    principal: AuthContext = Depends(get_user),
+):
+    """Extract an uploaded archive into a folder next to it.
+
+    SPEC §18: extraction is hardened against zip bombs (streamed size,
+    entry-count, and compression-ratio budgets), zip-slip (component-wise
+    path sanitization + safe_join), and hostile members (symlinks, devices,
+    and hardlinks are skipped; nested archives are never auto-expanded), and
+    the whole job runs in a resource-limited sandbox subprocess. Extracted
+    files can optionally be ingested into a knowledge context.
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"write:{principal.user_id}",
+        _get_rate_limit(runtime, "write_rate_limit_per_minute"),
+        60,
+    )
+
+    files_dir = (
+        FilePath(runtime.settings.shared_fs_root)
+        / "users"
+        / principal.user_id
+        / "files"
+    )
+    try:
+        archive_path = safe_join(files_dir, filename)
+    except PathTraversalError:
+        raise _http_error("validation_error", "invalid filename", status_code=400)
+    if (
+        _is_hidden_relpath(filename)
+        or not archive_path.exists()
+        or not archive_path.is_file()
+    ):
+        raise _http_error("not_found", "file not found", status_code=404)
+    if not is_archive_filename(filename):
+        raise _http_error(
+            "validation_error",
+            "not an archive (.zip, .tar, .tar.gz, .tgz, .gz)",
+            status_code=400,
+        )
+
+    # Destination folder sits next to the archive, named after its stem.
+    dest_rel = FilePath(filename).parent / archive_stem(archive_path.name)
+    try:
+        dest_path = safe_join(files_dir, dest_rel.as_posix())
+    except PathTraversalError:
+        raise _http_error("validation_error", "invalid filename", status_code=400)
+    if dest_path.exists():
+        raise _http_error(
+            "conflict",
+            f"'{dest_rel.as_posix()}' already exists; delete it first",
+            status_code=409,
+        )
+
+    # Budgets scale with the user's plan: per-member = upload limit,
+    # total = 10x upload limit. Ratio and entry caps stop crafted bombs.
+    user = runtime.store.get_user(principal.user_id)
+    plan_tier = user.plan_tier if user else "free"
+    member_bytes = max(1, _get_plan_upload_limit(runtime, plan_tier))
+    limits = {
+        "max_entries": 1000,
+        "max_member_bytes": member_bytes,
+        "max_total_bytes": member_bytes * 10,
+        "max_ratio": 100,
+        "allowed_extensions": sorted(ALLOWED_UPLOAD_EXTENSIONS),
+    }
+    try:
+        report = await asyncio.to_thread(
+            extract_archive_sandboxed, str(archive_path), str(dest_path), limits
+        )
+    except ArchiveExtractionError as exc:
+        raise _http_error("validation_error", str(exc), status_code=413)
+    except SandboxError as exc:
+        logger.warning(
+            "archive_extraction_sandbox_failed",
+            user_id=principal.user_id,
+            filename=filename,
+            error=str(exc),
+        )
+        raise _http_error(
+            "validation_error", f"extraction failed: {exc}", status_code=422
+        )
+
+    chunk_count = None
+    if context_id:
+        _get_owned_context(runtime, context_id, principal)
+        chunk_count = runtime.rag.ingest_path(
+            context_id,
+            str(dest_path),
+            recursive=True,
+            chunk_size=chunk_size,
+            allowed_base=files_dir,
+        )
+
+    logger.info(
+        "archive_extracted",
+        user_id=principal.user_id,
+        filename=filename,
+        files=len(report["extracted"]),
+        skipped=len(report["skipped"]),
+        total_bytes=report["total_bytes"],
+    )
+    return Envelope(
+        status="ok",
+        data={
+            "extracted_to": dest_rel.as_posix(),
+            "files": report["extracted"],
+            "skipped": report["skipped"],
+            "total_bytes": report["total_bytes"],
+            "chunk_count": chunk_count,
+        },
+    )
 
 
 @router.get("/conversations/{conversation_id}/messages", response_model=Envelope, tags=["conversations"])
@@ -3742,7 +4532,133 @@ async def get_conversation(
             title=conversation.title,
             status=conversation.status,
             active_context_id=conversation.active_context_id,
+            public=bool((conversation.meta or {}).get("public")),
         ),
+    )
+
+
+@router.post(
+    "/conversations/{conversation_id}/share", response_model=Envelope, tags=["conversations"]
+)
+async def share_conversation(
+    body: ConversationShareRequest,
+    conversation_id: str = Path(..., max_length=255, description="Conversation identifier"),
+    principal: AuthContext = Depends(get_user),
+):
+    """Toggle public sharing for a conversation.
+
+    Conversations are private by default; the owner can publish one to the
+    read-only /share/{id} page and unpublish it again at any time.
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        f"write:{principal.user_id}",
+        _get_rate_limit(runtime, "write_rate_limit_per_minute"),
+        60,
+    )
+    conversation = runtime.store.set_conversation_public(
+        conversation_id, user_id=principal.user_id, public=body.public
+    )
+    if not conversation:
+        raise NotFoundError(
+            "conversation not found", detail={"conversation_id": conversation_id}
+        )
+    logger.info(
+        "conversation_share_toggled",
+        user_id=principal.user_id,
+        conversation_id=conversation_id,
+        public=body.public,
+    )
+    return Envelope(
+        status="ok",
+        data={
+            "conversation_id": conversation.id,
+            "public": bool((conversation.meta or {}).get("public")),
+            "share_path": f"/share/{conversation.id}",
+        },
+    )
+
+
+# =========================================================================
+# Public (unauthenticated) read-only access to shared conversations.
+# The share directory and pages are noindex by default (SPEC §18): both the
+# API and page responses carry X-Robots-Tag, and robots.txt disallows /share/.
+# =========================================================================
+
+_PUBLIC_NOINDEX = {"X-Robots-Tag": "noindex, nofollow"}
+
+
+@router.get("/public/conversations", response_model=Envelope, tags=["public"])
+async def list_public_conversations(
+    response: Response,
+    limit: Optional[int] = Query(None, ge=1, le=100),
+):
+    """Directory of publicly shared conversations (unauthenticated)."""
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        "public:read",
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        60,
+    )
+    response.headers.update(_PUBLIC_NOINDEX)
+    items = runtime.store.list_public_conversations(limit=limit or 50)
+    return Envelope(
+        status="ok",
+        data={
+            "items": [
+                {
+                    "id": c.id,
+                    "title": c.title or "Untitled conversation",
+                    "updated_at": c.updated_at,
+                }
+                for c in items
+            ]
+        },
+    )
+
+
+@router.get(
+    "/public/conversations/{conversation_id}", response_model=Envelope, tags=["public"]
+)
+async def get_public_conversation(
+    response: Response,
+    conversation_id: str = Path(..., max_length=255),
+):
+    """Read a publicly shared conversation (unauthenticated).
+
+    Only role, content, and timestamps are exposed — message metadata,
+    adapter traces, and owner identity stay private.
+    """
+    runtime = get_runtime()
+    await _enforce_rate_limit(
+        runtime,
+        "public:read",
+        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        60,
+    )
+    response.headers.update(_PUBLIC_NOINDEX)
+    conversation = runtime.store.get_public_conversation(conversation_id)
+    if not conversation:
+        raise NotFoundError(
+            "conversation not found", detail={"conversation_id": conversation_id}
+        )
+    messages = runtime.store.list_messages(
+        conversation_id, limit=500, user_id=conversation.user_id
+    )
+    ordered = sorted(messages, key=lambda m: m.created_at)
+    return Envelope(
+        status="ok",
+        data={
+            "id": conversation.id,
+            "title": conversation.title or "Shared conversation",
+            "updated_at": conversation.updated_at,
+            "messages": [
+                {"role": m.role, "content": m.content, "created_at": m.created_at}
+                for m in ordered
+            ],
+        },
     )
 
 
@@ -3814,6 +4730,9 @@ async def list_contexts(
         cursor=cursor,
         include_sentinel=True,
     )
+    # Per-conversation attachment contexts are an implementation detail of the
+    # attach-to-conversation flow; they never appear in the contexts UI.
+    contexts = [c for c in contexts if not is_auto_context(c)]
     has_next = len(contexts) > resolved_page_size
     page_contexts = contexts[:resolved_page_size]
     next_cursor = None
@@ -4225,10 +5144,12 @@ async def websocket_chat(ws: WebSocket):
             workflow_slot_acquired = True
 
         convo_id = init.get("conversation_id")
+        needs_title = not convo_id
         if convo_id:
             conversation = _get_owned_conversation(runtime, convo_id, auth_ctx)
         else:
-            # Generate title from first message for new conversations
+            # Placeholder title; a model-written one replaces it once the turn
+            # completes (see _schedule_turn_labels).
             user_message = init.get("message", "")
             auto_title = _generate_conversation_title(user_message)
             conversation = runtime.store.create_conversation(
@@ -4238,7 +5159,7 @@ async def websocket_chat(ws: WebSocket):
         context_id = init.get("context_id") or conversation.active_context_id
         if context_id:
             _get_owned_context(runtime, context_id, auth_ctx)
-        runtime.store.append_message(
+        ws_user_msg = runtime.store.append_message(
             convo_id, sender="user", role="user", content=init.get("message", "")
         )
 
@@ -4386,6 +5307,19 @@ async def websocket_chat(ws: WebSocket):
             )
             await _store_idempotency_result("chat:ws", user_id, idempotency_key, envelope)
 
+            _schedule_turn_labels(
+                runtime,
+                conversation_id=convo_id,
+                user_id=user_id,
+                user_message_id=getattr(ws_user_msg, "id", None),
+                user_content=init.get("message", ""),
+                assistant_content=assistant_content,
+                set_title=needs_title,
+            )
+            _schedule_conversation_digest(
+                runtime, conversation_id=convo_id, user_id=user_id
+            )
+
             # Send final event with message_id and conversation_id to client
             # SPEC §18: Valid events are token, message_done, error, cancel_ack, trace
             await ws.send_json({
@@ -4393,6 +5327,10 @@ async def websocket_chat(ws: WebSocket):
                 "data": {
                     "message_id": assistant_msg.id,
                     "conversation_id": convo_id,
+                    # The full reply, so a client that received no token events
+                    # can still render it. Tool-calling nodes (the attachment
+                    # agent) return their answer at once rather than streaming.
+                    "content": assistant_content,
                     "adapters": adapter_names,
                     "adapter_gates": orchestration_dict.get("adapter_gates", []),
                     "usage": orchestration_dict.get("usage", {}),
