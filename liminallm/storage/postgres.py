@@ -1878,6 +1878,43 @@ class PostgresStore:
             ).fetchall()
         return [self._row_to_note(r) for r in rows]
 
+    def save_sweep_report(self, user_id: str, report: dict) -> dict:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO sweep_report (user_id, report)
+                VALUES (%s, %s) RETURNING id, user_id, created_at, report
+                """,
+                (user_id, json.dumps(report)),
+            ).fetchone()
+        return {
+            "id": str(row["id"]),
+            "user_id": str(row["user_id"]),
+            "created_at": row["created_at"],
+            "report": row["report"] if isinstance(row["report"], dict)
+            else json.loads(row["report"]),
+        }
+
+    def list_sweep_reports(self, user_id: str, limit: int = 10) -> List[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, user_id, created_at, report FROM sweep_report
+                WHERE user_id = %s ORDER BY created_at DESC LIMIT %s
+                """,
+                (user_id, limit),
+            ).fetchall()
+        out = []
+        for row in rows:
+            report = row["report"]
+            out.append({
+                "id": str(row["id"]),
+                "user_id": str(row["user_id"]),
+                "created_at": row["created_at"],
+                "report": report if isinstance(report, dict) else json.loads(report),
+            })
+        return out
+
     # conversations
     def create_conversation(
         self,

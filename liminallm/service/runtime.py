@@ -237,6 +237,9 @@ class Runtime:
             clusterer=self.clusterer,
             poll_interval=poll_interval,
             leader_lock=self.leader_lock,
+            # Lets the worker re-embed vectors left behind by a previous
+            # encoder; a hash encoder makes the sweep a no-op.
+            embeddings=self.embeddings,
         )
         self._local_idempotency: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         self._local_idempotency_lock = asyncio.Lock()

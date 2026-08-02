@@ -39,6 +39,10 @@ DEFAULT_CLUSTER_INTERVAL_SECONDS = 15 * 60
 DEFAULT_CLUSTER_USER_LIMIT = 50
 DEFAULT_CLUSTER_EVENT_LIMIT = 500
 DEFAULT_ADAPTER_PRUNE_INTERVAL_SECONDS = 6 * 60 * 60
+DEFAULT_REEMBED_INTERVAL_SECONDS = 60 * 60
+# Bounded per pass: a vault that changed encoders converges over several
+# passes instead of stalling the worker (or the provider) on one.
+REEMBED_BATCH = 100
 ADAPTER_PRUNE_MIN_USAGE = 2
 ADAPTER_PRUNE_MAX_SUCCESS = 0.25
 ADAPTER_PRUNE_STALE_DAYS = 7
@@ -65,6 +69,8 @@ class TrainingWorker:
         cluster_user_limit: int = DEFAULT_CLUSTER_USER_LIMIT,
         cluster_event_limit: int = DEFAULT_CLUSTER_EVENT_LIMIT,
         adapter_prune_interval: int = DEFAULT_ADAPTER_PRUNE_INTERVAL_SECONDS,
+        reembed_interval: int = DEFAULT_REEMBED_INTERVAL_SECONDS,
+        embeddings=None,
         leader_lock: Optional["AdvisoryLock"] = None,
     ) -> None:
         self.store = store
@@ -78,6 +84,9 @@ class TrainingWorker:
         self.cluster_user_limit = cluster_user_limit
         self.cluster_event_limit = cluster_event_limit
         self.adapter_prune_interval = adapter_prune_interval
+        self.reembed_interval = reembed_interval
+        # Needed to re-embed after an encoder change; None disables the sweep.
+        self.embeddings = embeddings
         # Periodic clustering and prune proposals are cluster-wide work, not
         # per-replica work: without this lock every replica repeats them.
         # Queued jobs need no lock — claim_training_job() is an atomic
@@ -87,6 +96,7 @@ class TrainingWorker:
         self._task: Optional[asyncio.Task] = None
         self._last_cluster_run: float = 0.0
         self._last_prune_run: float = 0.0
+        self._last_reembed_run: float = 0.0
 
     async def start(self) -> None:
         """Start the background worker."""
@@ -118,6 +128,7 @@ class TrainingWorker:
                 await self._process_queued_jobs()
                 await self._maybe_run_periodic_clustering()
                 await self._maybe_recommend_adapter_pruning()
+                await self._maybe_reembed_stale_vectors()
                 consecutive_errors = 0
             except Exception as exc:
                 consecutive_errors += 1
@@ -309,6 +320,77 @@ class TrainingWorker:
                         adapter_id=state.artifact_id,
                         error=str(exc),
                     )
+
+    async def _maybe_reembed_stale_vectors(self) -> None:
+        """Re-embed vectors written by a previous encoder, cluster-wide once.
+
+        Encoder changes are otherwise handled lazily: a vector whose recorded
+        encoder differs reads as "not embedded" and is recomputed only when
+        something reads it. Notes and messages nobody opens would keep stale
+        vectors indefinitely and quietly drop out of semantic search. This is
+        the sweep that closes that gap.
+        """
+        embeddings = self.embeddings
+        if embeddings is None or not getattr(embeddings, "is_semantic", False):
+            return  # hash vectors have no encoder identity to go stale
+        if self.reembed_interval <= 0:
+            return
+        now = time.monotonic()
+        if self._last_reembed_run and (now - self._last_reembed_run) < self.reembed_interval:
+            return
+        self._last_reembed_run = now
+        async with self.leader_lock.try_hold("training_worker:reembed") as leader:
+            if not leader:
+                logger.debug("reembed_skipped_not_leader")
+                return
+            done = await asyncio.to_thread(self._reembed_batch)
+            if done:
+                logger.info("reembed_sweep_completed", vectors=done)
+
+    def _reembed_batch(self) -> int:
+        """Re-embed up to REEMBED_BATCH stale note vectors. Returns the count."""
+        embeddings = self.embeddings
+        model_id = getattr(embeddings, "model_id", "")
+        lister = getattr(self.store, "list_users", None)
+        updater = getattr(self.store, "update_note", None)
+        note_lister = getattr(self.store, "list_notes", None)
+        if not all(callable(f) for f in (lister, updater, note_lister)):
+            return 0
+
+        done = 0
+        try:
+            users = list(lister(limit=self.cluster_user_limit))
+        except Exception as exc:  # noqa: BLE001 - sweep is best-effort
+            logger.warning("reembed_user_list_failed", error=str(exc))
+            return 0
+
+        for user in users:
+            if done >= REEMBED_BATCH:
+                break
+            try:
+                notes = note_lister(user.id, limit=1000)
+            except Exception:  # noqa: BLE001
+                continue
+            for note in notes:
+                if done >= REEMBED_BATCH:
+                    break
+                stale = (note.meta or {}).get("embedding_model") not in (None, model_id)
+                if note.embedding and not stale:
+                    continue
+                text = f"{note.title}\n{note.content}"[:8000]
+                if not text.strip():
+                    continue
+                try:
+                    vector = embeddings.embed(text)
+                    updater(note.id, embedding=vector)
+                    meta_updater = getattr(self.store, "update_note_meta", None)
+                    if callable(meta_updater):
+                        meta_updater(note.id, {"embedding_model": model_id})
+                    done += 1
+                except Exception as exc:  # noqa: BLE001 - provider hiccup
+                    logger.warning("reembed_failed", note_id=note.id, error=str(exc))
+                    return done  # stop this pass; the next one resumes
+        return done
 
     async def _process_queued_jobs(self) -> None:
         """Process a batch of queued training jobs."""

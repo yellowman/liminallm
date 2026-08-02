@@ -2351,6 +2351,33 @@ async def notes_graph(principal: AuthContext = Depends(get_user)):
     )
 
 
+@router.get("/notes/sweeps", response_model=Envelope, tags=["notes"])
+async def list_sweep_reports(
+    limit: int = 10, principal: AuthContext = Depends(get_user)
+):
+    """Past sweep reports, newest first — replay without re-spending calls."""
+    runtime = get_runtime()
+    _require_notes_enabled(runtime)
+    lister = getattr(runtime.store, "list_sweep_reports", None)
+    if not callable(lister):
+        return Envelope(status="ok", data={"sweeps": []})
+    rows = lister(principal.user_id, limit=max(1, min(limit, 50)))
+    return Envelope(
+        status="ok",
+        data={"sweeps": [
+            {
+                "id": r["id"],
+                "created_at": r["created_at"].isoformat(),
+                "contradictions": (r["report"] or {}).get("contradictions", 0),
+                "evolutions": (r["report"] or {}).get("evolutions", 0),
+                "judged": (r["report"] or {}).get("judged", 0),
+                "report": r["report"],
+            }
+            for r in rows
+        ]},
+    )
+
+
 @router.get("/notes/{note_id}", response_model=Envelope, tags=["notes"])
 async def get_note(note_id: str, principal: AuthContext = Depends(get_user)):
     runtime = get_runtime()
@@ -2463,6 +2490,16 @@ async def sweep_vault(principal: AuthContext = Depends(get_user)):
         runtime.llm,
         principal.user_id,
     )
+    # A sweep costs up to 30 model calls; keep the result so a reload replays
+    # it for free and the user has a record of what moved (SPEC 19.6).
+    saver = getattr(runtime.store, "save_sweep_report", None)
+    if callable(saver):
+        try:
+            saved = await asyncio.to_thread(saver, principal.user_id, report)
+            report = {**report, "id": saved["id"],
+                      "created_at": saved["created_at"].isoformat()}
+        except Exception as exc:  # noqa: BLE001 - archiving must not fail a sweep
+            logger.warning("sweep_report_save_failed", error=str(exc))
     return Envelope(status="ok", data=report)
 
 

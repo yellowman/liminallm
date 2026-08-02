@@ -489,6 +489,17 @@ class Settings(BaseModel):
             "not just a recency prefix. 0 disables recall."
         ),
     )
+    embedding_vector_dim: int = env_field(
+        1536,
+        "EMBEDDING_VECTOR_DIM",
+        description=(
+            "Dimension of the pgvector embedding column. MUST match the "
+            "configured encoder (1536 for text-embedding-3-small, 64 for the "
+            "hash fallback) — pgvector cannot index a dimensionless column. "
+            "Read by scripts/migrate.sh; changing it requires re-running "
+            "migrations and re-embedding."
+        ),
+    )
     model_context_window: int = env_field(
         0,
         "MODEL_CONTEXT_WINDOW",

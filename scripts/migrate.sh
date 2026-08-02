@@ -24,7 +24,11 @@ for sql_file in "${sorted_files[@]}"; do
   echo "Applying ${sql_file}"
   # ON_ERROR_STOP + single transaction: a failing statement aborts the file and
   # exits non-zero (tripping set -e) instead of leaving a half-applied schema.
-  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 --single-transaction -f "$sql_file"
+  # embedding_dim must match the configured encoder (EMBEDDING_VECTOR_DIM):
+  # pgvector cannot build an ivfflat index on a dimensionless column.
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+    -v embedding_dim="${EMBEDDING_VECTOR_DIM:-1536}" \
+    --single-transaction -f "$sql_file"
 done
 
 # Apply optional seed files if present (using glob pattern)

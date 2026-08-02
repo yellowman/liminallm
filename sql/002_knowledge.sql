@@ -1,5 +1,14 @@
 -- Knowledge context and chunk tables for RAG
 CREATE EXTENSION IF NOT EXISTS vector;
+
+-- pgvector requires a fixed dimension to build an ivfflat index; a bare
+-- VECTOR column fails with "column does not have dimensions". The size
+-- must match the configured encoder (EMBEDDING_VECTOR_DIM: 1536 for
+-- text-embedding-3-small, 64 for the built-in hash fallback).
+\if :{?embedding_dim}
+\else
+\set embedding_dim 1536
+\endif
 CREATE TABLE IF NOT EXISTS knowledge_context (
   id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
   owner_user_id   UUID NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
@@ -25,7 +34,7 @@ CREATE TABLE IF NOT EXISTS knowledge_chunk (
   fs_path         TEXT NOT NULL,
   chunk_index     INT NOT NULL,
   content         TEXT NOT NULL,
-  embedding       VECTOR NOT NULL,
+  embedding       VECTOR(:embedding_dim) NOT NULL,
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
   meta            JSONB
 );

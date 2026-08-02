@@ -93,6 +93,7 @@ class MemoryStore:
         self.conversations: Dict[str, Conversation] = {}
         self.messages: Dict[str, List[Message]] = {}
         self.notes: Dict[str, Note] = {}
+        self.sweep_reports: List[dict] = []
         self.note_links: Dict[str, List[str]] = {}
         self.credentials: Dict[str, tuple[str, str]] = {}
         self.providers: List[UserAuthProvider] = []
@@ -724,6 +725,23 @@ class MemoryStore:
             for n in self.notes.values()
             if n.user_id == user_id and title_key in (n.meta or {}).get("dangling", [])
         ]
+
+    def save_sweep_report(self, user_id: str, report: dict) -> dict:
+        with self._data_lock:
+            row = {
+                "id": str(uuid.uuid4()),
+                "user_id": user_id,
+                "created_at": datetime.utcnow(),
+                "report": dict(report),
+            }
+            self.sweep_reports.append(row)
+            self._persist_state()
+            return row
+
+    def list_sweep_reports(self, user_id: str, limit: int = 10) -> List[dict]:
+        rows = [r for r in self.sweep_reports if r["user_id"] == user_id]
+        rows.sort(key=lambda r: r["created_at"], reverse=True)
+        return rows[:limit]
 
     # chat
     def create_conversation(
