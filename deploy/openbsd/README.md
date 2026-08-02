@@ -51,11 +51,7 @@ psql -d liminallm -c "CREATE EXTENSION vector;"
 psql -d liminallm -c "CREATE EXTENSION citext;"
 
 # Run migrations
-psql -d liminallm -f /var/liminallm/sql/000_base.sql
-psql -d liminallm -f /var/liminallm/sql/001_artifacts.sql
-psql -d liminallm -f /var/liminallm/sql/002_knowledge.sql
-psql -d liminallm -f /var/liminallm/sql/003_preferences.sql
-psql -d liminallm -f /var/liminallm/sql/004_runtime_config.sql
+psql -d liminallm -v embedding_dim=1536 -f /var/liminallm/sql/schema.sql
 ```
 
 ### 4. Configure Redis

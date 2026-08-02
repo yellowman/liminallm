@@ -276,6 +276,17 @@ class PostgresStore:
                 """
             )
 
+    @staticmethod
+    def _configured_embedding_dim() -> Optional[int]:
+        """Vector width the configured encoder produces, if knowable."""
+        try:
+            from liminallm.config import get_settings
+
+            dim = int(getattr(get_settings(), "embedding_vector_dim", 0) or 0)
+            return dim or None
+        except Exception:  # noqa: BLE001 - never block startup on config read
+            return None
+
     def _verify_required_schema(self) -> None:
         """Ensure core tables and pgvector expectations exist before serving requests."""
 
@@ -324,6 +335,28 @@ class PostgresStore:
                 raise RuntimeError(
                     "pgvector extension is missing. Install it and rerun scripts/migrate.sh to satisfy SPEC §3 RAG requirements."
                 )
+
+            # The embedding column's dimension is fixed at schema time and the
+            # encoder's is fixed at runtime; if they disagree, every chunk
+            # insert fails later with an opaque pgvector error. Say so now,
+            # with the two numbers and the fix.
+            column_dim = conn.execute(
+                """
+                SELECT atttypmod FROM pg_attribute
+                WHERE attrelid = 'knowledge_chunk'::regclass AND attname = 'embedding'
+                """
+            ).fetchone()
+            configured = self._configured_embedding_dim()
+            if column_dim and configured:
+                actual = int(column_dim["atttypmod"])
+                if actual > 0 and actual != configured:
+                    raise RuntimeError(
+                        f"embedding dimension mismatch: knowledge_chunk.embedding "
+                        f"is vector({actual}) but the configured encoder produces "
+                        f"{configured}-d vectors. Set EMBEDDING_VECTOR_DIM={configured} "
+                        f"and re-apply sql/schema.sql, or configure an encoder "
+                        f"matching vector({actual})."
+                    )
 
             citext_ext = conn.execute(
                 "SELECT extname FROM pg_extension WHERE extname = 'citext'"

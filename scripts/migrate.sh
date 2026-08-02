@@ -1,47 +1,30 @@
 #!/usr/bin/env bash
+# Apply the liminallm schema (sql/schema.sql).
+#
+# Not a migration runner: there is no migration history. The schema is a
+# single idempotent file, so this is safe to re-run against an existing
+# database — it creates what is missing and leaves the rest alone.
 set -euo pipefail
 
 : "${DATABASE_URL:?DATABASE_URL must be set}"
 
-# Change to script directory for consistent relative paths
 cd "$(dirname "$0")/.."
 
-# Apply numbered migration files in order (using glob pattern, sorted by filename)
-shopt -s nullglob
-sql_files=(sql/*.sql)
-shopt -u nullglob
+# embedding_dim must match the configured encoder (EMBEDDING_VECTOR_DIM):
+# pgvector cannot build an ivfflat index on a dimensionless column, and a
+# vector of the wrong size is rejected on insert.
+echo "Applying sql/schema.sql (embedding_dim=${EMBEDDING_VECTOR_DIM:-1536})"
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -v embedding_dim="${EMBEDDING_VECTOR_DIM:-1536}" \
+  --single-transaction -f sql/schema.sql
 
-if [[ ${#sql_files[@]} -eq 0 ]]; then
-  echo "No migration files found in sql/"
-  exit 0
-fi
-
-# Sort files by name - use printf to put each file on its own line
-# Bug fix: ${sql_files[*]} with default IFS puts all files on one line
-mapfile -t sorted_files < <(printf '%s\n' "${sql_files[@]}" | sort)
-
-for sql_file in "${sorted_files[@]}"; do
-  echo "Applying ${sql_file}"
-  # ON_ERROR_STOP + single transaction: a failing statement aborts the file and
-  # exits non-zero (tripping set -e) instead of leaving a half-applied schema.
-  # embedding_dim must match the configured encoder (EMBEDDING_VECTOR_DIM):
-  # pgvector cannot build an ivfflat index on a dimensionless column.
-  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
-    -v embedding_dim="${EMBEDDING_VECTOR_DIM:-1536}" \
-    --single-transaction -f "$sql_file"
-done
-
-# Apply optional seed files if present (using glob pattern)
+# Optional seed data, if any is present.
 shopt -s nullglob
 seed_files=(sql/seed/*.sql)
 shopt -u nullglob
+for seed_file in "${seed_files[@]}"; do
+  echo "Seeding ${seed_file}"
+  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 --single-transaction -f "$seed_file"
+done
 
-if [[ ${#seed_files[@]} -gt 0 ]]; then
-  echo "Applying seed files"
-  # Bug fix: Use printf to put each file on its own line for proper sorting
-  mapfile -t sorted_seeds < <(printf '%s\n' "${seed_files[@]}" | sort)
-  for seed_file in "${sorted_seeds[@]}"; do
-    echo "Applying ${seed_file}"
-    psql "$DATABASE_URL" -v ON_ERROR_STOP=1 --single-transaction -f "$seed_file"
-  done
-fi
+echo "Schema applied."
