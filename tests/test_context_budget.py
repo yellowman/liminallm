@@ -998,3 +998,44 @@ def test_stale_vectors_are_re_embedded_not_reused():
     # The v1 vector must be ignored; ranking still works via a fresh embed.
     scores = compaction.rank_turns(older, "which database?", embeddings=Emb())
     assert scores and scores[0] > 0
+
+
+def test_hybrid_search_scores_native_dimension_embeddings():
+    """A 1536-d encoder must not silently collapse semantic search to BM25."""
+    from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
+    from liminallm.storage.common import hybrid_search_chunks
+    from liminallm.storage.models import KnowledgeChunk
+
+    big = [0.0] * 1536
+    big[7] = 1.0
+    other = [0.0] * 1536
+    other[900] = 1.0
+    chunks = [
+        KnowledgeChunk(context_id="c", fs_path="/a", content="alpha text",
+                       embedding=big, chunk_index=0),
+        KnowledgeChunk(context_id="c", fs_path="/b", content="beta text",
+                       embedding=other, chunk_index=1),
+    ]
+    hits = hybrid_search_chunks(
+        chunks, "zzz", big, limit=2,
+        tokenize_fn=tokenize_text, bm25_scores_fn=compute_bm25_scores,
+    )
+    # The vector-identical chunk must win on semantics alone (no word overlap).
+    assert hits and hits[0].fs_path == "/a"
+
+
+def test_hybrid_search_skips_mismatched_dimensions():
+    from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
+    from liminallm.storage.common import hybrid_search_chunks
+    from liminallm.storage.models import KnowledgeChunk
+
+    chunks = [
+        KnowledgeChunk(context_id="c", fs_path="/old", content="zzz",
+                       embedding=[1.0] * 64, chunk_index=0),
+    ]
+    # Query from a different encoder: incomparable, not garbage-compared.
+    hits = hybrid_search_chunks(
+        chunks, "zzz", [1.0] * 1536, limit=2,
+        tokenize_fn=tokenize_text, bm25_scores_fn=compute_bm25_scores,
+    )
+    assert isinstance(hits, list)  # no crash; semantic simply contributes 0

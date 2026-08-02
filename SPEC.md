@@ -307,13 +307,18 @@ USING ivfflat (embedding) WITH (lists = 100);
 - **parsers**: text, markdown, PDF (pdftotext), HTML (readability). Additional parsers can be registered via `artifact` type `tool.spec`.
 - **chunking**: sliding window token-based splitter (e.g., 300–500 tokens with 50 token overlap) tuned per file type; store `chunk_index` and offsets.
 - **hygiene**: dedupe by file checksum + path; skip binary blobs unless parser registered; enforce max file size per plan tier; optional PII-scrub per context.
-- **embedding model**: fixed small encoder (e.g., `all-MiniLM` equivalent) referenced in config; keep version in `knowledge_context.meta.embedding_model`.
+- **embedding model** *(revised — the original text assumed the hash fallback was the only encoder)*: the encoder is resolved from the model backend, not pinned to a named local model. when the backend exposes an openai-compatible `/embeddings` client (openai, gemini-compat, vllm/lorax self-hosted), embeddings go through it at the provider's **native** dimensionality; otherwise the kernel's deterministic hash embedding applies. the encoder id is recorded with every vector (`knowledge_chunk.meta.embedding_model_id`, `note.meta`, `message.meta.embedding_model`).
+- **`EmbeddingsService.is_semantic`**: the load-bearing honesty flag. hash-embedding cosine is *noise*, not weak signal — so every consumer that would blend cosine into a ranking checks this flag and falls back to bm25 alone when it is false. blending noise at any weight is worse than keywords alone.
+- **two spaces, deliberately**:
+  - *retrieval space* (rag chunks, notes, message recall): native dimensionality, provider encoder, compared only against vectors carrying the same encoder id.
+  - *routing/clustering space* (`preference_event.context_embedding`, `adapter_router_state.centroid_vec`): always the 64-d hash embedding via `deterministic_embedding`. this is intentional — clustering compares vectors across users and months, so it needs a space that is stable and free, and that does not shift when an admin swaps embedding providers.
+- **dimension handling is dynamic, never pinned**: retrieval validates that query and chunk share a dimension rather than asserting 64. pinning it to `EMBEDDING_DIM` made every real-encoder query fail validation and silently score 0 — collapsing semantic search to bm25 while appearing to work. a chunk from a different encoder scores 0 rather than being garbage-compared.
 - **embedding dimensionality**: 64-d (`EMBEDDING_DIM`) is the *hash-fallback* size and remains mandatory for routing and clustering, where vectors from many contexts are compared in one space.
   **amended:** external providers persist their **native** dimensionality (e.g. 1536) for rag chunks, notes, and message recall. truncating a real 1536-d embedding to 64-d discards most of the signal the encoder exists to provide — obeying the original rule would defeat semantic retrieval. the invariant that actually matters is *never compare vectors from different encoders*: every consumer records the encoder id alongside the vector (`knowledge_chunk.meta.embedding_model_id`, `note.meta`, `message.meta.embedding_model`) and filters on it; a mismatch is treated as "not embedded", so the backfill re-embeds rather than comparing across spaces.
   **operational consequence (unverified here):** `knowledge_chunk.embedding` is declared bare `VECTOR` and indexed `USING ivfflat`. pgvector requires a fixed dimension for an ivfflat/hnsw index, so a deployment mixing dimensions in that column — or indexing an unconstrained one — needs the column pinned to the chosen encoder's size (`VECTOR(1536)`) and a re-index when the encoder changes. this container has no pgvector, so it was not verified live; flagged rather than assumed working.
 - **refresh cadence**:
   - watch filesystem path events; enqueue ingestion job on file change.
-  - periodic sweep (daily) to re-embed if encoder version changes.
+  - encoder change is handled by *invalidation*, not a sweep: a vector whose recorded encoder id differs from the current one reads as "not embedded", so the normal backfill re-embeds it lazily. no daily job exists — a scheduled re-embed is still open work, and until it lands, old vectors are re-embedded only when something reads them.
 - **retrieval strategy**:
   - primary path: pgvector `ORDER BY embedding <-> $query LIMIT k` filtered by `context_id`.
   - optional re-ranking via lightweight cross-encoder tool if available.
@@ -1507,11 +1512,15 @@ that’s the whole point: minimal glue, maximal evolution.
 ### 17.1 layout architecture
 
 - **sidebar-main layout**: persistent conversation list sidebar (280px) with main content area.
-- **tab navigation**: four primary tabs organize functionality:
+- **tab navigation**: primary tabs organize functionality:
   - **Chat**: conversation interface with message streaming
+  - **Notes**: the vault — editor, link graph, witness (§19; hidden when `notes_enabled` is off)
   - **Contexts**: knowledge context management
   - **Artifacts**: system artifact browser
+  - **Tools**: tool specs and workflows
+  - **Insights**: preference clusters
   - **Settings**: user preferences and session info
+- tab data loads lazily on first activation; login preloads only what the chat needs.
 - responsive breakpoints: sidebar hidden on mobile (<1080px), single-column tabs on small screens (<640px).
 
 ### 17.2 conversation sidebar
@@ -1533,6 +1542,26 @@ that’s the whole point: minimal glue, maximal evolution.
 - **collapsible sections**:
   - **Upload knowledge**: file upload with context selection and chunk size configuration.
   - **Preferences**: thumbs up/down feedback with optional notes, displays routing metadata and trace.
+- **typography**: assistant prose is set in a serif column with a github-grade
+  markdown renderer (escape-first: html-escape, then rewrite to a fixed safe
+  tag set; nested/task lists, aligned tables, blockquotes, autolinks,
+  backslash escapes, and lightweight syntax highlighting across nine language
+  families). streaming batches dom writes with `requestAnimationFrame`,
+  auto-closes a dangling code fence mid-stream, and only auto-scrolls when the
+  reader is already near the bottom.
+- **per-message controls**: a copy button on every user and model message.
+- **tool activity**: while the agent loop runs, the typing indicator names the
+  tool in flight; injection findings surface as a warning on the message.
+- **attachments**: drag-and-drop or attach-button chips in the composer;
+  uploads bind to the conversation automatically (§19.5 tier 1).
+- **sharing**: conversations are private by default. a "Share It" control
+  publishes a read-only page; the public directory and shared pages carry
+  `noindex, nofollow` and a matching `robots.txt`, so sharing never means
+  indexing.
+- **turn rail**: a right-hand rail of tick marks, one per turn, labeled with a
+  model-written description of that turn. hovering (or focusing) expands the
+  bars into a selector for jumping between turns; moving away collapses them
+  back. conversation titles are model-written too — never raw uuids.
 
 ### 17.4 context manager (Contexts tab)
 
@@ -1928,7 +1957,7 @@ less precisely" instead of "forgets entirely".
   depend on redis being up, which made "why did it forget that"
   unreproducible.
 
-### 20.3 compaction is lossy — so it is not the only mechanism
+### 20.4 compaction is lossy — so it is not the only mechanism
 
 a rolling digest re-summarizes its own previous output, which decays: each
 fold paraphrases the paraphrase, and specifics (chosen values, hard
@@ -1989,7 +2018,7 @@ model window:
 pruning order under pressure: recall drops before the digest, the digest
 before the verbatim tail — optional context yields to essential context.
 
-### 20.4 token counting
+### 20.5 token counting
 
 budget math is only as good as the count. resolution per backend:
 
@@ -2022,7 +2051,7 @@ budget math is only as good as the count. resolution per backend:
   without the bus the store write still lands, and without either,
   calibration is per-process — correct, just slower to converge.
 
-### 20.5 other model-specific hazards
+### 20.6 other model-specific hazards
 
 - **temperature**: reasoning models (o-series, gpt-5, gemini 3) reject a
   caller-supplied temperature with a 400 that fails the whole request. the
@@ -2033,5 +2062,110 @@ budget math is only as good as the count. resolution per backend:
   the 4096 generation constant, which rejected a pasted document that a
   large-window model handles trivially. validation can only reject; the
   model budget is enforced in the workflow, which can prune.
-- **embedding spaces** are already keyed by `embedding_model_id` when
-  retrieving chunks, so switching embedding models cannot mix vector spaces.
+- **embedding spaces**: rag chunks were already keyed by
+  `embedding_model_id`; message recall was not, so a model switch would have
+  ranked on vectors from a dead space. every consumer now records the encoder
+  id with the vector and treats a mismatch as "not embedded" (see §3).
+
+---
+
+## 21. tools the model can call for itself
+
+beyond `llm.generic` and `rag.answer_with_context_v1`, the agent loop offers
+tools conditionally — a schema is only spent when the capability can actually
+be used, so an empty vault or a disabled feature costs zero prompt tokens.
+
+| tool | offered when | returns |
+|---|---|---|
+| `file_search` | conversation has searchable attachments | excerpts + file names |
+| `run_python` | conversation has analyzable attachments | stdout of a sandboxed run |
+| `web_search` | web tools on **and** a provider+key configured | titles/urls/snippets |
+| `web_fetch` | web tools on | one page's visible text |
+| `note_search` | notes enabled **and** the user's vault is non-empty | vault excerpts |
+| `history_search` | turns have fallen outside the verbatim window (§20.3) | earlier turns, verbatim |
+
+### 21.1 untrusted content and the injection rule
+
+web pages, search results, attachments, notes, and recalled turns are all
+**data**, never instructions. containment is layered because this app targets
+weak local models, which drop a rule stated once:
+
+- **sanitize at source**: the html extractor drops what a human cannot see
+  (script/style/comments, `hidden`, `aria-hidden`, `display:none`,
+  `visibility:hidden`); zero-width and format characters are stripped; page
+  `<title>` is sanitized like body text — it escaped the envelope before it
+  was.
+- **structural containment**: fetched text is wrapped in
+  `<<<UNTRUSTED_WEB_CONTENT>>>` markers with marker-lookalikes neutralized
+  inside, so content cannot forge an envelope boundary. the `source` label is
+  defanged for the same reason.
+- **heuristic detection**: 14 injection patterns are scanned; matches are
+  redacted, counted, and reported both in the trace and as a warning banner
+  next to the payload the model reads.
+- **capability limits**: fetches refuse private, loopback, link-local, and
+  cloud-metadata addresses, re-checked on **every** redirect hop, with a byte
+  cap enforced by streaming rather than trusting `content-length`.
+- **the rule is repeated deliberately** in the system prompt, the tool
+  descriptions, and the payload envelope. tighten the phrasing, never the
+  repetition (see CLAUDE.md's prompt budget rule).
+
+**known gap:** findings inform but do not yet restrict. after a poisoned
+fetch the model may still call `run_python` in the same turn; only
+instructions stand between fetched text and the interpreter. taint that
+degrades capability (an `injection_tainted` session refusing further
+code execution) is the next step, and enforcement beating instruction is
+this codebase's own doctrine.
+
+### 21.2 sandboxing untrusted work
+
+two kinds of untrusted work run outside the api process:
+
+- **code interpreter** (`run_python`): spawned child with rlimits
+  (memory/cpu/file-size/no core dumps), wall-clock kill, network policy with
+  an empty allowlist, and import-level blocking of networking/process
+  modules. artifacts it publishes go through the same upload extension
+  allowlist as user uploads.
+- **file extraction** (§19.5): pillow, pypdf, expat, tesseract, and poppler
+  all parse attacker-controlled bytes, so all of it runs in a disposable
+  rlimited child with a hard pixel ceiling against decompression bombs.
+
+both share the honest limit: the child runs as the same uid as the server, so
+this converts api-process compromise into compromise of a short-lived capped
+process — not into nothing. a container or vm is the outer wall.
+
+### 21.3 archives
+
+un-archiving is streamed and budgeted, never trusting headers: entry count,
+per-member size, total size, and compression-ratio caps are enforced as bytes
+are read (zip bombs), and every member path is sanitized component-wise and
+re-joined through `safe_join` (zip slip). member type is checked with
+`stat.S_IFMT` because many writers store permissions with no type bits.
+
+---
+
+## 22. running more than one replica
+
+postgres and `SHARED_FS_ROOT` are the shared state; nothing in the app
+assumes it is the only process.
+
+- **probes**: `/readyz` is the load-balancer probe and returns 503 when
+  postgres or the filesystem is unusable. `/healthz` always returns 200 with
+  a per-dependency breakdown, so it can never drain a replica. **redis is
+  deliberately excluded from readiness** — every redis-backed feature has a
+  fallback, so a redis outage must degrade the fleet, not drain it.
+- **cluster bus** (`CLUSTER_BUS_BACKEND`, default `auto`): redis pub/sub when
+  reachable, else postgres `LISTEN`/`NOTIFY` — which is why redis stays
+  optional. a single-process deployment gets a no-op backend. carries
+  cross-replica cancellation (`POST /chat/cancel` reaching the worker that
+  holds the stream) and token-calibration sharing (§20.5). best-effort: if it
+  is down, cancel degrades to local-only and nothing else changes.
+- **leader-locked periodic work**: clustering and adapter-prune proposals
+  take a postgres advisory lock so they run once per interval cluster-wide,
+  not once per replica. training jobs need no lock — claiming one is an
+  atomic conditional update. the lock **fails open** when postgres is
+  unreachable: maintenance running twice beats never running.
+- **shared vs node-local storage**: every replica mounts the same
+  `SHARED_FS_ROOT` (adapters, artifacts, uploads). `INTERPRETER_SCRATCH_DIR`
+  must **not** be on it — throwaway per-call copies belong on local disk.
+- **sticky sessions are not required.** websockets are per-connection and
+  cancellation crosses the bus.

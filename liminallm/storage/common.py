@@ -121,21 +121,35 @@ def hybrid_search_chunks(
 
     # Compute semantic scores
     semantic_scores: List[float] = []
+    # Dimension is whatever the configured encoder produces (64-d for the hash
+    # fallback, 1536-d for a real provider). Pinning this to EMBEDDING_DIM
+    # made every real-encoder query fail validation and silently score 0,
+    # collapsing semantic search to BM25 — the exact failure the switch to
+    # real embeddings was meant to end. What must hold is that query and
+    # chunk come from the same space, so compare dimensions instead.
     try:
         normalized_query = (
-            validated_embedding(query_embedding, expected_dim=EMBEDDING_DIM, name="query_embedding")
+            validated_embedding(
+                query_embedding, expected_dim=len(query_embedding),
+                name="query_embedding",
+            )
             if query_embedding
             else []
         )
     except ValueError:
         normalized_query = []
+    query_dim = len(normalized_query)
     for ch in candidates:
         if not normalized_query or not ch.embedding:
             semantic_scores.append(0.0)
             continue
+        if len(ch.embedding) != query_dim:
+            # A chunk embedded by a different encoder: not comparable.
+            semantic_scores.append(0.0)
+            continue
         try:
             chunk_embedding = validated_embedding(
-                ch.embedding, expected_dim=EMBEDDING_DIM, name="chunk_embedding"
+                ch.embedding, expected_dim=query_dim, name="chunk_embedding"
             )
         except ValueError:
             semantic_scores.append(0.0)
