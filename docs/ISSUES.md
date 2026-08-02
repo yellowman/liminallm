@@ -1,6 +1,6 @@
 # Codebase Issues and Security Audit
 
-**Last Updated:** 2025-12-09
+**Last Updated:** 2026-07-24
 **Scope:** Comprehensive review against SPEC.md requirements (12th pass)
 
 ---
@@ -6824,4 +6824,243 @@ The following bugs were identified and fixed:
 **Issue:** The refresh rate limit key combined client IP with the user-supplied tenant hint before validating it. Attackers could rotate fake tenant IDs to obtain separate buckets and bypass throttling.
 
 **Fix:** The refresh rate limit now keys solely on client IP, avoiding unvalidated tenant hints in the bucket namespace.
+
+---
+
+## 13th Pass: End-to-End Browser Testing Against a Live Model (2026-07-24)
+
+Methodology change from prior passes: instead of code review, every button on
+both pages was driven with Playwright against a running server (TEST_MODE,
+in-memory store), then the full chat flow was exercised against a live LLM
+backend (an OpenAI-compatible bridge) including token streaming, multi-turn
+conversation, and RAG. All findings below were discovered at runtime, fixed,
+and re-verified in the browser; the unit suite (481 tests) passes throughout.
+Several findings fall inside categories earlier passes marked closed (CSRF/
+session security, WebSocket implementation, frontend-backend contracts) -
+they survived 12 review passes because no test had ever driven the real
+client against the real server. Commits: 45dd411, 46f3235, d3222e4, b2e65e7.
+
+## 82. Findings from Live End-to-End Testing
+
+### 82.1 ~~CRITICAL: Frontend Never Sent X-CSRF-Token (Login Lockout)~~ (FIXED)
+**Location:** `frontend/chat.js`, `frontend/admin.js`
+
+**Issue:** The server implements double-submit CSRF (JS-readable `csrf_token`
+cookie, `enforce_csrf_token` middleware), but neither frontend ever echoed the
+cookie in `X-CSRF-Token`. After signup set session cookies, logout and every
+subsequent login returned 403 until the user manually cleared cookies - the
+UI was unrecoverable from its own signup flow.
+
+**Fix:** Both frontends read the `csrf_token` cookie and send `X-CSRF-Token`
+on all mutating requests (`authHeaders`/`jsonHeaders` helpers).
+
+### 82.2 ~~HIGH: CSRF Middleware 403 on Dead Sessions (Restart Lockout)~~ (FIXED)
+**Location:** `liminallm/app.py` (`enforce_csrf_token`)
+
+**Issue:** A session cookie referencing a session the server no longer knows
+(expired, revoked, or lost across a restart with the in-memory store) failed
+CSRF validation with 403 - permanently blocking login until cookies were
+cleared. A dead session authenticates nothing, so there is nothing for CSRF
+to protect.
+
+**Fix:** Session lookup happens first; an unresolvable session skips the CSRF
+check and the request proceeds as unauthenticated. Live sessions are still
+strictly validated (header, cookie, and session meta must all match).
+
+### 82.3 ~~CRITICAL: GET /admin Required Header Auth (Admin Console Unreachable)~~ (FIXED)
+**Location:** `liminallm/app.py` (`serve_admin`)
+
+**Issue:** The static admin page had `Depends(get_admin_user)`, which reads
+Authorization/session headers only. Browser navigation sends neither, so the
+route returned 403 to everyone - including admins. The console was unreachable
+in any deployment.
+
+**Fix:** The dependency was removed. The page is a static sign-in form; every
+API it calls still enforces the admin role server-side.
+
+### 82.4 ~~HIGH: Missing Content-Type Broke Settings, Password Change, and MFA~~ (FIXED)
+**Location:** `frontend/chat.js` (5 call sites)
+
+**Issue:** MFA request/verify/disable, password change, and settings PATCH
+posted JSON bodies with `authHeaders()` (no `Content-Type`), so FastAPI
+received the body as a string and returned 422. Five settings-page buttons
+were broken.
+
+**Fix:** Those call sites use `headers()` (includes
+`Content-Type: application/json`).
+
+### 82.5 ~~HIGH: Insights Tab Read Fields the API Never Returns~~ (FIXED)
+**Location:** `frontend/chat.js` (`renderInsights`)
+
+**Issue:** The renderer read `total_events`, `positive_count`, `top_adapters`,
+`recent_events`; the API returns `totals.{positive,negative,neutral}`,
+`adapters`, `events`, and clusters with `similarity_hint`. Every Insights
+panel rendered dashes/empty forever.
+
+**Fix:** Renderer consumes the actual `PreferenceInsightsResponse` shape.
+
+### 82.6 ~~MEDIUM: "My Files" Section Could Never Be Opened~~ (FIXED)
+**Location:** `frontend/chat.js`
+
+**Issue:** `#files-section-toggle` had two click handlers (the generic
+collapsible handler plus a dedicated one), each toggling `collapsed` - one
+click toggled twice, so the section never opened.
+
+**Fix:** Single handler; the lazy file-list fetch moved into the generic
+collapsible handler.
+
+### 82.7 ~~MEDIUM: Tools/Insights Tabs Never Loaded Data on Activation~~ (FIXED)
+**Location:** `frontend/chat.js` (`initTabs`)
+
+**Issue:** Tab switching only toggled visibility; Tools showed "Loading
+tools..." indefinitely and Insights stayed empty unless their Refresh buttons
+were clicked.
+
+**Fix:** Tab activation lazily loads the tab's data (contexts, artifacts,
+tools+workflows, insights).
+
+### 82.8 ~~MEDIUM: CSP Blocked Inline style Attributes (Admin Sections Visible)~~ (FIXED)
+**Location:** `frontend/index.html`, `frontend/chat.js`
+
+**Issue:** The app CSP is `style-src 'self'` (no unsafe-inline), so the three
+inline `style="display:none"` attributes were ignored - `#admin-settings-section`
+and `#tool-invoke-result` rendered visible to every user until JS ran.
+
+**Fix:** Initial state uses the `.hidden` class; JS toggles `classList`
+instead of `style.display` for these elements.
+
+### 82.9 ~~HIGH: WebSocket Streaming 404 - Missing Protocol Library~~ (FIXED)
+**Location:** `pyproject.toml`
+
+**Issue:** The app ships a `/v1/chat/stream` WebSocket endpoint but depended
+on bare `uvicorn`; without `websockets`/`wsproto` every handshake returned 404
+and chat silently fell back to non-streaming REST in every standard install.
+
+**Fix:** Dependency changed to `uvicorn[standard]`.
+
+### 82.10 ~~CRITICAL: WS Client Sent Dual Auth - Streaming Never Engaged~~ (FIXED)
+**Location:** `frontend/chat.js`
+
+**Issue:** The socket init included both `access_token` and `session_id`; the
+server rejects dual auth (`fresh_session_required`, close 4401). Combined with
+82.9, WebSocket streaming had never worked end to end.
+
+**Fix:** Exactly one auth method is sent (bearer token preferred).
+
+### 82.11 ~~CRITICAL: Client Waited for Nonexistent streaming_complete Event~~ (FIXED)
+**Location:** `frontend/chat.js` (`chatViaWebSocketStreaming`)
+
+**Issue:** After `message_done` the client kept waiting for a
+`streaming_complete` event that the server never sends (SPEC lists token,
+message_done, error, cancel_ack, trace). The pending promise left the Send
+button disabled and hidden after the first streamed reply.
+
+**Fix:** Client settles on `message_done` carrying `message_id`; a 120s
+inactivity timeout rejects into the REST fallback so the composer can never
+be stuck permanently.
+
+### 82.12 ~~HIGH: One-Message-Per-Connection Server vs Socket-Reusing Client~~ (FIXED)
+**Location:** `frontend/chat.js`
+
+**Issue:** The server WS handler reads a single init frame, replies, and
+returns; the client cached one socket with reconnect backoff and reused it for
+every send. The second message went into a connection nobody was reading and
+the UI hung on "Sending...".
+
+**Fix:** The client opens a fresh socket per exchange and closes it when the
+exchange settles, matching the server contract.
+
+### 82.13 ~~HIGH: Duplicate message_done Broke Multi-Turn Memory~~ (FIXED)
+**Location:** `liminallm/api/routes.py` (`websocket_chat`), `frontend/chat.js`
+
+**Issue:** The route relayed the workflow's internal `message_done` control
+event (no message_id/conversation_id) and then sent its own final
+`message_done` after persisting. Clients bound to the first, never learned the
+conversation id, and every turn silently started a new conversation - the
+model had no memory of prior turns.
+
+**Fix:** The internal event is no longer relayed; the client only settles on a
+`message_done` with `message_id`. Verified live: a "multiply the previous
+result" follow-up answers correctly.
+
+### 82.14 ~~MEDIUM: OAuth Start Returned 500 for Unconfigured Providers~~ (FIXED)
+**Location:** `liminallm/api/routes.py` (`oauth_start`)
+
+**Issue:** `start_oauth` raises `ValueError` for unsupported/unconfigured
+providers; the route let it escape as an unhandled 500.
+
+**Fix:** Mapped to a 400 `invalid_request` with the message surfaced in the UI
+("OAuth provider google is not configured").
+
+### 82.15 ~~MEDIUM: Voice Audio URLs Had No Serving Route~~ (FIXED)
+**Location:** `liminallm/app.py`
+
+**Issue:** `/v1/voice/synthesize` returns `audio_url` values under `/voice/...`
+but no route served them - playback always 404'd and silently fell back to
+browser TTS in every deployment.
+
+**Fix:** Added `GET /voice/{user_id}/{filename}` authenticated via the session
+cookie (audio elements send no Authorization header), restricted to the
+requesting user's own files (or `shared`), with a strict UUID filename pattern
+and path containment check. The frontend also skips the audio attempt for
+`text/placeholder` stubs.
+
+### 82.16 ~~LOW: Upload Checksum Manifest Exposed as a User File~~ (FIXED)
+**Location:** `liminallm/api/routes.py` (files endpoints)
+
+**Issue:** `GET /v1/files` listed the internal `.checksums.json` integrity
+manifest with Download/Delete affordances, and `DELETE /v1/files/{filename}`
+would remove it. Deleting a real file also left its manifest entry stale.
+
+**Fix:** Hidden files are excluded from listing and report not-found on
+delete/download-URL (uploads strip leading dots, so users can never own a
+dotfile there); deleting a file prunes its manifest entry.
+
+### 82.17 ~~LOW: favicon.ico 404 on Every Page Load~~ (FIXED)
+**Location:** `frontend/index.html`, `frontend/admin.html`
+
+**Issue:** No favicon existed; every page load logged a 404 console error.
+
+**Fix:** Added `frontend/favicon.svg` and linked it from both pages.
+
+### 13th Pass Summary
+
+17 findings, all fixed and re-verified in the browser: 4 critical, 6 high,
+5 medium, 2 low. Root-cause pattern: every critical/high item lived at an
+integration seam (client<->server contract, dependency wiring, or middleware
+interaction) that unit tests on either side could not observe. Recommendation
+carried forward: keep a Playwright end-to-end pass (auth flows, one streamed
+chat turn, one RAG turn) in CI so contract drift fails a build instead of
+shipping.
+
+---
+
+## TODO
+
+### 📋 Add a Playwright end-to-end pass to CI
+
+Every critical/high finding in the 13th pass lived at an integration seam
+(client<->server contract, dependency wiring, middleware interaction) that
+unit tests on either side cannot observe. A small browser-driven suite run in
+CI would turn future contract drift into a failed build instead of a shipped
+regression.
+
+Scope (keep it minimal - minutes, not hours):
+1. Boot the app in TEST_MODE with the in-memory store and
+   `MODEL_BACKEND=stub` (no live LLM, no network).
+2. Drive Chromium via Playwright through the seams that broke:
+   - signup -> logout -> login again (exercises the CSRF double-submit path)
+   - one chat turn over the WebSocket, asserting a streamed bubble appears,
+     `message_done` carries message_id, and the Send button is restored
+   - a second turn in the same conversation (multi-turn conversation_id)
+   - settings save + password change (Content-Type/422 class)
+   - load /admin and sign in (route reachability)
+   - fail the run on any console error or unexpected 4xx/5xx response
+3. Wire into CI (e.g. a `make e2e` target plus a GitHub Actions job with a
+   Playwright container image) and into the QA gate alongside `make qa`.
+
+Notes: the throwaway scripts used for the 13th pass (`bigtest.js`,
+`chatflow.js`) already cover most of step 2 and can be adapted; they need a
+stub-model mode, deterministic waits instead of sleeps, and unique per-run
+identities (both already partially done).
 

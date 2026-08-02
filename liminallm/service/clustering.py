@@ -381,12 +381,45 @@ class SemanticClusterer:
         description = lines[1] if len(lines) > 1 else ""
         return label, description or label
 
+    def _skill_prompt_instructions(self, cluster, events) -> str:
+        """Compose prompt-mode instructions for a newborn skill adapter.
+
+        SPEC §5.6: every skill is born as behavior-as-prompt so it is useful
+        immediately on any backend; trained weights come later, if the data
+        earns them. Kept deliberately short - small models pay for every token.
+        """
+        lines = [
+            f"Skill: {cluster.label or 'unnamed skill'}.",
+        ]
+        if cluster.description:
+            lines.append(cluster.description.strip())
+        exemplars = []
+        for event in events:
+            text = (event.corrected_text or event.context_text or "").strip()
+            if text:
+                exemplars.append(text[:200])
+            if len(exemplars) == 3:
+                break
+        if exemplars:
+            lines.append("Examples of responses users rated highly:")
+            lines.extend(f"- {ex}" for ex in exemplars)
+        return "\n".join(lines)
+
     def promote_skill_adapters(
         self,
         *,
         min_size: int = 5,
         positive_ratio: float = 0.7,
+        weights_min_events: int = 20,
     ) -> List[str]:
+        """Create skill adapters from qualifying clusters (SPEC §7.3).
+
+        The adapter ladder: qualifying clusters get a prompt-mode adapter
+        immediately; a weights-training job is enqueued only once the cluster
+        has pooled at least ``weights_min_events`` positive events, and the
+        eval gate in TrainingService decides whether trained weights actually
+        replace the prompt rung.
+        """
         promoted: List[str] = []
         clusters = self.store.list_semantic_clusters()
         adapters = self.store.list_artifacts(type_filter="adapter")  # type: ignore[arg-type]
@@ -405,8 +438,31 @@ class SemanticClusterer:
             ratio = len(positive) / len(events) if events else 0.0
             if ratio < positive_ratio:
                 continue
-            owner_id = cluster.user_id
-            visibility = "private" if owner_id else "global"
+            # Tenant scoping (CLAUDE.md): a cluster-wide skill adapter is
+            # trained on several users' events, so it must stay inside the
+            # tenant those users belong to. "shared" visibility resolves the
+            # tenant through the owner, so a cross-user cluster is owned by its
+            # most frequent contributor and shared within that tenant - never
+            # "global", which every tenant can see.
+            contributor_counts: dict[str, int] = {}
+            for event in positive:
+                contributor_counts[event.user_id] = (
+                    contributor_counts.get(event.user_id, 0) + 1
+                )
+            top_contributor = (
+                max(contributor_counts, key=contributor_counts.get)
+                if contributor_counts
+                else None
+            )
+            owner_id = cluster.user_id or top_contributor
+            if not owner_id:
+                self.logger.warning("skill_promotion_no_owner", cluster_id=cluster.id)
+                continue
+            visibility = "private" if cluster.user_id else "shared"
+            tenant_id = None
+            get_user = getattr(self.store, "get_user", None)
+            if callable(get_user):
+                tenant_id = getattr(get_user(owner_id), "tenant_id", None)
             # base_model is required by the adapter schema; source it from the
             # runtime/training base model so promotion validates instead of
             # silently failing.
@@ -418,8 +474,21 @@ class SemanticClusterer:
             schema = {
                 "kind": "adapter.lora",
                 "base_model": base_model,
-                "scope": "per-user" if cluster.user_id else "global",
-                "backend": "local",
+                # "tenant" scope means pooled across the tenant's contributors;
+                # the training service keys its pooling decision on this.
+                "scope": "per-user" if cluster.user_id else "tenant",
+                "tenant_id": tenant_id,
+                # Born on the prompt rung of the adapter ladder (SPEC §5.6).
+                "mode": "prompt",
+                "backend": "prompt",
+                "provider": "prompt",
+                "prompt_instructions": self._skill_prompt_instructions(
+                    cluster, positive
+                ),
+                "lifecycle": {
+                    "stage": "prompt",
+                    "weights_min_events": weights_min_events,
+                },
                 "rank": 4,
                 "layers": [0, 1, 2],
                 "matrices": ["attn_q"],
@@ -443,16 +512,18 @@ class SemanticClusterer:
                 owner_user_id=owner_id,
                 visibility=visibility,
             )
-            if self.training and cluster.user_id:
-                self.training.ensure_user_adapter(
-                    cluster.user_id, adapter_id_override=adapter.id
-                )
+            # Weights rung: enqueue training only once the cluster has pooled
+            # enough positive events to be worth training on. Global skill
+            # adapters use the most frequent contributor as the job's nominal
+            # owner; the training service pools cluster-wide regardless.
+            if self.training and len(positive) >= weights_min_events:
+                job_owner = owner_id
                 create_training_job = getattr(self.store, "create_training_job", None)
-                if callable(create_training_job):
+                if job_owner and callable(create_training_job):
                     create_training_job(
-                        user_id=cluster.user_id,
+                        user_id=job_owner,
                         adapter_id=adapter.id,
-                        preference_event_ids=[e.id for e in events],
+                        preference_event_ids=[e.id for e in positive],
                     )
             promoted.append(adapter.id)
         return promoted

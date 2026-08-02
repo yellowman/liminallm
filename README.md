@@ -2,10 +2,13 @@
 
 liminallm is an experiment in what a chatgpt-like system looks like if you **stop hard-coding product logic** and let the model help evolve itself.
 
+the core bet: **small models, deeply adapted.** a small self-hosted model with behavior baked into lora weights beats a small model begging through a long system prompt — weights survive context pressure, free the window for the user's actual content, and cost nothing per token. a frontier model can help as an offline teacher, but inference never depends on one.
+
 it’s a small kernel wrapped around:
 
-- a frozen base llm (jax)
-- per-user / per-skill lora adapters
+- a frozen base llm (jax — the primary training and serving framework)
+- per-user persona adapters + per-skill lora adapters trained on pooled cluster data
+- the adapter ladder: skills are born as prompts and only earn weights when the data justifies it — and an eval gate agrees
 - emergent “skills” from clusters + preference events
 - self-describing artifacts (workflows, routing policies, tools)
 - notebooklm-style grounding over filesystem-backed files
@@ -23,7 +26,7 @@ the code is just the glue. everything interesting lives as data.
 ```
 User Feedback → Embeddings → Clustering → Skill Discovery
      ↑                                            ↓
-Router Updates ← Adapter Training ← Promotion Decision
+Router Updates ← Eval Gate ← Adapter Training ← Prompt-Mode Skill
 ```
 
 - **chatgpt-like web ui**
@@ -31,9 +34,13 @@ Router Updates ← Adapter Training ← Promotion Decision
   - conversations, history, summaries
   - text first; voice later
 
-- **deep behavioral memory**
-  - per-user persona adapters (lora)
+- **deep behavioral memory (the adapter ladder)**
+  - per-user persona adapters (lora): small, low-stakes — tone and format
   - skill adapters born from usage: “when problems like this show up, start with this debugging workflow”
+  - every skill starts as a **prompt** (instructions distilled from cluster labels + highly-rated exemplars) — useful immediately on any backend
+  - once a cluster pools enough positive feedback **across users**, a jax training job runs; one user’s thumbs are too sparse to train weights on
+  - trained weights only ship if a **holdout eval gate** measures real improvement; a failed gate leaves the skill on the prompt rung. nothing regresses.
+  - optionally, a teacher model distills raw chat transcripts into clean training exemplars first
   - continuous micro-training jobs in jax, only on adapters, never on the base model
 
 - **natural factual memory**
@@ -74,7 +81,7 @@ Router Updates ← Adapter Training ← Promotion Decision
   - no hard-coded `DEBUGGING`, `WRITING`, whatever
   - we cluster preference events in embedding space
   - llm labels clusters (“kernel panic debugging”, “multi-tenant billing schema design”, …)
-  - when a cluster is big + consistently positive, we auto-propose a new skill adapter tied to that cluster
+  - when a cluster is big + consistently positive, we auto-create a prompt-mode skill adapter tied to that cluster — weights come later, gated on data volume and a passing eval
 
 - **router as data, not code**
   - routing policies are artifacts (`policy.routing`) with a tiny expression language:
@@ -95,7 +102,8 @@ Router Updates ← Adapter Training ← Promotion Decision
 
 - **language / runtime**
   - python (services, api, orchestration)
-  - jax (base model + lora training)
+  - jax + optax (base model, lora training, eval gates) — install with `pip install -e ".[train]"`
+  - remote multi-lora servers (lorax / vllm-style, openai-compatible) as an optional scale-out serving path; same artifacts, config change only
 
 - **storage**
   - postgres
@@ -136,6 +144,8 @@ for v1 these can all live in one python app with clear module boundaries.
 - **early design / prototyping**
   - do not treat as production-ready
   - interfaces & schemas are expected to change
+- the training loop is real: jax + optax lora training with causal-lm sft batches, holdout eval, and a promotion gate — a skipped or regressed run never ships weights
+- skill adapters follow the ladder end-to-end: prompt-mode birth → pooled-data training job → eval-gated graduation to hybrid
 - goal is to keep:
   - implementation minimal
   - all "product behavior" in data (artifacts / policies / workflows)

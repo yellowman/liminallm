@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import random
+import shutil
 import uuid
 from contextlib import suppress
 from dataclasses import asdict
@@ -26,6 +27,15 @@ DEFAULT_TRAIN_BATCH_SIZE = 2
 DEFAULT_MAX_TOKEN_LENGTH = 512
 DEFAULT_GRAD_ACCUM_STEPS = 4
 DEFAULT_LORA_LEARNING_RATE = 2e-3
+# SPEC §5.4: eval gate. Every Nth example is held out once the dataset is big
+# enough, and promotion requires the holdout loss to improve by at least the
+# relative margin below.
+DEFAULT_TRAIN_EPOCHS = 5
+HOLDOUT_MIN_EXAMPLES = 5
+HOLDOUT_EVERY_N = 5
+EVAL_MIN_RELATIVE_IMPROVEMENT = 0.01
+# SPEC §7.5: cap teacher-distillation calls per job to bound cost.
+MAX_DISTILL_EXAMPLES = 32
 
 
 class TrainingService:
@@ -47,6 +57,8 @@ class TrainingService:
         default_adapter_mode: str = AdapterMode.HYBRID,
         backend_mode: Optional[str] = None,
         max_active_training_jobs: int = 10,
+        teacher=None,
+        distillation_enabled: bool = False,
     ) -> None:
         self.store = store
         self.fs_root = Path(fs_root)
@@ -62,6 +74,10 @@ class TrainingService:
         self.backend_mode = backend_mode
         self._compatible_modes = get_compatible_adapter_modes(backend_mode or "openai")
         self.max_active_training_jobs = max_active_training_jobs
+        # SPEC §7.5: optional teacher LLM used to distill preference events
+        # into cleaner training targets before tokenization.
+        self.teacher = teacher
+        self.distillation_enabled = distillation_enabled
 
     def _safe_int(self, value: object, default: int, *, context: str) -> int:
         """Coerce values to int with fallback to avoid ValueError crashes (Issue 39.3)."""
@@ -90,6 +106,10 @@ class TrainingService:
             self._tokenizer_model = model_name
             self._tokenizer_error = None
         except Exception as exc:  # pragma: no cover - optional dependency
+            # Fall back to the deterministic hash tokenizer in
+            # _tokenize_batches rather than failing the job: a missing
+            # optional dependency (or a base model without a HF tokenizer)
+            # degrades fidelity, and the eval gate still judges the result.
             self.tokenizer = None
             self._tokenizer_model = model_name
             self._tokenizer_error = str(exc)
@@ -97,7 +117,6 @@ class TrainingService:
             logger.warning(
                 "tokenizer_load_failed", base_model=model_name, error=str(exc)
             )
-            raise
 
     def _vocab_size(self) -> int:
         if isinstance(self._adapter_vocab_size, int) and self._adapter_vocab_size > 0:
@@ -288,26 +307,86 @@ class TrainingService:
         )
         if not adapter:
             raise ConstraintViolation("adapter missing", {"adapter_id": adapter_id})
+        adapter_scope = (adapter.schema or {}).get("scope")
+        caller_tenant = getattr(
+            getattr(self.store, "get_user", lambda _uid: None)(user_id),
+            "tenant_id",
+            None,
+        )
         if adapter.owner_user_id and adapter.owner_user_id != user_id:
-            raise ConstraintViolation(
-                "adapter ownership mismatch", {"adapter_id": adapter.id}
+            # Tenant-scoped skill adapters are pooled across contributors, so
+            # their nominal owner is bookkeeping; any caller inside the same
+            # tenant may train them. Everything else stays owner-only.
+            owner_tenant = getattr(
+                getattr(self.store, "get_user", lambda _uid: None)(
+                    adapter.owner_user_id
+                ),
+                "tenant_id",
+                None,
             )
+            same_tenant = bool(caller_tenant) and caller_tenant == owner_tenant
+            if not (adapter_scope == "tenant" and same_tenant):
+                raise ConstraintViolation(
+                    "adapter ownership mismatch", {"adapter_id": adapter.id}
+                )
         adapter = self._assert_adapter_base(adapter)
         self._apply_adapter_vocab_size(adapter)
-        events = self.store.list_preference_events(
-            user_id=user_id,
-            feedback=POSITIVE_FEEDBACK_VALUES,
-            cluster_id=cluster_id,
+        adapter_schema_now = adapter.schema or {}
+        adapter_cluster = adapter_schema_now.get("cluster_id") or cluster_id
+        # SPEC §7.3: skill adapters (cluster-bound, not owned by a single user)
+        # pool positive events across every contributor to the cluster - one
+        # user's thumbs are too sparse to train weights on. Persona adapters
+        # stay strictly per-user.
+        # Pooling is decided by scope, not ownership: tenant-scoped skill
+        # adapters carry a nominal owner for visibility purposes.
+        pooled_skill = bool(adapter_cluster) and (
+            adapter_scope == "tenant" or not adapter.owner_user_id
         )
+        if pooled_skill:
+            # CLAUDE.md / SPEC §12: pooling must never cross a tenant boundary.
+            # Scope to the requesting user's tenant so one tenant's content can
+            # never end up in weights another tenant is served.
+            tenant_id = (adapter.schema or {}).get("tenant_id") or caller_tenant
+            if not tenant_id:
+                logger.warning(
+                    "pooled_training_tenant_unresolved",
+                    user_id=user_id,
+                    adapter_id=adapter.id,
+                )
+                raise ConstraintViolation(
+                    "cannot resolve tenant for pooled training",
+                    {"user_id": user_id, "adapter_id": adapter.id},
+                )
+            events = self.store.list_preference_events(
+                user_id=None,
+                feedback=POSITIVE_FEEDBACK_VALUES,
+                cluster_id=adapter_cluster,
+                tenant_id=tenant_id,
+            )
+        else:
+            events = self.store.list_preference_events(
+                user_id=user_id,
+                feedback=POSITIVE_FEEDBACK_VALUES,
+                cluster_id=cluster_id,
+            )
         if not events:
             return None
         cluster_meta = self._cluster_events(events, user_id)
         dataset_entries = list(self._build_examples(events))
+        dataset_entries = self._maybe_distill(dataset_entries)
+        # SPEC §5.4: hold out a slice of examples so promotion is gated on
+        # measured improvement rather than "training ran without raising".
+        train_entries, holdout_entries = self._split_holdout(dataset_entries)
         token_batches = list(
             self._tokenize_batches(
-                dataset_entries, base_model=adapter.schema.get("base_model")
+                train_entries, base_model=adapter.schema.get("base_model")
             )
         )
+        eval_batches = list(
+            self._tokenize_batches(
+                holdout_entries, base_model=adapter.schema.get("base_model")
+            )
+        ) if holdout_entries else []
         vocab_size = self._vocab_size()
         if adapter.schema.get("vocab_size") != vocab_size:
             adapter_schema = dict(adapter.schema)
@@ -367,20 +446,66 @@ class TrainingService:
             "token_batches": [b["shape"] for b in token_batches],
             "clusters": cluster_meta,
         }
-        (version_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+        # default=str: preference events carry datetime fields
+        (version_dir / "metadata.json").write_text(
+            json.dumps(metadata, indent=2, default=str)
+        )
         training_trace = self._run_jax_optax_training(
             weights,
             token_batches,
+            eval_batches=eval_batches,
             params_path=params_path,
             checkpoint_dir=version_dir / "checkpoints",
         )
-        # Promote the new version only after training completes without raising,
-        # so a failed run never repoints "latest" at randomly-initialized weights.
-        updated_schema = dict(adapter.schema)
-        updated_schema["current_version"] = next_version
-        updated_schema["fs_dir"] = str(adapter_dir)
-        self.store.update_artifact(adapter.id, updated_schema)
-        self._update_latest_symlink(adapter_dir, version_dir)
+        # SPEC §5.4/§10.2: promotion is gated on the holdout eval, not on
+        # "training ran without raising". A skipped or regressed run leaves
+        # the artifact untouched (prompt-mode skill adapters simply stay on
+        # the prompt rung of the ladder).
+        gate = self._promotion_gate(training_trace, holdout_count=len(holdout_entries))
+        if gate["promoted"]:
+            updated_schema = dict(adapter.schema)
+            updated_schema["current_version"] = next_version
+            updated_schema["fs_dir"] = str(adapter_dir)
+            # Adapter ladder (SPEC §5.6): a prompt-born skill adapter that
+            # passes its first eval graduates to hybrid - trained weights
+            # with the prompt instructions kept as portable fallback.
+            if updated_schema.get("mode") == AdapterMode.PROMPT:
+                updated_schema["mode"] = AdapterMode.HYBRID
+                updated_schema["backend"] = self._mode_to_backend(AdapterMode.HYBRID)
+                updated_schema["provider"] = self._mode_to_provider(AdapterMode.HYBRID)
+                updated_schema.setdefault("lifecycle", {})
+                if isinstance(updated_schema["lifecycle"], dict):
+                    updated_schema["lifecycle"]["stage"] = "weights"
+            self.store.update_artifact(adapter.id, updated_schema)
+            self._update_latest_symlink(adapter_dir, version_dir)
+        else:
+            # Quarantine the un-promoted weights. Leaving them in place as
+            # vNNNN/ let the serving backend pick them up as "newest on disk",
+            # which silently defeated the gate; they are kept under rejected/
+            # for debugging instead of deleted.
+            try:
+                rejected_root = adapter_dir / "rejected"
+                rejected_root.mkdir(parents=True, exist_ok=True)
+                destination = rejected_root / version_dir.name
+                if destination.exists():
+                    shutil.rmtree(destination, ignore_errors=True)
+                shutil.move(str(version_dir), str(destination))
+            except Exception as exc:
+                # Never fail the job over cleanup, but do not leave live
+                # weights behind either - drop them and log loudly.
+                logger.warning(
+                    "adapter_rejected_quarantine_failed",
+                    adapter_id=adapter.id,
+                    version_dir=str(version_dir),
+                    error=str(exc),
+                )
+                shutil.rmtree(version_dir, ignore_errors=True)
+            logger.info(
+                "adapter_promotion_gated",
+                adapter_id=adapter.id,
+                job_id=job_id,
+                reason=gate["reason"],
+            )
         # Extract actual loss from JAX training instead of using heuristic
         # Per SPEC §5.4: metrics = loss and preference alignment rate
         loss = 1.0 / (1 + len(dataset_entries))  # Fallback heuristic
@@ -395,11 +520,14 @@ class TrainingService:
             job_id,
             status="succeeded",
             loss=loss,
-            new_version=next_version,
+            new_version=next_version if gate["promoted"] else None,
             meta={
                 "token_batches": [b["shape"] for b in token_batches],
                 "jax_trace": training_trace,
                 "clusters": cluster_meta,
+                "eval_gate": gate,
+                "pooled_skill": pooled_skill,
+                "distilled": sum(1 for e in dataset_entries if e.get("distilled")),
             },
         )
         return {
@@ -410,6 +538,7 @@ class TrainingService:
             "token_batches": token_batches,
             "jax_trace": training_trace,
             "clusters": cluster_meta,
+            "eval_gate": gate,
         }
 
     def record_feedback_event(
@@ -610,6 +739,97 @@ class TrainingService:
             return {"status": "ok" if parsed else "no_data", "entries": parsed}
         return {"status": "unavailable"}
 
+    def _maybe_distill(self, entries: List[dict]) -> List[dict]:
+        """Rewrite training targets through the teacher LLM (SPEC §7.5).
+
+        Small student models train better on clean exemplars than on raw chat
+        transcripts. When a teacher is configured, each example's target is
+        rewritten into an ideal response; failures fall back to the raw target
+        so distillation can never lose data. Capped to bound teacher cost.
+        """
+        if not (self.distillation_enabled and self.teacher):
+            return entries
+        out: List[dict] = []
+        for idx, entry in enumerate(entries):
+            if idx >= MAX_DISTILL_EXAMPLES:
+                out.append(entry)
+                continue
+            try:
+                resp = self.teacher.generate(
+                    "You are preparing supervised training data for a smaller "
+                    "model. Rewrite the assistant response below into an ideal, "
+                    "concise exemplar that preserves its meaning and any facts. "
+                    "Reply with the improved response only.\n\n"
+                    f"CONVERSATION:\n{entry.get('prompt', '')[-4000:]}\n\n"
+                    f"RESPONSE TO IMPROVE:\n{entry.get('target', '')[:4000]}",
+                    adapters=[],
+                    context_snippets=[],
+                    history=[],
+                )
+                improved = (resp or {}).get("content", "").strip()
+                if improved:
+                    entry = {**entry, "target": improved, "distilled": True}
+            except Exception as exc:
+                logger.warning("distillation_failed", error=str(exc))
+            out.append(entry)
+        return out
+
+    def _split_holdout(self, entries: List[dict]) -> tuple[List[dict], List[dict]]:
+        """Deterministically hold out every Nth example for the eval gate."""
+        if len(entries) < HOLDOUT_MIN_EXAMPLES:
+            return entries, []
+        train: List[dict] = []
+        holdout: List[dict] = []
+        for idx, entry in enumerate(entries):
+            if idx % HOLDOUT_EVERY_N == HOLDOUT_EVERY_N - 1:
+                holdout.append(entry)
+            else:
+                train.append(entry)
+        return train, holdout
+
+    def _promotion_gate(self, trace: dict, *, holdout_count: int) -> dict:
+        """Decide whether trained weights may be promoted (SPEC §5.4).
+
+        Rules:
+        - training skipped/failed -> never promote (a zero-init adapter must
+          not become "latest"; prompt-mode adapters stay on the prompt rung).
+        - holdout present -> promote only when holdout loss improved by at
+          least EVAL_MIN_RELATIVE_IMPROVEMENT.
+        - dataset too small for a holdout -> promote on completed training,
+          recording that the gate ran without an eval.
+        """
+        status = trace.get("status")
+        if status != "ok":
+            return {
+                "promoted": False,
+                "reason": f"training did not run (status={status or 'unknown'})",
+                "holdout_examples": holdout_count,
+            }
+        eval_before = trace.get("eval_before")
+        eval_after = trace.get("eval_after")
+        if holdout_count and isinstance(eval_before, (int, float)) and isinstance(
+            eval_after, (int, float)
+        ):
+            denom = max(abs(eval_before), 1e-8)
+            improvement = (eval_before - eval_after) / denom
+            promoted = improvement >= EVAL_MIN_RELATIVE_IMPROVEMENT
+            return {
+                "promoted": promoted,
+                "reason": (
+                    f"holdout loss {eval_before:.4f} -> {eval_after:.4f} "
+                    f"({improvement:+.2%})"
+                ),
+                "holdout_examples": holdout_count,
+                "eval_before": eval_before,
+                "eval_after": eval_after,
+                "improvement": improvement,
+            }
+        return {
+            "promoted": True,
+            "reason": "no holdout (dataset below eval threshold)",
+            "holdout_examples": holdout_count,
+        }
+
     def _build_examples(self, events: Iterable[PreferenceEvent]) -> Iterable[dict]:
         # Issue 18.1: Dedupe by (conversation_id, message_id) per SPEC §18
         seen: set[tuple[str, str]] = set()
@@ -688,27 +908,41 @@ class TrainingService:
 
         for i in range(0, len(dataset_entries), batch_size):
             batch = dataset_entries[i : i + batch_size]
-            prompts = [_encode(row["prompt"]) for row in batch]
-            targets = [_encode(row["target"]) for row in batch]
-            max_prompt = min(max((len(p) for p in prompts), default=0), max_length)
-            max_target = min(max((len(t) for t in targets), default=0), max_length)
-
-            def _pad(seq: List[int], length: int) -> List[int]:
-                if len(seq) >= length:
-                    return seq[:length]
-                return seq + [0] * (length - len(seq))
-
+            # Causal-LM SFT layout: one sequence of prompt+target per example,
+            # next-token labels, and the loss masked to the target span so the
+            # adapter learns the response, not the prompt. (The previous
+            # layout padded inputs to prompt length and labels to target
+            # length, which could never broadcast in the loss.)
+            seqs: List[tuple[List[int], int]] = []
+            for row in batch:
+                prompt_tokens = _encode(row["prompt"])
+                target_tokens = _encode(row["target"]) or [0]
+                full = (prompt_tokens + target_tokens)[: max_length + 1]
+                if len(full) < 2:
+                    full = full + [0] * (2 - len(full))
+                prompt_len = min(len(prompt_tokens), len(full) - 1)
+                seqs.append((full, prompt_len))
+            seq_len = max(len(full) - 1 for full, _ in seqs)
+            input_ids: List[List[int]] = []
+            labels: List[List[int]] = []
+            loss_mask: List[List[float]] = []
+            for full, prompt_len in seqs:
+                inp = full[:-1]
+                lab = full[1:]
+                # Label position j predicts token full[j+1]; that token is
+                # part of the target once j+1 >= prompt_len.
+                mask = [1.0 if (j + 1) >= prompt_len else 0.0 for j in range(len(lab))]
+                pad = seq_len - len(inp)
+                input_ids.append(inp + [0] * pad)
+                labels.append(lab + [0] * pad)
+                loss_mask.append(mask + [0.0] * pad)
             yield {
-                "input_ids": [_pad(p, max_prompt) for p in prompts],
-                "labels": [_pad(t, max_target) for t in targets],
-                "attention_mask": [
-                    [1] * min(len(p), max_prompt) + [0] * max(0, max_prompt - len(p))
-                    for p in prompts
-                ],
+                "input_ids": input_ids,
+                "labels": labels,
+                "attention_mask": loss_mask,
                 "shape": {
                     "batch": len(batch),
-                    "prompt_len": max_prompt,
-                    "target_len": max_target,
+                    "seq_len": seq_len,
                 },
             }
 
@@ -812,10 +1046,12 @@ class TrainingService:
         params: dict,
         batches: Sequence[dict],
         *,
+        eval_batches: Sequence[dict] = (),
         params_path: Path,
         checkpoint_dir: Optional[Path] = None,
         accumulation_steps: int = DEFAULT_GRAD_ACCUM_STEPS,
         learning_rate: float = DEFAULT_LORA_LEARNING_RATE,
+        epochs: int = DEFAULT_TRAIN_EPOCHS,
     ) -> dict:
         """
         Train a single LoRA adapter with a supervised loss and checkpoints.
@@ -910,6 +1146,13 @@ class TrainingService:
             denom = jnp.maximum(jnp.sum(mask), 1.0)
             return jnp.sum(masked) / denom
 
+        def _eval_loss(p: dict) -> Optional[float]:
+            """Mean forward loss over the holdout batches (no gradients)."""
+            if not eval_batches:
+                return None
+            losses = [float(forward(p, batch)) for batch in eval_batches]
+            return sum(losses) / len(losses)
+
         opt = optax.adam(learning_rate)
         params_tree = _flatten_params(params)
         opt_state = opt.init(params_tree)
@@ -917,46 +1160,57 @@ class TrainingService:
         trace: list[dict] = []
         accum_grads = None
         accum_count = 0
+        eval_before = _eval_loss(params_tree)
 
-        for step, batch in enumerate(batches, start=1):
-            value, grads = grad_fn(params_tree, batch)
-            accum_grads = (
-                grads
-                if accum_grads is None
-                else jax.tree_util.tree_map(lambda a, b: a + b, accum_grads, grads)
-            )
-            accum_count += 1
-            if accum_count < accumulation_steps and step < len(batches):
+        # Small adapters on small datasets need several passes to converge;
+        # accumulation flushes at each epoch boundary so an epoch always ends
+        # in an optimizer update.
+        global_step = 0
+        for epoch in range(1, max(epochs, 1) + 1):
+            for step, batch in enumerate(batches, start=1):
+                global_step += 1
+                value, grads = grad_fn(params_tree, batch)
+                accum_grads = (
+                    grads
+                    if accum_grads is None
+                    else jax.tree_util.tree_map(lambda a, b: a + b, accum_grads, grads)
+                )
+                accum_count += 1
+                if accum_count < accumulation_steps and step < len(batches):
+                    trace.append(
+                        {
+                            "loss": float(value),
+                            "epoch": epoch,
+                            "shape": batch["shape"],
+                            "accumulating": True,
+                        }
+                    )
+                    continue
+
+                mean_grads = jax.tree_util.tree_map(
+                    lambda g: g / float(accum_count), accum_grads
+                )
+                updates, opt_state = opt.update(mean_grads, opt_state, params_tree)
+                params_tree = optax.apply_updates(params_tree, updates)
                 trace.append(
                     {
                         "loss": float(value),
+                        "epoch": epoch,
                         "shape": batch["shape"],
-                        "accumulating": True,
+                        "accumulated": accum_count,
                     }
                 )
-                continue
-
-            mean_grads = jax.tree_util.tree_map(
-                lambda g: g / float(accum_count), accum_grads
-            )
-            updates, opt_state = opt.update(mean_grads, opt_state, params_tree)
-            params_tree = optax.apply_updates(params_tree, updates)
-            trace.append(
-                {
-                    "loss": float(value),
-                    "shape": batch["shape"],
-                    "accumulated": accum_count,
-                }
-            )
-            _checkpoint(step, params_tree)
-            accum_grads = None
-            accum_count = 0
+                _checkpoint(global_step, params_tree)
+                accum_grads = None
+                accum_count = 0
 
         params_path.write_text(json.dumps(_to_python(params_tree), indent=2))
         return {
             "status": "ok",
             "steps": trace[-10:],
             "final_params_path": str(params_path),
+            "eval_before": eval_before,
+            "eval_after": _eval_loss(params_tree),
         }
 
     def _bucket_embedding(

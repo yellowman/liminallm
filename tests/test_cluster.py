@@ -13,6 +13,8 @@ import contextlib
 import json
 import os
 
+from types import SimpleNamespace
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -356,8 +358,17 @@ class _FakeClusterer:
 
 
 class _NoUsersStore:
+    """One user in one tenant.
+
+    Named for what it originally was; it now needs a user because "global"
+    clustering is scoped per tenant (a cluster spanning tenants would train a
+    skill adapter on mixed-tenant content). Tenants are derived from users, so
+    with no users there is nothing to cluster and the lock has nothing to
+    guard.
+    """
+
     def list_users(self, limit=None):
-        return []
+        return [SimpleNamespace(id="u1", tenant_id="t1")]
 
 
 def _worker(clusterer, lock):
