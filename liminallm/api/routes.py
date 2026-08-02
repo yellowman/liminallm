@@ -939,7 +939,7 @@ def _backfill_message_embeddings(runtime, history, user_id: str) -> None:
     for msg in history:
         if done >= _EMBED_BACKFILL_PER_PASS:
             break
-        if compaction._message_embedding(msg) is not None:
+        if compaction._message_embedding(msg, embeddings.model_id) is not None:
             continue
         content = str(getattr(msg, "content", "") or "").strip()
         if not content:

@@ -970,3 +970,31 @@ def test_backfill_persists_embeddings_for_a_real_encoder():
         runtime.embeddings = orig
     refreshed = store.list_messages(convo.id, user_id=user.id)
     assert compaction._message_embedding(refreshed[0]) is not None
+
+
+def test_vectors_from_a_different_encoder_are_never_compared():
+    """SPEC §3: filter on encoder identity; a mismatch means 'not embedded'."""
+    msg = SimpleNamespace(
+        role="user", content="x", seq=1,
+        meta={"embedding": [0.1, 0.2], "embedding_model": "old-encoder"},
+    )
+    assert compaction._message_embedding(msg, "new-encoder") is None
+    assert compaction._message_embedding(msg, "old-encoder") == [0.1, 0.2]
+    # Legacy rows without a recorded model are trusted (nothing to conflict).
+    legacy = SimpleNamespace(meta={"embedding": [0.3]})
+    assert compaction._message_embedding(legacy, "any") == [0.3]
+
+
+def test_stale_vectors_are_re_embedded_not_reused():
+    class Emb(_FakeSemanticEmbeddings):
+        model_id = "encoder-v2"
+
+    older = [
+        SimpleNamespace(
+            role="user", content="Postgres pooling", seq=1,
+            meta={"embedding": [1.0, 0.0, 0.0], "embedding_model": "encoder-v1"},
+        )
+    ]
+    # The v1 vector must be ignored; ranking still works via a fresh embed.
+    scores = compaction.rank_turns(older, "which database?", embeddings=Emb())
+    assert scores and scores[0] > 0

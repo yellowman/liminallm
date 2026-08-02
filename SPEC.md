@@ -308,7 +308,9 @@ USING ivfflat (embedding) WITH (lists = 100);
 - **chunking**: sliding window token-based splitter (e.g., 300–500 tokens with 50 token overlap) tuned per file type; store `chunk_index` and offsets.
 - **hygiene**: dedupe by file checksum + path; skip binary blobs unless parser registered; enforce max file size per plan tier; optional PII-scrub per context.
 - **embedding model**: fixed small encoder (e.g., `all-MiniLM` equivalent) referenced in config; keep version in `knowledge_context.meta.embedding_model`.
-- **embedding dimensionality**: embeddings are normalized/padded to a fixed 64-d vector (`EMBEDDING_DIM`) across routing, RAG, and clustering; external providers must truncate/pad to this size before persistence.
+- **embedding dimensionality**: 64-d (`EMBEDDING_DIM`) is the *hash-fallback* size and remains mandatory for routing and clustering, where vectors from many contexts are compared in one space.
+  **amended:** external providers persist their **native** dimensionality (e.g. 1536) for rag chunks, notes, and message recall. truncating a real 1536-d embedding to 64-d discards most of the signal the encoder exists to provide — obeying the original rule would defeat semantic retrieval. the invariant that actually matters is *never compare vectors from different encoders*: every consumer records the encoder id alongside the vector (`knowledge_chunk.meta.embedding_model_id`, `note.meta`, `message.meta.embedding_model`) and filters on it; a mismatch is treated as "not embedded", so the backfill re-embeds rather than comparing across spaces.
+  **operational consequence (unverified here):** `knowledge_chunk.embedding` is declared bare `VECTOR` and indexed `USING ivfflat`. pgvector requires a fixed dimension for an ivfflat/hnsw index, so a deployment mixing dimensions in that column — or indexing an unconstrained one — needs the column pinned to the chosen encoder's size (`VECTOR(1536)`) and a re-index when the encoder changes. this container has no pgvector, so it was not verified live; flagged rather than assumed working.
 - **refresh cadence**:
   - watch filesystem path events; enqueue ingestion job on file change.
   - periodic sweep (daily) to re-embed if encoder version changes.
@@ -317,6 +319,7 @@ USING ivfflat (embedding) WITH (lists = 100);
   - optional re-ranking via lightweight cross-encoder tool if available.
   - return chunk text + `fs_path` for citation; orchestrator can ask LLM to cite paths.
   - optional dev fallback: in-process hybrid BM25 + cosine search (controlled by `RAG_MODE=local_hybrid`), intended for tests or tiny corpora when pgvector is absent.
+  - **ranking precedence (applies to rag, notes, and conversation recall alike):** semantic is primary; bm25 is the fallback and the tie-breaker, never the peer. concretely: with a real encoder, ranking is hybrid (semantic-weighted, bm25 retained so exact identifiers and numbers keep their pull); **without** one, bm25 alone. hash-embedding cosine must never enter a score — `EmbeddingsService.is_semantic` is the flag every consumer checks, because noise blended at any weight is worse than keywords alone.
   - baseline kernel ships with a deterministic hashing-based embedding fallback (no external model dependency) shared across RAG/routing/clustering so chunks always have non-empty vectors for cosine search in both Postgres and in-memory stores.
 
 ### 2.6 preferences & training

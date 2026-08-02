@@ -239,14 +239,23 @@ def _normalized_scores(raw: List[float]) -> List[float]:
 SEMANTIC_RERANK_CANDIDATES = 20
 
 
-def _message_embedding(msg: Any) -> Optional[List[float]]:
-    """A turn's persisted embedding, if the digest backfill has reached it."""
+def _message_embedding(msg: Any, model_id: Optional[str] = None) -> Optional[List[float]]:
+    """A turn's persisted embedding, if it came from the current encoder.
+
+    Vectors from a different encoder live in a different space; comparing
+    across them yields confident nonsense. SPEC §3 handles this for rag by
+    filtering chunks on ``embedding_model_id`` — the same rule applies here,
+    and a mismatch simply means "not embedded yet" so the backfill redoes it.
+    """
     meta = getattr(msg, "meta", None)
-    if isinstance(meta, dict):
-        vec = meta.get("embedding")
-        if isinstance(vec, list) and vec:
-            return vec
-    return None
+    if not isinstance(meta, dict):
+        return None
+    vec = meta.get("embedding")
+    if not (isinstance(vec, list) and vec):
+        return None
+    if model_id and meta.get("embedding_model") not in (None, model_id):
+        return None
+    return vec
 
 
 def rank_turns(
@@ -289,11 +298,12 @@ def rank_turns(
 
     # Semantic reranks only the strongest BM25 candidates (plus any turn that
     # already carries a persisted embedding, which is free to score).
+    model_id = getattr(embeddings, "model_id", None)
     order = sorted(range(len(older)), key=lambda i: bm25[i], reverse=True)
     budget = max_embed
     sem_raw = [0.0] * len(older)
     for i in order:
-        vec = _message_embedding(older[i])
+        vec = _message_embedding(older[i], model_id)
         if vec is None:
             if budget <= 0 and bm25[i] == 0:
                 continue  # nothing cheap left to justify an embed
