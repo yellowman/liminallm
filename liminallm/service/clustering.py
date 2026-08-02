@@ -86,6 +86,143 @@ class SemanticClusterer:
             meta_extra={"scope": "global", "tenant_id": tenant_id},
         )
 
+    async def cluster_everyone(
+        self, *, user_limit: int, max_events: int
+    ) -> None:
+        """Re-cluster every user, then each tenant as a whole.
+
+        The periodic pass. Individual failures are logged and skipped: one
+        user whose events will not cluster must not stop the rest of the
+        install from being clustered.
+        """
+        users = list(self.store.list_users(limit=user_limit))
+
+        for user in users:
+            try:
+                await self.clusterer.cluster_user_preferences(
+                    user.id,
+                    max_events=max_events,
+                    streaming=True,
+                    approximate=True,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "periodic_user_clustering_failed",
+                    user_id=user.id,
+                    error=str(exc),
+                )
+
+        # "Global" clustering means global *within a tenant*. Clustering across
+        # every user regardless of tenant would produce clusters whose members
+        # span tenants, and a skill adapter trained on such a cluster would mix
+        # tenants' content (CLAUDE.md tenant isolation).
+        tenant_ids = []
+        for user in users:
+            tenant = getattr(user, "tenant_id", None)
+            if tenant and tenant not in tenant_ids:
+                tenant_ids.append(tenant)
+        for tenant_id in tenant_ids:
+            try:
+                await self.clusterer.cluster_global_preferences(
+                    max_events=max_events,
+                    streaming=True,
+                    approximate=True,
+                    tenant_id=tenant_id,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "periodic_global_clustering_failed",
+                    tenant_id=tenant_id,
+                    error=str(exc),
+                )
+
+
+    async def cluster_after_training(self, user_id: str) -> None:
+        """Re-cluster one user after their adapter trained.
+
+        Training changes what the user's preferences look like, which can make
+        a new skill cluster viable; this is where an emergent skill is first
+        noticed.
+        """
+        try:
+            clusters = await self.cluster_user_preferences(user_id)
+            if clusters:
+                self.logger.info(
+                    "post_training_clustering_complete",
+                    user_id=user_id,
+                    cluster_count=len(clusters),
+                )
+
+                promoted = self.promote_skill_adapters(
+                    min_size=5,
+                    positive_ratio=0.7,
+                )
+                if promoted:
+                    self.logger.info(
+                        "emergent_skills_promoted",
+                        user_id=user_id,
+                        adapter_ids=promoted,
+                    )
+        except Exception as exc:
+            self.logger.warning(
+                "post_training_clustering_failed",
+                user_id=user_id,
+                error=str(exc),
+            )
+
+
+    async def process_emergent_skills(self) -> List[str]:
+        """Scan every user with preferences and promote what has become a skill.
+
+        The on-demand version of the periodic pass: cluster, then promote the
+        clusters that now qualify. Returns the adapters created.
+        """
+        promoted_adapters: List[str] = []
+
+        for user_id in self._users_with_preferences():
+            try:
+                clusters = await self.cluster_user_preferences(user_id)
+
+                if clusters:
+                    promoted = self.promote_skill_adapters(
+                        min_size=5,
+                        positive_ratio=0.7,
+                    )
+                    promoted_adapters.extend(promoted)
+
+            except Exception as exc:
+                self.logger.warning(
+                    "emergent_skill_processing_failed",
+                    user_id=user_id,
+                    error=str(exc),
+                )
+
+        self.logger.info(
+            "emergent_skills_processed",
+            promoted_count=len(promoted_adapters),
+            adapter_ids=promoted_adapters,
+        )
+
+        return promoted_adapters
+
+    def _get_users_with_preferences(self) -> List[str]:
+        """Get list of users who have preference events."""
+        users: set[str] = set()
+
+        for event in self.store.list_preference_events():
+            if event.user_id:
+                users.add(event.user_id)
+
+        return list(users)
+
+    def _users_with_preferences(self) -> List[str]:
+        """User ids that have any preference events at all."""
+        users: set[str] = set()
+        for event in self.store.list_preference_events():
+            if event.user_id:
+                users.add(event.user_id)
+        return list(users)
+
     async def _fetch_preference_events(
         self,
         *,

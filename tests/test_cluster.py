@@ -356,6 +356,11 @@ class _FakeClusterer:
     async def cluster_global_preferences(self, *a, **kw):
         self.global_runs += 1
 
+    async def cluster_everyone(self, **kw):
+        # The worker now asks the clusterer to run the whole pass; what that
+        # pass does is the clusterer's business, not the scheduler's.
+        self.global_runs += 1
+
 
 class _NoUsersStore:
     """One user in one tenant.
@@ -371,12 +376,21 @@ class _NoUsersStore:
         return [SimpleNamespace(id="u1", tenant_id="t1")]
 
 
-def _worker(clusterer, lock):
+class _FakeTraining:
+    def __init__(self):
+        self.prune_scans = 0
+
+    def recommend_adapter_pruning(self):
+        self.prune_scans += 1
+        return 0
+
+
+def _worker(clusterer, lock, training=None):
     from liminallm.service.training_worker import TrainingWorker
 
     return TrainingWorker(
         store=_NoUsersStore(),
-        training_service=object(),
+        training_service=training or _FakeTraining(),
         clusterer=clusterer,
         leader_lock=lock,
     )
@@ -403,18 +417,17 @@ async def test_only_the_lock_holder_runs_periodic_clustering():
 
 async def test_prune_scan_is_leader_gated():
     lock = AdvisoryLock(None)
-    worker = _worker(_FakeClusterer(), lock)
-    calls = []
-    worker._run_adapter_prune_scan = lambda: calls.append(1) or asyncio.sleep(0)
+    training = _FakeTraining()
+    worker = _worker(_FakeClusterer(), lock, training)
 
     async with lock.try_hold("training_worker:adapter_prune") as held:
         assert held is True
         await worker._maybe_recommend_adapter_pruning()
-    assert calls == []
+    assert training.prune_scans == 0  # follower stood down
 
     worker._last_prune_run = 0.0
     await worker._maybe_recommend_adapter_pruning()
-    assert calls == [1]
+    assert training.prune_scans == 1
 
 
 # --------------------------------------------------------------------------

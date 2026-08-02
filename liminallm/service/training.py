@@ -6,7 +6,7 @@ import shutil
 import uuid
 from contextlib import suppress
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Sequence
 
@@ -19,7 +19,12 @@ from liminallm.service.tokenizer_utils import (
     vocab_size_from_tokenizer,
 )
 from liminallm.storage.errors import ConstraintViolation
-from liminallm.storage.models import POSITIVE_FEEDBACK_VALUES, Artifact, PreferenceEvent
+from liminallm.storage.models import (
+    POSITIVE_FEEDBACK_VALUES,
+    Artifact,
+    ConfigPatchAudit,
+    PreferenceEvent,
+)
 
 logger = get_logger(__name__)
 
@@ -690,6 +695,190 @@ class TrainingService:
             "routing_feedback": routing_feedback,
             "adapter_router_state": adapter_state,
         }
+
+    @staticmethod
+    def _aggregate_cluster_centroid(clusters: Optional[List[dict]]) -> List[float]:
+        if not clusters:
+            return []
+        accum: List[float] = []
+        weight_sum = 0
+        for cluster in clusters:
+            centroid = cluster.get("centroid") or []
+            count = cluster.get("count") or 0
+            if not isinstance(centroid, list) or not count:
+                continue
+            if len(accum) < len(centroid):
+                accum += [0.0] * (len(centroid) - len(accum))
+            padded = list(centroid) + [0.0] * (len(accum) - len(centroid))
+            accum = [a + c * count for a, c in zip(accum, padded)]
+            weight_sum += count
+        if not weight_sum:
+            return []
+        return [val / weight_sum for val in accum]
+
+    @staticmethod
+    def _score_from_loss(loss: Optional[float]) -> float:
+        if loss is None or not isinstance(loss, (int, float)):
+            return 0.0
+        if loss < 0:
+            return 0.0
+        return 1.0 / (1.0 + float(loss))
+
+    @staticmethod
+    def describe_run(result: Optional[dict]) -> Optional[dict]:
+        """Normalise what train_from_preferences returned into a run summary.
+
+        The version has to be recovered from the job directory name, and this
+        service is what created that directory (see _job_dir). A caller should
+        not have to know the layout to find out which version it just trained.
+        """
+        if not result:
+            return None
+        version = result.get("new_version")
+        version_dir = result.get("version_dir", "")
+        if version is None and "v" in version_dir:
+            try:
+                version = int(version_dir.split("/")[-1].replace("v", ""))
+            except (ValueError, IndexError):
+                version = None
+        return {
+            "loss": result.get("loss"),
+            "version": version,
+            "jax_trace": result.get("jax_trace"),
+            "clusters": result.get("clusters"),
+        }
+
+    def record_training_outcome(
+        self, *, adapter_id: str, loss: Optional[float], clusters: Optional[List[dict]]
+    ) -> None:
+        """Fold a finished run into the adapter's router state (SPEC §5.4).
+
+        The router picks adapters by comparing a request against each one's
+        centroid and success score, so those numbers are how training feeds
+        back into serving. Turning a training loss into a score is a judgement
+        about training, which is why it lives here and not in the worker that
+        happened to run the job.
+        """
+
+        centroid_vec = self._aggregate_cluster_centroid(clusters)
+        try:
+            self.store.update_adapter_router_state(
+                adapter_id,
+                centroid_vec=centroid_vec,
+                success_score=self._score_from_loss(loss),
+                last_trained_at=datetime.now(timezone.utc),
+            )
+        except Exception as exc:
+            logger.warning(
+                "adapter_router_state_update_failed",
+                adapter_id=adapter_id,
+                error=str(exc),
+            )
+
+
+    # An adapter is a prune candidate when it is barely used, scores badly,
+    # and has been idle. All three, so a new adapter is never proposed for
+    # retirement before it has had a chance to be used.
+    ADAPTER_PRUNE_MIN_USAGE = 2
+    ADAPTER_PRUNE_MAX_SUCCESS = 0.25
+    ADAPTER_PRUNE_STALE_DAYS = 7
+
+    def recommend_adapter_pruning(self) -> int:
+        """Propose retiring adapters that are used little and score badly.
+
+        A ConfigOps patch, not a deletion: the recommendation goes in front of
+        a human, because an adapter with poor measured numbers may still be the
+        one a small group of users depends on. Returns how many were proposed.
+
+        Lives here rather than in the worker because deciding an adapter has
+        stopped earning its keep is a judgement about adapters, and this
+        service already owns what an adapter is, how it is scored and when it
+        is promoted. The worker's job is to decide *when* to ask.
+        """
+        try:
+            states = self.store.list_adapter_router_state()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("adapter_prune_state_fetch_failed", error=str(exc))
+            return
+
+        proposed = 0
+
+        def _is_auto_prune_patch(patch: ConfigPatchAudit) -> bool:
+            if getattr(patch, "status", "pending") != "pending":
+                return False
+            ops = []
+            if isinstance(getattr(patch, "patch", None), dict):
+                ops = patch.patch.get("ops") or []
+            for op in ops:
+                if isinstance(op, dict) and op.get("path") == "/meta/auto_prune":
+                    return True
+            return False
+
+        existing_targets: set[str] = set()
+        try:
+            for patch in self.store.list_config_patches():
+                if _is_auto_prune_patch(patch):
+                    existing_targets.add(patch.artifact_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("adapter_prune_patch_scan_failed", error=str(exc))
+
+        stale_cutoff = datetime.now(timezone.utc) - timedelta(days=self.ADAPTER_PRUNE_STALE_DAYS)
+        for state in states:
+            artifact = self.store.get_artifact(state.artifact_id)
+            if not artifact or artifact.type != "adapter":
+                continue
+
+            last_used = state.last_used_at or state.last_trained_at or artifact.updated_at
+            if not last_used:
+                last_used = artifact.created_at
+            if last_used and last_used.tzinfo is None:
+                last_used = last_used.replace(tzinfo=timezone.utc)
+
+            if (
+                state.artifact_id not in existing_targets
+                and state.usage_count < self.ADAPTER_PRUNE_MIN_USAGE
+                and state.success_score < self.ADAPTER_PRUNE_MAX_SUCCESS
+                and (not last_used or last_used < stale_cutoff)
+            ):
+                patch = {
+                    "ops": [
+                        {
+                            "op": "add",
+                            "path": "/meta/auto_prune",
+                            "value": {
+                                "recommended": True,
+                                "reason": "low_usage_and_success_score",
+                                "usage_count": state.usage_count,
+                                "success_score": state.success_score,
+                                "last_used_at": last_used.isoformat() if last_used else None,
+                            },
+                        }
+                    ]
+                }
+                try:
+                    self.store.record_config_patch(
+                        artifact_id=state.artifact_id,
+                        proposer="system_llm",
+                        patch=patch,
+                        justification=(
+                            "Auto-prune recommendation for low-usage adapter; consider disabling or merging."
+                        ),
+                    )
+                    existing_targets.add(state.artifact_id)
+                    proposed += 1
+                    logger.info(
+                        "adapter_prune_recommendation_created",
+                        adapter_id=state.artifact_id,
+                        usage_count=state.usage_count,
+                        success_score=state.success_score,
+                    )
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning(
+                        "adapter_prune_patch_failed",
+                        adapter_id=state.artifact_id,
+                        error=str(exc),
+                    )
+        return proposed
 
     def _collect_adapter_router_state(self, user_id: Optional[str]) -> dict:
         try:

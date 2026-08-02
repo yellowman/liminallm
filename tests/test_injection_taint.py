@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import pytest
 
+from liminallm.service import notes
 from liminallm.service.runtime import get_runtime
 
 
@@ -115,13 +116,12 @@ async def test_sweep_reembeds_stale_and_missing_vectors(tmp_path):
     never = store.create_note(user.id, "Never", "z")  # no vector at all
 
     enc = _Enc()
-    worker = _worker(store, enc)
-    done = worker._reembed_batch()
+    done = notes.reembed_stale(store, enc, user_limit=100)
     assert done == 2  # the stale one and the un-embedded one, not the fresh one
     assert store.get_note(stale.id).meta["embedding_model"] == "encoder-v2"
     assert store.get_note(never.id).embedding == [0.5, 0.5]
     # A second pass finds nothing left to do — it converges.
-    assert worker._reembed_batch() == 0
+    assert notes.reembed_stale(store, enc, user_limit=100) == 0
 
 
 async def test_sweep_is_a_noop_without_a_real_encoder(tmp_path):
@@ -166,8 +166,7 @@ async def test_provider_failure_stops_the_pass_without_losing_progress(tmp_path)
                 raise RuntimeError("provider 500")
             return [0.1, 0.2]
 
-    worker = _worker(store, Flaky())
-    done = worker._reembed_batch()
+    done = notes.reembed_stale(store, Flaky(), user_limit=100)
     assert done == 2  # the two that succeeded are persisted, not rolled back
 
 

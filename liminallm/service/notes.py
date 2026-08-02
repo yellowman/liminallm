@@ -417,3 +417,50 @@ def format_note_results(results: List[Tuple[Any, float]]) -> str:
             f"{_excerpt(note.content)[:300]}"
         )
     return "\n".join(lines)
+
+
+REEMBED_BATCH = 100
+REEMBED_TEXT_LIMIT = 8000
+REEMBED_NOTES_PER_USER = 1000
+
+
+def reembed_stale(store, embeddings, *, user_limit: int, batch: int = REEMBED_BATCH) -> int:
+    """Recompute note vectors left behind by a previous encoder.
+
+    Encoder changes are otherwise handled lazily: a vector whose recorded
+    encoder differs reads as "not embedded" and is recomputed only when
+    something reads it. Notes nobody opens would keep stale vectors
+    indefinitely and quietly drop out of semantic search. This closes that gap.
+
+    Returns how many vectors were rewritten. Bounded per pass so a large vault
+    cannot monopolise the worker; the next pass resumes where this one stopped,
+    because "stale" is a property of the note, not a cursor.
+    """
+    model_id = getattr(embeddings, "model_id", "")
+    done = 0
+    try:
+        users = list(store.list_users(limit=user_limit))
+    except Exception as exc:  # noqa: BLE001 - the sweep is best-effort
+        logger.warning("reembed_user_list_failed", error=str(exc))
+        return 0
+
+    for user in users:
+        if done >= batch:
+            break
+        for note in store.list_notes(user.id, limit=REEMBED_NOTES_PER_USER):
+            if done >= batch:
+                break
+            stale = (note.meta or {}).get("embedding_model") not in (None, model_id)
+            if note.embedding and not stale:
+                continue
+            text = f"{note.title}\n{note.content}"[:REEMBED_TEXT_LIMIT]
+            if not text.strip():
+                continue
+            try:
+                store.update_note(note.id, embedding=embeddings.embed(text))
+                store.update_note_meta(note.id, {"embedding_model": model_id})
+                done += 1
+            except Exception as exc:  # noqa: BLE001 - provider hiccup
+                logger.warning("reembed_failed", note_id=note.id, error=str(exc))
+                return done  # stop this pass; the next one resumes
+    return done

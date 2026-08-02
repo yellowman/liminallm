@@ -13,16 +13,16 @@ from __future__ import annotations
 
 import asyncio
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, List, Optional
 
 from liminallm.logging import get_logger
+from liminallm.service import notes as notes_service
 from liminallm.service.cluster import AdvisoryLock
 
 if TYPE_CHECKING:
     from liminallm.service.clustering import SemanticClusterer
     from liminallm.service.training import TrainingService
-    from liminallm.storage.models import ConfigPatchAudit
     from liminallm.storage.postgres import PostgresStore
 
 logger = get_logger(__name__)
@@ -40,10 +40,6 @@ DEFAULT_ADAPTER_PRUNE_INTERVAL_SECONDS = 6 * 60 * 60
 DEFAULT_REEMBED_INTERVAL_SECONDS = 60 * 60
 # Bounded per pass: a vault that changed encoders converges over several
 # passes instead of stalling the worker (or the provider) on one.
-REEMBED_BATCH = 100
-ADAPTER_PRUNE_MIN_USAGE = 2
-ADAPTER_PRUNE_MAX_SUCCESS = 0.25
-ADAPTER_PRUNE_STALE_DAYS = 7
 
 
 class TrainingWorker:
@@ -162,50 +158,10 @@ class TrainingWorker:
             if not leader:
                 logger.debug("periodic_clustering_skipped_not_leader")
                 return
-            await self._run_periodic_clustering()
-
-    async def _run_periodic_clustering(self) -> None:
-        assert self.clusterer is not None
-        users = list(self.store.list_users(limit=self.cluster_user_limit))
-
-        for user in users:
-            try:
-                await self.clusterer.cluster_user_preferences(
-                    user.id,
-                    max_events=self.cluster_event_limit,
-                    streaming=True,
-                    approximate=True,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "periodic_user_clustering_failed",
-                    user_id=user.id,
-                    error=str(exc),
-                )
-
-        # "Global" clustering means global *within a tenant*. Clustering across
-        # every user regardless of tenant would produce clusters whose members
-        # span tenants, and a skill adapter trained on such a cluster would mix
-        # tenants' content (CLAUDE.md tenant isolation).
-        tenant_ids = []
-        for user in users:
-            tenant = getattr(user, "tenant_id", None)
-            if tenant and tenant not in tenant_ids:
-                tenant_ids.append(tenant)
-        for tenant_id in tenant_ids:
-            try:
-                await self.clusterer.cluster_global_preferences(
-                    max_events=self.cluster_event_limit,
-                    streaming=True,
-                    approximate=True,
-                    tenant_id=tenant_id,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "periodic_global_clustering_failed",
-                    tenant_id=tenant_id,
-                    error=str(exc),
-                )
+            await self.clusterer.cluster_everyone(
+                user_limit=self.cluster_user_limit,
+                max_events=self.cluster_event_limit,
+            )
 
     async def _maybe_recommend_adapter_pruning(self) -> None:
         """Surface low-quality adapters via ConfigOps auto-proposals."""
@@ -222,89 +178,7 @@ class TrainingWorker:
             if not leader:
                 logger.debug("adapter_prune_skipped_not_leader")
                 return
-            await self._run_adapter_prune_scan()
-
-    async def _run_adapter_prune_scan(self) -> None:
-        try:
-            states = self.store.list_adapter_router_state()
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("adapter_prune_state_fetch_failed", error=str(exc))
-            return
-
-        def _is_auto_prune_patch(patch: ConfigPatchAudit) -> bool:
-            if getattr(patch, "status", "pending") != "pending":
-                return False
-            ops = []
-            if isinstance(getattr(patch, "patch", None), dict):
-                ops = patch.patch.get("ops") or []
-            for op in ops:
-                if isinstance(op, dict) and op.get("path") == "/meta/auto_prune":
-                    return True
-            return False
-
-        existing_targets: set[str] = set()
-        try:
-            for patch in self.store.list_config_patches():
-                if _is_auto_prune_patch(patch):
-                    existing_targets.add(patch.artifact_id)
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.debug("adapter_prune_patch_scan_failed", error=str(exc))
-
-        stale_cutoff = datetime.now(timezone.utc) - timedelta(days=ADAPTER_PRUNE_STALE_DAYS)
-        for state in states:
-            artifact = self.store.get_artifact(state.artifact_id)
-            if not artifact or artifact.type != "adapter":
-                continue
-
-            last_used = state.last_used_at or state.last_trained_at or artifact.updated_at
-            if not last_used:
-                last_used = artifact.created_at
-            if last_used and last_used.tzinfo is None:
-                last_used = last_used.replace(tzinfo=timezone.utc)
-
-            if (
-                state.artifact_id not in existing_targets
-                and state.usage_count < ADAPTER_PRUNE_MIN_USAGE
-                and state.success_score < ADAPTER_PRUNE_MAX_SUCCESS
-                and (not last_used or last_used < stale_cutoff)
-            ):
-                patch = {
-                    "ops": [
-                        {
-                            "op": "add",
-                            "path": "/meta/auto_prune",
-                            "value": {
-                                "recommended": True,
-                                "reason": "low_usage_and_success_score",
-                                "usage_count": state.usage_count,
-                                "success_score": state.success_score,
-                                "last_used_at": last_used.isoformat() if last_used else None,
-                            },
-                        }
-                    ]
-                }
-                try:
-                    self.store.record_config_patch(
-                        artifact_id=state.artifact_id,
-                        proposer="system_llm",
-                        patch=patch,
-                        justification=(
-                            "Auto-prune recommendation for low-usage adapter; consider disabling or merging."
-                        ),
-                    )
-                    existing_targets.add(state.artifact_id)
-                    logger.info(
-                        "adapter_prune_recommendation_created",
-                        adapter_id=state.artifact_id,
-                        usage_count=state.usage_count,
-                        success_score=state.success_score,
-                    )
-                except Exception as exc:  # pragma: no cover - defensive
-                    logger.warning(
-                        "adapter_prune_patch_failed",
-                        adapter_id=state.artifact_id,
-                        error=str(exc),
-                    )
+            await asyncio.to_thread(self.training.recommend_adapter_pruning)
 
     async def _maybe_reembed_stale_vectors(self) -> None:
         """Re-embed vectors written by a previous encoder, cluster-wide once.
@@ -328,46 +202,14 @@ class TrainingWorker:
             if not leader:
                 logger.debug("reembed_skipped_not_leader")
                 return
-            done = await asyncio.to_thread(self._reembed_batch)
+            done = await asyncio.to_thread(
+                notes_service.reembed_stale,
+                self.store,
+                self.embeddings,
+                user_limit=self.cluster_user_limit,
+            )
             if done:
                 logger.info("reembed_sweep_completed", vectors=done)
-
-    def _reembed_batch(self) -> int:
-        """Re-embed up to REEMBED_BATCH stale note vectors. Returns the count."""
-        embeddings = self.embeddings
-        model_id = getattr(embeddings, "model_id", "")
-
-        done = 0
-        try:
-            users = list(self.store.list_users(limit=self.cluster_user_limit))
-        except Exception as exc:  # noqa: BLE001 - sweep is best-effort
-            logger.warning("reembed_user_list_failed", error=str(exc))
-            return 0
-
-        for user in users:
-            if done >= REEMBED_BATCH:
-                break
-            notes = self.store.list_notes(user.id, limit=1000)
-            for note in notes:
-                if done >= REEMBED_BATCH:
-                    break
-                stale = (note.meta or {}).get("embedding_model") not in (None, model_id)
-                if note.embedding and not stale:
-                    continue
-                text = f"{note.title}\n{note.content}"[:8000]
-                if not text.strip():
-                    continue
-                try:
-                    vector = embeddings.embed(text)
-                    self.store.update_note(note.id, embedding=vector)
-                    self.store.update_note_meta(
-                        note.id, {"embedding_model": model_id}
-                    )
-                    done += 1
-                except Exception as exc:  # noqa: BLE001 - provider hiccup
-                    logger.warning("reembed_failed", note_id=note.id, error=str(exc))
-                    return done  # stop this pass; the next one resumes
-        return done
 
     async def _process_queued_jobs(self) -> None:
         """Process a batch of queued training jobs."""
@@ -463,13 +305,14 @@ class TrainingWorker:
                     )
 
                     if promoted:
-                        self._update_adapter_router_state(
+                        self.training.record_training_outcome(
                             adapter_id=adapter_id,
                             loss=result.get("loss"),
                             clusters=result.get("clusters"),
                         )
                     # Trigger clustering after successful training
-                    await self._run_post_training_clustering(user_id)
+                    if self.clusterer:
+                        await self.clusterer.cluster_after_training(user_id)
                     return
                 else:
                     # No events to train on
@@ -529,35 +372,17 @@ class TrainingWorker:
         cluster_id: Optional[str] = None,
         job_id: Optional[str] = None,
     ) -> Optional[dict]:
-        """Execute the actual training via TrainingService."""
+        """Run the job through TrainingService and summarise the result."""
         # Pass the already-claimed job_id so training reuses it instead of
         # creating a duplicate queued job on every worker run.
-        result = self.training.train_from_preferences(
-            user_id=user_id,
-            adapter_id=adapter_id,
-            cluster_id=cluster_id,
-            job_id=job_id,
+        return self.training.describe_run(
+            self.training.train_from_preferences(
+                user_id=user_id,
+                adapter_id=adapter_id,
+                cluster_id=cluster_id,
+                job_id=job_id,
+            )
         )
-
-        if result:
-            # Extract version from result
-            version_dir = result.get("version_dir", "")
-            version = None
-            if "v" in version_dir:
-                try:
-                    version_str = version_dir.split("/")[-1].replace("v", "")
-                    version = int(version_str)
-                except (ValueError, IndexError):
-                    pass
-
-            return {
-                "loss": result.get("loss"),
-                "version": version or result.get("new_version"),
-                "jax_trace": result.get("jax_trace"),
-                "clusters": result.get("clusters"),
-            }
-
-        return None
 
     def _get_cluster_id(self, job) -> Optional[str]:
         """Extract cluster_id from job metadata if present."""
@@ -565,136 +390,6 @@ class TrainingWorker:
             return job.meta.get("cluster_id")
         return None
 
-    async def _run_post_training_clustering(self, user_id: str) -> None:
-        """Run clustering after successful training to detect emergent skills."""
-        if not self.clusterer:
-            return
-
-        try:
-            clusters = await self.clusterer.cluster_user_preferences(user_id)
-            if clusters:
-                logger.info(
-                    "post_training_clustering_complete",
-                    user_id=user_id,
-                    cluster_count=len(clusters),
-                )
-
-                # Check for skill promotion opportunities
-                promoted = self.clusterer.promote_skill_adapters(
-                    min_size=5,
-                    positive_ratio=0.7,
-                )
-                if promoted:
-                    logger.info(
-                        "emergent_skills_promoted",
-                        user_id=user_id,
-                        adapter_ids=promoted,
-                    )
-        except Exception as exc:
-            logger.warning(
-                "post_training_clustering_failed",
-                user_id=user_id,
-                error=str(exc),
-            )
-
-    def _aggregate_cluster_centroid(self, clusters: Optional[List[dict]]) -> List[float]:
-        if not clusters:
-            return []
-        accum: List[float] = []
-        weight_sum = 0
-        for cluster in clusters:
-            centroid = cluster.get("centroid") or []
-            count = cluster.get("count") or 0
-            if not isinstance(centroid, list) or not count:
-                continue
-            if len(accum) < len(centroid):
-                accum += [0.0] * (len(centroid) - len(accum))
-            padded = list(centroid) + [0.0] * (len(accum) - len(centroid))
-            accum = [a + c * count for a, c in zip(accum, padded)]
-            weight_sum += count
-        if not weight_sum:
-            return []
-        return [val / weight_sum for val in accum]
-
-    def _score_from_loss(self, loss: Optional[float]) -> float:
-        if loss is None or not isinstance(loss, (int, float)):
-            return 0.0
-        if loss < 0:
-            return 0.0
-        return 1.0 / (1.0 + float(loss))
-
-    def _update_adapter_router_state(
-        self, *, adapter_id: str, loss: Optional[float], clusters: Optional[List[dict]]
-    ) -> None:
-        """Update adapter router state after training (SPEC §5.4)."""
-
-        centroid_vec = self._aggregate_cluster_centroid(clusters)
-        try:
-            self.store.update_adapter_router_state(
-                adapter_id,
-                centroid_vec=centroid_vec,
-                success_score=self._score_from_loss(loss),
-                last_trained_at=datetime.now(timezone.utc),
-            )
-        except Exception as exc:
-            logger.warning(
-                "adapter_router_state_update_failed",
-                adapter_id=adapter_id,
-                error=str(exc),
-            )
-
-    async def process_emergent_skills(self) -> List[str]:
-        """Manually trigger emergent skill detection and training.
-
-        This scans all users for cluster promotion opportunities
-        and creates training jobs for newly created skill adapters.
-        """
-        if not self.clusterer:
-            logger.warning("emergent_skills_no_clusterer")
-            return []
-
-        promoted_adapters: List[str] = []
-
-        # Get all users with preference events
-        users = self._get_users_with_preferences()
-
-        for user_id in users:
-            try:
-                # Run clustering
-                clusters = await self.clusterer.cluster_user_preferences(user_id)
-
-                if clusters:
-                    # Promote eligible clusters to skill adapters
-                    promoted = self.clusterer.promote_skill_adapters(
-                        min_size=5,
-                        positive_ratio=0.7,
-                    )
-                    promoted_adapters.extend(promoted)
-
-            except Exception as exc:
-                logger.warning(
-                    "emergent_skill_processing_failed",
-                    user_id=user_id,
-                    error=str(exc),
-                )
-
-        logger.info(
-            "emergent_skills_processed",
-            promoted_count=len(promoted_adapters),
-            adapter_ids=promoted_adapters,
-        )
-
-        return promoted_adapters
-
-    def _get_users_with_preferences(self) -> List[str]:
-        """Get list of users who have preference events."""
-        users: set[str] = set()
-
-        for event in self.store.list_preference_events():
-            if event.user_id:
-                users.add(event.user_id)
-
-        return list(users)
 
 
 async def create_training_worker(
