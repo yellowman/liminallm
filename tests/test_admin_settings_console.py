@@ -63,6 +63,17 @@ class TestSchema:
         }
         assert flagged == set(MODEL_AFFECTING_SETTINGS)
 
+    def test_nothing_falls_into_the_unlabelled_bucket(self):
+        """"Other" is a safety net so a new setting still appears, not a
+        destination. Eighteen ended up there once and nobody noticed, because
+        the console rendered them — just at the bottom, under no heading."""
+        stranded = [
+            entry["name"]
+            for entry in managed_settings_schema()
+            if entry["group"] == "Other"
+        ]
+        assert stranded == []
+
     def test_settings_are_grouped_contiguously(self):
         """The console prints a heading when the group changes, so a group
         appearing twice would render two headings for it."""

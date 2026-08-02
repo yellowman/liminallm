@@ -601,8 +601,19 @@ const settingsFilterEl = document.getElementById('settings-filter');
 const settingsChangedOnlyEl = document.getElementById('settings-changed-only');
 const settingsDirtyCountEl = document.getElementById('settings-dirty-count');
 
-const labelFor = (name) =>
-  name.replace(/_/g, ' ').replace(/^./, (ch) => ch.toUpperCase());
+// Acronyms that should not be sentence-cased. Without this, settings read
+// "Adapter openai api key" and "Jwt issuer".
+const ACRONYMS = {
+  api: 'API', url: 'URL', uri: 'URI', id: 'ID', ids: 'IDs', ttl: 'TTL',
+  jwt: 'JWT', smtp: 'SMTP', mfa: 'MFA', rag: 'RAG', llm: 'LLM', tls: 'TLS',
+  ui: 'UI', cors: 'CORS', hsts: 'HSTS', oauth: 'OAuth', openai: 'OpenAI',
+  ws: 'WebSocket', json: 'JSON', dim: 'dimensions', pgvector: 'pgvector',
+};
+
+const labelFor = (name) => {
+  const words = name.split('_').map((w) => ACRONYMS[w] || w);
+  return words.join(' ').replace(/^./, (ch) => ch.toUpperCase());
+};
 
 const coerce = (field, raw) => {
   if (field.type === 'bool') return Boolean(raw);

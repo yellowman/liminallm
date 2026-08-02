@@ -413,10 +413,10 @@ class Settings(BaseModel):
         description="Delete tmp scratch files older than this many hours",
     )
     model_path: str = managed_field(
-        "gpt-4o-mini", description="Model path (overridable via admin UI)",
+        "gpt-4o-mini", description="Model path",
     )
     model_backend: ModelBackend | None = managed_field(
-        ModelBackend.OPENAI, description="Model backend (overridable via admin UI)",
+        ModelBackend.OPENAI, description="Model backend",
     )
     adapter_openai_api_key: str = secret_field(
         description="API key for the model provider. Write-only.",
@@ -467,45 +467,45 @@ class Settings(BaseModel):
         description="OAuth client secret for microsoft. Write-only.",
     )
     oauth_redirect_uri: str | None = managed_field(
-        None, description="OAuth redirect URI (overridable via admin UI)",
+        None, description="OAuth redirect URI",
     )
     # Email service settings (env vars are fallbacks - prefer admin UI)
     smtp_host: str | None = managed_field(
-        None, description="SMTP server host (overridable via admin UI)",
+        None, description="SMTP server host",
     )
     smtp_port: int = managed_field(
-        587, description="SMTP server port (overridable via admin UI)",
+        587, description="SMTP server port",
     )
     smtp_user: str | None = managed_field(
-        None, description="SMTP username (overridable via admin UI)",
+        None, description="SMTP username",
     )
     smtp_password: str = secret_field(
         description="SMTP password. Write-only: saved, never shown again.",
     )
     smtp_use_tls: bool = managed_field(
-        True, description="Use TLS for SMTP (overridable via admin UI)",
+        True, description="Use TLS for SMTP",
     )
     smtp_allow_insecure: bool = managed_field(
         False,
-        description="Allow plaintext SMTP when explicitly enabled (overridable via admin UI)",
+        description="Allow plaintext SMTP when explicitly enabled",
     )
     email_from_address: str | None = managed_field(
-        None, description="Email from address (overridable via admin UI)",
+        None, description="Email from address",
     )
     email_from_name: str = managed_field(
-        "LiminalLM", description="Email from name (overridable via admin UI)",
+        "LiminalLM", description="Email from name",
     )
     app_base_url: str = managed_field(
         "http://localhost:8000",
-        description="Application base URL (overridable via admin UI)",
+        description="Application base URL",
     )
     default_adapter_mode: AdapterMode = managed_field(
         AdapterMode.HYBRID,
-        description="Default mode for new adapters: local, remote, prompt, or hybrid (overridable via admin UI)",
+        description="Default mode for new adapters: local, remote, prompt, or hybrid",
     )
     allow_signup: bool = managed_field(
         True,
-        description="Allow new user signups (overridable via admin UI)",
+        description="Allow new user signups",
     )
     build_sha: str = env_field("dev", "BUILD_SHA")
     cors_allow_origins: list[str] = managed_field(
@@ -673,7 +673,7 @@ class Settings(BaseModel):
     )
     enable_mfa: bool = managed_field(
         True,
-        description="Enable multi-factor authentication (overridable via admin UI)",
+        description="Enable multi-factor authentication",
     )
     jwt_secret: str = secret_field(
         "",
@@ -684,27 +684,27 @@ class Settings(BaseModel):
     )
     jwt_issuer: str = managed_field(
         "liminallm",
-        description="JWT issuer (overridable via admin UI)",
+        description="JWT issuer",
     )
     jwt_audience: str = managed_field(
         "liminal-clients",
-        description="JWT audience (overridable via admin UI)",
+        description="JWT audience",
     )
     access_token_ttl_minutes: int = managed_field(
         30,
-        description="Access token TTL in minutes (overridable via admin UI)",
+        description="Access token TTL in minutes",
     )
     refresh_token_ttl_minutes: int = managed_field(
         24 * 60,
-        description="Refresh token TTL in minutes (overridable via admin UI)",
+        description="Refresh token TTL in minutes",
     )
     default_tenant_id: str = managed_field(
         "public",
-        description="Default tenant ID (overridable via admin UI)",
+        description="Default tenant ID",
     )
     rag_mode: RagMode = managed_field(
         RagMode.PGVECTOR,
-        description="RAG mode: pgvector or memory (overridable via admin UI)",
+        description="RAG mode: pgvector or memory",
     )
     embedding_model_id: Literal[
         "text-embedding",
@@ -765,11 +765,11 @@ class Settings(BaseModel):
     # Training worker settings (env vars are fallbacks - prefer admin UI)
     training_worker_enabled: bool = managed_field(
         True,
-        description="Enable background training job worker (overridable via admin UI)",
+        description="Enable background training job worker",
     )
     training_worker_poll_interval: int = managed_field(
         60,
-        description="Training worker poll interval in seconds (overridable via admin UI)",
+        description="Training worker poll interval in seconds",
     )
     settings_watch_interval_seconds: int = managed_field(
         10,
@@ -1120,15 +1120,19 @@ def managed_setting_names() -> set[str]:
 _SETTING_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Model", ("model_path", "model_backend", "model_context_window",
                "model_reasoning_effort", "default_adapter_mode",
-               "adapter_openai_base_url", "adapter_server_model")),
+               "adapter_openai_base_url", "adapter_openai_api_key",
+               "adapter_server_model")),
     ("Retrieval", ("rag_mode", "rag_chunk_size", "embedding_model_id",
                    "history_budget_fraction", "history_recall_fraction")),
     ("Features", ("notes_enabled", "allow_signup", "enable_mfa",
                   "web_tools_enabled", "extract_readers")),
     ("Web tools", ("web_search_provider", "web_search_engine_id",
-                   "web_fetch_timeout", "web_fetch_max_bytes",
-                   "tool_fetch_timeout", "tool_fetch_connect_timeout",
-                   "tool_network_proxy_url")),
+                   "web_search_api_key", "web_fetch_timeout",
+                   "web_fetch_max_bytes", "tool_fetch_timeout",
+                   "tool_fetch_connect_timeout", "tool_network_proxy_url")),
+    ("Sign-in with a provider", ("oauth_",)),
+    ("Security", ("cors_", "enable_hsts", "tool_network_allowlist",
+                  "web_fetch_allow_private")),
     ("Sessions & tokens", ("session_", "access_token_", "refresh_token_")),
     ("Rate limits", ("rate_limit_", "_rate_limit_")),
     ("Concurrency", ("max_concurrent_", "max_websocket_")),
@@ -1141,6 +1145,9 @@ _SETTING_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("URLs & identity", ("app_base_url", "oauth_redirect_uri",
                          "default_tenant_id", "jwt_")),
     ("Operations", ("settings_watch_interval_seconds",)),
+    ("Infrastructure", ("redis_url", "allow_redis_fallback_dev",
+                        "cluster_bus_backend", "shared_fs_root",
+                        "interpreter_scratch_dir")),
 )
 
 # Changing one of these rebuilds the model service stack, which takes a moment
