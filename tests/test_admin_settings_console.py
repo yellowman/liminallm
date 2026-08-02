@@ -244,6 +244,15 @@ class TestConsoleSource:
         script = (FRONTEND / "admin.js").read_text()
         assert "beforeunload" in script
 
+    def test_the_form_is_laid_out_as_a_grid_not_a_column(self):
+        """A hundred controls stacked one per row ran to fourteen screens."""
+        css = (FRONTEND / "styles.css").read_text()
+        assert ".setting-grid" in css
+        assert "grid-template-columns" in css
+        script = (FRONTEND / "admin.js").read_text()
+        # Each group is its own section, so related settings sit together.
+        assert "setting-group" in script
+
 
 def test_schema_is_json_serialisable():
     """It goes over the wire; a stray Enum or set would 500 the endpoint."""

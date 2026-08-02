@@ -696,7 +696,10 @@ const onFieldInput = (field, rawValue) => {
 
 const renderField = (field) => {
   const row = document.createElement('div');
-  row.className = 'field setting-row';
+  // The type drives the cell's width: a boolean needs a checkbox, a URL needs
+  // room to read. Letting CSS size by type is what keeps a hundred controls
+  // on a couple of screens instead of a hundred full-width rows.
+  row.className = `setting-row is-${field.type}${field.secret ? ' is-secret' : ''}`;
   row.dataset.setting = field.name;
   row.dataset.group = field.group;
 
@@ -750,12 +753,16 @@ const renderField = (field) => {
   });
   row.appendChild(input);
 
-  const help = document.createElement('div');
-  help.className = 'subtext';
   const defaultText = field.secret
     ? (field.is_set ? 'Currently set' : 'Not set')
     : `Default: ${JSON.stringify(field.default)}`;
-  help.textContent = field.description
+  const help = document.createElement('div');
+  help.className = 'setting-help';
+  // Visible: what the setting does. Tooltip: that plus the shipped default.
+  // Putting the default inline pushed the description past the one line a
+  // dense grid can afford, leaving four truncated words on every field.
+  help.textContent = field.description || defaultText;
+  help.title = field.description
     ? `${field.description} (${defaultText})`
     : defaultText;
   row.appendChild(help);
@@ -768,25 +775,52 @@ const renderField = (field) => {
   return row;
 };
 
+const groupId = (group) => `settings-group-${group.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`;
+
+// Seventeen groups is more than fits on a screen, so give them a jump list
+// rather than making an operator scroll to find one.
+const renderGroupNav = () => {
+  const nav = document.getElementById('settings-nav');
+  if (!nav) return;
+  nav.textContent = '';
+  settingsFormEl.querySelectorAll('.setting-group').forEach((section) => {
+    const link = document.createElement('a');
+    link.href = `#${section.id}`;
+    link.textContent = section.querySelector('h4').textContent;
+    link.className = 'group-chip';
+    nav.appendChild(link);
+  });
+};
+
 const renderSettingsForm = () => {
   if (!settingsFormEl) return;
   const needle = (settingsFilterEl?.value || '').trim().toLowerCase();
   const changedOnly = Boolean(settingsChangedOnlyEl?.checked);
   settingsFormEl.textContent = '';
 
+  // One section per group, each a grid. Grouping is the point: rate limits
+  // read as a block of related numbers, not eighteen unrelated rows.
   let shown = 0;
+  let grid = null;
   let lastGroup = null;
   settingsSchema.forEach((field) => {
     if (needle && !field.name.includes(needle) &&
         !field.description.toLowerCase().includes(needle)) return;
     if (changedOnly && !field.overridden && !settingsEdits.has(field.name)) return;
     if (field.group !== lastGroup) {
+      const section = document.createElement('section');
+      section.className = 'setting-group';
+      section.id = groupId(field.group);
       const heading = document.createElement('h4');
       heading.textContent = field.group;
-      settingsFormEl.appendChild(heading);
+      section.appendChild(heading);
+      grid = document.createElement('div');
+      grid.className = 'setting-grid';
+      section.appendChild(grid);
+      settingsFormEl.appendChild(section);
       lastGroup = field.group;
     }
-    settingsFormEl.appendChild(renderField(field));
+    grid.appendChild(renderField(field));
     shown += 1;
   });
 
@@ -796,6 +830,7 @@ const renderSettingsForm = () => {
     empty.textContent = 'No settings match this filter.';
     settingsFormEl.appendChild(empty);
   }
+  renderGroupNav();
   refreshDirtyState();
 };
 
