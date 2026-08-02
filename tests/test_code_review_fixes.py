@@ -74,71 +74,6 @@ class TestZeroWeightAdapterHandling:
 
 
 # ==============================================================================
-# Thread-Safe Memory Store Counter Tests
-# ==============================================================================
-
-
-class TestMemoryStoreThreadSafety:
-    """Test thread safety of memory store sequence counters."""
-
-    def test_artifact_version_seq_thread_safe(self):
-        """_next_artifact_version_id should be thread-safe."""
-        import tempfile
-
-        from liminallm.storage.memory import MemoryStore
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = MemoryStore(fs_root=tmpdir)
-
-            # Collect IDs from multiple threads
-            collected_ids = []
-            lock = threading.Lock()
-
-            def get_next_id():
-                for _ in range(100):
-                    next_id = store._next_artifact_version_id()
-                    with lock:
-                        collected_ids.append(next_id)
-
-            threads = [threading.Thread(target=get_next_id) for _ in range(10)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
-
-            # All IDs should be unique (no duplicates)
-            assert len(collected_ids) == len(set(collected_ids))
-            assert len(collected_ids) == 1000
-
-    def test_chunk_id_seq_thread_safe(self):
-        """_next_chunk_id should be thread-safe."""
-        import tempfile
-
-        from liminallm.storage.memory import MemoryStore
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = MemoryStore(fs_root=tmpdir)
-
-            collected_ids = []
-            lock = threading.Lock()
-
-            def get_next_id():
-                for _ in range(100):
-                    next_id = store._next_chunk_id()
-                    with lock:
-                        collected_ids.append(next_id)
-
-            threads = [threading.Thread(target=get_next_id) for _ in range(10)]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
-
-            # All IDs should be unique
-            assert len(collected_ids) == len(set(collected_ids))
-
-
-# ==============================================================================
 # Token-Based RAG Chunking Tests
 # ==============================================================================
 
@@ -169,67 +104,61 @@ class TestTokenBasedRAGChunking:
 
     def test_chunking_creates_overlap(self):
         """Chunks should have overlapping tokens."""
-        import tempfile
-
         from liminallm.service.rag import RAGService
-        from liminallm.storage.memory import MemoryStore
+        from tests.pgharness import get_test_store
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = MemoryStore(fs_root=tmpdir)
-            rag = RAGService(store, default_chunk_size=50, rag_mode="memory")
+        store = get_test_store()
+        rag = RAGService(store, default_chunk_size=50, rag_mode="memory")
 
-            # Create a test context
-            user = store.create_user("test@test.com", tenant_id="test")
-            ctx = store.upsert_context(
-                name="test",
-                description="test context",
-                owner_user_id=user.id,
-            )
+        # Create a test context
+        user = store.create_user("test@test.com", tenant_id="test")
+        ctx = store.upsert_context(
+            name="test",
+            description="test context",
+            owner_user_id=user.id,
+        )
 
-            # Ingest long text
-            long_text = " ".join([f"word{i}" for i in range(200)])
-            chunk_count = rag.ingest_text(ctx.id, long_text, chunk_size=50, overlap_tokens=20)
+        # Ingest long text
+        long_text = " ".join([f"word{i}" for i in range(200)])
+        chunk_count = rag.ingest_text(ctx.id, long_text, chunk_size=50, overlap_tokens=20)
 
-            assert chunk_count > 1
+        assert chunk_count > 1
 
-            # Verify chunks were created with metadata
-            chunks = store.list_chunks(ctx.id)
-            assert len(chunks) > 1
+        # Verify chunks were created with metadata
+        chunks = store.list_chunks(ctx.id)
+        assert len(chunks) > 1
 
-            # Check that overlap metadata exists
-            for i, chunk in enumerate(chunks):
-                if chunk.meta and i > 0:
-                    assert "overlap_tokens" in chunk.meta
+        # Check that overlap metadata exists
+        for i, chunk in enumerate(chunks):
+            if chunk.meta and i > 0:
+                assert "overlap_tokens" in chunk.meta
 
     def test_chunk_metadata_includes_token_info(self):
         """Chunks should have token count metadata."""
-        import tempfile
-
         from liminallm.service.rag import RAGService
-        from liminallm.storage.memory import MemoryStore
+        from tests.pgharness import get_test_store
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            store = MemoryStore(fs_root=tmpdir)
-            rag = RAGService(store, default_chunk_size=100, rag_mode="memory")
+        store = get_test_store()
+        rag = RAGService(store, default_chunk_size=100, rag_mode="memory")
 
-            # Create context
-            user = store.create_user("test@test.com")
-            ctx = store.upsert_context(
-                name="test",
-                description="test",
-                owner_user_id=user.id,
-            )
+        # Create context
+        user = store.create_user("test@test.com")
+        ctx = store.upsert_context(
+            name="test",
+            description="test",
+            owner_user_id=user.id,
+        )
 
-            text = "This is a test text with multiple words for chunking."
-            rag.ingest_text(ctx.id, text, chunk_size=100)
+        text = "This is a test text with multiple words for chunking."
+        rag.ingest_text(ctx.id, text, chunk_size=100)
 
-            chunks = store.list_chunks(ctx.id)
-            assert len(chunks) >= 1
+        chunks = store.list_chunks(ctx.id)
+        assert len(chunks) >= 1
 
-            for chunk in chunks:
-                if chunk.meta:
-                    assert "token_count" in chunk.meta
-                    assert "embedding_model_id" in chunk.meta
+        for chunk in chunks:
+            if chunk.meta:
+                assert "token_count" in chunk.meta
+                assert "embedding_model_id" in chunk.meta
 
 
 # ==============================================================================

@@ -11,7 +11,7 @@ Usage:
 Environment Variables:
     ADMIN_EMAIL: Email for the admin user
     ADMIN_PASSWORD: Password for the admin user (must meet complexity requirements)
-    DATABASE_URL: PostgreSQL connection string (optional, uses memory store if not set)
+    DATABASE_URL: PostgreSQL connection string (required)
 """
 from __future__ import annotations
 
@@ -156,10 +156,9 @@ def main():
     if not os.environ.get("SHARED_FS_ROOT"):
         os.environ["SHARED_FS_ROOT"] = "/tmp/liminallm-bootstrap"
 
-    # Use memory store if no database configured
     if not os.environ.get("DATABASE_URL"):
-        os.environ["USE_MEMORY_STORE"] = "true"
-        print("Note: Using in-memory store (set DATABASE_URL for persistence)")
+        print("Error: DATABASE_URL is required; bootstrap writes the admin to Postgres")
+        sys.exit(1)
 
     os.environ.setdefault("TEST_MODE", "true")
     os.environ.setdefault("ALLOW_REDIS_FALLBACK_DEV", "true")

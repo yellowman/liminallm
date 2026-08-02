@@ -10,7 +10,6 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from liminallm.service.tokenizer_utils import (
-    MAX_GENERATION_TOKENS,
     MAX_SINGLE_MESSAGE_TOKENS,
     estimate_token_count,
 )

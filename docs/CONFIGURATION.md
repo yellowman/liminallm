@@ -117,9 +117,8 @@ This is particularly useful for:
 
 ### To add a runtime-configurable setting:
 
-1. Add to `get_system_settings()` defaults in both:
-   - `liminallm/storage/memory.py`
-   - `liminallm/storage/postgres.py`
+1. Add it to `SYSTEM_SETTINGS_DEFAULTS` in `liminallm/config.py` — the store
+   merges those defaults under whatever an admin actually stored.
 
 2. Use it in code with fallback:
    ```python

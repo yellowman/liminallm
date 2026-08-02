@@ -336,7 +336,7 @@ USING ivfflat (embedding) WITH (lists = 100);
   - return chunk text + `fs_path` for citation; orchestrator can ask LLM to cite paths.
   - optional dev fallback: in-process hybrid BM25 + cosine search (controlled by `RAG_MODE=local_hybrid`), intended for tests or tiny corpora when pgvector is absent.
   - **ranking precedence (applies to rag, notes, and conversation recall alike):** semantic is primary; bm25 is the fallback and the tie-breaker, never the peer. concretely: with a real encoder, ranking is hybrid (semantic-weighted, bm25 retained so exact identifiers and numbers keep their pull); **without** one, bm25 alone. hash-embedding cosine must never enter a score — `EmbeddingsService.is_semantic` is the flag every consumer checks, because noise blended at any weight is worse than keywords alone.
-  - baseline kernel ships with a deterministic hashing-based embedding fallback (no external model dependency) shared across RAG/routing/clustering so chunks always have non-empty vectors for cosine search in both Postgres and in-memory stores.
+  - baseline kernel ships with a deterministic hashing-based embedding fallback (no external model dependency) shared across RAG/routing/clustering so chunks always have non-empty vectors for cosine search.
 
 ### 2.6 preferences & training
 
@@ -467,13 +467,19 @@ params_layer_00_attn_v_B.npy
 
 or a single `params.npz` keyed by `"layer_00.attn_q.A"`, etc.
 
-### 3.3 memory-store snapshots (dev / single-node mode)
+### 3.3 storage
 
-when the kernel runs in the in-memory fallback (no Postgres), it must persist state onto the shared filesystem so restarts do not wipe user data:
+postgres is the only store. there is no in-memory fallback: a second
+implementation of the storage layer means every feature is written twice and
+verified once, and the copy production runs is the untested one.
 
-- write a JSON snapshot under `{shared_fs_root}/state/memory_store.json` after each mutation covering users, auth sessions, credentials, conversations/messages, artifacts + versions, config patches, knowledge contexts, and chunks.
-- on startup, reload this snapshot before seeding default artifacts; only seed when no persisted state is present.
-- artifact payloads (e.g., workflow JSON) still live under `{shared_fs_root}/artifacts/{artifact_id}/vNNNN.json` so snapshot + files can fully reconstruct state.
+- `sql/schema.sql` is the whole schema, applied idempotently by
+  `scripts/migrate.sh`. the embedding column's width is pinned at apply time
+  (`-v embedding_dim=...`) because pgvector's ivfflat index requires a fixed
+  dimension.
+- artifact payloads (e.g., workflow JSON) live under
+  `{shared_fs_root}/artifacts/{artifact_id}/vNNNN.json`; the database holds the
+  metadata and version pointers.
 
 ---
 
@@ -1838,7 +1844,6 @@ the following are treated as constants the kernel must honor; LLM edits happen o
     - database connection: `DATABASE_URL`, `REDIS_URL`
     - bootstrap secrets: `JWT_SECRET` (required before DB available)
     - OAuth secrets: `client_secret` values (optional, can be moved to DB with encryption if needed)
-    - storage mode: `USE_MEMORY_STORE` (required before DB connection)
     - test harness: `TEST_MODE`
   - **admin UI** at `/admin.html` provides grouped controls for all database-managed settings; changes take effect immediately without server restart.
   - **API**: `GET /v1/admin/settings` returns current values merged with defaults; `PUT /v1/admin/settings` validates types (int/float/bool) and persists to `instance_config` table; requires admin role.

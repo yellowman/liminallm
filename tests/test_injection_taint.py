@@ -17,10 +17,14 @@ def _engine():
     return get_runtime().workflow
 
 
+_USER_ID = "00000000-0000-4000-8000-000000000001"
+
+
 def _exec(engine, name, args, session):
     return engine._execute_agent_tool(
         name, args,
-        conversation_id="c1", context_id=None, user_id="u1", tenant_id=None,
+        conversation_id="00000000-0000-4000-8000-0000000000c1", context_id=None,
+        user_id=_USER_ID, tenant_id=None,
         session=session, snippets=[], fallback_query="q",
     )
 
@@ -100,13 +104,13 @@ def _worker(store, embeddings, **kw):
 
 
 async def test_sweep_reembeds_stale_and_missing_vectors(tmp_path):
-    from liminallm.storage.memory import MemoryStore
+    from tests.pgharness import get_test_store
 
-    store = MemoryStore(fs_root=str(tmp_path))
+    store = get_test_store()
     user = store.create_user(email="sweep@example.com", role="user")
-    fresh = store.create_note(user.id, "Fresh", "x", embedding=[1.0, 0.0])
+    fresh = store.create_note(user.id, "Fresh", "x", embedding=[1.0] + [0.0] * 63)
     store.update_note_meta(fresh.id, {"embedding_model": "encoder-v2"})
-    stale = store.create_note(user.id, "Stale", "y", embedding=[1.0, 0.0])
+    stale = store.create_note(user.id, "Stale", "y", embedding=[1.0] + [0.0] * 63)
     store.update_note_meta(stale.id, {"embedding_model": "encoder-v1"})
     never = store.create_note(user.id, "Never", "z")  # no vector at all
 
@@ -122,9 +126,9 @@ async def test_sweep_reembeds_stale_and_missing_vectors(tmp_path):
 
 async def test_sweep_is_a_noop_without_a_real_encoder(tmp_path):
     from liminallm.service.embeddings import EmbeddingsService
-    from liminallm.storage.memory import MemoryStore
+    from tests.pgharness import get_test_store
 
-    store = MemoryStore(fs_root=str(tmp_path))
+    store = get_test_store()
     worker = _worker(store, EmbeddingsService("hash"))  # is_semantic False
     worker._last_reembed_run = 0.0
     await worker._maybe_reembed_stale_vectors()
@@ -133,9 +137,9 @@ async def test_sweep_is_a_noop_without_a_real_encoder(tmp_path):
 
 async def test_sweep_is_leader_locked(tmp_path):
     from liminallm.service.cluster import AdvisoryLock
-    from liminallm.storage.memory import MemoryStore
+    from tests.pgharness import get_test_store
 
-    store = MemoryStore(fs_root=str(tmp_path))
+    store = get_test_store()
     user = store.create_user(email="lock@example.com", role="user")
     store.create_note(user.id, "Needs embedding", "text")
     lock = AdvisoryLock(None)
@@ -148,9 +152,9 @@ async def test_sweep_is_leader_locked(tmp_path):
 
 
 async def test_provider_failure_stops_the_pass_without_losing_progress(tmp_path):
-    from liminallm.storage.memory import MemoryStore
+    from tests.pgharness import get_test_store
 
-    store = MemoryStore(fs_root=str(tmp_path))
+    store = get_test_store()
     user = store.create_user(email="fail@example.com", role="user")
     for i in range(4):
         store.create_note(user.id, f"Note {i}", "text")

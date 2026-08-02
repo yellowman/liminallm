@@ -190,7 +190,7 @@ pip install -e ".[dev]"
 # Set required environment variables
 export JWT_SECRET="YourSecure-JWT-Secret-With-32-Characters!"
 export SHARED_FS_ROOT="/tmp/liminallm"
-export USE_MEMORY_STORE=true
+export DATABASE_URL="postgresql://postgres:postgres@localhost:5432/liminallm"
 export TEST_MODE=true
 
 # Start the API server
@@ -244,8 +244,8 @@ uvicorn liminallm.app:app --host 0.0.0.0 --port 8000 --workers 4
 #### Running Tests (Native)
 
 ```bash
-# Run all tests in memory mode
-TEST_MODE=true USE_MEMORY_STORE=true pytest tests/ -v
+# The suite starts its own throwaway Postgres; set TEST_DATABASE_URL to reuse one
+TEST_MODE=true pytest tests/ -v
 
 # Run specific test suites
 pytest tests/test_post_smoke.py -v  # Post-smoke tests
@@ -330,7 +330,7 @@ Run the automated smoke test:
 
 ### tests
 
-- Run `scripts/run_tests.sh` to mirror CI defaults; it compiles the code and executes `pytest` with in-memory stores enabled for deterministic local runs.
+- Run `scripts/run_tests.sh` to mirror CI defaults; it compiles the code and executes `pytest`. the suite spins up a throwaway postgres cluster (`tests/pgharness.py`) and applies `sql/schema.sql` to it, so tests exercise the same store production runs — set `TEST_DATABASE_URL` to point at an existing database instead.
 
 ### adapters: local LoRA vs remote fine-tune IDs vs prompt-distilled
 
@@ -395,7 +395,6 @@ Run the automated smoke test:
    - `OPENAI_ADAPTER_API_KEY` – OpenAI plug API key (leave unset to use the echo fallback)
    - `OPENAI_ADAPTER_BASE_URL` – optional base URL override when pointing at an OpenAI-compatible endpoint
    - `ADAPTER_SERVER_MODEL` – model name when pointing at an OpenAI-compatible adapter server
-   - `USE_MEMORY_STORE` – set to `true` to run without Postgres/Redis while testing the API and LLM calls
    - `TEST_MODE` – set to `true` to allow Redis-free test harnesses (rate limits, idempotency durability, and caches are disabled)
    - `RAG_CHUNK_SIZE` – default character window for knowledge ingestion; overrides can be provided per request
    - `RAG_MODE` – `pgvector` (default) uses the database index; `local_hybrid` forces the in-process BM25+cosine fallback for dev/test

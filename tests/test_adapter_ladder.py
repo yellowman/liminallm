@@ -7,7 +7,7 @@ import pytest
 
 from liminallm.service.clustering import SemanticClusterer
 from liminallm.service.training import TrainingService
-from liminallm.storage.memory import MemoryStore
+from tests.pgharness import get_test_store
 
 
 def _seed_user_with_events(store, email, cluster_id, n_events, corrected="use tabs"):
@@ -45,7 +45,7 @@ def _make_cluster(store, *, user_id=None, size=10):
 
 class TestPromptFirstLadder:
     def test_skill_adapter_born_in_prompt_mode(self, tmp_path):
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, str(tmp_path))
         clusterer = SemanticClusterer(store, llm=None, training=training)
         cluster = _make_cluster(store)
@@ -61,11 +61,11 @@ class TestPromptFirstLadder:
         assert "use tabs" in schema["prompt_instructions"]
         assert schema["lifecycle"]["stage"] == "prompt"
         # Below the weights threshold: no training job enqueued.
-        jobs = [j for j in store.training_jobs.values() if j.adapter_id == adapter.id]
+        jobs = [j for j in store.list_training_jobs() if j.adapter_id == adapter.id]
         assert jobs == []
 
     def test_weights_job_enqueued_at_threshold(self, tmp_path):
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, str(tmp_path))
         clusterer = SemanticClusterer(store, llm=None, training=training)
         cluster = _make_cluster(store)
@@ -74,11 +74,11 @@ class TestPromptFirstLadder:
         promoted = clusterer.promote_skill_adapters(min_size=5, weights_min_events=8)
 
         adapter_id = promoted[0]
-        jobs = [j for j in store.training_jobs.values() if j.adapter_id == adapter_id]
+        jobs = [j for j in store.list_training_jobs() if j.adapter_id == adapter_id]
         assert len(jobs) == 1
 
     def test_cross_user_cluster_is_tenant_scoped_not_global(self, tmp_path):
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, str(tmp_path))
         clusterer = SemanticClusterer(store, llm=None, training=training)
         cluster = _make_cluster(store, user_id=None)
@@ -94,14 +94,14 @@ class TestPromptFirstLadder:
         assert adapter.owner_user_id == heavy_user.id
         assert adapter.schema["scope"] == "tenant"
         assert adapter.schema["tenant_id"] == "public"
-        jobs = [j for j in store.training_jobs.values() if j.adapter_id == adapter.id]
+        jobs = [j for j in store.list_training_jobs() if j.adapter_id == adapter.id]
         assert len(jobs) == 1
         assert jobs[0].user_id == heavy_user.id  # most frequent contributor
 
 
 class TestPooledTrainingData:
     def test_global_skill_adapter_pools_events_across_users(self, tmp_path):
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, str(tmp_path))
         clusterer = SemanticClusterer(store, llm=None, training=training)
         cluster = _make_cluster(store, user_id=None)
@@ -122,7 +122,7 @@ class TestPooledTrainingData:
         ) == 8  # dataset file holds all entries pre-split or post-split count
 
     def test_persona_adapter_stays_per_user(self, tmp_path):
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, str(tmp_path))
         cluster = _make_cluster(store, user_id=None)
         user_a, _ = _seed_user_with_events(store, "a@t.local", cluster.id, 2)
@@ -138,7 +138,7 @@ class TestPooledTrainingData:
 
 class TestEvalGate:
     def test_training_skip_blocks_promotion(self, tmp_path, monkeypatch):
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, str(tmp_path))
         cluster = _make_cluster(store)
         user, _ = _seed_user_with_events(store, "a@t.local", cluster.id, 3)
@@ -159,7 +159,7 @@ class TestEvalGate:
     def test_real_jax_training_runs_eval_and_promotes(self, tmp_path):
         pytest.importorskip("jax")
         pytest.importorskip("optax")
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, str(tmp_path))
         cluster = _make_cluster(store)
         user, _ = _seed_user_with_events(store, "a@t.local", cluster.id, 10)
@@ -179,7 +179,7 @@ class TestEvalGate:
 
     def test_prompt_adapter_graduates_to_hybrid_on_promotion(self, tmp_path):
         pytest.importorskip("jax")
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, str(tmp_path))
         clusterer = SemanticClusterer(store, llm=None, training=training)
         cluster = _make_cluster(store, user_id=None)
@@ -209,7 +209,7 @@ class _FakeTeacher:
 
 class TestDistillation:
     def test_targets_rewritten_when_enabled(self, tmp_path):
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         teacher = _FakeTeacher()
         training = TrainingService(
             store, str(tmp_path), teacher=teacher, distillation_enabled=True
@@ -226,7 +226,7 @@ class TestDistillation:
         assert "distilled exemplar response" in dataset
 
     def test_disabled_by_default(self, tmp_path):
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         teacher = _FakeTeacher()
         training = TrainingService(store, str(tmp_path), teacher=teacher)
         cluster = _make_cluster(store)
@@ -254,7 +254,7 @@ class TestTenantIsolation:
         return user
 
     def test_pooled_training_excludes_other_tenants(self, tmp_path):
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, str(tmp_path))
         clusterer = SemanticClusterer(store, llm=None, training=training)
         cluster = _make_cluster(store, user_id=None)
@@ -271,7 +271,7 @@ class TestTenantIsolation:
         assert "INITECH_SECRET" not in dataset
 
     def test_tenant_adapter_not_visible_to_other_tenant(self, tmp_path):
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, str(tmp_path))
         clusterer = SemanticClusterer(store, llm=None, training=training)
         cluster = _make_cluster(store, user_id=None)
@@ -302,7 +302,7 @@ class TestRejectedWeightsNotServed:
 
         from liminallm.service.model_backend import LocalJaxLoRABackend
 
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, str(tmp_path))
         cluster = _make_cluster(store)
         user, _ = _seed_user_with_events(store, "a@t.local", cluster.id, 10)

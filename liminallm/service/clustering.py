@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import json
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 from liminallm.logging import get_logger
@@ -291,11 +291,7 @@ class SemanticClusterer:
     async def _warm_start_centroids(
         self, user_id: str | None, k: int
     ) -> list[list[float]]:
-        if not hasattr(self.store, "list_semantic_clusters"):
-            return []
         clusters = self.store.list_semantic_clusters(user_id=user_id)
-        if inspect.isawaitable(clusters):
-            clusters = await clusters
         sorted_clusters = sorted(
             clusters,
             key=lambda c: c.size,
@@ -326,7 +322,7 @@ class SemanticClusterer:
                 cluster.id,
                 label=label,
                 description=description,
-                meta={"labeled_at": datetime.utcnow().isoformat()},
+                meta={"labeled_at": datetime.now(timezone.utc).isoformat()},
             )
 
     async def _label_with_llm(
@@ -459,10 +455,8 @@ class SemanticClusterer:
                 self.logger.warning("skill_promotion_no_owner", cluster_id=cluster.id)
                 continue
             visibility = "private" if cluster.user_id else "shared"
-            tenant_id = None
-            get_user = getattr(self.store, "get_user", None)
-            if callable(get_user):
-                tenant_id = getattr(get_user(owner_id), "tenant_id", None)
+            owner = self.store.get_user(owner_id)
+            tenant_id = owner.tenant_id if owner else None
             # base_model is required by the adapter schema; source it from the
             # runtime/training base model so promotion validates instead of
             # silently failing.
@@ -517,11 +511,9 @@ class SemanticClusterer:
             # adapters use the most frequent contributor as the job's nominal
             # owner; the training service pools cluster-wide regardless.
             if self.training and len(positive) >= weights_min_events:
-                job_owner = owner_id
-                create_training_job = getattr(self.store, "create_training_job", None)
-                if job_owner and callable(create_training_job):
-                    create_training_job(
-                        user_id=job_owner,
+                if owner_id:
+                    self.store.create_training_job(
+                        user_id=owner_id,
                         adapter_id=adapter.id,
                         preference_event_ids=[e.id for e in positive],
                     )

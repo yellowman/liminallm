@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from psycopg import errors
+from psycopg.abc import Buffer
+from psycopg.adapt import Loader
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
@@ -70,6 +72,42 @@ from liminallm.storage.models import (
 _MAX_SESSION_CACHE_SIZE = 10000
 
 
+class _UUIDAsText(Loader):
+    """Hand UUID columns back as strings.
+
+    Every id in the models is typed ``str``, and the ids flowing in from JWTs,
+    URLs and JSON are strings. Left as ``uuid.UUID``, a column value compares
+    unequal to the very id it was looked up by and is not JSON serializable —
+    both of which have shipped as bugs here. Convert once, at the boundary.
+    """
+
+    def load(self, data: Buffer) -> str:
+        return bytes(data).decode()
+
+
+def _configure_connection(conn) -> None:
+    conn.adapters.register_loader("uuid", _UUIDAsText)
+    # Without this, TIMESTAMPTZ comes back in whatever timezone the server was
+    # initialised with; the instant is right but the tzinfo is not UTC, and
+    # code that expects UTC (cookie expiry formatting, for one) rejects it.
+    conn.execute("SET TIME ZONE 'UTC'")
+    conn.commit()
+
+
+def _is_uuid(value: Any) -> bool:
+    """Every id in this schema is a UUID.
+
+    A malformed id cannot match a row, but Postgres raises on it rather than
+    returning nothing — so callers get a 500 where they should get a miss.
+    Check here and let the lookup return None.
+    """
+    try:
+        uuid.UUID(str(value))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return True
+
+
 class PostgresStore:
     """Thin Postgres-backed store to persist kernel primitives."""
 
@@ -103,6 +141,7 @@ class PostgresStore:
                 timeout=30.0,  # Don't wait more than 30s for a connection
                 max_waiting=100,  # Limit waiting queue to prevent unbounded growth
                 reconnect_timeout=5.0,  # Quick reconnection on failure
+                configure=_configure_connection,
                 kwargs={"row_factory": dict_row, "autocommit": False},
             )
             self.logger.info(
@@ -136,6 +175,19 @@ class PostgresStore:
                 error=str(exc),
             )
             raise
+
+    def verify_connection(self) -> None:
+        """Round-trip a query. Raises if the database is unreachable."""
+        with self._connect() as conn:
+            conn.execute("SELECT 1").fetchone()
+
+    def close_pool(self) -> None:
+        """Synchronously close the pool (test resets, shutdown without a loop)."""
+        try:
+            self.pool.close()
+            self.pool.wait_closed()
+        except Exception as exc:  # noqa: BLE001 - already closed is fine
+            self.logger.debug("postgres_pool_close_failed", error=str(exc))
 
     async def close(self) -> None:
         """Close the connection pool for graceful shutdown (Issues 57.7, 59.1)."""
@@ -557,7 +609,7 @@ class PostgresStore:
             context_text=context_text,
             corrected_text=corrected_text,
             created_at=(
-                row.get("created_at", datetime.utcnow()) if row else datetime.utcnow()
+                row.get("created_at", datetime.now(timezone.utc)) if row else datetime.now(timezone.utc)
             ),
             weight=normalized_weight,
             meta=meta,
@@ -614,7 +666,7 @@ class PostgresStore:
                 cluster_id=row.get("cluster_id"),
                 context_text=row.get("context_text"),
                 corrected_text=row.get("corrected_text"),
-                created_at=row.get("created_at", datetime.utcnow()),
+                created_at=row.get("created_at", datetime.now(timezone.utc)),
                 weight=self._safe_float(row.get("weight", 1.0), context="list_preference_events"),
                 meta=row.get("meta"),
             )
@@ -645,12 +697,14 @@ class PostgresStore:
             cluster_id=row.get("cluster_id"),
             context_text=row.get("context_text"),
             corrected_text=row.get("corrected_text"),
-            created_at=row.get("created_at", datetime.utcnow()),
+            created_at=row.get("created_at", datetime.now(timezone.utc)),
             weight=self._safe_float(row.get("weight", 1.0), context="update_preference_event"),
             meta=row.get("meta"),
         )
 
     def get_preference_event(self, event_id: str) -> PreferenceEvent | None:
+        if not _is_uuid(event_id):
+            return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM preference_event WHERE id = %s", (event_id,)
@@ -669,7 +723,7 @@ class PostgresStore:
             cluster_id=row.get("cluster_id"),
             context_text=row.get("context_text"),
             corrected_text=row.get("corrected_text"),
-            created_at=row.get("created_at", datetime.utcnow()),
+            created_at=row.get("created_at", datetime.now(timezone.utc)),
             weight=self._safe_float(row.get("weight", 1.0), context="get_preference_event"),
             meta=row.get("meta"),
         )
@@ -813,7 +867,7 @@ class PostgresStore:
             description=normalize_optional_text(row.get("description")),
             sample_message_ids=row.get("sample_message_ids") or [],
             created_at=row.get("created_at", existing.created_at),
-            updated_at=row.get("updated_at", datetime.utcnow()),
+            updated_at=row.get("updated_at", datetime.now(timezone.utc)),
             meta=row.get("meta"),
         )
 
@@ -839,14 +893,16 @@ class PostgresStore:
                 label=normalize_optional_text(row.get("label")),
                 description=normalize_optional_text(row.get("description")),
                 sample_message_ids=row.get("sample_message_ids") or [],
-                created_at=row.get("created_at", datetime.utcnow()),
-                updated_at=row.get("updated_at", datetime.utcnow()),
+                created_at=row.get("created_at", datetime.now(timezone.utc)),
+                updated_at=row.get("updated_at", datetime.now(timezone.utc)),
                 meta=row.get("meta"),
             )
             for row in rows
         ]
 
     def get_semantic_cluster(self, cluster_id: str) -> SemanticCluster | None:
+        if not _is_uuid(cluster_id):
+            return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM semantic_cluster WHERE id = %s", (cluster_id,)
@@ -861,8 +917,8 @@ class PostgresStore:
             label=row.get("label"),
             description=row.get("description"),
             sample_message_ids=row.get("sample_message_ids") or [],
-            created_at=row.get("created_at", datetime.utcnow()),
-            updated_at=row.get("updated_at", datetime.utcnow()),
+            created_at=row.get("created_at", datetime.now(timezone.utc)),
+            updated_at=row.get("updated_at", datetime.now(timezone.utc)),
             meta=row.get("meta"),
         )
 
@@ -875,7 +931,7 @@ class PostgresStore:
         meta: dict | None = None,
     ) -> TrainingJob:
         job_id = str(uuid.uuid4())
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         pref_ids = preference_event_ids or []
         num_events = len(pref_ids) if pref_ids else None
         columns = (
@@ -930,7 +986,7 @@ class PostgresStore:
         existing = self.get_training_job(job_id)
         if not existing:
             return None
-        new_updated_at = datetime.utcnow()
+        new_updated_at = datetime.now(timezone.utc)
         with self._connect() as conn:
             row = conn.execute(
                 """
@@ -987,7 +1043,7 @@ class PostgresStore:
             The claimed TrainingJob with status='running' if successful, None if
             the job doesn't exist or was already claimed by another worker.
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         with self._connect() as conn:
             # Atomic conditional update - only succeeds if status is still 'queued'
             row = conn.execute(
@@ -1020,6 +1076,8 @@ class PostgresStore:
         )
 
     def get_training_job(self, job_id: str) -> TrainingJob | None:
+        if not _is_uuid(job_id):
+            return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM training_job WHERE id = %s", (job_id,)
@@ -1034,8 +1092,8 @@ class PostgresStore:
             ),
             status=row.get("status", "queued"),
             num_events=row.get("num_events"),
-            created_at=row.get("created_at", datetime.utcnow()),
-            updated_at=row.get("updated_at", datetime.utcnow()),
+            created_at=row.get("created_at", datetime.now(timezone.utc)),
+            updated_at=row.get("updated_at", datetime.now(timezone.utc)),
             loss=row.get("loss"),
             preference_event_ids=row.get("preference_event_ids") or [],
             dataset_path=row.get("dataset_path"),
@@ -1077,8 +1135,8 @@ class PostgresStore:
                 ),
                 status=row.get("status", "queued"),
                 num_events=row.get("num_events"),
-                created_at=row.get("created_at", datetime.utcnow()),
-                updated_at=row.get("updated_at", datetime.utcnow()),
+                created_at=row.get("created_at", datetime.now(timezone.utc)),
+                updated_at=row.get("updated_at", datetime.now(timezone.utc)),
                 loss=row.get("loss"),
                 preference_event_ids=row.get("preference_event_ids") or [],
                 dataset_path=row.get("dataset_path"),
@@ -1174,7 +1232,7 @@ class PostgresStore:
             id=str(row["id"]),
             email=row["email"],
             handle=row.get("handle"),
-            created_at=row.get("created_at", datetime.utcnow()),
+            created_at=row.get("created_at", datetime.now(timezone.utc)),
             is_active=row.get("is_active", True),
             plan_tier=row.get("plan_tier", "free"),
             role=row.get("role", "user"),
@@ -1199,6 +1257,8 @@ class PostgresStore:
             )
 
     def get_password_record(self, user_id: str) -> Optional[tuple[str, str]]:
+        if not _is_uuid(user_id):
+            return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT password_hash, password_algo FROM user_auth_credential WHERE user_id = %s",
@@ -1228,6 +1288,8 @@ class PostgresStore:
         return record
 
     def get_user_mfa_secret(self, user_id: str) -> Optional[UserMFAConfig]:
+        if not _is_uuid(user_id):
+            return None
         try:
             with self._connect() as conn:
                 row = conn.execute(
@@ -1238,7 +1300,7 @@ class PostgresStore:
                     user_id=row["user_id"],
                     secret=row["secret"],
                     enabled=bool(row.get("enabled", False)),
-                    created_at=row.get("created_at", datetime.utcnow()),
+                    created_at=row.get("created_at", datetime.now(timezone.utc)),
                     meta=row.get("meta"),
                 )
                 return cfg
@@ -1248,6 +1310,8 @@ class PostgresStore:
         return None
 
     def get_user_settings(self, user_id: str) -> Optional[UserSettings]:
+        if not _is_uuid(user_id):
+            return None
         """Get user settings/preferences."""
         try:
             with self._connect() as conn:
@@ -1320,7 +1384,7 @@ class PostgresStore:
             id=str(row["id"]),
             email=row["email"],
             handle=row.get("handle"),
-            created_at=row.get("created_at", datetime.utcnow()),
+            created_at=row.get("created_at", datetime.now(timezone.utc)),
             is_active=row.get("is_active", True),
             plan_tier=row.get("plan_tier", "free"),
             role=row.get("role", "user"),
@@ -1329,6 +1393,8 @@ class PostgresStore:
         )
 
     def get_user(self, user_id: str) -> Optional[User]:
+        if not _is_uuid(user_id):
+            return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM app_user WHERE id = %s", (user_id,)
@@ -1339,7 +1405,7 @@ class PostgresStore:
             id=str(row["id"]),
             email=row["email"],
             handle=row.get("handle"),
-            created_at=row.get("created_at", datetime.utcnow()),
+            created_at=row.get("created_at", datetime.now(timezone.utc)),
             is_active=row.get("is_active", True),
             plan_tier=row.get("plan_tier", "free"),
             role=row.get("role", "user"),
@@ -1367,7 +1433,7 @@ class PostgresStore:
                     id=str(row["id"]),
                     email=row["email"],
                     handle=row.get("handle"),
-                    created_at=row.get("created_at", datetime.utcnow()),
+                    created_at=row.get("created_at", datetime.now(timezone.utc)),
                     is_active=row.get("is_active", True),
                     plan_tier=row.get("plan_tier", "free"),
                     role=row.get("role", "user"),
@@ -1389,7 +1455,7 @@ class PostgresStore:
             id=str(row["id"]),
             email=row["email"],
             handle=row.get("handle"),
-            created_at=row.get("created_at", datetime.utcnow()),
+            created_at=row.get("created_at", datetime.now(timezone.utc)),
             is_active=row.get("is_active", True),
             plan_tier=row.get("plan_tier", "free"),
             role=row.get("role", "user"),
@@ -1415,7 +1481,7 @@ class PostgresStore:
             id=str(row["id"]),
             email=row["email"],
             handle=row.get("handle"),
-            created_at=row.get("created_at", datetime.utcnow()),
+            created_at=row.get("created_at", datetime.now(timezone.utc)),
             is_active=row.get("is_active", True),
             plan_tier=row.get("plan_tier", "free"),
             role=row.get("role", "user"),
@@ -1645,6 +1711,8 @@ class PostgresStore:
             raise  # Re-raise to signal failure to caller
 
     def get_session(self, session_id: str) -> Optional[Session]:
+        if not _is_uuid(session_id):
+            return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM auth_session WHERE id = %s", (session_id,)
@@ -1667,8 +1735,8 @@ class PostgresStore:
         sess = Session(
             id=str(row["id"]),
             user_id=str(row["user_id"]),
-            created_at=row.get("created_at", datetime.utcnow()),
-            expires_at=row.get("expires_at", datetime.utcnow()),
+            created_at=row.get("created_at", datetime.now(timezone.utc)),
+            expires_at=row.get("expires_at", datetime.now(timezone.utc)),
             user_agent=row.get("user_agent"),
             ip_addr=ip_val,
             mfa_required=row.get("mfa_required", False),
@@ -1722,7 +1790,7 @@ class PostgresStore:
         meta: Optional[dict] = None,
     ) -> Note:
         note_id = str(uuid.uuid4())
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         try:
             with self._connect() as conn:
                 conn.execute(
@@ -1765,7 +1833,7 @@ class PostgresStore:
         embedding: Optional[List[float]] = None,
     ) -> Optional[Note]:
         sets = ["updated_at = %s"]
-        params: list = [datetime.utcnow()]
+        params: list = [datetime.now(timezone.utc)]
         if title is not None:
             sets.append("title = %s")
             params.append(title)
@@ -1807,6 +1875,8 @@ class PostgresStore:
         return row is not None
 
     def get_note(self, note_id: str, user_id: Optional[str] = None) -> Optional[Note]:
+        if not _is_uuid(note_id):
+            return None
         with self._connect() as conn:
             if user_id:
                 row = conn.execute(
@@ -1956,7 +2026,7 @@ class PostgresStore:
         active_context_id: Optional[str] = None,
     ) -> Conversation:
         conv_id = str(uuid.uuid4())
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         try:
             with self._connect() as conn:
                 conn.execute(
@@ -1980,6 +2050,8 @@ class PostgresStore:
     def get_conversation(
         self, conversation_id: str, *, user_id: Optional[str] = None
     ) -> Optional[Conversation]:
+        if not _is_uuid(conversation_id):
+            return None
         with self._connect() as conn:
             params: tuple[Any, ...] = (conversation_id,)
             query = "SELECT * FROM conversation WHERE id = %s"
@@ -2007,8 +2079,8 @@ class PostgresStore:
         return Conversation(
             id=str(_row_value("id")),
             user_id=str(_row_value("user_id")),
-            created_at=_row_value("created_at", datetime.utcnow()),
-            updated_at=_row_value("updated_at", datetime.utcnow()),
+            created_at=_row_value("created_at", datetime.now(timezone.utc)),
+            updated_at=_row_value("updated_at", datetime.now(timezone.utc)),
             title=_row_value("title"),
             status=_row_value("status") or "open",
             active_context_id=_row_value("active_context_id"),
@@ -2023,7 +2095,7 @@ class PostgresStore:
             row = conn.execute(
                 "UPDATE conversation SET title = %s, updated_at = %s "
                 "WHERE id = %s AND user_id = %s RETURNING id",
-                (title, datetime.utcnow(), conversation_id, user_id),
+                (title, datetime.now(timezone.utc), conversation_id, user_id),
             ).fetchone()
         return self.get_conversation(conversation_id) if row else None
 
@@ -2045,7 +2117,7 @@ class PostgresStore:
         self, conversation_id: str, *, user_id: str, patch: dict
     ) -> Optional[Conversation]:
         """Shallow-merge keys into a conversation's meta; owner-only."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         with self._connect() as conn:
             row = conn.execute(
                 "UPDATE conversation SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
@@ -2065,6 +2137,8 @@ class PostgresStore:
         )
 
     def get_public_conversation(self, conversation_id: str) -> Optional[Conversation]:
+        if not _is_uuid(conversation_id):
+            return None
         """Fetch a conversation only if it has been explicitly made public."""
         conv = self.get_conversation(conversation_id)
         if conv and (conv.meta or {}).get("public"):
@@ -2134,7 +2208,7 @@ class PostgresStore:
                     ).fetchone()
                     seq = seq_row["next_seq"] if seq_row else 0
                     msg_id = str(uuid.uuid4())
-                    now = datetime.utcnow()
+                    now = datetime.now(timezone.utc)
                     conn.execute(
                         "INSERT INTO message (id, conversation_id, sender, role, content, content_struct, seq, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                         (
@@ -2220,7 +2294,7 @@ class PostgresStore:
                     content=row["content"],
                     content_struct=content_struct,
                     seq=row["seq"],
-                    created_at=row.get("created_at", datetime.utcnow()),
+                    created_at=row.get("created_at", datetime.now(timezone.utc)),
                     meta=meta,
                 )
             )
@@ -2245,8 +2319,8 @@ class PostgresStore:
                 Conversation(
                     id=str(row["id"]),
                     user_id=str(row["user_id"]),
-                    created_at=row.get("created_at", datetime.utcnow()),
-                    updated_at=row.get("updated_at", datetime.utcnow()),
+                    created_at=row.get("created_at", datetime.now(timezone.utc)),
+                    updated_at=row.get("updated_at", datetime.now(timezone.utc)),
                     title=row.get("title"),
                     status=row.get("status", "open"),
                     active_context_id=row.get("active_context_id"),
@@ -2370,8 +2444,8 @@ class PostgresStore:
                         str(row["owner_user_id"]) if row.get("owner_user_id") else None
                     ),
                     visibility=row.get("visibility", "private"),
-                    created_at=row.get("created_at", datetime.utcnow()),
-                    updated_at=row.get("updated_at", datetime.utcnow()),
+                    created_at=row.get("created_at", datetime.now(timezone.utc)),
+                    updated_at=row.get("updated_at", datetime.now(timezone.utc)),
                     fs_path=row.get("fs_path"),
                     base_model=row.get("base_model")
                     or (row.get("schema") or {}).get("base_model"),
@@ -2381,6 +2455,8 @@ class PostgresStore:
         return artifacts
 
     def get_artifact(self, artifact_id: str) -> Optional[Artifact]:
+        if not _is_uuid(artifact_id):
+            return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM artifact WHERE id = %s", (artifact_id,)
@@ -2404,8 +2480,8 @@ class PostgresStore:
                 str(row["owner_user_id"]) if row.get("owner_user_id") else None
             ),
             visibility=row.get("visibility", "private"),
-            created_at=row.get("created_at", datetime.utcnow()),
-            updated_at=row.get("updated_at", datetime.utcnow()),
+            created_at=row.get("created_at", datetime.now(timezone.utc)),
+            updated_at=row.get("updated_at", datetime.now(timezone.utc)),
             fs_path=row.get("fs_path"),
             base_model=row.get("base_model") or (schema or {}).get("base_model"),
             meta=row.get("meta"),
@@ -2580,7 +2656,7 @@ class PostgresStore:
                     schema=schema or {},
                     created_by=row.get("created_by", "system_llm"),
                     change_note=row.get("change_note"),
-                    created_at=row.get("created_at", datetime.utcnow()),
+                    created_at=row.get("created_at", datetime.now(timezone.utc)),
                     fs_path=row.get("fs_path"),
                     base_model=row.get("base_model")
                     or (schema or {}).get("base_model"),
@@ -2618,8 +2694,6 @@ class PostgresStore:
         return result
 
     def persist_artifact_payload(self, artifact_id: str, schema: dict) -> str:
-        """Public wrapper kept for parity with MemoryStore."""
-
         with self._connect() as conn, conn.transaction():
             artifact_row = conn.execute(
                 "SELECT id, schema, base_model FROM artifact WHERE id = %s FOR UPDATE",
@@ -2837,7 +2911,7 @@ class PostgresStore:
                 row.get("status", "pending") if isinstance(row, dict) else row["status"]
             ),
             created_at=(
-                row.get("created_at", datetime.utcnow())
+                row.get("created_at", datetime.now(timezone.utc))
                 if isinstance(row, dict)
                 else row["created_at"]
             ),
@@ -3036,7 +3110,7 @@ class PostgresStore:
             status=(
                 row.get("status", "pending") if isinstance(row, dict) else row["status"]
             ),
-            created_at=self._parse_ts(created) or datetime.utcnow(),
+            created_at=self._parse_ts(created) or datetime.now(timezone.utc),
             decided_at=self._parse_ts(decided_at),
             applied_at=self._parse_ts(applied_at),
             meta=meta if isinstance(meta, dict) else {},
@@ -3267,6 +3341,8 @@ class PostgresStore:
         )
 
     def get_context(self, context_id: str) -> Optional[KnowledgeContext]:
+        if not _is_uuid(context_id):
+            return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM knowledge_context WHERE id = %s", (context_id,)
@@ -3293,8 +3369,8 @@ class PostgresStore:
             owner_user_id=str(_row_value("owner_user_id")),
             name=_row_value("name", ""),
             description=_row_value("description", ""),
-            created_at=_row_value("created_at", datetime.utcnow()),
-            updated_at=_row_value("updated_at", datetime.utcnow()),
+            created_at=_row_value("created_at", datetime.now(timezone.utc)),
+            updated_at=_row_value("updated_at", datetime.now(timezone.utc)),
             fs_path=_row_value("fs_path"),
             meta=raw_meta,
         )
@@ -3346,8 +3422,8 @@ class PostgresStore:
                     owner_user_id=str(row["owner_user_id"]),
                     name=row["name"],
                     description=row["description"],
-                    created_at=row.get("created_at", datetime.utcnow()),
-                    updated_at=row.get("updated_at", datetime.utcnow()),
+                    created_at=row.get("created_at", datetime.now(timezone.utc)),
+                    updated_at=row.get("updated_at", datetime.now(timezone.utc)),
                     fs_path=row.get("fs_path"),
                     meta=row.get("meta"),
                 )
@@ -3516,7 +3592,7 @@ class PostgresStore:
                     content=row["content"],
                     embedding=self._parse_vector(row.get("embedding")),
                     chunk_index=row.get("chunk_index", 0),
-                    created_at=row.get("created_at", datetime.utcnow()),
+                    created_at=row.get("created_at", datetime.now(timezone.utc)),
                     meta=row.get("meta"),
                 )
             )
@@ -3632,7 +3708,7 @@ class PostgresStore:
                 content=row["content"],
                 embedding=self._parse_vector(row.get("embedding")),
                 chunk_index=row.get("chunk_index", 0),
-                created_at=row.get("created_at", datetime.utcnow()),
+                created_at=row.get("created_at", datetime.now(timezone.utc)),
                 meta=row.get("meta"),
             )
             for row in rows
@@ -3710,7 +3786,7 @@ class PostgresStore:
                 sections["users"] = [_serialize(row) for row in rows]
             if kind in (None, "sessions"):
                 rows = conn.execute(
-                    "SELECT * FROM auth_session WHERE (%s IS NULL OR tenant_id = %s) ORDER BY created_at DESC LIMIT %s",
+                    "SELECT * FROM auth_session WHERE (%s::text IS NULL OR tenant_id = %s) ORDER BY created_at DESC LIMIT %s",
                     (tenant_id, tenant_id, limit),
                 ).fetchall()
                 sections["sessions"] = [_serialize(row) for row in rows]
@@ -3720,7 +3796,7 @@ class PostgresStore:
                     SELECT c.*
                     FROM conversation c
                     JOIN app_user u ON c.user_id = u.id
-                    WHERE (%s IS NULL OR u.tenant_id = %s)
+                    WHERE (%s::text IS NULL OR u.tenant_id = %s)
                     ORDER BY c.updated_at DESC
                     LIMIT %s
                     """,
@@ -3734,7 +3810,7 @@ class PostgresStore:
                     FROM message m
                     JOIN conversation c ON m.conversation_id = c.id
                     JOIN app_user u ON c.user_id = u.id
-                    WHERE (%s IS NULL OR u.tenant_id = %s)
+                    WHERE (%s::text IS NULL OR u.tenant_id = %s)
                     ORDER BY m.created_at DESC
                     LIMIT %s
                     """,
@@ -3752,7 +3828,7 @@ class PostgresStore:
                     SELECT kc.*
                     FROM knowledge_context kc
                     LEFT JOIN app_user u ON kc.owner_user_id = u.id
-                    WHERE (%s IS NULL OR u.tenant_id = %s)
+                    WHERE (%s::text IS NULL OR u.tenant_id = %s)
                     ORDER BY kc.created_at DESC
                     LIMIT %s
                     """,
@@ -3766,7 +3842,7 @@ class PostgresStore:
                     FROM knowledge_chunk kc
                     LEFT JOIN knowledge_context ctx ON kc.context_id = ctx.id
                     LEFT JOIN app_user u ON ctx.owner_user_id = u.id
-                    WHERE (%s IS NULL OR u.tenant_id = %s)
+                    WHERE (%s::text IS NULL OR u.tenant_id = %s)
                     ORDER BY kc.created_at DESC
                     LIMIT %s
                     """,
@@ -3779,7 +3855,7 @@ class PostgresStore:
                     SELECT tj.*
                     FROM training_job tj
                     JOIN app_user u ON tj.user_id = u.id
-                    WHERE (%s IS NULL OR u.tenant_id = %s)
+                    WHERE (%s::text IS NULL OR u.tenant_id = %s)
                     ORDER BY tj.created_at DESC
                     LIMIT %s
                     """,

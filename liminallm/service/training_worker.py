@@ -12,7 +12,6 @@ and executes them using the TrainingService. It handles:
 from __future__ import annotations
 
 import asyncio
-import inspect
 import time
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, List, Optional
@@ -23,7 +22,6 @@ from liminallm.service.cluster import AdvisoryLock
 if TYPE_CHECKING:
     from liminallm.service.clustering import SemanticClusterer
     from liminallm.service.training import TrainingService
-    from liminallm.storage.memory import MemoryStore
     from liminallm.storage.models import ConfigPatchAudit
     from liminallm.storage.postgres import PostgresStore
 
@@ -57,7 +55,7 @@ class TrainingWorker:
 
     def __init__(
         self,
-        store: "PostgresStore | MemoryStore",
+        store: "PostgresStore",
         training_service: "TrainingService",
         clusterer: Optional["SemanticClusterer"] = None,
         *,
@@ -168,13 +166,7 @@ class TrainingWorker:
 
     async def _run_periodic_clustering(self) -> None:
         assert self.clusterer is not None
-        users = []
-        if hasattr(self.store, "list_users"):
-            users_raw = self.store.list_users(limit=self.cluster_user_limit)
-            if inspect.isawaitable(users_raw):
-                users = list(await users_raw)
-            else:
-                users = list(users_raw)
+        users = list(self.store.list_users(limit=self.cluster_user_limit))
 
         for user in users:
             try:
@@ -233,14 +225,8 @@ class TrainingWorker:
             await self._run_adapter_prune_scan()
 
     async def _run_adapter_prune_scan(self) -> None:
-        list_states = getattr(self.store, "list_adapter_router_state", None)
-        record_patch = getattr(self.store, "record_config_patch", None)
-        list_patches = getattr(self.store, "list_config_patches", None)
-        if not callable(list_states) or not callable(record_patch):
-            return
-
         try:
-            states = list_states()  # type: ignore[call-arg]
+            states = self.store.list_adapter_router_state()
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("adapter_prune_state_fetch_failed", error=str(exc))
             return
@@ -257,15 +243,14 @@ class TrainingWorker:
             return False
 
         existing_targets: set[str] = set()
-        if callable(list_patches):
-            try:
-                for patch in list_patches():
-                    if _is_auto_prune_patch(patch):
-                        existing_targets.add(patch.artifact_id)
-            except Exception as exc:  # pragma: no cover - defensive
-                logger.debug("adapter_prune_patch_scan_failed", error=str(exc))
+        try:
+            for patch in self.store.list_config_patches():
+                if _is_auto_prune_patch(patch):
+                    existing_targets.add(patch.artifact_id)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("adapter_prune_patch_scan_failed", error=str(exc))
 
-        stale_cutoff = datetime.utcnow() - timedelta(days=ADAPTER_PRUNE_STALE_DAYS)
+        stale_cutoff = datetime.now(timezone.utc) - timedelta(days=ADAPTER_PRUNE_STALE_DAYS)
         for state in states:
             artifact = self.store.get_artifact(state.artifact_id)
             if not artifact or artifact.type != "adapter":
@@ -274,8 +259,8 @@ class TrainingWorker:
             last_used = state.last_used_at or state.last_trained_at or artifact.updated_at
             if not last_used:
                 last_used = artifact.created_at
-            if last_used and last_used.tzinfo:
-                last_used = last_used.astimezone(timezone.utc).replace(tzinfo=None)
+            if last_used and last_used.tzinfo is None:
+                last_used = last_used.replace(tzinfo=timezone.utc)
 
             if (
                 state.artifact_id not in existing_targets
@@ -299,7 +284,7 @@ class TrainingWorker:
                     ]
                 }
                 try:
-                    record_patch(
+                    self.store.record_config_patch(
                         artifact_id=state.artifact_id,
                         proposer="system_llm",
                         patch=patch,
@@ -351,15 +336,10 @@ class TrainingWorker:
         """Re-embed up to REEMBED_BATCH stale note vectors. Returns the count."""
         embeddings = self.embeddings
         model_id = getattr(embeddings, "model_id", "")
-        lister = getattr(self.store, "list_users", None)
-        updater = getattr(self.store, "update_note", None)
-        note_lister = getattr(self.store, "list_notes", None)
-        if not all(callable(f) for f in (lister, updater, note_lister)):
-            return 0
 
         done = 0
         try:
-            users = list(lister(limit=self.cluster_user_limit))
+            users = list(self.store.list_users(limit=self.cluster_user_limit))
         except Exception as exc:  # noqa: BLE001 - sweep is best-effort
             logger.warning("reembed_user_list_failed", error=str(exc))
             return 0
@@ -367,10 +347,7 @@ class TrainingWorker:
         for user in users:
             if done >= REEMBED_BATCH:
                 break
-            try:
-                notes = note_lister(user.id, limit=1000)
-            except Exception:  # noqa: BLE001
-                continue
+            notes = self.store.list_notes(user.id, limit=1000)
             for note in notes:
                 if done >= REEMBED_BATCH:
                     break
@@ -382,10 +359,10 @@ class TrainingWorker:
                     continue
                 try:
                     vector = embeddings.embed(text)
-                    updater(note.id, embedding=vector)
-                    meta_updater = getattr(self.store, "update_note_meta", None)
-                    if callable(meta_updater):
-                        meta_updater(note.id, {"embedding_model": model_id})
+                    self.store.update_note(note.id, embedding=vector)
+                    self.store.update_note_meta(
+                        note.id, {"embedding_model": model_id}
+                    )
                     done += 1
                 except Exception as exc:  # noqa: BLE001 - provider hiccup
                     logger.warning("reembed_failed", note_id=note.id, error=str(exc))
@@ -405,27 +382,14 @@ class TrainingWorker:
 
     def _get_queued_jobs(self) -> List:
         """Get queued training jobs from the store."""
-        list_fn = getattr(self.store, "list_training_jobs", None)
-        if callable(list_fn):
-            all_jobs = list_fn()
-            queued = [j for j in all_jobs if j.status == "queued"]
-            if len(queued) > MAX_QUEUE_DEPTH:
-                logger.warning(
-                    "training_queue_depth_capped",
-                    queued=len(queued),
-                    capped=MAX_QUEUE_DEPTH,
-                )
-            return queued[:MAX_QUEUE_DEPTH]
-
-        # MemoryStore fallback
-        if hasattr(self.store, "training_jobs"):
-            queued = [
-                j for j in self.store.training_jobs.values()
-                if j.status == "queued"
-            ]
-            return queued[:MAX_QUEUE_DEPTH]
-
-        return []
+        queued = [j for j in self.store.list_training_jobs() if j.status == "queued"]
+        if len(queued) > MAX_QUEUE_DEPTH:
+            logger.warning(
+                "training_queue_depth_capped",
+                queued=len(queued),
+                capped=MAX_QUEUE_DEPTH,
+            )
+        return queued[:MAX_QUEUE_DEPTH]
 
     async def _process_job(self, job) -> None:
         """Process a single training job."""
@@ -434,17 +398,9 @@ class TrainingWorker:
         adapter_id = job.adapter_id
 
         # Issue 26.2: Atomically claim the job to prevent duplicate processing
-        # Use claim_training_job if available (PostgresStore), fallback to update
-        claim_fn = getattr(self.store, "claim_training_job", None)
-        if callable(claim_fn):
-            claimed_job = claim_fn(job_id)
-            if not claimed_job:
-                # Job already claimed by another worker or doesn't exist
-                logger.info("training_job_already_claimed", job_id=job_id)
-                return
-        else:
-            # Fallback for MemoryStore - use regular update (less safe)
-            self.store.update_training_job(job_id, status="running")
+        if not self.store.claim_training_job(job_id):
+            logger.info("training_job_already_claimed", job_id=job_id)
+            return
 
         logger.info(
             "training_job_starting",
@@ -485,7 +441,7 @@ class TrainingWorker:
                         {
                             "jax_trace": result.get("jax_trace"),
                             "clusters": result.get("clusters"),
-                            "completed_at": datetime.utcnow().isoformat(),
+                            "completed_at": datetime.now(timezone.utc).isoformat(),
                         }
                     )
                     self.store.update_training_job(
@@ -556,7 +512,7 @@ class TrainingWorker:
             meta={
                 "error": last_error,
                 "attempts": attempt,
-                "failed_at": datetime.utcnow().isoformat(),
+                "failed_at": datetime.now(timezone.utc).isoformat(),
             },
         )
         logger.error(
@@ -672,15 +628,13 @@ class TrainingWorker:
     ) -> None:
         """Update adapter router state after training (SPEC §5.4)."""
 
-        if not hasattr(self.store, "update_adapter_router_state"):
-            return
         centroid_vec = self._aggregate_cluster_centroid(clusters)
         try:
             self.store.update_adapter_router_state(
                 adapter_id,
                 centroid_vec=centroid_vec,
                 success_score=self._score_from_loss(loss),
-                last_trained_at=datetime.utcnow(),
+                last_trained_at=datetime.now(timezone.utc),
             )
         except Exception as exc:
             logger.warning(
@@ -736,22 +690,15 @@ class TrainingWorker:
         """Get list of users who have preference events."""
         users: set[str] = set()
 
-        list_fn = getattr(self.store, "list_preference_events", None)
-        if callable(list_fn):
-            events = list_fn()
-            for event in events:
-                if event.user_id:
-                    users.add(event.user_id)
-        elif hasattr(self.store, "preference_events"):
-            for event in self.store.preference_events.values():
-                if event.user_id:
-                    users.add(event.user_id)
+        for event in self.store.list_preference_events():
+            if event.user_id:
+                users.add(event.user_id)
 
         return list(users)
 
 
 async def create_training_worker(
-    store: "PostgresStore | MemoryStore",
+    store: "PostgresStore",
     training_service: "TrainingService",
     clusterer: Optional["SemanticClusterer"] = None,
     *,

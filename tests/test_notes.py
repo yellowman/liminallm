@@ -459,23 +459,7 @@ def test_store_title_lookup_is_case_insensitive(client, auth_headers):
     assert found and found.id == made["id"]
 
 
-def test_memory_store_notes_survive_reload(tmp_path):
-    from liminallm.storage.memory import MemoryStore
-
-    store = MemoryStore(fs_root=str(tmp_path))
-    user = store.create_user(email="p@example.com", role="user")
-    note = store.create_note(user.id, "Persist me", "content", embedding=[0.1, 0.2])
-    store.set_note_links(note.id, [])
-    reborn = MemoryStore(fs_root=str(tmp_path))
-    loaded = reborn.get_note(note.id)
-    assert loaded and loaded.title == "Persist me"
-    assert loaded.embedding == [0.1, 0.2]
-
-
-def test_memory_store_duplicate_title_raises(tmp_path):
-    from liminallm.storage.memory import MemoryStore
-
-    store = MemoryStore(fs_root=str(tmp_path))
+def test_duplicate_title_raises(store):
     user = store.create_user(email="d@example.com", role="user")
     store.create_note(user.id, "Once")
     with pytest.raises(ConstraintViolation):

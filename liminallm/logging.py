@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import uuid
 from contextvars import ContextVar
 from typing import Any, Dict, Optional
@@ -51,14 +52,12 @@ def _redact_pii(
 def _configure_structlog(
     log_level: str = "INFO",
     json_output: bool = True,
-    development_mode: bool = False,
 ) -> None:
     """Configure structlog with processors per SPEC §15.2.
 
     Args:
         log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
-        json_output: If True, output JSON; if False, output human-readable
-        development_mode: If True, use pretty console output
+        json_output: If True, output JSON; if False, pretty console output
     """
     # Shared processors for all modes
     shared_processors = [
@@ -71,7 +70,7 @@ def _configure_structlog(
         structlog.processors.UnicodeDecoder(),
     ]
 
-    if development_mode or not json_output:
+    if not json_output:
         # Human-readable output for development
         processors = shared_processors + [
             structlog.dev.ConsoleRenderer(colors=True),
@@ -97,13 +96,7 @@ def _configure_structlog(
 # Initialize logging on module import
 _log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 _json_output = os.getenv("LOG_JSON", "true").lower() in {"1", "true", "yes", "on"}
-_dev_mode = os.getenv("LOG_DEV_MODE", "false").lower() in {"1", "true", "yes", "on"}
-
-_configure_structlog(
-    log_level=_log_level,
-    json_output=_json_output,
-    development_mode=_dev_mode,
-)
+_configure_structlog(log_level=_log_level, json_output=_json_output)
 
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:
@@ -146,8 +139,6 @@ _SENSITIVE_ERROR_PATTERNS = [
 ]
 
 # Compiled patterns for performance
-import re
-
 _SENSITIVE_PATTERNS_COMPILED = [re.compile(p) for p in _SENSITIVE_ERROR_PATTERNS]
 
 # Keys that should be redacted in response data

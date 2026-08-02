@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from liminallm.logging import get_logger
@@ -10,7 +10,6 @@ from liminallm.service.errors import BadRequestError, NotFoundError
 from liminallm.service.llm import LLMService
 from liminallm.service.router import RouterEngine
 from liminallm.service.training import TrainingService
-from liminallm.storage.memory import MemoryStore
 from liminallm.storage.models import Artifact, ConfigPatchAudit
 from liminallm.storage.postgres import PostgresStore
 
@@ -24,7 +23,7 @@ class ConfigOpsService:
 
     def __init__(
         self,
-        store: PostgresStore | MemoryStore,
+        store: PostgresStore,
         llm: LLMService,
         router: RouterEngine,
         training: TrainingService,
@@ -114,29 +113,16 @@ class ConfigOpsService:
         # Step 1: Apply patch to artifact (pure function)
         new_schema = self._apply_patch_to_schema(artifact.schema, patch.patch)
 
-        # Step 2: Persist schema and mark patch applied atomically when supported
+        # Step 2: Persist schema and mark the patch applied, in one transaction
         applied_patch = None
         status_update_failed = False
         try:
-            if hasattr(self.store, "apply_config_patch"):
-                updated, applied_patch = self.store.apply_config_patch(  # type: ignore[attr-defined]
-                    patch,
-                    new_schema,
-                    artifact_description=artifact.description,
-                    approver_user_id=approver_user_id,
-                )
-            else:
-                updated = self.store.update_artifact(
-                    artifact.id, new_schema, artifact.description
-                )
-                applied_patch = self.store.update_config_patch_status(
-                    patch_id,
-                    "applied",
-                    meta={"applied_by": approver_user_id}
-                    if approver_user_id
-                    else None,
-                    mark_applied=True,
-                )
+            updated, applied_patch = self.store.apply_config_patch(
+                patch,
+                new_schema,
+                artifact_description=artifact.description,
+                approver_user_id=approver_user_id,
+            )
         except Exception as exc:
             status_update_failed = True
             logger.error(
@@ -218,7 +204,7 @@ class ConfigOpsService:
         return full_json[: max_chars - 3] + "..."
 
     def _fallback_patch(self) -> dict:
-        timestamp = datetime.utcnow().isoformat()
+        timestamp = datetime.now(timezone.utc).isoformat()
         return {
             "ops": [
                 {

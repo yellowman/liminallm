@@ -1,12 +1,12 @@
 import uuid
 
 from liminallm.service.rag import RAGService
-from liminallm.storage.memory import MemoryStore
+from tests.pgharness import get_test_store
 from liminallm.storage.models import KnowledgeChunk, KnowledgeContext, User
 
 
 def _setup_store() -> tuple[RAGService, str, str, str, str]:
-    store = MemoryStore(fs_root=f"/tmp/liminallm-test-rag-{uuid.uuid4()}")
+    store = get_test_store()
     user_a = store.create_user("a@example.com", tenant_id="tenant_a")
     user_b = store.create_user("b@example.com", tenant_id="tenant_b")
     ctx_a = store.upsert_context(
@@ -82,6 +82,12 @@ class LegacyOnlyStore:
         self.contexts[ctx.id] = ctx
         return ctx
 
+    def get_context(self, context_id: str) -> KnowledgeContext | None:
+        return self.contexts.get(context_id)
+
+    def get_user(self, user_id: str) -> User | None:
+        return self.users.get(user_id)
+
     def add_chunks(self, context_id: str, chunks: list[KnowledgeChunk]) -> None:
         bucket = self.chunks.setdefault(context_id, [])
         for chunk in chunks:
@@ -90,7 +96,7 @@ class LegacyOnlyStore:
                 self._chunk_id_seq += 1
             bucket.append(chunk)
 
-    def search_chunks_legacy(
+    def search_chunks(
         self,
         context_id: str | None,
         query: str,
@@ -142,8 +148,8 @@ def test_local_hybrid_without_pgvector():
     assert denied == []
 
 
-def test_memory_store_pgvector_filters_fs_path(tmp_path):
-    store = MemoryStore(fs_root=tmp_path)
+def test_pgvector_filters_fs_path(tmp_path):
+    store = get_test_store()
     user = store.create_user("fs@example.com", tenant_id="tenant_fs")
     ctx = store.upsert_context(owner_user_id=user.id, name="fs ctx", description="desc")
 
@@ -155,7 +161,7 @@ def test_memory_store_pgvector_filters_fs_path(tmp_path):
                 context_id=ctx.id,
                 fs_path="keep_me",
                 content="keep",
-                embedding=[1.0, 0.0],
+                embedding=[1.0] + [0.0] * 63,
                 chunk_index=0,
             ),
             KnowledgeChunk(
@@ -163,7 +169,7 @@ def test_memory_store_pgvector_filters_fs_path(tmp_path):
                 context_id=ctx.id,
                 fs_path="skip_me",
                 content="skip",
-                embedding=[0.0, 1.0],
+                embedding=[0.0] + [1.0] + [0.0] * 62,
                 chunk_index=1,
             ),
         ],
@@ -172,7 +178,7 @@ def test_memory_store_pgvector_filters_fs_path(tmp_path):
     results = store.search_chunks_pgvector(
         [ctx.id],
         "query",
-        [1.0, 0.0],
+        [1.0] + [0.0] * 63,
         filters={"fs_path": "keep_me"},
         user_id=user.id,
         tenant_id="tenant_fs",

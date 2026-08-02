@@ -417,9 +417,6 @@ class Settings(BaseModel):
         "ALLOW_SIGNUP",
         description="Allow new user signups (overridable via admin UI)",
     )
-    log_level: str = env_field("INFO", "LOG_LEVEL")
-    log_json: bool = env_field(True, "LOG_JSON")
-    log_dev_mode: bool = env_field(False, "LOG_DEV_MODE")
     build_sha: str = env_field("dev", "BUILD_SHA")
     cors_allow_origins: list[str] = env_field(
         [
@@ -434,8 +431,6 @@ class Settings(BaseModel):
     )
     cors_allow_credentials: bool = env_field(False, "CORS_ALLOW_CREDENTIALS")
     enable_hsts: bool = env_field(False, "ENABLE_HSTS")
-    mfa_secret_key: str | None = env_field(None, "MFA_SECRET_KEY")
-    use_memory_store: bool = env_field(False, "USE_MEMORY_STORE")
     allow_redis_fallback_dev: bool = env_field(False, "ALLOW_REDIS_FALLBACK_DEV")
     test_mode: bool = env_field(
         False,
@@ -722,11 +717,6 @@ class Settings(BaseModel):
         if not 1 <= value <= 65535:
             raise ValueError("smtp_port must be between 1 and 65535")
         return value
-
-    @field_validator("log_level")
-    @classmethod
-    def _normalize_log_level(cls, value: str) -> str:
-        return (value or "INFO").upper()
 
     @model_validator(mode="after")
     def _validate_required_pairs(self):

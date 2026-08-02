@@ -9,9 +9,8 @@ import os
 import tempfile
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
 from typing import (
     Any,
     AsyncIterator,
@@ -22,12 +21,17 @@ from typing import (
     Sequence,
     Tuple,
 )
+from urllib.parse import urlparse
 
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import SchemaError
 
 from liminallm.config import Settings
 from liminallm.logging import get_logger, log_routing_trace, log_workflow_trace
+from liminallm.service import attachments as attachments_service
+from liminallm.service import compaction, interpreter, web
+from liminallm.service import notes as notes_service
+from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
 from liminallm.service.embeddings import (
     EMBEDDING_DIM,
     cosine_similarity,
@@ -35,13 +39,6 @@ from liminallm.service.embeddings import (
     ensure_embedding_dim,
     validated_embedding,
 )
-from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
-from liminallm.service import attachments as attachments_service
-from liminallm.service import compaction
-from liminallm.service import interpreter
-from liminallm.service import notes as notes_service
-from liminallm.service import web
-from liminallm.service.upload_policy import ALLOWED_UPLOAD_EXTENSIONS
 from liminallm.service.errors import BadRequestError
 from liminallm.service.llm import LLMService
 from liminallm.service.model_backend import DEFAULT_CONTEXT_WINDOW
@@ -60,8 +57,8 @@ from liminallm.service.tokenizer_utils import (
     MAX_GENERATION_TOKENS,
     estimate_token_count,
 )
+from liminallm.service.upload_policy import ALLOWED_UPLOAD_EXTENSIONS
 from liminallm.storage.common import get_default_attachment_workflow_schema
-from liminallm.storage.memory import MemoryStore
 from liminallm.storage.models import Message
 from liminallm.storage.postgres import PostgresStore
 from liminallm.storage.redis_cache import RedisCache
@@ -141,7 +138,7 @@ class WorkflowEngine:
 
     def __init__(
         self,
-        store: PostgresStore | MemoryStore,
+        store: PostgresStore,
         llm: LLMService,
         router: RouterEngine,
         rag: RAGService,
@@ -266,7 +263,7 @@ class WorkflowEngine:
         rollback_state = {
             "status": "rolled_back",
             "reason": reason,
-            "timestamp": datetime.utcnow().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "vars": vars_scope,
             "trace_length": len(workflow_trace),
             "restored_from": restored_from,
@@ -279,7 +276,7 @@ class WorkflowEngine:
                 {
                     "status": "rolling_back",
                     "reason": reason,
-                    "updated_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
                     "workflow_trace": workflow_trace,
                     "restored_from": restored_from,
                 },
@@ -556,7 +553,7 @@ class WorkflowEngine:
         state_key = f"{conversation_id or 'anon'}:{workflow_id or 'default'}"
         await self._persist_workflow_state(
             state_key,
-            {"status": "running", "started_at": datetime.utcnow().isoformat()},
+            {"status": "running", "started_at": datetime.now(timezone.utc).isoformat()},
         )
 
         while pending and visited < max_steps:
@@ -584,7 +581,7 @@ class WorkflowEngine:
                     state_key,
                     {
                         "status": "timeout",
-                        "failed_at": datetime.utcnow().isoformat(),
+                        "failed_at": datetime.now(timezone.utc).isoformat(),
                         "error": "workflow_timeout",
                         "elapsed_ms": elapsed_ms,
                     },
@@ -761,7 +758,7 @@ class WorkflowEngine:
             state_key,
             {
                 "status": "completed",
-                "completed_at": datetime.utcnow().isoformat(),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
                 "result": {
                     "content": content,
                     "adapters": [a.get("id") for a in adapters or []],
@@ -901,6 +898,7 @@ class WorkflowEngine:
                         node,
                         user_message=user_message,
                         context_id=context_id,
+                        conversation_id=conversation_id,
                         adapters=adapters,
                         history=history,
                         vars_scope=vars_scope,
@@ -1104,6 +1102,7 @@ class WorkflowEngine:
         *,
         user_message: str,
         context_id: Optional[str],
+        conversation_id: Optional[str],
         adapters: List[dict],
         history: List[Any],
         vars_scope: Dict[str, Any],
@@ -1198,7 +1197,7 @@ class WorkflowEngine:
             state_key,
             {
                 "status": "failed",
-                "failed_at": datetime.utcnow().isoformat(),
+                "failed_at": datetime.now(timezone.utc).isoformat(),
                 "error": str(exc),
                 "workflow_trace": workflow_trace,
                 "vars": vars_scope,
@@ -1239,7 +1238,7 @@ class WorkflowEngine:
             state_key,
             {
                 "status": "failed",
-                "completed_at": datetime.utcnow().isoformat(),
+                "completed_at": datetime.now(timezone.utc).isoformat(),
                 "result": result,
                 "error": result.get("error"),
             },
@@ -1433,7 +1432,7 @@ class WorkflowEngine:
         user_id: Optional[str],
         tenant_id: Optional[str],
     ) -> List[Message]:
-        if not conversation_id or not hasattr(self.store, "list_messages"):
+        if not conversation_id:
             return []
         if not self._validate_conversation_scope(
             conversation_id, user_id=user_id, tenant_id=tenant_id
@@ -1517,12 +1516,11 @@ class WorkflowEngine:
         if cached and now - cached[1] < self._BUDGET_CACHE_SECONDS:
             return cached[0]
         window = 0
-        getter = getattr(self.store, "get_system_settings_overrides", None)
-        if callable(getter):
-            try:
-                window = int((getter() or {}).get("model_context_window") or 0)
-            except Exception:  # noqa: BLE001 - settings read is best-effort
-                window = 0
+        try:
+            overrides = self.store.get_system_settings_overrides() or {}
+            window = int(overrides.get("model_context_window") or 0)
+        except Exception:  # noqa: BLE001 - settings read is best-effort
+            window = 0
         if window <= 0 and self.settings:
             window = int(getattr(self.settings, "model_context_window", 0) or 0)
         if window <= 0:
@@ -1565,8 +1563,6 @@ class WorkflowEngine:
                 fraction = 0.25
         if fraction <= 0:
             return None
-        if not hasattr(self.store, "list_messages"):
-            return None
         try:
             full = self.store.list_messages(
                 conversation_id, limit=self.MAX_HISTORY_FETCH, user_id=user_id
@@ -1597,11 +1593,8 @@ class WorkflowEngine:
         """The conversation's rolling digest, as a context snippet."""
         if not conversation_id:
             return None
-        getter = getattr(self.store, "get_conversation", None)
-        if not callable(getter):
-            return None
         try:
-            conversation = getter(conversation_id)
+            conversation = self.store.get_conversation(conversation_id)
         except Exception:  # noqa: BLE001 - memory is best-effort
             return None
         return compaction.digest_system_block(conversation) if conversation else None
@@ -1695,7 +1688,7 @@ class WorkflowEngine:
             conversation_id,
             {
                 "recent_messages": serialized,
-                "updated_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
             },
         )
 
@@ -1779,10 +1772,9 @@ class WorkflowEngine:
 
     def _build_tool_registry(self) -> Dict[str, dict]:
         registry: Dict[str, dict] = {}
-        if hasattr(self.store, "list_artifacts"):
-            for artifact in self.store.list_artifacts(type_filter="tool"):
-                if isinstance(artifact.schema, dict) and artifact.schema.get("name"):
-                    registry[artifact.schema["name"]] = artifact.schema
+        for artifact in self.store.list_artifacts(type_filter="tool"):
+            if isinstance(artifact.schema, dict) and artifact.schema.get("name"):
+                registry[artifact.schema["name"]] = artifact.schema
         return registry
 
     def _validate_tool_payload(
@@ -1856,12 +1848,12 @@ class WorkflowEngine:
             return {"status": "error", "content": "tool spec missing name"}
         self.tool_registry.setdefault(tool_name, dict(tool_schema))
         history: List[Any] = []
-        if conversation_id and hasattr(self.store, "list_messages"):
+        if conversation_id:
             if self._validate_conversation_scope(
                 conversation_id, user_id=user_id, tenant_id=tenant_id
             ):
                 try:
-                    history = self.store.list_messages(conversation_id, user_id=user_id)  # type: ignore[attr-defined]
+                    history = self.store.list_messages(conversation_id, user_id=user_id)
                 except Exception as exc:
                     self.logger.warning(
                         "conversation_history_load_failed",
@@ -1923,12 +1915,11 @@ class WorkflowEngine:
         context_embedding = deterministic_embedding(user_message or "")
         candidates = []
         cluster_lookup: dict[str, Any] = {}
-        if hasattr(self.store, "list_semantic_clusters"):
-            for cluster in self.store.list_semantic_clusters(user_id):  # type: ignore[attr-defined]
+        for cluster in self.store.list_semantic_clusters(user_id):
+            cluster_lookup[cluster.id] = cluster
+        for cluster in self.store.list_semantic_clusters(None):
+            if cluster.user_id is None:
                 cluster_lookup[cluster.id] = cluster
-            for cluster in self.store.list_semantic_clusters(None):  # type: ignore[attr-defined]
-                if cluster.user_id is None:
-                    cluster_lookup[cluster.id] = cluster
         for art in adapter_artifacts:
             candidate = {"id": art.id, "name": art.name}
             if isinstance(art.schema, dict):
@@ -2187,11 +2178,8 @@ class WorkflowEngine:
         # SPEC §18: privileged tools require admin role; enforced here so both
         # workflow nodes and direct /tools/{id}/invoke go through the check.
         if tool_spec and tool_spec.get("privileged"):
-            role = None
-            get_user = getattr(self.store, "get_user", None)
-            if user_id and callable(get_user):
-                user = get_user(user_id)
-                role = getattr(user, "role", None)
+            user = self.store.get_user(user_id) if user_id else None
+            role = user.role if user else None
             try:
                 get_tool_sandbox_config(tool_spec, user_role=role)
             except PrivilegedToolError as exc:
@@ -2701,7 +2689,7 @@ class WorkflowEngine:
         conversation's own messages, so it needs no embeddings and works on
         any deployment.
         """
-        if not conversation_id or not hasattr(self.store, "list_messages"):
+        if not conversation_id:
             return "No earlier turns are available."
         if not self._validate_conversation_scope(
             conversation_id, user_id=user_id, tenant_id=None
@@ -2743,12 +2731,11 @@ class WorkflowEngine:
     def _notes_enabled(self) -> bool:
         """Admin override > env var > default (on)."""
         enabled = getattr(self.settings, "notes_enabled", True) if self.settings else True
-        getter = getattr(self.store, "get_system_settings_overrides", None)
-        if callable(getter):
-            try:
-                enabled = (getter() or {}).get("notes_enabled", enabled)
-            except Exception:  # noqa: BLE001
-                pass
+        try:
+            overrides = self.store.get_system_settings_overrides() or {}
+            enabled = overrides.get("notes_enabled", enabled)
+        except Exception:  # noqa: BLE001 - settings read is best-effort
+            pass
         return bool(enabled)
 
     def _tool_note_search(
@@ -2808,7 +2795,7 @@ class WorkflowEngine:
         if older_span or len(history or []) >= self.MAX_HISTORY_FETCH:
             tools.append(self.HISTORY_SEARCH_SCHEMA)
         # Only pay for the schema when notes are enabled AND there is a vault.
-        if user_id and self._notes_enabled() and getattr(self.store, "count_notes", None):
+        if user_id and self._notes_enabled():
             try:
                 if self.store.count_notes(user_id) > 0:
                     tools.append(self.NOTE_SEARCH_SCHEMA)
@@ -2982,6 +2969,7 @@ class WorkflowEngine:
                 node,
                 user_message=user_message,
                 context_id=context_id,
+                conversation_id=conversation_id,
                 adapters=adapters,
                 history=history,
                 vars_scope=vars_scope,
@@ -3115,6 +3103,7 @@ class WorkflowEngine:
                 node,
                 user_message=user_message,
                 context_id=context_id,
+                conversation_id=conversation_id,
                 adapters=adapters,
                 history=history,
                 vars_scope=vars_scope,
@@ -3286,43 +3275,17 @@ class WorkflowEngine:
             return None
 
         allowed: List[str] = []
-        # MemoryStore path: direct access to context ownership and tenants
-        contexts = getattr(self.store, "contexts", None)
-        users = getattr(self.store, "users", None)
-        if isinstance(contexts, dict):
-            for ctx_id in ctx_ids:
-                ctx = contexts.get(ctx_id)
-                if not ctx or ctx.owner_user_id != user_id:
+        owned = {ctx.id: ctx for ctx in self.store.list_contexts(owner_user_id=user_id)}
+        for ctx_id in ctx_ids:
+            ctx = owned.get(ctx_id)
+            if not ctx:
+                continue
+            if tenant_id:
+                owner = self.store.get_user(ctx.owner_user_id)
+                if not owner or owner.tenant_id != tenant_id:
                     continue
-                if tenant_id and isinstance(users, dict):
-                    owner = users.get(ctx.owner_user_id)
-                    if not owner or owner.tenant_id != tenant_id:
-                        continue
-                allowed.append(ctx_id)
-            return allowed or None
-
-        # Postgres path: fall back to listed contexts for the user
-        list_contexts = getattr(self.store, "list_contexts", None)
-        get_user = getattr(self.store, "get_user", None)
-        if callable(list_contexts):
-            owned_contexts = {
-                ctx.id: ctx for ctx in list_contexts(owner_user_id=user_id)
-            }
-            for ctx_id in ctx_ids:
-                ctx = owned_contexts.get(ctx_id)
-                if not ctx:
-                    continue
-                if tenant_id and callable(get_user):
-                    owner = get_user(ctx.owner_user_id)
-                    if not owner or owner.tenant_id != tenant_id:
-                        continue
-                allowed.append(ctx_id)
-            return allowed or None
-
-        self.logger.warning(
-            "context_scope_validation_unavailable", requested=list(ctx_ids)
-        )
-        return None
+            allowed.append(ctx_id)
+        return allowed or None
 
     def _validate_conversation_scope(
         self, conversation_id: str, *, user_id: Optional[str], tenant_id: Optional[str]
@@ -3333,11 +3296,7 @@ class WorkflowEngine:
             )
             return False
 
-        get_conversation = getattr(self.store, "get_conversation", None)
-        if callable(get_conversation):
-            conv = get_conversation(conversation_id, user_id=user_id)
-        else:
-            conv = None
+        conv = self.store.get_conversation(conversation_id, user_id=user_id)
         if not conv:
             self.logger.warning(
                 "conversation_scope_forbidden",
@@ -3346,18 +3305,16 @@ class WorkflowEngine:
             )
             return False
 
-        if tenant_id and hasattr(self.store, "get_user"):
-            get_user = getattr(self.store, "get_user")
-            if callable(get_user):
-                owner = get_user(conv.user_id)
-                if not owner or owner.tenant_id != tenant_id:
-                    self.logger.warning(
-                        "conversation_scope_tenant_mismatch",
-                        conversation_id=conversation_id,
-                        user_id=user_id,
-                        tenant_id=tenant_id,
-                    )
-                    return False
+        if tenant_id:
+            owner = self.store.get_user(conv.user_id)
+            if not owner or owner.tenant_id != tenant_id:
+                self.logger.warning(
+                    "conversation_scope_tenant_mismatch",
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                )
+                return False
         return True
 
     def _tool_llm_generic(

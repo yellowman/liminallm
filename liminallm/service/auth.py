@@ -262,10 +262,7 @@ class AuthService:
 
         Returns merged settings with defaults for any missing values.
         """
-        if hasattr(self.store, "get_system_settings"):
-            db_settings = self.store.get_system_settings()
-        else:
-            db_settings = {}
+        db_settings = self.store.get_system_settings()
         defaults = {
             "session_rotation_hours": 24,
             "session_rotation_grace_seconds": 300,
@@ -680,9 +677,7 @@ class AuthService:
             return None, None, {}
         # Use tenant from state, falling back to default only if state had none
         normalized_tenant = state_tenant_id or self.settings.default_tenant_id
-        existing = None
-        if hasattr(self.store, "get_user_by_provider"):
-            existing = self.store.get_user_by_provider(provider, provider_uid)
+        existing = self.store.get_user_by_provider(provider, provider_uid)
         email = identity.get("email")
         user = existing or (self.store.get_user_by_email(email) if email else None)
         if not user:
@@ -694,12 +689,11 @@ class AuthService:
             # Store an unusable password marker so password-based auth cannot succeed for OAuth users
             unusable_secret = base64.urlsafe_b64encode(os.urandom(24)).decode()
             self.store.save_password(user.id, unusable_secret, "oauth")
-        if hasattr(self.store, "link_user_auth_provider"):
-            try:
-                self.store.link_user_auth_provider(user.id, provider, provider_uid)
-            except Exception as exc:
-                self.logger.error("link_oauth_provider_failed", error=str(exc))
-                raise
+        try:
+            self.store.link_user_auth_provider(user.id, provider, provider_uid)
+        except Exception as exc:
+            self.logger.error("link_oauth_provider_failed", error=str(exc))
+            raise
         session = self.store.create_session(
             user.id,
             tenant_id=user.tenant_id,
@@ -870,15 +864,13 @@ class AuthService:
             Number of sessions revoked
         """
         revoked_count = 0
-        if hasattr(self.store, "revoke_user_sessions"):
-            # Use store method if available for better performance
-            try:
-                self.store.revoke_user_sessions(user_id, except_session_id)  # type: ignore[attr-defined]
-                revoked_count = -1  # Unknown count when using bulk method
-            except Exception as exc:
-                self.logger.warning(
-                    "revoke_user_sessions_failed", user_id=user_id, error=str(exc)
-                )
+        try:
+            self.store.revoke_user_sessions(user_id, except_session_id)
+            revoked_count = -1  # the bulk delete does not report a count
+        except Exception as exc:
+            self.logger.warning(
+                "revoke_user_sessions_failed", user_id=user_id, error=str(exc)
+            )
         # Also clear from cache using proper method (Issue 22.3)
         if self.cache:
             try:
@@ -1311,8 +1303,7 @@ class AuthService:
         if not user:
             self.logger.warning("email_verification_missing_user", user_id=user_id)
             return False
-        if hasattr(self.store, "mark_email_verified"):
-            self.store.mark_email_verified(user.id)
+        self.store.mark_email_verified(user.id)
         if self.cache:
             await self.cache.client.delete(f"verify:{token}")
         else:
@@ -1502,7 +1493,7 @@ class AuthService:
             "access_token": access_token,
             "refresh_token": refresh_token,
             "token_type": "bearer",
-            "expires_at": datetime.utcfromtimestamp(access_exp).isoformat(),
+            "expires_at": datetime.fromtimestamp(access_exp, timezone.utc).isoformat(),
             "csrf_token": csrf_token,
         }
 

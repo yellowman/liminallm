@@ -94,9 +94,10 @@ async def lifespan(app: FastAPI):
             logger.warning("cluster_bus_start_failed", error=str(exc))
         # Check training_worker_enabled from DB settings (falls back to env var)
         training_worker_enabled = runtime.settings.training_worker_enabled
-        if hasattr(runtime.store, "get_system_settings"):
-            sys_settings = runtime.store.get_system_settings() or {}
-            training_worker_enabled = sys_settings.get("training_worker_enabled", training_worker_enabled)
+        sys_settings = runtime.store.get_system_settings() or {}
+        training_worker_enabled = sys_settings.get(
+            "training_worker_enabled", training_worker_enabled
+        )
         if training_worker_enabled:
             await runtime.training_worker.start()
             logger.info("training_worker_started_on_startup")
@@ -475,17 +476,7 @@ async def _dependency_checks() -> tuple[Dict[str, Dict[str, Any]], bool, bool]:
 
     # Database check
     runtime = get_runtime()
-    if hasattr(runtime.store, "verify_connection"):
-        db_ok = await _run_bounded("database", runtime.store.verify_connection)
-    elif hasattr(runtime.store, "_connect"):
-        def _db_probe() -> None:
-            with runtime.store._connect() as conn:
-                conn.execute("SELECT 1").fetchone()
-
-        db_ok = await _run_bounded("database", _db_probe)
-    else:
-        db_ok = True
-        checks["database"] = {"status": "healthy", "type": "memory"}
+    db_ok = await _run_bounded("database", runtime.store.verify_connection)
 
     if not checks.get("database"):
         checks["database"] = {"status": "healthy" if db_ok else "unhealthy"}
@@ -512,7 +503,7 @@ async def _dependency_checks() -> tuple[Dict[str, Dict[str, Any]], bool, bool]:
             # replicas.
             health_file = fs_path / f".health_check-{os.getpid()}-{uuid.uuid4().hex[:8]}"
             try:
-                health_file.write_text(datetime.utcnow().isoformat())
+                health_file.write_text(datetime.now(timezone.utc).isoformat())
                 health_file.read_text()
             finally:
                 health_file.unlink(missing_ok=True)
@@ -541,7 +532,7 @@ def _health_body(checks: Dict[str, Dict[str, Any]], healthy: bool) -> Dict[str, 
         "checks": checks,
         "version": __version__,
         "build": __build__,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -593,15 +584,13 @@ async def metrics() -> Response:
         runtime = get_runtime()
 
         # User count
-        if hasattr(runtime.store, "list_users"):
-            try:
-                all_users = runtime.store.list_users(limit=10000)
-                user_count = len(all_users)
-                lines.append('# HELP liminallm_users_total Total number of users')
-                lines.append('# TYPE liminallm_users_total gauge')
-                lines.append(f'liminallm_users_total {user_count}')
-            except Exception as exc:
-                logger.warning("metrics_user_count_failed", error=str(exc))
+        try:
+            user_count = len(runtime.store.list_users(limit=10000))
+            lines.append('# HELP liminallm_users_total Total number of users')
+            lines.append('# TYPE liminallm_users_total gauge')
+            lines.append(f'liminallm_users_total {user_count}')
+        except Exception as exc:
+            logger.warning("metrics_user_count_failed", error=str(exc))
 
         # Active sessions (if Redis available)
         if hasattr(runtime, "cache") and runtime.cache is not None:
@@ -616,12 +605,8 @@ async def metrics() -> Response:
         # Database status
         db_healthy = 0
         try:
-            if hasattr(runtime.store, "_connect"):
-                with runtime.store._connect() as conn:
-                    conn.execute("SELECT 1").fetchone()
-                db_healthy = 1
-            else:
-                db_healthy = 1  # Memory store
+            runtime.store.verify_connection()
+            db_healthy = 1
         except Exception as exc:
             logger.warning("metrics_database_health_failed", error=str(exc))
         lines.append('# HELP liminallm_database_healthy Database connection health')
@@ -641,24 +626,22 @@ async def metrics() -> Response:
                 logger.warning("metrics_training_jobs_failed", error=str(exc))
 
         # Preference event ingestion rate proxy
-        if hasattr(runtime.store, "list_preference_events"):
-            try:
-                events = runtime.store.list_preference_events(user_id=None)  # type: ignore[arg-type]
-                lines.append('# HELP liminallm_preference_events_total Total recorded preference events')
-                lines.append('# TYPE liminallm_preference_events_total counter')
-                lines.append(f'liminallm_preference_events_total {len(events)}')
-            except Exception as exc:
-                logger.warning("metrics_preference_events_failed", error=str(exc))
+        try:
+            events = runtime.store.list_preference_events(user_id=None)
+            lines.append('# HELP liminallm_preference_events_total Total recorded preference events')
+            lines.append('# TYPE liminallm_preference_events_total counter')
+            lines.append(f'liminallm_preference_events_total {len(events)}')
+        except Exception as exc:
+            logger.warning("metrics_preference_events_failed", error=str(exc))
 
         # Adapter usage counts
-        if hasattr(runtime.store, "list_artifacts"):
-            try:
-                adapters = runtime.store.list_artifacts(kind="adapter", owner_user_id=None)  # type: ignore[arg-type]
-                lines.append('# HELP liminallm_adapters_total Adapters stored in system')
-                lines.append('# TYPE liminallm_adapters_total gauge')
-                lines.append(f'liminallm_adapters_total {len(adapters)}')
-            except Exception as exc:
-                logger.warning("metrics_adapters_failed", error=str(exc))
+        try:
+            adapters = runtime.store.list_artifacts(type_filter="adapter")
+            lines.append('# HELP liminallm_adapters_total Adapters stored in system')
+            lines.append('# TYPE liminallm_adapters_total gauge')
+            lines.append(f'liminallm_adapters_total {len(adapters)}')
+        except Exception as exc:
+            logger.warning("metrics_adapters_failed", error=str(exc))
 
     except Exception as exc:
         logger.error("metrics_collection_failed", error=str(exc))

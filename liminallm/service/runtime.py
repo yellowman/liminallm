@@ -4,14 +4,14 @@ import asyncio
 import contextlib
 import inspect
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple, Union
 from urllib.parse import urlparse, urlunparse
 
 from liminallm.config import get_settings, reset_settings_cache
 from liminallm.logging import get_logger
-from liminallm.service.auth import AuthService
 from liminallm.service import token_counting
+from liminallm.service.auth import AuthService
 from liminallm.service.cluster import AdvisoryLock, ClusterBus
 from liminallm.service.clustering import SemanticClusterer
 from liminallm.service.config_ops import ConfigOpsService
@@ -24,7 +24,6 @@ from liminallm.service.training import TrainingService
 from liminallm.service.training_worker import TrainingWorker
 from liminallm.service.voice import VoiceService
 from liminallm.service.workflow import WorkflowEngine
-from liminallm.storage.memory import MemoryStore
 from liminallm.storage.postgres import PostgresStore
 from liminallm.storage.redis_cache import RedisCache, SyncRedisCache
 
@@ -71,29 +70,21 @@ class Runtime:
         self.settings = get_settings()
         logger.info(
             "runtime_init_started",
-            use_memory_store=self.settings.use_memory_store,
             test_mode=self.settings.test_mode,
         )
 
         try:
-            self.store = (
-                MemoryStore(
-                    fs_root=self.settings.shared_fs_root,
-                    mfa_encryption_key=self.settings.mfa_secret_key,
-                )
-                if self.settings.use_memory_store
-                else PostgresStore(
-                    self.settings.database_url, fs_root=self.settings.shared_fs_root
-                )
+            self.store = PostgresStore(
+                self.settings.database_url, fs_root=self.settings.shared_fs_root
             )
             logger.info(
                 "runtime_store_initialized",
-                store_type="memory" if self.settings.use_memory_store else "postgres",
+                store_type="postgres",
             )
         except Exception as exc:
             logger.error(
                 "runtime_store_init_failed",
-                store_type="memory" if self.settings.use_memory_store else "postgres",
+                store_type="postgres",
                 error_type=type(exc).__name__,
                 error=str(exc),
             )
@@ -140,9 +131,7 @@ class Runtime:
                 mode=fallback_mode,
             )
         # Get system settings from DB early (falls back to env vars if not in DB)
-        sys_settings = {}
-        if hasattr(self.store, "get_system_settings"):
-            sys_settings = self.store.get_system_settings() or {}
+        sys_settings = self.store.get_system_settings() or {}
 
         # Build all backend-dependent services (router, llm, rag, training,
         # clusterer, workflow, config_ops). Extracted into a helper so
@@ -208,7 +197,7 @@ class Runtime:
         # Cross-replica coordination. Both primitives are best-effort and
         # neither makes Redis required: the bus falls back to Postgres
         # LISTEN/NOTIFY, and a single-process deployment gets local semantics.
-        db_url = None if self.settings.use_memory_store else self.settings.database_url
+        db_url = self.settings.database_url
         # The cache object is the signal that Redis really exists here (the
         # setting has a localhost default even on redis-less deployments) —
         # but an explicit backend=redis is the operator's word over that
@@ -243,11 +232,11 @@ class Runtime:
         )
         self._local_idempotency: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         self._local_idempotency_lock = asyncio.Lock()
-        self._local_idempotency_last_cleanup = datetime.utcnow()
+        self._local_idempotency_last_cleanup = datetime.now(timezone.utc)
         self._local_idempotency_max_entries = 5000
         self._local_rate_limits: Dict[str, Tuple[float, datetime]] = {}
         self._local_rate_limit_lock = asyncio.Lock()
-        self._local_rate_limit_last_cleanup = datetime.utcnow()
+        self._local_rate_limit_last_cleanup = datetime.now(timezone.utc)
         self._local_rate_limit_max_entries = 5000
         # Cross-worker settings reload coordination: the version this worker's
         # model stack was built from, and a lock serializing rebuilds.
@@ -278,21 +267,17 @@ class Runtime:
         store = self.store
 
         def load(model: str):
-            getter = getattr(store, "get_instance_config", None)
-            if not callable(getter):
-                return None
-            entry = (getter(token_counting.CALIBRATION_CONFIG_NAME) or {}).get(model)
+            stored = store.get_instance_config(token_counting.CALIBRATION_CONFIG_NAME)
+            entry = (stored or {}).get(model)
             if isinstance(entry, dict):
                 return entry.get("factor")
             return entry if isinstance(entry, (int, float)) else None
 
         def publish(model: str, factor: float, observations: int) -> None:
-            merger = getattr(store, "merge_instance_config", None)
-            if callable(merger):
-                merger(
-                    token_counting.CALIBRATION_CONFIG_NAME,
-                    {model: {"factor": round(factor, 4), "observations": observations}},
-                )
+            store.merge_instance_config(
+                token_counting.CALIBRATION_CONFIG_NAME,
+                {model: {"factor": round(factor, 4), "observations": observations}},
+            )
             bus = getattr(self, "bus", None)
             if bus is None:
                 return
@@ -319,13 +304,11 @@ class Runtime:
         shadow MODEL_PATH / MODEL_BACKEND env vars the admin never overrode.
         Precedence here is: admin override > env var > code default.
         """
-        getter = getattr(self.store, "get_system_settings_overrides", None)
-        if callable(getter):
-            try:
-                return getter() or {}
-            except Exception as exc:
-                logger.warning("settings_overrides_read_failed", error=str(exc))
-        return {}
+        try:
+            return self.store.get_system_settings_overrides() or {}
+        except Exception as exc:
+            logger.warning("settings_overrides_read_failed", error=str(exc))
+            return {}
 
     def _build_model_services(self) -> None:
         """Construct all backend-dependent services from system settings.
@@ -444,11 +427,8 @@ class Runtime:
         )
 
     def _read_settings_version(self) -> Optional[str]:
-        getter = getattr(self.store, "get_system_settings_version", None)
-        if not callable(getter):
-            return None
         try:
-            return getter()
+            return self.store.get_system_settings_version()
         except Exception as exc:
             logger.warning("settings_version_read_failed", error=str(exc))
             return None
@@ -565,12 +545,8 @@ class Runtime:
                         await result
 
         if getattr(self, "store", None):
-            close_fn = getattr(self.store, "close", None)
-            if close_fn:
-                with contextlib.suppress(Exception):
-                    result = close_fn()
-                    if inspect.isawaitable(result):
-                        await result
+            with contextlib.suppress(Exception):
+                await self.store.close()
 
 
 runtime: Runtime | None = None
@@ -619,6 +595,12 @@ def reset_runtime_for_tests() -> Runtime:
                 # Ignore errors during cleanup - connection may already be closed
                 pass
 
+        # Close the store's connection pool too. Replacing the runtime without
+        # this leaks a pool per reset — invisible while the store was in-memory,
+        # and it exhausts Postgres connections the moment it is not.
+        if runtime is not None and getattr(runtime, "store", None) is not None:
+            runtime.store.close_pool()
+
         reset_settings_cache()
         settings = get_settings()
         if not settings.test_mode:
@@ -663,7 +645,7 @@ def _cleanup_local_idempotency(
 async def _get_cached_idempotency_record(
     runtime: Runtime, route: str, user_id: str, key: str, *, tenant_id: Optional[str] = None
 ) -> Optional[dict]:
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     if runtime.cache:
         # Issue 22.2: Pass tenant_id for multi-tenant isolation
         return await runtime.cache.get_idempotency_record(route, user_id, key, tenant_id=tenant_id)
@@ -690,7 +672,7 @@ async def _set_cached_idempotency_record(
     ttl_seconds: int = IDEMPOTENCY_TTL_SECONDS,
     tenant_id: Optional[str] = None,
 ) -> None:
-    expires_at = datetime.utcnow() + timedelta(seconds=ttl_seconds)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
     if runtime.cache:
         # Issue 22.2: Pass tenant_id for multi-tenant isolation
         await runtime.cache.set_idempotency_record(
@@ -700,7 +682,7 @@ async def _set_cached_idempotency_record(
     async with runtime._local_idempotency_lock:
         # Include tenant_id in in-memory key for multi-tenant isolation
         cache_key = (tenant_id, route, user_id, key) if tenant_id else (route, user_id, key)
-        _cleanup_local_idempotency(runtime, datetime.utcnow())
+        _cleanup_local_idempotency(runtime, datetime.now(timezone.utc))
         runtime._local_idempotency[cache_key] = {**record, "expires_at": expires_at}
 
 
@@ -730,7 +712,7 @@ async def _acquire_idempotency_slot(
     Returns:
         Tuple of (acquired: bool, existing_record: Optional[dict])
     """
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     expires_at = now + timedelta(seconds=ttl_seconds)
 
     if runtime.cache:
@@ -806,7 +788,7 @@ async def check_rate_limit(
             message="Invalid rate limit window_seconds; defaulting to 60 seconds",
         )
         window_seconds = 60  # Default to 1 minute if invalid window per SPEC §18
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     if runtime.cache:
         result = await runtime.cache.check_rate_limit(
             rate_limit_key,
@@ -818,7 +800,7 @@ async def check_rate_limit(
         return result
     refill_rate = float(limit) / float(window_seconds)
     async with runtime._local_rate_limit_lock:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         # Cleanup old or excess entries to prevent unbounded growth (Issue 57.2)
         max_age_seconds = max(window_seconds * 2, 3600)
         if (now - runtime._local_rate_limit_last_cleanup).total_seconds() > 300:

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
-from typing import Iterator, List, Optional
+from typing import Any, Iterator, List, Optional
 
 from liminallm.config import resolve_provider_endpoint
+from liminallm.logging import get_logger
 from liminallm.service.model_backend import (
     ApiAdapterBackend,
     LocalJaxLoRABackend,
@@ -11,6 +12,8 @@ from liminallm.service.model_backend import (
     StubBackend,
 )
 from liminallm.storage.models import Message
+
+logger = get_logger(__name__)
 
 
 class LLMService:

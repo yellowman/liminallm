@@ -1,21 +1,21 @@
 from liminallm.service.training import TrainingService
-from liminallm.storage.memory import MemoryStore
+from tests.pgharness import get_test_store
 
 
-def _create_user_and_conversation(store: MemoryStore, suffix: str = ""):
+def _create_user_and_conversation(store: "PostgresStore", suffix: str = ""):
     user = store.create_user(f"test{suffix}@example.com")
     conversation = store.create_conversation(user.id, title="test conversation")
     return user, conversation
 
 
-def _append_assistant_message(store: MemoryStore, conversation_id: str, sender_id: str):
+def _append_assistant_message(store: "PostgresStore", conversation_id: str, sender_id: str):
     return store.append_message(
         conversation_id, sender=sender_id, role="assistant", content="hello"
     )
 
 
 def test_feedback_enqueues_single_training_job_with_cooldown(tmp_path):
-    store = MemoryStore(fs_root=str(tmp_path))
+    store = get_test_store()
     training = TrainingService(store, fs_root=str(tmp_path))
     user, conversation = _create_user_and_conversation(store)
     message = _append_assistant_message(store, conversation.id, user.id)

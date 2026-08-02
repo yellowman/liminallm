@@ -6,7 +6,7 @@ import shutil
 import uuid
 from contextlib import suppress
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, List, Optional, Sequence
 
@@ -308,22 +308,14 @@ class TrainingService:
         if not adapter:
             raise ConstraintViolation("adapter missing", {"adapter_id": adapter_id})
         adapter_scope = (adapter.schema or {}).get("scope")
-        caller_tenant = getattr(
-            getattr(self.store, "get_user", lambda _uid: None)(user_id),
-            "tenant_id",
-            None,
-        )
+        caller = self.store.get_user(user_id)
+        caller_tenant = caller.tenant_id if caller else None
         if adapter.owner_user_id and adapter.owner_user_id != user_id:
             # Tenant-scoped skill adapters are pooled across contributors, so
             # their nominal owner is bookkeeping; any caller inside the same
             # tenant may train them. Everything else stays owner-only.
-            owner_tenant = getattr(
-                getattr(self.store, "get_user", lambda _uid: None)(
-                    adapter.owner_user_id
-                ),
-                "tenant_id",
-                None,
-            )
+            owner = self.store.get_user(adapter.owner_user_id)
+            owner_tenant = owner.tenant_id if owner else None
             same_tenant = bool(caller_tenant) and caller_tenant == owner_tenant
             if not (adapter_scope == "tenant" and same_tenant):
                 raise ConstraintViolation(
@@ -439,7 +431,7 @@ class TrainingService:
         metadata = {
             "adapter_id": adapter.id,
             "user_id": user_id,
-            "created_at": datetime.utcnow().isoformat(),
+            "created_at": datetime.now(timezone.utc).isoformat(),
             "version": next_version,
             "dataset_path": str(dataset_path),
             "preference_events": [asdict(e) for e in events],
@@ -599,13 +591,7 @@ class TrainingService:
         for job in recent_jobs:
             if job.status in active_statuses:
                 return False
-        global_jobs: List = []
-        list_all = getattr(self.store, "list_training_jobs", None)
-        if callable(list_all):
-            try:
-                global_jobs = list_all(status=None)
-            except TypeError:
-                global_jobs = list_all()
+        global_jobs = self.store.list_training_jobs(status=None)
         if global_jobs:
             active_global = [j for j in global_jobs if j.status in active_statuses]
             if len(active_global) >= self.max_active_training_jobs:
@@ -619,22 +605,12 @@ class TrainingService:
             return True
         most_recent = recent_jobs[0]
         cooldown_elapsed = (
-            datetime.utcnow() - (most_recent.updated_at or most_recent.created_at)
+            datetime.now(timezone.utc) - (most_recent.updated_at or most_recent.created_at)
         ).total_seconds()
         return cooldown_elapsed >= self.training_job_cooldown_seconds
 
     def _list_user_training_jobs(self, user_id: str) -> List:
-        list_fn = getattr(self.store, "list_training_jobs", None)
-        if callable(list_fn):
-            jobs = list_fn(user_id=user_id)
-        elif hasattr(self.store, "training_jobs"):
-            jobs = [
-                j
-                for j in getattr(self.store, "training_jobs", {}).values()
-                if j.user_id == user_id
-            ]
-        else:
-            jobs = []
+        jobs = self.store.list_training_jobs(user_id=user_id)
         try:
             jobs.sort(key=lambda j: j.updated_at or j.created_at, reverse=True)
         except Exception as exc:
@@ -663,22 +639,21 @@ class TrainingService:
                 )
         clusters: List[dict] = []
         clusters_error: Optional[str] = None
-        if hasattr(self.store, "list_semantic_clusters"):
-            try:
-                for cluster in self.store.list_semantic_clusters(user_id):  # type: ignore[attr-defined]
-                    clusters.append(
-                        {
-                            "id": cluster.id,
-                            "size": cluster.size,
-                            "label": cluster.label,
-                            "similarity_hint": cluster.description,
-                        }
-                    )
-            except Exception as exc:
-                clusters_error = str(exc)
-                logger.warning(
-                    "list_semantic_clusters_failed", user_id=user_id, error=str(exc)
+        try:
+            for cluster in self.store.list_semantic_clusters(user_id):
+                clusters.append(
+                    {
+                        "id": cluster.id,
+                        "size": cluster.size,
+                        "label": cluster.label,
+                        "similarity_hint": cluster.description,
+                    }
                 )
+        except Exception as exc:
+            clusters_error = str(exc)
+            logger.warning(
+                "list_semantic_clusters_failed", user_id=user_id, error=str(exc)
+            )
         adapter_candidates = [a for a in self.store.list_artifacts(type_filter="adapter")]  # type: ignore[arg-type]
         adapters = [
             {
@@ -717,27 +692,24 @@ class TrainingService:
         }
 
     def _collect_adapter_router_state(self, user_id: Optional[str]) -> dict:
-        if hasattr(self.store, "list_adapter_router_state"):
-            try:
-                states = self.store.list_adapter_router_state(user_id=user_id)  # type: ignore[attr-defined]
-            except Exception as exc:
-                logger.warning(
-                    "list_adapter_router_state_failed", user_id=user_id, error=str(exc)
-                )
-                return {"status": "error", "error": str(exc)}
-            parsed: List[dict] = []
-            for state in states or []:
-                parsed.append(
-                    {
-                        "adapter_id": getattr(state, "adapter_id", None),
-                        "centroid_vec": getattr(state, "centroid_vec", None),
-                        "base_model": getattr(state, "base_model", None),
-                        "success_score": getattr(state, "success_score", None),
-                        "last_trained_at": getattr(state, "last_trained_at", None),
-                    }
-                )
-            return {"status": "ok" if parsed else "no_data", "entries": parsed}
-        return {"status": "unavailable"}
+        try:
+            states = self.store.list_adapter_router_state(user_id=user_id)
+        except Exception as exc:
+            logger.warning(
+                "list_adapter_router_state_failed", user_id=user_id, error=str(exc)
+            )
+            return {"status": "error", "error": str(exc)}
+        parsed = [
+            {
+                "adapter_id": state.adapter_id,
+                "centroid_vec": state.centroid_vec,
+                "base_model": state.base_model,
+                "success_score": state.success_score,
+                "last_trained_at": state.last_trained_at,
+            }
+            for state in states or []
+        ]
+        return {"status": "ok" if parsed else "no_data", "entries": parsed}
 
     def _maybe_distill(self, entries: List[dict]) -> List[dict]:
         """Rewrite training targets through the teacher LLM (SPEC §7.5).

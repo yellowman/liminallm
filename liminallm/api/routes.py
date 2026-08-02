@@ -55,8 +55,8 @@ from liminallm.api.schemas import (
     ContextSourceRequest,
     ContextSourceResponse,
     ConversationListResponse,
-    ConversationShareRequest,
     ConversationMessagesResponse,
+    ConversationShareRequest,
     ConversationSummary,
     CreateConversationRequest,
     CreateConversationResponse,
@@ -113,6 +113,9 @@ from liminallm.config import (
 )
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
+from liminallm.service import compaction, labels
+from liminallm.service import extract as extract_service
+from liminallm.service import notes as notes_service
 from liminallm.service.archive import (
     ArchiveExtractionError,
     archive_stem,
@@ -127,14 +130,7 @@ from liminallm.service.attachments import (
     record_attachment,
 )
 from liminallm.service.auth import AuthContext
-from liminallm.service import compaction
-from liminallm.service import extract as extract_service
-from liminallm.service import labels
-from liminallm.service import notes as notes_service
-from liminallm.storage.errors import ConstraintViolation
-from liminallm.service.upload_policy import ALLOWED_UPLOAD_EXTENSIONS
 from liminallm.service.errors import BadRequestError, NotFoundError
-from liminallm.service.sandbox import SandboxError
 from liminallm.service.fs import (
     PathTraversalError,
     generate_signed_url,
@@ -148,11 +144,14 @@ from liminallm.service.runtime import (
     check_rate_limit,
     get_runtime,
 )
+from liminallm.service.sandbox import SandboxError
+from liminallm.service.upload_policy import ALLOWED_UPLOAD_EXTENSIONS
 from liminallm.storage.cursors import (
     encode_artifact_cursor,
     encode_index_cursor,
     encode_time_id_cursor,
 )
+from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import Conversation, KnowledgeContext, Session
 
 logger = get_logger(__name__)
@@ -173,7 +172,7 @@ CANCEL_CHANNEL = "chat.cancel"
 # Issue 28.2: Lazily initialize asyncio.Lock to avoid "no running event loop" errors
 # at module import time. The lock is created on first use when an event loop exists.
 _active_requests_lock: Optional[asyncio.Lock] = None
-_active_requests_last_cleanup = datetime.utcnow()
+_active_requests_last_cleanup = datetime.now(timezone.utc)
 # Maximum age for active requests before they're considered stale (30 minutes)
 _ACTIVE_REQUEST_TTL_SECONDS = 30 * 60
 
@@ -195,7 +194,7 @@ async def _cleanup_stale_active_requests() -> int:
     Called periodically during register/unregister to prevent unbounded growth.
     """
     global _active_requests_last_cleanup
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     # Only run cleanup every 5 minutes to avoid performance overhead
     if (now - _active_requests_last_cleanup).total_seconds() < 300:
@@ -231,7 +230,7 @@ async def _register_cancel_event(request_id: str, cancel_event: asyncio.Event, u
         user_id: Owner of this request (Issue 50.5 - for ownership validation)
     """
     async with _get_active_requests_lock():
-        _active_requests[request_id] = (cancel_event, datetime.utcnow(), user_id)
+        _active_requests[request_id] = (cancel_event, datetime.now(timezone.utc), user_id)
         # Periodic cleanup to prevent unbounded growth (Issue 23.2)
         await _cleanup_stale_active_requests()
 
@@ -446,12 +445,7 @@ def _get_system_settings(runtime) -> dict:
     Returns merged settings with defaults for any missing values.
     Uses SYSTEM_SETTINGS_DEFAULTS from config.py as single source of truth.
     """
-    if hasattr(runtime.store, "get_system_settings"):
-        db_settings = runtime.store.get_system_settings() or {}
-    else:
-        db_settings = {}
-
-    return {**SYSTEM_SETTINGS_DEFAULTS, **db_settings}
+    return {**SYSTEM_SETTINGS_DEFAULTS, **(runtime.store.get_system_settings() or {})}
 
 
 def _get_plan_rate_multiplier(runtime, plan_tier: str) -> float:
@@ -687,7 +681,7 @@ async def _resolve_idempotency(
     in_progress_record = {
         "status": "in_progress",
         "request_id": request_id,
-        "started_at": datetime.utcnow().isoformat(),
+        "started_at": datetime.now(timezone.utc).isoformat(),
     }
     acquired, existing_record = await _acquire_idempotency_slot(
         runtime,
@@ -1058,10 +1052,14 @@ def _generate_conversation_title(message: str, max_length: int = 50) -> str:
 def _apply_session_cookies(
     response: Response, session: Session, tokens: dict, *, refresh_ttl_minutes: Optional[int] = None
 ) -> None:
-    # Convert naive datetime to UTC-aware for cookie expiration
+    # Cookie expiry must be UTC-aware: a naive stamp is UTC by convention here,
+    # and an aware one may carry some other zone.
     expires_at = session.expires_at
-    if expires_at.tzinfo is None:
-        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    expires_at = (
+        expires_at.replace(tzinfo=timezone.utc)
+        if expires_at.tzinfo is None
+        else expires_at.astimezone(timezone.utc)
+    )
     response.set_cookie(
         "session_id",
         session.id,
@@ -1559,8 +1557,6 @@ async def admin_inspect_objects(
     )
     paging = _get_pagination_settings(runtime)
     resolved_limit = min(limit or paging["default_conversations_limit"], paging["max_page_size"])
-    if not hasattr(runtime.store, "inspect_state"):
-        raise BadRequestError("inspect not supported")
     details = runtime.store.inspect_state(
         kind=kind, tenant_id=principal.tenant_id, limit=resolved_limit
     )
@@ -3546,11 +3542,7 @@ async def get_config(principal: AuthContext = Depends(get_admin_user)):
     settings = get_settings().model_dump()
     sanitized_settings = _sanitize_dict(settings)
     # Also sanitize runtime_config to prevent data leakage
-    runtime_config = (
-        runtime.store.get_runtime_config()
-        if hasattr(runtime.store, "get_runtime_config")
-        else {}
-    )
+    runtime_config = runtime.store.get_runtime_config()
     sanitized_runtime_config = (
         _sanitize_dict(runtime_config)
         if isinstance(runtime_config, dict)
@@ -3579,12 +3571,7 @@ async def get_system_settings(principal: AuthContext = Depends(get_admin_user)):
         _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
         _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
     )
-    settings = (
-        runtime.store.get_system_settings()
-        if hasattr(runtime.store, "get_system_settings")
-        else {}
-    )
-    return Envelope(status="ok", data=settings)
+    return Envelope(status="ok", data=runtime.store.get_system_settings())
 
 
 @router.put("/admin/settings", response_model=Envelope, tags=["admin"])
@@ -3717,14 +3704,7 @@ async def update_system_settings(
                 status_code=400,
             )
 
-    if hasattr(runtime.store, "set_system_settings"):
-        updated = runtime.store.set_system_settings(body)
-    else:
-        raise _http_error(
-            "not_implemented",
-            "System settings not supported with this storage backend",
-            status_code=501,
-        )
+    updated = runtime.store.set_system_settings(body)
 
     # Rebuild backend-dependent services so a changed model_backend / model_path
     # (or rag/embedding setting) takes effect without a process restart.

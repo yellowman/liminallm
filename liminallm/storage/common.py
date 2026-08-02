@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, List, Optional
 
 # Import from canonical location to avoid duplication
 from liminallm.service.embeddings import (
-    EMBEDDING_DIM,
     cosine_similarity,
     deterministic_embedding,
     validated_embedding,

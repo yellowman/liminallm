@@ -294,14 +294,16 @@ curl -X POST http://localhost:8000/v1/auth/signup \
     -d '{"email": "test@example.com", "password": "TestPass123!"}'
 ```
 
-### running in-memory mode (development/testing)
+### running without redis (development/testing)
 
-for quick testing without postgresql/redis:
+postgres is required — it is the only store. redis is optional; without it rate
+limits, idempotency durability and caches fall back to in-process state:
 
 ```bash
 export JWT_SECRET="Test-Secret-Key-4-Testing-Only!"
 export SHARED_FS_ROOT="/tmp/liminallm"
-export USE_MEMORY_STORE=true
+export DATABASE_URL="postgresql://postgres:postgres@localhost:5432/liminallm"
+export ALLOW_REDIS_FALLBACK_DEV=true
 export TEST_MODE=true
 
 uvicorn liminallm.app:app --reload --host 0.0.0.0 --port 8000
@@ -310,8 +312,8 @@ uvicorn liminallm.app:app --reload --host 0.0.0.0 --port 8000
 ### running tests (native)
 
 ```bash
-# all tests with in-memory store
-TEST_MODE=true USE_MEMORY_STORE=true pytest tests/ -v
+# the suite starts its own throwaway postgres; TEST_DATABASE_URL reuses one
+TEST_MODE=true pytest tests/ -v
 
 # specific test files
 pytest tests/test_post_smoke.py -v          # post-smoke tests

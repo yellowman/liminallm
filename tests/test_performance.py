@@ -18,7 +18,6 @@ def perf_client():
     """Create a test client for performance testing."""
     import os
     os.environ.setdefault("TEST_MODE", "true")
-    os.environ.setdefault("USE_MEMORY_STORE", "true")
     os.environ.setdefault("ALLOW_REDIS_FALLBACK_DEV", "true")
     os.environ.setdefault("JWT_SECRET", "test-secret-key")
 
