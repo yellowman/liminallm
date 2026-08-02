@@ -40,10 +40,24 @@ def _settings(**kw):
 
 
 class TestWebSettings:
-    def test_defaults_are_the_closed_ones(self):
-        """An install that configured nothing does not get web access."""
-        cfg = agent_tools.web_settings(SimpleNamespace())
-        assert cfg["enabled"] is False
+    def test_shipped_defaults(self):
+        """What an install that configured nothing actually gets.
+
+        Web tools are on, but no search provider is configured, so search is
+        inert until an operator picks one. Fetching private addresses is off
+        and stays off: that one is an env-only SSRF control, not something the
+        admin UI can flip.
+
+        (Until settings were read directly, callers went through
+        `getattr(settings, "web_tools_enabled", False)`, so a caller without a
+        settings object saw False while the declaration said True. They now
+        agree, and this pins which value won.)
+        """
+        from liminallm.config import Settings
+
+        cfg = agent_tools.web_settings(Settings())
+        assert cfg["enabled"] is True
+        assert cfg["provider"] == "none"
         assert cfg["allow_private"] is False
 
     def test_reads_configured_values(self):

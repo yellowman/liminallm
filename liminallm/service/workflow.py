@@ -156,8 +156,10 @@ class WorkflowEngine(WorkflowStreamingMixin):
         self.logger = get_logger(__name__)
         self.tool_registry = self._build_tool_registry()
         self.cache = cache
-        # Retained for tools that need filesystem paths (attachments, interpreter).
-        self.settings = settings
+        # Never None: an optional settings object is what makes every read
+        # defensive, and a defensive read is a place for a stale default to
+        # hide. Absent one, the declared defaults are the right answer.
+        self.settings = settings or Settings()
         self.tool_network_policy: ToolNetworkPolicy = build_tool_network_policy(
             allowlist=(settings.tool_network_allowlist if settings else []),
             proxy_url=settings.tool_network_proxy_url if settings else None,
@@ -1086,15 +1088,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         on a small one digestion starts early. The share leaves room for
         system blocks, RAG snippets, attachments, and the new message.
         """
-        fraction = 0.5
-        if self.settings:
-            try:
-                configured = float(
-                    getattr(self.settings, "history_budget_fraction", 0.5) or 0.5
-                )
-                fraction = min(max(configured, 0.1), 0.9)
-            except (TypeError, ValueError):
-                pass
+        # Bounds are declared on the field (0.1-0.9), so no clamping here.
+        fraction = self.settings.history_budget_fraction
         return max(int(self.prompt_budget() * fraction), 1024)
 
     # Prompt budget = model window − output reserve, floored. Cached briefly
@@ -1114,14 +1109,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         cached = getattr(self, "_budget_cache", None)
         if cached and now - cached[1] < self._BUDGET_CACHE_SECONDS:
             return cached[0]
-        window = 0
-        try:
-            overrides = self.store.get_system_settings_overrides() or {}
-            window = int(overrides.get("model_context_window") or 0)
-        except Exception:  # noqa: BLE001 - settings read is best-effort
-            window = 0
-        if window <= 0 and self.settings:
-            window = int(getattr(self.settings, "model_context_window", 0) or 0)
+        # settings already carries what the admin saved; 0 means "discover".
+        window = self.settings.model_context_window
         if window <= 0:
             # Any llm-shaped object works here (tests inject doubles); an
             # object without the accessor falls back to the default window.
@@ -1152,14 +1141,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         """
         if not conversation_id or not (message or "").strip():
             return None
-        fraction = 0.25
-        if self.settings:
-            try:
-                fraction = float(
-                    getattr(self.settings, "history_recall_fraction", 0.25) or 0
-                )
-            except (TypeError, ValueError):
-                fraction = 0.25
+        fraction = self.settings.history_recall_fraction
         if fraction <= 0:
             return None
         try:
@@ -2075,14 +2057,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         )
 
     def _notes_enabled(self) -> bool:
-        """Admin override > env var > default (on)."""
-        enabled = getattr(self.settings, "notes_enabled", True) if self.settings else True
-        try:
-            overrides = self.store.get_system_settings_overrides() or {}
-            enabled = overrides.get("notes_enabled", enabled)
-        except Exception:  # noqa: BLE001 - settings read is best-effort
-            pass
-        return bool(enabled)
+        """Whether the vault is on. settings already carries the admin value."""
+        return bool(self.settings.notes_enabled)
 
     def _tool_note_search(
         self,
@@ -2117,7 +2093,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         conversation_id: Optional[str] = None,
     ) -> Tuple[List[dict], List[dict], str]:
         """Messages, offered tools, and the preamble for an attachment turn."""
-        fs_root = getattr(self.settings, "shared_fs_root", "/srv/liminallm")
+        fs_root = self.settings.shared_fs_root
         preamble = attachments_service.build_attachment_preamble(
             attachments, fs_root=fs_root, user_id=user_id or ""
         )

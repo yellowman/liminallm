@@ -7,7 +7,7 @@ import string
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from dotenv import dotenv_values
 from pydantic import (
@@ -393,18 +393,20 @@ class Settings(BaseModel):
     adapter_server_model: str | None = managed_field(None)
     # Voice service settings
     voice_api_key: str | None = env_field(None, "VOICE_API_KEY")
-    voice_transcription_model: str = managed_field(
+    # Literal, not str: the allowed values are part of the setting, and
+    # declaring them here means the admin API validates against the same list
+    # the admin UI renders as a dropdown.
+    voice_transcription_model: Literal["whisper-1"] = managed_field(
         "whisper-1",
-        description="Transcription model (overridable via admin UI)",
+        description="Transcription model",
     )
-    voice_synthesis_model: str = managed_field(
+    voice_synthesis_model: Literal["tts-1", "tts-1-hd"] = managed_field(
         "tts-1",
-        description="Synthesis model (overridable via admin UI)",
+        description="Synthesis model",
     )
-    voice_default_voice: str = managed_field(
-        "alloy",
-        description="Default voice (overridable via admin UI)",
-    )
+    voice_default_voice: Literal[
+        "alloy", "echo", "fable", "onyx", "nova", "shimmer"
+    ] = managed_field("alloy", description="Default voice")
     # OAuth settings
     oauth_google_client_id: str | None = env_field(None, "OAUTH_GOOGLE_CLIENT_ID")
     oauth_google_client_secret: str | None = env_field(None, "OAUTH_GOOGLE_CLIENT_SECRET")
@@ -502,6 +504,8 @@ class Settings(BaseModel):
     )
     history_budget_fraction: float = managed_field(
         0.5,
+        ge=0.1,
+        le=0.9,
         description=(
             "Share of the prompt budget kept as verbatim recent turns "
             "(0.1-0.9). The rest is left for system blocks, RAG, attachments, "
@@ -510,6 +514,8 @@ class Settings(BaseModel):
     )
     history_recall_fraction: float = managed_field(
         0.25,
+        ge=0.0,
+        le=0.9,
         description=(
             "Share of the history budget spent recalling older turns picked "
             "by relevance to the current message — the window is assembled, "
@@ -536,6 +542,7 @@ class Settings(BaseModel):
     )
     model_context_window: int = managed_field(
         0,
+        ge=0,
         description=(
             "Input window of the serving model, in tokens. 0 = discover: ask "
             "the provider, else a known-family table, else 8192. Set this "
@@ -598,10 +605,14 @@ class Settings(BaseModel):
     )
     web_fetch_timeout: float = managed_field(
         15.0,
+        gt=0,
+        le=120.0,
         description="Total timeout (seconds) for a web page fetch",
     )
     web_fetch_max_bytes: int = managed_field(
         2 * 1024 * 1024,
+        gt=0,
+        le=64 * 1024 * 1024,
         description="Maximum bytes read from a fetched page",
     )
     web_fetch_allow_private: bool = env_field(
@@ -641,9 +652,14 @@ class Settings(BaseModel):
         RagMode.PGVECTOR,
         description="RAG mode: pgvector or memory (overridable via admin UI)",
     )
-    embedding_model_id: str = managed_field(
+    embedding_model_id: Literal[
         "text-embedding",
-        description="Embedding model ID (overridable via admin UI)",
+        "text-embedding-3-small",
+        "text-embedding-3-large",
+        "text-embedding-ada-002",
+    ] = managed_field(
+        "text-embedding",
+        description="Embedding model. 'text-embedding' is the hash fallback.",
     )
 
     # NOTE: The following operational settings have been moved to database-managed
@@ -733,42 +749,48 @@ class Settings(BaseModel):
     # Device-specific windows (SPEC §18: 7d web, 1d mobile). Read by auth.py,
     # which used to carry its own copy of these defaults — a fourth declaration
     # site, for four keys the admin API would then reject as unknown.
-    session_ttl_minutes_web: int = managed_field(60 * 24 * 7)
-    session_ttl_minutes_mobile: int = managed_field(60 * 24)
-    refresh_token_ttl_minutes_web: int = managed_field(60 * 24 * 7)
-    refresh_token_ttl_minutes_mobile: int = managed_field(60 * 24)
-    session_rotation_hours: int = managed_field(24)
-    session_rotation_grace_seconds: int = managed_field(300)
-    max_concurrent_workflows: int = managed_field(3)
-    max_concurrent_inference: int = managed_field(2)
-    # Rate limit multipliers
-    rate_limit_multiplier_free: float = managed_field(1.0)
-    rate_limit_multiplier_paid: float = managed_field(2.0)
-    rate_limit_multiplier_enterprise: float = managed_field(5.0)
-    # Rate limits (0 = disabled/unlimited)
-    chat_rate_limit_per_minute: int = managed_field(60)
-    chat_rate_limit_window_seconds: int = managed_field(60)
-    login_rate_limit_per_minute: int = managed_field(10)
-    refresh_rate_limit_per_minute: int = managed_field(20)
-    refresh_rate_limit_window_seconds: int = managed_field(60)
-    signup_rate_limit_per_minute: int = managed_field(5)
-    reset_rate_limit_per_minute: int = managed_field(5)
-    mfa_rate_limit_per_minute: int = managed_field(5)
-    admin_rate_limit_per_minute: int = managed_field(30)
-    admin_rate_limit_window_seconds: int = managed_field(60)
-    files_upload_rate_limit_per_minute: int = managed_field(10)
-    websocket_connect_rate_limit_per_minute: int = managed_field(30)
-    configops_rate_limit_per_hour: int = managed_field(30)
-    read_rate_limit_per_minute: int = managed_field(120)
-    write_rate_limit_per_minute: int = managed_field(60)
-    max_websocket_connections_per_user: int = managed_field(5)
-    # Pagination
-    default_page_size: int = managed_field(100)
-    max_page_size: int = managed_field(500)
-    default_conversations_limit: int = managed_field(50)
+    # Session windows. A one-minute floor: a zero would log everyone out on
+    # arrival, and there is no reading of "0 minutes" that anyone wants.
+    session_ttl_minutes_web: int = managed_field(60 * 24 * 7, ge=1)
+    session_ttl_minutes_mobile: int = managed_field(60 * 24, ge=1)
+    refresh_token_ttl_minutes_web: int = managed_field(60 * 24 * 7, ge=1)
+    refresh_token_ttl_minutes_mobile: int = managed_field(60 * 24, ge=1)
+    session_rotation_hours: int = managed_field(24, ge=1)
+    session_rotation_grace_seconds: int = managed_field(300, ge=0)
+    # Concurrency: at least one, or the instance accepts work it will never run.
+    max_concurrent_workflows: int = managed_field(3, ge=1)
+    max_concurrent_inference: int = managed_field(2, ge=1)
+    # Rate limit multipliers. Positive: a zero multiplier would silently make
+    # every limit "0 requests" for that tier rather than disabling anything.
+    rate_limit_multiplier_free: float = managed_field(1.0, gt=0)
+    rate_limit_multiplier_paid: float = managed_field(2.0, gt=0)
+    rate_limit_multiplier_enterprise: float = managed_field(5.0, gt=0)
+    # Rate limits. 0 means unlimited, which is why these floor at 0 rather
+    # than 1 — an operator turning one off is a legitimate choice.
+    chat_rate_limit_per_minute: int = managed_field(60, ge=0)
+    chat_rate_limit_window_seconds: int = managed_field(60, ge=1)
+    login_rate_limit_per_minute: int = managed_field(10, ge=0)
+    refresh_rate_limit_per_minute: int = managed_field(20, ge=0)
+    refresh_rate_limit_window_seconds: int = managed_field(60, ge=1)
+    signup_rate_limit_per_minute: int = managed_field(5, ge=0)
+    reset_rate_limit_per_minute: int = managed_field(5, ge=0)
+    mfa_rate_limit_per_minute: int = managed_field(5, ge=0)
+    admin_rate_limit_per_minute: int = managed_field(30, ge=0)
+    admin_rate_limit_window_seconds: int = managed_field(60, ge=1)
+    files_upload_rate_limit_per_minute: int = managed_field(10, ge=0)
+    websocket_connect_rate_limit_per_minute: int = managed_field(30, ge=0)
+    configops_rate_limit_per_hour: int = managed_field(30, ge=0)
+    read_rate_limit_per_minute: int = managed_field(120, ge=0)
+    write_rate_limit_per_minute: int = managed_field(60, ge=0)
+    max_websocket_connections_per_user: int = managed_field(5, ge=1)
+    # Pagination. Capped so a page size cannot be set to something that reads
+    # the whole table into memory.
+    default_page_size: int = managed_field(100, ge=1, le=1000)
+    max_page_size: int = managed_field(500, ge=1, le=1000)
+    default_conversations_limit: int = managed_field(50, ge=1, le=1000)
     # Files
-    max_upload_bytes: int = managed_field(10485760)
-    rag_chunk_size: int = managed_field(400)
+    max_upload_bytes: int = managed_field(10485760, ge=1024)
+    rag_chunk_size: int = managed_field(400, ge=64, le=4000)
 
     @field_validator("cors_allow_origins", mode="before")
     @classmethod
@@ -971,32 +993,37 @@ def _admin_defaults_from_settings() -> dict:
 # never masquerades as an explicit override.
 SYSTEM_SETTINGS_DEFAULTS: dict = _admin_defaults_from_settings()
 
-# Derived validation sets for admin settings API
-SYSTEM_SETTINGS_INT_KEYS = {
-    k for k, v in SYSTEM_SETTINGS_DEFAULTS.items()
-    if isinstance(v, int) and not isinstance(v, bool)
-}
+def managed_setting_names() -> set[str]:
+    """Names an admin is allowed to write."""
+    return set(SYSTEM_SETTINGS_DEFAULTS)
 
-SYSTEM_SETTINGS_FLOAT_KEYS = {
-    k for k, v in SYSTEM_SETTINGS_DEFAULTS.items()
-    if isinstance(v, float)
-}
 
-SYSTEM_SETTINGS_BOOL_KEYS = {
-    k for k, v in SYSTEM_SETTINGS_DEFAULTS.items()
-    if isinstance(v, bool)
-}
+def validate_managed_settings(patch: dict) -> dict[str, str]:
+    """Check an admin's patch against the Settings model itself.
 
-SYSTEM_SETTINGS_STRING_KEYS = {
-    k for k, v in SYSTEM_SETTINGS_DEFAULTS.items()
-    if isinstance(v, str)
-}
+    Returns {field: message} for whatever failed, empty when the patch is
+    good. Types, bounds and allowed values are declared once, on the fields;
+    re-stating them in the API is how the two end up disagreeing, and the one
+    that would be wrong is the API — the model is what the code actually runs
+    against.
 
-# Rate limit keys that allow 0 (disabled/unlimited)
-SYSTEM_SETTINGS_RATE_LIMIT_KEYS = {
-    k for k in SYSTEM_SETTINGS_DEFAULTS.keys()
-    if k.endswith("_per_minute") or k.endswith("_per_hour")
-}
+    Fields are checked one at a time so the response names every problem
+    rather than only the first.
+    """
+    errors: dict[str, str] = {}
+    for key, value in patch.items():
+        if key not in SYSTEM_SETTINGS_DEFAULTS:
+            errors[key] = "not a managed setting"
+            continue
+        try:
+            Settings(**{key: value})
+        except ValidationError as exc:
+            detail = exc.errors()[0]
+            message = detail.get("msg", "invalid value")
+            # Pydantic prefixes its type errors; the field name is already the
+            # dict key, so the prefix is noise in a per-field message.
+            errors[key] = message.replace("Value error, ", "")
+    return errors
 
 
 def apply_managed_settings(base: Settings, stored: dict) -> Settings:

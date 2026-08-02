@@ -102,14 +102,9 @@ from liminallm.api.schemas import (
     WorkflowListResponse,
 )
 from liminallm.config import (
-    SYSTEM_SETTINGS_BOOL_KEYS,
     SYSTEM_SETTINGS_DEFAULTS,
-    SYSTEM_SETTINGS_FLOAT_KEYS,
-    SYSTEM_SETTINGS_INT_KEYS,
-    SYSTEM_SETTINGS_RATE_LIMIT_KEYS,
-    SYSTEM_SETTINGS_STRING_KEYS,
-    ModelBackend,
     get_settings,
+    validate_managed_settings,
 )
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
@@ -485,15 +480,6 @@ def _get_plan_upload_limit(runtime, plan_tier: str) -> int:
         "enterprise": 200 * 1024 * 1024, # 200MB
     }
     return limits.get(plan_tier, limits["free"])
-
-
-def _get_rate_limit(runtime, key: str) -> int:
-    """Read a rate limit off the effective settings.
-
-    runtime.settings already carries what the admin saved, so this needs no
-    database round trip — and it used to make one per request.
-    """
-    return int(getattr(runtime.settings, key))
 
 
 async def _enforce_rate_limit(
@@ -1108,7 +1094,7 @@ async def signup(body: SignupRequest, response: Response):
     await _enforce_rate_limit(
         runtime,
         f"signup:{body.email.lower()}",
-        _get_rate_limit(runtime, "signup_rate_limit_per_minute"),
+        runtime.settings.signup_rate_limit_per_minute,
         60,
     )
     # Issue 35.2/53.2: Per CLAUDE.md, derive tenant_id from server config, not user input
@@ -1157,7 +1143,7 @@ async def login(body: LoginRequest, request: Request, response: Response):
     await _enforce_rate_limit(
         runtime,
         f"login:{body.email.lower()}",
-        _get_rate_limit(runtime, "login_rate_limit_per_minute"),
+        runtime.settings.login_rate_limit_per_minute,
         60,
     )
     # Bug fix: Pass user_agent and ip_addr for session metadata
@@ -1309,8 +1295,8 @@ async def refresh_tokens(
     await _enforce_rate_limit(
         runtime,
         f"refresh:{client_ip}",
-        _get_rate_limit(runtime, "refresh_rate_limit_per_minute"),
-        _get_rate_limit(runtime, "refresh_rate_limit_window_seconds"),
+        runtime.settings.refresh_rate_limit_per_minute,
+        runtime.settings.refresh_rate_limit_window_seconds,
     )
     user, session, tokens = await runtime.auth.refresh_tokens(
         body.refresh_token, tenant_hint=tenant_hint
@@ -1360,8 +1346,8 @@ async def admin_list_users(
     await _enforce_rate_limit(
         runtime,
         f"admin:read:{principal.user_id}",
-        _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
-        _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
     )
     paging = _get_pagination_settings(runtime)
     resolved_limit = min(limit or paging["default_page_size"], paging["max_page_size"])
@@ -1385,8 +1371,8 @@ async def admin_create_user(
     await _enforce_rate_limit(
         runtime,
         f"admin:create_user:{principal.user_id}",
-        _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
-        _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
     )
     target_tenant = body.tenant_id or principal.tenant_id
     if target_tenant != principal.tenant_id:
@@ -1430,8 +1416,8 @@ async def admin_set_role(
     await _enforce_rate_limit(
         runtime,
         f"admin:set_role:{principal.user_id}",
-        _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
-        _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
     )
     # Issue 50.3: Validate tenant isolation - admin can only modify users in their tenant
     target_user = runtime.store.get_user(user_id)
@@ -1466,8 +1452,8 @@ async def admin_delete_user(
     await _enforce_rate_limit(
         runtime,
         f"admin:delete_user:{principal.user_id}",
-        _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
-        _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
     )
     # Issue 50.4: Validate tenant isolation - admin can only delete users in their tenant
     target_user = runtime.store.get_user(user_id)
@@ -1498,8 +1484,8 @@ async def admin_list_adapters(principal: AuthContext = Depends(get_admin_user)):
     await _enforce_rate_limit(
         runtime,
         f"admin:read:{principal.user_id}",
-        _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
-        _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
     )
     # Filter adapters by tenant to prevent cross-tenant data exposure
     adapters = list(runtime.store.list_artifacts(
@@ -1543,8 +1529,8 @@ async def admin_inspect_objects(
     await _enforce_rate_limit(
         runtime,
         f"admin:read:{principal.user_id}",
-        _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
-        _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
     )
     paging = _get_pagination_settings(runtime)
     resolved_limit = min(limit or paging["default_conversations_limit"], paging["max_page_size"])
@@ -1566,7 +1552,7 @@ async def request_mfa(body: MFARequest, request: Request):
     await _enforce_rate_limit(
         runtime,
         f"mfa:request:ip:{client_ip}",
-        _get_rate_limit(runtime, "mfa_rate_limit_per_minute"),
+        runtime.settings.mfa_rate_limit_per_minute,
         60,
     )
     if not session_cookie or session_cookie != body.session_id:
@@ -1595,7 +1581,7 @@ async def request_mfa(body: MFARequest, request: Request):
     await _enforce_rate_limit(
         runtime,
         f"mfa:request:{auth_ctx.user_id}",
-        _get_rate_limit(runtime, "mfa_rate_limit_per_minute"),
+        runtime.settings.mfa_rate_limit_per_minute,
         60,
     )
     challenge = await runtime.auth.issue_mfa_challenge(user_id=auth_ctx.user_id)
@@ -1612,7 +1598,7 @@ async def verify_mfa(body: MFAVerifyRequest, request: Request, response: Respons
     await _enforce_rate_limit(
         runtime,
         f"mfa:verify:ip:{client_ip}",
-        _get_rate_limit(runtime, "mfa_rate_limit_per_minute"),
+        runtime.settings.mfa_rate_limit_per_minute,
         60,
     )
     if not session_cookie or session_cookie != body.session_id:
@@ -1642,7 +1628,7 @@ async def verify_mfa(body: MFAVerifyRequest, request: Request, response: Respons
     await _enforce_rate_limit(
         runtime,
         f"mfa:verify:{auth_ctx.user_id}",
-        _get_rate_limit(runtime, "mfa_rate_limit_per_minute"),
+        runtime.settings.mfa_rate_limit_per_minute,
         60,
     )
     ok = await runtime.auth.verify_mfa_challenge(
@@ -1683,7 +1669,7 @@ async def get_mfa_status(principal: AuthContext = Depends(get_user)):
     await _enforce_rate_limit(
         runtime,
         f"mfa:status:{principal.user_id}",
-        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        runtime.settings.read_rate_limit_per_minute,
         60,
     )
     mfa_cfg = runtime.store.get_user_mfa_secret(principal.user_id)
@@ -1703,7 +1689,7 @@ async def disable_mfa(body: MFADisableRequest, principal: AuthContext = Depends(
     await _enforce_rate_limit(
         runtime,
         f"mfa:disable:{principal.user_id}",
-        _get_rate_limit(runtime, "mfa_rate_limit_per_minute"),
+        runtime.settings.mfa_rate_limit_per_minute,
         60,
     )
     mfa_cfg = runtime.store.get_user_mfa_secret(principal.user_id)
@@ -1729,7 +1715,7 @@ async def request_reset(body: PasswordResetRequest):
     await _enforce_rate_limit(
         runtime,
         f"reset:{body.email.lower()}",
-        _get_rate_limit(runtime, "reset_rate_limit_per_minute"),
+        runtime.settings.reset_rate_limit_per_minute,
         60,
     )
     # Check if user exists before generating token (don't reveal if user exists)
@@ -1769,7 +1755,7 @@ async def get_current_user(principal: AuthContext = Depends(get_user)):
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        runtime.settings.read_rate_limit_per_minute,
         60,
     )
     user = runtime.store.get_user(principal.user_id)
@@ -1801,7 +1787,7 @@ async def get_user_settings(principal: AuthContext = Depends(get_user)):
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        runtime.settings.read_rate_limit_per_minute,
         60,
     )
     settings = runtime.store.get_user_settings(principal.user_id)
@@ -1836,7 +1822,7 @@ async def update_user_settings(
     await _enforce_rate_limit(
         runtime,
         f"write:{principal.user_id}",
-        _get_rate_limit(runtime, "chat_rate_limit_per_minute"),
+        runtime.settings.chat_rate_limit_per_minute,
         60,
     )
     settings = runtime.store.set_user_settings(
@@ -2012,8 +1998,8 @@ async def chat(
         await _enforce_rate_limit_per_plan(
             runtime,
             f"chat:{user_id}",
-            _get_rate_limit(runtime, "chat_rate_limit_per_minute"),
-            _get_rate_limit(runtime, "chat_rate_limit_window_seconds"),
+            runtime.settings.chat_rate_limit_per_minute,
+            runtime.settings.chat_rate_limit_window_seconds,
             plan_tier,
         )
 
@@ -2232,16 +2218,8 @@ async def cancel_chat(
 
 
 def _require_notes_enabled(runtime) -> None:
-    """Admin override > env var > default (on)."""
-    enabled = getattr(runtime.settings, "notes_enabled", True)
-    getter = getattr(runtime.store, "get_system_settings_overrides", None)
-    if callable(getter):
-        try:
-            overrides = getter() or {}
-            enabled = overrides.get("notes_enabled", enabled)
-        except Exception:  # noqa: BLE001 - settings read is best-effort
-            pass
-    if not enabled:
+    """403 when the vault is switched off. settings carries the admin value."""
+    if not runtime.settings.notes_enabled:
         raise _http_error("notes_disabled", "the notes vault is disabled", status_code=403)
 
 
@@ -2516,7 +2494,7 @@ async def note_from_file(
             path,
             llm=runtime.llm,
             readers=extract_service.parse_reader_order(
-                getattr(runtime.settings, "extract_readers", None)
+                runtime.settings.extract_readers
             ),
         )
     except extract_service.ExtractError as exc:
@@ -2749,7 +2727,7 @@ async def list_artifacts(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        runtime.settings.read_rate_limit_per_minute,
         60,
     )
     paging = _get_pagination_settings(runtime)
@@ -2825,7 +2803,7 @@ async def get_artifact(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        runtime.settings.read_rate_limit_per_minute,
         60,
     )
     artifact = _get_owned_artifact(runtime, artifact_id, principal)
@@ -2856,7 +2834,7 @@ async def list_tool_specs(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        runtime.settings.read_rate_limit_per_minute,
         60,
     )
     resolved_page_size = min(max(page_size, 1), 200)
@@ -2906,7 +2884,7 @@ async def get_tool_spec(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        runtime.settings.read_rate_limit_per_minute,
         60,
     )
     artifact = _get_owned_artifact(runtime, artifact_id, principal)
@@ -2941,7 +2919,7 @@ async def list_workflows(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        runtime.settings.read_rate_limit_per_minute,
         60,
     )
     resolved_page_size = min(max(page_size, 1), 200)
@@ -2992,7 +2970,7 @@ async def list_artifact_versions(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        runtime.settings.read_rate_limit_per_minute,
         60,
     )
     paging = _get_pagination_settings(runtime)
@@ -3332,7 +3310,7 @@ async def propose_patch(
     await _enforce_rate_limit(
         runtime,
         f"configops:{principal.user_id}",
-        _get_rate_limit(runtime, "configops_rate_limit_per_hour"),
+        runtime.settings.configops_rate_limit_per_hour,
         3600,
     )
     proposer = "human_admin" if principal.role == "admin" else "user"
@@ -3366,7 +3344,7 @@ async def list_config_patches(
     await _enforce_rate_limit(
         runtime,
         f"configops:{principal.user_id}",
-        _get_rate_limit(runtime, "configops_rate_limit_per_hour"),
+        runtime.settings.configops_rate_limit_per_hour,
         3600,
     )
     patches = runtime.store.list_config_patches(status)
@@ -3399,7 +3377,7 @@ async def decide_config_patch(
     await _enforce_rate_limit(
         runtime,
         f"configops:{principal.user_id}",
-        _get_rate_limit(runtime, "configops_rate_limit_per_hour"),
+        runtime.settings.configops_rate_limit_per_hour,
         3600,
     )
     decision = runtime.config_ops.decide_patch(patch_id, body.decision, body.reason)
@@ -3428,7 +3406,7 @@ async def apply_config_patch(
     await _enforce_rate_limit(
         runtime,
         f"configops:{principal.user_id}",
-        _get_rate_limit(runtime, "configops_rate_limit_per_hour"),
+        runtime.settings.configops_rate_limit_per_hour,
         3600,
     )
     result = runtime.config_ops.apply_patch(
@@ -3463,7 +3441,7 @@ async def auto_patch(
     await _enforce_rate_limit(
         runtime,
         f"configops:{principal.user_id}",
-        _get_rate_limit(runtime, "configops_rate_limit_per_hour"),
+        runtime.settings.configops_rate_limit_per_hour,
         3600,
     )
     audit = runtime.config_ops.auto_generate_patch(
@@ -3491,8 +3469,8 @@ async def get_config(principal: AuthContext = Depends(get_admin_user)):
     await _enforce_rate_limit(
         runtime,
         f"admin:read:{principal.user_id}",
-        _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
-        _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
     )
 
     def _sanitize_dict(data: dict) -> dict:
@@ -3559,8 +3537,8 @@ async def get_system_settings(principal: AuthContext = Depends(get_admin_user)):
     await _enforce_rate_limit(
         runtime,
         f"admin:read:{principal.user_id}",
-        _get_rate_limit(runtime, "admin_rate_limit_per_minute"),
-        _get_rate_limit(runtime, "admin_rate_limit_window_seconds"),
+        runtime.settings.admin_rate_limit_per_minute,
+        runtime.settings.admin_rate_limit_window_seconds,
     )
     return Envelope(status="ok", data=runtime.store.get_system_settings())
 
@@ -3607,92 +3585,16 @@ async def update_system_settings(
         runtime.settings.admin_rate_limit_window_seconds,
     )
 
-    # Validate settings
-    # Use centralized settings definitions from config.py (single source of truth)
-    allowed_keys = set(SYSTEM_SETTINGS_DEFAULTS.keys())
-    invalid_keys = set(body.keys()) - allowed_keys
-    if invalid_keys:
+    # Types, bounds and allowed values are declared on the Settings fields;
+    # this checks the patch against them rather than restating them here.
+    errors = validate_managed_settings(body)
+    if errors:
         raise _http_error(
             "validation_error",
-            f"Invalid settings keys: {', '.join(invalid_keys)}",
+            "; ".join(f"{key}: {message}" for key, message in sorted(errors.items())),
             status_code=400,
+            details={"fields": errors},
         )
-
-    # Type validation - derived from SYSTEM_SETTINGS_DEFAULTS types
-    int_keys = SYSTEM_SETTINGS_INT_KEYS
-    float_keys = SYSTEM_SETTINGS_FLOAT_KEYS
-    bool_keys = SYSTEM_SETTINGS_BOOL_KEYS
-    string_keys = SYSTEM_SETTINGS_STRING_KEYS
-    # Enum validation for settings with known valid values
-    enum_values = {
-        "voice_transcription_model": {"whisper-1"},
-        "voice_synthesis_model": {"tts-1", "tts-1-hd"},
-        "voice_default_voice": {"alloy", "echo", "fable", "onyx", "nova", "shimmer"},
-        "rag_mode": {"pgvector", "memory"},
-        # Derived from the ModelBackend enum so new backends never drift out of sync.
-        "model_backend": {b.value for b in ModelBackend},
-        "default_adapter_mode": {"local", "remote", "prompt", "hybrid"},
-        "embedding_model_id": {
-            "text-embedding", "text-embedding-3-small", "text-embedding-3-large",
-            "text-embedding-ada-002",
-        },
-    }
-    for key, value in body.items():
-        # Bug fix: bool is a subclass of int in Python, so explicitly exclude booleans
-        if key in int_keys and (not isinstance(value, int) or isinstance(value, bool)):
-            raise _http_error(
-                "validation_error",
-                f"{key} must be an integer",
-                status_code=400,
-            )
-        # Bug fix: Also exclude booleans from float check
-        if key in float_keys and (not isinstance(value, (int, float)) or isinstance(value, bool)):
-            raise _http_error(
-                "validation_error",
-                f"{key} must be a number",
-                status_code=400,
-            )
-        if key in bool_keys and not isinstance(value, bool):
-            raise _http_error(
-                "validation_error",
-                f"{key} must be a boolean",
-                status_code=400,
-            )
-        if key in string_keys and not isinstance(value, str):
-            raise _http_error(
-                "validation_error",
-                f"{key} must be a string",
-                status_code=400,
-            )
-        # Validate positive values for numeric settings
-        # Rate limit keys allow 0 (disabled), but not negative
-        if key in int_keys and isinstance(value, int):
-            if key in SYSTEM_SETTINGS_RATE_LIMIT_KEYS:
-                if value < 0:
-                    raise _http_error(
-                        "validation_error",
-                        f"{key} must be non-negative (0 = disabled/unlimited)",
-                        status_code=400,
-                    )
-            elif value <= 0:
-                raise _http_error(
-                    "validation_error",
-                    f"{key} must be positive",
-                    status_code=400,
-                )
-        if key in float_keys and isinstance(value, (int, float)) and value <= 0:
-            raise _http_error(
-                "validation_error",
-                f"{key} must be positive",
-                status_code=400,
-            )
-        # Validate enum values
-        if key in enum_values and value not in enum_values[key]:
-            raise _http_error(
-                "validation_error",
-                f"{key} must be one of: {', '.join(sorted(enum_values[key]))}",
-                status_code=400,
-            )
 
     updated = runtime.store.set_system_settings(body)
 
@@ -3755,7 +3657,7 @@ async def get_file_limits(principal: AuthContext = Depends(get_user)):
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        runtime.settings.read_rate_limit_per_minute,
         60,
     )
     # Issue 4.3: Return per-plan upload limits (SPEC §18)
@@ -3839,7 +3741,7 @@ async def upload_file(
         await _enforce_rate_limit(
             runtime,
             f"files:upload:{principal.user_id}",
-            _get_rate_limit(runtime, "files_upload_rate_limit_per_minute"),
+            runtime.settings.files_upload_rate_limit_per_minute,
             60,
             cost=approx_cost,
         )
@@ -3849,7 +3751,7 @@ async def upload_file(
             await _enforce_rate_limit(
                 runtime,
                 f"files:upload:{principal.user_id}",
-                _get_rate_limit(runtime, "files_upload_rate_limit_per_minute"),
+                runtime.settings.files_upload_rate_limit_per_minute,
                 60,
                 cost=actual_cost - approx_cost,
             )
@@ -4017,7 +3919,7 @@ async def list_conversation_attachments(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        runtime.settings.read_rate_limit_per_minute,
         60,
     )
     conversation = _get_owned_conversation(runtime, conversation_id, principal)
@@ -4043,7 +3945,7 @@ async def list_files(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        runtime.settings.read_rate_limit_per_minute,
         60,
     )
     # Get user's file directory
@@ -4121,7 +4023,7 @@ async def get_file_download_url(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        runtime.settings.read_rate_limit_per_minute,
         60,
     )
 
@@ -4229,7 +4131,7 @@ async def delete_file(
     await _enforce_rate_limit(
         runtime,
         f"write:{principal.user_id}",
-        _get_rate_limit(runtime, "write_rate_limit_per_minute"),
+        runtime.settings.write_rate_limit_per_minute,
         60,
     )
 
@@ -4294,7 +4196,7 @@ async def extract_uploaded_archive(
     await _enforce_rate_limit(
         runtime,
         f"write:{principal.user_id}",
-        _get_rate_limit(runtime, "write_rate_limit_per_minute"),
+        runtime.settings.write_rate_limit_per_minute,
         60,
     )
 
@@ -4406,7 +4308,7 @@ async def list_messages(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        runtime.settings.read_rate_limit_per_minute,
         60,
     )
     paging = _get_pagination_settings(runtime)
@@ -4456,7 +4358,7 @@ async def create_conversation(
         await _enforce_rate_limit(
             runtime,
             f"write:{principal.user_id}",
-            _get_rate_limit(runtime, "write_rate_limit_per_minute"),
+            runtime.settings.write_rate_limit_per_minute,
             60,
         )
         # Validate context_id if provided
@@ -4492,7 +4394,7 @@ async def list_conversations(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        runtime.settings.read_rate_limit_per_minute,
         60,
     )
     paging = _get_pagination_settings(runtime)
@@ -4539,7 +4441,7 @@ async def get_conversation(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        runtime.settings.read_rate_limit_per_minute,
         60,
     )
     conversation = _get_owned_conversation(runtime, conversation_id, principal)
@@ -4574,7 +4476,7 @@ async def share_conversation(
     await _enforce_rate_limit(
         runtime,
         f"write:{principal.user_id}",
-        _get_rate_limit(runtime, "write_rate_limit_per_minute"),
+        runtime.settings.write_rate_limit_per_minute,
         60,
     )
     conversation = runtime.store.set_conversation_public(
@@ -4619,7 +4521,7 @@ async def list_public_conversations(
     await _enforce_rate_limit(
         runtime,
         "public:read",
-        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        runtime.settings.read_rate_limit_per_minute,
         60,
     )
     response.headers.update(_PUBLIC_NOINDEX)
@@ -4655,7 +4557,7 @@ async def get_public_conversation(
     await _enforce_rate_limit(
         runtime,
         "public:read",
-        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        runtime.settings.read_rate_limit_per_minute,
         60,
     )
     response.headers.update(_PUBLIC_NOINDEX)
@@ -4737,7 +4639,7 @@ async def list_contexts(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        runtime.settings.read_rate_limit_per_minute,
         60,
     )
     paging = _get_pagination_settings(runtime)
@@ -4801,7 +4703,7 @@ async def list_chunks(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        runtime.settings.read_rate_limit_per_minute,
         60,
     )
     paging = _get_pagination_settings(runtime)
@@ -4972,7 +4874,7 @@ async def list_context_sources(
     await _enforce_rate_limit(
         runtime,
         f"read:{principal.user_id}",
-        _get_rate_limit(runtime, "read_rate_limit_per_minute"),
+        runtime.settings.read_rate_limit_per_minute,
         60,
     )
 
@@ -5002,7 +4904,7 @@ async def transcribe_voice(
     await _enforce_rate_limit(
         runtime,
         f"voice:transcribe:{principal.user_id}",
-        _get_rate_limit(runtime, "chat_rate_limit_per_minute"),  # Use chat rate limit as default
+        runtime.settings.chat_rate_limit_per_minute,  # Use chat rate limit as default
         60,
     )
     # Limit audio file size to 10MB
@@ -5025,7 +4927,7 @@ async def synthesize_voice(
     await _enforce_rate_limit(
         runtime,
         f"voice:synthesize:{principal.user_id}",
-        _get_rate_limit(runtime, "chat_rate_limit_per_minute"),  # Use chat rate limit as default
+        runtime.settings.chat_rate_limit_per_minute,  # Use chat rate limit as default
         60,
     )
     # Limit text length to prevent resource exhaustion
@@ -5134,8 +5036,8 @@ async def websocket_chat(ws: WebSocket):
         await _enforce_rate_limit_per_plan(
             runtime,
             f"chat:{user_id}",
-            _get_rate_limit(runtime, "chat_rate_limit_per_minute"),
-            _get_rate_limit(runtime, "chat_rate_limit_window_seconds"),
+            runtime.settings.chat_rate_limit_per_minute,
+            runtime.settings.chat_rate_limit_window_seconds,
             plan_tier,
         )
 

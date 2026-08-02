@@ -21,6 +21,10 @@ class RecordingRAG:
 
 
 class StubLLM:
+    # A real LLMService always answers this; the engine asks before offering
+    # tools. Without it the agent path errors and retries into a failure.
+    supports_tools = False
+
     def generate(self, message, adapters=None, context_snippets=None, history=None):
         return {"content": message, "usage": {"tokens": 1}}
 

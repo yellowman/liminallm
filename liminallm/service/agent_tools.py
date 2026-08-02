@@ -32,20 +32,22 @@ HISTORY_EXCERPT_CHARS = 1200
 
 
 def web_settings(settings: Any) -> dict:
-    """Web tool configuration, with safe defaults when unset.
+    """Web tool configuration, read straight off Settings.
 
-    Defaults are the closed ones: disabled, no private addresses. An install
-    that never configured web access does not get it by omission.
+    No getattr defaults: every one of these is a declared field, so the
+    attribute is always there and its shipped default is written in config.py
+    and nowhere else. A default repeated here is a default that can go stale
+    without anything noticing.
     """
     return {
-        "enabled": bool(getattr(settings, "web_tools_enabled", False)),
-        "provider": getattr(settings, "web_search_provider", "none") or "none",
-        "api_key": getattr(settings, "web_search_api_key", None),
-        "engine_id": getattr(settings, "web_search_engine_id", None),
-        "timeout": float(getattr(settings, "web_fetch_timeout", 15.0) or 15.0),
-        "max_bytes": int(getattr(settings, "web_fetch_max_bytes", 2 * 1024 * 1024)),
-        "allow_private": bool(getattr(settings, "web_fetch_allow_private", False)),
-        "proxy": getattr(settings, "tool_network_proxy_url", None),
+        "enabled": bool(settings.web_tools_enabled),
+        "provider": settings.web_search_provider or "none",
+        "api_key": settings.web_search_api_key,
+        "engine_id": settings.web_search_engine_id,
+        "timeout": float(settings.web_fetch_timeout),
+        "max_bytes": int(settings.web_fetch_max_bytes),
+        "allow_private": bool(settings.web_fetch_allow_private),
+        "proxy": settings.tool_network_proxy_url,
     }
 
 
@@ -154,7 +156,7 @@ def run_python(
     """
     if not user_id:
         return "Python execution requires an authenticated user."
-    fs_root = getattr(settings, "shared_fs_root", "/srv/liminallm")
+    fs_root = settings.shared_fs_root
     files_dir = attachments_service.user_files_dir(fs_root, user_id)
     if session.get("workdir") is None:
         # Node-local, NOT under shared_fs_root: these session directories hold
@@ -163,8 +165,7 @@ def run_python(
         # would make every run_python call write tens of megabytes over NFS/EFS
         # for no benefit. Only *published* artifacts go to the user's files.
         scratch = Path(
-            getattr(settings, "interpreter_scratch_dir", None)
-            or tempfile.gettempdir()
+            settings.interpreter_scratch_dir or tempfile.gettempdir()
         ) / "liminallm-interpreter"
         scratch.mkdir(parents=True, exist_ok=True)
         session["workdir"] = interpreter.prepare_workdir(

@@ -210,3 +210,71 @@ def test_no_stray_env_var_reads_outside_config(monkeypatch):
         if not any(x in line for x in allowed)
     ]
     assert offenders == [], "\n".join(offenders)
+
+
+def test_no_setting_default_is_restated_outside_config():
+    """`getattr(settings, "x", <default>)` is a default written a second time.
+
+    Every managed setting is a declared field, so the attribute is always
+    there; supplying a fallback only creates a value that can drift from the
+    declaration without anything noticing. Two of them had already drifted:
+    web_tools_enabled read False at the call site while the declaration said
+    True, and history_budget_fraction was clamped in code to bounds the field
+    did not state.
+    """
+    import subprocess
+
+    out = subprocess.run(
+        # getattr with a third argument — the fallback is the problem, not the
+        # dynamic lookup.
+        ["rg", "-n", r"getattr\((self\.|runtime\.)?settings, [^)]+,", "liminallm/"],
+        capture_output=True, text=True,
+    )
+    assert out.stdout.strip() == "", out.stdout
+
+
+def test_bounds_are_declared_not_clamped():
+    """Numeric limits belong on the field, so the admin API rejects a bad
+    value instead of the code silently correcting it later."""
+    from pydantic import ValidationError
+
+    for field, bad in (
+        ("history_budget_fraction", 5.0),
+        ("default_page_size", 10**6),
+        ("session_ttl_minutes_web", 0),
+        ("max_concurrent_workflows", 0),
+        ("rag_chunk_size", 1),
+        ("web_fetch_timeout", 0),
+    ):
+        with pytest.raises(ValidationError):
+            Settings(**{field: bad})
+
+
+def test_rate_limits_may_be_switched_off():
+    """0 means unlimited, so these floor at 0 rather than 1."""
+    assert Settings(chat_rate_limit_per_minute=0).chat_rate_limit_per_minute == 0
+
+
+def test_managed_setting_validation_names_every_bad_field():
+    from liminallm.config import validate_managed_settings
+
+    errors = validate_managed_settings(
+        {
+            "default_page_size": 10**6,
+            "notes_enabled": "yes please",
+            "not_a_setting": 1,
+            "model_path": "this-one-is-fine",
+        }
+    )
+    assert set(errors) == {"default_page_size", "notes_enabled", "not_a_setting"}
+    assert "not a managed setting" in errors["not_a_setting"]
+
+
+def test_allowed_values_are_declared_on_the_field():
+    """The admin API used to keep its own copy of these lists."""
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError):
+        Settings(voice_default_voice="not-a-voice")
+    with pytest.raises(ValidationError):
+        Settings(embedding_model_id="not-a-model")
