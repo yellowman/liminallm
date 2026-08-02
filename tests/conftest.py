@@ -15,8 +15,10 @@ os.environ.setdefault("TEST_MODE", "true")
 os.environ.setdefault("EMBEDDING_VECTOR_DIM", "64")  # matches the hash encoder
 os.environ.setdefault("ALLOW_REDIS_FALLBACK_DEV", "true")
 os.environ.setdefault("JWT_SECRET", "Test-Secret-Key-4-Testing-Only-Do-Not-Use-In-Production!")
-# Use Redis in tests via SyncRedisCache to avoid async event loop issues
-# Falls back to in-memory if Redis is not available (via ALLOW_REDIS_FALLBACK_DEV)
+# Tests use the same async RedisCache production does. A second, synchronous
+# implementation used to exist for the test suite; it silently drifted eight
+# methods behind and broke the attachment agent whenever Redis was present.
+# Falls back to in-process state if Redis is absent (ALLOW_REDIS_FALLBACK_DEV).
 os.environ.setdefault("REDIS_URL", "redis://localhost:6379/1")
 
 import pytest  # noqa: E402

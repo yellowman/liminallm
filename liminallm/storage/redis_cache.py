@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import time
@@ -7,7 +8,6 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional, Tuple, Union
 
 import redis.asyncio as aioredis
-from redis import Redis
 
 # Atomically acquire an idempotency slot: claim it if absent, or reclaim it if
 # the existing record is a prior "failed" attempt (so a retry can proceed
@@ -70,15 +70,44 @@ return {1, tokens, 0}
 
     def __init__(self, redis_url: str, *, socket_timeout: float = 5.0):
         self.redis_url = redis_url
-        # Issue 48.3: Configure connection with explicit timeouts
-        self.client = aioredis.from_url(
-            redis_url,
-            decode_responses=True,
-            socket_timeout=socket_timeout,
-            socket_connect_timeout=socket_timeout,
-        )
-        # Register token bucket script for atomic rate limiting (Issue 77.10)
-        self._token_bucket = self.client.register_script(self._TOKEN_BUCKET_SCRIPT)
+        self._socket_timeout = socket_timeout
+        # A redis-py asyncio client pools connections bound to the loop that
+        # opened them; reusing one across loops raises "attached to a different
+        # loop". Uvicorn workers, startup probes and the test client all run on
+        # loops of their own, so hold one client per loop rather than one for
+        # the process. (A second, synchronous cache class used to exist to dodge
+        # this; it drifted out of sync and broke features instead.)
+        self._clients: Dict[int, Any] = {}
+        self._scripts: Dict[int, Any] = {}
+
+    def _loop_key(self) -> int:
+        try:
+            return id(asyncio.get_running_loop())
+        except RuntimeError:
+            return 0
+
+    @property
+    def client(self):
+        """The Redis client bound to the running event loop."""
+        key = self._loop_key()
+        client = self._clients.get(key)
+        if client is None:
+            # Issue 48.3: Configure connection with explicit timeouts
+            client = aioredis.from_url(
+                self.redis_url,
+                decode_responses=True,
+                socket_timeout=self._socket_timeout,
+                socket_connect_timeout=self._socket_timeout,
+            )
+            self._clients[key] = client
+            # Register token bucket script for atomic rate limiting (Issue 77.10)
+            self._scripts[key] = client.register_script(self._TOKEN_BUCKET_SCRIPT)
+        return client
+
+    @property
+    def _token_bucket(self):
+        self.client  # ensure the script is registered for this loop
+        return self._scripts[self._loop_key()]
 
     @staticmethod
     def _normalize_utc(dt: datetime) -> datetime:
@@ -480,9 +509,14 @@ return {1, tokens, 0}
         return (False, None)
 
     async def close(self) -> None:
-        """Close Redis connection pool. Call when shutting down or resetting runtime."""
-        await self.client.close()
-        await self.client.connection_pool.disconnect()
+        """Close every per-loop client. Call on shutdown or runtime reset."""
+        clients, self._clients, self._scripts = self._clients, {}, {}
+        for client in clients.values():
+            try:
+                await client.close()
+                await client.connection_pool.disconnect()
+            except Exception:  # noqa: BLE001 - a client from a dead loop
+                pass
 
     async def delete_workflow_state(
         self, state_key: str, *, tenant_id: Optional[str] = None
@@ -796,462 +830,3 @@ return {1, tokens, 0}
             pipe.delete(open_key)
             pipe.delete(failures_key)
             await pipe.execute()
-
-
-class _SyncClientAdapter:
-    """Adapter that wraps a sync Redis client with async method signatures.
-
-    This allows code that uses `await self.cache.client.method()` to work
-    with either async or sync Redis clients uniformly.
-    """
-
-    def __init__(self, sync_client: Redis):
-        self._sync = sync_client
-
-    async def get(self, key: str) -> Optional[str]:
-        return self._sync.get(key)
-
-    async def set(self, key: str, value: str, ex: Optional[int] = None) -> bool:
-        return self._sync.set(key, value, ex=ex)
-
-    async def delete(self, key: str) -> int:
-        return self._sync.delete(key)
-
-    async def incr(self, key: str) -> int:
-        return self._sync.incr(key)
-
-    async def expire(self, key: str, ttl: int) -> bool:
-        return self._sync.expire(key, ttl)
-
-    async def exists(self, key: str) -> int:
-        return self._sync.exists(key)
-
-    def pipeline(self):
-        """Return the underlying sync pipeline for batch operations."""
-        return self._sync.pipeline()
-
-
-class SyncRedisCache:
-    """Synchronous Redis wrapper for use in tests.
-
-    Uses a synchronous Redis client internally to avoid event loop binding
-    issues in pytest, but exposes async methods so they can be awaited
-    uniformly like RedisCache. The async methods simply call sync Redis
-    operations and return the results.
-    """
-
-    # Issue 48.3: Default operation timeout for Redis commands
-    DEFAULT_OPERATION_TIMEOUT = 5.0  # 5 seconds
-
-    def __init__(self, redis_url: str, *, socket_timeout: float = 5.0):
-        self.redis_url = redis_url
-        # Issue 48.3: Configure connection with explicit timeouts
-        self._sync_client = Redis.from_url(
-            redis_url,
-            decode_responses=True,
-            socket_timeout=socket_timeout,
-            socket_connect_timeout=socket_timeout,
-        )
-        # Wrap sync client with async-compatible adapter for direct client access
-        self.client = _SyncClientAdapter(self._sync_client)
-        # Register token bucket script for atomic rate limiting (Issue 77.10)
-        self._token_bucket = self._sync_client.register_script(
-            RedisCache._TOKEN_BUCKET_SCRIPT
-        )
-
-    def _redis_now(self) -> datetime:
-        """Return Redis server time to align TTLs with Redis clock (Issue 76.8)."""
-
-        try:
-            seconds, microseconds = self._sync_client.time()
-            return datetime.fromtimestamp(
-                seconds + microseconds / 1_000_000, tz=timezone.utc
-            )
-        except Exception:
-            return datetime.now(timezone.utc)
-
-    def verify_connection(self) -> None:
-        """Assert Redis connectivity."""
-        self._sync_client.ping()
-
-    async def cache_session(
-        self, session_id: str, user_id: str, expires_at: datetime
-    ) -> None:
-        ttl = RedisCache._ttl_seconds(expires_at, now=self._redis_now())
-        with self._sync_client.pipeline() as pipe:
-            pipe.set(f"auth:session:{session_id}", user_id, ex=ttl)
-            # Track session in user's session set for bulk revocation (Issue 22.3)
-            pipe.sadd(f"auth:user_sessions:{user_id}", session_id)
-            pipe.expire(f"auth:user_sessions:{user_id}", ttl)
-            pipe.execute()
-
-    async def get_session_user(self, session_id: str) -> Tuple[bool, Optional[str]]:
-        key = f"auth:session:{session_id}"
-        value = self._sync_client.get(key)
-        if value is not None:
-            return True, value
-        exists = bool(self._sync_client.exists(key))
-        return exists, None
-
-    async def revoke_session(self, session_id: str) -> None:
-        self._sync_client.delete(f"auth:session:{session_id}")
-
-    async def revoke_user_sessions(
-        self, user_id: str, except_session_id: Optional[str] = None
-    ) -> int:
-        """Revoke all cached sessions for a user (sync version)."""
-        user_sessions_key = f"auth:user_sessions:{user_id}"
-        session_ids = self._sync_client.smembers(user_sessions_key)
-        if not session_ids:
-            return 0
-
-        revoked = 0
-        with self._sync_client.pipeline() as pipe:
-            for session_id in session_ids:
-                if except_session_id and session_id == except_session_id:
-                    continue
-                pipe.delete(f"auth:session:{session_id}")
-                pipe.srem(user_sessions_key, session_id)
-                revoked += 1
-            pipe.execute()
-        return revoked
-
-    async def check_rate_limit(
-        self,
-        key: str,
-        limit: int,
-        window_seconds: int,
-        *,
-        return_remaining: bool = False,
-        tenant_id: Optional[str] = None,
-        cost: int = 1,
-    ) -> Union[bool, Tuple[bool, int, int]]:
-        if limit <= 0:
-            return (True, limit, 0) if return_remaining else True
-
-        if window_seconds <= 0:
-            window_seconds = 60
-
-        now = time.time()
-        safe_key = RedisCache._normalize_rate_key(key, tenant_id)
-        refill_rate = float(limit) / float(window_seconds)
-        allowed, tokens, reset_after = self._token_bucket(
-            keys=[safe_key], args=[now, refill_rate, limit, max(1, cost)]
-        )
-
-        allowed_bool = bool(int(allowed))
-        remaining = max(0, int(tokens))
-        reset_seconds = int(reset_after) if reset_after else 0
-        if return_remaining:
-            return (allowed_bool, remaining, reset_seconds)
-        return allowed_bool
-
-    async def mark_refresh_revoked(self, jti: str, ttl_seconds: int) -> None:
-        self._sync_client.set(f"auth:refresh:revoked:{jti}", "1", ex=ttl_seconds)
-
-    async def is_refresh_revoked(self, jti: str) -> bool:
-        return bool(self._sync_client.exists(f"auth:refresh:revoked:{jti}"))
-
-    # SPEC §12.1: "logout: add JWT to short-lived denylist if JWTs used"
-    async def denylist_access_token(self, jti: str, ttl_seconds: int) -> None:
-        """Add access token JTI to denylist with TTL matching token expiry."""
-        if ttl_seconds > 0:
-            self._sync_client.set(f"auth:access:denylist:{jti}", "1", ex=ttl_seconds)
-
-    async def is_access_token_denylisted(self, jti: str) -> bool:
-        """Check if access token JTI is in denylist."""
-        return bool(self._sync_client.exists(f"auth:access:denylist:{jti}"))
-
-    async def get_router_cache(
-        self, user_id: str, ctx_hash: str, *, tenant_id: Optional[str] = None
-    ) -> Optional[dict]:
-        # Issue 44.5: Include tenant_id in cache key for tenant isolation
-        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
-        cached = self._sync_client.get(f"router:last:{tenant_prefix}{user_id}:{ctx_hash}")
-        if not cached:
-            return None
-        try:
-            return json.loads(cached)
-        except (json.JSONDecodeError, TypeError):
-            return None
-
-    async def set_router_cache(
-        self, user_id: str, ctx_hash: str, payload: dict, ttl_seconds: int = 300,
-        *, tenant_id: Optional[str] = None
-    ) -> None:
-        # Issue 44.5: Include tenant_id in cache key for tenant isolation
-        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
-        self._sync_client.set(f"router:last:{tenant_prefix}{user_id}:{ctx_hash}", json.dumps(payload), ex=ttl_seconds)
-
-    async def get_workflow_state(
-        self, state_key: str, *, tenant_id: Optional[str] = None
-    ) -> Optional[dict]:
-        # Issue 44.4: Include tenant_id in cache key for tenant isolation
-        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
-        cached = self._sync_client.get(f"workflow:state:{tenant_prefix}{state_key}")
-        if not cached:
-            return None
-        try:
-            return json.loads(cached)
-        except (json.JSONDecodeError, TypeError):
-            return None
-
-    async def set_workflow_state(
-        self, state_key: str, state: dict, ttl_seconds: int = 1800,
-        *, tenant_id: Optional[str] = None
-    ) -> None:
-        # Issue 44.4: Include tenant_id in cache key for tenant isolation
-        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
-        self._sync_client.set(f"workflow:state:{tenant_prefix}{state_key}", json.dumps(state), ex=ttl_seconds)
-
-    async def get_conversation_summary(self, conversation_id: str) -> Optional[dict]:
-        cached = self._sync_client.get(f"chat:summary:{conversation_id}")
-        if not cached:
-            return None
-        try:
-            return json.loads(cached)
-        except (json.JSONDecodeError, TypeError):
-            return None
-
-    async def set_conversation_summary(
-        self, conversation_id: str, summary: Dict[str, Any], ttl_seconds: int = 3600
-    ) -> None:
-        self._sync_client.set(f"chat:summary:{conversation_id}", json.dumps(summary), ex=ttl_seconds)
-
-    async def set_oauth_state(
-        self, state: str, provider: str, expires_at: datetime, tenant_id: Optional[str]
-    ) -> None:
-        payload, ttl = RedisCache._prepare_oauth_state(
-            provider, expires_at, tenant_id, now=self._redis_now()
-        )
-        self._sync_client.set(f"auth:oauth:{state}", json.dumps(payload), ex=ttl)
-
-    async def pop_oauth_state(
-        self, state: str
-    ) -> Optional[tuple[str, datetime, Optional[str]]]:
-        """Atomically get and delete OAuth state."""
-        key = f"auth:oauth:{state}"
-        try:
-            cached = self._sync_client.getdel(key)
-        except AttributeError:
-            # Fallback for older redis-py versions
-            cached = self._sync_client.get(key)
-            if cached:
-                self._sync_client.delete(key)
-
-        if cached is None:
-            return None
-
-        try:
-            data = json.loads(cached)
-        except (json.JSONDecodeError, TypeError):
-            return None
-
-        expires_raw = data.get("expires_at")
-        # Issue 39.2: Add error handling for datetime parsing
-        expires_at = datetime.now(timezone.utc)
-        if isinstance(expires_raw, str):
-            try:
-                expires_at = datetime.fromisoformat(expires_raw)
-                if expires_at.tzinfo is None:
-                    expires_at = expires_at.replace(tzinfo=timezone.utc)
-            except (ValueError, TypeError):
-                pass  # Use default current UTC time
-        return data.get("provider"), expires_at, data.get("tenant_id")
-
-    async def get_idempotency_record(
-        self, route: str, user_id: str, key: str, *, tenant_id: Optional[str] = None
-    ) -> Optional[dict]:
-        # Issue 22.2: Include tenant_id in cache key for multi-tenant isolation
-        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
-        cached = self._sync_client.get(f"idemp:{tenant_prefix}{route}:{user_id}:{key}")
-        if not cached:
-            return None
-        try:
-            return json.loads(cached)
-        except (json.JSONDecodeError, TypeError):
-            return None
-
-    async def set_idempotency_record(
-        self,
-        route: str,
-        user_id: str,
-        key: str,
-        record: dict,
-        ttl_seconds: int = 60 * 60 * 24,
-        *,
-        tenant_id: Optional[str] = None,
-    ) -> None:
-        # Issue 22.2: Include tenant_id in cache key for multi-tenant isolation
-        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
-        self._sync_client.set(f"idemp:{tenant_prefix}{route}:{user_id}:{key}", json.dumps(record), ex=ttl_seconds)
-
-    async def acquire_idempotency_slot(
-        self,
-        route: str,
-        user_id: str,
-        key: str,
-        record: dict,
-        ttl_seconds: int = 60 * 60 * 24,
-        *,
-        tenant_id: Optional[str] = None,
-    ) -> tuple[bool, Optional[dict]]:
-        """Atomically acquire (or reclaim a failed) idempotency slot (sync version)."""
-        # Issue 22.2: Include tenant_id in cache key for multi-tenant isolation
-        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
-        cache_key = f"idemp:{tenant_prefix}{route}:{user_id}:{key}"
-        result = self._sync_client.eval(
-            _ACQUIRE_OR_RECLAIM_IDEMPOTENCY,
-            1,
-            cache_key,
-            json.dumps(record),
-            str(ttl_seconds),
-        )
-        if result and result[0]:
-            return (True, None)
-        existing = result[1] if result and len(result) > 1 else None
-        if existing:
-            try:
-                return (False, json.loads(existing))
-            except (json.JSONDecodeError, TypeError):
-                pass
-        return (False, None)
-
-    async def close(self) -> None:
-        """Close Redis connection."""
-        self._sync_client.close()
-
-    async def delete_workflow_state(
-        self, state_key: str, *, tenant_id: Optional[str] = None
-    ) -> None:
-        """Delete workflow state from cache."""
-        # Issue 44.4: Include tenant_id in cache key for tenant isolation
-        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
-        self._sync_client.delete(f"workflow:state:{tenant_prefix}{state_key}")
-
-    # =========================================================================
-    # Concurrency Caps (SPEC §18)
-    # =========================================================================
-
-    async def acquire_concurrency_slot(
-        self, slot_type: str, user_id: str, max_slots: int, ttl_seconds: int = 3600,
-        *, tenant_id: Optional[str] = None
-    ) -> tuple[bool, int]:
-        """Atomically acquire a concurrency slot for a user."""
-        # Issue 44.3: Include tenant_id in concurrency key for tenant isolation
-        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
-        key = f"concurrency:{tenant_prefix}{slot_type}:{user_id}"
-        lua_script = """
-        local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-        local max_allowed = tonumber(ARGV[1])
-        local ttl = tonumber(ARGV[2])
-        if current < max_allowed then
-            redis.call('INCR', KEYS[1])
-            redis.call('EXPIRE', KEYS[1], ttl)
-            return {1, current + 1}
-        end
-        return {0, current}
-        """
-        result = self._sync_client.eval(lua_script, 1, key, max_slots, ttl_seconds)
-        return (bool(result[0]), int(result[1]))
-
-    async def release_concurrency_slot(
-        self, slot_type: str, user_id: str, *, tenant_id: Optional[str] = None
-    ) -> int:
-        """Release a concurrency slot for a user."""
-        # Issue 44.3: Include tenant_id in concurrency key for tenant isolation
-        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
-        key = f"concurrency:{tenant_prefix}{slot_type}:{user_id}"
-        lua_script = """
-        local current = tonumber(redis.call('GET', KEYS[1]) or '0')
-        if current > 0 then
-            return redis.call('DECR', KEYS[1])
-        end
-        return 0
-        """
-        result = self._sync_client.eval(lua_script, 1, key)
-        return int(result)
-
-    async def get_concurrency_count(
-        self, slot_type: str, user_id: str, *, tenant_id: Optional[str] = None
-    ) -> int:
-        """Get current concurrency count for a user."""
-        # Issue 44.3: Include tenant_id in concurrency key for tenant isolation
-        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
-        key = f"concurrency:{tenant_prefix}{slot_type}:{user_id}"
-        count = self._sync_client.get(key)
-        return int(count) if count else 0
-
-    # =========================================================================
-    # Session Activity Tracking (SPEC §12.1)
-    # =========================================================================
-
-    async def update_session_activity(self, session_id: str, ttl_seconds: int = 86400) -> None:
-        """Update session last activity timestamp."""
-        key = f"session:activity:{session_id}"
-        now = datetime.now(timezone.utc).isoformat()
-        self._sync_client.set(key, now, ex=ttl_seconds)
-
-    async def get_session_activity(self, session_id: str) -> Optional[datetime]:
-        """Get session last activity timestamp."""
-        key = f"session:activity:{session_id}"
-        value = self._sync_client.get(key)
-        if value:
-            try:
-                parsed = datetime.fromisoformat(value)
-                if parsed.tzinfo is None:
-                    parsed = parsed.replace(tzinfo=timezone.utc)
-                return parsed
-            except (ValueError, TypeError):
-                return None
-        return None
-
-    async def set_session_rotation_grace(
-        self, old_session_id: str, new_session_id: str, grace_seconds: int = 300
-    ) -> None:
-        """Store mapping from old to new session ID during grace period."""
-        key = f"session:rotation:{old_session_id}"
-        self._sync_client.set(key, new_session_id, ex=grace_seconds)
-
-    async def get_rotated_session(self, old_session_id: str) -> Optional[str]:
-        """Get new session ID if old session was rotated."""
-        key = f"session:rotation:{old_session_id}"
-        return self._sync_client.get(key)
-
-    # =========================================================================
-    # MFA Lockout Tracking (Issue 19.3 - Atomic operations)
-    # =========================================================================
-
-    async def check_mfa_lockout(self, user_id: str) -> bool:
-        """Check if user is locked out from MFA attempts."""
-        key = f"mfa:lockout:{user_id}"
-        return bool(self._sync_client.exists(key))
-
-    async def atomic_mfa_attempt(
-        self, user_id: str, max_attempts: int = 5, lockout_seconds: int = 300
-    ) -> tuple[bool, int]:
-        """Atomically record a failed MFA attempt and check/trigger lockout (sync version)."""
-        lockout_key = f"mfa:lockout:{user_id}"
-        attempts_key = f"mfa:attempts:{user_id}"
-
-        lua_script = """
-        if redis.call('EXISTS', KEYS[1]) == 1 then
-            return {1, -1}
-        end
-        local attempts = redis.call('INCR', KEYS[2])
-        redis.call('EXPIRE', KEYS[2], ARGV[2])
-        local max_attempts = tonumber(ARGV[1])
-        if attempts >= max_attempts then
-            redis.call('SET', KEYS[1], '1', 'EX', ARGV[2])
-            redis.call('DEL', KEYS[2])
-            return {1, attempts}
-        end
-        return {0, attempts}
-        """
-        result = self._sync_client.eval(lua_script, 2, lockout_key, attempts_key, max_attempts, lockout_seconds)
-        return (bool(result[0]), int(result[1]))
-
-    async def clear_mfa_attempts(self, user_id: str) -> None:
-        """Clear MFA attempt counter on successful verification."""
-        attempts_key = f"mfa:attempts:{user_id}"
-        self._sync_client.delete(attempts_key)

@@ -25,7 +25,7 @@ from liminallm.service.training_worker import TrainingWorker
 from liminallm.service.voice import VoiceService
 from liminallm.service.workflow import WorkflowEngine
 from liminallm.storage.postgres import PostgresStore
-from liminallm.storage.redis_cache import RedisCache, SyncRedisCache
+from liminallm.storage.redis_cache import RedisCache
 
 logger = get_logger(__name__)
 
@@ -94,11 +94,7 @@ class Runtime:
         redis_error: Exception | None = None
         if self.settings.redis_url:
             try:
-                # Use sync Redis client in test mode to avoid event loop issues
-                if self.settings.test_mode:
-                    cache = SyncRedisCache(self.settings.redis_url)
-                else:
-                    cache = RedisCache(self.settings.redis_url)
+                cache = RedisCache(self.settings.redis_url)
                 cache.verify_connection()
                 self.cache = cache
             except Exception as exc:
@@ -581,16 +577,11 @@ def reset_runtime_for_tests() -> Runtime:
         # Close existing Redis connections to avoid event loop issues
         if runtime is not None and runtime.cache is not None:
             try:
-                # SyncRedisCache uses a sync client internally, close it directly
-                if isinstance(runtime.cache, SyncRedisCache):
-                    runtime.cache.client.close()
-                else:
-                    # Async RedisCache - try to close properly
-                    try:
-                        loop = asyncio.get_running_loop()
-                        loop.create_task(runtime.cache.close())
-                    except RuntimeError:
-                        asyncio.run(runtime.cache.close())
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(runtime.cache.close())
+                except RuntimeError:
+                    asyncio.run(runtime.cache.close())
             except Exception:
                 # Ignore errors during cleanup - connection may already be closed
                 pass
