@@ -259,20 +259,6 @@ def _get_owned_artifact(runtime, artifact_id: str, principal: AuthContext):
     return artifact
 
 
-def _user_to_response(user) -> UserResponse:
-    return UserResponse(
-        id=user.id,
-        email=user.email,
-        handle=user.handle,
-        role=user.role,
-        tenant_id=user.tenant_id,
-        created_at=user.created_at,
-        is_active=getattr(user, "is_active", True),
-        plan_tier=getattr(user, "plan_tier", "free"),
-        meta=getattr(user, "meta", None),
-    )
-
-
 def _get_artifact_kind(schema: Any) -> Optional[str]:
     """Extract 'kind' from artifact schema, handling None/non-dict safely."""
     if isinstance(schema, dict):
@@ -605,7 +591,7 @@ async def admin_list_users(
         )
     users = runtime.auth.list_users(tenant_id=target_tenant, limit=resolved_limit)
     return Envelope(
-        status="ok", data=UserListResponse(items=[_user_to_response(u) for u in users])
+        status="ok", data=UserListResponse(items=[UserResponse.model_validate(u) for u in users])
     )
 
 
@@ -647,7 +633,7 @@ async def admin_create_user(
     return Envelope(
         status="ok",
         data=AdminCreateUserResponse(
-            **_user_to_response(user).model_dump(), password=password
+            **UserResponse.model_validate(user).model_dump(), password=password
         ),
     )
 
@@ -687,7 +673,7 @@ async def admin_set_role(
         new_role=body.role,
         tenant_id=principal.tenant_id,
     )
-    return Envelope(status="ok", data=_user_to_response(user))
+    return Envelope(status="ok", data=UserResponse.model_validate(user))
 
 
 @router.delete("/admin/users/{user_id}", response_model=Envelope, tags=["admin"])
@@ -989,17 +975,7 @@ async def get_current_user(principal: AuthContext = Depends(get_user)):
         raise http_error("not_found", "user not found", status_code=404)
     return Envelope(
         status="ok",
-        data=UserResponse(
-            id=user.id,
-            email=user.email,
-            handle=user.handle,
-            role=user.role,
-            tenant_id=user.tenant_id or "global",
-            created_at=user.created_at,
-            is_active=user.is_active,
-            plan_tier=user.plan_tier or "free",
-            meta=user.meta,
-        ),
+        data=UserResponse.model_validate(user),
     )
 
 
@@ -2423,18 +2399,7 @@ async def propose_patch(
         patch=body.patch,
         justification=body.justification,
     )
-    resp = ConfigPatchAuditResponse(
-        id=audit.id,
-        artifact_id=audit.artifact_id,
-        proposer=audit.proposer,
-        justification=audit.justification,
-        status=audit.status,
-        patch=audit.patch,
-        created_at=audit.created_at,
-        decided_at=audit.decided_at,
-        applied_at=audit.applied_at,
-        meta=audit.meta,
-    )
+    resp = ConfigPatchAuditResponse.model_validate(audit)
     return Envelope(status="ok", data=resp)
 
 
@@ -2447,18 +2412,7 @@ async def list_config_patches(
     await rate_limit(runtime, "configops", principal.user_id)
     patches = runtime.store.list_config_patches(status)
     items = [
-        ConfigPatchAuditResponse(
-            id=p.id,
-            artifact_id=p.artifact_id,
-            proposer=p.proposer,
-            justification=p.justification,
-            status=p.status,
-            patch=p.patch,
-            created_at=p.created_at,
-            decided_at=p.decided_at,
-            applied_at=p.applied_at,
-            meta=p.meta,
-        )
+        ConfigPatchAuditResponse.model_validate(p)
         for p in patches
     ]
     return Envelope(status="ok", data=ConfigPatchListResponse(items=items))
@@ -2474,18 +2428,7 @@ async def decide_config_patch(
     # Rate limit configops per SPEC §18: 30 req/hour
     await rate_limit(runtime, "configops", principal.user_id)
     decision = runtime.config_ops.decide_patch(patch_id, body.decision, body.reason)
-    resp = ConfigPatchAuditResponse(
-        id=decision.id,
-        artifact_id=decision.artifact_id,
-        proposer=decision.proposer,
-        justification=decision.justification,
-        status=decision.status,
-        patch=decision.patch,
-        created_at=decision.created_at,
-        decided_at=decision.decided_at,
-        applied_at=decision.applied_at,
-        meta=decision.meta,
-    )
+    resp = ConfigPatchAuditResponse.model_validate(decision)
     return Envelope(status="ok", data=resp)
 
 
@@ -2501,17 +2444,12 @@ async def apply_config_patch(
         patch_id, approver_user_id=principal.user_id
     )
     patch = result.get("patch")
-    resp = ConfigPatchAuditResponse(
-        id=patch.id,
-        artifact_id=patch.artifact_id,
-        proposer=patch.proposer,
-        justification=patch.justification,
-        status="applied",
-        patch=patch.patch,
-        created_at=patch.created_at,
-        decided_at=patch.decided_at,
-        applied_at=patch.applied_at or patch.decided_at or patch.created_at,
-        meta=patch.meta,
+    resp = ConfigPatchAuditResponse.model_validate(patch).model_copy(
+        update={
+            # True by definition here, and the stored row may not have caught up.
+            "status": "applied",
+            "applied_at": patch.applied_at or patch.decided_at or patch.created_at,
+        }
     )
     # Include warning if status update failed (partial success)
     envelope_data = resp.model_dump()
@@ -2530,18 +2468,7 @@ async def auto_patch(
     audit = runtime.config_ops.auto_generate_patch(
         body.artifact_id, principal.user_id, goal=body.goal
     )
-    resp = ConfigPatchAuditResponse(
-        id=audit.id,
-        artifact_id=audit.artifact_id,
-        proposer=audit.proposer,
-        justification=audit.justification,
-        status=audit.status,
-        patch=audit.patch,
-        created_at=audit.created_at,
-        decided_at=audit.decided_at,
-        applied_at=audit.applied_at,
-        meta=audit.meta,
-    )
+    resp = ConfigPatchAuditResponse.model_validate(audit)
     return Envelope(status="ok", data=resp)
 
 
@@ -3896,13 +3823,7 @@ async def add_context_source(
 
         envelope = Envelope(
             status="ok",
-            data=ContextSourceResponse(
-                id=source.id,
-                context_id=source.context_id,
-                fs_path=source.fs_path,
-                recursive=source.recursive,
-                meta=source.meta,
-            ),
+            data=ContextSourceResponse.model_validate(source),
             request_id=idem.request_id,
         )
         await idem.store_result(envelope)
@@ -3923,14 +3844,7 @@ async def list_context_sources(
 
     sources = runtime.store.list_context_sources(context_id)
     items = [
-        ContextSourceResponse(
-            id=s.id,
-            context_id=s.context_id,
-            fs_path=s.fs_path,
-            recursive=s.recursive,
-            meta=s.meta,
-        )
-        for s in sources
+        ContextSourceResponse.model_validate(s) for s in sources
     ]
     return Envelope(status="ok", data=ContextSourceListResponse(items=items))
 

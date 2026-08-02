@@ -535,6 +535,13 @@ class ArtifactVersionListResponse(BaseModel):
 
 
 class ConfigPatchAuditResponse(BaseModel):
+    # Field-for-field mirror of the storage model, so it is built with
+    # model_validate(obj) rather than restated at each call site. Ten
+    # hand-written mappings had already drifted: /me reported
+    # `tenant_id or "global"` where the admin listing reported the
+    # stored value. tests/test_response_mirrors.py keeps the two in step.
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     artifact_id: str
     proposer: str
@@ -706,6 +713,13 @@ class ContextSourceRequest(BaseModel):
 
 
 class ContextSourceResponse(BaseModel):
+    # Field-for-field mirror of the storage model, so it is built with
+    # model_validate(obj) rather than restated at each call site. Ten
+    # hand-written mappings had already drifted: /me reported
+    # `tenant_id or "global"` where the admin listing reported the
+    # stored value. tests/test_response_mirrors.py keeps the two in step.
+    model_config = ConfigDict(from_attributes=True)
+
     """Response containing context source details."""
     id: str
     context_id: str
@@ -825,6 +839,13 @@ class VoiceSynthesisResponse(BaseModel):
 
 
 class UserResponse(BaseModel):
+    # Field-for-field mirror of the storage model, so it is built with
+    # model_validate(obj) rather than restated at each call site. Ten
+    # hand-written mappings had already drifted: /me reported
+    # `tenant_id or "global"` where the admin listing reported the
+    # stored value. tests/test_response_mirrors.py keeps the two in step.
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     email: str
     handle: Optional[str] = None
