@@ -117,8 +117,21 @@ This is particularly useful for:
 
 ### To add a runtime-configurable setting:
 
-1. Add it to `SYSTEM_SETTINGS_DEFAULTS` in `liminallm/config.py` — the store
-   merges those defaults under whatever an admin actually stored.
+1. Declare it once, on `Settings` in `liminallm/config.py`:
+
+   ```python
+   my_setting: int = env_field(30, "MY_SETTING", admin=True)
+   ```
+
+   `admin=True` puts it in the admin UI and flows its default into
+   `SYSTEM_SETTINGS_DEFAULTS` automatically. Do not also write the default into
+   that dict — the whole point is that there is one value. A setting with no
+   env var (an operational limit tuned only from the UI) goes in
+   `_ADMIN_ONLY_DEFAULTS` instead.
+
+   Precedence at read time is: admin override > env var > declared default.
+   Nothing seeds the defaults into the database, so a shipped default never
+   masquerades as something an admin chose.
 
 2. Use it in code with fallback:
    ```python

@@ -319,9 +319,15 @@ def resolve_provider_endpoint(mode: str) -> Optional[dict[str, Optional[str]]]:
     return PROVIDER_ENDPOINTS.get((mode or "").lower())
 
 
-def env_field(default: Any, env: str, **kwargs):
+def env_field(default: Any, env: str, *, admin: bool = False, **kwargs):
+    """Declare a setting once.
+
+    `admin=True` also exposes it in the admin UI, and its default flows into
+    SYSTEM_SETTINGS_DEFAULTS below. Declaring the default in both places is how
+    the two drift: nine of them already disagreed before this was derived.
+    """
     extra = kwargs.pop("json_schema_extra", {}) or {}
-    extra = {**extra, "env": env}
+    extra = {**extra, "env": env, "admin": admin}
     return Field(default, json_schema_extra=extra, **kwargs)
 
 
@@ -344,10 +350,12 @@ class Settings(BaseModel):
         description="Delete tmp scratch files older than this many hours",
     )
     model_path: str = env_field(
-        "gpt-4o-mini", "MODEL_PATH", description="Model path (overridable via admin UI)"
+        "gpt-4o-mini", "MODEL_PATH", description="Model path (overridable via admin UI)",
+        admin=True,
     )
     model_backend: ModelBackend | None = env_field(
-        ModelBackend.OPENAI, "MODEL_BACKEND", description="Model backend (overridable via admin UI)"
+        ModelBackend.OPENAI, "MODEL_BACKEND", description="Model backend (overridable via admin UI)",
+        admin=True,
     )
     adapter_openai_api_key: str | None = env_field(None, "OPENAI_ADAPTER_API_KEY")
     adapter_openai_base_url: str | None = env_field(None, "OPENAI_ADAPTER_BASE_URL")
@@ -356,15 +364,18 @@ class Settings(BaseModel):
     voice_api_key: str | None = env_field(None, "VOICE_API_KEY")
     voice_transcription_model: str = env_field(
         "whisper-1", "VOICE_TRANSCRIPTION_MODEL",
-        description="Transcription model (overridable via admin UI)"
+        description="Transcription model (overridable via admin UI)",
+        admin=True,
     )
     voice_synthesis_model: str = env_field(
         "tts-1", "VOICE_SYNTHESIS_MODEL",
-        description="Synthesis model (overridable via admin UI)"
+        description="Synthesis model (overridable via admin UI)",
+        admin=True,
     )
     voice_default_voice: str = env_field(
         "alloy", "VOICE_DEFAULT_VOICE",
-        description="Default voice (overridable via admin UI)"
+        description="Default voice (overridable via admin UI)",
+        admin=True,
     )
     # OAuth settings
     oauth_google_client_id: str | None = env_field(None, "OAUTH_GOOGLE_CLIENT_ID")
@@ -374,48 +385,60 @@ class Settings(BaseModel):
     oauth_microsoft_client_id: str | None = env_field(None, "OAUTH_MICROSOFT_CLIENT_ID")
     oauth_microsoft_client_secret: str | None = env_field(None, "OAUTH_MICROSOFT_CLIENT_SECRET")
     oauth_redirect_uri: str | None = env_field(
-        None, "OAUTH_REDIRECT_URI", description="OAuth redirect URI (overridable via admin UI)"
+        None, "OAUTH_REDIRECT_URI", description="OAuth redirect URI (overridable via admin UI)",
+        admin=True,
     )
     # Email service settings (env vars are fallbacks - prefer admin UI)
     smtp_host: str | None = env_field(
-        None, "SMTP_HOST", description="SMTP server host (overridable via admin UI)"
+        None, "SMTP_HOST", description="SMTP server host (overridable via admin UI)",
+        admin=True,
     )
     smtp_port: int = env_field(
-        587, "SMTP_PORT", description="SMTP server port (overridable via admin UI)"
+        587, "SMTP_PORT", description="SMTP server port (overridable via admin UI)",
+        admin=True,
     )
     smtp_user: str | None = env_field(
-        None, "SMTP_USER", description="SMTP username (overridable via admin UI)"
+        None, "SMTP_USER", description="SMTP username (overridable via admin UI)",
+        admin=True,
     )
     smtp_password: str | None = env_field(
-        None, "SMTP_PASSWORD", description="SMTP password (overridable via admin UI)"
+        None, "SMTP_PASSWORD", description="SMTP password (overridable via admin UI)",
+        admin=True,
     )
     smtp_use_tls: bool = env_field(
-        True, "SMTP_USE_TLS", description="Use TLS for SMTP (overridable via admin UI)"
+        True, "SMTP_USE_TLS", description="Use TLS for SMTP (overridable via admin UI)",
+        admin=True,
     )
     smtp_allow_insecure: bool = env_field(
         False,
         "SMTP_ALLOW_INSECURE",
         description="Allow plaintext SMTP when explicitly enabled (overridable via admin UI)",
+        admin=True,
     )
     email_from_address: str | None = env_field(
-        None, "EMAIL_FROM_ADDRESS", description="Email from address (overridable via admin UI)"
+        None, "EMAIL_FROM_ADDRESS", description="Email from address (overridable via admin UI)",
+        admin=True,
     )
     email_from_name: str = env_field(
-        "LiminalLM", "EMAIL_FROM_NAME", description="Email from name (overridable via admin UI)"
+        "LiminalLM", "EMAIL_FROM_NAME", description="Email from name (overridable via admin UI)",
+        admin=True,
     )
     app_base_url: str = env_field(
         "http://localhost:8000", "APP_BASE_URL",
-        description="Application base URL (overridable via admin UI)"
+        description="Application base URL (overridable via admin UI)",
+        admin=True,
     )
     default_adapter_mode: AdapterMode = env_field(
         AdapterMode.HYBRID,
         "DEFAULT_ADAPTER_MODE",
         description="Default mode for new adapters: local, remote, prompt, or hybrid (overridable via admin UI)",
+        admin=True,
     )
     allow_signup: bool = env_field(
         True,
         "ALLOW_SIGNUP",
         description="Allow new user signups (overridable via admin UI)",
+        admin=True,
     )
     build_sha: str = env_field("dev", "BUILD_SHA")
     cors_allow_origins: list[str] = env_field(
@@ -503,6 +526,7 @@ class Settings(BaseModel):
             "the provider, else a known-family table, else 8192. Set this "
             "when discovery guesses wrong for your deployment."
         ),
+        admin=True,
     )
     extract_readers: str = env_field(
         "ocr,vision",
@@ -520,6 +544,7 @@ class Settings(BaseModel):
             "Notes vault + witness. Admin-overridable via system settings; "
             "when off, notes routes and the note_search tool disappear."
         ),
+        admin=True,
     )
     cluster_bus_backend: str = env_field(
         "auto",
@@ -576,37 +601,45 @@ class Settings(BaseModel):
         True,
         "ENABLE_MFA",
         description="Enable multi-factor authentication (overridable via admin UI)",
+        admin=True,
     )
     jwt_secret: str = env_field(None, "JWT_SECRET", validate_default=True)
     jwt_issuer: str = env_field(
         "liminallm", "JWT_ISSUER",
-        description="JWT issuer (overridable via admin UI)"
+        description="JWT issuer (overridable via admin UI)",
+        admin=True,
     )
     jwt_audience: str = env_field(
         "liminal-clients", "JWT_AUDIENCE",
-        description="JWT audience (overridable via admin UI)"
+        description="JWT audience (overridable via admin UI)",
+        admin=True,
     )
     access_token_ttl_minutes: int = env_field(
         30,
         "ACCESS_TOKEN_TTL_MINUTES",
         description="Access token TTL in minutes (overridable via admin UI)",
+        admin=True,
     )
     refresh_token_ttl_minutes: int = env_field(
         24 * 60,
         "REFRESH_TOKEN_TTL_MINUTES",
         description="Refresh token TTL in minutes (overridable via admin UI)",
+        admin=True,
     )
     default_tenant_id: str = env_field(
         "public", "DEFAULT_TENANT_ID",
-        description="Default tenant ID (overridable via admin UI)"
+        description="Default tenant ID (overridable via admin UI)",
+        admin=True,
     )
     rag_mode: RagMode = env_field(
         RagMode.PGVECTOR, "RAG_MODE",
-        description="RAG mode: pgvector or memory (overridable via admin UI)"
+        description="RAG mode: pgvector or memory (overridable via admin UI)",
+        admin=True,
     )
     embedding_model_id: str = env_field(
         "text-embedding", "EMBEDDING_MODEL_ID",
-        description="Embedding model ID (overridable via admin UI)"
+        description="Embedding model ID (overridable via admin UI)",
+        admin=True,
     )
 
     # NOTE: The following operational settings have been moved to database-managed
@@ -660,11 +693,13 @@ class Settings(BaseModel):
         True,
         "TRAINING_WORKER_ENABLED",
         description="Enable background training job worker (overridable via admin UI)",
+        admin=True,
     )
     training_worker_poll_interval: int = env_field(
         60,
         "TRAINING_WORKER_POLL_INTERVAL",
         description="Training worker poll interval in seconds (overridable via admin UI)",
+        admin=True,
     )
     settings_watch_interval_seconds: int = env_field(
         10,
@@ -857,9 +892,11 @@ class Settings(BaseModel):
         return generated
 
 
-# Centralized system settings defaults - single source of truth
-# Used by routes.py, memory.py, postgres.py, and sql seeds
-SYSTEM_SETTINGS_DEFAULTS: dict = {
+# Admin-managed settings that have no environment variable: operational limits
+# an operator tunes from the UI, not from the process environment. Settings that
+# DO have an env var are declared once on Settings above with `admin=True` and
+# merged in below — declaring a default in two places is how the two drift.
+_ADMIN_ONLY_DEFAULTS: dict = {
     # Session & concurrency
     "session_rotation_hours": 24,
     "session_rotation_grace_seconds": 300,
@@ -893,42 +930,36 @@ SYSTEM_SETTINGS_DEFAULTS: dict = {
     # Files
     "max_upload_bytes": 10485760,
     "rag_chunk_size": 400,
-    # Token TTLs
-    "access_token_ttl_minutes": 30,
-    "refresh_token_ttl_minutes": 1440,
-    # Feature flags
-    "enable_mfa": True,
-    "allow_signup": True,
-    "training_worker_enabled": True,
-    "notes_enabled": True,
-    "model_context_window": 0,
-    "training_worker_poll_interval": 60,
-    # SMTP
-    "smtp_host": "",
-    "smtp_port": 587,
-    "smtp_user": "",
-    "smtp_password": "",
-    "smtp_use_tls": True,
-    "smtp_allow_insecure": False,
-    "email_from_address": "",
-    "email_from_name": "LiminalLM",
-    # URLs
-    "oauth_redirect_uri": "",
-    "app_base_url": "http://localhost:8000",
-    # Voice
-    "voice_transcription_model": "whisper-1",
-    "voice_synthesis_model": "tts-1",
-    "voice_default_voice": "alloy",
-    # Model/RAG
-    "rag_mode": "pgvector",
-    "embedding_model_id": "text-embedding",
-    "model_path": "gpt-4o-mini",
-    "model_backend": "openai",
-    "default_adapter_mode": "hybrid",
-    # Tenant/JWT
-    "default_tenant_id": "public",
-    "jwt_issuer": "liminallm",
-    "jwt_audience": "liminal-clients",
+}
+
+
+def _admin_defaults_from_settings() -> dict:
+    """Defaults for every Settings field declared with `admin=True`.
+
+    Serialised the way the admin API and the database carry them: enums become
+    their values, and an unset string becomes "" rather than None, because the
+    admin form posts an empty box, not a null.
+    """
+    derived: dict = {}
+    for name, field in Settings.model_fields.items():
+        extra = field.json_schema_extra or {}
+        if not (isinstance(extra, dict) and extra.get("admin")):
+            continue
+        value = field.default
+        if isinstance(value, Enum):
+            value = value.value
+        elif value is None:
+            value = ""
+        derived[name] = value
+    return derived
+
+
+# Every admin-managed setting and its shipped default. The store merges this
+# under whatever an admin actually saved; nothing seeds it into the database,
+# so a default never masquerades as an explicit override.
+SYSTEM_SETTINGS_DEFAULTS: dict = {
+    **_ADMIN_ONLY_DEFAULTS,
+    **_admin_defaults_from_settings(),
 }
 
 # Derived validation sets for admin settings API
