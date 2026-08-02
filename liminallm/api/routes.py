@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import base64
 import contextlib
 import hashlib
 import json
@@ -32,7 +31,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 
-from liminallm.api import idempotency
+from liminallm.api import chat_turn, idempotency
 from liminallm.api.errors import http_error
 from liminallm.api.limits import (
     client_ip,
@@ -56,7 +55,6 @@ from liminallm.api.schemas import (
     ChatCancelRequest,
     ChatCancelResponse,
     ChatRequest,
-    ChatResponse,
     ConfigPatchAuditResponse,
     ConfigPatchDecisionRequest,
     ConfigPatchListResponse,
@@ -118,9 +116,8 @@ from liminallm.config import (
     secret_setting_names,
     validate_managed_settings,
 )
-from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
-from liminallm.service import admission, cancellation, turn_effects
+from liminallm.service import admission, cancellation
 from liminallm.service import extract as extract_service
 from liminallm.service import notes as notes_service
 from liminallm.service.archive import (
@@ -1234,122 +1231,39 @@ async def chat(
         # SPEC §18: concurrency caps - limit decode pressure per user. The same
         # slots the streaming path takes, named once in service.admission.
         async with admission.slots(runtime, user_id, *admission.CHAT_SLOTS):
-            conversation: Conversation | None = None
-            context_id = body.context_id
-            validated_context_id: str | None = None
-            if body.conversation_id:
-                conversation = _get_owned_conversation(
-                    runtime, body.conversation_id, principal
-                )
-            else:
-                if context_id:
-                    _get_owned_context(runtime, context_id, principal)
-                    validated_context_id = context_id
-                # Generate title from first message for new conversations
-                auto_title = turn_effects.conversation_title(body.message.content)
-                conversation = runtime.store.create_conversation(
-                    user_id=user_id, active_context_id=body.context_id, title=auto_title
-                )
-            conversation_id = conversation.id
-            context_id = context_id or conversation.active_context_id
-            if context_id and context_id != validated_context_id:
-                _get_owned_context(runtime, context_id, principal)
-            user_content = body.message.content
-            voice_meta: dict = {}
-            if body.message.mode == "voice":
-                try:
-                    audio_bytes = base64.b64decode(body.message.content)
-                except Exception as exc:
-                    raise http_error(
-                        "validation_error",
-                        "invalid base64-encoded audio payload",
-                        status_code=400,
-                    ) from exc
-                transcript = await runtime.voice.transcribe(audio_bytes, user_id=user_id) or {}
-                user_content = transcript.get("transcript") or transcript.get("text")
-                if not user_content:
-                    raise http_error(
-                        "validation_error", "unable to transcribe audio", status_code=400
-                    )
-                voice_meta = {"mode": "voice", "transcript": transcript}
-            user_content_struct = normalize_content_struct(
-                body.message.content_struct, user_content
+            turn = await chat_turn.begin(
+                runtime,
+                principal,
+                conversation_id=body.conversation_id,
+                context_id=body.context_id,
+                workflow_id=body.workflow_id,
+                content=body.message.content,
+                content_struct=body.message.content_struct,
+                mode=body.message.mode,
+                owned_conversation=_get_owned_conversation,
+                owned_context=_get_owned_context,
             )
-            user_msg = runtime.store.append_message(
-                conversation_id,
-                sender="user",
-                role="user",
-                content=user_content,
-                meta=voice_meta or None,
-                content_struct=user_content_struct,
-            )
-            # A new conversation gets its real title from the same pass.
-            needs_title = not body.conversation_id
             orchestration = await runtime.workflow.run(
                 body.workflow_id,
-                conversation_id,
-                user_content,
-                context_id,
+                turn.conversation_id,
+                turn.user_content,
+                turn.context_id,
                 user_id,
                 tenant_id=principal.tenant_id,
             )
-            orchestration_dict: dict[str, Any] = (
-                orchestration if isinstance(orchestration, dict) else {}
-            )
-            usage: dict[str, Any] = orchestration_dict.get("usage") or {}
-            adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
-            assistant_content_struct = normalize_content_struct(
-                orchestration_dict.get("content_struct"),
-                orchestration_dict.get("content"),
-            )
-            assistant_content = orchestration_dict.get("content", "No response generated.")
-            assistant_msg = runtime.store.append_message(
-                conversation_id,
-                sender="assistant",
-                role="assistant",
-                content=assistant_content,
-                content_struct=assistant_content_struct,
-                meta={
-                    "adapters": orchestration_dict.get("adapters", []),
-                    "adapter_gates": orchestration_dict.get("adapter_gates", []),
-                    "routing_trace": orchestration_dict.get("routing_trace", []),
-                    "workflow_trace": orchestration_dict.get("workflow_trace", []),
-                    "usage": usage,
-                },
-            )
-            resp = ChatResponse(
-                message_id=assistant_msg.id,
-                conversation_id=conversation_id,
-                content=assistant_msg.content,
-                content_struct=assistant_msg.content_struct,
-                workflow_id=body.workflow_id,
-                adapters=adapter_names,
-                adapter_gates=orchestration_dict.get("adapter_gates", []),
-                usage=usage,
-                context_snippets=orchestration_dict.get("context_snippets", []),
-                routing_trace=orchestration_dict.get("routing_trace", []),
-                workflow_trace=orchestration_dict.get("workflow_trace", []),
-            )
-            turn_effects.schedule_turn_labels(
-                runtime,
-                conversation_id=conversation_id,
-                user_id=user_id,
-                user_message_id=getattr(user_msg, "id", None),
-                user_content=user_content,
-                assistant_content=assistant_content,
-                set_title=needs_title,
-            )
-            turn_effects.schedule_conversation_digest(
-                runtime, conversation_id=conversation_id, user_id=user_id
-            )
+            assistant_msg = await chat_turn.finish(runtime, turn, orchestration)
+            adapter_names = _stringify_adapters(turn.orchestration.get("adapters", []))
             envelope = Envelope(
-                status="ok", data=resp.model_dump(), request_id=idem.request_id
+                status="ok",
+                data=chat_turn.response(turn, assistant_msg, adapter_names).model_dump(),
+                request_id=idem.request_id,
             )
+            usage = turn.orchestration.get("usage") or {}
             logger.info(
                 "chat_response",
                 user_id=user_id,
-                conversation_id=conversation_id,
-                context_id=context_id,
+                conversation_id=turn.conversation_id,
+                context_id=turn.context_id,
                 workflow_id=body.workflow_id,
                 adapters=adapter_names,
                 total_tokens=usage.get("total_tokens"),
@@ -1357,14 +1271,6 @@ async def chat(
                 completion_tokens=usage.get("completion_tokens"),
                 request_id=idem.request_id,
             )
-            if runtime.cache:
-                # Issue 38.4: Add limit to prevent unbounded memory usage
-                # Use reasonable limit for conversation context caching
-                paging = _get_pagination_settings(runtime)
-                history = runtime.store.list_messages(
-                    conversation_id, limit=paging["max_page_size"], user_id=principal.user_id
-                )
-                await runtime.workflow.cache_conversation_state(conversation_id, history)
             await idem.store_result(envelope)
             return envelope
     # Exceptions bubble through the guard which records failed states
@@ -4178,24 +4084,19 @@ async def websocket_chat(ws: WebSocket):
             held_slots.append(kind)
 
         convo_id = init.get("conversation_id")
-        needs_title = not convo_id
-        if convo_id:
-            conversation = _get_owned_conversation(runtime, convo_id, auth_ctx)
-        else:
-            # Placeholder title; a model-written one replaces it once the turn
-            # completes (see _schedule_turn_labels).
-            user_message = init.get("message", "")
-            auto_title = turn_effects.conversation_title(user_message)
-            conversation = runtime.store.create_conversation(
-                user_id=user_id, title=auto_title
-            )
-            convo_id = conversation.id
-        context_id = init.get("context_id") or conversation.active_context_id
-        if context_id:
-            _get_owned_context(runtime, context_id, auth_ctx)
-        ws_user_msg = runtime.store.append_message(
-            convo_id, sender="user", role="user", content=init.get("message", "")
+        turn = await chat_turn.begin(
+            runtime,
+            auth_ctx,
+            conversation_id=convo_id,
+            context_id=init.get("context_id"),
+            workflow_id=init.get("workflow_id"),
+            content=init.get("message", ""),
+            content_struct=init.get("content_struct"),
+            owned_conversation=_get_owned_conversation,
+            owned_context=_get_owned_context,
         )
+        convo_id = turn.conversation_id
+        context_id = turn.context_id
 
         # SPEC §18: Check if streaming is requested (default True for WebSocket)
         stream_enabled = init.get("stream", True)
@@ -4299,60 +4200,18 @@ async def websocket_chat(ws: WebSocket):
             # Save assistant message after streaming completes (only if successful)
             if cancel_event.is_set() or not message_done_received:
                 return
-            adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
-            # Issue 38.5: Join tokens at end for O(n) performance
-            full_content = "".join(content_tokens)
-            assistant_content = orchestration_dict.get("content", full_content or "No response generated.")
-            assistant_content_struct = normalize_content_struct(
-                orchestration_dict.get("content_struct"),
-                assistant_content,
+            # Issue 38.5: join tokens at the end for O(n) rather than O(n^2).
+            assistant_msg = await chat_turn.finish(
+                runtime, turn, orchestration_dict, content="".join(content_tokens)
             )
-            assistant_msg = runtime.store.append_message(
-                convo_id,
-                sender="assistant",
-                role="assistant",
-                content=assistant_content,
-                content_struct=assistant_content_struct,
-                meta={
-                    "adapters": orchestration_dict.get("adapters", []),
-                    "adapter_gates": orchestration_dict.get("adapter_gates", []),
-                    "routing_trace": orchestration_dict.get("routing_trace", []),
-                    "workflow_trace": orchestration_dict.get("workflow_trace", []),
-                    "usage": orchestration_dict.get("usage", {}),
-                },
-            )
-            # Store idempotency result for completed streaming
+            adapter_names = _stringify_adapters(turn.orchestration.get("adapters", []))
+            assistant_content = assistant_msg.content
             envelope = Envelope(
                 status="ok",
-                data=ChatResponse(
-                    message_id=assistant_msg.id,
-                    conversation_id=convo_id,
-                    content=assistant_msg.content,
-                    content_struct=assistant_msg.content_struct,
-                    workflow_id=init.get("workflow_id"),
-                    adapters=adapter_names,
-                    adapter_gates=orchestration_dict.get("adapter_gates", []),
-                    usage=orchestration_dict.get("usage", {}),
-                    context_snippets=orchestration_dict.get("context_snippets", []),
-                    routing_trace=orchestration_dict.get("routing_trace", []),
-                    workflow_trace=orchestration_dict.get("workflow_trace", []),
-                ).model_dump(),
+                data=chat_turn.response(turn, assistant_msg, adapter_names).model_dump(),
                 request_id=request_id,
             )
             await idempotency.store("chat:ws", user_id, idempotency_key, envelope)
-
-            turn_effects.schedule_turn_labels(
-                runtime,
-                conversation_id=convo_id,
-                user_id=user_id,
-                user_message_id=getattr(ws_user_msg, "id", None),
-                user_content=init.get("message", ""),
-                assistant_content=assistant_content,
-                set_title=needs_title,
-            )
-            turn_effects.schedule_conversation_digest(
-                runtime, conversation_id=convo_id, user_id=user_id
-            )
 
             # Send final event with message_id and conversation_id to client
             # SPEC §18: Valid events are token, message_done, error, cancel_ack, trace
@@ -4385,44 +4244,14 @@ async def websocket_chat(ws: WebSocket):
                 user_id,
                 tenant_id=auth_ctx.tenant_id,
             )
-            orchestration_dict = (
-                orchestration if isinstance(orchestration, dict) else {}
-            )
-            adapter_names = _stringify_adapters(orchestration_dict.get("adapters", []))
-            assistant_content_struct = normalize_content_struct(
-                orchestration_dict.get("content_struct"),
-                orchestration_dict.get("content"),
-            )
-            assistant_content = orchestration_dict.get("content", "No response generated.")
-            assistant_msg = runtime.store.append_message(
-                convo_id,
-                sender="assistant",
-                role="assistant",
-                content=assistant_content,
-                content_struct=assistant_content_struct,
-                meta={
-                    "adapters": orchestration_dict.get("adapters", []),
-                    "adapter_gates": orchestration_dict.get("adapter_gates", []),
-                    "routing_trace": orchestration_dict.get("routing_trace", []),
-                    "workflow_trace": orchestration_dict.get("workflow_trace", []),
-                    "usage": orchestration_dict.get("usage", {}),
-                },
-            )
+            # Same finish as the streaming branch: this one used to persist the
+            # reply and schedule nothing, so `{"stream": false}` produced a turn
+            # with no label, no title, no digest and no embedding backfill.
+            assistant_msg = await chat_turn.finish(runtime, turn, orchestration)
+            adapter_names = _stringify_adapters(turn.orchestration.get("adapters", []))
             envelope = Envelope(
                 status="ok",
-                data=ChatResponse(
-                    message_id=assistant_msg.id,
-                    conversation_id=convo_id,
-                    content=assistant_msg.content,
-                    content_struct=assistant_msg.content_struct,
-                    workflow_id=init.get("workflow_id"),
-                    adapters=adapter_names,
-                    adapter_gates=orchestration_dict.get("adapter_gates", []),
-                    usage=orchestration_dict.get("usage", {}),
-                    context_snippets=orchestration_dict.get("context_snippets", []),
-                    routing_trace=orchestration_dict.get("routing_trace", []),
-                    workflow_trace=orchestration_dict.get("workflow_trace", []),
-                ).model_dump(),
+                data=chat_turn.response(turn, assistant_msg, adapter_names).model_dump(),
                 request_id=request_id,
             )
             await idempotency.store("chat:ws", user_id, idempotency_key, envelope)
