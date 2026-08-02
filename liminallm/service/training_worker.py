@@ -180,14 +180,29 @@ class TrainingWorker:
                     error=str(exc),
                 )
 
-        try:
-            await self.clusterer.cluster_global_preferences(
-                max_events=self.cluster_event_limit,
-                streaming=True,
-                approximate=True,
-            )
-        except Exception as exc:
-            logger.warning("periodic_global_clustering_failed", error=str(exc))
+        # "Global" clustering means global *within a tenant*. Clustering across
+        # every user regardless of tenant would produce clusters whose members
+        # span tenants, and a skill adapter trained on such a cluster would mix
+        # tenants' content (CLAUDE.md tenant isolation).
+        tenant_ids = []
+        for user in users:
+            tenant = getattr(user, "tenant_id", None)
+            if tenant and tenant not in tenant_ids:
+                tenant_ids.append(tenant)
+        for tenant_id in tenant_ids:
+            try:
+                await self.clusterer.cluster_global_preferences(
+                    max_events=self.cluster_event_limit,
+                    streaming=True,
+                    approximate=True,
+                    tenant_id=tenant_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "periodic_global_clustering_failed",
+                    tenant_id=tenant_id,
+                    error=str(exc),
+                )
 
     async def _maybe_recommend_adapter_pruning(self) -> None:
         """Surface low-quality adapters via ConfigOps auto-proposals."""
@@ -371,30 +386,50 @@ class TrainingWorker:
                 )
 
                 if result:
-                    # Training succeeded
-                    self.store.update_training_job(
-                        job_id,
-                        status="succeeded",
-                        loss=result.get("loss"),
-                        new_version=result.get("version"),
-                        meta={
+                    # SPEC §5.4.6: a run that trained but failed the eval gate
+                    # did NOT ship weights - record it as gate-rejected rather
+                    # than "succeeded", and leave router state alone so an
+                    # un-promoted adapter is not credited with a training pass.
+                    gate = result.get("eval_gate") or {}
+                    promoted = bool(gate.get("promoted", True))
+                    # Merge into the meta TrainingService already wrote (it
+                    # holds eval_gate/pooled_skill/distilled); replacing it
+                    # would destroy the gate audit trail.
+                    existing_meta = {}
+                    refreshed = self.store.get_training_job(job_id)
+                    if refreshed and isinstance(refreshed.meta, dict):
+                        existing_meta = dict(refreshed.meta)
+                    existing_meta.update(
+                        {
                             "jax_trace": result.get("jax_trace"),
                             "clusters": result.get("clusters"),
                             "completed_at": datetime.utcnow().isoformat(),
-                        },
+                        }
+                    )
+                    self.store.update_training_job(
+                        job_id,
+                        status="succeeded" if promoted else "gate_rejected",
+                        loss=result.get("loss"),
+                        # TrainingService already set new_version on promotion;
+                        # the result exposes the directory, not the number.
+                        new_version=None,
+                        meta=existing_meta,
                     )
                     logger.info(
-                        "training_job_succeeded",
+                        "training_job_finished",
                         job_id=job_id,
                         loss=result.get("loss"),
-                        version=result.get("version"),
+                        promoted=promoted,
+                        gate_reason=gate.get("reason"),
+                        version_dir=result.get("version_dir"),
                     )
 
-                    self._update_adapter_router_state(
-                        adapter_id=adapter_id,
-                        loss=result.get("loss"),
-                        clusters=result.get("clusters"),
-                    )
+                    if promoted:
+                        self._update_adapter_router_state(
+                            adapter_id=adapter_id,
+                            loss=result.get("loss"),
+                            clusters=result.get("clusters"),
+                        )
                     # Trigger clustering after successful training
                     await self._run_post_training_clustering(user_id)
                     return

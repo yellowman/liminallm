@@ -34,6 +34,13 @@ ocr = [
   "pytesseract>=0.3.10",
   "Pillow>=10.0",
 ]
+# JAX is the primary training/serving framework (SPEC §5); install this
+# extra wherever adapters are trained or served locally.
+train = [
+  "jax>=0.4.30",
+  "optax>=0.2",
+  "transformers>=4.40",
+]
 dev = [
   "pytest>=8.0",
   "pytest-cov>=4.1",

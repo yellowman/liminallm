@@ -2601,11 +2601,24 @@ async def record_preference(
         adapter_gates=body.adapter_gates,
         notes=body.notes,
     )
-    await runtime.clusterer.cluster_user_preferences(principal.user_id)
-    runtime.clusterer.promote_skill_adapters()
+    # Clustering + skill promotion are best-effort: they call the LLM (cluster
+    # labeling), which can be transiently unavailable, and the background
+    # training worker performs the same work on a schedule. The feedback event
+    # is already durably recorded above, so a downstream failure here must not
+    # turn a successful POST into a 500.
+    try:
+        await runtime.clusterer.cluster_user_preferences(principal.user_id)
+        runtime.clusterer.promote_skill_adapters()
+    except Exception as exc:
+        logger.warning(
+            "preference_clustering_deferred",
+            user_id=principal.user_id,
+            error=str(exc),
+        )
+    refreshed = runtime.store.get_preference_event(event.id) or event
     resp = PreferenceEventResponse(
         id=event.id,
-        cluster_id=event.cluster_id,
+        cluster_id=refreshed.cluster_id,
         feedback=event.feedback,
         created_at=event.created_at,
     )

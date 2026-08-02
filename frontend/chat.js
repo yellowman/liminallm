@@ -219,12 +219,37 @@ const renderCodeBlock = (code, lang) => (
   `<pre><code${lang ? ` class="lang-${lang}"` : ''}>${highlightCode(code, lang)}</code></pre></figure>`
 );
 
+// A URL we are willing to put in an href. The regexes below already require
+// an http(s) scheme, so javascript: never matches — this adds the checks a
+// pattern can't express: no quotes/brackets/backticks/whitespace, no control
+// characters, and it must actually parse as a URL. (Merged from the web-UI
+// polish branch, which centralized this more rigorously than the inline
+// character classes did.)
+const safeLinkHref = (raw) => {
+  const url = String(raw || '').trim();
+  if (!/^https?:\/\//i.test(url)) return null;
+  if (/["'`<>\\\s]/.test(url)) return null;
+  if (/[\u0000-\u001f\u007f]/.test(url)) return null;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+  } catch {
+    return null;
+  }
+  return url;
+};
+
 // Inline formatting; operates on escaped text after code has been stashed.
-// URL character classes exclude quotes so a crafted URL can never break out
-// of the href attribute (escapeHtml does not escape quotes).
+// A URL failing safeLinkHref renders as plain text rather than a link.
 const applyInlineMarkdown = (text) => text
-  .replace(/!?\[([^\]\n]+)\]\((https?:\/\/[^)\s"']+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
-  .replace(/(^|[\s(])(https?:\/\/[^\s"'<>]+[^\s"'<>.,;:!?)\]])/gm, '$1<a href="$2" target="_blank" rel="noopener noreferrer">$2</a>')
+  .replace(/!?\[([^\]\n]+)\]\((https?:\/\/[^)\s"']+)\)/g, (m, label, url) => {
+    const safe = safeLinkHref(url);
+    return safe ? `<a href="${safe}" target="_blank" rel="noopener noreferrer">${label}</a>` : m;
+  })
+  .replace(/(^|[\s(])(https?:\/\/[^\s"'<>]+[^\s"'<>.,;:!?)\]])/gm, (m, lead, url) => {
+    const safe = safeLinkHref(url);
+    return safe ? `${lead}<a href="${safe}" target="_blank" rel="noopener noreferrer">${safe}</a>` : m;
+  })
   .replace(/\*\*\*([^*\n]+)\*\*\*/g, '<strong><em>$1</em></strong>')
   .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
   .replace(/(^|[\s(])\*([^*\n]+)\*/gm, '$1<em>$2</em>')
