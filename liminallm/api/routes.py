@@ -117,7 +117,7 @@ from liminallm.config import (
     validate_managed_settings,
 )
 from liminallm.logging import get_logger
-from liminallm.service import admission, cancellation
+from liminallm.service import admission, cancellation, tenancy
 from liminallm.service import extract as extract_service
 from liminallm.service import notes as notes_service
 from liminallm.service.archive import (
@@ -170,17 +170,15 @@ def _get_system_settings(runtime) -> dict:
 
 
 async def get_user(
+    request: Request,
     authorization: Optional[str] = Header(None),
     session_id: Optional[str] = Header(None, convert_underscores=False),
-    x_tenant_id: Optional[str] = Header(
-        None, convert_underscores=False, alias="X-Tenant-ID"
-    ),
 ) -> AuthContext:
     runtime = get_runtime()
     ctx = await runtime.auth.authenticate(
         authorization,
         session_id,
-        tenant_hint=x_tenant_id,
+        tenant_hint=tenancy.tenant_of(request.headers, runtime.settings),
     )
     if not ctx:
         raise http_error("unauthorized", "invalid session", status_code=401)
@@ -188,17 +186,15 @@ async def get_user(
 
 
 async def get_admin_user(
+    request: Request,
     authorization: Optional[str] = Header(None),
     session_id: Optional[str] = Header(None, convert_underscores=False),
-    x_tenant_id: Optional[str] = Header(
-        None, convert_underscores=False, alias="X-Tenant-ID"
-    ),
 ) -> AuthContext:
     runtime = get_runtime()
     ctx = await runtime.auth.authenticate(
         authorization,
         session_id,
-        tenant_hint=x_tenant_id,
+        tenant_hint=tenancy.tenant_of(request.headers, runtime.settings),
         required_role="admin",
     )
     if not ctx:
@@ -330,7 +326,7 @@ def _apply_session_cookies(
 
 
 @router.post("/auth/signup", response_model=Envelope, status_code=201, tags=["auth"])
-async def signup(body: SignupRequest, response: Response):
+async def signup(body: SignupRequest, response: Response, request: Request):
     """Create a new user account.
 
     Registers a new user with email and password credentials. Returns session
@@ -344,13 +340,13 @@ async def signup(body: SignupRequest, response: Response):
     if not runtime.settings.allow_signup:
         raise http_error("forbidden", "signup disabled", status_code=403)
     await rate_limit(runtime, "signup", body.email.lower())
-    # Issue 35.2/53.2: Per CLAUDE.md, derive tenant_id from server config, not user input
-    # This prevents tenant spoofing attacks where users register in arbitrary tenants
+    # Per CLAUDE.md, tenant_id is never taken from the request. It is the tenant
+    # serving the site this signup arrived at (service/tenancy.py).
     user, session, tokens = await runtime.auth.signup(
         email=body.email,
         password=body.password,
         handle=body.handle,
-        tenant_id=None,  # Use server's default_tenant_id
+        tenant_id=tenancy.tenant_of(request.headers, runtime.settings),
     )
     logger.info("user_signup_completed", user_id=user.id, email=body.email)
     _apply_session_cookies(
@@ -391,13 +387,14 @@ async def login(body: LoginRequest, request: Request, response: Response):
     # Bug fix: Pass user_agent and ip_addr for session metadata
     user_agent = request.headers.get("user-agent")
     ip_addr = request.client.host if request.client else None
-    # Issue 35.2: Per CLAUDE.md, tenant_id should come from user record, not request
-    # The auth service looks up the user by email and uses their stored tenant_id
+    # Per CLAUDE.md the tenant is never taken from the request body. It is the
+    # tenant serving the site this login arrived at, and it must match the one
+    # on the user's record — an account from another site cannot sign in here.
     user, session, tokens = await runtime.auth.login(
         email=body.email,
         password=body.password,
         mfa_code=body.mfa_code,
-        tenant_id=None,  # Derived from user's existing record
+        tenant_id=tenancy.tenant_of(request.headers, runtime.settings),
         user_agent=user_agent,
         ip_addr=ip_addr,
         device_type=body.device_type,
@@ -447,11 +444,13 @@ async def oauth_start(
         limit=20,
         window_seconds=60,
     )
-    # Issue 35.2: Per CLAUDE.md, derive tenant_id from server config, not user input
-    # This prevents tenant spoofing attacks where users can OAuth into arbitrary tenants
+    # The tenant is bound into the server-created state here, so the callback
+    # lands the user on the site they started from and nowhere else.
     try:
         start = await runtime.auth.start_oauth(
-            provider, redirect_uri=body.redirect_uri, tenant_id=None
+            provider,
+            redirect_uri=body.redirect_uri,
+            tenant_id=tenancy.tenant_of(request.headers, runtime.settings),
         )
     except ValueError as exc:
         # Unsupported or unconfigured provider is a client-visible condition,
@@ -527,12 +526,9 @@ async def refresh_tokens(
     response: Response,
     request: Request,
     authorization: Optional[str] = Header(None),
-    x_tenant_id: Optional[str] = Header(
-        None, convert_underscores=False, alias="X-Tenant-ID"
-    ),
 ):
     runtime = get_runtime()
-    tenant_hint = body.tenant_id or x_tenant_id
+    tenant_hint = tenancy.tenant_of(request.headers, runtime.settings)
     client_ip = request.client.host if request.client else "unknown"
     await rate_limit(runtime, "refresh", client_ip)
     user, session, tokens = await runtime.auth.refresh_tokens(
@@ -606,11 +602,10 @@ async def admin_create_user(
         runtime.settings.admin_rate_limit_per_minute,
         runtime.settings.admin_rate_limit_window_seconds,
     )
-    target_tenant = body.tenant_id or principal.tenant_id
-    if target_tenant != principal.tenant_id:
-        raise http_error(
-            "forbidden", "cannot create users in other tenant", status_code=403
-        )
+    # An admin creates users in their own tenant, which is the site they are
+    # administering. There is deliberately no override: a tenant is a site, and
+    # reaching another one means visiting it.
+    target_tenant = principal.tenant_id
     user, password = await runtime.auth.admin_create_user(
         email=body.email,
         password=body.password,
@@ -3940,6 +3935,9 @@ async def websocket_chat(ws: WebSocket):
         auth_ctx = await runtime.auth.authenticate(
             f"Bearer {access_token}" if access_token else None,
             session_id,
+            # The site the socket was opened against, same as every HTTP route.
+            # A session from one tenant's site cannot be replayed at another's.
+            tenant_hint=tenancy.tenant_of(ws.headers, runtime.settings),
         )
         if not auth_ctx:
             await ws.close(code=4401)

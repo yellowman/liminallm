@@ -12,7 +12,9 @@ from typing import Annotated, Any, Literal, Optional, Union, get_args, get_origi
 
 from dotenv import dotenv_values
 from pydantic import (
+    AfterValidator,
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     TypeAdapter,
@@ -700,7 +702,24 @@ class Settings(BaseModel):
     )
     default_tenant_id: str = managed_field(
         "public",
-        description="Default tenant ID",
+        description="Tenant for an install that serves one site. Also the tenant for any host not listed in tenant_domains.",
+    )
+    tenant_domains: dict[str, str] = managed_field(
+        {},
+        description=(
+            "Hostname to tenant id, e.g. {\"acme.example.com\": \"acme\"}. "
+            "Empty means one tenant for the whole install. Once any mapping "
+            "exists, a request arriving on an unlisted host is refused rather "
+            "than served the default tenant."
+        ),
+    )
+    trust_forwarded_host: bool = managed_field(
+        False,
+        description=(
+            "Read the visited hostname from X-Forwarded-Host instead of Host. "
+            "Turn this on only when a reverse proxy you control sets it — "
+            "otherwise a client can name its own tenant."
+        ),
     )
     rag_mode: RagMode = managed_field(
         RagMode.PGVECTOR,
@@ -942,6 +961,32 @@ class Settings(BaseModel):
         description="Tokens per knowledge chunk. Changing this rebuilds the model services and only affects newly ingested content.",
     )
 
+    @field_validator("tenant_domains", mode="before")
+    @classmethod
+    def _parse_tenant_domains(cls, value: Any) -> dict[str, str]:
+        """Normalize hosts on the way in, so lookup is a plain dict hit.
+
+        Hosts are compared lowercase and without a port, because that is what
+        varies between how an operator types it and how a browser sends it.
+        """
+        if value in (None, ""):
+            return {}
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("tenant_domains must be a JSON object") from exc
+        if not isinstance(value, dict):
+            raise ValueError("tenant_domains must be a JSON object")
+        normalized: dict[str, str] = {}
+        for host, tenant in value.items():
+            host = str(host).strip().lower().rstrip(".").split(":")[0]
+            tenant = str(tenant).strip()
+            if not host or not tenant:
+                raise ValueError("tenant_domains entries need a host and a tenant")
+            normalized[host] = tenant
+        return normalized
+
     @field_validator("cors_allow_origins", mode="before")
     @classmethod
     def _parse_cors_origins(cls, value: Any) -> list[str]:
@@ -1142,8 +1187,8 @@ _SETTING_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Training", ("training_", "max_active_training_jobs")),
     ("Email", ("smtp_", "email_from_")),
     ("Voice", ("voice_",)),
-    ("URLs & identity", ("app_base_url", "oauth_redirect_uri",
-                         "default_tenant_id", "jwt_")),
+    ("Tenancy", ("default_tenant_id", "tenant_domains", "trust_forwarded_host")),
+    ("URLs & identity", ("app_base_url", "oauth_redirect_uri", "jwt_")),
     ("Operations", ("settings_watch_interval_seconds",)),
     ("Infrastructure", ("redis_url", "allow_redis_fallback_dev",
                         "cluster_bus_backend", "shared_fs_root",
@@ -1236,9 +1281,22 @@ def _field_adapter(name: str) -> TypeAdapter:
     view was even considered). Those rules belong to the second pass.
     """
     field = Settings.model_fields[name]
-    if not field.metadata:
+    parts: list[Any] = [field.annotation, *field.metadata]
+    # The field's own validators, which the raw annotation does not carry.
+    # Without them this pass judged a field by its declared type alone, so a
+    # setting whose validator accepts a friendlier form — tenant_domains as
+    # typed JSON, cors_allow_origins and tool_network_allowlist as a
+    # comma-separated list — was rejected before the friendlier form was ever
+    # parsed. Those three were simply not settable from the console.
+    for dec in Settings.__pydantic_decorators__.field_validators.values():
+        if name not in dec.info.fields:
+            continue
+        fn = getattr(dec.func, "__func__", dec.func)
+        wrapper = BeforeValidator if dec.info.mode == "before" else AfterValidator
+        parts.append(wrapper(lambda v, _fn=fn: _fn(Settings, v)))
+    if len(parts) == 1:
         return TypeAdapter(field.annotation)
-    return TypeAdapter(Annotated[tuple([field.annotation, *field.metadata])])
+    return TypeAdapter(Annotated[tuple(parts)])
 
 
 def validate_managed_settings(patch: dict, current: dict | None = None) -> dict[str, str]:

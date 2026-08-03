@@ -107,7 +107,6 @@ const handleLogin = async (event) => {
     email: document.getElementById('admin-email').value,
     password: document.getElementById('admin-password').value,
     mfa_code: document.getElementById('admin-mfa')?.value || undefined,
-    tenant_id: document.getElementById('admin-tenant').value || undefined,
   };
   try {
     const envelope = await requestEnvelope(
@@ -330,7 +329,6 @@ const createUser = async () => {
   const email = document.getElementById('new-user-email').value;
   const password = document.getElementById('new-user-password').value;
   const handle = document.getElementById('new-user-handle').value;
-  const tenant = document.getElementById('new-user-tenant').value;
   const role = document.getElementById('new-user-role').value;
   const plan = document.getElementById('new-user-plan').value;
   const active = document.getElementById('new-user-active').checked;
@@ -348,7 +346,6 @@ const createUser = async () => {
           email,
           password: password || undefined,
           handle: handle || undefined,
-          tenant_id: tenant || undefined,
           role: role || undefined,
           plan_tier: plan || undefined,
           is_active: active,

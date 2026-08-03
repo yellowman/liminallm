@@ -721,7 +721,6 @@ const handleLogin = async (event) => {
     email: $('email')?.value,
     password: $('password')?.value,
     mfa_code: $('mfa')?.value || undefined,
-    tenant_id: $('tenant')?.value || undefined,
   };
 
   try {
@@ -796,7 +795,6 @@ const startOAuth = async (provider) => {
     if (btn) btn.disabled = true;
     if (oauthStatus) oauthStatus.textContent = `Connecting to ${provider}...`;
 
-    const tenant = $('tenant')?.value?.trim() || undefined;
     const redirectUri = window.location.origin + window.location.pathname;
 
     const envelope = await requestEnvelope(
@@ -804,10 +802,7 @@ const startOAuth = async (provider) => {
       {
         method: 'POST',
         headers: jsonHeaders(),
-        body: JSON.stringify({
-          redirect_uri: redirectUri,
-          tenant_id: tenant,
-        }),
+        body: JSON.stringify({ redirect_uri: redirectUri }),
       },
       `Failed to start ${provider} login`
     );
@@ -865,7 +860,6 @@ const handleOAuthCallback = async () => {
   try {
     if (oauthStatus) oauthStatus.textContent = 'Completing sign in...';
 
-    const tenant = $('tenant')?.value?.trim() || undefined;
 
     const envelope = await requestEnvelope(
       `${apiBase}/auth/oauth/${provider}/callback?code=${encodeURIComponent(code)}&state=${encodeURIComponent(state)}`,
@@ -921,7 +915,6 @@ const handleSignup = async (event) => {
   const email = $('signup-email')?.value?.trim();
   const password = $('signup-password')?.value;
   const confirm = $('signup-confirm')?.value;
-  const tenant = $('signup-tenant')?.value?.trim() || undefined;
 
   if (!email || !password) {
     if (signupStatus) signupStatus.textContent = 'Email and password are required';
@@ -947,7 +940,7 @@ const handleSignup = async (event) => {
       {
         method: 'POST',
         headers: jsonHeaders(),
-        body: JSON.stringify({ email, password, tenant_id: tenant }),
+        body: JSON.stringify({ email, password }),
       },
       'Signup failed'
     );

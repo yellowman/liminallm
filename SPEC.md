@@ -1376,6 +1376,27 @@ execution guardrails:
 
 ### 12.2 isolation
 
+- **tenant**: a tenant *is* a site. `tenant_domains` maps hostname to tenant id;
+  the request's hostname decides, and nothing a caller sends can override it —
+  no request field, no header. An empty map means the install serves one tenant
+  (`default_tenant_id`), which is every deployment until a second site exists.
+  Once any mapping exists, a request arriving on an unlisted host is refused
+  (`not_found`) rather than served the default tenant, because otherwise any DNS
+  name pointed at the box would reach that tenant's login page.
+  - the hostname is read from `Host`, or from `X-Forwarded-Host` when
+    `trust_forwarded_host` is on. That flag is the entire trust boundary: turn it
+    on only when a reverse proxy you control sets the header from the real
+    request and refuses hosts it does not serve. `Host` is a client-supplied
+    header like any other.
+  - signup joins the tenant serving the site it arrived at. Login, refresh and
+    every authenticated request check that tenant against the user's stored
+    `tenant_id`, so an account cannot sign in — and a session cannot be
+    replayed — at another tenant's site.
+  - `POST /v1/auth/signup` and `POST /v1/auth/oauth/{provider}/start` reject a
+    `tenant_id` in the body with `validation_error` rather than ignoring it.
+    An admin creates users in their own tenant only; reaching another tenant
+    means visiting its site.
+
 - **postgres**:
   - all queries must be filtered by `user_id` where appropriate.
   - Optionally: PostgreSQL Row-Level Security (RLS) to enforce `user_id = current_user_id()`.
@@ -1758,7 +1779,7 @@ the following are treated as constants the kernel must honor; LLM edits happen o
   - success: `{ "status": "ok", "data": <payload>, "request_id": "uuid" }`; error: `{ "status": "error", "error": { "code": "string", "message": "string", "details": <object|array|null> }, "request_id": "uuid" }`.
   - pagination: either `{ data: [...], next_cursor: "opaque" }` or `{ page, page_size, total }`; choose per-endpoint but keep stable once published. For simple bounded queries, `limit` is accepted as an alias for `page_size` (defaults to 100, max 500).
   - idempotency: POST endpoints that create side effects (`/v1/chat`, `/v1/tools/run`, `/v1/artifacts`) accept `Idempotency-Key`; server replays prior response within a 24h TTL and returns `409` if the prior attempt is still running.
-  - auth header is `Authorization: Bearer <token>` in REST; WebSockets accept inline auth in the initial message frame: `{ "access_token": "...", "session_id": "...", "tenant_id": "...", "message": "...", ... }`; unauthenticated sockets close with code `4401`.
+  - auth header is `Authorization: Bearer <token>` in REST; WebSockets accept inline auth in the initial message frame: `{ "access_token": "...", "message": "...", ... }` **or** `{ "session_id": "...", ... }` — exactly one, never both (§12.1: mixed transports are rejected without a fresh session). No `tenant_id`: the socket's tenant comes from the host it was opened against, like every HTTP route. Unauthenticated sockets close with code `4401`.
   - streaming events: `token`, `message_done`, `error`, `cancel_ack`, `trace` (router/workflow trace snapshot). SSE uses `event:` labels; WebSockets wrap as `{ "event": "token", "data": "..." }`.
   - minimal REST surface (kernel-stable):
     - `POST /v1/auth/login { email, password, mfa_code? } → { access_token, refresh_token, user }`.
@@ -1839,12 +1860,21 @@ the following are treated as constants the kernel must honor; LLM edits happen o
     - URL settings: `oauth_redirect_uri`, `app_base_url`
     - voice settings: `voice_transcription_model` (enum: whisper-1), `voice_synthesis_model` (enum: tts-1, tts-1-hd), `voice_default_voice` (enum: alloy, echo, fable, onyx, nova, shimmer)
     - model settings: `model_path` (with common suggestions: gpt-4o, gpt-4o-mini, gpt-5.2, claude-opus-4-5, claude-sonnet-4, glm-4-plus), `model_backend` (enum: openai, anthropic, azure, azure_openai, vertex, gemini, google, bedrock, together, together.ai, lorax, adapter_server, sagemaker, aws_sagemaker, zhipu, zhipu.ai, glm, stub), `default_adapter_mode` (enum: local, remote, prompt, hybrid), `rag_mode` (enum: pgvector, memory), `embedding_model_id` (enum: text-embedding, text-embedding-3-small, text-embedding-3-large, text-embedding-ada-002)
-    - tenant & JWT: `default_tenant_id`, `jwt_issuer`, `jwt_audience`
-  - **environment-only settings** (infrastructure decisions or bootstrap secrets):
-    - database connection: `DATABASE_URL`, `REDIS_URL`
-    - bootstrap secrets: `JWT_SECRET` (required before DB available)
-    - OAuth secrets: `client_secret` values (optional, can be moved to DB with encryption if needed)
-    - test harness: `TEST_MODE`
+    - tenancy: `default_tenant_id`, `tenant_domains` (host → tenant id),
+      `trust_forwarded_host`; JWT: `jwt_issuer`, `jwt_audience`
+  - **environment-only settings** — everything that must be known *before* the
+    database is readable, or that describes the machine rather than the install.
+    There are five, and adding a sixth needs one of those two reasons:
+    - `DATABASE_URL` — where the rest of the configuration lives.
+    - `EMBEDDING_VECTOR_DIM` — the vector column's width, fixed at schema apply.
+    - `TEST_MODE`, `BUILD_SHA` — what this process is, not how it is configured.
+    - `EXTRACT_READER_PLUGINS` — code to import, so it cannot come from a row.
+  - **secrets live in the database, write-only.** `jwt_secret` (generated on
+    first boot), `smtp_password`, the OAuth `client_secret` values and the
+    provider API keys are stored like any managed setting but redacted on every
+    read path: `GET /v1/admin/settings` returns them empty and the console
+    renders a write-only control that submits only what an operator types.
+    Rotating one must not require a redeploy.
   - **admin UI** at `/admin.html` provides grouped controls for all database-managed settings; changes take effect immediately without server restart.
   - **API**: `GET /v1/admin/settings` returns current values merged with defaults; `PUT /v1/admin/settings` validates types (int/float/bool) and persists to `instance_config` table; requires admin role.
 

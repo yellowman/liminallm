@@ -224,7 +224,6 @@ app.add_middleware(
     allow_headers=[
         "Content-Type",
         "Authorization",
-        "X-Tenant-ID",
         "session_id",
         "Idempotency-Key",
         "X-CSRF-Token",

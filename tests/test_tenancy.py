@@ -1,0 +1,300 @@
+"""A tenant is the site you visited, and nothing a caller can say.
+
+Before this, five text boxes labelled "Tenant (optional)" collected a value the
+server variously discarded (login), rejected with a 422 (signup, OAuth) or
+refused with a 403 (admin create-user), and an `X-Tenant-ID` header echoed the
+server's own answer back at it. Nothing could set a tenant and typing in the box
+could only break the request.
+
+These tests pin the two halves of the replacement: the hostname decides, and no
+request field or header can override it.
+"""
+
+from __future__ import annotations
+
+import uuid
+from types import SimpleNamespace
+
+import pytest
+from fastapi.testclient import TestClient
+
+from liminallm import app as app_module
+from liminallm.service import tenancy
+from liminallm.service.errors import NotFoundError
+
+
+def _settings(**over):
+    base = dict(
+        default_tenant_id="public", tenant_domains={}, trust_forwarded_host=False
+    )
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+# ---------------------------------------------------------------------------
+# Resolution
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw, expected",
+    [
+        ("Acme.Example.COM", "acme.example.com"),
+        ("acme.example.com:8443", "acme.example.com"),
+        ("acme.example.com.", "acme.example.com"),
+        ("  acme.example.com  ", "acme.example.com"),
+        # A proxy may append; the first hop is the one the client visited.
+        ("acme.example.com, internal.lb", "acme.example.com"),
+        ("[::1]:8000", "[::1]"),
+        (None, ""),
+    ],
+)
+def test_host_normalization(raw, expected):
+    """Operators type one form, browsers send another. Both must match."""
+    assert tenancy.normalize_host(raw) == expected
+
+
+def test_no_mapping_means_one_tenant():
+    """The default install serves one site, so every host is that tenant."""
+    s = _settings()
+    assert tenancy.tenant_for_host("anything.example.com", s) == "public"
+
+
+def test_mapped_host_gets_its_tenant():
+    s = _settings(tenant_domains={"acme.example.com": "acme"})
+    assert tenancy.tenant_for_host("acme.example.com", s) == "acme"
+
+
+def test_unmapped_host_is_refused_once_a_mapping_exists():
+    """Serving the default tenant here would mean any DNS name pointed at the
+    box gets that tenant's login page — the spoofing this module prevents."""
+    s = _settings(tenant_domains={"acme.example.com": "acme"})
+    with pytest.raises(NotFoundError):
+        tenancy.tenant_for_host("evil.example.com", s)
+
+
+def test_probes_reach_the_box_by_address_not_by_site():
+    """A healthcheck must not be refused for having no site name."""
+    s = _settings(tenant_domains={"acme.example.com": "acme"})
+    for host in ("", "localhost", "127.0.0.1"):
+        assert tenancy.tenant_for_host(host, s) == "public"
+
+
+# ---------------------------------------------------------------------------
+# Which header is believed
+# ---------------------------------------------------------------------------
+
+
+def test_forwarded_host_is_ignored_unless_the_operator_opts_in():
+    """Off by default: with no proxy in front, X-Forwarded-Host is just a
+    header the client picked, and believing it hands the caller its tenant."""
+    headers = {"host": "acme.example.com", "x-forwarded-host": "globex.example.com"}
+    assert tenancy.host_of(headers, _settings()) == "acme.example.com"
+
+
+def test_forwarded_host_wins_when_trusted():
+    headers = {"host": "internal-lb", "x-forwarded-host": "globex.example.com"}
+    s = _settings(trust_forwarded_host=True)
+    assert tenancy.host_of(headers, s) == "globex.example.com"
+
+
+def test_trusted_but_absent_forwarded_host_falls_back_to_host():
+    headers = {"host": "acme.example.com"}
+    s = _settings(trust_forwarded_host=True)
+    assert tenancy.host_of(headers, s) == "acme.example.com"
+
+
+# ---------------------------------------------------------------------------
+# The API surface refuses to take a tenant
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def client():
+    return TestClient(app_module.app)
+
+
+def test_signup_rejects_a_supplied_tenant(client):
+    resp = client.post(
+        "/v1/auth/signup",
+        json={
+            "email": f"t_{uuid.uuid4().hex[:8]}@example.com",
+            "password": "TestPassword123!",
+            "tenant_id": "somewhere-else",
+        },
+    )
+    assert resp.status_code == 422, resp.text
+
+
+def test_oauth_start_rejects_a_supplied_tenant(client):
+    resp = client.post(
+        "/v1/auth/oauth/google/start",
+        json={"redirect_uri": "https://example.com/cb", "tenant_id": "somewhere-else"},
+    )
+    assert resp.status_code == 422, resp.text
+
+
+def test_login_no_longer_declares_a_tenant_field():
+    """It used to accept one and silently discard it, which reads as working."""
+    from liminallm.api.schemas import LoginRequest, TokenRefreshRequest
+
+    assert "tenant_id" not in LoginRequest.model_fields
+    assert "tenant_id" not in TokenRefreshRequest.model_fields
+
+
+def test_no_route_reads_a_tenant_header():
+    """X-Tenant-ID let a client pick the tenant its own session was checked
+    against; the only outcomes were 'matches' and 401."""
+    import inspect
+
+    from liminallm.api import routes
+
+    assert "X-Tenant-ID" not in inspect.getsource(routes)
+
+
+def test_signup_lands_in_the_tenant_serving_the_host(client):
+    """The default install has no mapping, so this is default_tenant_id — but
+    it arrives via tenancy, not via a hardcoded None."""
+    email = f"t_{uuid.uuid4().hex[:8]}@example.com"
+    resp = client.post(
+        "/v1/auth/signup", json={"email": email, "password": "TestPassword123!"}
+    )
+    assert resp.status_code == 201, resp.text
+    token = resp.json()["data"]["access_token"]
+    me = client.get("/v1/me", headers={"Authorization": f"Bearer {token}"})
+    assert me.status_code == 200, me.text
+    from liminallm.service.runtime import get_runtime
+
+    assert me.json()["data"]["tenant_id"] == get_runtime().settings.default_tenant_id
+
+
+# ---------------------------------------------------------------------------
+# Two sites on one box
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def two_sites():
+    """Serve acme and globex from the same install for one test."""
+    from liminallm.service.runtime import get_runtime
+
+    settings = get_runtime().settings
+    before = settings.tenant_domains
+    settings.tenant_domains = {
+        "acme.example.com": "acme",
+        "globex.example.com": "globex",
+    }
+    try:
+        yield
+    finally:
+        settings.tenant_domains = before
+
+
+def _signup(client, host):
+    email = f"t_{uuid.uuid4().hex[:8]}@example.com"
+    resp = client.post(
+        "/v1/auth/signup",
+        json={"email": email, "password": "TestPassword123!"},
+        headers={"Host": host},
+    )
+    assert resp.status_code == 201, resp.text
+    return email, resp.json()["data"]
+
+
+def test_the_site_decides_which_tenant_an_account_joins(client, two_sites):
+    _, acme = _signup(client, "acme.example.com")
+    me = client.get(
+        "/v1/me",
+        headers={"Authorization": f"Bearer {acme['access_token']}", "Host": "acme.example.com"},
+    )
+    assert me.status_code == 200, me.text
+    assert me.json()["data"]["tenant_id"] == "acme"
+
+
+def test_an_account_cannot_sign_in_at_another_tenants_site(client, two_sites):
+    email, _ = _signup(client, "acme.example.com")
+    body = {"email": email, "password": "TestPassword123!"}
+
+    at_home = client.post("/v1/auth/login", json=body, headers={"Host": "acme.example.com"})
+    assert at_home.status_code == 200, at_home.text
+
+    elsewhere = client.post(
+        "/v1/auth/login", json=body, headers={"Host": "globex.example.com"}
+    )
+    assert elsewhere.status_code == 401, elsewhere.text
+
+
+def test_a_session_cannot_be_replayed_at_another_tenants_site(client, two_sites):
+    _, acme = _signup(client, "acme.example.com")
+    token = {"Authorization": f"Bearer {acme['access_token']}"}
+
+    assert client.get("/v1/me", headers={**token, "Host": "acme.example.com"}).status_code == 200
+    assert client.get("/v1/me", headers={**token, "Host": "globex.example.com"}).status_code == 401
+
+
+def test_an_unmapped_host_is_not_served_a_tenant(client, two_sites):
+    resp = client.post(
+        "/v1/auth/signup",
+        json={"email": f"t_{uuid.uuid4().hex[:8]}@example.com", "password": "TestPassword123!"},
+        headers={"Host": "evil.example.com"},
+    )
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["error"]["code"] == "not_found"
+
+
+def test_a_client_cannot_name_its_tenant_with_a_forwarded_header(client, two_sites):
+    """trust_forwarded_host is off, so this is just a header the caller chose."""
+    _, acme = _signup(client, "acme.example.com")
+    resp = client.get(
+        "/v1/me",
+        headers={
+            "Authorization": f"Bearer {acme['access_token']}",
+            "Host": "globex.example.com",
+            "X-Forwarded-Host": "acme.example.com",
+        },
+    )
+    assert resp.status_code == 401, resp.text
+
+
+# ---------------------------------------------------------------------------
+# The console can actually set it
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "name, typed",
+    [
+        # Each of these declares a validator accepting a friendlier form than
+        # its annotation. The per-field pass used to judge them by the raw
+        # annotation alone and reject the friendly form, so all three were
+        # unsettable from the admin console.
+        ("tenant_domains", '{"Acme.Example.COM:443": "acme"}'),
+        ("cors_allow_origins", "http://a.example.com,http://b.example.com"),
+        ("tool_network_allowlist", "a.example.com,b.example.com"),
+    ],
+)
+def test_a_setting_accepts_what_its_own_validator_accepts(name, typed):
+    from liminallm.config import SYSTEM_SETTINGS_DEFAULTS, validate_managed_settings
+
+    errors = validate_managed_settings({name: typed}, dict(SYSTEM_SETTINGS_DEFAULTS))
+    assert errors == {}, errors
+
+
+def test_a_bad_tenant_map_says_why():
+    from liminallm.config import SYSTEM_SETTINGS_DEFAULTS, validate_managed_settings
+
+    current = dict(SYSTEM_SETTINGS_DEFAULTS)
+    assert "JSON object" in validate_managed_settings(
+        {"tenant_domains": "not json"}, current
+    )["tenant_domains"]
+    assert "host and a tenant" in validate_managed_settings(
+        {"tenant_domains": '{"acme.example.com": ""}'}, current
+    )["tenant_domains"]
+
+
+def test_tenancy_settings_have_a_home_in_the_console():
+    from liminallm.config import managed_settings_schema
+
+    groups = {e["name"]: e["group"] for e in managed_settings_schema()}
+    for name in ("default_tenant_id", "tenant_domains", "trust_forwarded_host"):
+        assert groups[name] == "Tenancy", f"{name} is under {groups.get(name)}"

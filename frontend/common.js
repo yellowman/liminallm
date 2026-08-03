@@ -44,10 +44,14 @@ const getCsrfToken = () => {
 
 // `state` is defined by whichever page loaded this; both keep the same auth
 // fields on it.
+//
+// No tenant header. The server derives the tenant from the hostname the request
+// arrived at (service/tenancy.py), so a client cannot name its own. This used
+// to echo back the value the server itself had just sent at login, where the
+// only two outcomes were "matches" and "401".
 const authHeaders = (idempotencyKey) => {
   const h = {};
   if (state.accessToken) h['Authorization'] = `Bearer ${state.accessToken}`;
-  if (state.tenantId) h['X-Tenant-ID'] = state.tenantId;
   if (state.sessionId) h['session_id'] = state.sessionId;
   const csrf = getCsrfToken();
   if (csrf) h['X-CSRF-Token'] = csrf;

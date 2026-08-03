@@ -239,10 +239,12 @@ class AuthResponse(BaseModel):
 
 
 class LoginRequest(BaseModel):
+    # No tenant_id: the tenant comes from the hostname the login arrived at.
+    # This field used to be accepted and then silently discarded by the route,
+    # which is worse than the raising validators below — it looked like it worked.
     email: str
     password: str
     mfa_code: Optional[str] = Field(default=None, max_length=10)
-    tenant_id: Optional[str] = Field(default=None, max_length=128)
     device_type: str = Field(default="web", max_length=16)
 
     @field_validator("email")
@@ -261,7 +263,6 @@ class LoginRequest(BaseModel):
 
 class TokenRefreshRequest(BaseModel):
     refresh_token: str = Field(..., max_length=2048)
-    tenant_id: Optional[str] = Field(default=None, max_length=128)
 
 
 class OAuthStartRequest(BaseModel):
