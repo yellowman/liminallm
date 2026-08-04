@@ -12,6 +12,7 @@ key and no SMTP host is the normal case, not an edge one.
 from __future__ import annotations
 
 import socket
+import threading
 
 import pytest
 
@@ -250,39 +251,153 @@ def test_an_unreachable_server_returns_false_rather_than_raising():
         smtp_host="127.0.0.1",
         smtp_port=_closed_port(),
         from_email="bot@example.com",
-        smtp_use_tls=True,
     )
     assert service.send_password_reset("alice@example.com", "tok") is False
 
 
-def test_plaintext_smtp_is_refused_on_a_plaintext_port():
-    """smtp_use_tls=False means implicit SSL, so ports 25/2525 are rejected
-    before a connection is attempted."""
-    service = EmailService(
-        smtp_host="127.0.0.1",
-        smtp_port=25,
-        from_email="bot@example.com",
-        smtp_use_tls=False,
-        smtp_allow_insecure=False,
-    )
-    assert service.send_password_reset("alice@example.com", "tok") is False
+# ---------------------------------------------------------------------------
+# smtp_security: against a real SMTP server, not a mock
+# ---------------------------------------------------------------------------
+
+
+class FakeSMTP(threading.Thread):
+    """A minimal SMTP responder, enough for smtplib to deliver one message.
+
+    Real sockets rather than a patched smtplib: the point is that the message
+    genuinely leaves, addressed correctly, with the body intact. It speaks no
+    TLS, so it is the counterpart of smtp_security="none".
+    """
+
+    daemon = True
+
+    def __init__(self):
+        super().__init__()
+        self.sock = socket.socket()
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(1)
+        self.port = self.sock.getsockname()[1]
+        self.received = None
+        self.mail_from = None
+        self.rcpt_to = None
+
+    def run(self):
+        try:
+            self._serve()
+        except OSError:
+            # A client that fails closed (starttls or ssl against a server
+            # that speaks neither) drops the connection mid-sentence. That is
+            # the behaviour under test, not an error here.
+            pass
+
+    def _serve(self):
+        conn, _ = self.sock.accept()
+        with conn, conn.makefile("rwb") as stream:
+            stream.write(b"220 fake ESMTP\r\n")
+            stream.flush()
+            for raw in stream:
+                line = raw.decode("utf-8", "replace").strip()
+                upper = line.upper()
+                if upper.startswith("EHLO"):
+                    stream.write(b"250-fake\r\n250 HELP\r\n")
+                elif upper.startswith("HELO"):
+                    stream.write(b"250 fake\r\n")
+                elif upper.startswith("MAIL FROM"):
+                    self.mail_from = line
+                    stream.write(b"250 OK\r\n")
+                elif upper.startswith("RCPT TO"):
+                    self.rcpt_to = line
+                    stream.write(b"250 OK\r\n")
+                elif upper == "DATA":
+                    stream.write(b"354 go ahead\r\n")
+                    stream.flush()
+                    body = []
+                    for data_line in stream:
+                        if data_line in (b".\r\n", b".\n"):
+                            break
+                        body.append(data_line)
+                    self.received = b"".join(body).decode("utf-8", "replace")
+                    stream.write(b"250 queued\r\n")
+                elif upper == "QUIT":
+                    stream.write(b"221 bye\r\n")
+                    stream.flush()
+                    return
+                else:
+                    stream.write(b"250 OK\r\n")
+                stream.flush()
+
+
+@pytest.fixture
+def fake_smtp():
+    server = FakeSMTP()
+    server.start()
+    yield server
+    server.sock.close()
 
 
 @pytest.mark.slow
-def test_allow_insecure_does_not_actually_enable_plaintext():
-    """Pins current behaviour, which does not match the setting's description
-    ("Allow plaintext SMTP when explicitly enabled").
-
-    There is no plaintext branch: smtp_use_tls=False always takes SMTP_SSL, and
-    smtp_allow_insecure only removes the port guard in front of it. An operator
-    with a local relay on port 25 — the ordinary self-hosted arrangement —
-    enables the setting and still cannot send.
-    """
+def test_an_unencrypted_relay_actually_delivers(fake_smtp):
+    """smtp_security="none" is the local-relay case — postfix on this box,
+    which is the ordinary self-hosted arrangement. It used to be unreachable:
+    the flag claiming to allow plaintext only removed a port guard in front of
+    an SSL connection, so there was no plaintext path at all."""
     service = EmailService(
         smtp_host="127.0.0.1",
-        smtp_port=_closed_port(),
+        smtp_port=fake_smtp.port,
         from_email="bot@example.com",
-        smtp_use_tls=False,
-        smtp_allow_insecure=True,
+        smtp_security="none",
+    )
+    assert service.send_password_reset("alice@example.com", "tok-live") is True
+
+    fake_smtp.join(timeout=10)
+    assert "alice@example.com" in fake_smtp.rcpt_to
+    assert "bot@example.com" in fake_smtp.mail_from
+    assert "tok-live" in fake_smtp.received
+
+
+@pytest.mark.slow
+def test_an_unencrypted_relay_refuses_to_send_a_password(fake_smtp):
+    """No encryption plus credentials means the password crosses the wire in
+    the clear. Almost always a misconfiguration, so it is refused rather than
+    quietly done."""
+    service = EmailService(
+        smtp_host="127.0.0.1",
+        smtp_port=fake_smtp.port,
+        from_email="bot@example.com",
+        smtp_user="bot@example.com",
+        smtp_password="hunter2",
+        smtp_security="none",
     )
     assert service.send_password_reset("alice@example.com", "tok") is False
+    assert fake_smtp.received is None, "the message went out anyway"
+
+
+@pytest.mark.slow
+def test_starttls_against_a_server_that_cannot_upgrade_fails_closed(fake_smtp):
+    """The fake speaks no TLS. Failing to upgrade must not fall back to
+    sending in the clear."""
+    service = EmailService(
+        smtp_host="127.0.0.1",
+        smtp_port=fake_smtp.port,
+        from_email="bot@example.com",
+        smtp_security="starttls",
+    )
+    assert service.send_password_reset("alice@example.com", "tok") is False
+    assert fake_smtp.received is None, "the message was sent unencrypted"
+
+
+@pytest.mark.slow
+def test_ssl_against_a_plaintext_server_fails_closed(fake_smtp):
+    service = EmailService(
+        smtp_host="127.0.0.1",
+        smtp_port=fake_smtp.port,
+        from_email="bot@example.com",
+        smtp_security="ssl",
+    )
+    assert service.send_password_reset("alice@example.com", "tok") is False
+    assert fake_smtp.received is None
+
+
+def test_starttls_is_the_default():
+    """An operator who sets only a host gets encryption, not plaintext."""
+    assert EmailService(smtp_host="h", from_email="a@b.co").smtp_security == "starttls"

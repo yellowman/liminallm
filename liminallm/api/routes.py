@@ -2587,7 +2587,7 @@ async def update_system_settings(
     - Token TTL: access_token_ttl_minutes (30), refresh_token_ttl_minutes (1440)
     - Feature flags: enable_mfa (true), allow_signup (true)
     - Training worker: training_worker_enabled (true), training_worker_poll_interval (60)
-    - SMTP: smtp_host, smtp_port (587), smtp_user, smtp_password, smtp_use_tls (true),
+    - SMTP: smtp_host, smtp_port (587), smtp_user, smtp_password, smtp_security (starttls),
       email_from_address, email_from_name ("LiminalLM")
     - URL settings: oauth_redirect_uri, app_base_url ("http://localhost:8000")
     - Voice: voice_transcription_model (whisper-1), voice_synthesis_model (tts-1, tts-1-hd),

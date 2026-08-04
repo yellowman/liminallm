@@ -3635,7 +3635,7 @@ Redirect URI not validated for HTTPS or allowed domain.
 ### 55.6 MEDIUM: Default Insecure SMTP Configuration
 **Location:** `liminallm/service/email.py:85-97`
 
-Configuration naming confusing - `smtp_use_tls=False` uses SMTP_SSL.
+Configuration naming confusing - `smtp_use_tls=False` uses SMTP_SSL. **Fixed:** replaced by `smtp_security` (`starttls`/`ssl`/`none`); `none` is a real plaintext path for a local relay, refused when credentials are set.
 
 **Status:** ✅ FIXED - SMTP sending enforces encrypted transport by default and requires explicit opt-in for plaintext ports.
 

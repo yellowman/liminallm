@@ -484,12 +484,15 @@ class Settings(BaseModel):
     smtp_password: str = secret_field(
         description="SMTP password. Write-only: saved, never shown again.",
     )
-    smtp_use_tls: bool = managed_field(
-        True, description="Use TLS for SMTP",
-    )
-    smtp_allow_insecure: bool = managed_field(
-        False,
-        description="Allow plaintext SMTP when explicitly enabled",
+    smtp_security: Literal["starttls", "ssl", "none"] = managed_field(
+        "starttls",
+        description=(
+            "How the SMTP connection is encrypted. starttls: connect in the "
+            "clear and upgrade (usually port 587). ssl: encrypted from the "
+            "first byte (usually port 465). none: no encryption — for a relay "
+            "on this machine only, and refused if a username is set, because "
+            "the password would cross the wire in the clear."
+        ),
     )
     email_from_address: str | None = managed_field(
         None, description="Email from address",
@@ -766,7 +769,7 @@ class Settings(BaseModel):
     # - training_worker_enabled, training_worker_poll_interval
     #
     # SMTP / Email (all settings including secrets):
-    # - smtp_host, smtp_port, smtp_user, smtp_password, smtp_use_tls
+    # - smtp_host, smtp_port, smtp_user, smtp_password, smtp_security
     # - email_from_address, email_from_name
     #
     # URL Settings:

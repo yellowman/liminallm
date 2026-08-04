@@ -3555,12 +3555,15 @@ class PostgresStore:
         """Non-pgvector hybrid search; suitable for tests and tiny corpora only."""
 
         def _cosine(a: List[float], b: List[float]) -> float:
-            if not a or not b:
+            # Belt and braces: knowledge_chunk.embedding is VECTOR(dim) NOT
+            # NULL, so widths cannot differ in practice. If one ever did,
+            # scoring the overlapping prefix would produce a number that looks
+            # like a similarity and is not — contribute nothing instead.
+            if not a or not b or len(a) != len(b):
                 return 0.0
-            length = min(len(a), len(b))
-            dot = sum(a[i] * b[i] for i in range(length))
+            dot = sum(x * y for x, y in zip(a, b))
             norm_a = sum(x * x for x in a) ** 0.5 or 1.0
-            norm_b = sum(x * x for x in b) ** 0.5 or 1.0
+            norm_b = sum(y * y for y in b) ** 0.5 or 1.0
             return dot / (norm_a * norm_b)
 
         candidate_limit = limit or 4

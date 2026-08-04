@@ -28,8 +28,7 @@ class EmailService:
         smtp_port: int = 587,
         smtp_user: Optional[str] = None,
         smtp_password: Optional[str] = None,
-        smtp_use_tls: bool = True,
-        smtp_allow_insecure: bool = False,
+        smtp_security: str = "starttls",
         from_email: Optional[str] = None,
         from_name: str = "LiminalLM",
         base_url: Optional[str] = None,
@@ -38,8 +37,7 @@ class EmailService:
         self.smtp_port = smtp_port
         self.smtp_user = smtp_user
         self.smtp_password = smtp_password
-        self.smtp_use_tls = smtp_use_tls
-        self.smtp_allow_insecure = smtp_allow_insecure
+        self.smtp_security = smtp_security
         self.from_email = from_email or smtp_user
         self.from_name = from_name
         self.base_url = base_url or "http://localhost:8000"
@@ -77,11 +75,6 @@ class EmailService:
             )
             return True
 
-        if not self.smtp_use_tls and not self.smtp_allow_insecure:
-            logger.info("email_ssl_mode", mode="ssl", port=self.smtp_port)
-        elif self.smtp_use_tls:
-            logger.info("email_ssl_mode", mode="starttls", port=self.smtp_port)
-
         try:
             msg = MIMEMultipart("alternative")
             msg["Subject"] = subject
@@ -100,27 +93,44 @@ class EmailService:
                 "email_connecting",
                 host=self.smtp_host,
                 port=self.smtp_port,
-                use_tls=self.smtp_use_tls,
+                security=self.smtp_security,
                 to=self._redact_email(to_email),
             )
 
-            if self.smtp_use_tls:
-                with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=30) as server:
-                    server.starttls(context=context)
-                    if self.smtp_user and self.smtp_password:
-                        server.login(self.smtp_user, self.smtp_password)
-                    server.sendmail(self.from_email, to_email, msg.as_string())
-            else:
-                if not self.smtp_allow_insecure and self.smtp_port in {25, 2525}:
-                    raise ValueError(
-                        "Plaintext SMTP is disabled; enable TLS/SSL or set smtp_allow_insecure=True"
-                    )
+            def _deliver(server) -> None:
+                if self.smtp_user and self.smtp_password:
+                    server.login(self.smtp_user, self.smtp_password)
+                server.sendmail(self.from_email, to_email, msg.as_string())
+
+            if self.smtp_security == "ssl":
+                # Encrypted from the first byte; usually port 465.
                 with smtplib.SMTP_SSL(
                     self.smtp_host, self.smtp_port, context=context, timeout=30
                 ) as server:
-                    if self.smtp_user and self.smtp_password:
-                        server.login(self.smtp_user, self.smtp_password)
-                    server.sendmail(self.from_email, to_email, msg.as_string())
+                    _deliver(server)
+            elif self.smtp_security == "none":
+                # Refused with credentials rather than sending them in the
+                # clear: an operator who wants no encryption almost always
+                # means a local relay, which does not ask for a password.
+                if self.smtp_user and self.smtp_password:
+                    raise ValueError(
+                        "smtp_security='none' sends the password in the clear; "
+                        "use starttls or ssl, or clear smtp_user/smtp_password "
+                        "for an unauthenticated local relay"
+                    )
+                logger.warning(
+                    "email_unencrypted",
+                    host=self.smtp_host,
+                    port=self.smtp_port,
+                    message="SMTP without encryption; message contents cross the wire in the clear",
+                )
+                with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=30) as server:
+                    _deliver(server)
+            else:
+                # starttls: connect in the clear, then upgrade. The default.
+                with smtplib.SMTP(self.smtp_host, self.smtp_port, timeout=30) as server:
+                    server.starttls(context=context)
+                    _deliver(server)
 
             logger.info("email_sent", to=self._redact_email(to_email), subject=subject)
             return True
