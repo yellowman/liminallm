@@ -167,6 +167,9 @@ def pytest_pyfunc_call(pyfuncitem):
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "asyncio: mark test as async")
+    config.addinivalue_line(
+        "markers", "slow: spawns a subprocess or waits on a real timeout"
+    )
 
 
 def pytest_sessionfinish(session, exitstatus):
