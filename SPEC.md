@@ -1749,7 +1749,7 @@ that’s the whole point: minimal glue, maximal evolution.
 ### 17.10 auth flow
 
 - **auth panel**: shown when not authenticated; hidden after successful login.
-- **login form**: email, password, optional MFA code, optional tenant ID.
+- **login form**: email, password, optional MFA code. No tenant field — the tenant is the site you visited (§12.2), never something a user types.
 - **MFA handling**: if `mfa_required` returned without token, prompt user to enter code.
 - **token management**: access token, refresh token, session ID stored in sessionStorage.
 - **auto-refresh**: on 401 response, attempt token refresh before failing.
@@ -1797,6 +1797,7 @@ the following are treated as constants the kernel must honor; LLM edits happen o
   - password reset: `POST /v1/auth/request_reset { email }` stores a one-time token in Redis (15m TTL) and emails it; `POST /v1/auth/complete_reset { token, new_password }` rotates credentials and revokes sessions.
   - email verification: `POST /v1/auth/verify_email { token }` marks `user.meta.email_verified=true`; unverified accounts are limited to 24h and low rate limits.
   - MFA: `POST /v1/auth/mfa/enable` returns TOTP secret + QR; `POST /v1/auth/mfa/verify { code }` gates login/refresh when `user.meta.mfa_enabled=true`; 5 failed codes locks MFA for 5 minutes.
+    - TOTP is **HMAC-SHA-1, 6 digits, 30s**, with a 160-bit secret (RFC 6238 / RFC 4226 §4 R6). These are the Key Uri Format defaults, so an authenticator app assumes them whatever the `otpauth://` URI omits — the server must verify the same thing its own QR code promises. It verified SHA-256 while every app computed SHA-1, so enrolment could never complete and nothing said why. The URI now states `algorithm`, `digits` and `period` explicitly rather than relying on the defaults holding.
   - session model: short-lived access token (15–60m configurable) + refresh token (7–30d) stored HttpOnly; refresh rotation on each use; logout revokes both; login from a new device invalidates prior refresh tokens if `meta.single_session=true`.
 
 - **multi-tenant isolation & filesystem guards**

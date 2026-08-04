@@ -50,6 +50,18 @@ OAUTH_PROVIDERS = {
 
 logger = get_logger(__name__)
 
+# TOTP parameters. These are the Key Uri Format defaults, and they are what an
+# authenticator app assumes when the otpauth:// URI omits them — which is why
+# the server has to agree with them rather than pick its own. It verified
+# HMAC-SHA-256 while every app computed HMAC-SHA-1, so enrolment could never
+# complete: the user scanned the QR, typed a correct code, and was told it was
+# wrong. SHA-1 here is HMAC-SHA-1, which collision attacks on the bare hash do
+# not weaken.
+TOTP_ALGORITHM = hashlib.sha1
+TOTP_ALGORITHM_NAME = "SHA1"
+TOTP_DIGITS = 6
+TOTP_INTERVAL_SECONDS = 30
+
 
 @dataclass
 class AuthContext:
@@ -1031,10 +1043,20 @@ class AuthService:
         secret = (
             existing.secret
             if existing
-            else base64.b32encode(os.urandom(10)).decode("utf-8").rstrip("=")
+            # RFC 4226 §4 R6 wants 160 bits of shared secret for HMAC-SHA-1.
+            else base64.b32encode(os.urandom(20)).decode("utf-8").rstrip("=")
         )
         self.store.set_user_mfa_secret(user_id, secret, enabled=False)
-        uri = f"otpauth://totp/liminallm:{user_id}?secret={secret}&issuer=LiminalLM"
+        # Spell out algorithm/digits/period rather than relying on the Key Uri
+        # Format's defaults. They are the defaults, but writing them down is
+        # what makes a mismatch with _verify_totp visible instead of silent —
+        # the server verified SHA-256 against apps computing SHA-1, so nobody
+        # could complete enrolment and nothing said why.
+        uri = (
+            f"otpauth://totp/liminallm:{user_id}"
+            f"?secret={secret}&issuer=LiminalLM"
+            f"&algorithm={TOTP_ALGORITHM_NAME}&digits={TOTP_DIGITS}&period={TOTP_INTERVAL_SECONDS}"
+        )
         return {"otpauth_uri": uri}
 
     async def verify_mfa_challenge(
@@ -1256,7 +1278,7 @@ class AuthService:
         self.store.save_password(user_id, pwd_hash, algo)
 
     def _verify_totp(
-        self, secret: str, code: str, *, window: int = 0, interval: int = 30
+        self, secret: str, code: str, *, window: int = 0, interval: int = TOTP_INTERVAL_SECONDS
     ) -> bool:
         # Issue 76.3: Narrow TOTP validation window and only allow a single
         # adjacent step for minor clock skew.
@@ -1272,7 +1294,12 @@ class AuthService:
         return False
 
     def _generate_totp(
-        self, secret: str, timestamp: float, *, interval: int = 30, digits: int = 6
+        self,
+        secret: str,
+        timestamp: float,
+        *,
+        interval: int = TOTP_INTERVAL_SECONDS,
+        digits: int = TOTP_DIGITS,
     ) -> str:
         padded = secret + "=" * ((8 - len(secret) % 8) % 8)
         try:
@@ -1281,7 +1308,7 @@ class AuthService:
             self.logger.warning("totp_secret_invalid")
             return ""
         counter = int(timestamp // interval).to_bytes(8, "big")
-        digest = hmac.new(key, counter, hashlib.sha256).digest()
+        digest = hmac.new(key, counter, TOTP_ALGORITHM).digest()
         offset = digest[-1] & 0x0F
         code_int = (int.from_bytes(digest[offset : offset + 4], "big") & 0x7FFFFFFF) % (
             10**digits
