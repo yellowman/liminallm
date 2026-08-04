@@ -85,6 +85,36 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
         "required": ["kind", "base_model", "current_version"],
         "additionalProperties": True,
     },
+    # SPEC §6.1 policy.routing / §8.1. The workflow engine already reads these
+    # (list_artifacts(type_filter="policy")) and §13.4 documents the type on the
+    # list endpoint — but there was no schema here, so validate_artifact refused
+    # "unknown artifact type" and POST /v1/artifacts could not create one.
+    # Routing-as-data had no way to get its data in.
+    "policy": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "kind": {"const": "policy.routing"},
+            "name": {"type": "string"},
+            "description": {"type": "string"},
+            "rules": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        # The condition the sandboxed evaluator runs (§8.1).
+                        "when": {"type": "string"},
+                        "action": {"type": "object"},
+                    },
+                    "required": ["when", "action"],
+                    "additionalProperties": True,
+                },
+            },
+        },
+        "required": ["kind", "rules"],
+        "additionalProperties": True,
+    },
     "artifact": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",

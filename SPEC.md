@@ -249,7 +249,7 @@ CREATE UNIQUE INDEX ON artifact_version (artifact_id, version);
 
 - `adapter.lora` (LoRA adapter metadata)
 - `workflow.chat` (graph-based workflow)
-- `policy.routing` (routing policy)
+- `policy.routing` (routing policy; artifact type `policy`, validated like the other kinds — it had no schema entry, so `POST /v1/artifacts {type: "policy"}` answered "unknown artifact type" and routing-as-data had no way to get its data in)
 - `tool.spec` (declarative tool definitions)
 - `memory.summary` (long-term memory summaries)
 - `context.knowledge` (knowledge/RAG context definitions)

@@ -238,8 +238,14 @@ class ConfigOpsService:
         if not action or not path:
             return
         segments = [seg for seg in path.strip("/").split("/") if seg]
+        if not segments:
+            # "/" addresses the whole document. Treating it as a key wrote an
+            # empty-string entry into the schema and reported success.
+            raise BadRequestError(
+                "patch path addresses the document root", detail={"path": path}
+            )
         parent = doc
-        for seg in segments[:-1]:
+        for depth, seg in enumerate(segments[:-1]):
             if isinstance(parent, list):
                 try:
                     idx = int(seg)
@@ -249,9 +255,35 @@ class ConfigOpsService:
                 while len(parent) <= idx:
                     parent.append({})
                 parent = parent[idx]
-            else:
+            elif isinstance(parent, dict):
                 parent = parent.setdefault(seg, {})
-        key = segments[-1] if segments else ""
+            else:
+                # The path runs through a scalar — /a/b where a is a string.
+                # This used to fall through to `parent[key] = value` and raise a
+                # bare TypeError, which the API turned into a 500. Patch bodies
+                # are model-authored, so this shape arrives routinely and the
+                # admin reviewing the proposal should be told which path is
+                # wrong.
+                raise BadRequestError(
+                    "patch path traverses a non-container value",
+                    detail={
+                        "path": path,
+                        "at": "/" + "/".join(segments[: depth + 1]),
+                        "found": type(parent).__name__,
+                    },
+                )
+        key = segments[-1]
+        if not isinstance(parent, (dict, list)):
+            # The final step landed on a scalar too: /a/b where a is a string
+            # walks the loop zero times and lands here.
+            raise BadRequestError(
+                "patch path traverses a non-container value",
+                detail={
+                    "path": path,
+                    "at": "/" + "/".join(segments[:-1]),
+                    "found": type(parent).__name__,
+                },
+            )
         if action == "add" or action == "replace":
             if isinstance(parent, list):
                 if key == "-":
