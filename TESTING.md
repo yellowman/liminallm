@@ -28,6 +28,18 @@ fallback looks exactly like success.
 Point at existing services with `TEST_DATABASE_URL` / `TEST_REDIS_URL` (CI
 service containers, or a local pair).
 
+### Coverage under-reports the extractor
+
+`service/extract.py` parses uploads in a spawned child process, because the
+parsers behind it (Pillow, pypdf, expat, tesseract, poppler) are treated as
+compromisable. `coverage.py` runs in the parent and cannot see the child, so
+`extract.py` reads around 33% while `tests/test_extract.py` is driving real
+PDFs, docx files, OCR and decompression bombs through it end to end.
+
+Wiring subprocess coverage through pytest-cov needs `parallel = true` plus a
+combine step, which litters `.coverage.*` files and clobbers the parent's data
+more often than it merges it. Not worth it: read the tests, not the number.
+
 Or with pytest directly:
 
 ```bash
