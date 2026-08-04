@@ -1,7 +1,7 @@
 import uuid
 
 from liminallm.service.rag import RAGService
-from tests.pgharness import get_test_store
+from tests.harness import get_test_store
 from liminallm.storage.models import KnowledgeChunk, KnowledgeContext, User
 
 

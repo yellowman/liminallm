@@ -9,26 +9,54 @@ from pathlib import Path
 _test_tmp_dir = tempfile.mkdtemp(prefix="liminallm_test_")
 os.environ.setdefault("SHARED_FS_ROOT", _test_tmp_dir)
 os.environ.setdefault("TEST_MODE", "true")
-# Tests run against a real Postgres. See tests/pgharness.py: the in-memory
+# Tests run against a real Postgres. See tests/harness.py: the in-memory
 # store used to double the storage layer, so every storage feature was written
 # twice and verified once — and the untested half was the one production runs.
 os.environ.setdefault("EMBEDDING_VECTOR_DIM", "64")  # matches the hash encoder
 os.environ.setdefault("ALLOW_REDIS_FALLBACK_DEV", "true")
 os.environ.setdefault("JWT_SECRET", "Test-Secret-Key-4-Testing-Only-Do-Not-Use-In-Production!")
-# Tests use the same async RedisCache production does. A second, synchronous
-# implementation used to exist for the test suite; it silently drifted eight
-# methods behind and broke the attachment agent whenever Redis was present.
-# Falls back to in-process state if Redis is absent (ALLOW_REDIS_FALLBACK_DEV).
-os.environ.setdefault("REDIS_URL", "redis://localhost:6379/1")
-
 import pytest  # noqa: E402
 
-from tests.pgharness import (  # noqa: E402
+from tests.harness import (  # noqa: E402
     ScratchPostgres,
+    ScratchRedis,
     apply_schema,
     close_test_store,
     get_test_store,
 )
+
+# Tests use the same async RedisCache production does, against a real
+# redis-server. A second, synchronous implementation used to exist for the
+# suite alone; it drifted eight methods behind and broke the attachment agent
+# the moment Redis was present. Running without Redis has the same shape of
+# problem one layer down — rate limits, idempotency, the session cache and the
+# concurrency slots all take their fallback path, so the code production runs
+# is the code the suite does not.
+_REDIS = None
+_redis_url = os.environ.get("TEST_REDIS_URL")
+if not _redis_url:
+    _REDIS = ScratchRedis()
+    if _REDIS.available:
+        _redis_url = _REDIS.start()
+    else:
+        # No redis-server here. The suite still runs on the documented
+        # fallback, which is what a Redis outage does in production — but say
+        # so, because a green run then means less than it looks like.
+        _REDIS = None
+        print("redis-server not found: running on the in-process fallback")
+if _redis_url:
+    # redis_url is a database-managed setting with no environment variable of
+    # its own, so exporting REDIS_URL does nothing — which is what conftest
+    # used to do, and why the suite ran on the fallback while looking
+    # configured. Move the *default* instead of storing a value: seeding
+    # through INSTANCE_SETTINGS_JSON would spend the instance's one first boot,
+    # and writing a row would make every "has an operator configured anything"
+    # check answer yes.
+    from liminallm.config import SYSTEM_SETTINGS_DEFAULTS, Settings  # noqa: E402
+
+    Settings.model_fields["redis_url"].default = _redis_url
+    Settings.model_rebuild(force=True)
+    SYSTEM_SETTINGS_DEFAULTS["redis_url"] = _redis_url
 
 _PG = None
 if not os.environ.get("TEST_DATABASE_URL"):
@@ -145,3 +173,5 @@ def pytest_sessionfinish(session, exitstatus):
     close_test_store()
     if _PG is not None:
         _PG.stop()
+    if _REDIS is not None:
+        _REDIS.stop()

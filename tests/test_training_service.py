@@ -1,5 +1,5 @@
 from liminallm.service.training import TrainingService
-from tests.pgharness import get_test_store
+from tests.harness import get_test_store
 
 
 def _create_user_and_conversation(store: "PostgresStore", suffix: str = ""):

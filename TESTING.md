@@ -6,13 +6,27 @@ This document describes how to set up and run tests for LiminalLM.
 
 ### Running the suite
 
-The suite starts its own throwaway Postgres cluster (`tests/pgharness.py`)
-and applies `sql/schema.sql` to it, so tests exercise the same store
-production runs. Nothing to set up:
+The suite starts its own throwaway Postgres **and Redis**
+(`tests/harness.py`) and applies `sql/schema.sql`, so tests exercise the same
+store and the same cache production runs. Nothing to set up:
 
 ```bash
 ./scripts/run_tests.sh
 ```
+
+Both services are real on purpose. An in-memory store used to double the
+storage layer, so every storage feature was written twice and verified once —
+and the untested half was the one production ran. Running without Redis is the
+same problem one layer down: rate limits, idempotency, the session cache and
+the concurrency slots all take their fallback path, so a green suite says
+nothing about the code that actually serves traffic.
+
+`tests/test_harness_runs_the_real_thing.py` asserts both are connected. If
+`redis-server` is missing those tests skip rather than pass, because a silent
+fallback looks exactly like success.
+
+Point at existing services with `TEST_DATABASE_URL` / `TEST_REDIS_URL` (CI
+service containers, or a local pair).
 
 Or with pytest directly:
 

@@ -105,7 +105,7 @@ def _worker(store, embeddings, **kw):
 
 
 async def test_sweep_reembeds_stale_and_missing_vectors(tmp_path):
-    from tests.pgharness import get_test_store
+    from tests.harness import get_test_store
 
     store = get_test_store()
     user = store.create_user(email="sweep@example.com", role="user")
@@ -126,7 +126,7 @@ async def test_sweep_reembeds_stale_and_missing_vectors(tmp_path):
 
 async def test_sweep_is_a_noop_without_a_real_encoder(tmp_path):
     from liminallm.service.embeddings import EmbeddingsService
-    from tests.pgharness import get_test_store
+    from tests.harness import get_test_store
 
     store = get_test_store()
     worker = _worker(store, EmbeddingsService("hash"))  # is_semantic False
@@ -137,7 +137,7 @@ async def test_sweep_is_a_noop_without_a_real_encoder(tmp_path):
 
 async def test_sweep_is_leader_locked(tmp_path):
     from liminallm.service.replication import AdvisoryLock
-    from tests.pgharness import get_test_store
+    from tests.harness import get_test_store
 
     store = get_test_store()
     user = store.create_user(email="lock@example.com", role="user")
@@ -152,7 +152,7 @@ async def test_sweep_is_leader_locked(tmp_path):
 
 
 async def test_provider_failure_stops_the_pass_without_losing_progress(tmp_path):
-    from tests.pgharness import get_test_store
+    from tests.harness import get_test_store
 
     store = get_test_store()
     user = store.create_user(email="fail@example.com", role="user")

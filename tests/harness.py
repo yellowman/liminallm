@@ -1,14 +1,22 @@
-"""Start a throwaway Postgres for the test suite.
+"""Throwaway Postgres and Redis for the test suite.
 
-Tests run against the real store, not a stand-in. The in-memory store used to
-double the storage layer so the suite could avoid a database; that meant every
-storage feature was written twice and verified once, and the version that
-production actually runs was the untested one. A scratch cluster costs a few
-seconds at session start and removes the whole class of "passes in tests,
-breaks in Postgres".
+Tests run against the real thing, not a stand-in, for both. The reasoning is
+the same each time and the suite has been bitten by it twice:
 
-Set ``TEST_DATABASE_URL`` to point at an existing database instead (CI with a
-service container, or a developer's local Postgres).
+* the in-memory store doubled the storage layer, so every storage feature was
+  written twice and verified once — and the untested half was the one
+  production runs. Removing it surfaced three Postgres-only bugs, including
+  preference recording that had never worked;
+* a synchronous Redis client existed for the tests alone. It drifted eight
+  methods behind the real one and broke the attachment agent the moment Redis
+  was present. It was only caught by starting a real ``redis-server``.
+
+So the suite starts both. Redis is what rate limits, idempotency, the session
+cache and the concurrency slots actually run on; without it the fallbacks were
+exercised and the production path was not (24% covered).
+
+Set ``TEST_DATABASE_URL`` or ``TEST_REDIS_URL`` to point at existing services
+instead — CI with service containers, or a developer's local pair.
 """
 
 from __future__ import annotations
@@ -18,15 +26,16 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 _PG_BIN_CANDIDATES = ("/usr/lib/postgresql/16/bin", "/usr/lib/postgresql/15/bin")
 
 
-def _free_port() -> int:
+def _free_port(env_override: str | None = None) -> int:
     """A port the kernel just handed out is one no other run is holding."""
-    if os.environ.get("TEST_PG_PORT"):
-        return int(os.environ["TEST_PG_PORT"])
+    if env_override and os.environ.get(env_override):
+        return int(os.environ[env_override])
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return sock.getsockname()[1]
@@ -47,7 +56,7 @@ class ScratchPostgres:
     def __init__(self) -> None:
         self.datadir: str | None = None
         self.url: str | None = None
-        self.port = _free_port()
+        self.port = _free_port("TEST_PG_PORT")
         self._bin = _pg_bin()
 
     @property
@@ -85,6 +94,51 @@ class ScratchPostgres:
             command, shell=True, check=check,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
         )
+
+
+class ScratchRedis:
+    """A redis-server on a free port, torn down with the session.
+
+    ``--save ''`` because nothing here outlives the run, and a background
+    rewrite during a test is noise. If redis-server is missing the suite still
+    runs: ``available`` is False and the code takes its documented fallback,
+    which is the same thing a Redis outage does in production.
+    """
+
+    def __init__(self) -> None:
+        self.port = _free_port("TEST_REDIS_PORT")
+        self.url = f"redis://127.0.0.1:{self.port}/0"
+        self._proc: subprocess.Popen | None = None
+        self._bin = shutil.which("redis-server")
+
+    @property
+    def available(self) -> bool:
+        return self._bin is not None
+
+    def start(self) -> str:
+        assert self._bin
+        self._proc = subprocess.Popen(
+            [self._bin, "--port", str(self.port), "--bind", "127.0.0.1",
+             "--save", "", "--appendonly", "no"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            with socket.socket() as probe:
+                probe.settimeout(0.2)
+                if probe.connect_ex(("127.0.0.1", self.port)) == 0:
+                    return self.url
+            time.sleep(0.05)
+        raise RuntimeError(f"redis-server did not accept connections on {self.port}")
+
+    def stop(self) -> None:
+        if self._proc is not None:
+            self._proc.terminate()
+            try:
+                self._proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                self._proc.kill()
+            self._proc = None
 
 
 _STORE = None

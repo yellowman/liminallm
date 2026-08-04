@@ -7,7 +7,7 @@ import pytest
 
 from liminallm.service.clustering import SemanticClusterer
 from liminallm.service.training import TrainingService
-from tests.pgharness import get_test_store
+from tests.harness import get_test_store
 
 
 def _seed_user_with_events(store, email, cluster_id, n_events, corrected="use tabs"):

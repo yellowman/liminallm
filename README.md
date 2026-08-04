@@ -327,7 +327,7 @@ Run the automated smoke test:
 
 ### tests
 
-- Run `scripts/run_tests.sh` to mirror CI defaults; it compiles the code and executes `pytest`. the suite spins up a throwaway postgres cluster (`tests/pgharness.py`) and applies `sql/schema.sql` to it, so tests exercise the same store production runs — set `TEST_DATABASE_URL` to point at an existing database instead.
+- Run `scripts/run_tests.sh` to mirror CI defaults; it compiles the code and executes `pytest`. the suite spins up a throwaway postgres cluster and a throwaway redis (`tests/harness.py`) and applies `sql/schema.sql`, so tests exercise the same store and cache production runs — set `TEST_DATABASE_URL` / `TEST_REDIS_URL` to point at existing services instead.
 
 ### adapters: local LoRA vs remote fine-tune IDs vs prompt-distilled
 

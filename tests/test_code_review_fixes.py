@@ -105,7 +105,7 @@ class TestTokenBasedRAGChunking:
     def test_chunking_creates_overlap(self):
         """Chunks should have overlapping tokens."""
         from liminallm.service.rag import RAGService
-        from tests.pgharness import get_test_store
+        from tests.harness import get_test_store
 
         store = get_test_store()
         rag = RAGService(store, default_chunk_size=50, rag_mode="memory")
@@ -136,7 +136,7 @@ class TestTokenBasedRAGChunking:
     def test_chunk_metadata_includes_token_info(self):
         """Chunks should have token count metadata."""
         from liminallm.service.rag import RAGService
-        from tests.pgharness import get_test_store
+        from tests.harness import get_test_store
 
         store = get_test_store()
         rag = RAGService(store, default_chunk_size=100, rag_mode="memory")

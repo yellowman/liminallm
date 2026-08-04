@@ -6,7 +6,7 @@ import pytest
 
 from liminallm.config import AdapterMode, get_compatible_adapter_modes
 from liminallm.service.training import TrainingService
-from tests.pgharness import get_test_store
+from tests.harness import get_test_store
 
 # ==============================================================================
 # TrainingService Initialization Tests
