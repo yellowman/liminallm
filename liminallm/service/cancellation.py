@@ -1,12 +1,8 @@
-"""Cancelling an in-flight streaming request, wherever in the cluster it runs.
+"""Cancelling an in-flight stream, wherever in the cluster it runs.
 
-The cancel event is an ``asyncio.Event`` living in the process that holds that
-request's WebSocket, so a multi-replica deployment can only stop 1/N of streams
-locally. When a request is unknown here we ask the peers over the cluster bus
-and return the owner's verdict; silence means no replica owns it.
-
-This is process-global mutable state, which is why it is a module and not a
-handful of helpers at the top of the HTTP layer.
+The cancel event lives in the process holding that request's WebSocket, so a
+replica can only stop its own streams locally. Unknown requests are put to the
+peers over the cluster bus; silence means no replica owns it.
 """
 
 from __future__ import annotations
@@ -39,11 +35,8 @@ def _get_active_requests_lock() -> asyncio.Lock:
 
 
 async def _cleanup_stale() -> int:
-    """Drop entries whose request died without unregistering.
-
-    Runs at most every five minutes, piggybacked on register/unregister, so the
-    registry cannot grow without bound.
-    """
+    """Drop entries whose request died without unregistering. Runs at most
+    every five minutes, so the registry cannot grow without bound."""
     global _active_requests_last_cleanup
     now = datetime.now(timezone.utc)
     if (now - _active_requests_last_cleanup).total_seconds() < 300:
@@ -88,11 +81,9 @@ async def unregister(request_id: str) -> None:
 
 
 async def cancel(request_id: str, user_id: str) -> tuple[bool, str]:
-    """Cancel a request here, or ask the replica that owns it.
-
-    Returns ``(cancelled, reason)`` where reason is one of ``cancelled``,
-    ``already_cancelled``, ``not_owner`` or ``request_not_found``.
-    """
+    """Cancel here, or ask the replica that owns it. Returns
+    ``(cancelled, reason)``: cancelled / already_cancelled / not_owner /
+    request_not_found."""
     cancelled, reason = await cancel_local(request_id, user_id)
     if reason != "request_not_found":
         return cancelled, reason
@@ -143,14 +134,11 @@ async def _cancel_remote(request_id: str, user_id: str) -> tuple[bool, str]:
 
 
 async def handle_remote_cancel(data: dict) -> Optional[dict]:
-    """Cluster-bus handler: cancel locally, or stay silent if we don't own it.
+    """Cluster-bus handler: cancel locally, or stay silent if we don't own it,
+    so the asker can tell a verdict from "nobody has it".
 
-    Only the owning replica answers, so the asking replica can distinguish
-    "cancelled" / "not_owner" / "already_cancelled" from "nobody has it".
-
-    The user_id in the frame was authenticated by the peer replica that took
-    the request; ownership is still re-checked here, so the trust boundary is
-    the coordination datastore (Redis/Postgres), not the caller.
+    Ownership is re-checked here even though the peer authenticated the
+    user_id, so the trust boundary is the coordination datastore, not a caller.
     """
     request_id = str(data.get("request_id") or "")
     user_id = str(data.get("user_id") or "")

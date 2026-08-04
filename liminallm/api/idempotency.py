@@ -1,9 +1,8 @@
 """Replaying a completed request instead of repeating its side effects.
 
-A client retrying a POST with the same Idempotency-Key gets the original
-response back rather than a second charge, a second upload, or a second turn.
-The slot is claimed atomically (SETNX), so two concurrent retries cannot both
-start work — the loser gets a 409 while the winner is still in flight.
+A retry with the same Idempotency-Key gets the original response back, not a
+second upload or a second turn. The slot is claimed atomically, so concurrent
+retries cannot both start work — the loser gets a 409.
 """
 
 from __future__ import annotations
@@ -30,11 +29,8 @@ async def resolve(
     require: bool = False,
     request_id: Optional[str] = None,
 ) -> tuple[str, Optional[Envelope]]:
-    """Claim the slot, or return the completed response to replay.
-
-    Returns ``(request_id, cached_envelope)``. A cached envelope means the work
-    is already done and must not be repeated.
-    """
+    """Claim the slot, or return the completed response to replay. A cached
+    envelope means the work is done and must not be repeated."""
     request_id = request_id or str(uuid4())
     runtime = get_runtime()
     if not idempotency_key:
@@ -108,9 +104,9 @@ async def store(
 class IdempotencyGuard:
     """Scope a request to its idempotency slot.
 
-    On entry the slot is claimed (or a completed result surfaces as
-    ``.cached``); on an exception the failure is recorded so a retry is allowed
-    rather than deadlocked behind an "in progress" record that never resolves.
+    Entry claims it, or surfaces a completed result as ``.cached``. An
+    exception records the failure, so a retry is not deadlocked behind an
+    "in progress" record that never resolves.
     """
 
     def __init__(
@@ -159,8 +155,7 @@ class IdempotencyGuard:
     async def store_result(
         self, envelope: Envelope, *, status: str = "completed"
     ) -> None:
-        """Record the response. Only a final status closes the slot — an
-        intermediate one like "processing" still allows error recording."""
+        """Record the response. Only a final status closes the slot."""
         await store(
             self.route, self.user_id, self.idempotency_key, envelope, status=status
         )

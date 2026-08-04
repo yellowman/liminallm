@@ -1,18 +1,9 @@
 """The suite talks to real services, and says so when it cannot.
 
-This file exists because "green" has twice meant less than it looked like:
-
-* the in-memory store doubled the storage layer, so every storage feature was
-  written twice and verified once — removing it surfaced three Postgres-only
-  bugs, including preference recording that had never worked;
-* the suite ran with no Redis while production runs with it, so rate limits,
-  idempotency, the session cache and the concurrency slots all took their
-  fallback path. redis_cache.py sat at 24% covered and a synchronous client
-  written for the tests alone drifted eight methods behind the real one.
-
-A silent fall back to the in-process path is the failure mode, because it looks
-identical to success. If Redis is genuinely unavailable these skip rather than
-fail — but they never pass quietly on the fallback.
+"Green" has twice meant less than it looked like: an in-memory store that hid
+three Postgres-only bugs, and a suite running without Redis while production
+runs with it. A silent fall back to the in-process path looks identical to
+success, so these skip when Redis is absent rather than passing quietly.
 """
 
 from __future__ import annotations
@@ -38,7 +29,6 @@ def test_the_store_is_the_one_production_runs():
 
 
 def test_redis_is_actually_connected():
-    """runtime.cache is None whenever the fallback is in play."""
     if not _redis_expected():
         pytest.skip("no redis-server available in this environment")
     cache = get_runtime().cache
@@ -59,7 +49,6 @@ def test_redis_is_the_async_client_production_uses():
 
 @pytest.mark.asyncio
 async def test_a_rate_limit_round_trips_through_redis():
-    """Not a mock: the token bucket is a Lua script on the server."""
     if not _redis_expected():
         pytest.skip("no redis-server available in this environment")
     runtime = get_runtime()

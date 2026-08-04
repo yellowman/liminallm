@@ -1,10 +1,9 @@
 """Named rate-limit policies.
 
 An endpoint names a policy instead of restating the settings lookup, the window
-and the key format — the same six lines appeared fifty-seven times, and a
-paragraph repeated that often is one an endpoint can be written without. Naming
-it also means "this route is unlimited" is a visible choice rather than an
-omission, which is how seventeen unlimited routes went unnoticed.
+and the key format — six lines that appeared fifty-seven times, and which an
+endpoint therefore got written without. Naming them also makes "unlimited" a
+visible choice; seventeen routes were unlimited by omission.
 """
 
 from __future__ import annotations
@@ -56,11 +55,8 @@ class RateLimitInfo:
 
 
 def client_ip(request: Optional[Request]) -> str:
-    """Best-effort client IP for keying unauthenticated limits.
-
-    Prevents a single client from exhausting a globally-shared limit (password
-    reset, email verification, OAuth) for every other user on the platform.
-    """
+    """Best-effort client IP, so one caller cannot exhaust a shared limit
+    (password reset, email verification, OAuth) for everyone else."""
     if request is None or request.client is None:
         return "unknown"
     return request.client.host
@@ -94,11 +90,8 @@ async def rate_limit(
     response: Optional[Response] = None,
     cost: int = 1,
 ) -> RateLimitInfo:
-    """Apply a named policy to a subject.
-
-    ``subject`` is whatever the limit is per: usually principal.user_id, but an
-    email for signup and an address for anonymous flows.
-    """
+    """Apply a named policy to a subject — usually principal.user_id, but an
+    email for signup and an address for anonymous flows."""
     limit_attr, window = RATE_POLICIES[policy]
     window_seconds = (
         window if isinstance(window, int) else getattr(runtime.settings, window)

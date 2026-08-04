@@ -1,14 +1,11 @@
-"""Per-user concurrency caps for expensive work.
+"""Per-user concurrency caps (SPEC §18), named in one place.
 
-One place that knows which slots a chat turn takes. It used to be two: the HTTP
-route took a workflow slot and an inference slot, the WebSocket route took a
-websocket slot and a workflow slot and never took the inference slot at all —
-so ``max_concurrent_inference`` was enforced only on the path the UI does not
-use. Naming the set of slots once is what stops that from recurring.
+They were named in two, and the two disagreed: the WebSocket path never took
+the inference slot, so ``max_concurrent_inference`` applied only to the
+endpoint the UI does not use.
 
-Without Redis there is nowhere to count across replicas, so every acquire
-succeeds. That is deliberate: the cap is a fairness control, not a correctness
-one, and failing closed would make Redis load-bearing for serving traffic.
+Without Redis there is nowhere to count, so every acquire succeeds. The cap is
+a fairness control; failing closed would make Redis load-bearing.
 """
 
 from __future__ import annotations
@@ -56,12 +53,8 @@ async def release(runtime, kind: str, user_id: str) -> None:
 
 @contextlib.asynccontextmanager
 async def slots(runtime, user_id: str, *kinds: str) -> AsyncIterator[None]:
-    """Hold several slots for the duration of a block.
-
-    Acquires in order and releases everything actually taken, including when a
-    later acquire is the thing that fails — the leak that made hand-rolled
-    acquire/release pairs worth replacing.
-    """
+    """Hold several slots for a block, releasing everything actually taken —
+    including when a later acquire is what fails."""
     taken: list[str] = []
     try:
         for kind in kinds:

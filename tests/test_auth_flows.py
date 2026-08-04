@@ -1,14 +1,8 @@
-"""Every way in, other than email and password.
+"""Every way in other than email and password: OAuth, MFA, reset, verification.
 
-auth.py was 41% covered and the uncovered half was all of it: OAuth sign-in,
-MFA verification and lockout, password reset completion, email verification,
-session rotation. Five test files mentioned MFA; none called
-verify_mfa_challenge. Two mentioned OAuth; none reached complete_oauth.
-
-These drive the real service against the real store and a real Redis, because
-the branches that matter here are the Redis ones — the MFA lockout and the
-reset/verification tokens are atomic cache operations, and the in-memory
-fallback beside them is a different implementation.
+Against the real service, store and Redis — the MFA lockout and the reset
+tokens are atomic cache operations, and the fallback beside them is a
+different implementation.
 """
 
 from __future__ import annotations

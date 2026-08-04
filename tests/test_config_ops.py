@@ -1,13 +1,7 @@
-"""ConfigOps: the model proposing edits to its own configuration.
+"""ConfigOps: the model proposing edits to its own configuration (SPEC §10).
 
-config_ops.py was 18% covered, the lowest in the codebase, while being the
-write path for SPEC §10 "LLM as architect" — the model proposes a patch, an
-admin approves it, and it rewrites an artifact's schema into a new version.
-
-Two things make the gap matter. The patch body is model-authored, so malformed
-shapes are the normal case rather than the exceptional one; and approval is the
-only thing between a proposal and a live config change, so the status check is
-a security control, not bookkeeping.
+The patch body is model-authored, so malformed shapes are the normal case; and
+approval is the only thing between a proposal and a live config change.
 """
 
 from __future__ import annotations
@@ -57,7 +51,6 @@ def _propose(store, artifact, patch):
 
 
 def test_a_pending_patch_cannot_be_applied(ops, store, artifact):
-    """The whole point of the flow: nothing reaches an artifact unapproved."""
     patch = _propose(store, artifact, {"ops": []})
     with pytest.raises(BadRequestError, match="approved"):
         ops.apply_patch(patch.id)

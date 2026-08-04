@@ -1,14 +1,10 @@
 """What happens after a chat turn is already on its way to the user.
 
-Labelling the turn, titling a new conversation, backfilling message embeddings
-and folding old turns into a digest are all off the hot path: scheduled once the
-reply is sent, failures logged and dropped. None of them affect correctness —
-a missing label or digest costs precision, and the recent window is always sent
-verbatim.
+Turn labels, conversation titles, embedding backfill and the rolling digest all
+run off the hot path, failures logged and dropped: a missing one costs
+precision, never correctness, since the recent window is always sent verbatim.
 
-This lives in the service layer because both chat transports need it. When it
-was four helpers inside the HTTP module, each transport had to remember to call
-each one, and remembering separately is how they drift.
+Both transports call ``schedule_all``, so neither can remember only half of it.
 """
 
 from __future__ import annotations
@@ -28,11 +24,8 @@ _EMBED_BACKFILL_PER_PASS = 30
 
 
 def _spawn(coro) -> None:
-    """Run a coroutine in the background, or drop it if there is no loop.
-
-    A sync test context has no running loop; background polish is exactly the
-    thing that should be skipped there rather than raising.
-    """
+    """Run a coroutine in the background, or drop it where there is no loop —
+    a sync context should skip background polish rather than raise."""
     try:
         task = asyncio.create_task(coro)
     except RuntimeError:
@@ -85,11 +78,9 @@ def schedule_turn_labels(
 
 
 def backfill_message_embeddings(runtime, history, user_id: str) -> None:
-    """Persist per-turn embeddings for semantic recall.
-
-    A real encoder only; skips turns already embedded; bounded so one pass
-    cannot stall on a huge backlog (the next turn's pass continues it).
-    """
+    """Persist per-turn embeddings for semantic recall. Real encoder only,
+    skips what is already embedded, bounded so one pass cannot stall on a
+    backlog — the next turn continues it."""
     embeddings = getattr(runtime, "embeddings", None)
     if embeddings is None or not getattr(embeddings, "is_semantic", False):
         return
@@ -188,10 +179,7 @@ def schedule_all(
     assistant_content: str,
     set_title: bool,
 ) -> None:
-    """Everything a finished turn owes, in one call.
-
-    Both chat transports call this, so neither can forget half of it.
-    """
+    """Everything a finished turn owes, in one call."""
     schedule_turn_labels(
         runtime,
         conversation_id=conversation_id,

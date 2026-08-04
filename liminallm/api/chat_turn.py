@@ -1,27 +1,15 @@
 """One chat turn, independent of the transport that carried it.
 
-POST /chat and the /chat/stream WebSocket differ in exactly one thing: how the
-assistant's reply reaches the client. Everything around that — resolving or
-creating the conversation, checking the caller owns the context, transcribing
-voice, persisting both messages, scheduling the post-turn work, warming the
-workflow cache — is the same turn, and was written twice.
+POST /chat and the /chat/stream WebSocket differ only in how the reply reaches
+the client. Everything else — resolving the conversation, checking context
+ownership, transcribing voice, persisting both messages, scheduling the
+post-turn work, warming the cache — is the same turn, and was written twice.
+Three things had already drifted, all silently: the socket never warmed the
+cache, its non-streaming branch scheduled nothing, and a conversation it
+created never recorded its ``active_context_id``.
 
-Twice meant drift, and the drift was silent:
-
-  - the WebSocket path never warmed the conversation cache, so the cache was
-    populated only by the endpoint the UI does not use;
-  - its non-streaming branch scheduled no turn effects at all, so a client
-    sending ``{"stream": false}`` got no turn label, no conversation title, no
-    digest and no embedding backfill;
-  - a conversation created over the WebSocket never recorded its
-    ``active_context_id``, so the context applied to that turn and silently
-    dropped on the next one.
-
-None of those raise. They just quietly do less.
-
-This is API-layer, not service-layer: both callers are transports, and the
-ownership checks are HTTP concerns (403 vs 404), so raising HTTPException here
-is the right shape rather than a layering leak.
+API-layer rather than service-layer: both callers are transports, and the
+ownership checks are HTTP concerns, so raising HTTPException here fits.
 """
 
 from __future__ import annotations
@@ -50,8 +38,8 @@ class Turn:
     workflow_id: Optional[str]
     user_content: str
     user_message: Any
-    #: True when this turn created the conversation, so it still needs a
-    #: model-written title to replace the placeholder.
+    #: This turn created the conversation, so a model-written title is still
+    #: owed to replace the placeholder.
     needs_title: bool
     orchestration: dict[str, Any] = field(default_factory=dict)
 
@@ -75,9 +63,8 @@ async def begin(
 ) -> Turn:
     """Resolve the conversation and context, then persist the user's message.
 
-    ``owned_conversation`` and ``owned_context`` are the caller's ownership
-    checks, passed in so this module does not import the route helpers it is
-    called from.
+    The ownership checks are passed in so this module need not import the
+    route helpers that call it.
     """
     requested_conversation_id = conversation_id
     validated_context_id: Optional[str] = None
@@ -144,8 +131,8 @@ async def _transcribe(runtime, payload: str, user_id: str) -> tuple[str, dict]:
 async def finish(runtime, turn: Turn, orchestration: Any, *, content: str = "") -> Any:
     """Persist the reply, schedule the post-turn work, warm the cache.
 
-    ``content`` overrides the orchestration's content, for the streaming path
-    where the reply was assembled from token events.
+    ``content`` is the streaming path's token-assembled reply, used when the
+    orchestration carries none.
     """
     turn.orchestration = orchestration if isinstance(orchestration, dict) else {}
     assistant_content = turn.orchestration.get(

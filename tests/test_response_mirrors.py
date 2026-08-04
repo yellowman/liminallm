@@ -1,17 +1,9 @@
 """Response schemas that mirror a storage model stay in step with it.
 
-Three API schemas are field-for-field copies of a storage dataclass. They were
-built by restating every field at each call site — ten such mappings — and had
-already drifted: GET /me reported `tenant_id or "global"` while the admin user
-listing reported the stored value, for the same user.
-
-They are now built with `model_validate(obj)`, which fixes the restating but
-introduces a quieter failure: add a field to the storage model and the mirror
-simply does not carry it. Nothing raises; the field is just missing from the
-API. This test is what makes that loud.
-
-A mirror is allowed to diverge — but only on purpose, by being listed here with
-the reason.
+Built with `model_validate(obj)` rather than restated field by field, which
+trades a drift that already happened (/me reported `tenant_id or "global"`)
+for a quieter one: add a field to the model and the mirror silently omits it.
+Divergence is allowed, but only by being listed in MIRRORS with a reason.
 """
 
 from __future__ import annotations

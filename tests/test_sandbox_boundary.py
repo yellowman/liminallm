@@ -1,16 +1,10 @@
 """The sandbox, driven the way an attacker would drive it.
 
-sandbox.py was 51% covered while being the boundary against three things the
-system deliberately lets in: expressions the model writes into routing policies
-and workflow conditions, files a user uploads, and hostnames a tool is asked to
-fetch. Each of those is attacker-influenced by design, so a gap here is not a
-missing unit test — it is an unexercised control.
-
-The expression evaluator is the sharpest edge. Routing policies are `artifact`
-rows the LLM can propose edits to (§10), so the string reaching safe_eval_expr
-is model-authored, and the model can be steered by anything in the context
-window. `ast.Attribute` being unsupported is the single line standing between
-that and `().__class__.__bases__[0].__subclasses__()`.
+It guards three attacker-influenced inputs: expressions the model writes into
+routing policies, files a user uploads, and hosts a tool is asked to fetch.
+The evaluator is the sharpest edge — policies are artifacts the LLM proposes
+edits to (SPEC §10), and `ast.Attribute` being unsupported is the one line
+between that and `().__class__.__bases__[0].__subclasses__()`.
 """
 
 from __future__ import annotations
@@ -66,7 +60,6 @@ ESCAPES = [
 
 @pytest.mark.parametrize("expr", ESCAPES, ids=lambda e: e[:34])
 def test_an_escape_attempt_is_refused(expr):
-    """Every one of these is a way out if the node allowlist slips."""
     with pytest.raises(ValueError):
         safe_eval_expr(expr, {"x": "s", "y": 1})
 
@@ -216,7 +209,6 @@ def egress_policy():
 
 
 def test_no_policy_means_no_enforcement(egress_policy):
-    """Outside a tool call there is nothing to restrict."""
     _NETWORK_POLICY_STATE.policy = None
     _enforce_network_allowlist("anywhere.example.com")  # must not raise
 

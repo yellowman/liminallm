@@ -1,7 +1,7 @@
-"""Building the SPEC §18 error envelope as an exception.
+"""The SPEC §18 error envelope, as an exception.
 
-Separate from ``error_handling`` (which installs the handlers that render it)
-so the modules that raise errors don't have to import the FastAPI app wiring.
+Separate from ``error_handling`` (which renders it) so modules that raise
+errors need not import the app wiring.
 """
 
 from __future__ import annotations

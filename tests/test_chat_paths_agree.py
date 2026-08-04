@@ -1,17 +1,9 @@
 """The two chat transports do the same turn.
 
-POST /chat and the /chat/stream WebSocket had drifted, and every divergence was
-silent — nothing raised, the streaming path just quietly did less:
-
-  - it never took the inference slot, so max_concurrent_inference applied only
-    to the endpoint the UI does not use;
-  - it never warmed the conversation cache;
-  - its non-streaming branch scheduled no post-turn work at all.
-
-Before this file there were no WebSocket tests at all, which is the whole
-reason the drift survived. The structural checks below are cheap and catch a
-new divergence at the point it is written; the end-to-end ones prove the turn
-actually completes on the transport the UI uses.
+They had drifted three ways, all silently — no inference slot, no cache
+warming, no post-turn work on the non-streaming branch — because there were no
+WebSocket tests at all. The structural checks catch a new divergence where it
+is written; the end-to-end ones prove the turn completes on the socket.
 """
 
 from __future__ import annotations
@@ -53,7 +45,6 @@ def auth(client):
 
 @pytest.mark.parametrize("name", ["chat", "websocket_chat"])
 def test_transport_delegates_the_turn(name):
-    """Both go through chat_turn rather than assembling their own."""
     source = inspect.getsource(getattr(routes, name))
     for step in ("chat_turn.begin(", "chat_turn.finish(", "chat_turn.response("):
         assert step in source, f"{name} does not call {step}"
@@ -61,7 +52,6 @@ def test_transport_delegates_the_turn(name):
 
 @pytest.mark.parametrize("name", ["chat", "websocket_chat"])
 def test_transport_persists_no_messages_of_its_own(name):
-    """append_message belongs to chat_turn; a transport doing it is drift."""
     source = inspect.getsource(getattr(routes, name))
     assert "append_message(" not in source, (
         f"{name} persists a message directly. Both transports must go through "
@@ -70,7 +60,6 @@ def test_transport_persists_no_messages_of_its_own(name):
 
 
 def test_a_chat_turn_costs_the_same_on_both_transports():
-    """The slot set is named once and taken by both."""
     assert set(admission.CHAT_SLOTS) == {"workflow", "inference"}
     for name in ("chat", "websocket_chat"):
         source = inspect.getsource(getattr(routes, name))
@@ -87,7 +76,6 @@ def test_no_route_reaches_past_admission_to_the_cache():
 
 
 def test_finish_schedules_every_post_turn_effect():
-    """One scheduler call, so no branch can schedule half of it."""
     source = inspect.getsource(chat_turn.finish)
     assert "turn_effects.schedule_all(" in source
     assert "cache_conversation_state(" in source
@@ -131,7 +119,6 @@ def test_non_streaming_websocket_turn_completes(client, auth):
 
 
 def test_streaming_websocket_turn_completes(client, auth):
-    """The path the UI uses ends with one message_done carrying the ids."""
     with _open(client, auth) as ws:
         ws.send_json(
             {

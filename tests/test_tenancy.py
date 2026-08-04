@@ -1,13 +1,6 @@
 """A tenant is the site you visited, and nothing a caller can say.
 
-Before this, five text boxes labelled "Tenant (optional)" collected a value the
-server variously discarded (login), rejected with a 422 (signup, OAuth) or
-refused with a 403 (admin create-user), and an `X-Tenant-ID` header echoed the
-server's own answer back at it. Nothing could set a tenant and typing in the box
-could only break the request.
-
-These tests pin the two halves of the replacement: the hostname decides, and no
-request field or header can override it.
+Two halves: the hostname decides, and no request field or header overrides it.
 """
 
 from __future__ import annotations
@@ -50,12 +43,10 @@ def _settings(**over):
     ],
 )
 def test_host_normalization(raw, expected):
-    """Operators type one form, browsers send another. Both must match."""
     assert tenancy.normalize_host(raw) == expected
 
 
 def test_no_mapping_means_one_tenant():
-    """The default install serves one site, so every host is that tenant."""
     s = _settings()
     assert tenancy.tenant_for_host("anything.example.com", s) == "public"
 
@@ -74,7 +65,6 @@ def test_unmapped_host_is_refused_once_a_mapping_exists():
 
 
 def test_probes_reach_the_box_by_address_not_by_site():
-    """A healthcheck must not be refused for having no site name."""
     s = _settings(tenant_domains={"acme.example.com": "acme"})
     for host in ("", "localhost", "127.0.0.1"):
         assert tenancy.tenant_for_host(host, s) == "public"
