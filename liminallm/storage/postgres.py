@@ -459,19 +459,6 @@ class PostgresStore:
                     "knowledge_chunk_context_idx is missing. Run scripts/migrate.sh to align with SPEC §2 context lookups."
                 )
 
-    def _set_runtime_config(self, config: dict) -> None:
-        """Persist the runtime configuration for admin-driven overrides."""
-
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO instance_config (name, config, created_at, updated_at)
-                VALUES (%s, %s, now(), now())
-                ON CONFLICT (name) DO UPDATE SET config = EXCLUDED.config, updated_at = EXCLUDED.updated_at
-                """,
-                ("default", json.dumps(config)),
-            )
-
     def _ensure_default_artifacts(self) -> None:
         """Seed default artifacts using common schema definitions."""
         existing = self.list_artifacts()
@@ -2899,43 +2886,6 @@ class PostgresStore:
         except (TypeError, ValueError):
             self.logger.warning("postgres_float_parse_failed", context=context, value=value)
             return default
-
-    def get_runtime_config(self) -> dict:
-        """Return deployment config sourced from SQL (placeholder until admin UI writes it).
-
-        Replace this stub with typed reads from an ``instance_config`` table
-        once config patches are persisted server-side, and enforce versioning
-        plus source attribution (UI vs. drift detection) per SPEC §10.
-        """
-
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT config FROM instance_config WHERE name = %s", ("default",)
-            ).fetchone()
-        raw_config = row.get("config") if row else {}
-        if isinstance(raw_config, str):
-            try:
-                return json.loads(raw_config)
-            except Exception as exc:
-                self.logger.warning("runtime_config_parse_failed", error=str(exc))
-                return {}
-        if isinstance(raw_config, dict):
-            return raw_config
-        try:
-            return dict(raw_config or {})
-        except Exception:
-            return {}
-
-    def set_runtime_config(self, config: dict) -> dict:
-        """Update runtime configuration via admin UI.
-
-        Merges provided config with existing config and persists to database.
-        Returns the updated full config.
-        """
-        existing = self.get_runtime_config()
-        merged = {**existing, **config}
-        self._set_runtime_config(merged)
-        return merged
 
     def get_system_settings(self) -> dict:
         """Get admin-managed system settings from database.

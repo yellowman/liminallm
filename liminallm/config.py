@@ -1156,11 +1156,6 @@ def redact_secrets(settings: dict) -> dict:
     return {k: ("" if k in hidden else v) for k, v in settings.items()}
 
 
-def managed_setting_names() -> set[str]:
-    """Names an admin is allowed to write."""
-    return set(SYSTEM_SETTINGS_DEFAULTS)
-
-
 # Admin console grouping. A table rather than a `group=` on all 78 fields:
 # the same information, in one place you can read top to bottom, and a new
 # setting that matches no rule still shows up (under "Other") instead of

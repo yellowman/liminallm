@@ -7,7 +7,7 @@ import json
 import math
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import (
     Any,
@@ -71,51 +71,6 @@ DEFAULT_BACKOFF_MS = (
     1000  # Initial backoff 1s, quadruples each retry (1s, 4s per SPEC §18)
 )
 MAX_RETRIES_HARD_CAP = 3  # SPEC §18: hard cap at 3 retries
-
-MAX_WORKFLOW_SNAPSHOTS = 10  # Keep max 10 snapshots for rollback (memory management)
-
-
-@dataclass
-class WorkflowSnapshot:
-    """Snapshot of workflow state for rollback support.
-
-    Captures the complete state before each node execution, allowing
-    rollback to a previous known-good state on failure.
-    """
-    node_id: str
-    vars_scope: Dict[str, Any]
-    workflow_trace: List[Dict[str, Any]]
-    content: str
-    usage: Dict[str, Any]
-    context_snippets: List[str]
-    pending: List[str]
-    visited_count: int
-    timestamp: datetime = field(default_factory=datetime.utcnow)
-
-    @classmethod
-    def capture(
-        cls,
-        node_id: str,
-        vars_scope: Dict[str, Any],
-        workflow_trace: List[Dict[str, Any]],
-        content: str,
-        usage: Dict[str, Any],
-        context_snippets: List[str],
-        pending: List[str],
-        visited_count: int,
-    ) -> "WorkflowSnapshot":
-        """Create a deep copy snapshot of current workflow state."""
-        return cls(
-            node_id=node_id,
-            vars_scope=copy.deepcopy(vars_scope),
-            workflow_trace=copy.deepcopy(workflow_trace),
-            content=content,
-            usage=copy.deepcopy(usage),
-            context_snippets=list(context_snippets),
-            pending=list(pending),
-            visited_count=visited_count,
-        )
-
 
 @dataclass
 class ParallelNodeResult:
@@ -226,48 +181,23 @@ class WorkflowEngine(WorkflowStreamingMixin):
         vars_scope: Dict[str, Any],
         *,
         reason: str = "node_failure",
-        snapshots: Optional[List[WorkflowSnapshot]] = None,
-        target_snapshot_index: int = -1,
     ) -> Optional[dict]:
-        """Rollback workflow state, optionally restoring from a snapshot.
+        """Mark a workflow as rolled back and drop its cached state.
 
-        Args:
-            state_key: Workflow state cache key
-            workflow_trace: Current trace (will be truncated if restoring)
-            vars_scope: Current variables (will be replaced if restoring)
-            reason: Reason for rollback
-            snapshots: List of captured snapshots for restoration
-            target_snapshot_index: Index of snapshot to restore to (-1 = latest)
+        A workflow that reaches here is over: both call sites go on to record
+        a terminal failure. So this records why it stopped and clears the
+        cache, rather than restoring earlier state there is nothing left to
+        run with.
 
         Returns:
-            Rollback state dict with restoration details, or None on failure
+            Rollback state dict, or None if the state could not be marked
         """
-        restored_from = None
-
-        # If snapshots available, restore to specified snapshot
-        if snapshots and len(snapshots) > 0:
-            idx = target_snapshot_index if target_snapshot_index >= 0 else len(snapshots) - 1
-            if idx < len(snapshots):
-                snapshot = snapshots[idx]
-                restored_from = {
-                    "snapshot_node": snapshot.node_id,
-                    "snapshot_time": snapshot.timestamp.isoformat(),
-                    "restored_vars": list(snapshot.vars_scope.keys()),
-                    "restored_trace_length": len(snapshot.workflow_trace),
-                }
-                self.logger.info(
-                    "workflow_rollback_restoring",
-                    from_node=snapshot.node_id,
-                    trace_length=len(snapshot.workflow_trace),
-                )
-
         rollback_state = {
             "status": "rolled_back",
             "reason": reason,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "vars": vars_scope,
             "trace_length": len(workflow_trace),
-            "restored_from": restored_from,
         }
 
         try:
@@ -279,7 +209,6 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     "reason": reason,
                     "updated_at": datetime.now(timezone.utc).isoformat(),
                     "workflow_trace": workflow_trace,
-                    "restored_from": restored_from,
                 },
             )
 
@@ -291,58 +220,6 @@ class WorkflowEngine(WorkflowStreamingMixin):
             return None
 
         return rollback_state
-
-    def _capture_snapshot(
-        self,
-        snapshots: List[WorkflowSnapshot],
-        node_id: str,
-        vars_scope: Dict[str, Any],
-        workflow_trace: List[Dict[str, Any]],
-        content: str,
-        usage: Dict[str, Any],
-        context_snippets: List[str],
-        pending: List[str],
-        visited_count: int,
-    ) -> None:
-        """Capture a snapshot of workflow state before node execution.
-
-        Maintains a bounded list of snapshots (max MAX_WORKFLOW_SNAPSHOTS)
-        by removing oldest snapshots when the limit is exceeded.
-        """
-        snapshot = WorkflowSnapshot.capture(
-            node_id=node_id,
-            vars_scope=vars_scope,
-            workflow_trace=workflow_trace,
-            content=content,
-            usage=usage,
-            context_snippets=context_snippets,
-            pending=pending,
-            visited_count=visited_count,
-        )
-        snapshots.append(snapshot)
-
-        # Keep only the most recent snapshots
-        while len(snapshots) > MAX_WORKFLOW_SNAPSHOTS:
-            snapshots.pop(0)
-
-    def _restore_from_snapshot(
-        self,
-        snapshot: WorkflowSnapshot,
-    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], str, Dict[str, Any], List[str], List[str], int]:
-        """Restore workflow state from a snapshot.
-
-        Returns:
-            Tuple of (vars_scope, workflow_trace, content, usage, context_snippets, pending, visited_count)
-        """
-        return (
-            copy.deepcopy(snapshot.vars_scope),
-            copy.deepcopy(snapshot.workflow_trace),
-            snapshot.content,
-            copy.deepcopy(snapshot.usage),
-            list(snapshot.context_snippets),
-            list(snapshot.pending),
-            snapshot.visited_count,
-        )
 
     async def _clear_workflow_cache(self, state_key: str) -> None:
         """Clear workflow-specific cache entries during rollback."""
@@ -548,9 +425,6 @@ class WorkflowEngine(WorkflowStreamingMixin):
         visited_nodes: Dict[str, int] = {}
         max_visits_per_node = max(2, math.ceil(max_steps / max(1, len(node_map))))
 
-        # Initialize snapshot list for rollback support
-        snapshots: List[WorkflowSnapshot] = []
-
         state_key = f"{conversation_id or 'anon'}:{workflow_id or 'default'}"
         await self._persist_workflow_state(
             state_key,
@@ -599,19 +473,6 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 self.logger.warning("workflow_loop_detected", node=node_id)
                 break
 
-            # Capture snapshot before node execution for rollback support
-            self._capture_snapshot(
-                snapshots,
-                node_id,
-                vars_scope,
-                workflow_trace,
-                content,
-                usage,
-                context_snippets,
-                pending,
-                visited,
-            )
-
             # SPEC §9/§18: Execute node with retry and exponential backoff
             result, next_nodes = await self._execute_node_with_retry(
                 node,
@@ -637,7 +498,6 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     context_snippets=context_snippets,
                     workflow_trace=workflow_trace,
                     routing_trace=routing_trace,
-                    snapshots=snapshots,
                 )
 
             # Handle parallel node execution - run child nodes concurrently
@@ -704,7 +564,6 @@ class WorkflowEngine(WorkflowStreamingMixin):
                             context_snippets=context_snippets,
                             workflow_trace=workflow_trace,
                             routing_trace=routing_trace,
-                            snapshots=snapshots,
                         )
 
                 # Continue to "after" node if specified
@@ -737,7 +596,6 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     routing_trace=routing_trace,
                     context_snippets=context_snippets,
                     vars_scope=vars_scope,
-                    snapshots=snapshots,
                 )
             if result.get("status") == "end":
                 break
@@ -779,7 +637,6 @@ class WorkflowEngine(WorkflowStreamingMixin):
         context_snippets: List[str],
         workflow_trace: List[Dict[str, Any]],
         routing_trace: List[Dict[str, Any]],
-        snapshots: Optional[List[WorkflowSnapshot]] = None,
     ) -> dict:
         self.logger.error("workflow_node_failed", node=node_id, error=str(exc))
         failure_entry = {
@@ -790,7 +647,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         }
         self._append_trace(workflow_trace, failure_entry)
         rollback_state = await self._rollback_workflow(
-            state_key, workflow_trace, vars_scope, snapshots=snapshots
+            state_key, workflow_trace, vars_scope
         )
         if rollback_state:
             failure_entry["rollback"] = rollback_state
@@ -824,10 +681,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
         routing_trace: List[Dict[str, Any]],
         context_snippets: List[str],
         vars_scope: Dict[str, Any],
-        snapshots: Optional[List[WorkflowSnapshot]] = None,
     ) -> Dict[str, Any]:
         rollback_state = await self._rollback_workflow(
-            state_key, workflow_trace, vars_scope, reason="tool_error", snapshots=snapshots
+            state_key, workflow_trace, vars_scope, reason="tool_error"
         )
         if rollback_state:
             result["rollback"] = rollback_state

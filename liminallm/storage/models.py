@@ -92,26 +92,6 @@ class Session:
 
 
 @dataclass
-class UserAuthCredential:
-    """Password credentials for a user (maps to user_auth_credential table)."""
-    user_id: str
-    password_hash: Optional[str] = None
-    password_algo: Optional[str] = None
-    created_at: datetime = field(default_factory=_utcnow)
-    last_updated_at: Optional[datetime] = None
-
-
-@dataclass
-class UserAuthProvider:
-    """OAuth/external auth provider link (maps to user_auth_provider table)."""
-    id: int
-    user_id: str
-    provider: str
-    provider_uid: str
-    created_at: datetime = field(default_factory=_utcnow)
-
-
-@dataclass
 class UserSettings:
     """User preferences and settings (maps to user_settings table)."""
     user_id: str

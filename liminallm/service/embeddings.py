@@ -191,24 +191,6 @@ def validated_embedding(
     )
 
 
-def pad_vectors(
-    vectors: list[list[float]], *, dim: int = EMBEDDING_DIM, sanitize: bool = True
-) -> list[list[float]]:
-    """Pad/truncate vectors to uniform dimension.
-
-    Args:
-        vectors: List of embedding vectors
-        dim: Target dimension
-        sanitize: If True, sanitize NaN/Infinity values
-
-    Returns:
-        List of embeddings with uniform dimension
-    """
-    if not vectors:
-        return []
-    return [ensure_embedding_dim(v, dim=dim, sanitize=sanitize) for v in vectors]
-
-
 def normalize_vector(vec: List[float]) -> List[float]:
     """Normalize a vector to unit length (Issue 45.10).
 

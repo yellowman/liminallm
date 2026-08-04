@@ -110,7 +110,6 @@ from liminallm.api.schemas import (
     WorkflowListResponse,
 )
 from liminallm.config import (
-    SYSTEM_SETTINGS_DEFAULTS,
     get_settings,
     managed_settings_schema,
     secret_setting_names,
@@ -159,15 +158,6 @@ logger = get_logger(__name__)
 # importable from this module because callers and tests reference it here.
 
 router = APIRouter(prefix="/v1")
-
-def _get_system_settings(runtime) -> dict:
-    """Get admin-managed system settings from database.
-
-    Returns merged settings with defaults for any missing values.
-    Uses SYSTEM_SETTINGS_DEFAULTS from config.py as single source of truth.
-    """
-    return {**SYSTEM_SETTINGS_DEFAULTS, **(runtime.store.get_system_settings() or {})}
-
 
 async def get_user(
     request: Request,
@@ -253,13 +243,6 @@ def _get_owned_artifact(runtime, artifact_id: str, principal: AuthContext):
             "forbidden", "artifact access requires admin privileges", status_code=403
         )
     return artifact
-
-
-def _get_artifact_kind(schema: Any) -> Optional[str]:
-    """Extract 'kind' from artifact schema, handling None/non-dict safely."""
-    if isinstance(schema, dict):
-        return schema.get("kind")
-    return None
 
 
 def _get_pagination_settings(runtime) -> dict:
@@ -2507,23 +2490,8 @@ async def get_config(principal: AuthContext = Depends(get_admin_user)):
                 sanitized[k] = v
         return sanitized
 
-    runtime = get_runtime()
     settings = get_settings().model_dump()
-    sanitized_settings = _sanitize_dict(settings)
-    # Also sanitize runtime_config to prevent data leakage
-    runtime_config = runtime.store.get_runtime_config()
-    sanitized_runtime_config = (
-        _sanitize_dict(runtime_config)
-        if isinstance(runtime_config, dict)
-        else runtime_config
-    )
-    return Envelope(
-        status="ok",
-        data={
-            "runtime_config": sanitized_runtime_config,
-            "settings": sanitized_settings,
-        },
-    )
+    return Envelope(status="ok", data={"settings": _sanitize_dict(settings)})
 
 
 @router.get("/admin/settings", response_model=Envelope, tags=["admin"])

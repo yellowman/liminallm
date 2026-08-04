@@ -591,16 +591,6 @@ return {1, tokens, 0}
         result = await self.client.eval(lua_script, 1, key)
         return int(result)
 
-    async def get_concurrency_count(
-        self, slot_type: str, user_id: str, *, tenant_id: Optional[str] = None
-    ) -> int:
-        """Get current concurrency count for a user."""
-        # Issue 44.3: Include tenant_id in concurrency key for tenant isolation
-        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
-        key = f"concurrency:{tenant_prefix}{slot_type}:{user_id}"
-        count = await self.client.get(key)
-        return int(count) if count else 0
-
     # =========================================================================
     # Session Activity Tracking (SPEC §12.1)
     # =========================================================================
@@ -815,18 +805,3 @@ return {1, tokens, 0}
         tenant_prefix = f"{tenant_id}:" if tenant_id else ""
         failures_key = f"circuit:{tenant_prefix}{tool_id}:failures"
         await self.client.delete(failures_key)
-
-    async def reset_circuit_breaker(
-        self,
-        tool_id: str,
-        *,
-        tenant_id: Optional[str] = None,
-    ) -> None:
-        """Manually reset a circuit breaker (admin action)."""
-        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
-        open_key = f"circuit:{tenant_prefix}{tool_id}:open"
-        failures_key = f"circuit:{tenant_prefix}{tool_id}:failures"
-        async with self.client.pipeline() as pipe:
-            pipe.delete(open_key)
-            pipe.delete(failures_key)
-            await pipe.execute()

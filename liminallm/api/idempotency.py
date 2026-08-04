@@ -161,15 +161,3 @@ class IdempotencyGuard:
         )
         if status in {"completed", "failed"}:
             self._stored = True
-
-    async def store_error(self, message: str) -> None:
-        if not self.request_id:
-            return
-        await self.store_result(
-            Envelope(
-                status="error",
-                error={"code": "server_error", "message": message},
-                request_id=self.request_id,
-            ),
-            status="failed",
-        )

@@ -22,28 +22,6 @@ from liminallm.service.tokenizer_utils import (
     vocab_size_from_tokenizer,
 )
 
-# providers that expose fine-tuned models as first-class endpoints (model IDs)
-_MODEL_ID_PROVIDERS = {
-    "openai",
-    "azure",
-    "azure_openai",
-    "azure-openai",
-    "vertex",
-    "gemini",
-    "google",
-    "bedrock",
-}
-
-# providers that expose adapters via `adapter_id` / multi-LoRA parameters
-_ADAPTER_ID_PROVIDERS = {
-    "together",
-    "together.ai",
-    "lorax",
-    "adapter_server",
-    "sagemaker",
-    "aws_sagemaker",
-}
-
 logger = get_logger(__name__)
 
 
@@ -1121,12 +1099,6 @@ class ApiAdapterBackend:
         sorted_adapters = sorted(adapters, key=get_weight, reverse=True)
         return sorted_adapters[:max_count]
 
-    def _process_adapters(self, adapters: List[dict]) -> Tuple[List[dict], List[str]]:
-        """Legacy method - delegates to _process_adapters_for_provider."""
-        result = self._process_adapters_for_provider(adapters)
-        # Return in legacy format for backwards compatibility
-        return [], result["prompt_injections"]
-
     def _extract_prompt_instructions(self, adapter: dict) -> Optional[str]:
         """Extract prompt instructions from adapter for system prompt injection.
 
@@ -1506,14 +1478,6 @@ class LocalJaxLoRABackend:
             return int(name), name
         except ValueError:
             return 0, name
-
-    def _align_width(self, arr, width: int):
-        if arr.shape[1] > width:
-            return arr[:, :width]
-        if arr.shape[1] < width:
-            pad = ((0, 0), (0, width - arr.shape[1]))
-            return self._jnp.pad(arr, pad)
-        return arr
 
     def _align_last_dim(self, arr, width: int):
         current = arr.shape[-1]

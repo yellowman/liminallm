@@ -15,7 +15,6 @@ import ast
 import ipaddress
 import multiprocessing
 import operator
-import os
 import resource
 import socket
 import tempfile
@@ -285,8 +284,6 @@ class SandboxConfig:
     privileged: bool = False
 
     # Cgroup configuration (when available)
-    cgroup_cpu_shares: int = 256  # Lower than default 1024 for tools
-    cgroup_memory_limit_mb: int = 512
 
     def __post_init__(self) -> None:
         if self.scratch_dir is None:
@@ -799,104 +796,6 @@ def run_in_sandbox(
             raise payload
         raise SandboxError(f"sandboxed execution failed: {payload}")
     return payload
-
-
-# Cgroup v2 integration (when available)
-def setup_cgroup(
-    cgroup_name: str,
-    config: SandboxConfig,
-    *,
-    cgroup_base: str = "/sys/fs/cgroup",
-) -> Optional[str]:
-    """Set up cgroup v2 for tool sandboxing.
-
-    This function attempts to create and configure a cgroup for the tool.
-    Requires appropriate permissions (typically root or cgroup delegation).
-
-    Args:
-        cgroup_name: Name for the cgroup
-        config: Sandbox configuration
-        cgroup_base: Base path for cgroup v2 filesystem
-
-    Returns:
-        Path to created cgroup, or None if cgroups are not available
-    """
-    cgroup_path = Path(cgroup_base) / "liminallm" / cgroup_name
-
-    try:
-        # Create cgroup hierarchy
-        cgroup_path.mkdir(parents=True, exist_ok=True)
-
-        # Set memory limit
-        memory_max = cgroup_path / "memory.max"
-        if memory_max.exists():
-            memory_bytes = config.cgroup_memory_limit_mb * 1024 * 1024
-            memory_max.write_text(str(memory_bytes))
-
-        # Set CPU weight (similar to shares in v1)
-        cpu_weight = cgroup_path / "cpu.weight"
-        if cpu_weight.exists():
-            # Convert shares (1-1024 scale) to weight (1-10000 scale)
-            weight = int((config.cgroup_cpu_shares / 1024) * 100)
-            cpu_weight.write_text(str(max(1, weight)))
-
-        logger.info("cgroup_setup_success", cgroup=str(cgroup_path))
-        return str(cgroup_path)
-
-    except PermissionError:
-        logger.warning("cgroup_setup_permission_denied", cgroup=str(cgroup_path))
-        return None
-    except Exception as e:
-        logger.warning("cgroup_setup_failed", cgroup=str(cgroup_path), error=str(e))
-        return None
-
-
-def add_to_cgroup(cgroup_path: str, pid: Optional[int] = None) -> bool:
-    """Add a process to a cgroup.
-
-    Args:
-        cgroup_path: Path to cgroup
-        pid: Process ID to add (defaults to current process)
-
-    Returns:
-        True if successful, False otherwise
-    """
-    if pid is None:
-        pid = os.getpid()
-
-    procs_file = Path(cgroup_path) / "cgroup.procs"
-    try:
-        procs_file.write_text(str(pid))
-        logger.debug("cgroup_process_added", cgroup=cgroup_path, pid=pid)
-        return True
-    except Exception as e:
-        logger.warning("cgroup_add_failed", cgroup=cgroup_path, pid=pid, error=str(e))
-        return False
-
-
-def cleanup_cgroup(cgroup_path: str) -> bool:
-    """Clean up a cgroup after tool execution.
-
-    Args:
-        cgroup_path: Path to cgroup to remove
-
-    Returns:
-        True if successful, False otherwise
-    """
-    try:
-        cgroup = Path(cgroup_path)
-        if cgroup.exists():
-            # Move all processes to parent before removing
-            procs = (cgroup / "cgroup.procs").read_text().strip().split()
-            parent_procs = cgroup.parent / "cgroup.procs"
-            for pid in procs:
-                if pid:
-                    parent_procs.write_text(pid)
-            cgroup.rmdir()
-        return True
-    except Exception as e:
-        logger.warning("cgroup_cleanup_failed", cgroup=cgroup_path, error=str(e))
-        return False
 
 
 def get_tool_sandbox_config(

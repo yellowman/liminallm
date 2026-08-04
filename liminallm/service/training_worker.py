@@ -389,37 +389,3 @@ class TrainingWorker:
         if job.meta and isinstance(job.meta, dict):
             return job.meta.get("cluster_id")
         return None
-
-
-
-async def create_training_worker(
-    store: "PostgresStore",
-    training_service: "TrainingService",
-    clusterer: Optional["SemanticClusterer"] = None,
-    *,
-    auto_start: bool = True,
-    poll_interval: int = DEFAULT_POLL_INTERVAL_SECONDS,
-) -> TrainingWorker:
-    """Factory function to create and optionally start a training worker.
-
-    Args:
-        store: Database store
-        training_service: TrainingService instance
-        clusterer: Optional SemanticClusterer for emergent skills
-        auto_start: Whether to start the worker immediately
-        poll_interval: How often to check for queued jobs
-
-    Returns:
-        TrainingWorker instance
-    """
-    worker = TrainingWorker(
-        store=store,
-        training_service=training_service,
-        clusterer=clusterer,
-        poll_interval=poll_interval,
-    )
-
-    if auto_start:
-        await worker.start()
-
-    return worker

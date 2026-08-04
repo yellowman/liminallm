@@ -18,8 +18,6 @@ from liminallm.service.tokenizer_utils import (
 MAX_JSON_DEPTH = 20
 # Issue 46.2: Maximum array items to prevent memory exhaustion
 MAX_ARRAY_ITEMS = 1000
-# Issue 46.3: Maximum string length for unbounded strings
-MAX_STRING_LENGTH = 65536
 
 
 def _validate_json_depth(obj: Any, max_depth: int = MAX_JSON_DEPTH, current_depth: int = 0) -> None:

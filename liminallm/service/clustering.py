@@ -99,7 +99,7 @@ class SemanticClusterer:
 
         for user in users:
             try:
-                await self.clusterer.cluster_user_preferences(
+                await self.cluster_user_preferences(
                     user.id,
                     max_events=max_events,
                     streaming=True,
@@ -123,7 +123,7 @@ class SemanticClusterer:
                 tenant_ids.append(tenant)
         for tenant_id in tenant_ids:
             try:
-                await self.clusterer.cluster_global_preferences(
+                await self.cluster_global_preferences(
                     max_events=max_events,
                     streaming=True,
                     approximate=True,
@@ -170,58 +170,6 @@ class SemanticClusterer:
                 error=str(exc),
             )
 
-
-    async def process_emergent_skills(self) -> List[str]:
-        """Scan every user with preferences and promote what has become a skill.
-
-        The on-demand version of the periodic pass: cluster, then promote the
-        clusters that now qualify. Returns the adapters created.
-        """
-        promoted_adapters: List[str] = []
-
-        for user_id in self._users_with_preferences():
-            try:
-                clusters = await self.cluster_user_preferences(user_id)
-
-                if clusters:
-                    promoted = self.promote_skill_adapters(
-                        min_size=5,
-                        positive_ratio=0.7,
-                    )
-                    promoted_adapters.extend(promoted)
-
-            except Exception as exc:
-                self.logger.warning(
-                    "emergent_skill_processing_failed",
-                    user_id=user_id,
-                    error=str(exc),
-                )
-
-        self.logger.info(
-            "emergent_skills_processed",
-            promoted_count=len(promoted_adapters),
-            adapter_ids=promoted_adapters,
-        )
-
-        return promoted_adapters
-
-    def _get_users_with_preferences(self) -> List[str]:
-        """Get list of users who have preference events."""
-        users: set[str] = set()
-
-        for event in self.store.list_preference_events():
-            if event.user_id:
-                users.add(event.user_id)
-
-        return list(users)
-
-    def _users_with_preferences(self) -> List[str]:
-        """User ids that have any preference events at all."""
-        users: set[str] = set()
-        for event in self.store.list_preference_events():
-            if event.user_id:
-                users.add(event.user_id)
-        return list(users)
 
     async def _fetch_preference_events(
         self,

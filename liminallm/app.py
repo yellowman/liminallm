@@ -180,10 +180,6 @@ def _allowed_origins() -> List[str]:
     return list(_cors_policy()[0])
 
 
-def _allow_credentials() -> bool:
-    return _cors_policy()[1]
-
-
 class DynamicCORSMiddleware:
     """Starlette's CORS implementation, rebuilt when the policy changes.
 
@@ -756,6 +752,3 @@ async def _run_tmp_cleanup(
     except asyncio.CancelledError:
         logger.info("tmp_cleanup_task_cancelled")
 
-
-def create_app() -> FastAPI:
-    return app
