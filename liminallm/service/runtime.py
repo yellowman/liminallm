@@ -698,26 +698,6 @@ def _cleanup_local_idempotency(
     return len(expired), evicted
 
 
-async def _get_cached_idempotency_record(
-    runtime: Runtime, route: str, user_id: str, key: str, *, tenant_id: Optional[str] = None
-) -> Optional[dict]:
-    now = datetime.now(timezone.utc)
-    if runtime.cache:
-        # Issue 22.2: Pass tenant_id for multi-tenant isolation
-        return await runtime.cache.get_idempotency_record(route, user_id, key, tenant_id=tenant_id)
-    async with runtime._local_idempotency_lock:
-        # Include tenant_id in in-memory key for multi-tenant isolation
-        cache_key = (tenant_id, route, user_id, key) if tenant_id else (route, user_id, key)
-        _cleanup_local_idempotency(runtime, now)
-        record = runtime._local_idempotency.get(cache_key)
-        if not record:
-            return None
-        if record.get("expires_at") and record["expires_at"] < now:
-            runtime._local_idempotency.pop(cache_key, None)
-            return None
-        return record
-
-
 async def _set_cached_idempotency_record(
     runtime: Runtime,
     route: str,

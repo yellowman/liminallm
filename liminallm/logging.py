@@ -122,8 +122,13 @@ def log_workflow_trace(trace: list, logger: Optional[Any] = None) -> None:
 # Issue 47.1-47.8: Content sanitization for API responses
 # Patterns that indicate sensitive information in error messages
 _SENSITIVE_ERROR_PATTERNS = [
-    # Database/SQL related
-    r'(?i)(sql|query|select|insert|update|delete|where|from|join)\s+.{0,50}',
+    # A SQL statement pasted into an exception message. Matching a bare verb
+    # would eat ordinary prose — "delete conversation failed", "update the
+    # adapter first" — so a clause keyword has to follow the verb before this
+    # counts as SQL. These messages are shown to users; over-redaction makes
+    # the field useless, which is its own failure.
+    r'(?i)\b(select|insert|update|delete|replace)\b[^\n]{0,200}?'
+    r'\b(from|into|where|values|set|join)\b[^\n]*',
     r'(?i)database\s+error',
     r'(?i)connection\s+.*\s+(failed|refused|timeout)',
     # Path/file related

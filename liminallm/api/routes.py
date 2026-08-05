@@ -831,6 +831,10 @@ async def verify_mfa(body: MFAVerifyRequest, request: Request, response: Respons
         runtime.settings.mfa_rate_limit_per_minute,
         60,
     )
+    # Read before verifying: a successful verify flips the secret to enabled,
+    # so this is the only point where enrolment is distinguishable from an
+    # ordinary login check.
+    was_enabled = bool(getattr(runtime.store.get_user_mfa_secret(auth_ctx.user_id), "enabled", False))
     ok = await runtime.auth.verify_mfa_challenge(
         user_id=auth_ctx.user_id, code=body.code, session_id=body.session_id
     )
@@ -838,6 +842,18 @@ async def verify_mfa(body: MFAVerifyRequest, request: Request, response: Respons
         logger.warning("mfa_verify_failed", user_id=auth_ctx.user_id, ip=client_ip)
         raise http_error("unauthorized", "invalid mfa", status_code=401)
     user, session, tokens = runtime.auth.issue_tokens_for_session(body.session_id)
+    if not was_enabled and user and user.email:
+        # Enrolment just completed. Telling the account holder that a second
+        # factor now guards their login is how they find out if it was not
+        # them who added it. Never block the response on the SMTP round trip.
+        try:
+            await asyncio.to_thread(
+                runtime.email.send_mfa_setup_confirmation, user.email
+            )
+        except Exception as exc:  # noqa: BLE001 - notification is best effort
+            logger.warning(
+                "mfa_setup_email_failed", user_id=auth_ctx.user_id, error=str(exc)
+            )
     resp: dict = {"status": "verified"}
     if user and session:
         resp.update(

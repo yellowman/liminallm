@@ -393,4 +393,4 @@ class TestChangesTakeEffectWithoutRestart:
             json={"cors_allow_origins": ["https://console.example"]},
         )
         get_runtime().refresh_settings()
-        assert app_module._allowed_origins() == ["https://console.example"]
+        assert list(app_module._cors_policy()[0]) == ["https://console.example"]

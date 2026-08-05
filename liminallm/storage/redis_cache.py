@@ -431,20 +431,6 @@ return {1, tokens, 0}
                 pass  # Use default current UTC time
         return data.get("provider"), expires_at, data.get("tenant_id")
 
-    async def get_idempotency_record(
-        self, route: str, user_id: str, key: str, *, tenant_id: Optional[str] = None
-    ) -> Optional[dict]:
-        # Issue 22.2: Include tenant_id in cache key for multi-tenant isolation
-        tenant_prefix = f"{tenant_id}:" if tenant_id else ""
-        cached = await self.client.get(f"idemp:{tenant_prefix}{route}:{user_id}:{key}")
-        if not cached:
-            return None
-        try:
-            return json.loads(cached)
-        except (json.JSONDecodeError, TypeError):
-            # Corrupted idempotency record - treat as not found
-            return None
-
     async def set_idempotency_record(
         self,
         route: str,

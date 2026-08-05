@@ -165,9 +165,15 @@ class WorkflowEngine(WorkflowStreamingMixin):
         Args:
             wait: If True, wait for pending futures to complete. If False, cancel them.
         """
-        if self._executor_shutdown:
+        # getattr, not attribute access: __del__ calls this, and __del__ can
+        # run on an instance whose __init__ raised part way through. Raising
+        # there produces an "Exception ignored in" on stderr and leaks the
+        # executor it was meant to close.
+        if getattr(self, "_executor_shutdown", False):
             return
         self._executor_shutdown = True
+        if getattr(self, "_tool_executor", None) is None:
+            return
         try:
             self._tool_executor.shutdown(wait=wait, cancel_futures=not wait)
             self.logger.info("workflow_executor_shutdown", wait=wait)
@@ -2363,21 +2369,28 @@ class WorkflowEngine(WorkflowStreamingMixin):
         history: List[Any],
         usage: Any,
     ) -> None:
-        """Feed provider-reported prompt_tokens back into the counter."""
+        """Feed provider-reported prompt_tokens back into the counter.
+
+        Counted as chat messages, not as loose strings: what the provider
+        reports includes the per-message wire overhead every chat format
+        adds. Summing bare `count()` calls estimates low by a fixed amount
+        per message, and `observe()` would then push the character factor up
+        to absorb it — correcting a per-message cost with a per-character
+        multiplier, which is only right at one history length.
+        """
         observer = getattr(self.llm, "observe_usage", None)
         if not callable(observer):
             return
         try:
             counter = self.llm.token_counter()
-            estimated = counter.count(prompt or "")
-            for snippet in context_snippets or []:
-                estimated += counter.count(snippet)
+            messages = [{"content": prompt or ""}]
+            messages += [{"content": s} for s in context_snippets or []]
             for entry in history or []:
                 content = getattr(entry, "content", None) or (
                     entry.get("content") if isinstance(entry, dict) else ""
                 )
-                estimated += counter.count(str(content or ""))
-            observer(estimated, usage)
+                messages.append({"content": str(content or "")})
+            observer(counter.count_messages(messages), usage)
         except Exception as exc:  # noqa: BLE001 - calibration is optional
             self.logger.debug("token_calibration_skipped", error=str(exc))
 

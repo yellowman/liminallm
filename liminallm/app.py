@@ -9,7 +9,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -174,10 +174,6 @@ def _cors_policy() -> tuple:
         tuple(settings.cors_allow_origins or _DEFAULT_ORIGINS),
         bool(settings.cors_allow_credentials),
     )
-
-
-def _allowed_origins() -> List[str]:
-    return list(_cors_policy()[0])
 
 
 class DynamicCORSMiddleware:

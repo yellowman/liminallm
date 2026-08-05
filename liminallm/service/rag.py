@@ -465,8 +465,12 @@ class RAGService:
                         fs_path=fs_path,
                         allowed_base=str(allowed_base),
                     )
+                    # The base is in the log line above, not in the message:
+                    # this reaches the client as a 400 body, and naming the
+                    # server's root is free reconnaissance for whoever is
+                    # probing with traversal paths.
                     raise PathTraversalError(
-                        f"path must be within allowed base directory: {allowed_base}"
+                        "path is outside the allowed base directory"
                     )
             else:
                 # For relative paths, use safe_join which validates traversal

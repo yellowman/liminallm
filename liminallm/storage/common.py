@@ -9,6 +9,8 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional
 
+from liminallm.logging import get_logger
+
 # Import from canonical location to avoid duplication
 from liminallm.service.embeddings import (
     deterministic_embedding,
@@ -17,6 +19,8 @@ from liminallm.storage.errors import ConstraintViolation
 
 if TYPE_CHECKING:
     pass
+
+logger = get_logger(__name__)
 
 
 # ============================================================================
@@ -61,12 +65,18 @@ def ensure_policy_compliant_texts(
             continue
         for pattern in _DEFAULT_POLICY_BLOCKLIST:
             if pattern.search(text):
+                # The detail dict reaches the caller in the 409 body. Naming
+                # the pattern that matched turns the filter into an oracle:
+                # submit, read which rule fired, edit, repeat until nothing
+                # fires. It goes to the log instead, where operators can see
+                # it and the submitter cannot.
+                logger.warning(
+                    "preference_policy_violation",
+                    pattern=pattern.pattern,
+                    **(violation_context or {}),
+                )
                 raise ConstraintViolation(
-                    "preference policy violation",
-                    {
-                        "pattern": pattern.pattern,
-                        **(violation_context or {}),
-                    },
+                    "preference policy violation", dict(violation_context or {})
                 )
 
 

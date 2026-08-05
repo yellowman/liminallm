@@ -55,7 +55,7 @@ def test_frontend_routes_serve_bundled_assets():
 
 def test_allowed_origins_default(monkeypatch):
     monkeypatch.delenv("CORS_ALLOW_ORIGINS", raising=False)
-    origins = app_module._allowed_origins()
+    origins = list(app_module._cors_policy()[0])
     assert "http://localhost" in origins
     assert "http://127.0.0.1:5173" in origins
 
@@ -77,7 +77,7 @@ def test_allowed_origins_come_from_the_running_instance(monkeypatch):
             )
         ),
     )
-    assert app_module._allowed_origins() == [
+    assert list(app_module._cors_policy()[0]) == [
         "https://example.com",
         "https://demo.local",
     ]
