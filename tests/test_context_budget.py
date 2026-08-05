@@ -284,15 +284,15 @@ def test_live_gemini_probe_reports_real_window():
 # Token counting: exact where we own the tokenizer, calibrated elsewhere
 
 
-def test_heuristic_no_longer_undercounts_cjk():
-    from liminallm.service.token_counting import heuristic_token_count
+def test_the_estimator_does_not_undercount_cjk():
     from liminallm.service.tokenizer_utils import estimate_token_count
 
     cjk = "这是一段中文文本用来测试分词计数" * 5
-    # The old estimator billed CJK at ~4 chars/token; real tokenizers are
-    # closer to 1, so it undercounted by ~4x — the dangerous direction.
-    assert heuristic_token_count(cjk) > estimate_token_count(cjk) * 2
-    assert heuristic_token_count(cjk) >= len(cjk.strip()) * 0.9
+    # An estimator billing CJK at ~4 chars/token undercounts by ~4x — the
+    # dangerous direction for a number that gates budgets. There were two
+    # estimators once, and only one had the CJK split; this pins the split
+    # onto the single survivor every caller now shares.
+    assert estimate_token_count(cjk) >= len(cjk.strip()) * 0.9
 
 
 def test_local_tokenizer_is_used_and_is_exact():

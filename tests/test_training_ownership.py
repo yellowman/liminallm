@@ -10,10 +10,6 @@ from liminallm.service import notes
 from liminallm.service.training import TrainingService
 
 
-def _service(store, tmp_path):
-    return TrainingService(store, fs_root=str(tmp_path))
-
-
 class TestRunSummary:
     """describe_run: the directory layout is the service's own knowledge."""
 

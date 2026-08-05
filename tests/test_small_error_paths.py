@@ -365,13 +365,15 @@ def test_a_crashing_encoder_falls_back_to_the_heuristic():
     assert counter.count("some words here") > 0
 
 
-def test_the_heuristic_bills_cjk_near_one_to_one():
-    from liminallm.service.token_counting import heuristic_token_count
+def test_the_one_estimator_bills_cjk_near_one_to_one():
+    """There used to be two estimators; the one most callers got undercounted
+    CJK fourfold. One implementation now, and it must keep the CJK split."""
+    from liminallm.service.tokenizer_utils import estimate_token_count
 
-    assert heuristic_token_count("") == 0
-    assert heuristic_token_count("   ") == 0
-    latin = heuristic_token_count("abcdefgh")  # 8 chars ≈ 2 tokens
-    cjk = heuristic_token_count("四个汉字加四个")  # 7 chars ≈ 7 tokens
+    assert estimate_token_count("") == 0
+    assert estimate_token_count("   ") == 0
+    latin = estimate_token_count("abcdefgh")  # 8 chars ≈ 2 tokens
+    cjk = estimate_token_count("四个汉字加四个")  # 7 chars ≈ 7 tokens
     assert cjk > latin
 
 
