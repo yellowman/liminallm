@@ -33,7 +33,8 @@ def test_the_node_suite_passes():
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
-@pytest.mark.parametrize("script", ["common.js", "markdown.js", "chat.js", "share.js", "admin.js"])
+@pytest.mark.parametrize("script", ["common.js", "markdown.js", "auth.js", "admin-tab.js",
+                                    "notes.js", "chat.js", "share.js", "admin.js"])
 def test_every_frontend_script_parses(script):
     proc = subprocess.run(
         ["node", "--check", f"frontend/{script}"],
@@ -51,7 +52,8 @@ def test_each_page_loads_its_dependencies_in_order():
     """Scripts share one top-level scope; defer preserves order. A page that
     lists a dependent before its dependency ships a ReferenceError."""
     for page, required in {
-        "index.html": ["common.js", "markdown.js", "chat.js"],
+        "index.html": ["common.js", "markdown.js", "auth.js", "admin-tab.js",
+                       "notes.js", "chat.js"],
         "share.html": ["common.js", "markdown.js", "share.js"],
     }.items():
         scripts = _scripts_of(page)
@@ -79,3 +81,40 @@ def test_share_js_uses_nothing_beyond_its_declared_dependencies():
                               "requestEnvelope", "fetchWithRetry") if name in share}
     missing = {u for u in used if u not in provided}
     assert not missing, f"share.js uses {missing} which no loaded script defines"
+
+
+def test_the_chat_page_scripts_parse_as_one_scope(tmp_path):
+    """Deferred classic scripts share one global lexical scope, so a name
+    declared twice across files is a SyntaxError that kills the second script
+    in the browser. Concatenating in manifest order and parsing reproduces
+    that check at test time."""
+    if shutil.which("node") is None:
+        pytest.skip("node not installed")
+    scripts = _scripts_of("index.html")
+    concat = "\n;\n".join(
+        (ROOT / "frontend" / s).read_text() for s in scripts
+    )
+    bundle = tmp_path / "bundle.js"
+    bundle.write_text(concat)
+    proc = subprocess.run(
+        ["node", "--check", str(bundle)], capture_output=True, text=True, timeout=30
+    )
+    assert proc.returncode == 0, f"cross-file conflict:\n{proc.stderr}"
+
+
+def test_extracted_modules_define_but_never_execute():
+    """The split is safe because the moved files only define — wiring stays in
+    chat.js's DOMContentLoaded path. A top-level call added to an extracted
+    module would run before chat.js's helpers exist."""
+    import re as _re
+
+    for name in ("auth.js", "admin-tab.js", "notes.js", "markdown.js"):
+        src = (ROOT / "frontend" / name).read_text()
+        for i, line in enumerate(src.splitlines(), 1):
+            if not line or line.startswith((" ", "//", "const ", "let ", "var ",
+                                            "function ", "async function ", "}",
+                                            ")", "]", "/*", " *", "*/")):
+                continue
+            assert not _re.match(r"[A-Za-z_$][\w$]*\s*\(", line), (
+                f"{name}:{i} executes at load: {line[:80]}"
+            )
