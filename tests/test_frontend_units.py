@@ -118,3 +118,23 @@ def test_extracted_modules_define_but_never_execute():
             assert not _re.match(r"[A-Za-z_$][\w$]*\s*\(", line), (
                 f"{name}:{i} executes at load: {line[:80]}"
             )
+
+
+def test_the_chat_column_is_for_chat():
+    """Upload-knowledge and the file browser live in the Files tab. They are
+    persistent panels, not conversation state; pinned above #messages (which
+    is its own scroll container) they cost the chat column ~300px that never
+    scrolled away."""
+    html = (ROOT / "frontend" / "index.html").read_text()
+
+    chat = re.search(r'<section class="tab-panel active" id="chat-tab".*?</section>\s*<!-- Files Tab -->',
+                     html, re.S)
+    assert chat, "chat-tab or Files tab marker missing"
+    assert 'id="upload-section"' not in chat.group(0)
+    assert 'id="files-section"' not in chat.group(0)
+
+    files = re.search(r'id="files-tab".*?id="contexts-tab"', html, re.S)
+    assert files, "files-tab missing"
+    assert 'id="upload-section"' in files.group(0)
+    assert 'id="files-section"' in files.group(0)
+    assert 'data-tab="files-tab"' in html, "Files tab has no nav button"

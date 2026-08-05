@@ -1638,6 +1638,7 @@ that’s the whole point: minimal glue, maximal evolution.
   - **Chat**: conversation interface with message streaming
   - **Notes**: the vault — editor, link graph, witness (§19; hidden when `notes_enabled` is off)
   - **Contexts**: knowledge context management
+  - **Files**: knowledge upload and the user's file browser
   - **Artifacts**: system artifact browser
   - **Tools**: tool specs and workflows
   - **Insights**: preference clusters
@@ -1662,8 +1663,10 @@ that’s the whole point: minimal glue, maximal evolution.
 - **workflow override**: optional text input for `workflow_id` to steer execution.
 - **optimistic UI**: user messages displayed immediately before server confirmation.
 - **collapsible sections**:
-  - **Upload knowledge**: file upload with context selection and chunk size configuration.
   - **Preferences**: thumbs up/down feedback with optional notes, displays routing metadata and trace.
+  - (Knowledge upload and the file browser live in the Files tab — they are
+    persistent panels, not conversation state, and pinning them above the
+    message stream cost the chat column ~300px that never scrolled away.)
 - **typography**: assistant prose is set in a serif column with a github-grade
   markdown renderer (escape-first: html-escape, then rewrite to a fixed safe
   tag set; nested/task lists, aligned tables, blockquotes, autolinks,

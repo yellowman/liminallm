@@ -385,6 +385,7 @@ const initTabs = () => {
       if (state.accessToken) {
         if (tabId === 'notes-tab') fetchNotes();
         else if (tabId === 'contexts-tab') fetchContexts();
+        else if (tabId === 'files-tab') fetchUserFiles();
         else if (tabId === 'artifacts-tab') fetchArtifacts();
         else if (tabId === 'tools-tab') refreshToolsAndWorkflows();
         else if (tabId === 'insights-tab') fetchInsights();
