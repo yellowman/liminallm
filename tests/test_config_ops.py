@@ -274,11 +274,14 @@ def test_a_failing_op_abandons_the_whole_patch(ops):
     assert schema["meta"]["weight"] == 1
 
 
-def test_a_non_numeric_list_index_is_skipped_not_fatal(ops):
-    out = ops._apply_patch_to_schema(
-        {"rules": [1]}, {"ops": [{"op": "add", "path": "/rules/x", "value": 2}]}
-    )
-    assert out["rules"] == [1]
+def test_a_non_numeric_list_index_is_refused_not_skipped(ops):
+    """This used to be silently dropped, which meant a patch op that did
+    nothing reported success — the admin approved a change that never
+    happened. The reviewer is told which path is wrong instead."""
+    with pytest.raises(BadRequestError, match="list index"):
+        ops._apply_patch_to_schema(
+            {"rules": [1]}, {"ops": [{"op": "add", "path": "/rules/x", "value": 2}]}
+        )
 
 
 # ---------------------------------------------------------------------------

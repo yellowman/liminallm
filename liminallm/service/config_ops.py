@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from liminallm.logging import get_logger
+from liminallm.service import json_patch
 from liminallm.service.errors import BadRequestError, NotFoundError
 from liminallm.service.llm import LLMService
 from liminallm.service.router import RouterEngine
@@ -15,7 +16,6 @@ from liminallm.storage.postgres import PostgresStore
 
 logger = get_logger(__name__)
 
-MAX_LIST_EXTENSION = 1024
 
 
 class ConfigOpsService:
@@ -232,108 +232,7 @@ class ConfigOpsService:
         return working
 
     def _apply_single_op(self, doc: dict, op: Dict[str, Any]) -> None:
-        action = (op or {}).get("op")
-        path = (op or {}).get("path", "")
-        value = op.get("value")
-        if not action or not path:
-            return
-        segments = [seg for seg in path.strip("/").split("/") if seg]
-        if not segments:
-            # "/" addresses the whole document. Treating it as a key wrote an
-            # empty-string entry into the schema and reported success.
-            raise BadRequestError(
-                "patch path addresses the document root", detail={"path": path}
-            )
-        parent = doc
-        for depth, seg in enumerate(segments[:-1]):
-            if isinstance(parent, list):
-                try:
-                    idx = int(seg)
-                except ValueError:
-                    return
-                self._ensure_list_capacity(parent, idx, path)
-                while len(parent) <= idx:
-                    parent.append({})
-                parent = parent[idx]
-            elif isinstance(parent, dict):
-                parent = parent.setdefault(seg, {})
-            else:
-                # The path runs through a scalar — /a/b where a is a string.
-                # This used to fall through to `parent[key] = value` and raise a
-                # bare TypeError, which the API turned into a 500. Patch bodies
-                # are model-authored, so this shape arrives routinely and the
-                # admin reviewing the proposal should be told which path is
-                # wrong.
-                raise BadRequestError(
-                    "patch path traverses a non-container value",
-                    detail={
-                        "path": path,
-                        "at": "/" + "/".join(segments[: depth + 1]),
-                        "found": type(parent).__name__,
-                    },
-                )
-        key = segments[-1]
-        if not isinstance(parent, (dict, list)):
-            # The final step landed on a scalar too: /a/b where a is a string
-            # walks the loop zero times and lands here.
-            raise BadRequestError(
-                "patch path traverses a non-container value",
-                detail={
-                    "path": path,
-                    "at": "/" + "/".join(segments[:-1]),
-                    "found": type(parent).__name__,
-                },
-            )
-        if action == "add" or action == "replace":
-            if isinstance(parent, list):
-                if key == "-":
-                    parent.append(value)
-                else:
-                    try:
-                        idx = int(key)
-                        self._ensure_list_capacity(parent, idx, path)
-                        if idx < len(parent):
-                            parent[idx] = value
-                        else:
-                            parent.append(value)
-                    except ValueError:
-                        return
-            else:
-                parent[key] = value
-        elif action == "remove":
-            if isinstance(parent, list):
-                try:
-                    idx = int(key)
-                    self._ensure_list_capacity(parent, idx, path)
-                    if 0 <= idx < len(parent):
-                        parent.pop(idx)
-                except ValueError:
-                    return
-            else:
-                parent.pop(key, None)
-
-    def _ensure_list_capacity(self, parent: list, idx: int, path: str) -> None:
-        if idx < 0:
-            raise BadRequestError(
-                "negative list index", detail={"path": path, "index": idx}
-            )
-        if idx >= MAX_LIST_EXTENSION:
-            raise BadRequestError(
-                "list index too large",
-                detail={
-                    "path": path,
-                    "index": idx,
-                    "max_index": MAX_LIST_EXTENSION - 1,
-                },
-            )
+        json_patch.apply_op(doc, op)
 
     def _deep_merge(self, base: dict, patch: dict) -> dict:
-        merged = dict(base)
-        for key, value in patch.items():
-            if key == "ops":
-                continue
-            if isinstance(value, dict) and isinstance(base.get(key), dict):
-                merged[key] = self._deep_merge(base[key], value)
-            else:
-                merged[key] = value
-        return merged
+        return json_patch.deep_merge(base, patch, skip_keys=("ops",))

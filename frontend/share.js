@@ -1,7 +1,7 @@
 /**
  * Read-only viewer for publicly shared conversations, plus the share
- * directory at /share. Relies on chat.js (loaded first) for renderMarkdown,
- * escapeHtml, and MSG_COPY_BUTTON_HTML.
+ * directory at /share. Relies on common.js (escapeHtml) and markdown.js
+ * (renderMarkdown, MSG_COPY_BUTTON_HTML), loaded first.
  */
 (() => {
   const publicApi = '/v1/public/conversations';

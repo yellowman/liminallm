@@ -8,8 +8,9 @@
     <title>Shared conversation · liminallm</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
     <link rel="stylesheet" href="/static/styles.css" />
-    <!-- chat.js provides the markdown renderer; share.js drives this page -->
-    <script defer src="/static/chat.js"></script>
+    <!-- common.js (escapeHtml) then markdown.js (renderer) then the driver -->
+    <script defer src="/static/common.js"></script>
+    <script defer src="/static/markdown.js"></script>
     <script defer src="/static/share.js"></script>
   </head>
   <body>

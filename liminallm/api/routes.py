@@ -116,7 +116,7 @@ from liminallm.config import (
     validate_managed_settings,
 )
 from liminallm.logging import get_logger
-from liminallm.service import admission, cancellation, tenancy
+from liminallm.service import admission, cancellation, json_patch, tenancy
 from liminallm.service import extract as extract_service
 from liminallm.service import notes as notes_service
 from liminallm.service.archive import (
@@ -2198,120 +2198,6 @@ async def create_artifact(
         return envelope
 
 
-def _apply_json_patch_ops(schema: dict, ops: list) -> dict:
-    """Apply RFC 6902 JSON Patch operations to a schema.
-
-    Supports: add, remove, replace, move, copy, test
-    """
-    import copy
-    result = copy.deepcopy(schema)
-
-    for op in ops:
-        action = op.get("op", "")
-        path = op.get("path", "")
-        value = op.get("value")
-        from_path = op.get("from", "")
-
-        segments = [seg for seg in path.strip("/").split("/") if seg]
-        if not segments:
-            continue
-
-        # Navigate to parent
-        parent = result
-        for seg in segments[:-1]:
-            if isinstance(parent, list):
-                try:
-                    parent = parent[int(seg)]
-                except (ValueError, IndexError):
-                    break
-            elif isinstance(parent, dict):
-                parent = parent.setdefault(seg, {})
-            else:
-                break
-
-        key = segments[-1]
-
-        if action in ("add", "replace"):
-            if isinstance(parent, dict):
-                parent[key] = value
-            elif isinstance(parent, list):
-                try:
-                    idx = int(key) if key != "-" else len(parent)
-                    if action == "add":
-                        parent.insert(idx, value)
-                    else:
-                        parent[idx] = value
-                except (ValueError, IndexError):
-                    pass
-
-        elif action == "remove":
-            if isinstance(parent, dict) and key in parent:
-                del parent[key]
-            elif isinstance(parent, list):
-                try:
-                    del parent[int(key)]
-                except (ValueError, IndexError):
-                    pass
-
-        elif action == "move":
-            # Get value from source
-            from_segments = [seg for seg in from_path.strip("/").split("/") if seg]
-            if from_segments:
-                src_parent = result
-                for seg in from_segments[:-1]:
-                    if isinstance(src_parent, dict):
-                        src_parent = src_parent.get(seg, {})
-                    elif isinstance(src_parent, list):
-                        try:
-                            src_parent = src_parent[int(seg)]
-                        except (ValueError, IndexError):
-                            break
-                src_key = from_segments[-1]
-                if isinstance(src_parent, dict) and src_key in src_parent:
-                    value = src_parent.pop(src_key)
-                    if isinstance(parent, dict):
-                        parent[key] = value
-
-        elif action == "copy":
-            from_segments = [seg for seg in from_path.strip("/").split("/") if seg]
-            if from_segments:
-                src = result
-                for seg in from_segments:
-                    if isinstance(src, dict):
-                        src = src.get(seg)
-                    elif isinstance(src, list):
-                        try:
-                            src = src[int(seg)]
-                        except (ValueError, IndexError):
-                            src = None
-                            break
-                if src is not None and isinstance(parent, dict):
-                    parent[key] = copy.deepcopy(src)
-
-        elif action == "test":
-            # Test operation - verify value matches
-            current = parent.get(key) if isinstance(parent, dict) else None
-            if current != value:
-                raise BadRequestError(
-                    "JSON Patch test operation failed",
-                    detail={"path": path, "expected": value, "actual": current},
-                )
-
-    return result
-
-
-def _deep_merge(base: dict, updates: dict) -> dict:
-    """Deep merge updates into base dict."""
-    import copy
-    result = copy.deepcopy(base)
-    for key, value in updates.items():
-        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-            result[key] = _deep_merge(result[key], value)
-        else:
-            result[key] = copy.deepcopy(value)
-    return result
-
-
 @router.patch("/artifacts/{artifact_id}", response_model=Envelope, tags=["artifacts"])
 async def patch_artifact(
     artifact_id: str = Path(..., max_length=255, description="Artifact identifier"),
@@ -2336,10 +2222,10 @@ async def patch_artifact(
         # RFC 6902 JSON Patch operations
         ops = normalized["ops"]
         if ops:
-            new_schema = _apply_json_patch_ops(new_schema, ops)
+            new_schema = json_patch.apply_ops(new_schema, ops)
     elif "schema_update" in normalized:
         # Legacy schema update - deep merge
-        new_schema = _deep_merge(new_schema, normalized["schema_update"])
+        new_schema = json_patch.deep_merge(new_schema, normalized["schema_update"])
 
     if "description" in normalized:
         new_description = normalized["description"]
