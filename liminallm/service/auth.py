@@ -97,7 +97,6 @@ class AuthService:
         self.mfa_enabled = mfa_enabled
         self.revoked_refresh_tokens: set[str] = set()
         self._oauth_states: dict[str, tuple[str, datetime, Optional[str]]] = {}
-        self._oauth_code_registry: dict[tuple[str, str], dict] = {}
         self._email_verification_tokens: dict[str, tuple[str, datetime]] = {}
         # Issue 11.2: In-memory fallback for password reset tokens when Redis unavailable
         self._password_reset_tokens: dict[str, tuple[str, datetime]] = {}  # token -> (email, expires_at)
@@ -381,33 +380,14 @@ class AuthService:
             "provider": provider,
         }
 
-    def register_oauth_code(self, provider: str, code: str, payload: dict) -> None:
-        """Record an exchanged OAuth payload for testing or offline flows."""
-
-        self._oauth_code_registry[(provider, code)] = payload
-
     async def _exchange_oauth_code(self, provider: str, code: str) -> Optional[dict]:
-        """Exchange OAuth authorization code for user identity.
+        """Exchange an OAuth authorization code with the provider for an identity.
 
-        First checks cache/registry (for testing), then calls real OAuth providers.
+        This is the trust boundary of the whole OAuth flow: whatever payload
+        comes back here becomes an account. There is deliberately no cache and
+        no injection point in front of the provider round trip — tests stub
+        this method, nothing pre-registers codes.
         """
-        # Check cache first (for testing or pre-registered codes)
-        cached_payload: Optional[dict] = None
-        if self.cache:
-            raw = await self.cache.client.get(f"auth:oauth:code:{provider}:{code}")
-            if raw:
-                try:
-                    cached_payload = json.loads(raw)
-                except Exception as exc:
-                    self.logger.warning("oauth_code_parse_failed", error=str(exc))
-                else:
-                    await self.cache.client.delete(f"auth:oauth:code:{provider}:{code}")
-        if not cached_payload:
-            cached_payload = self._oauth_code_registry.pop((provider, code), None)
-        if cached_payload:
-            return cached_payload
-
-        # No cached payload - exchange code with real OAuth provider
         if provider not in OAUTH_PROVIDERS:
             self.logger.error("oauth_unknown_provider", provider=provider)
             return None

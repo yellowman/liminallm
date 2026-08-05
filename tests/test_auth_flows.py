@@ -276,19 +276,32 @@ def oauth_configured():
         ) = before
 
 
+def _stub_exchange(auth, payloads):
+    """Stub the provider round trip — the seam tests are meant to use.
+
+    `_exchange_oauth_code` is the trust boundary; production has no way to
+    pre-register a payload, so the stub lives here and consumes each code
+    once, the way a real provider treats an authorization code.
+    """
+
+    async def exchange(provider, code):
+        return payloads.pop((provider, code), None)
+
+    auth._exchange_oauth_code = exchange
+    return payloads
+
+
 async def _round_trip(auth, *, tenant_id=None, email=None, uid=None):
     """start_oauth then complete_oauth, with the provider stubbed offline."""
     start = await auth.start_oauth("google", tenant_id=tenant_id)
     code = uuid.uuid4().hex
-    auth.register_oauth_code(
-        "google",
-        code,
-        {
+    _stub_exchange(auth, {
+        ("google", code): {
             "provider_uid": uid or uuid.uuid4().hex,
             "email": email or f"oauth_{uuid.uuid4().hex[:8]}@example.com",
             "handle": "someone",
         },
-    )
+    })
     return await auth.complete_oauth("google", code, start["state"])
 
 
@@ -353,11 +366,11 @@ async def test_an_oauth_state_cannot_be_replayed(auth, oauth_configured):
     start = await auth.start_oauth("google")
     code = uuid.uuid4().hex
     payload = {"provider_uid": uuid.uuid4().hex, "email": "replay@example.com"}
-    auth.register_oauth_code("google", code, payload)
+    payloads = _stub_exchange(auth, {("google", code): payload})
     user, _, _ = await auth.complete_oauth("google", code, start["state"])
     assert user is not None
 
-    auth.register_oauth_code("google", code, payload)
+    payloads[("google", code)] = payload
     again, _, _ = await auth.complete_oauth("google", code, start["state"])
     assert again is None, "a spent OAuth state was accepted a second time"
 
@@ -366,7 +379,7 @@ async def test_an_oauth_state_cannot_be_replayed(auth, oauth_configured):
 async def test_an_oauth_state_is_bound_to_its_provider(auth, oauth_configured):
     start = await auth.start_oauth("google")
     code = uuid.uuid4().hex
-    auth.register_oauth_code("github", code, {"provider_uid": "x"})
+    _stub_exchange(auth, {("github", code): {"provider_uid": "x"}})
     user, _, _ = await auth.complete_oauth("github", code, start["state"])
     assert user is None
 
@@ -381,7 +394,7 @@ async def test_an_expired_oauth_state_is_refused(auth, oauth_configured):
         await auth.cache.pop_oauth_state(state)
 
     code = uuid.uuid4().hex
-    auth.register_oauth_code("google", code, {"provider_uid": "x"})
+    _stub_exchange(auth, {("google", code): {"provider_uid": "x"}})
     user, _, _ = await auth.complete_oauth("google", code, state)
     assert user is None
 

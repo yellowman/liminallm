@@ -1275,17 +1275,6 @@ button.minor:hover {
   color: white;
 }
 
-/* Streaming indicator */
-.streaming-indicator {
-  display: inline-block;
-  width: 7px;
-  height: 7px;
-  background: var(--accent);
-  border-radius: 50%;
-  animation: pulse 1s ease-in-out infinite;
-  margin-left: 4px;
-}
-
 @keyframes pulse {
   0%, 100% { opacity: 0.4; }
   50% { opacity: 1; }
@@ -1684,11 +1673,6 @@ button.minor:hover {
   display: flex;
   align-items: center;
   gap: 4px;
-}
-
-/* Artifacts list */
-.artifacts-list .artifact-row {
-  cursor: pointer;
 }
 
 .schema-viewer {
