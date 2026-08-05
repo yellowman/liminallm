@@ -118,7 +118,7 @@ class SemanticClusterer:
         # tenants' content (CLAUDE.md tenant isolation).
         tenant_ids = []
         for user in users:
-            tenant = getattr(user, "tenant_id", None)
+            tenant = user.tenant_id
             if tenant and tenant not in tenant_ids:
                 tenant_ids.append(tenant)
         for tenant_id in tenant_ids:
@@ -178,12 +178,9 @@ class SemanticClusterer:
         tenant_id: str | None,
         max_events: int,
     ) -> list[PreferenceEvent]:
-        events_raw = self.store.list_preference_events(
+        events = self.store.list_preference_events(
             user_id=user_id, feedback=POSITIVE_FEEDBACK_VALUES, tenant_id=tenant_id, limit=max_events * 4
         )
-        events = events_raw
-        if inspect.isawaitable(events_raw):
-            events = await events_raw
         filtered = [e for e in events if e.context_embedding]
         if len(filtered) > max_events:
             filtered = self._reservoir_sample(filtered, max_events)

@@ -525,36 +525,31 @@ async def _dependency_checks() -> tuple[Dict[str, Dict[str, Any]], bool, bool]:
 
     # Redis check (if configured). Never gates serving — see the docstring.
     redis_ok = True
-    if hasattr(runtime, "cache") and runtime.cache is not None:
+    if runtime.cache is not None:
         redis_ok = await _run_bounded("redis", runtime.cache.verify_connection)
         checks["redis"] = {"status": "healthy" if redis_ok else "unhealthy", "degraded": not redis_ok}
     else:
         checks["redis"] = {"status": "not_configured"}
 
     # Filesystem check
-    fs_root = getattr(runtime.store, "fs_root", None)
-    if fs_root:
-        fs_path = Path(fs_root)
+    fs_path = Path(runtime.store.fs_root)
 
-        def _fs_probe() -> None:
-            if not fs_path.exists() or not fs_path.is_dir():
-                raise FileNotFoundError(fs_path)
-            # Unique name per probe: SHARED_FS_ROOT is shared across replicas,
-            # and concurrent probes racing on one fixed filename made read_text
-            # hit another probe's unlink — a spurious 503 that drained healthy
-            # replicas.
-            health_file = fs_path / f".health_check-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-            try:
-                health_file.write_text(datetime.now(timezone.utc).isoformat())
-                health_file.read_text()
-            finally:
-                health_file.unlink(missing_ok=True)
+    def _fs_probe() -> None:
+        if not fs_path.exists() or not fs_path.is_dir():
+            raise FileNotFoundError(fs_path)
+        # Unique name per probe: SHARED_FS_ROOT is shared across replicas,
+        # and concurrent probes racing on one fixed filename made read_text
+        # hit another probe's unlink — a spurious 503 that drained healthy
+        # replicas.
+        health_file = fs_path / f".health_check-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        try:
+            health_file.write_text(datetime.now(timezone.utc).isoformat())
+            health_file.read_text()
+        finally:
+            health_file.unlink(missing_ok=True)
 
-        fs_ok = await _run_bounded("filesystem", _fs_probe)
-        checks["filesystem"] = {"status": "healthy" if fs_ok else "unhealthy"}
-    else:
-        fs_ok = True
-        checks["filesystem"] = {"status": "not_configured"}
+    fs_ok = await _run_bounded("filesystem", _fs_probe)
+    checks["filesystem"] = {"status": "healthy" if fs_ok else "unhealthy"}
 
     # Reported, never gating: the cluster bus only affects cross-replica
     # cancellation, and "local" is the right answer for a single process.
@@ -635,7 +630,7 @@ async def metrics() -> Response:
             logger.warning("metrics_user_count_failed", error=str(exc))
 
         # Active sessions (if Redis available)
-        if hasattr(runtime, "cache") and runtime.cache is not None:
+        if runtime.cache is not None:
             lines.append('# HELP liminallm_cache_available Redis cache availability')
             lines.append('# TYPE liminallm_cache_available gauge')
             lines.append('liminallm_cache_available 1')
@@ -656,16 +651,14 @@ async def metrics() -> Response:
         lines.append(f'liminallm_database_healthy {db_healthy}')
 
         # Training job activity
-        list_jobs = getattr(runtime.store, "list_training_jobs", None)
-        if callable(list_jobs):
-            try:
-                jobs = list_jobs()
-                active = len([j for j in jobs if j.status in {"queued", "running"}])
-                lines.append('# HELP liminallm_training_jobs_active Active training jobs')
-                lines.append('# TYPE liminallm_training_jobs_active gauge')
-                lines.append(f'liminallm_training_jobs_active {active}')
-            except Exception as exc:
-                logger.warning("metrics_training_jobs_failed", error=str(exc))
+        try:
+            jobs = runtime.store.list_training_jobs()
+            active = len([j for j in jobs if j.status in {"queued", "running"}])
+            lines.append('# HELP liminallm_training_jobs_active Active training jobs')
+            lines.append('# TYPE liminallm_training_jobs_active gauge')
+            lines.append(f'liminallm_training_jobs_active {active}')
+        except Exception as exc:
+            logger.warning("metrics_training_jobs_failed", error=str(exc))
 
         # Preference event ingestion rate proxy
         try:

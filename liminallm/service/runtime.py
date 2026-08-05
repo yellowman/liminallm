@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import inspect
 import json
 import os
 import threading
@@ -598,12 +597,8 @@ class Runtime:
                 await self.voice.close()
 
         if getattr(self, "cache", None):
-            close_fn = getattr(self.cache, "close", None)
-            if close_fn:
-                with contextlib.suppress(Exception):
-                    result = close_fn()
-                    if inspect.isawaitable(result):
-                        await result
+            with contextlib.suppress(Exception):
+                await self.cache.close()
 
         if getattr(self, "store", None):
             with contextlib.suppress(Exception):

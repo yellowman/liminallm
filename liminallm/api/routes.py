@@ -1345,7 +1345,7 @@ def _save_note_graph(runtime, principal: AuthContext, note) -> None:
     )
     runtime.store.update_note_meta(note.id, {"dangling": dangling})
     embedding = notes_service.embed_note(
-        getattr(runtime, "embeddings", None), note.title, note.content
+        runtime.embeddings, note.title, note.content
     )
     if embedding:
         runtime.store.update_note(note.id, embedding=embedding)
@@ -1423,10 +1423,9 @@ async def list_sweep_reports(
     runtime = get_runtime()
     await rate_limit(runtime, "read", principal.user_id)
     _require_notes_enabled(runtime)
-    lister = getattr(runtime.store, "list_sweep_reports", None)
-    if not callable(lister):
-        return Envelope(status="ok", data={"sweeps": []})
-    rows = lister(principal.user_id, limit=max(1, min(limit, 50)))
+    rows = runtime.store.list_sweep_reports(
+        principal.user_id, limit=max(1, min(limit, 50))
+    )
     return Envelope(
         status="ok",
         data={"sweeps": [
@@ -1520,7 +1519,7 @@ async def search_notes(
     _require_notes_enabled(runtime)
     results = notes_service.search_notes(
         runtime.store,
-        getattr(runtime, "embeddings", None),
+        runtime.embeddings,
         principal.user_id,
         body.query,
         limit=body.limit,
@@ -1555,20 +1554,20 @@ async def sweep_vault(principal: AuthContext = Depends(get_user)):
     report = await asyncio.to_thread(
         notes_service.vault_sweep,
         runtime.store,
-        getattr(runtime, "embeddings", None),
+        runtime.embeddings,
         runtime.llm,
         principal.user_id,
     )
     # A sweep costs up to 30 model calls; keep the result so a reload replays
     # it for free and the user has a record of what moved (SPEC 19.6).
-    saver = getattr(runtime.store, "save_sweep_report", None)
-    if callable(saver):
-        try:
-            saved = await asyncio.to_thread(saver, principal.user_id, report)
-            report = {**report, "id": saved["id"],
-                      "created_at": saved["created_at"].isoformat()}
-        except Exception as exc:  # noqa: BLE001 - archiving must not fail a sweep
-            logger.warning("sweep_report_save_failed", error=str(exc))
+    try:
+        saved = await asyncio.to_thread(
+            runtime.store.save_sweep_report, principal.user_id, report
+        )
+        report = {**report, "id": saved["id"],
+                  "created_at": saved["created_at"].isoformat()}
+    except Exception as exc:  # noqa: BLE001 - archiving must not fail a sweep
+        logger.warning("sweep_report_save_failed", error=str(exc))
     return Envelope(status="ok", data=report)
 
 
@@ -1664,7 +1663,7 @@ async def witness_note(
     report = await asyncio.to_thread(
         notes_service.witness_report,
         runtime.store,
-        getattr(runtime, "embeddings", None),
+        runtime.embeddings,
         runtime.llm,
         principal.user_id,
         note,

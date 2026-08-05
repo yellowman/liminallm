@@ -1823,29 +1823,15 @@ class PostgresStore:
         if not row:
             return None
 
-        def _row_value(key: str, default: Optional[Any] = None) -> Optional[Any]:
-            if hasattr(row, "get"):
-                return row.get(key, default)
-            try:
-                return row[key]
-            except Exception:
-                return default
-
-        raw_meta = _row_value("meta")
-        if isinstance(raw_meta, str):
-            try:
-                raw_meta = json.loads(raw_meta)
-            except Exception:
-                raw_meta = None
         return Conversation(
-            id=str(_row_value("id")),
-            user_id=str(_row_value("user_id")),
-            created_at=_row_value("created_at", datetime.now(timezone.utc)),
-            updated_at=_row_value("updated_at", datetime.now(timezone.utc)),
-            title=_row_value("title"),
-            status=_row_value("status") or "open",
-            active_context_id=_row_value("active_context_id"),
-            meta=raw_meta,
+            id=str(row["id"]),
+            user_id=str(row["user_id"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            title=row.get("title"),
+            status=row.get("status") or "open",
+            active_context_id=row.get("active_context_id"),
+            meta=row.get("meta"),
         )
 
     def set_conversation_title(
@@ -1914,9 +1900,7 @@ class PostgresStore:
                 "ORDER BY updated_at DESC LIMIT %s",
                 (limit,),
             ).fetchall()
-        ids = [
-            str(r["id"] if hasattr(r, "get") else r[0]) for r in rows
-        ]
+        ids = [str(r["id"]) for r in rows]
         found = (self.get_conversation(cid) for cid in ids)
         return [c for c in found if c]
 
@@ -3072,29 +3056,15 @@ class PostgresStore:
         if not row:
             return None
 
-        def _row_value(key: str, default: Optional[Any] = None) -> Optional[Any]:
-            if hasattr(row, "get"):
-                return row.get(key, default)
-            try:
-                return row[key]
-            except Exception:
-                return default
-
-        raw_meta = _row_value("meta")
-        if isinstance(raw_meta, str):
-            try:
-                raw_meta = json.loads(raw_meta)
-            except Exception:
-                raw_meta = None
         return KnowledgeContext(
-            id=str(_row_value("id")),
-            owner_user_id=str(_row_value("owner_user_id")),
-            name=_row_value("name", ""),
-            description=_row_value("description", ""),
-            created_at=_row_value("created_at", datetime.now(timezone.utc)),
-            updated_at=_row_value("updated_at", datetime.now(timezone.utc)),
-            fs_path=_row_value("fs_path"),
-            meta=raw_meta,
+            id=str(row["id"]),
+            owner_user_id=str(row["owner_user_id"]),
+            name=row["name"],
+            description=row.get("description") or "",
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            fs_path=row.get("fs_path"),
+            meta=row.get("meta"),
         )
 
     def list_contexts(

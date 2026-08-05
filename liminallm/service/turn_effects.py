@@ -81,11 +81,8 @@ def backfill_message_embeddings(runtime, history, user_id: str) -> None:
     """Persist per-turn embeddings for semantic recall. Real encoder only,
     skips what is already embedded, bounded so one pass cannot stall on a
     backlog — the next turn continues it."""
-    embeddings = getattr(runtime, "embeddings", None)
-    if embeddings is None or not getattr(embeddings, "is_semantic", False):
-        return
-    updater = getattr(runtime.store, "update_message_meta", None)
-    if not callable(updater):
+    embeddings = runtime.embeddings
+    if not embeddings.is_semantic:
         return
     done = 0
     for msg in history:
@@ -98,7 +95,7 @@ def backfill_message_embeddings(runtime, history, user_id: str) -> None:
             continue
         try:
             vector = embeddings.embed(content)
-            updater(
+            runtime.store.update_message_meta(
                 msg.id,
                 user_id=user_id,
                 patch={"embedding": vector, "embedding_model": embeddings.model_id},
