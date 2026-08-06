@@ -39,6 +39,9 @@ class ModelBackend(str, Enum):
     VERTEX = "vertex"
     GEMINI = "gemini"
     GOOGLE = "google"
+    # Native generativelanguage API (SSE, thoughts/cached token counts);
+    # "gemini" stays the OpenAI-compat shim.
+    GEMINI_NATIVE = "gemini_native"
     BEDROCK = "bedrock"
     TOGETHER = "together"
     TOGETHER_AI = "together.ai"

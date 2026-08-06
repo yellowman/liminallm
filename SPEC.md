@@ -848,6 +848,16 @@ JAX local serving is the primary path. at scale, the same artifacts can be
 served by a dedicated multi-LoRA server (LoRAX-style, vLLM multi-LoRA,
 Together adapter APIs) behind the existing OpenAI-compatible transport:
 
+- **native Gemini** (`model_backend: gemini_native`): speaks
+  generativelanguage.googleapis.com directly — generateContent /
+  streamGenerateContent SSE — rather than the OpenAI-compat shim (which
+  remains `gemini`). usageMetadata's thoughtsTokenCount and
+  cachedContentTokenCount map to the same reasoning_tokens / cached_tokens
+  keys as the Responses path, so the rich usage is provider-uniform. The
+  chat-shaped internal history (system prompt, assistant tool_calls,
+  role:"tool" results) converts losslessly to native `contents`
+  (service/gemini_backend.py), so a conversation resumes mid-history on any
+  provider.
 - **endpoint selection**: the Responses API (`/responses`) is the primary
   endpoint for OpenAI-compatible backends — richer usage (reasoning and
   cached-token counts flow into turn usage), typed output items, first-class

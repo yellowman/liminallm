@@ -306,6 +306,24 @@ class LLMService:
             return StubBackend()
         if mode in {"local_lora", "local_gpu_lora"}:
             return LocalJaxLoRABackend(self.base_model, fs_root or "/srv/liminallm")
+        if mode == "gemini_native":
+            from liminallm.service.gemini_backend import GeminiBackend
+
+            override = (
+                self.adapter_configs.get("gemini_native")
+                or self.adapter_configs.get("gemini")
+                or self.adapter_configs.get("openai")
+                or {}
+            )
+            # Same env resolution as the compat providers: the variable name
+            # comes from config's provider table, not a literal here.
+            api_key_env = (resolve_provider_endpoint("gemini") or {}).get("api_key_env")
+            return GeminiBackend(
+                self.base_model,
+                api_key=override.get("api_key") or api_key
+                or (os.getenv(api_key_env) if api_key_env else None),
+                base_url=override.get("base_url") or base_url,
+            )
 
         # OpenAI-compatible API providers (openai, anthropic, zhipu/glm, together,
         # gemini). Each resolves credentials as: explicit adapter_configs override,
