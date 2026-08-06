@@ -110,6 +110,18 @@ def _walk_create(doc: Any, segments: List[str], path: str) -> Any:
     return parent
 
 
+def _read_index(seg: str, path: str) -> int:
+    """RFC 6902 array indices are non-negative digit runs. Python's list[-1]
+    would otherwise quietly serve `/xs/-1` on the read paths (move/copy/test)
+    while the write path refuses it — the same op legal on one side of a
+    round trip and not the other."""
+    if not seg.isdigit():
+        raise BadRequestError(
+            "patch source path not found", detail={"path": path, "at": seg}
+        )
+    return int(seg)
+
+
 def _read(doc: Any, segments: List[str], path: str) -> Any:
     """Resolve a source path without creating anything along the way."""
     node = doc
@@ -123,8 +135,8 @@ def _read(doc: Any, segments: List[str], path: str) -> Any:
             node = node[seg]
         elif isinstance(node, list):
             try:
-                node = node[int(seg)]
-            except (ValueError, IndexError):
+                node = node[_read_index(seg, path)]
+            except IndexError:
                 raise BadRequestError(
                     "patch source path not found",
                     detail={"path": path, "at": "/" + "/".join(segments[: depth + 1])},
@@ -147,8 +159,8 @@ def _remove_at(doc: Any, segments: List[str], path: str) -> Any:
         return parent.pop(key)
     if isinstance(parent, list):
         try:
-            return parent.pop(int(key))
-        except (ValueError, IndexError):
+            return parent.pop(_read_index(key, path))
+        except IndexError:
             raise BadRequestError(
                 "patch source path not found", detail={"path": path}
             )

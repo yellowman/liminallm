@@ -193,3 +193,20 @@ def test_a_failed_test_op_aborts_the_whole_patch(client, auth_headers, owned_art
     assert resp.status_code == 400
     check = client.get(f"/v1/artifacts/{owned_artifact['id']}", headers=auth_headers)
     assert check.json()["data"]["schema"]["kind"] == "policy.routing"
+
+
+@pytest.mark.parametrize(
+    "op",
+    [
+        {"op": "copy", "path": "/x", "from": "/rules/-1"},
+        {"op": "move", "path": "/x", "from": "/rules/-2"},
+        {"op": "test", "path": "/rules/-1", "value": 2},
+    ],
+    ids=["copy", "move", "test"],
+)
+def test_negative_indices_are_refused_on_the_read_path_too(op):
+    """RFC 6902 array indices are non-negative. Python's list[-1] quietly
+    served `/rules/-1` to move/copy/test while the write path refused it —
+    found reviewing the commit that introduced this module."""
+    with pytest.raises(BadRequestError, match="source path not found"):
+        json_patch.apply_ops({"rules": [1, 2]}, [op])
