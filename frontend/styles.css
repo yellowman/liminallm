@@ -1767,6 +1767,28 @@ button.minor:hover {
   flex-wrap: wrap;
 }
 
+/* Context and workflow ride the conversation header as compact pills: they
+   parameterize the next turn, so they sit beside the thread actions instead
+   of costing the chat column a row of labelled form fields. */
+.conversation-header .header-ctl {
+  height: var(--ctl-h);
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+}
+
+.conversation-header select.header-ctl {
+  max-width: 170px;
+}
+
+.conversation-header input.header-ctl {
+  max-width: 150px;
+}
+
 .form-actions {
   display: flex;
   align-items: center;

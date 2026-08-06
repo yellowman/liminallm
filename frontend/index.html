@@ -196,21 +196,15 @@
                   <span id="conversation-label">New conversation</span>
                 </div>
                 <div class="pill-row">
+                  <select id="context-id" class="header-ctl" aria-label="Knowledge context"
+                          title="Knowledge context for RAG-grounded answers">
+                    <option value="">No context</option>
+                  </select>
+                  <input type="text" id="workflow-id" class="header-ctl" aria-label="Workflow override"
+                         title="Optional workflow override" placeholder="workflow…" />
                   <button class="ghost" id="share-btn" disabled>Share It</button>
                   <button class="ghost" id="new-thread">New thread</button>
                   <button class="minor" id="refresh-conversations">Refresh history</button>
-                </div>
-              </div>
-              <div class="input-grid">
-                <div class="field compact">
-                  <label for="context-id">Context ID</label>
-                  <select id="context-id">
-                    <option value="">No context</option>
-                  </select>
-                </div>
-                <div class="field compact">
-                  <label for="workflow-id">Workflow ID</label>
-                  <input type="text" id="workflow-id" placeholder="workflow.chat..." />
                 </div>
               </div>
 
