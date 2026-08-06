@@ -400,7 +400,10 @@ class Runtime:
                 "api_key": self.settings.adapter_openai_api_key,
                 "base_url": self.settings.adapter_openai_base_url,
                 "adapter_server_model": self.settings.adapter_server_model,
-            }
+            },
+            "gemini": {
+                "api_key": self.settings.gemini_api_key or None,
+            },
         }
         self.router = RouterEngine(cache=self.cache, backend_mode=self.backend_mode)
         self.llm = LLMService(

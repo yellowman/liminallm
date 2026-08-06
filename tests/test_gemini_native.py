@@ -323,3 +323,68 @@ def test_a_foreign_history_gets_the_documented_placeholder():
                         "function": {"name": "f", "arguments": "{}"}}],
     }])
     assert contents[0]["parts"][0]["thoughtSignature"] == gb.THOUGHT_SIGNATURE_PLACEHOLDER
+
+
+# ---------------------------------------------------------------------------
+# Admin key resolution — the gemini_api_key setting flows to both Gemini
+# backends, with the generic provider key and GEMINI_API_KEY env as fallbacks
+# ---------------------------------------------------------------------------
+
+
+class TestAdminKeyResolution:
+    def _service(self, monkeypatch, *, gemini_key=None, env_key=None):
+        from liminallm.service.llm import LLMService
+
+        if env_key is None:
+            monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        else:
+            monkeypatch.setenv("GEMINI_API_KEY", env_key)
+        configs = {
+            "openai": {"api_key": "sk-openai-field", "base_url": None},
+            "gemini": {"api_key": gemini_key},
+        }
+        return LLMService(
+            "gemini-flash-latest", backend_mode="gemini_native",
+            adapter_configs=configs, api_key="sk-openai-field",
+        )
+
+    def test_the_admin_setting_wins(self, monkeypatch):
+        svc = self._service(monkeypatch, gemini_key="g-admin", env_key="g-env")
+        assert isinstance(svc.backend, GeminiBackend)
+        assert svc.backend._api_key == "g-admin"
+
+    def test_it_falls_back_to_the_provider_key_setting(self, monkeypatch):
+        svc = self._service(monkeypatch, env_key="g-env")
+        assert svc.backend._api_key == "sk-openai-field"
+
+    def test_the_env_var_is_the_last_fallback(self, monkeypatch):
+        from liminallm.service.llm import LLMService
+
+        monkeypatch.setenv("GEMINI_API_KEY", "g-env")
+        svc = LLMService(
+            "gemini-flash-latest", backend_mode="gemini_native",
+            adapter_configs={"gemini": {"api_key": None}},
+        )
+        assert svc.backend._api_key == "g-env"
+
+    def test_the_compat_shim_reads_the_same_setting(self, monkeypatch):
+        from liminallm.service.llm import LLMService
+
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        svc = LLMService(
+            "gemini-2.5-flash", backend_mode="gemini",
+            adapter_configs={"gemini": {"api_key": "g-admin"},
+                             "openai": {"api_key": "sk-openai-field"}},
+        )
+        assert svc.backend._api_key == "g-admin"
+        assert "generativelanguage" in svc.backend._base_url
+
+    def test_runtime_wires_the_setting_into_the_gemini_config(self):
+        """The adapter_configs dict runtime builds must carry the setting —
+        this is the seam _build_backend reads."""
+        import inspect
+
+        from liminallm.service import runtime
+
+        src = inspect.getsource(runtime.Runtime._build_model_services)
+        assert "gemini_api_key" in src

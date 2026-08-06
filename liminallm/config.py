@@ -434,6 +434,13 @@ class Settings(BaseModel):
         None,
         description="Model name to send when pointing at an adapter server",
     )
+    gemini_api_key: str = secret_field(
+        description=(
+            "API key for the Gemini backends (model_backend=gemini_native "
+            "or gemini). Falls back to the provider key above, then the "
+            "GEMINI_API_KEY env var. Write-only."
+        ),
+    )
     # Voice service settings
     voice_api_key: str = secret_field(
         description="API key for transcription and synthesis. Write-only.",
@@ -1167,7 +1174,7 @@ _SETTING_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Model", ("model_path", "model_backend", "model_context_window",
                "model_reasoning_effort", "default_adapter_mode",
                "adapter_openai_base_url", "adapter_openai_api_key",
-               "adapter_server_model")),
+               "adapter_server_model", "gemini_api_key")),
     ("Retrieval", ("rag_mode", "rag_chunk_size", "embedding_model_id",
                    "history_budget_fraction", "history_recall_fraction")),
     ("Features", ("notes_enabled", "allow_signup", "enable_mfa",

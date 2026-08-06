@@ -92,7 +92,7 @@ class TestSchema:
         """
         by_name = {entry["name"]: entry for entry in managed_settings_schema()}
         for name in ("smtp_password", "jwt_secret", "web_search_api_key",
-                     "adapter_openai_api_key", "voice_api_key",
+                     "adapter_openai_api_key", "gemini_api_key", "voice_api_key",
                      "oauth_google_client_secret"):
             assert by_name[name]["secret"] is True, name
             assert by_name[name]["default"] == "", name
