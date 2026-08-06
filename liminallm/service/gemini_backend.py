@@ -30,6 +30,15 @@ DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com"
 # JSON-Schema keys Gemini's OpenAPI-subset validator rejects outright.
 _UNSUPPORTED_SCHEMA_KEYS = {"$schema", "additionalProperties"}
 
+# Gemini attaches a thoughtSignature to functionCall parts and rejects a
+# resumed history whose functionCall lacks one (INVALID_ARGUMENT, live).
+# The signature rides the chat-shaped assistant_message as a vendor extra so
+# the provider-agnostic loop round-trips it untouched. For a history built
+# elsewhere (another provider, a hand-written test), Google documents this
+# placeholder as the accepted stand-in:
+# https://ai.google.dev/gemini-api/docs/thought-signatures
+THOUGHT_SIGNATURE_PLACEHOLDER = "context_engineering_is_the_way_to_go"
+
 
 # ---------------------------------------------------------------------------
 # Chat-shape -> native conversion (pure, tested directly)
@@ -137,7 +146,9 @@ def to_contents(messages: List[dict]) -> Tuple[Optional[dict], List[dict]]:
                     "functionCall": {
                         "name": fn.get("name") or tc.get("name") or "",
                         "args": _parse_args(fn.get("arguments") or tc.get("arguments")),
-                    }
+                    },
+                    "thoughtSignature": tc.get("thought_signature")
+                    or THOUGHT_SIGNATURE_PLACEHOLDER,
                 })
             emit("model", parts)
             continue
@@ -196,12 +207,33 @@ def function_calls_of(payload: dict) -> List[Dict[str, str]]:
     for i, part in enumerate(_candidate_parts(payload)):
         fc = part.get("functionCall")
         if fc:
-            calls.append({
+            call = {
                 "id": f"gemini-call-{i}-{fc.get('name') or 'fn'}",
                 "name": fc.get("name") or "",
                 "arguments": json.dumps(fc.get("args") or {}),
-            })
+            }
+            if part.get("thoughtSignature"):
+                call["thought_signature"] = part["thoughtSignature"]
+            calls.append(call)
     return calls
+
+
+def _assistant_message(content: str, calls: List[Dict[str, str]]) -> Dict[str, Any]:
+    """Chat-shaped assistant message, carrying each call's thoughtSignature as
+    a vendor extra so the loop's verbatim round trip preserves it."""
+    msg: Dict[str, Any] = {"role": "assistant", "content": content or None}
+    if calls:
+        msg["tool_calls"] = [
+            {
+                "id": c["id"],
+                "type": "function",
+                "function": {"name": c["name"], "arguments": c["arguments"]},
+                **({"thought_signature": c["thought_signature"]}
+                   if c.get("thought_signature") else {}),
+            }
+            for c in calls
+        ]
+    return msg
 
 
 # ---------------------------------------------------------------------------
@@ -362,12 +394,10 @@ class GeminiBackend:
         payload = resp.json()
         content = candidate_text(payload)
         calls = function_calls_of(payload)
-        from liminallm.service.responses_compat import assistant_message
-
         return {
             "content": content,
             "tool_calls": calls,
-            "assistant_message": assistant_message(content, calls),
+            "assistant_message": _assistant_message(content, calls),
             "usage": usage_dict(payload),
         }
 

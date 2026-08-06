@@ -44,7 +44,8 @@ def test_the_structured_history_resumes_as_native_contents():
         {"role": "user", "parts": [{"text": "Fix median()"}]},
         {"role": "model", "parts": [
             {"text": "Looking at it."},
-            {"functionCall": {"name": "run_tests", "args": {"fn": "median"}}},
+            {"functionCall": {"name": "run_tests", "args": {"fn": "median"}},
+             "thoughtSignature": gb.THOUGHT_SIGNATURE_PLACEHOLDER},
         ]},
         {"role": "user", "parts": [
             {"functionResponse": {"name": "run_tests",
@@ -290,3 +291,35 @@ def test_every_provider_reports_the_rich_usage_keys():
         "promptTokenCount": 1, "candidatesTokenCount": 2, "totalTokenCount": 3,
         "thoughtsTokenCount": 4, "cachedContentTokenCount": 5}})
     assert responses_usage == gemini_usage
+
+
+# ---------------------------------------------------------------------------
+# Thought signatures — found live: Gemini 400s a resumed functionCall that
+# lacks one ("Function call is missing a thought_signature")
+# ---------------------------------------------------------------------------
+
+
+def test_the_thought_signature_survives_the_chat_shaped_round_trip():
+    payload = _payload("", calls=[{"name": "run_tests", "args": {"fn": "median"}}])
+    payload["candidates"][0]["content"]["parts"][0]["thoughtSignature"] = "sig-abc"
+
+    calls = gb.function_calls_of(payload)
+    assert calls[0]["thought_signature"] == "sig-abc"
+
+    am = gb._assistant_message("", calls)
+    assert am["tool_calls"][0]["thought_signature"] == "sig-abc"
+
+    _, contents = gb.to_contents([am])
+    assert contents[0]["parts"][0]["thoughtSignature"] == "sig-abc"
+
+
+def test_a_foreign_history_gets_the_documented_placeholder():
+    """A history that came from another provider carries no signature; the
+    placeholder Google documents keeps cross-provider resume working
+    (verified live against gemini-flash-latest)."""
+    _, contents = gb.to_contents([{
+        "role": "assistant", "content": None,
+        "tool_calls": [{"id": "call_x", "type": "function",
+                        "function": {"name": "f", "arguments": "{}"}}],
+    }])
+    assert contents[0]["parts"][0]["thoughtSignature"] == gb.THOUGHT_SIGNATURE_PLACEHOLDER
