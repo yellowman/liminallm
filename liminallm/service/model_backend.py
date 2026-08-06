@@ -15,6 +15,7 @@ from liminallm.config import (
     get_provider_capabilities,
 )
 from liminallm.logging import get_logger
+from liminallm.service import responses_compat
 from liminallm.service.fs import safe_join
 from liminallm.service.prompt_utils import extract_prompt_instructions
 from liminallm.service.tokenizer_utils import (
@@ -565,6 +566,9 @@ class ApiAdapterBackend:
         self._api_key_env = api_key_env or "OPENAI_API_KEY"
         self._client_timeout = 30.0
         self._active_api_key: Optional[str] = None
+        # Responses is the primary endpoint; None = not yet probed, False =
+        # this provider only ships chat/completions (sticky for the process).
+        self._responses_ok: Optional[bool] = None
         self.client = None
         self._ensure_client()
         # Infer provider from adapter_mode if not specified
@@ -690,6 +694,24 @@ class ApiAdapterBackend:
         augmented_messages = self._inject_adapter_prompts(messages, prompt_injections)
         extra_body = self._with_reasoning_effort(extra_body)
 
+        if self.client and self._responses_available():
+            try:
+                response = self.client.responses.create(
+                    input=responses_compat.to_input_items(augmented_messages),
+                    **self._responses_kwargs(target_model, processed["extra_body"]),
+                )
+                self._responses_ok = True
+                return {
+                    "content": responses_compat.output_text(response),
+                    "usage": responses_compat.usage_dict(response),
+                    "adapters_applied": processed["applied"],
+                }
+            except Exception as exc:
+                if self._responses_ok is not True and responses_compat.is_unsupported(exc):
+                    self._mark_responses_unsupported(exc)
+                else:
+                    raise
+
         if self.client:
             completion = self.client.chat.completions.create(
                 model=target_model,
@@ -732,6 +754,33 @@ class ApiAdapterBackend:
         self._ensure_client()
         return self.client is not None
 
+    def _responses_available(self) -> bool:
+        if self._responses_ok is False or self.client is None:
+            return False
+        if not hasattr(self.client, "responses"):
+            self._responses_ok = False
+            return False
+        return True
+
+    def _mark_responses_unsupported(self, exc: Exception) -> None:
+        logger.info(
+            "responses_endpoint_unsupported",
+            provider=self.provider,
+            error=str(exc)[:200],
+        )
+        self._responses_ok = False
+
+    def _responses_kwargs(self, model: str, extra_body: Optional[dict]) -> dict:
+        """Request kwargs for /responses. Reasoning effort travels as the
+        first-class `reasoning` parameter here, not extra_body."""
+        kwargs: Dict[str, Any] = {"model": model, **self._sampling_params(model)}
+        reasoning = responses_compat.reasoning_param(self._reasoning_effort)
+        if reasoning:
+            kwargs["reasoning"] = reasoning
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        return kwargs
+
     def generate_with_tools(
         self,
         messages: List[dict],
@@ -754,12 +803,38 @@ class ApiAdapterBackend:
         augmented = self._inject_adapter_prompts(
             messages, processed["prompt_injections"]
         )
+        if self._responses_available():
+            try:
+                kwargs = self._responses_kwargs(processed["model"], processed["extra_body"])
+                if tools:
+                    kwargs["tools"] = responses_compat.to_tools(tools)
+                    kwargs["tool_choice"] = "auto"
+                response = self.client.responses.create(
+                    input=responses_compat.to_input_items(augmented), **kwargs
+                )
+                self._responses_ok = True
+                content = responses_compat.output_text(response)
+                calls = responses_compat.tool_calls_of(response)
+                return {
+                    "content": content,
+                    "tool_calls": calls,
+                    "assistant_message": responses_compat.assistant_message(content, calls),
+                    "usage": responses_compat.usage_dict(response),
+                }
+            except Exception as exc:
+                if self._responses_ok is not True and responses_compat.is_unsupported(exc):
+                    self._mark_responses_unsupported(exc)
+                else:
+                    raise
+
         extra_body = self._with_reasoning_effort(processed["extra_body"])
+        # The loop's final round offers no tools; OpenAI rejects an empty
+        # tools list outright, so omit the parameters entirely.
+        tool_kwargs = {"tools": tools, "tool_choice": "auto"} if tools else {}
         completion = self.client.chat.completions.create(
             model=processed["model"],
             messages=augmented,
-            tools=tools,
-            tool_choice="auto",
+            **tool_kwargs,
             **self._sampling_params(processed["model"]),
             extra_body=extra_body,
         )
@@ -812,6 +887,61 @@ class ApiAdapterBackend:
             },
         }
 
+    def _stream_via_responses(
+        self, messages: List[dict], model: str, processed: dict
+    ):
+        """Stream via /responses. Returns True if any event was emitted (the
+        caller must not fall through to chat), False to fall back — which is
+        only safe when nothing has been yielded yet."""
+        full_content = ""
+        usage: Dict[str, Any] = {}
+        try:
+            stream = self.client.responses.create(
+                input=responses_compat.to_input_items(messages),
+                stream=True,
+                **self._responses_kwargs(model, processed["extra_body"]),
+            )
+            for event in stream:
+                etype = getattr(event, "type", "") or ""
+                if etype == "response.output_text.delta":
+                    delta = getattr(event, "delta", "") or ""
+                    if delta:
+                        full_content += delta
+                        yield {"event": "token", "data": delta}
+                elif etype == "response.completed":
+                    usage = responses_compat.usage_dict(getattr(event, "response", None))
+                elif etype in ("response.failed", "error"):
+                    raise RuntimeError(str(getattr(event, "error", None) or "response failed"))
+        except Exception as exc:
+            # A provider without /responses fails at request time or on the
+            # first read, before any token; only then is falling back safe.
+            if (
+                not full_content
+                and self._responses_ok is not True
+                and responses_compat.is_unsupported(exc)
+            ):
+                self._mark_responses_unsupported(exc)
+                return False
+            logger.error("streaming_error", error=str(exc))
+            yield {"event": "error", "data": {"code": "server_error", "message": str(exc)}}
+            return True
+        self._responses_ok = True
+        if not usage:
+            usage = {
+                "prompt_tokens": 0,
+                "completion_tokens": len(full_content.split()),
+                "total_tokens": len(full_content.split()),
+            }
+        yield {
+            "event": "message_done",
+            "data": {
+                "content": full_content,
+                "usage": usage,
+                "adapters_applied": processed["applied"],
+            },
+        }
+        return True
+
     def generate_stream(
         self,
         messages: List[dict],
@@ -835,6 +965,13 @@ class ApiAdapterBackend:
         prompt_injections = processed["prompt_injections"]
         augmented_messages = self._inject_adapter_prompts(messages, prompt_injections)
         extra_body = self._with_reasoning_effort(extra_body)
+
+        if self.client and self._responses_available():
+            emitted = yield from self._stream_via_responses(
+                augmented_messages, target_model, processed
+            )
+            if emitted:
+                return
 
         if self.client:
             try:

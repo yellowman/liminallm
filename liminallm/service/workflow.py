@@ -335,11 +335,12 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 if content:
                     merged_content_parts.append(f"[{node_id}]\n{content}")
 
-                # Sum usage
+                # Sum usage — via _merge_usage, which keeps every numeric
+                # key. A fixed key list here silently discarded the Responses
+                # API's reasoning_tokens and cached_tokens on parallel nodes.
                 usage = result.get("usage", {})
                 if isinstance(usage, dict):
-                    for key in ["prompt_tokens", "completion_tokens", "total_tokens"]:
-                        merged_usage[key] += usage.get(key, 0)
+                    merged_usage = self._merge_usage(merged_usage, usage)
 
                 # Collect snippets
                 all_snippets.extend(snippets)

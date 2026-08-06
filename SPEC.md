@@ -848,6 +848,14 @@ JAX local serving is the primary path. at scale, the same artifacts can be
 served by a dedicated multi-LoRA server (LoRAX-style, vLLM multi-LoRA,
 Together adapter APIs) behind the existing OpenAI-compatible transport:
 
+- **endpoint selection**: the Responses API (`/responses`) is the primary
+  endpoint for OpenAI-compatible backends — richer usage (reasoning and
+  cached-token counts flow into turn usage), typed output items, first-class
+  reasoning control. The backend probes once per process and falls back to
+  `/chat/completions` permanently for providers that answer 404/405; the
+  internal message shape stays chat-format, translated at the wire
+  (service/responses_compat.py).
+
 - the kernel already models this as `remote`/`adapter_param` providers
   (§5.0.2); adapters trained by the JAX pipeline are exported per-version to
   the shared filesystem and mounted by the server.
