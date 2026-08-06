@@ -20,6 +20,7 @@ from liminallm.service.fs import safe_join
 from liminallm.service.prompt_utils import extract_prompt_instructions
 from liminallm.service.tokenizer_utils import (
     DEFAULT_VOCAB_SIZE,
+    estimate_token_count,
     vocab_size_from_tokenizer,
 )
 
@@ -695,22 +696,21 @@ class ApiAdapterBackend:
         extra_body = self._with_reasoning_effort(extra_body)
 
         if self.client and self._responses_available():
-            try:
-                response = self.client.responses.create(
-                    input=responses_compat.to_input_items(augmented_messages),
-                    **self._responses_kwargs(target_model, processed["extra_body"]),
-                )
-                self._responses_ok = True
+            # Convert outside the try: is_unsupported() reads an AttributeError
+            # or TypeError as "this SDK has no /responses", so a bug in our own
+            # conversion would be blamed on the provider and turn the endpoint
+            # off for the whole process.
+            items = responses_compat.to_input_items(augmented_messages)
+            kwargs = self._responses_kwargs(target_model, processed["extra_body"])
+            response = self._try_responses(lambda: self.client.responses.create(
+                input=items, **kwargs
+            ))
+            if response is not None:
                 return {
                     "content": responses_compat.output_text(response),
                     "usage": responses_compat.usage_dict(response),
                     "adapters_applied": processed["applied"],
                 }
-            except Exception as exc:
-                if self._responses_ok is not True and responses_compat.is_unsupported(exc):
-                    self._mark_responses_unsupported(exc)
-                else:
-                    raise
 
         if self.client:
             completion = self.client.chat.completions.create(
@@ -770,6 +770,25 @@ class ApiAdapterBackend:
         )
         self._responses_ok = False
 
+    def _try_responses(self, call):
+        """Run one /responses call. Returns the response, or None when the
+        provider turns out to have no such endpoint — the one case where
+        falling back to chat/completions is correct. Any other failure is the
+        provider's real answer and propagates.
+
+        Only the call itself belongs in here. Conversion and parsing raise the
+        same exception types is_unsupported() treats as "endpoint missing".
+        """
+        try:
+            response = call()
+        except Exception as exc:
+            if self._responses_ok is not True and responses_compat.is_unsupported(exc):
+                self._mark_responses_unsupported(exc)
+                return None
+            raise
+        self._responses_ok = True
+        return response
+
     def _responses_kwargs(self, model: str, extra_body: Optional[dict]) -> dict:
         """Request kwargs for /responses. Reasoning effort travels as the
         first-class `reasoning` parameter here, not extra_body."""
@@ -804,15 +823,15 @@ class ApiAdapterBackend:
             messages, processed["prompt_injections"]
         )
         if self._responses_available():
-            try:
-                kwargs = self._responses_kwargs(processed["model"], processed["extra_body"])
-                if tools:
-                    kwargs["tools"] = responses_compat.to_tools(tools)
-                    kwargs["tool_choice"] = "auto"
-                response = self.client.responses.create(
-                    input=responses_compat.to_input_items(augmented), **kwargs
-                )
-                self._responses_ok = True
+            kwargs = self._responses_kwargs(processed["model"], processed["extra_body"])
+            if tools:
+                kwargs["tools"] = responses_compat.to_tools(tools)
+                kwargs["tool_choice"] = "auto"
+            items = responses_compat.to_input_items(augmented)
+            response = self._try_responses(lambda: self.client.responses.create(
+                input=items, **kwargs
+            ))
+            if response is not None:
                 content = responses_compat.output_text(response)
                 calls = responses_compat.tool_calls_of(response)
                 return {
@@ -821,11 +840,6 @@ class ApiAdapterBackend:
                     "assistant_message": responses_compat.assistant_message(content, calls),
                     "usage": responses_compat.usage_dict(response),
                 }
-            except Exception as exc:
-                if self._responses_ok is not True and responses_compat.is_unsupported(exc):
-                    self._mark_responses_unsupported(exc)
-                else:
-                    raise
 
         extra_body = self._with_reasoning_effort(processed["extra_body"])
         # The loop's final round offers no tools; OpenAI rejects an empty
@@ -895,12 +909,12 @@ class ApiAdapterBackend:
         only safe when nothing has been yielded yet."""
         full_content = ""
         usage: Dict[str, Any] = {}
+        # Converted before the try for the same reason as the blocking paths:
+        # our own AttributeError must not read as "provider has no /responses".
+        items = responses_compat.to_input_items(messages)
+        kwargs = self._responses_kwargs(model, processed["extra_body"])
         try:
-            stream = self.client.responses.create(
-                input=responses_compat.to_input_items(messages),
-                stream=True,
-                **self._responses_kwargs(model, processed["extra_body"]),
-            )
+            stream = self.client.responses.create(input=items, stream=True, **kwargs)
             for event in stream:
                 etype = getattr(event, "type", "") or ""
                 if etype == "response.output_text.delta":
@@ -927,10 +941,13 @@ class ApiAdapterBackend:
             return True
         self._responses_ok = True
         if not usage:
+            # No response.completed carrying usage. The shared estimator, not a
+            # word count: word counts undercount CJK roughly fourfold.
+            estimated = estimate_token_count(full_content)
             usage = {
                 "prompt_tokens": 0,
-                "completion_tokens": len(full_content.split()),
-                "total_tokens": len(full_content.split()),
+                "completion_tokens": estimated,
+                "total_tokens": estimated,
             }
         yield {
             "event": "message_done",

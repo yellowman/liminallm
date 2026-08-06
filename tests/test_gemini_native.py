@@ -388,3 +388,144 @@ class TestAdminKeyResolution:
 
         src = inspect.getsource(runtime.Runtime._build_model_services)
         assert "gemini_api_key" in src
+
+
+# ---------------------------------------------------------------------------
+# Reasoning effort — the admin setting reached every backend but this one
+# ---------------------------------------------------------------------------
+
+
+class TestThinkingConfig:
+    """thinkingLevel values verified live against gemini-flash-latest:
+    low/medium/high are accepted verbatim, "none" is a 400, "minimal" is the
+    accepted floor and spends zero thought tokens."""
+
+    def test_the_setting_vocabulary_maps_onto_the_native_one(self):
+        assert gb.thinking_config("low") == {"thinkingLevel": "low"}
+        assert gb.thinking_config("medium") == {"thinkingLevel": "medium"}
+        assert gb.thinking_config("HIGH ") == {"thinkingLevel": "high"}
+
+    def test_none_becomes_minimal_because_none_is_a_400(self):
+        """The setting advertises "none to disable"; the API rejects that
+        literal, so it maps to the level that does disable thinking."""
+        assert gb.thinking_config("none") == {"thinkingLevel": "minimal"}
+
+    def test_unset_sends_no_thinking_config_at_all(self):
+        assert gb.thinking_config("") is None
+        assert gb.thinking_config(None) is None
+        assert gb.thinking_config("bogus") is None
+
+    def test_the_effort_reaches_the_wire(self):
+        seen = {}
+
+        def handler(request):
+            seen.update(json.loads(request.content))
+            return httpx.Response(200, json=_payload("hi"))
+
+        GeminiBackend(
+            "gemini-flash-latest", api_key="k", reasoning_effort="low",
+            transport=httpx.MockTransport(handler),
+        ).generate([{"role": "user", "content": "hi"}], [])
+        assert seen["generationConfig"] == {"thinkingConfig": {"thinkingLevel": "low"}}
+
+    def test_no_effort_means_no_generation_config(self):
+        seen = {}
+
+        def handler(request):
+            seen.update(json.loads(request.content))
+            return httpx.Response(200, json=_payload("hi"))
+
+        _backend(handler).generate([{"role": "user", "content": "hi"}], [])
+        assert "generationConfig" not in seen
+
+    def test_a_model_that_rejects_thinking_degrades_once_and_stays_degraded(self):
+        """An older model 400s on thinkingConfig. Failing every request
+        because an admin set an effort is the wrong answer: drop the field,
+        log it, and keep serving."""
+        bodies = []
+
+        def handler(request):
+            body = json.loads(request.content)
+            bodies.append(body)
+            if "generationConfig" in body:
+                return httpx.Response(400, json={"error": {
+                    "message": "Unknown name \"thinking_level\" at 'generation_config.thinking_config'"}})
+            return httpx.Response(200, json=_payload("served"))
+
+        backend = GeminiBackend(
+            "gemini-1.0-pro", api_key="k", reasoning_effort="high",
+            transport=httpx.MockTransport(handler),
+        )
+        assert backend.generate([{"role": "user", "content": "hi"}], [])["content"] == "served"
+        assert len(bodies) == 2, "should retry once without the rejected field"
+
+        backend.generate([{"role": "user", "content": "again"}], [])
+        assert len(bodies) == 3, "the second turn must not re-probe"
+        assert all("generationConfig" not in b for b in bodies[2:])
+
+    def test_a_real_400_is_not_mistaken_for_a_thinking_rejection(self):
+        def handler(request):
+            return httpx.Response(400, json={"error": {"message": "API key not valid"}})
+
+        backend = GeminiBackend(
+            "gemini-flash-latest", api_key="bad", reasoning_effort="high",
+            transport=httpx.MockTransport(handler),
+        )
+        with pytest.raises(httpx.HTTPStatusError):
+            backend.generate([{"role": "user", "content": "hi"}], [])
+        assert backend._thinking_ok is None
+
+    def test_the_service_hands_the_setting_to_the_backend(self):
+        from liminallm.service.llm import LLMService
+
+        svc = LLMService(
+            "gemini-flash-latest", backend_mode="gemini_native",
+            adapter_configs={"gemini": {"api_key": "k"}},
+            reasoning_effort="medium",
+        )
+        assert svc.backend._reasoning_effort == "medium"
+
+
+def test_the_streaming_usage_fallback_uses_the_shared_estimator():
+    """A word count undercounts CJK roughly fourfold — that is why there is
+    one estimator."""
+    from liminallm.service.tokenizer_utils import estimate_token_count
+
+    cjk = "日本語のテキストです" * 5
+
+    def handler(request):
+        body = f'data: {json.dumps({"candidates": [{"content": {"parts": [{"text": cjk}]}}]})}\n\n'
+        return httpx.Response(200, content=body.encode(),
+                              headers={"content-type": "text/event-stream"})
+
+    events = list(_backend(handler).generate_stream([{"role": "user", "content": "hi"}], []))
+    usage = events[-1]["data"]["usage"]
+    assert usage["completion_tokens"] == estimate_token_count(cjk)
+    assert usage["completion_tokens"] > len(cjk.split()) * 4
+
+
+def test_the_stream_also_retries_once_without_the_rejected_thinking_config():
+    """The two-attempt loop in generate_stream is the fiddliest part of the
+    degrade: it has to read a 400 body from a response opened for streaming."""
+    bodies = []
+    chunk = json.dumps({"candidates": [{"content": {"parts": [{"text": "hello"}]}}],
+                        "usageMetadata": {"promptTokenCount": 3, "candidatesTokenCount": 1}})
+
+    def handler(request):
+        body = json.loads(request.content)
+        bodies.append(body)
+        if "generationConfig" in body:
+            return httpx.Response(400, json={"error": {
+                "message": "Unknown name \"thinking_config\" at 'generation_config'"}})
+        return httpx.Response(200, content=f"data: {chunk}\n\n".encode(),
+                              headers={"content-type": "text/event-stream"})
+
+    backend = GeminiBackend(
+        "gemini-1.0-pro", api_key="k", reasoning_effort="high",
+        transport=httpx.MockTransport(handler),
+    )
+    events = list(backend.generate_stream([{"role": "user", "content": "hi"}], []))
+    assert [e["event"] for e in events] == ["token", "message_done"]
+    assert events[0]["data"] == "hello"
+    assert len(bodies) == 2
+    assert events[-1]["data"]["usage"]["prompt_tokens"] == 3

@@ -22,6 +22,7 @@ import httpx
 
 from liminallm.logging import get_logger
 from liminallm.service.prompt_utils import extract_prompt_instructions
+from liminallm.service.tokenizer_utils import estimate_token_count
 
 logger = get_logger(__name__)
 
@@ -38,6 +39,23 @@ _UNSUPPORTED_SCHEMA_KEYS = {"$schema", "additionalProperties"}
 # placeholder as the accepted stand-in:
 # https://ai.google.dev/gemini-api/docs/thought-signatures
 THOUGHT_SIGNATURE_PLACEHOLDER = "context_engineering_is_the_way_to_go"
+
+# model_reasoning_effort -> generationConfig.thinkingConfig.thinkingLevel.
+# The native vocabulary is the setting's own, so low/medium/high pass through.
+# "none" is not an accepted level — sending it is a 400 — and "minimal" is the
+# floor the API does accept: it answers with zero thought tokens. Verified
+# live against gemini-flash-latest (minimal: no thoughtsTokenCount at all;
+# low: 87; medium: 164; high: 145 against an unconfigured 158).
+_THINKING_LEVELS = {
+    "none": "minimal", "minimal": "minimal",
+    "low": "low", "medium": "medium", "high": "high",
+}
+
+
+def thinking_config(effort: Optional[str]) -> Optional[dict]:
+    """The configured reasoning effort as a thinkingConfig, or None to omit."""
+    level = _THINKING_LEVELS.get((effort or "").strip().lower())
+    return {"thinkingLevel": level} if level else None
 
 
 # ---------------------------------------------------------------------------
@@ -253,14 +271,19 @@ class GeminiBackend:
         *,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
         transport: Optional[httpx.BaseTransport] = None,
     ) -> None:
         self.base_model = base_model
         self._api_key = api_key or ""
         self._base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
+        self._reasoning_effort = (reasoning_effort or "").strip().lower() or None
         self._transport = transport
         self._client: Optional[httpx.Client] = None
         self._context_window: Optional[int] = None
+        # None = not yet contradicted, False = this model predates
+        # thinkingConfig and 400s on it (sticky for the process).
+        self._thinking_ok: Optional[bool] = None
 
     # -- plumbing ----------------------------------------------------------
 
@@ -318,7 +341,39 @@ class GeminiBackend:
             decls = to_function_declarations(tools)
             if decls:
                 body["tools"] = [{"functionDeclarations": decls}]
+        thinking = thinking_config(self._reasoning_effort)
+        if thinking and self._thinking_ok is not False:
+            body["generationConfig"] = {"thinkingConfig": thinking}
         return body, applied
+
+    def _drop_rejected_thinking(self, body: dict, status: int, text: str) -> bool:
+        """Did this 400 come from thinkingConfig, and can we retry without it?
+
+        A model older than thinking rejects the field outright. Since the
+        admin set one effort for whichever backend is serving, dropping it for
+        this process — loudly — beats failing every request.
+        """
+        if status != 400 or "thinking" not in (text or "").lower():
+            return False
+        config = body.get("generationConfig") or {}
+        if not config.pop("thinkingConfig", None):
+            return False
+        if not config:
+            body.pop("generationConfig", None)
+        self._thinking_ok = False
+        logger.warning(
+            "gemini_thinking_config_unsupported",
+            model=self.base_model, effort=self._reasoning_effort,
+        )
+        return True
+
+    def _post(self, verb: str, body: dict) -> httpx.Response:
+        url = self._url(self.base_model, verb)
+        resp = self._http().post(url, headers=self._headers(), json=body)
+        if self._drop_rejected_thinking(body, resp.status_code, resp.text):
+            resp = self._http().post(url, headers=self._headers(), json=body)
+        resp.raise_for_status()
+        return resp
 
     # -- ModelBackend ------------------------------------------------------
 
@@ -365,12 +420,7 @@ class GeminiBackend:
         user_id: Optional[str] = None,
     ) -> dict:
         body, applied = self._request_body(messages, adapters)
-        resp = self._http().post(
-            self._url(self.base_model, "generateContent"),
-            headers=self._headers(), json=body,
-        )
-        resp.raise_for_status()
-        payload = resp.json()
+        payload = self._post("generateContent", body).json()
         return {
             "content": candidate_text(payload),
             "usage": usage_dict(payload),
@@ -386,12 +436,7 @@ class GeminiBackend:
         user_id: Optional[str] = None,
     ) -> dict:
         body, _ = self._request_body(messages, adapters, tools=tools)
-        resp = self._http().post(
-            self._url(self.base_model, "generateContent"),
-            headers=self._headers(), json=body,
-        )
-        resp.raise_for_status()
-        payload = resp.json()
+        payload = self._post("generateContent", body).json()
         content = candidate_text(payload)
         calls = function_calls_of(payload)
         return {
@@ -412,40 +457,51 @@ class GeminiBackend:
         chunk whose candidate parts carry text deltas; the last one carries
         usageMetadata."""
         body, applied = self._request_body(messages, adapters)
+        url = self._url(self.base_model, "streamGenerateContent") + "?alt=sse"
         full_content = ""
         usage: Dict[str, int] = {}
         try:
-            with self._http().stream(
-                "POST",
-                self._url(self.base_model, "streamGenerateContent") + "?alt=sse",
-                headers=self._headers(), json=body,
-            ) as resp:
-                resp.raise_for_status()
-                for line in resp.iter_lines():
-                    if not line or not line.startswith("data:"):
-                        continue
-                    data = line[len("data:"):].strip()
-                    if not data or data == "[DONE]":
-                        continue
-                    try:
-                        chunk = json.loads(data)
-                    except json.JSONDecodeError:
-                        continue
-                    delta = candidate_text(chunk)
-                    if delta:
-                        full_content += delta
-                        yield {"event": "token", "data": delta}
-                    if chunk.get("usageMetadata"):
-                        usage = usage_dict(chunk)
+            # Two attempts at most: the second only happens when the first was
+            # a 400 blaming thinkingConfig, which _drop_rejected_thinking has
+            # then removed from the body for good.
+            for attempt in (1, 2):
+                with self._http().stream(
+                    "POST", url, headers=self._headers(), json=body,
+                ) as resp:
+                    if attempt == 1 and resp.status_code == 400:
+                        resp.read()
+                        if self._drop_rejected_thinking(body, 400, resp.text):
+                            continue
+                    resp.raise_for_status()
+                    for line in resp.iter_lines():
+                        if not line or not line.startswith("data:"):
+                            continue
+                        data = line[len("data:"):].strip()
+                        if not data or data == "[DONE]":
+                            continue
+                        try:
+                            chunk = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        delta = candidate_text(chunk)
+                        if delta:
+                            full_content += delta
+                            yield {"event": "token", "data": delta}
+                        if chunk.get("usageMetadata"):
+                            usage = usage_dict(chunk)
+                break
         except Exception as exc:  # noqa: BLE001 - a stream failure is an event
             logger.error("streaming_error", error=str(exc))
             yield {"event": "error", "data": {"code": "server_error", "message": str(exc)}}
             return
         if not usage:
+            # No chunk carried usageMetadata. The shared estimator, not a word
+            # count: word counts undercount CJK roughly fourfold.
+            estimated = estimate_token_count(full_content)
             usage = {
                 "prompt_tokens": 0,
-                "completion_tokens": len(full_content.split()),
-                "total_tokens": len(full_content.split()),
+                "completion_tokens": estimated,
+                "total_tokens": estimated,
             }
         yield {
             "event": "message_done",

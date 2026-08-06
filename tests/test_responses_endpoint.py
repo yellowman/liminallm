@@ -362,3 +362,40 @@ def test_no_fixed_usage_key_list_survives_in_the_merge_paths():
 
     src = pathlib.Path("liminallm/service/workflow.py").read_text()
     assert 'for key in ["prompt_tokens", "completion_tokens", "total_tokens"]' not in src
+
+
+# ---------------------------------------------------------------------------
+# The unsupported-endpoint verdict must describe the provider, not us
+# ---------------------------------------------------------------------------
+
+
+def test_our_own_conversion_bug_is_not_blamed_on_the_provider():
+    """is_unsupported() reads AttributeError/TypeError as "this SDK has no
+    /responses". Conversion and parsing raise those same types, so they run
+    outside the guarded call — otherwise one malformed message would turn the
+    endpoint off for the whole process and log it as the provider's fault."""
+    backend = _backend(_client(responses_create=lambda **kw: _response()))
+    # A history entry the converter cannot handle: .get() on a string raises
+    # AttributeError inside to_input_items.
+    with pytest.raises(AttributeError):
+        backend.generate(["not a message dict"], [])
+    assert backend._responses_ok is None, "the provider was never asked"
+
+    # And the endpoint is still used for the next, well-formed call.
+    assert backend.generate([{"role": "user", "content": "hi"}], [])["content"] == "hello"
+    assert backend._responses_ok is True
+
+
+def test_the_streaming_usage_fallback_uses_the_shared_estimator():
+    from liminallm.service.tokenizer_utils import estimate_token_count
+
+    cjk = "日本語のテキストです" * 5
+
+    def responses_create(**kw):
+        return iter([NS(type="response.output_text.delta", delta=cjk)])
+
+    backend = _backend(_client(responses_create=responses_create))
+    events = list(backend.generate_stream([{"role": "user", "content": "hi"}], []))
+    usage = events[-1]["data"]["usage"]
+    assert usage["completion_tokens"] == estimate_token_count(cjk)
+    assert usage["completion_tokens"] > len(cjk.split()) * 4

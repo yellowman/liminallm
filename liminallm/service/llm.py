@@ -323,6 +323,7 @@ class LLMService:
                 api_key=override.get("api_key") or api_key
                 or (os.getenv(api_key_env) if api_key_env else None),
                 base_url=override.get("base_url") or base_url,
+                reasoning_effort=self.reasoning_effort,
             )
 
         # OpenAI-compatible API providers (openai, anthropic, zhipu/glm, together,
