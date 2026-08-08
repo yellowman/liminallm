@@ -66,6 +66,7 @@ class ModelBackend(str, Enum):
     MINIMAX = "minimax"
     MISTRAL = "mistral"
     COHERE = "cohere"
+    META = "meta"
     # Resellers: same models, smaller serving windows than native.
     FIREWORKS = "fireworks"
     GROQ = "groq"
@@ -351,6 +352,11 @@ PROVIDER_ENDPOINTS: dict[str, dict[str, Optional[str]]] = {
     "minimax": {"provider": "minimax", "api_key_env": "MINIMAX_API_KEY", "base_url": "https://api.minimax.io/v1"},
     "mistral": {"provider": "mistral", "api_key_env": "MISTRAL_API_KEY", "base_url": "https://api.mistral.ai/v1"},
     "cohere": {"provider": "cohere", "api_key_env": "COHERE_API_KEY", "base_url": "https://api.cohere.ai/compatibility/v1"},
+    # Meta Model API (Muse Spark). Successor to the Llama API, whose
+    # api.llama.com host was retired in July 2026. The /v1 suffix is the
+    # OpenAI-compatible surface; Meta serves its Anthropic-shaped endpoint
+    # from the bare host, which this backend does not speak.
+    "meta": {"provider": "meta", "api_key_env": "META_API_KEY", "base_url": "https://api.meta.ai/v1"},
     # Resellers. The provider name is load-bearing beyond credentials: it
     # selects the host's own serving limits in HOSTED_CONTEXT_WINDOWS, which
     # are smaller than the models' native ceilings.

@@ -147,6 +147,11 @@ class TestHostedWindows:
         assert context_window_from_table("glm-5.2", provider="openai") == 1_000_000
         assert context_window_from_table("glm-5.2", provider="") == 1_000_000
 
+    def test_the_meta_model_api_serves_muse_spark(self):
+        """Meta's hosted family, reachable since the Llama API host retired."""
+        assert context_window_from_table("muse-spark-1.2", provider="meta") == 1_048_576
+        assert PROVIDER_ENDPOINTS["meta"]["base_url"] == "https://api.meta.ai/v1"
+
     def test_a_host_that_does_not_serve_the_model_falls_through(self):
         """Together has no gpt-5 row; the OpenAI family should still answer
         rather than the lookup returning nothing."""
@@ -217,7 +222,8 @@ class TestProviderWiring:
         """These providers serve one model per request with no adapter
         multiplexing — the default — so none of them needs a bespoke entry."""
         for provider in ("xai", "deepseek", "moonshot", "qwen", "baichuan",
-                         "minimax", "mistral", "cohere", "groq", "cerebras", "fireworks"):
+                         "minimax", "mistral", "cohere", "groq", "cerebras",
+                         "fireworks", "meta"):
             caps = get_provider_capabilities(provider)
             assert caps.max_adapters == 1
             assert not caps.multi_adapter
