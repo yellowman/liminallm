@@ -16,55 +16,34 @@ services:
       # HOST_BIND=0.0.0.0 for direct dev access without a proxy.
       - "${HOST_BIND:-127.0.0.1}:${HOST_PORT:-8000}:8000"
     environment:
-      # Database
+      # Bootstrap only. Everything else is an admin-managed setting stored in
+      # the database; INSTANCE_SETTINGS_JSON seeds those on first boot, and
+      # the admin console owns them from then on.
       DATABASE_URL: postgresql://liminallm:${POSTGRES_PASSWORD}@postgres:5432/liminallm
-      # Redis (with authentication)
-      REDIS_URL: redis://:${REDIS_PASSWORD:-changeme}@redis:6379/0
-      # Storage
-      SHARED_FS_ROOT: /srv/liminallm
-      # Model configuration
-      MODEL_BACKEND: ${MODEL_BACKEND:-openai}
-      MODEL_PATH: ${MODEL_PATH:-}
-      OPENAI_ADAPTER_API_KEY: ${OPENAI_ADAPTER_API_KEY:-}
-      OPENAI_ADAPTER_BASE_URL: ${OPENAI_ADAPTER_BASE_URL:-https://api.openai.com/v1}
-      ADAPTER_SERVER_MODEL: ${ADAPTER_SERVER_MODEL:-gpt-4o}
-      # Provider API keys for non-OpenAI backends (MODEL_BACKEND=anthropic|zhipu|glm|together|gemini)
+      EMBEDDING_VECTOR_DIM: ${EMBEDDING_VECTOR_DIM:-1536}
+      # Provider credentials, read as the last fallback when the matching
+      # admin setting is blank.
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       ZHIPU_API_KEY: ${ZHIPU_API_KEY:-}
       TOGETHER_API_KEY: ${TOGETHER_API_KEY:-}
-      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-text-embedding-3-small}
-      # Voice (optional)
-      VOICE_API_KEY: ${OPENAI_ADAPTER_API_KEY:-}
-      VOICE_TRANSCRIPTION_MODEL: ${VOICE_TRANSCRIPTION_MODEL:-whisper-1}
-      VOICE_SYNTHESIS_MODEL: ${VOICE_SYNTHESIS_MODEL:-tts-1}
-      VOICE_DEFAULT_VOICE: ${VOICE_DEFAULT_VOICE:-alloy}
-      # Auth
-      JWT_SECRET: ${JWT_SECRET:-}
-      JWT_ISSUER: ${JWT_ISSUER:-liminallm}
-      JWT_AUDIENCE: ${JWT_AUDIENCE:-liminal-clients}
-      ACCESS_TOKEN_TTL_MINUTES: ${ACCESS_TOKEN_TTL_MINUTES:-30}
-      REFRESH_TOKEN_TTL_MINUTES: ${REFRESH_TOKEN_TTL_MINUTES:-1440}
-      ENABLE_MFA: ${ENABLE_MFA:-true}
-      # Email (optional)
-      SMTP_HOST: ${SMTP_HOST:-}
-      SMTP_PORT: ${SMTP_PORT:-587}
-      SMTP_USER: ${SMTP_USER:-}
-      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
-      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
-      EMAIL_FROM_ADDRESS: ${EMAIL_FROM_ADDRESS:-}
-      EMAIL_FROM_NAME: ${EMAIL_FROM_NAME:-LiminalLM}
-      APP_BASE_URL: ${APP_BASE_URL:-http://localhost:8000}
-      # OAuth (optional)
-      OAUTH_GOOGLE_CLIENT_ID: ${OAUTH_GOOGLE_CLIENT_ID:-}
-      OAUTH_GOOGLE_CLIENT_SECRET: ${OAUTH_GOOGLE_CLIENT_SECRET:-}
-      OAUTH_GITHUB_CLIENT_ID: ${OAUTH_GITHUB_CLIENT_ID:-}
-      OAUTH_GITHUB_CLIENT_SECRET: ${OAUTH_GITHUB_CLIENT_SECRET:-}
-      OAUTH_MICROSOFT_CLIENT_ID: ${OAUTH_MICROSOFT_CLIENT_ID:-}
-      OAUTH_MICROSOFT_CLIENT_SECRET: ${OAUTH_MICROSOFT_CLIENT_SECRET:-}
-      OAUTH_REDIRECT_URI: ${OAUTH_REDIRECT_URI:-}
-      # Note: rate limits are admin-managed in system_settings, not env vars.
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      MOONSHOT_API_KEY: ${MOONSHOT_API_KEY:-}
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      # First-boot seed for the managed settings. redis_url matters here: its
+      # default points at localhost, which inside this container is the
+      # container itself rather than the redis service.
+      INSTANCE_SETTINGS_JSON: >-
+        {"redis_url": "redis://:${REDIS_PASSWORD:-changeme}@redis:6379/0",
+         "shared_fs_root": "/srv/liminallm",
+         "model_backend": "${MODEL_BACKEND:-openai}",
+         "model_path": "${MODEL_PATH:-gpt-4o-mini}",
+         "app_base_url": "${APP_BASE_URL:-http://localhost:8000}",
+         "embedding_model_id": "${EMBEDDING_MODEL_ID:-text-embedding-3-small}"}
     volumes:
       - liminallm-data:/srv/liminallm
     depends_on:
