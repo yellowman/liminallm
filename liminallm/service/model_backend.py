@@ -391,20 +391,56 @@ class StubBackend:
 DEFAULT_CONTEXT_WINDOW = 8192
 
 # Models that reject a caller-supplied temperature (400, whole request fails).
-_REASONING_PREFIXES = ("o1", "o3", "o4", "gpt-5", "gemini-3")
+# Omitting the parameter is always safe — every model has a sane default — so
+# this list errs toward including a family rather than risking the 400.
+_REASONING_PREFIXES = (
+    "o1", "o3", "o4", "gpt-5",
+    "gemini-3",
+    # Anthropic removed sampling parameters from Opus 4.7 onward; 4.6 and
+    # earlier still accept temperature.
+    "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5",
+    "claude-sonnet-5", "claude-fable-5", "claude-mythos-5",
+    # DeepSeek's thinking endpoint ignores/rejects sampling parameters.
+    "deepseek-reasoner",
+)
 
 
 def is_reasoning_model(model: str) -> bool:
     lowered = (model or "").lower()
     return any(lowered.startswith(prefix) for prefix in _REASONING_PREFIXES)
 
-# Longest-prefix wins. Values are input windows, deliberately the safe
-# published number rather than any beta/extended tier.
+# Longest-prefix wins. This is the *fallback* — the provider probe
+# (GeminiBackend's models/{id}, an adapter server's config) is consulted first,
+# and model_context_window overrides everything. So each value is the safe
+# published number, never a beta or extended tier: under-guessing costs a
+# little prompt budget, over-guessing overflows the window and fails the turn.
 KNOWN_CONTEXT_WINDOWS: List[Tuple[str, int]] = [
-    ("gemini-1.5-pro", 2_000_000),
+    # Google. Verified against a live ListModels call: every current Gemini
+    # text model reports inputTokenLimit 1048576. The image, TTS, and
+    # computer-use variants are much smaller and would otherwise inherit 1M.
     ("gemini", 1_000_000),
-    ("gpt-4.1", 1_000_000),
+    ("gemini-2.5-flash-image", 32_768),
+    ("gemini-3.1-flash-image", 65_536),
+    ("gemini-3-pro-image", 131_072),
+    ("gemini-2.5-computer-use", 131_072),
+    ("gemini-omni", 131_072),
+    ("gemma", 262_144),
+    # OpenAI. The 5.x line splits by tier, not by version: 5.6/5.5/5.4 and
+    # their Pro variants are 1,050,000, but 5.4 mini/nano and 5.3-codex are
+    # 400,000, and the legacy chat-latest aliases are 128,000. Each exception
+    # needs its own entry or the family prefix over-guesses it.
     ("gpt-5", 400_000),
+    ("gpt-5.4", 1_050_000),
+    ("gpt-5.4-mini", 400_000),
+    ("gpt-5.4-nano", 400_000),
+    ("gpt-5.5", 1_050_000),
+    ("gpt-5.6", 1_050_000),
+    ("gpt-5.3-codex", 400_000),
+    ("gpt-5-chat-latest", 128_000),
+    ("gpt-5.1-chat-latest", 128_000),
+    ("gpt-5.2-chat-latest", 128_000),
+    ("gpt-5.3-chat-latest", 128_000),
+    ("gpt-4.1", 1_000_000),
     ("gpt-4o", 128_000),
     ("chatgpt-4o", 128_000),
     ("gpt-4-turbo", 128_000),
@@ -413,14 +449,67 @@ KNOWN_CONTEXT_WINDOWS: List[Tuple[str, int]] = [
     ("o1", 200_000),
     ("o3", 200_000),
     ("o4", 200_000),
+    # Anthropic. The 4.6-and-later families moved to 1M; Haiku and everything
+    # older stay at 200K, which is why "claude" keeps the smaller floor.
     ("claude", 200_000),
+    ("claude-opus-4-6", 1_000_000),
+    ("claude-opus-4-7", 1_000_000),
+    ("claude-opus-4-8", 1_000_000),
+    ("claude-opus-5", 1_000_000),
+    ("claude-sonnet-4-6", 1_000_000),
+    ("claude-sonnet-5", 1_000_000),
+    ("claude-fable-5", 1_000_000),
+    ("claude-mythos-5", 1_000_000),
+    # xAI. Newer is not larger here: 4.5 is the current flagship at 500K while
+    # 4.3 and the 4.20 deployments carry 1M. The slugs retired on 2026-05-15
+    # (grok-4-fast, grok-4-0709, grok-3, grok-code-fast-1) still resolve — xAI
+    # routes them to newer models — so the 256K floor under-guesses rather than
+    # overflowing. grok-build-latest aliases 4.5, but an alias target can move,
+    # so it takes the same conservative floor as grok-build-0.1.
+    ("grok", 131_072),
+    ("grok-4", 256_000),
+    ("grok-4.3", 1_000_000),
+    ("grok-4.5", 500_000),
+    ("grok-4.20", 1_000_000),
+    ("grok-build", 256_000),
+    # DeepSeek. The chat/reasoner aliases track V3.2 at 128K; the V4 line
+    # ships 1M.
+    ("deepseek", 128_000),
+    ("deepseek-v4", 1_000_000),
+    # Zhipu / GLM.
+    ("glm", 128_000),
+    ("glm-5", 200_000),
+    ("glm-5.2", 1_000_000),
+    # Moonshot / Kimi.
+    ("moonshot", 131_072),
+    ("moonshot-v1-8k", 8_192),
+    ("moonshot-v1-32k", 32_768),
+    ("kimi", 256_000),
+    # Alibaba Model Studio. The 3.5-and-later tiers and the long-lived
+    # plus/flash families are 1M; qwen3-max and qwen3.6-max-preview stay at
+    # 262,144 despite the newer-looking names, and qwen-long is a 10M
+    # document model. The bare "qwen" floor covers self-hosted open weights,
+    # whose window is set by the deployment rather than by Alibaba.
+    ("qwen", 131_072),
+    ("qwen-plus", 1_000_000),
+    ("qwen-flash", 1_000_000),
+    ("qwen-long", 10_000_000),
+    ("qwen3-coder", 1_000_000),
+    ("qwen3-max", 262_144),
+    ("qwen3.5", 1_000_000),
+    ("qwen3.6", 1_000_000),
+    ("qwen3.6-max", 262_144),
+    ("qwen3.7", 1_000_000),
+    ("qwen3.8", 1_000_000),
+    # Baichuan documents every current model at 32k; only the explicitly
+    # named 128k variant is larger.
+    ("baichuan", 32_768),
+    ("baichuan3-turbo-128k", 128_000),
+    # Open weights, commonly self-hosted.
     ("llama-3.1", 131_072),
     ("llama-3.2", 131_072),
     ("llama-3.3", 131_072),
     ("llama-4", 131_072),
-    ("glm", 128_000),
-    ("deepseek", 64_000),
-    ("qwen", 32_768),
     ("mistral", 32_768),
 ]
 

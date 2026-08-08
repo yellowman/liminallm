@@ -25,7 +25,8 @@ from liminallm.service.tokenizer_utils import MAX_GENERATION_TOKENS
 
 def test_known_families_resolve_longest_prefix():
     assert context_window_from_table("gemini-flash-latest") == 1_000_000
-    assert context_window_from_table("gemini-1.5-pro-002") == 2_000_000  # longer wins
+    # Longer wins: the image variants are a fraction of the text window.
+    assert context_window_from_table("gemini-2.5-flash-image") == 32_768
     assert context_window_from_table("gpt-4o-mini") == 128_000
     assert context_window_from_table("gpt-4") == 8_192
     assert context_window_from_table("gpt-4.1-mini") == 1_000_000

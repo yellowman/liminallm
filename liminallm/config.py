@@ -49,10 +49,20 @@ class ModelBackend(str, Enum):
     ADAPTER_SERVER = "adapter_server"
     SAGEMAKER = "sagemaker"
     AWS_SAGEMAKER = "aws_sagemaker"
-    # Zhipu AI GLM models (glm-4, glm-4-plus, etc.)
+    # Zhipu AI GLM models (glm-4, glm-4-plus, glm-5, etc.)
     ZHIPU = "zhipu"
     ZHIPU_AI = "zhipu.ai"
     GLM = "glm"
+    # Further OpenAI-compatible providers. Each resolves through
+    # PROVIDER_ENDPOINTS, so adding one is a table entry, not a new backend.
+    XAI = "xai"
+    GROK = "grok"
+    DEEPSEEK = "deepseek"
+    MOONSHOT = "moonshot"
+    KIMI = "kimi"
+    QWEN = "qwen"
+    DASHSCOPE = "dashscope"
+    BAICHUAN = "baichuan"
     # Local JAX + LoRA serving
     LOCAL_LORA = "local_lora"
     LOCAL_GPU_LORA = "local_gpu_lora"
@@ -321,6 +331,16 @@ PROVIDER_ENDPOINTS: dict[str, dict[str, Optional[str]]] = {
     "glm": {"provider": "zhipu", "api_key_env": "ZHIPU_API_KEY", "base_url": "https://open.bigmodel.cn/api/paas/v4"},
     "together": {"provider": "together", "api_key_env": "TOGETHER_API_KEY", "base_url": "https://api.together.xyz/v1"},
     "together.ai": {"provider": "together", "api_key_env": "TOGETHER_API_KEY", "base_url": "https://api.together.xyz/v1"},
+    "xai": {"provider": "xai", "api_key_env": "XAI_API_KEY", "base_url": "https://api.x.ai/v1"},
+    "grok": {"provider": "xai", "api_key_env": "XAI_API_KEY", "base_url": "https://api.x.ai/v1"},
+    "deepseek": {"provider": "deepseek", "api_key_env": "DEEPSEEK_API_KEY", "base_url": "https://api.deepseek.com/v1"},
+    "moonshot": {"provider": "moonshot", "api_key_env": "MOONSHOT_API_KEY", "base_url": "https://api.moonshot.ai/v1"},
+    "kimi": {"provider": "moonshot", "api_key_env": "MOONSHOT_API_KEY", "base_url": "https://api.moonshot.ai/v1"},
+    # Alibaba Model Studio. The international endpoint; mainland deployments
+    # set adapter_openai_base_url to dashscope.aliyuncs.com instead.
+    "qwen": {"provider": "qwen", "api_key_env": "DASHSCOPE_API_KEY", "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"},
+    "dashscope": {"provider": "qwen", "api_key_env": "DASHSCOPE_API_KEY", "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"},
+    "baichuan": {"provider": "baichuan", "api_key_env": "BAICHUAN_API_KEY", "base_url": "https://api.baichuan-ai.com/v1"},
 }
 
 
