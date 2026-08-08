@@ -621,8 +621,35 @@ _WINDOW_KEYS = (
 )
 
 
-def _window_from_json(payload: Any) -> Optional[int]:
-    """Depth-limited scan of a /models-style payload for a window field."""
+# A listing can be long — Together publishes several hundred models — but not
+# unbounded; a payload past this is treated as not naming the model.
+_MAX_LISTING_ENTRIES = 2048
+
+
+def _entry_names(entry: dict, model: str) -> bool:
+    """Does this listing entry describe the model we asked about?
+
+    Hosts qualify ids in their own way — Together's `moonshotai/Kimi-K3`,
+    Gemini's `models/gemini-3.6-flash` — so the trailing segment counts too.
+    """
+    for key in ("id", "name", "model"):
+        value = entry.get(key)
+        if isinstance(value, str):
+            lowered = value.lower()
+            if lowered == model or lowered.rsplit("/", 1)[-1] == model:
+                return True
+    return False
+
+
+def _window_from_json(payload: Any, model: Optional[str] = None) -> Optional[int]:
+    """Depth-limited scan of a /models-style payload for a window field.
+
+    With a model name, a listing is resolved by id first: scanning a
+    multi-model listing freely returns whichever window appears earliest,
+    which on a reseller's catalogue is some unrelated model's. That is an
+    over-guess, the one direction this whole fallback chain avoids. A listing
+    that does not name the model says nothing about it, so the answer is None.
+    """
     def scan(node: Any, depth: int) -> Optional[int]:
         if depth > 3 or not isinstance(node, (dict, list)):
             return None
@@ -644,6 +671,14 @@ def _window_from_json(payload: Any) -> Optional[int]:
                     return found
         return None
 
+    if model:
+        entries = payload.get("data") if isinstance(payload, dict) else payload
+        if isinstance(entries, list):
+            wanted = model.lower()
+            for entry in entries[:_MAX_LISTING_ENTRIES]:
+                if isinstance(entry, dict) and _entry_names(entry, wanted):
+                    return scan(entry, 0)
+            return None
     return scan(payload, 0)
 
 
@@ -681,7 +716,7 @@ def probe_context_window(
                         f"{base_url.rstrip('/')}/models"):
                 resp = httpx.get(url, headers=headers, timeout=5.0)
                 if resp.status_code == 200:
-                    window = _window_from_json(resp.json())
+                    window = _window_from_json(resp.json(), model=model)
                     if window:
                         return window
     except Exception as exc:  # noqa: BLE001 - probing must never break serving
@@ -778,9 +813,14 @@ class ApiAdapterBackend:
             if not window:
                 window, source = DEFAULT_CONTEXT_WINDOW, "default"
             self._context_window = window
-            logger.info(
+            # "default" means neither the provider nor the table knew this
+            # model, so every turn is budgeted against 8192 — for a
+            # million-token model that is under one percent of its window,
+            # and nothing else says so. Worth an operator's attention.
+            log = logger.warning if source == "default" else logger.info
+            log(
                 "model_context_window_resolved",
-                model=model, window=window, source=source,
+                model=model, provider=self.provider, window=window, source=source,
             )
         return self._context_window
 

@@ -227,3 +227,107 @@ class TestProviderWiring:
             caps = get_provider_capabilities(provider)
             assert caps.max_adapters == 1
             assert not caps.multi_adapter
+
+
+class TestListingDiscovery:
+    """Resolving a window out of a /models listing.
+
+    A reseller's listing holds hundreds of models. Reading a window from it
+    without checking which model it belongs to is an over-guess — the one
+    direction the whole fallback chain is built to avoid.
+    """
+
+    TOGETHER_LISTING = {
+        "object": "list",
+        "data": [
+            {"id": "moonshotai/Kimi-K3", "context_length": 1_000_000},
+            {"id": "Qwen/Qwen2.5-7B-Instruct-Turbo", "context_length": 32_768},
+            {"id": "zai-org/GLM-5.2", "context_length": 262_144},
+        ],
+    }
+
+    def test_the_listing_answers_for_the_model_that_was_asked_about(self):
+        from liminallm.service.model_backend import _window_from_json
+
+        assert _window_from_json(
+            self.TOGETHER_LISTING, model="Qwen/Qwen2.5-7B-Instruct-Turbo"
+        ) == 32_768
+        assert _window_from_json(
+            self.TOGETHER_LISTING, model="zai-org/GLM-5.2"
+        ) == 262_144
+
+    def test_it_does_not_hand_back_an_unrelated_models_window(self):
+        """Without the id check this returns 1,000,000 — the first entry —
+        for a 32K model, and the turn overflows."""
+        from liminallm.service.model_backend import _window_from_json
+
+        window = _window_from_json(
+            self.TOGETHER_LISTING, model="Qwen/Qwen2.5-7B-Instruct-Turbo"
+        )
+        assert window != 1_000_000
+
+    def test_a_listing_that_never_names_the_model_says_nothing(self):
+        from liminallm.service.model_backend import _window_from_json
+
+        assert _window_from_json(self.TOGETHER_LISTING, model="acme-llm-9") is None
+
+    def test_a_host_qualified_id_matches_on_its_trailing_segment(self):
+        """Gemini names models `models/x`; hosts prefix with an org."""
+        from liminallm.service.model_backend import _window_from_json
+
+        payload = {"data": [{"name": "models/gemini-3.6-flash",
+                             "inputTokenLimit": 1_048_576}]}
+        assert _window_from_json(payload, model="gemini-3.6-flash") == 1_048_576
+
+    def test_a_single_model_response_still_scans_freely(self):
+        """One-model servers (vLLM, LM Studio) answer without a listing, and
+        their payload may not echo the id at all."""
+        from liminallm.service.model_backend import _window_from_json
+
+        assert _window_from_json({"max_model_len": 32_768}, model="whatever") == 32_768
+        assert _window_from_json(
+            {"id": "served-model", "max_model_len": 8_192}, model="requested-name"
+        ) == 8_192
+
+    def test_the_probe_passes_the_model_into_the_listing_lookup(self):
+        import inspect
+
+        from liminallm.service.model_backend import probe_context_window
+
+        src = inspect.getsource(probe_context_window)
+        assert "_window_from_json(resp.json(), model=model)" in src
+
+
+def test_an_unknown_model_warns_rather_than_budgeting_8192_silently(monkeypatch):
+    """Falling to the default is a real degradation, not routine info: every
+    turn is then budgeted against 8192, and nothing else says so."""
+    from unittest.mock import MagicMock
+
+    from liminallm.service import model_backend as mb
+
+    fake = MagicMock()
+    monkeypatch.setattr(mb, "logger", fake)
+    monkeypatch.setattr(mb, "probe_context_window", lambda **kw: None)
+
+    backend = mb.ApiAdapterBackend("acme-llm-9", adapter_mode="openai", api_key=None)
+    assert backend.context_window == mb.DEFAULT_CONTEXT_WINDOW
+    fake.warning.assert_called_once()
+    assert fake.warning.call_args.kwargs["source"] == "default"
+    assert fake.warning.call_args.kwargs["model"] == "acme-llm-9"
+
+
+def test_a_recognised_model_stays_at_info(monkeypatch):
+    """The warning has to mean something — a model the table knows is not an
+    operator problem."""
+    from unittest.mock import MagicMock
+
+    from liminallm.service import model_backend as mb
+
+    fake = MagicMock()
+    monkeypatch.setattr(mb, "logger", fake)
+    monkeypatch.setattr(mb, "probe_context_window", lambda **kw: None)
+
+    backend = mb.ApiAdapterBackend("gpt-4o-mini", adapter_mode="openai", api_key=None)
+    assert backend.context_window == 128_000
+    fake.warning.assert_not_called()
+    assert fake.info.call_args.kwargs["source"] == "table"
