@@ -272,12 +272,14 @@ class GeminiBackend:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
+        temperature: Optional[float] = None,
         transport: Optional[httpx.BaseTransport] = None,
     ) -> None:
         self.base_model = base_model
         self._api_key = api_key or ""
         self._base_url = (base_url or DEFAULT_BASE_URL).rstrip("/")
         self._reasoning_effort = (reasoning_effort or "").strip().lower() or None
+        self._temperature = temperature
         self._transport = transport
         self._client: Optional[httpx.Client] = None
         self._context_window: Optional[int] = None
@@ -341,9 +343,22 @@ class GeminiBackend:
             decls = to_function_declarations(tools)
             if decls:
                 body["tools"] = [{"functionDeclarations": decls}]
+        generation: Dict[str, Any] = {}
         thinking = thinking_config(self._reasoning_effort)
         if thinking and self._thinking_ok is not False:
-            body["generationConfig"] = {"thinkingConfig": thinking}
+            generation["thinkingConfig"] = thinking
+        # Same policy as the compat backends: Gemini 3 deprecated sampling
+        # parameters and warns that lowering temperature can drive it into
+        # loops, so only a 2.5-class model takes a configured value.
+        from liminallm.service.model_backend import temperature_param
+
+        generation.update(temperature_param(
+            self.base_model,
+            configured=self._temperature,
+            reasoning_effort=self._reasoning_effort,
+        ))
+        if generation:
+            body["generationConfig"] = generation
         return body, applied
 
     def _drop_rejected_thinking(self, body: dict, status: int, text: str) -> bool:

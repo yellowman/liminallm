@@ -30,10 +30,12 @@ class LLMService:
         adapter_server_model: Optional[str] = None,
         fs_root: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
+        temperature: Optional[float] = None,
         backend: Optional[ModelBackend] = None,
     ) -> None:
         self.base_model = base_model
         self.reasoning_effort = reasoning_effort
+        self.temperature = temperature
         self.adapter_configs = adapter_configs or {}
         self.backend = backend or self._build_backend(
             backend_mode,
@@ -324,6 +326,7 @@ class LLMService:
                 or (os.getenv(api_key_env) if api_key_env else None),
                 base_url=override.get("base_url") or base_url,
                 reasoning_effort=self.reasoning_effort,
+                temperature=self.temperature,
             )
 
         # OpenAI-compatible API providers (openai, anthropic, zhipu/glm, together,
@@ -357,6 +360,7 @@ class LLMService:
                 provider=provider,
                 api_key_env=api_key_env,
                 reasoning_effort=self.reasoning_effort,
+                temperature=self.temperature,
             )
 
         # adapter_server and other adapter-id providers (azure, vertex, bedrock,

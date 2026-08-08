@@ -413,14 +413,21 @@ def test_budget_uses_the_counter(monkeypatch):
 # Model-specific hazards
 
 
-def test_reasoning_models_get_no_temperature():
+def test_no_temperature_is_sent_unless_an_operator_configured_one():
+    """The old default of 0.2 went out on every non-reasoning request,
+    overriding whatever each provider tuned its model around."""
     from liminallm.service import model_backend as mb
 
     backend = mb.ApiAdapterBackend("gpt-4o-mini", adapter_mode="openai", api_key=None)
-    assert backend._sampling_params("gpt-4o-mini") == {"temperature": 0.2}
+    assert backend._sampling_params("gpt-4o-mini") == {}
+
+    configured = mb.ApiAdapterBackend(
+        "gpt-4o-mini", adapter_mode="openai", api_key=None, temperature=0.2
+    )
+    assert configured._sampling_params("gpt-4o-mini") == {"temperature": 0.2}
     # o-series/gpt-5/gemini-3 reject a caller temperature with a 400.
     for model in ("o1-mini", "o3", "gpt-5.2", "gemini-3-pro"):
-        assert backend._sampling_params(model) == {}, model
+        assert configured._sampling_params(model) == {}, model
 
 
 def test_single_message_cap_allows_long_pastes():

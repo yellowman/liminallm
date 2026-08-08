@@ -51,6 +51,7 @@ def _backend(client) -> APIBackend:
     b._api_key = "k"
     b._base_url = None
     b._reasoning_effort = None
+    b._temperature = None
     b._api_key_env = "OPENAI_API_KEY"
     b._client_timeout = 30.0
     b._active_api_key = "k"

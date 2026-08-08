@@ -18,8 +18,10 @@ from liminallm.config import (
 from liminallm.service.model_backend import (
     HOSTED_CONTEXT_WINDOWS,
     KNOWN_CONTEXT_WINDOWS,
+    TemperaturePolicy,
     context_window_from_table,
-    is_reasoning_model,
+    temperature_param,
+    temperature_policy,
 )
 
 
@@ -174,20 +176,119 @@ class TestHostedWindows:
         assert "provider=self.provider" in src
 
 
-class TestReasoningModels:
-    @pytest.mark.parametrize("model", [
-        "o3-mini", "o4-mini", "gpt-5.2", "gemini-3-pro-preview",
-        "claude-opus-5", "claude-sonnet-5", "claude-opus-4-8", "deepseek-reasoner",
-    ])
-    def test_models_that_reject_temperature_are_flagged(self, model):
-        assert is_reasoning_model(model)
+class TestTemperaturePolicy:
+    """Temperature is no longer a universal generation parameter.
 
-    @pytest.mark.parametrize("model", [
-        "gpt-4o", "gpt-4.1", "claude-opus-4-6", "claude-sonnet-4-6",
-        "claude-haiku-4-5", "deepseek-chat", "gemini-2.5-flash",
+    Providers now reject it, ignore it, or prescribe one fixed value, and a
+    wrong guess is a 400 on every request rather than a mis-sized budget.
+    """
+
+    @pytest.mark.parametrize("model,policy", [
+        # Rejects it outright.
+        ("o3-mini", TemperaturePolicy.OMIT),
+        ("gpt-5", TemperaturePolicy.OMIT),
+        ("claude-opus-5", TemperaturePolicy.OMIT),
+        ("claude-sonnet-5", TemperaturePolicy.OMIT),
+        # Accepted only with reasoning off.
+        ("gpt-5.4", TemperaturePolicy.CONDITIONAL),
+        ("gpt-5.2", TemperaturePolicy.CONDITIONAL),
+        ("claude-haiku-4-5-20251001", TemperaturePolicy.CONDITIONAL),
+        ("deepseek-v4-pro", TemperaturePolicy.CONDITIONAL),
+        # Trained around a fixed value; moving it degrades output.
+        ("gemini-flash-latest", TemperaturePolicy.OMIT),
+        ("gemini-3.6-flash", TemperaturePolicy.OMIT),
+        ("kimi-k3", TemperaturePolicy.OMIT),
+        ("kimi-latest", TemperaturePolicy.OMIT),
+        ("muse-spark-1.2", TemperaturePolicy.OMIT),
+        # Conventional sampling APIs.
+        ("gpt-4o", TemperaturePolicy.TUNABLE),
+        ("gemini-2.5-flash", TemperaturePolicy.TUNABLE),
+        ("grok-4.5", TemperaturePolicy.TUNABLE),
+        ("qwen3.8-max", TemperaturePolicy.TUNABLE),
+        ("glm-4.7-flash", TemperaturePolicy.TUNABLE),
+        ("deepseek-chat", TemperaturePolicy.TUNABLE),
+        ("Baichuan4-Turbo", TemperaturePolicy.TUNABLE),
+        ("minimax-m3", TemperaturePolicy.TUNABLE),
+        ("mistral-medium-3-5", TemperaturePolicy.TUNABLE),
+        ("command-a-03-2025", TemperaturePolicy.TUNABLE),
+        ("llama-3.3-70b-versatile", TemperaturePolicy.TUNABLE),
     ])
-    def test_models_that_accept_temperature_are_not(self, model):
-        assert not is_reasoning_model(model)
+    def test_the_policy_matches_what_the_provider_documents(self, model, policy):
+        assert temperature_policy(model) == policy
+
+    def test_the_mini_tiers_do_not_inherit_their_versions_allowance(self):
+        """gpt-5.4 takes temperature at reasoning "none"; no such allowance is
+        published for its mini and nano tiers."""
+        assert temperature_policy("gpt-5.4") is TemperaturePolicy.CONDITIONAL
+        assert temperature_policy("gpt-5.4-mini") is TemperaturePolicy.OMIT
+        assert temperature_policy("gpt-5.4-nano") is TemperaturePolicy.OMIT
+
+    def test_nothing_is_sent_when_the_operator_configured_nothing(self):
+        """The heart of it: a default of ours overrides whatever the provider
+        tuned its model around."""
+        for model in ("gpt-4o", "grok-4.5", "qwen-turbo", "glm-4.7-flash"):
+            assert temperature_param(
+                model, configured=None, reasoning_effort=None
+            ) == {}
+
+    def test_a_configured_value_reaches_a_model_that_accepts_one(self):
+        assert temperature_param(
+            "grok-4.5", configured=0.7, reasoning_effort=None
+        ) == {"temperature": 0.7}
+
+    def test_a_configured_value_is_withheld_from_a_model_that_rejects_one(self):
+        for model in ("gpt-5.6-sol", "claude-opus-5", "kimi-k3",
+                      "gemini-flash-latest", "muse-spark-1.2"):
+            assert temperature_param(
+                model, configured=0.7, reasoning_effort=None
+            ) == {}, model
+
+    def test_conditional_models_take_it_only_with_reasoning_off(self):
+        assert temperature_param(
+            "gpt-5.4", configured=0.7, reasoning_effort="high"
+        ) == {}
+        assert temperature_param(
+            "gpt-5.4", configured=0.7, reasoning_effort=None
+        ) == {}
+        assert temperature_param(
+            "gpt-5.4", configured=0.7, reasoning_effort="none"
+        ) == {"temperature": 0.7}
+
+    def test_zero_is_a_value_not_an_absence(self):
+        """0.0 is falsy; treating it as unset would silently ignore the one
+        setting a user reaches for when they want determinism."""
+        assert temperature_param(
+            "grok-4.5", configured=0.0, reasoning_effort=None
+        ) == {"temperature": 0.0}
+
+    def test_an_unknown_model_is_tunable(self):
+        """Most unknown ids are conventional open models on a self-hosted
+        server, and nothing is sent unless someone asked for it anyway."""
+        assert temperature_policy("acme-llm-9") is TemperaturePolicy.TUNABLE
+
+    def test_the_backend_sends_no_temperature_by_default(self):
+        from liminallm.service.model_backend import ApiAdapterBackend
+
+        backend = ApiAdapterBackend("gpt-4o", adapter_mode="openai", api_key=None)
+        assert backend._sampling_params("gpt-4o") == {}
+
+    def test_the_backend_honours_a_configured_temperature(self):
+        from liminallm.service.model_backend import ApiAdapterBackend
+
+        backend = ApiAdapterBackend(
+            "gpt-4o", adapter_mode="openai", api_key=None, temperature=0.3
+        )
+        assert backend._sampling_params("gpt-4o") == {"temperature": 0.3}
+        assert backend._sampling_params("claude-opus-5") == {}
+
+    def test_the_setting_reaches_the_backend(self):
+        from liminallm.service.llm import LLMService
+
+        svc = LLMService(
+            "grok-4.5", backend_mode="xai",
+            adapter_configs={"xai": {"api_key": "k"}}, temperature=0.9,
+        )
+        assert svc.backend._sampling_params("grok-4.5") == {"temperature": 0.9}
 
 
 class TestProviderWiring:

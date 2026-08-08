@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Protocol, Tuple
 
@@ -390,24 +391,113 @@ class StubBackend:
 
 DEFAULT_CONTEXT_WINDOW = 8192
 
-# Models that reject a caller-supplied temperature (400, whole request fails).
-# Omitting the parameter is always safe — every model has a sane default — so
-# this list errs toward including a family rather than risking the 400.
-_REASONING_PREFIXES = (
-    "o1", "o3", "o4", "gpt-5",
-    "gemini-3",
-    # Anthropic removed sampling parameters from Opus 4.7 onward; 4.6 and
-    # earlier still accept temperature.
-    "claude-opus-4-7", "claude-opus-4-8", "claude-opus-5",
-    "claude-sonnet-5", "claude-fable-5", "claude-mythos-5",
-    # DeepSeek's thinking endpoint ignores/rejects sampling parameters.
-    "deepseek-reasoner",
-)
+class TemperaturePolicy(str, Enum):
+    """What a model does with a caller-supplied temperature.
+
+    A single "supports temperature" boolean is too weak: providers now reject
+    it outright, accept it only with reasoning disabled, or accept the field
+    while prescribing one fixed value. Getting this wrong is a 400 on every
+    request, which is harsher than any context-window mistake.
+    """
+
+    TUNABLE = "tunable"
+    # Accepted only with reasoning explicitly off. OpenAI's 5.1/5.2/5.4 error
+    # at any other reasoning level; Anthropic's pre-4.7 models require the
+    # default while thinking; DeepSeek accepts the field in thinking mode and
+    # silently ignores it.
+    CONDITIONAL = "conditional"
+    # Never send. Either the API rejects it, or the model is trained around
+    # one fixed value and moving it degrades output — Gemini 3 loops, Kimi
+    # and Muse Spark prescribe 1.0.
+    OMIT = "omit"
 
 
-def is_reasoning_model(model: str) -> bool:
+# Longest-prefix, as with context windows. Unmatched models are TUNABLE: an
+# unknown id is most often a conventional open model on a self-hosted server,
+# and this only decides whether an explicitly configured value is honoured —
+# nothing is ever sent on its own.
+_TEMPERATURE_POLICIES: List[Tuple[str, TemperaturePolicy]] = [
+    # OpenAI. 5.1/5.2/5.4 take temperature only at reasoning "none"; the mini
+    # and nano tiers and the 5.5/5.6 families have no such published
+    # allowance, so they stay out.
+    ("gpt-3.5", TemperaturePolicy.TUNABLE),
+    ("gpt-4", TemperaturePolicy.TUNABLE),
+    ("gpt-5", TemperaturePolicy.OMIT),
+    ("gpt-5.1", TemperaturePolicy.CONDITIONAL),
+    ("gpt-5.2", TemperaturePolicy.CONDITIONAL),
+    ("gpt-5.4", TemperaturePolicy.CONDITIONAL),
+    ("gpt-5.4-mini", TemperaturePolicy.OMIT),
+    ("gpt-5.4-nano", TemperaturePolicy.OMIT),
+    ("o1", TemperaturePolicy.OMIT),
+    ("o3", TemperaturePolicy.OMIT),
+    ("o4", TemperaturePolicy.OMIT),
+    ("gpt-oss", TemperaturePolicy.TUNABLE),
+    # Google deprecated sampling parameters for Gemini 3, and warns that
+    # lowering temperature there can drive the model into loops. The moving
+    # -latest aliases point into that generation.
+    ("gemini", TemperaturePolicy.OMIT),
+    ("gemini-2.5", TemperaturePolicy.TUNABLE),
+    # Anthropic removed sampling parameters from Opus 4.7 onward. Earlier
+    # models accept temperature only while thinking is off.
+    ("claude", TemperaturePolicy.CONDITIONAL),
+    ("claude-opus-4-7", TemperaturePolicy.OMIT),
+    ("claude-opus-4-8", TemperaturePolicy.OMIT),
+    ("claude-opus-5", TemperaturePolicy.OMIT),
+    ("claude-sonnet-5", TemperaturePolicy.OMIT),
+    ("claude-fable-5", TemperaturePolicy.OMIT),
+    ("claude-mythos-5", TemperaturePolicy.OMIT),
+    # DeepSeek: tunable outside thinking mode, ignored inside it. The legacy
+    # chat alias was the non-thinking model.
+    ("deepseek", TemperaturePolicy.CONDITIONAL),
+    ("deepseek-chat", TemperaturePolicy.TUNABLE),
+    ("deepseek-reasoner", TemperaturePolicy.OMIT),
+    # Moonshot prescribes 1.0 and recommends omitting the parameter; kimi
+    # -latest is a moving alias whose contract is unknown.
+    ("kimi", TemperaturePolicy.OMIT),
+    ("moonshot", TemperaturePolicy.OMIT),
+    # Meta tunes Muse Spark for the default 1.0.
+    ("muse-spark", TemperaturePolicy.OMIT),
+    # Conventional sampling APIs.
+    ("grok", TemperaturePolicy.TUNABLE),
+    ("qwen", TemperaturePolicy.TUNABLE),
+    ("glm", TemperaturePolicy.TUNABLE),
+    ("baichuan", TemperaturePolicy.TUNABLE),
+    ("minimax", TemperaturePolicy.TUNABLE),
+    ("mistral", TemperaturePolicy.TUNABLE),
+    ("codestral", TemperaturePolicy.TUNABLE),
+    ("command-", TemperaturePolicy.TUNABLE),
+    ("llama", TemperaturePolicy.TUNABLE),
+    ("gemma", TemperaturePolicy.TUNABLE),
+]
+
+
+def temperature_policy(model: str) -> TemperaturePolicy:
+    """How this model treats a caller-supplied temperature."""
     lowered = (model or "").lower()
-    return any(lowered.startswith(prefix) for prefix in _REASONING_PREFIXES)
+    best: Optional[Tuple[str, TemperaturePolicy]] = None
+    for prefix, policy in _TEMPERATURE_POLICIES:
+        if lowered.startswith(prefix) and (best is None or len(prefix) > len(best[0])):
+            best = (prefix, policy)
+    return best[1] if best else TemperaturePolicy.TUNABLE
+
+
+def temperature_param(
+    model: str, *, configured: Optional[float], reasoning_effort: Optional[str]
+) -> dict:
+    """The temperature to send, if any.
+
+    Nothing is sent unless an operator asked for it: a default of our own
+    would override whatever each provider tuned its model around, and several
+    now document that moving it degrades output.
+    """
+    if configured is None:
+        return {}
+    policy = temperature_policy(model)
+    if policy is TemperaturePolicy.OMIT:
+        return {}
+    if policy is TemperaturePolicy.CONDITIONAL and (reasoning_effort or "") != "none":
+        return {}
+    return {"temperature": configured}
 
 # Longest-prefix wins. This is the *fallback* — the provider probe
 # (GeminiBackend's models/{id}, an adapter server's config) is consulted first,
@@ -764,9 +854,12 @@ class ApiAdapterBackend:
         provider: Optional[str] = None,
         api_key_env: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
+        temperature: Optional[float] = None,
     ) -> None:
         self.base_model = base_model
         self.adapter_server_model = adapter_server_model
+        # None means "send no temperature at all", not "send zero".
+        self._temperature = temperature
         self.adapter_mode = adapter_mode
         self.mode = adapter_mode
         self._api_key = api_key
@@ -882,17 +975,18 @@ class ApiAdapterBackend:
         return {**(extra_body or {}), "reasoning_effort": self._reasoning_effort}
 
     def _sampling_params(self, model: str) -> dict:
-        """Sampling args this model will accept.
+        """Sampling args to send, which is nothing unless an operator set one.
 
-        Reasoning models (OpenAI o-series, gpt-5, and Gemini 3 through the
-        compat endpoint) reject any temperature other than the default and
-        fail the whole request with a 400. Omitting the parameter is the
-        portable choice: every model has a sane default, and only these
-        models treat setting it as an error.
+        The previous default of 0.2 went out on every non-reasoning request,
+        overriding whatever each provider tuned its model around — and several
+        now document that moving temperature degrades output rather than
+        merely varying it.
         """
-        if is_reasoning_model(model):
-            return {}
-        return {"temperature": 0.2}
+        return temperature_param(
+            model,
+            configured=self._temperature,
+            reasoning_effort=self._reasoning_effort,
+        )
 
     def generate(
         self,

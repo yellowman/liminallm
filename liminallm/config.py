@@ -670,6 +670,17 @@ class Settings(BaseModel):
             "none to disable. Empty means omit the parameter entirely."
         ),
     )
+    model_temperature: float | None = managed_field(
+        None,
+        ge=0.0,
+        le=2.0,
+        description=(
+            "Sampling temperature. Blank sends none, which is the right "
+            "default: each provider tunes its model around its own, and "
+            "several reject or ignore a supplied value. Only honoured for "
+            "models that accept one."
+        ),
+    )
     model_context_window: int = managed_field(
         0,
         ge=0,
@@ -1063,6 +1074,20 @@ class Settings(BaseModel):
             normalized[host] = tenant
         return normalized
 
+    @field_validator("model_temperature", mode="before")
+    @classmethod
+    def _blank_temperature_is_unset(cls, value: Any) -> Any:
+        """A cleared console field arrives as "", which is not a number.
+
+        Managed settings round-trip through the store as strings, so every
+        nullable setting so far has been a string and absorbed the blank
+        silently. This is the first nullable numeric one, and unset has to
+        keep meaning "send no temperature" rather than failing validation.
+        """
+        if value is None or (isinstance(value, str) and not value.strip()):
+            return None
+        return value
+
     @field_validator("cors_allow_origins", mode="before")
     @classmethod
     def _parse_cors_origins(cls, value: Any) -> list[str]:
@@ -1235,7 +1260,8 @@ def redact_secrets(settings: dict) -> dict:
 # vanishing from the console.
 _SETTING_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("Model", ("model_path", "model_backend", "model_context_window",
-               "model_reasoning_effort", "default_adapter_mode",
+               "model_reasoning_effort", "model_temperature",
+               "default_adapter_mode",
                "adapter_openai_base_url", "adapter_openai_api_key",
                "adapter_server_model", "gemini_api_key")),
     ("Retrieval", ("rag_mode", "rag_chunk_size", "embedding_model_id",

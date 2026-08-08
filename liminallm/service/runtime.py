@@ -415,6 +415,7 @@ class Runtime:
             adapter_server_model=self.settings.adapter_server_model,
             fs_root=self.settings.shared_fs_root,
             reasoning_effort=self.settings.model_reasoning_effort,
+            temperature=self.settings.model_temperature,
         )
         # Real embeddings when the backend has an OpenAI-compatible client
         # (its /embeddings endpoint serves OpenAI, Gemini-compat, and

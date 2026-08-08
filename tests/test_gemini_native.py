@@ -529,3 +529,57 @@ def test_the_stream_also_retries_once_without_the_rejected_thinking_config():
     assert events[0]["data"] == "hello"
     assert len(bodies) == 2
     assert events[-1]["data"]["usage"]["prompt_tokens"] == 3
+
+
+class TestNativeTemperature:
+    """The native backend must honour the same policy as the compat ones — a
+    setting that works on one backend and is silently ignored on another is
+    the bug this branch already fixed once, for reasoning effort."""
+
+    def _generation_config(self, model, temperature):
+        seen = {}
+
+        def handler(request):
+            seen.update(json.loads(request.content))
+            return httpx.Response(200, json=_payload("hi"))
+
+        GeminiBackend(model, api_key="k", temperature=temperature,
+                      transport=httpx.MockTransport(handler)).generate(
+            [{"role": "user", "content": "hi"}], [])
+        return seen.get("generationConfig")
+
+    def test_gemini_3_never_receives_one(self):
+        """Google deprecated sampling parameters there and warns that lowering
+        temperature can drive the model into loops."""
+        assert self._generation_config("gemini-3.6-flash", 0.7) is None
+        assert self._generation_config("gemini-flash-latest", 0.7) is None
+
+    def test_a_2_5_model_receives_a_configured_one(self):
+        assert self._generation_config("gemini-2.5-flash", 0.7) == {"temperature": 0.7}
+
+    def test_nothing_is_sent_when_unconfigured(self):
+        assert self._generation_config("gemini-2.5-flash", None) is None
+
+    def test_it_rides_alongside_the_thinking_config(self):
+        seen = {}
+
+        def handler(request):
+            seen.update(json.loads(request.content))
+            return httpx.Response(200, json=_payload("hi"))
+
+        GeminiBackend("gemini-2.5-flash", api_key="k", temperature=0.4,
+                      reasoning_effort="low",
+                      transport=httpx.MockTransport(handler)).generate(
+            [{"role": "user", "content": "hi"}], [])
+        assert seen["generationConfig"] == {
+            "thinkingConfig": {"thinkingLevel": "low"}, "temperature": 0.4,
+        }
+
+    def test_the_service_hands_the_setting_to_the_native_backend(self):
+        from liminallm.service.llm import LLMService
+
+        svc = LLMService(
+            "gemini-2.5-flash", backend_mode="gemini_native",
+            adapter_configs={"gemini": {"api_key": "k"}}, temperature=0.4,
+        )
+        assert svc.backend._temperature == 0.4
