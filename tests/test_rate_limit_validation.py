@@ -5,7 +5,7 @@ Invalid window_seconds should be logged and default to 60 seconds.
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -25,7 +25,7 @@ class TestCheckRateLimit:
         runtime._local_rate_limit_lock = asyncio.Lock()
         # Instance attributes aren't covered by spec=Runtime; set the ones the
         # local rate-limit path reads.
-        runtime._local_rate_limit_last_cleanup = datetime.utcnow()
+        runtime._local_rate_limit_last_cleanup = datetime.now(timezone.utc)
         runtime._local_rate_limit_max_entries = 5000
         return runtime
 
@@ -39,7 +39,7 @@ class TestCheckRateLimit:
         runtime.cache.check_rate_limit = AsyncMock(return_value=True)
         runtime._local_rate_limits = {}
         runtime._local_rate_limit_lock = asyncio.Lock()
-        runtime._local_rate_limit_last_cleanup = datetime.utcnow()
+        runtime._local_rate_limit_last_cleanup = datetime.now(timezone.utc)
         runtime._local_rate_limit_max_entries = 5000
         return runtime
 
@@ -152,7 +152,7 @@ class TestCheckRateLimit:
         tokens, _last_ts = mock_runtime._local_rate_limits["test_key"]
         from datetime import timedelta
 
-        backdated_ts = datetime.utcnow() - timedelta(seconds=2)
+        backdated_ts = datetime.now(timezone.utc) - timedelta(seconds=2)
         mock_runtime._local_rate_limits["test_key"] = (tokens, backdated_ts)
 
         # Should pass now (bucket refilled after elapsed time)
@@ -172,7 +172,7 @@ class TestRateLimitIntegration:
         # Clear any existing rate limits for clean test
         runtime._local_rate_limits = {}
 
-        key = f"test_integration_{datetime.utcnow().timestamp()}"
+        key = f"test_integration_{datetime.now(timezone.utc).timestamp()}"
 
         # Should pass up to limit
         for _ in range(5):
@@ -190,7 +190,7 @@ class TestRateLimitIntegration:
         runtime = get_runtime()
         runtime._local_rate_limits = {}
 
-        key = f"test_concurrent_{datetime.utcnow().timestamp()}"
+        key = f"test_concurrent_{datetime.now(timezone.utc).timestamp()}"
         limit = 10
         results = []
 

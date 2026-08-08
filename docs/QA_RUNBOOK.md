@@ -20,8 +20,12 @@ make qa
 ### Native Testing (No Docker)
 
 - Python 3.11+
+- PostgreSQL 15+ with the `vector` extension (`postgresql-16-pgvector`)
 - curl and jq (for smoke tests)
-- No external dependencies required - uses in-memory stores
+
+The test suite starts its own throwaway cluster from the installed Postgres
+binaries, so no database needs to be running for `pytest`. A server you drive
+by hand needs a real one — see Step 3.
 
 ### Docker Testing
 
@@ -34,20 +38,20 @@ either upgrade or use the native testing path which doesn't require Docker.
 
 ## Native Testing Quick Start
 
-Most QA testing can be done without Docker using in-memory stores:
+Most QA testing can be done without Docker:
 
 ```bash
 # 1. Install dependencies
 pip install -e ".[dev]"
 
-# 2. Run all unit and integration tests (in-memory mode)
-TEST_MODE=true USE_MEMORY_STORE=true pytest tests/ -v
+# 2. Run all unit and integration tests (starts its own scratch Postgres)
+TEST_MODE=true pytest tests/ -v
 
-# 3. Start server for manual testing
-export JWT_SECRET="Test-Secret-Key-4-Testing-Only-Do-Not-Use-In-Production!"
-export SHARED_FS_ROOT="/tmp/liminallm-data"
-export USE_MEMORY_STORE=true
+# 3. Start server for manual testing (needs a running database)
+export DATABASE_URL="postgresql://postgres:postgres@localhost:5432/liminallm"
+export ALLOW_REDIS_FALLBACK_DEV=true
 export TEST_MODE=true
+scripts/migrate.sh
 uvicorn liminallm.app:app --reload --host 0.0.0.0 --port 8000
 
 # 4. Run smoke tests (in another terminal)
@@ -66,22 +70,21 @@ pip install -e ".[dev]"
 python -c "from liminallm.app import app; print('OK')"
 ```
 
-### Step 2: Unit Tests (In-Memory Mode)
+### Step 2: Unit Tests
 
 ```bash
-# Run all tests with in-memory store
-TEST_MODE=true USE_MEMORY_STORE=true python -m pytest tests/ -v
+# The suite starts a scratch Postgres and applies sql/schema.sql to it
+TEST_MODE=true python -m pytest tests/ -v
 
-# Expected: All tests pass (32+ tests)
+# Expected: all tests pass (~810), a handful skipped
 ```
 
 ### Step 3: Local API Smoke Test
 
 ```bash
 # Start server
-export JWT_SECRET="Test-Secret-Key-4-Testing-Only-Do-Not-Use-In-Production!"
-export SHARED_FS_ROOT="/tmp/liminallm-data"
-export USE_MEMORY_STORE=true
+export DATABASE_URL="postgresql://postgres:postgres@localhost:5432/liminallm"
+export ALLOW_REDIS_FALLBACK_DEV=true
 export TEST_MODE=true
 
 python -m uvicorn liminallm.app:app --host 0.0.0.0 --port 8000
@@ -122,46 +125,26 @@ curl -s -X POST "$BASE_URL/v1/chat" \
 - Signup returns access_token
 - Chat returns status: ok
 
-### Step 5: Integration Tests with PostgreSQL (Optional - Docker)
+### Step 5: Run against a specific database (optional)
 
-Skip this step if you don't have Docker. The in-memory tests in Step 2 cover the same functionality.
+Step 2 already exercises real Postgres — the suite starts its own cluster. Use
+this only to test against a particular server (a Docker container, a staging
+database, a different Postgres version):
 
 ```bash
-# Start PostgreSQL and Redis containers (--wait ensures health checks pass)
+# Example: the compose test stack
 docker compose -f docker-compose.test.yml up -d --wait postgres redis
-
-# Run migrations to create tables
 docker compose -f docker-compose.test.yml run --rm migrate
 
-# Run tests with real database (must disable memory store)
-USE_MEMORY_STORE=false \
-DATABASE_URL="postgresql://liminallm:testpassword123@localhost:5433/liminallm_test" \
+TEST_DATABASE_URL="postgresql://liminallm:testpassword123@localhost:5433/liminallm_test" \
 REDIS_URL="redis://localhost:6380/0" \
     python -m pytest tests/ -v
 
-# Cleanup
 docker compose -f docker-compose.test.yml down -v
 ```
 
-### Step 5 (Native Alternative): Integration Tests with Local PostgreSQL
-
-If you have PostgreSQL installed locally without Docker:
-
-```bash
-# Create test database (requires pgvector extension)
-sudo -u postgres psql -c "CREATE DATABASE liminallm_test;"
-sudo -u postgres psql -d liminallm_test -c "CREATE EXTENSION IF NOT EXISTS vector;"
-sudo -u postgres psql -d liminallm_test -c "CREATE EXTENSION IF NOT EXISTS citext;"
-
-# Run migrations to create tables
-DATABASE_URL="postgresql://postgres@localhost:5432/liminallm_test" \
-    ./scripts/migrate.sh
-
-# Run tests (must disable memory store)
-USE_MEMORY_STORE=false \
-DATABASE_URL="postgresql://postgres@localhost:5432/liminallm_test" \
-    pytest tests/ -v
-```
+The target needs the `vector` and `citext` extensions available; the suite
+applies `sql/schema.sql` itself.
 
 ### Step 6: Full Docker Compose Test (Optional - Docker)
 
@@ -182,7 +165,7 @@ docker compose -f docker-compose.test.yml down -v
 
 ```bash
 # Run admin integration tests
-TEST_MODE=true USE_MEMORY_STORE=true python -m pytest tests/test_integration_admin.py -v
+TEST_MODE=true python -m pytest tests/test_integration_admin.py -v
 
 # Expected: 18 tests pass
 ```
@@ -353,20 +336,16 @@ pytest tests/test_post_smoke.py -v
 
 ```bash
 # Use a complex secret with mixed character classes
-export JWT_SECRET="Test-Secret-Key-4-Testing-Only-Do-Not-Use-In-Production!"
 ```
 
 ### Rate limiting in tests
 
-Rate limits apply even in test mode. Wait 60 seconds between repeated file uploads, or restart the server to clear in-memory rate limit state.
+Rate limits apply even in test mode. Wait 60 seconds between repeated file uploads, or restart the server to clear in-process rate limit state.
 
-### Session "invalid session" errors
+### Admin bootstrap
 
-With `USE_MEMORY_STORE=true`, each server instance has its own memory store. Ensure all requests go to the same running instance.
-
-### Admin bootstrap with in-memory store
-
-The `bootstrap_admin.py` script creates its own runtime. For in-memory mode, use the test fixtures or run with PostgreSQL.
+`bootstrap_admin.py` creates its own runtime and requires `DATABASE_URL`; it
+writes the admin to Postgres.
 
 ## CI/CD Integration
 

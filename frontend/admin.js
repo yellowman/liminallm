@@ -19,13 +19,6 @@ const sessionStorageKey = (key) => `liminal.${key}`;
 const readSession = (key) => sessionStorage.getItem(sessionStorageKey(key));
 
 // XSS protection: escape HTML entities
-const escapeHtml = (str) => {
-  if (str == null) return '';
-  const text = String(str);
-  const div = document.createElement('div');
-  div.textContent = text;
-  return div.innerHTML;
-};
 const writeSession = (key, value) => {
   if (value) {
     sessionStorage.setItem(sessionStorageKey(key), value);
@@ -45,69 +38,7 @@ const state = {
 const defaultPatchStatuses = new Set(['pending', 'approved', 'rejected', 'applied']);
 let knownPatchStatuses = new Set(defaultPatchStatuses);
 
-const randomIdempotencyKey = () => {
-  if (window.crypto?.randomUUID) return window.crypto.randomUUID();
-  // Fallback using crypto.getRandomValues() - cryptographically secure, broader browser support
-  if (window.crypto?.getRandomValues) {
-    const bytes = new Uint8Array(16);
-    window.crypto.getRandomValues(bytes);
-    bytes[6] = (bytes[6] & 0x0f) | 0x40; // UUID v4 version
-    bytes[8] = (bytes[8] & 0x3f) | 0x80; // UUID v4 variant
-    const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
-    return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
-  }
-  // Ultimate fallback for ancient browsers without crypto support
-  return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-};
-
 // Double-submit CSRF: echo the JS-readable csrf_token cookie on mutating requests.
-const getCsrfToken = () => {
-  const match = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
-  return match ? decodeURIComponent(match[1]) : null;
-};
-
-const headers = (idempotencyKey) => {
-  const h = { 'Content-Type': 'application/json' };
-  if (state.accessToken) h['Authorization'] = `Bearer ${state.accessToken}`;
-  if (state.tenantId) h['X-Tenant-ID'] = state.tenantId;
-  if (state.sessionId) h['session_id'] = state.sessionId;
-  const csrf = getCsrfToken();
-  if (csrf) h['X-CSRF-Token'] = csrf;
-  h['Idempotency-Key'] = idempotencyKey || randomIdempotencyKey();
-  return h;
-};
-
-const fetchWithRetry = async (url, options, retries = 3, backoffMs = 400) => {
-  let lastError;
-  for (let attempt = 0; attempt <= retries; attempt += 1) {
-    try {
-      const resp = await fetch(url, options);
-      // Don't retry client errors (4xx) - they won't succeed on retry
-      if (resp.status >= 400 && resp.status < 500) {
-        return resp;
-      }
-      // Only retry on server errors (5xx) or network failures
-      if (!resp.ok && resp.status >= 500) {
-        lastError = new Error(`Server error: ${resp.status}`);
-        if (attempt === retries) return resp;
-        const delay = backoffMs * Math.pow(2, attempt);
-        await new Promise((resolve) => setTimeout(resolve, delay));
-        continue;
-      }
-      return resp;
-    } catch (err) {
-      // Network error - retry
-      lastError = err;
-      if (attempt === retries) break;
-      const delay = backoffMs * Math.pow(2, attempt);
-      await new Promise((resolve) => setTimeout(resolve, delay));
-    }
-  }
-  const attempts = retries + 1;
-  const label = attempts === 1 ? 'attempt' : 'attempts';
-  throw new Error(`Request failed after ${attempts} ${label}: ${lastError?.message || 'unknown error'}`);
-};
-
 const showError = (msg) => {
   if (!errorEl) return;
   errorEl.textContent = msg;
@@ -157,33 +88,9 @@ const gatekeep = () => {
   return true;
 };
 
-const extractError = (payload, fallback) => {
-  const detail = payload?.detail || payload?.error || payload;
-  if (typeof detail === 'string') return detail.trim() || fallback;
-  if (detail?.message) return detail.message;
-  if (detail?.error?.message) return detail.error.message;
-  return fallback;
-};
-
-const requestEnvelope = async (url, options, fallbackMessage) => {
-  const resp = await fetchWithRetry(url, options);
-  const text = await resp.text();
-  const trimmed = text.trim();
-  let payload;
-  if (trimmed) {
-    try {
-      payload = JSON.parse(trimmed);
-    } catch (err) {
-      if (!resp.ok) throw new Error(fallbackMessage || resp.statusText || 'Request failed');
-      throw err;
-    }
-  }
-  if (!resp.ok) {
-    throw new Error(extractError(payload ?? trimmed, fallbackMessage || 'Request failed'));
-  }
-  return payload ?? {};
-};
-
+// The API puts structured problems (e.g. which settings were rejected and why)
+// under error.details. Flattening a response to its message string throws that
+// away, and it is exactly what a form needs to mark the offending field.
 const setPatchStatusOptions = (statuses = []) => {
   knownPatchStatuses = new Set([...defaultPatchStatuses, ...statuses.map((s) => (s || '').toLowerCase())]);
   if (!patchStatusOptions) return;
@@ -200,7 +107,6 @@ const handleLogin = async (event) => {
     email: document.getElementById('admin-email').value,
     password: document.getElementById('admin-password').value,
     mfa_code: document.getElementById('admin-mfa')?.value || undefined,
-    tenant_id: document.getElementById('admin-tenant').value || undefined,
   };
   try {
     const envelope = await requestEnvelope(
@@ -423,7 +329,6 @@ const createUser = async () => {
   const email = document.getElementById('new-user-email').value;
   const password = document.getElementById('new-user-password').value;
   const handle = document.getElementById('new-user-handle').value;
-  const tenant = document.getElementById('new-user-tenant').value;
   const role = document.getElementById('new-user-role').value;
   const plan = document.getElementById('new-user-plan').value;
   const active = document.getElementById('new-user-active').checked;
@@ -441,7 +346,6 @@ const createUser = async () => {
           email,
           password: password || undefined,
           handle: handle || undefined,
-          tenant_id: tenant || undefined,
           role: role || undefined,
           plan_tier: plan || undefined,
           is_active: active,
@@ -571,184 +475,334 @@ const showSettingsFeedback = (msg) => {
   settingsFeedbackEl.style.display = msg ? 'block' : 'none';
 };
 
+// ---------------------------------------------------------------------------
+// System settings
+//
+// The form is built from GET /admin/settings/schema, which describes every
+// managed setting: type, bounds, choices, default, group. Hard-coding the
+// field list here is how thirty settings ended up with no control at all and
+// one that had become environment-only was still posted, failing every save.
+
+let settingsSchema = [];
+let settingsCurrent = {};
+const settingsEdits = new Map();
+
+const settingsFormEl = document.getElementById('settings-form');
+const settingsFilterEl = document.getElementById('settings-filter');
+const settingsChangedOnlyEl = document.getElementById('settings-changed-only');
+const settingsDirtyCountEl = document.getElementById('settings-dirty-count');
+
+// Acronyms that should not be sentence-cased. Without this, settings read
+// "Adapter openai api key" and "Jwt issuer".
+const ACRONYMS = {
+  api: 'API', url: 'URL', uri: 'URI', id: 'ID', ids: 'IDs', ttl: 'TTL',
+  jwt: 'JWT', smtp: 'SMTP', mfa: 'MFA', rag: 'RAG', llm: 'LLM', tls: 'TLS',
+  ui: 'UI', cors: 'CORS', hsts: 'HSTS', oauth: 'OAuth', openai: 'OpenAI',
+  ws: 'WebSocket', json: 'JSON', dim: 'dimensions', pgvector: 'pgvector',
+};
+
+const labelFor = (name) => {
+  const words = name.split('_').map((w) => ACRONYMS[w] || w);
+  return words.join(' ').replace(/^./, (ch) => ch.toUpperCase());
+};
+
+const coerce = (field, raw) => {
+  if (field.type === 'bool') return Boolean(raw);
+  if (field.type === 'int') {
+    if (raw === '' || raw == null) return null;
+    return Number.isInteger(Number(raw)) ? Number(raw) : NaN;
+  }
+  if (field.type === 'float') {
+    if (raw === '' || raw == null) return null;
+    return Number(raw);
+  }
+  return String(raw ?? '');
+};
+
+// The same bounds the API enforces, so the control refuses a value before a
+// round trip rather than after one.
+const localError = (field, value) => {
+  if (field.secret) return '';
+  if (value === null) return 'required';
+  if (field.type === 'int' && !Number.isInteger(value)) return 'must be a whole number';
+  if ((field.type === 'int' || field.type === 'float') && Number.isNaN(value)) {
+    return 'must be a number';
+  }
+  if (field.min != null && value < field.min) return `must be at least ${field.min}`;
+  if (field.max != null && value > field.max) return `must be at most ${field.max}`;
+  if (field.exclusive_min != null && value <= field.exclusive_min) {
+    return `must be greater than ${field.exclusive_min}`;
+  }
+  if (field.exclusive_max != null && value >= field.exclusive_max) {
+    return `must be less than ${field.exclusive_max}`;
+  }
+  if (field.type === 'choice' && !field.choices.includes(value)) {
+    return `must be one of: ${field.choices.join(', ')}`;
+  }
+  return '';
+};
+
+const valueOf = (name) =>
+  settingsEdits.has(name) ? settingsEdits.get(name) : settingsCurrent[name];
+
+const setFieldError = (name, message) => {
+  const row = settingsFormEl.querySelector(`[data-setting="${name}"]`);
+  if (!row) return;
+  const errorEl = row.querySelector('.field-error');
+  errorEl.textContent = message || '';
+  errorEl.style.display = message ? 'block' : 'none';
+  row.classList.toggle('has-error', Boolean(message));
+};
+
+const refreshDirtyState = () => {
+  const count = settingsEdits.size;
+  const saveBtn = document.getElementById('save-settings');
+  const revertBtn = document.getElementById('revert-settings');
+  if (saveBtn) saveBtn.disabled = count === 0;
+  if (revertBtn) revertBtn.disabled = count === 0;
+  if (settingsDirtyCountEl) {
+    const reloads = [...settingsEdits.keys()].some(
+      (name) => settingsSchema.find((f) => f.name === name)?.reloads_model
+    );
+    settingsDirtyCountEl.textContent = count
+      ? `${count} unsaved change${count === 1 ? '' : 's'}` +
+        (reloads ? ' — saving will reload the model services' : '')
+      : '';
+  }
+  settingsFormEl.querySelectorAll('[data-setting]').forEach((row) => {
+    row.classList.toggle('is-dirty', settingsEdits.has(row.dataset.setting));
+  });
+};
+
+const onFieldInput = (field, rawValue) => {
+  const value = coerce(field, rawValue);
+  // A secret has no readable current value to compare against; an empty box
+  // is simply "unchanged".
+  const current = field.secret ? '' : settingsCurrent[field.name];
+  if (value === current) settingsEdits.delete(field.name);
+  else settingsEdits.set(field.name, value);
+  setFieldError(field.name, localError(field, value));
+  refreshDirtyState();
+};
+
+const renderField = (field) => {
+  const row = document.createElement('div');
+  // The type drives the cell's width: a boolean needs a checkbox, a URL needs
+  // room to read. Letting CSS size by type is what keeps a hundred controls
+  // on a couple of screens instead of a hundred full-width rows.
+  row.className = `setting-row is-${field.type}${field.secret ? ' is-secret' : ''}`;
+  row.dataset.setting = field.name;
+  row.dataset.group = field.group;
+
+  const label = document.createElement('label');
+  label.setAttribute('for', `setting-${field.name}`);
+  label.textContent = labelFor(field.name);
+  if (field.overridden) {
+    const badge = document.createElement('span');
+    badge.className = 'badge';
+    badge.textContent = 'changed';
+    badge.title = 'Saved in the database; differs from the shipped default';
+    label.appendChild(badge);
+  }
+  row.appendChild(label);
+
+  const value = valueOf(field.name);
+  let input;
+  if (field.type === 'choice') {
+    input = document.createElement('select');
+    field.choices.forEach((choice) => {
+      const option = document.createElement('option');
+      option.value = choice;
+      option.textContent = choice;
+      if (String(value) === choice) option.selected = true;
+      input.appendChild(option);
+    });
+  } else if (field.type === 'bool') {
+    input = document.createElement('input');
+    input.type = 'checkbox';
+    input.checked = Boolean(value);
+  } else if (field.secret) {
+    // Write-only: the server never sends the value back, so the control
+    // starts empty and an empty box means "leave what is stored alone".
+    input = document.createElement('input');
+    input.type = 'password';
+    input.autocomplete = 'new-password';
+    input.placeholder = field.is_set ? 'Set — type to replace' : 'Not set';
+    input.value = '';
+  } else {
+    input = document.createElement('input');
+    input.type = field.type === 'text' ? 'text' : 'number';
+    if (field.type === 'float') input.step = 'any';
+    if (field.min != null) input.min = field.min;
+    if (field.max != null) input.max = field.max;
+    input.value = value ?? '';
+  }
+  input.id = `setting-${field.name}`;
+  input.addEventListener(field.type === 'bool' ? 'change' : 'input', (event) => {
+    const target = event.target;
+    onFieldInput(field, field.type === 'bool' ? target.checked : target.value);
+  });
+  row.appendChild(input);
+
+  const defaultText = field.secret
+    ? (field.is_set ? 'Currently set' : 'Not set')
+    : `Default: ${JSON.stringify(field.default)}`;
+  const help = document.createElement('div');
+  help.className = 'setting-help';
+  // Visible: what the setting does. Tooltip: that plus the shipped default.
+  // Putting the default inline pushed the description past the one line a
+  // dense grid can afford, leaving four truncated words on every field.
+  help.textContent = field.description || defaultText;
+  help.title = field.description
+    ? `${field.description} (${defaultText})`
+    : defaultText;
+  row.appendChild(help);
+
+  const error = document.createElement('div');
+  error.className = 'field-error';
+  error.style.display = 'none';
+  error.setAttribute('role', 'alert');
+  row.appendChild(error);
+  return row;
+};
+
+const groupId = (group) => `settings-group-${group.replace(/[^a-z0-9]+/gi, '-').toLowerCase()}`;
+
+// Seventeen groups is more than fits on a screen, so give them a jump list
+// rather than making an operator scroll to find one.
+const renderGroupNav = () => {
+  const nav = document.getElementById('settings-nav');
+  if (!nav) return;
+  nav.textContent = '';
+  settingsFormEl.querySelectorAll('.setting-group').forEach((section) => {
+    const link = document.createElement('a');
+    link.href = `#${section.id}`;
+    link.textContent = section.querySelector('h4').textContent;
+    link.className = 'group-chip';
+    nav.appendChild(link);
+  });
+};
+
+const renderSettingsForm = () => {
+  if (!settingsFormEl) return;
+  const needle = (settingsFilterEl?.value || '').trim().toLowerCase();
+  const changedOnly = Boolean(settingsChangedOnlyEl?.checked);
+  settingsFormEl.textContent = '';
+
+  // One section per group, each a grid. Grouping is the point: rate limits
+  // read as a block of related numbers, not eighteen unrelated rows.
+  let shown = 0;
+  let grid = null;
+  let lastGroup = null;
+  settingsSchema.forEach((field) => {
+    if (needle && !field.name.includes(needle) &&
+        !field.description.toLowerCase().includes(needle)) return;
+    if (changedOnly && !field.overridden && !settingsEdits.has(field.name)) return;
+    if (field.group !== lastGroup) {
+      const section = document.createElement('section');
+      section.className = 'setting-group';
+      section.id = groupId(field.group);
+      const heading = document.createElement('h4');
+      heading.textContent = field.group;
+      section.appendChild(heading);
+      grid = document.createElement('div');
+      grid.className = 'setting-grid';
+      section.appendChild(grid);
+      settingsFormEl.appendChild(section);
+      lastGroup = field.group;
+    }
+    grid.appendChild(renderField(field));
+    shown += 1;
+  });
+
+  if (!shown) {
+    const empty = document.createElement('div');
+    empty.className = 'subtext';
+    empty.textContent = 'No settings match this filter.';
+    settingsFormEl.appendChild(empty);
+  }
+  renderGroupNav();
+  refreshDirtyState();
+};
+
 const fetchSystemSettings = async () => {
   showSettingsFeedback('Loading settings...');
   try {
-    const envelope = await requestEnvelope(
-      `${apiBase}/admin/settings`,
-      { headers: headers() },
-      'Unable to load system settings'
-    );
-    const s = envelope.data || {};
-    // Bug fix: Check for both null and undefined using val != null
-    const setVal = (id, val) => {
-      const el = document.getElementById(id);
-      if (el && val != null) el.value = val;
-    };
-    // Session & Concurrency
-    setVal('setting-session-rotation-hours', s.session_rotation_hours);
-    setVal('setting-session-rotation-grace', s.session_rotation_grace_seconds);
-    setVal('setting-max-concurrent-workflows', s.max_concurrent_workflows);
-    setVal('setting-max-concurrent-inference', s.max_concurrent_inference);
-    // Plan multipliers
-    setVal('setting-rate-limit-free', s.rate_limit_multiplier_free);
-    setVal('setting-rate-limit-paid', s.rate_limit_multiplier_paid);
-    setVal('setting-rate-limit-enterprise', s.rate_limit_multiplier_enterprise);
-    // Rate limits
-    setVal('setting-chat-rate', s.chat_rate_limit_per_minute);
-    setVal('setting-chat-window', s.chat_rate_limit_window_seconds);
-    setVal('setting-login-rate', s.login_rate_limit_per_minute);
-    setVal('setting-signup-rate', s.signup_rate_limit_per_minute);
-    setVal('setting-reset-rate', s.reset_rate_limit_per_minute);
-    setVal('setting-mfa-rate', s.mfa_rate_limit_per_minute);
-    setVal('setting-admin-rate', s.admin_rate_limit_per_minute);
-    setVal('setting-admin-window', s.admin_rate_limit_window_seconds);
-    setVal('setting-files-rate', s.files_upload_rate_limit_per_minute);
-    setVal('setting-configops-rate', s.configops_rate_limit_per_hour);
-    setVal('setting-read-rate', s.read_rate_limit_per_minute);
-    // Pagination & Files
-    setVal('setting-page-size', s.default_page_size);
-    setVal('setting-max-page', s.max_page_size);
-    setVal('setting-conversations-limit', s.default_conversations_limit);
-    setVal('setting-max-upload', s.max_upload_bytes);
-    setVal('setting-rag-chunk', s.rag_chunk_size);
-    // Token TTL
-    setVal('setting-access-ttl', s.access_token_ttl_minutes);
-    setVal('setting-refresh-ttl', s.refresh_token_ttl_minutes);
-    // Feature Flags (checkboxes)
-    const setChecked = (id, val) => {
-      const el = document.getElementById(id);
-      if (el && val !== undefined) el.checked = val;
-    };
-    setChecked('setting-enable-mfa', s.enable_mfa);
-    setChecked('setting-allow-signup', s.allow_signup);
-    // Training Worker
-    setChecked('setting-training-enabled', s.training_worker_enabled);
-    setVal('setting-training-poll', s.training_worker_poll_interval);
-    // SMTP / Email
-    setVal('setting-smtp-host', s.smtp_host);
-    setVal('setting-smtp-port', s.smtp_port);
-    setVal('setting-smtp-user', s.smtp_user);
-    // Don't display password - leave field empty for security
-    setChecked('setting-smtp-tls', s.smtp_use_tls);
-    setVal('setting-email-from', s.email_from_address);
-    setVal('setting-email-name', s.email_from_name);
-    // URL Settings
-    setVal('setting-oauth-redirect', s.oauth_redirect_uri);
-    setVal('setting-app-base-url', s.app_base_url);
-    // Voice Settings
-    setVal('setting-voice-transcription', s.voice_transcription_model);
-    setVal('setting-voice-synthesis', s.voice_synthesis_model);
-    setVal('setting-voice-default', s.voice_default_voice);
-    // Model Settings
-    setVal('setting-model-path', s.model_path);
-    setVal('setting-model-backend', s.model_backend);
-    setVal('setting-adapter-mode', s.default_adapter_mode);
-    setVal('setting-rag-mode', s.rag_mode);
-    setVal('setting-embedding-model', s.embedding_model_id);
-    // Tenant & JWT Settings
-    setVal('setting-default-tenant', s.default_tenant_id);
-    setVal('setting-jwt-issuer', s.jwt_issuer);
-    setVal('setting-jwt-audience', s.jwt_audience);
-    showSettingsFeedback('Settings loaded');
+    const [schemaEnvelope, valuesEnvelope] = await Promise.all([
+      requestEnvelope(
+        `${apiBase}/admin/settings/schema`,
+        { headers: headers() },
+        'Unable to load the settings schema'
+      ),
+      requestEnvelope(
+        `${apiBase}/admin/settings`,
+        { headers: headers() },
+        'Unable to load system settings'
+      ),
+    ]);
+    settingsSchema = schemaEnvelope.data?.fields || [];
+    settingsCurrent = valuesEnvelope.data || {};
+    settingsEdits.clear();
+    renderSettingsForm();
+    showSettingsFeedback(`${settingsSchema.length} settings loaded`);
   } catch (err) {
     showSettingsFeedback(err.message);
   }
 };
 
 const saveSystemSettings = async () => {
-  // Bug fix: Handle empty strings before parsing to avoid Number('') returning 0
-  const getVal = (id, parser) => {
-    const el = document.getElementById(id);
-    if (!el || el.value === '') return undefined;
-    return parser(el.value);
-  };
-  const getChecked = (id) => {
-    const el = document.getElementById(id);
-    return el ? el.checked : undefined;
-  };
-  const settings = {
-    // Session & Concurrency
-    session_rotation_hours: getVal('setting-session-rotation-hours', Number),
-    session_rotation_grace_seconds: getVal('setting-session-rotation-grace', Number),
-    max_concurrent_workflows: getVal('setting-max-concurrent-workflows', Number),
-    max_concurrent_inference: getVal('setting-max-concurrent-inference', Number),
-    // Plan multipliers
-    rate_limit_multiplier_free: getVal('setting-rate-limit-free', parseFloat),
-    rate_limit_multiplier_paid: getVal('setting-rate-limit-paid', parseFloat),
-    rate_limit_multiplier_enterprise: getVal('setting-rate-limit-enterprise', parseFloat),
-    // Rate limits
-    chat_rate_limit_per_minute: getVal('setting-chat-rate', Number),
-    chat_rate_limit_window_seconds: getVal('setting-chat-window', Number),
-    login_rate_limit_per_minute: getVal('setting-login-rate', Number),
-    signup_rate_limit_per_minute: getVal('setting-signup-rate', Number),
-    reset_rate_limit_per_minute: getVal('setting-reset-rate', Number),
-    mfa_rate_limit_per_minute: getVal('setting-mfa-rate', Number),
-    admin_rate_limit_per_minute: getVal('setting-admin-rate', Number),
-    admin_rate_limit_window_seconds: getVal('setting-admin-window', Number),
-    files_upload_rate_limit_per_minute: getVal('setting-files-rate', Number),
-    configops_rate_limit_per_hour: getVal('setting-configops-rate', Number),
-    read_rate_limit_per_minute: getVal('setting-read-rate', Number),
-    // Pagination & Files
-    default_page_size: getVal('setting-page-size', Number),
-    max_page_size: getVal('setting-max-page', Number),
-    default_conversations_limit: getVal('setting-conversations-limit', Number),
-    max_upload_bytes: getVal('setting-max-upload', Number),
-    rag_chunk_size: getVal('setting-rag-chunk', Number),
-    // Token TTL
-    access_token_ttl_minutes: getVal('setting-access-ttl', Number),
-    refresh_token_ttl_minutes: getVal('setting-refresh-ttl', Number),
-    // Feature Flags
-    enable_mfa: getChecked('setting-enable-mfa'),
-    allow_signup: getChecked('setting-allow-signup'),
-    // Training Worker
-    training_worker_enabled: getChecked('setting-training-enabled'),
-    training_worker_poll_interval: getVal('setting-training-poll', Number),
-    // SMTP / Email
-    smtp_host: getVal('setting-smtp-host', String),
-    smtp_port: getVal('setting-smtp-port', Number),
-    smtp_user: getVal('setting-smtp-user', String),
-    smtp_use_tls: getChecked('setting-smtp-tls'),
-    email_from_address: getVal('setting-email-from', String),
-    email_from_name: getVal('setting-email-name', String),
-    // URL Settings
-    oauth_redirect_uri: getVal('setting-oauth-redirect', String),
-    app_base_url: getVal('setting-app-base-url', String),
-    // Voice Settings
-    voice_transcription_model: getVal('setting-voice-transcription', String),
-    voice_synthesis_model: getVal('setting-voice-synthesis', String),
-    voice_default_voice: getVal('setting-voice-default', String),
-    // Model Settings
-    model_path: getVal('setting-model-path', String),
-    model_backend: getVal('setting-model-backend', String),
-    default_adapter_mode: getVal('setting-adapter-mode', String),
-    rag_mode: getVal('setting-rag-mode', String),
-    embedding_model_id: getVal('setting-embedding-model', String),
-    // Tenant & JWT Settings
-    default_tenant_id: getVal('setting-default-tenant', String),
-    jwt_issuer: getVal('setting-jwt-issuer', String),
-    jwt_audience: getVal('setting-jwt-audience', String),
-  };
-  // Only include password if it was entered (non-empty)
-  const smtpPassword = document.getElementById('setting-smtp-password')?.value;
-  if (smtpPassword) {
-    settings.smtp_password = smtpPassword;
+  if (!settingsEdits.size) return;
+
+  // Refuse locally first: the bounds here are the ones the API enforces, so a
+  // value that cannot be saved should not cost a round trip to find out.
+  let blocked = false;
+  settingsEdits.forEach((value, name) => {
+    const field = settingsSchema.find((f) => f.name === name);
+    const message = field ? localError(field, value) : 'unknown setting';
+    setFieldError(name, message);
+    if (message) blocked = true;
+  });
+  if (blocked) {
+    showSettingsFeedback('Some settings are not valid — see the fields marked below.');
+    return;
   }
+
+  const patch = Object.fromEntries(settingsEdits);
+  const reloads = Object.keys(patch).some(
+    (name) => settingsSchema.find((f) => f.name === name)?.reloads_model
+  );
+  if (reloads && !window.confirm(
+    'This changes a model setting. Saving rebuilds the model services and ' +
+    'briefly interrupts in-flight requests. Continue?'
+  )) return;
+
   showSettingsFeedback('Saving...');
   try {
     await requestEnvelope(
       `${apiBase}/admin/settings`,
-      {
-        method: 'PUT',
-        headers: headers(),
-        body: JSON.stringify(settings),
-      },
+      { method: 'PUT', headers: headers(), body: JSON.stringify(patch) },
       'Unable to save settings'
     );
-    showSettingsFeedback('Settings saved');
+    const saved = Object.keys(patch).length;
+    await fetchSystemSettings();
+    showSettingsFeedback(`Saved ${saved} setting${saved === 1 ? '' : 's'}`);
   } catch (err) {
-    showSettingsFeedback(err.message);
+    // The API reports per-field problems; put each one on its own control
+    // rather than leaving the operator to parse one long string.
+    const fields = err.details?.fields;
+    if (fields && typeof fields === 'object') {
+      Object.entries(fields).forEach(([name, message]) => setFieldError(name, message));
+      showSettingsFeedback('The server rejected some settings — see the fields below.');
+    } else {
+      showSettingsFeedback(err.message);
+    }
   }
+};
+
+const revertSystemSettings = () => {
+  settingsEdits.clear();
+  renderSettingsForm();
+  showSettingsFeedback('Changes discarded');
 };
 
 const logout = async () => {
@@ -812,6 +866,18 @@ const refreshSettingsBtn = document.getElementById('refresh-settings');
 if (refreshSettingsBtn) refreshSettingsBtn.addEventListener('click', fetchSystemSettings);
 const saveSettingsBtn = document.getElementById('save-settings');
 if (saveSettingsBtn) saveSettingsBtn.addEventListener('click', saveSystemSettings);
+const revertSettingsBtn = document.getElementById('revert-settings');
+if (revertSettingsBtn) revertSettingsBtn.addEventListener('click', revertSystemSettings);
+if (settingsFilterEl) settingsFilterEl.addEventListener('input', renderSettingsForm);
+if (settingsChangedOnlyEl) {
+  settingsChangedOnlyEl.addEventListener('change', renderSettingsForm);
+}
+// Unsaved edits are easy to walk away from in a form this long.
+window.addEventListener('beforeunload', (event) => {
+  if (!settingsEdits.size) return;
+  event.preventDefault();
+  event.returnValue = '';
+});
 
 // Bootstrap existing session
 if (state.accessToken) {

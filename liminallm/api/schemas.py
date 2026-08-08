@@ -10,7 +10,6 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from liminallm.service.tokenizer_utils import (
-    MAX_GENERATION_TOKENS,
     MAX_SINGLE_MESSAGE_TOKENS,
     estimate_token_count,
 )
@@ -19,8 +18,6 @@ from liminallm.service.tokenizer_utils import (
 MAX_JSON_DEPTH = 20
 # Issue 46.2: Maximum array items to prevent memory exhaustion
 MAX_ARRAY_ITEMS = 1000
-# Issue 46.3: Maximum string length for unbounded strings
-MAX_STRING_LENGTH = 65536
 
 
 def _validate_json_depth(obj: Any, max_depth: int = MAX_JSON_DEPTH, current_depth: int = 0) -> None:
@@ -240,10 +237,12 @@ class AuthResponse(BaseModel):
 
 
 class LoginRequest(BaseModel):
+    # No tenant_id: the tenant comes from the hostname the login arrived at.
+    # This field used to be accepted and then silently discarded by the route,
+    # which is worse than the raising validators below — it looked like it worked.
     email: str
     password: str
     mfa_code: Optional[str] = Field(default=None, max_length=10)
-    tenant_id: Optional[str] = Field(default=None, max_length=128)
     device_type: str = Field(default="web", max_length=16)
 
     @field_validator("email")
@@ -262,7 +261,6 @@ class LoginRequest(BaseModel):
 
 class TokenRefreshRequest(BaseModel):
     refresh_token: str = Field(..., max_length=2048)
-    tenant_id: Optional[str] = Field(default=None, max_length=128)
 
 
 class OAuthStartRequest(BaseModel):
@@ -536,6 +534,13 @@ class ArtifactVersionListResponse(BaseModel):
 
 
 class ConfigPatchAuditResponse(BaseModel):
+    # Field-for-field mirror of the storage model, so it is built with
+    # model_validate(obj) rather than restated at each call site. Ten
+    # hand-written mappings had already drifted: /me reported
+    # `tenant_id or "global"` where the admin listing reported the
+    # stored value. tests/test_response_mirrors.py keeps the two in step.
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     artifact_id: str
     proposer: str
@@ -707,6 +712,13 @@ class ContextSourceRequest(BaseModel):
 
 
 class ContextSourceResponse(BaseModel):
+    # Field-for-field mirror of the storage model, so it is built with
+    # model_validate(obj) rather than restated at each call site. Ten
+    # hand-written mappings had already drifted: /me reported
+    # `tenant_id or "global"` where the admin listing reported the
+    # stored value. tests/test_response_mirrors.py keeps the two in step.
+    model_config = ConfigDict(from_attributes=True)
+
     """Response containing context source details."""
     id: str
     context_id: str
@@ -826,6 +838,13 @@ class VoiceSynthesisResponse(BaseModel):
 
 
 class UserResponse(BaseModel):
+    # Field-for-field mirror of the storage model, so it is built with
+    # model_validate(obj) rather than restated at each call site. Ten
+    # hand-written mappings had already drifted: /me reported
+    # `tenant_id or "global"` where the admin listing reported the
+    # stored value. tests/test_response_mirrors.py keeps the two in step.
+    model_config = ConfigDict(from_attributes=True)
+
     id: str
     email: str
     handle: Optional[str] = None
@@ -880,29 +899,6 @@ class UpdateUserRoleRequest(BaseModel):
 class AdminInspectionResponse(BaseModel):
     summary: dict
     details: dict
-
-
-class AdminSettingsResponse(BaseModel):
-    """Runtime settings configurable via admin UI."""
-
-    # Pagination settings per SPEC §18
-    default_page_size: int = Field(default=100, ge=1, le=1000, description="Default page size for list endpoints")
-    max_page_size: int = Field(default=500, ge=1, le=1000, description="Maximum page size for list endpoints")
-    default_conversations_limit: int = Field(default=50, ge=1, le=500, description="Default limit for conversation list")
-
-    # Model settings
-    model_backend: Optional[str] = Field(default=None, description="Model backend override (openai, azure, etc.)")
-    model_path: Optional[str] = Field(default=None, description="Model path/name override")
-
-
-class AdminSettingsUpdateRequest(BaseModel):
-    """Request to update admin settings. All fields are optional - only provided fields are updated."""
-
-    default_page_size: Optional[int] = Field(default=None, ge=1, le=1000, description="Default page size for list endpoints")
-    max_page_size: Optional[int] = Field(default=None, ge=1, le=1000, description="Maximum page size for list endpoints")
-    default_conversations_limit: Optional[int] = Field(default=None, ge=1, le=500, description="Default limit for conversation list")
-    model_backend: Optional[str] = Field(default=None, description="Model backend override")
-    model_path: Optional[str] = Field(default=None, description="Model path/name override")
 
 
 class ToolInvokeRequest(BaseModel):

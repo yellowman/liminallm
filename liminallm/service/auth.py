@@ -11,7 +11,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, List, Optional, Protocol, Tuple
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 from urllib.parse import urlparse
 
 import httpx
@@ -20,8 +20,11 @@ from argon2.exceptions import InvalidHash, VerifyMismatchError
 
 from liminallm.config import Settings
 from liminallm.logging import get_logger
-from liminallm.storage.models import Session, User, UserMFAConfig
+from liminallm.storage.models import Session, User
 from liminallm.storage.redis_cache import RedisCache
+
+if TYPE_CHECKING:  # PostgresStore imports from service/, so keep this type-only.
+    from liminallm.storage.postgres import PostgresStore
 
 # OAuth provider configurations
 OAUTH_PROVIDERS = {
@@ -47,63 +50,17 @@ OAUTH_PROVIDERS = {
 
 logger = get_logger(__name__)
 
-
-class AuthStore(Protocol):
-    def create_user(
-        self,
-        email: str,
-        handle: Optional[str] = None,
-        *,
-        tenant_id: str,
-        role: str = "user",
-        plan_tier: str = "free",
-        is_active: bool = True,
-        meta: Optional[dict] = None,
-    ) -> User: ...
-
-    def save_password(
-        self, user_id: str, password_hash: str, password_algo: str
-    ) -> None: ...
-
-    def get_password_record(self, user_id: str) -> Optional[tuple[str, str]]: ...
-
-    def set_user_mfa_secret(
-        self, user_id: str, secret: str, enabled: bool = False
-    ) -> UserMFAConfig: ...
-
-    def get_user_mfa_secret(self, user_id: str) -> Optional[UserMFAConfig]: ...
-
-    def create_session(
-        self,
-        user_id: str,
-        ttl_minutes: int = 60 * 24,
-        user_agent: str | None = None,
-        ip_addr: str | None = None,
-        *,
-        mfa_required: bool = False,
-        tenant_id: str = "public",
-        meta: Optional[dict] = None,
-    ) -> Session: ...
-
-    def get_session(self, session_id: str) -> Optional[Session]: ...
-
-    def set_session_meta(self, session_id: str, meta: dict) -> None: ...
-
-    def revoke_session(self, session_id: str) -> None: ...
-
-    def mark_session_verified(self, session_id: str) -> None: ...
-
-    def get_user_by_email(self, email: str) -> Optional[User]: ...
-
-    def get_user(self, user_id: str) -> Optional[User]: ...
-
-    def update_user_role(self, user_id: str, role: str) -> Optional[User]: ...
-
-    def delete_user(self, user_id: str) -> bool: ...
-
-    def list_users(
-        self, tenant_id: Optional[str] = None, limit: int = 100
-    ) -> List[User]: ...
+# TOTP parameters. These are the Key Uri Format defaults, and they are what an
+# authenticator app assumes when the otpauth:// URI omits them — which is why
+# the server has to agree with them rather than pick its own. It verified
+# HMAC-SHA-256 while every app computed HMAC-SHA-1, so enrolment could never
+# complete: the user scanned the QR, typed a correct code, and was told it was
+# wrong. SHA-1 here is HMAC-SHA-1, which collision attacks on the bare hash do
+# not weaken.
+TOTP_ALGORITHM = hashlib.sha1
+TOTP_ALGORITHM_NAME = "SHA1"
+TOTP_DIGITS = 6
+TOTP_INTERVAL_SECONDS = 30
 
 
 @dataclass
@@ -115,17 +72,17 @@ class AuthContext:
 
 
 class AuthService:
-    """Session, JWT, and MFA handling for both persistent and in-memory modes."""
+    """Session, JWT, and MFA handling, backed by the store."""
 
     def __init__(
         self,
-        store: AuthStore,
+        store: "PostgresStore",
         cache: Optional[RedisCache],
         settings: Settings,
         *,
         mfa_enabled: bool = True,
     ) -> None:
-        self.store: AuthStore = store
+        self.store = store
         self.cache = cache
         self.settings = settings
         # Issue 28.4: Thread-safe lock for mutable state dictionaries
@@ -140,7 +97,6 @@ class AuthService:
         self.mfa_enabled = mfa_enabled
         self.revoked_refresh_tokens: set[str] = set()
         self._oauth_states: dict[str, tuple[str, datetime, Optional[str]]] = {}
-        self._oauth_code_registry: dict[tuple[str, str], dict] = {}
         self._email_verification_tokens: dict[str, tuple[str, datetime]] = {}
         # Issue 11.2: In-memory fallback for password reset tokens when Redis unavailable
         self._password_reset_tokens: dict[str, tuple[str, datetime]] = {}  # token -> (email, expires_at)
@@ -257,45 +213,15 @@ class AuthService:
     def _generate_password(self) -> str:
         return base64.urlsafe_b64encode(os.urandom(12)).decode().rstrip("=")
 
-    def _get_system_settings(self) -> dict:
-        """Get admin-managed system settings from database.
-
-        Returns merged settings with defaults for any missing values.
-        """
-        if hasattr(self.store, "get_system_settings"):
-            db_settings = self.store.get_system_settings()
-        else:
-            db_settings = {}
-        defaults = {
-            "session_rotation_hours": 24,
-            "session_rotation_grace_seconds": 300,
-            "access_token_ttl_minutes": 30,
-            "refresh_token_ttl_minutes": 1440,
-            # Device-specific session TTLs (SPEC §18: 7d web, 1d mobile)
-            "session_ttl_minutes_web": 60 * 24 * 7,
-            "session_ttl_minutes_mobile": 60 * 24,
-            # Device-specific refresh TTLs aligned with session windows
-            "refresh_token_ttl_minutes_web": 60 * 24 * 7,
-            "refresh_token_ttl_minutes_mobile": 60 * 24,
-        }
-        return {**defaults, **db_settings}
-
     def _get_session_ttl(self, device_type: str) -> int:
-        sys_settings = self._get_system_settings()
-        normalized = (device_type or "web").lower()
-        if normalized == "mobile":
-            return int(sys_settings.get("session_ttl_minutes_mobile", 60 * 24))
-        return int(sys_settings.get("session_ttl_minutes_web", 60 * 24 * 7))
+        if (device_type or "web").lower() == "mobile":
+            return int(self.settings.session_ttl_minutes_mobile)
+        return int(self.settings.session_ttl_minutes_web)
 
-    def _get_refresh_ttl(self, device_type: str, sys_settings: dict[str, Any]) -> int:
-        normalized = (device_type or "web").lower()
-        if normalized == "mobile":
-            return int(
-                sys_settings.get("refresh_token_ttl_minutes_mobile", 60 * 24)
-            )
-        return int(
-            sys_settings.get("refresh_token_ttl_minutes_web", 60 * 24 * 7)
-        )
+    def _get_refresh_ttl(self, device_type: str) -> int:
+        if (device_type or "web").lower() == "mobile":
+            return int(self.settings.refresh_token_ttl_minutes_mobile)
+        return int(self.settings.refresh_token_ttl_minutes_web)
 
     def _get_session_device(self, session: Session) -> str:
         meta = session.meta or {}
@@ -454,33 +380,14 @@ class AuthService:
             "provider": provider,
         }
 
-    def register_oauth_code(self, provider: str, code: str, payload: dict) -> None:
-        """Record an exchanged OAuth payload for testing or offline flows."""
-
-        self._oauth_code_registry[(provider, code)] = payload
-
     async def _exchange_oauth_code(self, provider: str, code: str) -> Optional[dict]:
-        """Exchange OAuth authorization code for user identity.
+        """Exchange an OAuth authorization code with the provider for an identity.
 
-        First checks cache/registry (for testing), then calls real OAuth providers.
+        This is the trust boundary of the whole OAuth flow: whatever payload
+        comes back here becomes an account. There is deliberately no cache and
+        no injection point in front of the provider round trip — tests stub
+        this method, nothing pre-registers codes.
         """
-        # Check cache first (for testing or pre-registered codes)
-        cached_payload: Optional[dict] = None
-        if self.cache:
-            raw = await self.cache.client.get(f"auth:oauth:code:{provider}:{code}")
-            if raw:
-                try:
-                    cached_payload = json.loads(raw)
-                except Exception as exc:
-                    self.logger.warning("oauth_code_parse_failed", error=str(exc))
-                else:
-                    await self.cache.client.delete(f"auth:oauth:code:{provider}:{code}")
-        if not cached_payload:
-            cached_payload = self._oauth_code_registry.pop((provider, code), None)
-        if cached_payload:
-            return cached_payload
-
-        # No cached payload - exchange code with real OAuth provider
         if provider not in OAUTH_PROVIDERS:
             self.logger.error("oauth_unknown_provider", provider=provider)
             return None
@@ -680,9 +587,7 @@ class AuthService:
             return None, None, {}
         # Use tenant from state, falling back to default only if state had none
         normalized_tenant = state_tenant_id or self.settings.default_tenant_id
-        existing = None
-        if hasattr(self.store, "get_user_by_provider"):
-            existing = self.store.get_user_by_provider(provider, provider_uid)
+        existing = self.store.get_user_by_provider(provider, provider_uid)
         email = identity.get("email")
         user = existing or (self.store.get_user_by_email(email) if email else None)
         if not user:
@@ -694,12 +599,11 @@ class AuthService:
             # Store an unusable password marker so password-based auth cannot succeed for OAuth users
             unusable_secret = base64.urlsafe_b64encode(os.urandom(24)).decode()
             self.store.save_password(user.id, unusable_secret, "oauth")
-        if hasattr(self.store, "link_user_auth_provider"):
-            try:
-                self.store.link_user_auth_provider(user.id, provider, provider_uid)
-            except Exception as exc:
-                self.logger.error("link_oauth_provider_failed", error=str(exc))
-                raise
+        try:
+            self.store.link_user_auth_provider(user.id, provider, provider_uid)
+        except Exception as exc:
+            self.logger.error("link_oauth_provider_failed", error=str(exc))
+            raise
         session = self.store.create_session(
             user.id,
             tenant_id=user.tenant_id,
@@ -870,15 +774,13 @@ class AuthService:
             Number of sessions revoked
         """
         revoked_count = 0
-        if hasattr(self.store, "revoke_user_sessions"):
-            # Use store method if available for better performance
-            try:
-                self.store.revoke_user_sessions(user_id, except_session_id)  # type: ignore[attr-defined]
-                revoked_count = -1  # Unknown count when using bulk method
-            except Exception as exc:
-                self.logger.warning(
-                    "revoke_user_sessions_failed", user_id=user_id, error=str(exc)
-                )
+        try:
+            self.store.revoke_user_sessions(user_id, except_session_id)
+            revoked_count = -1  # the bulk delete does not report a count
+        except Exception as exc:
+            self.logger.warning(
+                "revoke_user_sessions_failed", user_id=user_id, error=str(exc)
+            )
         # Also clear from cache using proper method (Issue 22.3)
         if self.cache:
             try:
@@ -980,8 +882,7 @@ class AuthService:
             await self.cache.update_session_activity(sess.id)
             return None
 
-        sys_settings = self._get_system_settings()
-        rotation_hours = sys_settings.get("session_rotation_hours", 24)
+        rotation_hours = self.settings.session_rotation_hours
         rotation_threshold = timedelta(hours=rotation_hours)
         if self._now() - last_activity < rotation_threshold:
             return None
@@ -1032,7 +933,7 @@ class AuthService:
                 new_session.mfa_verified = True
 
             # Set up grace period mapping
-            grace_seconds = sys_settings.get("session_rotation_grace_seconds", 300)
+            grace_seconds = self.settings.session_rotation_grace_seconds
             await self.cache.set_session_rotation_grace(
                 sess.id,
                 new_session.id,
@@ -1122,10 +1023,20 @@ class AuthService:
         secret = (
             existing.secret
             if existing
-            else base64.b32encode(os.urandom(10)).decode("utf-8").rstrip("=")
+            # RFC 4226 §4 R6 wants 160 bits of shared secret for HMAC-SHA-1.
+            else base64.b32encode(os.urandom(20)).decode("utf-8").rstrip("=")
         )
         self.store.set_user_mfa_secret(user_id, secret, enabled=False)
-        uri = f"otpauth://totp/liminallm:{user_id}?secret={secret}&issuer=LiminalLM"
+        # Spell out algorithm/digits/period rather than relying on the Key Uri
+        # Format's defaults. They are the defaults, but writing them down is
+        # what makes a mismatch with _verify_totp visible instead of silent —
+        # the server verified SHA-256 against apps computing SHA-1, so nobody
+        # could complete enrolment and nothing said why.
+        uri = (
+            f"otpauth://totp/liminallm:{user_id}"
+            f"?secret={secret}&issuer=LiminalLM"
+            f"&algorithm={TOTP_ALGORITHM_NAME}&digits={TOTP_DIGITS}&period={TOTP_INTERVAL_SECONDS}"
+        )
         return {"otpauth_uri": uri}
 
     async def verify_mfa_challenge(
@@ -1311,8 +1222,7 @@ class AuthService:
         if not user:
             self.logger.warning("email_verification_missing_user", user_id=user_id)
             return False
-        if hasattr(self.store, "mark_email_verified"):
-            self.store.mark_email_verified(user.id)
+        self.store.mark_email_verified(user.id)
         if self.cache:
             await self.cache.client.delete(f"verify:{token}")
         else:
@@ -1348,7 +1258,7 @@ class AuthService:
         self.store.save_password(user_id, pwd_hash, algo)
 
     def _verify_totp(
-        self, secret: str, code: str, *, window: int = 0, interval: int = 30
+        self, secret: str, code: str, *, window: int = 0, interval: int = TOTP_INTERVAL_SECONDS
     ) -> bool:
         # Issue 76.3: Narrow TOTP validation window and only allow a single
         # adjacent step for minor clock skew.
@@ -1364,7 +1274,12 @@ class AuthService:
         return False
 
     def _generate_totp(
-        self, secret: str, timestamp: float, *, interval: int = 30, digits: int = 6
+        self,
+        secret: str,
+        timestamp: float,
+        *,
+        interval: int = TOTP_INTERVAL_SECONDS,
+        digits: int = TOTP_DIGITS,
     ) -> str:
         padded = secret + "=" * ((8 - len(secret) % 8) % 8)
         try:
@@ -1373,7 +1288,7 @@ class AuthService:
             self.logger.warning("totp_secret_invalid")
             return ""
         counter = int(timestamp // interval).to_bytes(8, "big")
-        digest = hmac.new(key, counter, hashlib.sha256).digest()
+        digest = hmac.new(key, counter, TOTP_ALGORITHM).digest()
         offset = digest[-1] & 0x0F
         code_int = (int.from_bytes(digest[offset : offset + 4], "big") & 0x7FFFFFFF) % (
             10**digits
@@ -1460,14 +1375,13 @@ class AuthService:
         self, user: User, session: Session, *, device_type: Optional[str] = None
     ) -> dict[str, str]:
         now = self._now()
-        sys_settings = self._get_system_settings()
         access_exp = int(
             (
-                now + timedelta(minutes=sys_settings.get("access_token_ttl_minutes", 30))
+                now + timedelta(minutes=self.settings.access_token_ttl_minutes)
             ).timestamp()
         )
         device = (device_type or self._get_session_device(session)).lower()
-        refresh_ttl = self._get_refresh_ttl(device, sys_settings)
+        refresh_ttl = self._get_refresh_ttl(device)
         refresh_exp = int((now + timedelta(minutes=refresh_ttl)).timestamp())
         # SPEC §12.1: Generate JTIs for both tokens to support denylist on logout
         access_jti = str(uuid.uuid4())
@@ -1502,7 +1416,7 @@ class AuthService:
             "access_token": access_token,
             "refresh_token": refresh_token,
             "token_type": "bearer",
-            "expires_at": datetime.utcfromtimestamp(access_exp).isoformat(),
+            "expires_at": datetime.fromtimestamp(access_exp, timezone.utc).isoformat(),
             "csrf_token": csrf_token,
         }
 
@@ -1539,8 +1453,7 @@ class AuthService:
         if isinstance(exp, (int, float)):
             ttl = max(int(exp - self._now().timestamp()), 0)
         if ttl is None:
-            sys_settings = self._get_system_settings()
-            ttl = max(int(sys_settings.get("refresh_token_ttl_minutes", 1440) * 60), 0)
+            ttl = max(int(self.settings.refresh_token_ttl_minutes * 60), 0)
         if self.cache:
             try:
                 await self.cache.mark_refresh_revoked(jti, ttl)

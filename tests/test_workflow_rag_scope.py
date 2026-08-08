@@ -1,4 +1,5 @@
 import pytest
+from types import SimpleNamespace
 
 from liminallm.service.workflow import WorkflowEngine
 
@@ -20,6 +21,10 @@ class RecordingRAG:
 
 
 class StubLLM:
+    # A real LLMService always answers this; the engine asks before offering
+    # tools. Without it the agent path errors and retries into a failure.
+    supports_tools = False
+
     def generate(self, message, adapters=None, context_snippets=None, history=None):
         return {"content": message, "usage": {"tokens": 1}}
 
@@ -37,6 +42,12 @@ class StubStore:
 
     def list_semantic_clusters(self, user_id=None):
         return []
+
+    def list_contexts(self, owner_user_id=None, **kwargs):
+        return [SimpleNamespace(id="ctx-1", owner_user_id=owner_user_id)]
+
+    def get_user(self, user_id):
+        return SimpleNamespace(id=user_id, tenant_id="tenant-1")
 
 
 @pytest.mark.asyncio

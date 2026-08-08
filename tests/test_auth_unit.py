@@ -16,7 +16,6 @@ import pytest
 
 from liminallm.config import Settings
 from liminallm.service.auth import AuthService
-from liminallm.storage.memory import MemoryStore
 
 
 @pytest.fixture
@@ -31,24 +30,18 @@ def settings():
 
 
 @pytest.fixture
-def memory_store(tmp_path):
-    """Create memory store for testing."""
-    return MemoryStore(fs_root=str(tmp_path))
-
-
-@pytest.fixture
-def auth_service(memory_store, settings):
+def auth_service(store, settings):
     """Create auth service for testing."""
-    return AuthService(store=memory_store, cache=None, settings=settings)
+    return AuthService(store=store, cache=None, settings=settings)
 
 
 @pytest.fixture
-def test_user(memory_store, auth_service):
+def test_user(store, auth_service):
     """Create a test user with password."""
-    user = memory_store.create_user("test@example.com")
+    user = store.create_user("test@example.com")
     # Hash the password and save it properly
     pwd_hash, algo = auth_service._hash_password("TestPassword123!")
-    memory_store.save_password(user.id, pwd_hash, algo)
+    store.save_password(user.id, pwd_hash, algo)
     return user
 
 
@@ -84,18 +77,18 @@ class TestPasswordHashing:
 class TestJWTTokens:
     """Tests for JWT token generation and validation."""
 
-    def test_issue_tokens_returns_access_and_refresh(self, auth_service, test_user, memory_store):
+    def test_issue_tokens_returns_access_and_refresh(self, auth_service, test_user, store):
         """Test that issuing tokens returns both access and refresh tokens."""
-        session = memory_store.create_session(test_user.id)
+        session = store.create_session(test_user.id)
         tokens = auth_service._issue_tokens(test_user, session)
 
         assert "access_token" in tokens
         assert "refresh_token" in tokens
         assert tokens["token_type"].lower() == "bearer"
 
-    def test_decode_jwt_valid_token(self, auth_service, test_user, memory_store):
+    def test_decode_jwt_valid_token(self, auth_service, test_user, store):
         """Test decoding a valid JWT token."""
-        session = memory_store.create_session(test_user.id)
+        session = store.create_session(test_user.id)
         tokens = auth_service._issue_tokens(test_user, session)
 
         payload = auth_service._decode_jwt(tokens["access_token"])
@@ -109,9 +102,9 @@ class TestJWTTokens:
 
         assert payload is None
 
-    def test_access_token_contains_user_info(self, auth_service, test_user, memory_store):
+    def test_access_token_contains_user_info(self, auth_service, test_user, store):
         """Test that access token contains user info."""
-        session = memory_store.create_session(test_user.id)
+        session = store.create_session(test_user.id)
         tokens = auth_service._issue_tokens(test_user, session)
         payload = auth_service._decode_jwt(tokens["access_token"])
 
@@ -122,30 +115,30 @@ class TestJWTTokens:
 class TestSessionManagement:
     """Tests for session management."""
 
-    def test_create_session(self, test_user, memory_store):
+    def test_create_session(self, test_user, store):
         """Test session creation."""
-        session = memory_store.create_session(test_user.id)
+        session = store.create_session(test_user.id)
 
         assert session.id is not None
         assert session.user_id == test_user.id
         # Session.new() produces timezone-aware timestamps.
         assert session.expires_at > datetime.now(timezone.utc)
 
-    def test_get_session(self, test_user, memory_store):
+    def test_get_session(self, test_user, store):
         """Test getting a session."""
-        session = memory_store.create_session(test_user.id)
+        session = store.create_session(test_user.id)
 
-        fetched = memory_store.get_session(session.id)
+        fetched = store.get_session(session.id)
 
         assert fetched is not None
         assert fetched.id == session.id
 
-    def test_revoke_session(self, test_user, memory_store):
+    def test_revoke_session(self, test_user, store):
         """Test session revocation."""
-        session = memory_store.create_session(test_user.id)
+        session = store.create_session(test_user.id)
 
-        memory_store.revoke_session(session.id)
-        revoked = memory_store.get_session(session.id)
+        store.revoke_session(session.id)
+        revoked = store.get_session(session.id)
 
         # Session should be marked as revoked or deleted
         assert revoked is None or getattr(revoked, 'revoked_at', None) is not None
@@ -154,22 +147,22 @@ class TestSessionManagement:
 class TestMFAVerification:
     """Tests for MFA/TOTP verification."""
 
-    def test_set_mfa_secret(self, test_user, memory_store):
+    def test_set_mfa_secret(self, test_user, store):
         """Test setting MFA secret."""
-        memory_store.set_user_mfa_secret(test_user.id, "TESTSECRETKEY", enabled=False)
+        store.set_user_mfa_secret(test_user.id, "TESTSECRETKEY", enabled=False)
 
-        config = memory_store.get_user_mfa_secret(test_user.id)
+        config = store.get_user_mfa_secret(test_user.id)
 
         assert config is not None
         assert config.secret == "TESTSECRETKEY"
         assert config.enabled is False
 
-    def test_enable_mfa(self, test_user, memory_store):
+    def test_enable_mfa(self, test_user, store):
         """Test enabling MFA."""
-        memory_store.set_user_mfa_secret(test_user.id, "TESTSECRETKEY", enabled=False)
-        memory_store.set_user_mfa_secret(test_user.id, "TESTSECRETKEY", enabled=True)
+        store.set_user_mfa_secret(test_user.id, "TESTSECRETKEY", enabled=False)
+        store.set_user_mfa_secret(test_user.id, "TESTSECRETKEY", enabled=True)
 
-        config = memory_store.get_user_mfa_secret(test_user.id)
+        config = store.get_user_mfa_secret(test_user.id)
 
         assert config.enabled is True
 
@@ -177,7 +170,7 @@ class TestMFAVerification:
 class TestSignupFlow:
     """Tests for signup flow."""
 
-    def test_signup_creates_user(self, auth_service, memory_store):
+    def test_signup_creates_user(self, auth_service, store):
         """Test that signup creates a new user."""
         user, session, tokens = asyncio.run(
             auth_service.signup("new@example.com", "NewPassword123!")
@@ -187,14 +180,14 @@ class TestSignupFlow:
         assert user.email == "new@example.com"
         assert session is not None
 
-    def test_signup_stores_hashed_password(self, auth_service, memory_store):
+    def test_signup_stores_hashed_password(self, auth_service, store):
         """Test that signup stores hashed password."""
         user, session, tokens = asyncio.run(
             auth_service.signup("another@example.com", "Password123!")
         )
 
         # Verify password was hashed (not stored as plaintext)
-        pwd_info = memory_store.get_password_record(user.id)
+        pwd_info = store.get_password_record(user.id)
         assert pwd_info is not None
         assert pwd_info[0] != "Password123!"  # Hash should not equal plaintext
 
@@ -202,7 +195,7 @@ class TestSignupFlow:
 class TestLoginFlow:
     """Tests for complete login flow."""
 
-    def test_login_with_valid_credentials(self, auth_service, test_user, memory_store):
+    def test_login_with_valid_credentials(self, auth_service, test_user, store):
         """Test login with valid email and password."""
         user, session, tokens = asyncio.run(
             auth_service.login("test@example.com", "TestPassword123!")

@@ -11,10 +11,12 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from psycopg import errors
+from psycopg.abc import Buffer
+from psycopg.adapt import Loader
 from psycopg.rows import dict_row
 from psycopg_pool import ConnectionPool
 
-from liminallm.config import SYSTEM_SETTINGS_DEFAULTS
+from liminallm.config import SYSTEM_SETTINGS_DEFAULTS, redact_secrets
 from liminallm.content_struct import normalize_content_struct
 from liminallm.logging import get_logger
 from liminallm.service.artifact_validation import (
@@ -70,6 +72,42 @@ from liminallm.storage.models import (
 _MAX_SESSION_CACHE_SIZE = 10000
 
 
+class _UUIDAsText(Loader):
+    """Hand UUID columns back as strings.
+
+    Every id in the models is typed ``str``, and the ids flowing in from JWTs,
+    URLs and JSON are strings. Left as ``uuid.UUID``, a column value compares
+    unequal to the very id it was looked up by and is not JSON serializable —
+    both of which have shipped as bugs here. Convert once, at the boundary.
+    """
+
+    def load(self, data: Buffer) -> str:
+        return bytes(data).decode()
+
+
+def _configure_connection(conn) -> None:
+    conn.adapters.register_loader("uuid", _UUIDAsText)
+    # Without this, TIMESTAMPTZ comes back in whatever timezone the server was
+    # initialised with; the instant is right but the tzinfo is not UTC, and
+    # code that expects UTC (cookie expiry formatting, for one) rejects it.
+    conn.execute("SET TIME ZONE 'UTC'")
+    conn.commit()
+
+
+def _is_uuid(value: Any) -> bool:
+    """Every id in this schema is a UUID.
+
+    A malformed id cannot match a row, but Postgres raises on it rather than
+    returning nothing — so callers get a 500 where they should get a miss.
+    Check here and let the lookup return None.
+    """
+    try:
+        uuid.UUID(str(value))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return True
+
+
 class PostgresStore:
     """Thin Postgres-backed store to persist kernel primitives."""
 
@@ -103,6 +141,7 @@ class PostgresStore:
                 timeout=30.0,  # Don't wait more than 30s for a connection
                 max_waiting=100,  # Limit waiting queue to prevent unbounded growth
                 reconnect_timeout=5.0,  # Quick reconnection on failure
+                configure=_configure_connection,
                 kwargs={"row_factory": dict_row, "autocommit": False},
             )
             self.logger.info(
@@ -136,6 +175,19 @@ class PostgresStore:
                 error=str(exc),
             )
             raise
+
+    def verify_connection(self) -> None:
+        """Round-trip a query. Raises if the database is unreachable."""
+        with self._connect() as conn:
+            conn.execute("SELECT 1").fetchone()
+
+    def close_pool(self) -> None:
+        """Synchronously close the pool (test resets, shutdown without a loop)."""
+        try:
+            self.pool.close()
+            self.pool.wait_closed()
+        except Exception as exc:  # noqa: BLE001 - already closed is fine
+            self.logger.debug("postgres_pool_close_failed", error=str(exc))
 
     async def close(self) -> None:
         """Close the connection pool for graceful shutdown (Issues 57.7, 59.1)."""
@@ -276,6 +328,17 @@ class PostgresStore:
                 """
             )
 
+    @staticmethod
+    def _configured_embedding_dim() -> Optional[int]:
+        """Vector width the configured encoder produces, if knowable."""
+        try:
+            from liminallm.config import get_settings
+
+            dim = int(getattr(get_settings(), "embedding_vector_dim", 0) or 0)
+            return dim or None
+        except Exception:  # noqa: BLE001 - never block startup on config read
+            return None
+
     def _verify_required_schema(self) -> None:
         """Ensure core tables and pgvector expectations exist before serving requests."""
 
@@ -325,6 +388,28 @@ class PostgresStore:
                     "pgvector extension is missing. Install it and rerun scripts/migrate.sh to satisfy SPEC §3 RAG requirements."
                 )
 
+            # The embedding column's dimension is fixed at schema time and the
+            # encoder's is fixed at runtime; if they disagree, every chunk
+            # insert fails later with an opaque pgvector error. Say so now,
+            # with the two numbers and the fix.
+            column_dim = conn.execute(
+                """
+                SELECT atttypmod FROM pg_attribute
+                WHERE attrelid = 'knowledge_chunk'::regclass AND attname = 'embedding'
+                """
+            ).fetchone()
+            configured = self._configured_embedding_dim()
+            if column_dim and configured:
+                actual = int(column_dim["atttypmod"])
+                if actual > 0 and actual != configured:
+                    raise RuntimeError(
+                        f"embedding dimension mismatch: knowledge_chunk.embedding "
+                        f"is vector({actual}) but the configured encoder produces "
+                        f"{configured}-d vectors. Set EMBEDDING_VECTOR_DIM={configured} "
+                        f"and re-apply sql/schema.sql, or configure an encoder "
+                        f"matching vector({actual})."
+                    )
+
             citext_ext = conn.execute(
                 "SELECT extname FROM pg_extension WHERE extname = 'citext'"
             ).fetchone()
@@ -373,19 +458,6 @@ class PostgresStore:
                 raise RuntimeError(
                     "knowledge_chunk_context_idx is missing. Run scripts/migrate.sh to align with SPEC §2 context lookups."
                 )
-
-    def _set_runtime_config(self, config: dict) -> None:
-        """Persist the runtime configuration for admin-driven overrides."""
-
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO instance_config (name, config, created_at, updated_at)
-                VALUES (%s, %s, now(), now())
-                ON CONFLICT (name) DO UPDATE SET config = EXCLUDED.config, updated_at = EXCLUDED.updated_at
-                """,
-                ("default", json.dumps(config)),
-            )
 
     def _ensure_default_artifacts(self) -> None:
         """Seed default artifacts using common schema definitions."""
@@ -524,7 +596,7 @@ class PostgresStore:
             context_text=context_text,
             corrected_text=corrected_text,
             created_at=(
-                row.get("created_at", datetime.utcnow()) if row else datetime.utcnow()
+                row.get("created_at", datetime.now(timezone.utc)) if row else datetime.now(timezone.utc)
             ),
             weight=normalized_weight,
             meta=meta,
@@ -568,25 +640,7 @@ class PostgresStore:
         params.append(limit)
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
-        return [
-            PreferenceEvent(
-                id=str(row["id"]),
-                user_id=str(row["user_id"]),
-                conversation_id=str(row["conversation_id"]),
-                message_id=str(row["message_id"]),
-                feedback=row["feedback"],
-                score=row.get("score"),
-                explicit_signal=row.get("explicit_signal"),
-                context_embedding=self._parse_vector(row.get("context_embedding")),
-                cluster_id=row.get("cluster_id"),
-                context_text=row.get("context_text"),
-                corrected_text=row.get("corrected_text"),
-                created_at=row.get("created_at", datetime.utcnow()),
-                weight=self._safe_float(row.get("weight", 1.0), context="list_preference_events"),
-                meta=row.get("meta"),
-            )
-            for row in rows
-        ]
+        return [self._row_to_preference_event(row) for row in rows]
 
     def update_preference_event(
         self, event_id: str, *, cluster_id: str | None = None
@@ -600,46 +654,18 @@ class PostgresStore:
             ).fetchone()
         if not row:
             return None
-        return PreferenceEvent(
-            id=str(row["id"]),
-            user_id=str(row["user_id"]),
-            conversation_id=str(row["conversation_id"]),
-            message_id=str(row["message_id"]),
-            feedback=row["feedback"],
-            score=row.get("score"),
-            explicit_signal=row.get("explicit_signal"),
-            context_embedding=self._parse_vector(row.get("context_embedding")),
-            cluster_id=row.get("cluster_id"),
-            context_text=row.get("context_text"),
-            corrected_text=row.get("corrected_text"),
-            created_at=row.get("created_at", datetime.utcnow()),
-            weight=self._safe_float(row.get("weight", 1.0), context="update_preference_event"),
-            meta=row.get("meta"),
-        )
+        return self._row_to_preference_event(row)
 
     def get_preference_event(self, event_id: str) -> PreferenceEvent | None:
+        if not _is_uuid(event_id):
+            return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM preference_event WHERE id = %s", (event_id,)
             ).fetchone()
         if not row:
             return None
-        return PreferenceEvent(
-            id=str(row["id"]),
-            user_id=str(row["user_id"]),
-            conversation_id=str(row["conversation_id"]),
-            message_id=str(row["message_id"]),
-            feedback=row["feedback"],
-            score=row.get("score"),
-            explicit_signal=row.get("explicit_signal"),
-            context_embedding=self._parse_vector(row.get("context_embedding")),
-            cluster_id=row.get("cluster_id"),
-            context_text=row.get("context_text"),
-            corrected_text=row.get("corrected_text"),
-            created_at=row.get("created_at", datetime.utcnow()),
-            weight=self._safe_float(row.get("weight", 1.0), context="get_preference_event"),
-            meta=row.get("meta"),
-        )
+        return self._row_to_preference_event(row)
 
     # semantic clusters
     def upsert_semantic_cluster(
@@ -771,18 +797,7 @@ class PostgresStore:
             ).fetchone()
         if not row:
             return None
-        return SemanticCluster(
-            id=str(row["id"]),
-            user_id=row.get("user_id"),
-            centroid=self._parse_vector(row.get("centroid")) or new_centroid,
-            size=row.get("size", new_size),
-            label=normalize_optional_text(row.get("label")),
-            description=normalize_optional_text(row.get("description")),
-            sample_message_ids=row.get("sample_message_ids") or [],
-            created_at=row.get("created_at", existing.created_at),
-            updated_at=row.get("updated_at", datetime.utcnow()),
-            meta=row.get("meta"),
-        )
+        return self._row_to_semantic_cluster(row)
 
     def list_semantic_clusters(
         self, user_id: str | None = None
@@ -797,41 +812,18 @@ class PostgresStore:
                 rows = conn.execute(
                     "SELECT * FROM semantic_cluster ORDER BY updated_at DESC", ()
                 ).fetchall()
-        return [
-            SemanticCluster(
-                id=str(row["id"]),
-                user_id=row.get("user_id"),
-                centroid=self._parse_vector(row.get("centroid")),
-                size=row.get("size", 0),
-                label=normalize_optional_text(row.get("label")),
-                description=normalize_optional_text(row.get("description")),
-                sample_message_ids=row.get("sample_message_ids") or [],
-                created_at=row.get("created_at", datetime.utcnow()),
-                updated_at=row.get("updated_at", datetime.utcnow()),
-                meta=row.get("meta"),
-            )
-            for row in rows
-        ]
+        return [self._row_to_semantic_cluster(row) for row in rows]
 
     def get_semantic_cluster(self, cluster_id: str) -> SemanticCluster | None:
+        if not _is_uuid(cluster_id):
+            return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM semantic_cluster WHERE id = %s", (cluster_id,)
             ).fetchone()
         if not row:
             return None
-        return SemanticCluster(
-            id=str(row["id"]),
-            user_id=row.get("user_id"),
-            centroid=self._parse_vector(row.get("centroid")),
-            size=row.get("size", 0),
-            label=row.get("label"),
-            description=row.get("description"),
-            sample_message_ids=row.get("sample_message_ids") or [],
-            created_at=row.get("created_at", datetime.utcnow()),
-            updated_at=row.get("updated_at", datetime.utcnow()),
-            meta=row.get("meta"),
-        )
+        return self._row_to_semantic_cluster(row)
 
     def create_training_job(
         self,
@@ -842,7 +834,7 @@ class PostgresStore:
         meta: dict | None = None,
     ) -> TrainingJob:
         job_id = str(uuid.uuid4())
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         pref_ids = preference_event_ids or []
         num_events = len(pref_ids) if pref_ids else None
         columns = (
@@ -869,20 +861,7 @@ class PostgresStore:
                     self._json_param(meta),
                 ),
             ).fetchone()
-        return TrainingJob(
-            id=job_id,
-            user_id=user_id,
-            adapter_id=adapter_id,
-            status=row.get("status", "queued") if row else "queued",
-            num_events=row.get("num_events", num_events) if row else num_events,
-            created_at=row.get("created_at", now) if row else now,
-            updated_at=row.get("updated_at", now) if row else now,
-            loss=row.get("loss"),
-            preference_event_ids=row.get("preference_event_ids") or pref_ids,
-            dataset_path=row.get("dataset_path", dataset_path),
-            new_version=row.get("new_version"),
-            meta=row.get("meta") if row else meta,
-        )
+        return self._row_to_training_job(row)
 
     def update_training_job(
         self,
@@ -897,7 +876,7 @@ class PostgresStore:
         existing = self.get_training_job(job_id)
         if not existing:
             return None
-        new_updated_at = datetime.utcnow()
+        new_updated_at = datetime.now(timezone.utc)
         with self._connect() as conn:
             row = conn.execute(
                 """
@@ -923,23 +902,7 @@ class PostgresStore:
             ).fetchone()
         if not row:
             return None
-        adapter_id_value = row.get("adapter_id") or existing.adapter_id
-        return TrainingJob(
-            id=str(row["id"]),
-            user_id=str(row["user_id"]),
-            adapter_id=(
-                str(adapter_id_value) if adapter_id_value else existing.adapter_id
-            ),
-            status=row.get("status", existing.status),
-            num_events=row.get("num_events", existing.num_events),
-            created_at=row.get("created_at", existing.created_at),
-            updated_at=row.get("updated_at", new_updated_at),
-            loss=row.get("loss"),
-            preference_event_ids=row.get("preference_event_ids") or [],
-            dataset_path=row.get("dataset_path"),
-            new_version=row.get("new_version"),
-            meta=row.get("meta"),
-        )
+        return self._row_to_training_job(row)
 
     def claim_training_job(self, job_id: str) -> TrainingJob | None:
         """Atomically claim a training job for processing (Issue 26.2).
@@ -954,7 +917,7 @@ class PostgresStore:
             The claimed TrainingJob with status='running' if successful, None if
             the job doesn't exist or was already claimed by another worker.
         """
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         with self._connect() as conn:
             # Atomic conditional update - only succeeds if status is still 'queued'
             row = conn.execute(
@@ -969,46 +932,18 @@ class PostgresStore:
         if not row:
             # Either job doesn't exist or already claimed
             return None
-        return TrainingJob(
-            id=str(row["id"]),
-            user_id=str(row["user_id"]),
-            adapter_id=self._require_training_adapter_id(
-                row.get("adapter_id"), row.get("id")
-            ),
-            status="running",
-            num_events=row.get("num_events"),
-            created_at=row.get("created_at", now),
-            updated_at=now,
-            loss=row.get("loss"),
-            preference_event_ids=row.get("preference_event_ids") or [],
-            dataset_path=row.get("dataset_path"),
-            new_version=row.get("new_version"),
-            meta=row.get("meta"),
-        )
+        return self._row_to_training_job(row)
 
     def get_training_job(self, job_id: str) -> TrainingJob | None:
+        if not _is_uuid(job_id):
+            return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM training_job WHERE id = %s", (job_id,)
             ).fetchone()
         if not row:
             return None
-        return TrainingJob(
-            id=str(row["id"]),
-            user_id=str(row["user_id"]),
-            adapter_id=self._require_training_adapter_id(
-                row.get("adapter_id"), row.get("id")
-            ),
-            status=row.get("status", "queued"),
-            num_events=row.get("num_events"),
-            created_at=row.get("created_at", datetime.utcnow()),
-            updated_at=row.get("updated_at", datetime.utcnow()),
-            loss=row.get("loss"),
-            preference_event_ids=row.get("preference_event_ids") or [],
-            dataset_path=row.get("dataset_path"),
-            new_version=row.get("new_version"),
-            meta=row.get("meta"),
-        )
+        return self._row_to_training_job(row)
 
     def list_training_jobs(
         self,
@@ -1035,25 +970,7 @@ class PostgresStore:
             query += " LIMIT %s"
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
-        return [
-            TrainingJob(
-                id=str(row["id"]),
-                user_id=str(row["user_id"]),
-                adapter_id=self._require_training_adapter_id(
-                    row.get("adapter_id"), row.get("id")
-                ),
-                status=row.get("status", "queued"),
-                num_events=row.get("num_events"),
-                created_at=row.get("created_at", datetime.utcnow()),
-                updated_at=row.get("updated_at", datetime.utcnow()),
-                loss=row.get("loss"),
-                preference_event_ids=row.get("preference_event_ids") or [],
-                dataset_path=row.get("dataset_path"),
-                new_version=row.get("new_version"),
-                meta=row.get("meta"),
-            )
-            for row in rows
-        ]
+        return [self._row_to_training_job(row) for row in rows]
 
     @staticmethod
     def _require_training_adapter_id(adapter_id: Any, job_id: Any) -> str:
@@ -1137,17 +1054,7 @@ class PostgresStore:
             ).fetchone()
         if not row:
             return None
-        return User(
-            id=str(row["id"]),
-            email=row["email"],
-            handle=row.get("handle"),
-            created_at=row.get("created_at", datetime.utcnow()),
-            is_active=row.get("is_active", True),
-            plan_tier=row.get("plan_tier", "free"),
-            role=row.get("role", "user"),
-            tenant_id=row.get("tenant_id", "public"),
-            meta=row.get("meta"),
-        )
+        return self._row_to_user(row)
 
     def save_password(
         self, user_id: str, password_hash: str, password_algo: str
@@ -1166,6 +1073,8 @@ class PostgresStore:
             )
 
     def get_password_record(self, user_id: str) -> Optional[tuple[str, str]]:
+        if not _is_uuid(user_id):
+            return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT password_hash, password_algo FROM user_auth_credential WHERE user_id = %s",
@@ -1195,6 +1104,8 @@ class PostgresStore:
         return record
 
     def get_user_mfa_secret(self, user_id: str) -> Optional[UserMFAConfig]:
+        if not _is_uuid(user_id):
+            return None
         try:
             with self._connect() as conn:
                 row = conn.execute(
@@ -1205,7 +1116,7 @@ class PostgresStore:
                     user_id=row["user_id"],
                     secret=row["secret"],
                     enabled=bool(row.get("enabled", False)),
-                    created_at=row.get("created_at", datetime.utcnow()),
+                    created_at=row.get("created_at", datetime.now(timezone.utc)),
                     meta=row.get("meta"),
                 )
                 return cfg
@@ -1215,6 +1126,8 @@ class PostgresStore:
         return None
 
     def get_user_settings(self, user_id: str) -> Optional[UserSettings]:
+        if not _is_uuid(user_id):
+            return None
         """Get user settings/preferences."""
         try:
             with self._connect() as conn:
@@ -1283,36 +1196,18 @@ class PostgresStore:
             ).fetchone()
         if not row:
             return None
-        return User(
-            id=str(row["id"]),
-            email=row["email"],
-            handle=row.get("handle"),
-            created_at=row.get("created_at", datetime.utcnow()),
-            is_active=row.get("is_active", True),
-            plan_tier=row.get("plan_tier", "free"),
-            role=row.get("role", "user"),
-            tenant_id=row.get("tenant_id", "public"),
-            meta=row.get("meta"),
-        )
+        return self._row_to_user(row)
 
     def get_user(self, user_id: str) -> Optional[User]:
+        if not _is_uuid(user_id):
+            return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM app_user WHERE id = %s", (user_id,)
             ).fetchone()
         if not row:
             return None
-        return User(
-            id=str(row["id"]),
-            email=row["email"],
-            handle=row.get("handle"),
-            created_at=row.get("created_at", datetime.utcnow()),
-            is_active=row.get("is_active", True),
-            plan_tier=row.get("plan_tier", "free"),
-            role=row.get("role", "user"),
-            tenant_id=row.get("tenant_id", "public"),
-            meta=row.get("meta"),
-        )
+        return self._row_to_user(row)
 
     def list_users(
         self, tenant_id: Optional[str] = None, limit: int = 100
@@ -1327,22 +1222,7 @@ class PostgresStore:
                 rows = conn.execute(
                     "SELECT * FROM app_user ORDER BY created_at DESC LIMIT %s", (limit,)
                 ).fetchall()
-        users: List[User] = []
-        for row in rows:
-            users.append(
-                User(
-                    id=str(row["id"]),
-                    email=row["email"],
-                    handle=row.get("handle"),
-                    created_at=row.get("created_at", datetime.utcnow()),
-                    is_active=row.get("is_active", True),
-                    plan_tier=row.get("plan_tier", "free"),
-                    role=row.get("role", "user"),
-                    tenant_id=row.get("tenant_id", "public"),
-                    meta=row.get("meta"),
-                )
-            )
-        return users
+        return [self._row_to_user(row) for row in rows]
 
     def update_user_role(self, user_id: str, role: str) -> Optional[User]:
         with self._connect() as conn:
@@ -1352,17 +1232,7 @@ class PostgresStore:
             ).fetchone()
         if not row:
             return None
-        return User(
-            id=str(row["id"]),
-            email=row["email"],
-            handle=row.get("handle"),
-            created_at=row.get("created_at", datetime.utcnow()),
-            is_active=row.get("is_active", True),
-            plan_tier=row.get("plan_tier", "free"),
-            role=row.get("role", "user"),
-            tenant_id=row.get("tenant_id", "public"),
-            meta=row.get("meta"),
-        )
+        return self._row_to_user(row)
 
     def mark_email_verified(self, user_id: str) -> Optional[User]:
         with self._connect() as conn:
@@ -1378,17 +1248,7 @@ class PostgresStore:
             ).fetchone()
         if not row:
             return None
-        return User(
-            id=str(row["id"]),
-            email=row["email"],
-            handle=row.get("handle"),
-            created_at=row.get("created_at", datetime.utcnow()),
-            is_active=row.get("is_active", True),
-            plan_tier=row.get("plan_tier", "free"),
-            role=row.get("role", "user"),
-            tenant_id=row.get("tenant_id", "public"),
-            meta=row.get("meta"),
-        )
+        return self._row_to_user(row)
 
     def delete_user(self, user_id: str) -> bool:
         """Delete user and cascade to all related records.
@@ -1612,6 +1472,8 @@ class PostgresStore:
             raise  # Re-raise to signal failure to caller
 
     def get_session(self, session_id: str) -> Optional[Session]:
+        if not _is_uuid(session_id):
+            return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM auth_session WHERE id = %s", (session_id,)
@@ -1634,8 +1496,8 @@ class PostgresStore:
         sess = Session(
             id=str(row["id"]),
             user_id=str(row["user_id"]),
-            created_at=row.get("created_at", datetime.utcnow()),
-            expires_at=row.get("expires_at", datetime.utcnow()),
+            created_at=row.get("created_at", datetime.now(timezone.utc)),
+            expires_at=row.get("expires_at", datetime.now(timezone.utc)),
             user_agent=row.get("user_agent"),
             ip_addr=ip_val,
             mfa_required=row.get("mfa_required", False),
@@ -1689,7 +1551,7 @@ class PostgresStore:
         meta: Optional[dict] = None,
     ) -> Note:
         note_id = str(uuid.uuid4())
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         try:
             with self._connect() as conn:
                 conn.execute(
@@ -1732,7 +1594,7 @@ class PostgresStore:
         embedding: Optional[List[float]] = None,
     ) -> Optional[Note]:
         sets = ["updated_at = %s"]
-        params: list = [datetime.utcnow()]
+        params: list = [datetime.now(timezone.utc)]
         if title is not None:
             sets.append("title = %s")
             params.append(title)
@@ -1774,6 +1636,8 @@ class PostgresStore:
         return row is not None
 
     def get_note(self, note_id: str, user_id: Optional[str] = None) -> Optional[Note]:
+        if not _is_uuid(note_id):
+            return None
         with self._connect() as conn:
             if user_id:
                 row = conn.execute(
@@ -1878,6 +1742,43 @@ class PostgresStore:
             ).fetchall()
         return [self._row_to_note(r) for r in rows]
 
+    def save_sweep_report(self, user_id: str, report: dict) -> dict:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO sweep_report (user_id, report)
+                VALUES (%s, %s) RETURNING id, user_id, created_at, report
+                """,
+                (user_id, json.dumps(report)),
+            ).fetchone()
+        return {
+            "id": str(row["id"]),
+            "user_id": str(row["user_id"]),
+            "created_at": row["created_at"],
+            "report": row["report"] if isinstance(row["report"], dict)
+            else json.loads(row["report"]),
+        }
+
+    def list_sweep_reports(self, user_id: str, limit: int = 10) -> List[dict]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, user_id, created_at, report FROM sweep_report
+                WHERE user_id = %s ORDER BY created_at DESC LIMIT %s
+                """,
+                (user_id, limit),
+            ).fetchall()
+        out = []
+        for row in rows:
+            report = row["report"]
+            out.append({
+                "id": str(row["id"]),
+                "user_id": str(row["user_id"]),
+                "created_at": row["created_at"],
+                "report": report if isinstance(report, dict) else json.loads(report),
+            })
+        return out
+
     # conversations
     def create_conversation(
         self,
@@ -1886,7 +1787,7 @@ class PostgresStore:
         active_context_id: Optional[str] = None,
     ) -> Conversation:
         conv_id = str(uuid.uuid4())
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         try:
             with self._connect() as conn:
                 conn.execute(
@@ -1910,6 +1811,8 @@ class PostgresStore:
     def get_conversation(
         self, conversation_id: str, *, user_id: Optional[str] = None
     ) -> Optional[Conversation]:
+        if not _is_uuid(conversation_id):
+            return None
         with self._connect() as conn:
             params: tuple[Any, ...] = (conversation_id,)
             query = "SELECT * FROM conversation WHERE id = %s"
@@ -1920,29 +1823,15 @@ class PostgresStore:
         if not row:
             return None
 
-        def _row_value(key: str, default: Optional[Any] = None) -> Optional[Any]:
-            if hasattr(row, "get"):
-                return row.get(key, default)
-            try:
-                return row[key]
-            except Exception:
-                return default
-
-        raw_meta = _row_value("meta")
-        if isinstance(raw_meta, str):
-            try:
-                raw_meta = json.loads(raw_meta)
-            except Exception:
-                raw_meta = None
         return Conversation(
-            id=str(_row_value("id")),
-            user_id=str(_row_value("user_id")),
-            created_at=_row_value("created_at", datetime.utcnow()),
-            updated_at=_row_value("updated_at", datetime.utcnow()),
-            title=_row_value("title"),
-            status=_row_value("status") or "open",
-            active_context_id=_row_value("active_context_id"),
-            meta=raw_meta,
+            id=str(row["id"]),
+            user_id=str(row["user_id"]),
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            title=row.get("title"),
+            status=row.get("status") or "open",
+            active_context_id=row.get("active_context_id"),
+            meta=row.get("meta"),
         )
 
     def set_conversation_title(
@@ -1953,7 +1842,7 @@ class PostgresStore:
             row = conn.execute(
                 "UPDATE conversation SET title = %s, updated_at = %s "
                 "WHERE id = %s AND user_id = %s RETURNING id",
-                (title, datetime.utcnow(), conversation_id, user_id),
+                (title, datetime.now(timezone.utc), conversation_id, user_id),
             ).fetchone()
         return self.get_conversation(conversation_id) if row else None
 
@@ -1975,7 +1864,7 @@ class PostgresStore:
         self, conversation_id: str, *, user_id: str, patch: dict
     ) -> Optional[Conversation]:
         """Shallow-merge keys into a conversation's meta; owner-only."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         with self._connect() as conn:
             row = conn.execute(
                 "UPDATE conversation SET meta = COALESCE(meta, '{}'::jsonb) || %s::jsonb, "
@@ -1995,6 +1884,8 @@ class PostgresStore:
         )
 
     def get_public_conversation(self, conversation_id: str) -> Optional[Conversation]:
+        if not _is_uuid(conversation_id):
+            return None
         """Fetch a conversation only if it has been explicitly made public."""
         conv = self.get_conversation(conversation_id)
         if conv and (conv.meta or {}).get("public"):
@@ -2009,9 +1900,7 @@ class PostgresStore:
                 "ORDER BY updated_at DESC LIMIT %s",
                 (limit,),
             ).fetchall()
-        ids = [
-            str(r["id"] if hasattr(r, "get") else r[0]) for r in rows
-        ]
+        ids = [str(r["id"]) for r in rows]
         found = (self.get_conversation(cid) for cid in ids)
         return [c for c in found if c]
 
@@ -2064,7 +1953,7 @@ class PostgresStore:
                     ).fetchone()
                     seq = seq_row["next_seq"] if seq_row else 0
                     msg_id = str(uuid.uuid4())
-                    now = datetime.utcnow()
+                    now = datetime.now(timezone.utc)
                     conn.execute(
                         "INSERT INTO message (id, conversation_id, sender, role, content, content_struct, seq, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                         (
@@ -2124,8 +2013,6 @@ class PostgresStore:
             rows = conn.execute(query, tuple(params)).fetchall()
         messages: List[Message] = []
         for row in reversed(rows):
-            if not isinstance(row, dict):
-                raise TypeError("list_messages expects mapping rows")
             content_struct = row.get("content_struct")
             if isinstance(content_struct, str):
                 try:
@@ -2150,7 +2037,7 @@ class PostgresStore:
                     content=row["content"],
                     content_struct=content_struct,
                     seq=row["seq"],
-                    created_at=row.get("created_at", datetime.utcnow()),
+                    created_at=row.get("created_at", datetime.now(timezone.utc)),
                     meta=meta,
                 )
             )
@@ -2175,8 +2062,8 @@ class PostgresStore:
                 Conversation(
                     id=str(row["id"]),
                     user_id=str(row["user_id"]),
-                    created_at=row.get("created_at", datetime.utcnow()),
-                    updated_at=row.get("updated_at", datetime.utcnow()),
+                    created_at=row.get("created_at", datetime.now(timezone.utc)),
+                    updated_at=row.get("updated_at", datetime.now(timezone.utc)),
                     title=row.get("title"),
                     status=row.get("status", "open"),
                     active_context_id=row.get("active_context_id"),
@@ -2300,8 +2187,8 @@ class PostgresStore:
                         str(row["owner_user_id"]) if row.get("owner_user_id") else None
                     ),
                     visibility=row.get("visibility", "private"),
-                    created_at=row.get("created_at", datetime.utcnow()),
-                    updated_at=row.get("updated_at", datetime.utcnow()),
+                    created_at=row.get("created_at", datetime.now(timezone.utc)),
+                    updated_at=row.get("updated_at", datetime.now(timezone.utc)),
                     fs_path=row.get("fs_path"),
                     base_model=row.get("base_model")
                     or (row.get("schema") or {}).get("base_model"),
@@ -2311,13 +2198,15 @@ class PostgresStore:
         return artifacts
 
     def get_artifact(self, artifact_id: str) -> Optional[Artifact]:
+        if not _is_uuid(artifact_id):
+            return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM artifact WHERE id = %s", (artifact_id,)
             ).fetchone()
         if not row:
             return None
-        schema = row.get("schema") if isinstance(row, dict) else row["schema"]
+        schema = row.get("schema")
         if isinstance(schema, str):
             try:
                 schema = json.loads(schema)
@@ -2334,8 +2223,8 @@ class PostgresStore:
                 str(row["owner_user_id"]) if row.get("owner_user_id") else None
             ),
             visibility=row.get("visibility", "private"),
-            created_at=row.get("created_at", datetime.utcnow()),
-            updated_at=row.get("updated_at", datetime.utcnow()),
+            created_at=row.get("created_at", datetime.now(timezone.utc)),
+            updated_at=row.get("updated_at", datetime.now(timezone.utc)),
             fs_path=row.get("fs_path"),
             base_model=row.get("base_model") or (schema or {}).get("base_model"),
             meta=row.get("meta"),
@@ -2493,7 +2382,7 @@ class PostgresStore:
             rows = conn.execute(query, tuple(params)).fetchall()
         versions: List[ArtifactVersion] = []
         for row in rows:
-            schema = row.get("schema") if isinstance(row, dict) else row["schema"]
+            schema = row.get("schema")
             if isinstance(schema, str):
                 try:
                     schema = json.loads(schema)
@@ -2510,7 +2399,7 @@ class PostgresStore:
                     schema=schema or {},
                     created_by=row.get("created_by", "system_llm"),
                     change_note=row.get("change_note"),
-                    created_at=row.get("created_at", datetime.utcnow()),
+                    created_at=row.get("created_at", datetime.now(timezone.utc)),
                     fs_path=row.get("fs_path"),
                     base_model=row.get("base_model")
                     or (schema or {}).get("base_model"),
@@ -2548,8 +2437,6 @@ class PostgresStore:
         return result
 
     def persist_artifact_payload(self, artifact_id: str, schema: dict) -> str:
-        """Public wrapper kept for parity with MemoryStore."""
-
         with self._connect() as conn, conn.transaction():
             artifact_row = conn.execute(
                 "SELECT id, schema, base_model FROM artifact WHERE id = %s FOR UPDATE",
@@ -2567,7 +2454,7 @@ class PostgresStore:
             fs_path = self._persist_payload(artifact_id, next_version, schema)
 
             base_model = schema.get("base_model")
-            existing_schema = artifact_row.get("schema") if isinstance(artifact_row, dict) else None
+            existing_schema = artifact_row.get("schema")
             if not base_model and existing_schema:
                 if isinstance(existing_schema, str):
                     try:
@@ -2602,7 +2489,7 @@ class PostgresStore:
             ).fetchone()
         if not row:
             return None
-        schema = row.get("schema") if isinstance(row, dict) else row["schema"]
+        schema = row.get("schema")
         if isinstance(schema, str):
             try:
                 schema = json.loads(schema)
@@ -2630,31 +2517,31 @@ class PostgresStore:
 
         states: list[AdapterRouterState] = []
         for row in rows:
-            meta = row.get("meta") if isinstance(row, dict) else None
+            meta = row.get("meta")
             if isinstance(meta, str):
                 try:
                     meta = json.loads(meta)
                 except Exception:
                     meta = None
             centroid_vec = (
-                self._parse_vector(row.get("centroid_vec")) if isinstance(row, dict) else None
+                self._parse_vector(row.get("centroid_vec"))
             )
             states.append(
                 AdapterRouterState(
                     artifact_id=str(row["artifact_id"]),
-                    base_model=row.get("base_model") if isinstance(row, dict) else None,
+                    base_model=row.get("base_model"),
                     centroid_vec=centroid_vec if centroid_vec is not None else [],
                     usage_count=(
-                        row.get("usage_count", 0) if isinstance(row, dict) else 0
+                        row.get("usage_count", 0)
                     ),
                     success_score=(
-                        row.get("success_score", 0.0) if isinstance(row, dict) else 0.0
+                        row.get("success_score", 0.0)
                     ),
                     last_used_at=(
-                        row.get("last_used_at") if isinstance(row, dict) else None
+                        row.get("last_used_at")
                     ),
                     last_trained_at=(
-                        row.get("last_trained_at") if isinstance(row, dict) else None
+                        row.get("last_trained_at")
                     ),
                     meta=meta,
                 )
@@ -2764,24 +2651,18 @@ class PostgresStore:
             patch=patch,
             justification=justification,
             status=(
-                row.get("status", "pending") if isinstance(row, dict) else row["status"]
+                row.get("status", "pending")
             ),
             created_at=(
-                row.get("created_at", datetime.utcnow())
-                if isinstance(row, dict)
-                else row["created_at"]
+                row.get("created_at", datetime.now(timezone.utc))
             ),
             decided_at=(
                 row.get("decided_at")
-                if isinstance(row, dict)
-                else row.get("decided_at")
             ),
             applied_at=(
                 row.get("applied_at")
-                if isinstance(row, dict)
-                else row.get("applied_at")
             ),
-            meta=row.get("meta") if isinstance(row, dict) else row.get("meta"),
+            meta=row.get("meta"),
         )
 
     def get_config_patch(self, patch_id: int) -> Optional[ConfigPatchAudit]:
@@ -2935,11 +2816,11 @@ class PostgresStore:
         return updated_artifact, self._config_patch_from_row(refreshed)
 
     def _config_patch_from_row(self, row) -> ConfigPatchAudit:
-        raw_patch = row.get("patch") if isinstance(row, dict) else row["patch"]
+        raw_patch = row.get("patch")
         patch_data = (
             raw_patch if isinstance(raw_patch, dict) else json.loads(raw_patch or "{}")
         )
-        meta = row.get("meta") if isinstance(row, dict) else row.get("meta")
+        meta = row.get("meta")
         if isinstance(meta, str):
             try:
                 meta = json.loads(meta)
@@ -2947,26 +2828,24 @@ class PostgresStore:
                 self.logger.warning("config_patch_meta_parse_failed", error=str(exc))
                 meta = {}
         decided_at = (
-            row.get("decided_at") if isinstance(row, dict) else row.get("decided_at")
+            row.get("decided_at")
         )
         applied_at = (
-            row.get("applied_at") if isinstance(row, dict) else row.get("applied_at")
+            row.get("applied_at")
         )
-        created = row.get("created_at") if isinstance(row, dict) else row["created_at"]
+        created = row.get("created_at")
         return ConfigPatchAudit(
             id=int(row["id"]),
             artifact_id=str(row["artifact_id"]),
-            proposer=row.get("proposer") if isinstance(row, dict) else row["proposer"],
+            proposer=row.get("proposer"),
             patch=patch_data,
             justification=(
                 row.get("justification")
-                if isinstance(row, dict)
-                else row["justification"]
             ),
             status=(
-                row.get("status", "pending") if isinstance(row, dict) else row["status"]
+                row.get("status", "pending")
             ),
-            created_at=self._parse_ts(created) or datetime.utcnow(),
+            created_at=self._parse_ts(created) or datetime.now(timezone.utc),
             decided_at=self._parse_ts(decided_at),
             applied_at=self._parse_ts(applied_at),
             meta=meta if isinstance(meta, dict) else {},
@@ -2992,43 +2871,6 @@ class PostgresStore:
             self.logger.warning("postgres_float_parse_failed", context=context, value=value)
             return default
 
-    def get_runtime_config(self) -> dict:
-        """Return deployment config sourced from SQL (placeholder until admin UI writes it).
-
-        Replace this stub with typed reads from an ``instance_config`` table
-        once config patches are persisted server-side, and enforce versioning
-        plus source attribution (UI vs. drift detection) per SPEC §10.
-        """
-
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT config FROM instance_config WHERE name = %s", ("default",)
-            ).fetchone()
-        raw_config = row.get("config") if row else {}
-        if isinstance(raw_config, str):
-            try:
-                return json.loads(raw_config)
-            except Exception as exc:
-                self.logger.warning("runtime_config_parse_failed", error=str(exc))
-                return {}
-        if isinstance(raw_config, dict):
-            return raw_config
-        try:
-            return dict(raw_config or {})
-        except Exception:
-            return {}
-
-    def set_runtime_config(self, config: dict) -> dict:
-        """Update runtime configuration via admin UI.
-
-        Merges provided config with existing config and persists to database.
-        Returns the updated full config.
-        """
-        existing = self.get_runtime_config()
-        merged = {**existing, **config}
-        self._set_runtime_config(merged)
-        return merged
-
     def get_system_settings(self) -> dict:
         """Get admin-managed system settings from database.
 
@@ -3038,6 +2880,14 @@ class PostgresStore:
         """
         # Always merge stored overrides over defaults so callers get a complete,
         # current settings dict even when the row is partial, absent, or corrupt.
+        # Secrets are blanked: this feeds the admin API, and a value that is
+        # echoed back to every admin and into every log is not a secret.
+        return redact_secrets(
+            {**SYSTEM_SETTINGS_DEFAULTS, **self._get_stored_system_settings()}
+        )
+
+    def get_system_settings_raw(self) -> dict:
+        """Merged settings including secrets. For the runtime, not the API."""
         return {**SYSTEM_SETTINGS_DEFAULTS, **self._get_stored_system_settings()}
 
     def get_system_settings_overrides(self) -> dict:
@@ -3062,7 +2912,7 @@ class PostgresStore:
             ).fetchone()
         if not row:
             return None
-        updated_at = row.get("updated_at") if isinstance(row, dict) else None
+        updated_at = row.get("updated_at")
         return updated_at.isoformat() if updated_at else None
 
     def _get_stored_system_settings(self) -> dict:
@@ -3082,7 +2932,7 @@ class PostgresStore:
     def _coerce_stored_settings(row: Any) -> dict:
         if not row:
             return {}
-        raw_config = row.get("config") if isinstance(row, dict) else None
+        raw_config = row.get("config")
         if isinstance(raw_config, str):
             try:
                 parsed = json.loads(raw_config)
@@ -3197,6 +3047,8 @@ class PostgresStore:
         )
 
     def get_context(self, context_id: str) -> Optional[KnowledgeContext]:
+        if not _is_uuid(context_id):
+            return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM knowledge_context WHERE id = %s", (context_id,)
@@ -3204,29 +3056,15 @@ class PostgresStore:
         if not row:
             return None
 
-        def _row_value(key: str, default: Optional[Any] = None) -> Optional[Any]:
-            if hasattr(row, "get"):
-                return row.get(key, default)
-            try:
-                return row[key]
-            except Exception:
-                return default
-
-        raw_meta = _row_value("meta")
-        if isinstance(raw_meta, str):
-            try:
-                raw_meta = json.loads(raw_meta)
-            except Exception:
-                raw_meta = None
         return KnowledgeContext(
-            id=str(_row_value("id")),
-            owner_user_id=str(_row_value("owner_user_id")),
-            name=_row_value("name", ""),
-            description=_row_value("description", ""),
-            created_at=_row_value("created_at", datetime.utcnow()),
-            updated_at=_row_value("updated_at", datetime.utcnow()),
-            fs_path=_row_value("fs_path"),
-            meta=raw_meta,
+            id=str(row["id"]),
+            owner_user_id=str(row["owner_user_id"]),
+            name=row["name"],
+            description=row.get("description") or "",
+            created_at=row["created_at"],
+            updated_at=row["updated_at"],
+            fs_path=row.get("fs_path"),
+            meta=row.get("meta"),
         )
 
     def list_contexts(
@@ -3276,8 +3114,8 @@ class PostgresStore:
                     owner_user_id=str(row["owner_user_id"]),
                     name=row["name"],
                     description=row["description"],
-                    created_at=row.get("created_at", datetime.utcnow()),
-                    updated_at=row.get("updated_at", datetime.utcnow()),
+                    created_at=row.get("created_at", datetime.now(timezone.utc)),
+                    updated_at=row.get("updated_at", datetime.now(timezone.utc)),
                     fs_path=row.get("fs_path"),
                     meta=row.get("meta"),
                 )
@@ -3436,21 +3274,92 @@ class PostgresStore:
                 )
                 params.extend([fetch_limit, offset])
                 rows = conn.execute(query, tuple(params)).fetchall()
-        chunks: List[KnowledgeChunk] = []
-        for row in rows:
-            chunks.append(
-                KnowledgeChunk(
-                    id=int(row["id"]),
-                    context_id=str(row["context_id"]),
-                    fs_path=row["fs_path"],
-                    content=row["content"],
-                    embedding=self._parse_vector(row.get("embedding")),
-                    chunk_index=row.get("chunk_index", 0),
-                    created_at=row.get("created_at", datetime.utcnow()),
-                    meta=row.get("meta"),
-                )
-            )
-        return chunks
+        return [self._row_to_knowledge_chunk(row) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Row -> model
+    #
+    # One reader per table. Written out at each call site, they drifted:
+    # `get_semantic_cluster` was the only one not normalizing label and
+    # description, so the same row came back with a different label
+    # depending on which method fetched it.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _row_to_user(row: Dict[str, Any]) -> User:
+        return User(
+            id=str(row["id"]),
+            email=row["email"],
+            handle=row.get("handle"),
+            created_at=row.get("created_at", datetime.now(timezone.utc)),
+            is_active=row.get("is_active", True),
+            plan_tier=row.get("plan_tier", "free"),
+            role=row.get("role", "user"),
+            tenant_id=row.get("tenant_id", "public"),
+            meta=row.get("meta"),
+        )
+
+    def _row_to_preference_event(self, row: Dict[str, Any]) -> PreferenceEvent:
+        return PreferenceEvent(
+            id=str(row["id"]),
+            user_id=str(row["user_id"]),
+            conversation_id=str(row["conversation_id"]),
+            message_id=str(row["message_id"]),
+            feedback=row["feedback"],
+            score=row.get("score"),
+            explicit_signal=row.get("explicit_signal"),
+            context_embedding=self._parse_vector(row.get("context_embedding")),
+            cluster_id=row.get("cluster_id"),
+            context_text=row.get("context_text"),
+            corrected_text=row.get("corrected_text"),
+            created_at=row.get("created_at", datetime.now(timezone.utc)),
+            weight=self._safe_float(row.get("weight", 1.0), context="preference_event"),
+            meta=row.get("meta"),
+        )
+
+    def _row_to_training_job(self, row: Dict[str, Any]) -> TrainingJob:
+        return TrainingJob(
+            id=str(row["id"]),
+            user_id=str(row["user_id"]),
+            adapter_id=self._require_training_adapter_id(
+                row.get("adapter_id"), row.get("id")
+            ),
+            status=row.get("status", "queued"),
+            num_events=row.get("num_events"),
+            created_at=row.get("created_at", datetime.now(timezone.utc)),
+            updated_at=row.get("updated_at", datetime.now(timezone.utc)),
+            loss=row.get("loss"),
+            preference_event_ids=row.get("preference_event_ids") or [],
+            dataset_path=row.get("dataset_path"),
+            new_version=row.get("new_version"),
+            meta=row.get("meta"),
+        )
+
+    def _row_to_knowledge_chunk(self, row: Dict[str, Any]) -> KnowledgeChunk:
+        return KnowledgeChunk(
+            id=int(row["id"]),
+            context_id=str(row["context_id"]),
+            fs_path=row["fs_path"],
+            content=row["content"],
+            embedding=self._parse_vector(row.get("embedding")),
+            chunk_index=row.get("chunk_index", 0),
+            created_at=row.get("created_at", datetime.now(timezone.utc)),
+            meta=row.get("meta"),
+        )
+
+    def _row_to_semantic_cluster(self, row: Dict[str, Any]) -> SemanticCluster:
+        return SemanticCluster(
+            id=str(row["id"]),
+            user_id=row.get("user_id"),
+            centroid=self._parse_vector(row.get("centroid")),
+            size=row.get("size", 0),
+            label=normalize_optional_text(row.get("label")),
+            description=normalize_optional_text(row.get("description")),
+            sample_message_ids=row.get("sample_message_ids") or [],
+            created_at=row.get("created_at", datetime.now(timezone.utc)),
+            updated_at=row.get("updated_at", datetime.now(timezone.utc)),
+            meta=row.get("meta"),
+        )
 
     def _format_vector(self, embedding: Sequence[float]) -> str:
         safe_vals = (
@@ -3554,19 +3463,7 @@ class PostgresStore:
             ).fetchall()
         # pgvector mode: results already ordered by vector similarity via SQL
         # No BM25 re-ranking per SPEC §3 - pure vector search for pgvector mode
-        return [
-            KnowledgeChunk(
-                id=int(row["id"]),
-                context_id=str(row["context_id"]),
-                fs_path=row["fs_path"],
-                content=row["content"],
-                embedding=self._parse_vector(row.get("embedding")),
-                chunk_index=row.get("chunk_index", 0),
-                created_at=row.get("created_at", datetime.utcnow()),
-                meta=row.get("meta"),
-            )
-            for row in rows
-        ]
+        return [self._row_to_knowledge_chunk(row) for row in rows]
 
     def search_chunks(
         self,
@@ -3578,12 +3475,15 @@ class PostgresStore:
         """Non-pgvector hybrid search; suitable for tests and tiny corpora only."""
 
         def _cosine(a: List[float], b: List[float]) -> float:
-            if not a or not b:
+            # Belt and braces: knowledge_chunk.embedding is VECTOR(dim) NOT
+            # NULL, so widths cannot differ in practice. If one ever did,
+            # scoring the overlapping prefix would produce a number that looks
+            # like a similarity and is not — contribute nothing instead.
+            if not a or not b or len(a) != len(b):
                 return 0.0
-            length = min(len(a), len(b))
-            dot = sum(a[i] * b[i] for i in range(length))
+            dot = sum(x * y for x, y in zip(a, b))
             norm_a = sum(x * x for x in a) ** 0.5 or 1.0
-            norm_b = sum(x * x for x in b) ** 0.5 or 1.0
+            norm_b = sum(y * y for y in b) ** 0.5 or 1.0
             return dot / (norm_a * norm_b)
 
         candidate_limit = limit or 4
@@ -3640,7 +3540,7 @@ class PostgresStore:
                 sections["users"] = [_serialize(row) for row in rows]
             if kind in (None, "sessions"):
                 rows = conn.execute(
-                    "SELECT * FROM auth_session WHERE (%s IS NULL OR tenant_id = %s) ORDER BY created_at DESC LIMIT %s",
+                    "SELECT * FROM auth_session WHERE (%s::text IS NULL OR tenant_id = %s) ORDER BY created_at DESC LIMIT %s",
                     (tenant_id, tenant_id, limit),
                 ).fetchall()
                 sections["sessions"] = [_serialize(row) for row in rows]
@@ -3650,7 +3550,7 @@ class PostgresStore:
                     SELECT c.*
                     FROM conversation c
                     JOIN app_user u ON c.user_id = u.id
-                    WHERE (%s IS NULL OR u.tenant_id = %s)
+                    WHERE (%s::text IS NULL OR u.tenant_id = %s)
                     ORDER BY c.updated_at DESC
                     LIMIT %s
                     """,
@@ -3664,7 +3564,7 @@ class PostgresStore:
                     FROM message m
                     JOIN conversation c ON m.conversation_id = c.id
                     JOIN app_user u ON c.user_id = u.id
-                    WHERE (%s IS NULL OR u.tenant_id = %s)
+                    WHERE (%s::text IS NULL OR u.tenant_id = %s)
                     ORDER BY m.created_at DESC
                     LIMIT %s
                     """,
@@ -3682,7 +3582,7 @@ class PostgresStore:
                     SELECT kc.*
                     FROM knowledge_context kc
                     LEFT JOIN app_user u ON kc.owner_user_id = u.id
-                    WHERE (%s IS NULL OR u.tenant_id = %s)
+                    WHERE (%s::text IS NULL OR u.tenant_id = %s)
                     ORDER BY kc.created_at DESC
                     LIMIT %s
                     """,
@@ -3696,7 +3596,7 @@ class PostgresStore:
                     FROM knowledge_chunk kc
                     LEFT JOIN knowledge_context ctx ON kc.context_id = ctx.id
                     LEFT JOIN app_user u ON ctx.owner_user_id = u.id
-                    WHERE (%s IS NULL OR u.tenant_id = %s)
+                    WHERE (%s::text IS NULL OR u.tenant_id = %s)
                     ORDER BY kc.created_at DESC
                     LIMIT %s
                     """,
@@ -3709,7 +3609,7 @@ class PostgresStore:
                     SELECT tj.*
                     FROM training_job tj
                     JOIN app_user u ON tj.user_id = u.id
-                    WHERE (%s IS NULL OR u.tenant_id = %s)
+                    WHERE (%s::text IS NULL OR u.tenant_id = %s)
                     ORDER BY tj.created_at DESC
                     LIMIT %s
                     """,

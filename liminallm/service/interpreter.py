@@ -51,9 +51,6 @@ _BLOCKED_MODULES = frozenset({
 class _BlockedImportFinder:
     """Meta-path finder that refuses networking / process-spawning modules."""
 
-    def find_module(self, fullname, path=None):  # legacy API, harmless
-        return self.find_spec(fullname, path)
-
     def find_spec(self, fullname, path=None, target=None):
         root = fullname.split(".")[0]
         if root in _BLOCKED_MODULES:

@@ -2,31 +2,37 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import inspect
+import json
+import os
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple, Union
 from urllib.parse import urlparse, urlunparse
 
-from liminallm.config import get_settings, reset_settings_cache
+from liminallm.config import (
+    SYSTEM_SETTINGS_DEFAULTS,
+    apply_managed_settings,
+    generate_jwt_secret,
+    get_settings,
+    reset_settings_cache,
+)
 from liminallm.logging import get_logger
-from liminallm.service.auth import AuthService
 from liminallm.service import token_counting
-from liminallm.service.cluster import AdvisoryLock, ClusterBus
+from liminallm.service.auth import AuthService
 from liminallm.service.clustering import SemanticClusterer
 from liminallm.service.config_ops import ConfigOpsService
 from liminallm.service.email import EmailService
 from liminallm.service.embeddings import EmbeddingsService, make_provider_encoder
 from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
+from liminallm.service.replication import AdvisoryLock, ClusterBus
 from liminallm.service.router import RouterEngine
 from liminallm.service.training import TrainingService
 from liminallm.service.training_worker import TrainingWorker
 from liminallm.service.voice import VoiceService
 from liminallm.service.workflow import WorkflowEngine
-from liminallm.storage.memory import MemoryStore
 from liminallm.storage.postgres import PostgresStore
-from liminallm.storage.redis_cache import RedisCache, SyncRedisCache
+from liminallm.storage.redis_cache import RedisCache
 
 logger = get_logger(__name__)
 
@@ -71,43 +77,39 @@ class Runtime:
         self.settings = get_settings()
         logger.info(
             "runtime_init_started",
-            use_memory_store=self.settings.use_memory_store,
             test_mode=self.settings.test_mode,
         )
 
         try:
-            self.store = (
-                MemoryStore(
-                    fs_root=self.settings.shared_fs_root,
-                    mfa_encryption_key=self.settings.mfa_secret_key,
-                )
-                if self.settings.use_memory_store
-                else PostgresStore(
-                    self.settings.database_url, fs_root=self.settings.shared_fs_root
-                )
+            self.store = PostgresStore(
+                self.settings.database_url, fs_root=self.settings.shared_fs_root
             )
             logger.info(
                 "runtime_store_initialized",
-                store_type="memory" if self.settings.use_memory_store else "postgres",
+                store_type="postgres",
             )
         except Exception as exc:
             logger.error(
                 "runtime_store_init_failed",
-                store_type="memory" if self.settings.use_memory_store else "postgres",
+                store_type="postgres",
                 error_type=type(exc).__name__,
                 error=str(exc),
             )
             raise
 
+        # Everything below is configured from the database, so resolve the
+        # settings before building anything that depends on them.
+        # Order matters: the seed only applies to an unconfigured instance, and
+        # the generated signing key would otherwise make it look configured.
+        self._seed_settings_from_env()
+        self._ensure_signing_key()
+        self.refresh_settings()
+
         self.cache = None
         redis_error: Exception | None = None
         if self.settings.redis_url:
             try:
-                # Use sync Redis client in test mode to avoid event loop issues
-                if self.settings.test_mode:
-                    cache = SyncRedisCache(self.settings.redis_url)
-                else:
-                    cache = RedisCache(self.settings.redis_url)
+                cache = RedisCache(self.settings.redis_url)
                 cache.verify_connection()
                 self.cache = cache
             except Exception as exc:
@@ -121,11 +123,15 @@ class Runtime:
             ):
                 raise RuntimeError(
                     "Redis is required for sessions, rate limits, idempotency, and workflow caches; "
-                    "start Redis or set TEST_MODE=true/ALLOW_REDIS_FALLBACK_DEV=true for local fallback."
+                    "start Redis, set TEST_MODE=true, or enable the "
+                    "allow_redis_fallback_dev setting for local fallback."
                 ) from redis_error
 
+            # test_mode is an environment variable; the other is an admin
+            # setting, and naming it in caps sent operators to export a
+            # variable nothing reads.
             fallback_mode = (
-                "TEST_MODE" if self.settings.test_mode else "ALLOW_REDIS_FALLBACK_DEV"
+                "TEST_MODE" if self.settings.test_mode else "allow_redis_fallback_dev"
             )
 
             logger.warning(
@@ -139,76 +145,23 @@ class Runtime:
                 ),
                 mode=fallback_mode,
             )
-        # Get system settings from DB early (falls back to env vars if not in DB)
-        sys_settings = {}
-        if hasattr(self.store, "get_system_settings"):
-            sys_settings = self.store.get_system_settings() or {}
-
         # Build all backend-dependent services (router, llm, rag, training,
         # clusterer, workflow, config_ops). Extracted into a helper so
         # reload_model_services() can rebuild them when an admin changes
         # model_backend/model_path without restarting the process.
         self._build_model_services()
 
-        # Voice/email settings resolve from DB with env var fallback
-        voice_transcription_model = (
-            sys_settings.get("voice_transcription_model")
-            or self.settings.voice_transcription_model
-        )
-        voice_synthesis_model = (
-            sys_settings.get("voice_synthesis_model")
-            or self.settings.voice_synthesis_model
-        )
-        voice_default_voice = (
-            sys_settings.get("voice_default_voice") or self.settings.voice_default_voice
-        )
-        app_base_url = sys_settings.get("app_base_url") or self.settings.app_base_url
-
-        self.voice = VoiceService(
-            self.settings.shared_fs_root,
-            api_key=self.settings.voice_api_key,
-            transcription_model=voice_transcription_model,
-            synthesis_model=voice_synthesis_model,
-            default_voice=voice_default_voice,
-        )
-        # Use MFA setting from sys_settings (already fetched above)
-        mfa_enabled = sys_settings.get("enable_mfa", self.settings.enable_mfa)
         self.auth = AuthService(
             self.store,
             self.cache,
             self.settings,
-            mfa_enabled=mfa_enabled,
+            mfa_enabled=self.settings.enable_mfa,
         )
-        # Get SMTP settings from sys_settings (falls back to env vars if not in DB)
-        smtp_host = sys_settings.get("smtp_host") or self.settings.smtp_host
-        smtp_port = sys_settings.get("smtp_port") or self.settings.smtp_port
-        smtp_user = sys_settings.get("smtp_user") or self.settings.smtp_user
-        smtp_password = sys_settings.get("smtp_password") or self.settings.smtp_password
-        smtp_use_tls = sys_settings.get("smtp_use_tls", self.settings.smtp_use_tls)
-        smtp_allow_insecure = sys_settings.get(
-            "smtp_allow_insecure", self.settings.smtp_allow_insecure
-        )
-        email_from_address = (
-            sys_settings.get("email_from_address") or self.settings.email_from_address
-        )
-        email_from_name = (
-            sys_settings.get("email_from_name") or self.settings.email_from_name
-        )
-        self.email = EmailService(
-            smtp_host=smtp_host,
-            smtp_port=smtp_port,
-            smtp_user=smtp_user,
-            smtp_password=smtp_password,
-            smtp_use_tls=smtp_use_tls,
-            smtp_allow_insecure=smtp_allow_insecure,
-            from_email=email_from_address,
-            from_name=email_from_name,
-            base_url=app_base_url,
-        )
+        self._build_credentialed_services()
         # Cross-replica coordination. Both primitives are best-effort and
         # neither makes Redis required: the bus falls back to Postgres
         # LISTEN/NOTIFY, and a single-process deployment gets local semantics.
-        db_url = None if self.settings.use_memory_store else self.settings.database_url
+        db_url = self.settings.database_url
         # The cache object is the signal that Redis really exists here (the
         # setting has a localhost default even on redis-less deployments) —
         # but an explicit backend=redis is the operator's word over that
@@ -228,23 +181,23 @@ class Runtime:
         self._install_calibration_sharing()
 
         # Training worker for background job processing
-        poll_interval = sys_settings.get(
-            "training_worker_poll_interval", self.settings.training_worker_poll_interval
-        )
         self.training_worker = TrainingWorker(
             store=self.store,
             training_service=self.training,
             clusterer=self.clusterer,
-            poll_interval=poll_interval,
+            poll_interval=self.settings.training_worker_poll_interval,
             leader_lock=self.leader_lock,
+            # Lets the worker re-embed vectors left behind by a previous
+            # encoder; a hash encoder makes the sweep a no-op.
+            embeddings=self.embeddings,
         )
         self._local_idempotency: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         self._local_idempotency_lock = asyncio.Lock()
-        self._local_idempotency_last_cleanup = datetime.utcnow()
+        self._local_idempotency_last_cleanup = datetime.now(timezone.utc)
         self._local_idempotency_max_entries = 5000
         self._local_rate_limits: Dict[str, Tuple[float, datetime]] = {}
         self._local_rate_limit_lock = asyncio.Lock()
-        self._local_rate_limit_last_cleanup = datetime.utcnow()
+        self._local_rate_limit_last_cleanup = datetime.now(timezone.utc)
         self._local_rate_limit_max_entries = 5000
         # Cross-worker settings reload coordination: the version this worker's
         # model stack was built from, and a lock serializing rebuilds.
@@ -261,7 +214,7 @@ class Runtime:
             redis_enabled=self.cache is not None,
             email_configured=self.email.is_configured,
             voice_configured=self.voice.is_configured,
-            mfa_enabled=mfa_enabled,
+            mfa_enabled=self.settings.enable_mfa,
         )
 
     def _install_calibration_sharing(self) -> None:
@@ -275,21 +228,17 @@ class Runtime:
         store = self.store
 
         def load(model: str):
-            getter = getattr(store, "get_instance_config", None)
-            if not callable(getter):
-                return None
-            entry = (getter(token_counting.CALIBRATION_CONFIG_NAME) or {}).get(model)
+            stored = store.get_instance_config(token_counting.CALIBRATION_CONFIG_NAME)
+            entry = (stored or {}).get(model)
             if isinstance(entry, dict):
                 return entry.get("factor")
             return entry if isinstance(entry, (int, float)) else None
 
         def publish(model: str, factor: float, observations: int) -> None:
-            merger = getattr(store, "merge_instance_config", None)
-            if callable(merger):
-                merger(
-                    token_counting.CALIBRATION_CONFIG_NAME,
-                    {model: {"factor": round(factor, 4), "observations": observations}},
-                )
+            store.merge_instance_config(
+                token_counting.CALIBRATION_CONFIG_NAME,
+                {model: {"factor": round(factor, 4), "observations": observations}},
+            )
             bus = getattr(self, "bus", None)
             if bus is None:
                 return
@@ -309,20 +258,133 @@ class Runtime:
         token_counting.install_sharing(load=load, publish=publish)
 
     def _system_settings_overrides(self) -> dict:
-        """Explicitly stored admin settings only, without defaults merged in.
+        """Only what an admin actually saved, without defaults merged in.
 
-        get_system_settings() merges code defaults over the stored values, so
-        resolving model settings from it would let those defaults permanently
-        shadow MODEL_PATH / MODEL_BACKEND env vars the admin never overrode.
-        Precedence here is: admin override > env var > code default.
+        get_system_settings() merges the shipped defaults over the stored
+        values; overlaying that would make a default indistinguishable from a
+        choice. This returns the choices.
         """
-        getter = getattr(self.store, "get_system_settings_overrides", None)
-        if callable(getter):
-            try:
-                return getter() or {}
-            except Exception as exc:
-                logger.warning("settings_overrides_read_failed", error=str(exc))
-        return {}
+        try:
+            return self.store.get_system_settings_overrides() or {}
+        except Exception as exc:
+            logger.warning("settings_overrides_read_failed", error=str(exc))
+            return {}
+
+    #: Written by the instance itself, not chosen by anyone.
+    GENERATED_SETTINGS = frozenset({"jwt_secret"})
+
+    def _seed_settings_from_env(self) -> None:
+        """Apply INSTANCE_SETTINGS_JSON on first boot, once.
+
+        Managed settings have no environment variables, which would otherwise
+        make a declarative deploy (compose, k8s) unable to configure anything
+        without a human opening the admin UI. This is the one seam: a JSON
+        object of managed settings, written to the database only when no admin
+        has saved anything yet. It is a seed, not an override — once a value is
+        in the database it is authoritative, so a stale container env cannot
+        quietly revert what an operator changed.
+        """
+        raw = os.environ.get("INSTANCE_SETTINGS_JSON")
+        if not raw:
+            return
+        try:
+            seed = json.loads(raw)
+        except ValueError as exc:
+            logger.error("instance_settings_seed_invalid_json", error=str(exc))
+            return
+        if not isinstance(seed, dict):
+            logger.error("instance_settings_seed_not_an_object")
+            return
+        known = set(SYSTEM_SETTINGS_DEFAULTS)
+        unknown = sorted(set(seed) - known)
+        if unknown:
+            logger.warning("instance_settings_seed_unknown_keys", keys=unknown)
+        seed = {k: v for k, v in seed.items() if k in known}
+        if not seed:
+            return
+        try:
+            # "Configured" means an operator chose something. The signing key
+            # writes itself on first boot, so it does not count.
+            chosen = set(self._system_settings_overrides()) - self.GENERATED_SETTINGS
+            if chosen:
+                logger.info("instance_settings_seed_skipped_already_configured")
+                return
+            self.store.merge_instance_config("system_settings", seed)
+            logger.info("instance_settings_seeded", settings=sorted(seed))
+        except Exception as exc:  # noqa: BLE001 - a failed seed must not block boot
+            logger.warning("instance_settings_seed_failed", error=str(exc))
+
+    def _ensure_signing_key(self) -> None:
+        """Put a signing key in the database on first boot.
+
+        It used to be generated into a file under shared_fs_root, which no
+        longer works: that path is itself a database setting now. Storing the
+        key alongside it also fixes a quieter problem — every replica that
+        could not read the file generated its own, so tokens issued by one
+        worker were rejected by the next.
+        """
+        try:
+            stored = self._system_settings_overrides()
+            if stored.get("jwt_secret"):
+                return
+            self.store.merge_instance_config(
+                "system_settings", {"jwt_secret": generate_jwt_secret()}
+            )
+            logger.info("jwt_secret_generated")
+        except Exception as exc:  # noqa: BLE001 - surfaced by the auth service
+            logger.error("jwt_secret_generation_failed", error=str(exc))
+
+    def _build_credentialed_services(self) -> None:
+        """(Re)build the services that capture credentials at construction.
+
+        Both take their configuration as constructor arguments, so handing them
+        a new settings object is not enough — rotating an SMTP password would
+        update self.settings and change nothing about the mail that gets sent.
+        Neither opens a connection when constructed, so rebuilding is cheap and
+        a rotation applies to the next message rather than the next restart.
+        """
+        settings = self.settings
+        self.voice = VoiceService(
+            settings.shared_fs_root,
+            api_key=settings.voice_api_key,
+            transcription_model=settings.voice_transcription_model,
+            synthesis_model=settings.voice_synthesis_model,
+            default_voice=settings.voice_default_voice,
+        )
+        self.email = EmailService(
+            smtp_host=settings.smtp_host,
+            smtp_port=settings.smtp_port,
+            smtp_user=settings.smtp_user,
+            smtp_password=settings.smtp_password,
+            smtp_security=settings.smtp_security,
+            from_email=settings.email_from_address,
+            from_name=settings.email_from_name,
+            base_url=settings.app_base_url,
+        )
+
+    def refresh_settings(self) -> None:
+        """Rebuild self.settings from the declared defaults plus what is stored.
+
+        Everything downstream reads plain attributes off self.settings. Before
+        this, sixty call sites each merged the store's dict by hand and wrote
+        the default out a third time inline; they disagreed, and nothing
+        noticed.
+        """
+        self.settings = apply_managed_settings(
+            get_settings(), self._system_settings_overrides()
+        )
+        # Services built earlier hold a reference to the old object. They only
+        # read attributes off it, so handing them the new one is enough — and
+        # without this an admin's change would not reach a running auth or
+        # email service until the process restarted.
+        for service in ("auth", "workflow", "training"):
+            existing = getattr(self, service, None)
+            if existing is not None and hasattr(existing, "settings"):
+                existing.settings = self.settings
+        # These capture their configuration rather than reading it, so they
+        # have to be rebuilt for a change to reach them.
+        if getattr(self, "email", None) is not None:
+            self._build_credentialed_services()
 
     def _build_model_services(self) -> None:
         """Construct all backend-dependent services from system settings.
@@ -330,28 +392,22 @@ class Runtime:
         Shared by __init__ and reload_model_services so a runtime
         model_backend / model_path change takes effect without a restart.
         """
-        overrides = self._system_settings_overrides()
-        self.resolved_base_model = (
-            overrides.get("model_path") or self.settings.model_path
-        )
-        self.backend_mode = (
-            overrides.get("model_backend") or self.settings.model_backend
-        )
-        self.default_adapter_mode = (
-            overrides.get("default_adapter_mode")
-            or self.settings.default_adapter_mode
-        )
-        self.rag_mode = overrides.get("rag_mode") or self.settings.rag_mode
-        embedding_model_id = (
-            overrides.get("embedding_model_id") or self.settings.embedding_model_id
-        )
-        rag_chunk_size = overrides.get("rag_chunk_size") or 400
+        self.refresh_settings()
+        self.resolved_base_model = self.settings.model_path
+        self.backend_mode = self.settings.model_backend
+        self.default_adapter_mode = self.settings.default_adapter_mode
+        self.rag_mode = self.settings.rag_mode
+        embedding_model_id = self.settings.embedding_model_id
+        rag_chunk_size = self.settings.rag_chunk_size
         adapter_configs = {
             "openai": {
                 "api_key": self.settings.adapter_openai_api_key,
                 "base_url": self.settings.adapter_openai_base_url,
                 "adapter_server_model": self.settings.adapter_server_model,
-            }
+            },
+            "gemini": {
+                "api_key": self.settings.gemini_api_key or None,
+            },
         }
         self.router = RouterEngine(cache=self.cache, backend_mode=self.backend_mode)
         self.llm = LLMService(
@@ -362,6 +418,8 @@ class Runtime:
             base_url=self.settings.adapter_openai_base_url,
             adapter_server_model=self.settings.adapter_server_model,
             fs_root=self.settings.shared_fs_root,
+            reasoning_effort=self.settings.model_reasoning_effort,
+            temperature=self.settings.model_temperature,
         )
         # Real embeddings when the backend has an OpenAI-compatible client
         # (its /embeddings endpoint serves OpenAI, Gemini-compat, and
@@ -399,14 +457,7 @@ class Runtime:
             # SPEC §7.5: the serving LLM doubles as distillation teacher when
             # enabled; targets are rewritten into clean exemplars pre-training.
             teacher=self.llm,
-            # Merge note: the polish branch read this from __init__'s
-            # sys_settings, which is out of scope here. `overrides` is the
-            # same source with the platform's precedence (admin > env >
-            # default), already resolved at the top of this method.
-            distillation_enabled=overrides.get(
-                "training_distillation_enabled",
-                self.settings.training_distillation_enabled,
-            ),
+            distillation_enabled=self.settings.training_distillation_enabled,
         )
         self.clusterer = SemanticClusterer(self.store, self.llm, self.training)
         self.workflow = WorkflowEngine(
@@ -427,25 +478,21 @@ class Runtime:
 
     def _model_signature(self) -> tuple:
         """Signature of the settings that affect the model service stack."""
-        overrides = self._system_settings_overrides()
+        effective = apply_managed_settings(
+            get_settings(), self._system_settings_overrides()
+        )
         return (
-            overrides.get("model_path") or self.settings.model_path,
-            str(overrides.get("model_backend") or self.settings.model_backend),
-            str(
-                overrides.get("default_adapter_mode")
-                or self.settings.default_adapter_mode
-            ),
-            str(overrides.get("rag_mode") or self.settings.rag_mode),
-            overrides.get("embedding_model_id") or self.settings.embedding_model_id,
-            overrides.get("rag_chunk_size") or 400,
+            effective.model_path,
+            str(effective.model_backend),
+            str(effective.default_adapter_mode),
+            str(effective.rag_mode),
+            effective.embedding_model_id,
+            effective.rag_chunk_size,
         )
 
     def _read_settings_version(self) -> Optional[str]:
-        getter = getattr(self.store, "get_system_settings_version", None)
-        if not callable(getter):
-            return None
         try:
-            return getter()
+            return self.store.get_system_settings_version()
         except Exception as exc:
             logger.warning("settings_version_read_failed", error=str(exc))
             return None
@@ -463,8 +510,12 @@ class Runtime:
         if version is not None and version == self._applied_settings_version:
             return False
         target = self._model_signature()
+        # Pick up every managed setting, not just the model ones: a rate-limit
+        # or feature-flag change has to reach self.settings too, since that is
+        # now what request handlers read.
+        self.refresh_settings()
         # Record the version even when nothing model-relevant changed, so an
-        # unrelated settings write (e.g. a rate-limit tweak) isn't rechecked.
+        # unrelated settings write isn't rechecked.
         self._applied_settings_version = version
         if target != self._model_settings_signature:
             self.reload_model_services()
@@ -514,7 +565,7 @@ class Runtime:
                 logger.error(
                     "runtime_model_services_reload_failed",
                     model_backend=str(
-                        self._system_settings_overrides().get("model_backend")
+                        self.settings.model_backend
                     ),
                     error=str(exc),
                 )
@@ -554,20 +605,12 @@ class Runtime:
                 await self.voice.close()
 
         if getattr(self, "cache", None):
-            close_fn = getattr(self.cache, "close", None)
-            if close_fn:
-                with contextlib.suppress(Exception):
-                    result = close_fn()
-                    if inspect.isawaitable(result):
-                        await result
+            with contextlib.suppress(Exception):
+                await self.cache.close()
 
         if getattr(self, "store", None):
-            close_fn = getattr(self.store, "close", None)
-            if close_fn:
-                with contextlib.suppress(Exception):
-                    result = close_fn()
-                    if inspect.isawaitable(result):
-                        await result
+            with contextlib.suppress(Exception):
+                await self.store.close()
 
 
 runtime: Runtime | None = None
@@ -602,19 +645,20 @@ def reset_runtime_for_tests() -> Runtime:
         # Close existing Redis connections to avoid event loop issues
         if runtime is not None and runtime.cache is not None:
             try:
-                # SyncRedisCache uses a sync client internally, close it directly
-                if isinstance(runtime.cache, SyncRedisCache):
-                    runtime.cache.client.close()
-                else:
-                    # Async RedisCache - try to close properly
-                    try:
-                        loop = asyncio.get_running_loop()
-                        loop.create_task(runtime.cache.close())
-                    except RuntimeError:
-                        asyncio.run(runtime.cache.close())
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(runtime.cache.close())
+                except RuntimeError:
+                    asyncio.run(runtime.cache.close())
             except Exception:
                 # Ignore errors during cleanup - connection may already be closed
                 pass
+
+        # Close the store's connection pool too. Replacing the runtime without
+        # this leaks a pool per reset — invisible while the store was in-memory,
+        # and it exhausts Postgres connections the moment it is not.
+        if runtime is not None and getattr(runtime, "store", None) is not None:
+            runtime.store.close_pool()
 
         reset_settings_cache()
         settings = get_settings()
@@ -657,26 +701,6 @@ def _cleanup_local_idempotency(
     return len(expired), evicted
 
 
-async def _get_cached_idempotency_record(
-    runtime: Runtime, route: str, user_id: str, key: str, *, tenant_id: Optional[str] = None
-) -> Optional[dict]:
-    now = datetime.utcnow()
-    if runtime.cache:
-        # Issue 22.2: Pass tenant_id for multi-tenant isolation
-        return await runtime.cache.get_idempotency_record(route, user_id, key, tenant_id=tenant_id)
-    async with runtime._local_idempotency_lock:
-        # Include tenant_id in in-memory key for multi-tenant isolation
-        cache_key = (tenant_id, route, user_id, key) if tenant_id else (route, user_id, key)
-        _cleanup_local_idempotency(runtime, now)
-        record = runtime._local_idempotency.get(cache_key)
-        if not record:
-            return None
-        if record.get("expires_at") and record["expires_at"] < now:
-            runtime._local_idempotency.pop(cache_key, None)
-            return None
-        return record
-
-
 async def _set_cached_idempotency_record(
     runtime: Runtime,
     route: str,
@@ -687,7 +711,7 @@ async def _set_cached_idempotency_record(
     ttl_seconds: int = IDEMPOTENCY_TTL_SECONDS,
     tenant_id: Optional[str] = None,
 ) -> None:
-    expires_at = datetime.utcnow() + timedelta(seconds=ttl_seconds)
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
     if runtime.cache:
         # Issue 22.2: Pass tenant_id for multi-tenant isolation
         await runtime.cache.set_idempotency_record(
@@ -697,7 +721,7 @@ async def _set_cached_idempotency_record(
     async with runtime._local_idempotency_lock:
         # Include tenant_id in in-memory key for multi-tenant isolation
         cache_key = (tenant_id, route, user_id, key) if tenant_id else (route, user_id, key)
-        _cleanup_local_idempotency(runtime, datetime.utcnow())
+        _cleanup_local_idempotency(runtime, datetime.now(timezone.utc))
         runtime._local_idempotency[cache_key] = {**record, "expires_at": expires_at}
 
 
@@ -727,7 +751,7 @@ async def _acquire_idempotency_slot(
     Returns:
         Tuple of (acquired: bool, existing_record: Optional[dict])
     """
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     expires_at = now + timedelta(seconds=ttl_seconds)
 
     if runtime.cache:
@@ -803,7 +827,7 @@ async def check_rate_limit(
             message="Invalid rate limit window_seconds; defaulting to 60 seconds",
         )
         window_seconds = 60  # Default to 1 minute if invalid window per SPEC §18
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     if runtime.cache:
         result = await runtime.cache.check_rate_limit(
             rate_limit_key,
@@ -815,7 +839,7 @@ async def check_rate_limit(
         return result
     refill_rate = float(limit) / float(window_seconds)
     async with runtime._local_rate_limit_lock:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         # Cleanup old or excess entries to prevent unbounded growth (Issue 57.2)
         max_age_seconds = max(window_seconds * 2, 3600)
         if (now - runtime._local_rate_limit_last_cleanup).total_seconds() > 300:

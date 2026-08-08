@@ -4,7 +4,11 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from liminallm.api.schemas import _VALID_ERROR_CODES, Envelope, ErrorBody
-from liminallm.logging import get_logger
+from liminallm.logging import (
+    get_logger,
+    sanitize_error_message,
+    sanitize_response_data,
+)
 from liminallm.service.artifact_validation import ArtifactValidationError
 from liminallm.service.errors import ServiceError
 from liminallm.service.fs import PathTraversalError
@@ -35,14 +39,25 @@ def _error_response(
     details: dict | list | None = None,
     code: str | None = None,
 ) -> JSONResponse:
-    """Create a SPEC §18 compliant error response envelope."""
+    """Create a SPEC §18 compliant error response envelope.
+
+    This is the one place an error leaves the process, so it is where the
+    sanitizers belong. `message` is often `str(exc)` and `details` is often
+    machine-built — a regex from a blocklist, a resolved filesystem path, a
+    driver's exception text. Both get scrubbed here rather than at each of
+    the several dozen raise sites, which is the only way it stays true.
+    """
     error_code = code or _error_code_for_status(status_code)
     # Never let an unsanctioned code raise inside the error handler itself
     # (which would turn a clean 4xx/5xx into a bare 500). Fall back to the
     # status-derived code when the provided one isn't whitelisted.
     if error_code not in _VALID_ERROR_CODES:
         error_code = _error_code_for_status(status_code)
-    error_body = ErrorBody(code=error_code, message=message, details=details)
+    error_body = ErrorBody(
+        code=error_code,
+        message=sanitize_error_message(message),
+        details=sanitize_response_data(details) if details is not None else None,
+    )
     envelope = Envelope(status="error", error=error_body)
     return JSONResponse(status_code=status_code, content=envelope.model_dump())
 

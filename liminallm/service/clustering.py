@@ -4,7 +4,7 @@ import asyncio
 import inspect
 import json
 import random
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, Iterable, List, Sequence, Tuple
 
 from liminallm.logging import get_logger
@@ -86,6 +86,91 @@ class SemanticClusterer:
             meta_extra={"scope": "global", "tenant_id": tenant_id},
         )
 
+    async def cluster_everyone(
+        self, *, user_limit: int, max_events: int
+    ) -> None:
+        """Re-cluster every user, then each tenant as a whole.
+
+        The periodic pass. Individual failures are logged and skipped: one
+        user whose events will not cluster must not stop the rest of the
+        install from being clustered.
+        """
+        users = list(self.store.list_users(limit=user_limit))
+
+        for user in users:
+            try:
+                await self.cluster_user_preferences(
+                    user.id,
+                    max_events=max_events,
+                    streaming=True,
+                    approximate=True,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "periodic_user_clustering_failed",
+                    user_id=user.id,
+                    error=str(exc),
+                )
+
+        # "Global" clustering means global *within a tenant*. Clustering across
+        # every user regardless of tenant would produce clusters whose members
+        # span tenants, and a skill adapter trained on such a cluster would mix
+        # tenants' content (CLAUDE.md tenant isolation).
+        tenant_ids = []
+        for user in users:
+            tenant = user.tenant_id
+            if tenant and tenant not in tenant_ids:
+                tenant_ids.append(tenant)
+        for tenant_id in tenant_ids:
+            try:
+                await self.cluster_global_preferences(
+                    max_events=max_events,
+                    streaming=True,
+                    approximate=True,
+                    tenant_id=tenant_id,
+                )
+            except Exception as exc:
+                self.logger.warning(
+                    "periodic_global_clustering_failed",
+                    tenant_id=tenant_id,
+                    error=str(exc),
+                )
+
+
+    async def cluster_after_training(self, user_id: str) -> None:
+        """Re-cluster one user after their adapter trained.
+
+        Training changes what the user's preferences look like, which can make
+        a new skill cluster viable; this is where an emergent skill is first
+        noticed.
+        """
+        try:
+            clusters = await self.cluster_user_preferences(user_id)
+            if clusters:
+                self.logger.info(
+                    "post_training_clustering_complete",
+                    user_id=user_id,
+                    cluster_count=len(clusters),
+                )
+
+                promoted = self.promote_skill_adapters(
+                    min_size=5,
+                    positive_ratio=0.7,
+                )
+                if promoted:
+                    self.logger.info(
+                        "emergent_skills_promoted",
+                        user_id=user_id,
+                        adapter_ids=promoted,
+                    )
+        except Exception as exc:
+            self.logger.warning(
+                "post_training_clustering_failed",
+                user_id=user_id,
+                error=str(exc),
+            )
+
+
     async def _fetch_preference_events(
         self,
         *,
@@ -93,12 +178,9 @@ class SemanticClusterer:
         tenant_id: str | None,
         max_events: int,
     ) -> list[PreferenceEvent]:
-        events_raw = self.store.list_preference_events(
+        events = self.store.list_preference_events(
             user_id=user_id, feedback=POSITIVE_FEEDBACK_VALUES, tenant_id=tenant_id, limit=max_events * 4
         )
-        events = events_raw
-        if inspect.isawaitable(events_raw):
-            events = await events_raw
         filtered = [e for e in events if e.context_embedding]
         if len(filtered) > max_events:
             filtered = self._reservoir_sample(filtered, max_events)
@@ -291,11 +373,7 @@ class SemanticClusterer:
     async def _warm_start_centroids(
         self, user_id: str | None, k: int
     ) -> list[list[float]]:
-        if not hasattr(self.store, "list_semantic_clusters"):
-            return []
         clusters = self.store.list_semantic_clusters(user_id=user_id)
-        if inspect.isawaitable(clusters):
-            clusters = await clusters
         sorted_clusters = sorted(
             clusters,
             key=lambda c: c.size,
@@ -326,7 +404,7 @@ class SemanticClusterer:
                 cluster.id,
                 label=label,
                 description=description,
-                meta={"labeled_at": datetime.utcnow().isoformat()},
+                meta={"labeled_at": datetime.now(timezone.utc).isoformat()},
             )
 
     async def _label_with_llm(
@@ -459,10 +537,8 @@ class SemanticClusterer:
                 self.logger.warning("skill_promotion_no_owner", cluster_id=cluster.id)
                 continue
             visibility = "private" if cluster.user_id else "shared"
-            tenant_id = None
-            get_user = getattr(self.store, "get_user", None)
-            if callable(get_user):
-                tenant_id = getattr(get_user(owner_id), "tenant_id", None)
+            owner = self.store.get_user(owner_id)
+            tenant_id = owner.tenant_id if owner else None
             # base_model is required by the adapter schema; source it from the
             # runtime/training base model so promotion validates instead of
             # silently failing.
@@ -517,11 +593,9 @@ class SemanticClusterer:
             # adapters use the most frequent contributor as the job's nominal
             # owner; the training service pools cluster-wide regardless.
             if self.training and len(positive) >= weights_min_events:
-                job_owner = owner_id
-                create_training_job = getattr(self.store, "create_training_job", None)
-                if job_owner and callable(create_training_job):
-                    create_training_job(
-                        user_id=job_owner,
+                if owner_id:
+                    self.store.create_training_job(
+                        user_id=owner_id,
                         adapter_id=adapter.id,
                         preference_event_ids=[e.id for e in positive],
                     )

@@ -48,23 +48,6 @@ class BadRequestError(ValidationError):
     pass
 
 
-class AuthenticationError(ServiceError):
-    """Authentication failed or missing (401)."""
-    status_code = 401
-    error_code = "unauthorized"
-
-
-class SessionExpiredError(AuthenticationError):
-    """Session has expired (401)."""
-    pass
-
-
-class ForbiddenError(ServiceError):
-    """Access denied - insufficient permissions (403)."""
-    status_code = 403
-    error_code = "forbidden"
-
-
 class NotFoundError(ServiceError):
     """Requested resource not found (404)."""
     status_code = 404
@@ -77,27 +60,10 @@ class ConflictError(ServiceError):
     error_code = "conflict"
 
 
-class RateLimitedError(ServiceError):
-    """Rate limit exceeded (429)."""
-    status_code = 429
-    error_code = "rate_limited"
-
-
-class ServerError(ServiceError):
-    """Internal server error (500)."""
-    status_code = 500
-    error_code = "server_error"
-
-
 __all__ = [
     "ServiceError",
     "ValidationError",
     "BadRequestError",
-    "AuthenticationError",
-    "SessionExpiredError",
-    "ForbiddenError",
     "NotFoundError",
     "ConflictError",
-    "RateLimitedError",
-    "ServerError",
 ]

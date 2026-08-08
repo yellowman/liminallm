@@ -10,10 +10,6 @@ class PathTraversalError(ValueError):
     """Raised when a path escapes the intended base directory."""
 
 
-class SignedURLError(ValueError):
-    """Raised when signed URL validation fails."""
-
-
 # SPEC §18: Signed URL expiry time (10 minutes)
 DEFAULT_URL_EXPIRY_SECONDS = 600
 

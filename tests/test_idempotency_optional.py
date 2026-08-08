@@ -7,10 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from liminallm.api.routes import (
-    IdempotencyGuard,
-    _resolve_idempotency,
-)
+from liminallm.api.idempotency import IdempotencyGuard, resolve
 
 # ==============================================================================
 # IdempotencyGuard Tests
@@ -30,7 +27,7 @@ class TestIdempotencyGuardOptional:
             require=False,
         )
 
-        with patch("liminallm.api.routes._resolve_idempotency") as mock_resolve:
+        with patch("liminallm.api.idempotency.resolve") as mock_resolve:
             mock_resolve.return_value = ("req-123", None)
 
             async with guard as g:
@@ -48,7 +45,7 @@ class TestIdempotencyGuardOptional:
             require=True,
         )
 
-        with patch("liminallm.api.routes._resolve_idempotency") as mock_resolve:
+        with patch("liminallm.api.idempotency.resolve") as mock_resolve:
             # Should raise validation error
             mock_resolve.side_effect = HTTPException(
                 status_code=400,
@@ -77,7 +74,7 @@ class TestIdempotencyGuardOptional:
             require=False,
         )
 
-        with patch("liminallm.api.routes._resolve_idempotency") as mock_resolve:
+        with patch("liminallm.api.idempotency.resolve") as mock_resolve:
             mock_resolve.return_value = ("req-123", None)
 
             async with guard as g:
@@ -90,7 +87,7 @@ class TestIdempotencyGuardOptional:
 
 
 # ==============================================================================
-# _resolve_idempotency Tests
+# resolve Tests
 # ==============================================================================
 
 
@@ -103,7 +100,7 @@ class TestResolveIdempotency:
         with patch("liminallm.api.routes.get_runtime") as mock_runtime:
             mock_runtime.return_value = MagicMock()
 
-            request_id, cached = await _resolve_idempotency(
+            request_id, cached = await resolve(
                 route="chat",
                 user_id="user123",
                 idempotency_key=None,
@@ -118,7 +115,7 @@ class TestResolveIdempotency:
     async def test_raises_when_required_but_missing(self):
         """Should raise HTTPException when key is required but missing."""
         with pytest.raises(HTTPException) as exc_info:
-            await _resolve_idempotency(
+            await resolve(
                 route="chat",
                 user_id="user123",
                 idempotency_key=None,
@@ -140,7 +137,7 @@ class TestResolveIdempotency:
         with (
             patch("liminallm.api.routes.get_runtime") as mock_runtime,
             patch(
-                "liminallm.api.routes._acquire_idempotency_slot",
+                "liminallm.api.idempotency._acquire_idempotency_slot",
                 new_callable=AsyncMock,
             ) as mock_acquire,
         ):
@@ -155,7 +152,7 @@ class TestResolveIdempotency:
                 },
             )
 
-            request_id, cached = await _resolve_idempotency(
+            request_id, cached = await resolve(
                 route="chat",
                 user_id="user123",
                 idempotency_key="repeat-key",
@@ -172,7 +169,7 @@ class TestResolveIdempotency:
         with (
             patch("liminallm.api.routes.get_runtime") as mock_runtime,
             patch(
-                "liminallm.api.routes._acquire_idempotency_slot",
+                "liminallm.api.idempotency._acquire_idempotency_slot",
                 new_callable=AsyncMock,
             ) as mock_acquire,
         ):
@@ -184,7 +181,7 @@ class TestResolveIdempotency:
             )
 
             with pytest.raises(HTTPException) as exc_info:
-                await _resolve_idempotency(
+                await resolve(
                     route="chat",
                     user_id="user123",
                     idempotency_key="busy-key",

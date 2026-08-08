@@ -18,9 +18,7 @@ dependencies = [
   "redis>=5.0",
   "openai>=1.30",
   "structlog>=24.4",
-  "prometheus-client>=0.20",
-  "jsonschema>=4.22",
-  "cryptography>=42.0"
+  "jsonschema>=4.22"
 ]
 
 [build-system]

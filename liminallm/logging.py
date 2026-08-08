@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import uuid
 from contextvars import ContextVar
 from typing import Any, Dict, Optional
@@ -51,14 +52,12 @@ def _redact_pii(
 def _configure_structlog(
     log_level: str = "INFO",
     json_output: bool = True,
-    development_mode: bool = False,
 ) -> None:
     """Configure structlog with processors per SPEC §15.2.
 
     Args:
         log_level: Logging level (DEBUG, INFO, WARNING, ERROR)
-        json_output: If True, output JSON; if False, output human-readable
-        development_mode: If True, use pretty console output
+        json_output: If True, output JSON; if False, pretty console output
     """
     # Shared processors for all modes
     shared_processors = [
@@ -71,7 +70,7 @@ def _configure_structlog(
         structlog.processors.UnicodeDecoder(),
     ]
 
-    if development_mode or not json_output:
+    if not json_output:
         # Human-readable output for development
         processors = shared_processors + [
             structlog.dev.ConsoleRenderer(colors=True),
@@ -97,13 +96,7 @@ def _configure_structlog(
 # Initialize logging on module import
 _log_level = os.getenv("LOG_LEVEL", "INFO").upper()
 _json_output = os.getenv("LOG_JSON", "true").lower() in {"1", "true", "yes", "on"}
-_dev_mode = os.getenv("LOG_DEV_MODE", "false").lower() in {"1", "true", "yes", "on"}
-
-_configure_structlog(
-    log_level=_log_level,
-    json_output=_json_output,
-    development_mode=_dev_mode,
-)
+_configure_structlog(log_level=_log_level, json_output=_json_output)
 
 
 def get_logger(name: str) -> structlog.stdlib.BoundLogger:
@@ -129,8 +122,13 @@ def log_workflow_trace(trace: list, logger: Optional[Any] = None) -> None:
 # Issue 47.1-47.8: Content sanitization for API responses
 # Patterns that indicate sensitive information in error messages
 _SENSITIVE_ERROR_PATTERNS = [
-    # Database/SQL related
-    r'(?i)(sql|query|select|insert|update|delete|where|from|join)\s+.{0,50}',
+    # A SQL statement pasted into an exception message. Matching a bare verb
+    # would eat ordinary prose — "delete conversation failed", "update the
+    # adapter first" — so a clause keyword has to follow the verb before this
+    # counts as SQL. These messages are shown to users; over-redaction makes
+    # the field useless, which is its own failure.
+    r'(?i)\b(select|insert|update|delete|replace)\b[^\n]{0,200}?'
+    r'\b(from|into|where|values|set|join)\b[^\n]*',
     r'(?i)database\s+error',
     r'(?i)connection\s+.*\s+(failed|refused|timeout)',
     # Path/file related
@@ -138,6 +136,16 @@ _SENSITIVE_ERROR_PATTERNS = [
     r'(?i)[a-z]:\\[^\s]+',
     # Credential patterns
     r'(?i)(password|secret|token|key|credential|api.?key)\s*[:=]\s*[^\s]+',
+    # An Authorization header pasted into an exception message. Not caught by
+    # the line above: "Authorization" is not one of its words, and
+    # "Bearer eyJ..." has no ':' or '=' after a matching one.
+    r'(?i)\bauthorization\s*:\s*\S+',
+    r'(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]{8,}',
+    # A bare JWT, which reaches a log without its header often enough.
+    r'\beyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+',
+    # A connection URI carrying credentials — psycopg puts the DSN in its
+    # exception text, so this is the common way a database password escapes.
+    r'(?i)\b[a-z][a-z0-9+.\-]*://[^\s:@/]+:[^\s@]+@\S*',
     # Stack traces
     r'(?i)traceback\s*\(most recent call last\)',
     r'(?i)at\s+\S+\.\S+\(\S+:\d+\)',
@@ -146,8 +154,6 @@ _SENSITIVE_ERROR_PATTERNS = [
 ]
 
 # Compiled patterns for performance
-import re
-
 _SENSITIVE_PATTERNS_COMPILED = [re.compile(p) for p in _SENSITIVE_ERROR_PATTERNS]
 
 # Keys that should be redacted in response data
@@ -209,12 +215,12 @@ def sanitize_response_data(data: Any, *, depth: int = 0, max_depth: int = 20) ->
             lower_key = key.lower().replace('-', '_').replace(' ', '_')
             if any(sensitive in lower_key for sensitive in _SENSITIVE_RESPONSE_KEYS):
                 # Redact sensitive values but preserve type hint
-                if isinstance(value, str):
-                    result[key] = "[REDACTED]"
+                # bool before int: bool is a subclass of int, so the numeric
+                # branch used to swallow it and a redacted flag came back as 0.
+                if isinstance(value, bool):
+                    result[key] = False
                 elif isinstance(value, (int, float)):
                     result[key] = 0
-                elif isinstance(value, bool):
-                    result[key] = False
                 else:
                     result[key] = "[REDACTED]"
             else:
@@ -226,39 +232,3 @@ def sanitize_response_data(data: Any, *, depth: int = 0, max_depth: int = 20) ->
         return data
 
 
-def sanitize_workflow_trace(trace: list) -> list:
-    """Sanitize workflow trace for API responses (Issue 47.6).
-
-    Removes internal details like:
-    - Detailed error messages with stack traces
-    - Internal node configuration
-    - Debugging information
-
-    Args:
-        trace: Raw workflow trace
-
-    Returns:
-        Sanitized trace safe for API responses
-    """
-    sanitized = []
-    for entry in trace:
-        if not isinstance(entry, dict):
-            continue
-
-        safe_entry = {
-            "node_id": entry.get("node_id"),
-            "status": entry.get("status"),
-            "duration_ms": entry.get("duration_ms"),
-        }
-
-        # Include error message only if sanitized
-        if "error" in entry:
-            safe_entry["error"] = sanitize_error_message(str(entry.get("error", "")))
-
-        # Include output keys but not values (for debugging without data exposure)
-        if "output" in entry and isinstance(entry["output"], dict):
-            safe_entry["output_keys"] = list(entry["output"].keys())
-
-        sanitized.append(safe_entry)
-
-    return sanitized

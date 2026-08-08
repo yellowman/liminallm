@@ -2,21 +2,20 @@ from __future__ import annotations
 
 import copy
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from liminallm.logging import get_logger
+from liminallm.service import json_patch
 from liminallm.service.errors import BadRequestError, NotFoundError
 from liminallm.service.llm import LLMService
 from liminallm.service.router import RouterEngine
 from liminallm.service.training import TrainingService
-from liminallm.storage.memory import MemoryStore
 from liminallm.storage.models import Artifact, ConfigPatchAudit
 from liminallm.storage.postgres import PostgresStore
 
 logger = get_logger(__name__)
 
-MAX_LIST_EXTENSION = 1024
 
 
 class ConfigOpsService:
@@ -24,7 +23,7 @@ class ConfigOpsService:
 
     def __init__(
         self,
-        store: PostgresStore | MemoryStore,
+        store: PostgresStore,
         llm: LLMService,
         router: RouterEngine,
         training: TrainingService,
@@ -114,29 +113,16 @@ class ConfigOpsService:
         # Step 1: Apply patch to artifact (pure function)
         new_schema = self._apply_patch_to_schema(artifact.schema, patch.patch)
 
-        # Step 2: Persist schema and mark patch applied atomically when supported
+        # Step 2: Persist schema and mark the patch applied, in one transaction
         applied_patch = None
         status_update_failed = False
         try:
-            if hasattr(self.store, "apply_config_patch"):
-                updated, applied_patch = self.store.apply_config_patch(  # type: ignore[attr-defined]
-                    patch,
-                    new_schema,
-                    artifact_description=artifact.description,
-                    approver_user_id=approver_user_id,
-                )
-            else:
-                updated = self.store.update_artifact(
-                    artifact.id, new_schema, artifact.description
-                )
-                applied_patch = self.store.update_config_patch_status(
-                    patch_id,
-                    "applied",
-                    meta={"applied_by": approver_user_id}
-                    if approver_user_id
-                    else None,
-                    mark_applied=True,
-                )
+            updated, applied_patch = self.store.apply_config_patch(
+                patch,
+                new_schema,
+                artifact_description=artifact.description,
+                approver_user_id=approver_user_id,
+            )
         except Exception as exc:
             status_update_failed = True
             logger.error(
@@ -218,7 +204,7 @@ class ConfigOpsService:
         return full_json[: max_chars - 3] + "..."
 
     def _fallback_patch(self) -> dict:
-        timestamp = datetime.utcnow().isoformat()
+        timestamp = datetime.now(timezone.utc).isoformat()
         return {
             "ops": [
                 {
@@ -246,76 +232,7 @@ class ConfigOpsService:
         return working
 
     def _apply_single_op(self, doc: dict, op: Dict[str, Any]) -> None:
-        action = (op or {}).get("op")
-        path = (op or {}).get("path", "")
-        value = op.get("value")
-        if not action or not path:
-            return
-        segments = [seg for seg in path.strip("/").split("/") if seg]
-        parent = doc
-        for seg in segments[:-1]:
-            if isinstance(parent, list):
-                try:
-                    idx = int(seg)
-                except ValueError:
-                    return
-                self._ensure_list_capacity(parent, idx, path)
-                while len(parent) <= idx:
-                    parent.append({})
-                parent = parent[idx]
-            else:
-                parent = parent.setdefault(seg, {})
-        key = segments[-1] if segments else ""
-        if action == "add" or action == "replace":
-            if isinstance(parent, list):
-                if key == "-":
-                    parent.append(value)
-                else:
-                    try:
-                        idx = int(key)
-                        self._ensure_list_capacity(parent, idx, path)
-                        if idx < len(parent):
-                            parent[idx] = value
-                        else:
-                            parent.append(value)
-                    except ValueError:
-                        return
-            else:
-                parent[key] = value
-        elif action == "remove":
-            if isinstance(parent, list):
-                try:
-                    idx = int(key)
-                    self._ensure_list_capacity(parent, idx, path)
-                    if 0 <= idx < len(parent):
-                        parent.pop(idx)
-                except ValueError:
-                    return
-            else:
-                parent.pop(key, None)
-
-    def _ensure_list_capacity(self, parent: list, idx: int, path: str) -> None:
-        if idx < 0:
-            raise BadRequestError(
-                "negative list index", detail={"path": path, "index": idx}
-            )
-        if idx >= MAX_LIST_EXTENSION:
-            raise BadRequestError(
-                "list index too large",
-                detail={
-                    "path": path,
-                    "index": idx,
-                    "max_index": MAX_LIST_EXTENSION - 1,
-                },
-            )
+        json_patch.apply_op(doc, op)
 
     def _deep_merge(self, base: dict, patch: dict) -> dict:
-        merged = dict(base)
-        for key, value in patch.items():
-            if key == "ops":
-                continue
-            if isinstance(value, dict) and isinstance(base.get(key), dict):
-                merged[key] = self._deep_merge(base[key], value)
-            else:
-                merged[key] = value
-        return merged
+        return json_patch.deep_merge(base, patch, skip_keys=("ops",))

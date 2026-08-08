@@ -6,6 +6,7 @@ import json
 import os
 import re
 import time
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Protocol, Tuple
 
@@ -15,34 +16,14 @@ from liminallm.config import (
     get_provider_capabilities,
 )
 from liminallm.logging import get_logger
+from liminallm.service import responses_compat
 from liminallm.service.fs import safe_join
 from liminallm.service.prompt_utils import extract_prompt_instructions
 from liminallm.service.tokenizer_utils import (
     DEFAULT_VOCAB_SIZE,
+    estimate_token_count,
     vocab_size_from_tokenizer,
 )
-
-# providers that expose fine-tuned models as first-class endpoints (model IDs)
-_MODEL_ID_PROVIDERS = {
-    "openai",
-    "azure",
-    "azure_openai",
-    "azure-openai",
-    "vertex",
-    "gemini",
-    "google",
-    "bedrock",
-}
-
-# providers that expose adapters via `adapter_id` / multi-LoRA parameters
-_ADAPTER_ID_PROVIDERS = {
-    "together",
-    "together.ai",
-    "lorax",
-    "adapter_server",
-    "sagemaker",
-    "aws_sagemaker",
-}
 
 logger = get_logger(__name__)
 
@@ -410,21 +391,146 @@ class StubBackend:
 
 DEFAULT_CONTEXT_WINDOW = 8192
 
-# Models that reject a caller-supplied temperature (400, whole request fails).
-_REASONING_PREFIXES = ("o1", "o3", "o4", "gpt-5", "gemini-3")
+class TemperaturePolicy(str, Enum):
+    """What a model does with a caller-supplied temperature.
+
+    A single "supports temperature" boolean is too weak: providers now reject
+    it outright, accept it only with reasoning disabled, or accept the field
+    while prescribing one fixed value. Getting this wrong is a 400 on every
+    request, which is harsher than any context-window mistake.
+    """
+
+    TUNABLE = "tunable"
+    # Accepted only with reasoning explicitly off. OpenAI's 5.1/5.2/5.4 error
+    # at any other reasoning level; Anthropic's pre-4.7 models require the
+    # default while thinking; DeepSeek accepts the field in thinking mode and
+    # silently ignores it.
+    CONDITIONAL = "conditional"
+    # Never send. Either the API rejects it, or the model is trained around
+    # one fixed value and moving it degrades output — Gemini 3 loops, Kimi
+    # and Muse Spark prescribe 1.0.
+    OMIT = "omit"
 
 
-def is_reasoning_model(model: str) -> bool:
+# Longest-prefix, as with context windows. Unmatched models are TUNABLE: an
+# unknown id is most often a conventional open model on a self-hosted server,
+# and this only decides whether an explicitly configured value is honoured —
+# nothing is ever sent on its own.
+_TEMPERATURE_POLICIES: List[Tuple[str, TemperaturePolicy]] = [
+    # OpenAI. 5.1/5.2/5.4 take temperature only at reasoning "none"; the mini
+    # and nano tiers and the 5.5/5.6 families have no such published
+    # allowance, so they stay out.
+    ("gpt-3.5", TemperaturePolicy.TUNABLE),
+    ("gpt-4", TemperaturePolicy.TUNABLE),
+    ("gpt-5", TemperaturePolicy.OMIT),
+    ("gpt-5.1", TemperaturePolicy.CONDITIONAL),
+    ("gpt-5.2", TemperaturePolicy.CONDITIONAL),
+    ("gpt-5.4", TemperaturePolicy.CONDITIONAL),
+    ("gpt-5.4-mini", TemperaturePolicy.OMIT),
+    ("gpt-5.4-nano", TemperaturePolicy.OMIT),
+    ("o1", TemperaturePolicy.OMIT),
+    ("o3", TemperaturePolicy.OMIT),
+    ("o4", TemperaturePolicy.OMIT),
+    ("gpt-oss", TemperaturePolicy.TUNABLE),
+    # Google deprecated sampling parameters for Gemini 3, and warns that
+    # lowering temperature there can drive the model into loops. The moving
+    # -latest aliases point into that generation.
+    ("gemini", TemperaturePolicy.OMIT),
+    ("gemini-2.5", TemperaturePolicy.TUNABLE),
+    # Anthropic removed sampling parameters from Opus 4.7 onward. Earlier
+    # models accept temperature only while thinking is off.
+    ("claude", TemperaturePolicy.CONDITIONAL),
+    ("claude-opus-4-7", TemperaturePolicy.OMIT),
+    ("claude-opus-4-8", TemperaturePolicy.OMIT),
+    ("claude-opus-5", TemperaturePolicy.OMIT),
+    ("claude-sonnet-5", TemperaturePolicy.OMIT),
+    ("claude-fable-5", TemperaturePolicy.OMIT),
+    ("claude-mythos-5", TemperaturePolicy.OMIT),
+    # DeepSeek: tunable outside thinking mode, ignored inside it. The legacy
+    # chat alias was the non-thinking model.
+    ("deepseek", TemperaturePolicy.CONDITIONAL),
+    ("deepseek-chat", TemperaturePolicy.TUNABLE),
+    ("deepseek-reasoner", TemperaturePolicy.OMIT),
+    # Moonshot prescribes 1.0 and recommends omitting the parameter; kimi
+    # -latest is a moving alias whose contract is unknown.
+    ("kimi", TemperaturePolicy.OMIT),
+    ("moonshot", TemperaturePolicy.OMIT),
+    # Meta tunes Muse Spark for the default 1.0.
+    ("muse-spark", TemperaturePolicy.OMIT),
+    # Conventional sampling APIs.
+    ("grok", TemperaturePolicy.TUNABLE),
+    ("qwen", TemperaturePolicy.TUNABLE),
+    ("glm", TemperaturePolicy.TUNABLE),
+    ("baichuan", TemperaturePolicy.TUNABLE),
+    ("minimax", TemperaturePolicy.TUNABLE),
+    ("mistral", TemperaturePolicy.TUNABLE),
+    ("codestral", TemperaturePolicy.TUNABLE),
+    ("command-", TemperaturePolicy.TUNABLE),
+    ("llama", TemperaturePolicy.TUNABLE),
+    ("gemma", TemperaturePolicy.TUNABLE),
+]
+
+
+def temperature_policy(model: str) -> TemperaturePolicy:
+    """How this model treats a caller-supplied temperature."""
     lowered = (model or "").lower()
-    return any(lowered.startswith(prefix) for prefix in _REASONING_PREFIXES)
+    best: Optional[Tuple[str, TemperaturePolicy]] = None
+    for prefix, policy in _TEMPERATURE_POLICIES:
+        if lowered.startswith(prefix) and (best is None or len(prefix) > len(best[0])):
+            best = (prefix, policy)
+    return best[1] if best else TemperaturePolicy.TUNABLE
 
-# Longest-prefix wins. Values are input windows, deliberately the safe
-# published number rather than any beta/extended tier.
+
+def temperature_param(
+    model: str, *, configured: Optional[float], reasoning_effort: Optional[str]
+) -> dict:
+    """The temperature to send, if any.
+
+    Nothing is sent unless an operator asked for it: a default of our own
+    would override whatever each provider tuned its model around, and several
+    now document that moving it degrades output.
+    """
+    if configured is None:
+        return {}
+    policy = temperature_policy(model)
+    if policy is TemperaturePolicy.OMIT:
+        return {}
+    if policy is TemperaturePolicy.CONDITIONAL and (reasoning_effort or "") != "none":
+        return {}
+    return {"temperature": configured}
+
+# Longest-prefix wins. This is the *fallback* — the provider probe
+# (GeminiBackend's models/{id}, an adapter server's config) is consulted first,
+# and model_context_window overrides everything. So each value is the safe
+# published number, never a beta or extended tier: under-guessing costs a
+# little prompt budget, over-guessing overflows the window and fails the turn.
 KNOWN_CONTEXT_WINDOWS: List[Tuple[str, int]] = [
-    ("gemini-1.5-pro", 2_000_000),
-    ("gemini", 1_000_000),
-    ("gpt-4.1", 1_000_000),
+    # Google. Verified against a live ListModels call: every current Gemini
+    # text model reports inputTokenLimit 1048576. The image, TTS, and
+    # computer-use variants are much smaller and would otherwise inherit 1M.
+    ("gemini", 1_048_576),
+    ("gemini-2.5-flash-image", 32_768),
+    ("gemini-3.1-flash-image", 65_536),
+    ("gemini-3-pro-image", 131_072),
+    ("gemini-2.5-computer-use", 131_072),
+    ("gemini-omni", 131_072),
+    ("gemma", 262_144),
+    # OpenAI. The 5.x line splits by tier, not by version: 5.6/5.5/5.4 and
+    # their Pro variants are 1,050,000, but 5.4 mini/nano and 5.3-codex are
+    # 400,000, and the legacy chat-latest aliases are 128,000. Each exception
+    # needs its own entry or the family prefix over-guesses it.
     ("gpt-5", 400_000),
+    ("gpt-5.4", 1_050_000),
+    ("gpt-5.4-mini", 400_000),
+    ("gpt-5.4-nano", 400_000),
+    ("gpt-5.5", 1_050_000),
+    ("gpt-5.6", 1_050_000),
+    ("gpt-5.3-codex", 400_000),
+    ("gpt-5-chat-latest", 128_000),
+    ("gpt-5.1-chat-latest", 128_000),
+    ("gpt-5.2-chat-latest", 128_000),
+    ("gpt-5.3-chat-latest", 128_000),
+    ("gpt-4.1", 1_000_000),
     ("gpt-4o", 128_000),
     ("chatgpt-4o", 128_000),
     ("gpt-4-turbo", 128_000),
@@ -433,26 +539,169 @@ KNOWN_CONTEXT_WINDOWS: List[Tuple[str, int]] = [
     ("o1", 200_000),
     ("o3", 200_000),
     ("o4", 200_000),
+    # Anthropic. The 4.6-and-later families moved to 1M; Haiku and everything
+    # older stay at 200K, which is why "claude" keeps the smaller floor.
     ("claude", 200_000),
+    ("claude-opus-4-6", 1_000_000),
+    ("claude-opus-4-7", 1_000_000),
+    ("claude-opus-4-8", 1_000_000),
+    ("claude-opus-5", 1_000_000),
+    ("claude-sonnet-4-6", 1_000_000),
+    ("claude-sonnet-5", 1_000_000),
+    ("claude-fable-5", 1_000_000),
+    ("claude-mythos-5", 1_000_000),
+    # xAI. Newer is not larger here: 4.5 is the current flagship at 500K while
+    # 4.3 and the 4.20 deployments carry 1M. The slugs retired on 2026-05-15
+    # (grok-4-fast, grok-4-0709, grok-3, grok-code-fast-1) still resolve — xAI
+    # routes them to newer models — so the 256K floor under-guesses rather than
+    # overflowing. grok-build-latest aliases 4.5, but an alias target can move,
+    # so it takes the same conservative floor as grok-build-0.1.
+    ("grok", 131_072),
+    ("grok-4", 256_000),
+    ("grok-4.3", 1_000_000),
+    ("grok-4.5", 500_000),
+    ("grok-4.20", 1_000_000),
+    ("grok-build", 256_000),
+    # DeepSeek. The chat/reasoner aliases track V3.2 at 128K; the V4 line
+    # ships 1M.
+    ("deepseek", 128_000),
+    ("deepseek-v4", 1_000_000),
+    # Zhipu / GLM.
+    ("glm", 128_000),
+    ("glm-4.7", 200_000),
+    ("glm-5", 200_000),
+    ("glm-5.2", 1_000_000),
+    # Moonshot / Kimi.
+    ("moonshot", 131_072),
+    ("moonshot-v1-8k", 8_192),
+    ("moonshot-v1-32k", 32_768),
+    ("kimi", 256_000),
+    ("kimi-k3", 1_000_000),
+    # Alibaba Model Studio. The 3.5-and-later tiers and the long-lived
+    # plus/flash families are 1M; qwen3-max and qwen3.6-max-preview stay at
+    # 262,144 despite the newer-looking names, and qwen-long is a 10M
+    # document model. The bare "qwen" floor covers self-hosted open weights,
+    # whose window is set by the deployment rather than by Alibaba.
+    ("qwen", 131_072),
+    ("qwen-plus", 1_000_000),
+    ("qwen-flash", 1_000_000),
+    ("qwen-long", 10_000_000),
+    ("qwen3-coder", 1_000_000),
+    ("qwen3-max", 262_144),
+    ("qwen3.5", 1_000_000),
+    ("qwen3.6", 1_000_000),
+    ("qwen3.6-max", 262_144),
+    ("qwen3.7", 1_000_000),
+    ("qwen3.8", 1_000_000),
+    # Baichuan documents every current model at 32k; only the explicitly
+    # named 128k variant is larger.
+    ("baichuan", 32_768),
+    ("baichuan3-turbo-128k", 128_000),
+    # MiniMax publishes exact integers rather than a rounded "200k".
+    ("minimax-m2", 204_800),
+    ("minimax-m3", 1_000_000),
+    # Mistral. Small's moving alias takes the conservative 128K reading: if
+    # the alias has moved to Small 4 we merely under-budget, and if a compat
+    # layer still resolves it to Small 3.2 we are right.
+    ("mistral", 32_768),
+    ("mistral-medium", 256_000),
+    ("mistral-large", 256_000),
+    ("mistral-small", 256_000),
+    ("mistral-small-latest", 128_000),
+    ("codestral", 128_000),
+    # Cohere.
+    ("command-a", 256_000),
+    ("command-a-plus", 128_000),
+    ("command-a-vision", 128_000),
+    ("command-r", 128_000),
+    # Meta Model API (Muse Spark). Llama weights served by someone else
+    # belong under that host, not here.
+    ("muse-spark", 1_048_576),
+    # Open weights, commonly self-hosted.
     ("llama-3.1", 131_072),
     ("llama-3.2", 131_072),
     ("llama-3.3", 131_072),
     ("llama-4", 131_072),
-    ("glm", 128_000),
-    ("deepseek", 64_000),
-    ("qwen", 32_768),
-    ("mistral", 32_768),
 ]
 
 
-def context_window_from_table(model_id: str) -> Optional[int]:
-    """Longest matching family prefix, or None for an unknown model."""
-    lowered = (model_id or "").lower()
+# Resellers serve a smaller window than the model's native ceiling, so the
+# host has to answer before the model family does: MiniMax M3 is 1M native but
+# 524,288 on Together and 512K on Fireworks, and DeepSeek V4 Pro is 1M native
+# but 512K on Together. Cerebras additionally varies by account tier, so these
+# take the free-tier figure and let discovery or the admin setting raise it.
+HOSTED_CONTEXT_WINDOWS: dict[str, List[Tuple[str, int]]] = {
+    "together": [
+        ("minimaxai/minimax-m3", 524_288),
+        ("qwen/qwen3.6-plus", 1_000_000),
+        ("qwen/qwen3.7-plus", 1_000_000),
+        ("qwen/qwen3.5-9b", 262_144),
+        ("moonshotai/kimi-k3", 1_000_000),
+        ("moonshotai/kimi-k2.7-code", 262_144),
+        ("moonshotai/kimi-k2.6", 262_144),
+        ("zai-org/glm-5.2", 262_144),
+        ("openai/gpt-oss-120b", 128_000),
+        ("openai/gpt-oss-20b", 128_000),
+        ("deepseek-ai/deepseek-v4-pro", 512_000),
+        ("deepseek-ai/deepseek-v4-flash", 1_000_000),
+        ("nvidia/nemotron-3-ultra", 512_300),
+        ("meta-llama/llama-3.3-70b", 131_072),
+        ("qwen/qwen2.5-7b", 32_768),
+        ("google/gemma-4-31b", 262_144),
+    ],
+    "fireworks": [
+        # Fireworks labels these 1040k/262k/196k and describes them as 1M in
+        # prose; the round floor is the defensible reading for a fallback.
+        ("accounts/fireworks/models/kimi-k3", 1_000_000),
+        ("accounts/fireworks/models/glm-5p2", 1_000_000),
+        ("accounts/fireworks/models/deepseek-v4-pro", 1_000_000),
+        ("accounts/fireworks/models/deepseek-v4-flash", 1_000_000),
+        ("accounts/fireworks/models/minimax-m3", 512_000),
+        ("accounts/fireworks/models/minimax-m2p7", 196_000),
+        ("accounts/fireworks/models/kimi-k2p7-code", 262_000),
+        ("accounts/fireworks/models/kimi-k2p6", 262_000),
+        ("accounts/fireworks/models/qwen3p7-plus", 262_000),
+    ],
+    "cerebras": [
+        ("gpt-oss-120b", 65_000),
+        ("gemma-4-31b", 65_000),
+    ],
+    "groq": [
+        ("llama-3.1-8b-instant", 131_072),
+        ("llama-3.3-70b-versatile", 131_072),
+        ("openai/gpt-oss-120b", 131_072),
+        ("openai/gpt-oss-20b", 131_072),
+        ("groq/compound", 131_072),
+        ("minimaxai/minimax-m2.7", 196_608),
+        ("qwen/qwen3.6-27b", 131_072),
+    ],
+}
+
+
+def _longest_prefix(lowered: str, table: List[Tuple[str, int]]) -> Optional[int]:
     best: Optional[Tuple[str, int]] = None
-    for prefix, window in KNOWN_CONTEXT_WINDOWS:
+    for prefix, window in table:
         if lowered.startswith(prefix) and (best is None or len(prefix) > len(best[0])):
             best = (prefix, window)
     return best[1] if best else None
+
+
+def context_window_from_table(
+    model_id: str, provider: Optional[str] = None
+) -> Optional[int]:
+    """Longest matching prefix for this host, else for the model family.
+
+    The host is consulted first because a reseller's serving limit overrides
+    the model's native ceiling. Returns None for an unknown model — the caller
+    then falls back to DEFAULT_CONTEXT_WINDOW rather than to a guess.
+    """
+    lowered = (model_id or "").lower()
+    hosted = HOSTED_CONTEXT_WINDOWS.get((provider or "").lower())
+    if hosted:
+        window = _longest_prefix(lowered, hosted)
+        if window:
+            return window
+    return _longest_prefix(lowered, KNOWN_CONTEXT_WINDOWS)
 
 
 # Keys self-hosted OpenAI-compatible servers use for the model's window.
@@ -462,8 +711,35 @@ _WINDOW_KEYS = (
 )
 
 
-def _window_from_json(payload: Any) -> Optional[int]:
-    """Depth-limited scan of a /models-style payload for a window field."""
+# A listing can be long — Together publishes several hundred models — but not
+# unbounded; a payload past this is treated as not naming the model.
+_MAX_LISTING_ENTRIES = 2048
+
+
+def _entry_names(entry: dict, model: str) -> bool:
+    """Does this listing entry describe the model we asked about?
+
+    Hosts qualify ids in their own way — Together's `moonshotai/Kimi-K3`,
+    Gemini's `models/gemini-3.6-flash` — so the trailing segment counts too.
+    """
+    for key in ("id", "name", "model"):
+        value = entry.get(key)
+        if isinstance(value, str):
+            lowered = value.lower()
+            if lowered == model or lowered.rsplit("/", 1)[-1] == model:
+                return True
+    return False
+
+
+def _window_from_json(payload: Any, model: Optional[str] = None) -> Optional[int]:
+    """Depth-limited scan of a /models-style payload for a window field.
+
+    With a model name, a listing is resolved by id first: scanning a
+    multi-model listing freely returns whichever window appears earliest,
+    which on a reseller's catalogue is some unrelated model's. That is an
+    over-guess, the one direction this whole fallback chain avoids. A listing
+    that does not name the model says nothing about it, so the answer is None.
+    """
     def scan(node: Any, depth: int) -> Optional[int]:
         if depth > 3 or not isinstance(node, (dict, list)):
             return None
@@ -485,6 +761,14 @@ def _window_from_json(payload: Any) -> Optional[int]:
                     return found
         return None
 
+    if model:
+        entries = payload.get("data") if isinstance(payload, dict) else payload
+        if isinstance(entries, list):
+            wanted = model.lower()
+            for entry in entries[:_MAX_LISTING_ENTRIES]:
+                if isinstance(entry, dict) and _entry_names(entry, wanted):
+                    return scan(entry, 0)
+            return None
     return scan(payload, 0)
 
 
@@ -522,7 +806,7 @@ def probe_context_window(
                         f"{base_url.rstrip('/')}/models"):
                 resp = httpx.get(url, headers=headers, timeout=5.0)
                 if resp.status_code == 200:
-                    window = _window_from_json(resp.json())
+                    window = _window_from_json(resp.json(), model=model)
                     if window:
                         return window
     except Exception as exc:  # noqa: BLE001 - probing must never break serving
@@ -570,9 +854,12 @@ class ApiAdapterBackend:
         provider: Optional[str] = None,
         api_key_env: Optional[str] = None,
         reasoning_effort: Optional[str] = None,
+        temperature: Optional[float] = None,
     ) -> None:
         self.base_model = base_model
         self.adapter_server_model = adapter_server_model
+        # None means "send no temperature at all", not "send zero".
+        self._temperature = temperature
         self.adapter_mode = adapter_mode
         self.mode = adapter_mode
         self._api_key = api_key
@@ -581,14 +868,15 @@ class ApiAdapterBackend:
         # via the OpenAI-compatible endpoint): "low" | "medium" | "high", or
         # "none" to disable where the provider allows it. Sent via extra_body
         # so older openai SDKs work; omitted entirely when unset.
-        self._reasoning_effort = (
-            reasoning_effort or os.getenv("MODEL_REASONING_EFFORT") or ""
-        ).strip().lower() or None
+        self._reasoning_effort = (reasoning_effort or "").strip().lower() or None
         # Env var consulted for credential rotation; provider-specific so that,
         # e.g., a Zhipu backend reads ZHIPU_API_KEY rather than OPENAI_API_KEY.
         self._api_key_env = api_key_env or "OPENAI_API_KEY"
         self._client_timeout = 30.0
         self._active_api_key: Optional[str] = None
+        # Responses is the primary endpoint; None = not yet probed, False =
+        # this provider only ships chat/completions (sticky for the process).
+        self._responses_ok: Optional[bool] = None
         self.client = None
         self._ensure_client()
         # Infer provider from adapter_mode if not specified
@@ -613,14 +901,19 @@ class ApiAdapterBackend:
             )
             source = "probe"
             if not window:
-                window = context_window_from_table(model)
+                window = context_window_from_table(model, provider=self.provider)
                 source = "table"
             if not window:
                 window, source = DEFAULT_CONTEXT_WINDOW, "default"
             self._context_window = window
-            logger.info(
+            # "default" means neither the provider nor the table knew this
+            # model, so every turn is budgeted against 8192 — for a
+            # million-token model that is under one percent of its window,
+            # and nothing else says so. Worth an operator's attention.
+            log = logger.warning if source == "default" else logger.info
+            log(
                 "model_context_window_resolved",
-                model=model, window=window, source=source,
+                model=model, provider=self.provider, window=window, source=source,
             )
         return self._context_window
 
@@ -682,17 +975,18 @@ class ApiAdapterBackend:
         return {**(extra_body or {}), "reasoning_effort": self._reasoning_effort}
 
     def _sampling_params(self, model: str) -> dict:
-        """Sampling args this model will accept.
+        """Sampling args to send, which is nothing unless an operator set one.
 
-        Reasoning models (OpenAI o-series, gpt-5, and Gemini 3 through the
-        compat endpoint) reject any temperature other than the default and
-        fail the whole request with a 400. Omitting the parameter is the
-        portable choice: every model has a sane default, and only these
-        models treat setting it as an error.
+        The previous default of 0.2 went out on every non-reasoning request,
+        overriding whatever each provider tuned its model around — and several
+        now document that moving temperature degrades output rather than
+        merely varying it.
         """
-        if is_reasoning_model(model):
-            return {}
-        return {"temperature": 0.2}
+        return temperature_param(
+            model,
+            configured=self._temperature,
+            reasoning_effort=self._reasoning_effort,
+        )
 
     def generate(
         self,
@@ -713,6 +1007,23 @@ class ApiAdapterBackend:
         # Inject adapter prompts if any hybrid/prompt adapters
         augmented_messages = self._inject_adapter_prompts(messages, prompt_injections)
         extra_body = self._with_reasoning_effort(extra_body)
+
+        if self.client and self._responses_available():
+            # Convert outside the try: is_unsupported() reads an AttributeError
+            # or TypeError as "this SDK has no /responses", so a bug in our own
+            # conversion would be blamed on the provider and turn the endpoint
+            # off for the whole process.
+            items = responses_compat.to_input_items(augmented_messages)
+            kwargs = self._responses_kwargs(target_model, processed["extra_body"])
+            response = self._try_responses(lambda: self.client.responses.create(
+                input=items, **kwargs
+            ))
+            if response is not None:
+                return {
+                    "content": responses_compat.output_text(response),
+                    "usage": responses_compat.usage_dict(response),
+                    "adapters_applied": processed["applied"],
+                }
 
         if self.client:
             completion = self.client.chat.completions.create(
@@ -756,6 +1067,52 @@ class ApiAdapterBackend:
         self._ensure_client()
         return self.client is not None
 
+    def _responses_available(self) -> bool:
+        if self._responses_ok is False or self.client is None:
+            return False
+        if not hasattr(self.client, "responses"):
+            self._responses_ok = False
+            return False
+        return True
+
+    def _mark_responses_unsupported(self, exc: Exception) -> None:
+        logger.info(
+            "responses_endpoint_unsupported",
+            provider=self.provider,
+            error=str(exc)[:200],
+        )
+        self._responses_ok = False
+
+    def _try_responses(self, call):
+        """Run one /responses call. Returns the response, or None when the
+        provider turns out to have no such endpoint — the one case where
+        falling back to chat/completions is correct. Any other failure is the
+        provider's real answer and propagates.
+
+        Only the call itself belongs in here. Conversion and parsing raise the
+        same exception types is_unsupported() treats as "endpoint missing".
+        """
+        try:
+            response = call()
+        except Exception as exc:
+            if self._responses_ok is not True and responses_compat.is_unsupported(exc):
+                self._mark_responses_unsupported(exc)
+                return None
+            raise
+        self._responses_ok = True
+        return response
+
+    def _responses_kwargs(self, model: str, extra_body: Optional[dict]) -> dict:
+        """Request kwargs for /responses. Reasoning effort travels as the
+        first-class `reasoning` parameter here, not extra_body."""
+        kwargs: Dict[str, Any] = {"model": model, **self._sampling_params(model)}
+        reasoning = responses_compat.reasoning_param(self._reasoning_effort)
+        if reasoning:
+            kwargs["reasoning"] = reasoning
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        return kwargs
+
     def generate_with_tools(
         self,
         messages: List[dict],
@@ -778,12 +1135,33 @@ class ApiAdapterBackend:
         augmented = self._inject_adapter_prompts(
             messages, processed["prompt_injections"]
         )
+        if self._responses_available():
+            kwargs = self._responses_kwargs(processed["model"], processed["extra_body"])
+            if tools:
+                kwargs["tools"] = responses_compat.to_tools(tools)
+                kwargs["tool_choice"] = "auto"
+            items = responses_compat.to_input_items(augmented)
+            response = self._try_responses(lambda: self.client.responses.create(
+                input=items, **kwargs
+            ))
+            if response is not None:
+                content = responses_compat.output_text(response)
+                calls = responses_compat.tool_calls_of(response)
+                return {
+                    "content": content,
+                    "tool_calls": calls,
+                    "assistant_message": responses_compat.assistant_message(content, calls),
+                    "usage": responses_compat.usage_dict(response),
+                }
+
         extra_body = self._with_reasoning_effort(processed["extra_body"])
+        # The loop's final round offers no tools; OpenAI rejects an empty
+        # tools list outright, so omit the parameters entirely.
+        tool_kwargs = {"tools": tools, "tool_choice": "auto"} if tools else {}
         completion = self.client.chat.completions.create(
             model=processed["model"],
             messages=augmented,
-            tools=tools,
-            tool_choice="auto",
+            **tool_kwargs,
             **self._sampling_params(processed["model"]),
             extra_body=extra_body,
         )
@@ -836,6 +1214,64 @@ class ApiAdapterBackend:
             },
         }
 
+    def _stream_via_responses(
+        self, messages: List[dict], model: str, processed: dict
+    ):
+        """Stream via /responses. Returns True if any event was emitted (the
+        caller must not fall through to chat), False to fall back — which is
+        only safe when nothing has been yielded yet."""
+        full_content = ""
+        usage: Dict[str, Any] = {}
+        # Converted before the try for the same reason as the blocking paths:
+        # our own AttributeError must not read as "provider has no /responses".
+        items = responses_compat.to_input_items(messages)
+        kwargs = self._responses_kwargs(model, processed["extra_body"])
+        try:
+            stream = self.client.responses.create(input=items, stream=True, **kwargs)
+            for event in stream:
+                etype = getattr(event, "type", "") or ""
+                if etype == "response.output_text.delta":
+                    delta = getattr(event, "delta", "") or ""
+                    if delta:
+                        full_content += delta
+                        yield {"event": "token", "data": delta}
+                elif etype == "response.completed":
+                    usage = responses_compat.usage_dict(getattr(event, "response", None))
+                elif etype in ("response.failed", "error"):
+                    raise RuntimeError(str(getattr(event, "error", None) or "response failed"))
+        except Exception as exc:
+            # A provider without /responses fails at request time or on the
+            # first read, before any token; only then is falling back safe.
+            if (
+                not full_content
+                and self._responses_ok is not True
+                and responses_compat.is_unsupported(exc)
+            ):
+                self._mark_responses_unsupported(exc)
+                return False
+            logger.error("streaming_error", error=str(exc))
+            yield {"event": "error", "data": {"code": "server_error", "message": str(exc)}}
+            return True
+        self._responses_ok = True
+        if not usage:
+            # No response.completed carrying usage. The shared estimator, not a
+            # word count: word counts undercount CJK roughly fourfold.
+            estimated = estimate_token_count(full_content)
+            usage = {
+                "prompt_tokens": 0,
+                "completion_tokens": estimated,
+                "total_tokens": estimated,
+            }
+        yield {
+            "event": "message_done",
+            "data": {
+                "content": full_content,
+                "usage": usage,
+                "adapters_applied": processed["applied"],
+            },
+        }
+        return True
+
     def generate_stream(
         self,
         messages: List[dict],
@@ -859,6 +1295,13 @@ class ApiAdapterBackend:
         prompt_injections = processed["prompt_injections"]
         augmented_messages = self._inject_adapter_prompts(messages, prompt_injections)
         extra_body = self._with_reasoning_effort(extra_body)
+
+        if self.client and self._responses_available():
+            emitted = yield from self._stream_via_responses(
+                augmented_messages, target_model, processed
+            )
+            if emitted:
+                return
 
         if self.client:
             try:
@@ -1122,12 +1565,6 @@ class ApiAdapterBackend:
 
         sorted_adapters = sorted(adapters, key=get_weight, reverse=True)
         return sorted_adapters[:max_count]
-
-    def _process_adapters(self, adapters: List[dict]) -> Tuple[List[dict], List[str]]:
-        """Legacy method - delegates to _process_adapters_for_provider."""
-        result = self._process_adapters_for_provider(adapters)
-        # Return in legacy format for backwards compatibility
-        return [], result["prompt_injections"]
 
     def _extract_prompt_instructions(self, adapter: dict) -> Optional[str]:
         """Extract prompt instructions from adapter for system prompt injection.
@@ -1508,14 +1945,6 @@ class LocalJaxLoRABackend:
             return int(name), name
         except ValueError:
             return 0, name
-
-    def _align_width(self, arr, width: int):
-        if arr.shape[1] > width:
-            return arr[:, :width]
-        if arr.shape[1] < width:
-            pad = ((0, 0), (0, width - arr.shape[1]))
-            return self._jnp.pad(arr, pad)
-        return arr
 
     def _align_last_dim(self, arr, width: int):
         current = arr.shape[-1]

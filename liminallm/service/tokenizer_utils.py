@@ -17,23 +17,30 @@ MAX_GENERATION_TOKENS = 4096
 MAX_SINGLE_MESSAGE_TOKENS = 200_000
 
 
+# CJK bills near one token per character; an estimator without this split
+# undercounts it roughly fourfold, which matters everywhere this number
+# gates something: message-size validation, compaction budgets, and the
+# no-tokenizer fallback in TokenCounter.
+_CJK_RE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")
+
+
 def estimate_token_count(text: str) -> int:
-    """Lightweight token estimate for enforcing model window limits.
+    """Tokenizer-free estimate, deliberately conservative (over-counts).
 
-    Avoids heavyweight tokenizer dependencies while providing a conservative
-    approximation that scales with both whitespace-delimited words and overall
-    character length. This is used to enforce SPEC token budgets on inputs and
-    assembled prompts (Issue 15.1/15.2).
+    Splits by script: CJK characters bill near 1:1, everything else at
+    4 chars/token with a word-count floor. The single estimator — the
+    calibrated TokenCounter multiplies this by a learned factor; validation
+    and compaction use it raw.
     """
-
     if not text:
         return 0
     normalized = text.strip()
-    # Count non-space spans and fall back to a character-based heuristic to
-    # avoid undercounting text with long tokens or lack of whitespace.
+    if not normalized:
+        return 0
+    cjk = len(_CJK_RE.findall(normalized))
+    rest = len(normalized) - cjk
     wordish = len(re.findall(r"\S+", normalized))
-    char_estimate = math.ceil(len(normalized) / 4)
-    return max(wordish, char_estimate)
+    return max(wordish, cjk + math.ceil(rest / 4))
 
 
 def vocab_size_from_tokenizer(

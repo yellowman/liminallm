@@ -6,6 +6,13 @@ from datetime import datetime, timedelta, timezone
 from ipaddress import IPv4Address, IPv6Address, ip_address
 from typing import Dict, List, Optional
 
+
+def _utcnow() -> datetime:
+    """Timezone-aware UTC. Naive stamps do not compare with what Postgres returns."""
+    return datetime.now(timezone.utc)
+
+
+
 POSITIVE_FEEDBACK_VALUES = {"positive", "like"}
 
 
@@ -16,7 +23,7 @@ class User:
     handle: Optional[str] = None
     role: str = "user"
     tenant_id: str = "public"
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
     is_active: bool = True
     plan_tier: str = "free"
     meta: Dict | None = None
@@ -85,26 +92,6 @@ class Session:
 
 
 @dataclass
-class UserAuthCredential:
-    """Password credentials for a user (maps to user_auth_credential table)."""
-    user_id: str
-    password_hash: Optional[str] = None
-    password_algo: Optional[str] = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    last_updated_at: Optional[datetime] = None
-
-
-@dataclass
-class UserAuthProvider:
-    """OAuth/external auth provider link (maps to user_auth_provider table)."""
-    id: int
-    user_id: str
-    provider: str
-    provider_uid: str
-    created_at: datetime = field(default_factory=datetime.utcnow)
-
-
-@dataclass
 class UserSettings:
     """User preferences and settings (maps to user_settings table)."""
     user_id: str
@@ -151,8 +138,8 @@ class Artifact:
     description: str = ""
     owner_user_id: Optional[str] = None
     visibility: str = "private"
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
+    updated_at: datetime = field(default_factory=_utcnow)
     fs_path: Optional[str] = None
     base_model: Optional[str] = None
     meta: Dict | None = None
@@ -166,7 +153,7 @@ class ArtifactVersion:
     schema: dict
     created_by: str = "system_llm"
     change_note: Optional[str] = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
     fs_path: Optional[str] = None
     base_model: Optional[str] = None
     meta: Dict | None = None
@@ -180,7 +167,7 @@ class ConfigPatchAudit:
     patch: dict
     justification: Optional[str]
     status: str = "pending"
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
     decided_at: Optional[datetime] = None
     applied_at: Optional[datetime] = None
     meta: Dict | None = None
@@ -192,8 +179,8 @@ class KnowledgeContext:
     owner_user_id: str
     name: str
     description: str
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
+    updated_at: datetime = field(default_factory=_utcnow)
     fs_path: Optional[str] = None
     meta: Dict | None = None
 
@@ -215,7 +202,7 @@ class KnowledgeChunk:
     embedding: List[float]
     chunk_index: int
     id: Optional[int] = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
     meta: Dict | None = None
 
 
@@ -232,7 +219,7 @@ class PreferenceEvent:
     cluster_id: Optional[str] = None
     context_text: Optional[str] = None
     corrected_text: Optional[str] = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
     weight: float = 1.0
     meta: Dict | None = None
 
@@ -256,8 +243,8 @@ class TrainingJob:
     adapter_id: str
     status: str = "queued"
     num_events: Optional[int] = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
+    updated_at: datetime = field(default_factory=_utcnow)
     loss: Optional[float] = None
     preference_event_ids: List[str] = field(default_factory=list)
     dataset_path: Optional[str] = None
@@ -274,8 +261,8 @@ class SemanticCluster:
     label: Optional[str] = None
     description: Optional[str] = None
     sample_message_ids: List[str] = field(default_factory=list)
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
+    updated_at: datetime = field(default_factory=_utcnow)
     meta: Dict | None = None
 
 
@@ -284,7 +271,7 @@ class UserMFAConfig:
     user_id: str
     secret: str
     enabled: bool = False
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
     meta: Dict | None = None
 
 
@@ -295,6 +282,6 @@ class Note:
     title: str
     content: str = ""
     embedding: List[float] | None = None
-    created_at: datetime = field(default_factory=datetime.utcnow)
-    updated_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=_utcnow)
+    updated_at: datetime = field(default_factory=_utcnow)
     meta: Dict | None = None

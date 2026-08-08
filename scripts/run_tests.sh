@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Default to the in-memory testing settings unless the caller overrides them.
+# The suite starts its own throwaway Postgres (tests/pgharness.py). Point
+# TEST_DATABASE_URL at an existing database to use that instead.
 export TEST_MODE="${TEST_MODE:-true}"
-export USE_MEMORY_STORE="${USE_MEMORY_STORE:-true}"
 export ALLOW_REDIS_FALLBACK_DEV="${ALLOW_REDIS_FALLBACK_DEV:-true}"
 
 python -m compileall liminallm

@@ -6,7 +6,7 @@ import pytest
 
 from liminallm.config import AdapterMode, get_compatible_adapter_modes
 from liminallm.service.training import TrainingService
-from liminallm.storage.memory import MemoryStore
+from tests.harness import get_test_store
 
 # ==============================================================================
 # TrainingService Initialization Tests
@@ -18,14 +18,14 @@ class TestTrainingServiceInit:
 
     def test_default_adapter_mode(self, tmp_path):
         """Should use default adapter mode when not specified."""
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, fs_root=str(tmp_path))
 
         assert training.default_adapter_mode == AdapterMode.HYBRID
 
     def test_explicit_adapter_mode(self, tmp_path):
         """Should accept explicit default adapter mode."""
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(
             store, fs_root=str(tmp_path), default_adapter_mode=AdapterMode.LOCAL
         )
@@ -34,7 +34,7 @@ class TestTrainingServiceInit:
 
     def test_backend_mode_sets_compatible_modes(self, tmp_path):
         """Should set compatible modes based on backend_mode."""
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, fs_root=str(tmp_path), backend_mode="openai")
 
         # OpenAI compatible modes
@@ -45,7 +45,7 @@ class TestTrainingServiceInit:
 
     def test_local_backend_mode_compatible_modes(self, tmp_path):
         """Local backend should support LOCAL mode."""
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(
             store, fs_root=str(tmp_path), backend_mode="local_lora"
         )
@@ -63,7 +63,7 @@ class TestInferAdapterMode:
 
     @pytest.fixture
     def training(self, tmp_path):
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         return TrainingService(store, fs_root=str(tmp_path))
 
     def test_infer_prompt_from_backend(self, training):
@@ -124,7 +124,7 @@ class TestModeToBackend:
 
     @pytest.fixture
     def training(self, tmp_path):
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         return TrainingService(store, fs_root=str(tmp_path))
 
     def test_local_mode(self, training):
@@ -154,12 +154,12 @@ class TestModeToProvider:
 
     @pytest.fixture
     def training_openai(self, tmp_path):
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         return TrainingService(store, fs_root=str(tmp_path), backend_mode="openai")
 
     @pytest.fixture
     def training_together(self, tmp_path):
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         return TrainingService(store, fs_root=str(tmp_path), backend_mode="together")
 
     def test_local_mode(self, training_openai):
@@ -190,7 +190,7 @@ class TestEnsureUserAdapter:
 
     def test_creates_adapter_with_default_mode(self, tmp_path):
         """Should create adapter with default mode."""
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(
             store, fs_root=str(tmp_path), default_adapter_mode=AdapterMode.HYBRID
         )
@@ -203,7 +203,7 @@ class TestEnsureUserAdapter:
 
     def test_creates_adapter_with_explicit_mode(self, tmp_path):
         """Should create adapter with explicit mode override."""
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(
             store, fs_root=str(tmp_path), default_adapter_mode=AdapterMode.HYBRID
         )
@@ -216,7 +216,7 @@ class TestEnsureUserAdapter:
 
     def test_local_mode_creates_fs_dir(self, tmp_path):
         """LOCAL mode should create fs_dir in schema."""
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, fs_root=str(tmp_path))
 
         user = store.create_user("test@example.com")
@@ -227,7 +227,7 @@ class TestEnsureUserAdapter:
 
     def test_hybrid_mode_creates_fs_dir(self, tmp_path):
         """HYBRID mode should create fs_dir in schema."""
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, fs_root=str(tmp_path))
 
         user = store.create_user("test@example.com")
@@ -237,7 +237,7 @@ class TestEnsureUserAdapter:
 
     def test_prompt_mode_no_fs_dir(self, tmp_path):
         """PROMPT mode should not create fs_dir."""
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, fs_root=str(tmp_path))
 
         user = store.create_user("test@example.com")
@@ -250,7 +250,7 @@ class TestEnsureUserAdapter:
 
     def test_remote_mode_no_fs_dir(self, tmp_path):
         """REMOTE mode should not create fs_dir."""
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, fs_root=str(tmp_path))
 
         user = store.create_user("test@example.com")
@@ -261,7 +261,7 @@ class TestEnsureUserAdapter:
 
     def test_migrates_existing_adapter_mode(self, tmp_path):
         """Should add mode field to existing adapter without one."""
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, fs_root=str(tmp_path))
 
         user = store.create_user("test@example.com")
@@ -292,7 +292,7 @@ class TestEnsureUserAdapter:
 
     def test_preserves_existing_mode(self, tmp_path):
         """Should not overwrite existing mode field."""
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, fs_root=str(tmp_path))
 
         user = store.create_user("test@example.com")
@@ -330,7 +330,7 @@ class TestAdapterSchemaFields:
 
     def test_schema_includes_kind(self, tmp_path):
         """Schema should include kind field."""
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, fs_root=str(tmp_path))
 
         user = store.create_user("test@example.com")
@@ -340,7 +340,7 @@ class TestAdapterSchemaFields:
 
     def test_schema_includes_mode(self, tmp_path):
         """Schema should include mode field."""
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, fs_root=str(tmp_path))
 
         user = store.create_user("test@example.com")
@@ -356,7 +356,7 @@ class TestAdapterSchemaFields:
 
     def test_schema_includes_backend(self, tmp_path):
         """Schema should include backend field."""
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, fs_root=str(tmp_path))
 
         user = store.create_user("test@example.com")
@@ -366,7 +366,7 @@ class TestAdapterSchemaFields:
 
     def test_schema_includes_provider(self, tmp_path):
         """Schema should include provider field."""
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, fs_root=str(tmp_path))
 
         user = store.create_user("test@example.com")
@@ -385,7 +385,7 @@ class TestCompatibleModesIntegration:
 
     def test_training_uses_compatible_modes(self, tmp_path):
         """TrainingService should use get_compatible_adapter_modes."""
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, fs_root=str(tmp_path), backend_mode="openai")
 
         expected = get_compatible_adapter_modes("openai")
@@ -393,7 +393,7 @@ class TestCompatibleModesIntegration:
 
     def test_default_backend_uses_openai_modes(self, tmp_path):
         """Default backend should use openai-compatible modes."""
-        store = MemoryStore(fs_root=str(tmp_path))
+        store = get_test_store()
         training = TrainingService(store, fs_root=str(tmp_path))
 
         # Default is "openai" if not specified

@@ -1,349 +1,38 @@
-# liminallm deployment
+# liminallm operations
 
-a self-contained guide for taking liminallm from zero to one on linux. it fills the gaps that the readme leaves out and does
-not assume you have read the spec. two execution lanes are available: local gpu lora (adapters over a frozen base model) and
-api backends (remote inference). you can run them side by side.
+Installation is in [INSTALL.md](../INSTALL.md). This covers what comes
+after: backend lanes, model handling, replicas, and ops defaults.
 
 ## prerequisites
-- runtime: python 3.11+.
+- runtime: python 3.10+.
 - ocr: `tesseract-ocr` (apt/brew) plus `pip install 'liminallm[ocr]'`. technically optional, practically required: it is what lets uploaded images and scanned pdfs be read locally — deterministic, free per call, and it quotes documents instead of paraphrasing them. without it every image read costs a model vision call (and a text-only backend can't read images at all). install it unless you have a reason not to.
 - extraction security: uploads are parsed (pillow/pypdf/tesseract/poppler) inside a disposable rlimited child process with a wall-clock kill — a malicious file that exploits a parser lands in a short-lived capped process, not the api server. the child shares the service user's uid, so run the app in a container/vm as the outer wall.
 - pdf rasterization: `poppler-utils` (apt/brew), auto-detected. scanned pdfs are rendered page-by-page through `pdftoppm` before ocr, which reads anything a viewer could show — jbig2 and ccitt fax compression included; without poppler, only pdfs whose embedded page images pypdf can decode are readable. pillow is the converter for images themselves: png/jpg (cmyk included)/webp/gif/tiff (multi-page)/bmp all normalize to what tesseract expects. `.docx`/`.odt` extract natively (stdlib zip+xml, no ocr involved); legacy `.doc` is refused with a save-as suggestion.
-- image reader order is configurable via `EXTRACT_READERS` (default `ocr,vision`); new readers — another ocr engine, a dedicated ocr model, a model on new hardware — register via `extract.register_reader` without touching the ladder.
+- image reader order is configurable via the `extract_readers` admin setting (default `ocr,vision`); new readers — another ocr engine, a dedicated ocr model, a model on new hardware — register via `extract.register_reader` without touching the ladder.
 - datastores: postgres 16 with `vector` + `citext`; redis 7 with auth.
-- filesystem: writable `SHARED_FS_ROOT` (defaults to `/srv/liminallm`) for adapters, artifacts, and user files.
-- gpu/tpu: only if `MODEL_BACKEND=local_gpu_lora` (nvidia cuda/cuDNN for jax gpu builds; amd/rocm if you build your own wheel).
+- filesystem: a writable path for adapters, artifacts, and user files. set `shared_fs_root` in the admin console; defaults to `/srv/liminallm`.
+- gpu/tpu: only if `model_backend` is `local_gpu_lora` (nvidia cuda/cuDNN for jax gpu builds; amd/rocm if you build your own wheel).
 - tls/reverse proxy: optional but recommended; an nginx template ships in-repo.
-
-## config cheatsheet
-set env vars before boot:
-- database: `DATABASE_URL` (example: `postgresql://liminallm:<password>@postgres:5432/liminallm`).
-- redis: `REDIS_URL` (example: `redis://:<password>@redis:6379/0`).
-- secrets: `JWT_SECRET` (required), `JWT_ISSUER`/`JWT_AUDIENCE` (optional defaults exist).
-- model backend: `MODEL_BACKEND` (defaults to `openai`), `MODEL_PATH` for local base models, adapter keys like `OPENAI_ADAPTER_API_KEY`/`OPENAI_ADAPTER_BASE_URL`, optional `VOICE_*`.
-- routing/limits: `CHAT_RATE_LIMIT_PER_MINUTE`, `RESET_RATE_LIMIT_PER_MINUTE`.
-- multi-replica: `CLUSTER_BUS_BACKEND` (`auto` by default; see running multiple replicas below).
-- smtp/oauth: `SMTP_*`, `OAUTH_*` if needed.
-- ports: `HOST_PORT` (compose host), `PORT` (app listen).
-
-data directories under `SHARED_FS_ROOT` must be writable:
-- `/srv/liminallm/adapters`
-- `/srv/liminallm/artifacts`
-- `/srv/liminallm/models` (for local jax lora base models)
-- `/srv/liminallm/users/<user_id>/files`
-
-## zero-to-one linux checklist
-1. create a service user, set `umask 027`, and `mkdir -p /srv/liminallm/{adapters,artifacts,models,users}`.
-2. install python 3.11, gcc/build-essentials, `libpq-dev`, postgres 16 + pgvector, redis 7 with a password, and nginx if you want tls.
-3. bootstrap db: create the `liminallm` role/db, enable `vector` + `citext`, then run `./scripts/migrate.sh` with `DATABASE_URL` set.
-4. lock redis down with `requirepass`; point `REDIS_URL` at it.
-5. pick your backend lane (see below), set env vars, and ensure `/srv/liminallm` is owned by the service user.
-6. enable lingering for the service user or wire up systemd/supervisor to run `uvicorn` (see api launch below).
-7. smoke test: `curl http://localhost:8000/healthz` returns `"ok"`; hit `/` for chat ui, `/admin` for admin-only controls.
-
-## option a: docker compose (fast path)
-1. export secrets/passwords (`POSTGRES_PASSWORD`, `REDIS_PASSWORD`, `JWT_SECRET`, provider keys).
-2. `docker compose up -d` (add `--profile production nginx` to enable the bundled reverse proxy). builds the app, brings postgres + pgvector, and secures redis with password auth.
-3. health: `curl http://localhost:${HOST_PORT:-8000}/healthz` should yield `"ok"`.
-4. persistence: app data in `liminallm-data`, postgres in `postgres-data`, redis in `redis-data`; migrations from `sql/` apply on first boot.
-
-## option b: native deployment (bare metal / no docker)
-
-complete instructions for running liminallm directly on a linux host without containers.
-
-### step 1: system dependencies
-
-```bash
-# debian/ubuntu
-sudo apt update
-sudo apt install -y \
-    python3.11 python3.11-venv python3.11-dev \
-    postgresql-16 postgresql-16-pgvector \
-    redis-server \
-    gcc libpq-dev libffi-dev \
-    nginx certbot python3-certbot-nginx
-
-# rhel/rocky/alma
-sudo dnf install -y \
-    python3.11 python3.11-devel \
-    postgresql16-server postgresql16-pgvector \
-    redis \
-    gcc libpq-devel libffi-devel \
-    nginx certbot python3-certbot-nginx
-```
-
-### step 2: create service user
-
-```bash
-sudo useradd -r -m -d /srv/liminallm -s /bin/bash liminallm
-sudo mkdir -p /srv/liminallm/{adapters,artifacts,models,users,logs}
-sudo chown -R liminallm:liminallm /srv/liminallm
-```
-
-### step 3: postgresql setup
-
-```bash
-# start and enable postgresql
-sudo systemctl enable --now postgresql
-
-# create database and user
-sudo -u postgres psql << 'EOF'
-CREATE USER liminallm WITH PASSWORD 'your-secure-password';
-CREATE DATABASE liminallm OWNER liminallm;
-\c liminallm
-CREATE EXTENSION IF NOT EXISTS vector;
-CREATE EXTENSION IF NOT EXISTS citext;
-GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO liminallm;
-EOF
-
-# verify extensions
-sudo -u postgres psql -d liminallm -c "\dx"
-```
-
-### step 4: redis setup
-
-```bash
-# configure redis with password
-sudo tee /etc/redis/redis.conf.d/liminallm.conf << 'EOF'
-requirepass your-redis-password
-maxmemory 256mb
-maxmemory-policy allkeys-lru
-EOF
-
-sudo systemctl restart redis
-sudo systemctl enable redis
-```
-
-### step 5: application installation
-
-```bash
-# switch to service user
-sudo -u liminallm -i
-
-# clone and install
-cd /srv/liminallm
-git clone https://github.com/your-org/liminallm.git app
-cd app
-
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -e ".[dev]"
-```
-
-### step 6: environment configuration
-
-```bash
-# create environment file
-sudo tee /srv/liminallm/.env << 'EOF'
-# Core
-JWT_SECRET="your-32-character-secure-secret-key-here!"
-SHARED_FS_ROOT="/srv/liminallm"
-
-# Database
-DATABASE_URL="postgresql://liminallm:your-secure-password@localhost:5432/liminallm"
-REDIS_URL="redis://:your-redis-password@localhost:6379/0"
-
-# Model backend (choose one)
-MODEL_BACKEND="openai"
-# MODEL_BACKEND="local_gpu_lora"
-# MODEL_PATH="/srv/liminallm/models/your-model"
-
-# API keys (if using openai backend)
-OPENAI_ADAPTER_API_KEY="sk-..."
-
-# Rate limits
-CHAT_RATE_LIMIT_PER_MINUTE=60
-RESET_RATE_LIMIT_PER_MINUTE=5
-
-# Optional: SMTP for email
-# SMTP_HOST="smtp.example.com"
-# SMTP_PORT=587
-# SMTP_USER="noreply@example.com"
-# SMTP_PASSWORD="..."
-EOF
-
-chmod 600 /srv/liminallm/.env
-```
-
-### step 7: database migrations
-
-```bash
-sudo -u liminallm -i
-cd /srv/liminallm/app
-source .venv/bin/activate
-source /srv/liminallm/.env
-
-./scripts/migrate.sh
-```
-
-### step 8: bootstrap admin user
-
-```bash
-python scripts/bootstrap_admin.py \
-    --email admin@yourdomain.com \
-    --password YourSecureAdminPassword123!
-```
-
-### step 9: systemd service
-
-```bash
-sudo tee /etc/systemd/system/liminallm.service << 'EOF'
-[Unit]
-Description=LiminalLM API Server
-After=network.target postgresql.service redis.service
-Requires=postgresql.service redis.service
-
-[Service]
-Type=simple
-User=liminallm
-Group=liminallm
-WorkingDirectory=/srv/liminallm/app
-EnvironmentFile=/srv/liminallm/.env
-ExecStart=/srv/liminallm/app/.venv/bin/uvicorn liminallm.app:app \
-    --host 127.0.0.1 \
-    --port 8000 \
-    --workers 4 \
-    --access-log \
-    --log-level info
-Restart=always
-RestartSec=5
-StandardOutput=append:/srv/liminallm/logs/app.log
-StandardError=append:/srv/liminallm/logs/error.log
-
-# Security hardening
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ReadWritePaths=/srv/liminallm
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now liminallm
-sudo systemctl status liminallm
-```
-
-### step 10: nginx reverse proxy with tls
-
-```bash
-sudo tee /etc/nginx/sites-available/liminallm << 'EOF'
-server {
-    listen 80;
-    server_name yourdomain.com;
-    return 301 https://$server_name$request_uri;
-}
-
-server {
-    listen 443 ssl http2;
-    server_name yourdomain.com;
-
-    ssl_certificate /etc/letsencrypt/live/yourdomain.com/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/yourdomain.com/privkey.pem;
-    ssl_protocols TLSv1.2 TLSv1.3;
-    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
-    ssl_prefer_server_ciphers off;
-
-    client_max_body_size 50M;
-
-    location / {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_http_version 1.1;
-        proxy_set_header Upgrade $http_upgrade;
-        proxy_set_header Connection "upgrade";
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-        proxy_read_timeout 300s;
-        proxy_connect_timeout 75s;
-    }
-
-    location /healthz {
-        proxy_pass http://127.0.0.1:8000/healthz;
-        access_log off;
-    }
-}
-EOF
-
-# enable site
-sudo ln -s /etc/nginx/sites-available/liminallm /etc/nginx/sites-enabled/
-sudo nginx -t && sudo systemctl reload nginx
-
-# obtain tls certificate
-sudo certbot --nginx -d yourdomain.com
-```
-
-### step 11: verify deployment
-
-```bash
-# check service status
-sudo systemctl status liminallm
-
-# check health endpoint
-curl http://localhost:8000/healthz
-
-# check logs
-sudo tail -f /srv/liminallm/logs/app.log
-
-# test signup
-curl -X POST http://localhost:8000/v1/auth/signup \
-    -H "Content-Type: application/json" \
-    -d '{"email": "test@example.com", "password": "TestPass123!"}'
-```
-
-### running in-memory mode (development/testing)
-
-for quick testing without postgresql/redis:
-
-```bash
-export JWT_SECRET="Test-Secret-Key-4-Testing-Only!"
-export SHARED_FS_ROOT="/tmp/liminallm"
-export USE_MEMORY_STORE=true
-export TEST_MODE=true
-
-uvicorn liminallm.app:app --reload --host 0.0.0.0 --port 8000
-```
-
-### running tests (native)
-
-```bash
-# all tests with in-memory store
-TEST_MODE=true USE_MEMORY_STORE=true pytest tests/ -v
-
-# specific test files
-pytest tests/test_post_smoke.py -v          # post-smoke tests
-pytest tests/test_integration_admin.py -v    # admin tests
-pytest tests/test_integration_auth.py -v     # auth tests
-
-# smoke tests against running server
-./scripts/smoke_test.sh http://localhost:8000
-
-# qa gate (lint + security + tests)
-make qa-unit
-```
 
 ## backend lanes and scenarios
 ### local gpu lora (adapters only; base stays frozen)
-- set `MODEL_BACKEND=local_gpu_lora`, `MODEL_PATH=/srv/liminallm/models/<base-model>` (hugging face-style dir), optional `MODEL_TOKENIZER` if tokenizer differs.
+- set `model_backend` to `local_gpu_lora` and `model_path` to `/srv/liminallm/models/<base-model>` (hugging face-style dir) in the admin console.
 - copy base weights into `/srv/liminallm/models`; adapters live under `/srv/liminallm/adapters/<adapter_id>/adapter.lora`.
 - gpu prep: install the matching jax gpu wheel (cuda/rocm), verify `nvidia-smi` sees the card, and keep drivers + cuda in `$LD_LIBRARY_PATH`.
 - run: `python -m uvicorn liminallm.app:app --host 0.0.0.0 --port 8000 --workers 1` (jax likes fewer workers). requests specify `adapter_id` and optionally `adapter_mode` (local/hybrid/prompt); the backend overlays adapters over the frozen base and serves tokens locally.
 - the base model remains immutable; training writes only adapter weights.
 
 ### api backend (remote inference)
-- set `MODEL_BACKEND=openai` (default) or another provider hook; set `OPENAI_ADAPTER_API_KEY`/`OPENAI_ADAPTER_BASE_URL` or peer keys for your provider.
+- set `model_backend` (default `openai`) and `adapter_openai_base_url` in the admin console; the provider key goes in its own admin setting, or the matching `<PROVIDER>_API_KEY` environment variable as a fallback.
 - calls go out to the remote model id you pass as `base_model`; adapters travel as ids or prompt patches when the provider supports multi-lora/prompt layering.
 - scenarios:
   - **managed foundation only**: set `base_model` to the provider model, omit adapters for pure hosted inference.
   - **hosted foundation + local adapters**: keep adapters on disk and send adapter metadata with the request so the provider overlays your deltas over its model.
   - **prompt-only adapters**: for providers without lora, use `adapter_mode=prompt` to inject adapter prompts instead of weights.
-- switching providers is a restart-level change: adjust `MODEL_BACKEND`, set the new api keys, and restart the process or container.
+- switching providers is an admin-console change: set `model_backend` and the provider key; model services rebuild without a restart.
 
 ### hybrid deployments
-- keep `MODEL_BACKEND=local_gpu_lora` for on-prem traffic and point select routes or tenants at an api backend via adapter modes or routing policies stored in artifacts.
+- keep `model_backend` on `local_gpu_lora` for on-prem traffic and point select routes or tenants at an api backend via adapter modes or routing policies stored in artifacts.
 - filesystem artifacts stay authoritative even with api backends; adapter payloads live under `/srv/liminallm/adapters`.
 
 ## model handling at a glance
@@ -360,20 +49,20 @@ make qa-unit
 - safety rails: content safety classifier on user/assistant text; preference events and training skip disallowed content.
 
 ## running multiple replicas
-scale out by running the same image behind a load balancer. postgres and `SHARED_FS_ROOT` are the shared state; nothing in the app assumes it is the only process.
+scale out by running the same image behind a load balancer. postgres and `shared_fs_root` are the shared state; nothing in the app assumes it is the only process.
 
 - **probes**: point the balancer at `/readyz`, not `/healthz`. `/readyz` fails a node whose database or filesystem is gone; redis is deliberately excluded so a redis outage degrades every node instead of draining the whole fleet.
-- **shared filesystem**: every replica must mount the *same* `SHARED_FS_ROOT` (nfs/efs or equivalent). adapters, artifacts, and user uploads are written by whichever node handled the request and read by any other.
-- **node-local scratch**: `INTERPRETER_SCRATCH_DIR` must stay off shared storage — it holds throwaway per-tool-call copies and defaults to the system temp dir.
+- **shared filesystem**: every replica must mount the *same* `shared_fs_root` (nfs/efs or equivalent). adapters, artifacts, and user uploads are written by whichever node handled the request and read by any other.
+- **node-local scratch**: `interpreter_scratch_dir` must stay off shared storage — it holds throwaway per-tool-call copies and defaults to the system temp dir.
 - **sessions/routing**: sticky sessions are not required. websockets are per-connection, and `POST /chat/cancel` reaches the replica holding the stream over the cluster bus, so a stop button works no matter which node the request lands on.
-- **cluster bus**: `CLUSTER_BUS_BACKEND=auto` (default) uses redis pub/sub when redis is reachable and otherwise falls back to postgres `LISTEN`/`NOTIFY`, which is why redis stays optional. force one with `redis`/`postgres`, or set `local` for a single-process deployment to skip peer coordination entirely. the bus is best-effort: if it is down, cancellation falls back to local-only behavior and nothing else changes.
+- **cluster bus**: `cluster_bus_backend` (default `auto`) uses redis pub/sub when redis is reachable and otherwise falls back to postgres `LISTEN`/`NOTIFY`, which is why redis stays optional. force one with `redis`/`postgres`, or set `local` for a single-process deployment to skip peer coordination entirely. the bus is best-effort: if it is down, cancellation falls back to local-only behavior and nothing else changes.
 - **background work**: periodic clustering and adapter-prune proposals take a postgres advisory lock, so they run once per interval cluster-wide rather than once per replica. training jobs need no lock — claiming a job is an atomic conditional update, so exactly one replica wins each one.
-- **workers per node**: with `MODEL_BACKEND=local_gpu_lora` keep `--workers 1` per gpu and scale by adding nodes; api backends scale fine with several workers per node.
+- **workers per node**: with `model_backend` on `local_gpu_lora` keep `--workers 1` per gpu and scale by adding nodes; api backends scale fine with several workers per node.
 
 ## configuration management expectations
 - principle: most runtime knobs live in the database and are editable via the admin ui (`/admin`) instead of env vars.
 - database-managed settings include session rotation, concurrency caps, rate limits, pagination defaults, token ttls, feature flags (mfa/signup), training worker toggles, smtp/oauth and url settings, voice defaults, model backend/path, rag mode, embedding model id, and tenant/jwt claims.
-- environment-only settings are reserved for infra/bootstrap secrets: `DATABASE_URL`, `REDIS_URL`, `JWT_SECRET`, provider api keys, and the minimal env overrides noted in the config cheatsheet above.
+- environment holds `DATABASE_URL` and four things that are not settings (`BUILD_SHA`, `TEST_MODE`, `EMBEDDING_VECTOR_DIM`, `EXTRACT_READER_PLUGINS`). everything else is in the database, so replicas cannot disagree and nothing needs a redeploy to change. see `docs/CONFIGURATION.md`.
 
 ## reverse proxy + os notes
 - nginx config sits at `nginx.conf`; enable the compose `nginx` service with the `production` profile or adapt for your host tls.
@@ -382,5 +71,6 @@ scale out by running the same image behind a load balancer. postgres and `SHARED
 ## troubleshooting quick hits
 - health: `curl http://localhost:8000/healthz`.
 - migrations: rerun `scripts/migrate.sh` if schema drift bites.
-- permissions: ensure write access to `SHARED_FS_ROOT` and authenticated connections to redis/postgres.
+- permissions: ensure write access to `shared_fs_root` and authenticated connections to redis/postgres.
 - logs: `docker compose logs -f app` or your process supervisor for startup clues.
+

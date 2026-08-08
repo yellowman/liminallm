@@ -249,7 +249,7 @@ CREATE UNIQUE INDEX ON artifact_version (artifact_id, version);
 
 - `adapter.lora` (LoRA adapter metadata)
 - `workflow.chat` (graph-based workflow)
-- `policy.routing` (routing policy)
+- `policy.routing` (routing policy; artifact type `policy`, validated like the other kinds — it had no schema entry, so `POST /v1/artifacts {type: "policy"}` answered "unknown artifact type" and routing-as-data had no way to get its data in)
 - `tool.spec` (declarative tool definitions)
 - `memory.summary` (long-term memory summaries)
 - `context.knowledge` (knowledge/RAG context definitions)
@@ -326,7 +326,7 @@ USING ivfflat (embedding) WITH (lists = 100);
 - **dimension handling is dynamic, never pinned**: retrieval validates that query and chunk share a dimension rather than asserting 64. pinning it to `EMBEDDING_DIM` made every real-encoder query fail validation and silently score 0 — collapsing semantic search to bm25 while appearing to work. a chunk from a different encoder scores 0 rather than being garbage-compared.
 - **embedding dimensionality**: 64-d (`EMBEDDING_DIM`) is the *hash-fallback* size and remains mandatory for routing and clustering, where vectors from many contexts are compared in one space.
   **amended:** external providers persist their **native** dimensionality (e.g. 1536) for rag chunks, notes, and message recall. truncating a real 1536-d embedding to 64-d discards most of the signal the encoder exists to provide — obeying the original rule would defeat semantic retrieval. the invariant that actually matters is *never compare vectors from different encoders*: every consumer records the encoder id alongside the vector (`knowledge_chunk.meta.embedding_model_id`, `note.meta`, `message.meta.embedding_model`) and filters on it; a mismatch is treated as "not embedded", so the backfill re-embeds rather than comparing across spaces.
-  **operational consequence (unverified here):** `knowledge_chunk.embedding` is declared bare `VECTOR` and indexed `USING ivfflat`. pgvector requires a fixed dimension for an ivfflat/hnsw index, so a deployment mixing dimensions in that column — or indexing an unconstrained one — needs the column pinned to the chosen encoder's size (`VECTOR(1536)`) and a re-index when the encoder changes. this container has no pgvector, so it was not verified live; flagged rather than assumed working.
+  **verified and fixed:** `knowledge_chunk.embedding` was declared bare `VECTOR` and indexed `USING ivfflat`. reproduced against real pgvector: `ERROR: column does not have dimensions` — so with `ON_ERROR_STOP` (which `scripts/migrate.sh` uses) migrations aborted at 002, and without it the index silently never existed and every similarity search was a sequential scan. the column is now pinned to `EMBEDDING_VECTOR_DIM` (default 1536, use 64 for the hash fallback), passed to psql by `migrate.sh`. there is no upgrade path to get wrong: the numbered migrations are gone in favour of one idempotent `sql/schema.sql` (see §2), because this project has never been deployed and a migration history that reconciles states no database was ever in is fiction with a data-loss hazard attached. a wrong `EMBEDDING_VECTOR_DIM` can no longer corrupt anything quietly either — startup compares the column's dimension against the encoder's and refuses with both numbers and the fix. verified end to end on postgres 16 + pgvector at 1536 and 64.
 - **refresh cadence**:
   - watch filesystem path events; enqueue ingestion job on file change.
   - encoder change is handled by *invalidation*, not a sweep: a vector whose recorded encoder id differs from the current one reads as "not embedded", so the normal backfill re-embeds it lazily. no daily job exists — a scheduled re-embed is still open work, and until it lands, old vectors are re-embedded only when something reads them.
@@ -336,7 +336,7 @@ USING ivfflat (embedding) WITH (lists = 100);
   - return chunk text + `fs_path` for citation; orchestrator can ask LLM to cite paths.
   - optional dev fallback: in-process hybrid BM25 + cosine search (controlled by `RAG_MODE=local_hybrid`), intended for tests or tiny corpora when pgvector is absent.
   - **ranking precedence (applies to rag, notes, and conversation recall alike):** semantic is primary; bm25 is the fallback and the tie-breaker, never the peer. concretely: with a real encoder, ranking is hybrid (semantic-weighted, bm25 retained so exact identifiers and numbers keep their pull); **without** one, bm25 alone. hash-embedding cosine must never enter a score — `EmbeddingsService.is_semantic` is the flag every consumer checks, because noise blended at any weight is worse than keywords alone.
-  - baseline kernel ships with a deterministic hashing-based embedding fallback (no external model dependency) shared across RAG/routing/clustering so chunks always have non-empty vectors for cosine search in both Postgres and in-memory stores.
+  - baseline kernel ships with a deterministic hashing-based embedding fallback (no external model dependency) shared across RAG/routing/clustering so chunks always have non-empty vectors for cosine search.
 
 ### 2.6 preferences & training
 
@@ -467,13 +467,19 @@ params_layer_00_attn_v_B.npy
 
 or a single `params.npz` keyed by `"layer_00.attn_q.A"`, etc.
 
-### 3.3 memory-store snapshots (dev / single-node mode)
+### 3.3 storage
 
-when the kernel runs in the in-memory fallback (no Postgres), it must persist state onto the shared filesystem so restarts do not wipe user data:
+postgres is the only store. there is no in-memory fallback: a second
+implementation of the storage layer means every feature is written twice and
+verified once, and the copy production runs is the untested one.
 
-- write a JSON snapshot under `{shared_fs_root}/state/memory_store.json` after each mutation covering users, auth sessions, credentials, conversations/messages, artifacts + versions, config patches, knowledge contexts, and chunks.
-- on startup, reload this snapshot before seeding default artifacts; only seed when no persisted state is present.
-- artifact payloads (e.g., workflow JSON) still live under `{shared_fs_root}/artifacts/{artifact_id}/vNNNN.json` so snapshot + files can fully reconstruct state.
+- `sql/schema.sql` is the whole schema, applied idempotently by
+  `scripts/migrate.sh`. the embedding column's width is pinned at apply time
+  (`-v embedding_dim=...`) because pgvector's ivfflat index requires a fixed
+  dimension.
+- artifact payloads (e.g., workflow JSON) live under
+  `{shared_fs_root}/artifacts/{artifact_id}/vNNNN.json`; the database holds the
+  metadata and version pointers.
 
 ---
 
@@ -841,6 +847,24 @@ cluster qualifies          pooled events ≥ threshold      eval gate passes
 JAX local serving is the primary path. at scale, the same artifacts can be
 served by a dedicated multi-LoRA server (LoRAX-style, vLLM multi-LoRA,
 Together adapter APIs) behind the existing OpenAI-compatible transport:
+
+- **native Gemini** (`model_backend: gemini_native`): speaks
+  generativelanguage.googleapis.com directly — generateContent /
+  streamGenerateContent SSE — rather than the OpenAI-compat shim (which
+  remains `gemini`). usageMetadata's thoughtsTokenCount and
+  cachedContentTokenCount map to the same reasoning_tokens / cached_tokens
+  keys as the Responses path, so the rich usage is provider-uniform. The
+  chat-shaped internal history (system prompt, assistant tool_calls,
+  role:"tool" results) converts losslessly to native `contents`
+  (service/gemini_backend.py), so a conversation resumes mid-history on any
+  provider.
+- **endpoint selection**: the Responses API (`/responses`) is the primary
+  endpoint for OpenAI-compatible backends — richer usage (reasoning and
+  cached-token counts flow into turn usage), typed output items, first-class
+  reasoning control. The backend probes once per process and falls back to
+  `/chat/completions` permanently for providers that answer 404/405; the
+  internal message shape stays chat-format, translated at the wire
+  (service/responses_compat.py).
 
 - the kernel already models this as `remote`/`adapter_param` providers
   (§5.0.2); adapters trained by the JAX pipeline are exported per-version to
@@ -1370,6 +1394,27 @@ execution guardrails:
 
 ### 12.2 isolation
 
+- **tenant**: a tenant *is* a site. `tenant_domains` maps hostname to tenant id;
+  the request's hostname decides, and nothing a caller sends can override it —
+  no request field, no header. An empty map means the install serves one tenant
+  (`default_tenant_id`), which is every deployment until a second site exists.
+  Once any mapping exists, a request arriving on an unlisted host is refused
+  (`not_found`) rather than served the default tenant, because otherwise any DNS
+  name pointed at the box would reach that tenant's login page.
+  - the hostname is read from `Host`, or from `X-Forwarded-Host` when
+    `trust_forwarded_host` is on. That flag is the entire trust boundary: turn it
+    on only when a reverse proxy you control sets the header from the real
+    request and refuses hosts it does not serve. `Host` is a client-supplied
+    header like any other.
+  - signup joins the tenant serving the site it arrived at. Login, refresh and
+    every authenticated request check that tenant against the user's stored
+    `tenant_id`, so an account cannot sign in — and a session cannot be
+    replayed — at another tenant's site.
+  - `POST /v1/auth/signup` and `POST /v1/auth/oauth/{provider}/start` reject a
+    `tenant_id` in the body with `validation_error` rather than ignoring it.
+    An admin creates users in their own tenant only; reaching another tenant
+    means visiting its site.
+
 - **postgres**:
   - all queries must be filtered by `user_id` where appropriate.
   - Optionally: PostgreSQL Row-Level Security (RLS) to enforce `user_id = current_user_id()`.
@@ -1476,8 +1521,7 @@ response:
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-psql "$DATABASE_URL" -f sql/000_base.sql
-psql "$DATABASE_URL" -f sql/001_artifacts.sql
+psql "$DATABASE_URL" -v embedding_dim="${EMBEDDING_VECTOR_DIM:-1536}" -f sql/schema.sql
 # add future numbered files in order
 ```
 
@@ -1612,6 +1656,7 @@ that’s the whole point: minimal glue, maximal evolution.
   - **Chat**: conversation interface with message streaming
   - **Notes**: the vault — editor, link graph, witness (§19; hidden when `notes_enabled` is off)
   - **Contexts**: knowledge context management
+  - **Files**: knowledge upload and the user's file browser
   - **Artifacts**: system artifact browser
   - **Tools**: tool specs and workflows
   - **Insights**: preference clusters
@@ -1636,8 +1681,10 @@ that’s the whole point: minimal glue, maximal evolution.
 - **workflow override**: optional text input for `workflow_id` to steer execution.
 - **optimistic UI**: user messages displayed immediately before server confirmation.
 - **collapsible sections**:
-  - **Upload knowledge**: file upload with context selection and chunk size configuration.
   - **Preferences**: thumbs up/down feedback with optional notes, displays routing metadata and trace.
+  - (Knowledge upload and the file browser live in the Files tab — they are
+    persistent panels, not conversation state, and pinning them above the
+    message stream cost the chat column ~300px that never scrolled away.)
 - **typography**: assistant prose is set in a serif column with a github-grade
   markdown renderer (escape-first: html-escape, then rewrite to a fixed safe
   tag set; nested/task lists, aligned tables, blockquotes, autolinks,
@@ -1723,7 +1770,7 @@ that’s the whole point: minimal glue, maximal evolution.
 ### 17.10 auth flow
 
 - **auth panel**: shown when not authenticated; hidden after successful login.
-- **login form**: email, password, optional MFA code, optional tenant ID.
+- **login form**: email, password, optional MFA code. No tenant field — the tenant is the site you visited (§12.2), never something a user types.
 - **MFA handling**: if `mfa_required` returned without token, prompt user to enter code.
 - **token management**: access token, refresh token, session ID stored in sessionStorage.
 - **auto-refresh**: on 401 response, attempt token refresh before failing.
@@ -1753,7 +1800,7 @@ the following are treated as constants the kernel must honor; LLM edits happen o
   - success: `{ "status": "ok", "data": <payload>, "request_id": "uuid" }`; error: `{ "status": "error", "error": { "code": "string", "message": "string", "details": <object|array|null> }, "request_id": "uuid" }`.
   - pagination: either `{ data: [...], next_cursor: "opaque" }` or `{ page, page_size, total }`; choose per-endpoint but keep stable once published. For simple bounded queries, `limit` is accepted as an alias for `page_size` (defaults to 100, max 500).
   - idempotency: POST endpoints that create side effects (`/v1/chat`, `/v1/tools/run`, `/v1/artifacts`) accept `Idempotency-Key`; server replays prior response within a 24h TTL and returns `409` if the prior attempt is still running.
-  - auth header is `Authorization: Bearer <token>` in REST; WebSockets accept inline auth in the initial message frame: `{ "access_token": "...", "session_id": "...", "tenant_id": "...", "message": "...", ... }`; unauthenticated sockets close with code `4401`.
+  - auth header is `Authorization: Bearer <token>` in REST; WebSockets accept inline auth in the initial message frame: `{ "access_token": "...", "message": "...", ... }` **or** `{ "session_id": "...", ... }` — exactly one, never both (§12.1: mixed transports are rejected without a fresh session). No `tenant_id`: the socket's tenant comes from the host it was opened against, like every HTTP route. Unauthenticated sockets close with code `4401`.
   - streaming events: `token`, `message_done`, `error`, `cancel_ack`, `trace` (router/workflow trace snapshot). SSE uses `event:` labels; WebSockets wrap as `{ "event": "token", "data": "..." }`.
   - minimal REST surface (kernel-stable):
     - `POST /v1/auth/login { email, password, mfa_code? } → { access_token, refresh_token, user }`.
@@ -1771,6 +1818,7 @@ the following are treated as constants the kernel must honor; LLM edits happen o
   - password reset: `POST /v1/auth/request_reset { email }` stores a one-time token in Redis (15m TTL) and emails it; `POST /v1/auth/complete_reset { token, new_password }` rotates credentials and revokes sessions.
   - email verification: `POST /v1/auth/verify_email { token }` marks `user.meta.email_verified=true`; unverified accounts are limited to 24h and low rate limits.
   - MFA: `POST /v1/auth/mfa/enable` returns TOTP secret + QR; `POST /v1/auth/mfa/verify { code }` gates login/refresh when `user.meta.mfa_enabled=true`; 5 failed codes locks MFA for 5 minutes.
+    - TOTP is **HMAC-SHA-1, 6 digits, 30s**, with a 160-bit secret (RFC 6238 / RFC 4226 §4 R6). These are the Key Uri Format defaults, so an authenticator app assumes them whatever the `otpauth://` URI omits — the server must verify the same thing its own QR code promises. It verified SHA-256 while every app computed SHA-1, so enrolment could never complete and nothing said why. The URI now states `algorithm`, `digits` and `period` explicitly rather than relying on the defaults holding.
   - session model: short-lived access token (15–60m configurable) + refresh token (7–30d) stored HttpOnly; refresh rotation on each use; logout revokes both; login from a new device invalidates prior refresh tokens if `meta.single_session=true`.
 
 - **multi-tenant isolation & filesystem guards**
@@ -1784,7 +1832,7 @@ the following are treated as constants the kernel must honor; LLM edits happen o
   - external fetches from tools use a allowlisted proxy with 10s connect + 30s total timeout; circuit breaker opens for a tool after 5 failures in 1 minute.
 
 - **workflow/tool sandboxing**
-  - tool workers run under a fixed UID with cgroup limits (CPU shares, memory hard cap) and no filesystem access except a tmp scratch; `privileged:true` tools require admin-owned artifacts and are never called by default workflows.
+  - tool workers run in a spawned child process under POSIX rlimits (memory hard cap `RLIMIT_AS`, CPU seconds, max file size, no core dumps), backstopped by a wall-clock kill, and have no filesystem access except a tmp scratch; `privileged:true` tools require admin-owned artifacts and are never called by default workflows.
   - JSON Schema validation enforced on tool inputs/outputs; outputs flagged `content_type: "html_untrusted"` must be sanitized by client before render.
   - retries: default 2 retries with exponential backoff (1s, 4s); per-node override allowed but capped at 3; node timeout default 15s, hard cap 60s.
 
@@ -1794,9 +1842,9 @@ the following are treated as constants the kernel must honor; LLM edits happen o
   - cancellation: orchestrator issues `{event:"cancel", request_id}`; worker aborts decode, frees KV cache and adapter refs, and emits `cancel_ack` with partial tokens if any.
 
 - **adapter mode configuration**
-  - `DEFAULT_ADAPTER_MODE` environment variable (default: `hybrid`): controls mode for newly created adapters.
+  - `default_adapter_mode` admin setting (default: `hybrid`): controls mode for newly created adapters.
   - valid values: `local`, `remote`, `prompt`, `hybrid` (see §5.0.1 for mode definitions).
-  - `MODEL_BACKEND` determines which adapter modes are compatible:
+  - `model_backend` determines which adapter modes are compatible:
     - `local_lora`/`local_gpu_lora`: supports `local`, `prompt`, `hybrid`
     - API backends (`openai`, `together`, `lorax`, etc.): support `remote`, `prompt`, `hybrid`
   - router automatically filters incompatible adapters before policy evaluation; filtered adapters logged with `adapter_filtered_by_mode` event.
@@ -1830,17 +1878,26 @@ the following are treated as constants the kernel must honor; LLM edits happen o
     - feature flags: `enable_mfa`, `allow_signup`
     - training worker: `training_worker_enabled`, `training_worker_poll_interval`
     - notes vault: `notes_enabled` (see §19)
-    - SMTP (all settings including secrets): `smtp_host`, `smtp_port`, `smtp_user`, `smtp_password`, `smtp_use_tls`, `email_from_address`, `email_from_name`
+    - SMTP (all settings including secrets): `smtp_host`, `smtp_port`, `smtp_user`, `smtp_password`, `smtp_security`, `email_from_address`, `email_from_name`
+      - `smtp_security` is `starttls` (default, usually port 587), `ssl` (encrypted from the first byte, usually 465) or `none`. `none` exists for a relay on the same machine and is refused when a username is set, since the password would cross the wire in the clear. It replaces a `smtp_use_tls`/`smtp_allow_insecure` pair in which the second flag never enabled plaintext at all — it only removed a port guard in front of an SSL connection, so the ordinary self-hosted arrangement could not send.
     - URL settings: `oauth_redirect_uri`, `app_base_url`
     - voice settings: `voice_transcription_model` (enum: whisper-1), `voice_synthesis_model` (enum: tts-1, tts-1-hd), `voice_default_voice` (enum: alloy, echo, fable, onyx, nova, shimmer)
     - model settings: `model_path` (with common suggestions: gpt-4o, gpt-4o-mini, gpt-5.2, claude-opus-4-5, claude-sonnet-4, glm-4-plus), `model_backend` (enum: openai, anthropic, azure, azure_openai, vertex, gemini, google, bedrock, together, together.ai, lorax, adapter_server, sagemaker, aws_sagemaker, zhipu, zhipu.ai, glm, stub), `default_adapter_mode` (enum: local, remote, prompt, hybrid), `rag_mode` (enum: pgvector, memory), `embedding_model_id` (enum: text-embedding, text-embedding-3-small, text-embedding-3-large, text-embedding-ada-002)
-    - tenant & JWT: `default_tenant_id`, `jwt_issuer`, `jwt_audience`
-  - **environment-only settings** (infrastructure decisions or bootstrap secrets):
-    - database connection: `DATABASE_URL`, `REDIS_URL`
-    - bootstrap secrets: `JWT_SECRET` (required before DB available)
-    - OAuth secrets: `client_secret` values (optional, can be moved to DB with encryption if needed)
-    - storage mode: `USE_MEMORY_STORE` (required before DB connection)
-    - test harness: `TEST_MODE`
+    - tenancy: `default_tenant_id`, `tenant_domains` (host → tenant id),
+      `trust_forwarded_host`; JWT: `jwt_issuer`, `jwt_audience`
+  - **environment-only settings** — everything that must be known *before* the
+    database is readable, or that describes the machine rather than the install.
+    There are five, and adding a sixth needs one of those two reasons:
+    - `DATABASE_URL` — where the rest of the configuration lives.
+    - `EMBEDDING_VECTOR_DIM` — the vector column's width, fixed at schema apply.
+    - `TEST_MODE`, `BUILD_SHA` — what this process is, not how it is configured.
+    - `EXTRACT_READER_PLUGINS` — code to import, so it cannot come from a row.
+  - **secrets live in the database, write-only.** `jwt_secret` (generated on
+    first boot), `smtp_password`, the OAuth `client_secret` values and the
+    provider API keys are stored like any managed setting but redacted on every
+    read path: `GET /v1/admin/settings` returns them empty and the console
+    renders a write-only control that submits only what an operator types.
+    Rotating one must not require a redeploy.
   - **admin UI** at `/admin.html` provides grouped controls for all database-managed settings; changes take effect immediately without server restart.
   - **API**: `GET /v1/admin/settings` returns current values merged with defaults; `PUT /v1/admin/settings` validates types (int/float/bool) and persists to `instance_config` table; requires admin role.
 
@@ -1936,8 +1993,8 @@ three tiers, from transient to permanent:
    typed paragraphs. methods compose accordingly: `pdf+ocr`, `docx-vision`,
    etc. images (png/jpg incl. cmyk/webp/gif/tiff incl.
    multi-page/bmp — pillow normalizes all of them to what tesseract expects) — and scanned pdfs via their embedded page
-   images — walk a configurable reader roster (`EXTRACT_READERS`, default
-   `ocr,vision`). readers are a registry (`extract.register_reader`), so
+   images — walk a configurable reader roster (the `extract_readers` admin
+   setting, default `ocr,vision`). readers are a registry (`extract.register_reader`), so
    another ocr engine, a dedicated ocr model, or a model on new hardware
    (e.g. a loom-hosted reader once its pjrt plugin lands — see
    docs/jax_backend.md) is a registration, not a rewrite. built-ins: `ocr` =
@@ -1988,8 +2045,8 @@ already self-contained json.
 
 ### 19.7 activation
 
-`notes_enabled` — code default on; env `NOTES_ENABLED`; admin override via
-system settings (databased-managed feature flag). when off: all `/v1/notes/*`
+`notes_enabled` — code default on, overridable from the admin console
+(database-managed feature flag). when off: all `/v1/notes/*`
 routes return 403 `notes_disabled`, the `note_search` tool is never offered,
 and the front-end hides the notes tab on first contact. precedence follows the
 platform rule: admin override > env var > code default.
@@ -2006,8 +2063,8 @@ is wrong in both directions: it wastes 99% of a million-token gemini window
 and overruns a small local checkpoint. resolution order, most authoritative
 first:
 
-1. **admin override / env**: `model_context_window` system setting, else
-   `MODEL_CONTEXT_WINDOW`. set this when discovery guesses wrong.
+1. **admin override**: the `model_context_window` setting. set this when
+   discovery guesses wrong.
 2. **provider probe** (5s, best-effort, never raises): gemini's native
    `models/{id}` states `inputTokenLimit`; self-hosted openai-compatible
    servers (vllm, lorax, lm studio) expose `max_model_len` /
@@ -2084,13 +2141,13 @@ is assembled from three sources, all budget-derived from the discovered
 model window:
 
 1. **verbatim tail** — the longest suffix of recent turns that fits
-   `history_budget` (= `HISTORY_BUDGET_FRACTION`, default 0.5, of the
+   `history_budget` (= `history_budget_fraction`, default 0.5, of the
    prompt budget; floor of 4 turns). on a large-window model turns stay
    verbatim until the window actually pressures; on a small one digestion
    starts early. the boundary is tokens, never a message count.
 2. **recall** — older turns chosen by relevance to the message being
    answered, restored verbatim from the permanent transcript, in
-   chronological order, within `HISTORY_RECALL_FRACTION` (default 0.25) of
+   chronological order, within `history_recall_fraction` (default 0.25) of
    the history budget. ranking is **hybrid semantic + bm25** when a real
    embedding encoder is configured, bm25 alone otherwise. semantic wins the
    cases keywords miss: "which database did we pick" finds "let's go with
@@ -2150,9 +2207,11 @@ budget math is only as good as the count. resolution per backend:
 ### 20.6 other model-specific hazards
 
 - **temperature**: reasoning models (o-series, gpt-5, gemini 3) reject a
-  caller-supplied temperature with a 400 that fails the whole request. the
-  parameter is omitted for them (`is_reasoning_model`); every model has a
-  sane default, so omission is the portable choice.
+  caller-supplied temperature with a 400 that fails the whole request, and
+  others prescribe one fixed value. `temperature_policy` classifies each
+  family as tunable, tunable-only-with-reasoning-off, or omit; nothing is
+  sent unless an operator sets `model_temperature`, because a default of
+  ours would override whatever the provider tuned its model around.
 - **single-message validation** is a dos ceiling
   (`MAX_SINGLE_MESSAGE_TOKENS`), not a model budget. it previously reused
   the 4096 generation constant, which rejected a pasted document that a
@@ -2241,7 +2300,7 @@ re-joined through `safe_join` (zip slip). member type is checked with
 
 ## 22. running more than one replica
 
-postgres and `SHARED_FS_ROOT` are the shared state; nothing in the app
+postgres and `shared_fs_root` are the shared state; nothing in the app
 assumes it is the only process.
 
 - **probes**: `/readyz` is the load-balancer probe and returns 503 when
@@ -2249,7 +2308,7 @@ assumes it is the only process.
   a per-dependency breakdown, so it can never drain a replica. **redis is
   deliberately excluded from readiness** — every redis-backed feature has a
   fallback, so a redis outage must degrade the fleet, not drain it.
-- **cluster bus** (`CLUSTER_BUS_BACKEND`, default `auto`): redis pub/sub when
+- **cluster bus** (`cluster_bus_backend`, default `auto`): redis pub/sub when
   reachable, else postgres `LISTEN`/`NOTIFY` — which is why redis stays
   optional. a single-process deployment gets a no-op backend. carries
   cross-replica cancellation (`POST /chat/cancel` reaching the worker that
@@ -2261,7 +2320,7 @@ assumes it is the only process.
   atomic conditional update. the lock **fails open** when postgres is
   unreachable: maintenance running twice beats never running.
 - **shared vs node-local storage**: every replica mounts the same
-  `SHARED_FS_ROOT` (adapters, artifacts, uploads). `INTERPRETER_SCRATCH_DIR`
+  `shared_fs_root` (adapters, artifacts, uploads). `interpreter_scratch_dir`
   must **not** be on it — throwaway per-call copies belong on local disk.
 - **sticky sessions are not required.** websockets are per-connection and
   cancellation crosses the bus.

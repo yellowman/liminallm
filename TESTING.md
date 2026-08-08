@@ -4,19 +4,51 @@ This document describes how to set up and run tests for LiminalLM.
 
 ## Quick Start
 
-### Unit Tests (In-Memory)
+### Running the suite
 
-Run unit tests with the in-memory store (no external dependencies):
+The suite starts its own throwaway Postgres **and Redis**
+(`tests/harness.py`) and applies `sql/schema.sql`, so tests exercise the same
+store and the same cache production runs. Nothing to set up:
 
 ```bash
 ./scripts/run_tests.sh
 ```
 
+Both services are real on purpose. An in-memory store used to double the
+storage layer, so every storage feature was written twice and verified once —
+and the untested half was the one production ran. Running without Redis is the
+same problem one layer down: rate limits, idempotency, the session cache and
+the concurrency slots all take their fallback path, so a green suite says
+nothing about the code that actually serves traffic.
+
+`tests/test_harness_runs_the_real_thing.py` asserts both are connected. If
+`redis-server` is missing those tests skip rather than pass, because a silent
+fallback looks exactly like success.
+
+Point at existing services with `TEST_DATABASE_URL` / `TEST_REDIS_URL` (CI
+service containers, or a local pair).
+
+### Coverage under-reports the extractor
+
+`service/extract.py` parses uploads in a spawned child process, because the
+parsers behind it (Pillow, pypdf, expat, tesseract, poppler) are treated as
+compromisable. `coverage.py` runs in the parent and cannot see the child, so
+`extract.py` reads around 33% while `tests/test_extract.py` is driving real
+PDFs, docx files, OCR and decompression bombs through it end to end.
+
+Wiring subprocess coverage through pytest-cov needs `parallel = true` plus a
+combine step, which litters `.coverage.*` files and clobbers the parent's data
+more often than it merges it. Not worth it: read the tests, not the number.
+
 Or with pytest directly:
 
 ```bash
-TEST_MODE=true USE_MEMORY_STORE=true pytest tests/
+TEST_MODE=true pytest tests/
 ```
+
+To reuse an existing database instead of starting one, point
+`TEST_DATABASE_URL` at it. It needs the `vector` extension available —
+the schema declares a `VECTOR` column.
 
 ### Integration Tests with Docker
 
@@ -60,9 +92,13 @@ Regular test users are created dynamically during tests.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TEST_MODE` | `false` | Enables test mode (relaxed security, in-memory fallback) |
-| `USE_MEMORY_STORE` | `false` | Use in-memory store instead of PostgreSQL |
-| `ALLOW_REDIS_FALLBACK_DEV` | `false` | Allow in-memory cache when Redis unavailable |
+| `TEST_MODE` | `false` | Enables test mode (relaxed security, in-process fallbacks) |
+| `TEST_DATABASE_URL` | _(unset)_ | Reuse this database instead of starting a scratch cluster |
+| `EMBEDDING_VECTOR_DIM` | `1536` | Vector width; the suite pins `64` to match the hash encoder |
+
+To let the app fall back to an in-process cache when Redis is unavailable,
+enable the `allow_redis_fallback_dev` admin setting — it is stored in the
+database, not read from the environment.
 
 ### Test Database
 
@@ -71,7 +107,6 @@ For integration tests with a real database:
 ```bash
 export DATABASE_URL="postgresql://user:pass@localhost:5432/liminallm_test"
 export REDIS_URL="redis://localhost:6379/1"
-export JWT_SECRET="Test-JWT-Secret-For-QA-Environment-Only-32chars!"
 ```
 
 ## Bootstrap Admin User
@@ -151,7 +186,6 @@ scripts/
 The test JWT secret must contain uppercase, lowercase, digits, and special characters:
 
 ```bash
-export JWT_SECRET="Test-Secret-Key-4-Testing-Only-Do-Not-Use-In-Production!"
 ```
 
 ### Redis connection errors in tests

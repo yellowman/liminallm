@@ -480,14 +480,20 @@ Redis rate limiting now uses an atomic Lua token bucket with weighted costs and 
 
 **Location:** `liminallm/service/sandbox.py`
 
-**SPEC §18 requires:** "Tool workers run under a fixed UID with cgroup limits (CPU shares, memory hard cap)"
+**SPEC §18 requires:** a memory hard cap and a CPU limit on tool workers.
 
 **Fix Applied:**
 - Added `SandboxConfig` with resource limits (CPU, memory, file size)
-- Added `apply_resource_limits()` using Python's resource module
-- Added `setup_cgroup()` and `add_to_cgroup()` for cgroup v2 integration
+- `run_in_sandbox()` spawns a child process and calls `apply_resource_limits()`
+  inside it, so the API process is never constrained
 - Limits: 512MB memory, 30s CPU, 100MB file size by default
 - Privileged tools get higher limits (1024MB, 120s)
+
+A `setup_cgroup()` / `add_to_cgroup()` / `cleanup_cgroup()` trio was written for
+cgroup v2 and never called by anything. It was deleted: the rlimits above are
+what enforce the cap, cgroups need root or cgroup delegation that a normal
+container deployment does not have, and a second unwired copy of a limit reads
+as a control that is running when it is not. SPEC §18 now names the rlimits.
 
 ### 6.3 ~~CRITICAL: No Filesystem Isolation for Tools~~ FIXED
 
@@ -3635,7 +3641,7 @@ Redirect URI not validated for HTTPS or allowed domain.
 ### 55.6 MEDIUM: Default Insecure SMTP Configuration
 **Location:** `liminallm/service/email.py:85-97`
 
-Configuration naming confusing - `smtp_use_tls=False` uses SMTP_SSL.
+Configuration naming confusing - `smtp_use_tls=False` uses SMTP_SSL. **Fixed:** replaced by `smtp_security` (`starttls`/`ssl`/`none`); `none` is a real plaintext path for a local relay, refused when credentials are set.
 
 **Status:** ✅ FIXED - SMTP sending enforces encrypted transport by default and requires explicit opt-in for plaintext ports.
 

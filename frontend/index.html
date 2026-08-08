@@ -6,6 +6,13 @@
     <title>liminallm chat</title>
     <link rel="icon" type="image/svg+xml" href="/static/favicon.svg" />
     <link rel="stylesheet" href="/static/styles.css" />
+    <!-- common.js first: defer preserves order, and it defines the
+         helpers both pages use. -->
+    <script defer src="/static/common.js"></script>
+    <script defer src="/static/markdown.js"></script>
+    <script defer src="/static/auth.js"></script>
+    <script defer src="/static/admin-tab.js"></script>
+    <script defer src="/static/notes.js"></script>
     <script defer src="/static/chat.js"></script>
   </head>
   <body>
@@ -58,10 +65,6 @@
                 <div class="field">
                   <label for="mfa">MFA code (if required)</label>
                   <input type="text" id="mfa" name="mfa" placeholder="123456" inputmode="numeric" />
-                </div>
-                <div class="field">
-                  <label for="tenant">Tenant (optional)</label>
-                  <input type="text" id="tenant" name="tenant" placeholder="tenant-123" />
                 </div>
                 <div class="form-actions">
                   <button class="primary" type="submit" id="auth-submit">Continue</button>
@@ -123,10 +126,6 @@
                   <label for="signup-confirm">Confirm password</label>
                   <input type="password" id="signup-confirm" name="confirm" placeholder="••••••••" required />
                 </div>
-                <div class="field">
-                  <label for="signup-tenant">Tenant (optional)</label>
-                  <input type="text" id="signup-tenant" name="tenant" placeholder="tenant-123" />
-                </div>
                 <div class="form-actions">
                   <button class="primary" type="submit" id="signup-submit">Create account</button>
                 </div>
@@ -181,6 +180,7 @@
             <button class="tab-btn active" data-tab="chat-tab" aria-selected="true">Chat</button>
             <button class="tab-btn" data-tab="notes-tab" aria-selected="false">Notes</button>
             <button class="tab-btn" data-tab="contexts-tab" aria-selected="false">Contexts</button>
+            <button class="tab-btn" data-tab="files-tab" aria-selected="false">Files</button>
             <button class="tab-btn" data-tab="artifacts-tab" aria-selected="false">Artifacts</button>
             <button class="tab-btn" data-tab="tools-tab" aria-selected="false">Tools</button>
             <button class="tab-btn" data-tab="insights-tab" aria-selected="false">Insights</button>
@@ -196,72 +196,17 @@
                   <span id="conversation-label">New conversation</span>
                 </div>
                 <div class="pill-row">
+                  <select id="context-id" class="header-ctl" aria-label="Knowledge context"
+                          title="Knowledge context for RAG-grounded answers">
+                    <option value="">No context</option>
+                  </select>
+                  <input type="text" id="workflow-id" class="header-ctl" aria-label="Workflow override"
+                         title="Optional workflow override" placeholder="workflow…" />
                   <button class="ghost" id="share-btn" disabled>Share It</button>
                   <button class="ghost" id="new-thread">New thread</button>
                   <button class="minor" id="refresh-conversations">Refresh history</button>
                 </div>
               </div>
-              <div class="input-grid">
-                <div class="field compact">
-                  <label for="context-id">Context ID</label>
-                  <select id="context-id">
-                    <option value="">No context</option>
-                  </select>
-                </div>
-                <div class="field compact">
-                  <label for="workflow-id">Workflow ID</label>
-                  <input type="text" id="workflow-id" placeholder="workflow.chat..." />
-                </div>
-              </div>
-
-              <section class="panel-section collapsed" id="upload-section" aria-label="Upload files">
-                <div class="section-header clickable" id="upload-section-toggle">
-                  <h3>Upload knowledge <span class="toggle-icon">+</span></h3>
-                </div>
-                <div class="section-content">
-                  <p class="subtext">
-                    Attach files to a context before asking questions. Leave Context ID blank to keep uploads private.
-                  </p>
-                  <div class="input-grid">
-                    <div class="field compact">
-                      <label for="upload-context-id">Context ID</label>
-                      <select id="upload-context-id">
-                        <option value="">Private (no context)</option>
-                      </select>
-                    </div>
-                    <div class="field compact">
-                      <label for="upload-chunk-size">Chunk size (optional)</label>
-                      <input type="number" id="upload-chunk-size" placeholder="512" min="64" max="4000" step="64" />
-                    </div>
-                  </div>
-                  <div class="field">
-                    <label for="file-upload">File</label>
-                    <input type="file" id="file-upload" aria-describedby="file-upload-hint" />
-                    <div class="small" id="file-upload-hint"></div>
-                  </div>
-                  <div class="pill-row">
-                    <button type="button" class="minor" id="upload-file-btn">Upload file</button>
-                  </div>
-                  <div class="small" id="file-upload-status" role="status"></div>
-                </div>
-              </section>
-
-              <section class="panel-section collapsed" id="files-section" aria-label="My files">
-                <div class="section-header clickable" id="files-section-toggle">
-                  <h3>My files <span class="toggle-icon">+</span></h3>
-                </div>
-                <div class="section-content">
-                  <p class="subtext">
-                    Browse and download your uploaded files.
-                  </p>
-                  <div class="pill-row">
-                    <button type="button" class="minor" id="refresh-files-btn">Refresh</button>
-                  </div>
-                  <div id="files-list" class="files-list"></div>
-                  <div id="files-empty" class="small">No files uploaded yet.</div>
-                  <div id="files-pagination" class="pagination-controls"></div>
-                </div>
-              </section>
 
               <div id="messages" aria-live="polite"></div>
               <div id="messages-empty" class="empty">Start a new thread to see your conversation history here.</div>
@@ -378,6 +323,65 @@
                   <p class="muted">A note becomes a node. <code>[[Links]]</code> become edges.<br/>The Witness compares your thoughts across time — wherever that process leads.</p>
                 </div>
               </div>
+            </div>
+          </section>
+
+          <!-- Files Tab -->
+          <section class="tab-panel" id="files-tab" aria-label="Files">
+            <div class="panel">
+              <div class="section-header">
+                <h2>Files</h2>
+              </div>
+              <p class="subtext">Upload knowledge into a context, and browse everything you have uploaded.</p>
+              <section class="panel-section" id="upload-section" aria-label="Upload files">
+                <div class="section-header clickable" id="upload-section-toggle">
+                  <h3>Upload knowledge <span class="toggle-icon">+</span></h3>
+                </div>
+                <div class="section-content">
+                  <p class="subtext">
+                    Attach files to a context before asking questions. Leave Context ID blank to keep uploads private.
+                  </p>
+                  <div class="input-grid">
+                    <div class="field compact">
+                      <label for="upload-context-id">Context ID</label>
+                      <select id="upload-context-id">
+                        <option value="">Private (no context)</option>
+                      </select>
+                    </div>
+                    <div class="field compact">
+                      <label for="upload-chunk-size">Chunk size (optional)</label>
+                      <input type="number" id="upload-chunk-size" placeholder="512" min="64" max="4000" step="64" />
+                    </div>
+                  </div>
+                  <div class="field">
+                    <label for="file-upload">File</label>
+                    <input type="file" id="file-upload" aria-describedby="file-upload-hint" />
+                    <div class="small" id="file-upload-hint"></div>
+                  </div>
+                  <div class="pill-row">
+                    <button type="button" class="minor" id="upload-file-btn">Upload file</button>
+                  </div>
+                  <div class="small" id="file-upload-status" role="status"></div>
+                </div>
+              </section>
+
+              <section class="panel-section" id="files-section" aria-label="My files">
+                <div class="section-header clickable" id="files-section-toggle">
+                  <h3>My files <span class="toggle-icon">+</span></h3>
+                </div>
+                <div class="section-content">
+                  <p class="subtext">
+                    Browse and download your uploaded files.
+                  </p>
+                  <div class="pill-row">
+                    <button type="button" class="minor" id="refresh-files-btn">Refresh</button>
+                  </div>
+                  <div id="files-list" class="files-list"></div>
+                  <div id="files-empty" class="small">No files uploaded yet.</div>
+                  <div id="files-pagination" class="pagination-controls"></div>
+                </div>
+              </section>
+
             </div>
           </section>
 

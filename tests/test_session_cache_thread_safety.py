@@ -6,7 +6,7 @@ race conditions under concurrent requests.
 
 import threading
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List
 
@@ -39,8 +39,8 @@ def create_session(user_id: str = None, expires_in_seconds: int = 3600) -> Sessi
         tenant_id="public",
         mfa_required=False,
         mfa_verified=False,
-        created_at=datetime.utcnow(),
-        expires_at=datetime.utcnow() + timedelta(seconds=expires_in_seconds),
+        created_at=datetime.now(timezone.utc),
+        expires_at=datetime.now(timezone.utc) + timedelta(seconds=expires_in_seconds),
     )
 
 

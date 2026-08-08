@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import os
-from typing import Iterator, List, Optional
+from typing import Any, Iterator, List, Optional
 
 from liminallm.config import resolve_provider_endpoint
+from liminallm.logging import get_logger
 from liminallm.service.model_backend import (
     ApiAdapterBackend,
     LocalJaxLoRABackend,
@@ -11,6 +12,8 @@ from liminallm.service.model_backend import (
     StubBackend,
 )
 from liminallm.storage.models import Message
+
+logger = get_logger(__name__)
 
 
 class LLMService:
@@ -26,9 +29,13 @@ class LLMService:
         base_url: Optional[str] = None,
         adapter_server_model: Optional[str] = None,
         fs_root: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        temperature: Optional[float] = None,
         backend: Optional[ModelBackend] = None,
     ) -> None:
         self.base_model = base_model
+        self.reasoning_effort = reasoning_effort
+        self.temperature = temperature
         self.adapter_configs = adapter_configs or {}
         self.backend = backend or self._build_backend(
             backend_mode,
@@ -301,6 +308,26 @@ class LLMService:
             return StubBackend()
         if mode in {"local_lora", "local_gpu_lora"}:
             return LocalJaxLoRABackend(self.base_model, fs_root or "/srv/liminallm")
+        if mode == "gemini_native":
+            from liminallm.service.gemini_backend import GeminiBackend
+
+            override = (
+                self.adapter_configs.get("gemini_native")
+                or self.adapter_configs.get("gemini")
+                or self.adapter_configs.get("openai")
+                or {}
+            )
+            # Same env resolution as the compat providers: the variable name
+            # comes from config's provider table, not a literal here.
+            api_key_env = (resolve_provider_endpoint("gemini") or {}).get("api_key_env")
+            return GeminiBackend(
+                self.base_model,
+                api_key=override.get("api_key") or api_key
+                or (os.getenv(api_key_env) if api_key_env else None),
+                base_url=override.get("base_url") or base_url,
+                reasoning_effort=self.reasoning_effort,
+                temperature=self.temperature,
+            )
 
         # OpenAI-compatible API providers (openai, anthropic, zhipu/glm, together,
         # gemini). Each resolves credentials as: explicit adapter_configs override,
@@ -332,6 +359,8 @@ class LLMService:
                 adapter_server_model=adapter_server_model,
                 provider=provider,
                 api_key_env=api_key_env,
+                reasoning_effort=self.reasoning_effort,
+                temperature=self.temperature,
             )
 
         # adapter_server and other adapter-id providers (azure, vertex, bedrock,
@@ -346,4 +375,5 @@ class LLMService:
             base_url=base_url,
             adapter_server_model=adapter_server_model,
             provider=provider,
+            reasoning_effort=self.reasoning_effort,
         )

@@ -58,7 +58,7 @@ Router Updates ← Eval Gate ← Adapter Training ← Prompt-Mode Skill
   - promoted pdfs and images get fleeced for content: text layer → pypdf, images and scans → ocr, then model vision. install `tesseract-ocr` + `pip install 'liminallm[ocr]'` — technically optional, practically required
 
 - **context that fits the model you actually run**
-  - the prompt budget comes from the serving model's real window — asked of the provider (gemini and vllm both report it), else a known-family table, else a conservative default; `MODEL_CONTEXT_WINDOW` overrides when discovery guesses wrong
+  - the prompt budget comes from the serving model's real window — asked of the provider (gemini and vllm both report it), else a known-family table, else a conservative default; `model_context_window` overrides when discovery guesses wrong
   - recent turns go verbatim; older ones are folded into a rolling digest kept on the conversation, so a long chat degrades to “remembers less precisely” instead of “forgets entirely”
   - the digest is written off the hot path and never blocks a reply; the window is the same whether redis is up or down
 
@@ -155,109 +155,8 @@ for v1 these can all live in one python app with clear module boundaries.
 
 ## quick start
 
-### Option 1: Docker (Recommended for QA/Testing)
-
-```bash
-# Start the full test stack (Postgres, Redis, App)
-docker compose -f docker-compose.test.yml up --build
-
-# Verify health
-curl http://localhost:8000/healthz
-
-# Pre-configured admin credentials:
-#   Email: admin@test.local
-#   Password: TestAdmin123!
-```
-
-This automatically:
-- Runs database migrations
-- Bootstraps an admin user
-- Serves the chat UI at `http://localhost:8000/`
-- Serves the admin console at `http://localhost:8000/admin`
-
-### Option 2: Native Deployment (No Docker)
-
-For running directly on a Linux host without containers.
-
-#### Quick Start (In-Memory Mode)
-
-For development and testing without external dependencies:
-
-```bash
-# Install dependencies
-pip install -e ".[dev]"
-
-# Set required environment variables
-export JWT_SECRET="YourSecure-JWT-Secret-With-32-Characters!"
-export SHARED_FS_ROOT="/tmp/liminallm"
-export USE_MEMORY_STORE=true
-export TEST_MODE=true
-
-# Start the API server
-uvicorn liminallm.app:app --reload --host 0.0.0.0 --port 8000
-
-# Verify health
-curl http://localhost:8000/healthz
-```
-
-#### Production (With PostgreSQL and Redis)
-
-For persistent storage and production use:
-
-```bash
-# 1. Install system dependencies
-sudo apt update
-sudo apt install -y python3.11 python3.11-venv postgresql-16 redis-server libpq-dev gcc
-
-# 2. Install PostgreSQL extensions
-sudo -u postgres psql -c "CREATE DATABASE liminallm;"
-sudo -u postgres psql -c "CREATE USER liminallm WITH PASSWORD 'yourpassword';"
-sudo -u postgres psql -d liminallm -c "CREATE EXTENSION IF NOT EXISTS vector;"
-sudo -u postgres psql -d liminallm -c "CREATE EXTENSION IF NOT EXISTS citext;"
-sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE liminallm TO liminallm;"
-
-# 3. Create Python environment and install
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-
-# 4. Create data directories
-sudo mkdir -p /srv/liminallm/{adapters,artifacts,models,users}
-sudo chown -R $USER:$USER /srv/liminallm
-
-# 5. Set environment variables
-export DATABASE_URL="postgresql://liminallm:yourpassword@localhost:5432/liminallm"
-export REDIS_URL="redis://localhost:6379/0"
-export JWT_SECRET="YourSecure-JWT-Secret-With-32-Characters!"
-export SHARED_FS_ROOT="/srv/liminallm"
-
-# 6. Run database migrations
-./scripts/migrate.sh
-
-# 7. Bootstrap admin user
-python scripts/bootstrap_admin.py --email admin@test.local --password TestAdmin123!
-
-# 8. Start the server
-uvicorn liminallm.app:app --host 0.0.0.0 --port 8000 --workers 4
-```
-
-#### Running Tests (Native)
-
-```bash
-# Run all tests in memory mode
-TEST_MODE=true USE_MEMORY_STORE=true pytest tests/ -v
-
-# Run specific test suites
-pytest tests/test_post_smoke.py -v  # Post-smoke tests
-pytest tests/test_integration_admin.py -v  # Admin tests
-
-# Run smoke tests
-./scripts/smoke_test.sh http://localhost:8000
-```
-
-See `docs/DEPLOYMENT.md` for complete native deployment documentation including systemd services, TLS setup, and GPU configuration.
-
----
+See [INSTALL.md](INSTALL.md) — Docker on Linux, Linux without Docker, or
+OpenBSD.
 
 ## acceptance criteria (ready to test)
 
@@ -284,7 +183,7 @@ Run the automated smoke test:
 
 ## deployment
 
-- Install and runtime guidance (docker compose and manual host setup) live in `docs/DEPLOYMENT.md`
+- Installation in [INSTALL.md](INSTALL.md); operations and backend lanes in `docs/DEPLOYMENT.md`
 - Configuration architecture documented in `docs/CONFIGURATION.md`
 - Testing guide in `TESTING.md`
 
@@ -320,7 +219,7 @@ Run the automated smoke test:
    - filesystem path accessible to the app
  - gpu / tpu for jax model if you expect to train adapters
  - backend selection is single-sourced from the SQL deployment config (editable from the web console when wired); env vars only override if you set them explicitly
-  - set `MODEL_BACKEND=local_gpu_lora` to target the local JAX+LoRA path instead of external API fine-tune IDs; omit or leave as the default to use the OpenAI-style plug. The JAX backend (`LocalJaxLoRABackend` in `liminallm/service/model_backend.py`) loads adapters from the filesystem, tokenizes prompts, runs a JAX forward pass, and enforces conservative shapes; it requires a JAX runtime and optionally a Transformers tokenizer for decode parity. OpenAI plug secrets live under adapter-specific env vars (see below).
+  - set `model_backend` to `local_gpu_lora` in the admin console to target the local JAX+LoRA path instead of external API fine-tune IDs; leave the default to use the OpenAI-style plug. The JAX backend (`LocalJaxLoRABackend` in `liminallm/service/model_backend.py`) loads adapters from the filesystem, tokenizes prompts, runs a JAX forward pass, and enforces conservative shapes; it requires a JAX runtime and optionally a Transformers tokenizer for decode parity. Provider keys are admin settings, with `<PROVIDER>_API_KEY` as an environment fallback.
 
 ### frontend (chat + admin)
 
@@ -330,7 +229,7 @@ Run the automated smoke test:
 
 ### tests
 
-- Run `scripts/run_tests.sh` to mirror CI defaults; it compiles the code and executes `pytest` with in-memory stores enabled for deterministic local runs.
+- Run `scripts/run_tests.sh` to mirror CI defaults; it compiles the code and executes `pytest`. the suite spins up a throwaway postgres cluster and a throwaway redis (`tests/harness.py`) and applies `sql/schema.sql`, so tests exercise the same store and cache production runs — set `TEST_DATABASE_URL` / `TEST_REDIS_URL` to point at existing services instead.
 
 ### adapters: local LoRA vs remote fine-tune IDs vs prompt-distilled
 
@@ -387,18 +286,22 @@ Run the automated smoke test:
 - “Adapter-ID adapters” (multi-LoRA / adapter servers) surface `adapter_id` parameters on Together AI Serverless Multi-LoRA, LoRAX-style servers, or SageMaker adapter inference components. The backend keeps the base model string and passes `adapter_id` for one-or-more adapters per request when supported.
 - Hybrid patterns (local adapter-enabled “controller” + external API “executor”) flow through the same artifacts: the controller uses a local LoRA backend to plan, then the API backend executes with prompt or remote-model adapters.
 
-2. **configure env**
-   - `DATABASE_URL` – postgres dsn
-   - `REDIS_URL` – redis dsn
-   - `SHARED_FS_ROOT` – filesystem root path
-   - `MODEL_PATH` – model identifier for cloud mode (default `gpt-4o-mini`) or filesystem path when using an adapter server
-   - `OPENAI_ADAPTER_API_KEY` – OpenAI plug API key (leave unset to use the echo fallback)
-   - `OPENAI_ADAPTER_BASE_URL` – optional base URL override when pointing at an OpenAI-compatible endpoint
-   - `ADAPTER_SERVER_MODEL` – model name when pointing at an OpenAI-compatible adapter server
-   - `USE_MEMORY_STORE` – set to `true` to run without Postgres/Redis while testing the API and LLM calls
-   - `TEST_MODE` – set to `true` to allow Redis-free test harnesses (rate limits, idempotency durability, and caches are disabled)
-   - `RAG_CHUNK_SIZE` – default character window for knowledge ingestion; overrides can be provided per request
-   - `RAG_MODE` – `pgvector` (default) uses the database index; `local_hybrid` forces the in-process BM25+cosine fallback for dev/test
+2. **configure env** — one variable
+   - `DATABASE_URL` – postgres dsn. that is the configuration.
+
+   four others exist and none of them are settings you tune: `BUILD_SHA`
+   (stamped by the build), `TEST_MODE` (the test harness),
+   `EMBEDDING_VECTOR_DIM` (a property of the schema you applied, shared with
+   `scripts/migrate.sh`), and `EXTRACT_READER_PLUGINS` (imports python
+   modules, so making it settable from a web form would mean remote code
+   execution).
+
+   everything else — the model, credentials, rate limits, ttls, cors, smtp,
+   the signing key — lives in the database and is edited from the admin
+   console at `/admin.html`, applied to every replica without a restart.
+   changing an smtp password should not require redeploying the app. for
+   declarative deploys, seed on first boot with
+   `INSTANCE_SETTINGS_JSON='{"model_backend": "stub"}'`.
 
 3. **migrate db**
    - run the alembic / migration tool to create tables described in the spec.
@@ -450,7 +353,7 @@ MIT
 See `TESTING.md` for comprehensive testing documentation.
 
 ```bash
-# Quick test (in-memory, no external dependencies)
+# The suite starts its own throwaway Postgres; no setup needed
 ./scripts/run_tests.sh
 
 # Full integration test with Docker
@@ -473,4 +376,4 @@ Admin endpoints (`/v1/admin/*`, `/v1/config/*`) require admin role.
 ## operational hardening
 
 - local rate limits now fall back to in-process counters when Redis is unavailable (TEST_MODE), covering auth and chat flows
-- uploads are capped by `MAX_UPLOAD_BYTES` to prevent unbounded in-memory reads
+- uploads are capped by `max_upload_bytes` to prevent unbounded in-memory reads

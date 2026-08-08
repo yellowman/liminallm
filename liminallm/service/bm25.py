@@ -1,7 +1,7 @@
 """BM25 scoring utilities for hybrid RAG retrieval.
 
 Shared implementation per SPEC §2.5 retrieval strategy to avoid duplication
-between PostgresStore and MemoryStore.
+across the store and the RAG service.
 """
 
 from __future__ import annotations

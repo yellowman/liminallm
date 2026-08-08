@@ -27,11 +27,11 @@ overruns the model.
 from __future__ import annotations
 
 import math
-import re
 import threading
 from typing import Any, Callable, Optional
 
 from liminallm.logging import get_logger
+from liminallm.service.tokenizer_utils import estimate_token_count
 
 logger = get_logger(__name__)
 
@@ -52,10 +52,6 @@ _OPENAI_ENCODINGS = (
 # Per-message overhead in the chat wire format (role, delimiters).
 MESSAGE_OVERHEAD_TOKENS = 4
 
-# CJK bills near one token per character; the old estimator undercounted it
-# roughly fourfold.
-_CJK_RE = re.compile(r"[぀-ヿ㐀-鿿가-힯]")
-
 # Calibration bounds: a correction factor outside this range means the
 # observation was mismatched (tool results, images, provider-side system
 # prompts), not that our estimate is that wrong.
@@ -65,23 +61,6 @@ _EMA_ALPHA = 0.25
 # Ignore tiny prompts: fixed per-request overhead dominates and would skew
 # the factor upward forever.
 _MIN_OBSERVE_TOKENS = 200
-
-
-def heuristic_token_count(text: str) -> int:
-    """Tokenizer-free estimate, deliberately conservative (over-counts).
-
-    Splits by script: CJK characters bill near 1:1, everything else at
-    4 chars/token with a word-count floor.
-    """
-    if not text:
-        return 0
-    normalized = text.strip()
-    if not normalized:
-        return 0
-    cjk = len(_CJK_RE.findall(normalized))
-    rest = len(normalized) - cjk
-    wordish = len(re.findall(r"\S+", normalized))
-    return max(wordish, cjk + math.ceil(rest / 4))
 
 
 def _tiktoken_encoding_name(model: str) -> Optional[str]:
@@ -153,7 +132,7 @@ class TokenCounter:
                     return len(self._encode(text))
             except Exception as exc:  # noqa: BLE001 - never block a turn
                 logger.warning("token_count_failed", error=str(exc))
-        return math.ceil(heuristic_token_count(text) * self.factor)
+        return math.ceil(estimate_token_count(text) * self.factor)
 
     def count_messages(self, messages: list[dict]) -> int:
         """Chat-format total: content plus per-message wire overhead."""

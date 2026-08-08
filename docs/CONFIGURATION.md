@@ -12,17 +12,20 @@ LiminalLM has three configuration sources, each serving a different purpose:
 **When loaded:** Application startup
 **Mutability:** Immutable after startup
 
-Used for:
-- Secrets (JWT_SECRET, API keys, SMTP passwords)
-- Infrastructure URLs (DATABASE_URL, REDIS_URL)
-- Development flags (TEST_MODE, ALLOW_REDIS_FALLBACK_DEV)
-- Default values for settings not in database
+Reserved for what must be readable *before* the database is: `DATABASE_URL`,
+plus `BUILD_SHA`, `TEST_MODE`, `EMBEDDING_VECTOR_DIM` and
+`EXTRACT_READER_PLUGINS`, which are not settings. Provider credentials
+(`OPENAI_API_KEY`, `GEMINI_API_KEY`, …) are read as a fallback when the
+matching admin setting is blank, and `INSTANCE_SETTINGS_JSON` seeds managed
+settings on first boot.
+
+Nothing else is read from the environment. A variable that is not in that
+list — `MODEL_BACKEND`, `REDIS_URL`, `SMTP_HOST` — is ignored.
 
 ```bash
 # Example
-export JWT_SECRET="your-secure-secret-here"
 export DATABASE_URL="postgresql://user:pass@localhost/liminallm"
-export MODEL_BACKEND="openai"
+export OPENAI_API_KEY="sk-..."
 ```
 
 ### 2. System Settings (Admin-Managed)
@@ -56,36 +59,82 @@ Used for deployment-level configuration that's visible but not directly editable
 - Adapter mode
 - RAG mode
 
-## Resolution Order
+## Where a setting comes from
 
-When the runtime initializes, settings are resolved in this order:
+Almost everything lives in the database. A setting in an environment variable
+is a value that differs per container, cannot be seen from inside the running
+system, cannot be changed without a redeploy, and is invisible to the console
+that claims to manage it. Restarting the application to change an SMTP
+password is the wrong answer.
 
-1. **Database (system_settings)** - highest priority
-2. **Environment variables** - fallback if not in database
+**Environment** — five variables, and only the first is configuration:
 
-```python
-# Example from runtime.py
-model_path = sys_settings.get("model_path") or self.settings.model_path
+| Variable | Why it cannot live in the database |
+|---|---|
+| `DATABASE_URL` | It is how you reach the database |
+| `BUILD_SHA` | Stamped by the build; provenance, not a setting |
+| `TEST_MODE` | The harness tells the process it is a test before anything else, and it must not be flippable from a web form |
+| `EMBEDDING_VECTOR_DIM` | A property of the schema that was applied; `scripts/migrate.sh` needs the same value |
+| `EXTRACT_READER_PLUGINS` | Imports Python modules — settable from the console would mean remote code execution |
+
+**Database** — everything else, declared with `managed_field` and edited from
+the admin console.
+
+**Database, write-only** — credentials, declared with `secret_field`: the SMTP
+password, provider API keys, OAuth client secrets, and the JWT signing key.
+Stored like any other setting so they can be rotated from the console, but
+redacted from every read: `GET /admin/settings` returns them empty, the schema
+endpoint reports only whether one is set, and a blank field on save means "not
+retyped", never "erase it". The signing key generates itself on first boot —
+which also fixed a quieter problem, since it used to be generated per process
+into a file, so a replica that could not read that file rejected tokens the
+others had issued.
+
+```
+managed_field default  ->  what an admin saved  ->  runtime.settings
+     (shipped)              (instance_config)        (what code reads)
 ```
 
-### Bootstrap Sync for MODEL_BACKEND
+`Runtime.refresh_settings()` builds that overlay once. Request handlers read
+plain attributes off `runtime.settings`; they do not merge dicts and they do
+not query the database per request. The settings watcher re-runs the overlay
+when another worker writes a change, so an edit reaches every replica within
+`settings_watch_interval_seconds`. Services that capture configuration at
+construction — the mailer and the voice service — are rebuilt, because handing
+them a new settings object would not change the mail they send.
 
-Because system_settings takes precedence over environment variables, the `MODEL_BACKEND`
-env var would normally be ignored if the database has a default value (e.g., "openai").
+Nothing seeds the defaults into the database. A stored value means an admin
+chose it; a shipped default written to the table would be indistinguishable
+from a choice and would silently outrank everything else.
 
-To ensure environment variables work as expected during initial setup or testing,
-`scripts/bootstrap_admin.py` syncs `MODEL_BACKEND` from the environment to system_settings:
+## Adding a setting
+
+Declare it once, on `Settings` in `liminallm/config.py`:
 
 ```python
-# During bootstrap, if MODEL_BACKEND env var is set, write it to system_settings
-desired_backend = os.environ.get("MODEL_BACKEND")
-if desired_backend:
-    runtime.store.set_system_settings({"model_backend": desired_backend})
+my_setting: int = managed_field(30, ge=1, le=600, description="What it does")
 ```
 
-This is particularly useful for:
-- **Testing**: Set `MODEL_BACKEND=stub` to use deterministic canned responses
-- **CI pipelines**: Override the default backend without modifying the database manually
+The bounds go on the field, not in the code that reads it: the admin API
+validates against them, and the console renders a control that already
+enforces them. The console builds itself from
+`GET /v1/admin/settings/schema`, so there is nothing to add to the frontend.
+
+### Declarative deploys
+
+Managed settings have no environment variables, which would leave a
+compose/k8s deploy unable to configure anything without a human opening the
+admin UI. `INSTANCE_SETTINGS_JSON` is the one seam:
+
+```yaml
+environment:
+  INSTANCE_SETTINGS_JSON: '{"model_backend": "stub", "notes_enabled": false}'
+```
+
+It is a *seed*, not an override: it is applied only when no admin has saved
+anything yet. Once a value is in the database it wins, so a stale container
+env cannot quietly revert what an operator changed. Unknown keys are logged
+and dropped, and a malformed value never blocks boot.
 
 ## Admin UI Workflow
 
@@ -117,9 +166,21 @@ This is particularly useful for:
 
 ### To add a runtime-configurable setting:
 
-1. Add to `get_system_settings()` defaults in both:
-   - `liminallm/storage/memory.py`
-   - `liminallm/storage/postgres.py`
+1. Declare it once, on `Settings` in `liminallm/config.py`:
+
+   ```python
+   my_setting: int = env_field(30, "MY_SETTING", admin=True)
+   ```
+
+   `admin=True` puts it in the admin UI and flows its default into
+   `SYSTEM_SETTINGS_DEFAULTS` automatically. Do not also write the default into
+   that dict — the whole point is that there is one value. A setting with no
+   env var (an operational limit tuned only from the UI) goes in
+   `_ADMIN_ONLY_DEFAULTS` instead.
+
+   Precedence at read time is: admin override > env var > declared default.
+   Nothing seeds the defaults into the database, so a shipped default never
+   masquerades as something an admin chose.
 
 2. Use it in code with fallback:
    ```python
@@ -158,11 +219,19 @@ def get_rate_limit():
     return runtime.store.get_system_settings().get("chat_rate_limit_per_minute", 60)
 ```
 
-### Don't store secrets in system_settings
-```python
-# BAD: Putting API keys in system_settings (visible in admin UI)
-sys_settings["openai_api_key"] = "sk-..."
+### Declare a secret as a secret, not as an ordinary setting
+`secret_field` stores the value in the database like any other managed
+setting — so an operator can rotate a key without a redeploy — but redacts it
+from every read path: `GET /admin/settings` returns an empty string and the
+console renders a write-only control.
 
-# GOOD: Keep secrets in environment variables
-os.environ.get("OPENAI_API_KEY")
+```python
+# BAD: an ordinary managed_field echoes its value back to every admin
+openai_api_key: str = managed_field("", description="...")
+
+# GOOD
+openai_api_key: str = secret_field(description="... Write-only.")
 ```
+
+Bootstrap secrets are the exception: `JWT_SECRET` and `DATABASE_URL` are
+needed before the database can be read, so they stay outside it.

@@ -11,7 +11,6 @@ from typing import Callable, Dict, List, Optional, Sequence, Union
 from liminallm.logging import get_logger
 from liminallm.service.embeddings import deterministic_embedding
 from liminallm.service.fs import PathTraversalError, safe_join
-from liminallm.storage.memory import MemoryStore
 from liminallm.storage.models import KnowledgeChunk
 from liminallm.storage.postgres import PostgresStore
 
@@ -49,7 +48,7 @@ class RAGService:
 
     def __init__(
         self,
-        store: PostgresStore | MemoryStore,
+        store: PostgresStore,
         default_chunk_size: int = 400,
         *,
         rag_mode: str | Enum | None = None,
@@ -63,17 +62,11 @@ class RAGService:
         self.embed = embed
         self.embedding_model_id = embedding_model_id
 
-        if self._uses_pgvector():
-            if not hasattr(store, "search_chunks_pgvector"):
-                raise ValueError("pgvector-backed store required for RAGService")
-            self._retriever = self._retrieve_pgvector
-        else:
-            if hasattr(store, "search_chunks"):
-                self._retriever = self._retrieve_local_hybrid
-            elif hasattr(store, "search_chunks_legacy"):
-                self._retriever = self._retrieve_local_hybrid
-            else:
-                raise ValueError("legacy-backed store required for hybrid RAG mode")
+        self._retriever = (
+            self._retrieve_pgvector
+            if self._uses_pgvector()
+            else self._retrieve_local_hybrid
+        )
 
     def retrieve(
         self,
@@ -203,54 +196,26 @@ class RAGService:
         allowed: List[str] = []
         filtered_reasons: Dict[str, str] = {}
 
-        if hasattr(self.store, "contexts"):
-            contexts = getattr(self.store, "contexts")
-            users = getattr(self.store, "users", {})
-            for ctx_id in context_ids:
-                ctx = contexts.get(ctx_id) if isinstance(contexts, dict) else None
-                if not ctx:
-                    filtered_reasons[ctx_id] = "not_found"
+        for ctx_id in context_ids:
+            context = self.store.get_context(ctx_id)
+            if not context:
+                filtered_reasons[ctx_id] = "not_found"
+                continue
+            visibility = (
+                (context.meta or {}).get("visibility") if context.meta else None
+            )
+            if user_id and context.owner_user_id != user_id:
+                if visibility not in {"shared", "global"}:
+                    filtered_reasons[ctx_id] = "owner_mismatch"
                     continue
-                visibility = (ctx.meta or {}).get("visibility") if ctx.meta else None
-                if user_id and ctx.owner_user_id != user_id:
-                    if visibility not in {"shared", "global"}:
-                        filtered_reasons[ctx_id] = "owner_mismatch"
-                        continue
-                # "global" is cross-tenant by design (see the visibility
-                # contract in the stores); only "shared" is tenant-scoped.
-                if tenant_id and visibility == "shared":
-                    owner = (
-                        users.get(ctx.owner_user_id)
-                        if isinstance(users, dict)
-                        else None
-                    )
-                    if not owner or owner.tenant_id != tenant_id:
-                        filtered_reasons[ctx_id] = "tenant_mismatch"
-                        continue
-                allowed.append(ctx_id)
-        else:
-            for ctx_id in context_ids:
-                context = getattr(self.store, "get_context", lambda *_: None)(ctx_id)
-                if not context:
-                    filtered_reasons[ctx_id] = "not_found"
+            # "global" is cross-tenant by design (see the visibility contract
+            # in the store); only "shared" is tenant-scoped.
+            if tenant_id and visibility == "shared":
+                owner = self.store.get_user(context.owner_user_id)
+                if not owner or owner.tenant_id != tenant_id:
+                    filtered_reasons[ctx_id] = "tenant_mismatch"
                     continue
-                visibility = (
-                    (context.meta or {}).get("visibility") if context.meta else None
-                )
-                if user_id and context.owner_user_id != user_id:
-                    if visibility not in {"shared", "global"}:
-                        filtered_reasons[ctx_id] = "owner_mismatch"
-                        continue
-                # "global" is cross-tenant by design (see the visibility
-                # contract in the stores); only "shared" is tenant-scoped.
-                if tenant_id and visibility == "shared":
-                    owner = getattr(self.store, "get_user", lambda *_: None)(
-                        context.owner_user_id
-                    )
-                    if not owner or owner.tenant_id != tenant_id:
-                        filtered_reasons[ctx_id] = "tenant_mismatch"
-                        continue
-                allowed.append(ctx_id)
+            allowed.append(ctx_id)
 
         # Log if any contexts were filtered for debugging
         if filtered_reasons:
@@ -310,17 +275,13 @@ class RAGService:
             return []
 
         query_embedding = self.embed(query)
-        legacy_search = getattr(self.store, "search_chunks", None) or getattr(
-            self.store, "search_chunks_legacy", None
-        )
-        if not callable(legacy_search):
-            return []
-
         results: List[KnowledgeChunk] = []
         per_context_limit = max(1, math.ceil(limit / len(allowed_ids)))
         for ctx_id in allowed_ids:
             results.extend(
-                legacy_search(ctx_id, query, query_embedding, per_context_limit)
+                self.store.search_chunks(
+                    ctx_id, query, query_embedding, per_context_limit
+                )
             )
 
         filtered = [
@@ -346,8 +307,6 @@ class RAGService:
         - Creates chunks with specified token count
         - Applies overlap between consecutive chunks for context continuity
         """
-        if not hasattr(self.store, "add_chunks"):
-            return 0
         # Issue 24.5: Normalize Unicode input so equivalent text shares canonical form
         text = unicodedata.normalize("NFC", text)
         lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
@@ -506,8 +465,12 @@ class RAGService:
                         fs_path=fs_path,
                         allowed_base=str(allowed_base),
                     )
+                    # The base is in the log line above, not in the message:
+                    # this reaches the client as a 400 body, and naming the
+                    # server's root is free reconnaissance for whoever is
+                    # probing with traversal paths.
                     raise PathTraversalError(
-                        f"path must be within allowed base directory: {allowed_base}"
+                        "path is outside the allowed base directory"
                     )
             else:
                 # For relative paths, use safe_join which validates traversal

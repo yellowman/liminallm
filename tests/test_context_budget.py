@@ -4,28 +4,29 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from types import SimpleNamespace
 
 import pytest
 
-from liminallm.service import compaction
+from liminallm.service import compaction, turn_effects
 from liminallm.service.model_backend import (
     DEFAULT_CONTEXT_WINDOW,
+    _window_from_json,
     context_window_from_model_dir,
     context_window_from_table,
-    _window_from_json,
 )
 from liminallm.service.runtime import get_runtime
 from liminallm.service.tokenizer_utils import MAX_GENERATION_TOKENS
-
 
 # ---------------------------------------------------------------------------
 # Discovery
 
 
 def test_known_families_resolve_longest_prefix():
-    assert context_window_from_table("gemini-flash-latest") == 1_000_000
-    assert context_window_from_table("gemini-1.5-pro-002") == 2_000_000  # longer wins
+    assert context_window_from_table("gemini-flash-latest") == 1_048_576
+    # Longer wins: the image variants are a fraction of the text window.
+    assert context_window_from_table("gemini-2.5-flash-image") == 32_768
     assert context_window_from_table("gpt-4o-mini") == 128_000
     assert context_window_from_table("gpt-4") == 8_192
     assert context_window_from_table("gpt-4.1-mini") == 1_000_000
@@ -284,15 +285,15 @@ def test_live_gemini_probe_reports_real_window():
 # Token counting: exact where we own the tokenizer, calibrated elsewhere
 
 
-def test_heuristic_no_longer_undercounts_cjk():
-    from liminallm.service.token_counting import heuristic_token_count
+def test_the_estimator_does_not_undercount_cjk():
     from liminallm.service.tokenizer_utils import estimate_token_count
 
     cjk = "这是一段中文文本用来测试分词计数" * 5
-    # The old estimator billed CJK at ~4 chars/token; real tokenizers are
-    # closer to 1, so it undercounted by ~4x — the dangerous direction.
-    assert heuristic_token_count(cjk) > estimate_token_count(cjk) * 2
-    assert heuristic_token_count(cjk) >= len(cjk.strip()) * 0.9
+    # An estimator billing CJK at ~4 chars/token undercounts by ~4x — the
+    # dangerous direction for a number that gates budgets. There were two
+    # estimators once, and only one had the CJK split; this pins the split
+    # onto the single survivor every caller now shares.
+    assert estimate_token_count(cjk) >= len(cjk.strip()) * 0.9
 
 
 def test_local_tokenizer_is_used_and_is_exact():
@@ -412,14 +413,21 @@ def test_budget_uses_the_counter(monkeypatch):
 # Model-specific hazards
 
 
-def test_reasoning_models_get_no_temperature():
+def test_no_temperature_is_sent_unless_an_operator_configured_one():
+    """The old default of 0.2 went out on every non-reasoning request,
+    overriding whatever each provider tuned its model around."""
     from liminallm.service import model_backend as mb
 
     backend = mb.ApiAdapterBackend("gpt-4o-mini", adapter_mode="openai", api_key=None)
-    assert backend._sampling_params("gpt-4o-mini") == {"temperature": 0.2}
+    assert backend._sampling_params("gpt-4o-mini") == {}
+
+    configured = mb.ApiAdapterBackend(
+        "gpt-4o-mini", adapter_mode="openai", api_key=None, temperature=0.2
+    )
+    assert configured._sampling_params("gpt-4o-mini") == {"temperature": 0.2}
     # o-series/gpt-5/gemini-3 reject a caller temperature with a 400.
     for model in ("o1-mini", "o3", "gpt-5.2", "gemini-3-pro"):
-        assert backend._sampling_params(model) == {}, model
+        assert configured._sampling_params(model) == {}, model
 
 
 def test_single_message_cap_allows_long_pastes():
@@ -915,7 +923,8 @@ def test_persisted_embeddings_are_used_and_free(monkeypatch):
 
 def test_embeddings_service_flags_semantic_honestly():
     from liminallm.service.embeddings import (
-        EmbeddingsService, deterministic_embedding, make_provider_encoder,
+        EmbeddingsService,
+        make_provider_encoder,
     )
 
     assert EmbeddingsService("hash").is_semantic is False
@@ -950,7 +959,6 @@ def test_provider_encoder_falls_back_on_failure():
 
 
 def test_backfill_persists_embeddings_for_a_real_encoder():
-    from liminallm.api import routes
 
     runtime = get_runtime()
     store = runtime.store
@@ -965,7 +973,7 @@ def test_backfill_persists_embeddings_for_a_real_encoder():
     runtime.embeddings = _FakeSemanticEmbeddings()
     try:
         history = store.list_messages(convo.id, user_id=user.id)
-        routes._backfill_message_embeddings(runtime, history, user.id)
+        turn_effects.backfill_message_embeddings(runtime, history, user.id)
     finally:
         runtime.embeddings = orig
     refreshed = store.list_messages(convo.id, user_id=user.id)
@@ -1000,42 +1008,56 @@ def test_stale_vectors_are_re_embedded_not_reused():
     assert scores and scores[0] > 0
 
 
-def test_hybrid_search_scores_native_dimension_embeddings():
-    """A 1536-d encoder must not silently collapse semantic search to BM25."""
-    from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
-    from liminallm.storage.common import hybrid_search_chunks
+def test_hybrid_search_ranks_on_the_vector_when_words_do_not_overlap(store):
+    """Semantic search must actually contribute, not collapse to BM25.
+
+    Against PostgresStore.search_chunks, which is the code that runs. These
+    used to drive a hybrid_search_chunks() in storage/common.py that nothing
+    called — the property was right, the implementation was not.
+    """
+    from liminallm.service.embeddings import EMBEDDING_DIM
     from liminallm.storage.models import KnowledgeChunk
 
-    big = [0.0] * 1536
-    big[7] = 1.0
-    other = [0.0] * 1536
-    other[900] = 1.0
-    chunks = [
-        KnowledgeChunk(context_id="c", fs_path="/a", content="alpha text",
-                       embedding=big, chunk_index=0),
-        KnowledgeChunk(context_id="c", fs_path="/b", content="beta text",
+    user = store.create_user(email=f"hs_{uuid.uuid4().hex[:8]}@example.com")
+    ctx = store.upsert_context(user.id, f"hs-{uuid.uuid4().hex[:6]}", "fixture")
+
+    wanted = [0.0] * EMBEDDING_DIM
+    wanted[7] = 1.0
+    other = [0.0] * EMBEDDING_DIM
+    other[EMBEDDING_DIM - 1] = 1.0
+    store.add_chunks(ctx.id, [
+        KnowledgeChunk(context_id=ctx.id, fs_path="/a", content="alpha text",
+                       embedding=wanted, chunk_index=0),
+        KnowledgeChunk(context_id=ctx.id, fs_path="/b", content="beta text",
                        embedding=other, chunk_index=1),
-    ]
-    hits = hybrid_search_chunks(
-        chunks, "zzz", big, limit=2,
-        tokenize_fn=tokenize_text, bm25_scores_fn=compute_bm25_scores,
-    )
-    # The vector-identical chunk must win on semantics alone (no word overlap).
+    ])
+
+    # The query shares no word with either chunk, so only the vector can decide.
+    hits = store.search_chunks(ctx.id, "zzz", wanted, limit=2)
     assert hits and hits[0].fs_path == "/a"
 
 
-def test_hybrid_search_skips_mismatched_dimensions():
-    from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
-    from liminallm.storage.common import hybrid_search_chunks
+def test_the_schema_refuses_a_chunk_of_the_wrong_dimension(store):
+    """Why search_chunks needs no mismatch handling: it cannot happen.
+
+    knowledge_chunk.embedding is VECTOR(:embedding_dim) NOT NULL, so every
+    stored vector has the same width and none is absent. That is a stronger
+    guarantee than a runtime check, and it is what makes a truncated cosine —
+    a number that looks like a similarity but is not — unreachable rather than
+    merely unlikely.
+    """
+    import psycopg
+
+    from liminallm.service.embeddings import EMBEDDING_DIM
+    from liminallm.storage.errors import ConstraintViolation
     from liminallm.storage.models import KnowledgeChunk
 
-    chunks = [
-        KnowledgeChunk(context_id="c", fs_path="/old", content="zzz",
-                       embedding=[1.0] * 64, chunk_index=0),
-    ]
-    # Query from a different encoder: incomparable, not garbage-compared.
-    hits = hybrid_search_chunks(
-        chunks, "zzz", [1.0] * 1536, limit=2,
-        tokenize_fn=tokenize_text, bm25_scores_fn=compute_bm25_scores,
-    )
-    assert isinstance(hits, list)  # no crash; semantic simply contributes 0
+    user = store.create_user(email=f"hs_{uuid.uuid4().hex[:8]}@example.com")
+    ctx = store.upsert_context(user.id, f"hs-{uuid.uuid4().hex[:6]}", "fixture")
+
+    for bad in ([0.0] * (EMBEDDING_DIM + 1), [0.0] * (EMBEDDING_DIM - 1)):
+        with pytest.raises((psycopg.Error, ConstraintViolation, ValueError)):
+            store.add_chunks(ctx.id, [
+                KnowledgeChunk(context_id=ctx.id, fs_path="/bad", content="x",
+                               embedding=bad, chunk_index=0),
+            ])

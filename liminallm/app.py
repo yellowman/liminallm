@@ -9,7 +9,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -68,10 +68,11 @@ async def lifespan(app: FastAPI):
         # Cross-replica coordination: lets POST /chat/cancel reach the worker
         # holding the stream's WebSocket instead of only stopping local ones.
         try:
-            from liminallm.api.routes import CANCEL_CHANNEL, handle_remote_cancel
-            from liminallm.service import token_counting
+            from liminallm.service import cancellation, token_counting
 
-            runtime.bus.subscribe(CANCEL_CHANNEL, handle_remote_cancel)
+            runtime.bus.subscribe(
+                cancellation.CANCEL_CHANNEL, cancellation.handle_remote_cancel
+            )
 
             async def _apply_calibration(data: dict):
                 """A peer learned a better token factor; adopt it."""
@@ -94,9 +95,10 @@ async def lifespan(app: FastAPI):
             logger.warning("cluster_bus_start_failed", error=str(exc))
         # Check training_worker_enabled from DB settings (falls back to env var)
         training_worker_enabled = runtime.settings.training_worker_enabled
-        if hasattr(runtime.store, "get_system_settings"):
-            sys_settings = runtime.store.get_system_settings() or {}
-            training_worker_enabled = sys_settings.get("training_worker_enabled", training_worker_enabled)
+        sys_settings = runtime.store.get_system_settings() or {}
+        training_worker_enabled = sys_settings.get(
+            "training_worker_enabled", training_worker_enabled
+        )
         if training_worker_enabled:
             await runtime.training_worker.start()
             logger.info("training_worker_started_on_startup")
@@ -142,37 +144,78 @@ app = FastAPI(title="LiminalLM Kernel", version=__version__, lifespan=lifespan)
 _CSRF_SAFE_METHODS = {"GET", "HEAD", "OPTIONS", "TRACE"}
 
 
-def _allowed_origins() -> List[str]:
-    # Read current settings rather than the import-time snapshot so the
-    # configured CORS_ALLOW_ORIGINS is honored (and testable).
-    settings = Settings.from_env()
-    if settings.cors_allow_origins:
-        return settings.cors_allow_origins
-    # Default to common local dev hosts; avoid wildcard when credentials are enabled.
-    return [
-        "http://localhost",
-        "http://localhost:3000",
-        "http://localhost:5173",
-        "http://127.0.0.1:3000",
-        "http://127.0.0.1:5173",
-    ]
+#: Local dev hosts, used when nothing is configured. Never a wildcard: with
+#: credentials allowed, a wildcard is an open door.
+_DEFAULT_ORIGINS = [
+    "http://localhost",
+    "http://localhost:3000",
+    "http://localhost:5173",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:5173",
+]
 
 
-def _allow_credentials() -> bool:
-    return Settings.from_env().cors_allow_credentials
+def _cors_policy() -> tuple:
+    """The origins and credentials flag currently in force.
+
+    Prefers the running instance's settings — which carry what an admin saved —
+    and falls back to the environment before the runtime exists (import time,
+    and tests that construct the app directly).
+    """
+    try:
+        from liminallm.service import runtime as runtime_module
+
+        settings = getattr(runtime_module.runtime, "settings", None)
+    except Exception:  # noqa: BLE001 - no runtime yet is the normal early case
+        settings = None
+    if settings is None:
+        settings = Settings.from_env()
+    return (
+        tuple(settings.cors_allow_origins or _DEFAULT_ORIGINS),
+        bool(settings.cors_allow_credentials),
+    )
+
+
+class DynamicCORSMiddleware:
+    """Starlette's CORS implementation, rebuilt when the policy changes.
+
+    CORSMiddleware fixes its origins at construction, which used to mean the
+    allowlist was whatever the environment said when the process started.
+    Origins are an admin-managed setting now, so this re-reads the policy per
+    request and rebuilds the inner middleware only when it actually differs —
+    reusing Starlette's implementation rather than reimplementing CORS, which
+    is not a thing to get subtly wrong.
+    """
+
+    def __init__(self, app, **static):
+        self.app = app
+        self._static = static
+        self._policy = None
+        self._inner = None
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        policy = _cors_policy()
+        if policy != self._policy or self._inner is None:
+            self._policy = policy
+            self._inner = CORSMiddleware(
+                self.app,
+                allow_origins=list(policy[0]),
+                allow_credentials=policy[1],
+                **self._static,
+            )
+        return await self._inner(scope, receive, send)
 
 
 app.add_middleware(
-    CORSMiddleware,
-    allow_origins=_allowed_origins(),
-    allow_credentials=_allow_credentials(),
+    DynamicCORSMiddleware,
     # Restrict to only required HTTP methods
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     # Restrict to only required headers
     allow_headers=[
         "Content-Type",
         "Authorization",
-        "X-Tenant-ID",
         "session_id",
         "Idempotency-Key",
         "X-CSRF-Token",
@@ -475,53 +518,38 @@ async def _dependency_checks() -> tuple[Dict[str, Dict[str, Any]], bool, bool]:
 
     # Database check
     runtime = get_runtime()
-    if hasattr(runtime.store, "verify_connection"):
-        db_ok = await _run_bounded("database", runtime.store.verify_connection)
-    elif hasattr(runtime.store, "_connect"):
-        def _db_probe() -> None:
-            with runtime.store._connect() as conn:
-                conn.execute("SELECT 1").fetchone()
-
-        db_ok = await _run_bounded("database", _db_probe)
-    else:
-        db_ok = True
-        checks["database"] = {"status": "healthy", "type": "memory"}
+    db_ok = await _run_bounded("database", runtime.store.verify_connection)
 
     if not checks.get("database"):
         checks["database"] = {"status": "healthy" if db_ok else "unhealthy"}
 
     # Redis check (if configured). Never gates serving — see the docstring.
     redis_ok = True
-    if hasattr(runtime, "cache") and runtime.cache is not None:
+    if runtime.cache is not None:
         redis_ok = await _run_bounded("redis", runtime.cache.verify_connection)
         checks["redis"] = {"status": "healthy" if redis_ok else "unhealthy", "degraded": not redis_ok}
     else:
         checks["redis"] = {"status": "not_configured"}
 
     # Filesystem check
-    fs_root = getattr(runtime.store, "fs_root", None)
-    if fs_root:
-        fs_path = Path(fs_root)
+    fs_path = Path(runtime.store.fs_root)
 
-        def _fs_probe() -> None:
-            if not fs_path.exists() or not fs_path.is_dir():
-                raise FileNotFoundError(fs_path)
-            # Unique name per probe: SHARED_FS_ROOT is shared across replicas,
-            # and concurrent probes racing on one fixed filename made read_text
-            # hit another probe's unlink — a spurious 503 that drained healthy
-            # replicas.
-            health_file = fs_path / f".health_check-{os.getpid()}-{uuid.uuid4().hex[:8]}"
-            try:
-                health_file.write_text(datetime.utcnow().isoformat())
-                health_file.read_text()
-            finally:
-                health_file.unlink(missing_ok=True)
+    def _fs_probe() -> None:
+        if not fs_path.exists() or not fs_path.is_dir():
+            raise FileNotFoundError(fs_path)
+        # Unique name per probe: SHARED_FS_ROOT is shared across replicas,
+        # and concurrent probes racing on one fixed filename made read_text
+        # hit another probe's unlink — a spurious 503 that drained healthy
+        # replicas.
+        health_file = fs_path / f".health_check-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        try:
+            health_file.write_text(datetime.now(timezone.utc).isoformat())
+            health_file.read_text()
+        finally:
+            health_file.unlink(missing_ok=True)
 
-        fs_ok = await _run_bounded("filesystem", _fs_probe)
-        checks["filesystem"] = {"status": "healthy" if fs_ok else "unhealthy"}
-    else:
-        fs_ok = True
-        checks["filesystem"] = {"status": "not_configured"}
+    fs_ok = await _run_bounded("filesystem", _fs_probe)
+    checks["filesystem"] = {"status": "healthy" if fs_ok else "unhealthy"}
 
     # Reported, never gating: the cluster bus only affects cross-replica
     # cancellation, and "local" is the right answer for a single process.
@@ -541,7 +569,7 @@ def _health_body(checks: Dict[str, Dict[str, Any]], healthy: bool) -> Dict[str, 
         "checks": checks,
         "version": __version__,
         "build": __build__,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
     }
 
 
@@ -593,18 +621,16 @@ async def metrics() -> Response:
         runtime = get_runtime()
 
         # User count
-        if hasattr(runtime.store, "list_users"):
-            try:
-                all_users = runtime.store.list_users(limit=10000)
-                user_count = len(all_users)
-                lines.append('# HELP liminallm_users_total Total number of users')
-                lines.append('# TYPE liminallm_users_total gauge')
-                lines.append(f'liminallm_users_total {user_count}')
-            except Exception as exc:
-                logger.warning("metrics_user_count_failed", error=str(exc))
+        try:
+            user_count = len(runtime.store.list_users(limit=10000))
+            lines.append('# HELP liminallm_users_total Total number of users')
+            lines.append('# TYPE liminallm_users_total gauge')
+            lines.append(f'liminallm_users_total {user_count}')
+        except Exception as exc:
+            logger.warning("metrics_user_count_failed", error=str(exc))
 
         # Active sessions (if Redis available)
-        if hasattr(runtime, "cache") and runtime.cache is not None:
+        if runtime.cache is not None:
             lines.append('# HELP liminallm_cache_available Redis cache availability')
             lines.append('# TYPE liminallm_cache_available gauge')
             lines.append('liminallm_cache_available 1')
@@ -616,12 +642,8 @@ async def metrics() -> Response:
         # Database status
         db_healthy = 0
         try:
-            if hasattr(runtime.store, "_connect"):
-                with runtime.store._connect() as conn:
-                    conn.execute("SELECT 1").fetchone()
-                db_healthy = 1
-            else:
-                db_healthy = 1  # Memory store
+            runtime.store.verify_connection()
+            db_healthy = 1
         except Exception as exc:
             logger.warning("metrics_database_health_failed", error=str(exc))
         lines.append('# HELP liminallm_database_healthy Database connection health')
@@ -629,36 +651,32 @@ async def metrics() -> Response:
         lines.append(f'liminallm_database_healthy {db_healthy}')
 
         # Training job activity
-        list_jobs = getattr(runtime.store, "list_training_jobs", None)
-        if callable(list_jobs):
-            try:
-                jobs = list_jobs()
-                active = len([j for j in jobs if j.status in {"queued", "running"}])
-                lines.append('# HELP liminallm_training_jobs_active Active training jobs')
-                lines.append('# TYPE liminallm_training_jobs_active gauge')
-                lines.append(f'liminallm_training_jobs_active {active}')
-            except Exception as exc:
-                logger.warning("metrics_training_jobs_failed", error=str(exc))
+        try:
+            jobs = runtime.store.list_training_jobs()
+            active = len([j for j in jobs if j.status in {"queued", "running"}])
+            lines.append('# HELP liminallm_training_jobs_active Active training jobs')
+            lines.append('# TYPE liminallm_training_jobs_active gauge')
+            lines.append(f'liminallm_training_jobs_active {active}')
+        except Exception as exc:
+            logger.warning("metrics_training_jobs_failed", error=str(exc))
 
         # Preference event ingestion rate proxy
-        if hasattr(runtime.store, "list_preference_events"):
-            try:
-                events = runtime.store.list_preference_events(user_id=None)  # type: ignore[arg-type]
-                lines.append('# HELP liminallm_preference_events_total Total recorded preference events')
-                lines.append('# TYPE liminallm_preference_events_total counter')
-                lines.append(f'liminallm_preference_events_total {len(events)}')
-            except Exception as exc:
-                logger.warning("metrics_preference_events_failed", error=str(exc))
+        try:
+            events = runtime.store.list_preference_events(user_id=None)
+            lines.append('# HELP liminallm_preference_events_total Total recorded preference events')
+            lines.append('# TYPE liminallm_preference_events_total counter')
+            lines.append(f'liminallm_preference_events_total {len(events)}')
+        except Exception as exc:
+            logger.warning("metrics_preference_events_failed", error=str(exc))
 
         # Adapter usage counts
-        if hasattr(runtime.store, "list_artifacts"):
-            try:
-                adapters = runtime.store.list_artifacts(kind="adapter", owner_user_id=None)  # type: ignore[arg-type]
-                lines.append('# HELP liminallm_adapters_total Adapters stored in system')
-                lines.append('# TYPE liminallm_adapters_total gauge')
-                lines.append(f'liminallm_adapters_total {len(adapters)}')
-            except Exception as exc:
-                logger.warning("metrics_adapters_failed", error=str(exc))
+        try:
+            adapters = runtime.store.list_artifacts(type_filter="adapter")
+            lines.append('# HELP liminallm_adapters_total Adapters stored in system')
+            lines.append('# TYPE liminallm_adapters_total gauge')
+            lines.append(f'liminallm_adapters_total {len(adapters)}')
+        except Exception as exc:
+            logger.warning("metrics_adapters_failed", error=str(exc))
 
     except Exception as exc:
         logger.error("metrics_collection_failed", error=str(exc))
@@ -723,6 +741,3 @@ async def _run_tmp_cleanup(
     except asyncio.CancelledError:
         logger.info("tmp_cleanup_task_cancelled")
 
-
-def create_app() -> FastAPI:
-    return app
