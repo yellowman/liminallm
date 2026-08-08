@@ -1842,9 +1842,9 @@ the following are treated as constants the kernel must honor; LLM edits happen o
   - cancellation: orchestrator issues `{event:"cancel", request_id}`; worker aborts decode, frees KV cache and adapter refs, and emits `cancel_ack` with partial tokens if any.
 
 - **adapter mode configuration**
-  - `DEFAULT_ADAPTER_MODE` environment variable (default: `hybrid`): controls mode for newly created adapters.
+  - `default_adapter_mode` admin setting (default: `hybrid`): controls mode for newly created adapters.
   - valid values: `local`, `remote`, `prompt`, `hybrid` (see §5.0.1 for mode definitions).
-  - `MODEL_BACKEND` determines which adapter modes are compatible:
+  - `model_backend` determines which adapter modes are compatible:
     - `local_lora`/`local_gpu_lora`: supports `local`, `prompt`, `hybrid`
     - API backends (`openai`, `together`, `lorax`, etc.): support `remote`, `prompt`, `hybrid`
   - router automatically filters incompatible adapters before policy evaluation; filtered adapters logged with `adapter_filtered_by_mode` event.
@@ -1993,8 +1993,8 @@ three tiers, from transient to permanent:
    typed paragraphs. methods compose accordingly: `pdf+ocr`, `docx-vision`,
    etc. images (png/jpg incl. cmyk/webp/gif/tiff incl.
    multi-page/bmp — pillow normalizes all of them to what tesseract expects) — and scanned pdfs via their embedded page
-   images — walk a configurable reader roster (`EXTRACT_READERS`, default
-   `ocr,vision`). readers are a registry (`extract.register_reader`), so
+   images — walk a configurable reader roster (the `extract_readers` admin
+   setting, default `ocr,vision`). readers are a registry (`extract.register_reader`), so
    another ocr engine, a dedicated ocr model, or a model on new hardware
    (e.g. a loom-hosted reader once its pjrt plugin lands — see
    docs/jax_backend.md) is a registration, not a rewrite. built-ins: `ocr` =
@@ -2045,8 +2045,8 @@ already self-contained json.
 
 ### 19.7 activation
 
-`notes_enabled` — code default on; env `NOTES_ENABLED`; admin override via
-system settings (databased-managed feature flag). when off: all `/v1/notes/*`
+`notes_enabled` — code default on, overridable from the admin console
+(database-managed feature flag). when off: all `/v1/notes/*`
 routes return 403 `notes_disabled`, the `note_search` tool is never offered,
 and the front-end hides the notes tab on first contact. precedence follows the
 platform rule: admin override > env var > code default.
@@ -2063,8 +2063,8 @@ is wrong in both directions: it wastes 99% of a million-token gemini window
 and overruns a small local checkpoint. resolution order, most authoritative
 first:
 
-1. **admin override / env**: `model_context_window` system setting, else
-   `MODEL_CONTEXT_WINDOW`. set this when discovery guesses wrong.
+1. **admin override**: the `model_context_window` setting. set this when
+   discovery guesses wrong.
 2. **provider probe** (5s, best-effort, never raises): gemini's native
    `models/{id}` states `inputTokenLimit`; self-hosted openai-compatible
    servers (vllm, lorax, lm studio) expose `max_model_len` /
@@ -2141,13 +2141,13 @@ is assembled from three sources, all budget-derived from the discovered
 model window:
 
 1. **verbatim tail** — the longest suffix of recent turns that fits
-   `history_budget` (= `HISTORY_BUDGET_FRACTION`, default 0.5, of the
+   `history_budget` (= `history_budget_fraction`, default 0.5, of the
    prompt budget; floor of 4 turns). on a large-window model turns stay
    verbatim until the window actually pressures; on a small one digestion
    starts early. the boundary is tokens, never a message count.
 2. **recall** — older turns chosen by relevance to the message being
    answered, restored verbatim from the permanent transcript, in
-   chronological order, within `HISTORY_RECALL_FRACTION` (default 0.25) of
+   chronological order, within `history_recall_fraction` (default 0.25) of
    the history budget. ranking is **hybrid semantic + bm25** when a real
    embedding encoder is configured, bm25 alone otherwise. semantic wins the
    cases keywords miss: "which database did we pick" finds "let's go with
@@ -2207,9 +2207,11 @@ budget math is only as good as the count. resolution per backend:
 ### 20.6 other model-specific hazards
 
 - **temperature**: reasoning models (o-series, gpt-5, gemini 3) reject a
-  caller-supplied temperature with a 400 that fails the whole request. the
-  parameter is omitted for them (`is_reasoning_model`); every model has a
-  sane default, so omission is the portable choice.
+  caller-supplied temperature with a 400 that fails the whole request, and
+  others prescribe one fixed value. `temperature_policy` classifies each
+  family as tunable, tunable-only-with-reasoning-off, or omit; nothing is
+  sent unless an operator sets `model_temperature`, because a default of
+  ours would override whatever the provider tuned its model around.
 - **single-message validation** is a dos ceiling
   (`MAX_SINGLE_MESSAGE_TOKENS`), not a model budget. it previously reused
   the 4096 generation constant, which rejected a pasted document that a
@@ -2298,7 +2300,7 @@ re-joined through `safe_join` (zip slip). member type is checked with
 
 ## 22. running more than one replica
 
-postgres and `SHARED_FS_ROOT` are the shared state; nothing in the app
+postgres and `shared_fs_root` are the shared state; nothing in the app
 assumes it is the only process.
 
 - **probes**: `/readyz` is the load-balancer probe and returns 503 when
@@ -2306,7 +2308,7 @@ assumes it is the only process.
   a per-dependency breakdown, so it can never drain a replica. **redis is
   deliberately excluded from readiness** — every redis-backed feature has a
   fallback, so a redis outage must degrade the fleet, not drain it.
-- **cluster bus** (`CLUSTER_BUS_BACKEND`, default `auto`): redis pub/sub when
+- **cluster bus** (`cluster_bus_backend`, default `auto`): redis pub/sub when
   reachable, else postgres `LISTEN`/`NOTIFY` — which is why redis stays
   optional. a single-process deployment gets a no-op backend. carries
   cross-replica cancellation (`POST /chat/cancel` reaching the worker that
@@ -2318,7 +2320,7 @@ assumes it is the only process.
   atomic conditional update. the lock **fails open** when postgres is
   unreachable: maintenance running twice beats never running.
 - **shared vs node-local storage**: every replica mounts the same
-  `SHARED_FS_ROOT` (adapters, artifacts, uploads). `INTERPRETER_SCRATCH_DIR`
+  `shared_fs_root` (adapters, artifacts, uploads). `interpreter_scratch_dir`
   must **not** be on it — throwaway per-call copies belong on local disk.
 - **sticky sessions are not required.** websockets are per-connection and
   cancellation crosses the bus.

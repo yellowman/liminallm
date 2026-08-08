@@ -49,13 +49,13 @@ after: backend lanes, model handling, replicas, and ops defaults.
 - safety rails: content safety classifier on user/assistant text; preference events and training skip disallowed content.
 
 ## running multiple replicas
-scale out by running the same image behind a load balancer. postgres and `SHARED_FS_ROOT` are the shared state; nothing in the app assumes it is the only process.
+scale out by running the same image behind a load balancer. postgres and `shared_fs_root` are the shared state; nothing in the app assumes it is the only process.
 
 - **probes**: point the balancer at `/readyz`, not `/healthz`. `/readyz` fails a node whose database or filesystem is gone; redis is deliberately excluded so a redis outage degrades every node instead of draining the whole fleet.
-- **shared filesystem**: every replica must mount the *same* `SHARED_FS_ROOT` (nfs/efs or equivalent). adapters, artifacts, and user uploads are written by whichever node handled the request and read by any other.
-- **node-local scratch**: `INTERPRETER_SCRATCH_DIR` must stay off shared storage — it holds throwaway per-tool-call copies and defaults to the system temp dir.
+- **shared filesystem**: every replica must mount the *same* `shared_fs_root` (nfs/efs or equivalent). adapters, artifacts, and user uploads are written by whichever node handled the request and read by any other.
+- **node-local scratch**: `interpreter_scratch_dir` must stay off shared storage — it holds throwaway per-tool-call copies and defaults to the system temp dir.
 - **sessions/routing**: sticky sessions are not required. websockets are per-connection, and `POST /chat/cancel` reaches the replica holding the stream over the cluster bus, so a stop button works no matter which node the request lands on.
-- **cluster bus**: `CLUSTER_BUS_BACKEND=auto` (default) uses redis pub/sub when redis is reachable and otherwise falls back to postgres `LISTEN`/`NOTIFY`, which is why redis stays optional. force one with `redis`/`postgres`, or set `local` for a single-process deployment to skip peer coordination entirely. the bus is best-effort: if it is down, cancellation falls back to local-only behavior and nothing else changes.
+- **cluster bus**: `cluster_bus_backend` (default `auto`) uses redis pub/sub when redis is reachable and otherwise falls back to postgres `LISTEN`/`NOTIFY`, which is why redis stays optional. force one with `redis`/`postgres`, or set `local` for a single-process deployment to skip peer coordination entirely. the bus is best-effort: if it is down, cancellation falls back to local-only behavior and nothing else changes.
 - **background work**: periodic clustering and adapter-prune proposals take a postgres advisory lock, so they run once per interval cluster-wide rather than once per replica. training jobs need no lock — claiming a job is an atomic conditional update, so exactly one replica wins each one.
 - **workers per node**: with `model_backend` on `local_gpu_lora` keep `--workers 1` per gpu and scale by adding nodes; api backends scale fine with several workers per node.
 
@@ -71,6 +71,6 @@ scale out by running the same image behind a load balancer. postgres and `SHARED
 ## troubleshooting quick hits
 - health: `curl http://localhost:8000/healthz`.
 - migrations: rerun `scripts/migrate.sh` if schema drift bites.
-- permissions: ensure write access to `SHARED_FS_ROOT` and authenticated connections to redis/postgres.
+- permissions: ensure write access to `shared_fs_root` and authenticated connections to redis/postgres.
 - logs: `docker compose logs -f app` or your process supervisor for startup clues.
 

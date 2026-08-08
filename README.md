@@ -58,7 +58,7 @@ Router Updates ← Eval Gate ← Adapter Training ← Prompt-Mode Skill
   - promoted pdfs and images get fleeced for content: text layer → pypdf, images and scans → ocr, then model vision. install `tesseract-ocr` + `pip install 'liminallm[ocr]'` — technically optional, practically required
 
 - **context that fits the model you actually run**
-  - the prompt budget comes from the serving model's real window — asked of the provider (gemini and vllm both report it), else a known-family table, else a conservative default; `MODEL_CONTEXT_WINDOW` overrides when discovery guesses wrong
+  - the prompt budget comes from the serving model's real window — asked of the provider (gemini and vllm both report it), else a known-family table, else a conservative default; `model_context_window` overrides when discovery guesses wrong
   - recent turns go verbatim; older ones are folded into a rolling digest kept on the conversation, so a long chat degrades to “remembers less precisely” instead of “forgets entirely”
   - the digest is written off the hot path and never blocks a reply; the window is the same whether redis is up or down
 
@@ -376,4 +376,4 @@ Admin endpoints (`/v1/admin/*`, `/v1/config/*`) require admin role.
 ## operational hardening
 
 - local rate limits now fall back to in-process counters when Redis is unavailable (TEST_MODE), covering auth and chat flows
-- uploads are capped by `MAX_UPLOAD_BYTES` to prevent unbounded in-memory reads
+- uploads are capped by `max_upload_bytes` to prevent unbounded in-memory reads

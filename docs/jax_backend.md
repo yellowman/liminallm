@@ -55,8 +55,8 @@ point:
 
 - a multimodal model hosted on loom can implement `transcribe_image` on the
   backend, which plugs it straight into the upload/scanned-pdf extraction
-  ladder (see `service/extract.py` — readers are a registry, `EXTRACT_READERS`
-  orders them);
+  ladder (see `service/extract.py` — readers are a registry, the `extract_readers`
+  admin setting orders them);
 - a small dedicated OCR model on loom can register as an extraction reader
   outright, sitting between tesseract and full model vision in cost.
 

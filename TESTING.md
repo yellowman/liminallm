@@ -95,7 +95,10 @@ Regular test users are created dynamically during tests.
 | `TEST_MODE` | `false` | Enables test mode (relaxed security, in-process fallbacks) |
 | `TEST_DATABASE_URL` | _(unset)_ | Reuse this database instead of starting a scratch cluster |
 | `EMBEDDING_VECTOR_DIM` | `1536` | Vector width; the suite pins `64` to match the hash encoder |
-| `ALLOW_REDIS_FALLBACK_DEV` | `false` | Allow in-process cache when Redis unavailable |
+
+To let the app fall back to an in-process cache when Redis is unavailable,
+enable the `allow_redis_fallback_dev` admin setting — it is stored in the
+database, not read from the environment.
 
 ### Test Database
 

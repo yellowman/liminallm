@@ -123,11 +123,15 @@ class Runtime:
             ):
                 raise RuntimeError(
                     "Redis is required for sessions, rate limits, idempotency, and workflow caches; "
-                    "start Redis or set TEST_MODE=true/ALLOW_REDIS_FALLBACK_DEV=true for local fallback."
+                    "start Redis, set TEST_MODE=true, or enable the "
+                    "allow_redis_fallback_dev setting for local fallback."
                 ) from redis_error
 
+            # test_mode is an environment variable; the other is an admin
+            # setting, and naming it in caps sent operators to export a
+            # variable nothing reads.
             fallback_mode = (
-                "TEST_MODE" if self.settings.test_mode else "ALLOW_REDIS_FALLBACK_DEV"
+                "TEST_MODE" if self.settings.test_mode else "allow_redis_fallback_dev"
             )
 
             logger.warning(
