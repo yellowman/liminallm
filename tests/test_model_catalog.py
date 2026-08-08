@@ -331,3 +331,57 @@ def test_a_recognised_model_stays_at_info(monkeypatch):
     assert backend.context_window == 128_000
     fake.warning.assert_not_called()
     assert fake.info.call_args.kwargs["source"] == "table"
+
+
+class TestAdapterCompatibility:
+    """Adapters must not silently stop working when the backend changes.
+
+    The router filters adapters to the modes its backend supports. A backend
+    with no entry falls to a PROMPT-only default, so a hybrid adapter that
+    works on openai is dropped without ever failing loudly.
+    """
+
+    HOSTED_API_BACKENDS = (
+        "xai", "grok", "deepseek", "moonshot", "kimi", "qwen", "dashscope",
+        "baichuan", "minimax", "mistral", "cohere", "meta", "fireworks",
+        "groq", "cerebras", "gemini_native",
+    )
+
+    @pytest.mark.parametrize("backend", HOSTED_API_BACKENDS)
+    def test_prompt_and_hybrid_adapters_apply(self, backend):
+        from liminallm.config import AdapterMode, get_compatible_adapter_modes
+
+        modes = get_compatible_adapter_modes(backend)
+        assert AdapterMode.PROMPT in modes, backend
+        assert AdapterMode.HYBRID in modes, backend
+
+    @pytest.mark.parametrize("backend", HOSTED_API_BACKENDS)
+    def test_remote_adapters_do_not(self, backend):
+        """None of these expose an adapter-id parameter, so offering remote
+        adapters would route to a request the provider cannot honour."""
+        from liminallm.config import AdapterMode, get_compatible_adapter_modes
+
+        assert AdapterMode.REMOTE not in get_compatible_adapter_modes(backend), backend
+
+    def test_every_selectable_backend_declares_its_modes(self):
+        """A backend an admin can pick must not rely on the default — that is
+        how hybrid got dropped in the first place."""
+        from liminallm.config import BACKEND_ADAPTER_COMPATIBILITY, ModelBackend
+
+        undeclared = [
+            mode.value for mode in ModelBackend
+            if mode.value not in BACKEND_ADAPTER_COMPATIBILITY
+        ]
+        assert undeclared == [], undeclared
+
+
+def test_a_listing_naming_the_model_without_a_window_stays_silent():
+    """Together publishes "-" for models whose capacity it will not commit to.
+    Reading a window from elsewhere in the payload would invent one."""
+    from liminallm.service.model_backend import _window_from_json
+
+    payload = {"object": "list", "data": [
+        {"id": "moonshotai/Kimi-K3", "context_length": 1_000_000},
+        {"id": "Qwen/Qwen3.7-Max"},
+    ]}
+    assert _window_from_json(payload, model="Qwen/Qwen3.7-Max") is None

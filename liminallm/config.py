@@ -127,6 +127,27 @@ BACKEND_ADAPTER_COMPATIBILITY: dict[str, set[str]] = {
     "adapter_server": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
     "sagemaker": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
     "aws_sagemaker": {AdapterMode.REMOTE, AdapterMode.PROMPT, AdapterMode.HYBRID},
+    # Hosted model APIs with no adapter-id parameter: prompt injection always
+    # applies, and hybrid is defined as falling back to prompt when no local
+    # weights are present, so it applies too. Without an entry here these fall
+    # to the PROMPT-only default and hybrid adapters are silently dropped —
+    # the same adapter keeps working on openai, which is the confusing part.
+    "xai": {AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "grok": {AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "deepseek": {AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "moonshot": {AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "kimi": {AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "qwen": {AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "dashscope": {AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "baichuan": {AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "minimax": {AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "mistral": {AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "cohere": {AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "meta": {AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "fireworks": {AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "groq": {AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "cerebras": {AdapterMode.PROMPT, AdapterMode.HYBRID},
+    "gemini_native": {AdapterMode.PROMPT, AdapterMode.HYBRID},
     # Local backend supports local weights
     "local_lora": {AdapterMode.LOCAL, AdapterMode.PROMPT, AdapterMode.HYBRID},
     "local_gpu_lora": {AdapterMode.LOCAL, AdapterMode.PROMPT, AdapterMode.HYBRID},
