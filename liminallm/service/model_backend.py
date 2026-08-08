@@ -418,7 +418,7 @@ KNOWN_CONTEXT_WINDOWS: List[Tuple[str, int]] = [
     # Google. Verified against a live ListModels call: every current Gemini
     # text model reports inputTokenLimit 1048576. The image, TTS, and
     # computer-use variants are much smaller and would otherwise inherit 1M.
-    ("gemini", 1_000_000),
+    ("gemini", 1_048_576),
     ("gemini-2.5-flash-image", 32_768),
     ("gemini-3.1-flash-image", 65_536),
     ("gemini-3-pro-image", 131_072),
@@ -478,6 +478,7 @@ KNOWN_CONTEXT_WINDOWS: List[Tuple[str, int]] = [
     ("deepseek-v4", 1_000_000),
     # Zhipu / GLM.
     ("glm", 128_000),
+    ("glm-4.7", 200_000),
     ("glm-5", 200_000),
     ("glm-5.2", 1_000_000),
     # Moonshot / Kimi.
@@ -485,6 +486,7 @@ KNOWN_CONTEXT_WINDOWS: List[Tuple[str, int]] = [
     ("moonshot-v1-8k", 8_192),
     ("moonshot-v1-32k", 32_768),
     ("kimi", 256_000),
+    ("kimi-k3", 1_000_000),
     # Alibaba Model Studio. The 3.5-and-later tiers and the long-lived
     # plus/flash families are 1M; qwen3-max and qwen3.6-max-preview stay at
     # 262,144 despite the newer-looking names, and qwen-long is a 10M
@@ -505,23 +507,111 @@ KNOWN_CONTEXT_WINDOWS: List[Tuple[str, int]] = [
     # named 128k variant is larger.
     ("baichuan", 32_768),
     ("baichuan3-turbo-128k", 128_000),
+    # MiniMax publishes exact integers rather than a rounded "200k".
+    ("minimax-m2", 204_800),
+    ("minimax-m3", 1_000_000),
+    # Mistral. Small's moving alias takes the conservative 128K reading: if
+    # the alias has moved to Small 4 we merely under-budget, and if a compat
+    # layer still resolves it to Small 3.2 we are right.
+    ("mistral", 32_768),
+    ("mistral-medium", 256_000),
+    ("mistral-large", 256_000),
+    ("mistral-small", 256_000),
+    ("mistral-small-latest", 128_000),
+    ("codestral", 128_000),
+    # Cohere.
+    ("command-a", 256_000),
+    ("command-a-plus", 128_000),
+    ("command-a-vision", 128_000),
+    ("command-r", 128_000),
+    # Meta Model API (Muse Spark). Llama weights served by someone else
+    # belong under that host, not here.
+    ("muse-spark", 1_048_576),
     # Open weights, commonly self-hosted.
     ("llama-3.1", 131_072),
     ("llama-3.2", 131_072),
     ("llama-3.3", 131_072),
     ("llama-4", 131_072),
-    ("mistral", 32_768),
 ]
 
 
-def context_window_from_table(model_id: str) -> Optional[int]:
-    """Longest matching family prefix, or None for an unknown model."""
-    lowered = (model_id or "").lower()
+# Resellers serve a smaller window than the model's native ceiling, so the
+# host has to answer before the model family does: MiniMax M3 is 1M native but
+# 524,288 on Together and 512K on Fireworks, and DeepSeek V4 Pro is 1M native
+# but 512K on Together. Cerebras additionally varies by account tier, so these
+# take the free-tier figure and let discovery or the admin setting raise it.
+HOSTED_CONTEXT_WINDOWS: dict[str, List[Tuple[str, int]]] = {
+    "together": [
+        ("minimaxai/minimax-m3", 524_288),
+        ("qwen/qwen3.6-plus", 1_000_000),
+        ("qwen/qwen3.7-plus", 1_000_000),
+        ("qwen/qwen3.5-9b", 262_144),
+        ("moonshotai/kimi-k3", 1_000_000),
+        ("moonshotai/kimi-k2.7-code", 262_144),
+        ("moonshotai/kimi-k2.6", 262_144),
+        ("zai-org/glm-5.2", 262_144),
+        ("openai/gpt-oss-120b", 128_000),
+        ("openai/gpt-oss-20b", 128_000),
+        ("deepseek-ai/deepseek-v4-pro", 512_000),
+        ("deepseek-ai/deepseek-v4-flash", 1_000_000),
+        ("nvidia/nemotron-3-ultra", 512_300),
+        ("meta-llama/llama-3.3-70b", 131_072),
+        ("qwen/qwen2.5-7b", 32_768),
+        ("google/gemma-4-31b", 262_144),
+    ],
+    "fireworks": [
+        # Fireworks labels these 1040k/262k/196k and describes them as 1M in
+        # prose; the round floor is the defensible reading for a fallback.
+        ("accounts/fireworks/models/kimi-k3", 1_000_000),
+        ("accounts/fireworks/models/glm-5p2", 1_000_000),
+        ("accounts/fireworks/models/deepseek-v4-pro", 1_000_000),
+        ("accounts/fireworks/models/deepseek-v4-flash", 1_000_000),
+        ("accounts/fireworks/models/minimax-m3", 512_000),
+        ("accounts/fireworks/models/minimax-m2p7", 196_000),
+        ("accounts/fireworks/models/kimi-k2p7-code", 262_000),
+        ("accounts/fireworks/models/kimi-k2p6", 262_000),
+        ("accounts/fireworks/models/qwen3p7-plus", 262_000),
+    ],
+    "cerebras": [
+        ("gpt-oss-120b", 65_000),
+        ("gemma-4-31b", 65_000),
+    ],
+    "groq": [
+        ("llama-3.1-8b-instant", 131_072),
+        ("llama-3.3-70b-versatile", 131_072),
+        ("openai/gpt-oss-120b", 131_072),
+        ("openai/gpt-oss-20b", 131_072),
+        ("groq/compound", 131_072),
+        ("minimaxai/minimax-m2.7", 196_608),
+        ("qwen/qwen3.6-27b", 131_072),
+    ],
+}
+
+
+def _longest_prefix(lowered: str, table: List[Tuple[str, int]]) -> Optional[int]:
     best: Optional[Tuple[str, int]] = None
-    for prefix, window in KNOWN_CONTEXT_WINDOWS:
+    for prefix, window in table:
         if lowered.startswith(prefix) and (best is None or len(prefix) > len(best[0])):
             best = (prefix, window)
     return best[1] if best else None
+
+
+def context_window_from_table(
+    model_id: str, provider: Optional[str] = None
+) -> Optional[int]:
+    """Longest matching prefix for this host, else for the model family.
+
+    The host is consulted first because a reseller's serving limit overrides
+    the model's native ceiling. Returns None for an unknown model — the caller
+    then falls back to DEFAULT_CONTEXT_WINDOW rather than to a guess.
+    """
+    lowered = (model_id or "").lower()
+    hosted = HOSTED_CONTEXT_WINDOWS.get((provider or "").lower())
+    if hosted:
+        window = _longest_prefix(lowered, hosted)
+        if window:
+            return window
+    return _longest_prefix(lowered, KNOWN_CONTEXT_WINDOWS)
 
 
 # Keys self-hosted OpenAI-compatible servers use for the model's window.
@@ -683,7 +773,7 @@ class ApiAdapterBackend:
             )
             source = "probe"
             if not window:
-                window = context_window_from_table(model)
+                window = context_window_from_table(model, provider=self.provider)
                 source = "table"
             if not window:
                 window, source = DEFAULT_CONTEXT_WINDOW, "default"

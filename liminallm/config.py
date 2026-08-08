@@ -63,6 +63,13 @@ class ModelBackend(str, Enum):
     QWEN = "qwen"
     DASHSCOPE = "dashscope"
     BAICHUAN = "baichuan"
+    MINIMAX = "minimax"
+    MISTRAL = "mistral"
+    COHERE = "cohere"
+    # Resellers: same models, smaller serving windows than native.
+    FIREWORKS = "fireworks"
+    GROQ = "groq"
+    CEREBRAS = "cerebras"
     # Local JAX + LoRA serving
     LOCAL_LORA = "local_lora"
     LOCAL_GPU_LORA = "local_gpu_lora"
@@ -341,6 +348,15 @@ PROVIDER_ENDPOINTS: dict[str, dict[str, Optional[str]]] = {
     "qwen": {"provider": "qwen", "api_key_env": "DASHSCOPE_API_KEY", "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"},
     "dashscope": {"provider": "qwen", "api_key_env": "DASHSCOPE_API_KEY", "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"},
     "baichuan": {"provider": "baichuan", "api_key_env": "BAICHUAN_API_KEY", "base_url": "https://api.baichuan-ai.com/v1"},
+    "minimax": {"provider": "minimax", "api_key_env": "MINIMAX_API_KEY", "base_url": "https://api.minimax.io/v1"},
+    "mistral": {"provider": "mistral", "api_key_env": "MISTRAL_API_KEY", "base_url": "https://api.mistral.ai/v1"},
+    "cohere": {"provider": "cohere", "api_key_env": "COHERE_API_KEY", "base_url": "https://api.cohere.ai/compatibility/v1"},
+    # Resellers. The provider name is load-bearing beyond credentials: it
+    # selects the host's own serving limits in HOSTED_CONTEXT_WINDOWS, which
+    # are smaller than the models' native ceilings.
+    "fireworks": {"provider": "fireworks", "api_key_env": "FIREWORKS_API_KEY", "base_url": "https://api.fireworks.ai/inference/v1"},
+    "groq": {"provider": "groq", "api_key_env": "GROQ_API_KEY", "base_url": "https://api.groq.com/openai/v1"},
+    "cerebras": {"provider": "cerebras", "api_key_env": "CEREBRAS_API_KEY", "base_url": "https://api.cerebras.ai/v1"},
 }
 
 

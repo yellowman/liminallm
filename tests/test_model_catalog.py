@@ -16,6 +16,7 @@ from liminallm.config import (
     resolve_provider_endpoint,
 )
 from liminallm.service.model_backend import (
+    HOSTED_CONTEXT_WINDOWS,
     KNOWN_CONTEXT_WINDOWS,
     context_window_from_table,
     is_reasoning_model,
@@ -25,9 +26,9 @@ from liminallm.service.model_backend import (
 class TestContextWindows:
     @pytest.mark.parametrize("model,window", [
         # Google — verified against a live ListModels call.
-        ("gemini-3.6-flash", 1_000_000),
-        ("gemini-flash-latest", 1_000_000),
-        ("gemini-2.5-pro", 1_000_000),
+        ("gemini-3.6-flash", 1_048_576),
+        ("gemini-flash-latest", 1_048_576),
+        ("gemini-2.5-pro", 1_048_576),
         ("gemini-2.5-flash-image", 32_768),
         ("gemini-3-pro-image-preview", 131_072),
         # OpenAI — tier splits within one version.
@@ -55,7 +56,17 @@ class TestContextWindows:
         ("grok-build-0.1", 256_000),
         ("deepseek-reasoner", 128_000),
         ("glm-5.2", 1_000_000),
+        ("glm-5.1", 200_000),
+        ("glm-4.7", 200_000),
         ("kimi-k2.6", 256_000),
+        ("kimi-k3", 1_000_000),
+        ("minimax-m3", 1_000_000),
+        ("minimax-m2.7", 204_800),
+        ("mistral-medium-3-5", 256_000),
+        ("mistral-small-latest", 128_000),
+        ("command-a-03-2025", 256_000),
+        ("command-a-plus-05-2026", 128_000),
+        ("muse-spark-1.2", 1_048_576),
         ("qwen3.8-max", 1_000_000),
         ("qwen3.7-plus", 1_000_000),
         ("qwen-plus-latest", 1_000_000),
@@ -100,9 +111,62 @@ class TestContextWindows:
         for prefix, window in KNOWN_CONTEXT_WINDOWS:
             assert 4096 <= window <= 10_000_000, prefix
 
-    def test_the_table_holds_no_duplicate_prefixes(self):
-        prefixes = [prefix for prefix, _ in KNOWN_CONTEXT_WINDOWS]
-        assert len(prefixes) == len(set(prefixes))
+    def test_no_table_holds_a_duplicate_prefix(self):
+        """A duplicate is dead weight at best and two disagreeing answers at
+        worst — longest-prefix picks whichever it reaches first."""
+        for name, table in [("known", KNOWN_CONTEXT_WINDOWS),
+                            *HOSTED_CONTEXT_WINDOWS.items()]:
+            prefixes = [prefix for prefix, _ in table]
+            assert len(prefixes) == len(set(prefixes)), name
+
+
+class TestHostedWindows:
+    """A reseller's serving limit is smaller than the model's native ceiling,
+    and using the native number would overflow the host's real window."""
+
+    @pytest.mark.parametrize("provider,model,hosted,native", [
+        ("together", "MiniMaxAI/MiniMax-M3", 524_288, 1_000_000),
+        ("together", "deepseek-ai/DeepSeek-V4-Pro", 512_000, 1_000_000),
+        ("together", "zai-org/GLM-5.2", 262_144, 1_000_000),
+        ("together", "moonshotai/Kimi-K2.6", 262_144, 256_000),
+        ("fireworks", "accounts/fireworks/models/minimax-m3", 512_000, 1_000_000),
+        ("fireworks", "accounts/fireworks/models/kimi-k3", 1_000_000, 1_000_000),
+        ("groq", "minimaxai/minimax-m2.7", 196_608, 204_800),
+    ])
+    def test_the_host_answers_before_the_model_family(self, provider, model, hosted, native):
+        assert context_window_from_table(model, provider=provider) == hosted
+        del native  # documented above for contrast, not asserted here
+
+    def test_the_native_window_still_answers_without_a_host(self):
+        assert context_window_from_table("minimax-m3") == 1_000_000
+        assert context_window_from_table("glm-5.2") == 1_000_000
+
+    def test_an_unlisted_host_falls_through_to_the_family(self):
+        """A provider with no hosted table is not an error — the model family
+        still answers."""
+        assert context_window_from_table("glm-5.2", provider="openai") == 1_000_000
+        assert context_window_from_table("glm-5.2", provider="") == 1_000_000
+
+    def test_a_host_that_does_not_serve_the_model_falls_through(self):
+        """Together has no gpt-5 row; the OpenAI family should still answer
+        rather than the lookup returning nothing."""
+        assert context_window_from_table("gpt-5.2", provider="together") == 400_000
+
+    def test_cerebras_takes_the_free_tier_figure(self):
+        """The window is account-tier dependent, so the table takes the floor
+        and lets discovery or model_context_window raise it."""
+        assert context_window_from_table("gpt-oss-120b", provider="cerebras") == 65_000
+        assert context_window_from_table("openai/gpt-oss-120b", provider="groq") == 131_072
+
+    def test_the_backend_passes_its_provider_into_the_lookup(self):
+        """Without this the hosted tables are unreachable — the whole point of
+        keying them by provider."""
+        import inspect
+
+        from liminallm.service.model_backend import ApiAdapterBackend
+
+        src = inspect.getsource(ApiAdapterBackend.context_window.fget)
+        assert "provider=self.provider" in src
 
 
 class TestReasoningModels:
@@ -152,7 +216,8 @@ class TestProviderWiring:
     def test_a_new_provider_gets_workable_default_capabilities(self):
         """These providers serve one model per request with no adapter
         multiplexing — the default — so none of them needs a bespoke entry."""
-        for provider in ("xai", "deepseek", "moonshot", "qwen", "baichuan"):
+        for provider in ("xai", "deepseek", "moonshot", "qwen", "baichuan",
+                         "minimax", "mistral", "cohere", "groq", "cerebras", "fireworks"):
             caps = get_provider_capabilities(provider)
             assert caps.max_adapters == 1
             assert not caps.multi_adapter
