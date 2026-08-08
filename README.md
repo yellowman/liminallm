@@ -155,106 +155,8 @@ for v1 these can all live in one python app with clear module boundaries.
 
 ## quick start
 
-### Option 1: Docker (Recommended for QA/Testing)
-
-```bash
-# Start the full test stack (Postgres, Redis, App)
-docker compose -f docker-compose.test.yml up --build
-
-# Verify health
-curl http://localhost:8000/healthz
-
-# Pre-configured admin credentials:
-#   Email: admin@test.local
-#   Password: TestAdmin123!
-```
-
-This automatically:
-- Runs database migrations
-- Bootstraps an admin user
-- Serves the chat UI at `http://localhost:8000/`
-- Serves the admin console at `http://localhost:8000/admin`
-
-### Option 2: Native Deployment (No Docker)
-
-For running directly on a Linux host without containers.
-
-#### Quick Start (Native)
-
-Postgres is required — it is the only store. Redis is optional; without it,
-rate limits, idempotency durability and caches fall back to in-process state.
-
-```bash
-# Install dependencies
-pip install -e ".[dev]"
-
-# Set required environment variables
-export DATABASE_URL="postgresql://postgres:postgres@localhost:5432/liminallm"
-export TEST_MODE=true
-
-# Start the API server
-uvicorn liminallm.app:app --reload --host 0.0.0.0 --port 8000
-
-# Verify health
-curl http://localhost:8000/healthz
-```
-
-#### Production (With PostgreSQL and Redis)
-
-For persistent storage and production use:
-
-```bash
-# 1. Install system dependencies
-sudo apt update
-sudo apt install -y python3.11 python3.11-venv postgresql-16 redis-server libpq-dev gcc
-
-# 2. Install PostgreSQL extensions
-sudo -u postgres psql -c "CREATE DATABASE liminallm;"
-sudo -u postgres psql -c "CREATE USER liminallm WITH PASSWORD 'yourpassword';"
-sudo -u postgres psql -d liminallm -c "CREATE EXTENSION IF NOT EXISTS vector;"
-sudo -u postgres psql -d liminallm -c "CREATE EXTENSION IF NOT EXISTS citext;"
-sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE liminallm TO liminallm;"
-
-# 3. Create Python environment and install
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[dev]"
-
-# 4. Create data directories
-sudo mkdir -p /srv/liminallm/{adapters,artifacts,models,users}
-sudo chown -R $USER:$USER /srv/liminallm
-
-# 5. Set environment variables
-export DATABASE_URL="postgresql://liminallm:yourpassword@localhost:5432/liminallm"
-export REDIS_URL="redis://localhost:6379/0"
-
-# 6. Run database migrations
-./scripts/migrate.sh
-
-# 7. Bootstrap admin user
-python scripts/bootstrap_admin.py --email admin@test.local --password TestAdmin123!
-
-# 8. Start the server
-uvicorn liminallm.app:app --host 0.0.0.0 --port 8000 --workers 4
-```
-
-#### Running Tests (Native)
-
-```bash
-# The suite starts its own throwaway Postgres; set TEST_DATABASE_URL to reuse one
-TEST_MODE=true pytest tests/ -v
-
-# Run specific test suites
-pytest tests/test_post_smoke.py -v  # Post-smoke tests
-pytest tests/test_integration_admin.py -v  # Admin tests
-
-# Run smoke tests
-./scripts/smoke_test.sh http://localhost:8000
-```
-
-See `docs/DEPLOYMENT.md` for complete native deployment documentation including systemd services, TLS setup, and GPU configuration.
-
----
+See [INSTALL.md](INSTALL.md) — Docker on Linux, Linux without Docker, or
+OpenBSD.
 
 ## acceptance criteria (ready to test)
 
@@ -281,7 +183,7 @@ Run the automated smoke test:
 
 ## deployment
 
-- Install and runtime guidance (docker compose and manual host setup) live in `docs/DEPLOYMENT.md`
+- Installation in [INSTALL.md](INSTALL.md); operations and backend lanes in `docs/DEPLOYMENT.md`
 - Configuration architecture documented in `docs/CONFIGURATION.md`
 - Testing guide in `TESTING.md`
 
@@ -317,7 +219,7 @@ Run the automated smoke test:
    - filesystem path accessible to the app
  - gpu / tpu for jax model if you expect to train adapters
  - backend selection is single-sourced from the SQL deployment config (editable from the web console when wired); env vars only override if you set them explicitly
-  - set `MODEL_BACKEND=local_gpu_lora` to target the local JAX+LoRA path instead of external API fine-tune IDs; omit or leave as the default to use the OpenAI-style plug. The JAX backend (`LocalJaxLoRABackend` in `liminallm/service/model_backend.py`) loads adapters from the filesystem, tokenizes prompts, runs a JAX forward pass, and enforces conservative shapes; it requires a JAX runtime and optionally a Transformers tokenizer for decode parity. OpenAI plug secrets live under adapter-specific env vars (see below).
+  - set `model_backend` to `local_gpu_lora` in the admin console to target the local JAX+LoRA path instead of external API fine-tune IDs; leave the default to use the OpenAI-style plug. The JAX backend (`LocalJaxLoRABackend` in `liminallm/service/model_backend.py`) loads adapters from the filesystem, tokenizes prompts, runs a JAX forward pass, and enforces conservative shapes; it requires a JAX runtime and optionally a Transformers tokenizer for decode parity. Provider keys are admin settings, with `<PROVIDER>_API_KEY` as an environment fallback.
 
 ### frontend (chat + admin)
 

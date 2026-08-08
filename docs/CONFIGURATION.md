@@ -12,17 +12,20 @@ LiminalLM has three configuration sources, each serving a different purpose:
 **When loaded:** Application startup
 **Mutability:** Immutable after startup
 
-Used for:
-- Secrets (JWT_SECRET, API keys, SMTP passwords)
-- Infrastructure URLs (DATABASE_URL, REDIS_URL)
-- Development flags (TEST_MODE, ALLOW_REDIS_FALLBACK_DEV)
-- Default values for settings not in database
+Reserved for what must be readable *before* the database is: `DATABASE_URL`,
+plus `BUILD_SHA`, `TEST_MODE`, `EMBEDDING_VECTOR_DIM` and
+`EXTRACT_READER_PLUGINS`, which are not settings. Provider credentials
+(`OPENAI_API_KEY`, `GEMINI_API_KEY`, …) are read as a fallback when the
+matching admin setting is blank, and `INSTANCE_SETTINGS_JSON` seeds managed
+settings on first boot.
+
+Nothing else is read from the environment. A variable that is not in that
+list — `MODEL_BACKEND`, `REDIS_URL`, `SMTP_HOST` — is ignored.
 
 ```bash
 # Example
-export JWT_SECRET="your-secure-secret-here"
 export DATABASE_URL="postgresql://user:pass@localhost/liminallm"
-export MODEL_BACKEND="openai"
+export OPENAI_API_KEY="sk-..."
 ```
 
 ### 2. System Settings (Admin-Managed)
@@ -216,11 +219,19 @@ def get_rate_limit():
     return runtime.store.get_system_settings().get("chat_rate_limit_per_minute", 60)
 ```
 
-### Don't store secrets in system_settings
-```python
-# BAD: Putting API keys in system_settings (visible in admin UI)
-sys_settings["openai_api_key"] = "sk-..."
+### Declare a secret as a secret, not as an ordinary setting
+`secret_field` stores the value in the database like any other managed
+setting — so an operator can rotate a key without a redeploy — but redacts it
+from every read path: `GET /admin/settings` returns an empty string and the
+console renders a write-only control.
 
-# GOOD: Keep secrets in environment variables
-os.environ.get("OPENAI_API_KEY")
+```python
+# BAD: an ordinary managed_field echoes its value back to every admin
+openai_api_key: str = managed_field("", description="...")
+
+# GOOD
+openai_api_key: str = secret_field(description="... Write-only.")
 ```
+
+Bootstrap secrets are the exception: `JWT_SECRET` and `DATABASE_URL` are
+needed before the database can be read, so they stay outside it.

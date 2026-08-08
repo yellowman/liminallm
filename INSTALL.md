@@ -10,7 +10,7 @@ Pick one path: Docker on Linux, Linux without Docker, or OpenBSD.
 ## Docker (Linux)
 
 ```sh
-git clone <repo> liminallm && cd liminallm
+git clone https://github.com/yellowman/liminallm.git && cd liminallm
 cp .env.example .env
 ```
 
@@ -61,7 +61,7 @@ sudo -u postgres psql -d liminallm -c 'CREATE EXTENSION vector; CREATE EXTENSION
 Application:
 
 ```sh
-git clone <repo> /opt/liminallm && cd /opt/liminallm
+git clone https://github.com/yellowman/liminallm.git /opt/liminallm && cd /opt/liminallm
 pip install -e .
 install -d -o "$USER" /srv/liminallm
 
@@ -116,7 +116,7 @@ Application:
 
 ```sh
 cd /var/liminallm
-git clone <repo> .
+git clone https://github.com/yellowman/liminallm.git .
 pip3 install -e .
 
 cp deploy/openbsd/env.example /etc/liminallm/env
