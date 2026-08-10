@@ -19,12 +19,28 @@ def test_findings_withdraw_code_execution():
     assert taint.is_withdrawn("run_python", session) is True
 
 
-def test_reading_tools_survive_a_tainted_turn():
-    """Only the ability to act is withdrawn, never the ability to look."""
+def test_local_reading_survives_a_tainted_turn():
+    """The turn must still be able to look at what is already on the box.
+
+    Withdrawing these would leave the model unable to explain what the page
+    attempted, which is the one useful thing left for it to do.
+    """
     session = {"injection_findings": ["persona-hijack"]}
-    for tool in ("file_search", "web_search", "web_fetch", "history_search",
-                 "note_search"):
+    for tool in ("file_search", "history_search", "note_search"):
         assert taint.is_withdrawn(tool, session) is False
+
+
+def test_everything_that_reaches_off_the_box_is_withdrawn():
+    """The line is egress, not action.
+
+    run_python's own schema promises no network, so it was never how a secret
+    would leave. web_fetch takes a model-supplied URL and web_search a
+    model-supplied query; either carries data to a destination the injected
+    page chose.
+    """
+    session = {"injection_findings": ["persona-hijack"]}
+    for tool in ("web_fetch", "web_search", "run_python"):
+        assert taint.is_withdrawn(tool, session) is True
 
 
 def test_refusal_names_what_was_seen_and_discourages_retry():

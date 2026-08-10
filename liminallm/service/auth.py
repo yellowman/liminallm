@@ -20,6 +20,7 @@ from argon2.exceptions import InvalidHash, VerifyMismatchError
 
 from liminallm.config import Settings
 from liminallm.logging import get_logger
+from liminallm.service.tenancy import user_belongs_to_site
 from liminallm.storage.models import Session, User
 from liminallm.storage.redis_cache import RedisCache
 
@@ -723,7 +724,12 @@ class AuthService:
             return None, None, {}
         if payload.get("sub") != user.id or payload.get("tenant_id") != user.tenant_id:
             return None, None, {}
-        if tenant_hint and tenant_hint != user.tenant_id:
+        # Both halves must agree (service/tenancy.py). `is not None` and
+        # not a truthiness test: a hint that arrived blank means the site
+        # could not be resolved, which is the case least safe to wave on.
+        if tenant_hint is not None and not user_belongs_to_site(
+            user.tenant_id, tenant_hint
+        ):
             return None, None, {}
         if not self._refresh_token_matches(session, jti):
             return None, None, {}
@@ -830,7 +836,12 @@ class AuthService:
         user = self.store.get_user(sess.user_id)
         if not user:
             return None
-        if tenant_hint and tenant_hint != user.tenant_id:
+        # Both halves must agree (service/tenancy.py). `is not None` and
+        # not a truthiness test: a hint that arrived blank means the site
+        # could not be resolved, which is the case least safe to wave on.
+        if tenant_hint is not None and not user_belongs_to_site(
+            user.tenant_id, tenant_hint
+        ):
             return None
         if required_role and not self._role_allows(user.role, required_role):
             return None
@@ -1520,7 +1531,12 @@ class AuthService:
             or payload.get("role") != user.role
         ):
             return None
-        if tenant_hint and tenant_hint != user.tenant_id:
+        # Both halves must agree (service/tenancy.py). `is not None` and
+        # not a truthiness test: a hint that arrived blank means the site
+        # could not be resolved, which is the case least safe to wave on.
+        if tenant_hint is not None and not user_belongs_to_site(
+            user.tenant_id, tenant_hint
+        ):
             return None
         if required_role and not self._role_allows(user.role, required_role):
             return None

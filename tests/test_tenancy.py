@@ -64,10 +64,47 @@ def test_unmapped_host_is_refused_once_a_mapping_exists():
         tenancy.tenant_for_host("evil.example.com", s)
 
 
-def test_probes_reach_the_box_by_address_not_by_site():
+def test_a_bare_address_is_not_a_site_either():
+    """No host is exempt once a mapping exists.
+
+    Letting localhost through to the default tenant meant anyone who could
+    reach the port named their own tenant by sending Host: localhost. Probes
+    do not authenticate and never ask for a tenant, so nothing legitimate
+    needed the exemption.
+    """
     s = _settings(tenant_domains={"acme.example.com": "acme"})
-    for host in ("", "localhost", "127.0.0.1"):
+    for host in ("", "localhost", "127.0.0.1", "::1", "testserver"):
+        with pytest.raises(NotFoundError):
+            tenancy.tenant_for_host(host, s)
+
+
+def test_a_bare_address_still_works_on_a_single_tenant_install():
+    """The strictness only applies once an operator maps a domain."""
+    s = _settings()
+    for host in ("", "localhost", "testserver"):
         assert tenancy.tenant_for_host(host, s) == "public"
+
+
+# ---------------------------------------------------------------------------
+# The account half
+# ---------------------------------------------------------------------------
+
+
+def test_both_halves_must_agree():
+    """A session is a bearer credential; it stays valid wherever it is sent."""
+    assert tenancy.user_belongs_to_site("acme", "acme")
+    assert not tenancy.user_belongs_to_site("acme", "globex")
+
+
+def test_a_blank_on_either_side_is_a_mismatch_not_a_pass():
+    """Skipping the comparison when a value is missing is how it goes missing.
+
+    The caller with nothing to compare is the one that resolved no site — the
+    case least safe to wave through.
+    """
+    assert not tenancy.user_belongs_to_site("acme", "")
+    assert not tenancy.user_belongs_to_site("", "acme")
+    assert not tenancy.user_belongs_to_site(None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +267,25 @@ def test_an_unmapped_host_is_not_served_a_tenant(client, two_sites):
     )
     assert resp.status_code == 404, resp.text
     assert resp.json()["error"]["code"] == "not_found"
+
+
+def test_a_bare_host_cannot_reach_the_default_tenant(client, two_sites):
+    """The hole this closed: Host is chosen by whoever reaches the port.
+
+    localhost and the test client's own testserver used to resolve to the
+    default tenant, so a caller who could reach the service directly picked
+    that tenant — and with signup open, registered an account on it.
+    """
+    for host in ("localhost", "testserver", "127.0.0.1"):
+        resp = client.post(
+            "/v1/auth/signup",
+            json={
+                "email": f"t_{uuid.uuid4().hex[:8]}@example.com",
+                "password": "TestPassword123!",
+            },
+            headers={"Host": host},
+        )
+        assert resp.status_code == 404, (host, resp.text)
 
 
 def test_a_client_cannot_name_its_tenant_with_a_forwarded_header(client, two_sites):

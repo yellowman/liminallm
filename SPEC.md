@@ -1480,10 +1480,28 @@ execution guardrails:
     on only when a reverse proxy you control sets the header from the real
     request and refuses hosts it does not serve. `Host` is a client-supplied
     header like any other.
-  - signup joins the tenant serving the site it arrived at. Login, refresh and
-    every authenticated request check that tenant against the user's stored
-    `tenant_id`, so an account cannot sign in — and a session cannot be
-    replayed — at another tenant's site.
+  - **no host is exempt.** *(fixed — `localhost`, `127.0.0.1`, `::1` and the
+    test client's `testserver` used to resolve to `default_tenant_id` even with
+    a mapping configured, on the theory that a probe arrives by address rather
+    than by site name.)* that exemption was a hole, not a convenience: `Host` is
+    chosen by whoever can reach the port, so anyone reaching the service
+    directly named the default tenant — and with `allow_signup` on, registered
+    an account there. probes do not authenticate and never resolve a tenant, so
+    nothing legitimate depended on it. an operator who wants a bare hostname
+    served lists it like any other.
+  - **a tenanted request has two halves, and both must agree.** the *site* comes
+    from the host, resolved through `tenant_domains`. the *account* comes from
+    the authenticated session, never from the request. neither is sufficient
+    alone, which is why the check is a comparison rather than a lookup: the host
+    is attacker-chosen on the unproxied path, and a session is a bearer
+    credential that stays valid against whatever site it is replayed at.
+    requiring a match means a stolen acme session is useless at globex, and a
+    forged `Host` reaches nothing the caller could not already reach.
+    `tenancy.user_belongs_to_site` is that rule, called from login, refresh and
+    every authenticated request; **a blank on either side is a mismatch, not a
+    pass**, because the caller with nothing to compare is the one that resolved
+    no site.
+  - signup joins the tenant serving the site it arrived at.
   - `POST /v1/auth/signup` and `POST /v1/auth/oauth/{provider}/start` reject a
     `tenant_id` in the body with `validation_error` rather than ignoring it.
     An admin creates users in their own tenant only; reaching another tenant

@@ -1,11 +1,31 @@
-"""Which tenant a request belongs to, decided by the site it arrived at.
+"""Which tenant a request belongs to: the site it arrived at, and who is on it.
 
-``tenant_domains`` maps host to tenant; an empty map means one tenant for the
-whole install. Nothing a caller sends can override it.
+A tenanted request has two halves and **both** must agree.
 
-``Host`` is a client-supplied header, so ``X-Forwarded-Host`` is believed only
-when ``trust_forwarded_host`` says a proxy sets it. That flag is the entire
-trust boundary.
+*The site* comes from the host the web server was addressed as, resolved
+through ``tenant_domains``. An empty map means one tenant for the whole
+install; once any mapping exists, an unlisted host is refused rather than
+served the default tenant, because otherwise any DNS name pointed at the box
+reaches it. ``Host`` is client-supplied, so ``X-Forwarded-Host`` is believed
+only when ``trust_forwarded_host`` says a proxy sets it — that flag is the
+entire trust boundary on the site half.
+
+*The account* comes from the authenticated session, never from the request
+(CLAUDE.md: derive ``tenant_id`` from the token, never from user input).
+
+Neither half is sufficient alone, which is why the check is a comparison and
+not a lookup. The host is attacker-chosen on the unproxied path, so the site
+half cannot stand by itself. A session is a bearer credential that stays valid
+against whatever site it is replayed at, so the account half cannot either.
+Requiring them to match means a stolen acme session is useless at globex, and
+a forged ``Host`` reaches nothing the caller could not already reach.
+
+No host is exempt. An earlier version let ``localhost`` and the test client's
+``testserver`` through to the default tenant on the theory that a probe
+arrives by address rather than by site name — but probes do not authenticate
+and never ask for a tenant, while that exemption let anyone who could reach
+the port name their own tenant. An operator who wants a bare hostname served
+lists it like any other.
 """
 
 from __future__ import annotations
@@ -13,9 +33,6 @@ from __future__ import annotations
 from typing import Optional
 
 from liminallm.service.errors import NotFoundError
-
-#: Hosts that carry no tenant: a probe arrives by address, not by site name.
-_INFRA_HOSTS = frozenset({"", "localhost", "127.0.0.1", "::1", "[::1]", "testserver"})
 
 
 def normalize_host(value: Optional[str]) -> str:
@@ -41,15 +58,14 @@ def host_of(headers, settings) -> str:
 
 
 def tenant_for_host(host: str, settings) -> str:
-    """The tenant serving ``host``.
+    """The tenant serving ``host`` — the site half of the decision.
 
-    Unlisted hosts are refused once any mapping exists: serving them the
-    default tenant would mean any DNS name pointed at the box reaches it.
+    Unlisted hosts are refused once any mapping exists, with no exemption for
+    bare addresses: serving them the default tenant would mean any DNS name
+    pointed at the box reaches it, and ``Host`` is chosen by the caller.
     """
     domains = settings.tenant_domains or {}
     if not domains:
-        return settings.default_tenant_id
-    if host in _INFRA_HOSTS:
         return settings.default_tenant_id
     tenant = domains.get(host)
     if not tenant:
@@ -60,3 +76,14 @@ def tenant_for_host(host: str, settings) -> str:
 def tenant_of(headers, settings) -> str:
     """The tenant for a request, from its headers. The only entry point."""
     return tenant_for_host(host_of(headers, settings), settings)
+
+
+def user_belongs_to_site(user_tenant: Optional[str], site_tenant: Optional[str]) -> bool:
+    """The account half: does this session belong on the site it arrived at?
+
+    A blank on either side is a mismatch, not a pass. Skipping the comparison
+    when one value is missing is how the comparison goes missing — and the
+    caller that has nothing to compare is exactly the one that resolved no
+    site, which is the case that must not be trusted.
+    """
+    return bool(user_tenant) and bool(site_tenant) and user_tenant == site_tenant
