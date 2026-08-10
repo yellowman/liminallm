@@ -140,7 +140,7 @@ from liminallm.service.fs import (
     safe_join,
     validate_signed_url,
 )
-from liminallm.service.runtime import get_runtime
+from liminallm.service.runtime import MODEL_AFFECTING_SETTINGS, get_runtime
 from liminallm.service.sandbox import SandboxError
 from liminallm.service.upload_policy import ALLOWED_UPLOAD_EXTENSIONS
 from liminallm.storage.cursors import (
@@ -2498,21 +2498,9 @@ async def update_system_settings(
 
     # Rebuild backend-dependent services so a changed model_backend / model_path
     # (or rag/embedding setting) takes effect without a process restart.
-    model_affecting_keys = {
-        "model_backend",
-        "model_path",
-        "default_adapter_mode",
-        "rag_mode",
-        "embedding_model_id",
-        "rag_chunk_size",
-        # Baked into RAGService at construction; without these a retrieval
-        # setting changed here would read back correctly and do nothing.
-        "rag_rerank",
-        "rag_rerank_candidates",
-        "rag_late_interaction",
-        "rag_late_segments",
-    }
-    if model_affecting_keys & set(body.keys()):
+    # The same list the rebuild signature is built from, so the two cannot
+    # disagree about which settings need one (service/runtime.py).
+    if set(MODEL_AFFECTING_SETTINGS) & set(body.keys()):
         try:
             # Off the event loop: the rebuild is synchronous and takes the
             # reload lock, which the background watcher may briefly hold.

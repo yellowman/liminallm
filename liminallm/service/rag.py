@@ -10,7 +10,7 @@ from typing import Callable, Dict, List, Optional, Sequence, Union
 
 from liminallm.logging import get_logger
 from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
-from liminallm.service.embeddings import deterministic_embedding
+from liminallm.service.embeddings import cosine_similarity, deterministic_embedding
 from liminallm.service.fs import PathTraversalError, safe_join
 from liminallm.service.late import maxsim, segment_text
 from liminallm.service.ranking import (
@@ -398,19 +398,22 @@ class RAGService:
         scored exactly against *all* of their segments. Approximate search
         decides who is considered; it never decides the order.
         """
-        # Bounded across all query parts, not per part: MaxSim below is pure
-        # Python over every segment of every candidate, so an unbounded union
-        # of nine parts' pools would put tens of millions of float operations
-        # on a synchronous retrieval.
+        # A share each, not first-come. The pool has to be bounded — MaxSim
+        # below is pure Python over every segment of every candidate — but a
+        # single overall cap is spent by the first vector before any other is
+        # consulted, and the first vector is the whole query. That collapses
+        # candidate generation back to single-vector recall, which is the one
+        # thing this channel exists not to be: MaxSim could then only reorder
+        # what a pooled vector had already found.
+        share = max(1, math.ceil(pool_size / len(query_vectors)))
         candidate_ids: List[int] = []
         seen: set[int] = set()
         for vector in query_vectors:
-            if len(candidate_ids) >= pool_size:
-                break
+            taken = 0
             for chunk_id in self.store.late_candidate_ids(  # type: ignore[attr-defined]
                 allowed_ids,
                 vector,
-                pool_size,
+                share,
                 filters=filters,
                 user_id=user_id,
                 tenant_id=tenant_id,
@@ -418,7 +421,8 @@ class RAGService:
                 if chunk_id not in seen:
                     seen.add(chunk_id)
                     candidate_ids.append(chunk_id)
-                if len(candidate_ids) >= pool_size:
+                    taken += 1
+                if taken >= share:
                     break
         if not candidate_ids:
             return []
@@ -538,17 +542,28 @@ class RAGService:
                 == self.embedding_model_id
             ])
 
-        # Interleave rather than concatenate. These lists are ranked within a
-        # context and carry no score to rank across them, so a concatenation
-        # that the caller then truncates would hand the whole answer to
-        # whichever context happened to be listed first — the second context
-        # unreachable however well it matched.
-        merged: List[KnowledgeChunk] = []
+        # Rank across contexts, and interleave only to break ties.
+        # Concatenating hands every slot to whichever context was listed
+        # first. Interleaving alone fixes that but guarantees an irrelevant
+        # context half the answer. So the union is scored again — the same
+        # fusion the pgvector path uses, the only thing here that can compare
+        # a chunk in one context against a chunk in another — and it is built
+        # in interleaved order so that chunks the scoring cannot separate fall
+        # back to a fair share rather than to whoever was listed first.
+        union: List[KnowledgeChunk] = []
         for rank in range(max((len(chunks) for chunks in per_context), default=0)):
             for chunks in per_context:
                 if rank < len(chunks):
-                    merged.append(chunks[rank])
-        return merged
+                    union.append(chunks[rank])
+        if not union:
+            return []
+        dense: List[KnowledgeChunk] = []
+        if self.semantic:
+            scores = [
+                cosine_similarity(query_embedding, chunk.embedding) for chunk in union
+            ]
+            dense = [union[index] for index in ranked_positive(scores)]
+        return self._fuse(query, union, dense)
 
     def ingest_text(
         self,

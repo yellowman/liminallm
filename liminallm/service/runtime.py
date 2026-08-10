@@ -37,6 +37,26 @@ from liminallm.storage.redis_cache import RedisCache
 
 logger = get_logger(__name__)
 
+#: Settings the model service stack reads once, when it is built. Changing one
+#: means rebuilding, so this list decides both when the admin route triggers a
+#: reload and what the signature the background watcher compares is made of.
+#: One list, because it used to be two: the retrieval settings were added to
+#: the signature and forgotten in the route's membership test, so an admin
+#: toggled reranking, read the new value back from the console, and nothing
+#: happened until the process restarted.
+MODEL_AFFECTING_SETTINGS: Tuple[str, ...] = (
+    "model_path",
+    "model_backend",
+    "default_adapter_mode",
+    "rag_mode",
+    "embedding_model_id",
+    "rag_chunk_size",
+    "rag_rerank",
+    "rag_rerank_candidates",
+    "rag_late_interaction",
+    "rag_late_segments",
+)
+
 
 def _mask_url_password(url: Optional[str]) -> Optional[str]:
     """Mask password in URL for safe logging (Issue 29.1).
@@ -486,21 +506,8 @@ class Runtime:
         effective = apply_managed_settings(
             get_settings(), self._system_settings_overrides()
         )
-        return (
-            effective.model_path,
-            str(effective.model_backend),
-            str(effective.default_adapter_mode),
-            str(effective.rag_mode),
-            effective.embedding_model_id,
-            effective.rag_chunk_size,
-            # Retrieval settings belong here for the same reason the rest do:
-            # RAGService reads them once, at construction. Left out, an admin
-            # toggles reranking, the console reads the new value back, and
-            # nothing changes until the process restarts.
-            str(effective.rag_rerank),
-            effective.rag_rerank_candidates,
-            effective.rag_late_interaction,
-            effective.rag_late_segments,
+        return tuple(
+            str(getattr(effective, name)) for name in MODEL_AFFECTING_SETTINGS
         )
 
     def _read_settings_version(self) -> Optional[str]:

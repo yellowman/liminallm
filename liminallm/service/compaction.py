@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from liminallm.logging import get_logger
 from liminallm.service.ranking import SEMANTIC_WEIGHT as RANKING_SEMANTIC_WEIGHT
+from liminallm.service.ranking import fuse_ranks, ranked_positive
 from liminallm.service.tokenizer_utils import estimate_token_count
 
 logger = get_logger(__name__)
@@ -225,14 +226,6 @@ RECALL_HEADER = (
 )
 
 
-def _normalized_scores(raw: List[float]) -> List[float]:
-    """Scale scores to [0,1] by their own max, so signals blend fairly."""
-    top = max(raw) if raw else 0.0
-    if top <= 0:
-        return [0.0] * len(raw)
-    return [max(0.0, s) / top for s in raw]
-
-
 # How many top-BM25 turns get the expensive semantic rerank. Bounds provider
 # embedding calls per recall to at most this many on-demand embeds, so the
 # hot path cost is fixed regardless of conversation length.
@@ -281,7 +274,6 @@ def rank_turns(
     embeddings (from the background backfill) are free.
     """
     from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
-    from liminallm.service.ranking import fuse_ranks, ranked_positive
 
     corpus = [tokenize_text(str(getattr(m, "content", "") or "")) for m in older]
     # Raw, not normalized: rank fusion reads order and nothing else, and the

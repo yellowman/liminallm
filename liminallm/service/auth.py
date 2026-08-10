@@ -591,6 +591,18 @@ class AuthService:
         existing = self.store.get_user_by_provider(provider, provider_uid)
         email = identity.get("email")
         user = existing or (self.store.get_user_by_email(email) if email else None)
+        if user and not self._site_matches(user, normalized_tenant):
+            # The provider proved who they are, not where they belong. Email
+            # is globally unique, so a lookup finds the account whatever site
+            # the flow started at; without this, signing in with Google at
+            # globex minted acme's tokens. The password path has always
+            # refused this — the two ways in must agree.
+            self.logger.warning(
+                "oauth_tenant_mismatch",
+                provider=provider,
+                site_tenant=normalized_tenant,
+            )
+            return None, None, {}
         if not user:
             user_email = identity.get("email") or f"{provider_uid}@{provider}.oauth"
             handle = identity.get("handle") or provider_uid
@@ -649,6 +661,25 @@ class AuthService:
     def delete_user(self, user_id: str) -> bool:
         return bool(self.store.delete_user(user_id))
 
+    def _site_matches(self, user: User, site_tenant: Optional[str]) -> bool:
+        """Does this account belong on the site the request arrived at?
+
+        Both halves of a tenanted request must agree (service/tenancy.py).
+        One method rather than one copy per entry point: the next change to
+        this rule — an audit line, a role carve-out — must not be able to
+        land in three places and miss the fourth, because the one it misses
+        is an authorization hole.
+
+        ``None`` means the caller resolved no site and is not making a
+        tenanted decision: logout revokes your own session and needs no
+        opinion about where you belong. A hint that arrived *blank* is a
+        different thing — that caller tried to resolve a site and failed,
+        which is the case least safe to wave through.
+        """
+        if site_tenant is None:
+            return True
+        return user_belongs_to_site(user.tenant_id, site_tenant)
+
     async def login(
         self,
         email: str,
@@ -663,7 +694,7 @@ class AuthService:
         user = self.store.get_user_by_email(email)
         if not user or not self.verify_password(user.id, password):
             return None, None, {}
-        if tenant_id and tenant_id != user.tenant_id:
+        if not self._site_matches(user, tenant_id):
             return None, None, {}
 
         # SPEC §18: Single-session mode - invalidate prior sessions if enabled
@@ -724,12 +755,7 @@ class AuthService:
             return None, None, {}
         if payload.get("sub") != user.id or payload.get("tenant_id") != user.tenant_id:
             return None, None, {}
-        # Both halves must agree (service/tenancy.py). `is not None` and
-        # not a truthiness test: a hint that arrived blank means the site
-        # could not be resolved, which is the case least safe to wave on.
-        if tenant_hint is not None and not user_belongs_to_site(
-            user.tenant_id, tenant_hint
-        ):
+        if not self._site_matches(user, tenant_hint):
             return None, None, {}
         if not self._refresh_token_matches(session, jti):
             return None, None, {}
@@ -836,12 +862,7 @@ class AuthService:
         user = self.store.get_user(sess.user_id)
         if not user:
             return None
-        # Both halves must agree (service/tenancy.py). `is not None` and
-        # not a truthiness test: a hint that arrived blank means the site
-        # could not be resolved, which is the case least safe to wave on.
-        if tenant_hint is not None and not user_belongs_to_site(
-            user.tenant_id, tenant_hint
-        ):
+        if not self._site_matches(user, tenant_hint):
             return None
         if required_role and not self._role_allows(user.role, required_role):
             return None
@@ -1531,12 +1552,7 @@ class AuthService:
             or payload.get("role") != user.role
         ):
             return None
-        # Both halves must agree (service/tenancy.py). `is not None` and
-        # not a truthiness test: a hint that arrived blank means the site
-        # could not be resolved, which is the case least safe to wave on.
-        if tenant_hint is not None and not user_belongs_to_site(
-            user.tenant_id, tenant_hint
-        ):
+        if not self._site_matches(user, tenant_hint):
             return None
         if required_role and not self._role_allows(user.role, required_role):
             return None

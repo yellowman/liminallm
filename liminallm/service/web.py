@@ -84,11 +84,20 @@ _INVISIBLE_RE = re.compile(
 )
 
 # Heuristics for classic prompt-injection phrasings. Redacted, not trusted.
+#
+# A match costs more than it used to. It once meant a redaction plus a warning;
+# it now also taints the turn, and taint withdraws web_fetch and web_search for
+# the rest of it (service/taint.py) — so a page saying "You are now a Pro
+# subscriber" in ordinary prose ends the turn's web access, not just that
+# sentence. That is the trade taken deliberately: the redaction alone protects
+# the model from reading the text, and nothing protects the user from a model
+# that already read it and then chose a URL. Tighten a pattern here rather than
+# weaken the withdrawal.
 _INJECTION_PATTERNS: tuple[tuple[str, str], ...] = (
     ("override-instructions", r"(?:ignore|disregard|forget)\s+(?:all\s+|any\s+|the\s+|your\s+)?(?:previous|prior|earlier|above|preceding)\s+(?:instructions?|prompts?|rules?|directions?|context)"),
     ("override-instructions", r"(?:ignore|disregard|forget)\s+(?:everything|all)\s+(?:above|before|prior|previous|you(?:'ve| have)\s+(?:been\s+told|read|learned))"),
     # "forget everything" on its own is a strong signal and rare in prose about
-    # a topic; the cost of a false positive is a redaction plus a warning.
+    # a topic.
     ("override-instructions", r"forget\s+everything\b"),
     ("persona-hijack", r"you\s+are\s+now\s+(?:a|an|the)\b"),
     ("persona-hijack", r"(?:act|behave)\s+as\s+(?:if\s+you\s+are|though\s+you\s+are)\b"),

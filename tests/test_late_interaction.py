@@ -284,3 +284,34 @@ def test_enabling_late_interaction_without_a_segment_count_still_indexes(store):
     rag = RAGService(store, embed=_subject_encoder, semantic=True, late_interaction=True)
 
     assert rag.late_segments >= 2
+
+
+def test_every_query_part_gets_a_share_of_the_candidate_pool(store, monkeypatch):
+    """A single overall cap is spent by the first vector, which is the whole
+    query — collapsing candidate generation back to single-vector recall.
+
+    MaxSim could then only reorder what a pooled vector already found, which
+    is the one thing this channel exists not to be.
+    """
+    user, ctx = _near_miss_corpus(store)
+    rag = _retriever(store, late=True)
+
+    asked: list[int] = []
+    real = store.late_candidate_ids
+
+    def spy(context_ids, vector, limit=4, filters=None, **kwargs):
+        asked.append(limit)
+        return real(context_ids, vector, limit, filters, **kwargs)
+
+    monkeypatch.setattr(store, "late_candidate_ids", spy)
+    # Long enough clauses to actually segment; a short query is one part and
+    # would prove nothing either way.
+    rag.retrieve(
+        [ctx.id], f"{_long('quokka')}. {_long('diesel')}.",
+        limit=4, user_id=user.id, min_token_count=0,
+    )
+
+    # One call per query part, each with its own share rather than the
+    # whole pool going to the first.
+    assert len(asked) > 1
+    assert all(limit < rag._pool_size(4) for limit in asked)

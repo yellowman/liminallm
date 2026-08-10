@@ -343,3 +343,49 @@ def test_local_hybrid_does_not_hand_the_whole_answer_to_one_context():
     )
 
     assert {hit.context_id for hit in hits} == {first.id, second.id}
+
+
+def test_local_hybrid_ranks_across_contexts_by_relevance():
+    """An irrelevant context must not get a fixed share of the answer.
+
+    Interleaving alone guaranteed it half the slots. The union is scored
+    again so relevance decides, and the interleave survives only as the
+    tie-break. This also exercises the semantic branch, which nothing else
+    reached — it carried an undefined name until ruff found it.
+    """
+    from liminallm.service.embeddings import EMBEDDING_DIM
+
+    store = LegacyOnlyStore()
+    owner = store.add_user("tenant_rank")
+    good = store.upsert_context(owner.id, "good", "ctx")
+    poor = store.upsert_context(owner.id, "poor", "ctx")
+
+    near = [0.0] * EMBEDDING_DIM
+    near[5] = 1.0
+    far = [0.0] * EMBEDDING_DIM
+    far[9] = 1.0
+
+    rag = RAGService(
+        store, rag_mode="local_hybrid", embedding_model_id="rank",
+        embed=lambda _text: near, semantic=True,
+    )
+    for ctx, body, vec in (
+        (good, "quokka census figures for rottnest island this year", near),
+        (poor, "unrelated pottery glazing notes from the studio archive", far),
+    ):
+        for index in range(6):
+            store.add_chunks(ctx.id, [
+                KnowledgeChunk(
+                    id=None, context_id=ctx.id, fs_path=f"/{ctx.name}-{index}",
+                    content=body, embedding=vec, chunk_index=index,
+                    meta={"embedding_model_id": "rank"},
+                )
+            ])
+
+    hits = rag.retrieve(
+        [good.id, poor.id], "quokka census", limit=4,
+        user_id=owner.id, tenant_id="tenant_rank", min_token_count=0,
+    )
+
+    assert hits
+    assert all(hit.context_id == good.id for hit in hits)

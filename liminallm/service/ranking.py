@@ -64,19 +64,27 @@ def fuse_ranks(
 
 
 def fusion_ceiling(
-    channels: Iterable[Tuple[float, Sequence[Hashable]]],
+    channels: Sequence[Tuple[float, Sequence[Hashable]]],
     *,
     k: int = RRF_K,
 ) -> float:
-    """The score a key would get by placing first in every channel.
+    """The score a key would get by placing first in every channel that spoke.
 
     Fused scores are tiny by construction (a two-channel first place is about
     0.016), so anything shown to a person or compared against a threshold has
     to be divided by this. Dividing by the best score actually seen would make
     the top result 1.0 every time, whatever it was; dividing by the ceiling
-    keeps 1.0 meaning "every channel ranked this first".
+    keeps 1.0 meaning "ranked first everywhere it could be".
+
+    A channel that ranked nothing is left out of the total, for the same
+    reason ``fuse_ranks`` gives it no say: an empty channel is silence. Count
+    its weight and a note that placed first in the only channel with an
+    opinion publishes as half a bar.
+
+    ``Sequence``, not ``Iterable``: the caller passes the same channels to
+    ``fuse_ranks``, and a generator would arrive here already exhausted.
     """
-    total = sum(weight for weight, _keys in channels)
+    total = sum(weight for weight, keys in channels if keys)
     return total / (k + 1) if total else 0.0
 
 

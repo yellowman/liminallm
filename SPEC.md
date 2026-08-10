@@ -1475,6 +1475,12 @@ execution guardrails:
   Once any mapping exists, a request arriving on an unlisted host is refused
   (`not_found`) rather than served the default tenant, because otherwise any DNS
   name pointed at the box would reach that tenant's login page.
+  - one normalizer, shared by the request path and the `tenant_domains`
+    validator, so a host an operator can type is a host that can match. They
+    were two and disagreed on bracketed IPv6 — settings split at the first
+    colon, requests kept the brackets — which made `::1` impossible to map and,
+    once bare addresses stopped being exempt, impossible to reach. A bare IPv6
+    literal is canonicalized to the bracketed spelling the wire uses.
   - the hostname is read from `Host`, or from `X-Forwarded-Host` when
     `trust_forwarded_host` is on. That flag is the entire trust boundary: turn it
     on only when a reverse proxy you control sets the header from the real
@@ -1497,10 +1503,25 @@ execution guardrails:
     credential that stays valid against whatever site it is replayed at.
     requiring a match means a stolen acme session is useless at globex, and a
     forged `Host` reaches nothing the caller could not already reach.
-    `tenancy.user_belongs_to_site` is that rule, called from login, refresh and
-    every authenticated request; **a blank on either side is a mismatch, not a
-    pass**, because the caller with nothing to compare is the one that resolved
-    no site.
+    `tenancy.user_belongs_to_site` is that rule and `AuthService._site_matches`
+    is its single caller-facing form — one method, not one copy per entry
+    point, because the copy that gets missed on the next edit is an
+    authorization hole. Every way in goes through it: password login, OAuth
+    completion, refresh, and every authenticated request. **A blank on either
+    side is a mismatch, not a pass**, because the caller with nothing to
+    compare is the one that resolved no site. `None` is different from blank —
+    it means the caller is not making a tenanted decision at all (logout
+    revoking your own session), not that it tried and failed.
+  - **OAuth is the same rule, and needed saying separately.** *(fixed — it had
+    no check at all.)* `app_user.email` is globally unique, so resolving an
+    account by provider id or email finds it whatever site the flow began at.
+    The provider proves who someone is, not where they belong: signing in with
+    Google at globex used to mint acme's tokens, while the password path
+    refused exactly that. Both ways in now agree.
+  - **`default_tenant_id` cannot be blank** (`min_length=1`). A blank site
+    tenant matches no account under the rule above, so clearing it in the
+    console would 401 every user — including the admin who would have to set
+    it back, since that route authenticates too. The field refuses instead.
   - signup joins the tenant serving the site it arrived at.
   - `POST /v1/auth/signup` and `POST /v1/auth/oauth/{provider}/start` reject a
     `tenant_id` in the body with `validation_error` rather than ignoring it.

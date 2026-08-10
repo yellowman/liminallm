@@ -789,7 +789,8 @@ class Settings(BaseModel):
     )
     default_tenant_id: str = managed_field(
         "public",
-        description="Tenant for an install that serves one site, i.e. one with tenant_domains empty. Once any domain is mapped, an unlisted host is refused rather than served this tenant.",
+        min_length=1,
+        description="Tenant for an install that serves one site, i.e. one with tenant_domains empty. Once any domain is mapped, an unlisted host is refused rather than served this tenant. Cannot be blank: a blank site tenant matches no account, so clearing it would lock every user out — including the admin who would have to set it back.",
     )
     tenant_domains: dict[str, str] = managed_field(
         {},
@@ -1095,9 +1096,17 @@ class Settings(BaseModel):
                 raise ValueError("tenant_domains must be a JSON object") from exc
         if not isinstance(value, dict):
             raise ValueError("tenant_domains must be a JSON object")
+        # The same normalizer the request path uses, not a second one that
+        # agrees with it most of the time. They disagreed on bracketed IPv6:
+        # this stripped at the first colon, so "[::1]" stored the key "[" and
+        # "::1" stored nothing at all, while normalize_host produced "[::1]".
+        # A loopback-over-IPv6 host was therefore impossible to map — and once
+        # unlisted hosts stopped being exempt, impossible to reach.
+        from liminallm.service.tenancy import normalize_host
+
         normalized: dict[str, str] = {}
         for host, tenant in value.items():
-            host = str(host).strip().lower().rstrip(".").split(":")[0]
+            host = normalize_host(host)
             tenant = str(tenant).strip()
             if not host or not tenant:
                 raise ValueError("tenant_domains entries need a host and a tenant")

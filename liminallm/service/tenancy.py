@@ -37,13 +37,23 @@ from liminallm.service.errors import NotFoundError
 
 def normalize_host(value: Optional[str]) -> str:
     """Lowercase, no port, no trailing dot: a browser sends
-    ``Acme.Example.com:8443`` where an operator typed ``acme.example.com``."""
+    ``Acme.Example.com:8443`` where an operator typed ``acme.example.com``.
+
+    One spelling for one host, because this is also what ``tenant_domains``
+    keys are normalized with. Two normalizers that agree most of the time
+    produce a host an operator can type but never match.
+    """
     if not value:
         return ""
     host = str(value).split(",")[0].strip().lower().rstrip(".")
     if host.startswith("["):  # bracketed IPv6 literal, optional :port after ]
         end = host.find("]")
         return host[: end + 1] if end != -1 else host
+    if host.count(":") > 1:
+        # A bare IPv6 literal, which is how an operator types it into settings
+        # and never how a Host header carries it. Canonicalize to the bracketed
+        # spelling the wire uses, so "::1" and "[::1]:8000" are one key.
+        return f"[{host}]"
     return host.split(":")[0]
 
 
