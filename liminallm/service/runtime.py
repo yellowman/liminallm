@@ -493,6 +493,14 @@ class Runtime:
             str(effective.rag_mode),
             effective.embedding_model_id,
             effective.rag_chunk_size,
+            # Retrieval settings belong here for the same reason the rest do:
+            # RAGService reads them once, at construction. Left out, an admin
+            # toggles reranking, the console reads the new value back, and
+            # nothing changes until the process restarts.
+            str(effective.rag_rerank),
+            effective.rag_rerank_candidates,
+            effective.rag_late_interaction,
+            effective.rag_late_segments,
         )
 
     def _read_settings_version(self) -> Optional[str]:

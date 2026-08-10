@@ -1,8 +1,8 @@
 import uuid
 
 from liminallm.service.rag import RAGService
-from tests.harness import get_test_store
 from liminallm.storage.models import KnowledgeChunk, KnowledgeContext, User
+from tests.harness import get_test_store
 
 
 def _setup_store() -> tuple[RAGService, str, str, str, str]:
@@ -312,3 +312,34 @@ def test_pgvector_filters_fs_path(tmp_path):
 
     assert len(results) == 1
     assert results[0].fs_path == "keep_me"
+
+
+def test_local_hybrid_does_not_hand_the_whole_answer_to_one_context():
+    """Per-context lists are ranked within a context and not across them.
+
+    Concatenating them and letting the caller truncate gives every slot to
+    whichever context was listed first, however well the second matched.
+    """
+    store = LegacyOnlyStore()
+    owner = store.add_user("tenant_multi")
+    first = store.upsert_context(owner.id, "first", "ctx")
+    second = store.upsert_context(owner.id, "second", "ctx")
+
+    rag = RAGService(store, rag_mode="local_hybrid", embedding_model_id="multi")
+    for ctx in (first, second):
+        for index in range(6):
+            store.add_chunks(ctx.id, [
+                KnowledgeChunk(
+                    id=None, context_id=ctx.id, fs_path=f"/{ctx.name}-{index}",
+                    content=f"shared subject line number {index} with enough words to keep it",
+                    embedding=[], chunk_index=index,
+                    meta={"embedding_model_id": "multi"},
+                )
+            ])
+
+    hits = rag.retrieve(
+        [first.id, second.id], "shared subject", limit=4,
+        user_id=owner.id, tenant_id="tenant_multi", min_token_count=0,
+    )
+
+    assert {hit.context_id for hit in hits} == {first.id, second.id}

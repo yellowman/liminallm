@@ -25,6 +25,7 @@ from liminallm.service.ranking import (
     LEXICAL_WEIGHT,
     SEMANTIC_WEIGHT,
     fuse_ranks,
+    fusion_ceiling,
     ranked_positive,
 )
 
@@ -195,8 +196,13 @@ def search_notes(
             ]),
         ))
 
+    # Scaled to the fusion ceiling before it leaves: this score is published
+    # as "score" by the search route and as "similarity" by the witness
+    # report, and a raw fused value is ~0.016 at its best — every result would
+    # render as roughly 1% of a bar.
     fused = fuse_ranks(channels)
-    scored = [(notes[i], score) for i, score in fused.items()]
+    ceiling = fusion_ceiling(channels) or 1.0
+    scored = [(notes[i], score / ceiling) for i, score in fused.items()]
     scored.sort(key=lambda pair: pair[1], reverse=True)
     return scored[:limit]
 

@@ -63,6 +63,23 @@ def fuse_ranks(
     return scores
 
 
+def fusion_ceiling(
+    channels: Iterable[Tuple[float, Sequence[Hashable]]],
+    *,
+    k: int = RRF_K,
+) -> float:
+    """The score a key would get by placing first in every channel.
+
+    Fused scores are tiny by construction (a two-channel first place is about
+    0.016), so anything shown to a person or compared against a threshold has
+    to be divided by this. Dividing by the best score actually seen would make
+    the top result 1.0 every time, whatever it was; dividing by the ceiling
+    keeps 1.0 meaning "every channel ranked this first".
+    """
+    total = sum(weight for weight, _keys in channels)
+    return total / (k + 1) if total else 0.0
+
+
 def ranked_positive(scores: Sequence[float]) -> List[int]:
     """Indices a channel actually matched, best first.
 

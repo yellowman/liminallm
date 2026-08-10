@@ -21,6 +21,7 @@ import re
 from typing import Any, Dict, List, Optional, Tuple
 
 from liminallm.logging import get_logger
+from liminallm.service.ranking import SEMANTIC_WEIGHT as RANKING_SEMANTIC_WEIGHT
 from liminallm.service.tokenizer_utils import estimate_token_count
 
 logger = get_logger(__name__)
@@ -262,7 +263,7 @@ def rank_turns(
     query: str,
     *,
     embeddings=None,
-    semantic_weight: float = 0.6,
+    semantic_weight: float = RANKING_SEMANTIC_WEIGHT,
     max_embed: int = SEMANTIC_RERANK_CANDIDATES,
 ) -> List[float]:
     """Relevance score per older turn: hybrid semantic+BM25, or BM25 alone.
@@ -283,7 +284,10 @@ def rank_turns(
     from liminallm.service.ranking import fuse_ranks, ranked_positive
 
     corpus = [tokenize_text(str(getattr(m, "content", "") or "")) for m in older]
-    bm25 = _normalized_scores(compute_bm25_scores(tokenize_text(query), corpus))
+    # Raw, not normalized: rank fusion reads order and nothing else, and the
+    # bm25-only return below is consumed the same way — sorted and filtered
+    # for a positive score. Scaling it was work with no reader.
+    bm25 = compute_bm25_scores(tokenize_text(query), corpus)
 
     if embeddings is None or not getattr(embeddings, "is_semantic", False):
         return bm25

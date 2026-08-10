@@ -102,7 +102,10 @@ class RAGService:
         # Late interaction needs a real encoder for the same reason the dense
         # channel does: MaxSim over hash vectors is noise with extra steps.
         self.late_interaction = bool(late_interaction and semantic)
-        self.late_segments = max(1, late_segments)
+        # Floor of two, not one: a single segment is the pooled vector by
+        # another name, so a caller that enabled the feature without naming a
+        # segment count would index nothing at all and never be told.
+        self.late_segments = max(2, late_segments)
 
         self._retriever = (
             self._retrieve_pgvector
@@ -395,8 +398,15 @@ class RAGService:
         scored exactly against *all* of their segments. Approximate search
         decides who is considered; it never decides the order.
         """
+        # Bounded across all query parts, not per part: MaxSim below is pure
+        # Python over every segment of every candidate, so an unbounded union
+        # of nine parts' pools would put tens of millions of float operations
+        # on a synchronous retrieval.
         candidate_ids: List[int] = []
+        seen: set[int] = set()
         for vector in query_vectors:
+            if len(candidate_ids) >= pool_size:
+                break
             for chunk_id in self.store.late_candidate_ids(  # type: ignore[attr-defined]
                 allowed_ids,
                 vector,
@@ -405,8 +415,11 @@ class RAGService:
                 user_id=user_id,
                 tenant_id=tenant_id,
             ):
-                if chunk_id not in candidate_ids:
+                if chunk_id not in seen:
+                    seen.add(chunk_id)
                     candidate_ids.append(chunk_id)
+                if len(candidate_ids) >= pool_size:
+                    break
         if not candidate_ids:
             return []
 
@@ -506,27 +519,36 @@ class RAGService:
             return []
 
         query_embedding = self.embed(query)
-        results: List[KnowledgeChunk] = []
         # A shortlist per context, not a share of the final answer: the stages
         # above still cut this to ``limit``, and a reranker needs more than the
         # answer to improve on it.
         per_context_limit = max(1, math.ceil(self._pool_size(limit) / len(allowed_ids)))
+        per_context: List[List[KnowledgeChunk]] = []
         for ctx_id in allowed_ids:
-            results.extend(
-                self.store.search_chunks(
+            per_context.append([
+                chunk
+                for chunk in self.store.search_chunks(
                     ctx_id,
                     query,
                     query_embedding,
                     per_context_limit,
                     semantic=self.semantic,
                 )
-            )
+                if (chunk.meta or {}).get("embedding_model_id")
+                == self.embedding_model_id
+            ])
 
-        return [
-            chunk
-            for chunk in results
-            if (chunk.meta or {}).get("embedding_model_id") == self.embedding_model_id
-        ]
+        # Interleave rather than concatenate. These lists are ranked within a
+        # context and carry no score to rank across them, so a concatenation
+        # that the caller then truncates would hand the whole answer to
+        # whichever context happened to be listed first — the second context
+        # unreachable however well it matched.
+        merged: List[KnowledgeChunk] = []
+        for rank in range(max((len(chunks) for chunks in per_context), default=0)):
+            for chunks in per_context:
+                if rank < len(chunks):
+                    merged.append(chunks[rank])
+        return merged
 
     def ingest_text(
         self,
@@ -654,16 +676,19 @@ class RAGService:
                 continue
             try:
                 segments = [(part, self.embed(part)) for part in parts]
-            except Exception as exc:  # noqa: BLE001 - the pooled vector stands
-                logger.warning(
-                    "rag_segment_embed_failed", chunk_id=chunk.id, error=str(exc)
+                self.store.add_chunk_vectors(  # type: ignore[attr-defined]
+                    chunk.id,
+                    segments,
+                    meta={"embedding_model_id": self.embedding_model_id},
                 )
-                continue
-            self.store.add_chunk_vectors(  # type: ignore[attr-defined]
-                chunk.id,
-                segments,
-                meta={"embedding_model_id": self.embedding_model_id},
-            )
+            except Exception as exc:  # noqa: BLE001 - the pooled vector stands
+                # The write is inside the guard, not just the embed: the chunk
+                # rows are already committed by here, so letting a missing
+                # table or a dimension mismatch escape would fail an ingest
+                # that in fact succeeded, and the retry would duplicate it.
+                logger.warning(
+                    "rag_segment_index_failed", chunk_id=chunk.id, error=str(exc)
+                )
 
     def ingest_file(
         self, context_id: str, path: str, chunk_size: Optional[int] = None

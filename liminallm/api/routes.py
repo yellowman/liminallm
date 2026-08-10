@@ -2505,6 +2505,12 @@ async def update_system_settings(
         "rag_mode",
         "embedding_model_id",
         "rag_chunk_size",
+        # Baked into RAGService at construction; without these a retrieval
+        # setting changed here would read back correctly and do nothing.
+        "rag_rerank",
+        "rag_rerank_candidates",
+        "rag_late_interaction",
+        "rag_late_segments",
     }
     if model_affecting_keys & set(body.keys()):
         try:

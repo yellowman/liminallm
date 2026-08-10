@@ -63,6 +63,14 @@ def segment_text(text: str, *, max_segments: int) -> List[str]:
         else:
             merged.append(piece)
 
+    # The loop can only merge a fragment forward into a segment that is still
+    # short, so a trailing fragment after a long segment survives on its own.
+    # Fold it backwards: at query time MaxSim takes the best segment, and a
+    # one-word segment's vector is near enough to noise to win on nothing.
+    if len(merged) > 1 and len(merged[-1].split()) < MIN_SEGMENT_WORDS:
+        tail = merged.pop()
+        merged[-1] = f"{merged[-1]} {tail}"
+
     if len(merged) <= max_segments:
         return merged
 

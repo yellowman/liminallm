@@ -267,3 +267,20 @@ def test_late_interaction_needs_a_real_encoder(store):
     rag = RAGService(store, late_interaction=True, late_segments=8)
 
     assert rag.late_interaction is False
+
+
+def test_a_short_trailing_sentence_does_not_earn_its_own_vector(store):
+    """MaxSim takes the best segment, so a near-noise segment can win on it."""
+    text = f"{_long('alpha')}. Yes."
+
+    segments = segment_text(text, max_segments=8)
+
+    assert len(segments) == 1
+    assert segments[0].endswith("Yes.")
+
+
+def test_enabling_late_interaction_without_a_segment_count_still_indexes(store):
+    """max(1, 0) segments would index nothing and never say so."""
+    rag = RAGService(store, embed=_subject_encoder, semantic=True, late_interaction=True)
+
+    assert rag.late_segments >= 2
