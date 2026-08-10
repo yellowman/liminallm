@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timezone
 from ipaddress import ip_address
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from psycopg import errors
 from psycopg.abc import Buffer
@@ -3226,7 +3226,16 @@ class PostgresStore:
             )
             return result.rowcount > 0
 
-    def add_chunks(self, context_id: str, chunks: Iterable[KnowledgeChunk]) -> None:
+    def add_chunks(
+        self, context_id: str, chunks: Iterable[KnowledgeChunk]
+    ) -> List[int]:
+        """Insert chunks and return their ids, in order.
+
+        The id is returned (and set on the passed chunk) because late
+        interaction has to attach segment vectors to the row it just wrote,
+        and reading them back by content would be both slower and ambiguous.
+        """
+        inserted: List[int] = []
         try:
             with self._connect() as conn:
                 for chunk in chunks:
@@ -3235,8 +3244,8 @@ class PostgresStore:
                             "fs_path required for knowledge_chunk",
                             {"fs_path": chunk.fs_path},
                         )
-                    conn.execute(
-                        "INSERT INTO knowledge_chunk (context_id, fs_path, chunk_index, content, embedding, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    row = conn.execute(
+                        "INSERT INTO knowledge_chunk (context_id, fs_path, chunk_index, content, embedding, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
                         (
                             context_id,
                             chunk.fs_path,
@@ -3246,9 +3255,133 @@ class PostgresStore:
                             chunk.created_at,
                             json.dumps(chunk.meta) if chunk.meta else None,
                         ),
-                    )
+                    ).fetchone()
+                    if row:
+                        chunk.id = int(row["id"])
+                        inserted.append(int(row["id"]))
         except errors.ForeignKeyViolation:
             raise ConstraintViolation("context not found", {"context_id": context_id})
+        return inserted
+
+    def add_chunk_vectors(
+        self,
+        chunk_id: int,
+        segments: Sequence[Tuple[str, List[float]]],
+        *,
+        meta: Optional[dict[str, Any]] = None,
+    ) -> int:
+        """Persist a chunk's segment vectors, replacing any it already had.
+
+        Replacing rather than appending keeps re-ingestion idempotent: a file
+        that is ingested twice must not end up scored against two generations
+        of its own segments.
+        """
+        if not segments:
+            return 0
+        payload = self._json_param(meta)
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM knowledge_chunk_vector WHERE chunk_id = %s", (chunk_id,)
+            )
+            for index, (content, embedding) in enumerate(segments):
+                conn.execute(
+                    "INSERT INTO knowledge_chunk_vector (chunk_id, segment_index, content, embedding, meta) VALUES (%s, %s, %s, %s, %s)",
+                    (chunk_id, index, content, embedding, payload),
+                )
+        return len(segments)
+
+    def late_candidate_ids(
+        self,
+        context_ids: Optional[Sequence[str]],
+        query_embedding: List[float],
+        limit: int = 4,
+        filters: Optional[dict[str, Any]] = None,
+        *,
+        user_id: str,  # REQUIRED per SPEC §12.2 - user isolation is mandatory
+        tenant_id: Optional[str] = None,
+    ) -> List[int]:
+        """Chunks with a segment near this query vector, nearest first.
+
+        Candidate generation only. A chunk qualifies on its best segment, not
+        on its average — which is the whole reason the segments are stored
+        separately — and the exact MaxSim score is computed by the caller over
+        every segment of the chunks this returns.
+
+        SECURITY: user_id is required to enforce data isolation per SPEC §12.2.
+        All queries MUST be filtered by user_id to prevent cross-user data leakage.
+        """
+        if not query_embedding or not context_ids:
+            return []
+        if not user_id:
+            self.logger.error("late_candidate_ids_missing_user_id")
+            return []
+        where, params = self._chunk_scope(
+            context_ids, user_id=user_id, tenant_id=tenant_id, filters=filters
+        )
+        with self._connect() as conn:
+            sql = """
+                SELECT kcv.chunk_id
+                FROM knowledge_chunk_vector kcv
+                JOIN knowledge_chunk kc ON kcv.chunk_id = kc.id
+                JOIN knowledge_context ctx ON kc.context_id = ctx.id
+                LEFT JOIN app_user u ON ctx.owner_user_id = u.id
+                """
+            sql += where
+            sql += " ORDER BY kcv.embedding <-> %s::vector LIMIT %s"
+            # Over-fetch: several segments of one chunk can occupy the nearest
+            # rows, and each of those is one candidate, not many.
+            rows = conn.execute(
+                sql, (*params, self._format_vector(query_embedding), limit * 4)
+            ).fetchall()
+        seen: List[int] = []
+        for row in rows:
+            chunk_id = int(row["chunk_id"])
+            if chunk_id not in seen:
+                seen.append(chunk_id)
+            if len(seen) >= limit:
+                break
+        return seen
+
+    def chunks_with_vectors(
+        self, chunk_ids: Sequence[int]
+    ) -> List[Tuple[KnowledgeChunk, List[List[float]]]]:
+        """Candidate chunks and every segment vector each one owns.
+
+        Access was already enforced when the ids were generated; this reads
+        rows by primary key and adds no scope of its own.
+        """
+        if not chunk_ids:
+            return []
+        ids = list(chunk_ids)
+        with self._connect() as conn:
+            chunk_rows = conn.execute(
+                """
+                SELECT kc.id, kc.context_id, kc.fs_path, kc.content, kc.embedding, kc.chunk_index, kc.created_at, kc.meta
+                FROM knowledge_chunk kc WHERE kc.id = ANY(%s)
+                """,
+                (ids,),
+            ).fetchall()
+            vector_rows = conn.execute(
+                "SELECT chunk_id, embedding FROM knowledge_chunk_vector"
+                " WHERE chunk_id = ANY(%s) ORDER BY chunk_id, segment_index",
+                (ids,),
+            ).fetchall()
+
+        vectors: dict[int, List[List[float]]] = {}
+        for row in vector_rows:
+            vectors.setdefault(int(row["chunk_id"]), []).append(
+                self._parse_vector(row["embedding"])
+            )
+
+        by_id = {
+            int(row["id"]): self._row_to_knowledge_chunk(row) for row in chunk_rows
+        }
+        # Caller's order is the candidate order; preserve it.
+        return [
+            (by_id[chunk_id], vectors.get(chunk_id, []))
+            for chunk_id in ids
+            if chunk_id in by_id
+        ]
 
     def list_chunks(
         self,

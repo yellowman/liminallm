@@ -12,8 +12,11 @@ from liminallm.logging import get_logger
 from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
 from liminallm.service.embeddings import deterministic_embedding
 from liminallm.service.fs import PathTraversalError, safe_join
+from liminallm.service.late import maxsim, segment_text
 from liminallm.service.ranking import (
+    LATE_WEIGHT,
     LEXICAL_WEIGHT,
+    POOLED_WITH_LATE_WEIGHT,
     SEMANTIC_WEIGHT,
     fuse_ranks,
     ranked_positive,
@@ -80,6 +83,8 @@ class RAGService:
         embedding_model_id: str = "text-embedding",
         semantic: bool = False,
         rerank: Optional[Callable[[str, Sequence[KnowledgeChunk]], List[KnowledgeChunk]]] = None,
+        late_interaction: bool = False,
+        late_segments: int = 0,
     ) -> None:
         self.store = store
         self.default_chunk_size = max(default_chunk_size, 64)
@@ -94,6 +99,10 @@ class RAGService:
         # Injected like ``embed`` so the kernel keeps no opinion about which
         # model does the reranking, or whether one does at all.
         self.rerank = rerank
+        # Late interaction needs a real encoder for the same reason the dense
+        # channel does: MaxSim over hash vectors is noise with extra steps.
+        self.late_interaction = bool(late_interaction and semantic)
+        self.late_segments = max(1, late_segments)
 
         self._retriever = (
             self._retrieve_pgvector
@@ -308,20 +317,31 @@ class RAGService:
         # a random sample: hash-vector distance carries no meaning to sort by.
         # Asking for it would only dilute the keyword pool.
         dense: List[KnowledgeChunk] = []
+        late: List[KnowledgeChunk] = []
         if self.semantic:
+            query_vectors = self._query_vectors(query)
             dense = list(
                 self.store.search_chunks_pgvector(  # type: ignore[attr-defined]
                     allowed_ids,
                     query,
-                    self.embed(query),
+                    query_vectors[0],
                     pool_size,
                     filters=filters,
                     user_id=user_id,
                     tenant_id=tenant_id,
                 )
             )
+            if self.late_interaction:
+                late = self._retrieve_late(
+                    allowed_ids,
+                    query_vectors,
+                    pool_size,
+                    filters=filters,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                )
 
-        ranked = self._fuse(query, lexical, dense)
+        ranked = self._fuse(query, lexical, dense, late)
         if not ranked:
             # Silence here is a result, not a fault: with no encoder and no
             # keyword overlap there is nothing honest to ground on, and four
@@ -338,9 +358,65 @@ class RAGService:
             semantic=self.semantic,
             lexical=len(lexical),
             dense=len(dense),
+            late=len(late),
             fused=len(ranked),
         )
         return ranked
+
+    def _query_vectors(self, query: str) -> List[List[float]]:
+        """The query as its parts, for MaxSim; the whole query stays first.
+
+        The first vector is the whole query and is what the pooled dense
+        channel uses, so a multi-clause question still gets one honest
+        whole-question vector even when its clauses are also embedded.
+        """
+        vectors = [self.embed(query)]
+        if not self.late_interaction:
+            return vectors
+        parts = segment_text(query, max_segments=self.late_segments)
+        if len(parts) > 1:
+            vectors.extend(self.embed(part) for part in parts)
+        return vectors
+
+    def _retrieve_late(
+        self,
+        allowed_ids: Sequence[str],
+        query_vectors: Sequence[List[float]],
+        pool_size: int,
+        *,
+        filters: Dict[str, str],
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+    ) -> List[KnowledgeChunk]:
+        """MaxSim ranking over chunks that keep their segments separately.
+
+        Two stages, as every multi-vector retriever does it: each part of the
+        query gathers candidates by nearest segment, then the candidates are
+        scored exactly against *all* of their segments. Approximate search
+        decides who is considered; it never decides the order.
+        """
+        candidate_ids: List[int] = []
+        for vector in query_vectors:
+            for chunk_id in self.store.late_candidate_ids(  # type: ignore[attr-defined]
+                allowed_ids,
+                vector,
+                pool_size,
+                filters=filters,
+                user_id=user_id,
+                tenant_id=tenant_id,
+            ):
+                if chunk_id not in candidate_ids:
+                    candidate_ids.append(chunk_id)
+        if not candidate_ids:
+            return []
+
+        scored: List[tuple[float, KnowledgeChunk]] = []
+        for chunk, segments in self.store.chunks_with_vectors(candidate_ids):  # type: ignore[attr-defined]
+            score = maxsim(query_vectors, segments)
+            if score > 0:
+                scored.append((score, chunk))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [chunk for _score, chunk in scored[:pool_size]]
 
     def _pool_size(self, limit: int) -> int:
         """How many candidates each channel offers the stages above.
@@ -366,8 +442,9 @@ class RAGService:
         query: str,
         lexical: Sequence[KnowledgeChunk],
         dense: Sequence[KnowledgeChunk],
+        late: Sequence[KnowledgeChunk] = (),
     ) -> List[KnowledgeChunk]:
-        """Fuse the two channels by rank, per SPEC §2.5.
+        """Fuse the channels by rank, per SPEC §2.5.
 
         The lexical pool arrives ordered by ``ts_rank``, which was only ever a
         recall filter; it is reordered here by real BM25 before fusion. That
@@ -375,11 +452,14 @@ class RAGService:
         is an approximation — sound for ordering a shortlist, which is all it
         does, since the corpus-wide decision was already made by the SQL.
 
-        The dense pool keeps the order the index returned. Nearest is what
-        that channel means, and re-scoring it here would say nothing new.
+        The dense and late pools keep the order they arrived in: nearest and
+        MaxSim are what those channels mean, and re-scoring here would say
+        nothing new. When late interaction has something to say, the pooled
+        vector steps back to a lower weight — it is the same signal read less
+        precisely, so it should not vote twice at full strength.
         """
         chunks: Dict[object, KnowledgeChunk] = {}
-        for chunk in list(lexical) + list(dense):
+        for chunk in list(lexical) + list(dense) + list(late):
             chunks.setdefault(self._chunk_key(chunk), chunk)
         if not chunks:
             return []
@@ -396,9 +476,14 @@ class RAGService:
                     [self._chunk_key(lexical[i]) for i in ranked_positive(scores)],
                 )
             )
-        if dense:
+        if late:
             channels.append(
-                (SEMANTIC_WEIGHT, [self._chunk_key(chunk) for chunk in dense])
+                (LATE_WEIGHT, [self._chunk_key(chunk) for chunk in late])
+            )
+        if dense:
+            pooled = POOLED_WITH_LATE_WEIGHT if late else SEMANTIC_WEIGHT
+            channels.append(
+                (pooled, [self._chunk_key(chunk) for chunk in dense])
             )
 
         fused = fuse_ranks(channels)
@@ -545,7 +630,40 @@ class RAGService:
 
         if chunks:
             self.store.add_chunks(context_id, chunks)  # type: ignore[attr-defined]
+            self._index_segments(chunks)
         return len(chunks)
+
+    def _index_segments(self, chunks: Sequence[KnowledgeChunk]) -> None:
+        """Store each chunk's segment vectors for late interaction.
+
+        Best effort on purpose: this is an extra index over content that is
+        already ingested and already retrievable. If the encoder fails here,
+        the chunk keeps its pooled vector and its text, and the late channel
+        simply has nothing to say about it — which the fusion already treats
+        as silence rather than as a bad score.
+        """
+        if not self.late_interaction:
+            return
+        for chunk in chunks:
+            if chunk.id is None:
+                continue
+            parts = segment_text(chunk.content, max_segments=self.late_segments)
+            if len(parts) < 2:
+                # One segment is the pooled vector by another name, and it
+                # would earn the chunk a second full-weight vote for it.
+                continue
+            try:
+                segments = [(part, self.embed(part)) for part in parts]
+            except Exception as exc:  # noqa: BLE001 - the pooled vector stands
+                logger.warning(
+                    "rag_segment_embed_failed", chunk_id=chunk.id, error=str(exc)
+                )
+                continue
+            self.store.add_chunk_vectors(  # type: ignore[attr-defined]
+                chunk.id,
+                segments,
+                meta={"embedding_model_id": self.embedding_model_id},
+            )
 
     def ingest_file(
         self, context_id: str, path: str, chunk_size: Optional[int] = None

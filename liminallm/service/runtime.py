@@ -449,6 +449,8 @@ class Runtime:
             embedding_model_id=embedding_model_id,
             semantic=self.embeddings.is_semantic,
             rerank=reranker_from_settings(self.llm, self.settings),
+            late_interaction=self.settings.rag_late_interaction,
+            late_segments=self.settings.rag_late_segments,
         )
         self.training = TrainingService(
             self.store,

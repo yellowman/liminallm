@@ -219,6 +219,25 @@ USING ivfflat (embedding) WITH (lists = 100);
 CREATE INDEX IF NOT EXISTS knowledge_chunk_content_fts_idx ON knowledge_chunk
 USING gin (to_tsvector('simple', content));
 CREATE INDEX IF NOT EXISTS knowledge_chunk_fs_path_idx ON knowledge_chunk (fs_path);
+
+-- Late interaction (SPEC §2.5): several vectors per chunk, compared at query
+-- time by MaxSim. A pooled chunk vector has to average everything the chunk
+-- says into one point; these keep the parts separate. Same encoder and so the
+-- same width as knowledge_chunk.embedding — a segment vector is only ever
+-- compared against a query vector from the same encoder.
+CREATE TABLE IF NOT EXISTS knowledge_chunk_vector (
+  id              BIGSERIAL PRIMARY KEY,
+  chunk_id        BIGINT NOT NULL REFERENCES knowledge_chunk(id) ON DELETE CASCADE,
+  segment_index   INT NOT NULL,
+  content         TEXT NOT NULL,
+  embedding       VECTOR(:embedding_dim) NOT NULL,
+  meta            JSONB
+);
+CREATE INDEX IF NOT EXISTS knowledge_chunk_vector_chunk_idx ON knowledge_chunk_vector (chunk_id);
+CREATE INDEX IF NOT EXISTS knowledge_chunk_vector_embedding_idx ON knowledge_chunk_vector
+USING ivfflat (embedding) WITH (lists = 100);
+CREATE UNIQUE INDEX IF NOT EXISTS knowledge_chunk_vector_segment_idx
+ON knowledge_chunk_vector (chunk_id, segment_index);
 CREATE INDEX IF NOT EXISTS knowledge_chunk_context_chunk_idx ON knowledge_chunk (context_id, chunk_index);
 
 -- Add FK constraint for conversation.active_context_id now that knowledge_context exists

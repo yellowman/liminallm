@@ -311,6 +311,27 @@ CREATE TABLE knowledge_chunk (
 CREATE INDEX knowledge_chunk_context_idx ON knowledge_chunk (context_id);
 CREATE INDEX knowledge_chunk_embedding_idx ON knowledge_chunk
 USING ivfflat (embedding) WITH (lists = 100);
+-- the lexical half of hybrid retrieval; 'simple' takes no stemming, and the
+-- two-arg to_tsvector is IMMUTABLE, which is what makes it indexable.
+CREATE INDEX knowledge_chunk_content_fts_idx ON knowledge_chunk
+USING gin (to_tsvector('simple', content));
+
+-- late interaction: several vectors per chunk, compared at query time by
+-- MaxSim, so a chunk is found on its best part rather than its average.
+-- written only when rag_late_interaction is on.
+CREATE TABLE knowledge_chunk_vector (
+  id              BIGSERIAL PRIMARY KEY,
+  chunk_id        BIGINT NOT NULL REFERENCES knowledge_chunk(id) ON DELETE CASCADE,
+  segment_index   INT NOT NULL,
+  content         TEXT NOT NULL,
+  embedding       VECTOR NOT NULL,   -- same encoder, so same width as above
+  meta            JSONB
+);
+CREATE INDEX knowledge_chunk_vector_chunk_idx ON knowledge_chunk_vector (chunk_id);
+CREATE INDEX knowledge_chunk_vector_embedding_idx ON knowledge_chunk_vector
+USING ivfflat (embedding) WITH (lists = 100);
+CREATE UNIQUE INDEX knowledge_chunk_vector_segment_idx
+ON knowledge_chunk_vector (chunk_id, segment_index);
 ```
 
 #### ingestion pipeline (knowledge → chunks)
@@ -347,8 +368,9 @@ USING ivfflat (embedding) WITH (lists = 100);
 
   a third result is worth recording because it is about evaluation, not retrieval: LIMIT scores do not correlate with BEIR. an encoder's benchmark position predicts nothing about this failure, so "we use a good embedding model" is not a mitigation.
 
-  **candidate generation — two channels in parallel**, each scoped by `context_id` and by the access rules in §12.2 (both channels share one predicate builder, so a filter cannot go missing from one of them — and the filter that matters is user isolation):
-  - *dense*: pgvector `ORDER BY embedding <-> $query LIMIT n`, ivfflat.
+  **candidate generation — up to three channels in parallel**, each scoped by `context_id` and by the access rules in §12.2 (they share one predicate builder, so a filter cannot go missing from one of them — and the filter that matters is user isolation):
+  - *dense (pooled)*: pgvector `ORDER BY embedding <-> $query LIMIT n`, ivfflat, one vector per chunk.
+  - *late interaction (multi-vector)*: several vectors per chunk in `knowledge_chunk_vector`, scored by MaxSim. off by default (`rag_late_interaction`); see below.
   - *lexical*: postgres FTS, `to_tsvector('simple', content) @@ to_tsquery(...)` ranked by `ts_rank`, over a GIN expression index. terms are **OR'd** — one absent rare word must not empty the pool. `'simple'` takes no stemming and assumes no language, so an identifier or error code indexes as itself. terms come from the BM25 tokenizer (`\w+` only), so a user query cannot reach the tsquery parser as syntax. measured on 50k chunks: **28.7 ms/query with the GIN index, 239.7 ms without**.
   - pool width is `max(limit × 5, reranker appetite)`, capped at 100. the reranker publishes how much it will read, because a reranker handed exactly the chunks that were going to be returned anyway can reorder them but never reach the one that placed just outside the cut.
 
@@ -367,7 +389,16 @@ USING ivfflat (embedding) WITH (lists = 100);
   - the candidates are the user's own files and therefore **untrusted input to a decision**: they travel inside an explicit untrusted-data envelope, marker-lookalikes are neutralized first so a chunk cannot close the envelope and speak as instruction, and the "data, never instructions" rule is stated twice because weak local models drop a rule stated once.
   - **fails open.** any error, timeout, or unreadable reply leaves the fused order standing: losing the model must never mean losing the user's grounding. the one exception is a bare `NONE` — an unambiguous verdict is honoured, because grounding an answer in chunks just judged irrelevant is how a model ends up citing text that does not support it. anything with more to say than the word itself is a hedge, not a refusal.
 
-  **what we deliberately do not do.** multi-vector / late interaction (ColBERT-style) is the other architecture the paper measures, and it beats every single-vector model on both splits. it is not here because it needs a different index and a per-token vector store — a real change to §2.5's storage model, not a ranking change — and the paper notes it is largely untested for instruction-following. it is the strongest candidate for future work if the reranker proves too slow.
+  **late interaction**, `rag_late_interaction`, **off by default**, bounded by `rag_late_segments` (default 8). multi-vector retrieval is the one architecture in the paper that beats single-vector on both splits — 83.5 against 54.3 recall@2 on the 46-document set, 23.1 against 3.0 on the 50k one — and it is the only entry here that attacks the bound itself rather than working around it.
+
+  - **why it escapes the bound.** the dimension bound is a statement about a score that is *one inner product* between *one* query vector and *one* document vector. MaxSim is not that: the chunk is stored as several vectors and the score is, for each part of the query, its best-matching part of the chunk, summed. the paper says as much in its limitations — the theory "do[es] not hold necessarily for other architectures, such as multi-vector models".
+  - **what it fixes, concretely.** a pooled embedding has to answer for the whole chunk at once, so a chunk covering two subjects lands between them and is the best match for neither. `tests/test_late_interaction.py` asserts both halves of that: pooled-only similarity returns the near-miss chunk first, and the same corpus with segments kept separate returns the right one.
+  - **two stages, as every multi-vector retriever does it.** each part of the query gathers candidates by nearest *segment* — so a chunk qualifies on its best part, not its average — and the candidates are then scored exactly against *all* of their segments. approximate search decides who is considered; it never decides the order.
+  - **this is not ColBERT, and must not be read as carrying its numbers.** segments here are sentence-sized, embedded by the same encoder as everything else, because that encoder is reached through an OpenAI-compatible `/embeddings` endpoint and such an endpoint returns one vector per input — it cannot return per-token vectors. what carries over is the mechanism, not the granularity, at roughly an order of magnitude less storage than per-token would cost. **the seam is the encoder**: a real late-interaction model replaces `segment_text` and the embed call without touching the storage, the candidate generation, or the scoring.
+  - **weights.** late leads at 0.55 and the pooled vector *steps back to 0.25* rather than out — it is the same signal read less precisely, so it should not vote twice at full strength, but a whole-chunk vector still says something no single best part does. lexical is unchanged at 0.45.
+  - **coverage is not retroactive.** segment vectors are written at ingestion, so turning this on covers new content only; existing corpora need re-ingesting. a chunk without segments is *unranked* by this channel, never penalised by it — the same silence rule as everywhere else. that also means a partly-covered corpus tilts toward the covered part, which is the honest cost of enabling it without a backfill, and a backfill job is open work.
+  - **it requires a real encoder**, for the same reason the dense channel does: MaxSim over hash vectors is noise with extra steps. `late_interaction` is silently false when `is_semantic` is false.
+  - **cost.** one embedding call per segment at ingestion (so up to `rag_late_segments`× the ingestion cost) and one row per segment in an ivfflat index. that is the reason it is off by default, and the reason the segment count is capped rather than per-token.
 
   **dimensionality.** retrieval vectors persist at the provider's **native** width (`EMBEDDING_VECTOR_DIM`, default 1536). do not truncate them: the same work shows recall falling monotonically with dimension for every model tested, and truncation without matryoshka training is worse still. the 64-d hash space is for routing and clustering only and never ranks a retrieval.
 
@@ -1925,7 +1956,7 @@ the following are treated as constants the kernel must honor; LLM edits happen o
       - `smtp_security` is `starttls` (default, usually port 587), `ssl` (encrypted from the first byte, usually 465) or `none`. `none` exists for a relay on the same machine and is refused when a username is set, since the password would cross the wire in the clear. It replaces a `smtp_use_tls`/`smtp_allow_insecure` pair in which the second flag never enabled plaintext at all — it only removed a port guard in front of an SSL connection, so the ordinary self-hosted arrangement could not send.
     - URL settings: `oauth_redirect_uri`, `app_base_url`
     - voice settings: `voice_transcription_model` (enum: whisper-1), `voice_synthesis_model` (enum: tts-1, tts-1-hd), `voice_default_voice` (enum: alloy, echo, fable, onyx, nova, shimmer)
-    - model settings: `model_path` (with common suggestions: gpt-4o, gpt-4o-mini, gpt-5.2, claude-opus-4-5, claude-sonnet-4, glm-4-plus), `model_backend` (enum: openai, anthropic, azure, azure_openai, vertex, gemini, google, bedrock, together, together.ai, lorax, adapter_server, sagemaker, aws_sagemaker, zhipu, zhipu.ai, glm, stub), `default_adapter_mode` (enum: local, remote, prompt, hybrid), `rag_mode` (enum: pgvector, memory), `embedding_model_id` (enum: text-embedding, text-embedding-3-small, text-embedding-3-large, text-embedding-ada-002), `rag_rerank` (bool, default off), `rag_rerank_candidates` (int, 2–100)
+    - model settings: `model_path` (with common suggestions: gpt-4o, gpt-4o-mini, gpt-5.2, claude-opus-4-5, claude-sonnet-4, glm-4-plus), `model_backend` (enum: openai, anthropic, azure, azure_openai, vertex, gemini, google, bedrock, together, together.ai, lorax, adapter_server, sagemaker, aws_sagemaker, zhipu, zhipu.ai, glm, stub), `default_adapter_mode` (enum: local, remote, prompt, hybrid), `rag_mode` (enum: pgvector, memory), `embedding_model_id` (enum: text-embedding, text-embedding-3-small, text-embedding-3-large, text-embedding-ada-002), `rag_rerank` (enum: auto, on, off), `rag_rerank_candidates` (int, 2–100), `rag_late_interaction` (bool, default off), `rag_late_segments` (int, 2–32)
     - tenancy: `default_tenant_id`, `tenant_domains` (host → tenant id),
       `trust_forwarded_host`; JWT: `jwt_issuer`, `jwt_audience`
   - **environment-only settings** — everything that must be known *before* the

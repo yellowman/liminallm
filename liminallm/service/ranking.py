@@ -25,6 +25,14 @@ from typing import Dict, Hashable, Iterable, List, Sequence, Tuple
 SEMANTIC_WEIGHT = 0.55
 LEXICAL_WEIGHT = 0.45
 
+# Late interaction is the stronger reading of the same semantic signal: it
+# compares the query against each part of a chunk instead of against one
+# averaged point. So it leads when it is available, and the pooled vector
+# steps back rather than out — a pooled embedding still says something about
+# the chunk as a whole that no single best-matching part does.
+LATE_WEIGHT = 0.55
+POOLED_WITH_LATE_WEIGHT = 0.25
+
 # Standard RRF damping constant. It flattens the head of the 1/(k+rank) curve
 # so rank 1 does not swamp ranks 2 and 3, which is exactly what lets a chunk
 # ranked well by both channels overtake one ranked first by only one.

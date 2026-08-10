@@ -1060,6 +1060,23 @@ class Settings(BaseModel):
         20, ge=2, le=100,
         description="How many retrieved chunks the reranker reads. Ignored when reranking is off.",
     )
+    rag_late_interaction: bool = managed_field(
+        False,
+        description=(
+            "Store several vectors per chunk and compare them at query time, "
+            "so a chunk is found on its best part rather than its average. "
+            "Needs a real embedding encoder, and only covers content ingested "
+            "after it is turned on."
+        ),
+    )
+    rag_late_segments: int = managed_field(
+        8, ge=2, le=32,
+        description=(
+            "Most vectors stored per chunk. Each one costs an embedding call "
+            "at ingestion and a row in the index. Ignored when late "
+            "interaction is off."
+        ),
+    )
 
     @field_validator("tenant_domains", mode="before")
     @classmethod
@@ -1279,6 +1296,7 @@ _SETTING_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
                "adapter_server_model", "gemini_api_key")),
     ("Retrieval", ("rag_mode", "rag_chunk_size", "embedding_model_id",
                    "rag_rerank", "rag_rerank_candidates",
+                   "rag_late_interaction", "rag_late_segments",
                    "history_budget_fraction", "history_recall_fraction")),
     ("Features", ("notes_enabled", "allow_signup", "enable_mfa",
                   "web_tools_enabled", "extract_readers")),
