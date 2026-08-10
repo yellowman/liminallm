@@ -1530,10 +1530,14 @@ async def search_notes(
             "results": [
                 {
                     **_note_payload(note, content=False),
-                    "score": round(float(score), 4),
+                    # Position, not a score. What search_notes returns is a
+                    # fused rank value that tops out near 0.016 and packs the
+                    # whole result set into a hair's breadth of itself — a
+                    # number no client can render and none should try to.
+                    "rank": position,
                     "excerpt": " ".join(note.content.split())[:300],
                 }
-                for note, score in results
+                for position, (note, _score) in enumerate(results, start=1)
             ]
         },
     )

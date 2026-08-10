@@ -25,7 +25,6 @@ from liminallm.service.ranking import (
     LEXICAL_WEIGHT,
     SEMANTIC_WEIGHT,
     fuse_ranks,
-    fusion_ceiling,
     ranked_positive,
 )
 
@@ -157,6 +156,13 @@ def embed_note(embeddings, title: str, content: str) -> Optional[List[float]]:
         return None
 
 
+def _pair_similarity(a: Any, b: Any) -> float:
+    """Cosine between two notes, or 0.0 when either was never embedded."""
+    if not getattr(a, "embedding", None) or not getattr(b, "embedding", None):
+        return 0.0
+    return max(0.0, cosine_similarity(a.embedding, b.embedding))
+
+
 def search_notes(
     store,
     embeddings,
@@ -196,13 +202,13 @@ def search_notes(
             ]),
         ))
 
-    # Scaled to the fusion ceiling before it leaves: this score is published
-    # as "score" by the search route and as "similarity" by the witness
-    # report, and a raw fused value is ~0.016 at its best — every result would
-    # render as roughly 1% of a bar.
+    # The returned number is a fused rank score and nothing else. Rank fusion
+    # packs its scores together by construction — a raw value tops out near
+    # 0.016, and scaling it to the ceiling only moves the whole set into
+    # 0.90-1.00 — so it is not a similarity and must not be published as one.
+    # Callers order by it; nothing should render it.
     fused = fuse_ranks(channels)
-    ceiling = fusion_ceiling(channels) or 1.0
-    scored = [(notes[i], score / ceiling) for i, score in fused.items()]
+    scored = [(notes[i], score) for i, score in fused.items()]
     scored.sort(key=lambda pair: pair[1], reverse=True)
     return scored[:limit]
 
@@ -312,13 +318,17 @@ def witness_report(
         exclude_id=note.id,
     )
     findings: List[Dict[str, Any]] = []
-    for other, score in candidates:
+    for other, _rank_score in candidates:
         judged = judge_pair(llm, note, other)
         entry: Dict[str, Any] = {
             "note_id": other.id,
             "title": other.title,
+            # The real thing, as vault_sweep publishes it. This used to carry
+            # search_notes' fused rank score under the same name, so one
+            # module had two "similarity" fields on incomparable scales and
+            # this one meant nothing.
+            "similarity": round(_pair_similarity(note, other), 4),
             "created_at": other.created_at.isoformat(),
-            "similarity": round(float(score), 4),
             "days_apart": abs((note.created_at - other.created_at).days),
             **judged,
         }

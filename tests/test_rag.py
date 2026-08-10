@@ -88,13 +88,20 @@ class LegacyOnlyStore:
     def get_user(self, user_id: str) -> User | None:
         return self.users.get(user_id)
 
-    def add_chunks(self, context_id: str, chunks: list[KnowledgeChunk]) -> None:
+    def add_chunks(self, context_id: str, chunks: list[KnowledgeChunk]) -> list[int]:
+        # Returns ids and stamps chunk.id, as PostgresStore does — late
+        # interaction attaches segment vectors to the row that was just
+        # written, and a double that returns None makes any test of it pass
+        # by skipping the code entirely.
         bucket = self.chunks.setdefault(context_id, [])
+        written: list[int] = []
         for chunk in chunks:
             if not chunk.id:
                 chunk.id = self._chunk_id_seq
                 self._chunk_id_seq += 1
             bucket.append(chunk)
+            written.append(chunk.id)
+        return written
 
     def search_chunks(
         self,

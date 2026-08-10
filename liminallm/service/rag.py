@@ -335,14 +335,24 @@ class RAGService:
                 )
             )
             if self.late_interaction:
-                late = self._retrieve_late(
-                    allowed_ids,
-                    query_vectors,
-                    pool_size,
-                    filters=filters,
-                    user_id=user_id,
-                    tenant_id=tenant_id,
-                )
+                try:
+                    late = self._retrieve_late(
+                        allowed_ids,
+                        query_vectors,
+                        pool_size,
+                        filters=filters,
+                        user_id=user_id,
+                        tenant_id=tenant_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 - the other channels stand
+                    # This channel is an addition, so its failure must cost
+                    # its own contribution and nothing else. The setting is
+                    # hot-reloadable, so the first person to enable it on a
+                    # database that never had sql/schema.sql re-applied would
+                    # otherwise break every chat turn that touches RAG, not
+                    # just the part of ranking that is new.
+                    logger.warning("rag_late_channel_failed", error=str(exc))
+                    late = []
 
         ranked = self._fuse(query, lexical, dense, late)
         if not ranked:
@@ -522,7 +532,10 @@ class RAGService:
         if not allowed_ids:
             return []
 
-        query_embedding = self.embed(query)
+        # Only when it will be used: with the hash fallback the store ignores
+        # the vector entirely, and encoding it is a round trip bought for
+        # nothing — the same reason the pgvector path stopped asking.
+        query_embedding = self.embed(query) if self.semantic else None
         # A shortlist per context, not a share of the final answer: the stages
         # above still cut this to ``limit``, and a reranker needs more than the
         # answer to improve on it.
@@ -701,9 +714,18 @@ class RAGService:
                 # rows are already committed by here, so letting a missing
                 # table or a dimension mismatch escape would fail an ingest
                 # that in fact succeeded, and the retry would duplicate it.
+                #
+                # And stop. These failures are structural — a missing table, a
+                # width mismatch — so carrying on would pay the provider for
+                # `segments x remaining chunks` embeddings, throw every one
+                # away, and log the same warning several thousand times.
                 logger.warning(
-                    "rag_segment_index_failed", chunk_id=chunk.id, error=str(exc)
+                    "rag_segment_index_failed",
+                    chunk_id=chunk.id,
+                    error=str(exc),
+                    skipped=len(chunks) - chunks.index(chunk) - 1,
                 )
+                return
 
     def ingest_file(
         self, context_id: str, path: str, chunk_size: Optional[int] = None

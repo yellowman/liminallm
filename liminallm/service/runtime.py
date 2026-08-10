@@ -10,6 +10,9 @@ from typing import Any, Dict, Optional, Tuple, Union
 from urllib.parse import urlparse, urlunparse
 
 from liminallm.config import (
+    MODEL_AFFECTING_SETTINGS as _MODEL_AFFECTING,
+)
+from liminallm.config import (
     SYSTEM_SETTINGS_DEFAULTS,
     apply_managed_settings,
     generate_jwt_secret,
@@ -37,25 +40,9 @@ from liminallm.storage.redis_cache import RedisCache
 
 logger = get_logger(__name__)
 
-#: Settings the model service stack reads once, when it is built. Changing one
-#: means rebuilding, so this list decides both when the admin route triggers a
-#: reload and what the signature the background watcher compares is made of.
-#: One list, because it used to be two: the retrieval settings were added to
-#: the signature and forgotten in the route's membership test, so an admin
-#: toggled reranking, read the new value back from the console, and nothing
-#: happened until the process restarted.
-MODEL_AFFECTING_SETTINGS: Tuple[str, ...] = (
-    "model_path",
-    "model_backend",
-    "default_adapter_mode",
-    "rag_mode",
-    "embedding_model_id",
-    "rag_chunk_size",
-    "rag_rerank",
-    "rag_rerank_candidates",
-    "rag_late_interaction",
-    "rag_late_segments",
-)
+#: Sorted so the signature tuple has a stable shape; config.py owns the set,
+#: because the admin console labels settings from the same one.
+MODEL_AFFECTING_SETTINGS: Tuple[str, ...] = tuple(sorted(_MODEL_AFFECTING))
 
 
 def _mask_url_password(url: Optional[str]) -> Optional[str]:

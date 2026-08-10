@@ -710,6 +710,21 @@ RERANK_MIN_PARAMS_B = 30.0
 _PARAM_SIZE = re.compile(r"(?:^|[-_/x])(\d+(?:\.\d+)?)b(?:$|[-_./])", re.IGNORECASE)
 
 
+# A prefix match cannot tell a flagship from the distilled sibling that
+# shares its name, and the difference is the whole point of the list: the
+# evidence is about large models. "gpt-4o" would otherwise admit
+# "gpt-4o-mini", which is the *default* model_path — so an out-of-the-box
+# install would turn reranking on for the smallest model in the family.
+#
+# Matched as whole name parts, never as substrings: "mini" is inside
+# "gemini", and a naive `in` check rejected every Gemini model there is.
+RERANK_SMALL_VARIANTS: frozenset[str] = frozenset(
+    {"mini", "nano", "lite", "small", "tiny", "micro"}
+)
+
+_NAME_PARTS = re.compile(r"[-_./]+")
+
+
 def model_can_rerank(model_id: str) -> bool:
     """Whether `auto` should turn reranking on for this model.
 
@@ -721,10 +736,17 @@ def model_can_rerank(model_id: str) -> bool:
         return False
     # Strip a provider route like "openai/gpt-4o" or "vertex/gemini-2.5-pro".
     tail = lowered.rsplit("/", 1)[-1]
-    if any(tail.startswith(prefix) for prefix in RERANK_CAPABLE_PREFIXES):
-        return True
+    if RERANK_SMALL_VARIANTS & set(_NAME_PARTS.split(tail)):
+        return False
+
+    # A declared size beats family membership in both directions. A name that
+    # says it is small is small whatever family it belongs to — otherwise the
+    # allowlist would admit "gemini-2.0-flash-8b" on the strength of the
+    # prefix and never reach the size at all.
     sizes = [float(match) for match in _PARAM_SIZE.findall(tail)]
-    return bool(sizes) and max(sizes) >= RERANK_MIN_PARAMS_B
+    if sizes:
+        return max(sizes) >= RERANK_MIN_PARAMS_B
+    return any(tail.startswith(prefix) for prefix in RERANK_CAPABLE_PREFIXES)
 
 
 def context_window_from_table(

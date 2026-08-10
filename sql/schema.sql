@@ -233,9 +233,12 @@ CREATE TABLE IF NOT EXISTS knowledge_chunk_vector (
   embedding       VECTOR(:embedding_dim) NOT NULL,
   meta            JSONB
 );
-CREATE INDEX IF NOT EXISTS knowledge_chunk_vector_chunk_idx ON knowledge_chunk_vector (chunk_id);
 CREATE INDEX IF NOT EXISTS knowledge_chunk_vector_embedding_idx ON knowledge_chunk_vector
 USING ivfflat (embedding) WITH (lists = 100);
+-- (chunk_id, segment_index) also serves every lookup by chunk_id alone, so
+-- there is no separate index on the leading column. Late interaction makes
+-- this the hottest write path in ingestion; a second btree to maintain per
+-- segment row would be paid on every insert and read by nothing.
 CREATE UNIQUE INDEX IF NOT EXISTS knowledge_chunk_vector_segment_idx
 ON knowledge_chunk_vector (chunk_id, segment_index);
 CREATE INDEX IF NOT EXISTS knowledge_chunk_context_chunk_idx ON knowledge_chunk (context_id, chunk_index);

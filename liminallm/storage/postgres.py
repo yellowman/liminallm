@@ -3279,14 +3279,22 @@ class PostgresStore:
         if not segments:
             return 0
         payload = self._json_param(meta)
+        rows = [
+            (chunk_id, index, content, embedding, payload)
+            for index, (content, embedding) in enumerate(segments)
+        ]
         with self._connect() as conn:
             conn.execute(
                 "DELETE FROM knowledge_chunk_vector WHERE chunk_id = %s", (chunk_id,)
             )
-            for index, (content, embedding) in enumerate(segments):
-                conn.execute(
+            # One round trip for the batch. Ingestion calls this per chunk, so
+            # a 500-chunk file at eight segments each is 4000 inserts; sending
+            # them one at a time made late interaction the slowest thing in
+            # the pipeline by an order of magnitude.
+            with conn.cursor() as cur:
+                cur.executemany(
                     "INSERT INTO knowledge_chunk_vector (chunk_id, segment_index, content, embedding, meta) VALUES (%s, %s, %s, %s, %s)",
-                    (chunk_id, index, content, embedding, payload),
+                    rows,
                 )
         return len(segments)
 

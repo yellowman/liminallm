@@ -1335,6 +1335,17 @@ _SETTING_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
 
 # Changing one of these rebuilds the model service stack, which takes a moment
 # and briefly interrupts in-flight work. The console says so before you save.
+#: Settings the model service stack reads once, when it is built. Changing one
+#: tears the stack down and rebuilds it, so this list decides three things that
+#: must agree: what the admin console labels ``reloads_model``, when the admin
+#: route triggers a reload, and what the signature the background watcher
+#: compares is made of.
+#:
+#: One list because it was two, and they drifted the moment a setting was
+#: added: the retrieval settings reached the reload signature and never reached
+#: the console's label, so an admin toggling reranking was told nothing about
+#: the interruption. The console test compared the schema against this list, so
+#: it agreed with itself and noticed nothing.
 MODEL_AFFECTING_SETTINGS = frozenset({
     "model_backend",
     "model_path",
@@ -1342,6 +1353,10 @@ MODEL_AFFECTING_SETTINGS = frozenset({
     "rag_mode",
     "embedding_model_id",
     "rag_chunk_size",
+    "rag_rerank",
+    "rag_rerank_candidates",
+    "rag_late_interaction",
+    "rag_late_segments",
 })
 
 

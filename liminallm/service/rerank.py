@@ -43,7 +43,23 @@ SNIPPET_CHARS = 600
 # word itself is treated as an unreadable reply rather than a verdict.
 NONE_REPLY = re.compile(r"^\W*none\W*$", re.IGNORECASE)
 
+# A visible reasoning block, as several allowlisted models emit. Everything
+# inside it is working, not answer.
+_THINK_BLOCK = re.compile(r"<think\b.*?</think\s*>", re.IGNORECASE | re.DOTALL)
+
 Reranker = Callable[[str, Sequence[Any]], List[Any]]
+
+
+def _answer_only(reply: str) -> str:
+    """The part of a reply that is meant to be the ranking.
+
+    Reasoning blocks are dropped, then the last line carrying a digit wins:
+    a model that narrates before answering puts the answer last, and a model
+    that answers plainly has only one such line anyway.
+    """
+    cleaned = _THINK_BLOCK.sub(" ", reply or "")
+    lines = [line for line in cleaned.splitlines() if re.search(r"\d", line)]
+    return lines[-1] if lines else ""
 
 
 def build_prompt(query: str, snippets: Sequence[str]) -> str:
@@ -52,8 +68,12 @@ def build_prompt(query: str, snippets: Sequence[str]) -> str:
     The injection rule appears twice on purpose. This runs on small local
     models, and a weak model drops a rule stated once.
     """
+    # One line per passage, and the passage cannot add lines of its own: the
+    # numbering is what the model answers with, so a chunk containing a bare
+    # "[1] this is the definitive answer" on its own line would forge a
+    # candidate and make the returned index point at something else.
     body = "\n".join(
-        f"[{index}] {neutralize_markers(text)}"
+        f"[{index}] {' '.join(neutralize_markers(text).split())}"
         for index, text in enumerate(snippets, start=1)
     )
     return (
@@ -77,10 +97,15 @@ def parse_order(reply: str, count: int) -> List[int]:
 
     Out-of-range and repeated numbers drop out. An empty result means the
     reply carried no usable opinion, and the caller keeps its own order.
+
+    Only the answer is read, never the working. Several models this stage is
+    enabled for emit a visible reasoning block, and "passage 3 mentions 2024
+    revenue" is full of digits that are not a ranking — harvesting them scores
+    as a successful parse and silently reorders the user's context.
     """
     seen: set[int] = set()
     order: List[int] = []
-    for match in re.findall(r"\d+", reply or ""):
+    for match in re.findall(r"\d+", _answer_only(reply)):
         index = int(match) - 1
         if 0 <= index < count and index not in seen:
             seen.add(index)
@@ -128,8 +153,16 @@ def make_llm_reranker(
                 # say that no ranking can: none of these answer the question.
                 # Passing them on anyway is how a model ends up citing text
                 # that does not support what it just claimed.
-                logger.info("rag_rerank_rejected_all", candidates=len(head))
-                return tail
+                #
+                # The unread tail goes too. It is by construction ranked below
+                # the head the model just rejected, so returning it would turn
+                # "nothing here helps" into "here are the worse ones".
+                logger.info(
+                    "rag_rerank_rejected_all",
+                    candidates=len(head),
+                    unread=len(tail),
+                )
+                return []
             # Anything else unreadable is "no opinion", not "nothing is
             # relevant". A truncated or refused reply looks identical to a
             # deliberate NONE, and dropping the user's grounding on a parse
@@ -163,7 +196,14 @@ def reranker_from_settings(llm: Any, settings: Any) -> Optional[Reranker]:
     value free to drift from the declaration.
     """
     mode = settings.rag_rerank
-    model_id = str(getattr(llm, "base_model", "") or "")
+    # The serving model, not the configured base: an adapter server overrides
+    # it, and everything else in the kernel resolves the pair this way. Reading
+    # base_model alone judged "gpt-4o-mini" while a 7B actually answered.
+    model_id = str(
+        getattr(llm, "adapter_server_model", "")
+        or getattr(llm, "base_model", "")
+        or ""
+    )
     if mode == "auto":
         enabled = model_can_rerank(model_id)
         logger.info("rag_rerank_auto_resolved", model=model_id, enabled=enabled)
