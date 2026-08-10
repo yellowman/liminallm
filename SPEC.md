@@ -319,7 +319,7 @@ USING ivfflat (embedding) WITH (lists = 100);
 - **chunking**: sliding window token-based splitter (e.g., 300–500 tokens with 50 token overlap) tuned per file type; store `chunk_index` and offsets.
 - **hygiene**: dedupe by file checksum + path; skip binary blobs unless parser registered; enforce max file size per plan tier; optional PII-scrub per context.
 - **embedding model** *(revised — the original text assumed the hash fallback was the only encoder)*: the encoder is resolved from the model backend, not pinned to a named local model. when the backend exposes an openai-compatible `/embeddings` client (openai, gemini-compat, vllm/lorax self-hosted), embeddings go through it at the provider's **native** dimensionality; otherwise the kernel's deterministic hash embedding applies. the encoder id is recorded with every vector (`knowledge_chunk.meta.embedding_model_id`, `note.meta`, `message.meta.embedding_model`).
-- **`EmbeddingsService.is_semantic`**: the load-bearing honesty flag. hash-embedding cosine is *noise*, not weak signal — so every consumer that would blend cosine into a ranking checks this flag and falls back to bm25 alone when it is false. blending noise at any weight is worse than keywords alone.
+- **`EmbeddingsService.is_semantic`**: the load-bearing honesty flag. hash-embedding cosine is *noise*, not weak signal — so every consumer that would let cosine into a ranking checks this flag and falls back to bm25 alone when it is false. blending noise at any weight is worse than keywords alone. **the flag is passed in, never inferred**: `RAGService` receives it from the runtime alongside the encoder, because a retriever handed only an `embed` callable cannot tell a real encoder from the hash fallback — and for a while the primary rag path could not, and ranked the user's files by hash distance.
 - **two spaces, deliberately**:
   - *retrieval space* (rag chunks, notes, message recall): native dimensionality, provider encoder, compared only against vectors carrying the same encoder id.
   - *routing/clustering space* (`preference_event.context_embedding`, `adapter_router_state.centroid_vec`): always the 64-d hash embedding via `deterministic_embedding`. this is intentional — clustering compares vectors across users and months, so it needs a space that is stable and free, and that does not shift when an admin swaps embedding providers.
@@ -330,17 +330,54 @@ USING ivfflat (embedding) WITH (lists = 100);
 - **refresh cadence**:
   - watch filesystem path events; enqueue ingestion job on file change.
   - encoder change is handled by *invalidation*, not a sweep: a vector whose recorded encoder id differs from the current one reads as "not embedded", so the normal backfill re-embeds it lazily. no daily job exists — a scheduled re-embed is still open work, and until it lands, old vectors are re-embedded only when something reads them.
-- **retrieval strategy**:
-  - **why two channels, not one.** *(revised — the original text made the dense path primary and alone)* a single vector of dimension `d` bounds how many top-k sets of documents any query can return: the count of realizable `k`-subsets is capped by `d`, so past some corpus size there exist relevant combinations **no query retrieves**, whatever the encoder was trained on (Weller et al., ICLR 2026, *On the Theoretical Limitations of Embedding-Based Retrieval*). the ceiling is geometric, so it is not a data or model-size problem. their LIMIT probe is the practical shape of it: 46 documents, one-clause queries, and the best embedder reaches 54.3 recall@2 while bm25 reaches 97.8 — and on a synonym rewrite of the same corpus bm25 collapses to 10.6 while the embedders hold. neither channel is safe alone, and they fail on disjoint inputs. so retrieval runs both and fuses them.
-  - **candidate generation, two channels in parallel**, each scoped by `context_id` and the access rules in §12.2:
-    - dense: pgvector `ORDER BY embedding <-> $query LIMIT n`.
-    - lexical: postgres FTS, `to_tsvector('simple', content) @@ to_tsquery(...)` ordered by `ts_rank`, backed by a GIN expression index. terms are OR'd — one absent rare word must not empty the pool. `'simple'` takes no stemming and assumes no language, so an identifier indexes as itself.
-  - **fusion: weighted reciprocal rank fusion** over the two ordered pools, `Σ wᵢ / (k + rankᵢ)` with `k=60`. rank, never score: cosine is bounded and bm25 is not, so any weighted sum of the two needs a normalizer, and every normalizer moves with the pool it was computed over. fusion by position also lets a chunk both channels rank well beat one that only a single channel loves, which a fixed weighted sum cannot express. the lexical pool is reordered by real bm25 before fusion (`ts_rank` was only ever the recall filter). a channel ranks only what it actually matched — a zero score is silence, not a weak opinion, since under rank fusion an arbitrary order over non-matches would carry the channel's full weight.
-  - **optional re-ranking**, off by default (`rag_rerank`, bounded by `rag_rerank_candidates`): the serving model reads the query and the fused shortlist in one pass and returns an order. it is the only stage bound by neither ceiling above, and the only one that can answer "none of these". in the paper's own test a long-context reranker solved all 1000 LIMIT-small queries where the best embedder stayed under 60. cost is one model call per retrieval, on the hot path, which is why an operator opts in. the chunks are the user's own files and therefore untrusted input to a decision: they travel inside an explicit untrusted-data envelope, marker-lookalikes are defanged first, and the "data, never instructions" rule is stated twice because weak local models drop a rule stated once. the stage **fails open** — any error, timeout, or unreadable reply leaves the fused order standing, because losing the model must never mean losing the user's grounding.
+- **retrieval strategy** *(rewritten — the original made a single dense query both the whole pipeline and the primary path)*:
+
+  **why more than one channel.** a single vector of dimension `d` bounds how many distinct top-k sets of documents any query can ever return. the bound is geometric, not statistical, so no amount of training data or model size removes it: for `n` documents, `k` relevant, and a score margin `γ`, realizing every `k`-subset needs `d ≥ log C(n,k) / log(1 + 1/γ)` (Weller, Boratko, Naim & Lee, ICLR 2026, *On the Theoretical Limitations of Embedding-Based Retrieval*). that is a floor, and a loose one. optimizing the vectors directly against the test set — no language model, no generalization, the best case that can exist — the same work measures a *critical-n* per dimension: 10 documents at `d=4`, 99 at `d=18`, extrapolating to ~500k at 512, ~4m at 1024, ~250m at 4096. real encoders land far below their own floor: the 46-document probe below is solvable in 12 free dimensions, and real models at 64 dimensions still cannot solve it.
+
+  **what that looks like in practice.** their LIMIT probe is deliberately trivial — documents like "Jon likes quokkas and apples", queries like "who likes quokkas?" — and it breaks state-of-the-art embedders:
+
+  | | recall@2, 46 docs | recall@2, 50k docs |
+  |---|---|---|
+  | BM25 | 97.8 | 85.7 |
+  | GTE-ModernColBERT (multi-vector) | 83.5 | 23.1 |
+  | Promptriever 8B @4096 (best single-vector) | 54.3 | 3.0 |
+  | Qwen3 Embed @4096 | 19.0 | 0.8 |
+
+  two results matter more than the ranking. first, **it is not domain shift**: fine-tuning on in-domain training data moves recall@10 from ~0 to 2.8, while training on the test set solves it — the task is representationally hard, not unfamiliar. second, **lexical is not the answer either**: rewriting the same corpus with synonyms drops BM25 by ~89% (97.8 → 10.6) while the dense models hold, leaving BM25 *below* most of them. the two channels fail on disjoint inputs. neither is safe alone, which is the entire argument for running both.
+
+  a third result is worth recording because it is about evaluation, not retrieval: LIMIT scores do not correlate with BEIR. an encoder's benchmark position predicts nothing about this failure, so "we use a good embedding model" is not a mitigation.
+
+  **candidate generation — two channels in parallel**, each scoped by `context_id` and by the access rules in §12.2 (both channels share one predicate builder, so a filter cannot go missing from one of them — and the filter that matters is user isolation):
+  - *dense*: pgvector `ORDER BY embedding <-> $query LIMIT n`, ivfflat.
+  - *lexical*: postgres FTS, `to_tsvector('simple', content) @@ to_tsquery(...)` ranked by `ts_rank`, over a GIN expression index. terms are **OR'd** — one absent rare word must not empty the pool. `'simple'` takes no stemming and assumes no language, so an identifier or error code indexes as itself. terms come from the BM25 tokenizer (`\w+` only), so a user query cannot reach the tsquery parser as syntax. measured on 50k chunks: **28.7 ms/query with the GIN index, 239.7 ms without**.
+  - pool width is `max(limit × 5, reranker appetite)`, capped at 100. the reranker publishes how much it will read, because a reranker handed exactly the chunks that were going to be returned anyway can reorder them but never reach the one that placed just outside the cut.
+
+  **fusion — weighted reciprocal rank fusion**, `Σ wᵢ / (k + rankᵢ)`, `k=60`, semantic 0.55 / lexical 0.45:
+  - **rank, never score.** cosine is bounded and BM25 is not, and BM25's magnitude depends on the pool it was scored against — so any weighted sum needs a normalizer, and every normalizer moves with the pool. the same chunk would score differently depending on what it was ranked beside.
+  - rank fusion also expresses something a weighted sum cannot: a chunk **both** channels rank well beats one that only a single channel loves. under a fixed-weight sum, a perfect cosine always beats a perfect BM25 and the lexical channel can never win a head-to-head — which the table above says is exactly backwards.
+  - **a channel ranks only what it matched.** zero is silence, not a weak opinion: an arbitrary order over non-matches would otherwise carry the channel's full weight.
+  - the lexical pool is reordered by real BM25 before fusion (`ts_rank` was only ever the recall filter). that BM25 scores against the pool, not the corpus, so its IDF is an approximation — sound for ordering a shortlist, which is all it does.
+
+  **pipeline order.** retrievers do recall and return a shortlist; the stages above decide precision — short-chunk filter → rerank → token budget → `limit`. the filter runs first so no rerank slot is spent on a chunk that is about to be dropped; the truncation runs last so the rerank sees more than the answer.
+
+  **optional re-ranking**, `rag_rerank` = `auto` (default) | `on` | `off`, bounded by `rag_rerank_candidates`. the serving model reads the query and the shortlist in one pass and returns an order. it is the only stage bound by neither ceiling above, and the only one that can answer "none of these" — in the paper's own test a long-context reranker solved all 1000 of the 46-document queries where the best embedder stayed under 60.
+  - **why it is conditional rather than simply on**: that result is a frontier long-context model. this project's premise is small self-hosted models, which is the case the paper never tested, and this stage can *drop* context. one model call per grounded turn on the hot path is also not free. so the default is not a fixed answer but a question about the serving model.
+  - **`auto`** asks `model_can_rerank(model_path)`: a curated prefix list of families a listwise judgement is reasonable to ask of, plus the parameter count an open-weight name declares (≥30B). it answers "is there positive evidence", never "is this model good", and **unknown is a no** — a model given the benefit of the doubt here can silently drop a user's grounding. a mixture-of-experts name reads as its per-expert size, which understates it and lands off; that is the safe direction. the resolution is logged at startup (`rag_rerank_auto_resolved`) so an operator can see what the guess was rather than infer it from latency.
+  - **`on` / `off`** exist because a heuristic over model names will be wrong, and the operator who knows their deployment should be able to say so in either direction without editing a table.
+  - the candidates are the user's own files and therefore **untrusted input to a decision**: they travel inside an explicit untrusted-data envelope, marker-lookalikes are neutralized first so a chunk cannot close the envelope and speak as instruction, and the "data, never instructions" rule is stated twice because weak local models drop a rule stated once.
+  - **fails open.** any error, timeout, or unreadable reply leaves the fused order standing: losing the model must never mean losing the user's grounding. the one exception is a bare `NONE` — an unambiguous verdict is honoured, because grounding an answer in chunks just judged irrelevant is how a model ends up citing text that does not support it. anything with more to say than the word itself is a hedge, not a refusal.
+
+  **what we deliberately do not do.** multi-vector / late interaction (ColBERT-style) is the other architecture the paper measures, and it beats every single-vector model on both splits. it is not here because it needs a different index and a per-token vector store — a real change to §2.5's storage model, not a ranking change — and the paper notes it is largely untested for instruction-following. it is the strongest candidate for future work if the reranker proves too slow.
+
+  **dimensionality.** retrieval vectors persist at the provider's **native** width (`EMBEDDING_VECTOR_DIM`, default 1536). do not truncate them: the same work shows recall falling monotonically with dimension for every model tested, and truncation without matryoshka training is worse still. the 64-d hash space is for routing and clustering only and never ranks a retrieval.
+
+  **where this system is most exposed.** the paper's own difficulty metric is qrel graph density — how often one document is relevant to many queries, and how much queries share documents. LIMIT scores 0.085 density / 28.5 average query strength against ≤0.026 / ≤0.6 for NQ, HotpotQA, SciFact and FollowIR. the parts of this system that look like the hard end of that scale are the notes vault and the witness (§ notes), where the task *is* relating documents to each other and a hub note is relevant to many questions — not chat RAG over a handful of uploaded files, which sits at the easy end.
+
   - return chunk text + `fs_path` for citation; orchestrator can ask LLM to cite paths.
-  - optional dev fallback: in-process BM25 + cosine over a bounded candidate window (controlled by `RAG_MODE=local_hybrid`), fused by the same rule, intended for tests or tiny corpora when pgvector is absent.
-  - **ranking precedence (applies to rag, notes, and conversation recall alike):** *(amended — bm25 was "the tie-breaker, never the peer", which no weighting of a rank fusion can express, and which contradicts the evidence above)* semantic leads and lexical is weighted just below it (0.55 / 0.45), but lexical is a **peer that can win**: when it is the channel that actually matched, it takes the top slot. **without** a real encoder the semantic channel does not speak at all — it is not a weaker vote, it is noise, and hash-embedding cosine must never enter a ranking. `EmbeddingsService.is_semantic` is the flag every consumer checks and every retriever is passed.
-  - **a miss is a result.** with no real encoder and no lexical match there is nothing honest to ground on, and retrieval returns empty rather than the nearest hash vectors. arbitrary chunks read to the model as evidence.
+  - optional dev fallback: in-process BM25 + cosine over a bounded candidate window (`RAG_MODE=local_hybrid`), fused by the same rule, intended for tests or tiny corpora when pgvector is absent.
+  - **ranking precedence (applies to rag, notes, and conversation recall alike):** *(amended — the rule was "bm25 is the fallback and the tie-breaker, never the peer", which no weighting of a rank fusion can express, and which the evidence above contradicts)* semantic leads and lexical is weighted just below it, but lexical is a **peer that can win**: when it is the channel that actually matched, it takes the top slot. **without** a real encoder the semantic channel does not speak at all — it is not a weaker vote, it is noise. hash-embedding cosine must never enter a ranking; `EmbeddingsService.is_semantic` is the flag every consumer checks, and every retriever is now passed it rather than left to guess.
+  - **one mechanism, three callers.** rag, notes search (`search_notes`) and conversation recall (`rank_turns`) all fuse by rank through the same `service/ranking.py`, and all three honour the `is_semantic` guard. the weighted sums they used before are gone: notes weighted *lexical* 0.6 against the rule above, and recall had to score an un-embedded turn as a literal zero — which a weighted sum then held against it, where rank fusion simply reads it as a turn that channel never ranked. recall keeps its `semantic_weight` setting; it is now the semantic channel's fusion weight rather than a blend coefficient.
+  - **a miss is a result.** with no real encoder and no lexical match there is nothing honest to ground on, and retrieval returns empty rather than the nearest hash vectors. arbitrary chunks read to the model as evidence, and it will cite them.
   - baseline kernel ships with a deterministic hashing-based embedding fallback (no external model dependency) shared across RAG/routing/clustering so chunks always have non-empty vectors. those vectors are for routing and clustering; they never rank a retrieval.
 
 ### 2.6 preferences & training
@@ -1343,7 +1380,8 @@ execution guardrails:
    - compute `ctx_embedding` from last user message (+ context).
 4. **RAG retrieval (if contexts)**:
    - use `knowledge_context` bound to conversation.
-   - select chunks from `knowledge_chunk` via pgvector.
+   - select chunks from `knowledge_chunk` over both channels — pgvector and
+     postgres FTS — fused by rank, then optionally reranked (§2.5).
 5. **router**:
    - find nearest clusters → candidate skills.
    - load routing policy artifact.
@@ -1887,7 +1925,7 @@ the following are treated as constants the kernel must honor; LLM edits happen o
       - `smtp_security` is `starttls` (default, usually port 587), `ssl` (encrypted from the first byte, usually 465) or `none`. `none` exists for a relay on the same machine and is refused when a username is set, since the password would cross the wire in the clear. It replaces a `smtp_use_tls`/`smtp_allow_insecure` pair in which the second flag never enabled plaintext at all — it only removed a port guard in front of an SSL connection, so the ordinary self-hosted arrangement could not send.
     - URL settings: `oauth_redirect_uri`, `app_base_url`
     - voice settings: `voice_transcription_model` (enum: whisper-1), `voice_synthesis_model` (enum: tts-1, tts-1-hd), `voice_default_voice` (enum: alloy, echo, fable, onyx, nova, shimmer)
-    - model settings: `model_path` (with common suggestions: gpt-4o, gpt-4o-mini, gpt-5.2, claude-opus-4-5, claude-sonnet-4, glm-4-plus), `model_backend` (enum: openai, anthropic, azure, azure_openai, vertex, gemini, google, bedrock, together, together.ai, lorax, adapter_server, sagemaker, aws_sagemaker, zhipu, zhipu.ai, glm, stub), `default_adapter_mode` (enum: local, remote, prompt, hybrid), `rag_mode` (enum: pgvector, memory), `embedding_model_id` (enum: text-embedding, text-embedding-3-small, text-embedding-3-large, text-embedding-ada-002)
+    - model settings: `model_path` (with common suggestions: gpt-4o, gpt-4o-mini, gpt-5.2, claude-opus-4-5, claude-sonnet-4, glm-4-plus), `model_backend` (enum: openai, anthropic, azure, azure_openai, vertex, gemini, google, bedrock, together, together.ai, lorax, adapter_server, sagemaker, aws_sagemaker, zhipu, zhipu.ai, glm, stub), `default_adapter_mode` (enum: local, remote, prompt, hybrid), `rag_mode` (enum: pgvector, memory), `embedding_model_id` (enum: text-embedding, text-embedding-3-small, text-embedding-3-large, text-embedding-ada-002), `rag_rerank` (bool, default off), `rag_rerank_candidates` (int, 2–100)
     - tenancy: `default_tenant_id`, `tenant_domains` (host → tenant id),
       `trust_forwarded_host`; JWT: `jwt_issuer`, `jwt_audience`
   - **environment-only settings** — everything that must be known *before* the
@@ -1949,7 +1987,7 @@ note_link  (src_note_id → note, dst_note_id → note)   -- pk (src, dst)
   unparseable output degrades to UNRELATED; a model error degrades that one
   judgment, never the report.
 - **per-note witness** (`POST /v1/notes/{id}/witness`): ranks the vault
-  against the note (bm25 blended with cosine), judges the top ≤6 neighbors,
+  against the note (bm25 and cosine fused by rank, §2.5), judges the top ≤6 neighbors,
   and returns findings sorted movement-first. any verdict in
   {CONTRADICTS, EVOLVES} carries the bfs link path between the two notes
   (undirected, depth ≤6) — the trail matters more than the score.
@@ -2153,11 +2191,12 @@ model window:
 2. **recall** — older turns chosen by relevance to the message being
    answered, restored verbatim from the permanent transcript, in
    chronological order, within `history_recall_fraction` (default 0.25) of
-   the history budget. ranking is **hybrid semantic + bm25** when a real
-   embedding encoder is configured, bm25 alone otherwise. semantic wins the
-   cases keywords miss: "which database did we pick" finds "let's go with
-   postgres" though they share no words; bm25 keeps exact terms (ids,
-   numbers) weighted. cost is bounded — cheap bm25 ranks everything, and
+   the history budget. ranking is **the same rank fusion rag uses**
+   (§2.5) when a real embedding encoder is configured, bm25 alone otherwise.
+   semantic wins the cases keywords miss: "which database did we pick" finds
+   "let's go with postgres" though they share no words; bm25 keeps exact
+   terms (ids, numbers) in play. a turn the embedding budget never reached
+   is absent from the semantic channel rather than scored zero by it. cost is bounded — cheap bm25 ranks everything, and
    only the top ~20 candidates get the embedding rerank; per-turn
    embeddings are persisted by a background backfill so the hot path reads
    vectors rather than computing them. recency is one relevance signal, not

@@ -21,6 +21,12 @@ from typing import Any, Dict, List, Optional, Tuple
 from liminallm.logging import get_logger
 from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
 from liminallm.service.embeddings import cosine_similarity
+from liminallm.service.ranking import (
+    LEXICAL_WEIGHT,
+    SEMANTIC_WEIGHT,
+    fuse_ranks,
+    ranked_positive,
+)
 
 logger = get_logger(__name__)
 
@@ -161,31 +167,36 @@ def search_notes(
 ) -> List[Tuple[Any, float]]:
     """Rank the user's notes against a query.
 
-    Cosine over stored embeddings when available, blended with BM25 over
-    title+content so keyword matches surface even when the embedding space is
-    weak (deterministic fallback embeddings) or absent entirely.
+    Two channels fused by rank, the same rule rag uses (SPEC §2.5): BM25 over
+    title+content, and cosine over stored embeddings when the encoder is real.
+    Rank rather than a weighted sum of scores because BM25 is unbounded and
+    cosine is not, so any sum needs a normalizer and every normalizer moves
+    with the note set it was computed over.
     """
     notes = [n for n in store.list_notes(user_id, limit=10_000) if n.id != exclude_id]
     if not notes or not query.strip():
         return []
 
     corpus = [tokenize_text(f"{n.title}\n{n.content}") for n in notes]
-    bm25 = compute_bm25_scores(tokenize_text(query), corpus)
-    max_bm25 = max(bm25) if bm25 and max(bm25) > 0 else 1.0
+    channels: List[Tuple[float, List[int]]] = [
+        (LEXICAL_WEIGHT, ranked_positive(compute_bm25_scores(tokenize_text(query), corpus)))
+    ]
 
-    # Cosine joins the score only when embeddings are real: hash-vector
-    # cosine is noise, and noise at 40% weight is worse than BM25 alone.
+    # Cosine joins the ranking only when embeddings are real: hash-vector
+    # cosine is noise, and noise at any weight is worse than BM25 alone.
     semantic = bool(getattr(embeddings, "is_semantic", False))
     query_vec = embed_note(embeddings, query, "") if (embeddings and semantic) else None
-    scored: List[Tuple[Any, float]] = []
-    for i, note in enumerate(notes):
-        # BM25 carries the whole score without a real encoder; with one,
-        # meaning gets 40% so a note can match on sense, not just words.
-        score = (0.6 if query_vec else 1.0) * (bm25[i] / max_bm25)
-        if query_vec and note.embedding:
-            score += 0.4 * max(0.0, cosine_similarity(query_vec, note.embedding))
-        if score > 0.0:
-            scored.append((note, score))
+    if query_vec:
+        channels.append((
+            SEMANTIC_WEIGHT,
+            ranked_positive([
+                cosine_similarity(query_vec, note.embedding) if note.embedding else 0.0
+                for note in notes
+            ]),
+        ))
+
+    fused = fuse_ranks(channels)
+    scored = [(notes[i], score) for i, score in fused.items()]
     scored.sort(key=lambda pair: pair[1], reverse=True)
     return scored[:limit]
 

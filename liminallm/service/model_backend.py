@@ -686,6 +686,47 @@ def _longest_prefix(lowered: str, table: List[Tuple[str, int]]) -> Optional[int]
     return best[1] if best else None
 
 
+# Families a listwise rerank can reasonably be asked of. The evidence for
+# reranking as a fix for embedding's limits comes from a large hosted model
+# reading a whole shortlist in one pass; nothing establishes that a small
+# local model does the same job, and this stage can drop the user's context.
+# So the list is an allowlist of the tested shape, not a survey — an
+# unrecognized model reads as "no evidence" and reranking stays off.
+RERANK_CAPABLE_PREFIXES: Tuple[str, ...] = (
+    "gpt-4o", "gpt-4.1", "gpt-5", "o1", "o3", "o4",
+    "claude-3-5-sonnet", "claude-3-7", "claude-4", "claude-opus", "claude-sonnet",
+    "gemini-1.5-pro", "gemini-2", "gemini-3",
+    "deepseek-r", "deepseek-v3", "glm-4.5", "glm-4.6", "grok-3", "grok-4",
+    "kimi-k2", "qwen3-max", "mistral-large", "llama-4-maverick",
+)
+
+# Open-weight models name their size, and below this the instruction-following
+# a listwise rank needs is not reliable. Crude, deliberately conservative, and
+# only ever consulted for a model no prefix above recognized. A mixture-of-
+# experts name reads as its per-expert size ("8x22b" is 22), which understates
+# the model and so lands on the safe side of the bar; an operator who knows
+# better sets rag_rerank=on.
+RERANK_MIN_PARAMS_B = 30.0
+_PARAM_SIZE = re.compile(r"(?:^|[-_/x])(\d+(?:\.\d+)?)b(?:$|[-_./])", re.IGNORECASE)
+
+
+def model_can_rerank(model_id: str) -> bool:
+    """Whether `auto` should turn reranking on for this model.
+
+    A heuristic, and it says so: it answers "is there positive evidence this
+    model can judge a shortlist", never "is this model good". Unknown is a no.
+    """
+    lowered = (model_id or "").strip().lower()
+    if not lowered:
+        return False
+    # Strip a provider route like "openai/gpt-4o" or "vertex/gemini-2.5-pro".
+    tail = lowered.rsplit("/", 1)[-1]
+    if any(tail.startswith(prefix) for prefix in RERANK_CAPABLE_PREFIXES):
+        return True
+    sizes = [float(match) for match in _PARAM_SIZE.findall(tail)]
+    return bool(sizes) and max(sizes) >= RERANK_MIN_PARAMS_B
+
+
 def context_window_from_table(
     model_id: str, provider: Optional[str] = None
 ) -> Optional[int]:

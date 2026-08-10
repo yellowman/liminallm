@@ -131,17 +131,27 @@ class RAGService:
             return []
 
         normalized_query = query or ""
+        # Retrievers return a shortlist, not the final answer: recall is their
+        # job, and the stages below decide precision. A reranker that only ever
+        # saw ``limit`` chunks could reorder them but never rescue the one that
+        # placed just outside the cut.
         results = self._retriever(
             context_ids, normalized_query, limit * 2 if max_tokens else limit,
             user_id=user_id, tenant_id=tenant_id
         )
 
-        # Filter out very short chunks (likely noise)
+        # Filter out very short chunks (likely noise). Before reranking, so no
+        # rerank slot is spent on a chunk that is about to be dropped anyway.
         if min_token_count > 0:
             results = [
                 chunk for chunk in results
                 if self._get_chunk_token_count(chunk) >= min_token_count
             ]
+
+        # Both retrieval paths get the rerank stage, and both get it here
+        # rather than inside themselves, so the stage sees the whole shortlist.
+        if self.rerank is not None and results:
+            results = list(self.rerank(normalized_query, results))
 
         # Apply token budget if specified
         if max_tokens is not None and max_tokens > 0:
@@ -281,7 +291,7 @@ class RAGService:
             return []
 
         filters = {"embedding_model_id": self.embedding_model_id}
-        pool_size = min(max(limit * CANDIDATE_POOL_FACTOR, limit), MAX_CANDIDATE_POOL)
+        pool_size = self._pool_size(limit)
 
         lexical = list(
             self.store.search_chunks_lexical(  # type: ignore[attr-defined]
@@ -330,9 +340,19 @@ class RAGService:
             dense=len(dense),
             fused=len(ranked),
         )
-        if self.rerank is not None:
-            ranked = list(self.rerank(query, ranked))
-        return ranked[:limit]
+        return ranked
+
+    def _pool_size(self, limit: int) -> int:
+        """How many candidates each channel offers the stages above.
+
+        Wide enough that a chunk one channel buries but the other would rank
+        first still survives to fusion, and never narrower than what the
+        reranker is willing to read — a reranker handed exactly the chunks
+        that were going to be returned anyway can only reorder them.
+        """
+        appetite = int(getattr(self.rerank, "max_candidates", 0) or 0)
+        wanted = max(limit * CANDIDATE_POOL_FACTOR, limit, appetite)
+        return min(wanted, MAX_CANDIDATE_POOL)
 
     @staticmethod
     def _chunk_key(chunk: KnowledgeChunk) -> object:
@@ -402,7 +422,10 @@ class RAGService:
 
         query_embedding = self.embed(query)
         results: List[KnowledgeChunk] = []
-        per_context_limit = max(1, math.ceil(limit / len(allowed_ids)))
+        # A shortlist per context, not a share of the final answer: the stages
+        # above still cut this to ``limit``, and a reranker needs more than the
+        # answer to improve on it.
+        per_context_limit = max(1, math.ceil(self._pool_size(limit) / len(allowed_ids)))
         for ctx_id in allowed_ids:
             results.extend(
                 self.store.search_chunks(
@@ -414,12 +437,11 @@ class RAGService:
                 )
             )
 
-        filtered = [
+        return [
             chunk
             for chunk in results
             if (chunk.meta or {}).get("embedding_model_id") == self.embedding_model_id
         ]
-        return filtered[:limit]
 
     def ingest_text(
         self,

@@ -1047,11 +1047,13 @@ class Settings(BaseModel):
         400, ge=64, le=4000,
         description="Tokens per knowledge chunk. Changing this rebuilds the model services and only affects newly ingested content.",
     )
-    rag_rerank: bool = managed_field(
-        False,
+    rag_rerank: Literal["auto", "on", "off"] = managed_field(
+        "auto",
         description=(
             "Let the serving model reorder retrieved chunks before they reach "
-            "the answer. Better grounding, one extra model call per retrieval."
+            "the answer. Better grounding, one extra model call per retrieval. "
+            "'auto' turns it on only for models known to judge a shortlist "
+            "well; an unrecognized model stays off."
         ),
     )
     rag_rerank_candidates: int = managed_field(

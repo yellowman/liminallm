@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from liminallm.service.model_backend import model_can_rerank
 from liminallm.service.ranking import (
     LEXICAL_WEIGHT,
     RRF_K,
@@ -25,7 +26,6 @@ from liminallm.service.rerank import (
     parse_order,
     reranker_from_settings,
 )
-
 
 # --------------------------------------------------------------------------
 # fusion
@@ -179,12 +179,83 @@ def test_parse_order_is_one_based_and_deduped():
     assert parse_order("", 2) == []
 
 
-def test_reranking_stays_off_until_an_operator_turns_it_on():
-    """One model call per retrieval is not a default anyone should inherit."""
-    assert reranker_from_settings(_Reply("1"), SimpleNamespace(rag_rerank=False)) is None
-    assert (
-        reranker_from_settings(
-            _Reply("1"), SimpleNamespace(rag_rerank=True, rag_rerank_candidates=5)
-        )
-        is not None
+class _Model(_Reply):
+    """An llm stub that also answers for which model it is serving."""
+
+    def __init__(self, base_model: str) -> None:
+        super().__init__("1")
+        self.base_model = base_model
+
+
+def _wire(mode, model="", candidates=5):
+    return reranker_from_settings(
+        _Model(model),
+        SimpleNamespace(rag_rerank=mode, rag_rerank_candidates=candidates),
     )
+
+
+def test_off_and_on_overrule_the_guess_in_both_directions():
+    """Three states exist so the operator can disagree with the heuristic."""
+    assert _wire("off", "gpt-4o") is None
+    assert _wire("on", "some-unknown-local-model") is not None
+
+
+def test_auto_needs_positive_evidence_before_it_spends_a_model_call():
+    """Unknown is a no. This stage can drop the user's context."""
+    assert _wire("auto", "gpt-4o") is not None
+    assert _wire("auto", "vertex/gemini-2.5-pro") is not None
+    assert _wire("auto", "") is None
+    assert _wire("auto", "some-tuned-local-thing") is None
+
+
+def test_auto_reads_the_size_an_open_weight_model_names():
+    """Below the bar, a listwise rank is not a reliable ask."""
+    assert model_can_rerank("llama-3.1-70b-instruct")
+    assert model_can_rerank("qwen2.5-72b-instruct")
+    assert not model_can_rerank("llama-3.1-8b-instruct")
+    assert not model_can_rerank("qwen2.5-7b")
+
+
+def test_a_mixture_of_experts_name_lands_on_the_safe_side():
+    """"8x22b" reads as 22, which understates it. Off, and the operator can
+    say otherwise — guessing upward would enable the stage on a hunch."""
+    assert not model_can_rerank("mixtral-8x22b")
+    assert _wire("on", "mixtral-8x22b") is not None
+
+
+def test_a_version_number_is_not_a_parameter_count():
+    """'gpt-4' must not read as 4 billion, nor 'v3' as a size."""
+    assert not model_can_rerank("tinyllama-1.1b")
+    assert not model_can_rerank("some-model-v3")
+
+
+def test_a_bare_none_is_a_verdict():
+    """The one thing this stage can say that no ranking can.
+
+    Grounding the answer in chunks the reranker just judged irrelevant is how
+    a model ends up citing text that does not support its claim.
+    """
+    rerank = make_llm_reranker(_Reply("NONE"))
+
+    assert rerank("q", _chunks("first", "second")) == []
+
+
+def test_a_none_with_anything_else_to_say_is_not_a_verdict():
+    """"None of these look great, but..." is a hedge, not a refusal."""
+    rerank = make_llm_reranker(_Reply("None of these are a perfect match"))
+
+    assert len(rerank("q", _chunks("first", "second"))) == 2
+
+
+def test_a_rejection_keeps_the_candidates_it_never_read():
+    """Rejecting the head must not silently discard the unread tail."""
+    rerank = make_llm_reranker(_Reply("none."), max_candidates=2)
+
+    result = rerank("q", _chunks("a", "b", "c"))
+
+    assert [chunk.content for chunk in result] == ["c"]
+
+
+def test_the_reranker_publishes_how_much_it_will_read():
+    """Retrieval sizes its candidate pool from this."""
+    assert make_llm_reranker(_Reply("1"), max_candidates=37).max_candidates == 37

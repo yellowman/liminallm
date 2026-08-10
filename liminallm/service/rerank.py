@@ -27,6 +27,7 @@ import re
 from typing import Any, Callable, List, Optional, Sequence
 
 from liminallm.logging import get_logger
+from liminallm.service.model_backend import model_can_rerank
 from liminallm.service.web import neutralize_markers
 
 logger = get_logger(__name__)
@@ -37,6 +38,10 @@ UNTRUSTED_CLOSE = "<<<END_UNTRUSTED_DOCUMENT_TEXT>>>"
 # Enough of a chunk to judge relevance by. The whole chunk would multiply the
 # prompt by the candidate count for no gain — this decides order, not content.
 SNIPPET_CHARS = 600
+
+# An unambiguous refusal, and only that. Anything with more to say than the
+# word itself is treated as an unreadable reply rather than a verdict.
+NONE_REPLY = re.compile(r"^\W*none\W*$", re.IGNORECASE)
 
 Reranker = Callable[[str, Sequence[Any]], List[Any]]
 
@@ -118,10 +123,17 @@ def make_llm_reranker(
 
         order = parse_order(reply, len(head))
         if not order:
-            # Silence is "no opinion", not "nothing is relevant". A truncated
-            # or refused reply looks identical to a deliberate NONE, and
-            # dropping the user's grounding on a parse failure is the worse
-            # of the two mistakes.
+            if NONE_REPLY.match(reply.strip()):
+                # A bare NONE is a verdict, and the one thing this stage can
+                # say that no ranking can: none of these answer the question.
+                # Passing them on anyway is how a model ends up citing text
+                # that does not support what it just claimed.
+                logger.info("rag_rerank_rejected_all", candidates=len(head))
+                return tail
+            # Anything else unreadable is "no opinion", not "nothing is
+            # relevant". A truncated or refused reply looks identical to a
+            # deliberate NONE, and dropping the user's grounding on a parse
+            # failure is the worse of the two mistakes.
             logger.info("rag_rerank_no_verdict", candidates=len(head))
             return list(chunks)
 
@@ -130,16 +142,33 @@ def make_llm_reranker(
         )
         return [head[index] for index in order] + tail
 
+    # Retrieval reads this to size its candidate pool. A reranker handed only
+    # the chunks that were going to be returned anyway can reorder them but
+    # never reach the one that placed just outside the cut.
+    rerank.max_candidates = max_candidates
     return rerank
 
 
 def reranker_from_settings(llm: Any, settings: Any) -> Optional[Reranker]:
-    """Wire a reranker only when the operator asked for one.
+    """Wire a reranker per the operator's `auto` / `on` / `off`.
+
+    `auto` asks whether there is positive evidence the serving model can judge
+    a shortlist, and stays off when there is none — the stage can drop the
+    user's context, so an unrecognized model is not given the benefit of the
+    doubt. `on` and `off` are the operator overruling that guess in either
+    direction, which is the point of having three states rather than two.
 
     Both settings are read straight off the field. config.py owns their
     defaults and their bounds; restating either here would create a second
     value free to drift from the declaration.
     """
-    if not settings.rag_rerank:
+    mode = settings.rag_rerank
+    model_id = str(getattr(llm, "base_model", "") or "")
+    if mode == "auto":
+        enabled = model_can_rerank(model_id)
+        logger.info("rag_rerank_auto_resolved", model=model_id, enabled=enabled)
+    else:
+        enabled = mode == "on"
+    if not enabled:
         return None
     return make_llm_reranker(llm, max_candidates=settings.rag_rerank_candidates)

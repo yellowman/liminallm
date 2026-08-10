@@ -280,6 +280,7 @@ def rank_turns(
     embeddings (from the background backfill) are free.
     """
     from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
+    from liminallm.service.ranking import fuse_ranks, ranked_positive
 
     corpus = [tokenize_text(str(getattr(m, "content", "") or "")) for m in older]
     bm25 = _normalized_scores(compute_bm25_scores(tokenize_text(query), corpus))
@@ -315,10 +316,18 @@ def rank_turns(
                 vec = None
         if vec:
             sem_raw[i] = cosine_similarity(query_vec, vec)
-    semantic = _normalized_scores(sem_raw)
 
+    # Fused by rank, the same rule rag and notes use (SPEC §2.5). It suits the
+    # cost bound especially well: a turn nobody could afford to embed simply
+    # does not appear in the semantic channel, which is the honest reading of
+    # "not scored" — where a weighted sum had to call it a zero and let that
+    # zero drag the turn down.
     w = min(max(semantic_weight, 0.0), 1.0)
-    return [w * s + (1 - w) * b for s, b in zip(semantic, bm25)]
+    fused = fuse_ranks([
+        (1.0 - w, ranked_positive(bm25)),
+        (w, ranked_positive(sem_raw)),
+    ])
+    return [fused.get(i, 0.0) for i in range(len(older))]
 
 
 def recall_turns(
