@@ -213,6 +213,11 @@ CREATE TABLE IF NOT EXISTS knowledge_chunk (
 CREATE INDEX IF NOT EXISTS knowledge_chunk_context_idx ON knowledge_chunk (context_id);
 CREATE INDEX IF NOT EXISTS knowledge_chunk_embedding_idx ON knowledge_chunk
 USING ivfflat (embedding) WITH (lists = 100);
+-- The lexical half of hybrid retrieval (SPEC §2.5). 'simple' takes no
+-- stemming and no language, so an identifier indexes as itself; the two-arg
+-- to_tsvector is IMMUTABLE, which is what makes the expression indexable.
+CREATE INDEX IF NOT EXISTS knowledge_chunk_content_fts_idx ON knowledge_chunk
+USING gin (to_tsvector('simple', content));
 CREATE INDEX IF NOT EXISTS knowledge_chunk_fs_path_idx ON knowledge_chunk (fs_path);
 CREATE INDEX IF NOT EXISTS knowledge_chunk_context_chunk_idx ON knowledge_chunk (context_id, chunk_index);
 

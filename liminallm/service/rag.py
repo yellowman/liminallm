@@ -9,8 +9,15 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence, Union
 
 from liminallm.logging import get_logger
+from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
 from liminallm.service.embeddings import deterministic_embedding
 from liminallm.service.fs import PathTraversalError, safe_join
+from liminallm.service.ranking import (
+    LEXICAL_WEIGHT,
+    SEMANTIC_WEIGHT,
+    fuse_ranks,
+    ranked_positive,
+)
 from liminallm.storage.models import KnowledgeChunk
 from liminallm.storage.postgres import PostgresStore
 
@@ -18,6 +25,12 @@ logger = get_logger(__name__)
 
 # Default overlap per SPEC §2.5: "50 token overlap"
 DEFAULT_OVERLAP_TOKENS = 50
+
+# How many candidates each channel offers before the rerank. Wide enough that
+# a chunk one channel buries but the other would rank first still reaches the
+# rerank; capped so the rerank stays cheap on a large context.
+CANDIDATE_POOL_FACTOR = 5
+MAX_CANDIDATE_POOL = 100
 
 
 def _simple_tokenize(text: str) -> List[str]:
@@ -44,7 +57,18 @@ def _detokenize(tokens: List[str]) -> str:
 
 
 class RAGService:
-    """Hybrid retriever against knowledge chunks."""
+    """Hybrid retriever against knowledge chunks.
+
+    Retrieval runs two channels and fuses them: dense for meaning, lexical for
+    the exact word. Neither is sound alone. A single vector of dimension d
+    cannot express every top-k set of documents a query might ask for — that
+    ceiling is geometric, so no encoder or training set removes it, and a
+    dense-only ranking has no second opinion when it hits one. Keywords fail
+    the opposite way, on anything the user phrased differently.
+
+    An optional reranker takes the fused shortlist last. It is the only stage
+    not bound by either ceiling, and the only one that can return nothing.
+    """
 
     def __init__(
         self,
@@ -54,6 +78,8 @@ class RAGService:
         rag_mode: str | Enum | None = None,
         embed: Callable[[str], List[float]] = deterministic_embedding,
         embedding_model_id: str = "text-embedding",
+        semantic: bool = False,
+        rerank: Optional[Callable[[str, Sequence[KnowledgeChunk]], List[KnowledgeChunk]]] = None,
     ) -> None:
         self.store = store
         self.default_chunk_size = max(default_chunk_size, 64)
@@ -61,6 +87,13 @@ class RAGService:
         self.rag_mode = str(mode_value or os.getenv("RAG_MODE") or "pgvector").lower()
         self.embed = embed
         self.embedding_model_id = embedding_model_id
+        # EmbeddingsService.is_semantic, carried in. Defaults to False to match
+        # the kernel's default encoder, which is the hash fallback: cosine over
+        # those vectors is noise and must never reach a score (SPEC §2.5).
+        self.semantic = semantic
+        # Injected like ``embed`` so the kernel keeps no opinion about which
+        # model does the reranking, or whether one does at all.
+        self.rerank = rerank
 
         self._retriever = (
             self._retrieve_pgvector
@@ -240,24 +273,117 @@ class RAGService:
         user_id: Optional[str],
         tenant_id: Optional[str],
     ) -> List[KnowledgeChunk]:
+        """Hybrid retrieval: two candidate pools, one rerank (SPEC §2.5)."""
         allowed_ids = self._allowed_context_ids(
             context_ids, user_id=user_id, tenant_id=tenant_id
         )
         if not allowed_ids:
             return []
 
-        query_embedding = self.embed(query)
         filters = {"embedding_model_id": self.embedding_model_id}
+        pool_size = min(max(limit * CANDIDATE_POOL_FACTOR, limit), MAX_CANDIDATE_POOL)
 
-        return self.store.search_chunks_pgvector(  # type: ignore[attr-defined]
-            allowed_ids,
-            query,
-            query_embedding,
-            limit,
-            filters=filters,
-            user_id=user_id,
-            tenant_id=tenant_id,
+        lexical = list(
+            self.store.search_chunks_lexical(  # type: ignore[attr-defined]
+                allowed_ids,
+                query,
+                pool_size,
+                filters=filters,
+                user_id=user_id,
+                tenant_id=tenant_id,
+            )
         )
+
+        # Without a real encoder the dense pool is not a weaker channel, it is
+        # a random sample: hash-vector distance carries no meaning to sort by.
+        # Asking for it would only dilute the keyword pool.
+        dense: List[KnowledgeChunk] = []
+        if self.semantic:
+            dense = list(
+                self.store.search_chunks_pgvector(  # type: ignore[attr-defined]
+                    allowed_ids,
+                    query,
+                    self.embed(query),
+                    pool_size,
+                    filters=filters,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                )
+            )
+
+        ranked = self._fuse(query, lexical, dense)
+        if not ranked:
+            # Silence here is a result, not a fault: with no encoder and no
+            # keyword overlap there is nothing honest to ground on, and four
+            # arbitrary chunks would read to the model as evidence.
+            logger.info(
+                "rag_no_candidates",
+                semantic=self.semantic,
+                context_count=len(allowed_ids),
+            )
+            return []
+
+        logger.debug(
+            "rag_hybrid_pool",
+            semantic=self.semantic,
+            lexical=len(lexical),
+            dense=len(dense),
+            fused=len(ranked),
+        )
+        if self.rerank is not None:
+            ranked = list(self.rerank(query, ranked))
+        return ranked[:limit]
+
+    @staticmethod
+    def _chunk_key(chunk: KnowledgeChunk) -> object:
+        """Identity for fusion. Falls back for chunks not yet given an id."""
+        if chunk.id is not None:
+            return chunk.id
+        return (chunk.context_id, chunk.fs_path, chunk.chunk_index)
+
+    def _fuse(
+        self,
+        query: str,
+        lexical: Sequence[KnowledgeChunk],
+        dense: Sequence[KnowledgeChunk],
+    ) -> List[KnowledgeChunk]:
+        """Fuse the two channels by rank, per SPEC §2.5.
+
+        The lexical pool arrives ordered by ``ts_rank``, which was only ever a
+        recall filter; it is reordered here by real BM25 before fusion. That
+        BM25 scores against the pool rather than the whole corpus, so its IDF
+        is an approximation — sound for ordering a shortlist, which is all it
+        does, since the corpus-wide decision was already made by the SQL.
+
+        The dense pool keeps the order the index returned. Nearest is what
+        that channel means, and re-scoring it here would say nothing new.
+        """
+        chunks: Dict[object, KnowledgeChunk] = {}
+        for chunk in list(lexical) + list(dense):
+            chunks.setdefault(self._chunk_key(chunk), chunk)
+        if not chunks:
+            return []
+
+        channels: List[tuple[float, List[object]]] = []
+        if lexical:
+            scores = compute_bm25_scores(
+                tokenize_text(query),
+                [tokenize_text(chunk.content) for chunk in lexical],
+            )
+            channels.append(
+                (
+                    LEXICAL_WEIGHT,
+                    [self._chunk_key(lexical[i]) for i in ranked_positive(scores)],
+                )
+            )
+        if dense:
+            channels.append(
+                (SEMANTIC_WEIGHT, [self._chunk_key(chunk) for chunk in dense])
+            )
+
+        fused = fuse_ranks(channels)
+        order = sorted(fused, key=lambda key: fused[key], reverse=True)
+        return [chunks[key] for key in order]
 
     def _retrieve_local_hybrid(
         self,
@@ -280,7 +406,11 @@ class RAGService:
         for ctx_id in allowed_ids:
             results.extend(
                 self.store.search_chunks(
-                    ctx_id, query, query_embedding, per_context_limit
+                    ctx_id,
+                    query,
+                    query_embedding,
+                    per_context_limit,
+                    semantic=self.semantic,
                 )
             )
 

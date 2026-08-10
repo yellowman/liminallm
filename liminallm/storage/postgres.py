@@ -34,6 +34,18 @@ from liminallm.service.embeddings import (
     validated_embedding,
 )
 from liminallm.service.errors import NotFoundError
+from liminallm.service.ranking import (
+    LEXICAL_WEIGHT as _LEXICAL_WEIGHT,
+)
+from liminallm.service.ranking import (
+    SEMANTIC_WEIGHT as _SEMANTIC_WEIGHT,
+)
+from liminallm.service.ranking import (
+    fuse_ranks as _fuse_ranks,
+)
+from liminallm.service.ranking import (
+    ranked_positive as _ranked_positive,
+)
 from liminallm.storage.common import (
     blend_centroid,
     clamp_success_score,
@@ -106,6 +118,32 @@ def _is_uuid(value: Any) -> bool:
     except (AttributeError, TypeError, ValueError):
         return False
     return True
+
+
+# A term longer than this is a checksum or a mangled blob, not a word anyone
+# searched for; tsquery also refuses tokens past 2KB.
+_MAX_TSQUERY_TERM = 100
+_MAX_TSQUERY_TERMS = 32
+
+
+def _tsquery_terms(query: str, *, max_terms: int = _MAX_TSQUERY_TERMS) -> str:
+    """OR'd ``to_tsquery`` input built from a free-text query.
+
+    Terms come from the BM25 tokenizer, which yields ``\\w+`` and nothing else,
+    so no tsquery operator can reach the parser and a user query cannot become
+    a syntax error. Duplicates drop out and the term count is capped, because
+    the cost of the scan grows with the number of terms.
+    """
+    seen: set[str] = set()
+    terms: list[str] = []
+    for token in _tokenize_text(query):
+        if len(token) > _MAX_TSQUERY_TERM or token in seen:
+            continue
+        seen.add(token)
+        terms.append(token)
+        if len(terms) >= max_terms:
+            break
+    return " | ".join(terms)
 
 
 class PostgresStore:
@@ -3404,33 +3442,28 @@ class PostgresStore:
             return value
         return json.dumps(value)
 
-    def search_chunks_pgvector(
-        self,
-        context_ids: Optional[Sequence[str]],
-        query: str,
-        query_embedding: List[float],
-        limit: int = 4,
-        filters: Optional[dict[str, Any]] = None,
+    # Both chunk searches read the same rows through the same access rules;
+    # only the ORDER BY differs. Kept in one place so a filter added to one
+    # channel cannot go missing from the other — and the missing filter that
+    # matters here is the user isolation one.
+    _CHUNK_SELECT = """
+                SELECT kc.id, kc.context_id, kc.fs_path, kc.content, kc.embedding, kc.chunk_index, kc.created_at, kc.meta
+                FROM knowledge_chunk kc
+                JOIN knowledge_context ctx ON kc.context_id = ctx.id
+                LEFT JOIN app_user u ON ctx.owner_user_id = u.id
+                """
+
+    @staticmethod
+    def _chunk_scope(
+        context_ids: Sequence[str],
         *,
-        user_id: str,  # REQUIRED per SPEC §12.2 - user isolation is mandatory
-        tenant_id: Optional[str] = None,
-    ) -> List[KnowledgeChunk]:
-        """Primary pgvector-backed retrieval over knowledge chunks.
-
-        SECURITY: user_id is required to enforce data isolation per SPEC §12.2.
-        All queries MUST be filtered by user_id to prevent cross-user data leakage.
-        """
-
-        if not query_embedding or not context_ids:
-            return []
-        if not user_id:
-            # Defense in depth: reject if user_id somehow bypasses type checking
-            self.logger.error("search_chunks_pgvector_missing_user_id")
-            return []
-        where_clauses: list[str] = []
-        params: list[Any] = []
-        where_clauses.append("kc.context_id = ANY(%s)")
-        params.append(list(context_ids))
+        user_id: str,
+        tenant_id: Optional[str],
+        filters: Optional[dict[str, Any]],
+    ) -> tuple[str, list[Any]]:
+        """Access and metadata predicate shared by the chunk searches."""
+        where_clauses: list[str] = ["kc.context_id = ANY(%s)"]
+        params: list[Any] = [list(context_ids)]
         # Always enforce user isolation - this is not optional
         where_clauses.append("ctx.owner_user_id = %s")
         params.append(user_id)
@@ -3443,26 +3476,93 @@ class PostgresStore:
         if filters and filters.get("embedding_model_id"):
             where_clauses.append("kc.meta->>'embedding_model_id' = %s")
             params.append(filters["embedding_model_id"])
-        where = ""
-        if where_clauses:
-            where = " WHERE " + " AND ".join(where_clauses)
+        return " WHERE " + " AND ".join(where_clauses), params
+
+    def search_chunks_pgvector(
+        self,
+        context_ids: Optional[Sequence[str]],
+        query: str,
+        query_embedding: List[float],
+        limit: int = 4,
+        filters: Optional[dict[str, Any]] = None,
+        *,
+        user_id: str,  # REQUIRED per SPEC §12.2 - user isolation is mandatory
+        tenant_id: Optional[str] = None,
+    ) -> List[KnowledgeChunk]:
+        """Dense candidate generation over knowledge chunks.
+
+        Ordered by vector distance and nothing else. This is a first-stage
+        candidate pool, not a final ranking: ``RAGService`` reranks the pool
+        against the lexical channel per SPEC §2.5, because a single vector
+        cannot express every top-k set a query might want.
+
+        SECURITY: user_id is required to enforce data isolation per SPEC §12.2.
+        All queries MUST be filtered by user_id to prevent cross-user data leakage.
+        """
+
+        if not query_embedding or not context_ids:
+            return []
+        if not user_id:
+            # Defense in depth: reject if user_id somehow bypasses type checking
+            self.logger.error("search_chunks_pgvector_missing_user_id")
+            return []
+        where, params = self._chunk_scope(
+            context_ids, user_id=user_id, tenant_id=tenant_id, filters=filters
+        )
         with self._connect() as conn:
-            query = (
-                " "
-                """
-                SELECT kc.id, kc.context_id, kc.fs_path, kc.content, kc.embedding, kc.chunk_index, kc.created_at, kc.meta
-                FROM knowledge_chunk kc
-                JOIN knowledge_context ctx ON kc.context_id = ctx.id
-                LEFT JOIN app_user u ON ctx.owner_user_id = u.id
-                """
-            )
-            query += where
-            query += " ORDER BY kc.embedding <-> %s::vector LIMIT %s"
+            sql = self._CHUNK_SELECT + where
+            sql += " ORDER BY kc.embedding <-> %s::vector LIMIT %s"
             rows = conn.execute(
-                query, (*params, self._format_vector(query_embedding), limit)
+                sql, (*params, self._format_vector(query_embedding), limit)
             ).fetchall()
-        # pgvector mode: results already ordered by vector similarity via SQL
-        # No BM25 re-ranking per SPEC §3 - pure vector search for pgvector mode
+        return [self._row_to_knowledge_chunk(row) for row in rows]
+
+    def search_chunks_lexical(
+        self,
+        context_ids: Optional[Sequence[str]],
+        query: str,
+        limit: int = 4,
+        filters: Optional[dict[str, Any]] = None,
+        *,
+        user_id: str,  # REQUIRED per SPEC §12.2 - user isolation is mandatory
+        tenant_id: Optional[str] = None,
+    ) -> List[KnowledgeChunk]:
+        """Lexical candidate generation over knowledge chunks.
+
+        The keyword half of the hybrid. It is the only channel that works at
+        all when the encoder is the hash fallback, and it is what keeps exact
+        identifiers, error codes and numbers findable when it is not.
+
+        Terms are OR'd, not AND'd: one absent rare word must not empty the
+        pool. ``ts_rank`` only has to be a decent recall filter here — the
+        real ranking is BM25 over the returned pool.
+
+        SECURITY: user_id is required to enforce data isolation per SPEC §12.2.
+        All queries MUST be filtered by user_id to prevent cross-user data leakage.
+        """
+
+        if not context_ids:
+            return []
+        if not user_id:
+            # Defense in depth: reject if user_id somehow bypasses type checking
+            self.logger.error("search_chunks_lexical_missing_user_id")
+            return []
+        terms = _tsquery_terms(query)
+        if not terms:
+            return []
+        where, params = self._chunk_scope(
+            context_ids, user_id=user_id, tenant_id=tenant_id, filters=filters
+        )
+        # 'simple' rather than 'english': no stemming, so an identifier stays
+        # itself, and no language is assumed of the user's own files.
+        with self._connect() as conn:
+            sql = self._CHUNK_SELECT + where
+            sql += " AND to_tsvector('simple', kc.content) @@ to_tsquery('simple', %s)"
+            sql += (
+                " ORDER BY ts_rank(to_tsvector('simple', kc.content),"
+                " to_tsquery('simple', %s)) DESC, kc.id LIMIT %s"
+            )
+            rows = conn.execute(sql, (*params, terms, terms, limit)).fetchall()
         return [self._row_to_knowledge_chunk(row) for row in rows]
 
     def search_chunks(
@@ -3471,8 +3571,16 @@ class PostgresStore:
         query: str,
         query_embedding: Optional[List[float]],
         limit: int = 4,
+        *,
+        semantic: bool = False,
     ) -> List[KnowledgeChunk]:
-        """Non-pgvector hybrid search; suitable for tests and tiny corpora only."""
+        """Non-pgvector hybrid search; suitable for tests and tiny corpora only.
+
+        ``semantic`` is the caller's assertion that ``query_embedding`` came
+        from a real encoder. It defaults to False because the kernel's default
+        encoder is the hash fallback, and cosine over those vectors is noise
+        that must never enter a score (SPEC §2.5).
+        """
 
         def _cosine(a: List[float], b: List[float]) -> float:
             # Belt and braces: knowledge_chunk.embedding is VECTOR(dim) NOT
@@ -3495,18 +3603,33 @@ class PostgresStore:
         query_tokens = _tokenize_text(query)
         documents = [_tokenize_text(ch.content) for ch in candidates]
         bm25_scores = _compute_bm25_scores(query_tokens, documents)
-        semantic_scores = [
-            (_cosine(query_embedding, ch.embedding) if query_embedding else 0.0)
-            for ch in candidates
+        # Each channel ranks what it matched, and the two orders are fused by
+        # position rather than by score — the same rule the pgvector path uses
+        # (SPEC §2.5). Without a real encoder the semantic channel does not
+        # speak at all, because cosine over hash vectors is noise.
+        channels: list[tuple[float, list[int]]] = [
+            (_LEXICAL_WEIGHT, _ranked_positive(bm25_scores))
         ]
-        max_bm25 = max(bm25_scores) or 1.0
+        if semantic and query_embedding:
+            channels.append(
+                (
+                    _SEMANTIC_WEIGHT,
+                    _ranked_positive(
+                        [_cosine(query_embedding, ch.embedding) for ch in candidates]
+                    ),
+                )
+            )
+        fused = _fuse_ranks(channels)
+
         combined: dict[str, tuple[KnowledgeChunk, float]] = {}
-        for chunk, lex, sem in zip(candidates, bm25_scores, semantic_scores):
-            hybrid = 0.45 * (lex / max_bm25) + 0.55 * sem
+        for index, chunk in enumerate(candidates):
+            score = fused.get(index)
+            if score is None:
+                continue
             key = " ".join(chunk.content.split()).lower() or str(chunk.id or "")
             existing = combined.get(key)
-            if not existing or hybrid > existing[1]:
-                combined[key] = (chunk, hybrid)
+            if not existing or score > existing[1]:
+                combined[key] = (chunk, score)
         ranked = sorted(combined.values(), key=lambda pair: pair[1], reverse=True)
         return [pair[0] for pair in ranked[:limit]]
 

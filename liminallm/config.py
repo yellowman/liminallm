@@ -1047,6 +1047,17 @@ class Settings(BaseModel):
         400, ge=64, le=4000,
         description="Tokens per knowledge chunk. Changing this rebuilds the model services and only affects newly ingested content.",
     )
+    rag_rerank: bool = managed_field(
+        False,
+        description=(
+            "Let the serving model reorder retrieved chunks before they reach "
+            "the answer. Better grounding, one extra model call per retrieval."
+        ),
+    )
+    rag_rerank_candidates: int = managed_field(
+        20, ge=2, le=100,
+        description="How many retrieved chunks the reranker reads. Ignored when reranking is off.",
+    )
 
     @field_validator("tenant_domains", mode="before")
     @classmethod
@@ -1265,6 +1276,7 @@ _SETTING_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
                "adapter_openai_base_url", "adapter_openai_api_key",
                "adapter_server_model", "gemini_api_key")),
     ("Retrieval", ("rag_mode", "rag_chunk_size", "embedding_model_id",
+                   "rag_rerank", "rag_rerank_candidates",
                    "history_budget_fraction", "history_recall_fraction")),
     ("Features", ("notes_enabled", "allow_signup", "enable_mfa",
                   "web_tools_enabled", "extract_readers")),

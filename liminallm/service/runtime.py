@@ -26,6 +26,7 @@ from liminallm.service.embeddings import EmbeddingsService, make_provider_encode
 from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
 from liminallm.service.replication import AdvisoryLock, ClusterBus
+from liminallm.service.rerank import reranker_from_settings
 from liminallm.service.router import RouterEngine
 from liminallm.service.training import TrainingService
 from liminallm.service.training_worker import TrainingWorker
@@ -446,6 +447,8 @@ class Runtime:
             rag_mode=self.rag_mode,
             embed=self.embeddings.embed,
             embedding_model_id=embedding_model_id,
+            semantic=self.embeddings.is_semantic,
+            rerank=reranker_from_settings(self.llm, self.settings),
         )
         self.training = TrainingService(
             self.store,

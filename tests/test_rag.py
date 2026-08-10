@@ -102,6 +102,8 @@ class LegacyOnlyStore:
         query: str,
         query_embedding: list[float] | None,
         limit: int = 4,
+        *,
+        semantic: bool = False,
     ) -> list[KnowledgeChunk]:
         return list(self.chunks.get(context_id or "", []))[:limit]
 
@@ -146,6 +148,130 @@ def test_local_hybrid_without_pgvector():
         [ctx.id], "legacy", user_id=blocked_user.id, tenant_id="other"
     )
     assert denied == []
+
+
+def _hybrid_fixture(store, *, encoder="hybrid-encoder"):
+    """Two chunks: one matches the query's words, one matches its vector.
+
+    Vectors are orthogonal unit vectors so the semantic channel is decisive
+    when it is allowed to speak and provably absent when it is not.
+    """
+    from liminallm.service.embeddings import EMBEDDING_DIM
+
+    user = store.create_user(email=f"hy_{uuid.uuid4().hex[:8]}@example.com")
+    ctx = store.upsert_context(user.id, f"hy-{uuid.uuid4().hex[:6]}", "fixture")
+
+    near = [0.0] * EMBEDDING_DIM
+    near[3] = 1.0
+    far = [0.0] * EMBEDDING_DIM
+    far[9] = 1.0
+    store.add_chunks(ctx.id, [
+        KnowledgeChunk(
+            context_id=ctx.id, fs_path="/vector", chunk_index=0, embedding=near,
+            content="marsupials of western australia and their grazing habits",
+            meta={"embedding_model_id": encoder},
+        ),
+        KnowledgeChunk(
+            context_id=ctx.id, fs_path="/keyword", chunk_index=1, embedding=far,
+            content="the quokka population census for rottnest island",
+            meta={"embedding_model_id": encoder},
+        ),
+    ])
+    return user, ctx, near
+
+
+def test_pgvector_retrieval_finds_the_keyword_match_without_an_encoder(store):
+    """The default encoder is the hash fallback, so keywords must carry it.
+
+    Before hybrid retrieval this path was ORDER BY embedding <-> query and
+    nothing else, so the ranking of a user's own files was decided by hash
+    distance — the SPEC's own definition of noise.
+    """
+    user, ctx, near = _hybrid_fixture(store)
+    rag = RAGService(
+        store, embed=lambda _text: near, embedding_model_id="hybrid-encoder"
+    )
+
+    hits = rag.retrieve(
+        [ctx.id], "quokka census", limit=2, user_id=user.id, min_token_count=0
+    )
+
+    assert hits and hits[0].fs_path == "/keyword"
+
+
+def test_pgvector_retrieval_returns_nothing_rather_than_noise(store):
+    """No encoder and no keyword overlap is a miss, not four arbitrary chunks.
+
+    Returning the nearest hash vectors would hand the model text it has no
+    reason to trust and every reason to cite.
+    """
+    user, ctx, near = _hybrid_fixture(store)
+    rag = RAGService(
+        store, embed=lambda _text: near, embedding_model_id="hybrid-encoder"
+    )
+
+    hits = rag.retrieve(
+        [ctx.id], "unrelated zzzqqq", limit=2, user_id=user.id, min_token_count=0
+    )
+
+    assert hits == []
+
+
+def test_a_real_encoder_finds_what_shares_no_words(store):
+    """The semantic channel earns its place: no lexical overlap, still found."""
+    user, ctx, near = _hybrid_fixture(store)
+    rag = RAGService(
+        store,
+        embed=lambda _text: near,
+        embedding_model_id="hybrid-encoder",
+        semantic=True,
+    )
+
+    hits = rag.retrieve(
+        [ctx.id], "unrelated zzzqqq", limit=2, user_id=user.id, min_token_count=0
+    )
+
+    assert hits and hits[0].fs_path == "/vector"
+
+
+def test_a_real_encoder_still_keeps_exact_terms_in_play(store):
+    """bm25 stays in the score so an exact term is not lost to a near vector.
+
+    The keyword chunk is orthogonal to the query vector, so a dense-only
+    ranking puts it last. It should win anyway: it is the one that says the
+    word the user typed.
+    """
+    user, ctx, near = _hybrid_fixture(store)
+    rag = RAGService(
+        store,
+        embed=lambda _text: near,
+        embedding_model_id="hybrid-encoder",
+        semantic=True,
+    )
+
+    hits = rag.retrieve(
+        [ctx.id], "quokka census", limit=2, user_id=user.id, min_token_count=0
+    )
+
+    assert [hit.fs_path for hit in hits] == ["/keyword", "/vector"]
+
+
+def test_lexical_search_enforces_user_isolation(store):
+    """SPEC §12.2 applies to the new channel exactly as it does to the old."""
+    user, ctx, _ = _hybrid_fixture(store)
+    intruder = store.create_user(email=f"ix_{uuid.uuid4().hex[:8]}@example.com")
+
+    mine = store.search_chunks_lexical([ctx.id], "quokka", 4, user_id=user.id)
+    theirs = store.search_chunks_lexical([ctx.id], "quokka", 4, user_id=intruder.id)
+
+    assert mine and theirs == []
+
+
+def test_lexical_search_survives_a_query_of_pure_punctuation(store):
+    """to_tsquery would raise on an empty term list; the caller sees a miss."""
+    user, ctx, _ = _hybrid_fixture(store)
+
+    assert store.search_chunks_lexical([ctx.id], "?? -- ??", 4, user_id=user.id) == []
 
 
 def test_pgvector_filters_fs_path(tmp_path):
