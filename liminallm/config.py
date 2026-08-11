@@ -396,6 +396,19 @@ def resolve_provider_endpoint(mode: str) -> Optional[dict[str, Optional[str]]]:
     return PROVIDER_ENDPOINTS.get((mode or "").lower())
 
 
+def _require_non_blank(value: str) -> str:
+    """A length bound is not a blankness bound.
+
+    ``min_length=1`` accepts "   ", and a whitespace tenant matches no account
+    under the both-halves rule — so an admin who typed spaces into the console
+    locked every user out, including themselves, which is the exact failure
+    the bound was added to prevent.
+    """
+    if not str(value).strip():
+        raise ValueError("must not be blank")
+    return value
+
+
 def env_field(default: Any, env: str, **kwargs):
     """A setting that can only come from the environment.
 
@@ -787,7 +800,7 @@ class Settings(BaseModel):
         24 * 60,
         description="Refresh token TTL in minutes",
     )
-    default_tenant_id: str = managed_field(
+    default_tenant_id: Annotated[str, AfterValidator(_require_non_blank)] = managed_field(
         "public",
         min_length=1,
         description="Tenant for an install that serves one site, i.e. one with tenant_domains empty. Once any domain is mapped, an unlisted host is refused rather than served this tenant. Cannot be blank: a blank site tenant matches no account, so clearing it would lock every user out — including the admin who would have to set it back.",

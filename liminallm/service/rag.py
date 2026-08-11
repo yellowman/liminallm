@@ -12,7 +12,11 @@ from liminallm.logging import get_logger
 from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
 from liminallm.service.embeddings import cosine_similarity, deterministic_embedding
 from liminallm.service.fs import PathTraversalError, safe_join
-from liminallm.service.late import maxsim, segment_text
+from liminallm.service.late import (
+    QUERY_MIN_SEGMENT_WORDS,
+    maxsim,
+    segment_text,
+)
 from liminallm.service.ranking import (
     LATE_WEIGHT,
     LEXICAL_WEIGHT,
@@ -106,6 +110,10 @@ class RAGService:
         # another name, so a caller that enabled the feature without naming a
         # segment count would index nothing at all and never be told.
         self.late_segments = max(2, late_segments)
+        # Set when segment indexing fails structurally — a missing table, a
+        # width mismatch. Nothing clears it, because nothing that would fix
+        # those leaves this object standing.
+        self._segment_index_broken = False
 
         self._retriever = (
             self._retrieve_pgvector
@@ -302,7 +310,15 @@ class RAGService:
         if not allowed_ids:
             return []
 
-        filters = {"embedding_model_id": self.embedding_model_id}
+        # The encoder filter belongs to the vector channels and only to them:
+        # it exists so a query vector is never compared against a chunk from a
+        # different encoder. Keyword search compares no vectors, and gating it
+        # on encoder identity meant that changing embedding_model_id — a
+        # managed setting an admin can flip — made every stored chunk invisible
+        # to BM25 as well, so retrieval returned nothing at all for an exact
+        # filename or error code until the whole corpus was re-ingested by
+        # hand. There is no backfill job (SPEC §2.5), so "until" was forever.
+        vector_filters = {"embedding_model_id": self.embedding_model_id}
         pool_size = self._pool_size(limit)
 
         lexical = list(
@@ -310,7 +326,7 @@ class RAGService:
                 allowed_ids,
                 query,
                 pool_size,
-                filters=filters,
+                filters=None,
                 user_id=user_id,
                 tenant_id=tenant_id,
             )
@@ -329,7 +345,7 @@ class RAGService:
                     query,
                     query_vectors[0],
                     pool_size,
-                    filters=filters,
+                    filters=vector_filters,
                     user_id=user_id,
                     tenant_id=tenant_id,
                 )
@@ -340,7 +356,7 @@ class RAGService:
                         allowed_ids,
                         query_vectors,
                         pool_size,
-                        filters=filters,
+                        filters=vector_filters,
                         user_id=user_id,
                         tenant_id=tenant_id,
                     )
@@ -386,7 +402,11 @@ class RAGService:
         vectors = [self.embed(query)]
         if not self.late_interaction:
             return vectors
-        parts = segment_text(query, max_segments=self.late_segments)
+        parts = segment_text(
+            query,
+            max_segments=self.late_segments,
+            min_words=QUERY_MIN_SEGMENT_WORDS,
+        )
         if len(parts) > 1:
             vectors.extend(self.embed(part) for part in parts)
         return vectors
@@ -692,9 +712,9 @@ class RAGService:
         simply has nothing to say about it — which the fusion already treats
         as silence rather than as a bad score.
         """
-        if not self.late_interaction:
+        if not self.late_interaction or self._segment_index_broken:
             return
-        for chunk in chunks:
+        for position, chunk in enumerate(chunks):
             if chunk.id is None:
                 continue
             parts = segment_text(chunk.content, max_segments=self.late_segments)
@@ -719,11 +739,18 @@ class RAGService:
                 # width mismatch — so carrying on would pay the provider for
                 # `segments x remaining chunks` embeddings, throw every one
                 # away, and log the same warning several thousand times.
+                # Latched for the rest of this service's life, not just this
+                # file: ingest_path walks a tree one file at a time, so a
+                # per-call stop still paid `segments x chunks` embeddings and
+                # logged an identical warning for every one of ten thousand
+                # files. Changing the setting rebuilds the service, which is
+                # also how an operator clears it after fixing the schema.
+                self._segment_index_broken = True
                 logger.warning(
                     "rag_segment_index_failed",
                     chunk_id=chunk.id,
                     error=str(exc),
-                    skipped=len(chunks) - chunks.index(chunk) - 1,
+                    skipped=len(chunks) - position - 1,
                 )
                 return
 

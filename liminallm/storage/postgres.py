@@ -3272,9 +3272,12 @@ class PostgresStore:
     ) -> int:
         """Persist a chunk's segment vectors, replacing any it already had.
 
-        Replacing rather than appending keeps re-ingestion idempotent: a file
-        that is ingested twice must not end up scored against two generations
-        of its own segments.
+        The replace covers re-indexing one chunk — a backfill, a repair. It
+        does **not** make re-ingestion idempotent, and must not be read as
+        doing so: ``add_chunks`` always inserts fresh rows with new ids, and
+        nothing deletes a file's old chunks, so ingesting the same file twice
+        leaves two full generations of both chunks and segments. Fixing that
+        needs a delete-by-path on ingest, which does not exist yet.
         """
         if not segments:
             return 0
@@ -3698,10 +3701,12 @@ class PostgresStore:
         # itself, and no language is assumed of the user's own files.
         with self._connect() as conn:
             sql = self._CHUNK_SELECT + where
-            sql += " AND to_tsvector('simple', kc.content) @@ to_tsquery('simple', %s)"
+            # content_tsv is a stored generated column, so neither the match
+            # nor the rank tokenizes anything at query time.
+            sql += " AND kc.content_tsv @@ to_tsquery('simple', %s)"
             sql += (
-                " ORDER BY ts_rank(to_tsvector('simple', kc.content),"
-                " to_tsquery('simple', %s)) DESC, kc.id LIMIT %s"
+                " ORDER BY ts_rank(kc.content_tsv, to_tsquery('simple', %s))"
+                " DESC, kc.id LIMIT %s"
             )
             rows = conn.execute(sql, (*params, terms, terms, limit)).fetchall()
         return [self._row_to_knowledge_chunk(row) for row in rows]

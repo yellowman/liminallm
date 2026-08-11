@@ -38,11 +38,20 @@ from liminallm.service.embeddings import cosine_similarity
 _BOUNDARY = re.compile(r"(?<=[.!?])\s+|\n+")
 
 # A segment shorter than this carries too little to embed usefully, so it is
-# merged forward rather than stored as its own vector.
+# merged forward rather than stored as its own vector. Tuned for chunks, which
+# are hundreds of words long.
 MIN_SEGMENT_WORDS = 12
 
+# The query side needs its own floor. A real question is short — "Compare the
+# census with the grazing report. Which is newer?" has a three-word second
+# clause — so the chunk threshold folded every query back into one segment and
+# the multi-vector query side never ran at all.
+QUERY_MIN_SEGMENT_WORDS = 3
 
-def segment_text(text: str, *, max_segments: int) -> List[str]:
+
+def segment_text(
+    text: str, *, max_segments: int, min_words: int = MIN_SEGMENT_WORDS
+) -> List[str]:
     """Split a chunk into the parts that get their own vector.
 
     Short fragments merge forward, and the result is packed down to
@@ -58,7 +67,7 @@ def segment_text(text: str, *, max_segments: int) -> List[str]:
 
     merged: List[str] = []
     for piece in pieces:
-        if merged and len(merged[-1].split()) < MIN_SEGMENT_WORDS:
+        if merged and len(merged[-1].split()) < min_words:
             merged[-1] = f"{merged[-1]} {piece}"
         else:
             merged.append(piece)
@@ -67,7 +76,7 @@ def segment_text(text: str, *, max_segments: int) -> List[str]:
     # short, so a trailing fragment after a long segment survives on its own.
     # Fold it backwards: at query time MaxSim takes the best segment, and a
     # one-word segment's vector is near enough to noise to win on nothing.
-    if len(merged) > 1 and len(merged[-1].split()) < MIN_SEGMENT_WORDS:
+    if len(merged) > 1 and len(merged[-1].split()) < min_words:
         tail = merged.pop()
         merged[-1] = f"{merged[-1]} {tail}"
 

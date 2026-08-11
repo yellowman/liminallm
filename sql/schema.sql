@@ -215,9 +215,16 @@ CREATE INDEX IF NOT EXISTS knowledge_chunk_embedding_idx ON knowledge_chunk
 USING ivfflat (embedding) WITH (lists = 100);
 -- The lexical half of hybrid retrieval (SPEC §2.5). 'simple' takes no
 -- stemming and no language, so an identifier indexes as itself; the two-arg
--- to_tsvector is IMMUTABLE, which is what makes the expression indexable.
+-- to_tsvector is IMMUTABLE, which is what makes it usable in a generated
+-- column. Stored rather than computed per query: the WHERE clause is served
+-- by the index either way, but ts_rank in the ORDER BY has to tokenize every
+-- matching row, and on a large context that was the dominant cost of the
+-- channel — paid on every grounded chat turn.
+ALTER TABLE knowledge_chunk
+  ADD COLUMN IF NOT EXISTS content_tsv tsvector
+  GENERATED ALWAYS AS (to_tsvector('simple', content)) STORED;
 CREATE INDEX IF NOT EXISTS knowledge_chunk_content_fts_idx ON knowledge_chunk
-USING gin (to_tsvector('simple', content));
+USING gin (content_tsv);
 CREATE INDEX IF NOT EXISTS knowledge_chunk_fs_path_idx ON knowledge_chunk (fs_path);
 
 -- Late interaction (SPEC §2.5): several vectors per chunk, compared at query

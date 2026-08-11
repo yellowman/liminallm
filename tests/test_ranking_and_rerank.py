@@ -134,14 +134,18 @@ def test_rerank_ignores_numbers_it_was_not_offered():
     assert [c.content for c in rerank("q", _chunks("first", "second"))] == ["second"]
 
 
-def test_candidates_beyond_the_budget_keep_their_place():
-    """The reranker reads a bounded head; the tail is not silently dropped."""
-    llm = _Reply("2, 1")
-    rerank = make_llm_reranker(llm, max_candidates=2)
+def test_only_what_the_reranker_kept_comes_back():
+    """The unread tail ranks below every chunk the model actually read.
+
+    Appending it lets fusion ranks 21+ take grounding slots from head chunks
+    the model just read and rejected — the same "here are the worse ones"
+    the NONE branch refuses, on the far more common partial rejection.
+    """
+    rerank = make_llm_reranker(_Reply("2, 1"), max_candidates=2)
 
     result = rerank("q", _chunks("a", "b", "c"))
 
-    assert [chunk.content for chunk in result] == ["b", "a", "c"]
+    assert [chunk.content for chunk in result] == ["b", "a"]
 
 
 def test_a_single_candidate_costs_no_model_call():
@@ -179,17 +183,25 @@ def test_parse_order_is_one_based_and_deduped():
     assert parse_order("", 2) == []
 
 
-class _Model(_Reply):
-    """An llm stub that also answers for which model it is serving."""
+def _serving(base_model: str, adapter_server_model: str | None = None):
+    """A real LLMService, because a stub was how this went wrong.
 
-    def __init__(self, base_model: str) -> None:
-        super().__init__("1")
-        self.base_model = base_model
+    The last fix read adapter_server_model off the service, which never has
+    it — it lives on the backend. The test passed anyway, because it asserted
+    against a SimpleNamespace that was more capable than the real object.
+    """
+    from liminallm.service.llm import LLMService
+
+    return LLMService(
+        base_model=base_model,
+        backend_mode="api_adapters",
+        adapter_server_model=adapter_server_model,
+    )
 
 
-def _wire(mode, model="", candidates=5):
+def _wire(mode, model="", candidates=5, adapter_server_model=None):
     return reranker_from_settings(
-        _Model(model),
+        _serving(model, adapter_server_model),
         SimpleNamespace(rag_rerank=mode, rag_rerank_candidates=candidates),
     )
 
@@ -301,15 +313,21 @@ def test_a_small_variant_is_not_its_flagship():
 
 
 def test_auto_judges_the_model_that_will_answer():
-    """An adapter server overrides the configured base model everywhere else."""
-    from types import SimpleNamespace as NS
+    """An adapter server overrides the configured base model everywhere else.
 
-    served = NS(base_model="gpt-4o-mini", adapter_server_model="llama-3.1-70b")
-    configured = NS(base_model="gpt-4o", adapter_server_model="qwen2.5-7b")
-    on = NS(rag_rerank="auto", rag_rerank_candidates=5)
+    Both directions matter: a 70B behind a default model_path must be judged
+    on the 70B, and a 7B behind model_path=gpt-4o must not inherit gpt-4o's
+    reputation.
+    """
+    assert _wire("auto", "gpt-4o-mini", adapter_server_model="llama-3.1-70b")
+    assert _wire("auto", "gpt-4o", adapter_server_model="qwen2.5-7b") is None
 
-    assert reranker_from_settings(served, on) is not None
-    assert reranker_from_settings(configured, on) is None
+
+def test_the_serving_model_is_resolved_from_the_backend():
+    """The attribute lives on the backend, not the service — which is exactly
+    what the previous fix got wrong while its stub hid it."""
+    assert _serving("gpt-4o", "llama-3.1-70b").serving_model == "llama-3.1-70b"
+    assert _serving("gpt-4o").serving_model == "gpt-4o"
 
 
 def test_a_small_variant_is_matched_as_a_name_part_not_a_substring():

@@ -315,3 +315,32 @@ def test_every_query_part_gets_a_share_of_the_candidate_pool(store, monkeypatch)
     # whole pool going to the first.
     assert len(asked) > 1
     assert all(limit < rag._pool_size(4) for limit in asked)
+
+
+def test_segment_indexing_stops_for_the_whole_run_not_one_file(store, monkeypatch):
+    """ingest_path walks a tree one file at a time.
+
+    A per-call stop still paid `segments x chunks` provider embeddings and
+    logged an identical warning for every file in the tree — 10,000 files at
+    eight segments is 80,000 billed calls, all discarded.
+    """
+    user = store.create_user(email=f"lb_{uuid.uuid4().hex[:8]}@example.com")
+    ctx = store.upsert_context(user.id, f"lb-{uuid.uuid4().hex[:6]}", "fixture")
+    rag = _retriever(store, late=True)
+
+    calls: list[int] = []
+
+    def broken(*args, **kwargs):
+        calls.append(1)
+        raise RuntimeError("knowledge_chunk_vector is missing")
+
+    monkeypatch.setattr(store, "add_chunk_vectors", broken)
+
+    for index in range(5):
+        rag.ingest_text(
+            ctx.id, f"{_long('quokka')}. {_long('diesel')}.",
+            source_path=f"/f{index}",
+        )
+
+    assert calls == [1], "the failure must latch, not repeat per file"
+    assert rag._segment_index_broken is True

@@ -28,12 +28,18 @@ from typing import Any, Callable, List, Optional, Sequence
 
 from liminallm.logging import get_logger
 from liminallm.service.model_backend import model_can_rerank
+from liminallm.service.web import UNTRUSTED_CLOSE as _WEB_UNTRUSTED_CLOSE
+from liminallm.service.web import UNTRUSTED_OPEN as _WEB_UNTRUSTED_OPEN
 from liminallm.service.web import neutralize_markers
 
 logger = get_logger(__name__)
 
-UNTRUSTED_OPEN = "<<<UNTRUSTED_DOCUMENT_TEXT>>>"
-UNTRUSTED_CLOSE = "<<<END_UNTRUSTED_DOCUMENT_TEXT>>>"
+# The envelope vocabulary is web.py's, not a second one. neutralize_markers
+# defends these exact strings; a private pair here would be covered only by
+# its generic <<<CAPS>>> fallback, and a future tightening in web.py would
+# never reach this prompt.
+UNTRUSTED_OPEN = _WEB_UNTRUSTED_OPEN
+UNTRUSTED_CLOSE = _WEB_UNTRUSTED_CLOSE
 
 # Enough of a chunk to judge relevance by. The whole chunk would multiply the
 # prompt by the candidate count for no gain — this decides order, not content.
@@ -44,8 +50,19 @@ SNIPPET_CHARS = 600
 NONE_REPLY = re.compile(r"^\W*none\W*$", re.IGNORECASE)
 
 # A visible reasoning block, as several allowlisted models emit. Everything
-# inside it is working, not answer.
+# inside it is working, not answer — including when the reply was truncated
+# mid-thought and the closing tag never arrived, which is why the unclosed
+# form is stripped too. A closed-tag-only pattern left the narration in, and
+# narration is full of digits.
 _THINK_BLOCK = re.compile(r"<think\b.*?</think\s*>", re.IGNORECASE | re.DOTALL)
+_THINK_UNCLOSED = re.compile(r"<think\b.*\Z", re.IGNORECASE | re.DOTALL)
+
+# "1." or "2)" opening a line: an ordered list, where the marker is the
+# position and the answer is what follows it.
+_LIST_MARKER = re.compile(r"^\s*\d+[.)]\s+")
+
+# A line that is only numbers and separators — the shape the prompt asks for.
+_ONLY_NUMBERS = re.compile(r"^\W*\d+(?:\s*[,;]\s*\d+)*\W*$")
 
 Reranker = Callable[[str, Sequence[Any]], List[Any]]
 
@@ -53,13 +70,30 @@ Reranker = Callable[[str, Sequence[Any]], List[Any]]
 def _answer_only(reply: str) -> str:
     """The part of a reply that is meant to be the ranking.
 
-    Reasoning blocks are dropped, then the last line carrying a digit wins:
-    a model that narrates before answering puts the answer last, and a model
-    that answers plainly has only one such line anyway.
+    Reasoning is dropped first, then the answer is picked by shape rather
+    than by position:
+
+    - an ordered list ("1. Passage 3") has its markers stripped, because the
+      marker is the rank and the number after it is the passage;
+    - otherwise the last line that is *only* numbers wins, which is what the
+      prompt asks for;
+    - otherwise the last line carrying a digit, for a model that narrates
+      before answering.
+
+    Position alone was not enough: "last line with a digit" reads "2. Passage
+    1" as the answer 2, silently inverting an ordered list.
     """
-    cleaned = _THINK_BLOCK.sub(" ", reply or "")
+    cleaned = _THINK_UNCLOSED.sub(" ", _THINK_BLOCK.sub(" ", reply or ""))
     lines = [line for line in cleaned.splitlines() if re.search(r"\d", line)]
-    return lines[-1] if lines else ""
+    if not lines:
+        return ""
+    listed = [line for line in lines if _LIST_MARKER.match(line)]
+    if len(listed) > 1:
+        return "\n".join(_LIST_MARKER.sub("", line) for line in listed)
+    for line in reversed(lines):
+        if _ONLY_NUMBERS.match(line):
+            return line
+    return lines[-1]
 
 
 def build_prompt(query: str, snippets: Sequence[str]) -> str:
@@ -171,9 +205,17 @@ def make_llm_reranker(
             return list(chunks)
 
         logger.debug(
-            "rag_rerank_applied", candidates=len(head), kept=len(order)
+            "rag_rerank_applied",
+            candidates=len(head),
+            kept=len(order),
+            dropped_unread=len(tail),
         )
-        return [head[index] for index in order] + tail
+        # Only what the model kept. The unread tail does not come back: it
+        # ranks below every chunk in the head, so appending it would let
+        # fusion ranks 21+ take grounding slots from head chunks the model
+        # just read and rejected — the same "here are the worse ones" the
+        # NONE branch refuses, on the far more common partial rejection.
+        return [head[index] for index in order]
 
     # Retrieval reads this to size its candidate pool. A reranker handed only
     # the chunks that were going to be returned anyway can reorder them but
@@ -196,14 +238,10 @@ def reranker_from_settings(llm: Any, settings: Any) -> Optional[Reranker]:
     value free to drift from the declaration.
     """
     mode = settings.rag_rerank
-    # The serving model, not the configured base: an adapter server overrides
-    # it, and everything else in the kernel resolves the pair this way. Reading
-    # base_model alone judged "gpt-4o-mini" while a 7B actually answered.
-    model_id = str(
-        getattr(llm, "adapter_server_model", "")
-        or getattr(llm, "base_model", "")
-        or ""
-    )
+    # The serving model, which LLMService resolves from its backend. Reading
+    # the attributes off the service directly found neither, so this judged
+    # the configured base model while an adapter server answered the request.
+    model_id = str(getattr(llm, "serving_model", "") or "")
     if mode == "auto":
         enabled = model_can_rerank(model_id)
         logger.info("rag_rerank_auto_resolved", model=model_id, enabled=enabled)

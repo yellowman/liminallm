@@ -131,15 +131,31 @@ class LLMService:
             messages, self._normalize_adapters(adapters or []), user_id=user_id
         )
 
+    @property
+    def serving_model(self) -> str:
+        """The model that will actually answer, not the one configured.
+
+        An adapter server overrides the base model, and both live on the
+        backend rather than here. Anything deciding by model identity — the
+        tokenizer, the context window, whether a listwise rerank is a
+        reasonable ask — has to resolve the pair the same way, so it resolves
+        it here once. Read off ``self`` it silently returned nothing, and the
+        caller fell back to the configured base model without noticing.
+        """
+        return str(
+            getattr(self.backend, "adapter_server_model", None)
+            or getattr(self.backend, "base_model", None)
+            # Last resort: not every backend carries the pair (the stub does
+            # not), and the configured base is a better answer than nothing.
+            or self.base_model
+            or ""
+        )
+
     def token_counter(self):
         """Counter for the serving model: exact when we own its tokenizer."""
         from liminallm.service.token_counting import counter_for
 
-        model = (
-            getattr(self.backend, "adapter_server_model", None)
-            or getattr(self.backend, "base_model", None)
-            or ""
-        )
+        model = self.serving_model
         # Local backends load their tokenizer lazily; force it, or the first
         # turn would resolve to the heuristic and cache that decision.
         tokenizer = None
