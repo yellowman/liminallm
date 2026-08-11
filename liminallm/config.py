@@ -1366,8 +1366,11 @@ MODEL_AFFECTING_SETTINGS = frozenset({
     "rag_mode",
     "embedding_model_id",
     "rag_chunk_size",
-    "rag_rerank",
-    "rag_rerank_candidates",
+    # rag_rerank and rag_rerank_candidates are deliberately absent: the
+    # reranker reads them per retrieval, so they change behaviour on the next
+    # turn without a rebuild. They only ever shape one prompt, and tearing
+    # down the LLM, embeddings, training and workflow services to widen a
+    # candidate budget was a cost with nothing behind it.
     "rag_late_interaction",
     "rag_late_segments",
 })

@@ -24,8 +24,17 @@ from liminallm.service.rerank import (
     build_prompt,
     make_llm_reranker,
     parse_order,
-    reranker_from_settings,
 )
+
+
+def _rr(llm, *, candidates=20, mode="on"):
+    """A reranker whose settings are read per call, as production's is."""
+    return make_llm_reranker(
+        llm,
+        lambda: SimpleNamespace(
+            rag_rerank=mode, rag_rerank_candidates=candidates
+        ),
+    )
 
 # --------------------------------------------------------------------------
 # fusion
@@ -96,7 +105,7 @@ class _Reply:
 
 def test_rerank_reorders_and_drops():
     llm = _Reply("3, 1")
-    rerank = make_llm_reranker(llm)
+    rerank = _rr(llm)
 
     result = rerank("q", _chunks("first", "second", "third"))
 
@@ -110,7 +119,7 @@ def test_rerank_fails_open_when_the_model_raises():
         def generate(self, *args, **kwargs):
             raise RuntimeError("backend down")
 
-    rerank = make_llm_reranker(Broken())
+    rerank = _rr(Broken())
     chunks = _chunks("first", "second")
 
     assert [c.content for c in rerank("q", chunks)] == ["first", "second"]
@@ -122,14 +131,14 @@ def test_an_unreadable_reply_is_no_opinion_not_an_empty_result():
     Dropping the retrieved context on a parse failure is the worse of the two
     mistakes, so silence leaves the fusion order alone.
     """
-    rerank = make_llm_reranker(_Reply("I could not decide."))
+    rerank = _rr(_Reply("I could not decide."))
 
     assert len(rerank("q", _chunks("first", "second"))) == 2
 
 
 def test_rerank_ignores_numbers_it_was_not_offered():
     """A model that invents [9] must not index off the end of the list."""
-    rerank = make_llm_reranker(_Reply("9, 2, 2"))
+    rerank = _rr(_Reply("9, 2, 2"))
 
     assert [c.content for c in rerank("q", _chunks("first", "second"))] == ["second"]
 
@@ -141,7 +150,7 @@ def test_only_what_the_reranker_kept_comes_back():
     the model just read and rejected — the same "here are the worse ones"
     the NONE branch refuses, on the far more common partial rejection.
     """
-    rerank = make_llm_reranker(_Reply("2, 1"), max_candidates=2)
+    rerank = _rr(_Reply("2, 1"), candidates=2)
 
     result = rerank("q", _chunks("a", "b", "c"))
 
@@ -150,7 +159,7 @@ def test_only_what_the_reranker_kept_comes_back():
 
 def test_a_single_candidate_costs_no_model_call():
     llm = _Reply("1")
-    rerank = make_llm_reranker(llm)
+    rerank = _rr(llm)
 
     assert len(rerank("q", _chunks("only"))) == 1
     assert llm.prompts == []
@@ -200,10 +209,18 @@ def _serving(base_model: str, adapter_server_model: str | None = None):
 
 
 def _wire(mode, model="", candidates=5, adapter_server_model=None):
-    return reranker_from_settings(
+    """Whether this configuration would actually rerank.
+
+    The object always exists now — it decides per retrieval — so the question
+    is no longer "was one built" but "does it have a budget".
+    """
+    reranker = make_llm_reranker(
         _serving(model, adapter_server_model),
-        SimpleNamespace(rag_rerank=mode, rag_rerank_candidates=candidates),
+        lambda: SimpleNamespace(
+            rag_rerank=mode, rag_rerank_candidates=candidates
+        ),
     )
+    return reranker.max_candidates or None
 
 
 def test_off_and_on_overrule_the_guess_in_both_directions():
@@ -247,14 +264,14 @@ def test_a_bare_none_is_a_verdict():
     Grounding the answer in chunks the reranker just judged irrelevant is how
     a model ends up citing text that does not support its claim.
     """
-    rerank = make_llm_reranker(_Reply("NONE"))
+    rerank = _rr(_Reply("NONE"))
 
     assert rerank("q", _chunks("first", "second")) == []
 
 
 def test_a_none_with_anything_else_to_say_is_not_a_verdict():
     """"None of these look great, but..." is a hedge, not a refusal."""
-    rerank = make_llm_reranker(_Reply("None of these are a perfect match"))
+    rerank = _rr(_Reply("None of these are a perfect match"))
 
     assert len(rerank("q", _chunks("first", "second"))) == 2
 
@@ -266,14 +283,14 @@ def test_a_rejection_drops_the_unread_tail_too():
     rejected, so returning it hands the answer strictly weaker grounding
     than the text that was judged unhelpful.
     """
-    rerank = make_llm_reranker(_Reply("none."), max_candidates=2)
+    rerank = _rr(_Reply("none."), candidates=2)
 
     assert rerank("q", _chunks("a", "b", "c")) == []
 
 
 def test_the_reranker_publishes_how_much_it_will_read():
     """Retrieval sizes its candidate pool from this."""
-    assert make_llm_reranker(_Reply("1"), max_candidates=37).max_candidates == 37
+    assert _rr(_Reply("1"), candidates=37).max_candidates == 37
 
 
 def test_a_reasoning_block_is_working_not_a_ranking():
@@ -341,3 +358,39 @@ def test_a_declared_size_beats_family_membership():
     """Otherwise the allowlist admits a family's small model on the prefix
     alone and never reaches the size it states in its own name."""
     assert not model_can_rerank("gemini-2.0-flash-8b")
+
+
+def test_the_settings_are_read_per_call_not_captured():
+    """The point of the change: no rebuild to turn this on or resize it.
+
+    Both settings only ever shape one prompt, so baking them in made them
+    structural — they had to sit in MODEL_AFFECTING_SETTINGS, and nudging a
+    candidate budget tore down the LLM, embeddings, training and workflow
+    services to widen a number.
+    """
+    live = SimpleNamespace(rag_rerank="off", rag_rerank_candidates=20)
+    llm = _Reply("2, 1")
+    rerank = make_llm_reranker(llm, lambda: live)
+
+    assert rerank.max_candidates == 0
+    assert [c.content for c in rerank("q", _chunks("a", "b"))] == ["a", "b"]
+    assert llm.prompts == [], "disabled must not cost a model call"
+
+    live.rag_rerank = "on"
+
+    assert rerank.max_candidates == 20
+    assert [c.content for c in rerank("q", _chunks("a", "b"))] == ["b", "a"]
+
+    live.rag_rerank_candidates = 5
+
+    assert rerank.max_candidates == 5
+
+
+def test_the_rerank_settings_do_not_rebuild_the_model_stack():
+    """They are read per retrieval, so they have no business in that list."""
+    from liminallm.config import MODEL_AFFECTING_SETTINGS
+
+    assert "rag_rerank" not in MODEL_AFFECTING_SETTINGS
+    assert "rag_rerank_candidates" not in MODEL_AFFECTING_SETTINGS
+    # Late interaction genuinely changes what ingestion writes, so it stays.
+    assert "rag_late_interaction" in MODEL_AFFECTING_SETTINGS

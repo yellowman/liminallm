@@ -101,7 +101,10 @@ class RAGService:
         # those vectors is noise and must never reach a score (SPEC §2.5).
         self.semantic = semantic
         # Injected like ``embed`` so the kernel keeps no opinion about which
-        # model does the reranking, or whether one does at all.
+        # model does the reranking, or whether one does at all. The runtime's
+        # reranker decides per call and reports a budget of zero when the
+        # operator has it off, so nothing here has to be rebuilt to turn it
+        # on — and nothing here has to know that.
         self.rerank = rerank
         # Late interaction needs a real encoder for the same reason the dense
         # channel does: MaxSim over hash vectors is noise with extra steps.

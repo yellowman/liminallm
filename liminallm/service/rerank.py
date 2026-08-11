@@ -147,34 +147,82 @@ def parse_order(reply: str, count: int) -> List[int]:
     return order
 
 
-def make_llm_reranker(
-    llm: Any,
-    *,
-    max_candidates: int = 20,
-    snippet_chars: int = SNIPPET_CHARS,
-) -> Reranker:
-    """A reranker backed by the serving model.
+class LLMReranker:
+    """A reranker backed by the serving model, reading its own settings.
 
     No new dependency and no second provider: the model already running is the
     cross-encoder. It reads query and candidates in one pass, which is what
     lets it judge a set rather than score each chunk alone.
 
-    ``max_candidates`` is the operator's ``rag_rerank_candidates``, which
-    config.py declares and bounds; the value here only serves direct callers.
+    **Settings are read per call, not captured at construction.** Both of them
+    — whether to run at all, and how many candidates to read — only ever shape
+    one prompt. Baking them in made them structural: they had to sit in
+    MODEL_AFFECTING_SETTINGS, so nudging a candidate count from 20 to 25 tore
+    down and rebuilt the LLM backend, the embeddings service, RAG, training,
+    the clusterer and the workflow engine, taking the reload lock and
+    interrupting in-flight work for a number that bounds a prompt.
+
+    So this object always exists and decides per retrieval. Disabled, it hands
+    back what it was given.
     """
 
-    def rerank(query: str, chunks: Sequence[Any]) -> List[Any]:
-        head = list(chunks[:max_candidates])
-        tail = list(chunks[max_candidates:])
+    def __init__(
+        self,
+        llm: Any,
+        read_settings: Callable[[], Any],
+        *,
+        snippet_chars: int = SNIPPET_CHARS,
+    ) -> None:
+        self._llm = llm
+        self._read_settings = read_settings
+        self._snippet_chars = snippet_chars
+        # Only to keep the auto decision out of the log on every retrieval;
+        # it is reported when it changes, which is when it is news.
+        self._last_auto: Optional[bool] = None
+
+    @property
+    def enabled(self) -> bool:
+        """`off` never, `on` always, `auto` if the serving model earns it."""
+        mode = getattr(self._read_settings(), "rag_rerank", "off")
+        if mode != "auto":
+            return mode == "on"
+        model_id = str(getattr(self._llm, "serving_model", "") or "")
+        allowed = model_can_rerank(model_id)
+        if allowed != self._last_auto:
+            self._last_auto = allowed
+            logger.info(
+                "rag_rerank_auto_resolved", model=model_id, enabled=allowed
+            )
+        return allowed
+
+    @property
+    def max_candidates(self) -> int:
+        """How many chunks this will read — zero when it will read none.
+
+        Retrieval sizes its candidate pool from this, so a disabled reranker
+        must not widen the pool for work it is not going to do.
+        """
+        if not self.enabled:
+            return 0
+        return int(getattr(self._read_settings(), "rag_rerank_candidates", 0) or 0)
+
+    def __call__(self, query: str, chunks: Sequence[Any]) -> List[Any]:
+        budget = self.max_candidates
+        if budget < 2:
+            # Disabled, or too small a budget to reorder anything.
+            return list(chunks)
+
+        head = list(chunks[:budget])
+        tail = list(chunks[budget:])
         if len(head) < 2:
             # Nothing to reorder, and no call worth paying for.
             return list(chunks)
 
         prompt = build_prompt(
-            query, [chunk.content[:snippet_chars] for chunk in head]
+            query, [chunk.content[:self._snippet_chars] for chunk in head]
         )
         try:
-            response = llm.generate(prompt, adapters=[], context_snippets=[])
+            response = self._llm.generate(prompt, adapters=[], context_snippets=[])
             reply = str((response or {}).get("content") or "")
         except Exception as exc:  # noqa: BLE001 - fail open, never lose grounding
             logger.warning("rag_rerank_failed", error=str(exc))
@@ -217,36 +265,17 @@ def make_llm_reranker(
         # NONE branch refuses, on the far more common partial rejection.
         return [head[index] for index in order]
 
-    # Retrieval reads this to size its candidate pool. A reranker handed only
-    # the chunks that were going to be returned anyway can reorder them but
-    # never reach the one that placed just outside the cut.
-    rerank.max_candidates = max_candidates
-    return rerank
 
+def make_llm_reranker(
+    llm: Any,
+    read_settings: Callable[[], Any],
+    *,
+    snippet_chars: int = SNIPPET_CHARS,
+) -> LLMReranker:
+    """The reranker for a runtime. Always built; it decides per retrieval.
 
-def reranker_from_settings(llm: Any, settings: Any) -> Optional[Reranker]:
-    """Wire a reranker per the operator's `auto` / `on` / `off`.
-
-    `auto` asks whether there is positive evidence the serving model can judge
-    a shortlist, and stays off when there is none — the stage can drop the
-    user's context, so an unrecognized model is not given the benefit of the
-    doubt. `on` and `off` are the operator overruling that guess in either
-    direction, which is the point of having three states rather than two.
-
-    Both settings are read straight off the field. config.py owns their
-    defaults and their bounds; restating either here would create a second
-    value free to drift from the declaration.
+    ``read_settings`` is called on every decision rather than once, so the
+    operator's `auto` / `on` / `off` and their candidate budget take effect on
+    the next turn without rebuilding anything.
     """
-    mode = settings.rag_rerank
-    # The serving model, which LLMService resolves from its backend. Reading
-    # the attributes off the service directly found neither, so this judged
-    # the configured base model while an adapter server answered the request.
-    model_id = str(getattr(llm, "serving_model", "") or "")
-    if mode == "auto":
-        enabled = model_can_rerank(model_id)
-        logger.info("rag_rerank_auto_resolved", model=model_id, enabled=enabled)
-    else:
-        enabled = mode == "on"
-    if not enabled:
-        return None
-    return make_llm_reranker(llm, max_candidates=settings.rag_rerank_candidates)
+    return LLMReranker(llm, read_settings, snippet_chars=snippet_chars)

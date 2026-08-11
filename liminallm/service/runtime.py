@@ -29,7 +29,7 @@ from liminallm.service.embeddings import EmbeddingsService, make_provider_encode
 from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
 from liminallm.service.replication import AdvisoryLock, ClusterBus
-from liminallm.service.rerank import reranker_from_settings
+from liminallm.service.rerank import make_llm_reranker
 from liminallm.service.router import RouterEngine
 from liminallm.service.training import TrainingService
 from liminallm.service.training_worker import TrainingWorker
@@ -455,7 +455,10 @@ class Runtime:
             embed=self.embeddings.embed,
             embedding_model_id=embedding_model_id,
             semantic=self.embeddings.is_semantic,
-            rerank=reranker_from_settings(self.llm, self.settings),
+            # A live reader, not a captured value: the reranker asks
+            # self.settings on every retrieval, so its two settings take
+            # effect on the next turn without rebuilding this stack.
+            rerank=make_llm_reranker(self.llm, lambda: self.settings),
             late_interaction=self.settings.rag_late_interaction,
             late_segments=self.settings.rag_late_segments,
         )
