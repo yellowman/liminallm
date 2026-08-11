@@ -301,8 +301,6 @@ def rank_turns(
     for i in order:
         vec = _message_embedding(older[i], model_id)
         if vec is None:
-            if budget <= 0 and bm25[i] == 0:
-                continue  # nothing cheap left to justify an embed
             if budget <= 0:
                 continue
             try:

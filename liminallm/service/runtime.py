@@ -25,7 +25,11 @@ from liminallm.service.auth import AuthService
 from liminallm.service.clustering import SemanticClusterer
 from liminallm.service.config_ops import ConfigOpsService
 from liminallm.service.email import EmailService
-from liminallm.service.embeddings import EmbeddingsService, make_provider_encoder
+from liminallm.service.embeddings import (
+    EmbeddingsService,
+    make_provider_batch_encoder,
+    make_provider_encoder,
+)
 from liminallm.service.llm import LLMService
 from liminallm.service.rag import RAGService
 from liminallm.service.replication import AdvisoryLock, ClusterBus
@@ -439,6 +443,9 @@ class Runtime:
             self.embeddings = EmbeddingsService(
                 embedding_model_id,
                 encoder=make_provider_encoder(embed_client, embedding_model_id),
+                batch_encoder=make_provider_batch_encoder(
+                    embed_client, embedding_model_id
+                ),
                 semantic=True,
             )
         else:
@@ -453,6 +460,7 @@ class Runtime:
             default_chunk_size=rag_chunk_size,
             rag_mode=self.rag_mode,
             embed=self.embeddings.embed,
+            embed_many=self.embeddings.embed_many,
             embedding_model_id=embedding_model_id,
             semantic=self.embeddings.is_semantic,
             # A live reader, not a captured value: the reranker asks

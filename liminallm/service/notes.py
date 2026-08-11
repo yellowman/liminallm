@@ -156,8 +156,17 @@ def embed_note(embeddings, title: str, content: str) -> Optional[List[float]]:
         return None
 
 
-def _pair_similarity(a: Any, b: Any) -> float:
-    """Cosine between two notes, or 0.0 when either was never embedded."""
+def _pair_similarity(embeddings, a: Any, b: Any) -> float:
+    """Cosine between two notes, or 0.0 when there is no honest answer.
+
+    The ``is_semantic`` guard applies here as everywhere else: without a real
+    encoder these vectors are hash output, and their cosine is noise. The
+    witness report both publishes this number and *sorts by it*, so letting
+    the fallback through would rank findings on noise — the one thing SPEC
+    §2.5 says must never happen.
+    """
+    if not getattr(embeddings, "is_semantic", False):
+        return 0.0
     if not getattr(a, "embedding", None) or not getattr(b, "embedding", None):
         return 0.0
     return max(0.0, cosine_similarity(a.embedding, b.embedding))
@@ -327,7 +336,7 @@ def witness_report(
             # search_notes' fused rank score under the same name, so one
             # module had two "similarity" fields on incomparable scales and
             # this one meant nothing.
-            "similarity": round(_pair_similarity(note, other), 4),
+            "similarity": round(_pair_similarity(embeddings, note, other), 4),
             "created_at": other.created_at.isoformat(),
             "days_apart": abs((note.created_at - other.created_at).days),
             **judged,

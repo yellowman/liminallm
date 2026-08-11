@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
-from typing import Any, Callable, Iterable, List
+from typing import Any, Callable, Iterable, List, Optional, Sequence
 
 from liminallm.logging import get_logger
 
@@ -276,6 +276,45 @@ def make_provider_encoder(client: Any, model_id: str) -> Callable[[str], List[fl
     return encode
 
 
+def make_provider_batch_encoder(
+    client: Any, model_id: str
+) -> Callable[[Sequence[str]], List[List[float]]]:
+    """The same endpoint, asked once for many texts.
+
+    ``/embeddings`` takes an array, and late-interaction ingestion needs one
+    vector per segment — a 500-chunk file at eight segments each is 4000
+    embeddings, which one-at-a-time is 4000 sequential round trips. Falls back
+    per text like the single encoder, and reorders by the response's own index
+    rather than trusting arrival order.
+    """
+
+    def encode_many(texts: Sequence[str]) -> List[List[float]]:
+        clean = [(text or "")[:_EMBED_INPUT_MAX_CHARS] for text in texts]
+        if not clean:
+            return []
+        try:
+            response = client.embeddings.create(model=model_id, input=clean)
+            items = sorted(response.data, key=lambda item: getattr(item, "index", 0))
+            vectors = [list(item.embedding) for item in items]
+            if len(vectors) == len(clean) and all(vectors):
+                return vectors
+            logger.warning(
+                "provider_batch_embedding_short",
+                model=model_id,
+                asked=len(clean),
+                got=len(vectors),
+            )
+        except Exception as exc:  # noqa: BLE001 - degrade, never block
+            logger.warning(
+                "provider_batch_embedding_failed",
+                model=model_id,
+                error=str(exc)[:200],
+            )
+        return [deterministic_embedding(text) for text in clean]
+
+    return encode_many
+
+
 class EmbeddingsService:
     """Wrapper for embedding providers with a stable model identifier.
 
@@ -290,11 +329,19 @@ class EmbeddingsService:
         model_id: str,
         *,
         encoder: Callable[[str], List[float]] = deterministic_embedding,
+        batch_encoder: Optional[Callable[[Sequence[str]], List[List[float]]]] = None,
         semantic: bool = False,
     ):
         self.model_id = model_id
         self._encoder = encoder
+        self._batch_encoder = batch_encoder
         self.is_semantic = bool(semantic)
 
     def embed(self, text: str) -> List[float]:
         return self._encoder(text)
+
+    def embed_many(self, texts: Sequence[str]) -> List[List[float]]:
+        """One round trip where the provider supports it, else one per text."""
+        if self._batch_encoder is not None:
+            return self._batch_encoder(list(texts))
+        return [self._encoder(text) for text in texts]

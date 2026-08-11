@@ -84,6 +84,7 @@ class RAGService:
         *,
         rag_mode: str | Enum | None = None,
         embed: Callable[[str], List[float]] = deterministic_embedding,
+        embed_many: Optional[Callable[[Sequence[str]], List[List[float]]]] = None,
         embedding_model_id: str = "text-embedding",
         semantic: bool = False,
         rerank: Optional[Callable[[str, Sequence[KnowledgeChunk]], List[KnowledgeChunk]]] = None,
@@ -95,6 +96,12 @@ class RAGService:
         mode_value = rag_mode.value if isinstance(rag_mode, Enum) else rag_mode
         self.rag_mode = str(mode_value or os.getenv("RAG_MODE") or "pgvector").lower()
         self.embed = embed
+        # One round trip per chunk instead of one per segment. Falls back to
+        # the single encoder so a caller that supplies only ``embed`` still
+        # works — just slowly, which is the pre-existing behaviour.
+        self.embed_many = embed_many or (
+            lambda texts: [embed(text) for text in texts]
+        )
         self.embedding_model_id = embedding_model_id
         # EmbeddingsService.is_semantic, carried in. Defaults to False to match
         # the kernel's default encoder, which is the hash fallback: cosine over
@@ -324,16 +331,23 @@ class RAGService:
         vector_filters = {"embedding_model_id": self.embedding_model_id}
         pool_size = self._pool_size(limit)
 
-        lexical = list(
-            self.store.search_chunks_lexical(  # type: ignore[attr-defined]
-                allowed_ids,
-                query,
-                pool_size,
-                filters=None,
-                user_id=user_id,
-                tenant_id=tenant_id,
+        try:
+            lexical = list(
+                self.store.search_chunks_lexical(  # type: ignore[attr-defined]
+                    allowed_ids,
+                    query,
+                    pool_size,
+                    filters=None,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                )
             )
-        )
+        except Exception as exc:  # noqa: BLE001 - the other channels stand
+            # Belt and braces behind the startup check: a channel failing is
+            # a channel's worth of ranking lost, never the whole turn. The
+            # answer degrades to the vectors rather than 500-ing.
+            logger.warning("rag_lexical_channel_failed", error=str(exc))
+            lexical = []
 
         # Without a real encoder the dense pool is not a weaker channel, it is
         # a random sample: hash-vector distance carries no meaning to sort by.
@@ -563,20 +577,22 @@ class RAGService:
         # above still cut this to ``limit``, and a reranker needs more than the
         # answer to improve on it.
         per_context_limit = max(1, math.ceil(self._pool_size(limit) / len(allowed_ids)))
+        # No encoder gate here either. This path scores keywords as well as
+        # vectors, and dropping a chunk whose vector came from a previous
+        # encoder takes its *text* out of reach too — so flipping
+        # embedding_model_id answered nothing at all until the whole corpus
+        # was re-ingested, which the pgvector path was changed to stop doing.
+        # A stale vector still contributes nothing: cosine against a query
+        # from another encoder is not a match, and scores nothing.
         per_context: List[List[KnowledgeChunk]] = []
         for ctx_id in allowed_ids:
-            per_context.append([
-                chunk
-                for chunk in self.store.search_chunks(
-                    ctx_id,
-                    query,
-                    query_embedding,
-                    per_context_limit,
-                    semantic=self.semantic,
-                )
-                if (chunk.meta or {}).get("embedding_model_id")
-                == self.embedding_model_id
-            ])
+            per_context.append(list(self.store.search_chunks(
+                ctx_id,
+                query,
+                query_embedding,
+                per_context_limit,
+                semantic=self.semantic,
+            )))
 
         # Rank across contexts, and interleave only to break ties.
         # Concatenating hands every slot to whichever context was listed
@@ -726,7 +742,7 @@ class RAGService:
                 # would earn the chunk a second full-weight vote for it.
                 continue
             try:
-                segments = [(part, self.embed(part)) for part in parts]
+                segments = list(zip(parts, self.embed_many(parts)))
                 self.store.add_chunk_vectors(  # type: ignore[attr-defined]
                     chunk.id,
                     segments,

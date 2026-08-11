@@ -404,9 +404,14 @@ def _require_non_blank(value: str) -> str:
     locked every user out, including themselves, which is the exact failure
     the bound was added to prevent.
     """
-    if not str(value).strip():
+    stripped = str(value).strip()
+    if not stripped:
         raise ValueError("must not be blank")
-    return value
+    # Stripped, not just checked. " acme " passes a blankness test and then
+    # matches no account, which is the same lockout by a quieter route — and
+    # the tenant_domains validator already strips its values, so leaving this
+    # one raw made the two halves of a tenant normalize differently.
+    return stripped
 
 
 def env_field(default: Any, env: str, **kwargs):

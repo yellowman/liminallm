@@ -394,3 +394,25 @@ def test_the_rerank_settings_do_not_rebuild_the_model_stack():
     assert "rag_rerank_candidates" not in MODEL_AFFECTING_SETTINGS
     # Late interaction genuinely changes what ingestion writes, so it stays.
     assert "rag_late_interaction" in MODEL_AFFECTING_SETTINGS
+
+
+def test_a_single_numbered_line_is_still_a_numbered_line():
+    """A model naming one relevant passage writes "1. Passage 3".
+
+    Requiring two list lines left that one unstripped, so both digits were
+    harvested: chunk 1 — which the model did not choose — was promoted to
+    the top of the answer, and two chunks came back where one was named.
+    """
+    assert parse_order("1. Passage 3", 5) == [2]
+    assert parse_order("1) Passage 2", 5) == [1]
+
+
+def test_a_reasoning_model_can_still_say_none():
+    """Every reasoning family on the allowlist wraps its verdict in a block.
+
+    Matching NONE against the raw reply meant the verdict never registered
+    for exactly the models it was written for.
+    """
+    rerank = _rr(_Reply("<think>None of these help; passage 2 is 2024</think>\nNONE"))
+
+    assert rerank("q", _chunks("first", "second")) == []

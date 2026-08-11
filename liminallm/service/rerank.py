@@ -12,9 +12,12 @@ A model that reads the query and the candidates together is bound by neither.
 It is also the only stage that can say "none of these answer the question",
 which is the honest result more often than retrieval likes to admit.
 
-Cost is why it is off by default: one model call per retrieval, on the hot
-path. So it is bounded to the strongest candidates, and it fails open — on
-any error, timeout, or unreadable reply, the fusion order stands.
+Cost is why it is conditional rather than simply on: one model call per
+retrieval, on the hot path. The default is `auto`, which runs it only for a
+serving model there is positive evidence for — so pointing model_path at a
+capable model turns it on, and an unrecognized one leaves it off. It is
+bounded to the strongest candidates, and it fails open: on any error,
+timeout, or unreadable reply, the fusion order stands.
 
 The candidates are the user's own files, which makes them untrusted input to
 a decision. They travel inside an envelope that says so, and any text that
@@ -67,6 +70,11 @@ _ONLY_NUMBERS = re.compile(r"^\W*\d+(?:\s*[,;]\s*\d+)*\W*$")
 Reranker = Callable[[str, Sequence[Any]], List[Any]]
 
 
+def _answer_text(reply: str) -> str:
+    """The reply with any reasoning block removed, closed or not."""
+    return _THINK_UNCLOSED.sub(" ", _THINK_BLOCK.sub(" ", reply or "")).strip()
+
+
 def _answer_only(reply: str) -> str:
     """The part of a reply that is meant to be the ranking.
 
@@ -83,12 +91,17 @@ def _answer_only(reply: str) -> str:
     Position alone was not enough: "last line with a digit" reads "2. Passage
     1" as the answer 2, silently inverting an ordered list.
     """
-    cleaned = _THINK_UNCLOSED.sub(" ", _THINK_BLOCK.sub(" ", reply or ""))
+    cleaned = _answer_text(reply)
     lines = [line for line in cleaned.splitlines() if re.search(r"\d", line)]
     if not lines:
         return ""
     listed = [line for line in lines if _LIST_MARKER.match(line)]
-    if len(listed) > 1:
+    if listed:
+        # Any number of them, not two or more. A model naming a single
+        # relevant passage writes "1. Passage 3", and requiring a second line
+        # left that one unstripped: both digits were harvested, so chunk 1
+        # was promoted to the top of the answer and two chunks came back
+        # where the model had named one.
         return "\n".join(_LIST_MARKER.sub("", line) for line in listed)
     for line in reversed(lines):
         if _ONLY_NUMBERS.match(line):
@@ -181,30 +194,36 @@ class LLMReranker:
         self._last_auto: Optional[bool] = None
 
     @property
-    def enabled(self) -> bool:
-        """`off` never, `on` always, `auto` if the serving model earns it."""
-        mode = getattr(self._read_settings(), "rag_rerank", "off")
-        if mode != "auto":
-            return mode == "on"
-        model_id = str(getattr(self._llm, "serving_model", "") or "")
-        allowed = model_can_rerank(model_id)
-        if allowed != self._last_auto:
-            self._last_auto = allowed
-            logger.info(
-                "rag_rerank_auto_resolved", model=model_id, enabled=allowed
-            )
-        return allowed
-
-    @property
     def max_candidates(self) -> int:
         """How many chunks this will read — zero when it will read none.
 
-        Retrieval sizes its candidate pool from this, so a disabled reranker
-        must not widen the pool for work it is not going to do.
+        The single question this object answers about itself, so that asking
+        it is one settings read and one decision. Retrieval sizes its
+        candidate pool from this, and a disabled reranker must not widen the
+        pool for work it is not going to do.
+
+        It was two properties, and ``enabled`` both mutated state and logged
+        while being read twice per retrieval — once to size the pool and once
+        to run. A property that does that is a method wearing the wrong hat.
         """
-        if not self.enabled:
+        # Read off the fields, never getattr with a fallback: config.py owns
+        # these defaults, and a second copy here is free to drift from the
+        # declaration without anything noticing.
+        settings = self._read_settings()
+        mode = settings.rag_rerank
+        if mode == "auto":
+            model_id = str(getattr(self._llm, "serving_model", "") or "")
+            allowed = model_can_rerank(model_id)
+            if allowed != self._last_auto:
+                self._last_auto = allowed
+                logger.info(
+                    "rag_rerank_auto_resolved", model=model_id, enabled=allowed
+                )
+        else:
+            allowed = mode == "on"
+        if not allowed:
             return 0
-        return int(getattr(self._read_settings(), "rag_rerank_candidates", 0) or 0)
+        return int(settings.rag_rerank_candidates)
 
     def __call__(self, query: str, chunks: Sequence[Any]) -> List[Any]:
         budget = self.max_candidates
@@ -230,7 +249,11 @@ class LLMReranker:
 
         order = parse_order(reply, len(head))
         if not order:
-            if NONE_REPLY.match(reply.strip()):
+            # Against the answer, not the raw reply: every reasoning family on
+            # the allowlist wraps its verdict in a <think> block, and matching
+            # the whole string meant a bare NONE from exactly those models
+            # never registered. They were the ones the verdict existed for.
+            if NONE_REPLY.match(_answer_text(reply)):
                 # A bare NONE is a verdict, and the one thing this stage can
                 # say that no ranking can: none of these answer the question.
                 # Passing them on anyway is how a model ends up citing text

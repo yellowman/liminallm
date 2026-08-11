@@ -394,6 +394,7 @@ class PostgresStore:
             "knowledge_context",
             "context_source",
             "knowledge_chunk",
+            "knowledge_chunk_vector",
             "preference_event",
             "semantic_cluster",
             "adapter_router_state",
@@ -416,6 +417,26 @@ class PostgresStore:
                     "Missing required Postgres tables: {}. Run scripts/migrate.sh to install the SPEC §2 schema.".format(
                         ", ".join(sorted(missing_tables))
                     )
+                )
+
+            # Retrieval's lexical channel reads this generated column by
+            # name. The table list above cannot catch its absence — the table
+            # is old, the column is not — so an install that pulled new code
+            # without re-running migrations booted clean and then answered
+            # every grounded chat turn with a 500. Fail here instead, where
+            # the message can name the fix.
+            fts_column = conn.execute(
+                """
+                SELECT 1 FROM pg_attribute
+                WHERE attrelid = 'knowledge_chunk'::regclass
+                  AND attname = 'content_tsv' AND NOT attisdropped
+                """
+            ).fetchone()
+            if not fts_column:
+                raise RuntimeError(
+                    "knowledge_chunk.content_tsv is missing, so hybrid retrieval's "
+                    "keyword channel cannot run. Rerun scripts/migrate.sh to apply "
+                    "the SPEC §2.5 schema."
                 )
 
             vector_ext = conn.execute(
