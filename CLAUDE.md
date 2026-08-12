@@ -52,6 +52,21 @@ comment or a spec line is not evidence. Writing why the code is correct and
 writing the code both come from the same intent, so neither one checks the
 other. Verify first, then describe what you verified.
 
+### Code Review Runs Its Verification Pass
+
+The owner has authorized multi-agent orchestration for code review. Run every
+review as a fan-out of finders across distinct angles, then verify each finding
+with **independent adversarial verifiers** before reporting it — one that must
+reproduce the failure by running code, one that argues the finding is wrong and
+defaults to rejecting it when uncertain. A finding survives only if both agree.
+
+This standing authorization covers code review. It does not extend to
+orchestrating other work; ask for that separately.
+
+The reason is measured, not stylistic. Five single-pass reviews of one branch
+each missed defects the next pass found, and several of those were bugs the
+previous pass's *fix* introduced. Reading alone converged on nothing.
+
 ## Security Guidelines
 
 ### Tenant Isolation
