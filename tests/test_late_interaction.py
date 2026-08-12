@@ -344,3 +344,19 @@ def test_segment_indexing_stops_for_the_whole_run_not_one_file(store, monkeypatc
 
     assert calls == [1], "the failure must latch, not repeat per file"
     assert rag._segment_index_broken is True
+
+
+def test_packing_uses_the_whole_segment_budget():
+    """Slicing by ceil(len/max) yields fewer buckets than the cap allows.
+
+    At nine pieces and a cap of eight it stepped by two and produced five, so
+    the operator's segment budget was quietly missed by up to half.
+    """
+    text = ". ".join(_long(f"w{i}") for i in range(9)) + "."
+
+    assert len(segment_text(text, max_segments=8)) == 8
+    assert len(segment_text(text, max_segments=3)) == 3
+    # And still never drops content.
+    joined = " ".join(segment_text(text, max_segments=8))
+    for i in range(9):
+        assert f"w{i}" in joined

@@ -82,12 +82,15 @@ def segment_text(
     if len(merged) <= max_segments:
         return merged
 
-    # Pack into exactly max_segments buckets of near-equal size.
-    per_bucket = math.ceil(len(merged) / max_segments)
-    return [
-        " ".join(merged[start:start + per_bucket])
-        for start in range(0, len(merged), per_bucket)
-    ]
+    # Pack into exactly max_segments buckets of near-equal size. Slicing by
+    # ceil(len/max) does not: at 9 pieces and a cap of 8 it steps by 2 and
+    # yields 5 buckets, so the operator's segment budget was quietly missed by
+    # up to half. Index arithmetic spreads the remainder instead.
+    count = min(max_segments, len(merged))
+    buckets: List[List[str]] = [[] for _ in range(count)]
+    for index, piece in enumerate(merged):
+        buckets[index * count // len(merged)].append(piece)
+    return [" ".join(bucket) for bucket in buckets]
 
 
 def _unit(vector: Sequence[float]) -> Optional[List[float]]:

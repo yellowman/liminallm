@@ -707,7 +707,7 @@ RERANK_CAPABLE_PREFIXES: Tuple[str, ...] = (
 # the model and so lands on the safe side of the bar; an operator who knows
 # better sets rag_rerank=on.
 RERANK_MIN_PARAMS_B = 30.0
-_PARAM_SIZE = re.compile(r"(?:^|[-_/x])(\d+(?:\.\d+)?)b(?:$|[-_./])", re.IGNORECASE)
+_PARAM_SIZE = re.compile(r"(?:^|[-_/x:])(\d+(?:\.\d+)?)b(?:$|[-_./:])", re.IGNORECASE)
 
 
 # A prefix match cannot tell a flagship from the distilled sibling that
@@ -722,7 +722,11 @@ RERANK_SMALL_VARIANTS: frozenset[str] = frozenset(
     {"mini", "nano", "lite", "small", "tiny", "micro"}
 )
 
-_NAME_PARTS = re.compile(r"[-_./]+")
+# ":" belongs here: an Ollama tag ("deepseek-r1:1.5b") and an OpenRouter
+# variant suffix ("openai/gpt-4o-mini:online") both hide the part that
+# decides. Without it the size floor found no size and the small-variant
+# guard found no "mini", so auto turned reranking on for a 1.5B.
+_NAME_PARTS = re.compile(r"[-_./:]+")
 
 
 def model_can_rerank(model_id: str) -> bool:

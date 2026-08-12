@@ -396,3 +396,32 @@ def test_local_hybrid_ranks_across_contexts_by_relevance():
 
     assert hits
     assert all(hit.context_id == good.id for hit in hits)
+
+
+def test_a_chunk_the_store_matched_is_never_dropped_by_the_rescore(store):
+    """Postgres and the BM25 tokenizer disagree, and the store wins.
+
+    to_tsvector('simple', ...) splits "user_id" into 'user' + 'id'; bm25's
+    \\w+ keeps it whole. So SQL matched the chunk on "user id" and the
+    re-score gave it 0.0. With the hash encoder lexical is the only live
+    channel, so the whole turn came back empty for a question the corpus
+    answers — the common shape for the source files ingest_path defaults to.
+    """
+    user = store.create_user(email=f"tk_{uuid.uuid4().hex[:8]}@example.com")
+    ctx = store.upsert_context(user.id, f"tk-{uuid.uuid4().hex[:6]}", "fixture")
+
+    rag = RAGService(store, embedding_model_id="tok-encoder")
+    rag.ingest_text(
+        ctx.id,
+        "def resolve_user_id(request): the tenant_id and the user_id are both "
+        "derived from the authenticated jwt token and never from user input",
+        source_path="/auth.py",
+    )
+
+    # The store finds it either way; retrieval must not then throw it away.
+    assert store.search_chunks_lexical([ctx.id], "user id", 8, user_id=user.id)
+    hits = rag.retrieve(
+        [ctx.id], "user id", limit=4, user_id=user.id, min_token_count=0
+    )
+
+    assert [hit.fs_path for hit in hits] == ["/auth.py"]

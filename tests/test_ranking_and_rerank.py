@@ -416,3 +416,46 @@ def test_a_reasoning_model_can_still_say_none():
     rerank = _rr(_Reply("<think>None of these help; passage 2 is 2024</think>\nNONE"))
 
     assert rerank("q", _chunks("first", "second")) == []
+
+
+def test_a_newline_ranking_is_not_read_as_its_worst_pick():
+    """The prompt asks for "3, 1, 2"; models answer "3\\n1\\n2" anyway.
+
+    Taking one line read that as the model's third choice and discarded the
+    other two — and logged it as a successful rerank.
+    """
+    assert parse_order("3\n1\n2", 5) == [2, 0, 1]
+    assert parse_order("- 3\n- 1\n- 2", 5) == [2, 0, 1]
+
+
+def test_prose_is_never_read_as_a_ranking():
+    """A refusal carrying a count grounded the answer in that count.
+
+    "NONE of the 5 passages help" returned passage 5 — the stage that exists
+    to say none of these help instead picked one by a quantity.
+    """
+    for refusal in (
+        "NONE of the 5 passages help.",
+        "None. The 4 passages all discuss unrelated topics.",
+        "None of the passages answer the Q3 2024 question.",
+    ):
+        assert parse_order(refusal, 5) == [], refusal
+
+
+def test_a_labelled_answer_still_parses():
+    """Strictness must not cost the shapes that are genuinely answers."""
+    assert parse_order("Final: 2", 5) == [1]
+    assert parse_order("Let me consider 3 options.\nFinal: 2", 5) == [1]
+
+
+def test_a_model_tag_cannot_hide_the_part_that_decides():
+    """Ollama tags and OpenRouter suffixes put ':' where a '-' would be.
+
+    Neither separator class held it, so the size floor found no size and the
+    small-variant guard found no "mini": auto turned reranking on for a 1.5B.
+    """
+    assert not model_can_rerank("deepseek-r1:1.5b")
+    assert not model_can_rerank("openai/gpt-4o-mini:online")
+    assert not model_can_rerank("openai/gpt-5-nano:free")
+    assert not model_can_rerank("google/gemini-2.5-flash-lite:free")
+    assert model_can_rerank("gpt-4o")

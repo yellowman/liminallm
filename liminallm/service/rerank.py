@@ -65,7 +65,11 @@ _THINK_UNCLOSED = re.compile(r"<think\b.*\Z", re.IGNORECASE | re.DOTALL)
 _LIST_MARKER = re.compile(r"^\s*\d+[.)]\s+")
 
 # A line that is only numbers and separators — the shape the prompt asks for.
-_ONLY_NUMBERS = re.compile(r"^\W*\d+(?:\s*[,;]\s*\d+)*\W*$")
+# An optional short label is allowed in front ("Final: 2", "Answer: 3, 1"),
+# because models add one and the numbers after it are still the answer.
+_ONLY_NUMBERS = re.compile(
+    r"^\W*(?:[A-Za-z ]{1,20}:\s*)?\d+(?:\s*[,;]\s*\d+)*\W*$"
+)
 
 Reranker = Callable[[str, Sequence[Any]], List[Any]]
 
@@ -103,10 +107,22 @@ def _answer_only(reply: str) -> str:
         # was promoted to the top of the answer and two chunks came back
         # where the model had named one.
         return "\n".join(_LIST_MARKER.sub("", line) for line in listed)
+    # The trailing run of number-only lines, not just the last one. A model
+    # asked for "3, 1, 2" often answers "3\n1\n2", and taking one line read
+    # that as its *worst* pick and threw the other two away — a successful
+    # parse by every log line, and one wrong chunk in the answer.
+    trailing: List[str] = []
     for line in reversed(lines):
-        if _ONLY_NUMBERS.match(line):
-            return line
-    return lines[-1]
+        if not _ONLY_NUMBERS.match(line):
+            break
+        trailing.append(line)
+    if trailing:
+        return " ".join(reversed(trailing))
+
+    # Nothing ranking-shaped. Prose is not a ranking, and reading it as one is
+    # how "NONE of the 5 passages help" grounded the answer in passage 5. No
+    # opinion is the safe answer: the caller keeps the fusion order.
+    return ""
 
 
 def build_prompt(query: str, snippets: Sequence[str]) -> str:

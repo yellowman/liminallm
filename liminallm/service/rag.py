@@ -507,6 +507,8 @@ class RAGService:
         lexical: Sequence[KnowledgeChunk],
         dense: Sequence[KnowledgeChunk],
         late: Sequence[KnowledgeChunk] = (),
+        *,
+        lexical_is_matched: bool = True,
     ) -> List[KnowledgeChunk]:
         """Fuse the channels by rank, per SPEC §2.5.
 
@@ -530,25 +532,60 @@ class RAGService:
 
         channels: List[tuple[float, List[object]]] = []
         if lexical:
+            # ``lexical_is_matched`` says whether membership of this pool is
+            # itself the match signal. It is for the pgvector path, where the
+            # store's own full-text query selected every member — so BM25 may
+            # order that pool but must not empty it. Dropping its zeros
+            # deleted answers the store had found: Postgres indexes "user_id"
+            # as 'user' + 'id' while this tokenizer keeps it whole, so a query
+            # of "user id" scored a matching chunk 0.0, and with the hash
+            # encoder — where lexical is the only live channel — retrieval
+            # returned nothing at all for a question the corpus answers. Any
+            # pre-filtered pool re-scored by a different scorer can be emptied
+            # that way; ordering is safe, discarding is not.
+            #
+            # The local path's pool is not pre-filtered — it is a top-N by
+            # another score, and a zero there really is a non-match — so it
+            # keeps the silence rule.
             scores = compute_bm25_scores(
                 tokenize_text(query),
                 [tokenize_text(chunk.content) for chunk in lexical],
             )
-            channels.append(
-                (
-                    LEXICAL_WEIGHT,
-                    [self._chunk_key(lexical[i]) for i in ranked_positive(scores)],
+            if lexical_is_matched:
+                order = sorted(
+                    range(len(lexical)), key=lambda i: scores[i], reverse=True
                 )
+            else:
+                order = ranked_positive(scores)
+            channels.append(
+                (LEXICAL_WEIGHT, [self._chunk_key(lexical[i]) for i in order])
             )
         if late:
             channels.append(
                 (LATE_WEIGHT, [self._chunk_key(chunk) for chunk in late])
             )
         if dense:
-            pooled = POOLED_WITH_LATE_WEIGHT if late else SEMANTIC_WEIGHT
-            channels.append(
-                (pooled, [self._chunk_key(chunk) for chunk in dense])
-            )
+            # The pooled vector steps back only for chunks late interaction
+            # actually ranked. Weighting the whole channel down because *some
+            # other* chunk had segments demoted a chunk from 0.55 to 0.25 on
+            # its neighbours' behalf, with no late contribution to make up the
+            # difference — buried by the arrival of a feature that had nothing
+            # to say about it.
+            late_keys = {self._chunk_key(chunk) for chunk in late}
+            covered = [
+                self._chunk_key(chunk)
+                for chunk in dense
+                if self._chunk_key(chunk) in late_keys
+            ]
+            uncovered = [
+                self._chunk_key(chunk)
+                for chunk in dense
+                if self._chunk_key(chunk) not in late_keys
+            ]
+            if covered:
+                channels.append((POOLED_WITH_LATE_WEIGHT, covered))
+            if uncovered:
+                channels.append((SEMANTIC_WEIGHT, uncovered))
 
         fused = fuse_ranks(channels)
         order = sorted(fused, key=lambda key: fused[key], reverse=True)
@@ -615,7 +652,7 @@ class RAGService:
                 cosine_similarity(query_embedding, chunk.embedding) for chunk in union
             ]
             dense = [union[index] for index in ranked_positive(scores)]
-        return self._fuse(query, union, dense)
+        return self._fuse(query, union, dense, lexical_is_matched=False)
 
     def ingest_text(
         self,
