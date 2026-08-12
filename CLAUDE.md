@@ -26,6 +26,32 @@ Planning and careful use of resources is of the utmost importance. Use constrain
 ### Prompt Budget
 Model-facing prompt text is paid on every call — keep the wording tight. But this app exists to make weak local models perform well, and weak models drop a rule stated once: safety-critical rules (the untrusted-data/injection rule especially) are deliberately repeated across the system prompt, the tool descriptions, and the payload envelope. Tighten phrasing, never the repetition. No boilerplate; no copyright language.
 
+### Verification
+
+Three rules, each earned by a bug this project shipped and a review had to find.
+
+**Execute before claiming.** Run the code on a real input before you say it
+works. Parsers, heuristics and anything with a threshold are the worst
+offenders: reading them confirms what you meant, running them shows what they
+do. `"mini"` is a substring of `"gemini"`, and no amount of re-reading the
+line said so.
+
+**Build test doubles from the real object.** A stub you construct from your own
+belief about an interface encodes that belief, so the test passes and the code
+is still wrong. If a service resolves a value from its backend, the double must
+have a backend. Prefer the real class with a test backend over a hand-made
+stand-in.
+
+**Grep the class when you fix the instance.** A reported bug is one sighting of
+a shape. Before calling it fixed, search for the same shape elsewhere — the
+other retrieval path, the second copy of the list, the unclosed form of the tag
+you just handled. Fixes that stop at the reported line leave siblings behind.
+
+A related discipline, because it caused as much damage as the three above: a
+comment or a spec line is not evidence. Writing why the code is correct and
+writing the code both come from the same intent, so neither one checks the
+other. Verify first, then describe what you verified.
+
 ## Security Guidelines
 
 ### Tenant Isolation
