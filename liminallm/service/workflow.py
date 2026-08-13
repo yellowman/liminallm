@@ -2098,6 +2098,69 @@ class WorkflowEngine(WorkflowStreamingMixin):
             return notes_service.format_note_results(results)
         return f"unknown tool '{name}'"
 
+    #: Read-only tools: they neither record injection taint nor consult it, so
+    #: one round's worth can run concurrently. Everything else runs strictly in
+    #: order — a web_fetch that records an injection finding must be able to
+    #: withdraw run_python later in the same round, and that ordering only
+    #: exists when the calls run one at a time.
+    PARALLEL_SAFE_TOOLS = frozenset({"file_search", "history_search", "note_search"})
+
+    def _run_round_tools(
+        self,
+        parsed: List[tuple],
+        *,
+        conversation_id: Optional[str],
+        context_id: Optional[str],
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+        session: dict,
+        snippets: List[str],
+        fallback_query: str,
+    ) -> List[str]:
+        """Execute one round's tool calls; results always in call order.
+
+        A round of pure reads is the model fanning out searches, so those run
+        together. The egress guard is thread-local, which makes re-applying it
+        inside every worker mandatory, not hygiene: the ambient guard on the
+        handler's own thread does not follow work into a pool, and the socket
+        allowlist PERMITS when no policy is set on the connecting thread.
+        """
+
+        def run_one(name: str, args: Dict[str, Any], sink: List[str]) -> str:
+            with tool_network_guard(self.tool_network_policy):
+                return self._execute_agent_tool(
+                    name,
+                    args,
+                    conversation_id=conversation_id,
+                    context_id=context_id,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    session=session,
+                    snippets=sink,
+                    fallback_query=fallback_query,
+                )
+
+        if len(parsed) > 1 and all(
+            name in self.PARALLEL_SAFE_TOOLS for _, name, _ in parsed
+        ):
+            # Per-call snippet sinks keep context_snippets in call order no
+            # matter which worker finishes first. A fresh bounded pool, not
+            # self._tool_executor: this method already runs on one of that
+            # pool's threads, and a pool waiting on itself can starve.
+            sinks: List[List[str]] = [[] for _ in parsed]
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=min(4, len(parsed))
+            ) as pool:
+                futures = [
+                    pool.submit(run_one, name, args, sink)
+                    for (_, name, args), sink in zip(parsed, sinks)
+                ]
+                results = [future.result() for future in futures]
+            for sink in sinks:
+                snippets.extend(sink)
+            return results
+        return [run_one(name, args, snippets) for _, name, args in parsed]
+
     @staticmethod
     def _parse_tool_arguments(call: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -2172,20 +2235,21 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     response.get("assistant_message")
                     or {"role": "assistant", "content": content}
                 )
-                for call in calls:
-                    name = call.get("name") or ""
-                    args = self._parse_tool_arguments(call)
-                    result = self._execute_agent_tool(
-                        name,
-                        args,
-                        conversation_id=conversation_id,
-                        context_id=context_id,
-                        user_id=user_id,
-                        tenant_id=tenant_id,
-                        session=session,
-                        snippets=snippets,
-                        fallback_query=message,
-                    )
+                parsed = [
+                    (call, call.get("name") or "", self._parse_tool_arguments(call))
+                    for call in calls
+                ]
+                results = self._run_round_tools(
+                    parsed,
+                    conversation_id=conversation_id,
+                    context_id=context_id,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    session=session,
+                    snippets=snippets,
+                    fallback_query=message,
+                )
+                for (call, name, args), result in zip(parsed, results):
                     tool_trace.append({"tool": name, "arguments": args})
                     self.logger.info(
                         "attachment_tool_called",

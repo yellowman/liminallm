@@ -130,11 +130,20 @@ async def _transcribe(runtime, payload: str, user_id: str) -> tuple[str, dict]:
     return text, {"mode": "voice", "transcript": transcript}
 
 
-async def finish(runtime, turn: Turn, orchestration: Any, *, content: str = "") -> Any:
+async def finish(
+    runtime,
+    turn: Turn,
+    orchestration: Any,
+    *,
+    content: str = "",
+    assistant_message_id: Optional[str] = None,
+) -> Any:
     """Persist the reply, schedule the post-turn work, warm the cache.
 
     ``content`` is the streaming path's token-assembled reply, used when the
-    orchestration carries none.
+    orchestration carries none. ``assistant_message_id`` lets a transport that
+    must announce the reply's id before it exists (the streaming Responses
+    surface) mint it up front and keep every event consistent with the row.
     """
     turn.orchestration = orchestration if isinstance(orchestration, dict) else {}
     assistant_content = turn.orchestration.get(
@@ -155,6 +164,7 @@ async def finish(runtime, turn: Turn, orchestration: Any, *, content: str = "") 
             "workflow_trace": turn.orchestration.get("workflow_trace", []),
             "usage": turn.orchestration.get("usage", {}),
         },
+        message_id=assistant_message_id,
     )
 
     turn_effects.schedule_all(

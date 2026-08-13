@@ -1,8 +1,9 @@
-"""API keys: minted by a session, honored only by the served Responses API.
+"""API keys: minted by a session, honored only by the agent surfaces.
 
 The containment property under test is structural, not policy: get_user never
-reads keys, so a leaked key can drive /v1/responses and nothing else — it
-cannot list conversations, cannot mint another key, cannot revoke anything.
+reads keys, so a leaked key can drive /v1/responses and /v1/mcp and nothing
+else — it cannot list conversations, cannot mint another key, cannot revoke
+anything.
 """
 
 from liminallm.service.auth import API_KEY_PREFIX

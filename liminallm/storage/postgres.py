@@ -2086,6 +2086,7 @@ class PostgresStore:
         content: str,
         meta: Optional[dict] = None,
         content_struct: Optional[dict] = None,
+        message_id: Optional[str] = None,
     ) -> Message:
         try:
             normalized_content_struct = normalize_content_struct(
@@ -2103,7 +2104,14 @@ class PostgresStore:
                         (conversation_id,),
                     ).fetchone()
                     seq = seq_row["next_seq"] if seq_row else 0
-                    msg_id = str(uuid.uuid4())
+                    # A caller-minted id lets the streaming Responses surface
+                    # announce the id before the row exists; anything invalid
+                    # falls back to a fresh one rather than a failed INSERT.
+                    msg_id = (
+                        message_id
+                        if message_id and _is_uuid(message_id)
+                        else str(uuid.uuid4())
+                    )
                     now = datetime.now(timezone.utc)
                     conn.execute(
                         "INSERT INTO message (id, conversation_id, sender, role, content, content_struct, seq, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",

@@ -497,20 +497,6 @@ class WorkflowStreamingMixin:
                     msgs, offer, adapters, user_id=user_id
                 )
 
-        def _run_tool(name: str, args: Dict[str, Any]) -> str:
-            with tool_network_guard(self.tool_network_policy):
-                return self._execute_agent_tool(
-                    name,
-                    args,
-                    conversation_id=conversation_id,
-                    context_id=context_id,
-                    user_id=user_id,
-                    tenant_id=tenant_id,
-                    session=session,
-                    snippets=snippets,
-                    fallback_query=message,
-                )
-
         try:
             # Tool rounds. One round is always reserved for the streamed answer.
             for _ in range(max(0, self.MAX_AGENT_ROUNDS - 1)):
@@ -530,12 +516,28 @@ class WorkflowStreamingMixin:
                     response.get("assistant_message")
                     or {"role": "assistant", "content": response.get("content") or ""}
                 )
-                for call in calls:
-                    name = call.get("name") or ""
-                    args = self._parse_tool_arguments(call)
-                    # Tell the client what is happening before the slow part.
+                parsed = [
+                    (call, call.get("name") or "", self._parse_tool_arguments(call))
+                    for call in calls
+                ]
+                # Tell the client what is happening before the slow part.
+                for _, name, _ in parsed:
                     yield {"event": "trace", "data": {"tool": name, "status": "running"}}
-                    result = await asyncio.to_thread(_run_tool, name, args)
+                # _run_round_tools applies the egress guard per worker thread
+                # and parallelizes read-only rounds; taint-class rounds stay
+                # strictly ordered (see workflow.py).
+                results = await asyncio.to_thread(
+                    self._run_round_tools,
+                    parsed,
+                    conversation_id=conversation_id,
+                    context_id=context_id,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    session=session,
+                    snippets=snippets,
+                    fallback_query=message,
+                )
+                for (call, name, args), result in zip(parsed, results):
                     tool_trace.append({"tool": name, "arguments": args})
                     self.logger.info(
                         "attachment_tool_called",

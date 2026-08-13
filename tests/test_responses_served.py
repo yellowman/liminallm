@@ -183,7 +183,6 @@ class TestResponsesRejections:
     @pytest.mark.parametrize(
         ("body", "param"),
         [
-            ({"input": "hi", "stream": True}, "stream"),
             ({"input": "hi", "tools": [{"type": "function"}]}, "tools"),
             ({"input": "hi", "instructions": "Be terse."}, "instructions"),
             ({"input": "hi", "store": False}, "store"),
@@ -254,6 +253,146 @@ class TestResponsesRejections:
         resp = client.post("/v1/responses", json={"input": "hi"})
         # The documented seam: auth 401s keep the app-wide shape (see SPEC).
         assert resp.status_code == 401
+
+
+def _sse_events(text):
+    """Parse an SSE body into [{'event': name, 'data': parsed-json}, ...]."""
+    import json as json_module
+
+    events = []
+    for block in text.strip().split("\n\n"):
+        name, data = None, None
+        for line in block.split("\n"):
+            if line.startswith("event: "):
+                name = line[len("event: ") :]
+            elif line.startswith("data: "):
+                data = json_module.loads(line[len("data: ") :])
+        if name:
+            events.append({"event": name, "data": data})
+    return events
+
+
+class TestResponsesStreaming:
+    def test_stream_true_returns_sse_with_stable_id(self, client, auth_headers):
+        resp = client.post(
+            "/v1/responses",
+            headers=auth_headers,
+            json={"input": "hello over the stream", "stream": True},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.headers["content-type"].startswith("text/event-stream")
+
+        events = _sse_events(resp.text)
+        names = [e["event"] for e in events]
+        assert names[0] == "response.created"
+        assert names[-1] == "response.completed"
+        assert "response.output_item.added" in names
+        assert "response.output_text.done" in names
+
+        created = events[0]["data"]["response"]
+        completed = events[-1]["data"]["response"]
+        # The id announced first is the id the reply is persisted under.
+        assert created["id"] == completed["id"]
+        assert created["status"] == "in_progress"
+        assert completed["status"] == "completed"
+
+        text = completed["output"][0]["content"][0]["text"]
+        assert isinstance(text, str) and text
+        done_text = next(
+            e["data"]["text"]
+            for e in events
+            if e["event"] == "response.output_text.done"
+        )
+        assert done_text == text
+        deltas = "".join(
+            e["data"]["delta"]
+            for e in events
+            if e["event"] == "response.output_text.delta"
+        )
+        if deltas:
+            assert deltas == text
+        assert isinstance(completed["usage"], dict)
+
+        seqs = [e["data"]["sequence_number"] for e in events]
+        assert seqs == sorted(seqs) and len(set(seqs)) == len(seqs)
+
+    def test_streamed_turn_is_a_real_conversation_turn(self, client, auth_headers):
+        first = client.post(
+            "/v1/responses",
+            headers=auth_headers,
+            json={"input": "Remember the word crimson.", "stream": True},
+        )
+        assert first.status_code == 200, first.text
+        completed = _sse_events(first.text)[-1]["data"]["response"]
+        assert completed["status"] == "completed"
+
+        # The streamed reply chains exactly like a blocking one.
+        second = client.post(
+            "/v1/responses",
+            headers=auth_headers,
+            json={
+                "input": "What word did I mention?",
+                "previous_response_id": completed["id"],
+            },
+        )
+        assert second.status_code == 200, second.text
+        assert second.json()["previous_response_id"] == completed["id"]
+
+        convs = client.get("/v1/conversations", headers=auth_headers).json()["data"][
+            "items"
+        ]
+        assert len(convs) == 1
+        messages = client.get(
+            f"/v1/conversations/{convs[0]['id']}/messages", headers=auth_headers
+        ).json()["data"]["messages"]
+        assert sum(1 for m in messages if m["role"] == "assistant") == 2
+        # The persisted streamed reply carries the announced id.
+        streamed_id = completed["id"][len("resp_") :]
+        assert any(m["id"] == streamed_id for m in messages)
+
+    def test_stream_crash_emits_response_failed(
+        self, client, auth_headers, monkeypatch
+    ):
+        from liminallm.service.runtime import get_runtime
+
+        async def boom(*args, **kwargs):
+            raise RuntimeError("secret internals: db=10.0.0.7")
+            yield  # pragma: no cover — makes this an async generator
+
+        monkeypatch.setattr(get_runtime().workflow, "run_streaming", boom)
+        resp = client.post(
+            "/v1/responses",
+            headers=auth_headers,
+            json={"input": "hi", "stream": True},
+        )
+        assert resp.status_code == 200  # status was spent when the stream began
+        events = _sse_events(resp.text)
+        assert events[-1]["event"] == "response.failed"
+        failed = events[-1]["data"]["response"]
+        assert failed["status"] == "failed"
+        assert failed["error"]["code"] == "server_error"
+        assert "10.0.0.7" not in resp.text
+
+    def test_stream_error_event_carries_kernel_message(
+        self, client, auth_headers, monkeypatch
+    ):
+        from liminallm.service.runtime import get_runtime
+
+        async def erroring(*args, **kwargs):
+            yield {"event": "error", "data": {"message": "model backend unavailable"}}
+
+        monkeypatch.setattr(get_runtime().workflow, "run_streaming", erroring)
+        resp = client.post(
+            "/v1/responses",
+            headers=auth_headers,
+            json={"input": "hi", "stream": True},
+        )
+        events = _sse_events(resp.text)
+        assert events[-1]["event"] == "response.failed"
+        assert (
+            events[-1]["data"]["response"]["error"]["message"]
+            == "model backend unavailable"
+        )
 
 
 class TestResponsesWireShapeUnderFailure:

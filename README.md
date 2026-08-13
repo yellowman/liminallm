@@ -65,9 +65,16 @@ Router Updates ← Eval Gate ← Adapter Training ← Prompt-Mode Skill
 - **an openai-compatible responses api for agents**
   - `POST /v1/responses` speaks the responses dialect, so any agent framework can point its base url here and get the kernel's whole enrichment stack — personas, skill adapters, hybrid rag, notes, memory — behind what looks like a plain model endpoint. a weak local model plus this kernel presents as a much richer model; the caller changes nothing but the base url.
   - stateful: `previous_response_id` continues the conversation server-side; pass `context_id` (a liminallm extension) on the first turn to ground the whole thread in a knowledge context
-  - auth via api keys (`sk-liminal-…`): mint, list, and revoke from the settings tab in the web ui, or at `/v1/auth/api-keys` with a logged-in session. keys are valid only on `/v1/responses` — a leaked key can chat and nothing else, and in particular cannot mint or revoke keys. only a sha-256 of the key is stored; the plaintext is shown exactly once, at mint time.
+  - streaming: `stream: true` returns sse `response.*` events (created → text deltas → completed), with the reply's id stable from the first event to the persisted message
+  - auth via api keys (`sk-liminal-…`): mint, list, and revoke from the settings tab in the web ui, or at `/v1/auth/api-keys` with a logged-in session. keys are valid only on the agent surfaces (`/v1/responses`, `/v1/mcp`) — a leaked key can chat and search and nothing else, and in particular cannot mint or revoke keys. only a sha-256 of the key is stored; the plaintext is shown exactly once, at mint time.
   - agent conversations appear in the web ui like any other chat, tagged “api” in the sidebar
   - the kernel's internal tool loop (retrieval, notes, the reranker's out-of-band scoring) rides the provider tool-call transport wherever one exists — including the local jax backend via its advertised `<tool_call>` channel — so agents get the same grounded answers on every backend
+
+- **an mcp server for everyone else's agents**
+  - `POST /v1/mcp` speaks the model context protocol (streamable http, revision 2025-06-18): initialize, list tools, call tools — stateless, json responses, batching rejected as the spec now requires
+  - two tools, both read-only, both the kernel's own retrieval: `note_search` over the notes vault and `knowledge_search` over knowledge contexts, the exact services the internal agent loop uses
+  - read-only is the point: nothing here can carry data off the box, so an injected document has no egress to abuse, and every result names its own text as document content — not instructions
+  - same api keys as the responses api; the roadmap (resources, prompts, oauth, and an mcp *client* under the kernel's taint discipline) lives in the spec so growth is a decision, not drift
 
 - **small kernel, big data**
   - kernel only knows how to:
@@ -375,8 +382,9 @@ Key endpoints (Bearer access token required):
 - `POST /v1/auth/login` → returns tokens, with MFA gating when enabled
 - `POST /v1/auth/refresh` → rotates refresh tokens
 - `POST /v1/chat` → creates conversation + LLM reply
-- `POST /v1/responses` → the same turn in OpenAI's Responses shape, for agents (api key or session auth)
-- `POST /v1/auth/api-keys` → mint a responses api key (list with GET, revoke with `DELETE /v1/auth/api-keys/{id}`)
+- `POST /v1/responses` → the same turn in OpenAI's Responses shape, for agents (api key or session auth; `stream: true` for SSE)
+- `POST /v1/mcp` → MCP server (note_search + knowledge_search) for MCP-speaking agents
+- `POST /v1/auth/api-keys` → mint an agent-surface api key (list with GET, revoke with `DELETE /v1/auth/api-keys/{id}`)
 - `GET /v1/artifacts` → lists data-driven workflows/policies
 - `GET /v1/admin/settings` → admin-only system settings
 

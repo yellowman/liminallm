@@ -30,9 +30,9 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
-from liminallm.api import chat_turn, idempotency
+from liminallm.api import chat_turn, idempotency, mcp
 from liminallm.api.errors import http_error
 from liminallm.api.limits import (
     client_ip,
@@ -203,10 +203,11 @@ async def get_user_or_api_key(
     authorization: Optional[str] = Header(None),
     session_id: Optional[str] = Header(None, convert_underscores=False),
 ) -> AuthContext:
-    """Principal for the served Responses API: an API key, or any session auth.
+    """Principal for the agent surfaces (/v1/responses, /v1/mcp): an API key,
+    or any session auth.
 
     Only this dependency reads API keys. Native routes authenticate through
-    get_user, which cannot — so a leaked key can drive /v1/responses and
+    get_user, which cannot — so a leaked key can drive the agent surfaces and
     nothing else, and in particular cannot mint or revoke keys.
     """
     runtime = get_runtime()
@@ -1410,12 +1411,6 @@ def _responses_reject_unsupported(body: dict) -> None:
     "unsupported" alone reads as "broken", and every one of these has a
     deliberate reason.
     """
-    if body.get("stream") is True:
-        raise _ResponsesReject(
-            "stream is not supported yet on this surface; poll the "
-            "non-streaming form.",
-            param="stream",
-        )
     if body.get("tools"):
         raise _ResponsesReject(
             "caller-supplied tools are not supported: this surface runs the "
@@ -1544,6 +1539,241 @@ def _responses_metadata(payload: Any) -> dict:
     return dict(payload)
 
 
+def _responses_message_item(message_id: str, text: str, *, status: str = "completed") -> dict:
+    return {
+        "type": "message",
+        "id": f"msg_{message_id}",
+        "status": status,
+        "role": "assistant",
+        "content": (
+            [{"type": "output_text", "text": text, "annotations": []}]
+            if status == "completed"
+            else []
+        ),
+    }
+
+
+def _responses_usage(usage: dict) -> dict:
+    return {
+        "input_tokens": int(usage.get("prompt_tokens") or 0),
+        "output_tokens": int(usage.get("completion_tokens") or 0),
+        "total_tokens": int(usage.get("total_tokens") or 0),
+    }
+
+
+def _responses_payload(
+    *,
+    response_id: str,
+    created_at: int,
+    status: str,
+    model: str,
+    output: list,
+    previous_response_id: Optional[str],
+    metadata: dict,
+    usage: Optional[dict],
+    error: Optional[dict] = None,
+) -> dict:
+    return {
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "status": status,
+        "error": error,
+        "model": model,
+        "output": output,
+        "previous_response_id": previous_response_id,
+        "store": True,
+        "metadata": metadata,
+        "usage": usage,
+    }
+
+
+def _sse_event(event: str, sequence_number: int, data: dict) -> str:
+    payload = {"type": event, "sequence_number": sequence_number, **data}
+    return f"event: {event}\ndata: {json.dumps(payload, separators=(',', ':'))}\n\n"
+
+
+async def _responses_stream(
+    runtime,
+    principal: AuthContext,
+    turn,
+    *,
+    message_id: str,
+    previous_response_id: Optional[str],
+    metadata: dict,
+    held_slots: list,
+):
+    """The turn as OpenAI ``response.*`` server-sent events.
+
+    The reply's id is minted before the first event, so ``response.created``
+    and ``response.completed`` carry the SAME id and the assistant message is
+    persisted under it at finish. A client disconnect cancels generation;
+    failures become a ``response.failed`` event, never a broken stream or an
+    envelope-shaped body.
+    """
+    seq = 0
+
+    def ev(event: str, data: dict) -> str:
+        nonlocal seq
+        seq += 1
+        return _sse_event(event, seq, data)
+
+    resp_id = f"{_RESPONSES_ID_PREFIX}{message_id}"
+    item_id = f"msg_{message_id}"
+    created_at = int(time.time())
+    model = runtime.llm.serving_model or runtime.settings.model_path
+
+    def payload(status: str, output: list, usage=None, error=None) -> dict:
+        return _responses_payload(
+            response_id=resp_id,
+            created_at=created_at,
+            status=status,
+            model=model,
+            output=output,
+            previous_response_id=previous_response_id,
+            metadata=metadata,
+            usage=usage,
+            error=error,
+        )
+
+    cancel_event = asyncio.Event()
+    tokens: list[str] = []
+    orchestration: dict = {}
+    try:
+        yield ev("response.created", {"response": payload("in_progress", [])})
+        yield ev("response.in_progress", {"response": payload("in_progress", [])})
+        yield ev(
+            "response.output_item.added",
+            {
+                "output_index": 0,
+                "item": _responses_message_item(message_id, "", status="in_progress"),
+            },
+        )
+        yield ev(
+            "response.content_part.added",
+            {
+                "item_id": item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": "", "annotations": []},
+            },
+        )
+        finished = False
+        async for event in runtime.workflow.run_streaming(
+            None,
+            turn.conversation_id,
+            turn.user_content,
+            turn.context_id,
+            principal.user_id,
+            tenant_id=principal.tenant_id,
+            cancel_event=cancel_event,
+        ):
+            kind = event.get("event")
+            data = event.get("data")
+            if kind == "token":
+                if isinstance(data, str) and data:
+                    tokens.append(data)
+                    yield ev(
+                        "response.output_text.delta",
+                        {
+                            "item_id": item_id,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "delta": data,
+                        },
+                    )
+            elif kind == "message_done":
+                finished = True
+                orchestration = data if isinstance(data, dict) else {}
+            elif kind == "error":
+                message = data.get("message") if isinstance(data, dict) else None
+                yield ev(
+                    "response.failed",
+                    {
+                        "response": payload(
+                            "failed",
+                            [],
+                            error={
+                                "code": "server_error",
+                                "message": message or "generation failed",
+                            },
+                        )
+                    },
+                )
+                return
+            # trace and other kernel events are not part of this dialect.
+        if not finished:
+            yield ev(
+                "response.failed",
+                {
+                    "response": payload(
+                        "failed",
+                        [],
+                        error={
+                            "code": "server_error",
+                            "message": "generation ended early",
+                        },
+                    )
+                },
+            )
+            return
+        assistant_msg = await chat_turn.finish(
+            runtime,
+            turn,
+            orchestration,
+            content="".join(tokens),
+            assistant_message_id=message_id,
+        )
+        text = assistant_msg.content
+        yield ev(
+            "response.output_text.done",
+            {"item_id": item_id, "output_index": 0, "content_index": 0, "text": text},
+        )
+        yield ev(
+            "response.content_part.done",
+            {
+                "item_id": item_id,
+                "output_index": 0,
+                "content_index": 0,
+                "part": {"type": "output_text", "text": text, "annotations": []},
+            },
+        )
+        item = _responses_message_item(assistant_msg.id, text)
+        yield ev("response.output_item.done", {"output_index": 0, "item": item})
+        usage = turn.orchestration.get("usage") or {}
+        yield ev(
+            "response.completed",
+            {"response": payload("completed", [item], usage=_responses_usage(usage))},
+        )
+        logger.info(
+            "responses_turn",
+            user_id=principal.user_id,
+            conversation_id=turn.conversation_id,
+            previous_response_id=previous_response_id,
+            total_tokens=usage.get("total_tokens"),
+            stream=True,
+        )
+    except GeneratorExit:
+        # The client went away; stop generating. Nothing more can be sent.
+        cancel_event.set()
+        raise
+    except Exception:  # noqa: BLE001 — a failed event beats a broken stream
+        logger.exception("responses_stream_failed", user_id=principal.user_id)
+        yield ev(
+            "response.failed",
+            {
+                "response": payload(
+                    "failed",
+                    [],
+                    error={"code": "server_error", "message": "internal server error"},
+                )
+            },
+        )
+    finally:
+        for kind in reversed(held_slots):
+            await admission.release(runtime, kind, principal.user_id)
+
+
 @router.post("/responses", tags=["responses"])
 async def create_response(
     request: Request,
@@ -1608,6 +1838,48 @@ async def create_response(
             runtime.settings.chat_rate_limit_window_seconds,
             plan_tier,
         )
+
+        if body.get("stream") is True:
+            # Everything that can refuse the request refuses it HERE, as a
+            # proper HTTP error — once the stream starts the status is spent.
+            # Slots are taken in the route and handed to the generator, whose
+            # finally releases them however the stream ends.
+            held_slots: list[str] = []
+            try:
+                for kind in admission.CHAT_SLOTS:
+                    await admission.acquire(runtime, kind, user_id)
+                    held_slots.append(kind)
+                turn = await chat_turn.begin(
+                    runtime,
+                    principal,
+                    conversation_id=conversation_id,
+                    context_id=context_id,
+                    workflow_id=None,
+                    content=content,
+                    content_struct=None,
+                    mode="text",
+                    conversation_meta={"source": "responses"},
+                    owned_conversation=_get_owned_conversation,
+                    owned_context=_get_owned_context,
+                )
+            except BaseException:
+                for kind in reversed(held_slots):
+                    await admission.release(runtime, kind, user_id)
+                raise
+            return StreamingResponse(
+                _responses_stream(
+                    runtime,
+                    principal,
+                    turn,
+                    message_id=str(uuid4()),
+                    previous_response_id=previous_response_id,
+                    metadata=metadata,
+                    held_slots=held_slots,
+                ),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+            )
+
         async with admission.slots(runtime, user_id, *admission.CHAT_SLOTS):
             turn = await chat_turn.begin(
                 runtime,
@@ -1643,37 +1915,18 @@ async def create_response(
         )
         return JSONResponse(
             status_code=200,
-            content={
-                "id": f"{_RESPONSES_ID_PREFIX}{assistant_msg.id}",
-                "object": "response",
-                "created_at": int(time.time()),
-                "status": "completed",
-                "error": None,
-                "model": runtime.llm.serving_model or runtime.settings.model_path,
-                "output": [
-                    {
-                        "type": "message",
-                        "id": f"msg_{assistant_msg.id}",
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [
-                            {
-                                "type": "output_text",
-                                "text": assistant_msg.content,
-                                "annotations": [],
-                            }
-                        ],
-                    }
+            content=_responses_payload(
+                response_id=f"{_RESPONSES_ID_PREFIX}{assistant_msg.id}",
+                created_at=int(time.time()),
+                status="completed",
+                model=runtime.llm.serving_model or runtime.settings.model_path,
+                output=[
+                    _responses_message_item(assistant_msg.id, assistant_msg.content)
                 ],
-                "previous_response_id": previous_response_id,
-                "store": True,
-                "metadata": metadata,
-                "usage": {
-                    "input_tokens": int(usage.get("prompt_tokens") or 0),
-                    "output_tokens": int(usage.get("completion_tokens") or 0),
-                    "total_tokens": int(usage.get("total_tokens") or 0),
-                },
-            },
+                previous_response_id=previous_response_id,
+                metadata=metadata,
+                usage=_responses_usage(usage),
+            ),
         )
     except _ResponsesReject as reject:
         return _openai_error(reject.status, reject.message, param=reject.param)
@@ -1693,6 +1946,35 @@ async def create_response(
     except Exception:  # noqa: BLE001 — the wire-shape rule outranks the global handler
         logger.exception("responses_turn_failed", user_id=user_id)
         return _openai_error(500, "internal server error", code="server_error")
+
+
+@router.post("/mcp", tags=["mcp"])
+async def mcp_endpoint(
+    request: Request,
+    principal: AuthContext = Depends(get_user_or_api_key),
+):
+    """Model Context Protocol over Streamable HTTP (JSON responses only).
+
+    The same credentials as /v1/responses: an API key or a session. See
+    liminallm/api/mcp.py for what is spoken and what is deliberately not.
+    """
+    runtime = get_runtime()
+    await rate_limit(runtime, "read", principal.user_id)
+    try:
+        body = await request.json()
+    except ValueError:
+        return JSONResponse(status_code=200, content=mcp.parse_error())
+    reply = mcp.handle_message(runtime, principal, body)
+    if reply is None:
+        # A notification: accepted, nothing to say (spec: 202, empty body).
+        return Response(status_code=202)
+    return JSONResponse(status_code=200, content=reply)
+
+
+@router.get("/mcp", tags=["mcp"], include_in_schema=False)
+async def mcp_get():
+    """No server-initiated stream; the spec allows refusing GET outright."""
+    return Response(status_code=405)
 
 
 @router.post("/chat/cancel", response_model=Envelope, tags=["chat"])

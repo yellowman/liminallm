@@ -1597,7 +1597,7 @@ principles:
 - HTTP+JSON for control planes, WebSocket/SSE for streaming chat; stable versioned paths `/v1/...`.
 - every endpoint enforces auth via session cookie or bearer token; `X-User-Id` is ignored/forbidden.
 - request/response schemas stored as `artifact` of type `tool.spec` for LLM discoverability.
-- responses use envelope `{ "status": "ok|error", "data": ..., "error": { "code", "message", "details" } }`. compatibility surfaces that exist to speak someone else's dialect (`POST /v1/responses`, §13.1) are the exception: they keep that dialect's shape on success **and** on error, because an SDK parses by it.
+- responses use envelope `{ "status": "ok|error", "data": ..., "error": { "code", "message", "details" } }`. compatibility surfaces that exist to speak someone else's dialect (`POST /v1/responses` and `POST /v1/mcp`, §13.1) are the exception: they keep that dialect's shape on success **and** on error, because an SDK parses by it.
 - pagination uses `page`/`page_size` or opaque `next_cursor`; errors map to HTTP (400 validation, 401/403 auth, 404 missing, 409 conflict, 429 rate limit, 500 server).
 - idempotency via `Idempotency-Key` header on POST chat/tool calls; server replays prior response if key repeats within TTL.
 
@@ -1654,22 +1654,34 @@ the caller changes nothing but the base URL.
 - **`context_id` (liminallm extension).** binds a knowledge context on the
   first turn so retrieval grounds the whole thread; continuations inherit the
   conversation's binding, exactly as on `/v1/chat`.
-- **v1 scope line, each rejection named.** `stream` (not yet on this
-  surface), caller `tools` (the kernel runs its own tool loop server-side),
-  `instructions` (the system prompt belongs to per-user personas and
-  adapters — the reason this server exists), `store=false` (turns persist to
-  the conversation; that persistence is what `previous_response_id`
-  continues). input items accept user text only; system/developer items are
-  refused by position, and input is bounded to the same 100k-character DoS
-  cap `/v1/chat` enforces — checked as it accumulates, not after the join.
+- **streaming.** `stream: true` answers `text/event-stream` speaking the
+  OpenAI event dialect: `response.created` → `response.in_progress` →
+  `response.output_item.added` / `response.content_part.added` →
+  `response.output_text.delta`* → the `.done` trio → `response.completed`
+  (with usage), monotonic `sequence_number` throughout. the reply's id is
+  minted before the first event, so `created` and `completed` carry the same
+  id and the assistant message persists under it. everything that can refuse
+  the request refuses before the stream starts, as a proper HTTP error;
+  after that, failures are a `response.failed` event (generic on crashes —
+  internals never reach the wire), a client disconnect cancels generation,
+  and admission slots release however the stream ends.
+- **v1 scope line, each rejection named.** caller `tools` (the kernel runs
+  its own tool loop server-side), `instructions` (the system prompt belongs
+  to per-user personas and adapters — the reason this server exists),
+  `store=false` (turns persist to the conversation; that persistence is what
+  `previous_response_id` continues). input items accept user text only;
+  system/developer items are refused by position, and input is bounded to
+  the same 100k-character DoS cap `/v1/chat` enforces — checked as it
+  accumulates, not after the join.
 - **auth: api keys or session.** `Authorization: Bearer sk-liminal-…` — keys
   minted at `POST /v1/auth/api-keys` (§13.2), stored as sha-256 in
-  `user_api_key` (§2.1), plaintext shown once. keys authenticate **only this
-  surface**: the native routes' dependency cannot read them, so a leaked key
-  can drive chat turns and nothing else — it cannot list conversations, mint
-  another key, or revoke one. keys skip session/mfa machinery (minting one
-  already required a fully authenticated session) but never the tenant
-  check. session jwts also work here, so the web ui can drive the surface.
+  `user_api_key` (§2.1), plaintext shown once. keys authenticate **only the
+  agent surfaces** (`/v1/responses` and `/v1/mcp`): the native routes'
+  dependency cannot read them, so a leaked key can drive chat turns and
+  retrieval and nothing else — it cannot list conversations, mint another
+  key, or revoke one. keys skip session/mfa machinery (minting one already
+  required a fully authenticated session) but never the tenant check.
+  session jwts also work here, so the web ui can drive the surface.
 - **the thread is a native conversation.** turns land in the same
   conversation store; the web ui lists them beside the rest, badged via
   `source: "responses"` (from `conversation.meta`, exposed on the
@@ -1686,8 +1698,45 @@ the caller changes nothing but the base URL.
   a second limit to misconfigure.
 - `model` echoes the serving model; `usage` maps the orchestration's token
   counts; `metadata` is bounded (16 keys, 64/512 chars) and echoed back.
-- streaming (SSE `response.*` events) is the named follow-up, not a v1 gap
-  discovered later.
+
+#### mcp server (`POST /v1/mcp`)
+
+the kernel's retrieval, spoken in the Model Context Protocol so any
+mcp-speaking agent can ground itself in a user's vault and knowledge
+contexts without adopting the responses api. same credentials as
+`/v1/responses` (api key or session), same tenant check, envelope-free wire
+(json-rpc is the dialect here, and the §13 envelope exception covers it).
+
+- **protocol subset, honestly drawn.** streamable http, one POST endpoint,
+  json responses only; protocol revision 2025-06-18 (2025-03-26 accepted on
+  initialize). implemented: `initialize`, `ping`, `tools/list`,
+  `tools/call`; notifications answer 202 with no body. not implemented: no
+  sessions (stateless — `Mcp-Session-Id` ignored), no server-initiated
+  stream (GET answers 405), no resources or prompts yet. json-rpc batching
+  was removed from the protocol in 2025-06-18 and is rejected by name.
+- **two tools, both read-only, both the kernel's own.** `note_search` ranks
+  the notes vault (the same bm25+semantic fusion `note_search` uses inside
+  the agent loop); `knowledge_search` retrieves from knowledge contexts
+  through the full hybrid pipeline (§2.5), scoped to one owned context via
+  `context_id` or across everything the user owns. ownership verdicts match
+  the http surface: absent is absent, foreign is refused — as tool errors,
+  not protocol errors.
+- **read-only is the security posture, not a v1 shortcut.** these tools
+  reach nothing outside the install, so an injected document has no egress
+  to abuse here, and every result opens by naming its own text as document
+  content, never instructions — the same untrusted-data doctrine the kernel
+  repeats at every boundary.
+- **roadmap, so growth is a decision and not drift:** resources (notes and
+  chunks addressable by uri, with subscriptions as a change feed); prompts
+  (personas and prompt-mode skills offered as mcp prompts);
+  `tools/list_changed` notifications when artifacts change the tool set;
+  oauth 2.1 + protected-resource metadata (rfc 9728) so standard mcp
+  clients onboard without pasting keys; structured tool output
+  (`structuredContent`) beside the text; and — the consequential one — an
+  mcp **client** in the kernel loop, consuming external servers as tools
+  under the taint discipline: each server assigned a taint class, egress
+  withdrawal extended to third-party tools, so outside capability never
+  outruns the injection defenses.
 
 ### 13.2 auth/session api (minimal definitions)
 
@@ -1698,7 +1747,7 @@ the caller changes nothing but the base URL.
 - `POST /v1/auth/refresh` → rotate session/refresh token.
 - responses include `session_expires_at`; headers `Set-Cookie: session_id=...; HttpOnly; Secure` when cookies are used.
 - `POST /v1/auth/mfa/verify` when MFA enabled; returns new session + requires one-time recovery code flow if user is locked out.
-- `POST /v1/auth/api-keys { name }` → mint a key for the served responses api; the plaintext appears only in this response. `GET /v1/auth/api-keys` lists them (prefix only, revoked included — that is the audit view); `DELETE /v1/auth/api-keys/{key_id}` revokes immediately. session auth only, envelope-shaped, at most 20 active keys per user; a key can never manage keys.
+- `POST /v1/auth/api-keys { name }` → mint a key for the agent surfaces (`/v1/responses`, `/v1/mcp`); the plaintext appears only in this response. `GET /v1/auth/api-keys` lists them (prefix only, revoked included — that is the audit view); `DELETE /v1/auth/api-keys/{key_id}` revokes immediately. session auth only, envelope-shaped, at most 20 active keys per user; a key can never manage keys.
 
 ### 13.3 files & contexts
 
@@ -1949,7 +1998,7 @@ that’s the whole point: minimal glue, maximal evolution.
   - clear drafts button (removes all from localStorage).
   - export drafts button (downloads JSON file).
 - **upload limits**: display max file size and allowed extensions from `GET /v1/files/limits`.
-- **api keys**: mint/list/revoke keys for the served responses api (§13.1) against `/v1/auth/api-keys`; the plaintext renders once at mint time, the list shows prefix + created/last-used/revoked, revoke confirms before firing.
+- **api keys**: mint/list/revoke keys for the agent surfaces (§13.1) against `/v1/auth/api-keys`; the plaintext renders once at mint time, the list shows prefix + created/last-used/revoked, revoke confirms before firing.
 - **about section**: version and build info from `/healthz`.
 
 ### 17.7 draft persistence (offline-safe)
