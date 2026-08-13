@@ -658,6 +658,17 @@ const renderField = (field) => {
     : defaultText;
   row.appendChild(help);
 
+  if (field.warning) {
+    // A runtime fact the server attached, not schema: the setting is in a
+    // state the operator should change. Rendered like an error but visible
+    // without interaction, because it arrives already true.
+    const warning = document.createElement('div');
+    warning.className = 'field-error';
+    warning.setAttribute('role', 'alert');
+    warning.textContent = `\u26a0 ${field.warning}`;
+    row.appendChild(warning);
+  }
+
   const error = document.createElement('div');
   error.className = 'field-error';
   error.style.display = 'none';

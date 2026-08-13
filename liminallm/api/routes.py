@@ -2433,6 +2433,18 @@ async def get_system_settings_schema(
             # Whether a secret is set is useful; its value never leaves here.
             entry["default"] = ""
             entry["is_set"] = bool(stored.get(entry["name"]))
+        if entry["name"] == "rag_rerank" and (
+            getattr(runtime.rag.rerank, "transport", None) == "prose"
+        ):
+            # A runtime fact, not schema: reranking is on, and this backend
+            # cannot carry the verdict out-of-band, so it is parsed from
+            # reply text — the degraded transport. The one person who can fix
+            # that is the admin reading this screen.
+            entry["warning"] = (
+                "Active on a backend without tool calling: the verdict is "
+                "parsed from reply text, the degraded transport. Use a "
+                "tool-calling backend, or turn reranking off."
+            )
     return Envelope(status="ok", data={"fields": fields})
 
 
@@ -2525,6 +2537,14 @@ async def update_system_settings(
                 "previous backend remains active. Retry, or restart to apply them.",
                 status_code=500,
             )
+    else:
+        # Non-structural settings still have to reach THIS worker's
+        # runtime.settings before the response returns. The polling watcher
+        # exists for the *other* workers; leaning on it here made "the change
+        # is live" true only after an interval nobody promised the admin —
+        # the reranker reads rag_rerank per retrieval, but per-retrieval
+        # reads of a stale object are still stale.
+        runtime.refresh_settings()
 
     logger.info(
         "system_settings_updated",

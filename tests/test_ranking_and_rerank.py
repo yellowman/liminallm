@@ -679,3 +679,90 @@ def test_half_a_megabyte_of_arguments_is_bounded():
 def test_the_instruction_names_the_transport():
     assert "submit_ranking" in build_prompt("q", ["x"], tool_transport=True)
     assert "submit_ranking" not in build_prompt("q", ["x"])
+
+
+# --------------------------------------------------------------------------
+# the degraded transport warns the one person who can fix it
+# --------------------------------------------------------------------------
+
+
+def test_transport_names_the_channel_a_verdict_travels_on():
+    assert _rr(_ToolReply([])).transport == "tool"
+    assert _rr(_Reply("1")).transport == "prose"
+    assert _rr(_Reply("1"), mode="off").transport is None
+
+
+def test_active_on_a_prose_only_backend_warns_once(monkeypatch):
+    """Once per transition, not per retrieval — a warning on every turn
+    teaches the operator to ignore the log, which is worse than no warning.
+    And silence must not read as recovery: only a transition logs."""
+    import liminallm.service.rerank as rerank_module
+
+    events: list = []
+    monkeypatch.setattr(
+        rerank_module.logger,
+        "warning",
+        lambda event, **kw: events.append((event, kw)),
+    )
+
+    live = SimpleNamespace(rag_rerank="on", rag_rerank_candidates=20)
+    rerank = make_llm_reranker(_Reply("2, 1"), lambda: live)
+
+    rerank("q", _chunks("a", "b"))
+    rerank("q", _chunks("a", "b"))
+    prose_warnings = [e for e in events if e[0] == "rag_rerank_prose_transport"]
+    assert len(prose_warnings) == 1, events
+
+    # Turning it off and back on is a transition; it warns again.
+    live.rag_rerank = "off"
+    assert rerank.transport is None
+    live.rag_rerank = "on"
+    rerank("q", _chunks("a", "b"))
+    prose_warnings = [e for e in events if e[0] == "rag_rerank_prose_transport"]
+    assert len(prose_warnings) == 2
+
+
+def test_a_tool_capable_backend_never_draws_the_warning(monkeypatch):
+    import liminallm.service.rerank as rerank_module
+
+    events: list = []
+    monkeypatch.setattr(
+        rerank_module.logger,
+        "warning",
+        lambda event, **kw: events.append(event),
+    )
+
+
+    llm = _ToolReply([_tool_call({"ranking": [1]})])
+    _rr(llm)("q", _chunks("a", "b"))
+
+    assert "rag_rerank_prose_transport" not in events
+
+
+def test_the_console_is_told_about_the_degraded_transport(client, admin_headers):
+    """End to end through the real admin flow: the runtime's test backend has
+    no API client, so it cannot carry tool calls — turning reranking on must
+    surface the warning on the rag_rerank entry, and turning it off must
+    clear it. The console renders exactly what this endpoint says."""
+
+    def rag_rerank_field():
+        resp = client.get("/v1/admin/settings/schema", headers=admin_headers)
+        assert resp.status_code == 200, resp.text
+        return next(
+            f for f in resp.json()["data"]["fields"] if f["name"] == "rag_rerank"
+        )
+
+    assert "warning" not in rag_rerank_field(), "off must carry no warning"
+
+    client.put(
+        "/v1/admin/settings", headers=admin_headers, json={"rag_rerank": "on"}
+    )
+    try:
+        warning = rag_rerank_field().get("warning", "")
+        assert "tool" in warning and "reply text" in warning
+    finally:
+        client.put(
+            "/v1/admin/settings", headers=admin_headers, json={"rag_rerank": "auto"}
+        )
+
+    assert "warning" not in rag_rerank_field()

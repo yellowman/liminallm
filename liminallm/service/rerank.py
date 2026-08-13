@@ -381,6 +381,9 @@ class LLMReranker:
         # Only to keep the auto decision out of the log on every retrieval;
         # it is reported when it changes, which is when it is news.
         self._last_auto: Optional[bool] = None
+        # Same discipline for the transport: warned when it changes, silent
+        # while it stays what it was.
+        self._last_transport: Optional[str] = None
 
     @property
     def max_candidates(self) -> int:
@@ -414,6 +417,41 @@ class LLMReranker:
             return 0
         return int(settings.rag_rerank_candidates)
 
+    @property
+    def transport(self) -> Optional[str]:
+        """Which channel the verdict travels on right now, or None when off.
+
+        "prose" is the degraded mode, and an admin must hear about it from
+        the component, not discover it from a wrong answer: on that transport
+        the verdict is parsed out of reply text, which is exactly the parser
+        and forgery surface the tool channel exists to remove. Warned once
+        per transition — the operator who configured a prose-only backend is
+        the one person who can change it, and a warning per retrieval would
+        teach them to ignore the log instead.
+        """
+        if self.max_candidates < 2:
+            self._last_transport = None
+            return None
+        transport = (
+            "tool" if getattr(self._llm, "supports_tools", False) else "prose"
+        )
+        if transport != self._last_transport:
+            self._last_transport = transport
+            if transport == "prose":
+                logger.warning(
+                    "rag_rerank_prose_transport",
+                    model=str(getattr(self._llm, "serving_model", "") or ""),
+                    message=(
+                        "Reranking is active, but this backend does not carry "
+                        "tool calls, so the verdict is parsed from reply text "
+                        "— the degraded transport. A tool call arrives on a "
+                        "channel document text cannot write to; parsed text "
+                        "does not. Use a tool-calling backend, or set "
+                        "rag_rerank=off."
+                    ),
+                )
+        return transport
+
     def __call__(self, query: str, chunks: Sequence[Any]) -> List[Any]:
         budget = self.max_candidates
         if budget < 2:
@@ -431,7 +469,7 @@ class LLMReranker:
         # says can reach it. One model call either way — a tool-capable reply
         # that answered in text anyway falls through to the prose parser on
         # the same response, never to a second call.
-        use_tools = bool(getattr(self._llm, "supports_tools", False))
+        use_tools = self.transport == "tool"
         prompt = build_prompt(
             query,
             [chunk.content[:self._snippet_chars] for chunk in head],
@@ -491,20 +529,27 @@ class LLMReranker:
                     "rag_rerank_rejected_all",
                     candidates=len(head),
                     unread=len(tail),
+                    transport="text",
                 )
                 return []
             # Anything else unreadable is "no opinion", not "nothing is
             # relevant". A truncated or refused reply looks identical to a
             # deliberate NONE, and dropping the user's grounding on a parse
             # failure is the worse of the two mistakes.
-            logger.info("rag_rerank_no_verdict", candidates=len(head))
+            logger.info(
+                "rag_rerank_no_verdict", candidates=len(head), transport="text"
+            )
             return list(chunks)
 
+        # transport="text" even on a tool-capable wire: the model answered in
+        # prose, so THIS verdict took the degraded path. The latched warning
+        # only sees the wire; this field is how an operator sees the habit.
         logger.debug(
             "rag_rerank_applied",
             candidates=len(head),
             kept=len(order),
             dropped_unread=len(tail),
+            transport="text",
         )
         # Only what the model kept. The unread tail does not come back: it
         # ranks below every chunk in the head, so appending it would let
