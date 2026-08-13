@@ -1636,12 +1636,16 @@ the caller changes nothing but the base URL.
 
 - **wire shapes are OpenAI's, both ways.** success bodies are the bare
   Responses object (never the kernel envelope); error bodies are
-  `{"error": {message, type, param, code}}` (never the envelope). kernel
-  verdicts that arrive as envelope-styled HTTPExceptions (ownership, rate
-  limit, admission) are reshaped before they leave; the kernel `code` rides
-  in `error.code`. one documented seam: a 401 from the auth dependency is
-  still envelope-shaped, because the app-wide auth path is not rewritten for
-  one route.
+  `{"error": {message, type, param, code}}` (never the envelope). the route
+  reads the body raw and validates by hand, so malformed JSON and non-object
+  bodies get the same 400 shape instead of FastAPI's 422 — and every
+  mid-turn failure class is reshaped before it leaves: envelope-styled
+  HTTPExceptions (ownership, rate limit, admission), service errors
+  (provider failures keep their status, e.g. 502), storage conflicts (409),
+  and crashes (a generic 500 — internals never reach the wire); the kernel
+  `code` rides in `error.code`. one documented seam: a 401 from the auth
+  dependency is still envelope-shaped, because the app-wide auth path is not
+  rewritten for one route.
 - **stateful by design.** `id` is `resp_<assistant_message_id>`;
   `previous_response_id` resolves through that message to its conversation
   and continues it. ownership is the same owned-conversation check `/v1/chat`
@@ -1656,7 +1660,8 @@ the caller changes nothing but the base URL.
   adapters — the reason this server exists), `store=false` (turns persist to
   the conversation; that persistence is what `previous_response_id`
   continues). input items accept user text only; system/developer items are
-  refused by position.
+  refused by position, and input is bounded to the same 100k-character DoS
+  cap `/v1/chat` enforces — checked as it accumulates, not after the join.
 - **auth: api keys or session.** `Authorization: Bearer sk-liminal-…` — keys
   minted at `POST /v1/auth/api-keys` (§13.2), stored as sha-256 in
   `user_api_key` (§2.1), plaintext shown once. keys authenticate **only this

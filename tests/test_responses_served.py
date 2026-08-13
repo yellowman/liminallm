@@ -254,3 +254,74 @@ class TestResponsesRejections:
         resp = client.post("/v1/responses", json={"input": "hi"})
         # The documented seam: auth 401s keep the app-wide shape (see SPEC).
         assert resp.status_code == 401
+
+
+class TestResponsesWireShapeUnderFailure:
+    """The shape rule holds even when FastAPI or the kernel would answer
+    in its own vocabulary — the exact leaks a review probe reproduced."""
+
+    def test_array_body_is_openai_shaped_not_fastapi_422(self, client, auth_headers):
+        resp = client.post("/v1/responses", headers=auth_headers, json=[])
+        _assert_openai_error(resp, status=400)
+
+    def test_malformed_json_is_openai_shaped(self, client, auth_headers):
+        resp = client.post(
+            "/v1/responses",
+            headers={**auth_headers, "Content-Type": "application/json"},
+            content=b"not json{",
+        )
+        _assert_openai_error(resp, status=400)
+
+    def test_string_input_shares_chats_dos_cap(self, client, auth_headers):
+        resp = client.post(
+            "/v1/responses", headers=auth_headers, json={"input": "x" * 100_001}
+        )
+        _assert_openai_error(resp, status=400, param="input")
+
+    def test_item_inputs_cap_the_accumulated_total(self, client, auth_headers):
+        items = [
+            {"role": "user", "content": "y" * 60_000},
+            {"role": "user", "content": "y" * 60_000},
+        ]
+        resp = client.post(
+            "/v1/responses", headers=auth_headers, json={"input": items}
+        )
+        _assert_openai_error(resp, status=400, param="input")
+
+    def test_service_error_mid_turn_leaves_openai_shaped(
+        self, client, auth_headers, monkeypatch
+    ):
+        from liminallm.service.errors import ServiceError
+        from liminallm.service.runtime import get_runtime
+
+        async def boom(*args, **kwargs):
+            raise ServiceError("provider exploded", status_code=502)
+
+        monkeypatch.setattr(get_runtime().workflow, "run", boom)
+        resp = client.post(
+            "/v1/responses", headers=auth_headers, json={"input": "hi"}
+        )
+        assert resp.status_code == 502, resp.text
+        body = resp.json()
+        assert set(body) == {"error"}
+        assert body["error"]["type"] == "server_error"
+        assert body["error"]["message"] == "provider exploded"
+
+    def test_crash_mid_turn_leaves_openai_shaped(
+        self, client, auth_headers, monkeypatch
+    ):
+        from liminallm.service.runtime import get_runtime
+
+        async def boom(*args, **kwargs):
+            raise RuntimeError("secret internals: db=10.0.0.7")
+
+        monkeypatch.setattr(get_runtime().workflow, "run", boom)
+        resp = client.post(
+            "/v1/responses", headers=auth_headers, json={"input": "hi"}
+        )
+        assert resp.status_code == 500, resp.text
+        body = resp.json()
+        assert set(body) == {"error"}
+        # Generic message only: internals never reach the wire.
+        assert "10.0.0.7" not in resp.text
+        assert body["error"]["code"] == "server_error"

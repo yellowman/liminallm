@@ -139,7 +139,7 @@ from liminallm.service.attachments import (
     record_attachment,
 )
 from liminallm.service.auth import AuthContext
-from liminallm.service.errors import BadRequestError, NotFoundError
+from liminallm.service.errors import BadRequestError, NotFoundError, ServiceError
 from liminallm.service.fs import (
     PathTraversalError,
     generate_signed_url,
@@ -1372,6 +1372,9 @@ _RESPONSES_ID_PREFIX = "resp_"
 _RESPONSES_METADATA_MAX_KEYS = 16
 _RESPONSES_METADATA_KEY_CHARS = 64
 _RESPONSES_METADATA_VALUE_CHARS = 512
+# The same DoS cap /chat enforces (ChatMessage.content max_length); this
+# surface validates by hand, so the guard has to be written by hand too.
+_RESPONSES_INPUT_MAX_CHARS = 100_000
 
 
 class _ResponsesReject(Exception):
@@ -1444,6 +1447,11 @@ def _responses_input_text(payload: Any) -> str:
     surface does not take.
     """
     if isinstance(payload, str):
+        if len(payload) > _RESPONSES_INPUT_MAX_CHARS:
+            raise _ResponsesReject(
+                f"input must be at most {_RESPONSES_INPUT_MAX_CHARS} characters.",
+                param="input",
+            )
         text = payload.strip()
         if not text:
             raise _ResponsesReject("input must not be empty.", param="input")
@@ -1453,7 +1461,22 @@ def _responses_input_text(payload: Any) -> str:
             "input must be a string or a non-empty list of input items.",
             param="input",
         )
+    total_chars = 0
     texts: list[str] = []
+
+    def _take(chunk: str) -> None:
+        # Bail before the join: the cap has to stop the accumulation itself,
+        # not measure the giant string after it exists.
+        nonlocal total_chars
+        total_chars += len(chunk)
+        if total_chars > _RESPONSES_INPUT_MAX_CHARS:
+            raise _ResponsesReject(
+                f"input must be at most {_RESPONSES_INPUT_MAX_CHARS} characters "
+                "in total.",
+                param="input",
+            )
+        texts.append(chunk)
+
     for position, item in enumerate(payload):
         where = f"input[{position}]"
         if not isinstance(item, dict):
@@ -1477,7 +1500,7 @@ def _responses_input_text(payload: Any) -> str:
             )
         content = item.get("content")
         if isinstance(content, str):
-            texts.append(content)
+            _take(content)
             continue
         if isinstance(content, list):
             for part_at, part in enumerate(content):
@@ -1486,7 +1509,7 @@ def _responses_input_text(payload: Any) -> str:
                         f"{where}.content[{part_at}] must be input_text.",
                         param=where,
                     )
-                texts.append(str(part.get("text") or ""))
+                _take(str(part.get("text") or ""))
             continue
         raise _ResponsesReject(
             f"{where}.content must be a string or a list of input_text parts.",
@@ -1523,18 +1546,25 @@ def _responses_metadata(payload: Any) -> dict:
 
 @router.post("/responses", tags=["responses"])
 async def create_response(
-    body: dict,
+    request: Request,
     principal: AuthContext = Depends(get_user_or_api_key),
 ):
     """One enriched turn, in the Responses API shape.
 
-    The body is taken as a dict and validated by hand so both the success and
-    the error wire shapes are exactly OpenAI's — response_model wrapping and
-    FastAPI's 422s would each break an SDK's parser in a different way.
+    The body is read raw and validated by hand so both the success and the
+    error wire shapes are exactly OpenAI's — response_model wrapping, a typed
+    body parameter, and FastAPI's 422s would each break an SDK's parser in a
+    different way.
     """
     runtime = get_runtime()
     user_id = principal.user_id
     try:
+        try:
+            body = await request.json()
+        except ValueError:
+            raise _ResponsesReject("request body must be valid JSON.") from None
+        if not isinstance(body, dict):
+            raise _ResponsesReject("request body must be a JSON object.")
         _responses_reject_unsupported(body)
         content = _responses_input_text(body.get("input"))
         metadata = _responses_metadata(body.get("metadata"))
@@ -1654,6 +1684,15 @@ async def create_response(
         error = detail.get("error") if isinstance(detail.get("error"), dict) else {}
         message = error.get("message") or str(exc.detail) or "request failed"
         return _openai_error(exc.status_code, message, code=error.get("code"))
+    except ConstraintViolation as exc:
+        return _openai_error(409, exc.message, code="conflict")
+    except ServiceError as exc:
+        # A provider or service failure mid-turn: without this, the app-wide
+        # handler would answer in the Envelope and break the SDK parsing it.
+        return _openai_error(exc.status_code, exc.message, code=exc.error_code)
+    except Exception:  # noqa: BLE001 — the wire-shape rule outranks the global handler
+        logger.exception("responses_turn_failed", user_id=user_id)
+        return _openai_error(500, "internal server error", code="server_error")
 
 
 @router.post("/chat/cancel", response_model=Envelope, tags=["chat"])
