@@ -300,6 +300,33 @@ class MFAStatusResponse(BaseModel):
     configured: bool = Field(..., description="Whether MFA secret is configured (pending verification)")
 
 
+class ApiKeyCreateRequest(BaseModel):
+    name: str = Field(default="", max_length=100, description="Label for the key")
+
+
+class ApiKeySummary(BaseModel):
+    id: str
+    name: str
+    #: Enough of the key to recognize it, never enough to use it.
+    prefix: str
+    created_at: datetime
+    last_used_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+
+
+class ApiKeyCreatedResponse(ApiKeySummary):
+    #: The plaintext, present only in this one response.
+    api_key: str
+
+
+class ApiKeyListResponse(BaseModel):
+    items: list[ApiKeySummary]
+
+
+class ApiKeyRevokeResponse(BaseModel):
+    revoked: bool
+
+
 class UserSettingsRequest(BaseModel):
     """Request to update user settings."""
     locale: Optional[str] = Field(None, max_length=10, description="Locale code (e.g., en-US)")
@@ -636,6 +663,9 @@ class ConversationSummary(BaseModel):
     active_context_id: Optional[str]
     # Sharing state (SPEC §18): conversations are private by default.
     public: bool = False
+    #: "chat" for the native surface, "responses" when an agent made it via
+    #: the served Responses API — the UI badges the latter.
+    source: str = "chat"
 
 
 class ConversationShareRequest(BaseModel):

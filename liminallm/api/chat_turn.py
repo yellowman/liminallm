@@ -58,6 +58,7 @@ async def begin(
     content: str,
     content_struct: Any = None,
     mode: str = "text",
+    conversation_meta: Optional[dict] = None,
     owned_conversation,
     owned_context,
 ) -> Turn:
@@ -81,6 +82,7 @@ async def begin(
             user_id=principal.user_id,
             active_context_id=context_id,
             title=turn_effects.conversation_title(content),
+            meta=conversation_meta,
         )
 
     resolved_id = conversation.id

@@ -359,6 +359,21 @@ CREATE TABLE IF NOT EXISTS user_mfa_secret (
   meta        JSONB
 );
 
+-- Long-lived bearer credentials for the served Responses API (SPEC §13.1).
+-- Only a SHA-256 of the key is stored; the plaintext is shown once at
+-- creation. Revocation is a tombstone so the row keeps its audit trail.
+CREATE TABLE IF NOT EXISTS user_api_key (
+  id            UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+  user_id       UUID NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+  name          TEXT NOT NULL DEFAULT '',
+  key_hash      TEXT NOT NULL UNIQUE,
+  prefix        TEXT NOT NULL,
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_used_at  TIMESTAMPTZ,
+  revoked_at    TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_user_api_key_user ON user_api_key(user_id);
+
 -- Backfill MFA flags on sessions
 ALTER TABLE auth_session
   ADD COLUMN IF NOT EXISTS mfa_required BOOLEAN NOT NULL DEFAULT FALSE,

@@ -62,6 +62,13 @@ Router Updates ← Eval Gate ← Adapter Training ← Prompt-Mode Skill
   - recent turns go verbatim; older ones are folded into a rolling digest kept on the conversation, so a long chat degrades to “remembers less precisely” instead of “forgets entirely”
   - the digest is written off the hot path and never blocks a reply; the window is the same whether redis is up or down
 
+- **an openai-compatible responses api for agents**
+  - `POST /v1/responses` speaks the responses dialect, so any agent framework can point its base url here and get the kernel's whole enrichment stack — personas, skill adapters, hybrid rag, notes, memory — behind what looks like a plain model endpoint. a weak local model plus this kernel presents as a much richer model; the caller changes nothing but the base url.
+  - stateful: `previous_response_id` continues the conversation server-side; pass `context_id` (a liminallm extension) on the first turn to ground the whole thread in a knowledge context
+  - auth via api keys (`sk-liminal-…`): mint, list, and revoke from the settings tab in the web ui, or at `/v1/auth/api-keys` with a logged-in session. keys are valid only on `/v1/responses` — a leaked key can chat and nothing else, and in particular cannot mint or revoke keys. only a sha-256 of the key is stored; the plaintext is shown exactly once, at mint time.
+  - agent conversations appear in the web ui like any other chat, tagged “api” in the sidebar
+  - the kernel's internal tool loop (retrieval, notes, the reranker's out-of-band scoring) rides the provider tool-call transport wherever one exists — including the local jax backend via its advertised `<tool_call>` channel — so agents get the same grounded answers on every backend
+
 - **small kernel, big data**
   - kernel only knows how to:
     - auth users
@@ -368,6 +375,8 @@ Key endpoints (Bearer access token required):
 - `POST /v1/auth/login` → returns tokens, with MFA gating when enabled
 - `POST /v1/auth/refresh` → rotates refresh tokens
 - `POST /v1/chat` → creates conversation + LLM reply
+- `POST /v1/responses` → the same turn in OpenAI's Responses shape, for agents (api key or session auth)
+- `POST /v1/auth/api-keys` → mint a responses api key (list with GET, revoke with `DELETE /v1/auth/api-keys/{id}`)
 - `GET /v1/artifacts` → lists data-driven workflows/policies
 - `GET /v1/admin/settings` → admin-only system settings
 

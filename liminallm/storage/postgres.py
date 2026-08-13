@@ -63,6 +63,7 @@ from liminallm.storage.cursors import (
 from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import (
     AdapterRouterState,
+    ApiKey,
     Artifact,
     ArtifactVersion,
     ConfigPatchAudit,
@@ -384,6 +385,7 @@ class PostgresStore:
             "app_user",
             "user_auth_credential",
             "user_auth_provider",
+            "user_api_key",
             "user_settings",
             "auth_session",
             "conversation",
@@ -1184,6 +1186,86 @@ class PostgresStore:
             return None
         return None
 
+    def _api_key_from_row(self, row) -> ApiKey:
+        return ApiKey(
+            id=row["id"],
+            user_id=row["user_id"],
+            name=row["name"],
+            prefix=row["prefix"],
+            created_at=row["created_at"],
+            last_used_at=row.get("last_used_at"),
+            revoked_at=row.get("revoked_at"),
+        )
+
+    def create_api_key(
+        self, user_id: str, *, name: str, key_hash: str, prefix: str
+    ) -> ApiKey:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO user_api_key (user_id, name, key_hash, prefix)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id, user_id, name, prefix, created_at, last_used_at, revoked_at
+                """,
+                (user_id, name, key_hash, prefix),
+            ).fetchone()
+        return self._api_key_from_row(row)
+
+    def get_api_key_by_hash(self, key_hash: str) -> Optional[ApiKey]:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id, user_id, name, prefix, created_at, last_used_at, revoked_at "
+                "FROM user_api_key WHERE key_hash = %s",
+                (key_hash,),
+            ).fetchone()
+        return self._api_key_from_row(row) if row else None
+
+    def list_api_keys(self, user_id: str) -> List[ApiKey]:
+        if not _is_uuid(user_id):
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id, user_id, name, prefix, created_at, last_used_at, revoked_at "
+                "FROM user_api_key WHERE user_id = %s ORDER BY created_at DESC",
+                (user_id,),
+            ).fetchall()
+        return [self._api_key_from_row(row) for row in rows]
+
+    def count_active_api_keys(self, user_id: str) -> int:
+        if not _is_uuid(user_id):
+            return 0
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n FROM user_api_key "
+                "WHERE user_id = %s AND revoked_at IS NULL",
+                (user_id,),
+            ).fetchone()
+        return int(row["n"]) if row else 0
+
+    def revoke_api_key(self, key_id: str, *, user_id: str) -> bool:
+        """Tombstone the key. Owner-scoped: someone else's id is a miss."""
+        if not _is_uuid(key_id) or not _is_uuid(user_id):
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "UPDATE user_api_key SET revoked_at = now() "
+                "WHERE id = %s AND user_id = %s AND revoked_at IS NULL "
+                "RETURNING id",
+                (key_id, user_id),
+            ).fetchone()
+        return row is not None
+
+    def touch_api_key(self, key_id: str) -> None:
+        """Best-effort last-used stamp; auth must not fail on it."""
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "UPDATE user_api_key SET last_used_at = now() WHERE id = %s",
+                    (key_id,),
+                )
+        except Exception as exc:
+            self.logger.warning("touch_api_key_failed", error=str(exc))
+
     def get_user_settings(self, user_id: str) -> Optional[UserSettings]:
         if not _is_uuid(user_id):
             return None
@@ -1844,14 +1926,23 @@ class PostgresStore:
         user_id: str,
         title: Optional[str] = None,
         active_context_id: Optional[str] = None,
+        meta: Optional[dict] = None,
     ) -> Conversation:
         conv_id = str(uuid.uuid4())
         now = datetime.now(timezone.utc)
         try:
             with self._connect() as conn:
                 conn.execute(
-                    "INSERT INTO conversation (id, user_id, title, created_at, updated_at, active_context_id) VALUES (%s, %s, %s, %s, %s, %s)",
-                    (conv_id, user_id, title, now, now, active_context_id),
+                    "INSERT INTO conversation (id, user_id, title, created_at, updated_at, active_context_id, meta) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        conv_id,
+                        user_id,
+                        title,
+                        now,
+                        now,
+                        active_context_id,
+                        json.dumps(meta) if meta else None,
+                    ),
                 )
         except errors.ForeignKeyViolation:
             raise ConstraintViolation(
@@ -1865,6 +1956,7 @@ class PostgresStore:
             created_at=now,
             updated_at=now,
             active_context_id=active_context_id,
+            meta=meta,
         )
 
     def get_conversation(
@@ -2050,6 +2142,23 @@ class PostgresStore:
             created_at=now,
             meta=meta,
         )
+
+    def get_message_conversation(self, message_id: str) -> Optional[str]:
+        """The conversation a message belongs to, or None.
+
+        Purpose-built for the served Responses API, which resolves a
+        ``previous_response_id`` back to the conversation it continues. Only
+        the id comes back: continuity needs nothing else, and ownership is
+        the caller's check to make against the conversation itself.
+        """
+        if not _is_uuid(message_id):
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT conversation_id FROM message WHERE id = %s",
+                (message_id,),
+            ).fetchone()
+        return str(row["conversation_id"]) if row else None
 
     def list_messages(
         self,

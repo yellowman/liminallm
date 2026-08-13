@@ -7,6 +7,7 @@ import json
 import math
 import mimetypes
 import shutil
+import time
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path as FilePath
@@ -29,7 +30,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from liminallm.api import chat_turn, idempotency
 from liminallm.api.errors import http_error
@@ -44,6 +45,11 @@ from liminallm.api.schemas import (
     AdminCreateUserRequest,
     AdminCreateUserResponse,
     AdminInspectionResponse,
+    ApiKeyCreatedResponse,
+    ApiKeyCreateRequest,
+    ApiKeyListResponse,
+    ApiKeyRevokeResponse,
+    ApiKeySummary,
     ArtifactListResponse,
     ArtifactPatchRequest,
     ArtifactRequest,
@@ -190,6 +196,27 @@ async def get_admin_user(
     if not ctx:
         raise http_error("forbidden", "admin access required", status_code=403)
     return ctx
+
+
+async def get_user_or_api_key(
+    request: Request,
+    authorization: Optional[str] = Header(None),
+    session_id: Optional[str] = Header(None, convert_underscores=False),
+) -> AuthContext:
+    """Principal for the served Responses API: an API key, or any session auth.
+
+    Only this dependency reads API keys. Native routes authenticate through
+    get_user, which cannot — so a leaked key can drive /v1/responses and
+    nothing else, and in particular cannot mint or revoke keys.
+    """
+    runtime = get_runtime()
+    ctx = runtime.auth.authenticate_api_key(
+        authorization,
+        tenant_hint=tenancy.tenant_of(request.headers, runtime.settings),
+    )
+    if ctx:
+        return ctx
+    return await get_user(request, authorization, session_id)
 
 
 def _get_owned_conversation(
@@ -1148,6 +1175,82 @@ async def logout(
     return Envelope(status="ok", data={"message": "session revoked"})
 
 
+# Bounded so a compromised session can't stockpile credentials that each
+# need their own revocation.
+MAX_ACTIVE_API_KEYS = 20
+
+
+def _api_key_summary(record) -> ApiKeySummary:
+    return ApiKeySummary(
+        id=record.id,
+        name=record.name,
+        prefix=record.prefix,
+        created_at=record.created_at,
+        last_used_at=record.last_used_at,
+        revoked_at=record.revoked_at,
+    )
+
+
+@router.post("/auth/api-keys", response_model=Envelope, status_code=201, tags=["auth"])
+async def create_api_key(
+    body: ApiKeyCreateRequest,
+    principal: AuthContext = Depends(get_user),
+):
+    """Mint a bearer key for the served Responses API (SPEC §13.1).
+
+    Session-authenticated on purpose — get_user cannot read keys, so a key
+    can never mint another and outlive its own revocation.
+    """
+    runtime = get_runtime()
+    await rate_limit(runtime, "write", principal.user_id)
+    if runtime.store.count_active_api_keys(principal.user_id) >= MAX_ACTIVE_API_KEYS:
+        raise http_error(
+            "validation_error",
+            f"at most {MAX_ACTIVE_API_KEYS} active API keys; revoke one first",
+            status_code=400,
+        )
+    record, plaintext = runtime.auth.mint_api_key(
+        principal.user_id, name=body.name.strip()
+    )
+    logger.info("api_key_created", user_id=principal.user_id, key_id=record.id)
+    return Envelope(
+        status="ok",
+        data=ApiKeyCreatedResponse(
+            id=record.id,
+            name=record.name,
+            prefix=record.prefix,
+            created_at=record.created_at,
+            api_key=plaintext,
+        ),
+    )
+
+
+@router.get("/auth/api-keys", response_model=Envelope, tags=["auth"])
+async def list_api_keys(principal: AuthContext = Depends(get_user)):
+    """Every key the user holds, revoked ones included: that is the audit view."""
+    runtime = get_runtime()
+    await rate_limit(runtime, "read", principal.user_id)
+    records = runtime.store.list_api_keys(principal.user_id)
+    return Envelope(
+        status="ok",
+        data=ApiKeyListResponse(items=[_api_key_summary(r) for r in records]),
+    )
+
+
+@router.delete("/auth/api-keys/{key_id}", response_model=Envelope, tags=["auth"])
+async def revoke_api_key(
+    key_id: str = Path(..., max_length=64),
+    principal: AuthContext = Depends(get_user),
+):
+    runtime = get_runtime()
+    await rate_limit(runtime, "write", principal.user_id)
+    revoked = runtime.store.revoke_api_key(key_id, user_id=principal.user_id)
+    if not revoked:
+        raise http_error("not_found", "API key not found", status_code=404)
+    logger.info("api_key_revoked", user_id=principal.user_id, key_id=key_id)
+    return Envelope(status="ok", data=ApiKeyRevokeResponse(revoked=True))
+
+
 @router.post("/chat", response_model=Envelope, tags=["chat"])
 async def chat(
     body: ChatRequest,
@@ -1244,6 +1347,313 @@ async def chat(
             await idem.store_result(envelope)
             return envelope
     # Exceptions bubble through the guard which records failed states
+
+
+# ---------------------------------------------------------------------------
+# Served Responses API (OpenAI-compatible surface over liminallm turns)
+# ---------------------------------------------------------------------------
+#
+# The point of serving this shape: any client that speaks the Responses API
+# gets a weak model wrapped in this kernel's enrichment — hybrid RAG,
+# personas, skill adapters, routing, compaction — because a request here runs
+# the SAME turn pipeline as /chat. Responses rather than chat/completions
+# because Responses is stateful by design: previous_response_id maps directly
+# onto conversations, which carry exactly the state a completions shim would
+# throw away.
+#
+# Two shape rules this route must never break, because SDKs parse by them:
+# success bodies are the bare Responses object, never the Envelope; error
+# bodies are OpenAI's {"error": {...}}, never ours. The one seam left open is
+# auth: a 401 from the dependency still arrives Envelope-shaped (SPEC notes
+# it), because rewriting the app-wide auth path for one route is worse.
+
+_RESPONSES_ID_PREFIX = "resp_"
+# OpenAI's own metadata bounds; enforced so an echo cannot become a blob store.
+_RESPONSES_METADATA_MAX_KEYS = 16
+_RESPONSES_METADATA_KEY_CHARS = 64
+_RESPONSES_METADATA_VALUE_CHARS = 512
+
+
+class _ResponsesReject(Exception):
+    """A request shape this surface refuses, in OpenAI's error vocabulary."""
+
+    def __init__(self, message: str, *, param: Optional[str] = None, status: int = 400):
+        super().__init__(message)
+        self.message = message
+        self.param = param
+        self.status = status
+
+
+def _openai_error(
+    status: int, message: str, *, param: Optional[str] = None, code: Optional[str] = None
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status,
+        content={
+            "error": {
+                "message": message,
+                "type": "invalid_request_error" if status < 500 else "server_error",
+                "param": param,
+                "code": code,
+            }
+        },
+    )
+
+
+def _responses_reject_unsupported(body: dict) -> None:
+    """The v1 scope line, drawn where an SDK will read it.
+
+    Each rejection names why in terms of what this kernel already does —
+    "unsupported" alone reads as "broken", and every one of these has a
+    deliberate reason.
+    """
+    if body.get("stream") is True:
+        raise _ResponsesReject(
+            "stream is not supported yet on this surface; poll the "
+            "non-streaming form.",
+            param="stream",
+        )
+    if body.get("tools"):
+        raise _ResponsesReject(
+            "caller-supplied tools are not supported: this surface runs the "
+            "kernel's own tool loop (retrieval, files, notes) server-side.",
+            param="tools",
+        )
+    if body.get("instructions"):
+        raise _ResponsesReject(
+            "instructions are not supported: the system prompt here belongs "
+            "to per-user personas and skill adapters, which is the point of "
+            "this server.",
+            param="instructions",
+        )
+    if body.get("store") is False:
+        raise _ResponsesReject(
+            "store=false is not supported: turns persist to the conversation, "
+            "which is what previous_response_id continues.",
+            param="store",
+        )
+
+
+def _responses_input_text(payload: Any) -> str:
+    """The user text of a Responses ``input``, or a named rejection.
+
+    A string passes through. A list accepts message items carrying user text
+    — role shorthand or typed parts — and refuses the rest by name: system
+    and developer items would fight the personas that own the system prompt
+    here, and function_call_output belongs to caller tools, which this
+    surface does not take.
+    """
+    if isinstance(payload, str):
+        text = payload.strip()
+        if not text:
+            raise _ResponsesReject("input must not be empty.", param="input")
+        return text
+    if not isinstance(payload, list) or not payload:
+        raise _ResponsesReject(
+            "input must be a string or a non-empty list of input items.",
+            param="input",
+        )
+    texts: list[str] = []
+    for position, item in enumerate(payload):
+        where = f"input[{position}]"
+        if not isinstance(item, dict):
+            raise _ResponsesReject(f"{where} must be an object.", param=where)
+        item_type = item.get("type", "message")
+        if item_type != "message":
+            raise _ResponsesReject(
+                f"{where}.type {item_type!r} is not supported on this surface.",
+                param=where,
+            )
+        role = item.get("role")
+        if role in ("system", "developer"):
+            raise _ResponsesReject(
+                f"{where}: system/developer items are not supported — the "
+                "system prompt belongs to per-user personas and adapters here.",
+                param=where,
+            )
+        if role != "user":
+            raise _ResponsesReject(
+                f"{where}: only user message items are supported.", param=where
+            )
+        content = item.get("content")
+        if isinstance(content, str):
+            texts.append(content)
+            continue
+        if isinstance(content, list):
+            for part_at, part in enumerate(content):
+                if not isinstance(part, dict) or part.get("type") != "input_text":
+                    raise _ResponsesReject(
+                        f"{where}.content[{part_at}] must be input_text.",
+                        param=where,
+                    )
+                texts.append(str(part.get("text") or ""))
+            continue
+        raise _ResponsesReject(
+            f"{where}.content must be a string or a list of input_text parts.",
+            param=where,
+        )
+    combined = "\n\n".join(t for t in (t.strip() for t in texts) if t)
+    if not combined:
+        raise _ResponsesReject("input must not be empty.", param="input")
+    return combined
+
+
+def _responses_metadata(payload: Any) -> dict:
+    if payload is None:
+        return {}
+    if not isinstance(payload, dict) or len(payload) > _RESPONSES_METADATA_MAX_KEYS:
+        raise _ResponsesReject(
+            f"metadata must be an object of at most "
+            f"{_RESPONSES_METADATA_MAX_KEYS} string pairs.",
+            param="metadata",
+        )
+    for key, value in payload.items():
+        if (
+            not isinstance(key, str)
+            or not isinstance(value, str)
+            or len(key) > _RESPONSES_METADATA_KEY_CHARS
+            or len(value) > _RESPONSES_METADATA_VALUE_CHARS
+        ):
+            raise _ResponsesReject(
+                "metadata keys and values must be bounded strings.",
+                param="metadata",
+            )
+    return dict(payload)
+
+
+@router.post("/responses", tags=["responses"])
+async def create_response(
+    body: dict,
+    principal: AuthContext = Depends(get_user_or_api_key),
+):
+    """One enriched turn, in the Responses API shape.
+
+    The body is taken as a dict and validated by hand so both the success and
+    the error wire shapes are exactly OpenAI's — response_model wrapping and
+    FastAPI's 422s would each break an SDK's parser in a different way.
+    """
+    runtime = get_runtime()
+    user_id = principal.user_id
+    try:
+        _responses_reject_unsupported(body)
+        content = _responses_input_text(body.get("input"))
+        metadata = _responses_metadata(body.get("metadata"))
+
+        conversation_id: Optional[str] = None
+        previous_response_id = body.get("previous_response_id")
+        if previous_response_id is not None:
+            if not isinstance(previous_response_id, str) or not (
+                previous_response_id.startswith(_RESPONSES_ID_PREFIX)
+            ):
+                raise _ResponsesReject(
+                    "previous_response_id must be an id returned by this "
+                    "endpoint.",
+                    param="previous_response_id",
+                )
+            conversation_id = runtime.store.get_message_conversation(
+                previous_response_id[len(_RESPONSES_ID_PREFIX):]
+            )
+            if not conversation_id:
+                raise _ResponsesReject(
+                    f"No response found with id {previous_response_id!r}.",
+                    param="previous_response_id",
+                    status=404,
+                )
+
+        # Liminallm extension, documented in SPEC: bind a knowledge context on
+        # the FIRST turn so retrieval grounds the whole thread. Continuations
+        # inherit the conversation's binding, as they do on /chat.
+        context_id = body.get("context_id")
+        if context_id is not None and not isinstance(context_id, str):
+            raise _ResponsesReject("context_id must be a string.", param="context_id")
+
+        user = runtime.store.get_user(user_id)
+        plan_tier = user.plan_tier if user else "free"
+        # The same budget pool as /chat, deliberately: this IS a chat turn,
+        # and a second bucket would be a second limit to misconfigure.
+        await enforce_per_plan(
+            runtime,
+            f"chat:{user_id}",
+            runtime.settings.chat_rate_limit_per_minute,
+            runtime.settings.chat_rate_limit_window_seconds,
+            plan_tier,
+        )
+        async with admission.slots(runtime, user_id, *admission.CHAT_SLOTS):
+            turn = await chat_turn.begin(
+                runtime,
+                principal,
+                conversation_id=conversation_id,
+                context_id=context_id,
+                workflow_id=None,
+                content=content,
+                content_struct=None,
+                mode="text",
+                # The native UI badges these; the thread itself is ordinary.
+                conversation_meta={"source": "responses"},
+                owned_conversation=_get_owned_conversation,
+                owned_context=_get_owned_context,
+            )
+            orchestration = await runtime.workflow.run(
+                None,
+                turn.conversation_id,
+                turn.user_content,
+                turn.context_id,
+                user_id,
+                tenant_id=principal.tenant_id,
+            )
+            assistant_msg = await chat_turn.finish(runtime, turn, orchestration)
+
+        usage = turn.orchestration.get("usage") or {}
+        logger.info(
+            "responses_turn",
+            user_id=user_id,
+            conversation_id=turn.conversation_id,
+            previous_response_id=previous_response_id,
+            total_tokens=usage.get("total_tokens"),
+        )
+        return JSONResponse(
+            status_code=200,
+            content={
+                "id": f"{_RESPONSES_ID_PREFIX}{assistant_msg.id}",
+                "object": "response",
+                "created_at": int(time.time()),
+                "status": "completed",
+                "error": None,
+                "model": runtime.llm.serving_model or runtime.settings.model_path,
+                "output": [
+                    {
+                        "type": "message",
+                        "id": f"msg_{assistant_msg.id}",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": assistant_msg.content,
+                                "annotations": [],
+                            }
+                        ],
+                    }
+                ],
+                "previous_response_id": previous_response_id,
+                "store": True,
+                "metadata": metadata,
+                "usage": {
+                    "input_tokens": int(usage.get("prompt_tokens") or 0),
+                    "output_tokens": int(usage.get("completion_tokens") or 0),
+                    "total_tokens": int(usage.get("total_tokens") or 0),
+                },
+            },
+        )
+    except _ResponsesReject as reject:
+        return _openai_error(reject.status, reject.message, param=reject.param)
+    except HTTPException as exc:
+        # Ownership misses, rate limits and admission raise our Envelope-styled
+        # HTTPException; on this surface they must leave OpenAI-shaped.
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        error = detail.get("error") if isinstance(detail.get("error"), dict) else {}
+        message = error.get("message") or str(exc.detail) or "request failed"
+        return _openai_error(exc.status_code, message, code=error.get("code"))
 
 
 @router.post("/chat/cancel", response_model=Envelope, tags=["chat"])
@@ -3286,6 +3696,8 @@ async def list_conversations(
             title=c.title,
             status=c.status,
             active_context_id=c.active_context_id,
+            public=bool((c.meta or {}).get("public")),
+            source=(c.meta or {}).get("source") or "chat",
         )
         for c in convs
     ]
@@ -3322,6 +3734,7 @@ async def get_conversation(
             status=conversation.status,
             active_context_id=conversation.active_context_id,
             public=bool((conversation.meta or {}).get("public")),
+            source=(conversation.meta or {}).get("source") or "chat",
         ),
     )
 

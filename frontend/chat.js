@@ -461,9 +461,10 @@ const renderConversationList = () => {
       const isActive = c.id === state.conversationId;
       const title = escapeHtml(c.title || 'Untitled conversation');
       const date = c.updated_at ? new Date(c.updated_at).toLocaleDateString() : '';
+      const apiTag = c.source === 'responses' ? '<span class="source-tag">api</span>' : '';
       return `
         <div class="conversation-item ${isActive ? 'active' : ''}" data-id="${escapeHtml(c.id)}">
-          <div class="title">${title}</div>
+          <div class="title">${title}${apiTag}</div>
           <div class="meta">${date}</div>
         </div>
       `;
@@ -2733,6 +2734,109 @@ const setMfaDisableStatus = (message, isError = false) => {
 };
 
 // =============================================================================
+// API Keys (served Responses API)
+// =============================================================================
+
+const setApiKeyStatus = (message, isError = false) => {
+  const el = $('api-key-status');
+  if (!el) return;
+  el.textContent = message;
+  el.style.color = isError ? '#b00020' : 'inherit';
+};
+
+const loadApiKeys = async () => {
+  const listEl = $('api-key-list');
+  if (!listEl) return;
+  if (!state.accessToken) {
+    listEl.innerHTML = '';
+    return;
+  }
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/auth/api-keys`,
+      { headers: headers() },
+      'Failed to load API keys'
+    );
+    const items = envelope.data?.items || [];
+    if (!items.length) {
+      listEl.innerHTML = '<div class="empty">No API keys yet</div>';
+      return;
+    }
+    listEl.innerHTML = items
+      .map((k) => {
+        const created = k.created_at ? new Date(k.created_at).toLocaleDateString() : '';
+        const lastUsed = k.last_used_at
+          ? `last used ${new Date(k.last_used_at).toLocaleDateString()}`
+          : 'never used';
+        const stateText = k.revoked_at ? 'revoked' : lastUsed;
+        const revokeBtn = k.revoked_at
+          ? ''
+          : `<button type="button" class="ghost api-key-revoke" data-id="${escapeHtml(k.id)}">Revoke</button>`;
+        return `
+          <div class="api-key-item ${k.revoked_at ? 'revoked' : ''}">
+            <div class="api-key-info">
+              <span class="api-key-name">${escapeHtml(k.name || 'unnamed key')}</span>
+              <code class="api-key-prefix">${escapeHtml(k.prefix)}…</code>
+              <div class="meta">created ${created} · ${stateText}</div>
+            </div>
+            ${revokeBtn}
+          </div>`;
+      })
+      .join('');
+    listEl.querySelectorAll('.api-key-revoke').forEach((btn) => {
+      btn.addEventListener('click', () => revokeApiKey(btn.dataset.id));
+    });
+  } catch (err) {
+    setApiKeyStatus(err.message || 'Failed to load API keys', true);
+  }
+};
+
+const createApiKey = async (event) => {
+  event.preventDefault();
+  if (!state.accessToken) {
+    setApiKeyStatus('Sign in first', true);
+    return;
+  }
+  const nameInput = $('api-key-name');
+  try {
+    const envelope = await requestEnvelope(
+      `${apiBase}/auth/api-keys`,
+      {
+        method: 'POST',
+        headers: headers(),
+        body: JSON.stringify({ name: nameInput?.value?.trim() || '' }),
+      },
+      'Failed to create API key'
+    );
+    // The one plaintext sighting; after this only the prefix survives.
+    const plainEl = $('api-key-plaintext-value');
+    if (plainEl) plainEl.textContent = envelope.data?.api_key || '';
+    $('api-key-plaintext')?.classList.remove('hidden');
+    if (nameInput) nameInput.value = '';
+    setApiKeyStatus('Key created — copy it before leaving this page');
+    await loadApiKeys();
+  } catch (err) {
+    setApiKeyStatus(err.message || 'Failed to create API key', true);
+  }
+};
+
+const revokeApiKey = async (keyId) => {
+  if (!keyId) return;
+  if (!window.confirm('Revoke this API key? Agents using it stop working immediately.')) return;
+  try {
+    await requestEnvelope(
+      `${apiBase}/auth/api-keys/${encodeURIComponent(keyId)}`,
+      { method: 'DELETE', headers: headers() },
+      'Failed to revoke API key'
+    );
+    setApiKeyStatus('Key revoked');
+    await loadApiKeys();
+  } catch (err) {
+    setApiKeyStatus(err.message || 'Failed to revoke API key', true);
+  }
+};
+
+// =============================================================================
 // Email Verification
 // =============================================================================
 
@@ -3504,6 +3608,7 @@ const initEventListeners = () => {
 
   // Password change
   $('password-change-form')?.addEventListener('submit', changePassword);
+  $('api-key-create-form')?.addEventListener('submit', createApiKey);
 
   // User settings (preferences)
   $('user-settings-form')?.addEventListener('submit', saveUserSettings);
@@ -3631,6 +3736,7 @@ const init = async () => {
       fetchMfaStatus(),
       fetchEmailVerificationStatus(),
       fetchUserSettings(),
+      loadApiKeys(),
     ]);
 
     // Reopen the thread that was active before the reload; if it no longer

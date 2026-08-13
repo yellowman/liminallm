@@ -21,11 +21,16 @@ from argon2.exceptions import InvalidHash, VerifyMismatchError
 from liminallm.config import Settings
 from liminallm.logging import get_logger
 from liminallm.service.tenancy import user_belongs_to_site
-from liminallm.storage.models import Session, User
+from liminallm.storage.models import ApiKey, Session, User
 from liminallm.storage.redis_cache import RedisCache
 
 if TYPE_CHECKING:  # PostgresStore imports from service/, so keep this type-only.
     from liminallm.storage.postgres import PostgresStore
+
+# Bearer keys for the served Responses API. The prefix makes a key
+# recognizable in a paste or a log scrub, and — having no dots — impossible
+# to confuse with a JWT.
+API_KEY_PREFIX = "sk-liminal-"
 
 # OAuth provider configurations
 OAUTH_PROVIDERS = {
@@ -1030,6 +1035,54 @@ class AuthService:
             allow_pending_mfa=allow_pending_mfa,
             tenant_hint=tenant_hint,
             required_role=required_role,
+        )
+
+    def mint_api_key(self, user_id: str, *, name: str) -> Tuple["ApiKey", str]:
+        """Create a key and return (record, plaintext) — the one plaintext sighting.
+
+        The stored form is a SHA-256; a random 256-bit key needs no slow hash,
+        that cost model belongs to low-entropy passwords.
+        """
+        secret = secrets.token_urlsafe(32)
+        plaintext = f"{API_KEY_PREFIX}{secret}"
+        record = self.store.create_api_key(
+            user_id,
+            name=name,
+            key_hash=hashlib.sha256(plaintext.encode()).hexdigest(),
+            prefix=plaintext[: len(API_KEY_PREFIX) + 4],
+        )
+        return record, plaintext
+
+    def authenticate_api_key(
+        self, authorization: Optional[str], *, tenant_hint: Optional[str] = None
+    ) -> Optional[AuthContext]:
+        """A bearer API key to a principal, or None if this isn't one.
+
+        Keys skip the session and MFA machinery on purpose: minting one
+        already required a fully authenticated session, and the key is its
+        own credential class with its own revocation (the tombstone). The
+        tenant check is NOT skipped — a key must not cross sites any more
+        than a token may.
+        """
+        token = self._extract_bearer(authorization)
+        if not token or not token.startswith(API_KEY_PREFIX):
+            return None
+        record = self.store.get_api_key_by_hash(
+            hashlib.sha256(token.encode()).hexdigest()
+        )
+        if not record or record.revoked_at is not None:
+            return None
+        user = self.store.get_user(record.user_id)
+        if not user or not user.is_active:
+            return None
+        if not self._site_matches(user, tenant_hint):
+            return None
+        self.store.touch_api_key(record.id)
+        return AuthContext(
+            user_id=user.id,
+            role=user.role,
+            tenant_id=user.tenant_id,
+            session_id=None,
         )
 
     def issue_tokens_for_session(

@@ -144,6 +144,20 @@ CREATE TABLE auth_session (
   ip_addr         INET,
   meta            JSONB
 );
+
+-- long-lived bearer keys for the served responses api (§13.1). only the
+-- sha-256 lands here; the plaintext is shown once at mint time. revocation
+-- is a tombstone (revoked_at), keeping the audit trail.
+CREATE TABLE user_api_key (
+  id            UUID PRIMARY KEY,
+  user_id       UUID NOT NULL REFERENCES app_user(id) ON DELETE CASCADE,
+  name          TEXT NOT NULL DEFAULT '',
+  key_hash      TEXT NOT NULL UNIQUE,
+  prefix        TEXT NOT NULL,     -- enough to recognize, never to use
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+  last_used_at  TIMESTAMPTZ,
+  revoked_at    TIMESTAMPTZ
+);
 ```
 
 ### 2.2 conversations & messages
@@ -1583,7 +1597,7 @@ principles:
 - HTTP+JSON for control planes, WebSocket/SSE for streaming chat; stable versioned paths `/v1/...`.
 - every endpoint enforces auth via session cookie or bearer token; `X-User-Id` is ignored/forbidden.
 - request/response schemas stored as `artifact` of type `tool.spec` for LLM discoverability.
-- responses use envelope `{ "status": "ok|error", "data": ..., "error": { "code", "message", "details" } }`.
+- responses use envelope `{ "status": "ok|error", "data": ..., "error": { "code", "message", "details" } }`. compatibility surfaces that exist to speak someone else's dialect (`POST /v1/responses`, §13.1) are the exception: they keep that dialect's shape on success **and** on error, because an SDK parses by it.
 - pagination uses `page`/`page_size` or opaque `next_cursor`; errors map to HTTP (400 validation, 401/403 auth, 404 missing, 409 conflict, 429 rate limit, 500 server).
 - idempotency via `Idempotency-Key` header on POST chat/tool calls; server replays prior response if key repeats within TTL.
 
@@ -1612,6 +1626,64 @@ response:
 - if `stream=true`: SSE (`event: token`) or WebSocket frames `{event,data}` until `event=done` with `{message_id, usage, adapters, workflow_trace}`.
 - if `stream=false`: blocking JSON `{message_id, content, usage, adapters}`.
 
+#### served responses api (`POST /v1/responses`)
+
+the same chat turn in OpenAI's Responses API shape, so any agent framework
+that speaks that dialect gets the kernel's enrichment — personas, skill
+adapters, RAG, notes, memory — behind a base-model-shaped endpoint. that is
+the point: a weak model plus this kernel presents as a much richer model, and
+the caller changes nothing but the base URL.
+
+- **wire shapes are OpenAI's, both ways.** success bodies are the bare
+  Responses object (never the kernel envelope); error bodies are
+  `{"error": {message, type, param, code}}` (never the envelope). kernel
+  verdicts that arrive as envelope-styled HTTPExceptions (ownership, rate
+  limit, admission) are reshaped before they leave; the kernel `code` rides
+  in `error.code`. one documented seam: a 401 from the auth dependency is
+  still envelope-shaped, because the app-wide auth path is not rewritten for
+  one route.
+- **stateful by design.** `id` is `resp_<assistant_message_id>`;
+  `previous_response_id` resolves through that message to its conversation
+  and continues it. ownership is the same owned-conversation check `/v1/chat`
+  runs; a foreign or unknown id is 404 either way, so existence is not
+  confirmed across users.
+- **`context_id` (liminallm extension).** binds a knowledge context on the
+  first turn so retrieval grounds the whole thread; continuations inherit the
+  conversation's binding, exactly as on `/v1/chat`.
+- **v1 scope line, each rejection named.** `stream` (not yet on this
+  surface), caller `tools` (the kernel runs its own tool loop server-side),
+  `instructions` (the system prompt belongs to per-user personas and
+  adapters — the reason this server exists), `store=false` (turns persist to
+  the conversation; that persistence is what `previous_response_id`
+  continues). input items accept user text only; system/developer items are
+  refused by position.
+- **auth: api keys or session.** `Authorization: Bearer sk-liminal-…` — keys
+  minted at `POST /v1/auth/api-keys` (§13.2), stored as sha-256 in
+  `user_api_key` (§2.1), plaintext shown once. keys authenticate **only this
+  surface**: the native routes' dependency cannot read them, so a leaked key
+  can drive chat turns and nothing else — it cannot list conversations, mint
+  another key, or revoke one. keys skip session/mfa machinery (minting one
+  already required a fully authenticated session) but never the tenant
+  check. session jwts also work here, so the web ui can drive the surface.
+- **the thread is a native conversation.** turns land in the same
+  conversation store; the web ui lists them beside the rest, badged via
+  `source: "responses"` (from `conversation.meta`, exposed on the
+  conversation endpoints), and title generation, sharing, compaction and
+  retention behave exactly as on `/v1/chat`.
+- **kernel tool use keeps its transport.** the loop behind this surface is
+  the /chat agentic loop: internal tool calls — retrieval, notes, the
+  reranker's out-of-band verdict (§2.5) — ride the provider tool channel
+  wherever one exists, including `local_lora` / `local_gpu_lora` through the
+  advertised `<tool_call>` channel (§5.0.2). callers see only the final
+  text; caller-supplied tools stay rejected (the scope line above).
+- **same budget, same gate.** the `/v1/chat` rate bucket and admission slots
+  are shared deliberately: this is a chat turn, and a second bucket would be
+  a second limit to misconfigure.
+- `model` echoes the serving model; `usage` maps the orchestration's token
+  counts; `metadata` is bounded (16 keys, 64/512 chars) and echoed back.
+- streaming (SSE `response.*` events) is the named follow-up, not a v1 gap
+  discovered later.
+
 ### 13.2 auth/session api (minimal definitions)
 
 - `POST /v1/auth/signup { email, password }` → create user.
@@ -1621,6 +1693,7 @@ response:
 - `POST /v1/auth/refresh` → rotate session/refresh token.
 - responses include `session_expires_at`; headers `Set-Cookie: session_id=...; HttpOnly; Secure` when cookies are used.
 - `POST /v1/auth/mfa/verify` when MFA enabled; returns new session + requires one-time recovery code flow if user is locked out.
+- `POST /v1/auth/api-keys { name }` → mint a key for the served responses api; the plaintext appears only in this response. `GET /v1/auth/api-keys` lists them (prefix only, revoked included — that is the audit view); `DELETE /v1/auth/api-keys/{key_id}` revokes immediately. session auth only, envelope-shaped, at most 20 active keys per user; a key can never manage keys.
 
 ### 13.3 files & contexts
 
@@ -1800,6 +1873,7 @@ that’s the whole point: minimal glue, maximal evolution.
 - **conversation list**: paginated list of user conversations sorted by `updated_at`.
 - **search**: client-side filter by title or conversation ID.
 - **active indicator**: highlight currently loaded conversation.
+- **source tag**: conversations with `source: "responses"` carry a small “api” tag — agent-created threads sit beside native ones, visibly distinct.
 - **new conversation**: button to reset chat state and start fresh thread.
 - API endpoints: `GET /v1/conversations`, `GET /v1/conversations/{id}`, `GET /v1/conversations/{id}/messages`.
 
@@ -1870,6 +1944,7 @@ that’s the whole point: minimal glue, maximal evolution.
   - clear drafts button (removes all from localStorage).
   - export drafts button (downloads JSON file).
 - **upload limits**: display max file size and allowed extensions from `GET /v1/files/limits`.
+- **api keys**: mint/list/revoke keys for the served responses api (§13.1) against `/v1/auth/api-keys`; the plaintext renders once at mint time, the list shows prefix + created/last-used/revoked, revoke confirms before firing.
 - **about section**: version and build info from `/healthz`.
 
 ### 17.7 draft persistence (offline-safe)

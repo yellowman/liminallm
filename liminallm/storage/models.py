@@ -276,6 +276,23 @@ class UserMFAConfig:
 
 
 @dataclass
+class ApiKey:
+    """A long-lived bearer credential (user_api_key table).
+
+    Deliberately hashless: the SHA-256 stays in the store, the plaintext is
+    returned exactly once by the route that minted it.
+    """
+
+    id: str
+    user_id: str
+    name: str
+    prefix: str
+    created_at: datetime = field(default_factory=_utcnow)
+    last_used_at: Optional[datetime] = None
+    revoked_at: Optional[datetime] = None
+
+
+@dataclass
 class Note:
     id: str
     user_id: str
