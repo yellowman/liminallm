@@ -1554,10 +1554,74 @@ def _responses_message_item(message_id: str, text: str, *, status: str = "comple
 
 
 def _responses_usage(usage: dict) -> dict:
+    """The turn's usage in the Responses shape, details included.
+
+    The compat layer carries reasoning_tokens and cached_tokens all the way
+    into the turn's usage precisely so a consumer can see them; dropping them
+    here was the one gap in that chain. The details objects are always
+    present (zeros when unknown) because typed SDKs require the fields, and
+    the total falls back to input+output for backends — the local tokenizer
+    path historically — that report the parts without the sum.
+    """
+    prompt = int(usage.get("prompt_tokens") or 0)
+    completion = int(usage.get("completion_tokens") or 0)
     return {
-        "input_tokens": int(usage.get("prompt_tokens") or 0),
-        "output_tokens": int(usage.get("completion_tokens") or 0),
-        "total_tokens": int(usage.get("total_tokens") or 0),
+        "input_tokens": prompt,
+        "input_tokens_details": {
+            "cached_tokens": int(usage.get("cached_tokens") or 0)
+        },
+        "output_tokens": completion,
+        "output_tokens_details": {
+            "reasoning_tokens": int(usage.get("reasoning_tokens") or 0)
+        },
+        "total_tokens": int(usage.get("total_tokens") or 0) or (prompt + completion),
+    }
+
+
+#: Server-side tool runs served as the dialect's own output items — only the
+#: types the dialect defines, so typed SDK parsers never meet an unknown
+#: discriminator. Everything else (note_search, history_search, run_python,
+#: web_fetch) appears in the liminallm extension's tool_trace instead of
+#: being dressed up as something it is not.
+_RESPONSES_TOOL_ITEM_TYPES = {
+    "file_search": "file_search_call",
+    "web_search": "web_search_call",
+}
+
+
+def _responses_tool_items(tool_trace: list) -> list:
+    items = []
+    for call in tool_trace or []:
+        if not isinstance(call, dict):
+            continue
+        item_type = _RESPONSES_TOOL_ITEM_TYPES.get(call.get("tool"))
+        if not item_type:
+            continue
+        item = {
+            "type": item_type,
+            "id": f"{item_type[:2]}_{uuid4().hex}",
+            "status": "completed",
+        }
+        if item_type == "file_search_call":
+            query = (call.get("arguments") or {}).get("query")
+            item["queries"] = [str(query)] if query else []
+        items.append(item)
+    return items
+
+
+def _responses_extension(orchestration: dict) -> dict:
+    """The enrichment the dialect has no slot for, under one namespaced key.
+
+    Extra top-level keys survive the OpenAI SDKs (their models allow unknown
+    fields) and stay invisible to strict typed readers. Citations are NOT
+    faked into annotations: an annotation needs a character anchor and a file
+    identity this surface cannot honestly provide, so provenance rides here
+    as plain snippets instead.
+    """
+    return {
+        "context_snippets": list(orchestration.get("context_snippets") or []),
+        "tool_trace": list(orchestration.get("tool_calls") or []),
+        "adapters": _stringify_adapters(orchestration.get("adapters", [])),
     }
 
 
@@ -1572,8 +1636,9 @@ def _responses_payload(
     metadata: dict,
     usage: Optional[dict],
     error: Optional[dict] = None,
+    extension: Optional[dict] = None,
 ) -> dict:
-    return {
+    payload = {
         "id": response_id,
         "object": "response",
         "created_at": created_at,
@@ -1586,6 +1651,9 @@ def _responses_payload(
         "metadata": metadata,
         "usage": usage,
     }
+    if extension is not None:
+        payload["liminallm"] = extension
+    return payload
 
 
 def _sse_event(event: str, sequence_number: int, data: dict) -> str:
@@ -1623,7 +1691,7 @@ async def _responses_stream(
     created_at = int(time.time())
     model = runtime.llm.serving_model or runtime.settings.model_path
 
-    def payload(status: str, output: list, usage=None, error=None) -> dict:
+    def payload(status: str, output: list, usage=None, error=None, extension=None) -> dict:
         return _responses_payload(
             response_id=resp_id,
             created_at=created_at,
@@ -1634,30 +1702,67 @@ async def _responses_stream(
             metadata=metadata,
             usage=usage,
             error=error,
+            extension=extension,
         )
 
     cancel_event = asyncio.Event()
     tokens: list[str] = []
     orchestration: dict = {}
+    # Server-side tool runs become dialect items as their traces arrive; the
+    # message item is emitted lazily so its output_index lands after them.
+    open_items: list = []
+    closed_items: list = []
+    next_output_index = 0
+    message_index: Optional[int] = None
+
+    def close_open_items() -> list:
+        chunks = []
+        for tool_item, index in open_items:
+            tool_item["status"] = "completed"
+            chunks.append(
+                ev(
+                    "response.output_item.done",
+                    {"output_index": index, "item": tool_item},
+                )
+            )
+            closed_items.append(tool_item)
+        open_items.clear()
+        return chunks
+
+    def start_message() -> list:
+        # Tools ran before the text started; say so before saying the text.
+        nonlocal message_index, next_output_index
+        chunks = close_open_items()
+        if message_index is None:
+            message_index = next_output_index
+            next_output_index += 1
+            chunks.append(
+                ev(
+                    "response.output_item.added",
+                    {
+                        "output_index": message_index,
+                        "item": _responses_message_item(
+                            message_id, "", status="in_progress"
+                        ),
+                    },
+                )
+            )
+            chunks.append(
+                ev(
+                    "response.content_part.added",
+                    {
+                        "item_id": item_id,
+                        "output_index": message_index,
+                        "content_index": 0,
+                        "part": {"type": "output_text", "text": "", "annotations": []},
+                    },
+                )
+            )
+        return chunks
+
     try:
         yield ev("response.created", {"response": payload("in_progress", [])})
         yield ev("response.in_progress", {"response": payload("in_progress", [])})
-        yield ev(
-            "response.output_item.added",
-            {
-                "output_index": 0,
-                "item": _responses_message_item(message_id, "", status="in_progress"),
-            },
-        )
-        yield ev(
-            "response.content_part.added",
-            {
-                "item_id": item_id,
-                "output_index": 0,
-                "content_index": 0,
-                "part": {"type": "output_text", "text": "", "annotations": []},
-            },
-        )
         finished = False
         async for event in runtime.workflow.run_streaming(
             None,
@@ -1673,15 +1778,34 @@ async def _responses_stream(
             if kind == "token":
                 if isinstance(data, str) and data:
                     tokens.append(data)
+                    for chunk in start_message():
+                        yield chunk
                     yield ev(
                         "response.output_text.delta",
                         {
                             "item_id": item_id,
-                            "output_index": 0,
+                            "output_index": message_index,
                             "content_index": 0,
                             "delta": data,
                         },
                     )
+            elif kind == "trace":
+                tool = data.get("tool") if isinstance(data, dict) else None
+                item_type = _RESPONSES_TOOL_ITEM_TYPES.get(tool)
+                if item_type and message_index is None:
+                    tool_item = {
+                        "type": item_type,
+                        "id": f"{item_type[:2]}_{uuid4().hex}",
+                        "status": "in_progress",
+                    }
+                    if item_type == "file_search_call":
+                        tool_item["queries"] = []
+                    yield ev(
+                        "response.output_item.added",
+                        {"output_index": next_output_index, "item": dict(tool_item)},
+                    )
+                    open_items.append((tool_item, next_output_index))
+                    next_output_index += 1
             elif kind == "message_done":
                 finished = True
                 orchestration = data if isinstance(data, dict) else {}
@@ -1725,25 +1849,44 @@ async def _responses_stream(
             assistant_message_id=message_id,
         )
         text = assistant_msg.content
+        # An agent-loop answer arrives whole (zero deltas): the message item
+        # opens here instead, after the tool items it waited on close.
+        for chunk in start_message():
+            yield chunk
         yield ev(
             "response.output_text.done",
-            {"item_id": item_id, "output_index": 0, "content_index": 0, "text": text},
+            {
+                "item_id": item_id,
+                "output_index": message_index,
+                "content_index": 0,
+                "text": text,
+            },
         )
         yield ev(
             "response.content_part.done",
             {
                 "item_id": item_id,
-                "output_index": 0,
+                "output_index": message_index,
                 "content_index": 0,
                 "part": {"type": "output_text", "text": text, "annotations": []},
             },
         )
         item = _responses_message_item(assistant_msg.id, text)
-        yield ev("response.output_item.done", {"output_index": 0, "item": item})
+        yield ev(
+            "response.output_item.done",
+            {"output_index": message_index, "item": item},
+        )
         usage = turn.orchestration.get("usage") or {}
         yield ev(
             "response.completed",
-            {"response": payload("completed", [item], usage=_responses_usage(usage))},
+            {
+                "response": payload(
+                    "completed",
+                    closed_items + [item],
+                    usage=_responses_usage(usage),
+                    extension=_responses_extension(turn.orchestration),
+                )
+            },
         )
         logger.info(
             "responses_turn",
@@ -1913,6 +2056,10 @@ async def create_response(
             previous_response_id=previous_response_id,
             total_tokens=usage.get("total_tokens"),
         )
+        output = _responses_tool_items(turn.orchestration.get("tool_calls") or [])
+        output.append(
+            _responses_message_item(assistant_msg.id, assistant_msg.content)
+        )
         return JSONResponse(
             status_code=200,
             content=_responses_payload(
@@ -1920,12 +2067,11 @@ async def create_response(
                 created_at=int(time.time()),
                 status="completed",
                 model=runtime.llm.serving_model or runtime.settings.model_path,
-                output=[
-                    _responses_message_item(assistant_msg.id, assistant_msg.content)
-                ],
+                output=output,
                 previous_response_id=previous_response_id,
                 metadata=metadata,
                 usage=_responses_usage(usage),
+                extension=_responses_extension(turn.orchestration),
             ),
         )
     except _ResponsesReject as reject:

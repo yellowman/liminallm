@@ -139,17 +139,24 @@ def usage_dict(response: Any) -> Dict[str, int]:
 
 
 def output_text(response: Any) -> str:
-    """The response's text: the SDK convenience field, else walk the items."""
-    text = getattr(response, "output_text", None)
-    if text:
-        return text
+    """The response's text: the SDK convenience field, else walk the items.
+
+    Refusal parts count as text: a reply that is entirely a refusal used to
+    flatten to "" here, and the turn then fabricated "No response generated."
+    over the model's actual words. The refusal IS the answer.
+    """
     parts = []
     for item in getattr(response, "output", None) or []:
         if getattr(item, "type", None) == "message":
             for part in getattr(item, "content", None) or []:
-                if getattr(part, "type", None) == "output_text":
+                kind = getattr(part, "type", None)
+                if kind == "output_text":
                     parts.append(getattr(part, "text", "") or "")
-    return "".join(parts)
+                elif kind == "refusal":
+                    parts.append(getattr(part, "refusal", "") or "")
+    if parts:
+        return "".join(parts)
+    return getattr(response, "output_text", None) or ""
 
 
 def tool_calls_of(response: Any) -> List[Dict[str, str]]:

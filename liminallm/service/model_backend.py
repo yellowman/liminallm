@@ -2204,6 +2204,10 @@ class LocalJaxLoRABackend:
             "usage": {
                 "prompt_tokens": len(ids),
                 "completion_tokens": len(generated_ids),
+                # Counted by our own tokenizer; total included so every
+                # consumer (chat envelope, the served Responses usage) sees a
+                # real total on the local path, not a zero.
+                "total_tokens": len(ids) + len(generated_ids),
                 "model": self.base_model,
                 "adapter_id": (
                     ",".join(str(a.get("id")) for a in adapters if a.get("id"))

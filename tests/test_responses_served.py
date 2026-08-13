@@ -56,8 +56,19 @@ class TestResponsesSuccessShape:
         assert part["annotations"] == []
 
         usage = body["usage"]
-        assert set(usage) == {"input_tokens", "output_tokens", "total_tokens"}
-        assert all(isinstance(v, int) for v in usage.values())
+        assert set(usage) == {
+            "input_tokens",
+            "input_tokens_details",
+            "output_tokens",
+            "output_tokens_details",
+            "total_tokens",
+        }
+        assert all(
+            isinstance(v, int) for k, v in usage.items() if not k.endswith("_details")
+        )
+        # Typed SDKs require the details objects, zeros when unknown.
+        assert isinstance(usage["input_tokens_details"]["cached_tokens"], int)
+        assert isinstance(usage["output_tokens_details"]["reasoning_tokens"], int)
 
     def test_message_items_input(self, client, auth_headers):
         resp = _respond(
@@ -393,6 +404,152 @@ class TestResponsesStreaming:
             events[-1]["data"]["response"]["error"]["message"]
             == "model backend unavailable"
         )
+
+
+class TestResponsesUpstreamParity:
+    """What an upstream parent's Responses API would serve, ours serves too:
+    usage details, server-side tool items, and provenance — without faking
+    what it cannot honestly provide (citation anchors, file ids)."""
+
+    def test_usage_details_and_local_tokenizer_total(
+        self, client, auth_headers, monkeypatch
+    ):
+        from liminallm.service.runtime import get_runtime
+
+        async def run(*args, **kwargs):
+            # The local-tokenizer shape: real parts, no total — plus the
+            # detail keys the compat layer carries through from upstream.
+            return {
+                "content": "counted",
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 5,
+                    "reasoning_tokens": 7,
+                    "cached_tokens": 3,
+                },
+            }
+
+        monkeypatch.setattr(get_runtime().workflow, "run", run)
+        body = client.post(
+            "/v1/responses", headers=auth_headers, json={"input": "hi"}
+        ).json()
+        usage = body["usage"]
+        assert usage["total_tokens"] == 15
+        assert usage["input_tokens_details"]["cached_tokens"] == 3
+        assert usage["output_tokens_details"]["reasoning_tokens"] == 7
+
+    def test_tool_runs_become_dialect_items_and_extension_trace(
+        self, client, auth_headers, monkeypatch
+    ):
+        from liminallm.service.runtime import get_runtime
+
+        async def run(*args, **kwargs):
+            return {
+                "content": "grounded answer",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "context_snippets": ["the vermilion cabinet"],
+                "tool_calls": [
+                    {"tool": "file_search", "arguments": {"query": "cabinet"}},
+                    {"tool": "note_search", "arguments": {"query": "cabinet"}},
+                ],
+            }
+
+        monkeypatch.setattr(get_runtime().workflow, "run", run)
+        body = client.post(
+            "/v1/responses", headers=auth_headers, json={"input": "hi"}
+        ).json()
+
+        # file_search is a dialect-native item; note_search is not dressed up
+        # as one — it stays in the extension's full trace.
+        assert [o["type"] for o in body["output"]] == ["file_search_call", "message"]
+        assert body["output"][0]["status"] == "completed"
+        assert body["output"][0]["queries"] == ["cabinet"]
+        assert body["output"][1]["content"][0]["annotations"] == []
+
+        ext = body["liminallm"]
+        assert ext["context_snippets"] == ["the vermilion cabinet"]
+        assert [t["tool"] for t in ext["tool_trace"]] == ["file_search", "note_search"]
+
+    def test_streamed_tool_items_close_before_the_text_opens(
+        self, client, auth_headers, monkeypatch
+    ):
+        from liminallm.service.runtime import get_runtime
+
+        async def run_streaming(*args, **kwargs):
+            yield {"event": "trace", "data": {"tool": "file_search", "status": "running"}}
+            yield {"event": "trace", "data": {"tool": "note_search", "status": "running"}}
+            yield {"event": "token", "data": "Answer."}
+            yield {
+                "event": "message_done",
+                "data": {
+                    "content": "Answer.",
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+                    "tool_calls": [
+                        {"tool": "file_search", "arguments": {"query": "x"}}
+                    ],
+                },
+            }
+
+        monkeypatch.setattr(get_runtime().workflow, "run_streaming", run_streaming)
+        resp = client.post(
+            "/v1/responses",
+            headers=auth_headers,
+            json={"input": "hi", "stream": True},
+        )
+        events = _sse_events(resp.text)
+
+        added = [e for e in events if e["event"] == "response.output_item.added"]
+        assert [a["data"]["item"]["type"] for a in added] == [
+            "file_search_call",
+            "message",
+        ]
+        fs_done = next(
+            e
+            for e in events
+            if e["event"] == "response.output_item.done"
+            and e["data"]["item"]["type"] == "file_search_call"
+        )
+        assert fs_done["data"]["item"]["status"] == "completed"
+        # The tool item closed before the message item opened.
+        assert (
+            fs_done["data"]["sequence_number"]
+            < added[1]["data"]["sequence_number"]
+        )
+        delta = next(
+            e for e in events if e["event"] == "response.output_text.delta"
+        )
+        assert delta["data"]["output_index"] == 1
+
+        completed = events[-1]["data"]["response"]
+        assert [o["type"] for o in completed["output"]] == [
+            "file_search_call",
+            "message",
+        ]
+        assert completed["output"][1]["content"][0]["text"] == "Answer."
+        assert completed["usage"]["total_tokens"] == 3
+        assert completed["liminallm"]["tool_trace"][0]["tool"] == "file_search"
+
+    def test_refusal_part_survives_ingestion(self):
+        """Duck-typed on purpose: responses_compat reads SDK objects via
+        getattr, so the duck interface IS the real interface here."""
+        from types import SimpleNamespace
+
+        from liminallm.service import responses_compat
+
+        response = SimpleNamespace(
+            output_text="",
+            output=[
+                SimpleNamespace(
+                    type="message",
+                    content=[
+                        SimpleNamespace(
+                            type="refusal", refusal="I can't help with that."
+                        )
+                    ],
+                )
+            ],
+        )
+        assert responses_compat.output_text(response) == "I can't help with that."
 
 
 class TestResponsesWireShapeUnderFailure:

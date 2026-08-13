@@ -1656,11 +1656,14 @@ the caller changes nothing but the base URL.
   conversation's binding, exactly as on `/v1/chat`.
 - **streaming.** `stream: true` answers `text/event-stream` speaking the
   OpenAI event dialect: `response.created` → `response.in_progress` →
-  `response.output_item.added` / `response.content_part.added` →
-  `response.output_text.delta`* → the `.done` trio → `response.completed`
-  (with usage), monotonic `sequence_number` throughout. the reply's id is
-  minted before the first event, so `created` and `completed` carry the same
-  id and the assistant message persists under it. everything that can refuse
+  server-side tool items as they run (`response.output_item.added` /
+  `.done` for `file_search_call` / `web_search_call`, closed before the
+  text opens) → the message item and part → `response.output_text.delta`* →
+  the `.done` trio → `response.completed` (with full usage and the
+  `liminallm` extension), monotonic `sequence_number` throughout, output
+  indexes assigned in arrival order. the reply's id is minted before the
+  first event, so `created` and `completed` carry the same id and the
+  assistant message persists under it. everything that can refuse
   the request refuses before the stream starts, as a proper HTTP error;
   after that, failures are a `response.failed` event (generic on crashes —
   internals never reach the wire), a client disconnect cancels generation,
@@ -1696,8 +1699,26 @@ the caller changes nothing but the base URL.
 - **same budget, same gate.** the `/v1/chat` rate bucket and admission slots
   are shared deliberately: this is a chat turn, and a second bucket would be
   a second limit to misconfigure.
-- `model` echoes the serving model; `usage` maps the orchestration's token
-  counts; `metadata` is bounded (16 keys, 64/512 chars) and echoed back.
+- `model` echoes the serving model; `metadata` is bounded (16 keys, 64/512
+  chars) and echoed back. `usage` serves everything the turn learned: the
+  three totals, plus `input_tokens_details.cached_tokens` and
+  `output_tokens_details.reasoning_tokens` when the upstream reported them
+  (the compat layer carries both through the agent loop; the details objects
+  are always present, zeros when unknown, because typed SDKs require the
+  fields). on `local_lora`/`local_gpu_lora` the counts come from our own
+  tokenizer — real parts and a real total, not zeros.
+- **server-side tool runs are served, not hidden.** tool activity appears in
+  `output` as the dialect's own items — `file_search_call` (with queries)
+  and `web_search_call` — and only those: dialect-native types keep typed
+  SDK parsers away from unknown discriminators, so note_search,
+  history_search, run_python and web_fetch are never dressed up as
+  something they are not. the FULL trace, the grounding snippets and the
+  active adapters ride under one namespaced top-level key, `liminallm`
+  (`{context_snippets, tool_trace, adapters}`) — extra keys survive the
+  openai sdks and stay invisible to strict readers. citations are NOT faked
+  into `annotations`: an annotation needs a character anchor and a file
+  identity this surface cannot honestly provide, so `annotations` stays
+  empty until the model actually cites and provenance rides the extension.
 
 #### mcp server (`POST /v1/mcp`)
 
