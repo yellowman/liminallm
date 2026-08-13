@@ -529,6 +529,38 @@ class TestResponsesUpstreamParity:
         assert completed["usage"]["total_tokens"] == 3
         assert completed["liminallm"]["tool_trace"][0]["tool"] == "file_search"
 
+    def test_chat_completions_usage_keeps_the_rich_keys(self):
+        """Duck-typed like the compat layer itself: getattr is the interface.
+        vLLM's prefix caching and OpenAI both report the details on the chat
+        transport; they must survive into the internal usage shape."""
+        from types import SimpleNamespace
+
+        from liminallm.service.model_backend import ApiAdapterBackend
+
+        rich = SimpleNamespace(
+            prompt_tokens=100,
+            completion_tokens=20,
+            total_tokens=120,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=64),
+            completion_tokens_details=SimpleNamespace(reasoning_tokens=8),
+        )
+        assert ApiAdapterBackend._chat_usage(rich) == {
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+            "cached_tokens": 64,
+            "reasoning_tokens": 8,
+        }
+
+        # No details, no total: parts survive, total falls back to the sum.
+        bare = SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=0)
+        assert ApiAdapterBackend._chat_usage(bare) == {
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "total_tokens": 15,
+        }
+        assert ApiAdapterBackend._chat_usage(None)["total_tokens"] == 0
+
     def test_refusal_part_survives_ingestion(self):
         """Duck-typed on purpose: responses_compat reads SDK objects via
         getattr, so the duck interface IS the real interface here."""

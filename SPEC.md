@@ -1702,11 +1702,14 @@ the caller changes nothing but the base URL.
 - `model` echoes the serving model; `metadata` is bounded (16 keys, 64/512
   chars) and echoed back. `usage` serves everything the turn learned: the
   three totals, plus `input_tokens_details.cached_tokens` and
-  `output_tokens_details.reasoning_tokens` when the upstream reported them
-  (the compat layer carries both through the agent loop; the details objects
-  are always present, zeros when unknown, because typed SDKs require the
-  fields). on `local_lora`/`local_gpu_lora` the counts come from our own
-  tokenizer — real parts and a real total, not zeros.
+  `output_tokens_details.reasoning_tokens` when the upstream reported them —
+  on any ingestion transport: the Responses api, chat.completions
+  (vLLM-style prefix caching reports cached_tokens there), or gemini's
+  usageMetadata. the compat layers carry both through the agent loop, and
+  the details objects are always present, zeros when unknown, because typed
+  SDKs require the fields. on `local_lora`/`local_gpu_lora` the counts come
+  from our own tokenizer — real parts and a real total; cached stays 0
+  truthfully, because the local forward pass keeps no KV state to reuse yet.
 - **server-side tool runs are served, not hidden.** tool activity appears in
   `output` as the dialect's own items — `file_search_call` (with queries)
   and `web_search_call` — and only those: dialect-native types keep typed

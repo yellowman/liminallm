@@ -1108,11 +1108,7 @@ class ApiAdapterBackend:
                 content = ""
             else:
                 content = first_choice.message.content or ""
-            usage = {
-                "prompt_tokens": getattr(completion.usage, "prompt_tokens", 0),
-                "completion_tokens": getattr(completion.usage, "completion_tokens", 0),
-                "total_tokens": getattr(completion.usage, "total_tokens", 0),
-            }
+            usage = self._chat_usage(getattr(completion, "usage", None))
             return {
                 "content": content,
                 "usage": usage,
@@ -1179,6 +1175,40 @@ class ApiAdapterBackend:
         if extra_body:
             kwargs["extra_body"] = extra_body
         return kwargs
+
+    @staticmethod
+    def _chat_usage(usage_obj: Any) -> Dict[str, int]:
+        """chat.completions usage in the internal shape, rich keys included.
+
+        The chat transport names its details differently from Responses
+        (prompt_tokens_details / completion_tokens_details), and both OpenAI
+        and vLLM's prefix caching report cached_tokens there — dropping them
+        silenced exactly the servers the self-hosted lane runs. Same
+        convention as responses_compat.usage_dict: the rich keys ride as
+        flat ints, so the agent loop aggregates them and the served usage
+        details fill themselves in.
+        """
+        prompt = int(getattr(usage_obj, "prompt_tokens", 0) or 0)
+        completion = int(getattr(usage_obj, "completion_tokens", 0) or 0)
+        usage = {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": int(getattr(usage_obj, "total_tokens", 0) or 0)
+            or (prompt + completion),
+        }
+        cached = getattr(
+            getattr(usage_obj, "prompt_tokens_details", None), "cached_tokens", 0
+        )
+        if cached:
+            usage["cached_tokens"] = int(cached)
+        reasoning = getattr(
+            getattr(usage_obj, "completion_tokens_details", None),
+            "reasoning_tokens",
+            0,
+        )
+        if reasoning:
+            usage["reasoning_tokens"] = int(reasoning)
+        return usage
 
     def generate_with_tools(
         self,
@@ -1269,16 +1299,11 @@ class ApiAdapterBackend:
                     for tc in tool_calls
                 ]
         assistant_message.setdefault("role", "assistant")
-        usage_obj = getattr(completion, "usage", None)
         return {
             "content": (getattr(message, "content", None) if message else None) or "",
             "tool_calls": tool_calls,
             "assistant_message": assistant_message,
-            "usage": {
-                "prompt_tokens": getattr(usage_obj, "prompt_tokens", 0),
-                "completion_tokens": getattr(usage_obj, "completion_tokens", 0),
-                "total_tokens": getattr(usage_obj, "total_tokens", 0),
-            },
+            "usage": self._chat_usage(getattr(completion, "usage", None)),
         }
 
     def _stream_via_responses(
@@ -1382,6 +1407,7 @@ class ApiAdapterBackend:
                 full_content = ""
                 prompt_tokens = 0
                 completion_tokens = 0
+                usage_details: Dict[str, int] = {}
 
                 for chunk in stream:
                     choices = getattr(chunk, "choices", None) or []
@@ -1398,6 +1424,11 @@ class ApiAdapterBackend:
                     if hasattr(chunk, "usage") and chunk.usage:
                         prompt_tokens = getattr(chunk.usage, "prompt_tokens", 0)
                         completion_tokens = getattr(chunk.usage, "completion_tokens", completion_tokens)
+                        usage_details = {
+                            key: value
+                            for key, value in self._chat_usage(chunk.usage).items()
+                            if key in ("cached_tokens", "reasoning_tokens")
+                        }
 
                 yield {
                     "event": "message_done",
@@ -1407,6 +1438,7 @@ class ApiAdapterBackend:
                             "prompt_tokens": prompt_tokens,
                             "completion_tokens": completion_tokens,
                             "total_tokens": prompt_tokens + completion_tokens,
+                            **usage_details,
                         },
                         "adapters_applied": processed["applied"],
                     },
