@@ -237,8 +237,17 @@ def scan_for_injection(text: str) -> tuple[str, list[dict[str, str]]]:
 
 
 def neutralize_markers(text: str) -> str:
-    """Stop content from closing the untrusted-data envelope itself."""
+    """Stop content from writing control tokens it must never write.
+
+    Two vocabularies: the untrusted-data envelope, and the local backend's
+    tool-call tags. The local channel parses ``<tool_call>`` blocks out of
+    model OUTPUT only — input never reaches that parser — but a parrot-prone
+    small model is one echo away from carrying a document's block into the
+    output stream, so the tag is defanged in untrusted input the same way the
+    envelope markers are.
+    """
     cleaned = text.replace(UNTRUSTED_OPEN, "[filtered]").replace(UNTRUSTED_CLOSE, "[filtered]")
+    cleaned = re.sub(r"<\s*/?\s*tool_call\s*>", "[filtered]", cleaned, flags=re.IGNORECASE)
     # Any other all-caps <<<MARKER>>> lookalike gets defanged too.
     return re.sub(r"<<<[A-Z0-9_]{3,}>>>", "[filtered]", cleaned)
 

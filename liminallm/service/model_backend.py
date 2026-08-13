@@ -1686,6 +1686,65 @@ class ApiAdapterBackend:
         return augmented
 
 
+# The local tool channel. A raw checkpoint has no second wire, so the channel
+# is a contract the backend enforces: tools are advertised in the prompt, the
+# model emits a <tool_call>{json}</tool_call> block (the de-facto local
+# standard — Qwen and Hermes templates emit exactly this tag), and the backend
+# parses that block out of MODEL OUTPUT ONLY. Input text is never parsed,
+# which is the same property that makes the channel unforgeable by documents
+# at an API provider: a document can spell the tag, but it lands in input,
+# and only the model writes to the output stream.
+TOOL_CALL_OPEN = "<tool_call>"
+TOOL_CALL_CLOSE = "</tool_call>"
+_TOOL_CALL_BLOCK = re.compile(
+    r"<\s*tool_call\s*>\s*(\{.*?\})\s*<\s*/\s*tool_call\s*>",
+    re.IGNORECASE | re.DOTALL,
+)
+# One call per turn is the norm; a handful is a loop being decisive. More is a
+# model looping, and each block is bounded before json.loads sees it.
+MAX_TOOL_CALLS_PER_REPLY = 4
+MAX_TOOL_CALL_CHARS = 10_000
+
+
+def extract_tool_calls(completion: str) -> Tuple[str, List[Dict[str, str]]]:
+    """Split a completion into (content, tool_calls) per the local contract.
+
+    Only well-formed blocks become calls — a JSON object with a string name
+    and a dict of arguments, inside the size bound. A malformed block stays in
+    the content as ordinary text, where downstream treats it as prose; turning
+    almost-JSON into a guessed call would be the reranker's digit-harvesting
+    mistake wearing a new tag. Calls keep the provider dict shape (id, name,
+    arguments as a JSON string) so consumers cannot tell the transports apart.
+    """
+    calls: List[Dict[str, str]] = []
+
+    def swallow(match: re.Match) -> str:
+        raw = match.group(1)
+        if len(calls) >= MAX_TOOL_CALLS_PER_REPLY or len(raw) > MAX_TOOL_CALL_CHARS:
+            return match.group(0)
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            return match.group(0)
+        if not isinstance(payload, dict):
+            return match.group(0)
+        name = payload.get("name")
+        arguments = payload.get("arguments")
+        if not isinstance(name, str) or not name or not isinstance(arguments, dict):
+            return match.group(0)
+        calls.append(
+            {
+                "id": f"local-{len(calls) + 1}",
+                "name": name,
+                "arguments": json.dumps(arguments),
+            }
+        )
+        return " "
+
+    content = _TOOL_CALL_BLOCK.sub(swallow, completion or "")
+    return content.strip(), calls
+
+
 class LocalJaxLoRABackend:
     """Backend for local JAX generation with filesystem-backed LoRA adapters.
 
@@ -2186,6 +2245,90 @@ class LocalJaxLoRABackend:
                 "event": "error",
                 "data": {"code": "server_error", "message": str(exc)},
             }
+
+    @property
+    def supports_tools(self) -> bool:
+        """True: the channel is this backend's contract, not the checkpoint's habit.
+
+        Advertise-then-parse works for any checkpoint; whether a given model
+        actually emits the block is behaviour, and behaviour is visible where
+        it belongs — consumers log transport="text" when a verdict arrived as
+        prose. Side-effect free on purpose: reading a capability flag must not
+        load a tokenizer or touch JAX.
+        """
+        return True
+
+    def _tool_contract(self, tools: List[dict]) -> str:
+        """The system block that advertises tools and names the emission format."""
+        specs = []
+        for tool in tools or []:
+            function = tool.get("function") if isinstance(tool, dict) else None
+            if isinstance(function, dict):
+                specs.append(
+                    json.dumps(
+                        {
+                            "name": function.get("name"),
+                            "description": function.get("description"),
+                            "parameters": function.get("parameters"),
+                        },
+                        separators=(",", ":"),
+                    )
+                )
+        return (
+            "You can call tools. Tools available (JSON Schema):\n"
+            + "\n".join(specs)
+            + "\nTo call one, reply with exactly one line:\n"
+            + TOOL_CALL_OPEN
+            + '{"name": "<tool name>", "arguments": {<parameters>}}'
+            + TOOL_CALL_CLOSE
+            + "\nOnly that block is a call. Never invent tool names. "
+            "Otherwise answer normally."
+        )
+
+    def generate_with_tools(
+        self,
+        messages: List[dict],
+        tools: List[dict],
+        adapters: List[dict],
+        *,
+        user_id: Optional[str] = None,
+    ) -> dict:
+        """One tool-calling turn over the local forward pass.
+
+        Same dict shape as the API backend — content, tool_calls with
+        arguments as a JSON string, assistant_message, usage — so nothing
+        downstream can tell the transports apart. The contract that keeps the
+        channel honest lives in one line: ``extract_tool_calls`` reads the
+        COMPLETION and never the prompt, so input text — a chunk, a fetched
+        page, a pasted document — cannot write to the tool channel. Only the
+        model's own output tokens can.
+        """
+        augmented = list(messages or [])
+        if tools:
+            augmented = [
+                {"role": "system", "content": self._tool_contract(tools)}
+            ] + augmented
+        result = self.generate(augmented, adapters, user_id=user_id)
+        content, tool_calls = extract_tool_calls(str(result.get("content") or ""))
+        assistant_message: Dict[str, Any] = {"role": "assistant", "content": content}
+        if tool_calls:
+            assistant_message["tool_calls"] = [
+                {
+                    "id": call["id"],
+                    "type": "function",
+                    "function": {
+                        "name": call["name"],
+                        "arguments": call["arguments"],
+                    },
+                }
+                for call in tool_calls
+            ]
+        return {
+            "content": content,
+            "tool_calls": tool_calls,
+            "assistant_message": assistant_message,
+            "usage": result.get("usage", {}),
+        }
 
     def _blend_adapter_weights(
         self, adapters: List[dict], user_id: Optional[str]
