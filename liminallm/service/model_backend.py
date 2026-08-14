@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import re
+import threading
 import time
 from enum import Enum
 from pathlib import Path
@@ -16,7 +17,7 @@ from liminallm.config import (
     get_provider_capabilities,
 )
 from liminallm.logging import get_logger
-from liminallm.service import responses_compat
+from liminallm.service import responses_compat, transformer
 from liminallm.service.fs import safe_join
 from liminallm.service.prompt_utils import extract_prompt_instructions
 from liminallm.service.tokenizer_utils import (
@@ -1777,6 +1778,13 @@ def extract_tool_calls(completion: str) -> Tuple[str, List[Dict[str, str]]]:
     return content.strip(), calls
 
 
+def _is_prefix(shorter: Tuple[int, ...], longer: Tuple[int, ...]) -> bool:
+    """Whether ``shorter`` is a leading run of ``longer`` (superseded entry)."""
+    return len(shorter) <= len(longer) and transformer.prefix_length(
+        shorter, longer
+    ) == len(shorter)
+
+
 class LocalJaxLoRABackend:
     """Backend for local JAX generation with filesystem-backed LoRA adapters.
 
@@ -1802,12 +1810,30 @@ class LocalJaxLoRABackend:
         *,
         max_seq_len: int = 512,
         max_batch_size: int = 4,
+        max_new_tokens: int = 256,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        max_cached_tokens: int = 8192,
     ) -> None:
         self.base_model = base_model
         self.fs_root = Path(fs_root)
         self.mode = "local_lora"
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
+        self.max_new_tokens = max_new_tokens
+        # Greedy by default: a kernel that cannot reproduce its own output is
+        # one nobody can debug. Operators opt into sampling explicitly.
+        self.temperature = temperature
+        self.top_p = top_p
+        self.max_cached_tokens = max_cached_tokens
+        self._model_state: Optional[Tuple[Any, Dict[str, Any]]] = None
+        self._model_error: Optional[str] = None
+        self._vocab_mismatch_logged = False
+        # Content-addressed KV prefix cache: entries are (adapter signature,
+        # token tuple, kv cache). A conversation's next turn re-sends this
+        # turn verbatim, so the reusable prefix is usually the whole history.
+        self._prefix_cache: List[Tuple[str, Tuple[int, ...], Any]] = []
+        self._prefix_lock = threading.Lock()
         # The checkpoint's config states its trained positions; max_seq_len is
         # the serving cap. The window is whichever is smaller and known.
         discovered = context_window_from_model_dir(base_model)
@@ -1866,6 +1892,13 @@ class LocalJaxLoRABackend:
             )
 
     def _vocab_size(self) -> int:
+        if self._model_state is not None:
+            # A loaded checkpoint is authoritative: its embedding table
+            # defines the only ids that mean anything, and the tokenizer
+            # fallback must land inside it. Deriving this from the default
+            # instead let every out-of-range word clamp to the same id, so
+            # different prompts became identical input to the model.
+            return self._model_state[0].vocab_size
         if isinstance(self._adapter_vocab_size, int) and self._adapter_vocab_size > 0:
             return self._adapter_vocab_size
         self._ensure_tokenizer()
@@ -2049,6 +2082,11 @@ class LocalJaxLoRABackend:
             for k, v in weights_raw.items()
         }
         self._adapter_cache[adapter_id] = (mtime, weights)
+        # Reaching here means these weights were read from disk rather than
+        # served from the cache, so any KV state computed under the previous
+        # copy is stale. This is what makes the id+version cache key safe
+        # against an in-place edit that never bumped a version.
+        self._invalidate_prefix_cache()
         return weights
 
     def _resolve_params_path(
@@ -2166,6 +2204,201 @@ class LocalJaxLoRABackend:
                 )
         return " ".join([f"tok-{tid}" for tid in token_ids])
 
+    def _ensure_model(self) -> None:
+        """Load the frozen base checkpoint once, or record why we cannot.
+
+        Absence is not an error: a dev box or CI has no multi-gigabyte
+        weights, and the synthetic path still exercises the plumbing. It is
+        logged at warning once, because a production box silently answering
+        from the stand-in is the failure this note exists to prevent.
+        """
+        if self._model_state is not None or self._model_error is not None:
+            return
+        if not transformer.checkpoint_available(self.base_model):
+            self._model_error = "no checkpoint at base_model path"
+            logger.warning(
+                "local_checkpoint_absent",
+                base_model=self.base_model,
+                detail="serving the synthetic stand-in; answers are not model output",
+            )
+            return
+        try:
+            config, params = transformer.load_checkpoint(self.base_model)
+            self._ensure_jax()
+            self._model_state = (config, self._jax.device_put(params, self._device))
+        except Exception as exc:  # noqa: BLE001 - degrade to the stand-in
+            self._model_error = str(exc)
+            logger.error(
+                "local_checkpoint_load_failed",
+                base_model=self.base_model,
+                error=str(exc),
+            )
+
+    @staticmethod
+    def _adapter_signature(adapters: List[dict]) -> str:
+        """Identity of the LoRA stack, for keying cached KV state.
+
+        Version dirs are immutable (SPEC §5.2), so id+version identifies the
+        weights; an in-place edit is caught separately, by clearing the cache
+        whenever adapter weights actually reload.
+        """
+        parts = sorted(
+            f"{a.get('id')}:{a.get('current_version') or a.get('version') or ''}"
+            for a in adapters or []
+            if isinstance(a, dict)
+        )
+        return "|".join(parts) or "base"
+
+    def _invalidate_prefix_cache(self) -> None:
+        with self._prefix_lock:
+            self._prefix_cache.clear()
+
+    def _truncate_cache(self, cache, length: int):
+        return [(k[:, :length], v[:, :length]) for k, v in cache]
+
+    def _reuse_prefix(self, signature: str, ids: List[int]):
+        """The longest cached KV state that is a strict prefix of ``ids``.
+
+        Strict prefix, not "close enough": reusing keys computed for
+        different tokens would silently answer from a history the user never
+        wrote. Returns (cache, reused_token_count).
+        """
+        best_cache, best_length = None, 0
+        with self._prefix_lock:
+            for index, (sig, tokens, cache) in enumerate(self._prefix_cache):
+                if sig != signature:
+                    continue
+                shared = transformer.prefix_length(tokens, ids)
+                # The cache must correspond exactly to the tokens it covers,
+                # so only a whole stored entry (or a prefix of one) is usable.
+                if shared > best_length:
+                    best_cache, best_length = cache, shared
+                    self._prefix_cache.append(self._prefix_cache.pop(index))
+            if best_cache is not None and best_length < int(
+                best_cache[0][0].shape[1]
+            ):
+                best_cache = self._truncate_cache(best_cache, best_length)
+        return best_cache, best_length
+
+    def _store_prefix(self, signature: str, tokens: List[int], cache) -> None:
+        """Keep this turn's KV for the next one, within a token budget."""
+        entry = (signature, tuple(tokens), cache)
+        with self._prefix_lock:
+            self._prefix_cache = [
+                item
+                for item in self._prefix_cache
+                if not (item[0] == signature and _is_prefix(item[1], entry[1]))
+            ]
+            self._prefix_cache.append(entry)
+            total = sum(len(item[1]) for item in self._prefix_cache)
+            while total > self.max_cached_tokens and len(self._prefix_cache) > 1:
+                total -= len(self._prefix_cache.pop(0)[1])
+
+    def _eos_token_id(self) -> Optional[int]:
+        self._ensure_tokenizer()
+        value = getattr(self._tokenizer, "eos_token_id", None)
+        return int(value) if isinstance(value, int) else None
+
+    def _generate_real(
+        self, ids: List[int], adapters: List[dict], *, user_id: Optional[str]
+    ) -> dict:
+        """Prefill and decode against the real forward pass, with KV reuse."""
+        config, params = self._model_state
+        jnp, jax = self._jnp, self._jax
+        weights = (
+            self._blend_adapter_weights(adapters, user_id=user_id) if adapters else {}
+        )
+        lora = transformer.lora_by_layer(jnp, weights, config.num_layers)
+        signature = self._adapter_signature(adapters)
+
+        window = max(2, min(self.context_window, self.max_seq_len))
+        if len(ids) > window - 1:
+            # Keep the tail: the newest turn matters more than the oldest.
+            ids = ids[-(window - 1) :]
+
+        if ids and max(ids) >= config.vocab_size:
+            # The tokenizer and the checkpoint disagree — a configuration
+            # error, not a request error. JAX would clamp the index silently
+            # and answer from the wrong embeddings, so say it out loud (once)
+            # and clamp deliberately rather than serve a quiet lie.
+            if not self._vocab_mismatch_logged:
+                self._vocab_mismatch_logged = True
+                logger.error(
+                    "local_tokenizer_vocab_mismatch",
+                    base_model=self.base_model,
+                    tokenizer_vocab=self._vocab_size(),
+                    checkpoint_vocab=config.vocab_size,
+                )
+            ids = [min(token, config.vocab_size - 1) for token in ids]
+
+        start = time.perf_counter()
+        cache, cached_tokens = self._reuse_prefix(signature, ids)
+        if cached_tokens >= len(ids):
+            # Fully cached: step back one token so there is something to run
+            # and therefore logits to sample from.
+            cached_tokens = len(ids) - 1
+            cache = self._truncate_cache(cache, cached_tokens)
+        if cached_tokens <= 0:
+            cache, cached_tokens = None, 0
+
+        logits, cache = transformer.forward(
+            jnp,
+            config,
+            params,
+            jnp.array([ids[cached_tokens:]], dtype=jnp.int32),
+            cache=cache,
+            lora=lora,
+        )
+        eos = self._eos_token_id()
+        budget = max(0, min(self.max_new_tokens, window - len(ids)))
+        generated: List[int] = []
+        sequence = list(ids)
+        for _ in range(budget):
+            if self.temperature > 0.0:
+                self._rng, key = jax.random.split(self._rng)
+            else:
+                key = self._rng
+            token = transformer.sample_token(
+                jax,
+                jnp,
+                logits[0, -1],
+                key,
+                temperature=self.temperature,
+                top_p=self.top_p,
+            )
+            if eos is not None and token == eos:
+                break
+            generated.append(token)
+            sequence.append(token)
+            logits, cache = transformer.forward(
+                jnp,
+                config,
+                params,
+                jnp.array([[token]], dtype=jnp.int32),
+                cache=cache,
+                lora=lora,
+            )
+        self._store_prefix(signature, sequence, cache)
+        duration = time.perf_counter() - start
+        usage = {
+            "prompt_tokens": len(ids),
+            "completion_tokens": len(generated),
+            "total_tokens": len(ids) + len(generated),
+            "model": self.base_model,
+            "adapter_id": (
+                ",".join(str(a.get("id")) for a in adapters if a.get("id"))
+                if adapters
+                else None
+            ),
+            "latency_ms": round(duration * 1000, 2),
+        }
+        if cached_tokens:
+            # Reused prefill, reported the way every other transport reports
+            # it — so input_tokens_details.cached_tokens fills in on the
+            # served surface with no consumer change.
+            usage["cached_tokens"] = cached_tokens
+        return {"content": self._decode(generated), "usage": usage}
+
     def _sample_tokens(self, lora_scores, seed_token: int) -> List[int]:
         vocab = self._vocab_size()
         score = float(self._jnp.mean(lora_scores)) if lora_scores.size else 0.0
@@ -2187,6 +2420,9 @@ class LocalJaxLoRABackend:
         prompt = self._normalize_messages(messages)
         adapter = adapters[0] if adapters else {}
         self._apply_adapter_vocab_size(adapter)
+        # Before tokenizing, not after: the checkpoint's vocabulary governs
+        # what a token id may be, including in the hash fallback.
+        self._ensure_model()
         ids, attention = self._tokenize(prompt)
 
         # Handle empty prompts gracefully
@@ -2201,6 +2437,12 @@ class LocalJaxLoRABackend:
                     "latency_ms": 0.0,
                 },
             }
+
+        if self._model_state is not None:
+            # The real forward pass takes the tokens as they are: padding
+            # would feed the model tokens the user never wrote, and the
+            # causal mask here covers one unpadded sequence.
+            return self._generate_real(ids, adapters, user_id=user_id)
 
         ids, attention = self._pad_batch(ids, attention)
         if len(ids) > self.max_seq_len:

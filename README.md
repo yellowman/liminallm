@@ -118,6 +118,8 @@ Router Updates ← Eval Gate ← Adapter Training ← Prompt-Mode Skill
 - **language / runtime**
   - python (services, api, orchestration)
   - jax + optax (base model, lora training, eval gates) — install with `pip install -e ".[train]"`
+  - the local serving path is a real plain-jax decoder — rmsnorm, rope, grouped-query attention with a kv cache, swiglu — loading `config.json` + `*.safetensors` straight from the model directory (no torch, no flax). incremental decode is tested to reproduce a full recompute, and a lora adapter at `B=0` is tested to change nothing. with no checkpoint on disk it falls back to a synthetic stand-in and says so in the log — that path moves tokens, it does not answer questions. note the training loop still trains against that stand-in, so locally-trained adapters are refused whole by serving rather than half-applied; training against the real forward pass is the next step in this lane.
+  - conversations reuse their own kv prefix across turns (content-addressed, adapter-keyed, strict-prefix only), so the reused prefill shows up honestly as `cached_tokens` in usage
   - remote multi-lora servers (lorax / vllm-style, openai-compatible) as an optional scale-out serving path; same artifacts, config change only
 
 - **storage**

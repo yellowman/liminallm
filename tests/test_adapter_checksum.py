@@ -16,17 +16,16 @@ class TestAdapterChecksumValidation:
 
     @pytest.fixture
     def mock_backend(self, tmp_path):
-        """Create a LocalJaxLoRABackend for testing."""
+        """A real LocalJaxLoRABackend.
+
+        This used to be built with ``__new__`` and hand-set attributes, which
+        made it a record of what the test believed the backend held. It fell
+        over the moment the class gained state (the KV prefix cache and its
+        lock) — the exact failure mode a real construction cannot have.
+        """
         from liminallm.service.model_backend import LocalJaxLoRABackend
 
-        backend = LocalJaxLoRABackend.__new__(LocalJaxLoRABackend)
-        backend._fs_root = str(tmp_path)
-        backend.base_model = "test-model"
-        backend._adapter_cache = {}
-        backend._jnp = None
-        backend._jax = None
-        backend._vocab_size = 32000
-        return backend
+        return LocalJaxLoRABackend("test-model", str(tmp_path))
 
     @pytest.fixture
     def valid_weights(self):

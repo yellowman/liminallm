@@ -752,10 +752,30 @@ when using API backend:
 
 ### 5.1 base model
 
-- JAX/Flax implementation of a decoder-only transformer:
-  - config + params loaded from `/shared/models/base_lm_v1`.
-- base model **frozen**:
-  - no gradient / updates on base weights.
+- plain-JAX implementation of a decoder-only transformer
+  (`liminallm/service/transformer.py`): RMSNorm, RoPE, grouped-query
+  attention with a KV cache, SwiGLU MLP — the llama/qwen family shape, which
+  is what an HF-layout checkout on disk actually contains.
+- config + params loaded from the `model_path` directory: `config.json` plus
+  `*.safetensors` shards, read framework-neutrally (no torch, no flax). a
+  missing tensor **raises**: a half-loaded model answers confidently and
+  wrongly, which is worse than not starting.
+- base model **frozen**: no gradient / updates on base weights.
+- **serving invariants, pinned by tests** — incremental decode with the KV
+  cache reproduces a full recompute; attention is causal; a LoRA adapter with
+  `B = 0` (how every adapter initializes) changes not one logit; and a warm
+  prefix cache produces byte-identical output to a cold one.
+- **when no checkpoint is present** (a dev box, CI) the lane falls back to the
+  synthetic stand-in it used to run always — a sinusoidal embedding table
+  with no attention — and logs `local_checkpoint_absent` at warning. that path
+  exercises the plumbing; it does not answer questions, and the log exists so
+  a production box cannot serve it quietly.
+- **known gap, stated rather than implied**: the *training* loop
+  (`service/training.py`) still trains LoRA against that same synthetic table,
+  so adapters it produces do not match the serving matrices and are refused
+  whole (`lora_weights_unmatched`) rather than half-applied. training against
+  the real forward pass is the next step in this lane; until it lands, the
+  adapter ladder is real end-to-end only on the API backends.
 
 ### 5.2 lora parameterization
 
@@ -765,6 +785,12 @@ for each hooked weight matrix `W ∈ ℝ^{d_out × d_in}`:
   - `A_j ∈ ℝ^{r × d_in}`
   - `B_j ∈ ℝ^{d_out × r}`
   - scale `α_j` (scalar or per-matrix)
+- **naming, because serving matches on it**: matrices are keyed
+  `layers.{i}.{target}.{A|B}` with `target ∈ {attn_q, attn_k, attn_v,
+  attn_o}` and an optional `layers.{i}.{target}.scale`. names outside that
+  shape are counted and logged, never partially applied — an adapter trained
+  for a different architecture must fail visibly rather than land on half its
+  projections.
 - effective weight for given adapter gate weight `g_j`:
 
 \[
@@ -822,6 +848,34 @@ for performance:
   5. stream tokens back to orchestrator.
      - protocol: Server-Sent Events (text/event-stream) or WebSocket frames `{ "event": "token", "data": "..." }`.
      - final frame contains usage stats and adapter gates actually applied.
+
+#### KV prefix cache (local lane)
+
+a chat turn re-sends the whole conversation, so turn *N*'s prompt is a strict
+prefix of turn *N+1*'s. the local backend exploits exactly that, and nothing
+looser:
+
+- **content-addressed, not conversation-keyed.** entries are
+  `(adapter signature, token tuple, kv state)`; a lookup takes the longest
+  stored entry that is a **strict token prefix** of the incoming prompt and
+  truncates its KV to that length. no conversation id is plumbed anywhere,
+  so the cache cannot mistake one thread for another — only identical tokens
+  match.
+- **why strict.** reusing keys computed for different tokens would answer
+  from a history the user never wrote. the shared-prefix count is the only
+  thing reused; the divergent tail is always recomputed.
+- **adapter-keyed twice over.** the signature is adapter id + version (version
+  dirs are immutable), and any actual reload of adapter weights from disk
+  clears the cache outright — which closes the case of an in-place edit that
+  never bumped a version.
+- **bounded.** total cached tokens are capped (`max_cached_tokens`), evicted
+  LRU; an entry superseded by a longer one that extends it is dropped rather
+  than kept twice.
+- **reported, not estimated.** the reused prefix length is `cached_tokens` in
+  usage, which surfaces as `input_tokens_details.cached_tokens` on the served
+  Responses api (§13.1) — the same field a provider's own prefix cache fills.
+- a fully cached prompt still runs its final token, because logits to sample
+  from have to come from somewhere.
 
 initial minimal version:
 
@@ -1708,8 +1762,8 @@ the caller changes nothing but the base URL.
   usageMetadata. the compat layers carry both through the agent loop, and
   the details objects are always present, zeros when unknown, because typed
   SDKs require the fields. on `local_lora`/`local_gpu_lora` the counts come
-  from our own tokenizer — real parts and a real total; cached stays 0
-  truthfully, because the local forward pass keeps no KV state to reuse yet.
+  from our own tokenizer, and `cached_tokens` is the KV prefix the local
+  backend genuinely reused this turn (§5.3) — earned, not estimated.
 - **server-side tool runs are served, not hidden.** tool activity appears in
   `output` as the dialect's own items — `file_search_call` (with queries)
   and `web_search_call` — and only those: dialect-native types keep typed

@@ -38,6 +38,9 @@ train = [
   "jax>=0.4.30",
   "optax>=0.2",
   "transformers>=4.40",
+  # Reads the base checkpoint's shards framework-neutrally (numpy in, no
+  # torch), which is how serving loads weights without a second runtime.
+  "safetensors>=0.4",
 ]
 dev = [
   "pytest>=8.0",
