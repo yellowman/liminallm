@@ -223,30 +223,36 @@ class TestAdapterChecksumValidation:
         assert weights == {}
 
     def test_cache_hit_skips_checksum(self, mock_backend, tmp_path, valid_weights):
-        """Cached weights skip checksum verification."""
+        """A cache hit serves without re-verifying the checksum.
+
+        This used to hand-write the cache key, which encoded the internal key
+        format into the test — and broke when the key became
+        (adapter_id, version) as SPEC §5.3 declares. It now warms the cache
+        through the real load path and proves the hit by rewriting the file
+        with content that would fail verification: if the second call read
+        from disk it would raise.
+        """
+        import os
+
         adapter_dir, checksum = self.create_adapter_file(tmp_path, valid_weights)
         params_path = adapter_dir / "params.json"
-
-        adapter = {
-            "id": "test-adapter",
-            "checksum": checksum,
-        }
-
-        # Pre-populate cache
-        cached_weights = {"cached": True}
-        mock_backend._adapter_cache["test-adapter"] = (
-            params_path.stat().st_mtime,
-            cached_weights,
-        )
+        adapter = {"id": "test-adapter", "checksum": checksum}
 
         with patch.object(mock_backend, "_adapter_path", return_value=str(adapter_dir)):
             with patch.object(
                 mock_backend, "_resolve_params_path", return_value=params_path
             ):
-                weights = mock_backend._load_adapter_weights(adapter)
+                first = mock_backend._load_adapter_weights(adapter)
+                assert first, "the first load should have populated the cache"
 
-                # Should return cached weights
-                assert weights == cached_weights
+                # Same mtime, different bytes: only a cache hit can survive it.
+                stat = params_path.stat()
+                params_path.write_bytes(json.dumps({"tampered": [[9.0]]}).encode())
+                os.utime(params_path, (stat.st_atime, stat.st_mtime))
+
+                second = mock_backend._load_adapter_weights(adapter)
+                assert set(second) == set(first)
+                assert "tampered" not in second
 
     def test_modified_file_invalidates_cache(
         self, mock_backend, tmp_path, valid_weights

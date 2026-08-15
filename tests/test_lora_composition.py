@@ -314,6 +314,61 @@ class TestSftSequenceConstruction:
         service._tokenizer_error = None
         return service
 
+    def test_truncation_keeps_the_newest_prompt_context(self, tmp_path):
+        """The *newest* turn must survive, not the oldest.
+
+        The tokenizer was previously asked to truncate first, and tokenizers
+        truncate from the right — so a long prompt was already reduced to its
+        oldest tokens before the deliberate "keep the tail" slice ran, which
+        could then only pick among tokens that had lost the recent context.
+        This tokenizer does not truncate at all, so the code under test has to
+        do it correctly itself.
+        """
+
+        class HonestTokenizer:
+            """Never truncates: truncation is the caller's decision."""
+
+            def encode(self, text, truncation=False, add_special_tokens=True, **kw):
+                mapping = {"EARLY": 40, "LATEST": 41, "ANSWER": 42}
+                ids = [mapping.get(word, 7) for word in text.split()]
+                return ([1] + ids) if add_special_tokens else ids
+
+        service = self._service(tmp_path, HonestTokenizer())
+        prompt = "EARLY " + ("filler " * 300) + "LATEST"
+        entries = [{"prompt": prompt, "target": "ANSWER"}]
+        (batch,) = list(service._tokenize_batches(entries, batch_size=1, max_length=32))
+
+        sequence = batch["input_ids"][0] + [batch["labels"][0][-1]]
+        assert 41 in sequence, "the newest prompt context was truncated away"
+        assert 40 not in sequence, "the oldest context should have been trimmed"
+        assert sum(batch["attention_mask"][0]) > 0
+
+    def test_an_empty_target_is_dropped_not_invented(self, tmp_path):
+        """`or [0]` turned a missing correction into supervision teaching the
+        model to emit token 0 — with positive mask weight, so no later
+        zero-mask check could catch it."""
+
+        class WordTokenizer:
+            def encode(self, text, truncation=False, add_special_tokens=True, **kw):
+                ids = [(len(word) % 30) + 2 for word in text.split()]
+                return ([1] + ids) if add_special_tokens else ids
+
+        service = self._service(tmp_path, WordTokenizer())
+        entries = [
+            {"prompt": "a question", "target": ""},
+            {"prompt": "another question", "target": "   "},
+        ]
+        assert list(service._tokenize_batches(entries, batch_size=2, max_length=32)) == []
+
+        # A real target alongside an empty one keeps only the real one.
+        mixed = [
+            {"prompt": "a question", "target": ""},
+            {"prompt": "another question", "target": "real answer"},
+        ]
+        (batch,) = list(service._tokenize_batches(mixed, batch_size=2, max_length=32))
+        assert batch["shape"]["batch"] == 2  # the source batch size
+        assert len(batch["input_ids"]) == 1  # but only one usable example
+
     def test_a_long_prompt_never_erases_the_target(self, tmp_path):
         """Slicing the head of prompt+target could drop the whole target,
         leaving an all-zero mask: a zero loss that reads as a perfect

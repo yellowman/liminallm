@@ -1395,11 +1395,22 @@ class WorkflowEngine(WorkflowStreamingMixin):
             user_id=user_id,
         )
         gates = routing.get("adapters", []) if isinstance(routing, dict) else []
-        activated_ids = [gate.get("id", "") for gate in gates if gate.get("id")]
         candidate_lookup = {c.get("id"): c for c in candidates if c.get("id")}
-        activated_adapters = [
-            candidate_lookup[a_id] for a_id in activated_ids if a_id in candidate_lookup
-        ]
+        # The gate travels ON the adapter, not beside it. `gates` used to be
+        # returned for tracing only while the activated adapters were rebuilt
+        # from the candidate list, dropping every weight the router had just
+        # computed — so composition (SPEC §5.2) silently ran every adapter at
+        # 1.0 no matter what the policy decided.
+        activated_adapters = []
+        for gate in gates:
+            adapter_id = gate.get("id") or ""
+            candidate = candidate_lookup.get(adapter_id)
+            if candidate is None:
+                continue
+            weight = gate.get("weight")
+            activated_adapters.append(
+                {**candidate, "weight": 1.0 if weight is None else weight}
+            )
         return (
             activated_adapters,
             routing.get("trace", []) if isinstance(routing, dict) else [],

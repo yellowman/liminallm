@@ -2038,7 +2038,12 @@ class LocalJaxLoRABackend:
         if not params_path:
             return {}
         mtime = params_path.stat().st_mtime
-        cached = self._adapter_cache.get(adapter_id)
+        # Keyed by (adapter_id, version) as SPEC §5.3 declares, not by id
+        # alone: two versions of one adapter are different weights, and an id
+        # -only key made the mtime check the sole thing keeping a promotion
+        # from serving its predecessor's tensors.
+        cache_key = f"{adapter_id}:{current_version if current_version is not None else ''}"
+        cached = self._adapter_cache.get(cache_key)
         if cached and cached[0] == mtime:
             return cached[1]
         payload = params_path.read_bytes()
@@ -2081,7 +2086,7 @@ class LocalJaxLoRABackend:
             k: self._jnp.array(v, dtype=self._jnp.float32)
             for k, v in weights_raw.items()
         }
-        self._adapter_cache[adapter_id] = (mtime, weights)
+        self._adapter_cache[cache_key] = (mtime, weights)
         # Reaching here means these weights were read from disk rather than
         # served from the cache, so any KV state computed under the previous
         # copy is stale. This is what makes the id+version cache key safe
@@ -2248,16 +2253,26 @@ class LocalJaxLoRABackend:
                 error=str(exc),
             )
 
-    @staticmethod
-    def _adapter_signature(adapters: List[dict]) -> str:
-        """Identity of the LoRA stack, for keying cached KV state.
+    def _adapter_signature(self, adapters: List[dict]) -> str:
+        """Identity of the *effective* LoRA stack, for keying cached KV state.
 
         Version dirs are immutable (SPEC §5.2), so id+version identifies the
         weights; an in-place edit is caught separately, by clearing the cache
         whenever adapter weights actually reload.
+
+        The gate belongs in the key too, and did not use to be: gates are
+        per-request (§5.3), so the same adapter at 0.2 and at 0.8 is a
+        different effective model, and every cached K/V tensor was computed
+        under one of them. Keying on id+version alone would let a 0.2 request
+        continue a prefix computed at 0.8 — the cheapest possible way to
+        serve a model nobody asked for.
         """
         parts = sorted(
-            f"{a.get('id')}:{a.get('current_version') or a.get('version') or ''}"
+            "{}:{}:{:.6f}".format(
+                a.get("id"),
+                a.get("current_version") or a.get("version") or "",
+                self._gate_weight_of(a),
+            )
             for a in adapters or []
             if isinstance(a, dict)
         )
@@ -2330,11 +2345,16 @@ class LocalJaxLoRABackend:
             # Keep the tail: the newest turn matters more than the oldest.
             ids = ids[-(window - 1) :]
 
-        if ids and max(ids) >= config.vocab_size:
+        if ids and (max(ids) >= config.vocab_size or min(ids) < 0):
             # The tokenizer and the checkpoint disagree — a configuration
-            # error, not a request error. JAX would clamp the index silently
-            # and answer from the wrong embeddings, so say it out loud (once)
-            # and clamp deliberately rather than serve a quiet lie.
+            # error, not a request error. This used to clamp the id into
+            # range, which is the same "fold it into a token the user never
+            # wrote" that training refuses; answering from an arbitrary
+            # embedding is worse than not answering. Refuse the real model
+            # for the rest of this process and log it once: the documented
+            # stand-in path is at least honest about what it is.
+            self._model_state = None
+            self._model_error = "tokenizer and checkpoint disagree on vocabulary"
             if not self._vocab_mismatch_logged:
                 self._vocab_mismatch_logged = True
                 logger.error(
@@ -2342,8 +2362,13 @@ class LocalJaxLoRABackend:
                     base_model=self.base_model,
                     tokenizer_vocab=self._vocab_size(),
                     checkpoint_vocab=config.vocab_size,
+                    observed=[min(ids), max(ids)],
                 )
-            ids = [min(token, config.vocab_size - 1) for token in ids]
+            self._invalidate_prefix_cache()
+            raise ValueError(
+                "local model refused: tokenizer produced ids outside the "
+                f"checkpoint vocabulary ({config.vocab_size})"
+            )
 
         start = time.perf_counter()
         cache, cached_tokens = self._reuse_prefix(signature, ids)
@@ -2680,12 +2705,13 @@ class LocalJaxLoRABackend:
                 key = name[: -len(".A")]
                 b_tensor = weights.get(f"{key}.B")
                 if b_tensor is None:
-                    logger.warning(
-                        "adapter_missing_b_matrix",
-                        adapter_id=adapter.get("id"),
-                        name=name,
+                    # Half a LoRA pair is not a smaller LoRA, it is a broken
+                    # one. SPEC §5.2 refuses partial application, so the whole
+                    # stack is refused rather than the rest quietly applied.
+                    raise ValueError(
+                        f"adapter {adapter.get('id')!r} has {name} without its "
+                        f"matching {key}.B; refusing the adapter stack"
                     )
-                    continue
                 # α from the adapter's own params (SPEC §5.2 allows a
                 # per-matrix scale); folded into B together with the gate so
                 # the concatenation identity above holds exactly.
@@ -2700,17 +2726,20 @@ class LocalJaxLoRABackend:
             if len(parts) == 1:
                 a_matrix, b_matrix = parts[0]
             else:
-                widths = {a.shape[1] for a, _ in parts} | {b.shape[0] for _, b in parts}
-                if len({a.shape[1] for a, _ in parts}) > 1 or len(
-                    {b.shape[0] for _, b in parts}
-                ) > 1:
-                    logger.warning(
-                        "adapter_shape_mismatch", name=key, widths=sorted(widths)
+                # Concatenation needs every contribution to project the same
+                # space. Dropping the odd one out and applying the rest is
+                # precisely the partial application SPEC §5.2 forbids — the
+                # request would be served by a stack the router never chose.
+                in_widths = {a.shape[1] for a, _ in parts}
+                out_widths = {b.shape[0] for _, b in parts}
+                if len(in_widths) > 1 or len(out_widths) > 1:
+                    raise ValueError(
+                        f"adapters disagree on the shape of {key}: inputs "
+                        f"{sorted(in_widths)}, outputs {sorted(out_widths)}; "
+                        "refusing the adapter stack"
                     )
-                    a_matrix, b_matrix = parts[0]
-                else:
-                    a_matrix = self._jnp.concatenate([a for a, _ in parts], axis=0)
-                    b_matrix = self._jnp.concatenate([b for _, b in parts], axis=1)
+                a_matrix = self._jnp.concatenate([a for a, _ in parts], axis=0)
+                b_matrix = self._jnp.concatenate([b for _, b in parts], axis=1)
             combined[f"{key}.A"] = a_matrix
             combined[f"{key}.B"] = b_matrix
         return combined

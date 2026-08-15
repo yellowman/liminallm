@@ -841,6 +841,13 @@ of the sum. ranks may differ between adapters; concatenation needs no padding.
 a gate of 0 contributes nothing rather than being normalized back into
 existence.
 
+**composition refuses rather than partially applies.** an `A` without its
+matching `B`, or adapters that disagree on a projection's dimensions, raise
+and refuse the whole stack. dropping the odd contribution and applying the
+rest serves the request with a stack the router never chose, which is the
+partial application this section forbids one paragraph above — logging it and
+continuing is still doing it.
+
 for performance:
 
 - restrict LoRA to:
@@ -855,7 +862,16 @@ for performance:
 
   1. determine active adapters & gate weights (`adapter_ids`, `gate_weights`).
   2. load corresponding LoRA parameter PyTrees from the shared filesystem (cache hot ones in RAM).
-     - cache policy: LRU by `(adapter_id, version)`; pin persona adapters for logged-in user; max resident bytes guarded by config with periodic eviction.
+     - cache policy: LRU by `(adapter_id, version)` — keyed by both, because
+       two versions of one adapter are different weights and an id-only key
+       leaves file mtime as the only thing standing between a promotion and
+       its predecessor's tensors; pin persona adapters for logged-in user; max resident bytes guarded by config with periodic eviction.
+     - **the router's gate travels on the adapter it gates.** `_select_adapters`
+       attaches each gate weight to the activated adapter dict; the backend
+       reads it there and nowhere else. returning gates alongside the adapters
+       for tracing only — which is what used to happen — means composition
+       runs every adapter at 1.0 no matter what the policy decided, and the
+       §5.2 equation is exactly right about a number it never receives.
      - lazy load: if adapter missing from cache, fetch `metadata.json` + `params.npz`; validate checksum + version; keep small adapters in RAM, map large ones with memmap if supported.
      - per-request adapter cap (e.g., top 3) to bound composition cost; reject requests exceeding cap.
   3. compose an effective view of weights:
@@ -881,6 +897,13 @@ looser:
   truncates its KV to that length. no conversation id is plumbed anywhere,
   so the cache cannot mistake one thread for another — only identical tokens
   match.
+- **the signature identifies the effective stack, gates included**: each
+  active adapter contributes `(id, version, gate)`. gates are per-request
+  (§5.3), so the same adapter at 0.2 and at 0.8 is a different model and
+  every cached tensor was computed under one of them. keying on id+version
+  alone — which this section used to specify — would let a 0.2 request
+  continue a prefix built at 0.8, which is the cheapest imaginable way to
+  serve a model nobody asked for.
 - **why strict.** reusing keys computed for different tokens would answer
   from a history the user never wrote. the shared-prefix count is the only
   thing reused; the divergent tail is always recomputed.

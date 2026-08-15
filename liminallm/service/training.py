@@ -1110,30 +1110,35 @@ class TrainingService:
         self._ensure_tokenizer(base_model)
         vocab_size = max(self._vocab_size(), 1)
 
-        def _encode(text: str, *, continuation: bool = False) -> List[int]:
+        def _encode(
+            text: str, *, continuation: bool = False, limit: Optional[int] = None
+        ) -> List[int]:
             """Tokens for one span. ``continuation`` suppresses special tokens.
 
             The target continues the prompt inside one sequence, so encoding
             it with specials would splice a second BOS into the middle —
             training the model on a sequence shape it never sees at serving
             time.
+
+            ``limit`` is applied by this function, never by the tokenizer's
+            own ``truncation``: tokenizers truncate from the right, keeping
+            the OLDEST tokens. Letting it pre-truncate a long prompt threw
+            away the newest context before the caller could ask to keep it,
+            so the deliberate "trim oldest first" below operated on tokens
+            that had already lost the part it was trying to preserve.
             """
             if self.tokenizer is not None:
                 try:
-                    return list(
+                    tokens = list(
                         self.tokenizer.encode(
                             text,
-                            truncation=True,
-                            max_length=max_length,
+                            truncation=False,
                             add_special_tokens=not continuation,
                         )
                     )
                 except TypeError:  # pragma: no cover - minimal tokenizer objects
-                    return list(
-                        self.tokenizer.encode(
-                            text, truncation=True, max_length=max_length
-                        )
-                    )
+                    tokens = list(self.tokenizer.encode(text))
+                return tokens[:limit] if limit is not None else tokens
             # Use deterministic hashing instead of Python's randomized hash()
             tokens = text.split()
 
@@ -1154,26 +1159,40 @@ class TrainingService:
             # length, which could never broadcast in the loss.)
             seqs: List[tuple[List[int], int]] = []
             for row in batch:
-                prompt_tokens = _encode(row["prompt"])
-                target_tokens = _encode(row["target"], continuation=True) or [0]
-                # The target is the supervised span, so it is reserved first
-                # and the *prompt* gives ground — oldest context first. Taking
-                # a head slice of prompt+target instead could drop the target
-                # entirely, leaving an all-zero loss mask: an example that
-                # contributes a confident zero loss and teaches nothing.
                 budget = max_length + 1
-                if len(target_tokens) > budget - 1:
-                    target_tokens = target_tokens[: budget - 1]
+                # Target first: it is the supervised span, so it claims its
+                # room before the prompt gets any. An empty target is dropped,
+                # not padded to [0] — a zero there is not "no supervision", it
+                # is supervision teaching the model to emit token 0, and it
+                # carries positive mask weight so no later check can catch it.
+                target_tokens = _encode(
+                    row.get("target") or "", continuation=True, limit=budget - 1
+                )
+                if not target_tokens:
+                    logger.warning(
+                        "sft_example_without_target_dropped", reason="empty_target"
+                    )
+                    continue
                 room = budget - len(target_tokens)
+                # Trim the OLDEST prompt context; the newest turn is the one
+                # the target responds to.
+                prompt_tokens = _encode(row.get("prompt") or "")
                 if len(prompt_tokens) > room:
                     prompt_tokens = prompt_tokens[-room:]
                 if not prompt_tokens:
-                    prompt_tokens = [target_tokens.pop(0)] if len(
-                        target_tokens
-                    ) > 1 else [0]
+                    # Nothing to condition on: give the target one token of
+                    # ground rather than inventing content.
+                    if len(target_tokens) < 2:
+                        logger.warning(
+                            "sft_example_without_target_dropped", reason="no_prompt"
+                        )
+                        continue
+                    prompt_tokens = [target_tokens.pop(0)]
                 full = prompt_tokens + target_tokens
                 prompt_len = len(prompt_tokens)
                 seqs.append((full, prompt_len))
+            if not seqs:
+                continue
             seq_len = max(len(full) - 1 for full, _ in seqs)
             input_ids: List[List[int]] = []
             labels: List[List[int]] = []
@@ -1436,7 +1455,9 @@ class TrainingService:
         # α (SPEC §5.2) is a fixed hyperparameter, so it is carried as a
         # constant rather than handed to the optimizer as something to learn.
         scale_index = transformer.lora_layer_index(list(params), slots=("scale",))
-        constants = {name: params[name] for name in scale_index}
+        constants = {
+            name: jnp.asarray(params[name], dtype=jnp.float32) for name in scale_index
+        }
 
         def _assemble(tree: dict) -> List[dict]:
             layers: List[dict] = [{} for _ in range(config.num_layers)]
@@ -1447,10 +1468,28 @@ class TrainingService:
             return layers
 
         def _flatten_params(param_dict: dict) -> dict:
-            return {k: jnp.array(v, dtype=jnp.float32) for k, v in param_dict.items()}
+            """Only the trainable matrices enter the optimizer tree.
+
+            Including α here made the "constant" comment above a lie: Optax
+            updated it (the L2 term alone gives it a gradient), so the eval
+            ran with the original α while the file written afterwards carried
+            the modified one — passing a gate under one model and serving
+            another.
+            """
+            return {
+                name: jnp.array(param_dict[name], dtype=jnp.float32)
+                for name in lora_index
+            }
 
         def _to_python(tree: dict) -> dict:
-            return {k: v.tolist() for k, v in tree.items()}
+            # Constants are reattached unchanged on the way out, so the
+            # artifact keeps the α it was trained and evaluated under.
+            serialized = {k: v.tolist() for k, v in tree.items()}
+            for name, value in constants.items():
+                serialized[name] = (
+                    value.tolist() if hasattr(value, "tolist") else value
+                )
+            return serialized
 
         def _checkpoint(step: int, tree: dict) -> None:
             if not checkpoint_dir:

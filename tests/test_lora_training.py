@@ -211,6 +211,37 @@ class TestTrainingRuns:
             == 0.0
         )
 
+    def test_an_explicit_scale_survives_training_unchanged(
+        self, tmp_path, checkpoint
+    ):
+        """α is a hyperparameter, not a parameter.
+
+        It used to enter the optimizer tree — the L2 term alone gives it a
+        gradient — so Optax moved it while the evaluation still used the
+        original value. The gate then passed under one α and serving got
+        another.
+        """
+        service = _service(tmp_path, str(checkpoint))
+        weights = service._init_lora_weights(4, [0], ["attn_q"])
+        weights["layers.0.attn_q.scale"] = 0.75
+        params_path = tmp_path / "scaled.json"
+        trace = service._run_jax_optax_training(
+            weights,
+            [_batch([(PROMPT, TARGET)])],
+            eval_batches=[_batch([(PROMPT, TARGET)])],
+            params_path=params_path,
+            epochs=10,
+        )
+        assert trace["status"] == "ok"
+        trained = json.loads(params_path.read_text())
+        assert trained["layers.0.attn_q.scale"] == 0.75
+        # And the matrices did move, so this is not a no-op run.
+        assert any(
+            value != 0.0
+            for row in trained["layers.0.attn_q.B"]
+            for value in row
+        )
+
     def test_l2_regularization_is_in_the_loss(self, tmp_path, checkpoint, monkeypatch):
         """SPEC §5.4.4 adds an L2 term. A large lambda must visibly shrink the
         learned weights; if the term were missing, nothing would change."""
