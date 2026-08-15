@@ -347,6 +347,80 @@ def sample_token(
     return int(jax.random.categorical(key, jnp.log(probs + 1e-20)))
 
 
+def _shape_of(value) -> Tuple[int, ...]:
+    shape = getattr(value, "shape", None)
+    if shape is not None:
+        return tuple(shape)
+    # Lists, as they arrive from params.json before conversion.
+    if isinstance(value, list):
+        if value and isinstance(value[0], list):
+            return (len(value), len(value[0]))
+        return (len(value),)
+    return ()
+
+
+def validate_lora_weights(config: ModelConfig, weights: Dict[str, Any]) -> None:
+    """Raise unless **every** name is well-formed and correctly shaped.
+
+    SPEC §5.2 says names outside the declared shape are never partially
+    applied. Collecting the invalid ones, logging them and returning the
+    valid subset — which is what the assembly functions used to do — is
+    partial application with a log line attached: an adapter carrying one
+    foreign matrix still changed the model through its recognized ones.
+
+    One invalid member invalidates the adapter.
+    """
+    if not weights:
+        return
+    keys: set = set()
+    for name, value in weights.items():
+        parts = name.split(".")
+        if len(parts) != 4 or parts[0] != "layers" or parts[3] not in ("A", "B", "scale"):
+            raise ValueError(
+                f"LoRA name {name!r} is outside the declared shape "
+                "layers.{i}.{target}.{A|B|scale}; refusing the adapter"
+            )
+        try:
+            index = int(parts[1])
+        except ValueError:
+            raise ValueError(f"LoRA name {name!r} has a non-numeric layer index") from None
+        if parts[2] not in LORA_TARGETS:
+            raise ValueError(
+                f"LoRA name {name!r} targets {parts[2]!r}, which is not one of "
+                f"{sorted(LORA_TARGETS)}; refusing the adapter"
+            )
+        if not 0 <= index < config.num_layers:
+            raise ValueError(
+                f"LoRA name {name!r} targets layer {index}, outside the model's "
+                f"{config.num_layers}; refusing the adapter"
+            )
+        if parts[3] != "scale":
+            keys.add(".".join(parts[:3]))
+
+    for key in sorted(keys):
+        a_value = weights.get(f"{key}.A")
+        b_value = weights.get(f"{key}.B")
+        if a_value is None or b_value is None:
+            missing = "B" if a_value is not None else "A"
+            raise ValueError(
+                f"LoRA {key} is missing its {missing} matrix; refusing the adapter"
+            )
+        a_shape, b_shape = _shape_of(a_value), _shape_of(b_value)
+        if len(a_shape) != 2 or len(b_shape) != 2:
+            raise ValueError(f"LoRA {key} matrices must be 2-D; refusing the adapter")
+        expected = projection_shape(config, key.split(".")[2])
+        d_out, d_in = expected
+        if a_shape[1] != d_in or b_shape[0] != d_out:
+            raise ValueError(
+                f"LoRA {key} is shaped A{a_shape} B{b_shape}, but this model's "
+                f"projection is ({d_out}, {d_in}); refusing the adapter"
+            )
+        if a_shape[0] != b_shape[1]:
+            raise ValueError(
+                f"LoRA {key} disagrees with itself on rank: A{a_shape} B{b_shape}"
+            )
+
+
 def lora_by_layer(
     jnp, weights: Dict[str, Any], num_layers: int
 ) -> Optional[List[Dict[str, Any]]]:
@@ -358,34 +432,25 @@ def lora_by_layer(
     """
     if not weights:
         return None
+    # Assembly assumes validity: validate_lora_weights (called by both the
+    # serving and training paths before this point) has already refused any
+    # adapter carrying a name this loop would have had to skip.
     layers: List[Dict[str, Any]] = [{} for _ in range(num_layers)]
     matched = 0
-    unmatched: List[str] = []
     for name, value in weights.items():
         parts = name.split(".")
-        if len(parts) == 4 and parts[0] == "layers" and parts[2] in LORA_TARGETS:
-            try:
-                index = int(parts[1])
-            except ValueError:
-                unmatched.append(name)
-                continue
-            # `scale` is the α of SPEC §5.2 — part of the serialization
-            # contract, so a name carrying one must not be reported as
-            # unmatched, which is what made the declared format un-round-trippable.
-            if 0 <= index < num_layers and parts[3] in ("A", "B", "scale"):
-                layers[index][f"{parts[2]}.{parts[3]}"] = jnp.asarray(
-                    value, dtype=jnp.float32
-                )
-                matched += 1
-                continue
-        unmatched.append(name)
-    if unmatched:
-        logger.warning(
-            "lora_weights_unmatched",
-            matched=matched,
-            unmatched=len(unmatched),
-            sample=unmatched[:3],
-        )
+        if len(parts) != 4 or parts[0] != "layers" or parts[2] not in LORA_TARGETS:
+            continue
+        try:
+            index = int(parts[1])
+        except ValueError:
+            continue
+        # `scale` is the α of SPEC §5.2 — part of the serialization contract.
+        if 0 <= index < num_layers and parts[3] in ("A", "B", "scale"):
+            layers[index][f"{parts[2]}.{parts[3]}"] = jnp.asarray(
+                value, dtype=jnp.float32
+            )
+            matched += 1
     return layers if matched else None
 
 

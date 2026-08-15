@@ -2151,6 +2151,38 @@ class PostgresStore:
             meta=meta,
         )
 
+    def get_message(self, message_id: str) -> Optional[Message]:
+        """One message by id, or None.
+
+        Training needs the target's sequence *and* its content (SPEC §5.4.2),
+        and can get neither by scanning a fetch window: an older target simply
+        is not in the newest N messages, so the bound silently does nothing
+        and the fallback target text silently disappears.
+        """
+        if not _is_uuid(message_id):
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM message WHERE id = %s", (message_id,)
+            ).fetchone()
+        return self._message_from_row(row) if row else None
+
+    def list_messages_before(
+        self, conversation_id: str, seq: int, *, limit: int = 200
+    ) -> List[Message]:
+        """The messages preceding ``seq``, oldest-first, bounded to the newest
+        ``limit`` of them — the conversation as it stood when that turn was
+        written."""
+        if not _is_uuid(conversation_id):
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM message WHERE conversation_id = %s AND seq < %s "
+                "ORDER BY seq DESC LIMIT %s",
+                (conversation_id, seq, limit),
+            ).fetchall()
+        return [self._message_from_row(row) for row in reversed(rows)]
+
     def get_message_conversation(self, message_id: str) -> Optional[str]:
         """The conversation a message belongs to, or None.
 
@@ -2187,37 +2219,33 @@ class PostgresStore:
                 query += " LIMIT %s"
                 params.append(limit)
             rows = conn.execute(query, tuple(params)).fetchall()
-        messages: List[Message] = []
-        for row in reversed(rows):
-            content_struct = row.get("content_struct")
-            if isinstance(content_struct, str):
-                try:
-                    content_struct = json.loads(content_struct)
-                except Exception:
-                    content_struct = None
-            content_struct = normalize_content_struct(
-                content_struct, row.get("content")
-            )
-            meta = row.get("meta")
-            if isinstance(meta, str):
-                try:
-                    meta = json.loads(meta)
-                except Exception:
-                    meta = None
-            messages.append(
-                Message(
-                    id=str(row["id"]),
-                    conversation_id=str(row["conversation_id"]),
-                    sender=row["sender"],
-                    role=row["role"],
-                    content=row["content"],
-                    content_struct=content_struct,
-                    seq=row["seq"],
-                    created_at=row.get("created_at", datetime.now(timezone.utc)),
-                    meta=meta,
-                )
-            )
-        return messages
+        return [self._message_from_row(row) for row in reversed(rows)]
+
+    def _message_from_row(self, row) -> Message:
+        content_struct = row.get("content_struct")
+        if isinstance(content_struct, str):
+            try:
+                content_struct = json.loads(content_struct)
+            except Exception:
+                content_struct = None
+        content_struct = normalize_content_struct(content_struct, row.get("content"))
+        meta = row.get("meta")
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except Exception:
+                meta = None
+        return Message(
+            id=str(row["id"]),
+            conversation_id=str(row["conversation_id"]),
+            sender=row["sender"],
+            role=row["role"],
+            content=row["content"],
+            content_struct=content_struct,
+            seq=row["seq"],
+            created_at=row.get("created_at", datetime.now(timezone.utc)),
+            meta=meta,
+        )
 
     def list_conversations(
         self, user_id: str, limit: int = 20, offset: int = 0

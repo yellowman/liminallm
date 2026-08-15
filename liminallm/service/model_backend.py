@@ -1804,6 +1804,11 @@ class LocalJaxLoRABackend:
     # Modes compatible with this backend
     COMPATIBLE_MODES = {AdapterMode.LOCAL, AdapterMode.HYBRID, AdapterMode.PROMPT}
 
+    #: This backend loads LoRA weights itself, so a promoted hybrid adapter
+    #: is carried by its weights here and by its prompt on API backends
+    #: (SPEC §5.0.1). LLMService reads this to decide which.
+    applies_lora_weights = True
+
     def __init__(
         self,
         base_model: str,
@@ -2118,7 +2123,19 @@ class LocalJaxLoRABackend:
     def _resolve_params_path(
         self, path: Path, *, current_version: Optional[int] = None
     ) -> Optional[Path]:
+        # The version decision comes FIRST. A direct params.json path used to
+        # short-circuit ahead of it, so an artifact pointing at a file served
+        # that file at current_version 0 — or served something unrelated to
+        # the version it claimed to pin. SPEC §5.5 gives version authority
+        # over path shape.
         if path.is_file() and path.name == "params.json":
+            try:
+                pinned_direct = int(current_version) if current_version is not None else 0
+            except (TypeError, ValueError):
+                pinned_direct = 0
+            if current_version is not None and pinned_direct <= 0:
+                logger.debug("adapter_direct_path_without_promotion", adapter_path=str(path))
+                return None
             return path
         # When the artifact records a promoted version, serve exactly that
         # version (or the `latest` pointer maintained alongside it). Never fall
@@ -2399,6 +2416,9 @@ class LocalJaxLoRABackend:
         weights = (
             self._blend_adapter_weights(adapters, user_id=user_id) if adapters else {}
         )
+        # SPEC §5.2: one malformed name refuses the whole adapter, rather than
+        # the recognized half of it changing the model.
+        transformer.validate_lora_weights(config, weights)
         lora = transformer.lora_by_layer(jnp, weights, config.num_layers)
         signature = self._adapter_signature(adapters)
 

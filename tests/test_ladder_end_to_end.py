@@ -19,7 +19,7 @@ import uuid
 
 import pytest
 
-from liminallm.service import transformer
+from liminallm.service import local_format, transformer
 
 jax = pytest.importorskip("jax")
 jnp = pytest.importorskip("jax.numpy")
@@ -73,6 +73,7 @@ class TestLadderEndToEnd:
         still asserted to be real.
         """
         import liminallm.service.training as training_module
+        from liminallm.service.clustering import SemanticClusterer
 
         monkeypatch.setattr(
             training_module, "EVAL_MIN_RELATIVE_IMPROVEMENT", 1e-9
@@ -86,7 +87,16 @@ class TestLadderEndToEnd:
         training = TrainingService(
             store, str(tmp_path), runtime_base_model=str(checkpoint)
         )
-        result = training.train_from_preferences(user.id)
+        # The skill is BORN on the prompt rung, the way §7.3 creates it —
+        # not conjured as an already-trained artifact by the test.
+        clusterer = SemanticClusterer(store, llm=None, training=training)
+        born = clusterer.promote_skill_adapters(min_size=5, weights_min_events=10)
+        assert born, "no skill adapter was created from the qualifying cluster"
+        skill = store.get_artifact(born[0])
+        assert skill.schema["mode"] == "prompt"
+        assert skill.schema.get("current_version", 0) == 0
+
+        result = training.train_from_preferences(user.id, adapter_id=skill.id)
         assert result["jax_trace"]["status"] == "ok", result["jax_trace"].get("reason")
         gate = result["eval_gate"]
         # Real improvement, not merely a relaxed bar.
@@ -96,6 +106,9 @@ class TestLadderEndToEnd:
         adapter = store.get_artifact(result["adapter_id"])
         promoted_version = adapter.schema.get("current_version", 0)
         assert promoted_version >= 1
+        # §5.5: graduation flips the rung and keeps the prompt as fallback.
+        assert adapter.schema["mode"] == "hybrid"
+        assert adapter.schema.get("prompt_instructions")
         adapter_dir = training._adapter_dir(user.id, adapter.id, adapter.schema)
         # A decoy the gate never approved, newer on disk than the promoted one.
         decoy = adapter_dir / f"v{promoted_version + 1:04d}"
@@ -111,10 +124,46 @@ class TestLadderEndToEnd:
             )
         )
 
+        # The 0.4 comes from a routing policy through the real RouterEngine
+        # and WorkflowEngine, not from the test's hand.
+        import asyncio
+
+        from liminallm.service.runtime import get_runtime
+
+        runtime = get_runtime()
+        store.create_artifact(
+            "policy",
+            "default_routing",
+            {
+                "kind": "policy.routing",
+                "rules": [
+                    {
+                        "when": "true",
+                        "action": {
+                            "type": "activate_adapter_by_id",
+                            "adapter_id": adapter.id,
+                            "weight": 0.4,
+                        },
+                    }
+                ],
+            },
+            visibility="global",
+        )
+        routed, _, _ = asyncio.run(
+            runtime.workflow._select_adapters(
+                user_message="should I use tabs?",
+                user_id=user.id,
+                context_id=None,
+                tenant_id=user.tenant_id,
+            )
+        )
+        served = next((a for a in routed if a["id"] == adapter.id), None)
+        assert served is not None, "the promoted adapter was not routed"
+        assert served["weight"] == pytest.approx(0.4)
+
         backend = LocalJaxLoRABackend(
             str(checkpoint), str(tmp_path), max_new_tokens=4
         )
-        served = {**adapter.schema, "id": adapter.id, "weight": 0.4}
         blended = backend._blend_adapter_weights([served], user_id=user.id)
         assert blended, "the promoted adapter produced no weights"
         # The decoy's constant is 9.0; nothing that large may appear.
@@ -128,10 +177,24 @@ class TestLadderEndToEnd:
         full_delta = full["layers.0.attn_q.B"] @ full["layers.0.attn_q.A"]
         assert float(jnp.max(jnp.abs(gated_delta - 0.4 * full_delta))) < 1e-6
 
-        # And a whole turn runs through LLMService into the local backend.
+        # And a whole turn runs through LLMService into the local backend,
+        # carrying a context snippet so the local serialization is exercised.
         llm = LLMService(base_model=str(checkpoint), backend=backend)
+        messages, _ = llm._prepare_generation(
+            "should I use tabs?", [served], ["the style guide says tabs"]
+        )
+        rendered = local_format.format_conversation(messages)
+        # One representation (§5.1), and no prompt fallback beside the
+        # weights on a local backend (§5.0.1).
+        assert f"{local_format.CONTEXT_ROLE}: the style guide says tabs" in rendered
+        assert adapter.schema["prompt_instructions"] not in rendered
+
         reply = llm.generate(
-            "should I use tabs?", [served], [], history=None, user_id=user.id
+            "should I use tabs?",
+            [served],
+            ["the style guide says tabs"],
+            history=None,
+            user_id=user.id,
         )
         assert isinstance(reply.get("content"), str)
         assert reply["usage"]["prompt_tokens"] > 0

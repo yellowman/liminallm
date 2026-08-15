@@ -859,11 +859,21 @@ a gate of 0 contributes nothing rather than being normalized back into
 existence.
 
 **composition refuses rather than partially applies.** an `A` without its
-matching `B`, or adapters that disagree on a projection's dimensions, raise
-and refuse the whole stack. dropping the odd contribution and applying the
-rest serves the request with a stack the router never chose, which is the
-partial application this section forbids one paragraph above — logging it and
-continuing is still doing it.
+matching `B`, a `B` without its `A`, or adapters that disagree on a
+projection's dimensions, raise and refuse the whole stack. dropping the odd
+contribution and applying the rest serves the request with a stack the router
+never chose, which is the partial application this section forbids one
+paragraph above — logging it and continuing is still doing it.
+
+**one validator, checked at both boundaries.** `validate_lora_weights(config,
+weights)` verifies every key against this shape — name, target, layer index,
+A/B pairing, rank agreement, and the projection's real `(d_out, d_in)` — and
+raises on the first violation. serving calls it before assembly; training
+calls it before indexing (and skips, since a skipped run cannot promote).
+this is what makes "never partially applied" true rather than aspirational:
+assembly that merely *skips* names it does not recognize still applies the
+ones it does, so an adapter carrying a single foreign matrix changed the
+model through its recognized half while the rest went to a log line.
 
 for performance:
 
@@ -957,7 +967,13 @@ loop for a `training_job`:
        its position in the fetched list: dropping the target row alone leaves
        every later turn in the prompt, so an event trained after the
        conversation continued teaches its answer conditioned on things that
-       had not happened when the answer was written.
+       had not happened when the answer was written. the sequence is resolved
+       from the store *by message id* and the history is queried as
+       `seq < target_seq` — searching for the target inside a fetch window
+       silently disables the bound for any event older than the window, which
+       is exactly the event most likely to have later turns after it. a target
+       that cannot be resolved drops the example rather than falling back to
+       whatever messages happened to be fetched.
      - target `y` = preferred assistant answer:
        - either the answer that got “like”
        - or user’s corrected text.
@@ -1105,6 +1121,18 @@ cluster qualifies          pooled events ≥ threshold      eval gate passes
      `mode: "prompt"` contributes no LoRA weights whatever files exist on
      disk. one lock would be a race; a crash between writing the version and
      quarantining it would have made the race permanent.
+   - **version authority outranks path shape.** an adapter whose configured
+     path points straight at a `params.json` is still subject to the version
+     check; that fast path used to answer before the check ran, so a direct
+     file served at `current_version` 0 — or served something unrelated to
+     the version it claimed to pin.
+   - **after graduation the prompt is the fallback, not a second voice.** on a
+     backend that applies LoRA weights, a promoted hybrid adapter is carried
+     by its weights and its `prompt_instructions` are NOT injected (§5.0.1);
+     on an API backend the prompt carries it. injecting both gave the local
+     model the weights *and* the instructions they were distilled from — an
+     input the eval gate never scored. a hybrid adapter with nothing promoted
+     yet keeps its prompt locally, because no weights will load for it.
 4. **demotion mirrors promotion.** pruning (§7.4) can push an adapter back
    down the ladder (disable weights, keep prompt) via the same ConfigOps
    pipeline.

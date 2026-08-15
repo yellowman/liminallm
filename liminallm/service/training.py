@@ -1058,36 +1058,31 @@ class TrainingService:
             if key in seen:
                 continue
             seen.add(key)
-            messages = self.store.list_messages(
-                event.conversation_id, limit=200, user_id=event.user_id
+            # SPEC §5.4.2: the boundary is the target's sequence number, and
+            # it is resolved from the store rather than searched for inside a
+            # fetch window. Asking for the newest 200 messages and looking for
+            # the target among them silently disabled the bound for any older
+            # event — the target simply was not in the window, and every later
+            # turn became training context.
+            target_message = self.store.get_message(event.message_id or "")
+            if target_message is None:
+                logger.warning(
+                    "sft_example_dropped_unresolvable_target",
+                    conversation_id=event.conversation_id,
+                    message_id=event.message_id,
+                )
+                continue
+            # The query does the bounding, so the prompt cannot contain a turn
+            # written after the answer being taught.
+            messages = self.store.list_messages_before(
+                event.conversation_id, target_message.seq, limit=200
             )
             prompt_chunks: List[str] = []
-            target_text = event.corrected_text
+            target_text = event.corrected_text or target_message.content
             cluster_id = event.cluster_id or self._bucket_embedding(
                 event.context_embedding, event.user_id
             )
-            # SPEC §5.4.2: the prompt is the messages *up to* the event. The
-            # bound comes from the target's own sequence number, not from its
-            # position in this list: skipping the target row alone left every
-            # later turn in the prompt, so an event trained after the
-            # conversation continued taught its answer conditioned on things
-            # that had not happened when the answer was written.
-            target_seq = next(
-                (
-                    getattr(m, "seq", None)
-                    for m in messages
-                    if m.id == event.message_id
-                ),
-                None,
-            )
             for msg in messages:
-                if msg.id == event.message_id:
-                    # The target message: the label, never part of the prompt.
-                    if not target_text:
-                        target_text = msg.content
-                    continue
-                if target_seq is not None and getattr(msg, "seq", 0) >= target_seq:
-                    continue  # future turn, relative to the feedback
                 prompt_chunks.append(
                     local_format.format_turn(msg.role, msg.content)
                 )
@@ -1473,6 +1468,14 @@ class TrainingService:
                             "reason": "tokenizer and checkpoint disagree on vocabulary",
                         }
 
+        # SPEC §5.2: any malformed or foreign name refuses the whole adapter.
+        # Training skips rather than raises — a skipped run cannot promote, so
+        # the adapter waits on the prompt rung (§5.4.6).
+        try:
+            transformer.validate_lora_weights(config, params)
+        except ValueError as exc:
+            logger.warning("training_loop_skipped", reason="invalid_lora_weights", error=str(exc))
+            return {"status": "skipped", "reason": f"invalid LoRA weights: {exc}"}
         # Parsed once, out here: the assembly inside the loss must be pure
         # array plumbing so it stays traceable and differentiable.
         lora_index = transformer.lora_layer_index(list(params))
