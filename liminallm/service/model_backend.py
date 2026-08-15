@@ -2029,10 +2029,8 @@ class LocalJaxLoRABackend:
         schema_for_mode = (
             adapter.get("schema") if isinstance(adapter.get("schema"), dict) else {}
         )
-        mode = str(
-            adapter.get("mode") or schema_for_mode.get("mode") or ""
-        ).strip().lower()
-        if mode == AdapterMode.PROMPT:
+        _ = schema_for_mode
+        if self._adapter_mode_of(adapter) == AdapterMode.PROMPT:
             logger.debug("adapter_prompt_mode_carries_no_weights", adapter_id=adapter_id)
             return {}
 
@@ -2129,12 +2127,16 @@ class LocalJaxLoRABackend:
         # the version it claimed to pin. SPEC §5.5 gives version authority
         # over path shape.
         if path.is_file() and path.name == "params.json":
-            try:
-                pinned_direct = int(current_version) if current_version is not None else 0
-            except (TypeError, ValueError):
-                pinned_direct = 0
-            if current_version is not None and pinned_direct <= 0:
-                logger.debug("adapter_direct_path_without_promotion", adapter_path=str(path))
+            if current_version is not None:
+                # A bare file cannot demonstrate which version it is, so it
+                # cannot satisfy a versioned artifact — at 0 there is nothing
+                # promoted, and at N it would serve "whatever this file
+                # happens to be" while claiming to pin N.
+                logger.warning(
+                    "adapter_direct_path_cannot_prove_version",
+                    adapter_path=str(path),
+                    current_version=current_version,
+                )
                 return None
             return path
         # When the artifact records a promoted version, serve exactly that
@@ -2151,7 +2153,19 @@ class LocalJaxLoRABackend:
                 return exact
             latest_pinned = path / "latest" / "params.json"
             if latest_pinned.exists():
-                return latest_pinned
+                # `latest` is only acceptable when it demonstrably resolves to
+                # the pinned version. Trusting the pointer let current_version
+                # 1 serve v0002 whenever v0001's directory was missing.
+                resolved_parent = latest_pinned.resolve().parent.name
+                if resolved_parent == f"v{pinned:04d}":
+                    return latest_pinned
+                logger.warning(
+                    "adapter_latest_points_elsewhere",
+                    adapter_path=str(path),
+                    current_version=pinned,
+                    resolved=resolved_parent,
+                )
+                return None
             logger.warning(
                 "adapter_promoted_version_missing",
                 adapter_path=str(path),
@@ -2414,10 +2428,13 @@ class LocalJaxLoRABackend:
         config, params = self._model_state
         jnp, jax = self._jnp, self._jax
         weights = (
-            self._blend_adapter_weights(adapters, user_id=user_id) if adapters else {}
+            self._blend_adapter_weights(adapters, user_id=user_id, config=config)
+            if adapters
+            else {}
         )
-        # SPEC §5.2: one malformed name refuses the whole adapter, rather than
-        # the recognized half of it changing the model.
+        # Defensive second look: each adapter was validated before composition
+        # (that is the check that can see per-adapter rank disagreement), and
+        # the composed pair must still describe this model.
         transformer.validate_lora_weights(config, weights)
         lora = transformer.lora_by_layer(jnp, weights, config.num_layers)
         signature = self._adapter_signature(adapters)
@@ -2731,6 +2748,70 @@ class LocalJaxLoRABackend:
         }
 
     @staticmethod
+    def _adapter_mode_of(adapter: dict) -> str:
+        """The adapter's authoritative mode (SPEC §5.0.1).
+
+        ``mode`` wins over the legacy ``backend``/``provider`` inference, and
+        behaviour that keys off ``backend`` instead can disagree with the
+        field the spec calls authoritative.
+        """
+        schema = adapter.get("schema") if isinstance(adapter.get("schema"), dict) else {}
+        merged = {**(schema or {}), **{k: v for k, v in adapter.items() if k != "schema"}}
+        return str(get_adapter_mode(merged) or "").strip().lower()
+
+    @staticmethod
+    def _promoted_version_of(adapter: dict) -> int:
+        schema = adapter.get("schema") if isinstance(adapter.get("schema"), dict) else {}
+        version = adapter.get("current_version")
+        if version is None:
+            version = (schema or {}).get("current_version")
+        try:
+            return int(version or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _refuse_if_weights_expected(self, adapter: dict) -> None:
+        """Raise when a selected adapter that should carry weights has none."""
+        mode = self._adapter_mode_of(adapter)
+        if mode == AdapterMode.PROMPT:
+            return  # §5.5: the prompt rung is weightless by design.
+        if self._promoted_version_of(adapter) <= 0:
+            return  # nothing promoted yet; also weightless by design.
+        if self._gate_weight_of(adapter) == 0.0:
+            return  # a closed gate contributes nothing anyway.
+        raise ValueError(
+            f"adapter {adapter.get('id')!r} is promoted (version "
+            f"{self._promoted_version_of(adapter)}) and routed, but its weights "
+            "could not be loaded; refusing the adapter stack rather than "
+            "serving one the router did not select"
+        )
+
+    def _validate_adapter_weights(
+        self, adapter: dict, weights: dict, config: Any
+    ) -> None:
+        """SPEC §5.2 validation of ONE adapter's raw matrices."""
+        if config is not None:
+            transformer.validate_lora_weights(config, weights)
+            return
+        # Without a loaded model the projection dimensions are unknown, but
+        # an adapter's internal self-consistency still is not: this is the
+        # check that catches ranks which only agree after concatenation.
+        for name in weights:
+            if not name.endswith(".A"):
+                continue
+            key = name[: -len(".A")]
+            b_value = weights.get(f"{key}.B")
+            if b_value is None:
+                continue  # the orphan check below reports this
+            a_shape = transformer._shape_of(weights[name])
+            b_shape = transformer._shape_of(b_value)
+            if len(a_shape) == 2 and len(b_shape) == 2 and a_shape[0] != b_shape[1]:
+                raise ValueError(
+                    f"adapter {adapter.get('id')!r} disagrees with itself on the "
+                    f"rank of {key}: A{a_shape} B{b_shape}; refusing the adapter stack"
+                )
+
+    @staticmethod
     def _gate_weight_of(adapter: dict) -> float:
         # Not an `or` chain: 0.0 is a meaningful gate and also falsy.
         gate = adapter.get("weight")
@@ -2745,7 +2826,7 @@ class LocalJaxLoRABackend:
         return max(0.0, min(1.0, gate))
 
     def _blend_adapter_weights(
-        self, adapters: List[dict], user_id: Optional[str]
+        self, adapters: List[dict], user_id: Optional[str], config: Any = None
     ) -> dict:
         """Compose several adapters into one equivalent LoRA pair (SPEC §5.2).
 
@@ -2775,7 +2856,20 @@ class LocalJaxLoRABackend:
         for adapter in adapters:
             weights = self._load_adapter_weights(adapter, user_id=user_id)
             if not weights:
+                # An adapter the router selected must not vanish from the
+                # stack. Weightless is legitimate only where §5.5 says so —
+                # the prompt rung, or nothing promoted yet; a promoted
+                # local/hybrid adapter with an open gate whose file will not
+                # resolve means serving a stack the router did not choose.
+                self._refuse_if_weights_expected(adapter)
                 continue
+            # Per adapter, BEFORE anything is concatenated. Validating only
+            # the composed result cannot see a single adapter whose own A and
+            # B disagree on rank: concatenation adds the ranks up, so two
+            # adapters that are each internally inconsistent can produce a
+            # combined pair whose totals agree while every row pairs with the
+            # wrong column.
+            self._validate_adapter_weights(adapter, weights, config)
             gate = self._gate_weight_of(adapter)
             if gate == 0.0:
                 # A closed gate contributes no delta at all — which the old

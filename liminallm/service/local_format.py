@@ -49,6 +49,34 @@ def format_conversation(messages: Iterable[Any]) -> str:
     return "\n".join(lines)
 
 
+def place_context(messages: List[Any], snippets: Sequence[str]) -> List[Any]:
+    """Insert context turns where BOTH paths must put them: immediately
+    before the last user turn, so the retrieved material reads as ground for
+    the question that follows it.
+
+    Placement is part of the representation. Training appended the context
+    after every message (so it landed *after* the question) while serving
+    inserted it before the final user turn — same marker, different token
+    order, which for a raw decoder is a different input. Whichever order is
+    chosen, it has to be chosen once, here.
+    """
+    turns = [
+        {"role": CONTEXT_ROLE, "content": snippet} for snippet in snippets if snippet
+    ]
+    if not turns:
+        return list(messages)
+    result = list(messages)
+    for index in range(len(result) - 1, -1, -1):
+        role = (
+            result[index].get("role")
+            if isinstance(result[index], dict)
+            else getattr(result[index], "role", None)
+        )
+        if role == "user":
+            return result[:index] + turns + result[index:]
+    return result + turns
+
+
 def keep_newest(tokens: Sequence[int], limit: Optional[int]) -> List[int]:
     """The last ``limit`` tokens: a chat's newest turn is the load-bearing one.
 

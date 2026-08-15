@@ -865,11 +865,24 @@ contribution and applying the rest serves the request with a stack the router
 never chose, which is the partial application this section forbids one
 paragraph above — logging it and continuing is still doing it.
 
-**one validator, checked at both boundaries.** `validate_lora_weights(config,
-weights)` verifies every key against this shape — name, target, layer index,
-A/B pairing, rank agreement, and the projection's real `(d_out, d_in)` — and
-raises on the first violation. serving calls it before assembly; training
-calls it before indexing (and skips, since a skipped run cannot promote).
+**one validator, checked per adapter, before composition.**
+`validate_lora_weights(config, weights)` verifies every key against this
+shape — name, target, layer index, A/B pairing, rank agreement, and the
+projection's real `(d_out, d_in)` — and raises on the first violation. it
+runs on each adapter's **raw** matrices as they load, then again on the
+composed pair as a defensive check. the order matters twice over: composition
+carries only A/B pairs forward, so a foreign key never reaches a validator
+that runs afterwards; and concatenation *adds ranks up*, so two adapters that
+each disagree with themselves (A of rank 2 with B of rank 1, and A of rank 1
+with B of rank 2) compose into a pair whose totals agree — 3 and 3 — while
+every row pairs with the wrong column. training validates before indexing
+(and skips, since a skipped run cannot promote).
+
+**a selected adapter never silently leaves the stack.** weightless is
+legitimate exactly where §5.5 says so — the prompt rung, or nothing promoted
+yet, or a closed gate. a promoted local/hybrid adapter with an open gate
+whose weights will not load refuses the stack instead, because serving
+without it is serving a stack the router did not select.
 this is what makes "never partially applied" true rather than aspirational:
 assembly that merely *skips* names it does not recognize still applies the
 ones it does, so an adapter carrying a single foreign matrix changed the
@@ -1033,6 +1046,12 @@ loop for a `training_job`:
      the artifact is left untouched and the gate decision is recorded in
      `training_job.meta.eval_gate` for audit. "training ran without raising"
      is not a promotion criterion.
+   - **the decision travels with the run summary, and its absence is not
+     approval.** the background worker records job status and credits router
+     state from that summary; a summary that dropped `eval_gate` combined
+     with a default of "promoted" marked gate-rejected runs succeeded and
+     credited an adapter for a rollout that never happened. missing means
+     unknown, and unknown is not promoted.
    - **a dataset too small to hold anything out never promotes either.**
      "promoted only when holdout loss improves" refuses what it cannot
      measure. weights change the model now, so shipping an unevaluated
@@ -1121,11 +1140,14 @@ cluster qualifies          pooled events ≥ threshold      eval gate passes
      `mode: "prompt"` contributes no LoRA weights whatever files exist on
      disk. one lock would be a race; a crash between writing the version and
      quarantining it would have made the race permanent.
-   - **version authority outranks path shape.** an adapter whose configured
-     path points straight at a `params.json` is still subject to the version
-     check; that fast path used to answer before the check ran, so a direct
-     file served at `current_version` 0 — or served something unrelated to
-     the version it claimed to pin.
+   - **version authority outranks path shape, absolutely.** a positive
+     `current_version` of N resolves to `vNNNN/params.json` and nothing else.
+     a `latest` pointer is accepted only when it demonstrably resolves to
+     `vNNNN` — trusting it let version 1 serve v0002 whenever v0001's
+     directory was missing. a path pointing straight at a `params.json`
+     cannot demonstrate which version it is, so it cannot satisfy a versioned
+     artifact at all (only an artifact that has never been versioned may use
+     one).
    - **after graduation the prompt is the fallback, not a second voice.** on a
      backend that applies LoRA weights, a promoted hybrid adapter is carried
      by its weights and its `prompt_instructions` are NOT injected (§5.0.1);
@@ -1200,7 +1222,9 @@ Together adapter APIs) behind the existing OpenAI-compatible transport:
 }
 ```
 
-Router policies remain agnostic: they pick adapters by id/metadata and hand them to the inference backend. An adapter with `backend="api"` implies switching the request model ID to `remote_model_id` (e.g., Zhipu BigModel or Alibaba DashScope); `backend="local"` means applying filesystem-backed LoRA weights on the base model. `backend="prompt"` distills adapter behavior into a prompt/system-message overlay for API-only providers, and `backend="hybrid"` indicates a two-step plan where a local adapter-enabled controller plans and an external API model executes.
+Router policies remain agnostic: they pick adapters by id/metadata and hand them to the inference backend. An adapter with `backend="api"` implies switching the request model ID to `remote_model_id` (e.g., Zhipu BigModel or Alibaba DashScope); `backend="local"` means applying filesystem-backed LoRA weights on the base model. `backend="prompt"` distills adapter behavior into a prompt/system-message overlay for API-only providers.
+
+`mode` — not `backend` — is authoritative wherever behaviour depends on it (§5.0.1); `backend` and `provider` are legacy fields that mode is *inferred from* when it is absent, and code that branches on them directly can disagree with the field the spec calls controlling. In particular `hybrid` is defined by §5.0.1: **local weights on a backend that applies them, `prompt_instructions` as the portable fallback everywhere else** — one adapter served one way per backend, never a two-step controller/executor plan. (An earlier revision of this paragraph described `backend="hybrid"` that way; §5.0.1 controls, and this paragraph is corrected to match rather than left to produce a second valid answer.)
 
 **workflow.chat**:
 

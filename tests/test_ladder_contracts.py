@@ -229,11 +229,17 @@ class TestSftPromptEndsAtTheTarget:
 
 
 class TestVersionAuthorityOverPathShape:
-    def test_a_direct_params_file_still_obeys_current_version(
+    def test_a_direct_params_file_cannot_satisfy_a_versioned_artifact(
         self, tmp_path, checkpoint, config
     ):
-        """A path pointing straight at params.json used to short-circuit the
-        promotion check entirely."""
+        """A bare params.json cannot demonstrate which version it is.
+
+        This test previously asserted the opposite for a positive version —
+        it blessed a file being served as "version 1" on nothing but the
+        artifact's say-so, which is the escape hatch §5.5's version authority
+        exists to close. Only a never-versioned artifact may use a direct
+        path.
+        """
         adapter_dir = tmp_path / "direct"
         adapter_dir.mkdir()
         params = adapter_dir / "params.json"
@@ -246,9 +252,12 @@ class TestVersionAuthorityOverPathShape:
             "fs_dir": str(params),
         }
 
-        assert backend._blend_adapter_weights(
-            [{**adapter, "current_version": 0}], user_id="u"
-        ) == {}
-        assert backend._blend_adapter_weights(
-            [{**adapter, "current_version": 1}], user_id="u"
-        )
+        assert backend._resolve_params_path(params, current_version=0) is None
+        assert backend._resolve_params_path(params, current_version=1) is None
+        assert backend._resolve_params_path(params, current_version=None) == params
+        # A promoted artifact pointing at a bare file refuses rather than
+        # serving it: the adapter was selected and cannot be honored.
+        with pytest.raises(ValueError, match="could not be loaded"):
+            backend._blend_adapter_weights(
+                [{**adapter, "current_version": 1, "weight": 0.5}], user_id="u"
+            )

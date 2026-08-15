@@ -798,6 +798,11 @@ class TrainingService:
             "version": version,
             "jax_trace": result.get("jax_trace"),
             "clusters": result.get("clusters"),
+            # The gate decision travels with the summary. Dropping it let the
+            # worker default `promoted` to True (SPEC §5.4.6 requires the
+            # opposite), marking gate-rejected runs succeeded and crediting
+            # the adapter's router state for a rollout that never happened.
+            "eval_gate": result.get("eval_gate"),
         }
 
     def record_training_outcome(
@@ -1082,18 +1087,19 @@ class TrainingService:
             cluster_id = event.cluster_id or self._bucket_embedding(
                 event.context_embedding, event.user_id
             )
-            for msg in messages:
-                prompt_chunks.append(
-                    local_format.format_turn(msg.role, msg.content)
-                )
+            # Same placement rule serving uses (local_format.place_context):
+            # appending the context after every message put it *after* the
+            # question at training time and *before* it at serving time —
+            # one marker, two token orders, which is two inputs.
+            turns = [
+                {"role": msg.role, "content": msg.content} for msg in messages
+            ]
             if event.context_text:
-                # Same vocabulary serving uses for injected context, so the
-                # adapter sees one format rather than two.
-                prompt_chunks.append(
-                    local_format.format_turn(
-                        local_format.CONTEXT_ROLE, event.context_text
-                    )
-                )
+                turns = local_format.place_context(turns, [event.context_text])
+            prompt_chunks = [
+                local_format.format_turn(turn["role"], turn["content"])
+                for turn in turns
+            ]
             if not target_text:
                 target_text = ""
             yield {

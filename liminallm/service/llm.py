@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from typing import Any, Iterator, List, Optional
 
-from liminallm.config import resolve_provider_endpoint
+from liminallm.config import AdapterMode, resolve_provider_endpoint
 from liminallm.logging import get_logger
 from liminallm.service import local_format
 from liminallm.service.model_backend import (
@@ -11,6 +11,7 @@ from liminallm.service.model_backend import (
     LocalJaxLoRABackend,
     ModelBackend,
     StubBackend,
+    get_adapter_mode,
 )
 from liminallm.storage.models import Message
 
@@ -254,20 +255,11 @@ class LLMService:
             return list(messages)
         if self._backend_applies_lora_weights:
             # SPEC §5.1: the local decoder gets ONE representation, the same
-            # one training wrote. A separate "Context:" marker appended inside
-            # the user turn is a different input from the `context:` turn the
-            # adapter was fitted against — same checkpoint, same tokenizer,
-            # different text.
-            updated = [dict(msg) for msg in messages]
-            context_turns = [
-                {"role": local_format.CONTEXT_ROLE, "content": snippet}
-                for snippet in context_snippets
-                if snippet
-            ]
-            for idx in range(len(updated) - 1, -1, -1):
-                if updated[idx].get("role") == "user":
-                    return updated[:idx] + context_turns + updated[idx:]
-            return updated + context_turns
+            # one training wrote — marker AND placement, since token order is
+            # part of the input for a raw decoder.
+            return local_format.place_context(
+                [dict(msg) for msg in messages], context_snippets
+            )
         updated: List[dict] = [dict(msg) for msg in messages]
         for idx in range(len(updated) - 1, -1, -1):
             msg = updated[idx]
@@ -299,13 +291,17 @@ class LLMService:
         return bool(getattr(self.backend, "applies_lora_weights", False))
 
     def _build_adapter_prompts(self, adapters: List[dict]) -> List[dict]:
-        prompt_backends = {"prompt", "prompt_distill", "hybrid"}
         lines: List[str] = []
         for adapter in adapters:
-            backend = (adapter.get("backend") or "").lower()
-            if backend not in prompt_backends:
+            # `mode` is authoritative (SPEC §5.0.1); the legacy backend field
+            # is only an inference source when mode is absent. Deciding from
+            # `backend` directly let `mode: hybrid, backend: prompt` receive
+            # both the weights and the prompt after promotion, and
+            # `mode: prompt, backend: local` receive neither.
+            mode = str(get_adapter_mode(adapter) or "").strip().lower()
+            if mode not in {AdapterMode.PROMPT, AdapterMode.HYBRID}:
                 continue
-            if backend == "hybrid" and self._backend_applies_lora_weights:
+            if mode == AdapterMode.HYBRID and self._backend_applies_lora_weights:
                 # SPEC §5.0.1: for a hybrid adapter the prompt is the
                 # *portable fallback* — it carries the behaviour on API
                 # backends, while a local backend applies the trained

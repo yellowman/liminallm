@@ -271,7 +271,16 @@ class TrainingWorker:
                     # than "succeeded", and leave router state alone so an
                     # un-promoted adapter is not credited with a training pass.
                     gate = result.get("eval_gate") or {}
-                    promoted = bool(gate.get("promoted", True))
+                    # Absent means unknown, and unknown is not approval: the
+                    # summary used to drop eval_gate entirely, so this
+                    # defaulted to True and credited every rejected run.
+                    promoted = bool(gate.get("promoted", False))
+                    if "promoted" not in gate:
+                        logger.warning(
+                            "training_gate_decision_missing",
+                            job_id=job_id,
+                            detail="treating as not promoted",
+                        )
                     # Merge into the meta TrainingService already wrote (it
                     # holds eval_gate/pooled_skill/distilled); replacing it
                     # would destroy the gate audit trail.
