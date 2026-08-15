@@ -770,12 +770,13 @@ when using API backend:
   with no attention — and logs `local_checkpoint_absent` at warning. that path
   exercises the plumbing; it does not answer questions, and the log exists so
   a production box cannot serve it quietly.
-- **known gap, stated rather than implied**: the *training* loop
-  (`service/training.py`) still trains LoRA against that same synthetic table,
-  so adapters it produces do not match the serving matrices and are refused
-  whole (`lora_weights_unmatched`) rather than half-applied. training against
-  the real forward pass is the next step in this lane; until it lands, the
-  adapter ladder is real end-to-end only on the API backends.
+- **training uses this same forward pass** (§5.4): the loss is computed over
+  the real model with the LoRA matrices applied inside its attention
+  projections, so an adapter is fitted to the model that will serve it. the
+  base parameters are closed over and never differentiated, which makes
+  "only on adapters, never on the base model" structural rather than a
+  promise — and it is asserted by a test that the base weights come out of
+  training bit-identical.
 
 ### 5.2 lora parameterization
 
@@ -932,6 +933,10 @@ loop for a `training_job`:
    - once a dataset has ≥5 examples, every 5th example is held out; the job
      trains on the remainder for several epochs and evaluates holdout loss
      with the initial weights and again with the trained weights.
+   - the holdout number is **cross-entropy only**, without the L2 term of the
+     training objective: the gate asks whether predictions improved, and
+     since `B` starts at zero and can only grow, charging the regularizer to
+     the eval would count honest learning as a penalty against promotion.
    - a new adapter version is promoted (becomes `latest`, bumps
      `current_version`, and graduates a prompt-mode adapter to `hybrid` per
      §5.5) **only** when holdout loss improves by ≥1% relative.
@@ -939,6 +944,18 @@ loop for a `training_job`:
      the artifact is left untouched and the gate decision is recorded in
      `training_job.meta.eval_gate` for audit. "training ran without raising"
      is not a promotion criterion.
+   - **a dataset too small to hold anything out never promotes either.**
+     "promoted only when holdout loss improves" refuses what it cannot
+     measure. weights change the model now, so shipping an unevaluated
+     version is exactly the regression §5.5 forbids; the adapter waits on
+     the prompt rung until it has the data to prove itself.
+   - **what "skipped" covers**, each leaving the adapter on the prompt rung:
+     JAX/optax missing; **no base checkpoint to train against** (there is no
+     `model_apply(params_base, …)` without `params_base`, and training some
+     other function would report success for a model nobody serves); an
+     adapter carrying no LoRA matrices; and an adapter whose matrices match
+     no projection in the model (weights trained for another architecture
+     must fail visibly rather than land on half their targets).
 
 7. scheduling:
 

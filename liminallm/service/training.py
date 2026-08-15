@@ -8,10 +8,11 @@ from contextlib import suppress
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Iterator, List, Optional, Sequence
+from typing import Any, Iterable, Iterator, List, Optional, Sequence
 
 from liminallm.config import AdapterMode, get_compatible_adapter_modes
 from liminallm.logging import get_logger
+from liminallm.service import transformer
 from liminallm.service.embeddings import deterministic_embedding
 from liminallm.service.fs import PathTraversalError, safe_join
 from liminallm.service.tokenizer_utils import (
@@ -32,6 +33,10 @@ DEFAULT_TRAIN_BATCH_SIZE = 2
 DEFAULT_MAX_TOKEN_LENGTH = 512
 DEFAULT_GRAD_ACCUM_STEPS = 4
 DEFAULT_LORA_LEARNING_RATE = 2e-3
+# SPEC §5.4.4: the loss carries an L2 term over the LoRA parameters. Small
+# adapters on small datasets overfit quickly, and the regularizer is what
+# keeps a passing eval gate meaningful rather than memorized.
+LORA_L2_LAMBDA = 1e-4
 # SPEC §5.4: eval gate. Every Nth example is held out once the dataset is big
 # enough, and promotion requires the holdout loss to improve by at least the
 # relative margin below.
@@ -83,6 +88,44 @@ class TrainingService:
         # into cleaner training targets before tokenization.
         self.teacher = teacher
         self.distillation_enabled = distillation_enabled
+        # Resolved lazily: False = not looked at yet, None = looked and absent.
+        self._base_config_state: Any = False
+        self._base_checkpoint_state: Any = False
+
+    def _base_model_dir(self) -> Optional[str]:
+        return self.runtime_base_model
+
+    def _base_config(self):
+        """The frozen base model's config, or None. Cheap and cached."""
+        if self._base_config_state is not False:
+            return self._base_config_state
+        directory = self._base_model_dir()
+        self._base_config_state = (
+            transformer.load_config(directory) if directory else None
+        )
+        return self._base_config_state
+
+    def _base_checkpoint(self):
+        """(config, params) for the frozen base model, or None.
+
+        Loaded once per service: training needs the real weights to compute a
+        real gradient, and re-reading gigabytes per job would dominate the
+        run.
+        """
+        if self._base_checkpoint_state is not False:
+            return self._base_checkpoint_state
+        directory = self._base_model_dir()
+        self._base_checkpoint_state = None
+        if directory and transformer.checkpoint_available(directory):
+            try:
+                self._base_checkpoint_state = transformer.load_checkpoint(directory)
+            except Exception as exc:  # noqa: BLE001 - skip, never train blind
+                logger.error(
+                    "training_base_checkpoint_failed",
+                    base_model=directory,
+                    error=str(exc),
+                )
+        return self._base_checkpoint_state
 
     def _safe_int(self, value: object, default: int, *, context: str) -> int:
         """Coerce values to int with fallback to avoid ValueError crashes (Issue 39.3)."""
@@ -124,6 +167,12 @@ class TrainingService:
             )
 
     def _vocab_size(self) -> int:
+        config = self._base_config()
+        if config is not None:
+            # Same rule serving follows: the checkpoint's embedding table
+            # defines the only ids that mean anything, so tokenization must
+            # land inside it rather than inside a default.
+            return config.vocab_size
         if isinstance(self._adapter_vocab_size, int) and self._adapter_vocab_size > 0:
             return self._adapter_vocab_size
         return self._base_vocab_size
@@ -430,7 +479,10 @@ class TrainingService:
                 context="adapter_rank",
             ),
             layers=adapter.schema.get("layers", []),
-            matrices=adapter.schema.get("matrices", []),
+            # SPEC §5.2 restricts LoRA to the attention projections; an
+            # adapter that names none gets the standard Q/V pair rather than
+            # an empty weight set that could only be skipped.
+            matrices=adapter.schema.get("matrices") or ["attn_q", "attn_v"],
         )
         params_path.write_text(json.dumps(weights, indent=2))
         metadata = {
@@ -956,8 +1008,8 @@ class TrainingService:
           not become "latest"; prompt-mode adapters stay on the prompt rung).
         - holdout present -> promote only when holdout loss improved by at
           least EVAL_MIN_RELATIVE_IMPROVEMENT.
-        - dataset too small for a holdout -> promote on completed training,
-          recording that the gate ran without an eval.
+        - dataset too small for a holdout -> never promote: improvement
+          cannot be shown, and unevaluated weights now change the model.
         """
         status = trace.get("status")
         if status != "ok":
@@ -985,9 +1037,16 @@ class TrainingService:
                 "eval_after": eval_after,
                 "improvement": improvement,
             }
+        # No holdout means the ≥1% improvement of §5.4.6 cannot be shown, and
+        # "promoted only when it improves" refuses what it cannot measure.
+        # This used to promote: harmless while trained weights were inert,
+        # but they now change the model, so an unevaluated version could
+        # regress it — which is exactly what §5.5's "nothing regresses"
+        # forbids. The adapter stays on the prompt rung until it has enough
+        # data to prove itself.
         return {
-            "promoted": True,
-            "reason": "no holdout (dataset below eval threshold)",
+            "promoted": False,
+            "reason": "no holdout (dataset below eval threshold); nothing to prove improvement",
             "holdout_examples": holdout_count,
         }
 
@@ -1186,19 +1245,50 @@ class TrainingService:
     def _init_lora_weights(
         self, rank: int, layers: List[int], matrices: List[str]
     ) -> dict:
+        """Zero-initialized LoRA matrices sized to the base model (SPEC §5.2).
+
+        Three things here are load-bearing:
+
+        * **Shapes come from the checkpoint.** `A ∈ ℝ^{r × d_in}` and
+          `B ∈ ℝ^{d_out × r}` where the projection decides d_in/d_out — k and
+          v are narrower than q under grouped-query attention. Sizing both
+          from a made-up hidden width produced matrices that fit no model.
+        * **B starts at zero.** `B @ A` is then exactly zero, so a freshly
+          created adapter is the identity. That is what lets §5.5 put an
+          adapter on the prompt rung without it perturbing the model before
+          the data has earned any weights.
+        * **No base model, no weights.** LoRA hooks the base model's matrices;
+          without a checkpoint there is nothing to hook, so the adapter stays
+          prompt-only rather than carrying numbers that mean nothing.
+        """
+        config = self._base_config()
+        if config is None:
+            logger.warning(
+                "lora_init_without_base_model",
+                detail="no base checkpoint; adapter stays on the prompt rung",
+            )
+            return {}
         weights: dict[str, list[list[float]]] = {}
-        hidden_dim = max(rank * 4, 8)
         for layer in layers:
+            if not isinstance(layer, int) or not 0 <= layer < config.num_layers:
+                logger.warning(
+                    "lora_init_layer_out_of_range",
+                    layer=layer,
+                    num_layers=config.num_layers,
+                )
+                continue
             for matrix in matrices:
-                key_a = f"layer_{layer}.{matrix}.A"
-                key_b = f"layer_{layer}.{matrix}.B"
-                weights[key_a] = [
-                    [random.uniform(-0.01, 0.01) for _ in range(hidden_dim)]
+                shape = transformer.projection_shape(config, matrix)
+                if shape is None:
+                    logger.warning("lora_init_unknown_target", target=matrix)
+                    continue
+                d_out, d_in = shape
+                weights[f"layers.{layer}.{matrix}.A"] = [
+                    [random.uniform(-0.01, 0.01) for _ in range(d_in)]
                     for _ in range(rank)
                 ]
-                weights[key_b] = [
-                    [random.uniform(-0.01, 0.01) for _ in range(rank)]
-                    for _ in range(hidden_dim)
+                weights[f"layers.{layer}.{matrix}.B"] = [
+                    [0.0 for _ in range(rank)] for _ in range(d_out)
                 ]
         return weights
 
@@ -1218,11 +1308,14 @@ class TrainingService:
         Train a single LoRA adapter with a supervised loss and checkpoints.
 
         The loop mirrors the lightweight JAX forward pass used by the
-        ``LocalJaxLoRABackend``: embeddings are projected through paired
-        ``.A`` / ``.B`` matrices to produce logits and a masked
-        cross-entropy loss. Gradients are accumulated across
-        ``accumulation_steps`` microbatches before each optimizer update and
-        checkpoints are written so the backend can reload trained weights.
+        ``LocalJaxLoRABackend``: the frozen base checkpoint is loaded once,
+        the LoRA matrices are applied inside its attention projections, and
+        the gradient is taken with respect to those matrices alone — the base
+        parameters are closed over, never differentiated, so "only on
+        adapters, never on the base model" is structural rather than a
+        promise. Gradients are accumulated across ``accumulation_steps``
+        microbatches before each optimizer update and checkpoints are written
+        so the backend can reload trained weights.
         """
 
         try:
@@ -1235,27 +1328,35 @@ class TrainingService:
             )
             return {"status": "skipped", "reason": "jax/optax not installed"}
 
-        vocab_size = max(self._vocab_size(), 1)
-        max_token_id = 0
-        for batch in batches:
-            for key in ("input_ids", "labels"):
-                seqs = batch.get(key) or []
-                for seq in seqs:
-                    if seq:
-                        max_token_id = max(max_token_id, max(seq))
-        vocab_size = max(vocab_size, max_token_id + 1)
-        hidden_dim = 0
-        for name, value in params.items():
-            if name.endswith(".A"):
-                hidden_dim = max(hidden_dim, len(value[0]) if value else 0)
-        hidden_dim = hidden_dim or 16
-
-        emb_table = jnp.sin(
-            jnp.arange(vocab_size * hidden_dim, dtype=jnp.float32).reshape(
-                vocab_size, hidden_dim
+        # SPEC §5.4.4: the loss is over `model_apply(params_base, lora_params,
+        # inputs)`. Without a base model there is no such loss to compute, so
+        # the run is *skipped* — and §5.4.6 makes a skipped run unpromotable,
+        # which leaves the adapter on the prompt rung. Training something
+        # else and calling it a success is the failure this branch prevents.
+        checkpoint = self._base_checkpoint()
+        if checkpoint is None:
+            logger.warning(
+                "training_loop_skipped",
+                reason="no_base_checkpoint",
+                base_model=self._base_model_dir(),
             )
-            / float(hidden_dim)
-        )
+            return {"status": "skipped", "reason": "no base checkpoint to train against"}
+        if not params:
+            return {"status": "skipped", "reason": "adapter has no LoRA matrices"}
+        config, base_params = checkpoint
+        vocab_size = config.vocab_size
+
+        # Parsed once, out here: the assembly inside the loss must be pure
+        # array plumbing so it stays traceable and differentiable.
+        lora_index = transformer.lora_layer_index(list(params))
+        if not lora_index:
+            return {"status": "skipped", "reason": "no LoRA matrices matched the model"}
+
+        def _assemble(tree: dict) -> List[dict]:
+            layers: List[dict] = [{} for _ in range(config.num_layers)]
+            for name, (layer_index, slot) in lora_index.items():
+                layers[layer_index][slot] = tree[name]
+            return layers
 
         def _flatten_params(param_dict: dict) -> dict:
             return {k: jnp.array(v, dtype=jnp.float32) for k, v in param_dict.items()}
@@ -1270,48 +1371,47 @@ class TrainingService:
             path = checkpoint_dir / f"step_{step:04d}.json"
             path.write_text(json.dumps(_to_python(tree)))
 
-        def _apply_lora(p: dict, embeds: jnp.ndarray) -> jnp.ndarray:
-            acc = jnp.zeros_like(embeds)
-            for name, mat in p.items():
-                if not name.endswith(".A"):
-                    continue
-                b_key = name.replace(".A", ".B")
-                if b_key not in p:
-                    continue
-                base = embeds @ mat.T
-                update = base @ p[b_key].T
-                if update.shape[-1] != embeds.shape[-1]:
-                    width = embeds.shape[-1]
-                    pad = width - update.shape[-1]
-                    if pad > 0:
-                        update = jnp.pad(update, ((0, 0), (0, 0), (0, pad)))
-                    else:
-                        update = update[:, :, :width]
-                acc = acc + update
-            return embeds + acc
+        def cross_entropy(p: dict, batch: dict) -> jnp.ndarray:
+            """Masked token-level CE over the real model (SPEC §5.4.4).
 
-        def forward(p: dict, batch: dict) -> jnp.ndarray:
-            input_ids = jnp.array(batch["input_ids"], dtype=jnp.int32)
-            labels = jnp.array(batch["labels"], dtype=jnp.int32)
+            The mask is the target span only, so the adapter learns the
+            answer and not the prompt it was given. Normalized by mask weight
+            rather than by batch, so a long prompt cannot dilute a short
+            correction.
+            """
+            input_ids = jnp.clip(
+                jnp.array(batch["input_ids"], dtype=jnp.int32), 0, vocab_size - 1
+            )
+            labels = jnp.clip(
+                jnp.array(batch["labels"], dtype=jnp.int32), 0, vocab_size - 1
+            )
             mask = jnp.array(batch.get("attention_mask") or [[1]], dtype=jnp.float32)
-            clipped_ids = jnp.clip(input_ids, 0, vocab_size - 1)
-            embeds = emb_table[clipped_ids]
-            lora_embeds = _apply_lora(p, embeds)
-            logits = jnp.einsum("bsh,vh->bsv", lora_embeds, emb_table)
-            labels = jnp.clip(labels, 0, vocab_size - 1)
+            logits, _ = transformer.forward(
+                jnp, config, base_params, input_ids, lora=_assemble(p)
+            )
             log_probs = jax.nn.log_softmax(logits, axis=-1)
             nll = -jnp.take_along_axis(log_probs, labels[..., None], axis=-1).squeeze(
                 -1
             )
-            masked = nll * mask
             denom = jnp.maximum(jnp.sum(mask), 1.0)
-            return jnp.sum(masked) / denom
+            return jnp.sum(nll * mask) / denom
+
+        def forward(p: dict, batch: dict) -> jnp.ndarray:
+            """The training objective: CE plus the SPEC §5.4.4 L2 term."""
+            l2 = sum(jnp.sum(jnp.square(value)) for value in p.values())
+            return cross_entropy(p, batch) + LORA_L2_LAMBDA * l2
 
         def _eval_loss(p: dict) -> Optional[float]:
-            """Mean forward loss over the holdout batches (no gradients)."""
+            """Holdout cross-entropy, without the regularizer.
+
+            The gate asks whether predictions improved. Including the L2 term
+            would let a shrinking weight norm register as progress, and — since
+            B starts at zero and can only grow — it would count honest learning
+            as a penalty against promotion.
+            """
             if not eval_batches:
                 return None
-            losses = [float(forward(p, batch)) for batch in eval_batches]
+            losses = [float(cross_entropy(p, batch)) for batch in eval_batches]
             return sum(losses) / len(losses)
 
         opt = optax.adam(learning_rate)

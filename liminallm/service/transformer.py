@@ -119,6 +119,21 @@ def checkpoint_available(model_dir: str | Path) -> bool:
     return any(directory.glob("*.safetensors"))
 
 
+def load_config(model_dir: str | Path) -> Optional[ModelConfig]:
+    """Just the config, for callers that need shapes but not gigabytes.
+
+    Training sizes its LoRA matrices from this (SPEC §5.2 needs `d_in` and
+    `d_out` per projection) long before it needs the weights themselves.
+    """
+    try:
+        config = ModelConfig.from_dict(
+            json.loads((Path(model_dir) / "config.json").read_text())
+        )
+    except Exception:  # noqa: BLE001 - missing/unparseable config
+        return None
+    return config if config.is_usable() else None
+
+
 def load_checkpoint(model_dir: str | Path) -> Tuple[ModelConfig, Dict[str, Any]]:
     """Read config.json and every shard into a parameter tree.
 
@@ -369,6 +384,48 @@ def lora_by_layer(
             sample=unmatched[:3],
         )
     return layers if matched else None
+
+
+def projection_shape(config: ModelConfig, target: str) -> Optional[Tuple[int, int]]:
+    """``(d_out, d_in)`` of one attention projection, per SPEC §5.2.
+
+    LoRA is `A ∈ ℝ^{r × d_in}` and `B ∈ ℝ^{d_out × r}`, so a trainer cannot
+    size its matrices without these. Grouped-query attention makes k and v
+    narrower than q, which is exactly the kind of detail a guessed shape gets
+    wrong.
+    """
+    hidden = config.hidden_size
+    heads_width = config.num_heads * config.head_dim
+    kv_width = config.num_kv_heads * config.head_dim
+    return {
+        "attn_q": (heads_width, hidden),
+        "attn_k": (kv_width, hidden),
+        "attn_v": (kv_width, hidden),
+        "attn_o": (hidden, heads_width),
+    }.get(target)
+
+
+def lora_layer_index(names: Sequence[str]) -> Dict[str, Tuple[int, str]]:
+    """Map flat LoRA names to ``(layer index, "target.slot")``.
+
+    Computed once, outside any traced function: the assembly inside a loss
+    function must be pure array plumbing, with the string parsing already
+    done.
+    """
+    index: Dict[str, Tuple[int, str]] = {}
+    for name in names:
+        parts = name.split(".")
+        if (
+            len(parts) == 4
+            and parts[0] == "layers"
+            and parts[2] in LORA_TARGETS
+            and parts[3] in ("A", "B")
+        ):
+            try:
+                index[name] = (int(parts[1]), f"{parts[2]}.{parts[3]}")
+            except ValueError:
+                continue
+    return index
 
 
 def prefix_length(a: Sequence[int], b: Sequence[int]) -> int:
