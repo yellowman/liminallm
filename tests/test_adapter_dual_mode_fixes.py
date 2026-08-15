@@ -19,9 +19,10 @@ import pytest
 # Import validate_adapter_base_model unconditionally (doesn't require JAX)
 from liminallm.service.model_backend import validate_adapter_base_model
 
-# Check if JAX is available for LocalJaxLoRABackend tests
+# Check if JAX is available for LocalJaxLoRABackend tests. The import is the
+# probe — find_spec would say a broken install is present.
 try:
-    import jax
+    import jax  # noqa: F401
     HAS_JAX = True
 except ImportError:
     HAS_JAX = False
@@ -341,31 +342,36 @@ class TestWeightedAdapterBlending:
         assert abs(a_values[1][1] - 1.0) < 0.01
 
     def test_weighted_blend_respects_weights(self, backend_with_adapters):
-        """Blending should respect individual adapter weights."""
+        """Composition follows SPEC §5.2: ΔW = Σ_j g_j·α_j·B_j A_j.
+
+        This used to assert the average (0.3·1 + 0.7·2)/1.0 = 1.7 on the A
+        matrix alone, which described the implementation rather than the
+        SPEC — and that implementation cancelled the gate for a single
+        adapter and produced cross terms for two. The composed *delta* is
+        what the equation is about, so that is what is checked.
+        """
         backend, tmp_path = backend_with_adapters
 
-        # adapter1 has weight 0.3, adapter2 has weight 0.7
-        # adapter1 values are 1.0, adapter2 values are 2.0
-        # Expected blend: (0.3 * 1.0 + 0.7 * 2.0) / (0.3 + 0.7) = 1.7
         adapters = [
             {
-                "id": "adapter1",
+                "id": "adapter1",  # A = B = I
                 "weight": 0.3,
                 "fs_dir": str(tmp_path / "adapters" / "adapter1"),
             },
             {
-                "id": "adapter2",
+                "id": "adapter2",  # A = B = 2I
                 "weight": 0.7,
                 "fs_dir": str(tmp_path / "adapters" / "adapter2"),
             },
         ]
 
         weights = backend._blend_adapter_weights(adapters, user_id="test-user")
+        delta = (weights["layer0.B"] @ weights["layer0.A"]).tolist()
 
-        # Check blended value
-        a_values = weights["layer0.A"].tolist()
-        expected = 1.7  # (0.3 * 1.0 + 0.7 * 2.0) / 1.0
-        assert abs(a_values[0][0] - expected) < 0.01
+        # 0.3·(I·I) + 0.7·(2I·2I) = 0.3·I + 2.8·I = 3.1·I
+        assert abs(delta[0][0] - 3.1) < 0.01
+        assert abs(delta[1][1] - 3.1) < 0.01
+        assert abs(delta[0][1]) < 0.01  # no cross terms off the diagonal
 
     def test_gate_weight_field_recognized(self, backend_with_adapters):
         """Should recognize gate_weight as alternative to weight."""
@@ -479,31 +485,26 @@ class TestWeightedAdapterBlending:
 
         assert weights == {}
 
-    def test_normalization_preserves_scale(self, backend_with_adapters):
-        """Weight normalization should preserve expected scale."""
+    def test_gates_are_not_normalized_away(self, backend_with_adapters):
+        """A gate must scale the delta, not cancel itself.
+
+        The old implementation divided the accumulated matrices by the total
+        gate weight, so a lone adapter computed (g·A)/g = A and every gate
+        produced an identical delta. Halving the gate must halve the delta.
+        """
         backend, tmp_path = backend_with_adapters
+        path = str(tmp_path / "adapters" / "adapter1")  # A = B = I
 
-        # Two adapters with equal weights
-        # adapter1: 1.0, adapter2: 2.0
-        # Equal blend: (0.5 * 1.0 + 0.5 * 2.0) / 1.0 = 1.5
-        adapters = [
-            {
-                "id": "adapter1",
-                "weight": 0.5,
-                "fs_dir": str(tmp_path / "adapters" / "adapter1"),
-            },
-            {
-                "id": "adapter2",
-                "weight": 0.5,
-                "fs_dir": str(tmp_path / "adapters" / "adapter2"),
-            },
-        ]
+        def delta_at(gate):
+            weights = backend._blend_adapter_weights(
+                [{"id": "adapter1", "weight": gate, "fs_dir": path}],
+                user_id="test-user",
+            )
+            return (weights["layer0.B"] @ weights["layer0.A"]).tolist()[0][0]
 
-        weights = backend._blend_adapter_weights(adapters, user_id="test-user")
-
-        a_values = weights["layer0.A"].tolist()
-        expected = 1.5  # Average of 1.0 and 2.0
-        assert abs(a_values[0][0] - expected) < 0.01
+        assert abs(delta_at(1.0) - 1.0) < 0.01
+        assert abs(delta_at(0.5) - 0.5) < 0.01
+        assert abs(delta_at(0.25) - 0.25) < 0.01
 
 
 # ==============================================================================

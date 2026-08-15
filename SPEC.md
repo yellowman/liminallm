@@ -822,6 +822,25 @@ def compose_params(params_base, lora_params_list, gate_weights):
     # use jax.tree_map to map combine over all matrices.
 ```
 
+**composition is by rank concatenation, never by averaging matrices.** the
+implementation composes several adapters into one equivalent pair:
+
+```
+A* = [A_1 ; A_2 ; …]                 stacked on the rank axis
+B* = [g_1α_1B_1 , g_2α_2B_2 , …]     stacked on the rank axis
+⇒  B*A* = Σ_j g_j α_j B_j A_j        exactly
+```
+
+this matters because the obvious alternative is wrong in two ways, and both
+shipped: gate-weighting `A` and `B` separately and dividing by the total
+weight computes `(gA)/g = A` for a lone adapter — the router's gate cancels
+itself, so 0.2 and 1.0 behave identically — and for two adapters it forms
+`B̄Ā`, whose expansion contains `B_1A_2` and `B_2A_1`, products of one
+adapter's up-projection with another's down-projection that appear in no term
+of the sum. ranks may differ between adapters; concatenation needs no padding.
+a gate of 0 contributes nothing rather than being normalized back into
+existence.
+
 for performance:
 
 - restrict LoRA to:
@@ -926,6 +945,15 @@ loop for a `training_job`:
    - cap per-example tokens (e.g., 2048) and per-job total tokens (plan-tier bound) to control spend.
    - batch layout is causal-LM SFT: one `prompt+target` sequence per example,
      next-token labels, loss masked to the target span only.
+   - the two spans are tokenized under one convention: the prompt carries the
+     model's special tokens, the target is encoded as a **continuation** so no
+     second BOS is spliced into the middle of a sequence the model would never
+     see that way at serving time.
+   - **truncation reserves the target first** and trims the oldest prompt
+     context. slicing the head of `prompt + target` instead can drop the whole
+     supervised span, leaving an all-zero loss mask — an example that reports
+     a loss of zero, which reads as one the model already answers perfectly.
+     an example with no supervised token is dropped rather than emitted.
    - optional teacher distillation pass rewrites targets first (§7.5).
 
 6. evaluation + rollout (**normative - the eval gate**):
@@ -953,9 +981,20 @@ loop for a `training_job`:
      JAX/optax missing; **no base checkpoint to train against** (there is no
      `model_apply(params_base, …)` without `params_base`, and training some
      other function would report success for a model nobody serves); an
-     adapter carrying no LoRA matrices; and an adapter whose matrices match
-     no projection in the model (weights trained for another architecture
-     must fail visibly rather than land on half their targets).
+     adapter carrying no LoRA matrices; an adapter whose matrices match no
+     projection in the model (weights trained for another architecture must
+     fail visibly rather than land on half their targets); **a checkpoint
+     whose own tokenizer will not load**; and **token ids outside the
+     checkpoint's vocabulary**.
+   - the last two are the same invariant as the first: "train against the
+     model that will serve it" includes its tokenizer. gradients through the
+     right weights teach nothing transferable if the text reached them
+     through an invented token space — and the holdout, tokenized the same
+     wrong way, would agree that it worked. the id-hash fallback exists for
+     plumbing tests against the synthetic stand-in; it must never produce
+     promotable weights for a real checkpoint, and serving refuses such a
+     checkpoint for the same reason. an out-of-range id is refused rather
+     than clipped, because clipping trains on a token nobody wrote.
 
 7. scheduling:
 

@@ -369,7 +369,10 @@ def lora_by_layer(
             except ValueError:
                 unmatched.append(name)
                 continue
-            if 0 <= index < num_layers and parts[3] in ("A", "B"):
+            # `scale` is the α of SPEC §5.2 — part of the serialization
+            # contract, so a name carrying one must not be reported as
+            # unmatched, which is what made the declared format un-round-trippable.
+            if 0 <= index < num_layers and parts[3] in ("A", "B", "scale"):
                 layers[index][f"{parts[2]}.{parts[3]}"] = jnp.asarray(
                     value, dtype=jnp.float32
                 )
@@ -405,12 +408,16 @@ def projection_shape(config: ModelConfig, target: str) -> Optional[Tuple[int, in
     }.get(target)
 
 
-def lora_layer_index(names: Sequence[str]) -> Dict[str, Tuple[int, str]]:
+def lora_layer_index(
+    names: Sequence[str], *, slots: Sequence[str] = ("A", "B")
+) -> Dict[str, Tuple[int, str]]:
     """Map flat LoRA names to ``(layer index, "target.slot")``.
 
     Computed once, outside any traced function: the assembly inside a loss
     function must be pure array plumbing, with the string parsing already
-    done.
+    done. ``slots`` defaults to the trainable matrices — α is a fixed
+    hyperparameter, so a trainer asks for it separately and carries it as a
+    constant rather than handing it to the optimizer.
     """
     index: Dict[str, Tuple[int, str]] = {}
     for name in names:
@@ -419,7 +426,7 @@ def lora_layer_index(names: Sequence[str]) -> Dict[str, Tuple[int, str]]:
             len(parts) == 4
             and parts[0] == "layers"
             and parts[2] in LORA_TARGETS
-            and parts[3] in ("A", "B")
+            and parts[3] in slots
         ):
             try:
                 index[name] = (int(parts[1]), f"{parts[2]}.{parts[3]}")

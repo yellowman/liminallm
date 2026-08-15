@@ -2222,6 +2222,20 @@ class LocalJaxLoRABackend:
                 detail="serving the synthetic stand-in; answers are not model output",
             )
             return
+        self._ensure_tokenizer()
+        if self._tokenizer is None:
+            # A real checkpoint without its own tokenizer cannot be served:
+            # the id-hash fallback invents a token space this model was never
+            # trained on, so every embedding lookup would be arbitrary. Refuse
+            # the real path rather than produce confident nonsense from it.
+            self._model_error = "checkpoint present but its tokenizer failed to load"
+            logger.error(
+                "local_checkpoint_tokenizer_missing",
+                base_model=self.base_model,
+                error=self._tokenizer_error,
+                detail="refusing the real model; a hashed token space is not this model's",
+            )
+            return
         try:
             config, params = transformer.load_checkpoint(self.base_model)
             self._ensure_jax()
@@ -2608,84 +2622,97 @@ class LocalJaxLoRABackend:
             "usage": result.get("usage", {}),
         }
 
+    @staticmethod
+    def _gate_weight_of(adapter: dict) -> float:
+        # Not an `or` chain: 0.0 is a meaningful gate and also falsy.
+        gate = adapter.get("weight")
+        if gate is None:
+            gate = adapter.get("gate_weight")
+        if gate is None:
+            gate = adapter.get("schema", {}).get("weight")
+        if gate is None:
+            gate = 1.0
+        gate = _safe_weight(gate, default=1.0, context="blend_gate_weight")
+        # Clamped to [0, 1] per SPEC §8.1 guardrails.
+        return max(0.0, min(1.0, gate))
+
     def _blend_adapter_weights(
         self, adapters: List[dict], user_id: Optional[str]
     ) -> dict:
-        """Blend multiple adapter weights using router-assigned gate weights.
+        """Compose several adapters into one equivalent LoRA pair (SPEC §5.2).
 
-        Per SPEC §5.2, effective weight composition is:
-            W_eff = W_base + Σ_j (g_j * α_j * B_j @ A_j)
+            W_eff = W_base + Σ_j g_j · α_j · B_j A_j
 
-        Where g_j is the gate weight from the router. This implementation
-        respects per-adapter weights rather than simple averaging.
+        Composition is by **concatenation along the rank axis**, not by
+        averaging the matrices:
 
-        Args:
-            adapters: List of adapter dicts, each may have 'weight' or 'gate_weight'
-            user_id: User context for path resolution and ownership checks
+            A* = [A_1 ; A_2 ; …]                 (stacked rows, rank axis)
+            B* = [g_1α_1B_1 , g_2α_2B_2 , …]     (stacked columns)
+            ⇒  B*A* = Σ_j g_j α_j B_j A_j        exactly, no cross terms.
 
-        Returns:
-            Combined weight dict with properly weighted LoRA matrices
+        The previous implementation gate-weighted A and B separately, summed
+        them, and divided by the total weight. That is wrong twice over. For
+        one adapter it computed (gA)/g = A, so the router's gate cancelled
+        itself and 0.2 behaved identically to 1.0. For two it formed B̄Ā,
+        whose expansion contains B_1A_2 and B_2A_1 — products of one
+        adapter's up-projection with another's down-projection, which the
+        SPEC sum contains no term for. Ranks may differ between adapters;
+        concatenation handles that without any padding.
         """
         if not adapters:
             return {}
 
-        combined: dict[str, Any] = {}
-        total_weight: dict[str, float] = {}
-
+        # target key -> list of (A, B) contributions in adapter order.
+        stacks: dict[str, list] = {}
         for adapter in adapters:
             weights = self._load_adapter_weights(adapter, user_id=user_id)
             if not weights:
                 continue
-
-            # Extract gate weight from adapter (router-assigned or default 1.0)
-            # Note: Can't use `or` chain because 0.0 is falsy in Python
-            gate_weight = adapter.get("weight")
-            if gate_weight is None:
-                gate_weight = adapter.get("gate_weight")
-            if gate_weight is None:
-                gate_weight = adapter.get("schema", {}).get("weight")
-            if gate_weight is None:
-                gate_weight = 1.0
-            gate_weight = _safe_weight(
-                gate_weight, default=1.0, context="blend_gate_weight"
-            )
-
-            # Clamp gate weight to [0, 1] per SPEC §8.1 guardrails
-            gate_weight = max(0.0, min(1.0, gate_weight))
-
-            if gate_weight == 0.0:
-                logger.debug(
-                    "adapter_zero_weight_skipped",
-                    adapter_id=adapter.get("id"),
-                )
+            gate = self._gate_weight_of(adapter)
+            if gate == 0.0:
+                # A closed gate contributes no delta at all — which the old
+                # normalization could not express.
+                logger.debug("adapter_zero_weight_skipped", adapter_id=adapter.get("id"))
                 continue
-
             for name, tensor in weights.items():
-                if name in combined:
-                    if combined[name].shape != tensor.shape:
-                        logger.warning(
-                            "adapter_shape_mismatch",
-                            adapter_id=adapter.get("id"),
-                            name=name,
-                            expected_shape=combined[name].shape,
-                            actual_shape=tensor.shape,
-                        )
-                        continue
-                    # Weighted accumulation: W += g_j * W_j
-                    combined[name] = combined[name] + (gate_weight * tensor)
-                    total_weight[name] += gate_weight
+                if not name.endswith(".A"):
+                    continue
+                key = name[: -len(".A")]
+                b_tensor = weights.get(f"{key}.B")
+                if b_tensor is None:
+                    logger.warning(
+                        "adapter_missing_b_matrix",
+                        adapter_id=adapter.get("id"),
+                        name=name,
+                    )
+                    continue
+                # α from the adapter's own params (SPEC §5.2 allows a
+                # per-matrix scale); folded into B together with the gate so
+                # the concatenation identity above holds exactly.
+                scale = weights.get(f"{key}.scale")
+                alpha = float(scale) if scale is not None else 1.0
+                stacks.setdefault(key, []).append(
+                    (tensor, b_tensor * (gate * alpha))
+                )
+
+        combined: dict[str, Any] = {}
+        for key, parts in stacks.items():
+            if len(parts) == 1:
+                a_matrix, b_matrix = parts[0]
+            else:
+                widths = {a.shape[1] for a, _ in parts} | {b.shape[0] for _, b in parts}
+                if len({a.shape[1] for a, _ in parts}) > 1 or len(
+                    {b.shape[0] for _, b in parts}
+                ) > 1:
+                    logger.warning(
+                        "adapter_shape_mismatch", name=key, widths=sorted(widths)
+                    )
+                    a_matrix, b_matrix = parts[0]
                 else:
-                    combined[name] = gate_weight * tensor
-                    total_weight[name] = gate_weight
-
-        # Normalize by total weight to maintain scale
-        # If weights sum to 1.0, this is a no-op; otherwise it prevents
-        # over-amplification when sum > 1 or under-representation when sum < 1
-        for name, tensor in combined.items():
-            w = total_weight.get(name, 1.0)
-            if w > 0.0 and w != 1.0:
-                combined[name] = tensor / w
-
+                    a_matrix = self._jnp.concatenate([a for a, _ in parts], axis=0)
+                    b_matrix = self._jnp.concatenate([b for _, b in parts], axis=1)
+            combined[f"{key}.A"] = a_matrix
+            combined[f"{key}.B"] = b_matrix
         return combined
 
     def _adapter_path(self, adapter: dict, *, requested_user_id: Optional[str]) -> str:

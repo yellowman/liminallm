@@ -45,8 +45,47 @@ CONFIG = {
 }
 
 
+#: Words the fixture tokenizer knows. Anything else becomes [UNK], which is
+#: what a real tokenizer does and what the training path must survive.
+_TOKENIZER_WORDS = (
+    "hello there friend question answer use tabs context the a and now "
+    "another entirely follow up word wanted alpha beta gamma delta"
+).split()
+
+
+def _build_tokenizer(directory, vocab_size):
+    """A real tokenizer beside the weights, as a real checkout has.
+
+    Without one, the local lane refuses the checkpoint outright: a hashed
+    token space is not the model's own, and an adapter fitted to hashed ids
+    would be scored against tokens serving never emits. The fixture ships a
+    genuine tokenizer so the tests exercise the text → tokenizer → batch path
+    production uses, rather than hand-written token ids.
+    """
+    from tokenizers import Tokenizer, models, pre_tokenizers
+
+    vocab = {"[UNK]": 0, "[BOS]": 1}
+    for index, word in enumerate(_TOKENIZER_WORDS):
+        if len(vocab) >= vocab_size:
+            break
+        vocab.setdefault(word, index + 2)
+    tokenizer = Tokenizer(models.WordLevel(vocab=vocab, unk_token="[UNK]"))
+    tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer.save(str(directory / "tokenizer.json"))
+    (directory / "tokenizer_config.json").write_text(
+        json.dumps(
+            {
+                "tokenizer_class": "PreTrainedTokenizerFast",
+                "unk_token": "[UNK]",
+                "bos_token": "[BOS]",
+                "model_max_length": 512,
+            }
+        )
+    )
+
+
 def _build_checkpoint(directory, seed=0):
-    """A real HF-layout checkpoint with random weights."""
+    """A real HF-layout checkpoint: config, weights, and its own tokenizer."""
     rng = np.random.default_rng(seed)
     hidden = CONFIG["hidden_size"]
     heads = CONFIG["num_attention_heads"]
@@ -76,6 +115,7 @@ def _build_checkpoint(directory, seed=0):
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "config.json").write_text(json.dumps(CONFIG))
     save_file(tensors, str(directory / "model.safetensors"))
+    _build_tokenizer(directory, CONFIG["vocab_size"])
     return directory
 
 

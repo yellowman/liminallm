@@ -1110,11 +1110,30 @@ class TrainingService:
         self._ensure_tokenizer(base_model)
         vocab_size = max(self._vocab_size(), 1)
 
-        def _encode(text: str) -> List[int]:
+        def _encode(text: str, *, continuation: bool = False) -> List[int]:
+            """Tokens for one span. ``continuation`` suppresses special tokens.
+
+            The target continues the prompt inside one sequence, so encoding
+            it with specials would splice a second BOS into the middle —
+            training the model on a sequence shape it never sees at serving
+            time.
+            """
             if self.tokenizer is not None:
-                return list(
-                    self.tokenizer.encode(text, truncation=True, max_length=max_length)
-                )
+                try:
+                    return list(
+                        self.tokenizer.encode(
+                            text,
+                            truncation=True,
+                            max_length=max_length,
+                            add_special_tokens=not continuation,
+                        )
+                    )
+                except TypeError:  # pragma: no cover - minimal tokenizer objects
+                    return list(
+                        self.tokenizer.encode(
+                            text, truncation=True, max_length=max_length
+                        )
+                    )
             # Use deterministic hashing instead of Python's randomized hash()
             tokens = text.split()
 
@@ -1136,11 +1155,24 @@ class TrainingService:
             seqs: List[tuple[List[int], int]] = []
             for row in batch:
                 prompt_tokens = _encode(row["prompt"])
-                target_tokens = _encode(row["target"]) or [0]
-                full = (prompt_tokens + target_tokens)[: max_length + 1]
-                if len(full) < 2:
-                    full = full + [0] * (2 - len(full))
-                prompt_len = min(len(prompt_tokens), len(full) - 1)
+                target_tokens = _encode(row["target"], continuation=True) or [0]
+                # The target is the supervised span, so it is reserved first
+                # and the *prompt* gives ground — oldest context first. Taking
+                # a head slice of prompt+target instead could drop the target
+                # entirely, leaving an all-zero loss mask: an example that
+                # contributes a confident zero loss and teaches nothing.
+                budget = max_length + 1
+                if len(target_tokens) > budget - 1:
+                    target_tokens = target_tokens[: budget - 1]
+                room = budget - len(target_tokens)
+                if len(prompt_tokens) > room:
+                    prompt_tokens = prompt_tokens[-room:]
+                if not prompt_tokens:
+                    prompt_tokens = [target_tokens.pop(0)] if len(
+                        target_tokens
+                    ) > 1 else [0]
+                full = prompt_tokens + target_tokens
+                prompt_len = len(prompt_tokens)
                 seqs.append((full, prompt_len))
             seq_len = max(len(full) - 1 for full, _ in seqs)
             input_ids: List[List[int]] = []
@@ -1152,10 +1184,21 @@ class TrainingService:
                 # Label position j predicts token full[j+1]; that token is
                 # part of the target once j+1 >= prompt_len.
                 mask = [1.0 if (j + 1) >= prompt_len else 0.0 for j in range(len(lab))]
+                if sum(mask) <= 0.0:
+                    # Nothing supervised: the example would train on nothing
+                    # while reporting a loss of zero, which reads as a
+                    # perfectly learned example. Construction above prevents
+                    # it; this refuses to emit one if that ever stops holding.
+                    logger.warning(
+                        "sft_example_without_target_dropped", prompt_len=prompt_len
+                    )
+                    continue
                 pad = seq_len - len(inp)
                 input_ids.append(inp + [0] * pad)
                 labels.append(lab + [0] * pad)
                 loss_mask.append(mask + [0.0] * pad)
+            if not input_ids:
+                continue
             yield {
                 "input_ids": input_ids,
                 "labels": labels,
@@ -1343,19 +1386,64 @@ class TrainingService:
             return {"status": "skipped", "reason": "no base checkpoint to train against"}
         if not params:
             return {"status": "skipped", "reason": "adapter has no LoRA matrices"}
+        # Resolved here rather than assumed: the invariant must not depend on
+        # whether a caller happened to tokenize through this service first.
+        self._ensure_tokenizer(self._base_model_dir())
+        if self.tokenizer is None:
+            # Gradients through the real transformer are worth nothing if the
+            # text reached it through an invented token space: the adapter
+            # would be fitted to ids that serving never produces, and the
+            # holdout — tokenized the same wrong way — would happily agree.
+            # "Train against the model that will serve it" includes its
+            # tokenizer.
+            logger.warning(
+                "training_loop_skipped",
+                reason="no_real_tokenizer",
+                base_model=self._base_model_dir(),
+                error=self._tokenizer_error,
+            )
+            return {
+                "status": "skipped",
+                "reason": "base checkpoint present but its tokenizer failed to load",
+            }
         config, base_params = checkpoint
         vocab_size = config.vocab_size
+
+        # A token the model has no embedding for means the tokenizer and the
+        # checkpoint disagree. Clipping it to vocab_size-1 would train on a
+        # token nobody wrote — the mismatch has to be refused, the same way a
+        # missing checkpoint tensor is.
+        for batch in list(batches) + list(eval_batches):
+            for key in ("input_ids", "labels"):
+                for sequence in batch.get(key) or []:
+                    if sequence and max(sequence) >= vocab_size:
+                        logger.error(
+                            "training_loop_skipped",
+                            reason="tokenizer_vocab_mismatch",
+                            checkpoint_vocab=vocab_size,
+                            observed_token=max(sequence),
+                        )
+                        return {
+                            "status": "skipped",
+                            "reason": "tokenizer and checkpoint disagree on vocabulary",
+                        }
 
         # Parsed once, out here: the assembly inside the loss must be pure
         # array plumbing so it stays traceable and differentiable.
         lora_index = transformer.lora_layer_index(list(params))
         if not lora_index:
             return {"status": "skipped", "reason": "no LoRA matrices matched the model"}
+        # α (SPEC §5.2) is a fixed hyperparameter, so it is carried as a
+        # constant rather than handed to the optimizer as something to learn.
+        scale_index = transformer.lora_layer_index(list(params), slots=("scale",))
+        constants = {name: params[name] for name in scale_index}
 
         def _assemble(tree: dict) -> List[dict]:
             layers: List[dict] = [{} for _ in range(config.num_layers)]
             for name, (layer_index, slot) in lora_index.items():
                 layers[layer_index][slot] = tree[name]
+            for name, (layer_index, slot) in scale_index.items():
+                layers[layer_index][slot] = constants[name]
             return layers
 
         def _flatten_params(param_dict: dict) -> dict:
@@ -1379,12 +1467,11 @@ class TrainingService:
             rather than by batch, so a long prompt cannot dilute a short
             correction.
             """
-            input_ids = jnp.clip(
-                jnp.array(batch["input_ids"], dtype=jnp.int32), 0, vocab_size - 1
-            )
-            labels = jnp.clip(
-                jnp.array(batch["labels"], dtype=jnp.int32), 0, vocab_size - 1
-            )
+            # No clipping: ids are validated against the checkpoint's vocab
+            # before training starts, and a mismatch is refused there rather
+            # than folded into a token the user never wrote.
+            input_ids = jnp.array(batch["input_ids"], dtype=jnp.int32)
+            labels = jnp.array(batch["labels"], dtype=jnp.int32)
             mask = jnp.array(batch.get("attention_mask") or [[1]], dtype=jnp.float32)
             logits, _ = transformer.forward(
                 jnp, config, base_params, input_ids, lora=_assemble(p)
