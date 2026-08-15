@@ -366,8 +366,11 @@ class TestSftSequenceConstruction:
             {"prompt": "another question", "target": "real answer"},
         ]
         (batch,) = list(service._tokenize_batches(mixed, batch_size=2, max_length=32))
-        assert batch["shape"]["batch"] == 2  # the source batch size
-        assert len(batch["input_ids"]) == 1  # but only one usable example
+        assert len(batch["input_ids"]) == 1  # only one usable example
+        # The shape describes the rows actually emitted. It used to report the
+        # source slice, so a consumer preallocating from it would size for
+        # examples that were dropped — and this assertion used to pin that.
+        assert batch["shape"]["batch"] == 1
 
     def test_a_long_prompt_never_erases_the_target(self, tmp_path):
         """Slicing the head of prompt+target could drop the whole target,

@@ -5,6 +5,7 @@ import importlib.util
 import json
 import os
 import re
+import struct
 import threading
 import time
 from enum import Enum
@@ -17,7 +18,7 @@ from liminallm.config import (
     get_provider_capabilities,
 )
 from liminallm.logging import get_logger
-from liminallm.service import responses_compat, transformer
+from liminallm.service import local_format, responses_compat, transformer
 from liminallm.service.fs import safe_join
 from liminallm.service.prompt_utils import extract_prompt_instructions
 from liminallm.service.tokenizer_utils import (
@@ -1827,6 +1828,10 @@ class LocalJaxLoRABackend:
         self.top_p = top_p
         self.max_cached_tokens = max_cached_tokens
         self._model_state: Optional[Tuple[Any, Dict[str, Any]]] = None
+        #: None = not resolved yet; "absent" | "valid" | "broken" thereafter.
+        #: Distinct from _model_state so "no real model" cannot be confused
+        #: with "no checkpoint configured" (see _ensure_model).
+        self._checkpoint_state: Optional[str] = None
         self._model_error: Optional[str] = None
         self._vocab_mismatch_logged = False
         # Content-addressed KV prefix cache: entries are (adapter signature,
@@ -1905,11 +1910,9 @@ class LocalJaxLoRABackend:
         return self._base_vocab_size
 
     def _normalize_messages(self, messages: List[dict]) -> str:
-        if not messages:
-            return ""
-        return "\n".join(
-            [f"{m.get('role', 'user')}: {m.get('content', '')}" for m in messages]
-        )
+        # Shared with training (service/local_format.py): the role labels are
+        # tokens to a raw decoder, so both paths must write the same ones.
+        return local_format.format_conversation(messages or [])
 
     def _apply_adapter_vocab_size(self, adapter: dict) -> None:
         self._adapter_vocab_size = None
@@ -1951,14 +1954,18 @@ class LocalJaxLoRABackend:
         """
         self._ensure_tokenizer()
         if self._tokenizer:
-            encoded = self._tokenizer(
-                text,
-                truncation=True,
-                max_length=self.max_seq_len,
-                return_tensors="np",
+            # truncation=False deliberately: the tokenizer would keep the
+            # OLDEST tokens, discarding the newest turn before this method
+            # could choose. Training keeps the tail (SPEC §5.4.5); serving has
+            # to make the same choice or the adapter is fitted to one input
+            # distribution and asked to serve another.
+            encoded = self._tokenizer(text, truncation=False, return_tensors="np")
+            ids = local_format.keep_newest(
+                encoded["input_ids"][0].tolist(), self.max_seq_len
             )
-            ids = encoded["input_ids"][0].tolist()
-            attention = encoded["attention_mask"][0].tolist()
+            attention = local_format.keep_newest(
+                encoded["attention_mask"][0].tolist(), self.max_seq_len
+            )
             return ids, attention
 
         # Fallback: deterministic whitespace tokenization with FNV-1a hash
@@ -2009,6 +2016,20 @@ class LocalJaxLoRABackend:
         if not adapter:
             return {}
         adapter_id = adapter.get("id", "unknown")
+
+        # SPEC §5.5: a prompt-rung adapter carries instructions, never
+        # weights. Defense in depth alongside the version pin — the ladder
+        # says weights arrive only on graduation to hybrid/local, so files
+        # that happen to exist on disk must not change that.
+        schema_for_mode = (
+            adapter.get("schema") if isinstance(adapter.get("schema"), dict) else {}
+        )
+        mode = str(
+            adapter.get("mode") or schema_for_mode.get("mode") or ""
+        ).strip().lower()
+        if mode == AdapterMode.PROMPT:
+            logger.debug("adapter_prompt_mode_carries_no_weights", adapter_id=adapter_id)
+            return {}
 
         # Validate base model compatibility before loading weights
         is_compatible, warning = validate_adapter_base_model(
@@ -2103,24 +2124,33 @@ class LocalJaxLoRABackend:
         # version (or the `latest` pointer maintained alongside it). Never fall
         # back to scanning for the newest directory: an un-promoted version
         # left on disk by a gate-rejected training run would win that scan.
-        if current_version:
-            try:
-                pinned = int(current_version)
-            except (TypeError, ValueError):
-                pinned = 0
-            if pinned > 0:
-                exact = path / f"v{pinned:04d}" / "params.json"
-                if exact.exists():
-                    return exact
-                latest_pinned = path / "latest" / "params.json"
-                if latest_pinned.exists():
-                    return latest_pinned
-                logger.warning(
-                    "adapter_promoted_version_missing",
-                    adapter_path=str(path),
-                    current_version=pinned,
-                )
-                return None
+        try:
+            pinned = int(current_version) if current_version is not None else 0
+        except (TypeError, ValueError):
+            pinned = 0
+        if pinned > 0:
+            exact = path / f"v{pinned:04d}" / "params.json"
+            if exact.exists():
+                return exact
+            latest_pinned = path / "latest" / "params.json"
+            if latest_pinned.exists():
+                return latest_pinned
+            logger.warning(
+                "adapter_promoted_version_missing",
+                adapter_path=str(path),
+                current_version=pinned,
+            )
+            return None
+        if current_version is not None:
+            # version 0 (or unparseable) means nothing has been promoted yet.
+            # Falling through to the scan below would find the vNNNN a
+            # training job writes *before* its eval gate runs, so a prompt-rung
+            # adapter would serve weights the gate never approved — and a crash
+            # between writing and quarantine would make that permanent.
+            logger.debug(
+                "adapter_has_no_promoted_version", adapter_path=str(path)
+            )
+            return None
         candidates: list[Path] = []
         direct = path / "params.json"
         if direct.exists():
@@ -2210,16 +2240,29 @@ class LocalJaxLoRABackend:
         return " ".join([f"tok-{tid}" for tid in token_ids])
 
     def _ensure_model(self) -> None:
-        """Load the frozen base checkpoint once, or record why we cannot.
+        """Resolve the base checkpoint into one of three states.
 
-        Absence is not an error: a dev box or CI has no multi-gigabyte
-        weights, and the synthetic path still exercises the plumbing. It is
-        logged at warning once, because a production box silently answering
-        from the stand-in is the failure this note exists to prevent.
+        The distinction is the whole point, and collapsing it was a bug:
+
+        ``ABSENT``  no checkpoint on disk — a dev box or CI. The synthetic
+                    stand-in is allowed, and logged, because it exercises the
+                    plumbing and answers nothing.
+        ``VALID``   loaded; the real model serves.
+        ``BROKEN``  a checkpoint exists but cannot be served — its tokenizer
+                    will not load, the weights will not read, or the
+                    tokenizer disagrees with its vocabulary. This is a
+                    production configuration failure, and it must fail
+                    closed.
+
+        Using ``_model_state is None`` to mean both "dev fallback" and
+        "misconfigured" meant a broken checkpoint quietly answered from the
+        stand-in on the very next request — the opposite of the refusal this
+        was supposed to implement.
         """
-        if self._model_state is not None or self._model_error is not None:
+        if self._model_state is not None or self._checkpoint_state is not None:
             return
         if not transformer.checkpoint_available(self.base_model):
+            self._checkpoint_state = "absent"
             self._model_error = "no checkpoint at base_model path"
             logger.warning(
                 "local_checkpoint_absent",
@@ -2233,7 +2276,7 @@ class LocalJaxLoRABackend:
             # the id-hash fallback invents a token space this model was never
             # trained on, so every embedding lookup would be arbitrary. Refuse
             # the real path rather than produce confident nonsense from it.
-            self._model_error = "checkpoint present but its tokenizer failed to load"
+            self._mark_broken("checkpoint present but its tokenizer failed to load")
             logger.error(
                 "local_checkpoint_tokenizer_missing",
                 base_model=self.base_model,
@@ -2245,12 +2288,28 @@ class LocalJaxLoRABackend:
             config, params = transformer.load_checkpoint(self.base_model)
             self._ensure_jax()
             self._model_state = (config, self._jax.device_put(params, self._device))
-        except Exception as exc:  # noqa: BLE001 - degrade to the stand-in
-            self._model_error = str(exc)
+            self._checkpoint_state = "valid"
+        except Exception as exc:  # noqa: BLE001 - present but unusable
+            self._mark_broken(str(exc))
             logger.error(
                 "local_checkpoint_load_failed",
                 base_model=self.base_model,
                 error=str(exc),
+            )
+
+    def _mark_broken(self, reason: str) -> None:
+        """A present-but-unusable checkpoint. Every request fails from here."""
+        self._model_state = None
+        self._checkpoint_state = "broken"
+        self._model_error = reason
+        self._invalidate_prefix_cache()
+
+    def _refuse_if_broken(self) -> None:
+        if self._checkpoint_state == "broken":
+            raise ValueError(
+                f"local model refused: {self._model_error}. The checkpoint is "
+                "present but unusable; this is a configuration error, not a "
+                "reason to answer from the synthetic stand-in."
             )
 
     def _adapter_signature(self, adapters: List[dict]) -> str:
@@ -2268,10 +2327,13 @@ class LocalJaxLoRABackend:
         serve a model nobody asked for.
         """
         parts = sorted(
-            "{}:{}:{:.6f}".format(
+            "{}:{}:{}".format(
                 a.get("id"),
                 a.get("current_version") or a.get("version") or "",
-                self._gate_weight_of(a),
+                # The exact bits, not six decimal places: two gates that
+                # round to the same string are still two different models,
+                # and this key is the only thing keeping their KV apart.
+                struct.pack("<f", self._gate_weight_of(a)).hex(),
             )
             for a in adapters or []
             if isinstance(a, dict)
@@ -2353,8 +2415,6 @@ class LocalJaxLoRABackend:
             # embedding is worse than not answering. Refuse the real model
             # for the rest of this process and log it once: the documented
             # stand-in path is at least honest about what it is.
-            self._model_state = None
-            self._model_error = "tokenizer and checkpoint disagree on vocabulary"
             if not self._vocab_mismatch_logged:
                 self._vocab_mismatch_logged = True
                 logger.error(
@@ -2364,11 +2424,11 @@ class LocalJaxLoRABackend:
                     checkpoint_vocab=config.vocab_size,
                     observed=[min(ids), max(ids)],
                 )
-            self._invalidate_prefix_cache()
-            raise ValueError(
-                "local model refused: tokenizer produced ids outside the "
-                f"checkpoint vocabulary ({config.vocab_size})"
+            self._mark_broken(
+                "tokenizer produced ids outside the checkpoint vocabulary "
+                f"({config.vocab_size})"
             )
+            self._refuse_if_broken()
 
         start = time.perf_counter()
         cache, cached_tokens = self._reuse_prefix(signature, ids)
@@ -2462,6 +2522,9 @@ class LocalJaxLoRABackend:
         # Before tokenizing, not after: the checkpoint's vocabulary governs
         # what a token id may be, including in the hash fallback.
         self._ensure_model()
+        # A present-but-unusable checkpoint fails every request rather than
+        # letting the next one slide into the synthetic path.
+        self._refuse_if_broken()
         ids, attention = self._tokenize(prompt)
 
         # Handle empty prompts gracefully
@@ -2699,6 +2762,15 @@ class LocalJaxLoRABackend:
                 # normalization could not express.
                 logger.debug("adapter_zero_weight_skipped", adapter_id=adapter.get("id"))
                 continue
+            # Both orphans, not just one: the loop is A-driven, so a lone
+            # `.B` used to be invisible — "weights for a broken architecture
+            # fail visibly" with one silent case left in it.
+            for name in weights:
+                if name.endswith(".B") and f"{name[: -len('.B')]}.A" not in weights:
+                    raise ValueError(
+                        f"adapter {adapter.get('id')!r} has {name} without its "
+                        f"matching {name[: -len('.B')]}.A; refusing the adapter stack"
+                    )
             for name, tensor in weights.items():
                 if not name.endswith(".A"):
                     continue

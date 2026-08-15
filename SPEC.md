@@ -765,11 +765,28 @@ when using API backend:
   cache reproduces a full recompute; attention is causal; a LoRA adapter with
   `B = 0` (how every adapter initializes) changes not one logit; and a warm
   prefix cache produces byte-identical output to a cold one.
-- **when no checkpoint is present** (a dev box, CI) the lane falls back to the
-  synthetic stand-in it used to run always — a sinusoidal embedding table
-  with no attention — and logs `local_checkpoint_absent` at warning. that path
-  exercises the plumbing; it does not answer questions, and the log exists so
-  a production box cannot serve it quietly.
+- **three checkpoint states, and the middle one is not a state.** `absent`
+  (nothing on disk — a dev box or CI) falls back to the synthetic stand-in it
+  used to run always, a sinusoidal embedding table with no attention, and
+  logs `local_checkpoint_absent`: that path exercises the plumbing, does not
+  answer questions, and the log exists so a production box cannot serve it
+  quietly. `valid` serves the real model. `broken` — a checkpoint that
+  exists but cannot be served (its tokenizer will not load, the weights will
+  not read, the tokenizer disagrees with its vocabulary) — **fails every
+  request closed**. collapsing the last two into "no real model" meant a
+  refused request was followed by one silently answered from the stand-in,
+  which is the opposite of refusing.
+
+#### the local text format is one function
+
+the role labels are tokens to a raw decoder, so `USER:` and `user:` are
+different inputs, not two styles. training and serving therefore share one
+serializer (`service/local_format.py`) for turn labels, for the injected
+context marker, and for truncation — which **keeps the newest tokens**,
+because a tokenizer's own `truncation` keeps the oldest and a chat's newest
+turn is the one the answer responds to. an adapter fitted to one format and
+asked to serve another is fitted to a model that does not exist, however
+identical the checkpoint and tokenizer are.
 - **training uses this same forward pass** (§5.4): the loss is computed over
   the real model with the LoRA matrices applied inside its attention
   projections, so an adapter is fitted to the model that will serve it. the
@@ -936,6 +953,11 @@ loop for a `training_job`:
 
    - for each event:
      - assemble `prompt` = preceding user + assistant messages up to event.
+       "up to" is bounded by the target message's **sequence number**, not by
+       its position in the fetched list: dropping the target row alone leaves
+       every later turn in the prompt, so an event trained after the
+       conversation continued teaches its answer conditioned on things that
+       had not happened when the answer was written.
      - target `y` = preferred assistant answer:
        - either the answer that got “like”
        - or user’s corrected text.
@@ -1076,6 +1098,13 @@ cluster qualifies          pooled events ≥ threshold      eval gate passes
    weights where the backend supports them, with `prompt_instructions` kept
    as the portable fallback. a failed or skipped gate leaves the adapter on
    the prompt rung; nothing regresses.
+   - **two independent locks make "before graduation" unservable**, because a
+     training job writes its `vNNNN/params.json` *before* the gate runs:
+     `current_version <= 0` pins nothing and resolves to no weights (never a
+     directory scan, which would find exactly that un-gated version), and
+     `mode: "prompt"` contributes no LoRA weights whatever files exist on
+     disk. one lock would be a race; a crash between writing the version and
+     quarantining it would have made the race permanent.
 4. **demotion mirrors promotion.** pruning (§7.4) can push an adapter back
    down the ladder (disable weights, keep prompt) via the same ConfigOps
    pipeline.

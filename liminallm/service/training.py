@@ -12,7 +12,7 @@ from typing import Any, Iterable, Iterator, List, Optional, Sequence
 
 from liminallm.config import AdapterMode, get_compatible_adapter_modes
 from liminallm.logging import get_logger
-from liminallm.service import transformer
+from liminallm.service import local_format, transformer
 from liminallm.service.embeddings import deterministic_embedding
 from liminallm.service.fs import PathTraversalError, safe_join
 from liminallm.service.tokenizer_utils import (
@@ -1066,16 +1066,39 @@ class TrainingService:
             cluster_id = event.cluster_id or self._bucket_embedding(
                 event.context_embedding, event.user_id
             )
-            # Issue 18.2: Exclude target message from prompt (SFT principle)
+            # SPEC §5.4.2: the prompt is the messages *up to* the event. The
+            # bound comes from the target's own sequence number, not from its
+            # position in this list: skipping the target row alone left every
+            # later turn in the prompt, so an event trained after the
+            # conversation continued taught its answer conditioned on things
+            # that had not happened when the answer was written.
+            target_seq = next(
+                (
+                    getattr(m, "seq", None)
+                    for m in messages
+                    if m.id == event.message_id
+                ),
+                None,
+            )
             for msg in messages:
                 if msg.id == event.message_id:
-                    # This is the target message - extract for training target, not prompt
+                    # The target message: the label, never part of the prompt.
                     if not target_text:
                         target_text = msg.content
-                    continue  # Don't include target in prompt
-                prompt_chunks.append(f"{msg.role.upper()}: {msg.content}")
+                    continue
+                if target_seq is not None and getattr(msg, "seq", 0) >= target_seq:
+                    continue  # future turn, relative to the feedback
+                prompt_chunks.append(
+                    local_format.format_turn(msg.role, msg.content)
+                )
             if event.context_text:
-                prompt_chunks.append(f"CONTEXT_SNIPPET: {event.context_text}")
+                # Same vocabulary serving uses for injected context, so the
+                # adapter sees one format rather than two.
+                prompt_chunks.append(
+                    local_format.format_turn(
+                        local_format.CONTEXT_ROLE, event.context_text
+                    )
+                )
             if not target_text:
                 target_text = ""
             yield {
@@ -1223,7 +1246,10 @@ class TrainingService:
                 "labels": labels,
                 "attention_mask": loss_mask,
                 "shape": {
-                    "batch": len(batch),
+                    # The rows actually emitted, not the source slice: the
+                    # shape exists so a consumer can preallocate, and it lied
+                    # by the number of examples dropped for having no target.
+                    "batch": len(input_ids),
                     "seq_len": seq_len,
                 },
             }
