@@ -105,6 +105,64 @@ class TestValidationHappensPerAdapter:
             )
 
 
+class TestOrphanScaleCannotHide:
+    def test_a_scale_only_adapter_is_refused(self, tmp_path, checkpoint, config):
+        """The raw dict is non-empty, so the "never silently leaves the
+        stack" check did not fire — and composition, which iterates `.A`,
+        produced nothing. A promoted adapter contributed exactly nothing
+        while looking present."""
+        _write(tmp_path / "scaly" / "v0001", {"layers.0.attn_q.scale": 0.5})
+        backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
+        with pytest.raises(ValueError, match="missing its A matrix"):
+            backend._blend_adapter_weights(
+                [
+                    {
+                        "id": "scaly",
+                        "mode": "local",
+                        "fs_dir": "scaly",
+                        "current_version": 1,
+                        "weight": 0.5,
+                    }
+                ],
+                user_id="u",
+                config=config,
+            )
+
+    def test_a_scale_for_a_projection_with_no_matrices_is_refused(self, config):
+        weights = {
+            "layers.0.attn_q.A": [[0.1] * config.hidden_size] * 2,
+            "layers.0.attn_q.B": [[0.1, 0.1]] * (config.num_heads * config.head_dim),
+            "layers.0.attn_v.scale": 0.5,  # orphan: no attn_v matrices
+        }
+        with pytest.raises(ValueError, match="attn_v"):
+            transformer.validate_lora_weights(config, weights)
+
+    def test_a_non_scalar_scale_is_refused(self, config):
+        weights = {
+            "layers.0.attn_q.A": [[0.1] * config.hidden_size] * 2,
+            "layers.0.attn_q.B": [[0.1, 0.1]] * (config.num_heads * config.head_dim),
+            "layers.0.attn_q.scale": [[0.5]],
+        }
+        with pytest.raises(ValueError, match="must be a scalar"):
+            transformer.validate_lora_weights(config, weights)
+
+    def test_the_same_rules_hold_without_a_model_config(self):
+        """One validator, not two: the no-checkpoint lane checks everything
+        knowable from the weights alone."""
+        with pytest.raises(ValueError, match="outside the declared shape"):
+            transformer.validate_lora_weights(None, {"foreign.0.x.A": [[0.1]]})
+        with pytest.raises(ValueError, match="missing its A matrix"):
+            transformer.validate_lora_weights(None, {"layers.0.attn_q.scale": 0.5})
+        with pytest.raises(ValueError, match="rank"):
+            transformer.validate_lora_weights(
+                None,
+                {
+                    "layers.0.attn_q.A": [[0.1, 0.2]] * 2,
+                    "layers.0.attn_q.B": [[0.1]] * 4,
+                },
+            )
+
+
 class TestASelectedAdapterNeverVanishes:
     def test_promoted_but_unloadable_refuses_the_stack(self, tmp_path, checkpoint):
         """The router chose it; serving without it is serving a different
@@ -153,21 +211,31 @@ class TestASelectedAdapterNeverVanishes:
 
 
 class TestVersionAuthorityIsAbsolute:
-    def test_latest_pointing_elsewhere_is_refused(self, tmp_path, checkpoint, config):
+    def test_latest_takes_no_part_in_authoritative_resolution(
+        self, tmp_path, checkpoint
+    ):
+        """`latest` proved only that its target was *named* vNNNN, so
+        `A/latest -> B/v0001` served another adapter's weights as A's version
+        1. And it enabled nothing: a pointer legitimately aimed at A/vNNNN
+        means A/vNNNN exists, which the exact path already returns."""
+        other = tmp_path / "other"
+        _write(other / "v0001", {"layers.0.attn_q.A": [[0.9]]})
         adapter_dir = tmp_path / "skill"
-        _write(adapter_dir / "v0002", {"layers.0.attn_q.A": [[0.9]]})
-        (adapter_dir / "latest").symlink_to(adapter_dir / "v0002")
+        adapter_dir.mkdir(parents=True)
+        (adapter_dir / "latest").symlink_to(other / "v0001")
+
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
-        # v0001 is promoted but absent; `latest` resolves to v0002 and must
-        # not be substituted for it.
-        assert (
-            backend._resolve_params_path(adapter_dir, current_version=1) is None
-        )
-        # Pointing at the pinned version, it is acceptable.
+        # Version 1 is promoted, skill/v0001 does not exist, and `latest`
+        # points into a different adapter entirely.
+        assert backend._resolve_params_path(adapter_dir, current_version=1) is None
+
+        # Even a same-adapter pointer is not consulted; the real directory is.
         (adapter_dir / "latest").unlink()
-        _write(adapter_dir / "v0001", {"layers.0.attn_q.A": [[0.1]]})
         (adapter_dir / "latest").symlink_to(adapter_dir / "v0001")
-        assert backend._resolve_params_path(adapter_dir, current_version=1) is not None
+        assert backend._resolve_params_path(adapter_dir, current_version=1) is None
+        _write(adapter_dir / "v0001", {"layers.0.attn_q.A": [[0.1]]})
+        resolved = backend._resolve_params_path(adapter_dir, current_version=1)
+        assert resolved == adapter_dir / "v0001" / "params.json"
 
     def test_a_direct_file_cannot_satisfy_a_versioned_artifact(
         self, tmp_path, checkpoint
@@ -197,17 +265,55 @@ class TestTheWorkerCarriesTheGateDecision:
         )
         assert summary["eval_gate"] == {"promoted": False, "reason": "regressed"}
 
-    def test_a_missing_decision_is_not_approval(self):
-        """The worker read `gate.get("promoted", True)` while the summary it
-        was reading had dropped eval_gate entirely, so every run was credited
-        as promoted."""
-        import inspect
+    def test_a_rejected_run_is_not_recorded_as_a_rollout(self, tmp_path):
+        """Executed, not inspected.
 
-        from liminallm.service import training_worker
+        The first version of this test read the worker's source for the
+        literal default — which proves the character is present, not that a
+        rejected run leaves the adapter uncredited. This drives the real
+        `_process_job` against a gate-rejected result.
+        """
+        import asyncio
 
-        source = inspect.getsource(training_worker.TrainingWorker._process_job)
-        assert 'gate.get("promoted", False)' in source
-        assert 'gate.get("promoted", True)' not in source
+        from liminallm.service.training_worker import TrainingWorker
+
+        store = get_test_store()
+        user = store.create_user(email=f"worker_{uuid.uuid4().hex[:8]}@t.local")
+        adapter = store.create_artifact(
+            "adapter",
+            f"a_{uuid.uuid4().hex[:6]}",
+            {
+                "kind": "adapter.lora",
+                "mode": "local",
+                "backend": "local",
+                "base_model": "b",
+                "current_version": 0,
+            },
+            owner_user_id=user.id,
+        )
+        job = store.create_training_job(user.id, adapter.id)
+
+        service = TrainingService(store=store, fs_root=str(tmp_path))
+        credited = []
+
+        def rejected_run(**kwargs):
+            return {
+                "loss": 1.0,
+                "new_version": 1,
+                "jax_trace": {"status": "ok"},
+                "eval_gate": {"promoted": False, "reason": "regressed"},
+            }
+
+        service.train_from_preferences = rejected_run  # type: ignore[assignment]
+        service.record_training_outcome = lambda *a, **k: credited.append(a)  # type: ignore[assignment]
+
+        worker = TrainingWorker(store, service)
+        asyncio.run(worker._process_job(job))
+
+        refreshed = store.get_training_job(job.id)
+        assert refreshed.status == "gate_rejected", refreshed.status
+        assert credited == [], "a gate-rejected run was credited as a rollout"
+        assert store.get_artifact(adapter.id).schema.get("current_version", 0) == 0
 
 
 class TestModeIsAuthoritative:
@@ -247,10 +353,17 @@ class TestModeIsAuthoritative:
 
 
 class TestTrainingAndServingSerializeIdentically:
-    def test_the_exact_prefix_matches(self, tmp_path):
+    def test_the_canonical_conversation_serialization_matches(self, tmp_path):
         """Not "context: appears somewhere" — the same conversation and
         snippet must produce the same string on both sides, ordering
-        included."""
+        included.
+
+        The comparison is of the canonical *conversation* serialization:
+        roles, the retrieved-context representation and its placement. The
+        runtime system instruction serving prepends is application-level
+        content, not part of that convention, so it is excluded rather than
+        retroactively made an invariant.
+        """
         store = get_test_store()
         user = store.create_user(email=f"fmt_{uuid.uuid4().hex[:8]}@t.local")
         convo = store.create_conversation(user.id, title="c")

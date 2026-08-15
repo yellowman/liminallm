@@ -1462,12 +1462,17 @@ class TrainingService:
         for batch in list(batches) + list(eval_batches):
             for key in ("input_ids", "labels"):
                 for sequence in batch.get(key) or []:
-                    if sequence and max(sequence) >= vocab_size:
+                    # Both ends of [0, vocab_size), symmetrically with
+                    # serving: a negative id is as far outside the vocabulary
+                    # as an oversized one, and it does not even fail loudly —
+                    # array indexing reads it from the end of the table, so
+                    # training would fit the adapter to a token nobody wrote.
+                    if sequence and (min(sequence) < 0 or max(sequence) >= vocab_size):
                         logger.error(
                             "training_loop_skipped",
                             reason="tokenizer_vocab_mismatch",
                             checkpoint_vocab=vocab_size,
-                            observed_token=max(sequence),
+                            observed=[min(sequence), max(sequence)],
                         )
                         return {
                             "status": "skipped",

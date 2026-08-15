@@ -292,7 +292,15 @@ class TestWeightedAdapterBlending:
 
     @pytest.fixture
     def backend_with_adapters(self, tmp_path):
-        """Create backend with mock adapter weights."""
+        """Backend with adapter weights in the SPEC §5.2 name shape.
+
+        These matrices used to be keyed `layer0.A` / `layer0.B`, a name shape
+        the spec does not define. That was invisible while composition
+        accepted anything ending in `.A`; now that a malformed name refuses
+        the whole adapter, the fixture has to speak the format the product
+        does — otherwise it tests blending against inputs no real adapter can
+        have.
+        """
         backend = LocalJaxLoRABackend("test-model", str(tmp_path))
 
         # Create adapter directories with weight files
@@ -301,8 +309,8 @@ class TestWeightedAdapterBlending:
         (adapter1_dir / "params.json").write_text(
             json.dumps(
                 {
-                    "layer0.A": [[1.0, 0.0], [0.0, 1.0]],
-                    "layer0.B": [[1.0, 0.0], [0.0, 1.0]],
+                    "layers.0.attn_q.A": [[1.0, 0.0], [0.0, 1.0]],
+                    "layers.0.attn_q.B": [[1.0, 0.0], [0.0, 1.0]],
                 }
             )
         )
@@ -312,8 +320,8 @@ class TestWeightedAdapterBlending:
         (adapter2_dir / "params.json").write_text(
             json.dumps(
                 {
-                    "layer0.A": [[2.0, 0.0], [0.0, 2.0]],
-                    "layer0.B": [[2.0, 0.0], [0.0, 2.0]],
+                    "layers.0.attn_q.A": [[2.0, 0.0], [0.0, 2.0]],
+                    "layers.0.attn_q.B": [[2.0, 0.0], [0.0, 2.0]],
                 }
             )
         )
@@ -335,9 +343,9 @@ class TestWeightedAdapterBlending:
         weights = backend._blend_adapter_weights(adapters, user_id="test-user")
 
         # Should be identity matrices (1.0 weight * original)
-        assert "layer0.A" in weights
+        assert "layers.0.attn_q.A" in weights
         # Values should be approximately [1, 0], [0, 1]
-        a_values = weights["layer0.A"].tolist()
+        a_values = weights["layers.0.attn_q.A"].tolist()
         assert abs(a_values[0][0] - 1.0) < 0.01
         assert abs(a_values[1][1] - 1.0) < 0.01
 
@@ -366,7 +374,7 @@ class TestWeightedAdapterBlending:
         ]
 
         weights = backend._blend_adapter_weights(adapters, user_id="test-user")
-        delta = (weights["layer0.B"] @ weights["layer0.A"]).tolist()
+        delta = (weights["layers.0.attn_q.B"] @ weights["layers.0.attn_q.A"]).tolist()
 
         # 0.3·(I·I) + 0.7·(2I·2I) = 0.3·I + 2.8·I = 3.1·I
         assert abs(delta[0][0] - 3.1) < 0.01
@@ -388,7 +396,7 @@ class TestWeightedAdapterBlending:
         weights = backend._blend_adapter_weights(adapters, user_id="test-user")
 
         # Should have loaded weights
-        assert "layer0.A" in weights
+        assert "layers.0.attn_q.A" in weights
 
     def test_weight_in_schema_recognized(self, backend_with_adapters):
         """Should check schema dict for weight."""
@@ -404,7 +412,7 @@ class TestWeightedAdapterBlending:
 
         weights = backend._blend_adapter_weights(adapters, user_id="test-user")
 
-        assert "layer0.A" in weights
+        assert "layers.0.attn_q.A" in weights
 
     def test_zero_weight_adapter_skipped(self, backend_with_adapters):
         """Adapters with zero weight should be skipped.
@@ -432,7 +440,7 @@ class TestWeightedAdapterBlending:
         weights = backend._blend_adapter_weights(adapters, user_id="test-user")
 
         # Should only contain adapter2's values (2.0) since adapter1 has weight=0
-        a_values = weights["layer0.A"].tolist()
+        a_values = weights["layers.0.attn_q.A"].tolist()
         assert abs(a_values[0][0] - 2.0) < 0.01
 
     def test_weight_clamping(self, backend_with_adapters):
@@ -456,7 +464,7 @@ class TestWeightedAdapterBlending:
 
         # adapter2 should be skipped (weight clamped to 0)
         # adapter1 should use weight 1.0
-        a_values = weights["layer0.A"].tolist()
+        a_values = weights["layers.0.attn_q.A"].tolist()
         assert abs(a_values[0][0] - 1.0) < 0.01
 
     def test_default_weight(self, backend_with_adapters):
@@ -474,7 +482,7 @@ class TestWeightedAdapterBlending:
         weights = backend._blend_adapter_weights(adapters, user_id="test-user")
 
         # Should use full weight (1.0 * 1.0 = 1.0)
-        a_values = weights["layer0.A"].tolist()
+        a_values = weights["layers.0.attn_q.A"].tolist()
         assert abs(a_values[0][0] - 1.0) < 0.01
 
     def test_empty_adapters_returns_empty(self, backend_with_adapters):
@@ -500,7 +508,7 @@ class TestWeightedAdapterBlending:
                 [{"id": "adapter1", "weight": gate, "fs_dir": path}],
                 user_id="test-user",
             )
-            return (weights["layer0.B"] @ weights["layer0.A"]).tolist()[0][0]
+            return (weights["layers.0.attn_q.B"] @ weights["layers.0.attn_q.A"]).tolist()[0][0]
 
         assert abs(delta_at(1.0) - 1.0) < 0.01
         assert abs(delta_at(0.5) - 0.5) < 0.01
@@ -523,7 +531,7 @@ class TestDualModeIntegration:
         # Create adapter with mismatched base model
         adapter_dir = tmp_path / "adapters" / "mismatch"
         adapter_dir.mkdir(parents=True)
-        (adapter_dir / "params.json").write_text(json.dumps({"layer0.A": [[1.0]]}))
+        (adapter_dir / "params.json").write_text(json.dumps({"layers.0.attn_q.A": [[1.0]]}))
 
         adapter = {
             "id": "mismatch",
@@ -533,7 +541,7 @@ class TestDualModeIntegration:
 
         # Non-strict mode should log warning but still load
         weights = backend._load_adapter_weights(adapter, user_id="test-user")
-        assert "layer0.A" in weights
+        assert "layers.0.attn_q.A" in weights
 
     def test_strict_base_model_rejects_mismatch(self, tmp_path):
         """Strict mode should reject mismatched base models."""
@@ -541,7 +549,7 @@ class TestDualModeIntegration:
 
         adapter_dir = tmp_path / "adapters" / "mismatch"
         adapter_dir.mkdir(parents=True)
-        (adapter_dir / "params.json").write_text(json.dumps({"layer0.A": [[1.0]]}))
+        (adapter_dir / "params.json").write_text(json.dumps({"layers.0.attn_q.A": [[1.0]]}))
 
         adapter = {
             "id": "mismatch",

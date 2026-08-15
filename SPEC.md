@@ -867,8 +867,15 @@ paragraph above — logging it and continuing is still doing it.
 
 **one validator, checked per adapter, before composition.**
 `validate_lora_weights(config, weights)` verifies every key against this
-shape — name, target, layer index, A/B pairing, rank agreement, and the
-projection's real `(d_out, d_in)` — and raises on the first violation. it
+shape — name, target, layer index, rank agreement, the projection's real
+`(d_out, d_in)`, and pairing for **every** projection a key mentions,
+`scale` included — and raises on the first violation. a `scale` is a scalar
+attached to a hooked weight, so a projection named only by a `scale` has no
+matrices and is refused: that adapter is non-empty on the way in and
+contributes nothing on the way out, which is how it slipped past the rule
+below. the config argument is optional, so this is the only validator: what
+is knowable from the weights alone is checked either way, and layer bounds
+and projection widths are added when a model is loaded. it
 runs on each adapter's **raw** matrices as they load, then again on the
 composed pair as a defensive check. the order matters twice over: composition
 carries only A/B pairs forward, so a foreign key never reaches a validator
@@ -1141,13 +1148,17 @@ cluster qualifies          pooled events ≥ threshold      eval gate passes
      disk. one lock would be a race; a crash between writing the version and
      quarantining it would have made the race permanent.
    - **version authority outranks path shape, absolutely.** a positive
-     `current_version` of N resolves to `vNNNN/params.json` and nothing else.
-     a `latest` pointer is accepted only when it demonstrably resolves to
-     `vNNNN` — trusting it let version 1 serve v0002 whenever v0001's
-     directory was missing. a path pointing straight at a `params.json`
-     cannot demonstrate which version it is, so it cannot satisfy a versioned
-     artifact at all (only an artifact that has never been versioned may use
-     one).
+     `current_version` of N resolves to **this adapter's**
+     `vNNNN/params.json` and nothing else. the `latest` pointer takes no part
+     in authoritative resolution: it remains a convenience for humans and
+     tooling, but serving does not consult it. checking that its target was
+     merely *named* `vNNNN` proved a basename, not an identity, so
+     `A/latest → B/v0001` served another adapter's weights as A's version 1
+     — and it enabled nothing, because a pointer legitimately aimed at
+     `A/vNNNN` means that directory exists and the exact path has already
+     answered. a path pointing straight at a `params.json` cannot demonstrate
+     which version it is, so it cannot satisfy a versioned artifact at all
+     (only an artifact that has never been versioned may use one).
    - **after graduation the prompt is the fallback, not a second voice.** on a
      backend that applies LoRA weights, a promoted hybrid adapter is carried
      by its weights and its `prompt_instructions` are NOT injected (§5.0.1);

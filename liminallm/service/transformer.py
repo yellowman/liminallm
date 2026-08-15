@@ -359,7 +359,9 @@ def _shape_of(value) -> Tuple[int, ...]:
     return ()
 
 
-def validate_lora_weights(config: ModelConfig, weights: Dict[str, Any]) -> None:
+def validate_lora_weights(
+    config: Optional[ModelConfig], weights: Dict[str, Any]
+) -> None:
     """Raise unless **every** name is well-formed and correctly shaped.
 
     SPEC §5.2 says names outside the declared shape are never partially
@@ -369,6 +371,12 @@ def validate_lora_weights(config: ModelConfig, weights: Dict[str, Any]) -> None:
     foreign matrix still changed the model through its recognized ones.
 
     One invalid member invalidates the adapter.
+
+    ``config`` is optional so this stays the *only* validator: name grammar,
+    target vocabulary, A/B/scale pairing and rank self-consistency are all
+    knowable without a model, and a second partial checker for the no-model
+    case is how the two drift apart. Layer bounds and real projection widths
+    are checked additionally when a config is available.
     """
     if not weights:
         return
@@ -389,13 +397,22 @@ def validate_lora_weights(config: ModelConfig, weights: Dict[str, Any]) -> None:
                 f"LoRA name {name!r} targets {parts[2]!r}, which is not one of "
                 f"{sorted(LORA_TARGETS)}; refusing the adapter"
             )
-        if not 0 <= index < config.num_layers:
+        if config is not None and not 0 <= index < config.num_layers:
             raise ValueError(
                 f"LoRA name {name!r} targets layer {index}, outside the model's "
                 f"{config.num_layers}; refusing the adapter"
             )
-        if parts[3] != "scale":
-            keys.add(".".join(parts[:3]))
+        if parts[3] == "scale" and _shape_of(value) != ():
+            # α is a scalar attached to a hooked weight (SPEC §5.2), not a
+            # free-standing tensor.
+            raise ValueError(
+                f"LoRA {name!r} must be a scalar; refusing the adapter"
+            )
+        # Every prefix, scale included: a `.scale` whose projection has no
+        # matrices is an adapter that contributes nothing while looking
+        # non-empty — which slipped past the "a selected adapter never
+        # silently leaves the stack" rule, because the raw dict was truthy.
+        keys.add(".".join(parts[:3]))
 
     for key in sorted(keys):
         a_value = weights.get(f"{key}.A")
@@ -408,16 +425,17 @@ def validate_lora_weights(config: ModelConfig, weights: Dict[str, Any]) -> None:
         a_shape, b_shape = _shape_of(a_value), _shape_of(b_value)
         if len(a_shape) != 2 or len(b_shape) != 2:
             raise ValueError(f"LoRA {key} matrices must be 2-D; refusing the adapter")
-        expected = projection_shape(config, key.split(".")[2])
-        d_out, d_in = expected
+        if a_shape[0] != b_shape[1]:
+            raise ValueError(
+                f"LoRA {key} disagrees with itself on rank: A{a_shape} B{b_shape}"
+            )
+        if config is None:
+            continue
+        d_out, d_in = projection_shape(config, key.split(".")[2])
         if a_shape[1] != d_in or b_shape[0] != d_out:
             raise ValueError(
                 f"LoRA {key} is shaped A{a_shape} B{b_shape}, but this model's "
                 f"projection is ({d_out}, {d_in}); refusing the adapter"
-            )
-        if a_shape[0] != b_shape[1]:
-            raise ValueError(
-                f"LoRA {key} disagrees with itself on rank: A{a_shape} B{b_shape}"
             )
 
 

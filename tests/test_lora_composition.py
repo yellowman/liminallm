@@ -277,10 +277,24 @@ class TestTokenizerFidelity:
         assert "tokenizer" in trace["reason"]
         assert service._promotion_gate(trace, holdout_count=5)["promoted"] is False
 
+    @pytest.mark.parametrize(
+        ("input_ids", "labels"),
+        [
+            ([[1, 99_999]], [[99_999, 3]]),  # above the vocabulary
+            ([[1, -1]], [[-1, 3]]),  # below it — and negative indexing does
+            ([[1, 2]], [[-5, 3]]),  # not crash, it reads from the far end
+        ],
+    )
     def test_training_refuses_ids_outside_the_checkpoint_vocabulary(
-        self, tmp_path, checkpoint, monkeypatch
+        self, tmp_path, checkpoint, monkeypatch, input_ids, labels
     ):
-        """A mismatch is refused, not clipped into a token nobody wrote."""
+        """A mismatch is refused, not clipped into a token nobody wrote.
+
+        Both ends of [0, vocab_size): a negative id is as far outside the
+        vocabulary as an oversized one, and it is the quieter of the two —
+        array indexing resolves it against the end of the embedding table
+        instead of failing.
+        """
         from liminallm.service.training import TrainingService
 
         service = TrainingService(
@@ -293,8 +307,8 @@ class TestTokenizerFidelity:
             weights,
             [
                 {
-                    "input_ids": [[1, 99_999]],
-                    "labels": [[99_999, 3]],
+                    "input_ids": input_ids,
+                    "labels": labels,
                     "attention_mask": [[0.0, 1.0]],
                     "shape": {"batch": 1, "seq_len": 2},
                 }

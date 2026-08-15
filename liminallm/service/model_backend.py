@@ -2148,24 +2148,18 @@ class LocalJaxLoRABackend:
         except (TypeError, ValueError):
             pinned = 0
         if pinned > 0:
+            # Exactly this adapter's vNNNN, and nothing else. The `latest`
+            # pointer used to be a fallback here; checking that its target
+            # was *named* vNNNN proved only a basename, so `A/latest ->
+            # B/v0001` served another adapter's weights as A's version 1. And
+            # it enabled nothing: a `latest` legitimately pointing at
+            # A/vNNNN means A/vNNNN exists, which the exact path above has
+            # already returned. `latest` remains a convenience pointer for
+            # humans and tooling; it takes no part in authoritative
+            # resolution.
             exact = path / f"v{pinned:04d}" / "params.json"
             if exact.exists():
                 return exact
-            latest_pinned = path / "latest" / "params.json"
-            if latest_pinned.exists():
-                # `latest` is only acceptable when it demonstrably resolves to
-                # the pinned version. Trusting the pointer let current_version
-                # 1 serve v0002 whenever v0001's directory was missing.
-                resolved_parent = latest_pinned.resolve().parent.name
-                if resolved_parent == f"v{pinned:04d}":
-                    return latest_pinned
-                logger.warning(
-                    "adapter_latest_points_elsewhere",
-                    adapter_path=str(path),
-                    current_version=pinned,
-                    resolved=resolved_parent,
-                )
-                return None
             logger.warning(
                 "adapter_promoted_version_missing",
                 adapter_path=str(path),
@@ -2789,27 +2783,19 @@ class LocalJaxLoRABackend:
     def _validate_adapter_weights(
         self, adapter: dict, weights: dict, config: Any
     ) -> None:
-        """SPEC §5.2 validation of ONE adapter's raw matrices."""
-        if config is not None:
+        """SPEC §5.2 validation of ONE adapter's raw matrices.
+
+        The same validator with or without a model: it checks everything
+        knowable from the weights alone and adds the model-dependent checks
+        when a config exists. A separate reduced checker for the no-model
+        lane is how two validators drift into disagreeing.
+        """
+        try:
             transformer.validate_lora_weights(config, weights)
-            return
-        # Without a loaded model the projection dimensions are unknown, but
-        # an adapter's internal self-consistency still is not: this is the
-        # check that catches ranks which only agree after concatenation.
-        for name in weights:
-            if not name.endswith(".A"):
-                continue
-            key = name[: -len(".A")]
-            b_value = weights.get(f"{key}.B")
-            if b_value is None:
-                continue  # the orphan check below reports this
-            a_shape = transformer._shape_of(weights[name])
-            b_shape = transformer._shape_of(b_value)
-            if len(a_shape) == 2 and len(b_shape) == 2 and a_shape[0] != b_shape[1]:
-                raise ValueError(
-                    f"adapter {adapter.get('id')!r} disagrees with itself on the "
-                    f"rank of {key}: A{a_shape} B{b_shape}; refusing the adapter stack"
-                )
+        except ValueError as exc:
+            raise ValueError(
+                f"adapter {adapter.get('id')!r}: {exc}; refusing the adapter stack"
+            ) from exc
 
     @staticmethod
     def _gate_weight_of(adapter: dict) -> float:
