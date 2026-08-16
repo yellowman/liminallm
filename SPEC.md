@@ -2581,6 +2581,19 @@ the following are treated as constants the kernel must honor; LLM edits happen o
     it and used for that invocation alone; caching it into the shared registry
     made one user's private definition resolvable for every later request in
     that process.
+  - **a worker's authority ends when its invocation ends.** a tool handler
+    runs on a pool thread, and a python thread cannot be killed —
+    `future.cancel()` returns false for anything already running. so what
+    ends is the *lease*, not the thread: the worker holds a `ToolInvocation`
+    naming one, and every call it makes to the store, the model or retrieval
+    asks the broker whether that lease is still live. on timeout the lease is
+    revoked **before** the worker is abandoned; the reverse order leaves the
+    window this exists to close. the worker is then reaped, bounded, before
+    the node retries in its name — three attempts otherwise means three live
+    workers and three sandbox children for one node. the check runs on every
+    leased call, reads included: a revoked invocation has no authority to
+    read with either, and a list of "write methods" would be a guess about
+    which calls matter.
   - **an invocation names an id and must execute that id.** a tool name is
     free text inside `schema`, and artifact names carry no uniqueness
     constraint, so two tools may answer to one name. `POST /tools/{id}/invoke`

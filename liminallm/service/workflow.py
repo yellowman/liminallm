@@ -37,6 +37,12 @@ from liminallm.service.embeddings import (
     validated_embedding,
 )
 from liminallm.service.errors import BadRequestError
+from liminallm.service.lease import (
+    InvocationBroker,
+    LeasedProxy,
+    LeaseRevoked,
+    current_invocation,
+)
 from liminallm.service.llm import LLMService
 from liminallm.service.model_backend import DEFAULT_CONTEXT_WINDOW, active_adapters
 from liminallm.service.rag import RAGService
@@ -129,10 +135,16 @@ class WorkflowEngine(WorkflowStreamingMixin):
         settings: Optional[Settings] = None,
         embeddings=None,
     ) -> None:
-        self.store = store
-        self.llm = llm
+        # A tool worker reaches its dependencies through the engine, so the
+        # lease check belongs on the engine's references to them rather than
+        # at each of the handlers' call sites — a handler cannot forget what
+        # it never had to remember. Threads with no lease (every API request)
+        # pass straight through. See service/lease.py.
+        self.broker = InvocationBroker()
+        self.store = LeasedProxy(store, self.broker)
+        self.llm = LeasedProxy(llm, self.broker)
         self.router = router
-        self.rag = rag
+        self.rag = LeasedProxy(rag, self.broker)
         # For notes search; None degrades to BM25-only ranking.
         self.embeddings = embeddings
         self.logger = get_logger(__name__)
@@ -1806,8 +1818,20 @@ class WorkflowEngine(WorkflowStreamingMixin):
         if tool_spec and not handler:
             handler = self._builtin_tool_handlers().get(tool_spec.get("handler"))
 
+        invocation = self.broker.issue(
+            tool_name,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            artifact_id=descriptor.artifact_id if descriptor else None,
+        )
+
         def _run_handler() -> Dict[str, Any]:
-            with tool_network_guard(self.tool_network_policy):
+            # The lease is bound to the worker thread, not passed to the
+            # handler: it has to cover everything the handler reaches,
+            # including code it calls that predates this mechanism.
+            with current_invocation(invocation), tool_network_guard(
+                self.tool_network_policy
+            ):
                 if not handler:
                     return {"status": "error", "content": f"unknown tool {tool_name}"}
                 return handler(
@@ -1846,9 +1870,67 @@ class WorkflowEngine(WorkflowStreamingMixin):
             return sanitized
         except (asyncio.TimeoutError, concurrent.futures.TimeoutError):
             self.logger.warning("tool_timeout", tool=tool_name, timeout=timeout)
-            if not future.cancel():
-                self.logger.warning("tool_timeout_cancellation_failed", tool=tool_name)
+            # Revoke first. `future.cancel()` returns False for anything
+            # already running and Python cannot kill a thread, so the worker
+            # is still executing at this line — the order is the only thing
+            # that decides whether its next write lands.
+            self.broker.revoke(invocation)
+            future.cancel()
+            await self._reap(future, invocation, tool_name)
             return {"status": "error", "content": "tool timed out", "error": "timeout"}
+        except LeaseRevoked:
+            # The worker hit the revocation before the node stopped awaiting
+            # it. It has done nothing since, which is the point — report it
+            # rather than letting a security stop surface as a crash.
+            self.logger.warning(
+                "tool_lease_revoked",
+                tool=tool_name,
+                invocation_id=invocation.invocation_id,
+            )
+            return {
+                "status": "error",
+                "content": "tool invocation was revoked",
+                "error": "revoked",
+            }
+        finally:
+            # A worker that returned normally still holds its lease until
+            # here; leaving it live would let a handler that spawned its own
+            # thread keep the caller's authority indefinitely.
+            self.broker.revoke(invocation)
+
+    # How long a revoked worker gets to notice before the node gives up
+    # waiting for it. Bounded because it is on the timeout path: the lease is
+    # already gone, so this is about not stacking workers, not about safety.
+    REAP_GRACE_SECONDS = 5.0
+
+    async def _reap(self, future, invocation, tool_name: str) -> None:
+        """Wait for a revoked worker to finish before the node retries.
+
+        `_execute_node_with_retry` runs up to three attempts. Without this the
+        second attempt starts while the first worker is still in the pool, so
+        one node can hold three workers and three sandbox children at once.
+        The lease has already been revoked, so an overrunning worker is
+        harmless — it is reported, not waited on further.
+        """
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(asyncio.wrap_future(future)),
+                timeout=self.REAP_GRACE_SECONDS,
+            )
+        except (asyncio.TimeoutError, concurrent.futures.TimeoutError):
+            self.logger.warning(
+                "tool_worker_unreaped",
+                tool=tool_name,
+                invocation_id=invocation.invocation_id,
+                grace=self.REAP_GRACE_SECONDS,
+            )
+        except BaseException as exc:  # noqa: BLE001 - the worker's own failure
+            self.logger.info(
+                "tool_worker_reaped_with_error",
+                tool=tool_name,
+                invocation_id=invocation.invocation_id,
+                error=str(exc),
+            )
 
     def _builtin_tool_handlers(
         self,

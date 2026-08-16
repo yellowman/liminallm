@@ -1,0 +1,173 @@
+"""Authority that ends when the invocation ends.
+
+A tool handler runs on a `ThreadPoolExecutor` thread. When the node times
+out, `asyncio.wait_for` gives up on the *future* — the thread keeps running,
+because `concurrent.futures` can only cancel work that has not started, and
+Python cannot kill a thread at all. The handler therefore carried on holding
+the caller's `user_id` and `tenant_id`, and could still write to the store,
+spend on the model, or publish into the user's file area, long after the
+request that authorized it had been reported failed. With retries the engine
+would start a second worker on top of the first.
+
+So the thing that ends is not the thread. It is the **lease**:
+
+* the worker never holds authority, only a `ToolInvocation` naming one;
+* every authority-bearing call it makes goes through a proxy that asks the
+  broker whether that lease is still live;
+* on timeout the lease is revoked **before** the worker is abandoned, never
+  after — the reverse order leaves exactly the window this exists to close;
+* the worker is reaped before anything retries in its name.
+
+The check is on *every* call a leased thread makes through the proxy, reads
+included. A name-prefix list of "write methods" would be a heuristic about
+which calls matter, and a revoked invocation has no authority to read with
+either.
+"""
+from __future__ import annotations
+
+import threading
+import uuid
+from contextlib import contextmanager
+from dataclasses import dataclass, field
+from typing import Any, Optional
+
+__all__ = [
+    "InvocationBroker",
+    "LeaseRevoked",
+    "LeasedProxy",
+    "ToolInvocation",
+    "current_invocation",
+]
+
+_CURRENT = threading.local()
+
+
+class LeaseRevoked(RuntimeError):
+    """The invocation ended before this call, so it carries no authority."""
+
+
+@dataclass(frozen=True)
+class ToolInvocation:
+    """One tool call's identity. Held by the worker; proves nothing by itself.
+
+    The worker can read these fields, but reading them is not authority —
+    only the broker says whether the lease behind `invocation_id` is live.
+    """
+
+    invocation_id: str
+    tool_name: str
+    user_id: Optional[str]
+    tenant_id: Optional[str]
+    artifact_id: Optional[str] = None
+    id_factory: Any = field(default=None, repr=False, compare=False)
+
+
+class InvocationBroker:
+    """The only thing that knows which leases are live.
+
+    Kept deliberately small: issue, revoke, ask. It is consulted from worker
+    threads and mutated from the event loop, so every operation takes the
+    lock.
+    """
+
+    def __init__(self) -> None:
+        self._live: set[str] = set()
+        self._lock = threading.Lock()
+
+    def issue(
+        self,
+        tool_name: str,
+        *,
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+        artifact_id: Optional[str] = None,
+    ) -> ToolInvocation:
+        invocation = ToolInvocation(
+            invocation_id=uuid.uuid4().hex,
+            tool_name=tool_name,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            artifact_id=artifact_id,
+        )
+        with self._lock:
+            self._live.add(invocation.invocation_id)
+        return invocation
+
+    def revoke(self, invocation: ToolInvocation) -> None:
+        """Idempotent: a lease revoked on timeout is revoked again on return."""
+        with self._lock:
+            self._live.discard(invocation.invocation_id)
+
+    def is_live(self, invocation: ToolInvocation) -> bool:
+        with self._lock:
+            return invocation.invocation_id in self._live
+
+    def check(self, invocation: ToolInvocation) -> None:
+        if not self.is_live(invocation):
+            raise LeaseRevoked(
+                f"invocation {invocation.invocation_id} of {invocation.tool_name!r} "
+                "was revoked; this worker no longer holds the caller's authority"
+            )
+
+
+@contextmanager
+def current_invocation(invocation: Optional[ToolInvocation]):
+    """Bind a lease to this thread for the duration of the handler.
+
+    Restores the previous value rather than clearing it, because the pool
+    reuses threads: clearing would leave the next invocation on that thread
+    unleased, which reads as "the API path" and passes every check.
+    """
+    previous = getattr(_CURRENT, "invocation", None)
+    _CURRENT.invocation = invocation
+    try:
+        yield invocation
+    finally:
+        _CURRENT.invocation = previous
+
+
+def active_invocation() -> Optional[ToolInvocation]:
+    return getattr(_CURRENT, "invocation", None)
+
+
+class LeasedProxy:
+    """Passes calls through, unless the calling thread holds a dead lease.
+
+    A thread with no lease is the API path and is not this module's business,
+    so it delegates untouched. Wrapping is engine-wide rather than per-worker
+    because handlers reach their dependencies through the engine, and the
+    thread-local is what makes one shared object behave correctly for both.
+    """
+
+    __slots__ = ("_inner", "_broker")
+
+    def __init__(self, inner: Any, broker: InvocationBroker) -> None:
+        object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "_broker", broker)
+
+    def __getattr__(self, name: str) -> Any:
+        attr = getattr(self._inner, name)
+        invocation = active_invocation()
+        if invocation is None or not callable(attr):
+            return attr
+
+        def guarded(*args: Any, **kwargs: Any) -> Any:
+            self._broker.check(invocation)
+            return attr(*args, **kwargs)
+
+        return guarded
+
+    # Writes go to the wrapped object. The proxy adds a check to calls; it is
+    # not a second place to keep state, and anything that sets an attribute —
+    # a test substituting a method, a service caching on its store — must
+    # land where every other reader will see it.
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._inner, name, value)
+
+    def __delattr__(self, name: str) -> None:
+        delattr(self._inner, name)
+
+    # Repr should describe the thing being wrapped: the proxy is a policy,
+    # not a different object.
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"LeasedProxy({self._inner!r})"
