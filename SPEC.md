@@ -2567,6 +2567,26 @@ the following are treated as constants the kernel must honor; LLM edits happen o
 
 - **workflow/tool sandboxing**
   - tool workers run in a spawned child process under POSIX rlimits (memory hard cap `RLIMIT_AS`, CPU seconds, max file size, no core dumps), backstopped by a wall-clock kill, and have no filesystem access except a tmp scratch; `privileged:true` tools require admin-owned artifacts and are never called by default workflows.
+  - **privileged is a conjunction, and provenance comes from the row.** a
+    privileged invocation requires an admin-owned *persisted artifact* AND an
+    admin caller. checking only the caller was not enough: `/v1/artifacts` is
+    open to any authenticated user and the tool schema permits additional
+    properties, so an ordinary user could author `privileged: true` and an
+    admin invoking it would be handed the privileged sandbox for someone
+    else's definition. ownership is read from the artifact row, never from a
+    field inside `schema` — a spec naming its own owner is quoting itself. a
+    spec with no persisted artifact behind it cannot be privileged at all.
+  - **tool resolution is per request.** the process-wide registry holds only
+    globally visible specs. a private tool is resolved for the caller who owns
+    it and used for that invocation alone; caching it into the shared registry
+    made one user's private definition resolvable for every later request in
+    that process.
+  - **a workflow is an artifact.** `workflow_id` arrives in a request body, so
+    running one is subject to the same permission rule as reading one: private
+    to its owner, shared within a tenant, global to anyone. the lookup takes
+    the caller's identity as a required argument rather than an optional one,
+    because the two call sites that existed both had it and neither passed
+    it.
   - **the filesystem contract is a view, stated as a property and not a
     mechanism.** a worker running model-written code can see its per-call
     workdir (read-write), the inputs staged into it (read-only), and the

@@ -2685,7 +2685,42 @@ class PostgresStore:
             )
         return fs_path
 
-    def get_latest_workflow(self, workflow_id: str) -> Optional[dict]:
+    def get_latest_workflow(
+        self,
+        workflow_id: str,
+        *,
+        user_id: Optional[str],
+        tenant_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        """The newest version of a workflow this caller may run, or None.
+
+        `user_id` is required rather than optional: `workflow_id` arrives in a
+        request body, and this method used to select on `artifact_id` alone,
+        so naming another user's private workflow ran it. A keyword with no
+        default means a caller cannot omit the question by accident — the two
+        callers that existed both had the identity to hand and neither passed
+        it.
+        """
+        artifact = self.get_artifact(workflow_id)
+        if artifact is None:
+            return None
+        visibility = getattr(artifact, "visibility", "private")
+        owner_id = getattr(artifact, "owner_user_id", None)
+        if visibility == "private" and owner_id and owner_id != user_id:
+            self.logger.warning(
+                "workflow_access_denied",
+                workflow_id=workflow_id,
+                user_id=user_id,
+                owner_user_id=owner_id,
+            )
+            return None
+        artifact_tenant = getattr(artifact, "tenant_id", None)
+        if (
+            visibility == "shared"
+            and tenant_id
+            and artifact_tenant not in (None, tenant_id)
+        ):
+            return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT schema FROM artifact_version WHERE artifact_id = %s ORDER BY version DESC LIMIT 1",

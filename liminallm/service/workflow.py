@@ -83,6 +83,32 @@ class ParallelNodeResult:
     status: str = "ok"  # "ok" if all succeeded, "partial" if some failed, "error" if all failed
 
 
+@dataclass(frozen=True)
+class ToolDescriptor:
+    """A resolved tool and where its authority comes from.
+
+    `artifact_id`/`owner_user_id`/`owner_role` are read from the persisted
+    artifact row. SPEC §18 makes `privileged:true` a property of an
+    *admin-owned artifact*, so the authority cannot be read out of the spec
+    the caller supplied — a `privileged: true` key is only a claim until an
+    admin-owned row is standing behind it.
+    """
+
+    name: str
+    schema: dict
+    artifact_id: Optional[str]
+    owner_user_id: Optional[str]
+    owner_role: Optional[str]
+
+    @property
+    def privileged(self) -> bool:
+        return bool((self.schema or {}).get("privileged"))
+
+    @property
+    def admin_owned(self) -> bool:
+        return bool(self.artifact_id) and self.owner_role == "admin"
+
+
 class WorkflowEngine(WorkflowStreamingMixin):
     """Executes workflow.chat graphs using a small tool registry."""
 
@@ -382,7 +408,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
     ) -> dict:
         workflow_schema = None
         if workflow_id:
-            workflow_schema = self.store.get_latest_workflow(workflow_id)
+            workflow_schema = self._load_workflow_for(
+                workflow_id, user_id=user_id, tenant_id=tenant_id
+            )
         if not workflow_schema:
             # The tool agent handles anything needing tools: conversation
             # attachments (so uploading a file is all the user has to do) or an
@@ -1215,11 +1243,80 @@ class WorkflowEngine(WorkflowStreamingMixin):
         return list(dict.fromkeys(hosts))
 
     def _build_tool_registry(self) -> Dict[str, dict]:
+        """Tool specs visible to everyone, resolved once per process.
+
+        Unscoped `list_artifacts` returns global and shared artifacts only, so
+        nothing private lands here — and nothing private may be *added* here
+        either. Direct invocation used to `setdefault` its caller's spec into
+        this dict, which made one user's private tool definition resolvable
+        for every later request in the process. A private tool is resolved per
+        request instead, through `_resolve_tool`.
+        """
         registry: Dict[str, dict] = {}
         for artifact in self.store.list_artifacts(type_filter="tool"):
             if isinstance(artifact.schema, dict) and artifact.schema.get("name"):
                 registry[artifact.schema["name"]] = artifact.schema
         return registry
+
+    def _resolve_tool(
+        self,
+        tool_name: str,
+        *,
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+    ) -> Optional["ToolDescriptor"]:
+        """The tool this caller means by `tool_name`, with its provenance.
+
+        Provenance comes from the persisted artifact row — `owner_user_id` and
+        the owner's role — never from fields inside `schema`, which is
+        caller-authored data. A spec claiming `owner_user_id: <an admin>` is
+        just a string someone typed.
+        """
+        for artifact in self.store.list_artifacts(
+            type_filter="tool", owner_user_id=user_id, tenant_id=tenant_id
+        ):
+            schema = artifact.schema if isinstance(artifact.schema, dict) else {}
+            if schema.get("name") != tool_name:
+                continue
+            return self._describe_tool(artifact)
+        schema = self.tool_registry.get(tool_name)
+        if schema is None:
+            return None
+        # A globally visible spec with no artifact behind it in this lookup:
+        # usable, but unattributed, so it can never be privileged.
+        return ToolDescriptor(
+            name=tool_name, schema=schema, artifact_id=None,
+            owner_user_id=None, owner_role=None,
+        )
+
+    def _describe_tool(self, artifact) -> "ToolDescriptor":
+        owner_id = getattr(artifact, "owner_user_id", None)
+        owner = self.store.get_user(owner_id) if owner_id else None
+        return ToolDescriptor(
+            name=(artifact.schema or {}).get("name") or artifact.name,
+            schema=artifact.schema if isinstance(artifact.schema, dict) else {},
+            artifact_id=artifact.id,
+            owner_user_id=owner_id,
+            owner_role=getattr(owner, "role", None),
+        )
+
+    def _load_workflow_for(
+        self,
+        workflow_id: str,
+        *,
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+    ) -> Optional[dict]:
+        """A workflow the caller is allowed to run, or None.
+
+        The rule lives in the store, which is where a caller cannot skip it;
+        this is the engine's name for it.
+        """
+        if not workflow_id:
+            return None
+        return self.store.get_latest_workflow(
+            workflow_id, user_id=user_id, tenant_id=tenant_id
+        )
 
     def _validate_tool_payload(
         self, payload: Any, schema: Optional[dict], *, phase: str, tool_name: str
@@ -1290,7 +1387,15 @@ class WorkflowEngine(WorkflowStreamingMixin):
         tool_name = tool_schema.get("name") or tool_schema.get("id")
         if not tool_name:
             return {"status": "error", "content": "tool spec missing name"}
-        self.tool_registry.setdefault(tool_name, dict(tool_schema))
+        # Resolved for this call only. `setdefault` here put a private spec
+        # into the process-global registry, where later requests from other
+        # users would resolve it.
+        descriptor = self._resolve_tool(
+            tool_name, user_id=user_id, tenant_id=tenant_id
+        ) or ToolDescriptor(
+            name=tool_name, schema=dict(tool_schema), artifact_id=None,
+            owner_user_id=None, owner_role=None,
+        )
         history: List[Any] = []
         if conversation_id:
             if self._validate_conversation_scope(
@@ -1316,6 +1421,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             user_message=user_message or inputs.get("message") or "",
             user_id=user_id,
             tenant_id=tenant_id,
+            descriptor=descriptor,
         )
 
     def _default_workflow(self) -> dict:
@@ -1627,9 +1733,14 @@ class WorkflowEngine(WorkflowStreamingMixin):
         *,
         user_id: Optional[str],
         tenant_id: Optional[str],
+        descriptor: Optional[ToolDescriptor] = None,
     ) -> Dict[str, Any]:
         tool_name = tool or "llm.generic"
-        tool_spec = self.tool_registry.get(tool_name)
+        if descriptor is None:
+            descriptor = self._resolve_tool(
+                tool_name, user_id=user_id, tenant_id=tenant_id
+            )
+        tool_spec = descriptor.schema if descriptor else None
         # Issue 6.9: Apply hardcap per SPEC §18 (default 15s, hard cap 60s)
         raw_timeout = tool_spec.get("timeout_seconds", 15) if tool_spec else 15
         timeout = min(raw_timeout, MAX_NODE_TIMEOUT_SECONDS)
@@ -1643,11 +1754,33 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 "error": "validation_error",
                 "details": {"errors": validation_errors},
             }
-        # SPEC §18: privileged tools require admin role; enforced here so both
-        # workflow nodes and direct /tools/{id}/invoke go through the check.
-        if tool_spec and tool_spec.get("privileged"):
+        # SPEC §18: a privileged tool requires an admin-owned *artifact* and
+        # an admin caller. This used to ask only about the caller, so an
+        # ordinary user could author `privileged: true` — /v1/artifacts is
+        # open to any authenticated user and the tool schema permits extra
+        # properties — and an admin invoking it would be handed the privileged
+        # sandbox for someone else's definition. Ownership comes from the
+        # persisted row; a spec that names an owner is quoting itself.
+        if descriptor is not None and descriptor.privileged:
             user = self.store.get_user(user_id) if user_id else None
             role = user.role if user else None
+            if not descriptor.admin_owned:
+                self.logger.warning(
+                    "privileged_tool_denied",
+                    tool=tool_name,
+                    user_id=user_id,
+                    reason="artifact is not admin-owned",
+                    artifact_id=descriptor.artifact_id,
+                    owner_user_id=descriptor.owner_user_id,
+                )
+                return {
+                    "status": "error",
+                    "error": "forbidden",
+                    "content": (
+                        f"privileged tool {tool_name!r} requires an admin-owned "
+                        "artifact (SPEC §18)"
+                    ),
+                }
             try:
                 get_tool_sandbox_config(tool_spec, user_role=role)
             except PrivilegedToolError as exc:
@@ -1656,6 +1789,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     tool=tool_name,
                     user_id=user_id,
                     role=role,
+                    reason="caller is not an admin",
                 )
                 return {"status": "error", "content": str(exc), "error": "forbidden"}
 

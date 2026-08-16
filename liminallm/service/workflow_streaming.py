@@ -59,7 +59,13 @@ class WorkflowStreamingMixin:
         """
         workflow_schema = None
         if workflow_id:
-            workflow_schema = self.store.get_latest_workflow(workflow_id)
+            # Same ownership check as the blocking path: a workflow is an
+            # artifact, and `workflow_id` comes from the request body. Loading
+            # it by id alone let any authenticated user stream another user's
+            # private workflow.
+            workflow_schema = self._load_workflow_for(
+                workflow_id, user_id=user_id, tenant_id=tenant_id
+            )
         if not workflow_schema:
             # The tool agent handles anything needing tools: conversation
             # attachments (so uploading a file is all the user has to do) or an
