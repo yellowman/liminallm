@@ -947,6 +947,63 @@ class TestOnlyAPromotedVersionAuthorizesWeights:
         ) == {}
 
 
+class TestTheBackendServesOnlyItsOwnModes:
+    """§5.0.1's compatibility matrix, held by the backend that declares it.
+
+    `local_lora` accepts local, prompt and hybrid; `remote` is incompatible.
+    The weight path tested only "not the prompt rung", which let a promoted
+    `remote` adapter through path resolution, base and identity validation
+    and into composition — so a provider-hosted adapter was applied as local
+    LoRA weights because a `params.json` happened to sit under its directory.
+    """
+
+    def test_a_remote_adapter_is_refused_rather_than_applied(
+        self, tmp_path, checkpoint, config
+    ):
+        """Refused, not silently weightless: the router filters on mode
+        before policy evaluation, so an incompatible adapter arriving here is
+        a broken hand-off rather than a transient state."""
+        _write(tmp_path / "adapters" / "R" / "v0001", _valid_pair(config))
+        backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
+        remote = {
+            "id": "R",
+            "mode": "remote",
+            "current_version": 1,
+            "base_model": str(checkpoint),
+            "fs_dir": "adapters/R",
+            "weight": 1.0,
+        }
+        with pytest.raises(ValueError, match="does not serve"):
+            backend._blend_adapter_weights([remote], user_id="u", config=config)
+
+        # Control: the same files under a mode this backend does serve.
+        assert backend._blend_adapter_weights(
+            [{**remote, "id": "R", "mode": "local"}], user_id="u", config=config
+        )
+
+    def test_the_modes_it_does_serve_still_work(self, tmp_path, checkpoint, config):
+        _write(tmp_path / "adapters" / "A" / "v0001", _valid_pair(config))
+        backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
+        base = {
+            "id": "A",
+            "current_version": 1,
+            "base_model": str(checkpoint),
+            "fs_dir": "adapters/A",
+            "weight": 1.0,
+        }
+        assert backend._blend_adapter_weights(
+            [{**base, "mode": "local"}], user_id="u", config=config
+        )
+        assert backend._blend_adapter_weights(
+            [{**base, "mode": "hybrid"}], user_id="u", config=config
+        )
+        # The prompt rung is carried by its instructions, weightlessly — not
+        # refused, because it is a mode this backend accepts.
+        assert backend._blend_adapter_weights(
+            [{**base, "mode": "prompt"}], user_id="u", config=config
+        ) == {}
+
+
 class TestPromotionSurvivesConvenienceState:
     def test_a_failing_latest_symlink_does_not_undo_a_promotion(self, tmp_path):
         """`latest` takes no part in serving (§5.5), so it must not be able to

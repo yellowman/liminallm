@@ -1965,20 +1965,25 @@ class LocalJaxLoRABackend:
             attention = [0]
         return ids, attention
 
+    #: The modes whose representation on this backend is weights (§5.0.1's
+    #: compatibility matrix). Stated positively, because "not PROMPT" also
+    #: admitted REMOTE — an adapter this class advertises as incompatible.
+    WEIGHT_BEARING_MODES = frozenset({AdapterMode.LOCAL, AdapterMode.HYBRID})
+
     @staticmethod
     def _weight_bearing(adapters: List[dict]) -> List[dict]:
-        """Those of `adapters` that can carry weights on this backend.
+        """Those of `adapters` that carry weights on this backend.
 
-        Past the gate (§5.0.1), not the prompt rung, and promoted (§5.5).
-        Anything else applies no mechanism here, so it must not size the
-        tokenizer, name itself in usage, or otherwise leave a trace of having
-        done something.
+        Past the gate (§5.0.1), a mode whose local representation is weights,
+        and promoted (§5.5). Anything else applies no mechanism here, so it
+        must not size the tokenizer, name itself in usage, key the KV cache,
+        or otherwise leave a trace of having done something.
         """
         return [
             adapter
             for adapter in adapters or []
             if isinstance(adapter, dict)
-            and effective_mode(adapter) != AdapterMode.PROMPT
+            and effective_mode(adapter) in LocalJaxLoRABackend.WEIGHT_BEARING_MODES
             and LocalJaxLoRABackend._promoted_version_of(adapter) > 0
         ]
 
@@ -2020,6 +2025,20 @@ class LocalJaxLoRABackend:
         if mode == AdapterMode.PROMPT:
             logger.debug("adapter_prompt_mode_carries_no_weights", adapter_id=adapter_id)
             return {}
+        if mode not in self.WEIGHT_BEARING_MODES:
+            # §5.0.1's matrix says `remote` is incompatible with this backend,
+            # and the router filters on it before policy evaluation — so an
+            # incompatible adapter arriving here is a broken hand-off, not a
+            # transient state like "nothing promoted yet". Refusing visibly
+            # rather than treating it as weightless: the alternative was
+            # applying a provider-hosted adapter's id as local LoRA weights
+            # because a `params.json` happened to sit under its directory.
+            raise ValueError(
+                f"adapter {adapter_id!r} has mode {mode!r}, which this backend "
+                f"does not serve (accepts {sorted(self.WEIGHT_BEARING_MODES)} "
+                "for weights, and prompt-rung adapters weightlessly); the "
+                "router should not have routed it here"
+            )
 
         # SPEC §5.4.6/§5.5: only a promoted version may be served, and that
         # decision comes BEFORE the filesystem is touched. `_adapter_path`
@@ -2336,8 +2355,7 @@ class LocalJaxLoRABackend:
                 # and this key is the only thing keeping their KV apart.
                 struct.pack("<f", self._gate_weight_of(a)).hex(),
             )
-            for a in active_adapters(adapters)
-            if isinstance(a, dict)
+            for a in self._weight_bearing(active_adapters(adapters))
         )
         return "|".join(parts) or "base"
 

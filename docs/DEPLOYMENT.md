@@ -20,15 +20,15 @@ after: backend lanes, model handling, replicas, and ops defaults.
 - copy base weights into `/srv/liminallm/models` (`config.json` + `*.safetensors` + tokenizer files; a checkpoint that exists but will not load fails requests rather than degrading to the synthetic stand-in).
 - adapters live under `/srv/liminallm/adapters/<adapter_id>/vNNNN/params.json`, one directory per trained version. serving reads **only** the version the artifact's `current_version` names — a loose `params.json`, a `latest` pointer, or the newest directory on disk are not servable state, so hand-placing weights does nothing until an artifact records the version. the directory is named for the adapter that owns it; an explicit `fs_dir` may move it, never rename it to another adapter's.
 - gpu prep: install the matching jax gpu wheel (cuda/rocm), verify `nvidia-smi` sees the card, and keep drivers + cuda in `$LD_LIBRARY_PATH`.
-- run: `python -m uvicorn liminallm.app:app --host 0.0.0.0 --port 8000 --workers 1` (jax likes fewer workers). requests specify `adapter_id` and optionally `adapter_mode` (local/hybrid/prompt); the backend overlays adapters over the frozen base and serves tokens locally.
+- run: `python -m uvicorn liminallm.app:app --host 0.0.0.0 --port 8000 --workers 1` (jax likes fewer workers). callers do not choose adapters: a chat request carries no `adapter_id` or `adapter_mode`, and the router selects and gates adapters internally from policies and clusters. this backend serves `local` and `hybrid` adapters as weights over the frozen base, carries `prompt` adapters through their instructions, and refuses `remote` — a provider-hosted adapter reaching it means the routing hand-off is broken, not that it should improvise.
 - the base model remains immutable; training writes only adapter weights.
 
 ### api backend (remote inference)
 - set `model_backend` (default `openai`) and `adapter_openai_base_url` in the admin console; the provider key goes in its own admin setting, or the matching `<PROVIDER>_API_KEY` environment variable as a fallback.
-- calls go out to the remote model id you pass as `base_model`; adapters travel as ids or prompt patches when the provider supports multi-lora/prompt layering.
+- calls go out to the remote model id you pass as `base_model`; adapters travel as provider adapter ids, as a fine-tuned model id, or as prompt text, depending on what the provider supports.
 - scenarios:
-  - **managed foundation only**: set `base_model` to the provider model, omit adapters for pure hosted inference.
-  - **hosted foundation + local adapters**: keep adapters on disk and send adapter metadata with the request so the provider overlays your deltas over its model.
+  - **managed foundation only**: set `base_model` to the provider model; with no adapters routed this is pure hosted inference.
+  - **provider-hosted adapters** (`mode: remote`): the provider holds the weights. the adapter records `remote_adapter_id` or `remote_model_id`, and the backend sends it — as an `adapter_id` parameter with its gate for a multi-lora provider, or as the model id where one fine-tune serves the request. locally trained weights on disk are **not** usable this way: an api backend cannot apply your `params.json`, and §5.0.1's matrix marks `local` incompatible with it.
   - **prompt-only adapters**: for providers without lora, use `adapter_mode=prompt` to inject adapter prompts instead of weights. the injection happens once, in the service, before any backend runs — backends transport prepared messages and never add a second copy.
 - switching providers is an admin-console change: set `model_backend` and the provider key; model services rebuild without a restart.
 
@@ -38,9 +38,9 @@ after: backend lanes, model handling, replicas, and ops defaults.
 
 ## model handling at a glance
 - base models are frozen. local deployments place them under `/srv/liminallm/models` and the local jax backend keeps them resident; api backends treat `base_model` as a provider-owned model id and never upload local weights.
-- adapters live under `/srv/liminallm/adapters/<adapter_id>/adapter.lora` and are loaded or streamed as metadata depending on backend capabilities.
+- adapters live under `/srv/liminallm/adapters/<adapter_id>/vNNNN/`, and a version becomes servable only when an artifact's `current_version` names it. the local backend reads that version's `params.json`; api backends never receive it, and carry the adapter as a provider adapter id or as prompt text instead.
 - training and clustering write only adapter weights. the base model on disk or at the provider is untouched.
-- when sending requests, set `base_model` to the foundation you want and `adapter_id`/`adapter_mode` to pick the adapter path (local weights, provider-hosted adapters, or prompt patching).
+- requests do not pick adapters. `base_model` and `model_backend` are admin settings, and the router chooses and gates adapters per turn from policies, clusters and the user's own personas — which is what makes the same conversation portable across backends without the caller knowing which one answered.
 
 ## ops & safety defaults (from the spec)
 - observability: metrics and traces should include chat latency/error rates, adapter usage, preference/training counts, and workflow node timings; `/healthz` always answers 200 with a per-dependency breakdown (postgres, redis, filesystem) for humans and dashboards, while `/readyz` is the load balancer probe and returns 503 when postgres or the filesystem is unusable.

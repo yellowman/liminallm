@@ -356,6 +356,29 @@ class TestTheEffectiveStackHashesTheSame:
             [{**closed, "weight": 0.2}]
         ) != backend._adapter_signature([{**closed, "weight": 0.8}])
 
+    def test_the_key_names_the_mechanisms_that_ran(self, tmp_path, checkpoint):
+        """§5.3 keys cached KV by the *effective* stack, and on this backend
+        the mechanism is weights. An adapter that applies none — nothing
+        promoted, or a prompt rung whose text is already in the tokens the
+        key covers — describes the same local model as no adapter at all, so
+        it must not key apart from it. Safe either way (a mismatch only costs
+        a reuse), but one definition of "effective" is the point."""
+        backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
+        base = backend._adapter_signature([])
+
+        assert backend._adapter_signature(
+            [{"id": "u", "mode": "local", "current_version": 0}]
+        ) == base
+        assert backend._adapter_signature(
+            [{"id": "p", "mode": "prompt", "current_version": 3}]
+        ) == base
+        # And the promoted ones still key apart by gate, as §5.3 requires.
+        assert backend._adapter_signature(
+            [{"id": "a", "current_version": 2, "weight": 0.2}]
+        ) != backend._adapter_signature(
+            [{"id": "a", "current_version": 2, "weight": 0.8}]
+        )
+
     def test_a_closed_gate_does_not_perturb_an_open_one(self, tmp_path, checkpoint):
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
         served = {"id": "y", "current_version": 1, "weight": 0.6}

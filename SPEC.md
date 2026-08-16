@@ -667,6 +667,26 @@ to support seamless switching between deployment modes, each adapter artifact in
 
 the router filters adapters before policy evaluation, only considering those compatible with the active backend mode. incompatible adapters are logged and excluded from routing decisions.
 
+**and the backend holds the same line.** a backend refuses an adapter whose
+mode its matrix marks incompatible, rather than improvising a representation
+for it: the local backend serves `local` and `hybrid` as weights and carries
+`prompt` weightlessly, and refuses `remote`. this is not the
+inert-state-into-outage shape guarded against elsewhere — an unpromoted or
+zero-gated adapter is a *state* the ladder passes through, while an
+incompatible mode arriving at a backend is a hand-off the router was supposed
+to have made impossible. checking only "is it the prompt rung" let a promoted
+`remote` adapter through the whole weight path and applied a provider-hosted
+adapter as local LoRA, because a `params.json` happened to sit under its
+directory.
+
+**one derived set answers "what applies here".** the same predicate — past
+the gate, a mode this backend serves as weights, promoted — decides which
+adapters compose, which supply weight-specific state such as an adapter
+vocabulary, which appear in the turn's accounting, and which key the KV
+cache (§5.3). letting the cache key hash adapters that apply nothing is safe
+in itself, costing a reuse and never granting a wrong one, but it leaves two
+definitions of "the effective stack" to drift apart.
+
 **hybrid mode behavior:**
 
 for `hybrid` adapters:
