@@ -9,16 +9,23 @@ Containment, outermost first:
 
 1. The code runs in a spawned child process (``run_in_sandbox``) with memory,
    CPU-time, file-size, and core-dump rlimits plus a wall-clock kill.
-2. Network egress is blocked: an empty-allowlist policy trips the socket guard,
+2. **The child is confined to its workdir** (``service/confine.py``): the
+   shared filesystem root, other users' files, service configuration and every
+   other host path are absent from its view, not merely unreadable. This is
+   the boundary that matters, because the service uid owns every user's files
+   — a same-uid process with an ordinary filesystem view can read all of them
+   by naming an absolute path, whatever the working directory is.
+3. Network egress is blocked: an empty-allowlist policy trips the socket guard,
    and the networking/process modules are blocked at import.
-3. Process-spawning entry points (``os.system``, ``fork``, ``exec*``, ...) are
+4. Process-spawning entry points (``os.system``, ``fork``, ``exec*``, ...) are
    removed before user code runs, so code cannot escape the rlimited process.
-4. The child's working directory holds only copies of the user's own files.
+5. The child's working directory holds only copies of the user's own files.
 
-This is meaningful isolation, not a security boundary against a determined
-attacker sharing the host: in-process hardening (3) is best-effort, and the
-model is executing code derived from user-supplied content. Run the API in a
-container or VM if the threat model includes hostile uploads.
+There is no unconfined fallback. On a platform with no confinement backend
+this tool refuses to run at all (``ConfinementUnavailable``), because the
+alternative — the same-uid unrestricted process this used to be — is what
+(2) exists to remove. (3) and (4) remain best-effort defense in depth around
+it rather than the wall itself.
 """
 from __future__ import annotations
 
@@ -31,6 +38,8 @@ import uuid
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any, Optional
+
+from liminallm.service.confine import backend_name, confine
 
 DEFAULT_TIMEOUT_SECONDS = 20
 MAX_OUTPUT_CHARS = 8_000
@@ -61,12 +70,20 @@ class _BlockedImportFinder:
         return None
 
 
-def _harden_child() -> None:
-    """Drop escape hatches inside the sandbox child before running user code."""
+def _harden_child(workdir: str) -> str:
+    """Confine the sandbox child and drop its escape hatches.
+
+    Returns the workdir's name after confinement — the Linux backend re-roots
+    the process, so the path passed in stops existing. Confinement happens
+    first: everything after it is defense in depth, and a failure to establish
+    it must stop the call rather than soften it.
+    """
     from liminallm.service.sandbox import (  # local: child-side import
         _NETWORK_POLICY_STATE,
         ToolNetworkPolicy,
     )
+
+    confined_workdir = confine(workdir)
 
     # An empty allowlist makes the socket guard reject every connection.
     _NETWORK_POLICY_STATE.policy = ToolNetworkPolicy(allowlist=[])
@@ -86,6 +103,7 @@ def _harden_child() -> None:
     ):
         if hasattr(os, attr):
             setattr(os, attr, _denied)
+    return confined_workdir
 
 
 def _truncate(text: str) -> str:
@@ -101,7 +119,7 @@ def execute_python(code: str, workdir: str) -> dict[str, Any]:
     a child process. Returns captured output rather than raising, so the model
     can read and react to its own errors.
     """
-    _harden_child()
+    workdir = _harden_child(workdir)
     os.chdir(workdir)
     sys.path.insert(0, workdir)
     before = {p.name for p in Path(workdir).iterdir() if p.is_file()}
@@ -199,8 +217,25 @@ def run_python_sandboxed(
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     max_memory_mb: int = 512,
 ) -> dict[str, Any]:
-    """Execute model-written Python in the resource-limited sandbox."""
+    """Execute model-written Python in the confined, resource-limited sandbox.
+
+    Refuses up front on a platform with no confinement backend, rather than
+    letting the child discover it: the caller gets one clear reason instead of
+    a sandbox error, and no untrusted code is ever spawned unconfined.
+    """
     from liminallm.service.sandbox import SandboxConfig, SandboxError, run_in_sandbox
+
+    if backend_name() is None:
+        return {
+            "ok": False,
+            "stdout": "",
+            "stderr": (
+                "the code interpreter is unavailable on this platform: no "
+                "filesystem confinement backend, and model-written code is "
+                "not run unconfined (SPEC §18)"
+            ),
+            "created_files": [],
+        }
 
     config = SandboxConfig(
         max_memory_mb=max_memory_mb,

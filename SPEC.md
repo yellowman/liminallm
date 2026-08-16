@@ -2567,6 +2567,25 @@ the following are treated as constants the kernel must honor; LLM edits happen o
 
 - **workflow/tool sandboxing**
   - tool workers run in a spawned child process under POSIX rlimits (memory hard cap `RLIMIT_AS`, CPU seconds, max file size, no core dumps), backstopped by a wall-clock kill, and have no filesystem access except a tmp scratch; `privileged:true` tools require admin-owned artifacts and are never called by default workflows.
+  - **the filesystem contract is a view, stated as a property and not a
+    mechanism.** a worker running model-written code can see its per-call
+    workdir (read-write), the inputs staged into it (read-only), and the
+    language runtime it needs to execute at all (read-only). it cannot see
+    `shared_fs_root`, any other user's files, service configuration or
+    secrets, arbitrary host paths, or the network. "cannot see" means absent
+    from the process's view — not present-but-unreadable: the service uid owns
+    every user's files, so unix permissions are the wrong instrument and
+    `os.chdir()` is not confinement at all. an unconfined same-uid process
+    reads any of those paths by naming it.
+  - **implemented per platform, failing closed.** linux establishes the view
+    with a user + mount namespace and a fresh root — workdir bound rw, runtime
+    bound ro, nothing else mounted. openbsd uses `unveil(2)` for exactly those
+    paths, a locking `unveil(NULL, NULL)`, then `pledge(2)`. a platform with no
+    backend does not get a weaker sandbox: `run_python` is **unavailable**
+    there, and the tool says so rather than spawning untrusted code with an
+    ordinary filesystem view. the rlimits, wall-clock kill, network denial and
+    process-spawn removal above are defense in depth *around* this view, not a
+    substitute for it.
   - JSON Schema validation enforced on tool inputs/outputs; outputs flagged `content_type: "html_untrusted"` must be sanitized by client before render.
   - retries: default 2 retries with exponential backoff (1s, 4s); per-node override allowed but capped at 3; node timeout default 15s, hard cap 60s.
 
@@ -3010,7 +3029,7 @@ this codebase's own doctrine.
 
 two kinds of untrusted work run outside the api process:
 
-- **code interpreter** (`run_python`): spawned child with rlimits
+- **code interpreter** (`run_python`): confined child (§18's filesystem view) with rlimits
   (memory/cpu/file-size/no core dumps), wall-clock kill, network policy with
   an empty allowlist, and import-level blocking of networking/process
   modules. artifacts it publishes go through the same upload extension
