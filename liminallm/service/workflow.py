@@ -8,6 +8,7 @@ import math
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import (
@@ -27,9 +28,10 @@ from jsonschema.exceptions import SchemaError
 
 from liminallm.config import Settings
 from liminallm.logging import get_logger
-from liminallm.service import agent_tools, compaction, interpreter, taint, web
+from liminallm.service import agent_tools, compaction, taint, tool_worker, web
 from liminallm.service import attachments as attachments_service
 from liminallm.service import notes as notes_service
+from liminallm.service.broker import CapabilityBroker, InvocationContext
 from liminallm.service.embeddings import (
     EMBEDDING_DIM,
     cosine_similarity,
@@ -38,8 +40,9 @@ from liminallm.service.embeddings import (
     validated_embedding,
 )
 from liminallm.service.errors import BadRequestError
-from liminallm.service.lease import (
-    InvocationBroker,
+from liminallm.service.invocation import (
+    Invocation,
+    InvocationRegistry,
     LeasedProxy,
     LeaseRevoked,
     active_invocation,
@@ -50,6 +53,7 @@ from liminallm.service.model_backend import DEFAULT_CONTEXT_WINDOW, active_adapt
 from liminallm.service.rag import RAGService
 from liminallm.service.router import RouterEngine
 from liminallm.service.sandbox import (
+    DEFAULT_SANDBOX_CONFIG,
     AllowlistedFetcher,
     PrivilegedToolError,
     ToolNetworkPolicy,
@@ -80,6 +84,10 @@ DEFAULT_BACKOFF_MS = (
     1000  # Initial backoff 1s, quadruples each retry (1s, 4s per SPEC §18)
 )
 MAX_RETRIES_HARD_CAP = 3  # SPEC §18: hard cap at 3 retries
+# How long the next attempt waits for the last one's parent-side serve loop to
+# return. The worker is already dead; this covers a capability that was mid-call
+# when the kill landed, and each of those carries a timeout of its own.
+ATTEMPT_HANDOVER_SECONDS = 30.0
 
 @dataclass
 class ParallelNodeResult:
@@ -121,9 +129,11 @@ class ToolDescriptor:
 class WorkflowEngine(WorkflowStreamingMixin):
     """Executes workflow.chat graphs using a small tool registry."""
 
-    # Issue 48.6: Increase ThreadPoolExecutor workers and add scaling config
-    DEFAULT_TOOL_WORKERS = 8  # Up from 4 to handle concurrent tool calls
-    MAX_TOOL_WORKERS = 16  # Hard cap to prevent resource exhaustion
+    # Kept as accepted keyword arguments because callers still pass them; the
+    # tool thread pool they sized is gone (SPEC §18: a tool worker is a spawned
+    # child process), so concurrency is now one process per live invocation.
+    DEFAULT_TOOL_WORKERS = 8
+    MAX_TOOL_WORKERS = 16
 
     def __init__(
         self,
@@ -137,16 +147,20 @@ class WorkflowEngine(WorkflowStreamingMixin):
         settings: Optional[Settings] = None,
         embeddings=None,
     ) -> None:
-        # A tool worker reaches its dependencies through the engine, so the
-        # lease check belongs on the engine's references to them rather than
-        # at each of the handlers' call sites — a handler cannot forget what
-        # it never had to remember. Threads with no lease (every API request)
-        # pass straight through. See service/lease.py.
-        self.broker = InvocationBroker()
-        self.store = LeasedProxy(store, self.broker)
-        self.llm = LeasedProxy(llm, self.broker)
+        # The live logical executions of this engine. Not a module global: hot
+        # reload replaces the engine while in-flight work finishes, and a
+        # global would have an old attempt asking the new engine about an
+        # execution it never opened (SPEC §18).
+        self.invocations = InvocationRegistry()
+        # A capability handler reaches its dependencies through the engine, so
+        # the liveness check belongs on the engine's references to them rather
+        # than at each call site — a handler cannot forget what it never had to
+        # remember. Threads with nothing bound (every API request) pass
+        # straight through. See service/invocation.py.
+        self.store = LeasedProxy(store)
+        self.llm = LeasedProxy(llm)
         self.router = router
-        self.rag = LeasedProxy(rag, self.broker)
+        self.rag = LeasedProxy(rag)
         # For notes search; None degrades to BM25-only ranking.
         self.embeddings = embeddings
         self.logger = get_logger(__name__)
@@ -170,10 +184,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             infrastructure_hosts=self._model_provider_hosts(),
         )
         self.tool_fetcher = AllowlistedFetcher(self.tool_network_policy)
-        # Issue 48.6: Configurable worker pool with bounds
-        workers = min(max(1, tool_workers), self.MAX_TOOL_WORKERS)
-        self._tool_executor = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
-        self._executor_shutdown = False
+        self._shutdown = False
 
     def _error_event(
         self, code: str, message: str, details: dict | None = None
@@ -197,29 +208,29 @@ class WorkflowEngine(WorkflowStreamingMixin):
             del workflow_trace[0 : len(workflow_trace) - max_entries]
 
     def shutdown(self, wait: bool = True) -> None:
-        """Explicitly shutdown the executor. Call during app shutdown.
+        """Close every live execution. Call during app shutdown.
 
-        Issue 23.1: Provides explicit cleanup instead of relying on __del__.
-        This should be called during application shutdown to ensure proper cleanup
-        of ThreadPoolExecutor resources.
-
-        Args:
-            wait: If True, wait for pending futures to complete. If False, cancel them.
+        `wait` is accepted for the callers that already pass it, but there is
+        nothing left to wait for: a live execution is a child process, and
+        closing it kills and reaps that process rather than asking it to stop.
+        A process left behind here is one no request is watching any more.
         """
         # getattr, not attribute access: __del__ calls this, and __del__ can
         # run on an instance whose __init__ raised part way through. Raising
         # there produces an "Exception ignored in" on stderr and leaks the
-        # executor it was meant to close.
-        if getattr(self, "_executor_shutdown", False):
+        # very children it was meant to reap.
+        if getattr(self, "_shutdown", False):
             return
-        self._executor_shutdown = True
-        if getattr(self, "_tool_executor", None) is None:
+        self._shutdown = True
+        registry = getattr(self, "invocations", None)
+        if registry is None:
             return
         try:
-            self._tool_executor.shutdown(wait=wait, cancel_futures=not wait)
-            self.logger.info("workflow_executor_shutdown", wait=wait)
-        except Exception as exc:
-            self.logger.warning("workflow_executor_shutdown_error", error=str(exc))
+            live = len(registry)
+            registry.close_all()
+            self.logger.info("workflow_invocations_closed", live=live)
+        except Exception as exc:  # noqa: BLE001 - shutdown never raises
+            self.logger.warning("workflow_shutdown_error", error=str(exc))
 
     async def _rollback_workflow(
         self,
@@ -773,6 +784,12 @@ class WorkflowEngine(WorkflowStreamingMixin):
         Retry settings are read from node metadata with defaults:
         - max_retries: 2 (hard cap at 3 per SPEC §18)
         - backoff_ms: 1000 (quadruples each retry: 1s, 4s per SPEC §18)
+
+        One logical execution spans every attempt, so the ledger a killed
+        attempt wrote is the ledger its replacement replays. And no attempt
+        starts until the previous one is dead: two attempts sharing a working
+        directory and a sandbox child is not a retry, it is a race whose winner
+        writes the answer.
         """
         node_id = node.get("id", "unknown")
         max_retries = min(
@@ -781,15 +798,113 @@ class WorkflowEngine(WorkflowStreamingMixin):
         )
         backoff_ms = node.get("backoff_ms", DEFAULT_BACKOFF_MS)
 
+        # One id for this node execution, stable across its attempts. Each
+        # attempt gets its own worker — attempt two must not inherit attempt
+        # one's process — but the ledger is keyed by this, because killing
+        # attempt one does not recall what it already committed.
+        invocation = self.invocations.open(
+            uuid.uuid4().hex,
+            tool=str(node.get("tool") or ""),
+            user_id=user_id,
+            tenant_id=tenant_id,
+        )
+        try:
+            async with self._cancel_revokes(invocation, cancel_event):
+                return await self._attempt_node(
+                    node,
+                    invocation=invocation,
+                    node_id=node_id,
+                    max_retries=max_retries,
+                    backoff_ms=backoff_ms,
+                    user_message=user_message,
+                    context_id=context_id,
+                    conversation_id=conversation_id,
+                    adapters=adapters,
+                    history=history,
+                    vars_scope=vars_scope,
+                    user_id=user_id,
+                    tenant_id=tenant_id,
+                    workflow_start_time=workflow_start_time,
+                    workflow_timeout_ms=workflow_timeout_ms,
+                    cancel_event=cancel_event,
+                )
+        finally:
+            # Reached on success, failure, timeout and cancellation alike. An
+            # execution that ends any other way leaves a live sandbox child and
+            # a scratch directory with nobody left to notice them. Off the event
+            # loop: killing and reaping block, and stalling the loop here would
+            # make one node's teardown everybody's latency.
+            await asyncio.to_thread(invocation.close)
+
+    def _watch_for_cancel(
+        self, invocation: Invocation, cancel_event: Optional[asyncio.Event]
+    ) -> Optional[asyncio.Task]:
+        """Make `POST /chat/cancel` stop the work, not just the waiting.
+
+        The cancel event was only read between retry attempts, so a cancel
+        arriving mid-tool was noticed after the tool had finished doing
+        whatever it was doing. Watching it cancels the execution the moment it
+        fires: the worker's process tree comes down and every capability racing
+        the flag is refused rather than started. The caller cancels the task it
+        gets back — an unattended watcher outlives the turn it belongs to.
+        """
+        if cancel_event is None:
+            return None
+
+        async def watch() -> None:
+            await cancel_event.wait()
+            await asyncio.to_thread(invocation.cancel, "cancelled")
+
+        return asyncio.create_task(watch())
+
+    @asynccontextmanager
+    async def _cancel_revokes(
+        self, invocation: Invocation, cancel_event: Optional[asyncio.Event]
+    ):
+        """`_watch_for_cancel`, scoped to a block."""
+        watcher = self._watch_for_cancel(invocation, cancel_event)
+        try:
+            yield
+        finally:
+            if watcher is not None:
+                watcher.cancel()
+
+    async def _attempt_node(
+        self,
+        node: Dict[str, Any],
+        *,
+        invocation: Invocation,
+        node_id: str,
+        max_retries: int,
+        backoff_ms: float,
+        user_message: str,
+        context_id: Optional[str],
+        conversation_id: Optional[str],
+        adapters: List[dict],
+        history: List[Any],
+        vars_scope: Dict[str, Any],
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+        workflow_start_time: float,
+        workflow_timeout_ms: float,
+        cancel_event: Optional[asyncio.Event] = None,
+    ) -> Tuple[Dict[str, Any], List[str]]:
+        """The attempt loop of one logical execution."""
         last_error: Optional[Exception] = None
         attempt = 0
-        # One id for this node execution, stable across its attempts. Each
-        # attempt gets its own lease — attempt two must not inherit attempt
-        # one's authority — but a durable idempotency key derives from this,
-        # because killing attempt one does not recall what it already sent.
-        logical_execution_id = uuid.uuid4().hex
 
         while attempt <= max_retries:
+            if attempt and not await self._previous_attempt_is_dead(
+                invocation, node_id, attempt
+            ):
+                return (
+                    {
+                        "status": "error",
+                        "error": "tool_worker_unreaped",
+                        "attempts": attempt,
+                    },
+                    [],
+                )
             # Check workflow timeout before each attempt
             elapsed_ms = (time.monotonic() - workflow_start_time) * 1000
             remaining_ms = workflow_timeout_ms - elapsed_ms
@@ -818,7 +933,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                         vars_scope=vars_scope,
                         user_id=user_id,
                         tenant_id=tenant_id,
-                        logical_execution_id=logical_execution_id,
+                        invocation=invocation,
                     ),
                     timeout=node_timeout_ms / 1000.0,
                 )
@@ -839,6 +954,11 @@ class WorkflowEngine(WorkflowStreamingMixin):
             except asyncio.TimeoutError:
                 timeout_latency = (time.monotonic() * 1000) - start_ms
                 last_error = asyncio.TimeoutError("node_timeout")
+                # `wait_for` cancelled the coroutine; it did not stop the work.
+                # Revoke before anything else, so a capability racing this line
+                # is refused rather than started, and the worker's process tree
+                # comes down with it. Off the loop: the kill and reap block.
+                await asyncio.to_thread(invocation.revoke, "node_timeout")
                 self.logger.warning(
                     "workflow_node_timeout",
                     node=node_id,
@@ -926,6 +1046,36 @@ class WorkflowEngine(WorkflowStreamingMixin):
             },
             [],
         )
+
+    async def _previous_attempt_is_dead(
+        self, invocation: Invocation, node_id: str, attempt: int
+    ) -> bool:
+        """The retry's precondition, not its cleanup.
+
+        The old model cancelled the coroutine awaiting a thread and started
+        again; the thread kept running, so attempt two shared attempt one's
+        working directory, its sandbox child and its half-written files. Here
+        attempt two may not begin until attempt one has no process left and its
+        parent-side serve loop has returned. Killing and reaping block, so they
+        happen in a thread — and the answer is honoured: a tree that will not
+        die stops the retry rather than being run alongside it.
+        """
+
+        def _reap() -> bool:
+            invocation.revoke("retry")
+            if not invocation.terminate():
+                return False
+            return invocation.await_attempt(ATTEMPT_HANDOVER_SECONDS)
+
+        reaped = await asyncio.to_thread(_reap)
+        if not reaped:
+            self.logger.error(
+                "tool_worker_unreaped",
+                node=node_id,
+                attempt=attempt,
+                invocation_id=invocation.invocation_id,
+            )
+        return reaped
 
     def _merge_usage(
         self, accum: Dict[str, Any], new_usage: Dict[str, Any]
@@ -1598,7 +1748,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         vars_scope: Dict[str, Any],
         user_id: Optional[str],
         tenant_id: Optional[str],
-        logical_execution_id: Optional[str] = None,
+        invocation: Optional[Invocation] = None,
     ) -> Tuple[Dict[str, Any], List[str]]:
         node_type = node.get("type", "tool_call")
         if node_type == "switch":
@@ -1673,7 +1823,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 user_message,
                 user_id=user_id,
                 tenant_id=tenant_id,
-                logical_execution_id=logical_execution_id,
+                invocation=invocation,
             )
             # SPEC §18: Record success to reset failure counter
             if self.cache and tool_name:
@@ -1765,7 +1915,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         user_id: Optional[str],
         tenant_id: Optional[str],
         descriptor: Optional[ToolDescriptor] = None,
-        logical_execution_id: Optional[str] = None,
+        invocation: Optional[Invocation] = None,
     ) -> Dict[str, Any]:
         tool_name = tool or "llm.generic"
         if descriptor is None:
@@ -1825,75 +1975,54 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 )
                 return {"status": "error", "content": str(exc), "error": "forbidden"}
 
-        handler = self._builtin_tool_handlers().get(tool_name)
-        if tool_spec and not handler:
-            handler = self._builtin_tool_handlers().get(tool_spec.get("handler"))
-
-        invocation = self.broker.issue(
+        # One logical execution. A node's retry loop passes the same one back,
+        # so the second attempt replays the first's ledger; a direct invocation
+        # has no retry loop above it and owns its own.
+        owned = invocation is None
+        if invocation is None:
+            invocation = self.invocations.open(
+                uuid.uuid4().hex,
+                tool=tool_name,
+                user_id=user_id,
+                tenant_id=tenant_id,
+            )
+        worker_tool, plan, context, preamble = self._plan_invocation(
             tool_name,
+            inputs,
+            adapters=adapters,
+            history=history,
+            context_id=context_id,
+            conversation_id=conversation_id,
+            user_message=user_message,
             user_id=user_id,
             tenant_id=tenant_id,
-            artifact_id=descriptor.artifact_id if descriptor else None,
-            logical_execution_id=logical_execution_id,
+            tool_spec=tool_spec,
         )
-
-        def _run_handler() -> Dict[str, Any]:
-            # The lease is bound to the worker thread, not passed to the
-            # handler: it has to cover everything the handler reaches,
-            # including code it calls that predates this mechanism.
-            with current_invocation(invocation), tool_network_guard(
-                self.tool_network_policy
-            ):
-                if not handler:
-                    return {"status": "error", "content": f"unknown tool {tool_name}"}
-                return handler(
-                    inputs,
-                    adapters,
-                    history,
-                    context_id,
-                    conversation_id,
-                    user_message,
-                    user_id,
-                    tenant_id,
-                )
-
-        future = self._tool_executor.submit(_run_handler)
+        limits = self._worker_limits(tool_spec)
         try:
-            # Await the worker-thread future instead of blocking the event loop on
-            # future.result(); this keeps the loop responsive so node/workflow
-            # timeouts fire and other requests are not stalled by a slow tool.
+            # to_thread carries the broker's serve loop, not the tool's work.
+            # That distinction is the whole change: when this await is
+            # abandoned the work is in a process the caller can kill, rather
+            # than in a thread that keeps running beside its own retry.
             result = await asyncio.wait_for(
-                asyncio.wrap_future(future), timeout=timeout
+                asyncio.to_thread(
+                    self._serve_invocation,
+                    invocation,
+                    worker_tool,
+                    plan,
+                    context,
+                    limits,
+                ),
+                timeout=timeout,
             )
-            sanitized = self._sanitize_html_untrusted(result)
-            output_errors = self._validate_tool_payload(
-                sanitized,
-                tool_spec.get("output_schema") if tool_spec else None,
-                phase="output",
-                tool_name=tool_name,
-            )
-            if output_errors:
-                return {
-                    "status": "error",
-                    "content": "tool output validation failed",
-                    "error": "validation_error",
-                    "details": {"errors": output_errors},
-                }
-            return sanitized
-        except (asyncio.TimeoutError, concurrent.futures.TimeoutError):
+        except asyncio.TimeoutError:
             self.logger.warning("tool_timeout", tool=tool_name, timeout=timeout)
-            # Revoke first. `future.cancel()` returns False for anything
-            # already running and Python cannot kill a thread, so the worker
-            # is still executing at this line — the order is the only thing
-            # that decides whether its next write lands.
-            self.broker.revoke(invocation)
-            future.cancel()
-            await self._reap(future, invocation, tool_name)
+            # Revoke before returning, and in that order: a timeout that leaves
+            # the worker running is the defect, not the report of one. Off the
+            # event loop, because killing and reaping block.
+            await asyncio.to_thread(invocation.revoke, "tool_timeout")
             return {"status": "error", "content": "tool timed out", "error": "timeout"}
         except LeaseRevoked:
-            # The worker hit the revocation before the node stopped awaiting
-            # it. It has done nothing since, which is the point — report it
-            # rather than letting a security stop surface as a crash.
             self.logger.warning(
                 "tool_lease_revoked",
                 tool=tool_name,
@@ -1905,44 +2034,173 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 "error": "revoked",
             }
         finally:
-            # A worker that returned normally still holds its lease until
-            # here; leaving it live would let a handler that spawned its own
-            # thread keep the caller's authority indefinitely.
-            self.broker.revoke(invocation)
+            if owned:
+                await asyncio.to_thread(invocation.close)
+        if preamble:
+            result.setdefault("context_snippets", []).insert(0, preamble)
+        sanitized = self._sanitize_html_untrusted(result)
+        output_errors = self._validate_tool_payload(
+            sanitized,
+            tool_spec.get("output_schema") if tool_spec else None,
+            phase="output",
+            tool_name=tool_name,
+        )
+        if output_errors:
+            return {
+                "status": "error",
+                "content": "tool output validation failed",
+                "error": "validation_error",
+                "details": {"errors": output_errors},
+            }
+        return sanitized
 
-    # How long a revoked worker gets to notice before the node gives up
-    # waiting for it. Bounded because it is on the timeout path: the lease is
-    # already gone, so this is about not stacking workers, not about safety.
-    REAP_GRACE_SECONDS = 5.0
+    def _plan_invocation(
+        self,
+        tool_name: str,
+        inputs: Dict[str, Any],
+        *,
+        adapters: List[dict],
+        history: List[Any],
+        context_id: Optional[str],
+        conversation_id: Optional[str],
+        user_message: str,
+        user_id: Optional[str],
+        tenant_id: Optional[str],
+        tool_spec: Optional[dict] = None,
+    ) -> Tuple[str, Dict[str, Any], InvocationContext, str]:
+        """Everything the worker gets, and everything it does not.
 
-    async def _reap(self, future, invocation, tool_name: str) -> None:
-        """Wait for a revoked worker to finish before the node retries.
+        The plan is plain data — inputs, messages, offered schemas, budgets.
+        The context stays here: user, tenant, conversation, adapters and
+        history never cross the pipe, so a worker has no field in which to name
+        another tenant's data (§12.2).
+        """
+        context = InvocationContext(
+            user_id=user_id,
+            tenant_id=tenant_id,
+            conversation_id=conversation_id,
+            context_id=context_id,
+            adapters=list(adapters or []),
+            history=list(history or []),
+            user_message=user_message,
+        )
+        plan: Dict[str, Any] = {"inputs": dict(inputs or {}), "message": user_message}
+        worker_tool = self._resolve_worker_tool(tool_name, tool_spec)
+        if worker_tool != "agent.files_v1":
+            return worker_tool, plan, context, ""
 
-        `_execute_node_with_retry` runs up to three attempts. Without this the
-        second attempt starts while the first worker is still in the pool, so
-        one node can hold three workers and three sandbox children at once.
-        The lease has already been revoked, so an overrunning worker is
-        harmless — it is reported, not waited on further.
+        # The agent loop's prompt is assembled here because assembling it reads
+        # attachments, the digest and the vault — none of which the worker can
+        # reach. What crosses is the finished message list.
+        message = inputs.get("message") or user_message or ""
+        attachments = self._conversation_attachments(conversation_id, user_id)
+        messages, tools, preamble = self._build_agent_context(
+            message, attachments, history, user_id, conversation_id
+        )
+        if not tools or not self.llm.supports_tools:
+            # Nothing to offer, or a backend that cannot call tools: answer the
+            # ordinary way rather than degrading the reply.
+            fallback = {"inputs": {**dict(inputs or {}), "message": message}}
+            return "llm.generic", fallback, context, preamble
+        plan.update(
+            {
+                "messages": messages,
+                "tools": tools,
+                "message": message,
+                "max_rounds": self.MAX_AGENT_ROUNDS,
+                "deadline_seconds": self.AGENT_DEADLINE_SECONDS,
+            }
+        )
+        return worker_tool, plan, context, ""
+
+    def _resolve_worker_tool(
+        self, tool_name: str, tool_spec: Optional[dict] = None
+    ) -> str:
+        """The body this tool runs, following a spec's `handler` alias.
+
+        A `tool.spec` artifact may name a builtin as its handler, and the spec
+        that matters is the authorized row's — a private tool is resolved for
+        its caller and never enters the shared registry (SPEC §18), so reading
+        the alias out of the registry alone would leave it unresolved and the
+        tool would answer "unknown".
+        """
+        if tool_name in tool_worker.BODY_NAMES:
+            return tool_name
+        alias = (tool_spec or self.tool_registry.get(tool_name) or {}).get("handler")
+        if alias in tool_worker.BODY_NAMES or alias in self._builtin_tool_handlers():
+            return alias
+        return tool_name
+
+    def _worker_limits(self, tool_spec: Optional[dict]) -> Dict[str, int]:
+        """SPEC §18: the rlimits this tool's worker runs under.
+
+        Read off the same SandboxConfig the privileged-tool check uses, so a
+        tool's resource policy is decided in one place whether it is being
+        asked "may this run" or "how much may it have".
         """
         try:
-            await asyncio.wait_for(
-                asyncio.shield(asyncio.wrap_future(future)),
-                timeout=self.REAP_GRACE_SECONDS,
+            return tool_worker.limits_from_config(
+                get_tool_sandbox_config(tool_spec, user_role="admin")
             )
-        except (asyncio.TimeoutError, concurrent.futures.TimeoutError):
-            self.logger.warning(
-                "tool_worker_unreaped",
-                tool=tool_name,
-                invocation_id=invocation.invocation_id,
-                grace=self.REAP_GRACE_SECONDS,
-            )
-        except BaseException as exc:  # noqa: BLE001 - the worker's own failure
-            self.logger.info(
-                "tool_worker_reaped_with_error",
-                tool=tool_name,
-                invocation_id=invocation.invocation_id,
-                error=str(exc),
-            )
+        except Exception:  # noqa: BLE001 - fall back to the shipped defaults
+            return tool_worker.limits_from_config(DEFAULT_SANDBOX_CONFIG)
+
+    def _serve_invocation(
+        self,
+        invocation: Invocation,
+        worker_tool: str,
+        plan: Dict[str, Any],
+        context: InvocationContext,
+        limits: Dict[str, int],
+        *,
+        on_capability: Optional[Callable[[dict], None]] = None,
+    ) -> Dict[str, Any]:
+        """Spawn one worker, answer it until it finishes, then confirm it is gone.
+
+        The terminate in the `finally` is not tidying: it is what lets the
+        caller state that nothing of this attempt is still running.
+        """
+        broker = CapabilityBroker(self, context, on_capability=on_capability)
+        handle = tool_worker.spawn(invocation, worker_tool, plan, limits=limits)
+        try:
+            return broker.serve(handle.conn, invocation, is_alive=handle.is_alive)
+        finally:
+            handle.terminate()
+            invocation.resources.forget_child(handle.pid or 0)
+            invocation.end_attempt(handle.attempt)
+
+    def _run_host_tool(
+        self,
+        tool_name: str,
+        inputs: Dict[str, Any],
+        *,
+        context: InvocationContext,
+    ) -> Dict[str, Any]:
+        """Run a builtin whose body still belongs in the parent.
+
+        These bodies are broad reads of the store — prompt assembly, adapter
+        selection, RAG composition — with no model-chosen control flow in them.
+        Moving one across the pipe would contain nothing and would hand the
+        worker a proxy for every method of the store, which is a worse boundary
+        than none. The worker process, its rlimits, the ledger and the liveness
+        check all still apply; only the body runs here.
+        """
+        handler = self._builtin_tool_handlers().get(tool_name)
+        if handler is None:
+            spec = self.tool_registry.get(tool_name) or {}
+            handler = self._builtin_tool_handlers().get(spec.get("handler"))
+        if handler is None:
+            return {"status": "error", "content": f"unknown tool {tool_name}"}
+        return handler(
+            inputs,
+            context.adapters,
+            context.history,
+            context.context_id,
+            context.conversation_id,
+            context.user_message,
+            context.user_id,
+            context.tenant_id,
+        )
 
     def _builtin_tool_handlers(
         self,
@@ -1962,18 +2220,17 @@ class WorkflowEngine(WorkflowStreamingMixin):
             Dict[str, Any],
         ],
     ]:
+        # The tools whose bodies run in the worker (service/tool_worker.py) are
+        # deliberately absent: agent.files_v1, code.python_v1, web.search_v1,
+        # web.fetch_v1, file.search_v1 and notes.search_v1 are all model-chosen
+        # control flow over untrusted content. What is left here is the set of
+        # bodies that read broadly from the store instead.
         return {
             "llm.generic": self._tool_llm_generic,
             "llm.generic_chat_v1": self._tool_llm_generic,
             "rag.answer_with_context_v1": self._tool_rag_answer,
             "llm.intent_classifier_v1": self._tool_intent_classifier,
             "agent.code_v1": self._tool_agent_code,
-            "agent.files_v1": self._tool_agent_files,
-            "file.search_v1": self._tool_file_search,
-            "code.python_v1": self._tool_code_python,
-            "notes.search_v1": self._tool_note_search,
-            "web.search_v1": self._tool_web_search,
-            "web.fetch_v1": self._tool_web_fetch,
             "workflow.end": self._tool_end,
         }
 
@@ -2033,21 +2290,51 @@ class WorkflowEngine(WorkflowStreamingMixin):
             user_id=user_id, tenant_id=tenant_id,
         )
 
-    def _run_python_tool(
+    def _run_python_capability(
         self,
         code: str,
         *,
+        invocation: Optional[Invocation],
+        operation_seq: int = 0,
+        step: str = "",
         conversation_id: Optional[str],
         user_id: Optional[str],
-        session: dict,
+        session: Optional[dict] = None,
     ) -> str:
-        """Look up the conversation's attachments, then hand off to the tool."""
+        """Look up the conversation's attachments, then run the code.
+
+        The invocation owns the scratch and the sandbox child; the taint check
+        happens before either exists, because a turn that has read a possible
+        injection does not get code execution at all (§21.1).
+        """
+        # `session if session is not None`, never `session or {}`: an empty
+        # dict is falsy, and the caller's dict is where the workdir has to land.
+        state = (
+            invocation.session
+            if invocation is not None
+            else (session if session is not None else {})
+        )
+        if taint.is_withdrawn("run_python", state):
+            self.logger.warning(
+                "capability_withdrawn_by_injection_taint",
+                capability="run_python",
+                conversation_id=conversation_id,
+                findings=len(taint.findings(state)),
+            )
+            return taint.refusal(state)
         names: List[str] = []
-        if session.get("workdir") is None:
+        if state.get("workdir") is None:
             attachments = self._conversation_attachments(conversation_id, user_id)
             names = [a.get("name") for a in attachments if a.get("name")]
         return agent_tools.run_python(
-            code, names, settings=self.settings, user_id=user_id, session=session
+            code,
+            names,
+            settings=self.settings,
+            user_id=user_id,
+            session=state,
+            invocation=invocation,
+            operation_seq=operation_seq,
+            step=step,
         )
 
     def _web_settings(self) -> dict:
@@ -2062,98 +2349,6 @@ class WorkflowEngine(WorkflowStreamingMixin):
         return agent_tools.run_web_fetch(
             url, settings=self.settings, logger=self.logger
         )
-
-    def _tool_web_search(
-        self,
-        inputs: Dict[str, Any],
-        adapters: List[dict],
-        history: List[Any],
-        context_id: Optional[str],
-        conversation_id: Optional[str],
-        user_message: str,
-        user_id: Optional[str],
-        tenant_id: Optional[str],
-    ) -> Dict[str, Any]:
-        """Direct-invocable web search (also used by the agent loop)."""
-        query = inputs.get("query") or inputs.get("message") or user_message or ""
-        text, findings = self._run_web_search(query, int(inputs.get("limit") or 5))
-        return {
-            "content": text,
-            "usage": {},
-            "injection_findings": [f["type"] for f in findings],
-        }
-
-    def _tool_web_fetch(
-        self,
-        inputs: Dict[str, Any],
-        adapters: List[dict],
-        history: List[Any],
-        context_id: Optional[str],
-        conversation_id: Optional[str],
-        user_message: str,
-        user_id: Optional[str],
-        tenant_id: Optional[str],
-    ) -> Dict[str, Any]:
-        """Direct-invocable page fetch (also used by the agent loop)."""
-        url = inputs.get("url") or ""
-        if not url:
-            return {"status": "error", "content": "no url supplied", "usage": {}}
-        text, findings = self._run_web_fetch(str(url))
-        return {
-            "content": text,
-            "usage": {},
-            "injection_findings": [f["type"] for f in findings],
-        }
-
-    def _tool_file_search(
-        self,
-        inputs: Dict[str, Any],
-        adapters: List[dict],
-        history: List[Any],
-        context_id: Optional[str],
-        conversation_id: Optional[str],
-        user_message: str,
-        user_id: Optional[str],
-        tenant_id: Optional[str],
-    ) -> Dict[str, Any]:
-        """Direct-invocable form of file_search (also used by the agent loop)."""
-        query = inputs.get("query") or inputs.get("message") or user_message or ""
-        text, snippets = self._run_file_search(
-            query,
-            int(inputs.get("limit") or 4),
-            conversation_id=conversation_id,
-            context_id=context_id,
-            user_id=user_id,
-            tenant_id=tenant_id,
-        )
-        return {"content": text, "usage": {}, "context_snippets": snippets}
-
-    def _tool_code_python(
-        self,
-        inputs: Dict[str, Any],
-        adapters: List[dict],
-        history: List[Any],
-        context_id: Optional[str],
-        conversation_id: Optional[str],
-        user_message: str,
-        user_id: Optional[str],
-        tenant_id: Optional[str],
-    ) -> Dict[str, Any]:
-        """Direct-invocable form of run_python (also used by the agent loop)."""
-        code = inputs.get("code") or ""
-        if not code:
-            return {"status": "error", "content": "no code supplied", "usage": {}}
-        session: dict = {}
-        try:
-            output = self._run_python_tool(
-                code,
-                conversation_id=conversation_id,
-                user_id=user_id,
-                session=session,
-            )
-        finally:
-            interpreter.cleanup_workdir(session.get("workdir"))
-        return {"content": output, "usage": {}}
 
     def _run_history_search(
         self,
@@ -2184,29 +2379,20 @@ class WorkflowEngine(WorkflowStreamingMixin):
         """Whether the vault is on. settings already carries the admin value."""
         return bool(self.settings.notes_enabled)
 
-    def _tool_note_search(
-        self,
-        inputs: Dict[str, Any],
-        adapters: List[dict],
-        history: List[Any],
-        context_id: Optional[str],
-        conversation_id: Optional[str],
-        user_message: str,
-        user_id: Optional[str],
-        tenant_id: Optional[str],
-    ) -> Dict[str, Any]:
-        """Direct-invocable notes search (also reachable from the agent loop)."""
-        query = inputs.get("query") or inputs.get("message") or user_message or ""
+    def _run_note_search(
+        self, query: str, limit: int, *, user_id: Optional[str]
+    ) -> str:
+        """Search the user's own vault. Empty when notes are off."""
         if not user_id or not self._notes_enabled():
-            return {"content": "No notes available.", "usage": {}}
+            return "No notes available."
         results = notes_service.search_notes(
             self.store,
             self.embeddings,
             user_id,
             str(query),
-            limit=max(1, min(int(inputs.get("limit") or 6), 10)),
+            limit=max(1, min(int(limit or 6), 10)),
         )
-        return {"content": notes_service.format_note_results(results), "usage": {}}
+        return notes_service.format_note_results(results)
 
     def _build_agent_context(
         self,
@@ -2298,11 +2484,24 @@ class WorkflowEngine(WorkflowStreamingMixin):
         session: dict,
         snippets: List[str],
         fallback_query: str,
+        invocation: Optional[Invocation] = None,
+        operation_seq: int = 0,
+        step: str = "",
     ) -> str:
-        """Run one model-requested tool and return its text result."""
+        """Run one model-requested tool and return its text result.
+
+        Parent-side, always: the worker chose the tool and its arguments, and
+        this is where that choice becomes an effect. Liveness is checked before
+        each one, so a turn revoked between two calls of the same round makes
+        no request at all rather than making it and discarding the answer.
+        """
+        if invocation is not None:
+            invocation.check_live()
         # Capability withdrawal: a turn that read a possible injection loses
-        # code execution for the rest of it. See service/taint.py for why this
-        # is enforced here rather than asked of the model.
+        # code execution and web access for the rest of it. See service/taint.py
+        # for why this is enforced here rather than asked of the model — and
+        # note that "here" is the parent, which is the half the injected page
+        # never reached.
         if taint.is_withdrawn(name, session):
             self.logger.warning(
                 "tool_blocked_by_injection_taint",
@@ -2323,8 +2522,11 @@ class WorkflowEngine(WorkflowStreamingMixin):
             snippets.extend(found)
             return result
         if name == "run_python":
-            return self._run_python_tool(
+            return self._run_python_capability(
                 str(args.get("code") or ""),
+                invocation=invocation,
+                operation_seq=operation_seq,
+                step=step,
                 conversation_id=conversation_id,
                 user_id=user_id,
                 session=session,
@@ -2347,16 +2549,11 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 user_id=user_id,
             )
         if name == "note_search":
-            if not user_id:
-                return "No notes available."
-            results = notes_service.search_notes(
-                self.store,
-                self.embeddings,
-                user_id,
+            return self._run_note_search(
                 str(args.get("query") or fallback_query),
-                limit=max(1, min(int(args.get("limit") or 6), 10)),
+                int(args.get("limit") or 6),
+                user_id=user_id,
             )
-            return notes_service.format_note_results(results)
         return f"unknown tool '{name}'"
 
     #: Read-only tools: they neither record injection taint nor consult it, so
@@ -2377,25 +2574,26 @@ class WorkflowEngine(WorkflowStreamingMixin):
         session: dict,
         snippets: List[str],
         fallback_query: str,
+        invocation: Optional[Invocation] = None,
+        operation_seq: int = 0,
     ) -> List[str]:
         """Execute one round's tool calls; results always in call order.
 
         A round of pure reads is the model fanning out searches, so those run
         together. The egress guard is thread-local, which makes re-applying it
         inside every worker mandatory, not hygiene: the ambient guard on the
-        handler's own thread does not follow work into a pool, and the socket
-        allowlist PERMITS when no policy is set on the connecting thread.
+        serving thread does not follow work into a pool, and the socket
+        allowlist PERMITS when no policy is set on the connecting thread. The
+        invocation is thread-local for the same reason and is re-applied with
+        it, or a parallel round would run unbound — which `LeasedProxy` reads as
+        the API path and waves through.
         """
 
-        # Both of these are thread-local, and for the same reason neither
-        # follows work into a pool. The guard was already re-applied here; the
-        # lease was not, so a parallel round ran with `active_invocation()`
-        # None — which `LeasedProxy` reads as the API path and waves through.
-        # Captured on the leased thread, before any worker starts.
-        leased = active_invocation()
+        # Captured on the serving thread, before any pool worker starts.
+        bound = invocation if invocation is not None else active_invocation()
 
-        def run_one(name: str, args: Dict[str, Any], sink: List[str]) -> str:
-            with current_invocation(leased), tool_network_guard(
+        def run_one(index: int, name: str, args: Dict[str, Any], sink: List[str]) -> str:
+            with current_invocation(bound), tool_network_guard(
                 self.tool_network_policy
             ):
                 return self._execute_agent_tool(
@@ -2408,28 +2606,36 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     session=session,
                     snippets=sink,
                     fallback_query=fallback_query,
+                    invocation=bound,
+                    operation_seq=operation_seq,
+                    # A durable step of this round needs a name a replay can
+                    # reproduce. The call's position in the round is that name:
+                    # the round's payload is hashed as a whole, so the same
+                    # position in a matching round is the same call.
+                    step=f"call{index}",
                 )
 
         if len(parsed) > 1 and all(
             name in self.PARALLEL_SAFE_TOOLS for _, name, _ in parsed
         ):
             # Per-call snippet sinks keep context_snippets in call order no
-            # matter which worker finishes first. A fresh bounded pool, not
-            # self._tool_executor: this method already runs on one of that
-            # pool's threads, and a pool waiting on itself can starve.
+            # matter which pool worker finishes first.
             sinks: List[List[str]] = [[] for _ in parsed]
             with concurrent.futures.ThreadPoolExecutor(
                 max_workers=min(4, len(parsed))
             ) as pool:
                 futures = [
-                    pool.submit(run_one, name, args, sink)
-                    for (_, name, args), sink in zip(parsed, sinks)
+                    pool.submit(run_one, index, name, args, sink)
+                    for index, ((_, name, args), sink) in enumerate(zip(parsed, sinks))
                 ]
                 results = [future.result() for future in futures]
             for sink in sinks:
                 snippets.extend(sink)
             return results
-        return [run_one(name, args, snippets) for _, name, args in parsed]
+        return [
+            run_one(index, name, args, snippets)
+            for index, (_, name, args) in enumerate(parsed)
+        ]
 
     @staticmethod
     def _parse_tool_arguments(call: Dict[str, Any]) -> Dict[str, Any]:
@@ -2438,132 +2644,6 @@ class WorkflowEngine(WorkflowStreamingMixin):
         except (TypeError, ValueError):
             return {}
         return args if isinstance(args, dict) else {}
-
-    def _tool_agent_files(
-        self,
-        inputs: Dict[str, Any],
-        adapters: List[dict],
-        history: List[Any],
-        context_id: Optional[str],
-        conversation_id: Optional[str],
-        user_message: str,
-        user_id: Optional[str],
-        tenant_id: Optional[str],
-    ) -> Dict[str, Any]:
-        """Answer using the conversation's attachments, model-driven.
-
-        Small text files are already in the prompt; for anything else the model
-        decides whether to search or to run code, and may do both, repeatedly.
-        Falls back to push-style retrieval when the backend cannot call tools.
-        """
-        message = inputs.get("message") or user_message or ""
-        attachments = self._conversation_attachments(conversation_id, user_id)
-        messages, tools, preamble = self._build_agent_context(
-            message, attachments, history, user_id, conversation_id
-        )
-        if not tools or not self.llm.supports_tools:
-            # Nothing to offer, or a backend without tool calling: keep the
-            # existing behaviour rather than degrading the answer.
-            result = self._tool_llm_generic(
-                {**inputs, "message": message},
-                adapters,
-                history,
-                context_id,
-                conversation_id,
-                user_message,
-                user_id,
-                tenant_id,
-            )
-            if preamble:
-                result.setdefault("context_snippets", []).insert(0, preamble)
-            return result
-
-        session: dict = {}
-        snippets: List[str] = []
-        tool_trace: List[dict] = []
-        usage: Dict[str, Any] = {}
-        content = ""
-        deadline = time.monotonic() + self.AGENT_DEADLINE_SECONDS
-
-        try:
-            for round_index in range(self.MAX_AGENT_ROUNDS):
-                # Withhold the tools on the last permitted round (or once the
-                # budget is spent) so the model has to produce a final answer.
-                out_of_time = time.monotonic() > deadline
-                offer = [] if (out_of_time or round_index == self.MAX_AGENT_ROUNDS - 1) else tools
-                response = self.llm.generate_with_tools(
-                    messages, offer, adapters, user_id=user_id
-                )
-                for key, value in (response.get("usage") or {}).items():
-                    if isinstance(value, int):
-                        usage[key] = usage.get(key, 0) + value
-                calls = response.get("tool_calls") or []
-                content = response.get("content") or content
-                if not calls:
-                    break
-                messages.append(
-                    response.get("assistant_message")
-                    or {"role": "assistant", "content": content}
-                )
-                parsed = [
-                    (call, call.get("name") or "", self._parse_tool_arguments(call))
-                    for call in calls
-                ]
-                results = self._run_round_tools(
-                    parsed,
-                    conversation_id=conversation_id,
-                    context_id=context_id,
-                    user_id=user_id,
-                    tenant_id=tenant_id,
-                    session=session,
-                    snippets=snippets,
-                    fallback_query=message,
-                )
-                for (call, name, args), result in zip(parsed, results):
-                    tool_trace.append({"tool": name, "arguments": args})
-                    self.logger.info(
-                        "attachment_tool_called",
-                        tool=name,
-                        conversation_id=conversation_id,
-                        user_id=user_id,
-                        round=round_index,
-                    )
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call.get("id") or name,
-                            "name": name,
-                            "content": result,
-                        }
-                    )
-        except Exception as exc:  # noqa: BLE001 - degrade, don't fail the chat
-            self.logger.warning(
-                "attachment_agent_failed",
-                conversation_id=conversation_id,
-                error=str(exc),
-            )
-            if not content:
-                return self._tool_llm_generic(
-                    {**inputs, "message": message},
-                    adapters,
-                    history,
-                    context_id,
-                    conversation_id,
-                    user_message,
-                    user_id,
-                    tenant_id,
-                )
-        finally:
-            interpreter.cleanup_workdir(session.get("workdir"))
-
-        return {
-            "content": content or "I could not derive an answer from the available sources.",
-            "usage": usage,
-            "context_snippets": snippets,
-            "tool_calls": tool_trace,
-            "artifacts": session.get("artifacts", []),
-            "injection_findings": session.get("injection_findings", []),
-        }
 
     def _resolve_context_ids(
         self, provided: Any, fallback: Optional[str]

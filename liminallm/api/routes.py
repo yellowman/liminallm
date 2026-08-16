@@ -1325,7 +1325,9 @@ async def chat(
                 user_id,
                 tenant_id=principal.tenant_id,
             )
-            assistant_msg = await chat_turn.finish(runtime, turn, orchestration)
+            assistant_msg = await chat_turn.finish(
+                runtime, turn, orchestration, commit=idem.commit
+            )
             adapter_names = _stringify_adapters(turn.orchestration.get("adapters", []))
             envelope = Envelope(
                 status="ok",
@@ -3657,16 +3659,40 @@ async def upload_file(
 
         # The IdempotencyGuard already claimed an in-progress slot on entry, so
         # a concurrent duplicate request is rejected with 409 while this write
-        # proceeds; no separate intent record is needed.
-        # Write the file (Issue 32.3: off the event loop to avoid blocking)
-        await asyncio.to_thread(dest_path.write_bytes, contents)
+        # proceeds. The slot records that the request was entered; the two
+        # guards below record which of its mutations actually landed — this
+        # upload writes bytes and then ingests them, and those are two facts,
+        # not one.
+        # Write the file (Issue 32.3: off the event loop to avoid blocking).
+        # The guard goes into the thread with the write rather than around the
+        # await: SPEC §18 wants the linearization point held for the mutation
+        # and nothing else, and a lock held across an await is held by the event
+        # loop, which is the one thread that must never wait on it.
+        def _write_bytes() -> None:
+            with idem.commit(
+                "files.write", {"path": safe_filename, "checksum": checksum}
+            ) as operation:
+                if not operation.replayable:
+                    dest_path.write_bytes(contents)
+
+        await asyncio.to_thread(_write_bytes)
         chunk_count = None
         if context_id:
             try:
                 _get_owned_context(runtime, context_id, principal)
-                chunk_count = runtime.rag.ingest_file(
-                    context_id, str(dest_path), chunk_size=chunk_size
-                )
+                # Ingestion is its own mutation: the bytes can be on disk with
+                # the chunks not yet written, and a retry must be able to tell.
+                with idem.commit(
+                    "files.ingest",
+                    {"path": safe_filename, "context_id": context_id},
+                ) as operation:
+                    if operation.replayable:
+                        chunk_count = operation.result
+                    else:
+                        chunk_count = runtime.rag.ingest_file(
+                            context_id, str(dest_path), chunk_size=chunk_size
+                        )
+                        operation.result = chunk_count
             except Exception:
                 # Clean up file on any error (not just ConstraintViolation)
                 dest_path.unlink(missing_ok=True)

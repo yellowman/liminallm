@@ -7082,71 +7082,81 @@ stub-model mode, deterministic waits instead of sleeps, and unique per-run
 identities (both already partially done).
 
 
-## 1b.1 carry-forward
 
-Open at `6993563`. Four strict xfails in `tests/test_invocation_lease.py`
-carry most of this in-repo; these two carry nothing, so they are written
-down here.
+## 1b.1 closed: a tool call is a process the kernel can kill
 
-### MEDIUM: `InvocationBroker._guards` grows for the life of the process
+Opened at `6993563`, closed by this tranche. The carry-forward listed four
+strict xfails in `tests/test_invocation_lease.py`, plus two items that carried
+nothing in-repo. All six are done; what follows is what each turned into, so a
+later reader can find the mechanism rather than the plan.
 
-`issue()` installs one lock per invocation. `revoke()` drops the id from
-`_live` and leaves the guard behind, so a long-lived server retains a dict
-entry, a lock and an invocation-id string for every tool attempt ever made.
-Measured: 1000 issue+revoke cycles leave `_live` empty and 1000 guards
-retained.
+### The four closure conditions
 
-**Do not fix by popping the guard in `revoke()`.** A waiter would then build
-a new lock for the same invocation while revocation still held the old one.
-The two would stop contending, and contention is the entire linearization
-property that `commit_guard` exists for.
+They are now ordinary tests in `tests/test_invocation_lease.py`, and each one
+asserts on processes or files rather than on return values — every one of these
+properties was false before in a way no assertion about results could see.
 
-The fix belongs to the spawned broker's per-invocation state:
+- **No retry before the prior worker's process tree is dead.** The retry loop
+  calls `Invocation.terminate()` and honours the answer; a tree that will not
+  die fails the node with `tool_worker_unreaped` instead of running beside it.
+  The old `_reap` waited `REAP_GRACE_SECONDS` and returned, which was the best
+  a thread worker could do — a thread cannot be killed.
+- **A revoked invocation sends no web request.** The capability checks liveness
+  before it acts, under the invocation's lock. The test counts calls into
+  `web.fetch_url`/`web.search_web`; asserting on the returned error would pass
+  just as well if the request had gone out and the answer been discarded.
+- **A revoked invocation launches no Python sandbox child.** Checked twice:
+  before the scratch is prepared (preparing it copies the user's attachments)
+  and again before the child is spawned, because preparation is a window wide
+  enough for a cancel to land inside it.
+- **Every broker-owned descendant and resource is killed and reaped first.**
+  Sandbox children are the *parent's* children, so killing the worker never
+  reached them; they are registered on `Invocation.resources` as they start.
+  Reaped, not merely signalled — a zombie still holds a process-table slot.
 
-```
-InvocationState:
-    lock
-    live
-    active_commits
-    resources
-```
+### `_guards` lifetime
 
-retired only once the invocation is revoked *and* no commit guard or
-resource user can still reach it.
+Fixed as the carry-forward said it should be, by giving the state an owner
+rather than by popping the guard in `revoke()`. `InvocationRegistry` holds one
+`Invocation` per logical execution; `close()` is idempotent, tears the tree
+down and retires the entry, and is reached from the terminal path of every node
+execution, direct invocation and request. Measured the same way the defect was:
+1000 open/close cycles now leave the registry empty
+(`TestTheRegistryDoesNotGrow`).
 
-### Delete `ToolInvocation.operation_key()` rather than evolve it
+The registry belongs to the engine, not to the module. SPEC §18 requires it:
+hot reload replaces the engine while in-flight work finishes, and a global
+would have an old attempt asking the new engine about an execution it never
+opened.
 
-`logical_execution_id + ":" + operation_name` cannot distinguish two durable
-operations of the same kind inside one node execution, and `agent.files`
-makes several tool calls per logical execution. It has no consumer. The
-operation ledger replaces it outright:
+### `operation_key()` deleted
 
-```
-logical_execution_id
-operation_seq
-capability
-canonical_payload_hash
-state = pending | committed | failed | unknown
-result
-```
+Replaced by `OperationLedger`, as decided:
+`(operation_seq, capability, payload_hash, state, result)` with state in
+`pending | committed | failed | unknown`. Retry identity (the per-attempt
+lease) stays distinct from operation identity (the per-execution ledger).
+A durable step whose payload diverges at a taken position is refused
+(`RetryDivergence`) rather than answered with the earlier mutation's result; a
+read diverging there simply runs again. A step still `pending` when its attempt
+died becomes `unknown`, and a durable `unknown` is refused rather than
+repeated — nothing left can say whether it landed.
 
-A retry presenting the same `operation_seq` must present the same capability
-and payload hash; a difference is retry divergence and is refused, not
-silently treated as the earlier mutation. That keeps retry identity
-(`invocation_id`) distinct from operation identity.
+`commit_guard` wraps the mutations themselves: artifact publication
+(`service/agent_tools.py`), the assistant message (`api/chat_turn.py`), and the
+uploaded bytes and their ingestion (`api/routes.py`), which are two facts and
+now two entries.
 
-### Closure criterion
+### What this leaves
 
-Tranche 1b.1 closes when the four strict xfails are green and the
-`ThreadPoolExecutor` handler path is gone:
-
-- no retry begins before the prior worker's process tree is dead and reaped;
-- a revoked invocation sends no web request;
-- a revoked invocation launches no Python sandbox child;
-- every broker-owned descendant and resource is killed and reaped first.
-
-`commit_guard` must be wired into real durable mutation commit points, not
-call boundaries. The worker receives no store, LLM, settings, filesystem
-roots or provider credentials — the broker pipe is the capability. The
-filesystem/archive/signed-URL census waits until then, so 1b can be audited
-as one authority boundary rather than a sequence of thread patches.
+- The `Idempotency-Key` slot still answers the cross-request question, and it
+  is the only thing that does: it lives in Redis, so it survives the process
+  and the replica (§22). The request-level ledger is in memory and lives for
+  one request. Making replay survive a restart would mean a durable ledger, and
+  that is a separate piece of work with a schema in it.
+- `ATTEMPT_HANDOVER_SECONDS` bounds how long the next attempt waits for the
+  last attempt's parent-side serve loop to return. The worker is dead by then;
+  the wait covers a capability that was mid-call when the kill landed, and each
+  of those carries a timeout of its own. It is a wait, not a grace period —
+  expiry fails the node rather than starting the retry anyway.
+- The filesystem/archive/signed-URL census the carry-forward deferred until
+  after this boundary existed is now unblocked, and still to do.

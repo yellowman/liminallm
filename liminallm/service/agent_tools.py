@@ -24,6 +24,7 @@ from typing import Any, Callable, List, Optional, Tuple
 from liminallm.service import attachments as attachments_service
 from liminallm.service import compaction, interpreter, web
 from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
+from liminallm.service.invocation import Invocation, commit_guard
 from liminallm.service.upload_policy import ALLOWED_UPLOAD_EXTENSIONS
 
 PYTHON_TOOL_TIMEOUT = 12.0
@@ -148,16 +149,30 @@ def run_python(
     settings: Any,
     user_id: Optional[str],
     session: dict,
+    invocation: Optional[Invocation] = None,
+    operation_seq: int = 0,
+    step: str = "",
 ) -> str:
     """Execute model-written Python against the conversation's attachments.
 
     Callers must check service/taint.py first: a turn that has read a possible
     injection does not get here.
+
+    The invocation, when there is one, owns everything this call starts. The
+    scratch is registered as a path so teardown removes it whether the attempt
+    ended or was killed; the sandbox child is registered as it starts, because
+    it is the *parent's* child and killing the worker never reaches it; and the
+    publication — the one durable effect here — happens inside a commit guard,
+    around the copy rather than around this function.
     """
     if not user_id:
         return "Python execution requires an authenticated user."
     fs_root = settings.shared_fs_root
     files_dir = attachments_service.user_files_dir(fs_root, user_id)
+    if invocation is not None:
+        # Before the scratch is prepared, not after: preparing it copies the
+        # user's attachments, which is work a revoked turn must not do.
+        invocation.check_live()
     if session.get("workdir") is None:
         # Node-local, NOT under shared_fs_root: these session directories hold
         # throwaway copies of the attachments (up to 64MB each) and exist only
@@ -168,17 +183,37 @@ def run_python(
             settings.interpreter_scratch_dir or tempfile.gettempdir()
         ) / "liminallm-interpreter"
         scratch.mkdir(parents=True, exist_ok=True)
-        session["workdir"] = interpreter.prepare_workdir(
+        workdir = interpreter.prepare_workdir(
             str(scratch), str(files_dir), attachment_names
         )
+        session["workdir"] = workdir
+        if invocation is not None:
+            invocation.resources.add_path(workdir)
+    if invocation is not None:
+        # Preparation is a window wide enough for a cancel to land inside it,
+        # so liveness is checked again before the child exists.
+        invocation.check_live()
     result = interpreter.run_python_sandboxed(
-        code, workdir=session["workdir"], timeout=PYTHON_TOOL_TIMEOUT
+        code,
+        workdir=session["workdir"],
+        timeout=PYTHON_TOOL_TIMEOUT,
+        on_child=(
+            None
+            if invocation is None
+            else (
+                lambda pid, reap: invocation.resources.add_child(
+                    pid, "sandbox:run_python", reap=reap
+                )
+            )
+        ),
     )
-    published = interpreter.publish_artifacts(
+    published = _publish(
         session["workdir"],
         str(files_dir),
         result.get("created_files") or [],
-        allowed_extensions=ALLOWED_UPLOAD_EXTENSIONS,
+        invocation=invocation,
+        operation_seq=operation_seq,
+        step=step,
     )
     parts = []
     if result.get("stdout"):
@@ -193,6 +228,44 @@ def run_python(
     if not parts:
         parts.append("(the code produced no output — remember to print())")
     return "\n\n".join(parts)
+
+
+def _publish(
+    workdir: str,
+    files_dir: str,
+    created: List[dict],
+    *,
+    invocation: Optional[Invocation],
+    operation_seq: int,
+    step: str,
+) -> List[str]:
+    """Copy what the code produced into the user's files, exactly once.
+
+    The guard is around the copy, not around the call that leads to it: a retry
+    has to be able to tell "the files are in the user's area" from "a worker
+    asked for them to be", and only the first is a fact about the filesystem.
+    Replaying a committed entry returns the earlier attempt's filenames without
+    copying anything a second time.
+    """
+    if not created:
+        return []
+    if invocation is None:
+        return interpreter.publish_artifacts(
+            workdir, files_dir, created, allowed_extensions=ALLOWED_UPLOAD_EXTENSIONS
+        )
+    with commit_guard(
+        invocation,
+        "publish.artifacts",
+        {"created": [c.get("name") for c in created]},
+        operation_seq=operation_seq,
+        step=step or "publish",
+    ) as operation:
+        if operation.replayable:
+            return list(operation.result or [])
+        operation.result = interpreter.publish_artifacts(
+            workdir, files_dir, created, allowed_extensions=ALLOWED_UPLOAD_EXTENSIONS
+        )
+    return list(operation.result or [])
 
 
 def run_history_search(

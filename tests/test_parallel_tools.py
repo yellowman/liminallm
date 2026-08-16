@@ -46,6 +46,9 @@ def _fake_exec(record=None):
         session,
         snippets,
         fallback_query,
+        invocation=None,
+        operation_seq=0,
+        step="",
     ):
         time.sleep(args.get("sleep", 0.15))
         if record is not None:
@@ -119,7 +122,7 @@ class TestParallelRounds:
         )
         monkeypatch.setattr(
             engine,
-            "_run_python_tool",
+            "_run_python_capability",
             lambda code, **kw: python_ran.append(code) or "ran",
         )
         parsed = _parsed(

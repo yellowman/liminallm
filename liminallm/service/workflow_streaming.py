@@ -20,11 +20,11 @@ from __future__ import annotations
 import asyncio
 import math
 import time
+import uuid
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from liminallm.logging import log_routing_trace, log_workflow_trace
-from liminallm.service import interpreter
-from liminallm.service.sandbox import tool_network_guard
+from liminallm.service.broker import InvocationContext
 
 # Shared with the batch path in workflow.py; imported rather than re-declared so
 # a stream and a non-stream run of the same graph cannot diverge.
@@ -495,71 +495,67 @@ class WorkflowStreamingMixin:
         # Once a token has reached the client, restarting on the plain node
         # would append a second answer to the same bubble.
         emitted_tokens = False
-        deadline = time.monotonic() + self.AGENT_DEADLINE_SECONDS
+        invocation = self.invocations.open(
+            uuid.uuid4().hex,
+            tool="agent.files_v1",
+            user_id=user_id,
+            tenant_id=tenant_id,
+        )
 
-        def _turn(msgs: List[dict], offer: List[dict]) -> dict:
-            with tool_network_guard(self.tool_network_policy):
-                return self.llm.generate_with_tools(
-                    msgs, offer, adapters, user_id=user_id
-                )
+        # A cancel arriving mid-round must stop the work, not only the waiting:
+        # the watcher cancels the execution, which takes the worker's process
+        # tree down with it.
+        cancel_watch = self._watch_for_cancel(invocation, cancel_event)
 
         try:
-            # Tool rounds. One round is always reserved for the streamed answer.
-            for _ in range(max(0, self.MAX_AGENT_ROUNDS - 1)):
-                if cancel_event and cancel_event.is_set():
-                    yield {"event": "cancel_ack", "data": {}}
-                    return
-                if time.monotonic() > deadline:
-                    break
-                response = await asyncio.to_thread(_turn, messages, tools)
-                usage = self._merge_usage(usage, response.get("usage") or {})
-                calls = response.get("tool_calls") or []
-                if not calls:
-                    # The model answered without tools; keep its message out of
-                    # the history so the streamed turn produces the text.
-                    break
-                messages.append(
-                    response.get("assistant_message")
-                    or {"role": "assistant", "content": response.get("content") or ""}
-                )
-                parsed = [
-                    (call, call.get("name") or "", self._parse_tool_arguments(call))
-                    for call in calls
-                ]
-                # Tell the client what is happening before the slow part.
-                for _, name, _ in parsed:
-                    yield {"event": "trace", "data": {"tool": name, "status": "running"}}
-                # _run_round_tools applies the egress guard per worker thread
-                # and parallelizes read-only rounds; taint-class rounds stay
-                # strictly ordered (see workflow.py).
-                results = await asyncio.to_thread(
-                    self._run_round_tools,
-                    parsed,
-                    conversation_id=conversation_id,
-                    context_id=context_id,
-                    user_id=user_id,
-                    tenant_id=tenant_id,
-                    session=session,
-                    snippets=snippets,
-                    fallback_query=message,
-                )
-                for (call, name, args), result in zip(parsed, results):
-                    tool_trace.append({"tool": name, "arguments": args})
-                    self.logger.info(
-                        "attachment_tool_called",
-                        tool=name,
-                        conversation_id=conversation_id,
+            # The tool rounds run in the worker, exactly as they do on the
+            # batch path — a second copy of the agent loop here is a second
+            # copy of its defects. `stream_final` stops the worker once the
+            # tools are done and hands back the conversation it built; the
+            # final turn offers no tools, so there is no model-chosen control
+            # flow left in it to contain, and this side streams it.
+            traces: List[dict] = []
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._serve_invocation,
+                    invocation,
+                    "agent.files_v1",
+                    {
+                        "inputs": dict(inputs or {}),
+                        "messages": messages,
+                        "tools": tools,
+                        "message": message,
+                        "max_rounds": self.MAX_AGENT_ROUNDS,
+                        "deadline_seconds": self.AGENT_DEADLINE_SECONDS,
+                        "stream_final": True,
+                    },
+                    InvocationContext(
                         user_id=user_id,
-                        streaming=True,
-                    )
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": call.get("id") or name,
-                            "name": name,
-                            "content": result,
-                        }
-                    )
+                        tenant_id=tenant_id,
+                        conversation_id=conversation_id,
+                        context_id=context_id,
+                        adapters=list(adapters or []),
+                        history=list(history or []),
+                        user_message=user_message,
+                    ),
+                    self._worker_limits(self.tool_registry.get("agent.files_v1")),
+                    on_capability=traces.append,
+                ),
+                timeout=self.AGENT_DEADLINE_SECONDS,
+            )
+            for entry in traces:
+                yield {"event": "trace", "data": entry}
+            if cancel_event and cancel_event.is_set():
+                yield {"event": "cancel_ack", "data": {}}
+                return
+            messages = result.get("messages") or messages
+            usage = self._merge_usage(usage, result.get("usage") or {})
+            snippets.extend(result.get("context_snippets") or [])
+            tool_trace.extend(result.get("tool_calls") or [])
+            session["artifacts"] = list(result.get("artifacts") or [])
+            session["injection_findings"] = list(
+                result.get("injection_findings") or []
+            )
 
             # Final turn: no tools offered, so the model must answer — streamed.
             content_parts: List[str] = []
@@ -586,6 +582,10 @@ class WorkflowStreamingMixin:
                 await asyncio.sleep(0)
             content = "".join(content_parts)
         except Exception as exc:  # noqa: BLE001 - degrade to a plain answer
+            # Revoke before degrading, not after: the fallback below runs
+            # inside this handler, so a worker left alive would be answering
+            # capability requests while a second answer is being produced.
+            await asyncio.to_thread(invocation.revoke, "agent_stream_failed")
             self.logger.warning(
                 "attachment_agent_stream_failed",
                 conversation_id=conversation_id,
@@ -596,7 +596,6 @@ class WorkflowStreamingMixin:
                 # Keep the partial answer rather than gluing a second one after
                 # it; the caller stores what was streamed.
                 content = "".join(content_parts)
-                interpreter.cleanup_workdir(session.pop("workdir", None))
                 yield {
                     "event": "message_done",
                     "data": {
@@ -623,7 +622,12 @@ class WorkflowStreamingMixin:
                 yield event
             return
         finally:
-            interpreter.cleanup_workdir(session.get("workdir"))
+            if cancel_watch is not None:
+                cancel_watch.cancel()
+            # Closing the execution kills what it started and removes the
+            # scratch, on every path out of here — including the one where a
+            # token had already reached the client. Off the loop: it blocks.
+            await asyncio.to_thread(invocation.close)
 
         yield {
             "event": "message_done",

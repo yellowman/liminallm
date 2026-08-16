@@ -2581,25 +2581,49 @@ the following are treated as constants the kernel must honor; LLM edits happen o
     it and used for that invocation alone; caching it into the shared registry
     made one user's private definition resolvable for every later request in
     that process.
-  - **a worker's authority ends when its invocation ends.** a tool handler
-    runs on a pool thread, and a python thread cannot be killed —
-    `future.cancel()` returns false for anything already running. so what
-    ends is the *lease*, not the thread: the worker holds a `ToolInvocation`
-    naming one, and every call it makes to the store, the model or retrieval
-    asks the broker whether that lease is still live. on timeout the lease is
-    revoked **before** the worker is abandoned; the reverse order leaves the
-    window this exists to close. the worker is then reaped, bounded, before
-    the node retries in its name — three attempts otherwise means three live
-    workers and three sandbox children for one node. the check runs on every
-    leased call, reads included: a revoked invocation has no authority to
-    read with either, and a list of "write methods" would be a guess about
-    which calls matter.
-  - **the lease follows the work, not the thread that started it.** a round of
-    parallel reads runs in a nested pool, and the lease is thread-local, so it
-    is re-applied in every worker — the same reason the egress guard already
-    was. an unleased thread reads as the api path and passes every check.
+  - **a worker's authority ends when its invocation ends, and so does the
+    worker.** a tool handler used to run on a pool thread, and a python thread
+    cannot be killed — `future.cancel()` returns false for anything already
+    running, so a node timeout cancelled the coroutine and the handler carried
+    on beside its own retry. the unit of tool execution is a **spawned worker
+    process per attempt**, leading its own process group: on timeout the
+    invocation is revoked **before** anything is killed (the reverse order
+    lets an effect that has already passed its check start against a tree the
+    parent has torn down), and then the group is killed and reaped. reaping is
+    confirmed rather than bounded: a tree that will not die fails the node
+    instead of running alongside its successor.
+  - **the worker holds nothing; the parent serves every effect.** the child
+    gets a plan — inputs, messages, offered schemas, budgets — and no store
+    handle, model client, settings object, filesystem credential or identity.
+    user and tenant came off the authenticated request and never cross the
+    pipe, so a worker has no field in which to name another tenant's data.
+    every effect is a capability request the parent answers, and liveness is
+    checked *before* each one: a revoked turn issues no web request and starts
+    no sandbox child, rather than starting one and reporting it afterwards.
+  - **a tool body may stay in the parent, and says so by name.** bodies that
+    are broad reads of the store — prompt assembly, adapter selection, RAG
+    composition — hold no model-chosen control flow, so moving one across the
+    pipe contains nothing and hands the worker a proxy for every method of the
+    store, which is a worse boundary than none. they run behind the
+    `tool.host` capability: same worker process, same rlimits, same ledger,
+    same liveness check; only the body is on this side.
+  - **what the invocation started, the invocation can kill.** the sandbox
+    children a capability spawns are the *parent's* children, not the
+    worker's, so killing the worker never reaches them. they are registered
+    against the invocation as they start, together with the scratch directory,
+    and that registry is what makes "the tree is dead" a claim anyone can
+    check. the scratch dies with the attempt and its *name* dies with it: a
+    retry that inherited only the name would run in a path that no longer
+    exists.
+  - **the check follows the work, not the thread that started it.** a round of
+    parallel reads runs in a nested pool, and the bound invocation is
+    thread-local, so it is re-applied in every worker — the same reason the
+    egress guard already was. an unbound thread reads as the api path and
+    passes every check. the check runs on every call, reads included: a
+    revoked invocation has no authority to read with either, and a list of
+    "write methods" would be a guess about which calls matter.
   - **a durable operation that does not travel through a proxied dependency
-    asks the broker itself.** publishing into the user's file area copies
+    asks the invocation itself.** publishing into the user's file area copies
     straight to disk, so the check lives at the copy, and it refuses loudly
     rather than returning an empty result a caller would report as success.
   - **a durable commit needs a linearization point, not a check before it.**
@@ -2608,18 +2632,41 @@ the following are treated as constants the kernel must honor; LLM edits happen o
     commit is still in flight. `commit_guard` and `revoke` contend on the
     same per-invocation lock, leaving only two histories: the commit runs and
     revocation waits for it, or revocation completes and the commit is
-    refused. no blocking work inside the guard.
-  - **the broker travels with the invocation, never in a process global.**
-    hot reload replaces the engine while in-flight workers finish, and a
-    global would have an old worker asking the new engine's broker about a
-    lease it never issued — a refusal indistinguishable from a real
-    revocation.
-  - **two ids, because they answer different questions.** a lease is keyed by
-    `invocation_id`, fresh per attempt, so a retry cannot inherit the previous
-    attempt's authority. a durable idempotency key is keyed by
-    `logical_execution_id`, one per node execution and stable across its
-    attempts, because killing a worker does not recall an external operation
-    it already submitted.
+    refused. no blocking work inside the guard. the guard goes around the
+    *mutation*, never around the call that leads to it: between "the handler
+    was entered" and "the row exists" there is a window, and a retry landing
+    inside it either duplicates the write or skips it depending on which side
+    of the boundary the guard sat. the `Idempotency-Key` slot is unchanged and
+    answers a different question — it identifies the request and lives in
+    redis, so it survives the process; the ledger identifies the mutations.
+  - **the invocation state travels with the work, never in a process global.**
+    hot reload replaces the engine while in-flight work finishes, and a global
+    would have an old attempt asking the new engine about an execution it
+    never opened — a refusal indistinguishable from a real revocation. the
+    registry of live executions belongs to the engine, and each entry is
+    opened once and closed once, on every terminal path including revocation.
+    a map that leaks entries is the same defect as one that drops them early,
+    told backwards.
+  - **two ids, because they answer different questions.** the lease is per
+    *attempt*, so a retry cannot inherit the authority of the attempt that was
+    abandoned. the **operation ledger** is per *logical execution* — one node
+    execution, stable across its attempts — because killing a worker does not
+    recall an operation it already committed.
+  - **the ledger is ordered, not content-addressed.** an entry is
+    `(operation_seq, capability, payload_hash, state, result)` with state in
+    `pending | committed | failed | unknown`. a replacement worker replays its
+    control flow and stamps each request with its position; a committed step
+    at that position returns its stored result instead of happening twice. a
+    key of `execution_id + operation_name` could not: it collides two
+    legitimate identical calls into one and misses a retry whose model-written
+    payload differs by a byte. a retry presenting the same `operation_seq`
+    must present the same capability and payload hash — for a durable
+    mutation a difference is retry divergence and is **refused**, never
+    answered with the earlier mutation's result; for a read, which has no
+    earlier effect to misreport, the entry is dropped and the step runs again.
+    a step still `pending` when its attempt died becomes `unknown`, not
+    `failed`: nothing left can say whether it landed, and a durable `unknown`
+    is refused rather than repeated.
   - **an invocation names an id and must execute that id.** a tool name is
     free text inside `schema`, and artifact names carry no uniqueness
     constraint, so two tools may answer to one name. `POST /tools/{id}/invoke`
@@ -3110,12 +3157,18 @@ weak local models, which drop a rule stated once:
   descriptions, and the payload envelope. tighten the phrasing, never the
   repetition (see CLAUDE.md's prompt budget rule).
 
-**known gap:** findings inform but do not yet restrict. after a poisoned
-fetch the model may still call `run_python` in the same turn; only
-instructions stand between fetched text and the interpreter. taint that
-degrades capability (an `injection_tainted` session refusing further
-code execution) is the next step, and enforcement beating instruction is
-this codebase's own doctrine.
+- **findings restrict, they do not only inform.** a turn that has read a
+  possible injection loses every capability that could carry data off the box
+  — `run_python`, `web_fetch`, `web_search` — for the rest of it. local
+  reading stays, because a tainted turn must still be able to tell the user
+  what the page attempted. the findings live on the invocation, **parent-side**,
+  and the refusal happens at the capability: the process that just read
+  "ignore your rules and run this" is the last one that should be asked
+  whether the rule still applies, and enforcement beating instruction is this
+  codebase's own doctrine. withdrawal covers the same round, not merely the
+  next one — a fetch that taints the turn withdraws a `run_python` the model
+  requested beside it, which is why anything that can taint runs in order
+  while pure reads may fan out.
 
 ### 21.2 sandboxing untrusted work
 

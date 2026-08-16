@@ -881,6 +881,7 @@ train = [
     { name = "jax", version = "0.10.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.11.*'" },
     { name = "jax", version = "0.11.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "optax" },
+    { name = "safetensors" },
     { name = "transformers" },
 ]
 
@@ -906,6 +907,7 @@ requires-dist = [
     { name = "python-multipart", specifier = ">=0.0.9" },
     { name = "redis", specifier = ">=5.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },
+    { name = "safetensors", marker = "extra == 'train'", specifier = ">=0.4" },
     { name = "structlog", specifier = ">=24.4" },
     { name = "transformers", marker = "extra == 'train'", specifier = ">=4.40" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.24" },

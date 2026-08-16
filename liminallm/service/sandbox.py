@@ -699,6 +699,7 @@ def run_in_sandbox(
     *args: Any,
     config: Optional[SandboxConfig] = None,
     timeout: Optional[float] = None,
+    on_child: Optional[Callable[[int, Callable[[], None]], None]] = None,
     **kwargs: Any,
 ) -> T:
     """Execute a function in a resource-limited child process.
@@ -719,6 +720,11 @@ def run_in_sandbox(
         config: Sandbox configuration (uses default if None)
         timeout: Wall-clock seconds before the child is killed
                  (default: config.max_cpu_seconds + 15)
+        on_child: Called with (pid, reap) as soon as the child exists, so the
+                 invocation that asked for it can kill it. This child is the
+                 *parent's* child, not the worker's, so killing the worker
+                 never reaches it — registering it is what makes the tree
+                 reachable (SPEC §18).
         **kwargs: Keyword arguments for function
 
     Returns:
@@ -742,6 +748,8 @@ def run_in_sandbox(
     )
     proc.start()
     child_conn.close()
+    if on_child is not None and proc.pid:
+        on_child(proc.pid, lambda: proc.join(5))
     wall_timeout = timeout if timeout is not None else cfg.max_cpu_seconds + 15
     try:
         if not parent_conn.poll(wall_timeout):

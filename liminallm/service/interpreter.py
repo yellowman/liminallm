@@ -37,10 +37,10 @@ import sys
 import uuid
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from liminallm.service.confine import backend_name, confine
-from liminallm.service.lease import require_live_lease
+from liminallm.service.invocation import require_live_lease
 
 DEFAULT_TIMEOUT_SECONDS = 20
 MAX_OUTPUT_CHARS = 8_000
@@ -241,6 +241,7 @@ def run_python_sandboxed(
     workdir: str,
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     max_memory_mb: int = 512,
+    on_child: Optional[Callable[[int, Callable[[], None]], None]] = None,
 ) -> dict[str, Any]:
     """Execute model-written Python in the confined, resource-limited sandbox.
 
@@ -270,7 +271,12 @@ def run_python_sandboxed(
     )
     try:
         return run_in_sandbox(
-            execute_python, code, workdir, config=config, timeout=timeout
+            execute_python,
+            code,
+            workdir,
+            config=config,
+            timeout=timeout,
+            on_child=on_child,
         )
     except SandboxError as exc:
         return {
