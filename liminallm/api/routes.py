@@ -141,7 +141,9 @@ from liminallm.service.attachments import (
 from liminallm.service.auth import AuthContext
 from liminallm.service.errors import BadRequestError, NotFoundError, ServiceError
 from liminallm.service.fs import (
+    PathAuthorityError,
     PathTraversalError,
+    authorize_path,
     generate_signed_url,
     safe_join,
     validate_signed_url,
@@ -4539,45 +4541,32 @@ async def add_context_source(
     runtime = get_runtime()
     await rate_limit(runtime, "write", principal.user_id)
 
-    # SECURITY: Validate path to prevent path traversal attacks (Issue 14.1)
-    # Per SPEC §18: "all filesystem paths resolved via safe_join(base=/users/{user_id}, relative)"
-    user_base = FilePath(runtime.settings.shared_fs_root) / "users" / principal.user_id
-    shared_base = FilePath(runtime.settings.shared_fs_root) / "shared"
-
-    fs_path = body.fs_path
-    validated_path = None
-
-    # Try user's directory first
+    # SPEC §18: a path resolves under `/users/{user_id}`, or an artifact whose
+    # persisted visibility is `shared`/`global` covers it. This used to accept
+    # anything underneath `shared_fs_root/shared` because it was underneath
+    # that directory, and then check that the destination *context* belonged to
+    # the caller — which says who receives the content and never who was
+    # entitled to the source. See service/fs.authorize_path.
     try:
-        validated_path = safe_join(user_base, fs_path)
-    except PathTraversalError:
-        pass
-
-    # Try shared directory if user directory didn't work
-    if validated_path is None:
-        try:
-            validated_path = safe_join(shared_base, fs_path)
-        except PathTraversalError:
-            pass
-
-    # Also allow absolute paths within allowed directories
-    if validated_path is None:
-        abs_path = FilePath(fs_path).resolve()
-        user_base_resolved = user_base.resolve()
-        shared_base_resolved = shared_base.resolve()
-        if abs_path == user_base_resolved or user_base_resolved in abs_path.parents:
-            validated_path = abs_path
-        elif abs_path == shared_base_resolved or shared_base_resolved in abs_path.parents:
-            validated_path = abs_path
-
-    if validated_path is None:
-        raise BadRequestError(
-            "path not allowed",
-            detail={
-                "fs_path": fs_path,
-                "reason": "path must be within user directory or shared directory",
-            },
+        validated_path = authorize_path(
+            runtime.store,
+            runtime.settings,
+            body.fs_path,
+            user_id=principal.user_id,
+            tenant_id=principal.tenant_id,
         )
+    except PathAuthorityError as exc:
+        logger.warning(
+            "context_source_denied",
+            user_id=principal.user_id,
+            fs_path=body.fs_path,
+            reason=str(exc),
+        )
+        raise http_error(
+            "forbidden",
+            "you do not have authority over that path",
+            status_code=403,
+        ) from exc
 
     async with idempotency.IdempotencyGuard(
         "context_sources:create", principal.user_id, idempotency_key, require=False

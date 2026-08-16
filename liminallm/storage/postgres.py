@@ -2451,6 +2451,25 @@ class PostgresStore:
             meta=row.get("meta"),
         )
 
+    def artifacts_for_paths(self, paths: Sequence[str]) -> List[Artifact]:
+        """Artifacts whose `fs_path` is exactly one of `paths`.
+
+        The caller passes a filesystem path and its ancestors, so an artifact
+        naming a corpus directory answers for the files inside it while an
+        artifact naming a sibling directory does not. Exact matches rather than
+        a `LIKE` prefix: `/shared/corpus` must not match `/shared/corpus-2`,
+        and a prefix comparison on strings says it does.
+        """
+        wanted = [p for p in paths if p]
+        if not wanted:
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM artifact WHERE fs_path = ANY(%s)", (list(wanted),)
+            ).fetchall()
+        found = [self.get_artifact(str(row["id"])) for row in rows]
+        return [artifact for artifact in found if artifact is not None]
+
     def create_artifact(
         self,
         type_: str,

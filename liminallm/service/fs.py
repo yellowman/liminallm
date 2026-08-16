@@ -117,6 +117,110 @@ def safe_join(base: Path, relative: str) -> Path:
     raise PathTraversalError("path traversal detected")
 
 
+class PathAuthorityError(PermissionError):
+    """This caller has nothing that entitles them to this filesystem path."""
+
+
+def user_base(fs_root, user_id: str) -> Path:
+    """The root SPEC §18 resolves an ordinary path against."""
+    return Path(fs_root) / "users" / str(user_id)
+
+
+def authorize_path(
+    store,
+    settings,
+    fs_path: str,
+    *,
+    user_id: Optional[str],
+    tenant_id: Optional[str],
+) -> Path:
+    """The resolved path this caller may have, or `PathAuthorityError`.
+
+    SPEC §18 gives filesystem authority two sources and no third:
+
+    * the caller's own area — `safe_join(base=/users/{user_id}, relative)`;
+    * an artifact whose *persisted* visibility is `shared` or `global` and
+      whose `fs_path` covers what is being asked for.
+
+    A pathname is not one of them. `POST /contexts/{id}/sources` used to accept
+    anything underneath `shared_fs_root/shared` because it was underneath that
+    directory, and then checked that the destination context belonged to the
+    caller — which establishes who receives the content and never who was
+    entitled to the source. Knowing a name became the whole of the authority.
+
+    Authority is decided on where the path **resolves**, not how it reads:
+    `..` is the escape everyone writes tests for, and a symlink is the same
+    escape spelled so the string looks innocent.
+
+    Every unprovable claim refuses, the same rule the workflow permission model
+    follows: an ownerless `shared` artifact has no tenant to match, a caller
+    with no tenant cannot match one, and a visibility nobody recognized grants
+    exactly the values nobody considered.
+    """
+    if not user_id:
+        raise PathAuthorityError("a filesystem path needs a caller to belong to")
+
+    root = Path(settings.shared_fs_root).resolve()
+    mine = user_base(settings.shared_fs_root, user_id)
+    raw = Path(fs_path)
+
+    if not raw.is_absolute():
+        # Relative means "in my own area", and only that. Trying the relative
+        # form against `/shared` as a fallback is how a name became a licence.
+        try:
+            return safe_join(mine, fs_path)
+        except PathTraversalError as exc:
+            raise PathAuthorityError(
+                f"{fs_path!r} does not resolve inside your own files"
+            ) from exc
+
+    candidate = raw.resolve()
+    mine_resolved = mine.resolve() if mine.exists() else mine
+    if candidate == mine_resolved or mine_resolved in candidate.parents:
+        return candidate
+
+    if root not in candidate.parents and candidate != root:
+        raise PathAuthorityError(
+            f"{fs_path!r} is outside the managed filesystem root"
+        )
+
+    # Ask the ancestors, not the string: an artifact naming a corpus directory
+    # authorizes the files in it, and naming one directory does not name the
+    # one beside it.
+    lineage = [str(candidate)] + [
+        str(parent) for parent in candidate.parents if parent != parent.parent
+    ]
+    for artifact in store.artifacts_for_paths(lineage):
+        if _artifact_authorizes(store, artifact, user_id=user_id, tenant_id=tenant_id):
+            return candidate
+
+    raise PathAuthorityError(
+        f"{fs_path!r} is not covered by any artifact you may read"
+    )
+
+
+def _artifact_authorizes(store, artifact, *, user_id: str, tenant_id) -> bool:
+    """Whether this artifact row entitles this caller to the path it names."""
+    visibility = getattr(artifact, "visibility", "private")
+    owner_id = getattr(artifact, "owner_user_id", None)
+    if visibility == "private":
+        # Ownerless too: an artifact nobody owns cannot be shown to be this
+        # caller's, and a check that only refuses when an owner is present
+        # serves everyone a null owner.
+        return bool(owner_id) and owner_id == user_id
+    if visibility == "shared":
+        # `shared` is within one tenant, and the tenant is the owner's —
+        # `artifact` has no tenant column of its own.
+        if not owner_id or not tenant_id:
+            return False
+        owner = store.get_user(owner_id)
+        return bool(owner) and owner.tenant_id == tenant_id
+    if visibility == "global":
+        return True
+    # An unrecognized visibility is not a licence.
+    return False
+
+
 def adapter_dir_owner(path) -> str:
     """The adapter id a weights path claims to belong to, read from layout.
 

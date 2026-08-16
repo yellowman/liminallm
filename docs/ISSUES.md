@@ -7224,3 +7224,69 @@ path and not the other. Both are ledgered now.
   expiry fails the node rather than starting the retry anyway.
 - The filesystem/archive/signed-URL census the carry-forward deferred until
   after this boundary existed is now unblocked, and still to do.
+
+## Tranche 2A: a pathname stops being a licence
+
+SPEC §18 gives filesystem authority two sources: the caller's own area through
+`safe_join(base=/users/{user_id}, relative)`, or an artifact whose persisted
+visibility is `shared`/`global` covering the path. Only the first was
+implemented.
+
+### HIGH: `/shared` was reachable by knowing a name
+
+`POST /contexts/{id}/sources` accepted any absolute path underneath
+`shared_fs_root/shared` because it was underneath that directory, then verified
+that the *destination context* belonged to the caller. That establishes who
+receives the content and never who was entitled to the source. It also tried
+the caller's area, then `/shared`, then absolute forms under either, so a
+relative name that meant nothing in the caller's own files could become a name
+in a directory they had no claim on.
+
+`service/fs.authorize_path` is now the single predicate: relative means the
+caller's own area and only that; absolute is refused unless an artifact row
+covering it authorizes this caller. Visibility is read from the persisted row
+and every unprovable claim refuses — an ownerless `shared` artifact has no
+tenant to match, a principal whose tenant did not resolve cannot match one, and
+an unrecognized visibility grants exactly the values nobody considered. This is
+the rule `get_latest_workflow` already followed, applied to paths.
+
+Authority is decided on where a path **resolves**, not how it reads. `..` is
+the escape everyone writes tests for; a symlink is the same escape spelled so
+the string looks innocent, and `safe_join` resolves before it compares (now
+stated as a test rather than assumed).
+
+### The census
+
+Every surface that takes a caller-supplied path, checked behaviourally by
+having a second user name the first user's real file, both relatively and
+absolutely:
+
+- `POST /contexts/{id}/sources` — was the hole; fixed.
+- `GET /files/{name}/url`, `DELETE /files/{name}`, `POST /files/{name}/extract`,
+  `POST /notes/from-file` — the base is derived from the authenticated
+  principal and the caller supplies only the leaf, so `safe_join` decides. All
+  refuse another user's file.
+- `POST /files/upload` — filename sanitized, then joined under the caller's dir.
+- artifact `fs_path` — computed by the store from the artifact id
+  (`artifacts/{id}/vN.json`); never caller-supplied.
+- voice files — server-generated UUID names under the caller's directory.
+- adapter files — `adapter_root` binds the directory's final component to the
+  adapter id, hardened in the ladder tranche.
+- ingestion — `ingest_path` re-checks against `allowed_base` independently.
+
+### What this leaves
+
+**`/shared` is now unreachable, and that is the honest state rather than the
+intended one.** The predicate asks for an artifact whose `fs_path` covers the
+path, and no code path produces one: `create_artifact`/`update_artifact` both
+set `fs_path` from `_persist_payload`, which always writes under
+`artifacts/{id}`. So a deployment that placed a corpus in `shared_fs_root/shared`
+and expected users to ingest it by pathname can no longer do so — correctly,
+because nothing said they were entitled to it, but there is currently no way to
+say so either. Giving operators a way to publish a shared corpus (an artifact
+type whose `fs_path` names a directory under `/shared`, minted through an
+admin route) is the follow-on, and it is deliberately not invented here.
+
+Still open in tranche 2: signed-download capability (2B), the hostile-member
+archive census (2C), the extraction-to-publication boundary (2D), and the
+TOCTOU/filesystem-identity work (2E).
