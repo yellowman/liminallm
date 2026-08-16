@@ -129,6 +129,56 @@ def _safe_weight(value: Any, default: float = 1.0, *, context: str = "") -> floa
         return default
 
 
+def effective_gate(adapter: dict) -> float:
+    """The gate that actually applies to an adapter (SPEC §5.0.1).
+
+        g = clamp(g_router, 0, 1)
+
+    One definition, because every consumer — LoRA weights, prompt injection,
+    remote passthrough, the KV signature, inference accounting — has to agree
+    on which adapters are in the effective request. Where the weight lives is
+    not an `or` chain: 0.0 is a meaningful gate and also falsy.
+    """
+    if not isinstance(adapter, dict):
+        return 1.0
+    gate = adapter.get("weight")
+    if gate is None:
+        gate = adapter.get("gate_weight")
+    if gate is None:
+        schema = adapter.get("schema")
+        gate = schema.get("weight") if isinstance(schema, dict) else None
+    if gate is None:
+        gate = 1.0
+    return max(0.0, min(1.0, _safe_weight(gate, default=1.0, context="effective_gate")))
+
+
+def active_adapters(adapters: Optional[List[dict]]) -> List[dict]:
+    """The effective adapter set: those the router left with `g > 0`.
+
+    SPEC §5.0.1 gives the gate two meanings, in order — activation, then
+    intensity. `g == 0` (including any negative weight, which §8.1 clamps)
+    means the adapter is absent from the request, so it is removed here,
+    once, before anything mechanism-specific happens to it. Filtering inside
+    each mechanism instead is how the weight path, the prompt path and the
+    cache path grew three different ideas of "active adapter": composition
+    dropped the term, prompt injection did not, and the signature hashed it.
+
+    Routing traces are built from the router's own output, not from this
+    list, so a zero-gated adapter stays auditable — "the router assigned this
+    a zero gate" is not the same fact as "this adapter affected inference".
+    """
+    result: List[dict] = []
+    for adapter in adapters or []:
+        if isinstance(adapter, dict) and effective_gate(adapter) == 0.0:
+            logger.debug(
+                "adapter_gate_closed_skipped",
+                adapter_id=adapter.get("id") or adapter.get("name"),
+            )
+            continue
+        result.append(adapter)
+    return result
+
+
 class ModelBackend(Protocol):
     """Interface for pluggable generation backends."""
 
@@ -1368,7 +1418,11 @@ class ApiAdapterBackend:
         applied: List[str] = []
         dropped: List[str] = []
 
-        for adapter in adapters:
+        # §5.0.1: a zero-gated adapter is absent from the request, so it
+        # reaches neither the prompt, nor the provider, nor `applied`. It is
+        # not "dropped" either — dropping records an adapter the backend
+        # could not honour, and this one was never asked for.
+        for adapter in active_adapters(adapters):
             mode = get_adapter_mode(adapter)
             adapter_id = adapter.get("id") or adapter.get("name") or "unknown"
 
@@ -2235,6 +2289,13 @@ class LocalJaxLoRABackend:
         under one of them. Keying on id+version alone would let a 0.2 request
         continue a prefix computed at 0.8 — the cheapest possible way to
         serve a model nobody asked for.
+
+        Zero-gated adapters are excluded, because §5.0.1 says they are not in
+        the effective request at all: `[X @ 0]` and `[]` are the same model,
+        so they must be the same key. Hashing them was safe in the sense that
+        it only ever cost a reuse — but it made this function disagree with
+        composition about what "the effective stack" means, and the value of
+        one canonical answer is that there is nowhere for the two to drift.
         """
         parts = sorted(
             "{}:{}:{}".format(
@@ -2245,7 +2306,7 @@ class LocalJaxLoRABackend:
                 # and this key is the only thing keeping their KV apart.
                 struct.pack("<f", self._gate_weight_of(a)).hex(),
             )
-            for a in adapters or []
+            for a in active_adapters(adapters)
             if isinstance(a, dict)
         )
         return "|".join(parts) or "base"
@@ -2710,17 +2771,10 @@ class LocalJaxLoRABackend:
 
     @staticmethod
     def _gate_weight_of(adapter: dict) -> float:
-        # Not an `or` chain: 0.0 is a meaningful gate and also falsy.
-        gate = adapter.get("weight")
-        if gate is None:
-            gate = adapter.get("gate_weight")
-        if gate is None:
-            gate = adapter.get("schema", {}).get("weight")
-        if gate is None:
-            gate = 1.0
-        gate = _safe_weight(gate, default=1.0, context="blend_gate_weight")
-        # Clamped to [0, 1] per SPEC §8.1 guardrails.
-        return max(0.0, min(1.0, gate))
+        # The module-level rule (SPEC §5.0.1), not a second copy of it: the
+        # gate that composition scales by must be the same number that
+        # decided whether the adapter is in the request at all.
+        return effective_gate(adapter)
 
     def _blend_adapter_weights(
         self, adapters: List[dict], user_id: Optional[str], config: Any = None

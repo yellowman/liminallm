@@ -306,11 +306,16 @@ class GeminiBackend:
     def _prompt_injections(self, adapters: List[dict]) -> Tuple[List[str], List[str]]:
         """Prompt-rung adapters apply; weight-bearing modes cannot reach a
         hosted Gemini model and are dropped with their ids logged."""
-        from liminallm.service.model_backend import AdapterMode, get_adapter_mode
+        from liminallm.service.model_backend import (
+            AdapterMode,
+            active_adapters,
+            get_adapter_mode,
+        )
 
         injections: List[str] = []
         applied: List[str] = []
-        for adapter in adapters or []:
+        # §5.0.1: `g == 0` is absent, not dropped — it was never requested.
+        for adapter in active_adapters(adapters):
             adapter_id = adapter.get("id") or adapter.get("name") or "unknown"
             mode = get_adapter_mode(adapter)
             if mode in (AdapterMode.PROMPT, AdapterMode.HYBRID):

@@ -676,6 +676,68 @@ for `hybrid` adapters:
 
 this allows the same adapter artifact to work across deployment modes without modification.
 
+**adapter gate semantics (normative).**
+
+every routed adapter carries an effective gate
+
+\[
+g = \operatorname{clamp}(g_{\text{router}}, 0, 1)
+\]
+
+after router selection and filtering. the gate has two meanings, **in this
+order**:
+
+1. **activation.** `g == 0` means the adapter is absent from the effective
+   request.
+2. **intensity.** when the active execution mechanism has a mathematically
+   defined continuous weight, `g > 0` supplies that weight.
+
+a zero-gated adapter therefore:
+
+- contributes no local LoRA delta;
+- injects no `prompt_instructions`;
+- is not sent as a remote adapter or model selection;
+- is omitted from the effective adapter stack and the KV-cache signature;
+- is omitted from the set of adapters reported as actually applied.
+
+it may still appear in the routing trace, because "the router considered this
+adapter and assigned it a zero gate" is a different fact from "this adapter
+affected inference", and only the second one is a claim about the answer.
+
+**continuous gates apply only where the mechanism supports continuous
+composition.**
+
+- local LoRA, and remote multi-LoRA backends that accept adapter weights,
+  apply the number exactly: `g · αBA`.
+- **prompt execution is binary.** for a prompt or prompt-fallback adapter,
+  `g == 0` injects nothing and `g > 0` injects the instructions **once and
+  unchanged**. a fractional gate does not shorten, repeat, paraphrase,
+  probabilistically inject or otherwise scale natural-language text: there is
+  no defined analogue of multiplying a sentence by `g`.
+- remote mechanisms with no continuous adapter weight likewise read `g > 0`
+  as activation; the number may still inform router ranking and capping
+  *before* execution.
+- **no threshold downstream.** `g = 0.01` means the router activated the
+  adapter. rounding a small positive gate to "off" after the fact would be a
+  second routing policy, hidden downstream of the one that owns the decision.
+  the router's own `weight_floor` and `max_active_adapters` (§8.1) are not
+  that: they are the routing decision, taken by policy, before execution —
+  an adapter they exclude is one the router did not activate.
+
+for `hybrid` adapters the rule applies to whichever representation the active
+backend uses: on a local backend with a promoted version, `g > 0` applies
+weights scaled by `g` and injects no fallback prompt; on an API or
+prompt-fallback backend, `g > 0` injects the fallback once; an unpromoted
+hybrid has no weights, so `g > 0` activates the prompt fallback once.
+
+**one effective-adapter set drives everything downstream.** after clamping,
+adapters with `g == 0` are removed *once*, before backend-specific weight
+loading, prompt injection, remote passthrough, effective-stack hashing and
+inference accounting. deciding it separately in each mechanism is how they
+came to disagree: composition dropped the zero-gated term, prompt injection
+did not read the gate at all, and the KV signature hashed an adapter that
+contributes nothing.
+
 ### 5.0.2 provider capabilities (implementation detail)
 
 different API providers handle adapters in fundamentally different ways. the kernel maintains a capability registry to format requests correctly:

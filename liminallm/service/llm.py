@@ -11,6 +11,7 @@ from liminallm.service.model_backend import (
     LocalJaxLoRABackend,
     ModelBackend,
     StubBackend,
+    active_adapters,
     get_adapter_mode,
 )
 from liminallm.storage.models import Message
@@ -277,13 +278,22 @@ class LLMService:
         return updated
 
     def _normalize_adapters(self, adapters: List[dict]) -> List[dict]:
+        """The effective adapter set, built once for every path (§5.0.1).
+
+        Gate first, mechanism second: `g == 0` means the adapter is absent
+        from the request, so it is dropped here — before prompt injection,
+        weight loading, remote passthrough, KV hashing or accounting can see
+        it. This is the only funnel into a backend (generate, generate_stream,
+        chat and complete all pass through it), which is what keeps those
+        five surfaces from disagreeing about which adapters are active.
+        """
         normalized = []
         for adapter in adapters or []:
             if isinstance(adapter, str):
                 normalized.append({"id": adapter})
             elif isinstance(adapter, dict):
                 normalized.append(adapter)
-        return normalized
+        return active_adapters(normalized)
 
     @property
     def _backend_applies_lora_weights(self) -> bool:

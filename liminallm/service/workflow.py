@@ -37,7 +37,7 @@ from liminallm.service.embeddings import (
 )
 from liminallm.service.errors import BadRequestError
 from liminallm.service.llm import LLMService
-from liminallm.service.model_backend import DEFAULT_CONTEXT_WINDOW
+from liminallm.service.model_backend import DEFAULT_CONTEXT_WINDOW, active_adapters
 from liminallm.service.rag import RAGService
 from liminallm.service.router import RouterEngine
 from liminallm.service.sandbox import (
@@ -1411,8 +1411,14 @@ class WorkflowEngine(WorkflowStreamingMixin):
             activated_adapters.append(
                 {**candidate, "weight": 1.0 if weight is None else weight}
             )
+        # SPEC §5.0.1: the gate activates before it modulates. A zero-gated
+        # adapter is absent from the request, so it does not travel to the
+        # backend and does not appear in what the turn reports as applied —
+        # that report is a claim about what shaped the answer. It stays in
+        # `gates` and in the routing trace, which record a different fact:
+        # the router considered it and assigned it zero.
         return (
-            activated_adapters,
+            active_adapters(activated_adapters),
             routing.get("trace", []) if isinstance(routing, dict) else [],
             gates,
         )
