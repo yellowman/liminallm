@@ -704,6 +704,16 @@ it may still appear in the routing trace, because "the router considered this
 adapter and assigned it a zero gate" is a different fact from "this adapter
 affected inference", and only the second one is a claim about the answer.
 
+**what a turn reports as applied names mechanisms, never modes.** an adapter
+contributes through prompt instructions, through local weights, through a
+remote adapter or model selection — and each one that actually ran gets its
+own entry. an adapter whose mode permits a mechanism it does not carry has
+applied nothing: `hybrid` requires neither `prompt_instructions` nor a remote
+id, so an artifact with neither is valid, materializes nothing, sends
+nothing, changes no model, and must be reported as **dropped**. reporting it
+as applied on the strength of its mode named an adapter the answer never
+saw.
+
 **continuous gates apply only where the mechanism supports continuous
 composition.**
 

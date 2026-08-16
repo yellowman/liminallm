@@ -188,6 +188,68 @@ class TestBackendsDoNotMaterializeAgain:
         assert applied == []
 
 
+class TestAppliedNamesMechanismsNotModes:
+    """`applied` claims the adapter affected inference (§5.0.1).
+
+    It was built from the mode: a hybrid adapter with neither instructions
+    nor a remote id was reported as `:prompt` because it was hybrid, while
+    nothing was injected, no adapter was sent and the model was unchanged.
+    The artifact schema permits that shape — neither field is required — so
+    it is a valid artifact producing a false claim.
+    """
+
+    def _api(self, provider="openai", model="gpt-x"):
+        return ApiAdapterBackend(base_model=model, api_key=None, provider=provider)
+
+    def test_a_hybrid_with_no_usable_representation_is_dropped(self):
+        processed = self._api()._process_adapters_for_provider(
+            [{"id": "empty", "mode": "hybrid", "current_version": 0, "weight": 1.0}]
+        )
+        assert processed["applied"] == []
+        assert processed["dropped"] == ["empty"]
+        assert processed["model"] == "gpt-x", "the model was changed by nothing"
+
+    def test_a_prompt_adapter_with_no_instructions_is_dropped(self):
+        processed = self._api()._process_adapters_for_provider(
+            [{"id": "silent", "mode": "prompt"}]
+        )
+        assert processed["applied"] == []
+        assert processed["dropped"] == ["silent"]
+
+    def test_each_mechanism_present_gets_its_own_entry(self):
+        """Two mechanisms, two entries — not one marker for the mode. The
+        `:hybrid` marker was appended before the provider had decided whether
+        it would select the model at all."""
+        processed = self._api()._process_adapters_for_provider(
+            [
+                {
+                    "id": "both",
+                    "mode": "hybrid",
+                    "prompt_instructions": INSTRUCTION,
+                    "remote_model_id": "ft:gpt-4:custom",
+                }
+            ]
+        )
+        assert processed["applied"] == ["both:prompt", "both:model_id"]
+        assert processed["model"] == "ft:gpt-4:custom"
+
+    def test_a_hybrid_carried_only_by_its_prompt_says_so(self):
+        processed = self._api()._process_adapters_for_provider(
+            [{"id": "p", "mode": "hybrid", "prompt_instructions": INSTRUCTION}]
+        )
+        assert processed["applied"] == ["p:prompt"]
+        assert processed["dropped"] == []
+
+    def test_a_hybrid_carried_only_by_a_remote_adapter_says_so(self):
+        processed = self._api(
+            provider="together", model="mixtral"
+        )._process_adapters_for_provider(
+            [{"id": "r", "mode": "hybrid", "remote_adapter_id": "ra-1"}]
+        )
+        assert processed["applied"] == ["r:adapter_param"]
+        assert processed["dropped"] == []
+
+
 class TestTheServiceIsTheMaterializer:
     """If the service stops placing the text, nothing else puts it back.
 

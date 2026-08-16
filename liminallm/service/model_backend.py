@@ -1450,24 +1450,43 @@ class ApiAdapterBackend:
                 dropped.append(adapter_id)
                 continue
 
-            if mode == AdapterMode.PROMPT:
-                # A prompt adapter's text is already in the messages: SPEC
-                # §5.0.1 gives materialization to LLMService, which every
-                # path into a backend goes through. Extracting it here is
-                # only how this backend knows whether the adapter carries
-                # anything to report as applied.
-                if self._extract_prompt_instructions(adapter):
+            if mode in (AdapterMode.PROMPT, AdapterMode.HYBRID):
+                # `applied` is a claim that the adapter affected inference
+                # (§5.0.1), so it is built from the mechanisms actually
+                # present, one entry each — never from the mode alone. A
+                # hybrid with neither instructions nor a remote id used to be
+                # reported as `:prompt` on the strength of being hybrid,
+                # while nothing was injected, no adapter was sent and the
+                # model was unchanged: a turn that named an adapter it did
+                # not use.
+                #
+                # The text itself is already in the messages — LLMService
+                # materializes it (§5.0.1) — so extracting it here only
+                # answers whether there was anything to materialize.
+                has_prompt = bool(self._extract_prompt_instructions(adapter))
+                has_remote = bool(
+                    mode == AdapterMode.HYBRID
+                    and (
+                        adapter.get("remote_model_id")
+                        or adapter.get("remote_adapter_id")
+                    )
+                )
+                if has_prompt:
                     applied.append(f"{adapter_id}:prompt")
-                continue
-
-            if mode == AdapterMode.HYBRID:
-                # Same for the hybrid fallback; the remote half below is a
-                # different mechanism and still this backend's to perform.
-                if adapter.get("remote_model_id") or adapter.get("remote_adapter_id"):
+                if has_remote:
+                    # Whether the provider actually selects it is
+                    # `_format_remote_adapters`' answer, and it reports its
+                    # own mechanism; claiming it here would pre-empt a
+                    # decision this backend has not made yet.
                     remote_adapters.append(adapter)
-                    applied.append(f"{adapter_id}:hybrid")
-                else:
-                    applied.append(f"{adapter_id}:prompt")
+                if not has_prompt and not has_remote:
+                    logger.debug(
+                        "adapter_carries_no_usable_representation",
+                        adapter_id=adapter_id,
+                        mode=str(mode),
+                        provider=self.provider,
+                    )
+                    dropped.append(adapter_id)
                 continue
 
             if mode == AdapterMode.REMOTE:

@@ -262,9 +262,13 @@ class TestProcessAdaptersForProvider:
         ]
         result = backend._process_adapters_for_provider(adapters)
 
-        # The remote half is this backend's to perform; the prompt half is
-        # not. Two mechanisms, one of them elsewhere (§5.0.1).
-        assert "a1:hybrid" in result["applied"]
+        # One entry per mechanism actually used, never one for the mode:
+        # this adapter contributes a prompt (materialized by the service)
+        # and a model selection, so `applied` names both. The old `:hybrid`
+        # marker was appended before the provider had decided whether it
+        # would select the model at all.
+        assert result["applied"] == ["a1:prompt", "a1:model_id"]
+        assert result["model"] == "ft:gpt-4:custom"
         assert "prompt_injections" not in result
 
     def test_remote_adapters_added_to_list(self):

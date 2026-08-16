@@ -170,7 +170,7 @@ def test_prompt_adapters_reach_the_system_instruction_exactly_once():
         seen["body"] = json.loads(request.read())
         return httpx.Response(200, json=_payload())
 
-    adapter = {"id": "tone", "schema": {"adapter_mode": "prompt",
+    adapter = {"id": "tone", "schema": {"mode": "prompt",
                                         "prompt_instructions": "Answer in haiku."}}
     backend = _backend(handler)
     out = LLMService(base_model="gemini-2.5-flash", backend=backend).generate(
@@ -187,7 +187,7 @@ def test_a_weight_bearing_adapter_is_dropped_not_faked():
     def handler(request):
         return httpx.Response(200, json=_payload())
 
-    adapter = {"id": "lora", "schema": {"adapter_mode": "local"}, "fs_dir": "/x"}
+    adapter = {"id": "lora", "schema": {"mode": "local"}, "fs_dir": "/x"}
     out = _backend(handler).generate([{"role": "user", "content": "hi"}], [adapter])
     assert out["adapters_applied"] == []
 
