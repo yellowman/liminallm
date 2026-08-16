@@ -49,9 +49,6 @@ DEFAULT_MAX_TOTAL_BYTES = 256 * 1024 * 1024
 DEFAULT_MAX_RATIO = 100
 MAX_PATH_DEPTH = 16
 _CHUNK = 64 * 1024
-# Tiny archives may legitimately expand far past the ratio cap (an empty-file
-# tar is mostly header), so the ratio check only kicks in past this floor.
-_RATIO_FLOOR_BYTES = 1024 * 1024
 
 
 def is_archive_filename(name: str) -> bool:
@@ -117,8 +114,17 @@ class _Budget:
                 f"archive expands past the total size limit "
                 f"({self.max_total // (1024 * 1024)}MB)"
             )
-        ratio_cap = max(_RATIO_FLOOR_BYTES, self.archive_bytes * self.max_ratio)
-        if self.total > ratio_cap:
+        # No small-archive exemption. This used to be
+        # `max(1 MiB, archive_bytes * max_ratio)`, which meant the configured
+        # 100:1 cap was not a cap below a megabyte: measured, a 726-byte zip
+        # expanded to 600 KiB — about 846:1 — and extracted. §21.3 states the
+        # ratio cap with no floor in it.
+        #
+        # The floor's own justification was backwards. It read "an empty-file
+        # tar is mostly header" and so expands past the ratio; measured, an
+        # empty-file tar is 10240 bytes on disk and expands to 0 — a ratio of
+        # zero, which no cap could trouble.
+        if self.total > self.archive_bytes * self.max_ratio:
             raise ArchiveExtractionError(
                 f"compression ratio exceeds {self.max_ratio}:1 — refusing to "
                 "extract (archive bomb suspected)"

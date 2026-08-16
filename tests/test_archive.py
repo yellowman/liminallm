@@ -166,10 +166,19 @@ def test_compression_ratio_bomb(tmp_path):
 
 
 def test_member_size_cap(tmp_path):
+    # `max_ratio` is raised so this isolates the per-member cap. 3MB of one
+    # repeated byte compresses to a few KB, so with the shipped 100:1 ratio it
+    # is *also* a bomb — and since the ratio cap lost its 1MB floor, that cap
+    # now fires first. Both refusals are correct; this test is about the
+    # member one, so it removes the other from the picture.
     archive = make_zip(tmp_path / "big.zip", {"big.txt": b"a" * (3 * 1024 * 1024)})
     dest = tmp_path / "out"
     with pytest.raises(ArchiveExtractionError, match="per-file limit"):
-        extract_archive(str(archive), str(dest), {"max_member_bytes": 1024 * 1024})
+        extract_archive(
+            str(archive),
+            str(dest),
+            {"max_member_bytes": 1024 * 1024, "max_ratio": 100_000},
+        )
     assert not dest.exists()
 
 
