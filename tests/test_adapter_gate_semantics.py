@@ -80,6 +80,35 @@ class TestTheGateIsClampedBeforeItIsRead:
         ]
         assert [a["id"] for a in active_adapters(adapters)] == ["tiny", "default"]
 
+    def test_the_effective_set_carries_the_canonical_magnitude(self):
+        """Membership is half the answer. A consumer that reads the adapter's
+        weight must read the same number composition scales by — otherwise it
+        re-derives it, and re-derivation is what sent a provider 5.0 for an
+        adapter already clamped to 1.0."""
+        adapters = [
+            {"id": "over", "weight": 5.0},
+            {"id": "schema_only", "schema": {"weight": 0.25}},
+            {"id": "unparseable", "weight": "nonsense"},
+            {"id": "legacy", "gate_weight": 0.4},
+        ]
+        assert [a["weight"] for a in active_adapters(adapters)] == [
+            1.0,
+            0.25,
+            1.0,
+            0.4,
+        ]
+
+    def test_the_callers_adapters_are_not_edited(self):
+        original = {"id": "over", "weight": 5.0}
+        (canonical,) = active_adapters([original])
+        assert canonical is not original
+        assert original["weight"] == 5.0, "the caller's dict was rewritten"
+
+    def test_canonicalizing_twice_changes_nothing(self):
+        """The set passes through several layers on the way to a backend."""
+        once = active_adapters([{"id": "a", "weight": 5.0}])
+        assert active_adapters(once) == once
+
     def test_no_threshold_rounds_a_small_gate_to_off(self):
         """A threshold would be a second routing policy, downstream of the
         one that owns the decision."""
@@ -165,6 +194,51 @@ class TestRemotePassthroughAndAccounting:
         assert active["extra_body"]["adapter_id"] == "ra-1"
         assert active["extra_body"]["adapter_weights"] == pytest.approx(0.5)
         assert active["applied"] == ["r:adapter_param"]
+
+    @pytest.mark.parametrize(
+        "adapter_fields, expected",
+        [
+            ({"weight": 0.5}, 0.5),
+            ({"weight": 5.0}, 1.0),  # §8.1 clamp, not the raw number
+            ({"schema": {"weight": 0.25}}, 0.25),  # same precedence as §5.2
+            ({"weight": "nonsense"}, 1.0),  # one interpretation, not a crash
+            ({"gate_weight": 0.4}, 0.4),
+        ],
+    )
+    def test_the_provider_receives_the_canonical_gate(self, adapter_fields, expected):
+        """§5.0.1: a mechanism with a continuous weight applies `g` exactly.
+
+        The formatter used to re-read the raw dict, so it sent 5.0 for an
+        adapter the kernel clamps to 1.0, sent 1.0 for one whose gate lived in
+        `schema.weight`, and raised on a weight the canonical rule reads as
+        1.0 — a malformed number became a failed request rather than a
+        defaulted one.
+        """
+        adapter = {
+            "id": "r",
+            "mode": "remote",
+            "remote_adapter_id": "ra-1",
+            **adapter_fields,
+        }
+        processed = self._api()._process_adapters_for_provider([adapter])
+        assert processed["extra_body"]["adapter_weights"] == pytest.approx(expected)
+
+    def test_ranking_uses_the_canonical_gate(self):
+        """MODEL_ID providers serve exactly one adapter, so the ranking is
+        the choice. An out-of-range 5.0 must not outrank a legitimate 1.0,
+        and a schema-held gate must not rank as if it were unset."""
+        api = self._api(provider="openai", model="gpt-x")
+        loud = {"id": "loud", "mode": "remote", "remote_model_id": "ft-loud", "weight": 5.0}
+        quiet = {"id": "quiet", "mode": "remote", "remote_model_id": "ft-quiet",
+                 "schema": {"weight": 0.9}}
+        # Both clamp below/at 1.0; `loud` at 1.0 still wins, but on 1.0 not 5.0.
+        model, _, applied, _ = api._format_remote_adapters([quiet, loud])
+        assert model == "ft-loud" and applied == ["loud:model_id"]
+        # And a malformed weight ranks as 1.0 rather than raising.
+        broken = {"id": "b", "mode": "remote", "remote_model_id": "ft-b",
+                  "weight": "nonsense"}
+        model, _, applied, _ = api._format_remote_adapters([broken])
+        assert model == "ft-b"
 
     def test_gemini_native_agrees(self):
         from liminallm.service.gemini_backend import GeminiBackend
@@ -287,6 +361,65 @@ class TestTheEffectiveStackHashesTheSame:
         assert backend._adapter_signature([served, closed]) == (
             backend._adapter_signature([served])
         )
+
+    def test_a_closed_gate_is_not_reported_as_applied(self, tmp_path, checkpoint):
+        """§5.0.1 omits a zero-gated adapter from inference accounting, not
+        only from the LoRA sum and the cache key.
+
+        The backend applied no weights and hashed as the base model, then
+        returned `usage.adapter_id == "X"` — a turn that claimed an adapter
+        shaped an answer it had no part in. `generate()` canonicalizes the
+        list at its own entry now, so this holds for a direct call and not
+        only downstream of LLMService.
+        """
+        config = __import__(
+            "liminallm.service.transformer", fromlist=["x"]
+        ).load_config(checkpoint)
+        version = tmp_path / "X" / "v0001"
+        version.mkdir(parents=True)
+        (version / "params.json").write_text(
+            json.dumps(
+                {
+                    "layers.0.attn_q.A": [[0.05] * config.hidden_size] * 2,
+                    "layers.0.attn_q.B": [[0.05, 0.05]]
+                    * (config.num_heads * config.head_dim),
+                }
+            )
+        )
+        backend = LocalJaxLoRABackend(
+            str(checkpoint), str(tmp_path), max_new_tokens=2
+        )
+        adapter = {
+            "id": "X",
+            "mode": "local",
+            "fs_dir": "X",
+            "current_version": 1,
+            "base_model": str(checkpoint),
+        }
+        messages = [{"role": "user", "content": "hello"}]
+
+        closed = backend.generate(messages, [{**adapter, "weight": 0.0}], user_id="u")
+        assert closed["usage"].get("adapter_id") is None
+
+        # Control: the same adapter, open, is reported — so the absence above
+        # is the gate and not a backend that never reports anything.
+        open_ = backend.generate(messages, [{**adapter, "weight": 1.0}], user_id="u")
+        assert open_["usage"].get("adapter_id") == "X"
+
+    def test_a_closed_first_adapter_does_not_size_the_tokenizer(
+        self, tmp_path, checkpoint
+    ):
+        """`adapters[0]` fed `_apply_adapter_vocab_size` before any filtering,
+        so an absent adapter could still reconfigure tokenization."""
+        backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
+        seen = []
+        backend._apply_adapter_vocab_size = lambda adapter: seen.append(adapter)
+        backend.generate(
+            [{"role": "user", "content": "hi"}],
+            [{"id": "X", "weight": 0.0, "vocab_size": 99}, {"id": "Y", "weight": 1.0}],
+            user_id="u",
+        )
+        assert [a.get("id") for a in seen] == ["Y"]
 
     def test_a_closed_gate_reuses_the_prefix_built_without_it(
         self, tmp_path, checkpoint

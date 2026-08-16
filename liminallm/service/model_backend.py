@@ -153,15 +153,23 @@ def effective_gate(adapter: dict) -> float:
 
 
 def active_adapters(adapters: Optional[List[dict]]) -> List[dict]:
-    """The effective adapter set: those the router left with `g > 0`.
+    """The effective adapter set: those the router left with `g > 0`, each
+    carrying its canonical `g` as `weight`.
 
     SPEC §5.0.1 gives the gate two meanings, in order — activation, then
-    intensity. `g == 0` (including any negative weight, which §8.1 clamps)
-    means the adapter is absent from the request, so it is removed here,
-    once, before anything mechanism-specific happens to it. Filtering inside
-    each mechanism instead is how the weight path, the prompt path and the
-    cache path grew three different ideas of "active adapter": composition
-    dropped the term, prompt injection did not, and the signature hashed it.
+    intensity — and this function answers **both**. `g == 0` (including any
+    negative weight, which §8.1 clamps) means the adapter is absent from the
+    request, so it is removed here, once, before anything mechanism-specific
+    happens to it. Everything that survives carries the clamped, precedence-
+    resolved number, so a consumer reading `adapter["weight"]` reads the same
+    value composition scales by.
+
+    Answering only membership was not enough. The remote formatter re-derived
+    the magnitude from the raw dict and so sent `5.0` for an adapter this
+    function had already clamped to `1.0`, sent `1.0` for one held in
+    `schema.weight`, and raised on a weight this function reads as `1.0`.
+    Members are shallow copies for that reason: the canonical value has to be
+    on the adapter without editing the caller's dict.
 
     Routing traces are built from the router's own output, not from this
     list, so a zero-gated adapter stays auditable — "the router assigned this
@@ -169,13 +177,17 @@ def active_adapters(adapters: Optional[List[dict]]) -> List[dict]:
     """
     result: List[dict] = []
     for adapter in adapters or []:
-        if isinstance(adapter, dict) and effective_gate(adapter) == 0.0:
+        if not isinstance(adapter, dict):
+            result.append(adapter)
+            continue
+        gate = effective_gate(adapter)
+        if gate == 0.0:
             logger.debug(
                 "adapter_gate_closed_skipped",
                 adapter_id=adapter.get("id") or adapter.get("name"),
             )
             continue
-        result.append(adapter)
+        result.append({**adapter, "weight": gate})
     return result
 
 
@@ -1535,16 +1547,13 @@ class ApiAdapterBackend:
                     adapter_ids.append(aid)
                     applied.append(f"{adapter.get('id', 'unknown')}:adapter_param")
                     if caps.gate_weights:
-                        # Use explicit None checks to handle weight=0.0 correctly
-                        # (0.0 is falsy in Python but is a valid weight for disabling adapters)
-                        weight = adapter.get("weight")
-                        if weight is None:
-                            weight = adapter.get("gate_weight")
-                        if weight is None:
-                            weight = 1.0
-                        gate_weights.append(
-                            self._safe_float(weight, context="adapter_param_gate_weight")
-                        )
+                        # §5.0.1: a multi-LoRA provider that accepts weights
+                        # applies `g` exactly, so it must be sent the same `g`
+                        # the rest of the kernel used — clamped, and resolved
+                        # through the same precedence. Re-reading the raw dict
+                        # here sent 5.0 for an adapter this kernel treats as
+                        # 1.0, and 1.0 for one whose gate lived in its schema.
+                        gate_weights.append(effective_gate(adapter))
 
             # Mark dropped adapters
             for a in adapters:
@@ -1585,22 +1594,17 @@ class ApiAdapterBackend:
             return self.base_model, None, [], dropped
 
     def _select_best_adapter(self, adapters: List[dict], max_count: int) -> List[dict]:
-        """Select best adapters up to max_count, sorted by weight descending."""
+        """Select best adapters up to max_count, ranked by the canonical gate.
+
+        Ranking used to re-derive the weight here with a bare `float()`, which
+        disagreed with `effective_gate` three ways: it ignored
+        `schema.weight`, it ranked an out-of-range 5.0 above a legitimate 1.0,
+        and it raised on a weight the canonical rule reads as 1.0 — turning a
+        malformed number into a failed request instead of a defaulted one.
+        """
         if not adapters:
             return []
-
-        # Sort by weight/gate_weight descending
-        # Use explicit None checks to handle weight=0.0 correctly
-        def get_weight(a: dict) -> float:
-            weight = a.get("weight")
-            if weight is None:
-                weight = a.get("gate_weight")
-            if weight is None:
-                weight = 1.0
-            return float(weight)
-
-        sorted_adapters = sorted(adapters, key=get_weight, reverse=True)
-        return sorted_adapters[:max_count]
+        return sorted(adapters, key=effective_gate, reverse=True)[:max_count]
 
     def _extract_prompt_instructions(self, adapter: dict) -> Optional[str]:
         """Extract prompt instructions from adapter for system prompt injection.
@@ -2115,22 +2119,32 @@ class LocalJaxLoRABackend:
                 "adapter_has_no_promoted_version", adapter_path=str(path)
             )
             return None
-        candidates: list[Path] = []
+        # An artifact with no `current_version` at all — the never-versioned
+        # legacy shape; the artifact schema requires the field, so nothing
+        # created or updated through the store arrives here. Its own
+        # `params.json` is the only thing it can serve.
+        #
+        # This used to fall through to a scan: `latest`, then `v*`, then any
+        # subdirectory, newest wins. That reintroduced both holes §5.5 closed
+        # on the pinned path — a `latest` aimed at another adapter served that
+        # adapter's weights, and a bare `vNNNN` served a version no
+        # `current_version` ever authorized, which is exactly what a
+        # gate-rejected training run leaves on disk. A versionless artifact
+        # cannot authorize a version, so it may not resolve to one.
         direct = path / "params.json"
         if direct.exists():
-            candidates.append(direct)
-        latest = path / "latest" / "params.json"
-        if latest.exists():
-            candidates.append(latest)
-        versioned = [p for p in path.glob("v*/params.json") if p.parent.is_dir()]
-        versioned.sort(key=lambda p: self._version_sort_key(p.parent.name))
-        candidates.extend(versioned)
-        wildcard = [p for p in path.glob("*/params.json") if p.parent.is_dir()]
-        wildcard.sort(key=lambda p: p.stat().st_mtime)
-        candidates.extend(wildcard)
-        for candidate in reversed(candidates):
-            if candidate.exists():
-                return candidate
+            return direct
+        for stale in ("latest", "v*", "*"):
+            if any(p.exists() for p in path.glob(f"{stale}/params.json")):
+                logger.warning(
+                    "adapter_versionless_cannot_resolve_a_version",
+                    adapter_path=str(path),
+                    message=(
+                        "versioned weights exist but the artifact records no "
+                        "current_version to authorize one; serving nothing"
+                    ),
+                )
+                break
         return None
 
     def _version_sort_key(self, name: str) -> Tuple[int, str]:
@@ -2494,6 +2508,15 @@ class LocalJaxLoRABackend:
         user_id: Optional[str] = None,
     ) -> dict:
         prompt = self._normalize_messages(messages)
+        # §5.0.1, before anything reads the list: a zero-gated adapter is
+        # absent from the request, so it must not be the adapter whose vocab
+        # size configures the tokenizer, and must not be the id this turn
+        # reports as applied. Composition and the KV signature already knew
+        # that; usage accounting and `adapters[0]` did not, so a closed gate
+        # produced a turn that hashed as the base model and still claimed the
+        # adapter. Filtering here makes the backend correct when called
+        # directly, not only downstream of LLMService.
+        adapters = active_adapters(adapters)
         adapter = adapters[0] if adapters else {}
         self._apply_adapter_vocab_size(adapter)
         # Before tokenizing, not after: the checkpoint's vocabulary governs

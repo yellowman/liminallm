@@ -264,6 +264,36 @@ class TestVersionAuthorityIsAbsolute:
         resolved = backend._resolve_params_path(adapter_dir, current_version=1)
         assert resolved == adapter_dir / "v0001" / "params.json"
 
+    def test_a_versionless_artifact_cannot_resolve_to_a_version(
+        self, tmp_path, checkpoint
+    ):
+        """§5.5: `current_version` is the authority, so an artifact that has
+        none cannot serve a version at all.
+
+        The pinned lane refuses `latest` and refuses a bare directory scan.
+        The versionless lane still did both, which reopened the same two
+        holes for any adapter whose schema predates the required field: a
+        `latest` aimed elsewhere served another adapter's weights, and a bare
+        `vNNNN` served exactly what a gate-rejected run leaves behind.
+        """
+        backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
+        adapter_root = tmp_path / "legacy"
+        _write(adapter_root / "v0001", {"layers.0.attn_q.A": [[0.1]]})
+
+        # A version exists on disk; nothing authorized it.
+        assert backend._resolve_params_path(adapter_root, current_version=None) is None
+
+        # A pointer into a different adapter is not a way in either.
+        _write(tmp_path / "elsewhere" / "v0001", {"layers.0.attn_q.A": [[0.9]]})
+        (adapter_root / "latest").symlink_to(tmp_path / "elsewhere" / "v0001")
+        assert backend._resolve_params_path(adapter_root, current_version=None) is None
+
+        # Its own params.json is the one thing it may serve.
+        (adapter_root / "params.json").write_text(json.dumps({"layers.0.attn_q.A": [[0.1]]}))
+        assert backend._resolve_params_path(adapter_root, current_version=None) == (
+            adapter_root / "params.json"
+        )
+
     def test_a_direct_file_cannot_satisfy_a_versioned_artifact(
         self, tmp_path, checkpoint
     ):

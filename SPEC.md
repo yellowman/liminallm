@@ -730,13 +730,24 @@ weights scaled by `g` and injects no fallback prompt; on an API or
 prompt-fallback backend, `g > 0` injects the fallback once; an unpromoted
 hybrid has no weights, so `g > 0` activates the prompt fallback once.
 
-**one effective-adapter set drives everything downstream.** after clamping,
-adapters with `g == 0` are removed *once*, before backend-specific weight
-loading, prompt injection, remote passthrough, effective-stack hashing and
-inference accounting. deciding it separately in each mechanism is how they
-came to disagree: composition dropped the zero-gated term, prompt injection
-did not read the gate at all, and the KV signature hashed an adapter that
-contributes nothing.
+**one effective-adapter set drives everything downstream, and it carries the
+magnitude too.** after clamping, adapters with `g == 0` are removed *once*,
+before backend-specific weight loading, prompt injection, remote passthrough,
+effective-stack hashing and inference accounting — and every adapter that
+survives carries its canonical `g`, so a consumer reading the adapter's
+weight reads the number composition scales by. membership alone is not
+enough: a mechanism that re-derives the magnitude from the raw artifact will
+disagree about range, about precedence, and about what an unparseable value
+means. deciding either half separately in each mechanism is how they came to
+disagree — composition dropped the zero-gated term while prompt injection did
+not read the gate at all, the KV signature hashed an adapter contributing
+nothing, and the remote formatter sent a provider `5.0` for an adapter this
+kernel had already clamped to `1.0`.
+
+a backend must hold this line at its own entry, not only downstream of the
+service that calls it: the local backend reported a zero-gated adapter as the
+turn's `adapter_id`, and sized its tokenizer from it, while correctly
+excluding it from both the LoRA sum and the cache key.
 
 ### 5.0.2 provider capabilities (implementation detail)
 
@@ -1273,6 +1284,14 @@ cluster qualifies          pooled events ≥ threshold      eval gate passes
      never at `adapters/<id>/latest`: handing it the pointer made it look for
      `latest/vNNNN`, so a correctly promoted adapter became unservable merely
      because the convenience pointer existed beside its versions.
+   - **a versionless artifact cannot authorize a version.** an artifact with
+     no `current_version` at all — the never-versioned legacy shape, which
+     the adapter schema no longer permits to be created — may serve its own
+     `params.json` and nothing else. it must not scan for `latest`, for
+     `vNNNN`, or for any subdirectory, because both holes closed above reopen
+     immediately in a lane that skips the version check: a `latest` aimed
+     elsewhere serves another adapter's weights, and a bare `vNNNN` serves
+     exactly what a gate-rejected run leaves on disk.
    - **after graduation the prompt is the fallback, not a second voice.** on a
      backend that applies LoRA weights, a promoted hybrid adapter is carried
      by its weights and its `prompt_instructions` are NOT injected (§5.0.1);
