@@ -111,6 +111,34 @@ def _hf_weight_names(layer: int) -> Dict[str, str]:
     }
 
 
+def base_identity(value: Any) -> str:
+    """The comparable identity of a base model, per SPEC §5.1.
+
+    One definition, because both sides of the ladder ask the same question:
+    training refuses to fit an adapter to a base other than the runtime's,
+    and serving refuses to apply the result to a base other than the one it
+    was fitted to. Two spellings of that rule drift, and the looser one
+    decides.
+
+    Identity is the final path component, lowercased, so a checkout at
+    ``/models/qwen3-4b`` and the name ``qwen3-4b`` are one model. Nothing
+    fuzzier: ``-chat``, ``-base`` and version suffixes mark *different*
+    frozen weights, so treating them as one model is what the rule exists to
+    prevent. An empty value has no identity and matches nothing, including
+    another empty value.
+    """
+    text = str(value or "").strip().rstrip("/")
+    if not text:
+        return ""
+    return text.split("/")[-1].lower()
+
+
+def same_base_model(left: Any, right: Any) -> bool:
+    """Whether two base-model references name the same checkpoint."""
+    identity = base_identity(left)
+    return bool(identity) and identity == base_identity(right)
+
+
 def checkpoint_available(model_dir: str | Path) -> bool:
     """Whether ``model_dir`` looks like a loadable HF-layout checkout."""
     directory = Path(model_dir)

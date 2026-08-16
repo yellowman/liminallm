@@ -17,6 +17,7 @@ the rule was enforced one step too late, or from the wrong field:
 
 import json
 import uuid
+from pathlib import Path
 
 import pytest
 
@@ -32,10 +33,24 @@ from liminallm.service.training import TrainingService  # noqa: E402
 from tests.harness import get_test_store  # noqa: E402
 from tests.test_local_transformer import _build_checkpoint  # noqa: E402
 
+BASE = ""
+"""The serving base identity these fixtures' adapters declare.
 
-@pytest.fixture(scope="module")
+SPEC §5.1 ties LoRA weights to one frozen base, so serving refuses an adapter
+that does not declare the base it is being applied to — a fixture without one
+describes an adapter the artifact schema could not store either.
+"""
+
+
+@pytest.fixture(scope="module", autouse=True)
 def checkpoint(tmp_path_factory):
-    return _build_checkpoint(tmp_path_factory.mktemp("contract2_model"))
+    """autouse so BASE is set before any test in the module reads it, whatever
+    order they run in — an unset BASE would refuse weights for the wrong
+    reason."""
+    global BASE
+    directory = _build_checkpoint(tmp_path_factory.mktemp("contract2_model"))
+    BASE = str(directory)
+    return directory
 
 
 @pytest.fixture(scope="module")
@@ -46,6 +61,15 @@ def config(checkpoint):
 def _write(directory, weights):
     directory.mkdir(parents=True, exist_ok=True)
     (directory / "params.json").write_text(json.dumps(weights))
+
+
+def _valid_pair(config, rank=2, value=0.05):
+    """An A/B pair that satisfies SPEC §5.2 for this checkpoint."""
+    width = config.num_heads * config.head_dim
+    return {
+        "layers.0.attn_q.A": [[value] * config.hidden_size] * rank,
+        "layers.0.attn_q.B": [[value] * rank] * width,
+    }
 
 
 class TestValidationHappensPerAdapter:
@@ -73,8 +97,8 @@ class TestValidationHappensPerAdapter:
         )
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
         stack = [
-            {"id": "a1", "mode": "local", "fs_dir": "a1", "current_version": 1},
-            {"id": "a2", "mode": "local", "fs_dir": "a2", "current_version": 1},
+            {"id": "a1", "base_model": BASE, "mode": "local", "fs_dir": "a1", "current_version": 1},
+            {"id": "a2", "base_model": BASE, "mode": "local", "fs_dir": "a2", "current_version": 1},
         ]
         with pytest.raises(ValueError, match="rank"):
             backend._blend_adapter_weights(stack, user_id="u", config=config)
@@ -99,7 +123,7 @@ class TestValidationHappensPerAdapter:
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
         with pytest.raises(ValueError, match="outside the declared shape"):
             backend._blend_adapter_weights(
-                [{"id": "mixed", "mode": "local", "fs_dir": "mixed", "current_version": 1}],
+                [{"id": "mixed", "base_model": BASE, "mode": "local", "fs_dir": "mixed", "current_version": 1}],
                 user_id="u",
                 config=config,
             )
@@ -118,6 +142,7 @@ class TestOrphanScaleCannotHide:
                 [
                     {
                         "id": "scaly",
+                        "base_model": BASE,
                         "mode": "local",
                         "fs_dir": "scaly",
                         "current_version": 1,
@@ -174,6 +199,7 @@ class TestASelectedAdapterNeverVanishes:
                 [
                     {
                         "id": "skill",
+                        "base_model": BASE,
                         "mode": "local",
                         "fs_dir": "skill",
                         "current_version": 3,
@@ -187,12 +213,12 @@ class TestASelectedAdapterNeverVanishes:
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
         # Prompt rung.
         assert backend._blend_adapter_weights(
-            [{"id": "p", "mode": "prompt", "fs_dir": "nothing", "current_version": 0}],
+            [{"id": "p", "base_model": BASE, "mode": "prompt", "fs_dir": "nothing", "current_version": 0}],
             user_id="u",
         ) == {}
         # Nothing promoted yet.
         assert backend._blend_adapter_weights(
-            [{"id": "l", "mode": "local", "fs_dir": "nothing", "current_version": 0}],
+            [{"id": "l", "base_model": BASE, "mode": "local", "fs_dir": "nothing", "current_version": 0}],
             user_id="u",
         ) == {}
         # Closed gate.
@@ -200,6 +226,7 @@ class TestASelectedAdapterNeverVanishes:
             [
                 {
                     "id": "l",
+                    "base_model": BASE,
                     "mode": "local",
                     "fs_dir": "nothing",
                     "current_version": 2,
@@ -333,6 +360,7 @@ class TestModeIsAuthoritative:
         weights once promoted, because injection read `backend`."""
         adapter = {
             "id": "s",
+            "base_model": BASE,
             "mode": "hybrid",
             "backend": "prompt",
             "current_version": 2,
@@ -345,11 +373,202 @@ class TestModeIsAuthoritative:
         (prompt rung) nor prompt (not a prompt backend)."""
         adapter = {
             "id": "s",
+            "base_model": BASE,
             "mode": "prompt",
             "backend": "local",
             "prompt_instructions": "be terse",
         }
         assert "be terse" in self._prompts(adapter)
+
+
+class TestOneBaseIdentityRuleForBothEnds:
+    """Training and serving ask the same question, so they ask it once.
+
+    Training compared the two strings with `!=` while serving compared final
+    path components, so `/models/m` stored against a runtime of `m` was a
+    refusal on one side and a match on the other — and which spelling a
+    deployment happened to store decided whether an adapter could train.
+    """
+
+    def test_the_rule_is_identity_not_resemblance(self):
+        assert transformer.same_base_model("qwen3-4b", "/models/qwen3-4b/")
+        assert transformer.same_base_model("Llama-7B", "llama-7b")
+        # Different frozen weights, however close the names.
+        assert not transformer.same_base_model("llama-7b", "llama-7b-chat")
+        assert not transformer.same_base_model("llama-7b", "llama-7b-v2")
+        # Nothing has the identity of nothing.
+        assert not transformer.same_base_model("", "")
+        assert not transformer.same_base_model(None, "llama-7b")
+
+    def test_training_accepts_the_same_checkpoint_spelled_two_ways(self, tmp_path):
+        store = get_test_store()
+        user = store.create_user(email=f"base_{uuid.uuid4().hex[:8]}@t.local")
+        adapter = store.create_artifact(
+            "adapter",
+            f"a_{uuid.uuid4().hex[:6]}",
+            {
+                "kind": "adapter.lora",
+                "mode": "local",
+                "base_model": "qwen3-4b",
+                "current_version": 0,
+            },
+            owner_user_id=user.id,
+        )
+        service = TrainingService(
+            store=store, fs_root=str(tmp_path), runtime_base_model="/models/qwen3-4b"
+        )
+        assert service._assert_adapter_base(adapter).id == adapter.id
+
+    def test_training_still_refuses_a_different_base(self, tmp_path):
+        from liminallm.storage.errors import ConstraintViolation
+
+        store = get_test_store()
+        user = store.create_user(email=f"base_{uuid.uuid4().hex[:8]}@t.local")
+        adapter = store.create_artifact(
+            "adapter",
+            f"a_{uuid.uuid4().hex[:6]}",
+            {
+                "kind": "adapter.lora",
+                "mode": "local",
+                "base_model": "qwen3-4b",
+                "current_version": 0,
+            },
+            owner_user_id=user.id,
+        )
+        service = TrainingService(
+            store=store, fs_root=str(tmp_path), runtime_base_model="/models/qwen3-14b"
+        )
+        with pytest.raises(ConstraintViolation):
+            service._assert_adapter_base(adapter)
+
+
+class TestWeightsOnlyServeTheirOwnBase:
+    def test_a_different_base_refuses(self, tmp_path, checkpoint, config):
+        """SPEC §5.1: an adapter is fitted to the model that will serve it.
+
+        Training refuses a base mismatch outright; serving used to accept one
+        with a warning, and "same family" accepted it silently. B·A was
+        optimized against one particular frozen W — an eval gate passed on
+        that W says nothing about a different one, however similar the name.
+        """
+        _write(tmp_path / "foreign" / "v0001", _valid_pair(config))
+        backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
+        adapter = {
+            "id": "foreign",
+            "mode": "local",
+            "fs_dir": "foreign",
+            "current_version": 1,
+            "weight": 0.5,
+            "base_model": "some-other-model",
+        }
+        with pytest.raises(ValueError, match="serves"):
+            backend._blend_adapter_weights([adapter], user_id="u", config=config)
+
+    def test_an_undeclared_base_refuses(self, tmp_path, checkpoint, config):
+        """An adapter that does not say what it was trained against cannot
+        demonstrate it was trained against this. (The artifact schema
+        requires base_model, so this shape cannot reach serving from a real
+        artifact — it fails closed anyway.)"""
+        _write(tmp_path / "silent" / "v0001", _valid_pair(config))
+        backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
+        with pytest.raises(ValueError, match="declares base model None"):
+            backend._blend_adapter_weights(
+                [
+                    {
+                        "id": "silent",
+                        "mode": "local",
+                        "fs_dir": "silent",
+                        "current_version": 1,
+                        "weight": 0.5,
+                    }
+                ],
+                user_id="u",
+                config=config,
+            )
+
+    def test_an_unpromoted_adapter_with_a_foreign_base_is_a_no_op(
+        self, tmp_path, checkpoint, config
+    ):
+        """The rule guards weights that are about to be applied.
+
+        Nothing is promoted here, so nothing loads either way. Refusing at
+        selection time instead would make renaming a checkpoint directory an
+        outage on every routed turn, including turns that would have served
+        no weights at all.
+        """
+        _write(tmp_path / "quiet" / "v0001", _valid_pair(config))
+        backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
+        assert (
+            backend._blend_adapter_weights(
+                [
+                    {
+                        "id": "quiet",
+                        "mode": "local",
+                        "fs_dir": "quiet",
+                        "current_version": 0,
+                        "base_model": "some-other-model",
+                    }
+                ],
+                user_id="u",
+                config=config,
+            )
+            == {}
+        )
+
+    def test_the_matching_base_loads(self, tmp_path, checkpoint, config):
+        """A contract, not a wall: the same base still serves, and a path and
+        a bare name for the same checkpoint are the same identity."""
+        _write(tmp_path / "ours" / "v0001", _valid_pair(config))
+        backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
+        base = {
+            "id": "ours",
+            "base_model": BASE,
+            "mode": "local",
+            "fs_dir": "ours",
+            "current_version": 1,
+            "weight": 1.0,
+        }
+        assert backend._blend_adapter_weights(
+            [{**base, "base_model": str(checkpoint)}], user_id="u", config=config
+        )
+        assert backend._blend_adapter_weights(
+            [{**base, "base_model": str(checkpoint).split("/")[-1]}],
+            user_id="u",
+            config=config,
+        )
+
+
+class TestPromotionSurvivesConvenienceState:
+    def test_a_failing_latest_symlink_does_not_undo_a_promotion(self, tmp_path):
+        """`latest` takes no part in serving (§5.5), so it must not be able to
+        abort a run after the gate passed and the version was bumped — which
+        left the §5.4.6 audit unwritten and, on the worker path, retried
+        against weights that were already authoritative."""
+        service = TrainingService(store=None, fs_root=str(tmp_path))
+        adapter_dir = tmp_path / "adapter"
+        version_dir = adapter_dir / "v0001"
+        version_dir.mkdir(parents=True)
+        # A directory where the symlink wants to be: replace() cannot proceed.
+        (adapter_dir / "latest").mkdir()
+        (adapter_dir / "latest" / "occupied").write_text("x")
+
+        service._update_latest_symlink(adapter_dir, version_dir)  # must not raise
+
+    def test_adapter_path_returns_the_root_not_latest(self, tmp_path, checkpoint):
+        """Handing version resolution the `latest` directory made it look for
+        latest/vNNNN, so a promoted artifact became unservable merely because
+        the pointer existed."""
+        backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
+        adapter_root = tmp_path / "adapters" / "skill"
+        _write(adapter_root / "v0001", {"layers.0.attn_q.A": [[0.1]]})
+        (adapter_root / "latest").symlink_to(adapter_root / "v0001")
+
+        resolved = backend._adapter_path({"id": "skill"}, requested_user_id="u")
+        assert resolved == str(adapter_root)
+        assert (
+            backend._resolve_params_path(Path(resolved), current_version=1)
+            == adapter_root / "v0001" / "params.json"
+        )
 
 
 class TestTrainingAndServingSerializeIdentically:

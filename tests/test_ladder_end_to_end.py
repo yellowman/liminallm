@@ -223,6 +223,9 @@ class TestLadderEndToEnd:
             "id": "skill",
             "backend": "prompt",
             "mode": "prompt",
+            # Declared because a real artifact declares it (§5.1); the prompt
+            # rung itself is exempt, carrying no weights to be fitted.
+            "base_model": str(checkpoint),
             "fs_dir": str(adapter_dir),
             "current_version": 0,
         }

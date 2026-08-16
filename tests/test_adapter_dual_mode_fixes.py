@@ -7,7 +7,7 @@ and external API modes:
 3. Deterministic tokenizer fallback (FNV-1a hash)
 
 NOTE: Tests that use LocalJaxLoRABackend require JAX and are skipped
-when JAX is not installed. TestValidateAdapterBaseModel runs without JAX.
+when JAX is not installed.
 """
 
 from __future__ import annotations
@@ -15,9 +15,6 @@ from __future__ import annotations
 import json
 
 import pytest
-
-# Import validate_adapter_base_model unconditionally (doesn't require JAX)
-from liminallm.service.model_backend import validate_adapter_base_model
 
 # Check if JAX is available for LocalJaxLoRABackend tests. The import is the
 # probe — find_spec would say a broken install is present.
@@ -40,130 +37,55 @@ requires_jax = pytest.mark.skipif(not HAS_JAX, reason="JAX not installed")
 # ==============================================================================
 
 
-class TestValidateAdapterBaseModel:
-    """Test base model compatibility validation per SPEC §5.1."""
+@requires_jax
+class TestBaseIdentityGovernsTheWeightPath:
+    """SPEC §5.1: weights load onto the base they were fitted to, or not at all.
 
-    def test_exact_match(self):
-        """Should return valid for exact base model match."""
-        adapter = {"id": "a1", "base_model": "llama-7b"}
-        is_valid, warning = validate_adapter_base_model(adapter, "llama-7b")
+    This class replaces a suite of fuzzy-match tests that pinned a helper the
+    weight path no longer consults. That helper accepted a mistral adapter on
+    a llama backend with a warning, treated "-chat" and "-base" as one model,
+    and stripped version suffixes so v1 weights loaded onto v2. Every one of
+    those is a different frozen W.
+    """
 
-        assert is_valid is True
-        assert warning is None
+    def _backend(self, tmp_path, base="llama-7b"):
+        return LocalJaxLoRABackend(base, str(tmp_path))
 
-    def test_normalized_match(self):
-        """Should normalize model names for comparison."""
-        adapter = {"id": "a1", "base_model": "models/llama-7b"}
-        is_valid, warning = validate_adapter_base_model(adapter, "llama-7b")
+    def test_the_same_name_is_the_same_base(self, tmp_path):
+        backend = self._backend(tmp_path)
+        backend._assert_exact_base_model({"base_model": "llama-7b"}, "a1")
+        # Case and a trailing separator are spelling, not identity.
+        backend._assert_exact_base_model({"base_model": "Llama-7B"}, "a1")
+        # A checkout path and the bare name of the same checkpoint agree.
+        backend._assert_exact_base_model({"base_model": "models/llama-7b"}, "a1")
 
-        assert is_valid is True
-        assert warning is None
+    def test_the_declaration_may_live_in_the_schema(self, tmp_path):
+        backend = self._backend(tmp_path)
+        backend._assert_exact_base_model({"schema": {"base_model": "llama-7b"}}, "a1")
+        backend._assert_exact_base_model({"model": "llama-7b"}, "a1")
 
-    def test_case_insensitive(self):
-        """Should match case-insensitively."""
-        adapter = {"id": "a1", "base_model": "Llama-7B"}
-        is_valid, warning = validate_adapter_base_model(adapter, "llama-7b")
+    @pytest.mark.parametrize(
+        "declared",
+        [
+            "mistral-7b",      # a different model
+            "llama-7b-chat",   # a different fine-tune of the same family
+            "llama-13b",       # a different size
+            "llama-7b-v2",     # a different release
+            None,              # no declaration at all
+            "",
+        ],
+    )
+    def test_anything_else_refuses(self, tmp_path, declared):
+        backend = self._backend(tmp_path)
+        with pytest.raises(ValueError, match="serves 'llama-7b'"):
+            backend._assert_exact_base_model({"base_model": declared}, "a1")
 
-        assert is_valid is True
-        assert warning is None
-
-    def test_variant_match_with_warning(self):
-        """Should match model variants with warning."""
-        adapter = {"id": "a1", "base_model": "llama-7b"}
-        is_valid, warning = validate_adapter_base_model(adapter, "llama-7b-chat")
-
-        assert is_valid is True
-        assert warning is not None
-        assert "variant" in warning.lower()
-
-    def test_family_match_variants(self):
-        """Should recognize model family variants."""
-        # Base vs chat variant
-        adapter = {"id": "a1", "base_model": "llama-7b-base"}
-        is_valid, warning = validate_adapter_base_model(adapter, "llama-7b-chat")
-
-        assert is_valid is True
-        assert "llama-7b" in warning.lower()
-
-    def test_mismatch_different_models(self):
-        """Should detect incompatible base models."""
-        adapter = {"id": "a1", "base_model": "mistral-7b"}
-        is_valid, warning = validate_adapter_base_model(adapter, "llama-7b")
-
-        assert is_valid is True  # Non-strict mode allows but warns
-        assert warning is not None
-        assert "mistral-7b" in warning
-
-    def test_mismatch_strict_mode(self):
-        """Should reject mismatched models in strict mode."""
-        adapter = {"id": "a1", "base_model": "mistral-7b"}
-        is_valid, warning = validate_adapter_base_model(
-            adapter, "llama-7b", strict=True
-        )
-
-        assert is_valid is False
-        assert "incompatible" in warning.lower()
-
-    def test_missing_base_model_non_strict(self):
-        """Should warn but allow missing base_model in non-strict mode."""
-        adapter = {"id": "a1"}
-        is_valid, warning = validate_adapter_base_model(adapter, "llama-7b")
-
-        assert is_valid is True
-        assert warning is not None
-        assert "unverified" in warning.lower()
-
-    def test_missing_base_model_strict(self):
-        """Should reject missing base_model in strict mode."""
-        adapter = {"id": "a1"}
-        is_valid, warning = validate_adapter_base_model(
-            adapter, "llama-7b", strict=True
-        )
-
-        assert is_valid is False
-        assert "missing" in warning.lower()
-
-    def test_base_model_in_schema(self):
-        """Should check schema dict for base_model."""
-        adapter = {"id": "a1", "schema": {"base_model": "llama-7b"}}
-        is_valid, warning = validate_adapter_base_model(adapter, "llama-7b")
-
-        assert is_valid is True
-        assert warning is None
-
-    def test_model_field_as_fallback(self):
-        """Should check 'model' field as alternative to base_model."""
-        adapter = {"id": "a1", "model": "llama-7b"}
-        is_valid, warning = validate_adapter_base_model(adapter, "llama-7b")
-
-        assert is_valid is True
-        assert warning is None
-
-    def test_empty_adapter(self):
-        """Should handle empty/None adapter gracefully."""
-        is_valid, warning = validate_adapter_base_model(None, "llama-7b")
-        assert is_valid is True
-        assert warning is None
-
-        # Empty dict is falsy, treated same as None - nothing to validate
-        is_valid2, warning2 = validate_adapter_base_model({}, "llama-7b")
-        assert is_valid2 is True
-        assert warning2 is None
-
-    def test_version_suffix_normalization(self):
-        """Should normalize version suffixes."""
-        adapter = {"id": "a1", "base_model": "llama-7b-v1.0"}
-        is_valid, warning = validate_adapter_base_model(adapter, "llama-7b-v2.0")
-
-        # Same base, different version - should still match
-        assert is_valid is True
-
-    def test_prefix_normalization(self):
-        """Should strip common prefixes."""
-        adapter = {"id": "a1", "base_model": "hf://meta-llama/llama-7b"}
-        is_valid, warning = validate_adapter_base_model(adapter, "meta-llama/llama-7b")
-
-        assert is_valid is True
+    def test_a_backend_with_no_base_serves_no_weights(self, tmp_path):
+        """Fail closed at both ends: an unnamed serving base cannot be
+        matched, so it cannot be shown to be the base anything was fitted to."""
+        backend = self._backend(tmp_path, base="")
+        with pytest.raises(ValueError, match="serves"):
+            backend._assert_exact_base_model({"base_model": ""}, "a1")
 
 
 # ==============================================================================
@@ -335,6 +257,7 @@ class TestWeightedAdapterBlending:
         adapters = [
             {
                 "id": "adapter1",
+                "base_model": "test-model",
                 "weight": 1.0,
                 "fs_dir": str(tmp_path / "adapters" / "adapter1"),
             }
@@ -363,11 +286,13 @@ class TestWeightedAdapterBlending:
         adapters = [
             {
                 "id": "adapter1",  # A = B = I
+                "base_model": "test-model",
                 "weight": 0.3,
                 "fs_dir": str(tmp_path / "adapters" / "adapter1"),
             },
             {
                 "id": "adapter2",  # A = B = 2I
+                "base_model": "test-model",
                 "weight": 0.7,
                 "fs_dir": str(tmp_path / "adapters" / "adapter2"),
             },
@@ -388,6 +313,7 @@ class TestWeightedAdapterBlending:
         adapters = [
             {
                 "id": "adapter1",
+                "base_model": "test-model",
                 "gate_weight": 0.5,
                 "fs_dir": str(tmp_path / "adapters" / "adapter1"),
             },
@@ -405,6 +331,7 @@ class TestWeightedAdapterBlending:
         adapters = [
             {
                 "id": "adapter1",
+                "base_model": "test-model",
                 "schema": {"weight": 0.5},
                 "fs_dir": str(tmp_path / "adapters" / "adapter1"),
             },
@@ -427,11 +354,13 @@ class TestWeightedAdapterBlending:
         adapters = [
             {
                 "id": "adapter1_zero",  # Unique ID to avoid cache issues
+                "base_model": "test-model",
                 "weight": 0.0,
                 "fs_dir": str(tmp_path / "adapters" / "adapter1"),
             },
             {
                 "id": "adapter2_full",  # Unique ID
+                "base_model": "test-model",
                 "weight": 1.0,
                 "fs_dir": str(tmp_path / "adapters" / "adapter2"),
             },
@@ -450,11 +379,13 @@ class TestWeightedAdapterBlending:
         adapters = [
             {
                 "id": "adapter1",
+                "base_model": "test-model",
                 "weight": 1.5,  # Should be clamped to 1.0
                 "fs_dir": str(tmp_path / "adapters" / "adapter1"),
             },
             {
                 "id": "adapter2",
+                "base_model": "test-model",
                 "weight": -0.5,  # Should be clamped to 0.0
                 "fs_dir": str(tmp_path / "adapters" / "adapter2"),
             },
@@ -474,6 +405,7 @@ class TestWeightedAdapterBlending:
         adapters = [
             {
                 "id": "adapter1",
+                "base_model": "test-model",
                 # No weight specified
                 "fs_dir": str(tmp_path / "adapters" / "adapter1"),
             },
@@ -505,7 +437,7 @@ class TestWeightedAdapterBlending:
 
         def delta_at(gate):
             weights = backend._blend_adapter_weights(
-                [{"id": "adapter1", "weight": gate, "fs_dir": path}],
+                [{"id": "adapter1", "base_model": "test-model", "weight": gate, "fs_dir": path}],
                 user_id="test-user",
             )
             return (weights["layers.0.attn_q.B"] @ weights["layers.0.attn_q.A"]).tolist()[0][0]
@@ -524,11 +456,18 @@ class TestWeightedAdapterBlending:
 class TestDualModeIntegration:
     """Integration tests for dual-mode adapter handling."""
 
-    def test_base_model_validation_in_load(self, tmp_path):
-        """Base model validation should be called during weight loading."""
+    def test_a_mismatched_base_model_refuses_the_weights(self, tmp_path):
+        """SPEC §5.1: an adapter is fitted to the model that will serve it.
+
+        This test used to assert the opposite — that a mistral adapter loads
+        onto a llama backend because non-strict mode "logs a warning but
+        still loads". That recorded the implementation, not the contract:
+        B·A was optimized against one particular frozen W, and an eval gate
+        passed on that W says nothing about a different one. Training already
+        refuses this mismatch; serving now holds the same line.
+        """
         backend = LocalJaxLoRABackend("llama-7b", str(tmp_path))
 
-        # Create adapter with mismatched base model
         adapter_dir = tmp_path / "adapters" / "mismatch"
         adapter_dir.mkdir(parents=True)
         (adapter_dir / "params.json").write_text(json.dumps({"layers.0.attn_q.A": [[1.0]]}))
@@ -539,25 +478,34 @@ class TestDualModeIntegration:
             "fs_dir": str(adapter_dir),
         }
 
-        # Non-strict mode should log warning but still load
-        weights = backend._load_adapter_weights(adapter, user_id="test-user")
-        assert "layers.0.attn_q.A" in weights
+        with pytest.raises(ValueError, match="serves"):
+            backend._load_adapter_weights(adapter, user_id="test-user")
 
-    def test_strict_base_model_rejects_mismatch(self, tmp_path):
-        """Strict mode should reject mismatched base models."""
+        # The matching adapter loads, so this is a contract and not a wall.
+        matching = {**adapter, "base_model": "llama-7b"}
+        assert "layers.0.attn_q.A" in backend._load_adapter_weights(
+            matching, user_id="test-user"
+        )
+
+    def test_a_prompt_rung_adapter_is_exempt(self, tmp_path):
+        """The base rule guards weights, not instructions.
+
+        A prompt-rung adapter carries no tensors, so it has no base to
+        disagree with — and refusing it would silence the ladder's first
+        rung on any deployment that renamed its checkpoint.
+        """
         backend = LocalJaxLoRABackend("llama-7b", str(tmp_path))
 
-        adapter_dir = tmp_path / "adapters" / "mismatch"
+        adapter_dir = tmp_path / "adapters" / "prompted"
         adapter_dir.mkdir(parents=True)
         (adapter_dir / "params.json").write_text(json.dumps({"layers.0.attn_q.A": [[1.0]]}))
 
-        adapter = {
-            "id": "mismatch",
-            "base_model": "mistral-7b",
-            "fs_dir": str(adapter_dir),
-        }
-
-        with pytest.raises(ValueError, match="incompatible"):
-            backend._load_adapter_weights(
-                adapter, user_id="test-user", strict_base_model=True
-            )
+        assert backend._load_adapter_weights(
+            {
+                "id": "prompted",
+                "mode": "prompt",
+                "base_model": "mistral-7b",
+                "fs_dir": str(adapter_dir),
+            },
+            user_id="test-user",
+        ) == {}

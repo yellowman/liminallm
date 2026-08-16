@@ -10,6 +10,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+BASE = "test-model"
+"""The base these adapters declare, and the one the backend below serves.
+
+SPEC §5.1 refuses LoRA weights whose declared base is not the serving base,
+so an adapter fixture without one loads nothing and the checksum path under
+test is never reached.
+"""
+
 
 class TestAdapterChecksumValidation:
     """Tests for _load_adapter_weights checksum validation."""
@@ -50,6 +58,7 @@ class TestAdapterChecksumValidation:
 
         adapter = {
             "id": "test-adapter",
+            "base_model": BASE,
             "checksum": checksum,
         }
 
@@ -79,6 +88,7 @@ class TestAdapterChecksumValidation:
 
         adapter = {
             "id": "test-adapter",
+            "base_model": BASE,
             "checksum": "invalid_checksum_that_wont_match",
         }
 
@@ -99,6 +109,7 @@ class TestAdapterChecksumValidation:
 
         adapter = {
             "id": "test-adapter",
+            "base_model": BASE,
             "checksum": "wrong_checksum",
         }
 
@@ -127,6 +138,7 @@ class TestAdapterChecksumValidation:
 
         adapter = {
             "id": "test-adapter",
+            "base_model": BASE,
             # No checksum provided
         }
 
@@ -165,6 +177,7 @@ class TestAdapterChecksumValidation:
 
         adapter = {
             "id": "test-adapter",
+            "base_model": BASE,
             "schema": {"checksum": checksum},
         }
 
@@ -192,6 +205,7 @@ class TestAdapterChecksumValidation:
 
         adapter = {
             "id": "test-adapter",
+            "base_model": BASE,
             "checksum": correct_checksum,
             "schema": {"checksum": "wrong_in_schema"},
         }
@@ -236,7 +250,7 @@ class TestAdapterChecksumValidation:
 
         adapter_dir, checksum = self.create_adapter_file(tmp_path, valid_weights)
         params_path = adapter_dir / "params.json"
-        adapter = {"id": "test-adapter", "checksum": checksum}
+        adapter = {"id": "test-adapter", "base_model": BASE, "checksum": checksum}
 
         with patch.object(mock_backend, "_adapter_path", return_value=str(adapter_dir)):
             with patch.object(
@@ -263,6 +277,7 @@ class TestAdapterChecksumValidation:
 
         adapter = {
             "id": "test-adapter",
+            "base_model": BASE,
             "checksum": checksum,
         }
 

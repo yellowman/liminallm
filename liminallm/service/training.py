@@ -190,7 +190,16 @@ class TrainingService:
         stored_base = (
             adapter.schema.get("base_model") if adapter and adapter.schema else None
         )
-        if runtime_base and stored_base and stored_base != runtime_base:
+        # One identity rule for both ends of the ladder (SPEC §5.1). Raw
+        # string inequality made a checkout path and its own directory name
+        # two different models here while serving called them one, so which
+        # spelling a deployment happened to store decided whether an adapter
+        # could be trained at all.
+        if (
+            runtime_base
+            and stored_base
+            and not transformer.same_base_model(stored_base, runtime_base)
+        ):
             migration_plan = {
                 "expected_base": runtime_base,
                 "stored_base": stored_base,
@@ -249,7 +258,11 @@ class TrainingService:
             adapter = existing[0]
             runtime_base = self.runtime_base_model
             stored_base = adapter.schema.get("base_model") if adapter.schema else None
-            if runtime_base and stored_base and stored_base != runtime_base:
+            if (
+                runtime_base
+                and stored_base
+                and not transformer.same_base_model(stored_base, runtime_base)
+            ):
                 migration_plan = {
                     "expected_base": runtime_base,
                     "stored_base": stored_base,
@@ -1295,15 +1308,22 @@ class TrainingService:
             temp.symlink_to(version_dir, target_is_directory=True)
             temp.replace(latest)
         except OSError as exc:
+            # Best-effort, deliberately. `latest` is convenience state that
+            # serving does not consult (SPEC §5.5); `current_version` is the
+            # authority and has already been written by the time this runs.
+            # Re-raising meant a failed symlink aborted the run *after* the
+            # adapter was promoted, so the gate decision §5.4.6 requires for
+            # audit was never recorded — and on the worker path the job then
+            # retried against weights that were already authoritative.
             logger.warning(
                 "update_latest_symlink_failed",
                 adapter_dir=str(adapter_dir),
                 version_dir=str(version_dir),
                 error=str(exc),
+                detail="promotion stands; latest is convenience state only",
             )
             with suppress(FileNotFoundError):
                 temp.unlink(missing_ok=True)  # type: ignore[arg-type]
-            raise
 
     @staticmethod
     def _normalize_feedback_score(

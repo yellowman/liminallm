@@ -106,125 +106,6 @@ def filter_adapters_by_mode(adapters: List[dict], compatible_modes: set) -> List
     return result
 
 
-def validate_adapter_base_model(
-    adapter: dict,
-    backend_base_model: str,
-    *,
-    strict: bool = False,
-) -> Tuple[bool, Optional[str]]:
-    """Validate that adapter was trained on a compatible base model.
-
-    Per SPEC §5.1, LoRA adapters are tied to specific base models. Using an adapter
-    with an incompatible base model can produce incorrect or degraded outputs.
-
-    Args:
-        adapter: Adapter dict with optional base_model field
-        backend_base_model: The base model the inference backend is using
-        strict: If True, reject adapters with missing base_model field
-
-    Returns:
-        Tuple of (is_valid, warning_message)
-        - is_valid: True if adapter is compatible or validation can't be determined
-        - warning_message: Human-readable warning if validation failed or uncertain
-    """
-    if not adapter:
-        return True, None
-
-    adapter_id = adapter.get("id") or adapter.get("name") or "unknown"
-    schema = adapter.get("schema", {})
-
-    # Extract adapter's base model
-    adapter_base = (
-        adapter.get("base_model")
-        or schema.get("base_model")
-        or adapter.get("model")
-        or schema.get("model")
-    )
-
-    if not adapter_base:
-        if strict:
-            return (
-                False,
-                f"Adapter '{adapter_id}' missing base_model field (strict mode)",
-            )
-        logger.warning(
-            "adapter_base_model_missing",
-            adapter_id=adapter_id,
-            backend_base_model=backend_base_model,
-            message="Adapter has no base_model field; compatibility cannot be verified",
-        )
-        return (
-            True,
-            f"Adapter '{adapter_id}' has no base_model; compatibility unverified",
-        )
-
-    # Normalize model names for comparison
-    def normalize_model_name(name: str) -> str:
-        """Normalize model name for fuzzy matching."""
-        name = name.lower().strip()
-        # Remove common prefixes/suffixes
-        for prefix in ("models/", "model/", "hf://", "huggingface/"):
-            if name.startswith(prefix):
-                name = name[len(prefix) :]
-        # Remove version suffixes for family comparison
-        # e.g., "llama-7b-v1.0" -> "llama-7b"
-        for suffix in ("-v1", "-v2", "-v1.0", "-v2.0", ".0", ".1"):
-            if name.endswith(suffix):
-                name = name[: -len(suffix)]
-        return name
-
-    adapter_normalized = normalize_model_name(adapter_base)
-    backend_normalized = normalize_model_name(backend_base_model)
-
-    # Check for exact match (after normalization)
-    if adapter_normalized == backend_normalized:
-        return True, None
-
-    # Check for model family compatibility (e.g., llama-7b adapter on llama-7b-chat)
-    # Extract base family name (first part before version/variant)
-    def extract_family(name: str) -> str:
-        # Split on common separators and take base
-        for sep in ("-chat", "-instruct", "-base", "-hf", "-gguf"):
-            if sep in name:
-                name = name.split(sep)[0]
-        return name
-
-    adapter_family = extract_family(adapter_normalized)
-    backend_family = extract_family(backend_normalized)
-
-    if adapter_family == backend_family:
-        # Same family but different variant - likely compatible but warn
-        logger.info(
-            "adapter_base_model_variant_match",
-            adapter_id=adapter_id,
-            adapter_base_model=adapter_base,
-            backend_base_model=backend_base_model,
-            message="Adapter base model is variant of backend model; proceeding with caution",
-        )
-        return (
-            True,
-            f"Adapter '{adapter_id}' trained on '{adapter_base}' (variant of '{backend_base_model}')",
-        )
-
-    # Incompatible base models
-    logger.warning(
-        "adapter_base_model_mismatch",
-        adapter_id=adapter_id,
-        adapter_base_model=adapter_base,
-        backend_base_model=backend_base_model,
-        message="Adapter was trained on different base model; outputs may be degraded",
-    )
-    if strict:
-        return (
-            False,
-            f"Adapter '{adapter_id}' incompatible: trained on '{adapter_base}', backend uses '{backend_base_model}'",
-        )
-    return (
-        True,
-        f"Adapter '{adapter_id}' trained on '{adapter_base}' but backend uses '{backend_base_model}'",
-    )
-
-
 _OPENAI_SPEC = importlib.util.find_spec("openai")
 if _OPENAI_SPEC:
     from openai import OpenAI as _OpenAIClient  # pragma: no cover
@@ -2000,23 +1881,21 @@ class LocalJaxLoRABackend:
         adapter: dict,
         *,
         user_id: Optional[str] = None,
-        strict_base_model: bool = False,
     ) -> dict:
         """Load adapter weights from filesystem with checksum and base model verification.
 
         Per SPEC §18, checksum of params is verified against schema.checksum before activation.
-        Per SPEC §5.1, base model compatibility is validated to prevent degraded outputs.
+        Per SPEC §5.1, the declared base must be the serving base, exactly.
 
         Args:
             adapter: Adapter dict with weights path and metadata
             user_id: User context for ownership validation
-            strict_base_model: If True, reject adapters with incompatible base model
 
         Returns:
             Weight dict with LoRA matrices as JAX arrays
 
         Raises:
-            ValueError: If checksum mismatch or base model incompatible (in strict mode)
+            ValueError: If the checksum mismatches or the base model is not ours
         """
         if not adapter:
             return {}
@@ -2034,22 +1913,6 @@ class LocalJaxLoRABackend:
             logger.debug("adapter_prompt_mode_carries_no_weights", adapter_id=adapter_id)
             return {}
 
-        # Validate base model compatibility before loading weights
-        is_compatible, warning = validate_adapter_base_model(
-            adapter, self.base_model, strict=strict_base_model
-        )
-        if not is_compatible:
-            raise ValueError(
-                warning or f"Adapter '{adapter_id}' incompatible with base model"
-            )
-        if warning:
-            # Log warning but continue - adapter may still work
-            logger.info(
-                "adapter_base_model_warning",
-                adapter_id=adapter_id,
-                warning=warning,
-            )
-
         path = Path(self._adapter_path(adapter, requested_user_id=user_id))
         # SPEC §5.4.6: only the promoted version may be served. current_version
         # is authoritative - without it, resolution would fall back to "newest
@@ -2061,6 +1924,25 @@ class LocalJaxLoRABackend:
         params_path = self._resolve_params_path(path, current_version=current_version)
         if not params_path:
             return {}
+
+        # SPEC §5.1: an adapter is fitted to the model that will serve it, and
+        # training refuses to run when the bases disagree. Serving holds the
+        # same line — B·A was optimized against one particular frozen W, and
+        # passing the eval gate on that W says nothing about W'.
+        #
+        # Placed here, after resolution and before the cache, so it guards
+        # exactly what it is about: weights that are about to be applied.
+        # Checking it earlier also refused adapters that would contribute no
+        # weights at all (nothing promoted yet, gate closed), which turns a
+        # no-op into an outage — renaming a checkpoint directory would have
+        # taken down every routed turn rather than just the weight-bearing
+        # ones. This is the only base check on the weight path; a
+        # family-similarity pass used to run beside it, which was both dead
+        # (an exact match is a family match) and contradictory (it compared
+        # whole strings, so in strict mode it refused an adapter naming the
+        # same checkpoint by a different path).
+        self._assert_exact_base_model(adapter, adapter_id)
+
         mtime = params_path.stat().st_mtime
         # Keyed by (adapter_id, version) as SPEC §5.3 declares, not by id
         # alone: two versions of one adapter are different weights, and an id
@@ -2140,9 +2022,12 @@ class LocalJaxLoRABackend:
                 return None
             return path
         # When the artifact records a promoted version, serve exactly that
-        # version (or the `latest` pointer maintained alongside it). Never fall
-        # back to scanning for the newest directory: an un-promoted version
-        # left on disk by a gate-rejected training run would win that scan.
+        # version. Never fall back to scanning for the newest directory: an
+        # un-promoted version left on disk by a gate-rejected training run
+        # would win that scan. (This comment used to add "or the `latest`
+        # pointer maintained alongside it", which the code below stopped
+        # doing — and a comment describing the behaviour it replaced reads as
+        # a licence to restore it.)
         try:
             pinned = int(current_version) if current_version is not None else 0
         except (TypeError, ValueError):
@@ -2764,6 +2649,29 @@ class LocalJaxLoRABackend:
         except (TypeError, ValueError):
             return 0
 
+    def _assert_exact_base_model(self, adapter: dict, adapter_id: str) -> None:
+        """Refuse weights whose declared base is not the serving base.
+
+        Identity comes from `transformer.same_base_model`, the same rule
+        training applies before it fits anything (SPEC §5.1). Fails closed on
+        a missing declaration too: an adapter that does not say what it was
+        trained against cannot demonstrate it was trained against this.
+        """
+        schema = adapter.get("schema") if isinstance(adapter.get("schema"), dict) else {}
+        declared = (
+            adapter.get("base_model")
+            or (schema or {}).get("base_model")
+            or adapter.get("model")
+            or (schema or {}).get("model")
+        )
+        if transformer.same_base_model(declared, self.base_model):
+            return
+        raise ValueError(
+            f"adapter {adapter_id!r} declares base model {declared!r}, but this "
+            f"backend serves {self.base_model!r}; LoRA weights are fitted to one "
+            "frozen base and refusing is the only safe reading of a mismatch"
+        )
+
     def _refuse_if_weights_expected(self, adapter: dict) -> None:
         """Raise when a selected adapter that should carry weights has none."""
         mode = self._adapter_mode_of(adapter)
@@ -2949,8 +2857,10 @@ class LocalJaxLoRABackend:
                 raise ValueError("adapter path must reside within fs_root")
             return str(resolved)
         adapter_id = adapter.get("id", "unknown")
-        candidate = safe_join(self.fs_root, f"adapters/{adapter_id}")
-        latest = candidate / "latest"
-        if latest.exists():
-            return str(latest)
-        return str(candidate)
+        # The adapter ROOT. Returning `latest` when it existed handed version
+        # resolution a directory that has no vNNNN inside it, so a promoted
+        # artifact with adapters/A/v0001 became unservable merely because
+        # A/latest also existed — and it contradicted §5.5, which says
+        # serving does not consult that pointer. Version resolution alone
+        # chooses the directory.
+        return str(safe_join(self.fs_root, f"adapters/{adapter_id}"))

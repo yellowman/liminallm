@@ -795,6 +795,38 @@ identical the checkpoint and tokenizer are.
   promise — and it is asserted by a test that the base weights come out of
   training bit-identical.
 
+#### weights serve one base, and only that base (normative)
+
+before any LoRA weights load, the adapter's declared base must be the base
+the backend serves. identity is compared on the final path component,
+case-insensitively, so `/models/qwen3-4b` and `qwen3-4b` are the same
+checkpoint named two ways — and nothing looser. **an undeclared base refuses
+too**: an adapter that does not say what it was fitted against cannot show it
+was fitted against this one.
+
+**one implementation answers it for both ends** of the ladder
+(`transformer.same_base_model`): training asks it before fitting an adapter,
+serving before applying one. two spellings of the same rule drift, and the
+looser one decides — training compared the raw strings while serving compared
+path components, so which spelling a deployment happened to store determined
+whether an adapter could be trained at all.
+
+the rule is a consequence of §5.2, not a policy choice. `B·A` was optimized
+against one particular frozen `W`, so a gate (§5.4.6) passed on that `W` says
+nothing about a different one. training already refuses a base mismatch; a
+serving path that accepted one with a warning applied weights no gate ever
+scored. a family-similarity comparison — treating `-chat`, `-base` and
+version suffixes as the same model — is expressly not sufficient here: those
+are different frozen weights and therefore different models.
+
+the rule guards weights, not adapters. it is checked at the point weights
+would be applied — after version resolution (§5.5) and before the adapter
+cache — so a prompt-rung adapter, an adapter with nothing promoted yet, and
+one whose router gate is closed are all unaffected: they contribute no
+tensors either way. checking it at selection time instead would turn renaming
+a checkpoint directory into an outage on every routed turn rather than on the
+weight-bearing ones.
+
 ### 5.2 lora parameterization
 
 for each hooked weight matrix `W ∈ ℝ^{d_out × d_in}`:
@@ -1046,9 +1078,15 @@ loop for a `training_job`:
      training objective: the gate asks whether predictions improved, and
      since `B` starts at zero and can only grow, charging the regularizer to
      the eval would count honest learning as a penalty against promotion.
-   - a new adapter version is promoted (becomes `latest`, bumps
-     `current_version`, and graduates a prompt-mode adapter to `hybrid` per
-     §5.5) **only** when holdout loss improves by ≥1% relative.
+   - a new adapter version is promoted (bumps `current_version` — which is
+     what promotion *is* — and graduates a prompt-mode adapter to `hybrid`
+     per §5.5) **only** when holdout loss improves by ≥1% relative. the
+     `latest` pointer is refreshed for humans and tooling as a side effect,
+     and is **best-effort**: it is not consulted by serving (§5.5), so a
+     failure to write it is logged and the promotion stands. re-raising there
+     aborted a run *after* the version was bumped, which left the gate
+     decision below unrecorded and let the worker retry against weights that
+     were already authoritative.
    - a skipped run (JAX unavailable) or a regression **never** promotes:
      the artifact is left untouched and the gate decision is recorded in
      `training_job.meta.eval_gate` for audit. "training ran without raising"
@@ -1159,6 +1197,10 @@ cluster qualifies          pooled events ≥ threshold      eval gate passes
      answered. a path pointing straight at a `params.json` cannot demonstrate
      which version it is, so it cannot satisfy a versioned artifact at all
      (only an artifact that has never been versioned may use one).
+     resolution therefore starts at the adapter **root** (`adapters/<id>`),
+     never at `adapters/<id>/latest`: handing it the pointer made it look for
+     `latest/vNNNN`, so a correctly promoted adapter became unservable merely
+     because the convenience pointer existed beside its versions.
    - **after graduation the prompt is the fallback, not a second voice.** on a
      backend that applies LoRA weights, a promoted hybrid adapter is carried
      by its weights and its `prompt_instructions` are NOT injected (§5.0.1);

@@ -34,10 +34,24 @@ from liminallm.service.training import TrainingService  # noqa: E402
 from tests.harness import get_test_store  # noqa: E402
 from tests.test_local_transformer import _build_checkpoint  # noqa: E402
 
+BASE = ""
+"""The serving base identity these fixtures' adapters declare.
 
-@pytest.fixture(scope="module")
+SPEC §5.1 ties LoRA weights to one frozen base, so serving refuses an adapter
+that does not declare the base it is being applied to — a fixture without one
+describes an adapter the artifact schema could not store either.
+"""
+
+
+@pytest.fixture(scope="module", autouse=True)
 def checkpoint(tmp_path_factory):
-    return _build_checkpoint(tmp_path_factory.mktemp("contract_model"))
+    """autouse so BASE is set before any test in the module reads it, whatever
+    order they run in — an unset BASE would refuse weights for the wrong
+    reason."""
+    global BASE
+    directory = _build_checkpoint(tmp_path_factory.mktemp("contract_model"))
+    BASE = str(directory)
+    return directory
 
 
 @pytest.fixture(scope="module")
@@ -106,6 +120,7 @@ class TestMalformedAdaptersNeverPartiallyApply:
                 [{"role": "user", "content": "hello"}],
                 [{
                     "id": "mixed",
+                    "base_model": BASE,
                     "backend": "local",
                     "mode": "local",
                     "fs_dir": "mixed",
@@ -138,6 +153,7 @@ class TestHybridIsWeightsOrPromptNotBoth:
         the behaviour the weights already carry."""
         adapter = {
             "id": "skill",
+            "base_model": BASE,
             "backend": "hybrid",
             "mode": "hybrid",
             "current_version": 2,
@@ -152,6 +168,7 @@ class TestHybridIsWeightsOrPromptNotBoth:
         the adapter has, and dropping it would silence it entirely."""
         adapter = {
             "id": "skill",
+            "base_model": BASE,
             "backend": "hybrid",
             "mode": "hybrid",
             "current_version": 0,
@@ -162,6 +179,7 @@ class TestHybridIsWeightsOrPromptNotBoth:
     def test_prompt_mode_injects_on_every_backend(self):
         adapter = {
             "id": "p",
+            "base_model": BASE,
             "backend": "prompt",
             "mode": "prompt",
             "prompt_instructions": "be terse",
@@ -247,6 +265,7 @@ class TestVersionAuthorityOverPathShape:
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
         adapter = {
             "id": "direct",
+            "base_model": BASE,
             "backend": "local",
             "mode": "local",
             "fs_dir": str(params),

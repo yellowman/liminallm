@@ -28,10 +28,24 @@ pytest.importorskip("safetensors")
 from liminallm.service.model_backend import LocalJaxLoRABackend  # noqa: E402
 from tests.test_local_transformer import _build_checkpoint  # noqa: E402
 
+BASE = ""
+"""The serving base identity these fixtures' adapters declare.
 
-@pytest.fixture(scope="module")
+SPEC §5.1 ties LoRA weights to one frozen base, so serving refuses an adapter
+that does not declare the base it is being applied to — a fixture without one
+describes an adapter the artifact schema could not store either.
+"""
+
+
+@pytest.fixture(scope="module", autouse=True)
 def checkpoint(tmp_path_factory):
-    return _build_checkpoint(tmp_path_factory.mktemp("compose_model"))
+    """autouse so BASE is set before any test in the module reads it, whatever
+    order they run in — an unset BASE would refuse weights for the wrong
+    reason."""
+    global BASE
+    directory = _build_checkpoint(tmp_path_factory.mktemp("compose_model"))
+    BASE = str(directory)
+    return directory
 
 
 @pytest.fixture(scope="module")
@@ -93,7 +107,7 @@ class TestGateWeights:
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
         _adapter_on_disk(tmp_path / "one", config, seed=1)
         _, params = transformer.load_checkpoint(checkpoint)
-        adapter = {"id": "one", "backend": "local", "fs_dir": "one"}
+        adapter = {"id": "one", "base_model": BASE, "backend": "local", "fs_dir": "one"}
 
         full = _effective_delta(
             backend._blend_adapter_weights([{**adapter, "weight": 1.0}], user_id="u")
@@ -125,7 +139,7 @@ class TestGateWeights:
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
         _adapter_on_disk(tmp_path / "off", config, seed=2)
         blended = backend._blend_adapter_weights(
-            [{"id": "off", "backend": "local", "fs_dir": "off", "weight": 0.0}],
+            [{"id": "off", "base_model": BASE, "backend": "local", "fs_dir": "off", "weight": 0.0}],
             user_id="u",
         )
         assert blended == {}
@@ -141,12 +155,12 @@ class TestGateWeights:
 
         plain = _effective_delta(
             backend._blend_adapter_weights(
-                [{"id": "plain", "backend": "local", "fs_dir": "plain"}], user_id="u"
+                [{"id": "plain", "base_model": BASE, "backend": "local", "fs_dir": "plain"}], user_id="u"
             )
         )
         scaled = _effective_delta(
             backend._blend_adapter_weights(
-                [{"id": "scaled", "backend": "local", "fs_dir": "scaled"}], user_id="u"
+                [{"id": "scaled", "base_model": BASE, "backend": "local", "fs_dir": "scaled"}], user_id="u"
             )
         )
         assert float(jnp.max(jnp.abs(plain))) > 1e-6
@@ -177,8 +191,8 @@ class TestTwoAdaptersCompose:
         _adapter_on_disk(tmp_path / "a1", config, seed=11)
         _adapter_on_disk(tmp_path / "a2", config, seed=22, rank=2)  # differing rank
         _, params = transformer.load_checkpoint(checkpoint)
-        first = {"id": "a1", "backend": "local", "fs_dir": "a1", "weight": 0.6}
-        second = {"id": "a2", "backend": "local", "fs_dir": "a2", "weight": 0.4}
+        first = {"id": "a1", "base_model": BASE, "backend": "local", "fs_dir": "a1", "weight": 0.6}
+        second = {"id": "a2", "base_model": BASE, "backend": "local", "fs_dir": "a2", "weight": 0.4}
 
         alone_first = _effective_delta(
             backend._blend_adapter_weights([first], user_id="u")
@@ -217,8 +231,8 @@ class TestTwoAdaptersCompose:
         _adapter_on_disk(tmp_path / "r2", config, seed=6, rank=2)
         blended = backend._blend_adapter_weights(
             [
-                {"id": "r4", "backend": "local", "fs_dir": "r4"},
-                {"id": "r2", "backend": "local", "fs_dir": "r2"},
+                {"id": "r4", "base_model": BASE, "backend": "local", "fs_dir": "r4"},
+                {"id": "r2", "base_model": BASE, "backend": "local", "fs_dir": "r2"},
             ],
             user_id="u",
         )
@@ -449,7 +463,7 @@ class TestSftSequenceConstruction:
         adapter_dir.mkdir()
         (adapter_dir / "params.json").write_text(params_path.read_text())
         blended = backend._blend_adapter_weights(
-            [{"id": "e2e", "backend": "local", "fs_dir": "served", "weight": 1.0}],
+            [{"id": "e2e", "base_model": BASE, "backend": "local", "fs_dir": "served", "weight": 1.0}],
             user_id="u",
         )
         assert transformer.lora_by_layer(jnp, blended, config.num_layers) is not None

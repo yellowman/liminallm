@@ -19,10 +19,24 @@ pytest.importorskip("safetensors")
 from liminallm.service.model_backend import LocalJaxLoRABackend  # noqa: E402
 from tests.test_local_transformer import _build_checkpoint  # noqa: E402
 
+BASE = ""
+"""The serving base identity these fixtures' adapters declare.
 
-@pytest.fixture(scope="module")
+SPEC §5.1 ties LoRA weights to one frozen base, so serving refuses an adapter
+that does not declare the base it is being applied to — a fixture without one
+describes an adapter the artifact schema could not store either.
+"""
+
+
+@pytest.fixture(scope="module", autouse=True)
 def checkpoint(tmp_path_factory):
-    return _build_checkpoint(tmp_path_factory.mktemp("gate_model"))
+    """autouse so BASE is set before any test in the module reads it, whatever
+    order they run in — an unset BASE would refuse weights for the wrong
+    reason."""
+    global BASE
+    directory = _build_checkpoint(tmp_path_factory.mktemp("gate_model"))
+    BASE = str(directory)
+    return directory
 
 
 def _write_adapter(directory, config, *, value, rank=2):
@@ -119,7 +133,7 @@ class TestRouterGatesReachTheModel:
         config = transformer.load_config(checkpoint)
         _write_adapter(tmp_path / "ad", config, value=0.05)
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
-        adapter = {"id": "ad", "backend": "local", "fs_dir": "ad"}
+        adapter = {"id": "ad", "base_model": BASE, "backend": "local", "fs_dir": "ad"}
 
         full = backend._blend_adapter_weights(
             [{**adapter, "weight": 1.0}], user_id="u"
@@ -158,7 +172,7 @@ class TestGateAwareKvCache:
         backend = LocalJaxLoRABackend(
             str(checkpoint), str(tmp_path), max_new_tokens=2
         )
-        adapter = {"id": "ad", "backend": "local", "fs_dir": "ad"}
+        adapter = {"id": "ad", "base_model": BASE, "backend": "local", "fs_dir": "ad"}
         messages = [{"role": "user", "content": "hello there friend"}]
 
         backend.generate(messages, [{**adapter, "weight": 0.8}], user_id="u")
@@ -194,8 +208,8 @@ class TestCompositionRefusesRatherThanPartiallyApplies:
         with pytest.raises(ValueError, match="refusing the adapter stack"):
             backend._blend_adapter_weights(
                 [
-                    {"id": "ok", "backend": "local", "fs_dir": "ok"},
-                    {"id": "bad", "backend": "local", "fs_dir": "bad"},
+                    {"id": "ok", "base_model": BASE, "backend": "local", "fs_dir": "ok"},
+                    {"id": "bad", "base_model": BASE, "backend": "local", "fs_dir": "bad"},
                 ],
                 user_id="u",
             )
@@ -208,7 +222,7 @@ class TestCompositionRefusesRatherThanPartiallyApplies:
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
         with pytest.raises(ValueError, match="refusing the adapter stack"):
             backend._blend_adapter_weights(
-                [{"id": "half", "backend": "local", "fs_dir": "half"}], user_id="u"
+                [{"id": "half", "base_model": BASE, "backend": "local", "fs_dir": "half"}], user_id="u"
             )
 
 
@@ -229,6 +243,7 @@ class TestPromotedVersionIsWhatServes:
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
         adapter = {
             "id": "skill",
+            "base_model": BASE,
             "backend": "local",
             "fs_dir": str(adapter_dir),
             "current_version": 1,
@@ -244,7 +259,7 @@ class TestPromotedVersionIsWhatServes:
         _write_adapter(adapter_dir / "v0001", config, value=0.05)
         _write_adapter(adapter_dir / "v0002", config, value=0.9)
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
-        base = {"id": "skill", "backend": "local", "fs_dir": str(adapter_dir)}
+        base = {"id": "skill", "base_model": BASE, "backend": "local", "fs_dir": str(adapter_dir)}
 
         first = backend._blend_adapter_weights(
             [{**base, "current_version": 1}], user_id="u"
