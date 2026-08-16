@@ -17,7 +17,8 @@ after: backend lanes, model handling, replicas, and ops defaults.
 ## backend lanes and scenarios
 ### local gpu lora (adapters only; base stays frozen)
 - set `model_backend` to `local_gpu_lora` and `model_path` to `/srv/liminallm/models/<base-model>` (hugging face-style dir) in the admin console.
-- copy base weights into `/srv/liminallm/models`; adapters live under `/srv/liminallm/adapters/<adapter_id>/adapter.lora`.
+- copy base weights into `/srv/liminallm/models` (`config.json` + `*.safetensors` + tokenizer files; a checkpoint that exists but will not load fails requests rather than degrading to the synthetic stand-in).
+- adapters live under `/srv/liminallm/adapters/<adapter_id>/vNNNN/params.json`, one directory per trained version. serving reads **only** the version the artifact's `current_version` names — a loose `params.json`, a `latest` pointer, or the newest directory on disk are not servable state, so hand-placing weights does nothing until an artifact records the version. the directory is named for the adapter that owns it; an explicit `fs_dir` may move it, never rename it to another adapter's.
 - gpu prep: install the matching jax gpu wheel (cuda/rocm), verify `nvidia-smi` sees the card, and keep drivers + cuda in `$LD_LIBRARY_PATH`.
 - run: `python -m uvicorn liminallm.app:app --host 0.0.0.0 --port 8000 --workers 1` (jax likes fewer workers). requests specify `adapter_id` and optionally `adapter_mode` (local/hybrid/prompt); the backend overlays adapters over the frozen base and serves tokens locally.
 - the base model remains immutable; training writes only adapter weights.
@@ -28,7 +29,7 @@ after: backend lanes, model handling, replicas, and ops defaults.
 - scenarios:
   - **managed foundation only**: set `base_model` to the provider model, omit adapters for pure hosted inference.
   - **hosted foundation + local adapters**: keep adapters on disk and send adapter metadata with the request so the provider overlays your deltas over its model.
-  - **prompt-only adapters**: for providers without lora, use `adapter_mode=prompt` to inject adapter prompts instead of weights.
+  - **prompt-only adapters**: for providers without lora, use `adapter_mode=prompt` to inject adapter prompts instead of weights. the injection happens once, in the service, before any backend runs — backends transport prepared messages and never add a second copy.
 - switching providers is an admin-console change: set `model_backend` and the provider key; model services rebuild without a restart.
 
 ### hybrid deployments

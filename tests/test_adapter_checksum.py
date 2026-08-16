@@ -64,6 +64,10 @@ class TestAdapterChecksumValidation:
         adapter = {
             "id": "test-adapter",
             "base_model": BASE,
+            # Promoted: §5.5 answers "no weights" from metadata before any
+            # path is consulted, so an unversioned fixture never reaches the
+            # checksum these tests are about.
+            "current_version": 1,
             "checksum": checksum,
         }
 
@@ -94,6 +98,10 @@ class TestAdapterChecksumValidation:
         adapter = {
             "id": "test-adapter",
             "base_model": BASE,
+            # Promoted: §5.5 answers "no weights" from metadata before any
+            # path is consulted, so an unversioned fixture never reaches the
+            # checksum these tests are about.
+            "current_version": 1,
             "checksum": "invalid_checksum_that_wont_match",
         }
 
@@ -115,6 +123,10 @@ class TestAdapterChecksumValidation:
         adapter = {
             "id": "test-adapter",
             "base_model": BASE,
+            # Promoted: §5.5 answers "no weights" from metadata before any
+            # path is consulted, so an unversioned fixture never reaches the
+            # checksum these tests are about.
+            "current_version": 1,
             "checksum": "wrong_checksum",
         }
 
@@ -144,6 +156,10 @@ class TestAdapterChecksumValidation:
         adapter = {
             "id": "test-adapter",
             "base_model": BASE,
+            # Promoted: §5.5 answers "no weights" from metadata before any
+            # path is consulted, so an unversioned fixture never reaches the
+            # checksum these tests are about.
+            "current_version": 1,
             # No checksum provided
         }
 
@@ -183,6 +199,10 @@ class TestAdapterChecksumValidation:
         adapter = {
             "id": "test-adapter",
             "base_model": BASE,
+            # Promoted: §5.5 answers "no weights" from metadata before any
+            # path is consulted, so an unversioned fixture never reaches the
+            # checksum these tests are about.
+            "current_version": 1,
             "schema": {"checksum": checksum},
         }
 
@@ -211,6 +231,10 @@ class TestAdapterChecksumValidation:
         adapter = {
             "id": "test-adapter",
             "base_model": BASE,
+            # Promoted: §5.5 answers "no weights" from metadata before any
+            # path is consulted, so an unversioned fixture never reaches the
+            # checksum these tests are about.
+            "current_version": 1,
             "checksum": correct_checksum,
             "schema": {"checksum": "wrong_in_schema"},
         }
@@ -255,7 +279,7 @@ class TestAdapterChecksumValidation:
 
         adapter_dir, checksum = self.create_adapter_file(tmp_path, valid_weights)
         params_path = adapter_dir / "params.json"
-        adapter = {"id": "test-adapter", "base_model": BASE, "checksum": checksum}
+        adapter = {"id": "test-adapter", "base_model": BASE, "current_version": 1, "checksum": checksum}
 
         with patch.object(mock_backend, "_adapter_path", return_value=str(adapter_dir)):
             with patch.object(
@@ -283,6 +307,10 @@ class TestAdapterChecksumValidation:
         adapter = {
             "id": "test-adapter",
             "base_model": BASE,
+            # Promoted: §5.5 answers "no weights" from metadata before any
+            # path is consulted, so an unversioned fixture never reaches the
+            # checksum these tests are about.
+            "current_version": 1,
             "checksum": checksum,
         }
 

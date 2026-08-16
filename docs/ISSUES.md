@@ -1103,7 +1103,9 @@ Training jobs perform multiple database operations:
 
 **Location:** `liminallm/service/training.py:680-705`
 
-**Fix Applied:** `_update_latest_symlink` now wraps symlink creation/replacement in an error-handling guard that logs failures, cleans up temporary links, and propagates the exception so callers can respond instead of silently continuing.
+**Fix Applied:** `_update_latest_symlink` wraps symlink creation/replacement in an error-handling guard that logs failures and cleans up temporary links.
+
+**Superseded:** it no longer propagates the exception. Re-raising aborted a run *after* the eval gate had passed and `current_version` had been bumped, so the §5.4.6 gate decision was never recorded and the worker retried against weights that were already authoritative. `latest` is convenience state that serving does not consult (SPEC §5.5), so a failure to write it is logged and the promotion stands.
 
 ### 20.4 ~~HIGH: WebSocket Send Without Error Handling~~ FIXED
 
@@ -5181,6 +5183,8 @@ Adapter `prompt_instructions` injected into system messages without validation.
 
 ### 69.3 CRITICAL: Prompt Injection - Model Backend Adapter Prompts
 **Location:** `liminallm/service/model_backend.py:771-772, 786`
+
+**Site removed (not the risk):** the backends no longer materialize adapter prompts. SPEC §5.0.1 puts prompt materialization solely in `LLMService`, so `ApiAdapterBackend._inject_adapter_prompts` and Gemini's guidance block are gone — they were a second copy of the same text, not a second class of exposure. The surface is now 69.2 alone: `prompt_instructions` still reach a system message without validation, and that remains open.
 
 ### 69.4 HIGH: HTML Injection - Email Password Reset
 **Location:** `liminallm/service/email.py:108, 112-140`

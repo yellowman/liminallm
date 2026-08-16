@@ -1,43 +1,52 @@
 # JAX LoRA backend
 
-`LocalJaxLoRABackend` now runs a functional local adapter path instead of the earlier placeholder. This page summarizes how the implementation works and the operational expectations for using it.
+`LocalJaxLoRABackend` serves a real decoder with LoRA adapters applied inside it. This page summarizes how the implementation works and the operational expectations for using it. SPEC §5 is the authority; where this page and SPEC disagree, SPEC is right and this page is stale.
 
 ## Backend capabilities
 
-- **Tokenizer-aware prompt handling:** Messages are normalized into a `role: content` string and tokenized with the base model's tokenizer when available (via `transformers.AutoTokenizer`). If the tokenizer dependency is missing, a deterministic hash-based fallback keeps the pathway usable for testing.
-- **Fixed shapes with light checks:** Requests are padded/truncated to `max_seq_len` (default 512). The backend always builds a single-element batch and only validates that `max_batch_size` is positive; callers that pass multiple examples will be trimmed to one without enforcement beyond length checks.
-- **Adapter materialization with caching:** LoRA weights are loaded from `fs_root/adapters/<adapter_id>/` (or an explicit `fs_dir`/`cephfs_dir`) by reading `params.json`. The backend caches weights keyed by adapter ID and file `mtime` so hot adapters avoid repeated disk reads.
-- **Device placement and JAX execution:** Token/attention arrays are placed on the first available JAX device, and adapter matrices are lifted to JAX arrays. A lightweight forward pass applies paired `.A`/`.B` matrices with width alignment before sampling.
-- **Deterministic sampling and decoding:** Generated tokens are sampled deterministically from the LoRA score aggregate (seeded by the last prompt token) and decoded with the tokenizer when present; otherwise a `tok-<id>` fallback is used. Usage metrics include prompt/completion token counts, latency, model ID, and adapter ID.
+- **A real decoder:** `service/transformer.py` implements a decoder-only transformer in plain JAX — RMSNorm, RoPE, grouped-query attention with a KV cache, SwiGLU — loading `config.json` plus `*.safetensors` from the model directory with no torch and no flax. LoRA matrices are applied inside the attention projections, so an adapter changes the model rather than a score aggregate bolted on afterwards.
+- **Three checkpoint states:** `absent` (nothing on disk) falls back to a synthetic stand-in and logs `local_checkpoint_absent` — that path moves tokens, it does not answer questions. `valid` serves the real model. `broken` (weights or tokenizer present but unloadable) **fails every request**, rather than degrading into the stand-in.
+- **Tokenizer-aware prompt handling:** Messages are serialized by `service/local_format.py`, the one function training and serving share, and tokenized with the base model's tokenizer. A deterministic hash fallback keeps the path usable without `transformers`; a checkpoint whose tokenizer disagrees with its vocabulary is `broken`, not fallback-eligible.
+- **Adapter materialization with caching:** Weights are read from the promoted version only (see below) and cached by `(adapter_id, version)` alongside the file `mtime`, so a promotion cannot be served its predecessor's tensors and an in-place edit still invalidates.
+- **Gate-aware KV reuse:** Conversations reuse their own prefix across turns. The cache key is content-addressed and includes each active adapter's id, version and exact gate bits, so a request at gate 0.2 can never continue a prefix computed at 0.8. Reused prefill is reported as `cached_tokens`.
+- **Usage:** prompt/completion token counts from the real tokenizer, latency, model ID, and the adapters that actually applied.
 
 ## Adapter resolution
 
-- Default path: `fs_root/adapters/<adapter_id>/latest/params.json` if present; otherwise the newest `v*/params.json` directory is selected.
-- Explicit paths: callers may supply `fs_dir` or `cephfs_dir` in the adapter metadata to override the default layout.
-- Cache: weight arrays are cached per adapter ID alongside the `params.json` modification time to avoid stale loads after updates.
+Per SPEC §5.5, the artifact's `current_version` is the sole authority:
+
+- `current_version = N > 0` resolves to exactly `<adapter root>/vNNNN/params.json`. Nothing else is authoritative — not a direct `params.json`, not a `latest` pointer, not the newest directory. `latest` is still written for humans and tooling and is never read back.
+- `current_version <= 0`, or absent, resolves to **no weights**. A training job writes its version directory *before* the eval gate runs, so anything that scanned would serve weights the gate rejected.
+- **Explicit paths relocate, they do not rename.** `fs_dir`/`cephfs_dir` may point an adapter's directory elsewhere under `fs_root`, but its final component must be the adapter's own id — otherwise `fs_dir: adapters/B` serves B's weights as A's version. The version's `metadata.json`, which training writes with `adapter_id` and `version`, is checked too when present, because a directory can be renamed and a training run's own record cannot.
+- **One base, exactly.** An adapter's declared `base_model` must be the base being served, compared on the final path component; a missing or different declaration refuses the weights. `B·A` was fitted to one frozen `W`, and an eval gate passed on that `W` says nothing about another.
+- **Prompt-rung adapters carry no weights** whatever files exist, and a zero-gated adapter is skipped before any of the above runs.
 
 ## Request flow
 
-1. Normalize chat messages and tokenize to `(input_ids, attention_mask)` with truncation to `max_seq_len`.
-2. Pad to non-empty tensors and move them to the active JAX device with dtype `int32`; a single-item batch is created regardless of caller intent.
-3. Load and cache adapter weights; if none are found, generation falls back to zeroed scores.
-4. Run the LoRA forward pass (`_lora_forward`) to accumulate adapter contributions, mask with attention, and sample a fixed-length completion using a rolling deterministic sampler.
-5. Decode tokens and return the text plus usage metadata (prompt/completion token counts, latency, model, adapter ID).
+1. Reduce the adapter list to the effective set: gate first, so `g = 0` is gone before anything reads it (SPEC §5.0.1).
+2. Serialize the messages with `local_format` and tokenize, keeping the **newest** tokens when truncating — a chat's last turn is the one the answer responds to.
+3. Resolve and load the promoted weights for each active adapter, then compose them by rank concatenation: `A* = [A₁;A₂]`, `B* = [g₁α₁B₁, g₂α₂B₂]`, so `B*A* = Σ gⱼαⱼBⱼAⱼ` exactly, with no cross terms. A malformed adapter refuses the whole stack rather than partially applying.
+4. Reuse the longest cached KV prefix that is a strict prefix of these tokens under the same adapter signature, then decode incrementally.
+5. Decode and return the text plus usage — including `cached_tokens` for the reused prefill.
+
+Prompt instructions are **not** materialized here. `LLMService` places them before any backend runs, so this class applies weights and nothing else (SPEC §5.0.1).
 
 ## Operational notes
 
-- **Dependencies:** JAX and (optionally) `transformers` must be available for full fidelity; the backend degrades gracefully without the tokenizer by using hashed tokens and naive decoding. If JAX is missing, training falls back to a skip trace while generation uses array stubs.
-- **Limits:** `max_seq_len` defaults to 512 and batch size to 4, but the generation path enforces a single example and only rejects prompts that exceed the length ceiling. Multi-example requests will silently drop down to one.
-- **Determinism:** The sampler is deterministic given the prompt and adapter weights; a process-level PRNG key is initialized but not mutated per call.
+- **Dependencies:** JAX must be available; `transformers` supplies the tokenizer. Without a checkpoint the backend serves the synthetic stand-in and says so in the log; with a checkpoint whose tokenizer will not load it refuses, because a request answered from the stand-in *after* one was refused is the opposite of refusing. If JAX is missing, training records a skip trace.
+- **Limits:** `max_seq_len` defaults to 512 and batch size to 4; the generation path builds a single example. Truncation keeps the newest tokens, unlike a tokenizer's own `truncation`, which keeps the oldest.
+- **Determinism:** Greedy decoding is deterministic given the prompt, the adapter stack and its gates. Incremental decode with the KV cache is tested to reproduce a full recompute, and a warm prefix cache to produce byte-identical output to a cold one.
 - **Observability:** Per-call latency is reported in milliseconds. Additional metrics (throughput, memory) can be layered on top of this scaffolding if needed.
 
 ## Training loop
 
 The `TrainingService` now performs a usable JAX+Optax fine-tuning cycle for LoRA adapters:
 
-- **Supervised loss:** Preference-derived prompts/targets are tokenized and fed through the same lightweight LoRA projection used at inference time. A masked cross-entropy loss over a fixed vocab drives updates when JAX/Optax are available; otherwise the training job records a skipped trace.
-- **Gradient accumulation:** Microbatches accumulate gradients across configurable steps before each optimizer update, allowing larger effective batch sizes without exceeding device memory.
-- **Checkpoints and persistence:** Each optimizer step writes a checkpoint under the adapter version's `checkpoints/` directory and rewrites `params.json` with the trained weights so `local_gpu_lora` reloads the latest adapter artifacts immediately. A `latest` symlink is refreshed after every successful run.
+- **Supervised loss over the real forward pass:** Preference-derived prompts and targets are tokenized and run through the same decoder that serves them, with the LoRA matrices inside its attention projections, so an adapter is fitted to the model that will serve it. The base parameters are closed over and never differentiated. Loss is cross-entropy on the target tokens only; an L2 term on the adapter weights is in the training objective and deliberately not in the eval.
+- **It refuses rather than pretends:** no checkpoint, no tokenizer, a tokenizer that disagrees with the checkpoint's vocabulary, or token ids outside `[0, vocab)` all record a skipped trace instead of training against something that is not the model.
+- **Gradient accumulation:** Microbatches accumulate gradients across configurable steps before each optimizer update.
+- **Eval gate:** Every fifth example is held out; the job promotes only when holdout cross-entropy improves by at least 1% relative. A skipped or regressed run never promotes, and the decision is recorded in `training_job.meta.eval_gate` for audit — its absence is not approval.
+- **Checkpoints and persistence:** Each optimizer step writes a checkpoint under the version's `checkpoints/` directory, and a passing gate bumps `current_version`, which is what makes the weights servable. The `latest` symlink is refreshed as a convenience and is best-effort: serving never reads it, so failing to write it logs and leaves the promotion standing rather than aborting a run that already succeeded.
 
 With these pieces, `local_gpu_lora` mirrors the repository's data-driven kernel expectations while remaining lightweight and test-friendly.
 

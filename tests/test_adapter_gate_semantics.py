@@ -412,13 +412,42 @@ class TestTheEffectiveStackHashesTheSame:
         self, tmp_path, checkpoint
     ):
         """`adapters[0]` fed `_apply_adapter_vocab_size` before any filtering,
-        so an absent adapter could still reconfigure tokenization."""
-        backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
+        so an absent adapter could still reconfigure tokenization.
+
+        Both adapters here are promoted, because vocabulary is weight-specific
+        state and §5.5 only lets a promoted adapter carry weights — an
+        unpromoted one applies no mechanism and so has no say either.
+        """
+        config = __import__(
+            "liminallm.service.transformer", fromlist=["x"]
+        ).load_config(checkpoint)
+        version = tmp_path / "adapters" / "Y" / "v0001"
+        version.mkdir(parents=True)
+        (version / "params.json").write_text(
+            json.dumps(
+                {
+                    "layers.0.attn_q.A": [[0.05] * config.hidden_size] * 2,
+                    "layers.0.attn_q.B": [[0.05, 0.05]]
+                    * (config.num_heads * config.head_dim),
+                }
+            )
+        )
+        backend = LocalJaxLoRABackend(
+            str(checkpoint), str(tmp_path), max_new_tokens=2
+        )
         seen = []
         backend._apply_adapter_vocab_size = lambda adapter: seen.append(adapter)
         backend.generate(
             [{"role": "user", "content": "hi"}],
-            [{"id": "X", "weight": 0.0, "vocab_size": 99}, {"id": "Y", "weight": 1.0}],
+            [
+                {"id": "X", "weight": 0.0, "vocab_size": 99, "current_version": 1},
+                {
+                    "id": "Y",
+                    "weight": 1.0,
+                    "current_version": 1,
+                    "base_model": str(checkpoint),
+                },
+            ],
             user_id="u",
         )
         assert [a.get("id") for a in seen] == ["Y"]

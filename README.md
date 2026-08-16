@@ -40,6 +40,8 @@ Router Updates ← Eval Gate ← Adapter Training ← Prompt-Mode Skill
   - every skill starts as a **prompt** (instructions distilled from cluster labels + highly-rated exemplars) — useful immediately on any backend
   - once a cluster pools enough positive feedback **across users**, a jax training job runs; one user’s thumbs are too sparse to train weights on
   - trained weights only ship if a **holdout eval gate** measures real improvement; a failed gate leaves the skill on the prompt rung. nothing regresses.
+  - passing the gate is the *only* thing that makes weights servable: the adapter's promoted version number is the authority, and serving reads exactly that version's weights. a file on disk, a `latest` pointer, the newest directory — none of them mean an adapter graduated.
+  - a graduated skill speaks once, not twice: where its weights apply it is carried by them, and where they cannot (an api backend) its prompt carries it instead
   - optionally, a teacher model distills raw chat transcripts into clean training exemplars first
   - continuous micro-training jobs in jax, only on adapters, never on the base model
 
@@ -103,6 +105,7 @@ Router Updates ← Eval Gate ← Adapter Training ← Prompt-Mode Skill
     - conditions over embeddings, clusters, safety flags
     - actions: activate/deactivate adapters, scale weights, etc.
   - the router engine is dumb and stable; policy is editable data
+  - a gate is an activation first and a strength second: weight `0` means the adapter is absent from the turn — no weights, no prompt, nothing sent to a provider, nothing in the kv cache key, and nothing claimed in what the turn reports it used. above zero it scales where scaling is defined; prompt text has no half-measure, so it goes in once, unchanged.
 
 - **llm as architect (under guardrails)**
   - a config-ops api lets the llm propose patches to:

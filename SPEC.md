@@ -712,7 +712,11 @@ applied nothing: `hybrid` requires neither `prompt_instructions` nor a remote
 id, so an artifact with neither is valid, materializes nothing, sends
 nothing, changes no model, and must be reported as **dropped**. reporting it
 as applied on the strength of its mode named an adapter the answer never
-saw.
+saw. the local backend performs exactly one mechanism — weights — so the
+adapters it reports, and any weight-specific state it derives from them such
+as an adapter vocabulary, are those past the gate, off the prompt rung, and
+promoted. an open-gated `local` adapter with nothing promoted applies
+nothing, whatever its metadata offers.
 
 **continuous gates apply only where the mechanism supports continuous
 composition.**
@@ -1341,6 +1345,15 @@ cluster qualifies          pooled events ≥ threshold      eval gate passes
      presence of a file on disk never authorizes anything. a legacy artifact
      without the field is treated as having no promoted weights and must be
      migrated before it can serve any.
+
+     **the version decision comes before the filesystem is touched.** path
+     resolution is not inert — it validates ownership and containment and
+     refuses on either — so an adapter that authorizes no weights must be
+     answered from its metadata alone. resolving first turned an unpromoted
+     hybrid whose `fs_dir` was stale or out of root into a failed request,
+     when the correct answer was the prompt fallback and nothing was ever
+     going to read that path. same inert-state-into-outage shape as the gate,
+     base and identity rules above.
 
      the lane that existed for such artifacts was constrained twice and then
      removed, because every hole this section closes had reopened inside it:

@@ -1965,6 +1965,28 @@ class LocalJaxLoRABackend:
             attention = [0]
         return ids, attention
 
+    @staticmethod
+    def _weight_bearing(adapters: List[dict]) -> List[dict]:
+        """Those of `adapters` that can carry weights on this backend.
+
+        Past the gate (§5.0.1), not the prompt rung, and promoted (§5.5).
+        Anything else applies no mechanism here, so it must not size the
+        tokenizer, name itself in usage, or otherwise leave a trace of having
+        done something.
+        """
+        return [
+            adapter
+            for adapter in adapters or []
+            if isinstance(adapter, dict)
+            and effective_mode(adapter) != AdapterMode.PROMPT
+            and LocalJaxLoRABackend._promoted_version_of(adapter) > 0
+        ]
+
+    @staticmethod
+    def _applied_adapter_ids(adapters: List[dict]) -> Optional[str]:
+        ids = [str(a.get("id")) for a in adapters or [] if a.get("id")]
+        return ",".join(ids) if ids else None
+
     def _load_adapter_weights(
         self,
         adapter: dict,
@@ -1999,13 +2021,20 @@ class LocalJaxLoRABackend:
             logger.debug("adapter_prompt_mode_carries_no_weights", adapter_id=adapter_id)
             return {}
 
-        # SPEC §5.4.6: only the promoted version may be served. current_version
-        # is authoritative - without it, resolution would fall back to "newest
-        # directory on disk", which serves weights the eval gate rejected.
-        schema = adapter.get("schema") if isinstance(adapter.get("schema"), dict) else {}
-        current_version = adapter.get("current_version")
-        if current_version is None:
-            current_version = (schema or {}).get("current_version")
+        # SPEC §5.4.6/§5.5: only a promoted version may be served, and that
+        # decision comes BEFORE the filesystem is touched. `_adapter_path`
+        # is not inert — it raises for a missing user context, an owner
+        # mismatch, or a path outside fs_root — so resolving first turned an
+        # adapter that authorizes no weights at all into a failed request.
+        # An unpromoted hybrid is prompt fallback; whatever its `fs_dir` says
+        # is irrelevant, because nothing will read it. Same inert-state ->
+        # outage shape as the gate, base and identity rules before it.
+        current_version = self._promoted_version_of(adapter)
+        if current_version <= 0:
+            logger.debug(
+                "adapter_has_no_promoted_version", adapter_id=adapter_id
+            )
+            return {}
 
         path = Path(self._adapter_path(adapter, requested_user_id=user_id))
         params_path = self._resolve_params_path(path, current_version=current_version)
@@ -2366,6 +2395,9 @@ class LocalJaxLoRABackend:
         self, ids: List[int], adapters: List[dict], *, user_id: Optional[str]
     ) -> dict:
         """Prefill and decode against the real forward pass, with KV reuse."""
+        # This turn applies weights and nothing else, so accounting names the
+        # adapters that could carry them (§5.0.1, §5.5).
+        weight_bearing = self._weight_bearing(adapters)
         config, params = self._model_state
         jnp, jax = self._jnp, self._jax
         weights = (
@@ -2462,11 +2494,7 @@ class LocalJaxLoRABackend:
             "completion_tokens": len(generated),
             "total_tokens": len(ids) + len(generated),
             "model": self.base_model,
-            "adapter_id": (
-                ",".join(str(a.get("id")) for a in adapters if a.get("id"))
-                if adapters
-                else None
-            ),
+            "adapter_id": self._applied_adapter_ids(weight_bearing),
             "latency_ms": round(duration * 1000, 2),
         }
         if cached_tokens:
@@ -2504,8 +2532,16 @@ class LocalJaxLoRABackend:
         # adapter. Filtering here makes the backend correct when called
         # directly, not only downstream of LLMService.
         adapters = active_adapters(adapters)
-        adapter = adapters[0] if adapters else {}
-        self._apply_adapter_vocab_size(adapter)
+        # Weights are the only mechanism this backend performs — prompts are
+        # materialized by LLMService (§5.0.1) — so weight-specific state and
+        # this turn's accounting both come from the adapters that can
+        # actually carry weights: past the gate, not the prompt rung, and
+        # promoted. An open-gated `local` adapter with nothing promoted
+        # applies no mechanism at all, yet it was sizing the tokenizer's
+        # vocabulary and being named in `usage.adapter_id` — the local
+        # analogue of reporting `:prompt` for a hybrid with no prompt.
+        weight_bearing = self._weight_bearing(adapters)
+        self._apply_adapter_vocab_size(weight_bearing[0] if weight_bearing else {})
         # Before tokenizing, not after: the checkpoint's vocabulary governs
         # what a token id may be, including in the hash fallback.
         self._ensure_model()
@@ -2572,11 +2608,7 @@ class LocalJaxLoRABackend:
                 # real total on the local path, not a zero.
                 "total_tokens": len(ids) + len(generated_ids),
                 "model": self.base_model,
-                "adapter_id": (
-                    ",".join(str(a.get("id")) for a in adapters if a.get("id"))
-                    if adapters
-                    else None
-                ),
+                "adapter_id": self._applied_adapter_ids(weight_bearing),
                 "latency_ms": round(duration * 1000, 2),
             },
         }

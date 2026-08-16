@@ -857,6 +857,80 @@ class TestOnlyAPromotedVersionAuthorizesWeights:
         _write(tmp_path / "adapters" / "legacy", _valid_pair(config))
         assert system_text() == without
 
+    def test_an_unpromoted_adapter_never_touches_the_filesystem(
+        self, tmp_path, checkpoint, config
+    ):
+        """`current_version <= 0` authorizes no weights, and that decision
+        comes before any path is resolved.
+
+        `_adapter_path` is not inert — it raises for a missing user context,
+        an owner mismatch, or a path outside `fs_root` — so resolving first
+        turned an adapter that authorizes nothing into a failed request. An
+        unpromoted hybrid is prompt fallback; whatever its `fs_dir` says is
+        irrelevant, because nothing will read it. The earlier tests here used
+        harmless in-root paths, so they proved the file was not loaded and not
+        that the filesystem was never consulted.
+        """
+        _, backend = self._service_and_backend(tmp_path, checkpoint)
+        for fs_dir in ("/outside/fs_root", "../../escape", "adapters/someone_else"):
+            adapter = self._adapter(
+                checkpoint, "skill", mode="hybrid", current_version=0, fs_dir=fs_dir
+            )
+            assert backend._blend_adapter_weights(
+                [adapter], user_id="u", config=config
+            ) == {}
+        # A missing user context is the other way that path raises.
+        assert backend._blend_adapter_weights(
+            [self._adapter(checkpoint, "skill", mode="hybrid", current_version=0)],
+            user_id=None,
+            config=config,
+        ) == {}
+        # Control: promoted, and the path is consulted again — this one
+        # really is outside the root, and refusing it is correct.
+        with pytest.raises(ValueError, match="fs_root"):
+            backend._blend_adapter_weights(
+                [
+                    self._adapter(
+                        checkpoint, "skill", mode="local",
+                        current_version=1, fs_dir="/outside/fs_root",
+                    )
+                ],
+                user_id="u",
+                config=config,
+            )
+
+    def test_an_adapter_that_applies_nothing_is_not_reported_as_applied(
+        self, tmp_path, checkpoint, config
+    ):
+        """The local analogue of the API accounting bug: weights are the only
+        mechanism this backend performs, so an open-gated `local` adapter
+        with nothing promoted applied none — and must not size the tokenizer
+        or name itself in `usage.adapter_id`."""
+        _write(tmp_path / "adapters" / "P" / "v0001", _valid_pair(config))
+        backend = LocalJaxLoRABackend(
+            str(checkpoint), str(tmp_path), max_new_tokens=2
+        )
+        sized = []
+        backend._apply_adapter_vocab_size = lambda adapter: sized.append(
+            adapter.get("id")
+        )
+        messages = [{"role": "user", "content": "hello"}]
+
+        unpromoted = self._adapter(
+            checkpoint, "X", mode="local", current_version=0,
+            schema={"vocab_size": 1234},
+        )
+        usage = backend.generate(messages, [unpromoted], user_id="u")["usage"]
+        assert usage.get("adapter_id") is None
+        assert sized == [None], "an adapter that applied nothing sized the tokenizer"
+
+        # Control: promoted weights really do apply, and are reported.
+        sized.clear()
+        promoted = self._adapter(checkpoint, "P", mode="local", current_version=1)
+        usage = backend.generate(messages, [promoted], user_id="u")["usage"]
+        assert usage.get("adapter_id") == "P"
+        assert sized == ["P"]
+
     def test_an_inferred_prompt_rung_never_loads_weights(
         self, tmp_path, checkpoint, config
     ):
