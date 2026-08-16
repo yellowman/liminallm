@@ -537,9 +537,16 @@ as a control that is running when it is not. SPEC §18 now names the rlimits.
 
 **Fix Applied:**
 - Added `PrivilegedToolError` exception class
-- Added `check_privileged_access()` function in sandbox.py
 - Privileged tools require admin role to invoke
 - `PRIVILEGED_SANDBOX_CONFIG` provides higher resource limits for admin tools
+
+**Corrected later.** This entry claimed the SPEC rule and delivered half of
+it. The `check_privileged_access()` helper it added accepted an
+`artifact_owner_id`, never read it, and had no callers — so "admin-owned
+artifacts" was enforced nowhere. The helper is deleted. `ToolDescriptor`
+carries the persisted artifact row into `WorkflowEngine._invoke_tool`, which
+requires both an admin caller and an admin-owned artifact; see
+`tests/test_tool_authority.py`.
 
 ### 6.9 ~~MEDIUM: Per-Node Timeout Hardcap Not Enforced~~ FIXED
 

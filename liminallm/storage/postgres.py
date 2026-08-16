@@ -2314,6 +2314,23 @@ class PostgresStore:
                 cursor_params.extend([created_at_cursor, artifact_cursor_id])
             except Exception as exc:
                 self.logger.warning("artifact_cursor_decode_failed", error=str(exc))
+        # An explicit visibility filter needs the identity that scopes it.
+        # Without one, the branches below dropped the scoping clause and
+        # returned *every* user's private rows, or every tenant's shared ones.
+        # Unreachable from `/v1/artifacts` — `app_user.tenant_id` is NOT NULL
+        # and the route always passes the caller — but it is the same
+        # fail-open default that `get_latest_workflow` shipped with, so it
+        # narrows here rather than waiting for a caller to find it.
+        if (visibility == "private" and not owner_user_id) or (
+            visibility == "shared" and not tenant_id
+        ):
+            self.logger.warning(
+                "artifact_list_unscoped",
+                visibility=visibility,
+                owner_user_id=owner_user_id,
+                tenant_id=tenant_id,
+            )
+            return []
         with self._connect() as conn:
             clauses = []
             params: list[Any] = []
@@ -2685,6 +2702,15 @@ class PostgresStore:
             )
         return fs_path
 
+    def _deny_workflow(self, workflow_id, user_id, owner_user_id, visibility) -> None:
+        self.logger.warning(
+            "workflow_access_denied",
+            workflow_id=workflow_id,
+            user_id=user_id,
+            owner_user_id=owner_user_id,
+            visibility=visibility,
+        )
+
     def get_latest_workflow(
         self,
         workflow_id: str,
@@ -2706,20 +2732,26 @@ class PostgresStore:
             return None
         visibility = getattr(artifact, "visibility", "private")
         owner_id = getattr(artifact, "owner_user_id", None)
-        if visibility == "private" and owner_id and owner_id != user_id:
-            self.logger.warning(
-                "workflow_access_denied",
-                workflow_id=workflow_id,
-                user_id=user_id,
-                owner_user_id=owner_id,
-            )
-            return None
-        artifact_tenant = getattr(artifact, "tenant_id", None)
-        if (
-            visibility == "shared"
-            and tenant_id
-            and artifact_tenant not in (None, tenant_id)
-        ):
+        if visibility == "private":
+            # Ownerless too: an artifact nobody owns cannot be shown to be
+            # this caller's, and the previous form only refused when an owner
+            # was present, so a null owner served everyone.
+            if not owner_id or owner_id != user_id:
+                self._deny_workflow(workflow_id, user_id, owner_id, visibility)
+                return None
+        elif visibility == "shared":
+            # `shared` means within a tenant, and the tenant is the owner's —
+            # `Artifact` has no tenant column, so the previous
+            # `getattr(artifact, "tenant_id", None)` was always None and the
+            # `None in (...)` acceptance served shared workflows across
+            # tenants. Read it from the owner, the way list_artifacts does.
+            owner = self.get_user(owner_id) if owner_id else None
+            if not owner or not tenant_id or owner.tenant_id != tenant_id:
+                self._deny_workflow(workflow_id, user_id, owner_id, visibility)
+                return None
+        elif visibility != "global":
+            # An unrecognized visibility is not a licence.
+            self._deny_workflow(workflow_id, user_id, owner_id, visibility)
             return None
         with self._connect() as conn:
             row = conn.execute(

@@ -164,11 +164,14 @@ def test_no_stray_env_var_reads_outside_config(monkeypatch):
     A direct getenv elsewhere is a setting that escaped the classification.
     """
     import subprocess
-    import sys
 
+    # A *read* is the escaped setting. The sandbox child clears and rewrites
+    # its own environment on the way into confinement — that is the opposite
+    # move, and matching it here would push a security control into an
+    # allowlist of exceptions.
     out = subprocess.run(
         [
-            "rg", "-n", r"os\.(getenv|environ)",
+            "rg", "-n", r"os\.getenv\(|os\.environ\.get\(|os\.environ\[",
             "--glob", "!**/config.py",
             "--glob", "!**/logging.py",
             "liminallm/",

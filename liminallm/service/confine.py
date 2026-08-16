@@ -190,6 +190,31 @@ def _linux_confine(workdir: str, runtime: Sequence[str]) -> str:
 
 # --- openbsd: unveil + pledge ---------------------------------------------
 
+# Standard-library modules whose implementation is a shared object. Loading one
+# is a `dlopen`, which maps pages `PROT_EXEC` — and `pledge` denies that
+# without the `prot_exec` promise. The child is spawned, not forked, so it
+# starts with none of these resident and the first `import zipfile` in model
+# code would be killed rather than refused. Granting `prot_exec` would fix the
+# symptom by handing untrusted code the ability to map executable memory, so
+# instead they are loaded *before* the promise drops: what the interpreter is
+# documented to do keeps working, and a later attempt to load any other shared
+# object is denied.
+_NATIVE_WARMUP = (
+    "array", "binascii", "bz2", "csv", "datetime", "decimal", "hashlib",
+    "json", "lzma", "math", "random", "struct", "unicodedata", "zlib",
+)
+
+
+def _warm_native_modules() -> None:
+    import importlib
+
+    for name in _NATIVE_WARMUP:
+        try:
+            importlib.import_module(name)
+        except ImportError:  # a build without this module: nothing to warm
+            continue
+
+
 def _openbsd_available() -> bool:
     if sys.platform != "openbsd6" and not sys.platform.startswith("openbsd"):
         return False
@@ -212,6 +237,9 @@ def _openbsd_confine(workdir: str, runtime: Sequence[str]) -> str:
     libc = _libc()
     libc.unveil.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
     libc.pledge.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+
+    # Before anything narrows: see `_NATIVE_WARMUP`.
+    _warm_native_modules()
 
     if libc.unveil(_as_bytes(workdir), b"rwc") != 0:
         errno = ctypes.get_errno()
@@ -236,7 +264,13 @@ def _openbsd_confine(workdir: str, runtime: Sequence[str]) -> str:
         raise OSError(errno, f"unveil(lock): {os.strerror(errno)}")
     # No `inet`, no `proc`/`exec`: the network and process-spawn denials the
     # sandbox already applies in Python, made structural.
-    if libc.pledge(b"stdio rpath wpath cpath flock tmppath", None) != 0:
+    # No `tmppath`: pledge(2) lists it as "No longer available", so naming it
+    # fails the whole call — and it granted /tmp, which `unveil` above does
+    # not expose anyway. TMPDIR points at the workdir; `cpath`/`wpath` there
+    # is what temporary files actually need.
+    # No `prot_exec`: see `_NATIVE_WARMUP`. Denying new executable mappings is
+    # the point, not an oversight.
+    if libc.pledge(b"stdio rpath wpath cpath flock", None) != 0:
         errno = ctypes.get_errno()
         raise OSError(errno, f"pledge: {os.strerror(errno)}")
     os.chdir(workdir)

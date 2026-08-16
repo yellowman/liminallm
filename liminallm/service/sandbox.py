@@ -631,44 +631,13 @@ def ensure_scratch_dir(config: SandboxConfig) -> Path:
     return config.scratch_dir
 
 
-def check_privileged_access(
-    tool_name: str,
-    config: SandboxConfig,
-    *,
-    user_role: Optional[str] = None,
-    artifact_owner_id: Optional[str] = None,
-    requesting_user_id: Optional[str] = None,
-) -> None:
-    """Validate privileged tool access.
-
-    SPEC §18: `privileged:true` tools require admin-owned artifacts and are
-    never called by default workflows.
-
-    Args:
-        tool_name: Name of the tool being invoked
-        config: Sandbox configuration
-        user_role: Role of the requesting user
-        artifact_owner_id: Owner ID of the tool artifact
-        requesting_user_id: ID of the user making the request
-
-    Raises:
-        PrivilegedToolError: If access is denied
-    """
-    if not config.privileged:
-        return
-
-    # Privileged tools require admin role
-    if user_role != "admin":
-        raise PrivilegedToolError(
-            f"Tool '{tool_name}' requires admin role (current: {user_role})"
-        )
-
-    logger.info(
-        "privileged_tool_access",
-        tool=tool_name,
-        user_id=requesting_user_id,
-        user_role=user_role,
-    )
+# A `check_privileged_access(..., artifact_owner_id=...)` helper used to live
+# here. It named the SPEC §18 rule — `privileged:true` requires an *admin-owned
+# artifact* — accepted the owner id, and then checked only the caller's role.
+# Nothing in the service called it, so the rule it claimed to enforce was
+# enforced nowhere. The two halves now sit where each can actually be answered:
+# `get_tool_sandbox_config` asks about the caller, and `WorkflowEngine`'s
+# `ToolDescriptor` carries the persisted artifact row that answers ownership.
 
 
 class SandboxedFileHandle:

@@ -17,6 +17,7 @@ from typing import (
     Optional,
     Sequence,
     Tuple,
+    Union,
 )
 from urllib.parse import urlparse
 
@@ -1375,7 +1376,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
 
     async def invoke_tool(
         self,
-        tool_schema: dict,
+        tool_schema: Union["ToolDescriptor", dict],
         inputs: Dict[str, Any],
         *,
         conversation_id: Optional[str] = None,
@@ -1384,18 +1385,26 @@ class WorkflowEngine(WorkflowStreamingMixin):
         user_id: Optional[str] = None,
         tenant_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        tool_name = tool_schema.get("name") or tool_schema.get("id")
+        # A ToolDescriptor keeps this invocation bound to the artifact the
+        # caller was authorized for. Passing a bare schema and re-resolving by
+        # name did not: artifact names carry no uniqueness constraint, so the
+        # route could authorize row A and the engine execute row B — including
+        # a B that declares `privileged: true` where A did not. Workflow nodes
+        # still resolve by name, because a workflow refers to tools by name;
+        # an invocation of a specific id stays bound to that id.
+        if isinstance(tool_schema, ToolDescriptor):
+            descriptor = tool_schema
+        else:
+            descriptor = ToolDescriptor(
+                name=tool_schema.get("name") or tool_schema.get("id") or "",
+                schema=dict(tool_schema),
+                artifact_id=None,
+                owner_user_id=None,
+                owner_role=None,
+            )
+        tool_name = descriptor.name
         if not tool_name:
             return {"status": "error", "content": "tool spec missing name"}
-        # Resolved for this call only. `setdefault` here put a private spec
-        # into the process-global registry, where later requests from other
-        # users would resolve it.
-        descriptor = self._resolve_tool(
-            tool_name, user_id=user_id, tenant_id=tenant_id
-        ) or ToolDescriptor(
-            name=tool_name, schema=dict(tool_schema), artifact_id=None,
-            owner_user_id=None, owner_role=None,
-        )
         history: List[Any] = []
         if conversation_id:
             if self._validate_conversation_scope(

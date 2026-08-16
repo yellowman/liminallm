@@ -2581,12 +2581,33 @@ the following are treated as constants the kernel must honor; LLM edits happen o
     it and used for that invocation alone; caching it into the shared registry
     made one user's private definition resolvable for every later request in
     that process.
+  - **an invocation names an id and must execute that id.** a tool name is
+    free text inside `schema`, and artifact names carry no uniqueness
+    constraint, so two tools may answer to one name. `POST /tools/{id}/invoke`
+    authorizes one artifact row and carries that row through execution.
+    handing the engine a bare schema and letting it resolve the name again is
+    a substitution: the second lookup can return a different row, including
+    one that declares `privileged: true` where the authorized row did not.
+    workflow *nodes* still resolve by name, because a workflow refers to its
+    tools by name; an invocation of an id stays bound to that id.
   - **a workflow is an artifact.** `workflow_id` arrives in a request body, so
     running one is subject to the same permission rule as reading one: private
     to its owner, shared within a tenant, global to anyone. the lookup takes
     the caller's identity as a required argument rather than an optional one,
     because the two call sites that existed both had it and neither passed
     it.
+  - **the tenant of an artifact is its owner's.** the artifact row has no
+    tenant column, so `shared` is resolved by reading the owner's `tenant_id`.
+    reading a tenant off the artifact yields `None` always, and a comparison
+    written to accept `None` on either side then serves every shared workflow
+    to every tenant. `None` is the absence of the answer, never a wildcard.
+  - **every unprovable claim fails closed.** an artifact with no owner cannot
+    be shown to belong to the caller, and cannot supply the tenant that
+    `shared` is scoped by, so both refuse. a visibility value the code does
+    not recognize refuses; an if/elif chain that falls through at the end
+    grants access to exactly the values nobody considered. listing obeys the
+    same rule as fetching: asked to filter by a visibility whose scoping
+    identity is missing, it returns nothing rather than dropping the clause.
   - **the filesystem contract is a view, stated as a property and not a
     mechanism.** a worker running model-written code can see its per-call
     workdir (read-write), the inputs staged into it (read-only), and the

@@ -325,6 +325,41 @@ class TestTheAvailabilityCheckIsSafeToAskAnywhere:
         assert "confined" in result["stdout"]
 
 
+class TestTheNativeWarmupListIsReal:
+    """`pledge` without `prot_exec` denies new executable mappings, which is
+    what `dlopen` needs — so a C extension not already resident when the
+    promise drops can never be imported. The child is spawned, so it starts
+    with none of them. They are loaded up front instead of granting the
+    promise.
+
+    The loader swallows `ImportError` (a build may genuinely lack `lzma`), so
+    a misspelled name would warm nothing and say nothing, and the failure
+    would appear only on OpenBSD as model code being killed mid-import. These
+    run on whatever platform the suite runs on, which is the point.
+    """
+
+    def test_every_name_resolves(self):
+        import importlib
+
+        unresolved = []
+        for name in confine._NATIVE_WARMUP:
+            try:
+                importlib.import_module(name)
+            except ImportError:
+                unresolved.append(name)
+        assert unresolved == [], f"not importable on this build: {unresolved}"
+
+    def test_it_covers_what_the_interpreter_advertises(self):
+        """The module docstring promises parsing and unzipping attachments.
+        `zipfile` is pure Python and reaches `zlib` for anything compressed,
+        so the extension, not the wrapper, is the name that must be listed."""
+        import sys
+
+        confine._warm_native_modules()
+        for extension in ("zlib", "bz2", "lzma", "_csv", "_json"):
+            assert extension in sys.modules, extension
+
+
 class TestNoUnconfinedFallback:
     """A platform without a backend loses the tool; it does not get a weaker one."""
 

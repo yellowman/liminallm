@@ -2978,7 +2978,8 @@ async def invoke_tool(
         ):
             raise NotFoundError("tool spec not found", detail={"artifact_id": tool_id})
         result = await runtime.workflow.invoke_tool(
-            artifact.schema,
+            # The exact row this request authorized, not its name.
+            runtime.workflow._describe_tool(artifact),
             body.inputs or {},
             conversation_id=body.conversation_id,
             context_id=body.context_id,
