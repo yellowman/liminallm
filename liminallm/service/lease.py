@@ -28,7 +28,7 @@ from __future__ import annotations
 import threading
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Optional
 
 __all__ = [
@@ -36,7 +36,10 @@ __all__ = [
     "LeaseRevoked",
     "LeasedProxy",
     "ToolInvocation",
+    "active_invocation",
     "current_invocation",
+    "require_live_lease",
+    "set_broker",
 ]
 
 _CURRENT = threading.local()
@@ -59,7 +62,16 @@ class ToolInvocation:
     user_id: Optional[str]
     tenant_id: Optional[str]
     artifact_id: Optional[str] = None
-    id_factory: Any = field(default=None, repr=False, compare=False)
+    # One node execution, stable across its retries. The lease is keyed by
+    # `invocation_id` — attempt two must not inherit attempt one's authority —
+    # but a durable idempotency key has to be keyed by the *logical* execution,
+    # or attempt two duplicates an operation attempt one already submitted at
+    # the boundary. Killing a worker does not recall what it sent.
+    logical_execution_id: str = ""
+
+    def operation_key(self, operation: str) -> str:
+        """A key stable across retries of one logical node execution."""
+        return f"{self.logical_execution_id or self.invocation_id}:{operation}"
 
 
 class InvocationBroker:
@@ -81,6 +93,7 @@ class InvocationBroker:
         user_id: Optional[str],
         tenant_id: Optional[str],
         artifact_id: Optional[str] = None,
+        logical_execution_id: Optional[str] = None,
     ) -> ToolInvocation:
         invocation = ToolInvocation(
             invocation_id=uuid.uuid4().hex,
@@ -88,6 +101,8 @@ class InvocationBroker:
             user_id=user_id,
             tenant_id=tenant_id,
             artifact_id=artifact_id,
+            # A call with no node behind it is its own logical execution.
+            logical_execution_id=logical_execution_id or uuid.uuid4().hex,
         )
         with self._lock:
             self._live.add(invocation.invocation_id)
@@ -128,6 +143,36 @@ def current_invocation(invocation: Optional[ToolInvocation]):
 
 def active_invocation() -> Optional[ToolInvocation]:
     return getattr(_CURRENT, "invocation", None)
+
+
+# The broker that answers for leases in this process. Durable operations that
+# do not reach their target through a proxied dependency — publishing into the
+# user's file area is the one that exists today — ask it directly, and cannot
+# be handed a proxy to go through instead.
+_BROKER: Optional["InvocationBroker"] = None
+
+
+def set_broker(broker: "InvocationBroker") -> None:
+    global _BROKER
+    _BROKER = broker
+
+
+def require_live_lease() -> None:
+    """Refuse a durable operation whose invocation has ended.
+
+    A thread with no lease is the API path and passes, exactly as the proxy
+    treats it. A leased thread with no registered broker is a wiring mistake
+    rather than an authorization one, so it fails closed and says which.
+    """
+    invocation = active_invocation()
+    if invocation is None:
+        return
+    if _BROKER is None:  # pragma: no cover - defensive
+        raise LeaseRevoked(
+            "a leased thread reached a durable operation but no broker is "
+            "registered to say whether the lease is live"
+        )
+    _BROKER.check(invocation)
 
 
 class LeasedProxy:

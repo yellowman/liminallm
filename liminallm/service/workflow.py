@@ -7,6 +7,7 @@ import json
 import math
 import os
 import time
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import (
@@ -41,7 +42,9 @@ from liminallm.service.lease import (
     InvocationBroker,
     LeasedProxy,
     LeaseRevoked,
+    active_invocation,
     current_invocation,
+    set_broker,
 )
 from liminallm.service.llm import LLMService
 from liminallm.service.model_backend import DEFAULT_CONTEXT_WINDOW, active_adapters
@@ -141,6 +144,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # it never had to remember. Threads with no lease (every API request)
         # pass straight through. See service/lease.py.
         self.broker = InvocationBroker()
+        set_broker(self.broker)
         self.store = LeasedProxy(store, self.broker)
         self.llm = LeasedProxy(llm, self.broker)
         self.router = router
@@ -781,6 +785,11 @@ class WorkflowEngine(WorkflowStreamingMixin):
 
         last_error: Optional[Exception] = None
         attempt = 0
+        # One id for this node execution, stable across its attempts. Each
+        # attempt gets its own lease — attempt two must not inherit attempt
+        # one's authority — but a durable idempotency key derives from this,
+        # because killing attempt one does not recall what it already sent.
+        logical_execution_id = uuid.uuid4().hex
 
         while attempt <= max_retries:
             # Check workflow timeout before each attempt
@@ -811,6 +820,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                         vars_scope=vars_scope,
                         user_id=user_id,
                         tenant_id=tenant_id,
+                        logical_execution_id=logical_execution_id,
                     ),
                     timeout=node_timeout_ms / 1000.0,
                 )
@@ -1590,6 +1600,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         vars_scope: Dict[str, Any],
         user_id: Optional[str],
         tenant_id: Optional[str],
+        logical_execution_id: Optional[str] = None,
     ) -> Tuple[Dict[str, Any], List[str]]:
         node_type = node.get("type", "tool_call")
         if node_type == "switch":
@@ -1664,6 +1675,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 user_message,
                 user_id=user_id,
                 tenant_id=tenant_id,
+                logical_execution_id=logical_execution_id,
             )
             # SPEC §18: Record success to reset failure counter
             if self.cache and tool_name:
@@ -1755,6 +1767,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         user_id: Optional[str],
         tenant_id: Optional[str],
         descriptor: Optional[ToolDescriptor] = None,
+        logical_execution_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         tool_name = tool or "llm.generic"
         if descriptor is None:
@@ -1823,6 +1836,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             user_id=user_id,
             tenant_id=tenant_id,
             artifact_id=descriptor.artifact_id if descriptor else None,
+            logical_execution_id=logical_execution_id,
         )
 
         def _run_handler() -> Dict[str, Any]:
@@ -2375,8 +2389,17 @@ class WorkflowEngine(WorkflowStreamingMixin):
         allowlist PERMITS when no policy is set on the connecting thread.
         """
 
+        # Both of these are thread-local, and for the same reason neither
+        # follows work into a pool. The guard was already re-applied here; the
+        # lease was not, so a parallel round ran with `active_invocation()`
+        # None — which `LeasedProxy` reads as the API path and waves through.
+        # Captured on the leased thread, before any worker starts.
+        leased = active_invocation()
+
         def run_one(name: str, args: Dict[str, Any], sink: List[str]) -> str:
-            with tool_network_guard(self.tool_network_policy):
+            with current_invocation(leased), tool_network_guard(
+                self.tool_network_policy
+            ):
                 return self._execute_agent_tool(
                     name,
                     args,

@@ -40,6 +40,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from liminallm.service.confine import backend_name, confine
+from liminallm.service.lease import require_live_lease
 
 DEFAULT_TIMEOUT_SECONDS = 20
 MAX_OUTPUT_CHARS = 8_000
@@ -206,6 +207,13 @@ def publish_artifacts(
     extension policy as an upload: publishing arbitrary types would let the
     interpreter put files into the user's area that /files/upload would reject.
     """
+    # Publication is a durable operation on the user's persistent area, and
+    # it reaches it directly rather than through the store — so the leased
+    # proxies never see it and a revoked invocation could still leave a file
+    # behind. The check is here, at the copy, rather than at a caller: this
+    # function is what actually writes.
+    require_live_lease()
+
     published: list[str] = []
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)

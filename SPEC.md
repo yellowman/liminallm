@@ -2594,6 +2594,20 @@ the following are treated as constants the kernel must honor; LLM edits happen o
     leased call, reads included: a revoked invocation has no authority to
     read with either, and a list of "write methods" would be a guess about
     which calls matter.
+  - **the lease follows the work, not the thread that started it.** a round of
+    parallel reads runs in a nested pool, and the lease is thread-local, so it
+    is re-applied in every worker — the same reason the egress guard already
+    was. an unleased thread reads as the api path and passes every check.
+  - **a durable operation that does not travel through a proxied dependency
+    asks the broker itself.** publishing into the user's file area copies
+    straight to disk, so the check lives at the copy, and it refuses loudly
+    rather than returning an empty result a caller would report as success.
+  - **two ids, because they answer different questions.** a lease is keyed by
+    `invocation_id`, fresh per attempt, so a retry cannot inherit the previous
+    attempt's authority. a durable idempotency key is keyed by
+    `logical_execution_id`, one per node execution and stable across its
+    attempts, because killing a worker does not recall an external operation
+    it already submitted.
   - **an invocation names an id and must execute that id.** a tool name is
     free text inside `schema`, and artifact names carry no uniqueness
     constraint, so two tools may answer to one name. `POST /tools/{id}/invoke`
