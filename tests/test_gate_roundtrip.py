@@ -131,9 +131,10 @@ class TestRouterGatesReachTheModel:
     def test_a_routed_gate_scales_the_served_delta(self, tmp_path, checkpoint):
         """End of the chain: the gate the router picked is the gate applied."""
         config = transformer.load_config(checkpoint)
-        _write_adapter(tmp_path / "ad", config, value=0.05)
+        _write_adapter(tmp_path / "ad" / "v0001", config, value=0.05)
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
-        adapter = {"id": "ad", "base_model": BASE, "backend": "local", "fs_dir": "ad"}
+        adapter = {"id": "ad", "base_model": BASE, "backend": "local", "fs_dir": "ad",
+                   "current_version": 1}
 
         full = backend._blend_adapter_weights(
             [{**adapter, "weight": 1.0}], user_id="u"
@@ -168,11 +169,12 @@ class TestGateAwareKvCache:
         self, tmp_path, checkpoint
     ):
         config = transformer.load_config(checkpoint)
-        _write_adapter(tmp_path / "ad", config, value=0.05)
+        _write_adapter(tmp_path / "ad" / "v0001", config, value=0.05)
         backend = LocalJaxLoRABackend(
             str(checkpoint), str(tmp_path), max_new_tokens=2
         )
-        adapter = {"id": "ad", "base_model": BASE, "backend": "local", "fs_dir": "ad"}
+        adapter = {"id": "ad", "base_model": BASE, "backend": "local", "fs_dir": "ad",
+                   "current_version": 1}
         messages = [{"role": "user", "content": "hello there friend"}]
 
         backend.generate(messages, [{**adapter, "weight": 0.8}], user_id="u")
@@ -193,10 +195,10 @@ class TestCompositionRefusesRatherThanPartiallyApplies:
         """SPEC §5.2 forbids partial application; dropping the odd adapter
         and applying the rest serves a stack the router never chose."""
         config = transformer.load_config(checkpoint)
-        _write_adapter(tmp_path / "ok", config, value=0.05)
+        _write_adapter(tmp_path / "ok" / "v0001", config, value=0.05)
         # Same target, incompatible projection width.
-        (tmp_path / "bad").mkdir()
-        (tmp_path / "bad" / "params.json").write_text(
+        (tmp_path / "bad" / "v0001").mkdir(parents=True)
+        (tmp_path / "bad" / "v0001" / "params.json").write_text(
             json.dumps(
                 {
                     "layers.0.attn_q.A": [[0.1] * (config.hidden_size + 3)] * 2,
@@ -208,21 +210,22 @@ class TestCompositionRefusesRatherThanPartiallyApplies:
         with pytest.raises(ValueError, match="refusing the adapter stack"):
             backend._blend_adapter_weights(
                 [
-                    {"id": "ok", "base_model": BASE, "backend": "local", "fs_dir": "ok"},
-                    {"id": "bad", "base_model": BASE, "backend": "local", "fs_dir": "bad"},
+                    {"id": "ok", "base_model": BASE, "backend": "local", "fs_dir": "ok", "current_version": 1},
+                    {"id": "bad", "base_model": BASE, "backend": "local", "fs_dir": "bad", "current_version": 1},
                 ],
                 user_id="u",
             )
 
     def test_an_a_without_its_b_refuses(self, tmp_path, checkpoint):
-        (tmp_path / "half").mkdir()
-        (tmp_path / "half" / "params.json").write_text(
+        (tmp_path / "half" / "v0001").mkdir(parents=True)
+        (tmp_path / "half" / "v0001" / "params.json").write_text(
             json.dumps({"layers.0.attn_q.A": [[0.1, 0.2]]})
         )
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
         with pytest.raises(ValueError, match="refusing the adapter stack"):
             backend._blend_adapter_weights(
-                [{"id": "half", "base_model": BASE, "backend": "local", "fs_dir": "half"}], user_id="u"
+                [{"id": "half", "base_model": BASE, "backend": "local", "fs_dir": "half",
+                  "current_version": 1}], user_id="u"
             )
 
 

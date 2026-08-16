@@ -13,15 +13,11 @@ from liminallm.service.model_backend import (
     StubBackend,
     active_adapters,
     get_adapter_mode,
+    mode_value,
 )
 from liminallm.storage.models import Message
 
 logger = get_logger(__name__)
-
-
-def _mode_value(mode) -> str:
-    """An adapter mode as its comparable string, enum member or not."""
-    return str(getattr(mode, "value", mode) or "").strip().lower()
 
 
 class LLMService:
@@ -362,7 +358,7 @@ class LLMService:
             # because the API backends were injecting the prompt themselves;
             # with materialization now solely the service's (§5.0.1), the same
             # bug would drop those adapters' instructions entirely.
-            mode = _mode_value(get_adapter_mode(adapter))
+            mode = mode_value(get_adapter_mode(adapter))
             if mode not in {AdapterMode.PROMPT, AdapterMode.HYBRID}:
                 continue
             if mode == AdapterMode.HYBRID and self._backend_applies_lora_weights:

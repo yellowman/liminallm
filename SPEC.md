@@ -1333,14 +1333,24 @@ cluster qualifies          pooled events ≥ threshold      eval gate passes
      absence. the same identity binds the write side: a training job may not
      place a new version in another adapter's tree, where that adapter's
      promotion would authorize it.
-   - **a versionless artifact cannot authorize a version.** an artifact with
-     no `current_version` at all — the never-versioned legacy shape, which
-     the adapter schema no longer permits to be created — may serve its own
-     `params.json` and nothing else. it must not scan for `latest`, for
-     `vNNNN`, or for any subdirectory, because both holes closed above reopen
-     immediately in a lane that skips the version check: a `latest` aimed
-     elsewhere serves another adapter's weights, and a bare `vNNNN` serves
-     exactly what a gate-rejected run leaves on disk.
+   - **there is no versionless serving lane.** every adapter that may serve
+     LoRA weights records `current_version`, which the adapter schema
+     requires. `current_version <= 0`, or absent, authorizes no weights;
+     `N > 0` authorizes exactly this adapter's `vNNNN/params.json`. a direct
+     `params.json`, a `latest` pointer, a directory scan, or the mere
+     presence of a file on disk never authorizes anything. a legacy artifact
+     without the field is treated as having no promoted weights and must be
+     migrated before it can serve any.
+
+     the lane that existed for such artifacts was constrained twice and then
+     removed, because every hole this section closes had reopened inside it:
+     `latest` aimed elsewhere served another adapter's weights, a bare
+     `vNNNN` served what a gate-rejected run leaves behind, and a versionless
+     *hybrid* took weights from its direct file while the service, reading
+     metadata alone, injected the prompt fallback — the two voices §5.0.1
+     forbids, reached because the two sides asked different questions. it was
+     compatibility code for state the system cannot create, and deleting it
+     is what makes the resolver agree with the data model.
    - **after graduation the prompt is the fallback, not a second voice.** on a
      backend that applies LoRA weights, a promoted hybrid adapter is carried
      by its weights and its `prompt_instructions` are NOT injected (§5.0.1);

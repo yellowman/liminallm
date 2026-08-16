@@ -226,7 +226,9 @@ class TestWeightedAdapterBlending:
         backend = LocalJaxLoRABackend("test-model", str(tmp_path))
 
         # Create adapter directories with weight files
-        adapter1_dir = tmp_path / "adapters" / "adapter1"
+        # A promoted version, because that is the only thing §5.5 lets
+        # serving read; a bare params.json authorizes nothing.
+        adapter1_dir = tmp_path / "adapters" / "adapter1" / "v0001"
         adapter1_dir.mkdir(parents=True)
         (adapter1_dir / "params.json").write_text(
             json.dumps(
@@ -237,7 +239,7 @@ class TestWeightedAdapterBlending:
             )
         )
 
-        adapter2_dir = tmp_path / "adapters" / "adapter2"
+        adapter2_dir = tmp_path / "adapters" / "adapter2" / "v0001"
         adapter2_dir.mkdir(parents=True)
         (adapter2_dir / "params.json").write_text(
             json.dumps(
@@ -260,6 +262,7 @@ class TestWeightedAdapterBlending:
                 "base_model": "test-model",
                 "weight": 1.0,
                 "fs_dir": str(tmp_path / "adapters" / "adapter1"),
+                "current_version": 1,
             }
         ]
 
@@ -289,12 +292,14 @@ class TestWeightedAdapterBlending:
                 "base_model": "test-model",
                 "weight": 0.3,
                 "fs_dir": str(tmp_path / "adapters" / "adapter1"),
+                "current_version": 1,
             },
             {
                 "id": "adapter2",  # A = B = 2I
                 "base_model": "test-model",
                 "weight": 0.7,
                 "fs_dir": str(tmp_path / "adapters" / "adapter2"),
+                "current_version": 1,
             },
         ]
 
@@ -316,6 +321,7 @@ class TestWeightedAdapterBlending:
                 "base_model": "test-model",
                 "gate_weight": 0.5,
                 "fs_dir": str(tmp_path / "adapters" / "adapter1"),
+                "current_version": 1,
             },
         ]
 
@@ -334,6 +340,7 @@ class TestWeightedAdapterBlending:
                 "base_model": "test-model",
                 "schema": {"weight": 0.5},
                 "fs_dir": str(tmp_path / "adapters" / "adapter1"),
+                "current_version": 1,
             },
         ]
 
@@ -357,12 +364,14 @@ class TestWeightedAdapterBlending:
                 "base_model": "test-model",
                 "weight": 0.0,
                 "fs_dir": str(tmp_path / "adapters" / "adapter1"),
+                "current_version": 1,
             },
             {
                 "id": "adapter2",  # matches its directory (§5.5)
                 "base_model": "test-model",
                 "weight": 1.0,
                 "fs_dir": str(tmp_path / "adapters" / "adapter2"),
+                "current_version": 1,
             },
         ]
 
@@ -382,12 +391,14 @@ class TestWeightedAdapterBlending:
                 "base_model": "test-model",
                 "weight": 1.5,  # Should be clamped to 1.0
                 "fs_dir": str(tmp_path / "adapters" / "adapter1"),
+                "current_version": 1,
             },
             {
                 "id": "adapter2",
                 "base_model": "test-model",
                 "weight": -0.5,  # Should be clamped to 0.0
                 "fs_dir": str(tmp_path / "adapters" / "adapter2"),
+                "current_version": 1,
             },
         ]
 
@@ -408,6 +419,7 @@ class TestWeightedAdapterBlending:
                 "base_model": "test-model",
                 # No weight specified
                 "fs_dir": str(tmp_path / "adapters" / "adapter1"),
+                "current_version": 1,
             },
         ]
 
@@ -437,7 +449,8 @@ class TestWeightedAdapterBlending:
 
         def delta_at(gate):
             weights = backend._blend_adapter_weights(
-                [{"id": "adapter1", "base_model": "test-model", "weight": gate, "fs_dir": path}],
+                [{"id": "adapter1", "base_model": "test-model", "weight": gate,
+                  "fs_dir": path, "current_version": 1}],
                 user_id="test-user",
             )
             return (weights["layers.0.attn_q.B"] @ weights["layers.0.attn_q.A"]).tolist()[0][0]
@@ -468,14 +481,15 @@ class TestDualModeIntegration:
         """
         backend = LocalJaxLoRABackend("llama-7b", str(tmp_path))
 
-        adapter_dir = tmp_path / "adapters" / "mismatch"
+        adapter_dir = tmp_path / "adapters" / "mismatch" / "v0001"
         adapter_dir.mkdir(parents=True)
         (adapter_dir / "params.json").write_text(json.dumps({"layers.0.attn_q.A": [[1.0]]}))
 
         adapter = {
             "id": "mismatch",
             "base_model": "mistral-7b",  # Different from backend's llama-7b
-            "fs_dir": str(adapter_dir),
+            "fs_dir": str(adapter_dir.parent),
+            "current_version": 1,
         }
 
         with pytest.raises(ValueError, match="serves"):
@@ -496,7 +510,7 @@ class TestDualModeIntegration:
         """
         backend = LocalJaxLoRABackend("llama-7b", str(tmp_path))
 
-        adapter_dir = tmp_path / "adapters" / "prompted"
+        adapter_dir = tmp_path / "adapters" / "prompted" / "v0001"
         adapter_dir.mkdir(parents=True)
         (adapter_dir / "params.json").write_text(json.dumps({"layers.0.attn_q.A": [[1.0]]}))
 
@@ -505,7 +519,8 @@ class TestDualModeIntegration:
                 "id": "prompted",
                 "mode": "prompt",
                 "base_model": "mistral-7b",
-                "fs_dir": str(adapter_dir),
+                "fs_dir": str(adapter_dir.parent),
+                "current_version": 1,
             },
             user_id="test-user",
         ) == {}

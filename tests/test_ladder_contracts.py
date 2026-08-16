@@ -255,8 +255,11 @@ class TestVersionAuthorityOverPathShape:
         This test previously asserted the opposite for a positive version —
         it blessed a file being served as "version 1" on nothing but the
         artifact's say-so, which is the escape hatch §5.5's version authority
-        exists to close. Only a never-versioned artifact may use a direct
-        path.
+        exists to close. It then allowed a never-versioned artifact to use a
+        direct path, which was the same hatch with a different key: a
+        versionless hybrid took weights from the file while the service,
+        reading metadata alone, injected its prompt. A direct file authorizes
+        nothing, at any version.
         """
         adapter_dir = tmp_path / "direct"
         adapter_dir.mkdir()
@@ -273,7 +276,7 @@ class TestVersionAuthorityOverPathShape:
 
         assert backend._resolve_params_path(params, current_version=0) is None
         assert backend._resolve_params_path(params, current_version=1) is None
-        assert backend._resolve_params_path(params, current_version=None) == params
+        assert backend._resolve_params_path(params, current_version=None) is None
         # A promoted artifact pointing at a bare file refuses rather than
         # serving it: the adapter was selected and cannot be honored.
         with pytest.raises(ValueError, match="could not be loaded"):

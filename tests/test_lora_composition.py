@@ -105,9 +105,9 @@ class TestGateWeights:
         """SPEC §5.2: the delta is g·α·BA. Averaging then normalizing gave
         (gA)/g = A, so every gate produced an identical delta."""
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
-        _adapter_on_disk(tmp_path / "one", config, seed=1)
+        _adapter_on_disk(tmp_path / "one" / "v0001", config, seed=1)
         _, params = transformer.load_checkpoint(checkpoint)
-        adapter = {"id": "one", "base_model": BASE, "backend": "local", "fs_dir": "one"}
+        adapter = {"id": "one", "base_model": BASE, "backend": "local", "fs_dir": "one", "current_version": 1}
 
         full = _effective_delta(
             backend._blend_adapter_weights([{**adapter, "weight": 1.0}], user_id="u")
@@ -137,9 +137,9 @@ class TestGateWeights:
 
     def test_a_closed_gate_contributes_nothing(self, tmp_path, checkpoint, config):
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
-        _adapter_on_disk(tmp_path / "off", config, seed=2)
+        _adapter_on_disk(tmp_path / "off" / "v0001", config, seed=2)
         blended = backend._blend_adapter_weights(
-            [{"id": "off", "base_model": BASE, "backend": "local", "fs_dir": "off", "weight": 0.0}],
+            [{"id": "off", "base_model": BASE, "backend": "local", "fs_dir": "off", "current_version": 1, "weight": 0.0}],
             user_id="u",
         )
         assert blended == {}
@@ -149,18 +149,18 @@ class TestGateWeights:
         classified as an unmatched name, so the declared serialization
         contract was not round-trippable."""
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
-        _adapter_on_disk(tmp_path / "plain", config, seed=3)
-        _adapter_on_disk(tmp_path / "scaled", config, seed=3, scale=0.5)
+        _adapter_on_disk(tmp_path / "plain" / "v0001", config, seed=3)
+        _adapter_on_disk(tmp_path / "scaled" / "v0001", config, seed=3, scale=0.5)
         _, params = transformer.load_checkpoint(checkpoint)
 
         plain = _effective_delta(
             backend._blend_adapter_weights(
-                [{"id": "plain", "base_model": BASE, "backend": "local", "fs_dir": "plain"}], user_id="u"
+                [{"id": "plain", "base_model": BASE, "backend": "local", "fs_dir": "plain", "current_version": 1}], user_id="u"
             )
         )
         scaled = _effective_delta(
             backend._blend_adapter_weights(
-                [{"id": "scaled", "base_model": BASE, "backend": "local", "fs_dir": "scaled"}], user_id="u"
+                [{"id": "scaled", "base_model": BASE, "backend": "local", "fs_dir": "scaled", "current_version": 1}], user_id="u"
             )
         )
         assert float(jnp.max(jnp.abs(plain))) > 1e-6
@@ -188,11 +188,11 @@ class TestTwoAdaptersCompose:
         No term of the SPEC sum has that shape.
         """
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
-        _adapter_on_disk(tmp_path / "a1", config, seed=11)
-        _adapter_on_disk(tmp_path / "a2", config, seed=22, rank=2)  # differing rank
+        _adapter_on_disk(tmp_path / "a1" / "v0001", config, seed=11)
+        _adapter_on_disk(tmp_path / "a2" / "v0001", config, seed=22, rank=2)  # differing rank
         _, params = transformer.load_checkpoint(checkpoint)
-        first = {"id": "a1", "base_model": BASE, "backend": "local", "fs_dir": "a1", "weight": 0.6}
-        second = {"id": "a2", "base_model": BASE, "backend": "local", "fs_dir": "a2", "weight": 0.4}
+        first = {"id": "a1", "base_model": BASE, "backend": "local", "fs_dir": "a1", "current_version": 1, "weight": 0.6}
+        second = {"id": "a2", "base_model": BASE, "backend": "local", "fs_dir": "a2", "current_version": 1, "weight": 0.4}
 
         alone_first = _effective_delta(
             backend._blend_adapter_weights([first], user_id="u")
@@ -227,12 +227,12 @@ class TestTwoAdaptersCompose:
 
     def test_ranks_concatenate_rather_than_collide(self, tmp_path, checkpoint, config):
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
-        _adapter_on_disk(tmp_path / "r4", config, seed=5, rank=4)
-        _adapter_on_disk(tmp_path / "r2", config, seed=6, rank=2)
+        _adapter_on_disk(tmp_path / "r4" / "v0001", config, seed=5, rank=4)
+        _adapter_on_disk(tmp_path / "r2" / "v0001", config, seed=6, rank=2)
         blended = backend._blend_adapter_weights(
             [
-                {"id": "r4", "base_model": BASE, "backend": "local", "fs_dir": "r4"},
-                {"id": "r2", "base_model": BASE, "backend": "local", "fs_dir": "r2"},
+                {"id": "r4", "base_model": BASE, "backend": "local", "fs_dir": "r4", "current_version": 1},
+                {"id": "r2", "base_model": BASE, "backend": "local", "fs_dir": "r2", "current_version": 1},
             ],
             user_id="u",
         )
@@ -459,13 +459,13 @@ class TestSftSequenceConstruction:
 
         # And serving consumes exactly this file, through gate composition.
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
-        # The directory carries the adapter's identity (§5.5), so it is named
-        # for the adapter rather than for its role in this test.
-        adapter_dir = tmp_path / "e2e"
-        adapter_dir.mkdir()
+        # The directory carries the adapter's identity and the version its
+        # promotion authorized (§5.5) — a bare params.json authorizes nothing.
+        adapter_dir = tmp_path / "e2e" / "v0001"
+        adapter_dir.mkdir(parents=True)
         (adapter_dir / "params.json").write_text(params_path.read_text())
         blended = backend._blend_adapter_weights(
-            [{"id": "e2e", "base_model": BASE, "backend": "local", "fs_dir": "e2e", "weight": 1.0}],
+            [{"id": "e2e", "base_model": BASE, "backend": "local", "fs_dir": "e2e", "current_version": 1, "weight": 1.0}],
             user_id="u",
         )
         assert transformer.lora_by_layer(jnp, blended, config.num_layers) is not None

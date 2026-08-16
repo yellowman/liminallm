@@ -129,6 +129,33 @@ def _safe_weight(value: Any, default: float = 1.0, *, context: str = "") -> floa
         return default
 
 
+def mode_value(mode) -> str:
+    """An adapter mode as its comparable string, enum member or not.
+
+    `get_adapter_mode` returns the raw string when an artifact states a mode
+    and an `AdapterMode` member when it infers one — and `AdapterMode` is a
+    `str` Enum whose `str()` is "AdapterMode.HYBRID". Normalizing with a bare
+    `str()` therefore produced a value matching nothing, so every comparison
+    against the mode constants silently failed for adapters that stated no
+    mode. That is the documented default for legacy adapters: it dropped
+    their prompts in the service, and here it let a legacy `backend: prompt`
+    adapter load weights, which is the one thing §5.5 says the prompt rung
+    can never do.
+    """
+    return str(getattr(mode, "value", mode) or "").strip().lower()
+
+
+def effective_mode(adapter: dict) -> str:
+    """The adapter's authoritative mode (SPEC §5.0.1), stated or inferred.
+
+    `mode` wins over the legacy `backend`/`provider` inference, in the
+    adapter or in its schema.
+    """
+    schema = adapter.get("schema") if isinstance(adapter.get("schema"), dict) else {}
+    merged = {**(schema or {}), **{k: v for k, v in adapter.items() if k != "schema"}}
+    return mode_value(get_adapter_mode(merged))
+
+
 def effective_gate(adapter: dict) -> float:
     """The gate that actually applies to an adapter (SPEC §5.0.1).
 
@@ -1967,15 +1994,11 @@ class LocalJaxLoRABackend:
         # weights. Defense in depth alongside the version pin — the ladder
         # says weights arrive only on graduation to hybrid/local, so files
         # that happen to exist on disk must not change that.
-        schema_for_mode = (
-            adapter.get("schema") if isinstance(adapter.get("schema"), dict) else {}
-        )
-        _ = schema_for_mode
-        if self._adapter_mode_of(adapter) == AdapterMode.PROMPT:
+        mode = self._adapter_mode_of(adapter)
+        if mode == AdapterMode.PROMPT:
             logger.debug("adapter_prompt_mode_carries_no_weights", adapter_id=adapter_id)
             return {}
 
-        path = Path(self._adapter_path(adapter, requested_user_id=user_id))
         # SPEC §5.4.6: only the promoted version may be served. current_version
         # is authoritative - without it, resolution would fall back to "newest
         # directory on disk", which serves weights the eval gate rejected.
@@ -1983,6 +2006,8 @@ class LocalJaxLoRABackend:
         current_version = adapter.get("current_version")
         if current_version is None:
             current_version = (schema or {}).get("current_version")
+
+        path = Path(self._adapter_path(adapter, requested_user_id=user_id))
         params_path = self._resolve_params_path(path, current_version=current_version)
         if not params_path:
             return {}
@@ -2068,90 +2093,45 @@ class LocalJaxLoRABackend:
     def _resolve_params_path(
         self, path: Path, *, current_version: Optional[int] = None
     ) -> Optional[Path]:
-        # The version decision comes FIRST. A direct params.json path used to
-        # short-circuit ahead of it, so an artifact pointing at a file served
-        # that file at current_version 0 — or served something unrelated to
-        # the version it claimed to pin. SPEC §5.5 gives version authority
-        # over path shape.
-        if path.is_file() and path.name == "params.json":
-            if current_version is not None:
-                # A bare file cannot demonstrate which version it is, so it
-                # cannot satisfy a versioned artifact — at 0 there is nothing
-                # promoted, and at N it would serve "whatever this file
-                # happens to be" while claiming to pin N.
-                logger.warning(
-                    "adapter_direct_path_cannot_prove_version",
-                    adapter_path=str(path),
-                    current_version=current_version,
-                )
-                return None
-            return path
-        # When the artifact records a promoted version, serve exactly that
-        # version. Never fall back to scanning for the newest directory: an
-        # un-promoted version left on disk by a gate-rejected training run
-        # would win that scan. (This comment used to add "or the `latest`
-        # pointer maintained alongside it", which the code below stopped
-        # doing — and a comment describing the behaviour it replaced reads as
-        # a licence to restore it.)
+        """The one `params.json` a promoted version authorizes, or None.
+
+        SPEC §5.5, entire: `current_version <= 0` (or absent) authorizes no
+        weights; `N > 0` authorizes exactly this adapter's
+        `vNNNN/params.json`. Nothing else is authoritative — not a direct
+        `params.json`, not `latest`, not a directory scan, not the mere
+        presence of a file.
+
+        This used to have a third lane for artifacts with no `current_version`
+        at all, which served a direct file and, before that, scanned `latest`
+        then `v*` then any subdirectory. Every hole this method closes had
+        reopened inside it: `latest` aimed elsewhere served another adapter's
+        weights, a bare `vNNNN` served exactly what a gate-rejected run leaves
+        behind, and a versionless *hybrid* got weights from the file while the
+        service, reading only metadata, injected its prompt fallback — the two
+        voices §5.0.1 forbids. The lane existed for artifacts the adapter
+        schema has required `current_version` from for some time, so it was
+        compatibility code for state that cannot be created. Deleting it is
+        what makes the resolver agree with the data model.
+        """
         try:
             pinned = int(current_version) if current_version is not None else 0
         except (TypeError, ValueError):
             pinned = 0
-        if pinned > 0:
-            # Exactly this adapter's vNNNN, and nothing else. The `latest`
-            # pointer used to be a fallback here; checking that its target
-            # was *named* vNNNN proved only a basename, so `A/latest ->
-            # B/v0001` served another adapter's weights as A's version 1. And
-            # it enabled nothing: a `latest` legitimately pointing at
-            # A/vNNNN means A/vNNNN exists, which the exact path above has
-            # already returned. `latest` remains a convenience pointer for
-            # humans and tooling; it takes no part in authoritative
-            # resolution.
-            exact = path / f"v{pinned:04d}" / "params.json"
-            if exact.exists():
-                return exact
-            logger.warning(
-                "adapter_promoted_version_missing",
-                adapter_path=str(path),
-                current_version=pinned,
-            )
+        if pinned <= 0:
+            # Nothing promoted. Never scan: a training job writes its version
+            # directory *before* the eval gate runs, so a scan finds weights
+            # the gate never approved, and a crash between writing and
+            # quarantine would make that permanent.
+            logger.debug("adapter_has_no_promoted_version", adapter_path=str(path))
             return None
-        if current_version is not None:
-            # version 0 (or unparseable) means nothing has been promoted yet.
-            # Falling through to the scan below would find the vNNNN a
-            # training job writes *before* its eval gate runs, so a prompt-rung
-            # adapter would serve weights the gate never approved — and a crash
-            # between writing and quarantine would make that permanent.
-            logger.debug(
-                "adapter_has_no_promoted_version", adapter_path=str(path)
-            )
-            return None
-        # An artifact with no `current_version` at all — the never-versioned
-        # legacy shape; the artifact schema requires the field, so nothing
-        # created or updated through the store arrives here. Its own
-        # `params.json` is the only thing it can serve.
-        #
-        # This used to fall through to a scan: `latest`, then `v*`, then any
-        # subdirectory, newest wins. That reintroduced both holes §5.5 closed
-        # on the pinned path — a `latest` aimed at another adapter served that
-        # adapter's weights, and a bare `vNNNN` served a version no
-        # `current_version` ever authorized, which is exactly what a
-        # gate-rejected training run leaves on disk. A versionless artifact
-        # cannot authorize a version, so it may not resolve to one.
-        direct = path / "params.json"
-        if direct.exists():
-            return direct
-        for stale in ("latest", "v*", "*"):
-            if any(p.exists() for p in path.glob(f"{stale}/params.json")):
-                logger.warning(
-                    "adapter_versionless_cannot_resolve_a_version",
-                    adapter_path=str(path),
-                    message=(
-                        "versioned weights exist but the artifact records no "
-                        "current_version to authorize one; serving nothing"
-                    ),
-                )
-                break
+        exact = path / f"v{pinned:04d}" / "params.json"
+        if exact.exists():
+            return exact
+        logger.warning(
+            "adapter_promoted_version_missing",
+            adapter_path=str(path),
+            current_version=pinned,
+        )
         return None
 
     def _version_sort_key(self, name: str) -> Tuple[int, str]:
@@ -2719,15 +2699,8 @@ class LocalJaxLoRABackend:
 
     @staticmethod
     def _adapter_mode_of(adapter: dict) -> str:
-        """The adapter's authoritative mode (SPEC §5.0.1).
-
-        ``mode`` wins over the legacy ``backend``/``provider`` inference, and
-        behaviour that keys off ``backend`` instead can disagree with the
-        field the spec calls authoritative.
-        """
-        schema = adapter.get("schema") if isinstance(adapter.get("schema"), dict) else {}
-        merged = {**(schema or {}), **{k: v for k, v in adapter.items() if k != "schema"}}
-        return str(get_adapter_mode(merged) or "").strip().lower()
+        """The adapter's authoritative mode (SPEC §5.0.1), stated or inferred."""
+        return effective_mode(adapter)
 
     @staticmethod
     def _promoted_version_of(adapter: dict) -> int:

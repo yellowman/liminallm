@@ -373,49 +373,38 @@ class TestVersionAuthorityIsAbsolute:
             tmp_path / "users" / "u" / "adapters" / "A"
         )
 
-    def test_a_versionless_artifact_cannot_resolve_to_a_version(
+    def test_only_a_promoted_version_resolves_to_anything(
         self, tmp_path, checkpoint
     ):
-        """§5.5: `current_version` is the authority, so an artifact that has
-        none cannot serve a version at all.
+        """§5.5, entire: `current_version > 0` or nothing.
 
-        The pinned lane refuses `latest` and refuses a bare directory scan.
-        The versionless lane still did both, which reopened the same two
-        holes for any adapter whose schema predates the required field: a
-        `latest` aimed elsewhere served another adapter's weights, and a bare
-        `vNNNN` served exactly what a gate-rejected run leaves behind.
+        There is no versionless lane. It served a direct `params.json` and,
+        before that, scanned `latest` then `v*` then any subdirectory — so
+        every hole this resolver closes had reopened inside it. It existed for
+        artifacts the adapter schema has long required `current_version` from,
+        which is to say for state the system cannot create.
         """
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
         adapter_root = tmp_path / "legacy"
         _write(adapter_root / "v0001", {"layers.0.attn_q.A": [[0.1]]})
-
-        # A version exists on disk; nothing authorized it.
-        assert backend._resolve_params_path(adapter_root, current_version=None) is None
-
-        # A pointer into a different adapter is not a way in either.
+        (adapter_root / "params.json").write_text(
+            json.dumps({"layers.0.attn_q.A": [[0.2]]})
+        )
         _write(tmp_path / "elsewhere" / "v0001", {"layers.0.attn_q.A": [[0.9]]})
         (adapter_root / "latest").symlink_to(tmp_path / "elsewhere" / "v0001")
+
+        # Absent and 0 are the same answer now: nothing is authorized.
         assert backend._resolve_params_path(adapter_root, current_version=None) is None
-
-        # Its own params.json is the one thing it may serve.
-        (adapter_root / "params.json").write_text(json.dumps({"layers.0.attn_q.A": [[0.1]]}))
-        assert backend._resolve_params_path(adapter_root, current_version=None) == (
-            adapter_root / "params.json"
-        )
-
-    def test_a_direct_file_cannot_satisfy_a_versioned_artifact(
-        self, tmp_path, checkpoint
-    ):
-        """A bare params.json cannot demonstrate which version it is. This
-        used to be accepted for any positive version — the earlier test even
-        asserted it."""
-        params = tmp_path / "loose" / "params.json"
+        assert backend._resolve_params_path(adapter_root, current_version=0) is None
+        # A bare file is never authoritative, at any version.
+        loose = tmp_path / "loose" / "params.json"
         _write(tmp_path / "loose", {"layers.0.attn_q.A": [[0.1]]})
-        backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
-        assert backend._resolve_params_path(params, current_version=1) is None
-        assert backend._resolve_params_path(params, current_version=0) is None
-        # An artifact that was never versioned may still use a direct path.
-        assert backend._resolve_params_path(params, current_version=None) == params
+        for version in (None, 0, 1):
+            assert backend._resolve_params_path(loose, current_version=version) is None
+        # And the one thing that is: this adapter's promoted vNNNN.
+        assert backend._resolve_params_path(adapter_root, current_version=1) == (
+            adapter_root / "v0001" / "params.json"
+        )
 
 
 class TestTheWorkerCarriesTheGateDecision:
@@ -782,6 +771,106 @@ class TestAClosedGateRemovesTheAdapterFromTheModel:
         )
         # Exactly one adapter's rank, so the closed one contributed nothing.
         assert blended["layers.0.attn_q.A"].shape[0] == 2
+
+
+class TestOnlyAPromotedVersionAuthorizesWeights:
+    """SPEC §5.5, through the service and the backend together.
+
+    The resolver test above proves the path rule. This proves what it is
+    for: a versionless hybrid used to take weights from a direct file while
+    the service, reading only metadata, injected its prompt fallback — the
+    two voices §5.0.1 forbids, arrived at because the two sides asked
+    different questions. One of them is now unable to ask.
+    """
+
+    def _service_and_backend(self, tmp_path, checkpoint):
+        backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
+        return LLMService(base_model=str(checkpoint), backend=backend), backend
+
+    def _representation(self, tmp_path, checkpoint, config, adapter):
+        service, backend = self._service_and_backend(tmp_path, checkpoint)
+        messages, kept = service._prepare_generation("hi", [adapter], [])
+        system = "\n".join(m["content"] for m in messages if m["role"] == "system")
+        weights = backend._blend_adapter_weights(kept, user_id="u", config=config)
+        return system.count("prefer tabs"), bool(weights)
+
+    def _adapter(self, checkpoint, name, **overrides):
+        return {
+            "id": name,
+            "base_model": str(checkpoint),
+            "fs_dir": f"adapters/{name}",
+            "prompt_instructions": "prefer tabs",
+            "weight": 1.0,
+            **overrides,
+        }
+
+    def test_a_versionless_adapter_serves_no_weights_whatever_its_mode(
+        self, tmp_path, checkpoint, config
+    ):
+        _write(tmp_path / "adapters" / "legacy", _valid_pair(config))
+        for mode in ("hybrid", "local", "prompt"):
+            _, weights = self._representation(
+                tmp_path, checkpoint, config,
+                self._adapter(checkpoint, "legacy", mode=mode),
+            )
+            assert weights is False, f"{mode} served an unauthorized file"
+
+    def test_the_versionless_hybrid_second_voice_is_gone(
+        self, tmp_path, checkpoint, config
+    ):
+        _write(tmp_path / "adapters" / "legacy", _valid_pair(config))
+        assert self._representation(
+            tmp_path, checkpoint, config,
+            self._adapter(checkpoint, "legacy", mode="hybrid"),
+        ) == (1, False)
+
+    def test_zero_authorizes_nothing_either(self, tmp_path, checkpoint, config):
+        _write(tmp_path / "adapters" / "zeroed", _valid_pair(config))
+        assert self._representation(
+            tmp_path, checkpoint, config,
+            self._adapter(checkpoint, "zeroed", mode="hybrid", current_version=0),
+        ) == (1, False)
+
+    def test_a_promoted_hybrid_is_weights_only(self, tmp_path, checkpoint, config):
+        """The control: promotion is the one thing that authorizes."""
+        _write(tmp_path / "adapters" / "graduated" / "v0001", _valid_pair(config))
+        prompts, weights = self._representation(
+            tmp_path, checkpoint, config,
+            self._adapter(checkpoint, "graduated", mode="hybrid", current_version=1),
+        )
+        assert weights is True
+        assert prompts == 0, "the prompt is the fallback, not a second voice"
+
+    def test_the_filesystem_does_not_choose_the_representation(
+        self, tmp_path, checkpoint, config
+    ):
+        """The architectural reason: what the service materializes must not
+        depend on whether a file happens to exist."""
+        adapter = self._adapter(checkpoint, "legacy", mode="hybrid")
+        service, _ = self._service_and_backend(tmp_path, checkpoint)
+
+        def system_text():
+            messages, _ = service._prepare_generation("hi", [adapter], [])
+            return "\n".join(m["content"] for m in messages if m["role"] == "system")
+
+        without = system_text()
+        _write(tmp_path / "adapters" / "legacy", _valid_pair(config))
+        assert system_text() == without
+
+    def test_an_inferred_prompt_rung_never_loads_weights(
+        self, tmp_path, checkpoint, config
+    ):
+        """§5.5's prompt-rung lock read the mode through `str()` of an enum,
+        so it recognized only a *stated* mode — a legacy `backend: prompt`
+        adapter loaded promoted weights."""
+        _write(tmp_path / "adapters" / "rung" / "v0001", _valid_pair(config))
+        _, backend = self._service_and_backend(tmp_path, checkpoint)
+        adapter = self._adapter(
+            checkpoint, "rung", backend="prompt", current_version=1
+        )
+        assert backend._blend_adapter_weights(
+            [adapter], user_id="u", config=config
+        ) == {}
 
 
 class TestPromotionSurvivesConvenienceState:
