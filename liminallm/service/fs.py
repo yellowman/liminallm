@@ -140,7 +140,12 @@ def authorize_path(
 
     * the caller's own area — `safe_join(base=/users/{user_id}, relative)`;
     * an artifact whose *persisted* visibility is `shared` or `global` and
-      whose `fs_path` covers what is being asked for.
+      whose `fs_path` covers what is being asked for **under `/shared`**.
+
+    The destination is part of the second rule, not decoration on it. An
+    artifact is not a general-purpose grant that happens to name a path: a row
+    covering `artifacts/{id}/v1.json`, or covering another user's files, must
+    confer nothing, because §18 opened `/shared` and nowhere else.
 
     A pathname is not one of them. `POST /contexts/{id}/sources` used to accept
     anything underneath `shared_fs_root/shared` because it was underneath that
@@ -179,9 +184,14 @@ def authorize_path(
     if candidate == mine_resolved or mine_resolved in candidate.parents:
         return candidate
 
-    if root not in candidate.parents and candidate != root:
+    shared_root = (root / "shared").resolve()
+    if shared_root not in candidate.parents:
+        # Not the caller's own area and not `/shared`, so there is no rule
+        # left that could permit it. Checked before the artifact lookup rather
+        # than inside it: an artifact row is only ever evidence about `/shared`,
+        # so asking about any other path is asking the wrong question.
         raise PathAuthorityError(
-            f"{fs_path!r} is outside the managed filesystem root"
+            f"{fs_path!r} is neither in your own files nor under the shared area"
         )
 
     # Ask the ancestors, not the string: an artifact naming a corpus directory
@@ -200,14 +210,16 @@ def authorize_path(
 
 
 def _artifact_authorizes(store, artifact, *, user_id: str, tenant_id) -> bool:
-    """Whether this artifact row entitles this caller to the path it names."""
+    """Whether this artifact row entitles this caller to the path it names.
+
+    Only `shared` and `global` — the two §18 names. `private` is deliberately
+    absent: the caller's own authority is their `/users/{id}` root and is
+    already spent there, so honouring a private row here would let an artifact
+    widen a caller's filesystem reach beyond their own area, which is not one
+    of the two sources the rule allows.
+    """
     visibility = getattr(artifact, "visibility", "private")
     owner_id = getattr(artifact, "owner_user_id", None)
-    if visibility == "private":
-        # Ownerless too: an artifact nobody owns cannot be shown to be this
-        # caller's, and a check that only refuses when an owner is present
-        # serves everyone a null owner.
-        return bool(owner_id) and owner_id == user_id
     if visibility == "shared":
         # `shared` is within one tenant, and the tenant is the owner's —
         # `artifact` has no tenant column of its own.

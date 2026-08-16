@@ -3922,14 +3922,21 @@ async def download_file(
     if not content_type:
         content_type = "application/octet-stream"
 
-    # SPEC §18: content-disposition set to prevent inline execution
-    # Use 'attachment' to force download rather than inline display
+    # SPEC §18: content-disposition set to prevent inline execution.
+    # The header is built by FileResponse rather than interpolated here: a
+    # filename is attacker-influenced the moment model-written code chose it,
+    # and `filename="{path}"` let a name containing a quote close the string
+    # and add a second `filename=` parameter — a browser taking the last one
+    # saves the file under a name and extension the injected page picked.
+    # `interpreter.publish_artifacts` refuses only `/` and a leading dot, so
+    # such a name is reachable. Starlette percent-encodes anything that is not
+    # already safe and emits the RFC 5987 `filename*=` form instead.
     return FileResponse(
         path=str(file_path),
         filename=path,
         media_type=content_type,
+        content_disposition_type="attachment",
         headers={
-            "Content-Disposition": f'attachment; filename="{path}"',
             "X-Content-Type-Options": "nosniff",
             "Cache-Control": "private, no-cache, no-store, must-revalidate",
         },

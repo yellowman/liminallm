@@ -150,11 +150,20 @@ class TestSharedNeedsAnArtifactNotAPathname:
         with pytest.raises(PermissionError):
             _authorize(runtime, shared_object, user=tenants["outsider"])
 
-    def test_the_owner_of_a_private_shared_path_may_still_use_it(
+    def test_a_private_artifact_confers_no_path_authority_at_all(
         self, runtime, tenants, shared_object
     ):
+        """Not even to its own owner.
+
+        §18 names two sources of filesystem authority and `private` is not one
+        of them: the caller's authority is their `/users/{id}` root, and it is
+        already exhausted there. Letting a private artifact confer path
+        authority as well means an artifact row can widen a caller's reach
+        beyond their own area, which the rule does not permit.
+        """
         _artifact(runtime, shared_object, owner=tenants["owner"], visibility="private")
-        assert _authorize(runtime, shared_object, user=tenants["owner"])
+        with pytest.raises(PermissionError):
+            _authorize(runtime, shared_object, user=tenants["owner"])
 
     def test_an_ownerless_shared_artifact_has_no_tenant_to_match(
         self, runtime, tenants, shared_object
@@ -232,6 +241,76 @@ class TestSharedNeedsAnArtifactNotAPathname:
         )
         with pytest.raises(PermissionError):
             _authorize(runtime, secret, user=tenants["outsider"])
+
+
+class TestTheExceptionIsForSharedAndNowhereElse:
+    """§18 states the exception with a destination in it.
+
+    "`artifact.visibility in ('shared','global')` **points into `/shared`**" —
+    so an artifact is not a general-purpose grant that happens to name a path.
+    Searching artifacts for any candidate under `shared_fs_root` made it one:
+    a row covering `artifacts/{id}/v1.json`, or covering another user's files,
+    would confer authority over paths §18 never opened.
+    """
+
+    @pytest.fixture
+    def outside_shared(self, runtime, tenants):
+        """A real path under the root but outside `/shared` — another user's
+        file, which is the version of this that matters."""
+        victim = tenants["colleague"]
+        files = (
+            Path(runtime.settings.shared_fs_root) / "users" / victim.id / "files"
+        )
+        files.mkdir(parents=True, exist_ok=True)
+        document = files / "private.md"
+        document.write_text("not yours\n")
+        return document
+
+    def test_a_shared_artifact_cannot_reach_outside_shared(
+        self, runtime, tenants, outside_shared
+    ):
+        """Asked as `owner`, not as `colleague`: `colleague` owns that
+        directory and would be granted it by the ownership rule, which would
+        make this test pass without the artifact rule doing anything. `owner`
+        is in the same tenant — so the artifact would grant it — and owns
+        nothing here.
+        """
+        _artifact(
+            runtime, outside_shared, owner=tenants["owner"], visibility="shared"
+        )
+        with pytest.raises(PermissionError):
+            _authorize(runtime, outside_shared, user=tenants["owner"])
+
+    def test_a_global_artifact_cannot_reach_outside_shared(
+        self, runtime, tenants, outside_shared
+    ):
+        _artifact(
+            runtime, outside_shared, owner=tenants["owner"], visibility="global"
+        )
+        with pytest.raises(PermissionError):
+            _authorize(runtime, outside_shared, user=tenants["outsider"])
+
+    def test_a_global_artifact_cannot_reach_the_artifact_store(
+        self, runtime, tenants
+    ):
+        """The one path an artifact really does own — its own payload — is
+        still not `/shared`, so it is still not this exception."""
+        payload = (
+            Path(runtime.settings.shared_fs_root)
+            / "artifacts"
+            / _unique("a")
+            / "v1.json"
+        )
+        payload.parent.mkdir(parents=True, exist_ok=True)
+        payload.write_text("{}")
+        _artifact(runtime, payload, owner=tenants["owner"], visibility="global")
+        with pytest.raises(PermissionError):
+            _authorize(runtime, payload, user=tenants["outsider"])
+
+    def test_the_victims_own_access_is_unaffected(self, runtime, tenants, outside_shared):
+        """The refusals above must come from the artifact rule, not from
+        breaking ordinary ownership."""
+        assert _authorize(runtime, outside_shared, user=tenants["colleague"])
 
 
 # ---------------------------------------------------------------------------
