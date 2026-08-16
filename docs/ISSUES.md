@@ -7081,3 +7081,72 @@ Notes: the throwaway scripts used for the 13th pass (`bigtest.js`,
 stub-model mode, deterministic waits instead of sleeps, and unique per-run
 identities (both already partially done).
 
+
+## 1b.1 carry-forward
+
+Open at `6993563`. Four strict xfails in `tests/test_invocation_lease.py`
+carry most of this in-repo; these two carry nothing, so they are written
+down here.
+
+### MEDIUM: `InvocationBroker._guards` grows for the life of the process
+
+`issue()` installs one lock per invocation. `revoke()` drops the id from
+`_live` and leaves the guard behind, so a long-lived server retains a dict
+entry, a lock and an invocation-id string for every tool attempt ever made.
+Measured: 1000 issue+revoke cycles leave `_live` empty and 1000 guards
+retained.
+
+**Do not fix by popping the guard in `revoke()`.** A waiter would then build
+a new lock for the same invocation while revocation still held the old one.
+The two would stop contending, and contention is the entire linearization
+property that `commit_guard` exists for.
+
+The fix belongs to the spawned broker's per-invocation state:
+
+```
+InvocationState:
+    lock
+    live
+    active_commits
+    resources
+```
+
+retired only once the invocation is revoked *and* no commit guard or
+resource user can still reach it.
+
+### Delete `ToolInvocation.operation_key()` rather than evolve it
+
+`logical_execution_id + ":" + operation_name` cannot distinguish two durable
+operations of the same kind inside one node execution, and `agent.files`
+makes several tool calls per logical execution. It has no consumer. The
+operation ledger replaces it outright:
+
+```
+logical_execution_id
+operation_seq
+capability
+canonical_payload_hash
+state = pending | committed | failed | unknown
+result
+```
+
+A retry presenting the same `operation_seq` must present the same capability
+and payload hash; a difference is retry divergence and is refused, not
+silently treated as the earlier mutation. That keeps retry identity
+(`invocation_id`) distinct from operation identity.
+
+### Closure criterion
+
+Tranche 1b.1 closes when the four strict xfails are green and the
+`ThreadPoolExecutor` handler path is gone:
+
+- no retry begins before the prior worker's process tree is dead and reaped;
+- a revoked invocation sends no web request;
+- a revoked invocation launches no Python sandbox child;
+- every broker-owned descendant and resource is killed and reaped first.
+
+`commit_guard` must be wired into real durable mutation commit points, not
+call boundaries. The worker receives no store, LLM, settings, filesystem
+roots or provider credentials — the broker pipe is the capability. The
+filesystem/archive/signed-URL census waits until then, so 1b can be audited
+as one authority boundary rather than a sequence of thread patches.

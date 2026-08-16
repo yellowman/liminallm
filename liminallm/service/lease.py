@@ -122,8 +122,22 @@ class InvocationBroker:
         with self._lock:
             guard = self._guards.get(invocation.invocation_id)
             if guard is None:
-                # Already revoked and cleaned up. A fresh lock is correct:
-                # `check` inside the guard will refuse anyway.
+                # Reachable only for an invocation this broker never issued —
+                # nothing is cleaned up here. An earlier version of this
+                # comment said "already revoked and cleaned up", which was
+                # never true: `revoke` drops the id from `_live` and leaves
+                # the guard, so `_guards` grows by one lock per tool attempt
+                # for the life of the process. Measured: 1000 issue+revoke
+                # cycles leave `_live` empty and 1000 guards retained.
+                #
+                # Do NOT fix that by popping the guard in `revoke`: a waiter
+                # would then build a *new* lock for the same invocation while
+                # revocation still holds the old one, and the two would no
+                # longer contend — which is the whole linearization property.
+                # The fix belongs to the spawned broker's per-invocation state
+                # (lock + live + active_commits + resources), retired only
+                # once no commit guard or resource user can still reach it.
+                # See docs/ISSUES.md, "1b.1 carry-forward".
                 guard = threading.Lock()
                 self._guards[invocation.invocation_id] = guard
             return guard
