@@ -2680,6 +2680,9 @@ class LocalJaxLoRABackend:
         if self._promoted_version_of(adapter) <= 0:
             return  # nothing promoted yet; also weightless by design.
         if self._gate_weight_of(adapter) == 0.0:
+            # Redundant by construction now — composition skips closed gates
+            # before it loads anything — but kept so the helper states the
+            # whole rule for any future caller rather than half of it.
             return  # a closed gate contributes nothing anyway.
         raise ValueError(
             f"adapter {adapter.get('id')!r} is promoted (version "
@@ -2748,6 +2751,21 @@ class LocalJaxLoRABackend:
         # target key -> list of (A, B) contributions in adapter order.
         stacks: dict[str, list] = {}
         for adapter in adapters:
+            # The gate decides FIRST. In `W_eff = W + Σ_j g_j α_j B_j A_j` a
+            # term with g_j = 0 is not in the sum, so a closed-gate adapter is
+            # not part of the effective model and nothing about its weights
+            # can matter — not the base they declare, not their checksum, not
+            # whether the file parses at all. Reading the gate after the load
+            # made "a closed gate is unaffected" (§5.1) true only when the
+            # file happened to be missing: a zero-gated adapter with a
+            # promoted version on disk was refused for a mismatched base it
+            # was never going to contribute.
+            gate = self._gate_weight_of(adapter)
+            if gate == 0.0:
+                logger.debug(
+                    "adapter_zero_weight_skipped", adapter_id=adapter.get("id")
+                )
+                continue
             weights = self._load_adapter_weights(adapter, user_id=user_id)
             if not weights:
                 # An adapter the router selected must not vanish from the
@@ -2764,12 +2782,6 @@ class LocalJaxLoRABackend:
             # combined pair whose totals agree while every row pairs with the
             # wrong column.
             self._validate_adapter_weights(adapter, weights, config)
-            gate = self._gate_weight_of(adapter)
-            if gate == 0.0:
-                # A closed gate contributes no delta at all — which the old
-                # normalization could not express.
-                logger.debug("adapter_zero_weight_skipped", adapter_id=adapter.get("id"))
-                continue
             # Both orphans, not just one: the loop is A-driven, so a lone
             # `.B` used to be invisible — "weights for a broken architecture
             # fail visibly" with one silent case left in it.

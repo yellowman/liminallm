@@ -847,6 +847,16 @@ for each hooked weight matrix `W ∈ ℝ^{d_out × d_in}`:
 W_{\text{eff}} = W + \sum_j g_j \cdot \alpha_j B_j A_j
 \]
 
+- **the gate decides before the weights are read (normative).** a term with
+  `g_j = 0` is not in the sum, so that adapter is not part of the effective
+  model and nothing about its files can matter — not the base they declare
+  (§5.1), not their checksum, not whether they parse. composition therefore
+  reads `g_j` first and skips the adapter entirely; a zero-gated adapter with
+  a promoted version on disk must be a no-op, exactly as one with no file at
+  all is. router weights are clamped to `[0, 1]` (§8.1), so a negative gate
+  is a closed one. this is per adapter, not per stack: an open-gated adapter
+  beside a closed one still composes, and still has to be valid.
+
 in JAX:
 
 - represent `params_base` and `params_lora[adapter_id]` as nested PyTrees.

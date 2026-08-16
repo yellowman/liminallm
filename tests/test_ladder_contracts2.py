@@ -538,6 +538,113 @@ class TestWeightsOnlyServeTheirOwnBase:
         )
 
 
+class TestAClosedGateRemovesTheAdapterFromTheModel:
+    """§5.2: in `W_eff = W + Σ_j g_j α_j B_j A_j`, a term with `g_j = 0` is
+    not in the sum. The adapter is not part of the effective model, so
+    nothing about its weights can matter — not the base they declare, not
+    their checksum, not whether the file parses.
+
+    The earlier closed-gate test pointed `fs_dir` at a directory with no
+    weights in it, so resolution returned nothing before any check ran and
+    the no-op it asserted came from the missing file rather than from the
+    gate. Each test here therefore carries its own control: the same adapter
+    with an open gate must raise, which is what proves the fixture is
+    load-bearing.
+    """
+
+    def _backend(self, tmp_path, checkpoint):
+        return LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
+
+    def _foreign(self, **overrides):
+        adapter = {
+            "id": "closed",
+            "mode": "local",
+            "fs_dir": "closed",
+            "current_version": 1,
+            "base_model": "mistral-7b",  # emphatically not the serving base
+        }
+        adapter.update(overrides)
+        return adapter
+
+    def test_a_closed_gate_skips_a_promoted_version_it_would_refuse(
+        self, tmp_path, checkpoint, config
+    ):
+        _write(tmp_path / "closed" / "v0001", _valid_pair(config))
+        backend = self._backend(tmp_path, checkpoint)
+
+        assert (
+            backend._blend_adapter_weights(
+                [self._foreign(weight=0.0)], user_id="u", config=config
+            )
+            == {}
+        )
+        # Control: the very same adapter, gate open, is refused — so the
+        # no-op above came from the gate and not from a harmless fixture.
+        with pytest.raises(ValueError, match="serves"):
+            backend._blend_adapter_weights(
+                [self._foreign(weight=1.0)], user_id="u", config=config
+            )
+
+    def test_a_negative_gate_is_closed(self, tmp_path, checkpoint, config):
+        """§8.1 clamps router weights to [0, 1], so a negative gate is a
+        closed one and must behave identically."""
+        _write(tmp_path / "closed" / "v0001", _valid_pair(config))
+        backend = self._backend(tmp_path, checkpoint)
+
+        assert backend._gate_weight_of(self._foreign(weight=-1.0)) == 0.0
+        assert (
+            backend._blend_adapter_weights(
+                [self._foreign(weight=-1.0)], user_id="u", config=config
+            )
+            == {}
+        )
+
+    def test_a_closed_gate_survives_a_file_that_will_not_parse(
+        self, tmp_path, checkpoint, config
+    ):
+        """Not only the base rule: no load-time failure may reach a term the
+        equation does not contain."""
+        version_dir = tmp_path / "closed" / "v0001"
+        version_dir.mkdir(parents=True)
+        (version_dir / "params.json").write_text("{not json")
+        backend = self._backend(tmp_path, checkpoint)
+        ours = {"base_model": str(checkpoint)}  # base is fine; the bytes are not
+
+        assert (
+            backend._blend_adapter_weights(
+                [self._foreign(weight=0.0, **ours)], user_id="u", config=config
+            )
+            == {}
+        )
+        with pytest.raises(ValueError, match="params.json"):
+            backend._blend_adapter_weights(
+                [self._foreign(weight=1.0, **ours)], user_id="u", config=config
+            )
+
+    def test_a_closed_gate_does_not_hide_an_open_one_beside_it(
+        self, tmp_path, checkpoint, config
+    ):
+        """Skipping is per adapter, not per stack: the open-gated adapter
+        beside it still composes, and still has to be valid."""
+        _write(tmp_path / "closed" / "v0001", _valid_pair(config))
+        _write(tmp_path / "open" / "v0001", _valid_pair(config))
+        backend = self._backend(tmp_path, checkpoint)
+        served = {
+            "id": "open",
+            "mode": "local",
+            "fs_dir": "open",
+            "current_version": 1,
+            "base_model": str(checkpoint),
+            "weight": 1.0,
+        }
+
+        blended = backend._blend_adapter_weights(
+            [self._foreign(weight=0.0), served], user_id="u", config=config
+        )
+        # Exactly one adapter's rank, so the closed one contributed nothing.
+        assert blended["layers.0.attn_q.A"].shape[0] == 2
+
+
 class TestPromotionSurvivesConvenienceState:
     def test_a_failing_latest_symlink_does_not_undo_a_promotion(self, tmp_path):
         """`latest` takes no part in serving (§5.5), so it must not be able to
