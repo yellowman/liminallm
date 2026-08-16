@@ -17,6 +17,7 @@ page turns out to be hostile.
 
 from __future__ import annotations
 
+import hashlib
 import tempfile
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
@@ -193,19 +194,20 @@ def run_python(
         # Preparation is a window wide enough for a cancel to land inside it,
         # so liveness is checked again before the child exists.
         invocation.check_live()
+    # A sibling of the workdir, not a child of it: the workdir is bind-mounted
+    # into the new root, so a mount point inside it would be bound into itself.
+    # Owned here because after `pivot_root` the child cannot reach it again,
+    # and an unowned mount point is one empty directory leaked per call.
+    confine_root = f"{session['workdir']}-root"
+    Path(confine_root).mkdir(parents=True, exist_ok=True)
+    if invocation is not None:
+        invocation.resources.add_path(confine_root)
     result = interpreter.run_python_sandboxed(
         code,
         workdir=session["workdir"],
+        confine_root=confine_root,
         timeout=PYTHON_TOOL_TIMEOUT,
-        on_child=(
-            None
-            if invocation is None
-            else (
-                lambda pid, reap: invocation.resources.add_child(
-                    pid, "sandbox:run_python", reap=reap
-                )
-            )
-        ),
+        on_child=None if invocation is None else _register_child(invocation),
     )
     published = _publish(
         session["workdir"],
@@ -230,6 +232,49 @@ def run_python(
     return "\n\n".join(parts)
 
 
+def _register_child(
+    invocation: Invocation,
+) -> Callable[[int, Callable[[], None]], Callable[[], None]]:
+    """Give the invocation a grip on a sandbox child, and a way to let go.
+
+    Letting go matters as much as taking hold. Once the child has exited and
+    been reaped its pid is only a number, and the kernel reuses numbers — a
+    registration left behind is a standing licence to SIGKILL whoever gets it
+    next, redeemed at teardown.
+    """
+
+    def register(pid: int, reap: Callable[[], None]) -> Callable[[], None]:
+        invocation.resources.add_child(pid, "sandbox:run_python", reap=reap)
+        return lambda: invocation.resources.forget_child(pid)
+
+    return register
+
+
+def _durable_identity(workdir: str, created: List[dict]) -> List[dict]:
+    """What makes one publication the same publication as another.
+
+    The filename alone is not it. A retry runs the model's code again, and the
+    same code writing `result.csv` from different input — or from a different
+    branch the model took the second time — produces the same *name* over
+    different *bytes*. Replaying on the name would leave the first attempt's
+    file in the user's area while the second attempt's answer describes the
+    contents it computed, and nothing would report the disagreement.
+    """
+    identity: List[dict] = []
+    for item in sorted(created, key=lambda c: str(c.get("name") or "")):
+        name = str(item.get("name") or "")
+        source = Path(workdir) / name
+        digest = ""
+        try:
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+        except OSError:
+            # Unreadable here means unpublishable below, but the identity must
+            # still differ from a readable file of the same name.
+            digest = f"unreadable:{name}"
+        identity.append({"name": name, "sha256": digest})
+    return identity
+
+
 def _publish(
     workdir: str,
     files_dir: str,
@@ -245,7 +290,8 @@ def _publish(
     has to be able to tell "the files are in the user's area" from "a worker
     asked for them to be", and only the first is a fact about the filesystem.
     Replaying a committed entry returns the earlier attempt's filenames without
-    copying anything a second time.
+    copying anything a second time — which is why the entry's identity has to
+    include the bytes, not just the names.
     """
     if not created:
         return []
@@ -256,7 +302,7 @@ def _publish(
     with commit_guard(
         invocation,
         "publish.artifacts",
-        {"created": [c.get("name") for c in created]},
+        {"created": _durable_identity(workdir, created)},
         operation_seq=operation_seq,
         step=step or "publish",
     ) as operation:

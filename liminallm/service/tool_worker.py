@@ -41,6 +41,13 @@ if TYPE_CHECKING:  # parent-side only; `from __future__ import annotations`
 #: nothing to flush, so this is short by design.
 _JOIN_TIMEOUT_SECONDS = 2.0
 
+#: How long the parent waits for the child's READY handshake before deciding it
+#: does not lead a group of its own. Generous: a loaded host can take a while
+#: to start an interpreter, and the cost of giving up early is only that the
+#: worker is killed by single pid instead of by group.
+_READY_TIMEOUT_SECONDS = 15.0
+_READY_POLL_SECONDS = 0.05
+
 
 # ---------------------------------------------------------------------------
 # child side
@@ -86,6 +93,10 @@ class BrokerClient:
         return reply.get("result") or {}
 
 
+class WorkerLimitsUnavailable(RuntimeError):
+    """A declared rlimit could not be applied, so the body must not run."""
+
+
 def _apply_limits(limits: Dict[str, int]) -> None:
     """SPEC §18: memory hard cap, CPU seconds, max file size, no core dumps.
 
@@ -93,60 +104,153 @@ def _apply_limits(limits: Dict[str, int]) -> None:
     module. The numbers are still the parent's — one `SandboxConfig` decides
     them — but a child that imported the service layer to read them would pay
     for exactly the imports this process exists to do without.
+
+    **Fails closed.** These are the hard caps SPEC declares, and a wall-clock
+    kill is not a substitute for an address-space or file-size cap: it stops a
+    slow worker, not one that allocates 40GB in a second or fills the disk. A
+    limit the platform refuses means this process cannot honour the contract it
+    is running under, so it refuses to run the body at all.
     """
     import resource
 
     caps = (
-        (resource.RLIMIT_AS, limits.get("memory_bytes")),
-        (resource.RLIMIT_CPU, limits.get("cpu_seconds")),
-        (resource.RLIMIT_FSIZE, limits.get("file_size_bytes")),
-        (resource.RLIMIT_CORE, 0),
+        ("memory_bytes", resource.RLIMIT_AS, limits.get("memory_bytes")),
+        ("cpu_seconds", resource.RLIMIT_CPU, limits.get("cpu_seconds")),
+        ("file_size_bytes", resource.RLIMIT_FSIZE, limits.get("file_size_bytes")),
+        ("core", resource.RLIMIT_CORE, 0),
     )
-    for which, value in caps:
+    for name, which, value in caps:
         if value is None:
             continue
         try:
             resource.setrlimit(which, (value, value))
-        except (ValueError, OSError):
-            # A limit the platform refuses is not a reason to run unbounded
-            # work unannounced; the parent's wall-clock kill still backstops it.
-            pass
+        except (ValueError, OSError) as exc:
+            raise WorkerLimitsUnavailable(
+                f"the {name} rlimit could not be applied ({exc}); refusing to "
+                "run a tool body without the caps SPEC §18 declares"
+            ) from exc
+
+
+def _confine(scratch: str) -> None:
+    """Remove this process's ambient authority before any body runs.
+
+    The worker is designated as the untrusted side of the boundary, and until
+    this ran it was untrusted in name only: `multiprocessing` spawn inherits
+    the service's environment, filesystem view and network namespace, so the
+    deployment's database url and provider keys, every host path, and an
+    outbound socket were all still available to it. The broker being its
+    *intended* channel is not the same as the broker being its *only* channel
+    — one bug in a body is the difference, and that is exactly the bug this
+    process exists to contain.
+
+    Same mechanism `run_python` uses (service/confine.py) and the same rule:
+    no degraded fallback. A platform with no backend cannot give a worker the
+    view SPEC §18 describes, so it does not get a worker.
+    """
+    from liminallm.service.confine import confine
+
+    # `scratch` is a directory the parent made and registered against the
+    # invocation, so both of these go away with it. The new root must be a
+    # sibling of the view rather than a child: the view is bind-mounted into
+    # the root, and a mount point inside it would be bound into itself.
+    view = os.path.join(scratch, "view")
+    root = os.path.join(scratch, "root")
+    os.makedirs(view, exist_ok=True)
+    os.makedirs(root, exist_ok=True)
+    # The pipe is an already-connected AF_UNIX socketpair, so it survives the
+    # new network namespace and the new root: the broker channel is the one
+    # thing confinement must not take away.
+    confined = confine(view, root=root)
+    # Inherited at process start and living in memory, so re-rooting does
+    # nothing to it. Replaced wholesale, not filtered: a denylist of secret
+    # names is a guess about what the deployment exported.
+    os.environ.clear()
+    os.environ.update(
+        {
+            "HOME": confined,
+            "TMPDIR": confined,
+            "PWD": confined,
+            "PATH": "",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONDONTWRITEBYTECODE": "1",
+        }
+    )
 
 
 def _worker_main(
-    conn: Any, tool: str, plan: Dict[str, Any], limits: Dict[str, int]
+    conn: Any,
+    tool: str,
+    plan: Dict[str, Any],
+    limits: Dict[str, int],
+    scratch: str,
 ) -> None:
-    """Child entrypoint. Leads a process group, runs one tool, exits.
+    """Child entrypoint. Leads a process group, confines itself, runs one tool.
 
     `os.setsid` is the first statement for a reason: everything after it,
     including anything a tool body spawns, belongs to a group the parent can
     take down with one signal. Doing it later leaves a window in which a
     descendant is already running and is not yet reachable.
+
+    The READY message is the second, and it is what makes the group safe to
+    use. Until the parent has seen a pgid equal to this pid, this process is
+    still in the *parent's* group, and a `killpg` aimed at it would take down
+    the API server. The parent kills by single pid until READY arrives.
     """
     try:
         os.setsid()
     except (AttributeError, OSError):
-        # No sessions on this platform, or already a group leader. The parent's
-        # per-child registry still reaches everything the broker started; only
-        # the group shortcut is lost.
+        # No sessions on this platform, or already a group leader. The pgid
+        # reported below will not equal our pid, so the parent keeps killing by
+        # single pid — the group shortcut is lost, nothing else is.
         pass
-    _apply_limits(limits)
-    broker = BrokerClient(conn)
     try:
-        body = _BODIES.get(tool, _body_host_tool)
-        result = body(broker, tool, plan)
-    except BrokerRefused as exc:
+        conn.send({"ready": True, "pid": os.getpid(), "pgid": os.getpgid(0)})
+    except (BrokenPipeError, OSError):
+        return
+
+    result: Optional[Dict[str, Any]] = None
+    try:
+        # Warm what the body may reach for lazily: after confinement the
+        # project's own tree is gone from this process's view, and the runtime
+        # is read-only at its original paths.
+        import resource  # noqa: F401 - imported for its side effect
+
+        if not scratch:
+            # No conditional confinement: a caller that forgot the scratch
+            # would otherwise get an unconfined worker, which is the whole
+            # defect stated as a default argument.
+            raise RuntimeError("a tool worker was started with no scratch to confine to")
+        _confine(scratch)
+        _apply_limits(limits)
+    except BaseException as exc:  # noqa: BLE001 - refuse, never run uncontained
         result = {
             "status": "error",
-            "content": f"tool capability refused: {exc}",
-            "error": exc.code,
+            "content": (
+                "the tool worker could not establish the boundary it runs "
+                f"under, so it ran nothing: {exc}"
+            ),
+            "error": "worker_unconfined",
         }
-    except BaseException as exc:  # noqa: BLE001 - report, never crash silently
-        result = {
-            "status": "error",
-            "content": "tool execution failed",
-            "error": f"{type(exc).__name__}: {exc}",
-        }
+
+    if result is None:
+        broker = BrokerClient(conn)
+        try:
+            body = _BODIES.get(tool, _body_host_tool)
+            result = body(broker, tool, plan)
+        except BrokerRefused as exc:
+            result = {
+                "status": "error",
+                "content": f"tool capability refused: {exc}",
+                "error": exc.code,
+            }
+        except BaseException as exc:  # noqa: BLE001 - report, never crash silently
+            result = {
+                "status": "error",
+                "content": "tool execution failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
     try:
         conn.send({"done": True, "result": result})
     except (BrokenPipeError, OSError):
@@ -404,12 +508,21 @@ def spawn(
     plan: Dict[str, Any],
     *,
     limits: Optional[Dict[str, int]] = None,
+    scratch: str,
 ) -> WorkerHandle:
     """Start a worker for one attempt at one tool call.
 
     The child is registered against the invocation before anything is awaited,
-    and as a process-group leader, so a revoke arriving one instruction later
-    still reaches it and everything it has spawned since.
+    so a revoke arriving one instruction later still reaches it — but as a
+    **single pid**, not a group. `os.setsid()` runs in the child and cannot
+    have happened yet when `start()` returns, so `os.getpgid(child)` still
+    answers with the *parent's* group: a `killpg` in that window would SIGKILL
+    the API server and everything sharing its group. Measured, not reasoned
+    about — `getpgid` on a just-started spawn child returns the parent's pgid.
+
+    So the group is earned, not assumed. The child sends READY once `setsid`
+    has actually happened, carrying the pgid it ended up in, and only a pgid
+    equal to the child's pid promotes the registration to `group=True`.
     """
     from liminallm.logging import get_logger  # parent-side: see module docstring
 
@@ -421,24 +534,55 @@ def spawn(
     parent_conn, child_conn = ctx.Pipe(duplex=True)
     process = ctx.Process(
         target=_worker_main,
-        args=(child_conn, tool, plan, limits or {}),
+        args=(child_conn, tool, plan, limits or {}, scratch),
         daemon=True,
     )
     process.start()
     child_conn.close()
     attempt.pid = process.pid
     handle = WorkerHandle(process, parent_conn, attempt)
+    reap = lambda: process.join(_JOIN_TIMEOUT_SECONDS)  # noqa: E731
     invocation.resources.add_child(
-        process.pid or 0,
-        f"worker:{tool}",
-        group=True,
-        reap=lambda: process.join(_JOIN_TIMEOUT_SECONDS),
+        process.pid or 0, f"worker:{tool}", group=False, reap=reap
     )
+    leads_group = _await_ready(parent_conn, process)
+    if leads_group:
+        invocation.resources.add_child(
+            process.pid or 0, f"worker:{tool}", group=True, reap=reap
+        )
     logger.info(
         "tool_worker_spawned",
         invocation_id=invocation.invocation_id,
         tool=tool,
         pid=process.pid,
         attempt=attempt.index,
+        leads_group=leads_group,
     )
     return handle
+
+
+def _await_ready(conn: Any, process: Any) -> bool:
+    """Whether the child has proved it leads a process group of its own.
+
+    False on anything unexpected — a child that died, a pipe that closed, a
+    platform with no sessions, a message that is not the handshake. Every one
+    of those means the same thing here: keep killing by single pid, because a
+    group kill would reach processes this worker does not own.
+    """
+    deadline = time.monotonic() + _READY_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if conn.poll(_READY_POLL_SECONDS):
+            try:
+                message = conn.recv()
+            except (EOFError, OSError):
+                return False
+            if not isinstance(message, dict) or not message.get("ready"):
+                return False
+            pgid, pid = message.get("pgid"), message.get("pid")
+            # The pgid must be the child's own pid. Anything else is a group it
+            # shares with someone — the parent's, most likely — and killing it
+            # would take them down too.
+            return bool(pgid) and pgid == pid == process.pid
+        if not process.is_alive():
+            return False
+    return False

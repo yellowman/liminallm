@@ -699,7 +699,9 @@ def run_in_sandbox(
     *args: Any,
     config: Optional[SandboxConfig] = None,
     timeout: Optional[float] = None,
-    on_child: Optional[Callable[[int, Callable[[], None]], None]] = None,
+    on_child: Optional[
+        Callable[[int, Callable[[], None]], Optional[Callable[[], None]]]
+    ] = None,
     **kwargs: Any,
 ) -> T:
     """Execute a function in a resource-limited child process.
@@ -724,7 +726,11 @@ def run_in_sandbox(
                  invocation that asked for it can kill it. This child is the
                  *parent's* child, not the worker's, so killing the worker
                  never reaches it — registering it is what makes the tree
-                 reachable (SPEC §18).
+                 reachable (SPEC §18). It may return a callable, which is
+                 invoked once the child has been reaped: a pid outlives the
+                 process only as a number, and the kernel reuses it, so a
+                 registration left behind is authority over whoever gets it
+                 next.
         **kwargs: Keyword arguments for function
 
     Returns:
@@ -748,8 +754,9 @@ def run_in_sandbox(
     )
     proc.start()
     child_conn.close()
+    release: Optional[Callable[[], None]] = None
     if on_child is not None and proc.pid:
-        on_child(proc.pid, lambda: proc.join(5))
+        release = on_child(proc.pid, lambda: proc.join(5))
     wall_timeout = timeout if timeout is not None else cfg.max_cpu_seconds + 15
     try:
         if not parent_conn.poll(wall_timeout):
@@ -768,6 +775,11 @@ def run_in_sandbox(
         if proc.is_alive():
             proc.kill()
         proc.join(5)
+        # Reaped, so the pid is now just a number the kernel may hand to
+        # anyone. Releasing the registration here is what stops a later
+        # teardown signalling whoever inherits it.
+        if release is not None:
+            release()
     if not ok:
         if isinstance(payload, BaseException):
             raise payload

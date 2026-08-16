@@ -113,6 +113,18 @@ class CapabilityBroker:
     #: against this set rather than passed through.
     ROUND_LABELS = frozenset(TRACE_LABELS.values())
 
+    #: Capability → the tool name §21.1 withdraws it under. The withdrawal has
+    #: to be enforced here, on the capability itself, and not only inside the
+    #: round that usually carries it: the worker is the untrusted side, so
+    #: "the worker asks through `tools.round`" is a description of the intended
+    #: protocol, not a constraint on the compromised one. A worker that has
+    #: read a hostile page can send `web.fetch` directly.
+    WITHDRAWABLE = {
+        "web.fetch": "web_fetch",
+        "web.search": "web_search",
+        "python.run": "run_python",
+    }
+
     def __init__(
         self,
         engine: Any,
@@ -194,6 +206,9 @@ class CapabilityBroker:
             handler = self._handlers().get(capability)
             if handler is None:
                 raise UnknownCapability(capability)
+            withdrawn = self._withdrawn(invocation, capability)
+            if withdrawn is not None:
+                return {"ok": True, "result": withdrawn}
             digest = payload_hash(payload)
             replayed = invocation.ledger.replay(operation_seq, capability, digest)
             if replayed is not None:
@@ -254,6 +269,30 @@ class CapabilityBroker:
                 error=str(exc),
             )
             return {"ok": False, "code": "failed", "error": str(exc)}
+
+    def _withdrawn(
+        self, invocation: Invocation, capability: str
+    ) -> Optional[Dict[str, Any]]:
+        """The refusal this capability has earned, or None if it still runs.
+
+        §21.1: a turn that has read a possible injection loses every capability
+        that could carry data off the box, for the rest of it. Returned as a
+        result rather than raised, so the model reads plainly why it was
+        refused and does not spend the turn retrying.
+        """
+        from liminallm.service import taint
+
+        tool_name = self.WITHDRAWABLE.get(capability)
+        if tool_name is None or not taint.is_withdrawn(tool_name, invocation.session):
+            return None
+        logger.warning(
+            "capability_withdrawn_by_injection_taint",
+            invocation_id=invocation.invocation_id,
+            capability=capability,
+            findings=len(taint.findings(invocation.session)),
+        )
+        refusal = taint.refusal(invocation.session)
+        return {"text": refusal, "findings": [], "artifacts": []}
 
     def _notify(self, capability: str) -> None:
         self._emit(self.TRACE_LABELS.get(capability))

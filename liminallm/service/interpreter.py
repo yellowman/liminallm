@@ -71,20 +71,25 @@ class _BlockedImportFinder:
         return None
 
 
-def _harden_child(workdir: str) -> str:
+def _harden_child(workdir: str, confine_root: str = "") -> str:
     """Confine the sandbox child and drop its escape hatches.
 
     Returns the workdir's name after confinement — the Linux backend re-roots
     the process, so the path passed in stops existing. Confinement happens
     first: everything after it is defense in depth, and a failure to establish
     it must stop the call rather than soften it.
+
+    `confine_root` is the mount point for the new root, supplied by the caller
+    so the caller can remove it: after `pivot_root` nothing here can reach the
+    host path again, so a backend left to make its own leaks one empty
+    directory per call.
     """
     from liminallm.service.sandbox import (  # local: child-side import
         _NETWORK_POLICY_STATE,
         ToolNetworkPolicy,
     )
 
-    confined_workdir = confine(workdir)
+    confined_workdir = confine(workdir, root=confine_root or None)
 
     # The environment is inherited at process start and lives in memory, so
     # re-rooting the filesystem does nothing to it: `DATABASE_URL` and every
@@ -130,14 +135,14 @@ def _truncate(text: str) -> str:
     return text[:MAX_OUTPUT_CHARS] + f"\n...[output truncated at {MAX_OUTPUT_CHARS} chars]"
 
 
-def execute_python(code: str, workdir: str) -> dict[str, Any]:
+def execute_python(code: str, workdir: str, confine_root: str = "") -> dict[str, Any]:
     """Run ``code`` with ``workdir`` as the current directory.
 
     Module-level with picklable arguments so ``run_in_sandbox`` can ship it to
     a child process. Returns captured output rather than raising, so the model
     can read and react to its own errors.
     """
-    workdir = _harden_child(workdir)
+    workdir = _harden_child(workdir, confine_root)
     os.chdir(workdir)
     sys.path.insert(0, workdir)
     before = {p.name for p in Path(workdir).iterdir() if p.is_file()}
@@ -239,9 +244,12 @@ def run_python_sandboxed(
     code: str,
     *,
     workdir: str,
+    confine_root: str = "",
     timeout: float = DEFAULT_TIMEOUT_SECONDS,
     max_memory_mb: int = 512,
-    on_child: Optional[Callable[[int, Callable[[], None]], None]] = None,
+    on_child: Optional[
+        Callable[[int, Callable[[], None]], Optional[Callable[[], None]]]
+    ] = None,
 ) -> dict[str, Any]:
     """Execute model-written Python in the confined, resource-limited sandbox.
 
@@ -274,6 +282,7 @@ def run_python_sandboxed(
             execute_python,
             code,
             workdir,
+            confine_root,
             config=config,
             timeout=timeout,
             on_child=on_child,

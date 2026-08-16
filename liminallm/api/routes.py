@@ -3633,9 +3633,21 @@ async def upload_file(
             chunk_count = None
             if context_id and context_id not in prior_contexts:
                 _get_owned_context(runtime, context_id, principal)
-                chunk_count = runtime.rag.ingest_file(
-                    context_id, str(dest_path), chunk_size=chunk_size
-                )
+                # The bytes are already on disk, so this branch makes exactly
+                # one durable mutation — and it is ledgered like the other
+                # ingestion, or "the ledger records the uploads" would be true
+                # of one upload path and not the other.
+                with idem.commit(
+                    "files.ingest",
+                    {"path": safe_filename, "context_id": context_id},
+                ) as operation:
+                    if operation.replayable:
+                        chunk_count = operation.result
+                    else:
+                        chunk_count = runtime.rag.ingest_file(
+                            context_id, str(dest_path), chunk_size=chunk_size
+                        )
+                        operation.result = chunk_count
                 prior_contexts.add(context_id)
                 try:
                     existing_checksums[safe_filename] = {

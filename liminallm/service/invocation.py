@@ -357,10 +357,18 @@ def _kill(pid: int, *, group: bool) -> bool:
 
     A revoked execution has no cleanup worth running, and a signal handler is
     one more thing an untrusted process can decline to honour.
+
+    A group kill is only ever aimed at a group the target *leads*. A process
+    that has not yet called `setsid` — or could not — is still in the group
+    that started it, which for a tool worker is the API server's: `killpg`
+    there would take down the service and everything sharing its group. The
+    registration is supposed to prevent that (`group=True` is only set once the
+    child proves its pgid), and this is the second check, because the cost of
+    the two disagreeing is the whole process group.
     """
     try:
-        if group and hasattr(os, "killpg"):
-            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        if group and hasattr(os, "killpg") and os.getpgid(pid) == pid:
+            os.killpg(pid, signal.SIGKILL)
         else:
             os.kill(pid, signal.SIGKILL)
         return True

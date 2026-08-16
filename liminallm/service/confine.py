@@ -34,7 +34,6 @@ import ctypes
 import os
 import platform
 import sys
-import tempfile
 from pathlib import Path
 from typing import Iterable, Optional, Sequence
 
@@ -119,7 +118,7 @@ def _linux_available() -> bool:
     return True
 
 
-def _linux_confine(workdir: str, runtime: Sequence[str]) -> str:
+def _linux_confine(workdir: str, runtime: Sequence[str], root: Optional[str] = None) -> str:
     libc = _libc()
     uid, gid = os.getuid(), os.getgid()
     # Files staged into the workdir before confinement are inputs and become
@@ -144,7 +143,15 @@ def _linux_confine(workdir: str, runtime: Sequence[str]) -> str:
     # Detach propagation so nothing here is visible to the host mount table.
     _mount(libc, None, "/", None, _MS_REC | _MS_PRIVATE)
 
-    root = tempfile.mkdtemp(prefix="confine-")
+    # The mount point is a real directory on the host filesystem, and after
+    # pivot_root nothing can reach it to remove it: the old root is detached
+    # and the process's own root is the tmpfs mounted on top. So the caller
+    # supplies a path it already cleans up. Absent one, it goes beside the
+    # workdir rather than into the system temp root — a caller that cleans up
+    # after its own workdir then cleans up after this too, and one that does
+    # not leaks in a place it is already leaking.
+    root = root or f"{workdir.rstrip('/')}-confine-root"
+    os.makedirs(root, exist_ok=True)
     _mount(libc, "tmpfs", root, "tmpfs", _MS_NOSUID | _MS_NODEV, "size=16m")
 
     scratch = os.path.join(root, LINUX_SCRATCH.lstrip("/"))
@@ -225,7 +232,7 @@ def _openbsd_available() -> bool:
         return False
 
 
-def _openbsd_confine(workdir: str, runtime: Sequence[str]) -> str:
+def _openbsd_confine(workdir: str, runtime: Sequence[str], root: Optional[str] = None) -> str:
     """Expose only these paths, then drop the capabilities left over.
 
     Unverified on this machine — there is no OpenBSD host here to run the
@@ -317,12 +324,24 @@ def runtime_paths() -> list[str]:
     return list(seen)
 
 
-def confine(workdir: str, runtime: Optional[Sequence[str]] = None) -> str:
+def confine(
+    workdir: str,
+    runtime: Optional[Sequence[str]] = None,
+    *,
+    root: Optional[str] = None,
+) -> str:
     """Restrict this process to `workdir` plus the language runtime.
 
     Returns the working directory as it is named *after* confinement, which
     the caller must use from then on: the Linux backend re-roots the process,
     so the path it was given no longer exists. Irreversible by design.
+
+    `root` is where the new root is mounted. It must be a path the caller
+    already owns and removes, and a *sibling* of `workdir` rather than a child
+    of it — the Linux backend binds `workdir` into the new root, and a mount
+    point inside it would be bound into itself. Callers that omit it leak one
+    empty directory per call, because after `pivot_root` nothing is left that
+    can reach the host path to clean it.
 
     Raises `ConfinementUnavailable` when the platform has no backend, because
     running untrusted code unconfined is the outcome this module exists to
@@ -335,7 +354,7 @@ def confine(workdir: str, runtime: Optional[Sequence[str]] = None) -> str:
                 continue
         except OSError:  # pragma: no cover
             continue
-        return apply(workdir, paths)
+        return apply(workdir, paths, root)
     raise ConfinementUnavailable(
         f"no filesystem confinement backend for platform {sys.platform!r} "
         f"({platform.machine()}); model-written code will not be run "

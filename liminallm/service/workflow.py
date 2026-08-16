@@ -6,11 +6,13 @@ import copy
 import json
 import math
 import os
+import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import (
     Any,
     Callable,
@@ -2145,6 +2147,22 @@ class WorkflowEngine(WorkflowStreamingMixin):
         except Exception:  # noqa: BLE001 - fall back to the shipped defaults
             return tool_worker.limits_from_config(DEFAULT_SANDBOX_CONFIG)
 
+    def _worker_scratch(self, invocation: Invocation) -> str:
+        """The empty directory a worker is confined to, made by the parent.
+
+        The worker has no filesystem credentials to make one with — that is the
+        point of it — and the invocation has to own the path so teardown
+        removes it whether the attempt ended or was killed. Node-local, like the
+        interpreter's, and never under `shared_fs_root`.
+        """
+        root = Path(
+            self.settings.interpreter_scratch_dir or tempfile.gettempdir()
+        ) / "liminallm-worker"
+        root.mkdir(parents=True, exist_ok=True)
+        scratch = tempfile.mkdtemp(prefix="worker-", dir=str(root))
+        invocation.resources.add_path(scratch)
+        return scratch
+
     def _serve_invocation(
         self,
         invocation: Invocation,
@@ -2161,7 +2179,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
         caller state that nothing of this attempt is still running.
         """
         broker = CapabilityBroker(self, context, on_capability=on_capability)
-        handle = tool_worker.spawn(invocation, worker_tool, plan, limits=limits)
+        handle = tool_worker.spawn(
+            invocation,
+            worker_tool,
+            plan,
+            limits=limits,
+            scratch=self._worker_scratch(invocation),
+        )
         try:
             return broker.serve(handle.conn, invocation, is_alive=handle.is_alive)
         finally:

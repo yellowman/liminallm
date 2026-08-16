@@ -7146,6 +7146,70 @@ repeated — nothing left can say whether it landed.
 uploaded bytes and their ingestion (`api/routes.py`), which are two facts and
 now two entries.
 
+### Review round: five defects on the new boundary
+
+The first cut of this tranche put the architecture in place and left the
+boundary softer than the SPEC describing it. All five are fixed here, each with
+a test that fails when the fix is reverted (verified by reverting it).
+
+**BLOCKER — the worker was contained in name only.** `_worker_main` did
+`setsid` and rlimits and nothing else. A `multiprocessing` spawn child inherits
+the service's environment, filesystem view and network namespace, so the
+process designated as the untrusted side still held `DATABASE_URL`,
+`open('/etc/passwd')` and an outbound socket. The bodies it runs are fixed, not
+model-written, so this was not a one-prompt RCE — but the broker being the
+*intended* channel is not the broker being the *only* one, and one body bug is
+the difference. The worker now confines itself with the same backend
+`run_python` uses, clears its environment wholesale, and refuses to run
+anything if it cannot (including when given no scratch, so the check has no
+conditional form). Tested by asking the kernel from inside a real spawned
+child, not by reading the source.
+
+**BLOCKER — cancellation could `killpg` the API server.** `spawn` registered
+the child as `group=True` immediately, and `_kill` did
+`killpg(getpgid(pid))`. But `setsid` runs in the *child*, after `start()`
+returns: measured, `getpgid` on a just-started spawn child returns the parent's
+pgid, so a cancel landing in that window would SIGKILL the service and
+everything sharing its group. The group is now earned — the child sends a
+READY handshake carrying the pgid it reached, and only `pgid == pid` promotes
+the registration from single-pid to group — and `_kill` re-checks the same
+thing, because the cost of the two disagreeing is the whole process group. The
+old test read the source for `setsid` ordering, which proved nothing about
+parent/child synchronization; the new one observes the window and asserts no
+`killpg` is aimed at our own group.
+
+**HIGH — a reaped sandbox pid stayed registered.** `run_in_sandbox` registered
+the child and never released it, and teardown later signalled the stored pid.
+A pid outlives its process only as a number and the kernel reuses numbers, so
+that was a standing licence to SIGKILL a stranger. Registration now hands back
+the means to undo it and the normal exit path uses it. The previous test
+asserted the stale entry was still there — it encoded the defect — and now
+asserts registration and release as a pair.
+
+**HIGH — the rlimits failed open.** `setrlimit` failures were swallowed while
+the comment beside them said a refused limit must not mean unbounded work. A
+wall-clock kill does not replace an address-space or file-size cap. They fail
+closed now: the body never runs.
+
+**HIGH — withdrawal was enforced one layer too high.** After an injection
+finding, `tools.round` refused `run_python`/`web_fetch`/`web_search` — but the
+`web.fetch` and `web.search` capabilities themselves checked only liveness. The
+worker is the untrusted side by construction, so "it asks through the round" is
+a description of the intended protocol, not a constraint on a compromised one:
+a tainted worker could ask for `web.fetch` directly. The refusal is now on the
+capability, where the authority is.
+
+**MEDIUM — publication identity ignored the bytes.** The durable payload hashed
+filenames only, so a retry whose code wrote the same name with different
+content replayed the earlier entry and skipped the copy: the user keeps
+attempt one's file while attempt two's answer describes what it computed. The
+digest now covers each file's contents.
+
+**MEDIUM — one upload path skipped the ingestion ledger.** The dedupe branch
+(same bytes, new context) called `ingest_file` outside `idem.commit`, so the
+claim that uploads and their ingestion are separately ledgered was true of one
+path and not the other. Both are ledgered now.
+
 ### What this leaves
 
 - The `Idempotency-Key` slot still answers the cross-request question, and it
