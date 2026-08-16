@@ -2577,9 +2577,21 @@ the following are treated as constants the kernel must honor; LLM edits happen o
     every user's files, so unix permissions are the wrong instrument and
     `os.chdir()` is not confinement at all. an unconfined same-uid process
     reads any of those paths by naming it.
+  - **the view is not only the filesystem.** the environment is inherited at
+    process start and lives in memory, so re-rooting does nothing to it: the
+    worker's `os.environ` is replaced before untrusted code runs, or the
+    deployment's `DATABASE_URL` and provider keys are readable from inside the
+    jail. the network is removed structurally — refusing to import `socket`
+    is not a network boundary, since it missed `_socket` and any already-loaded
+    module can hand out the same primitive.
+  - **staged inputs are read-only, the workdir is read-write.** the originals
+    are never at risk (the worker gets copies), but a writable input lets one
+    run rewrite `input.csv` and the next read the forgery as the user's
+    attachment, which is the provenance this clause exists to state.
   - **implemented per platform, failing closed.** linux establishes the view
-    with a user + mount namespace and a fresh root — workdir bound rw, runtime
-    bound ro, nothing else mounted. openbsd uses `unveil(2)` for exactly those
+    with a user + mount + **network** namespace and a fresh root — workdir
+    bound rw, each staged input bound ro over it, runtime bound ro, nothing
+    else mounted. openbsd uses `unveil(2)` for exactly those
     paths, a locking `unveil(NULL, NULL)`, then `pledge(2)`. a platform with no
     backend does not get a weaker sandbox: `run_python` is **unavailable**
     there, and the tool says so rather than spawning untrusted code with an

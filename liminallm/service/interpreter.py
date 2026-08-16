@@ -85,6 +85,23 @@ def _harden_child(workdir: str) -> str:
 
     confined_workdir = confine(workdir)
 
+    # The environment is inherited at process start and lives in memory, so
+    # re-rooting the filesystem does nothing to it: `DATABASE_URL` and every
+    # other secret passed by the deployment was still readable through
+    # os.environ from inside the jail. Replaced wholesale with the few
+    # variables the runtime wants, all pointing at the scratch it already has.
+    os.environ.clear()
+    os.environ.update({
+        "HOME": confined_workdir,
+        "TMPDIR": confined_workdir,
+        "PWD": confined_workdir,
+        "PATH": "",  # nothing to exec anyway; see the denials below
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONDONTWRITEBYTECODE": "1",
+    })
+
     # An empty allowlist makes the socket guard reject every connection.
     _NETWORK_POLICY_STATE.policy = ToolNetworkPolicy(allowlist=[])
 

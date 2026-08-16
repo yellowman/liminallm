@@ -53,6 +53,7 @@ class ConfinementUnavailable(RuntimeError):
 # --- linux: user + mount namespace ----------------------------------------
 
 _CLONE_NEWNS = 0x00020000
+_CLONE_NEWNET = 0x40000000
 _CLONE_NEWUSER = 0x10000000
 _MS_RDONLY = 1
 _MS_NOSUID = 2
@@ -121,7 +122,18 @@ def _linux_available() -> bool:
 def _linux_confine(workdir: str, runtime: Sequence[str]) -> str:
     libc = _libc()
     uid, gid = os.getuid(), os.getgid()
-    if libc.unshare(_CLONE_NEWUSER | _CLONE_NEWNS) != 0:
+    # Files staged into the workdir before confinement are inputs and become
+    # read-only; anything the code creates afterwards is its own output. Read
+    # here because after pivot_root this path no longer exists.
+    staged = sorted(
+        entry.name for entry in Path(workdir).iterdir() if entry.is_file()
+    )
+    # NEWNET as well: with no interfaces but a down loopback there is no
+    # network to reach, which is what SPEC asks for. Blocking `socket` at
+    # import cannot do this — it missed `_socket`, and any already-loaded
+    # module can hand out the same primitive. The import denial stays as
+    # defense in depth, the way `pledge` without `inet` is on OpenBSD.
+    if libc.unshare(_CLONE_NEWUSER | _CLONE_NEWNS | _CLONE_NEWNET) != 0:
         errno = ctypes.get_errno()
         raise OSError(errno, f"unshare: {os.strerror(errno)}")
     # Map this uid to root *inside the namespace only*, which is what allows
@@ -138,6 +150,14 @@ def _linux_confine(workdir: str, runtime: Sequence[str]) -> str:
     scratch = os.path.join(root, LINUX_SCRATCH.lstrip("/"))
     os.mkdir(scratch)
     _mount(libc, workdir, scratch, None, _MS_BIND | _MS_REC)
+    # Each staged input bound onto itself, read-only. The directory stays
+    # writable so the code can produce artifacts; the inputs it was given do
+    # not, or run 2 of a session reads what run 1 rewrote and calls it the
+    # user's attachment.
+    for name in staged:
+        target = os.path.join(scratch, name)
+        _mount(libc, target, target, None, _MS_BIND)
+        _mount(libc, None, target, None, _MS_REMOUNT | _MS_BIND | _MS_RDONLY)
 
     for path in runtime:
         if not os.path.isdir(path):
@@ -196,6 +216,14 @@ def _openbsd_confine(workdir: str, runtime: Sequence[str]) -> str:
     if libc.unveil(_as_bytes(workdir), b"rwc") != 0:
         errno = ctypes.get_errno()
         raise OSError(errno, f"unveil({workdir!r}): {os.strerror(errno)}")
+    # Staged inputs read-only. unveil matches the longest prefix, so a file
+    # entry overrides the directory's `rwc` for that file alone.
+    for entry in sorted(Path(workdir).iterdir()):
+        if not entry.is_file():
+            continue
+        if libc.unveil(_as_bytes(str(entry)), b"r") != 0:
+            errno = ctypes.get_errno()
+            raise OSError(errno, f"unveil({str(entry)!r}): {os.strerror(errno)}")
     for path in runtime:
         if not os.path.isdir(path):
             continue

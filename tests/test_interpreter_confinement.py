@@ -133,6 +133,121 @@ class TestWhatItCannotSee:
 
 
 @requires_backend
+class TestTheViewIsNotOnlyTheFilesystem:
+    """`pivot_root` moves the filesystem and nothing else.
+
+    The first version of this jail closed the path escape and left two ways
+    out that never touch a path: the environment, inherited at process start
+    and living in memory, and the network, which was denied only by refusing
+    to import `socket`.
+    """
+
+    def test_service_secrets_are_not_in_the_environment(self, staged, monkeypatch):
+        """Reproduced with a real DSN shape: the deployment passes secrets in
+        the environment, and the confined child was reading them."""
+        monkeypatch.setenv("DATABASE_URL", "postgres://u:SENTINEL-SECRET@db/l")
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-SENTINEL-KEY")
+        result = _run(
+            "import os\n"
+            "print('DSN=%s' % os.environ.get('DATABASE_URL'))\n"
+            "print('KEY=%s' % os.environ.get('OPENAI_API_KEY'))\n"
+            "print('ALL=%s' % sorted(os.environ))\n",
+            staged,
+        )
+        assert result["ok"], result["stderr"]
+        assert "SENTINEL-SECRET" not in result["stdout"], result["stdout"]
+        assert "SENTINEL-KEY" not in result["stdout"], result["stdout"]
+
+    def test_the_network_is_unreachable_below_the_import_denial(self, staged):
+        """`_BlockedImportFinder` refuses `socket`; it did not refuse
+        `_socket`, and an import denylist cannot be the wall anyway — an
+        already-loaded module can hand out the same primitive. Proven against
+        a listener in this process, so it needs no internet."""
+        import socket as _sock
+        import threading
+
+        listener = _sock.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(1)
+        port = listener.getsockname()[1]
+        reached = threading.Event()
+
+        def _accept():
+            try:
+                conn, _ = listener.accept()
+                reached.set()
+                conn.close()
+            except OSError:
+                pass
+
+        threading.Thread(target=_accept, daemon=True).start()
+        try:
+            result = _run(
+                "import _socket\n"
+                "s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)\n"
+                "s.settimeout(3)\n"
+                "try:\n"
+                f"    s.connect(('127.0.0.1', {port}))\n"
+                "    print('CONNECTED')\n"
+                "except OSError as exc:\n"
+                "    print('blocked:%s' % exc.errno)\n",
+                staged,
+            )
+            assert result["ok"], result["stderr"]
+            assert "CONNECTED" not in result["stdout"], result["stdout"]
+            assert not reached.wait(1.0), "the confined child reached this process"
+        finally:
+            listener.close()
+
+
+@requires_backend
+class TestStagedInputsAreReadOnly:
+    """SPEC §18 says inputs are read-only and the workdir is read-write.
+
+    Both were read-write. The originals are safe — the workdir holds copies —
+    but run 1 of a session could rewrite `input.csv` and run 2 would read the
+    forgery as the user's attachment, which is the provenance the contract
+    exists to state.
+    """
+
+    def test_a_staged_input_cannot_be_rewritten(self, staged):
+        result = _run(
+            "try:\n"
+            "    open('input.csv', 'w').write('forged')\n"
+            "    print('REWROTE')\n"
+            "except OSError as exc:\n"
+            "    print('blocked:%s' % exc.errno)\n",
+            staged,
+        )
+        assert result["ok"], result["stderr"]
+        assert "REWROTE" not in result["stdout"], result["stdout"]
+        assert staged.joinpath("input.csv").read_text() == "a,b\n1,2\n"
+
+    def test_it_cannot_be_appended_to_or_unlinked_either(self, staged):
+        result = _run(
+            "import os\n"
+            "for label, fn in (('append', lambda: open('input.csv','a').write('x')),\n"
+            "                  ('unlink', lambda: os.unlink('input.csv')),\n"
+            "                  ('rename', lambda: os.rename('input.csv','other.csv'))):\n"
+            "    try:\n"
+            "        fn(); print('%s:SUCCEEDED' % label)\n"
+            "    except OSError as exc:\n"
+            "        print('%s:blocked' % label)\n",
+            staged,
+        )
+        assert result["ok"], result["stderr"]
+        assert "SUCCEEDED" not in result["stdout"], result["stdout"]
+        assert staged.joinpath("input.csv").exists()
+
+    def test_new_files_are_still_writable(self, staged):
+        """The read-only inputs must not make the workdir read-only, or the
+        tool cannot produce anything."""
+        result = _run("open('out.txt','w').write('computed')", staged)
+        assert result["ok"], result["stderr"]
+        assert [f["name"] for f in result["created_files"]] == ["out.txt"]
+
+
+@requires_backend
 class TestWhatItCanSee:
     def test_the_staged_attachment_is_readable(self, staged):
         result = _run("print(open('input.csv').read())", staged)
