@@ -184,6 +184,32 @@ class TestTheOtherLayersStillHold:
         assert "process execution is not available" in result["stderr"]
 
 
+class TestTheAvailabilityCheckIsSafeToAskAnywhere:
+    """It is called from the API process, which has JAX loaded and threads
+    running. The first version answered by forking and unsharing in a child —
+    a correct answer obtained a dangerous way: a fork there can leave the
+    child deadlocked on a lock held by a thread it did not inherit, which the
+    interpreter warns about. It reads /proc now, and the authoritative check
+    is `confine()` itself in the already-spawned single-threaded child.
+    """
+
+    def test_it_does_not_fork(self, monkeypatch):
+        def _no_forking(*args, **kwargs):  # pragma: no cover - the assertion
+            raise AssertionError("the availability check forked")
+
+        monkeypatch.setattr("os.fork", _no_forking)
+        assert confine.backend_name() in {None, "linux-namespaces", "openbsd-unveil"}
+
+    @requires_backend
+    def test_it_agrees_with_what_actually_happens(self, staged):
+        """Cheap predicate, real outcome: if it says a backend exists, the
+        confined child must actually run. A predicate that drifted optimistic
+        would turn every call into a sandbox error."""
+        result = _run("print('confined')", staged)
+        assert result["ok"], result["stderr"]
+        assert "confined" in result["stdout"]
+
+
 class TestNoUnconfinedFallback:
     """A platform without a backend loses the tool; it does not get a weaker one."""
 

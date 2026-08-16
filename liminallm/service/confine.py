@@ -87,19 +87,35 @@ def _mount(libc, source, target, fstype, flags, data=None) -> None:
 
 
 def _linux_available() -> bool:
-    """Whether a user namespace can be created at all.
+    """Whether this kernel can give a process its own user + mount namespace.
 
-    Probed in a forked child: `unshare` is irreversible for the caller, so
-    asking the question in this process would answer it by confining it.
+    Read from /proc rather than probed by actually unsharing. `unshare` is
+    irreversible for the caller, so the probe has to happen somewhere other
+    than the asking process — and the obvious somewhere, a forked child, is
+    the wrong tool: this question is asked from the API process, which has JAX
+    loaded and threads running, and `os.fork()` there risks the child
+    deadlocking on a lock held by a thread that does not exist in it. (The
+    interpreter warns about exactly this.)
+
+    So this is the cheap "could this platform confine" question, and the
+    authoritative one is `confine()` itself, which runs in the already-spawned
+    single-threaded sandbox child and fails closed if the kernel refuses.
     """
     if sys.platform != "linux" or platform.machine() not in _SYS_PIVOT_ROOT:
         return False
-    pid = os.fork()
-    if pid == 0:  # pragma: no cover - trivial child
-        libc = _libc()
-        os._exit(0 if libc.unshare(_CLONE_NEWUSER | _CLONE_NEWNS) == 0 else 1)
-    _, status = os.waitpid(pid, 0)
-    return os.waitstatus_to_exitcode(status) == 0
+    if not os.path.exists("/proc/self/uid_map"):
+        return False  # user namespaces not compiled in
+    for path, minimum in (
+        ("/proc/sys/user/max_user_namespaces", 1),
+        # A Debian-family knob; absent on kernels that never had it.
+        ("/proc/sys/kernel/unprivileged_userns_clone", 1),
+    ):
+        try:
+            if int(Path(path).read_text().strip()) < minimum:
+                return False
+        except (OSError, ValueError):
+            continue
+    return True
 
 
 def _linux_confine(workdir: str, runtime: Sequence[str]) -> str:
