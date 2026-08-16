@@ -1014,10 +1014,10 @@ class ApiAdapterBackend:
         processed = self._process_adapters_for_provider(adapter_list)
         target_model = processed["model"]
         extra_body = processed["extra_body"]
-        prompt_injections = processed["prompt_injections"]
-
-        # Inject adapter prompts if any hybrid/prompt adapters
-        augmented_messages = self._inject_adapter_prompts(messages, prompt_injections)
+        # Messages arrive materialized: LLMService places adapter
+        # instructions once, on every path into a backend (SPEC §5.0.1).
+        # Injecting here as well put them in twice.
+        augmented_messages = list(messages or [])
         extra_body = self._with_reasoning_effort(extra_body)
 
         if self.client and self._responses_available():
@@ -1174,9 +1174,10 @@ class ApiAdapterBackend:
             raise RuntimeError("tool calling requires a configured API client")
 
         processed = self._process_adapters_for_provider(adapters or [])
-        augmented = self._inject_adapter_prompts(
-            messages, processed["prompt_injections"]
-        )
+        # Messages arrive materialized: LLMService places adapter
+        # instructions once, on every path into a backend (SPEC §5.0.1).
+        # Injecting here as well put them in twice.
+        augmented = list(messages or [])
         if self._responses_available():
             kwargs = self._responses_kwargs(processed["model"], processed["extra_body"])
             if tools:
@@ -1329,8 +1330,10 @@ class ApiAdapterBackend:
         processed = self._process_adapters_for_provider(adapter_list)
         target_model = processed["model"]
         extra_body = processed["extra_body"]
-        prompt_injections = processed["prompt_injections"]
-        augmented_messages = self._inject_adapter_prompts(messages, prompt_injections)
+        # Messages arrive materialized: LLMService places adapter
+        # instructions once, on every path into a backend (SPEC §5.0.1).
+        # Injecting here as well put them in twice.
+        augmented_messages = list(messages or [])
         extra_body = self._with_reasoning_effort(extra_body)
 
         if self.client and self._responses_available():
@@ -1421,11 +1424,9 @@ class ApiAdapterBackend:
         Returns dict with:
         - model: Target model ID
         - extra_body: Additional request body parameters
-        - prompt_injections: List of prompt strings to inject
         - applied: List of adapter IDs that were applied
         - dropped: List of adapter IDs that were dropped
         """
-        prompt_injections: List[str] = []
         remote_adapters: List[dict] = []
         applied: List[str] = []
         dropped: List[str] = []
@@ -1450,19 +1451,18 @@ class ApiAdapterBackend:
                 continue
 
             if mode == AdapterMode.PROMPT:
-                # Pure prompt adapter
-                prompt = self._extract_prompt_instructions(adapter)
-                if prompt:
-                    prompt_injections.append(prompt)
+                # A prompt adapter's text is already in the messages: SPEC
+                # §5.0.1 gives materialization to LLMService, which every
+                # path into a backend goes through. Extracting it here is
+                # only how this backend knows whether the adapter carries
+                # anything to report as applied.
+                if self._extract_prompt_instructions(adapter):
                     applied.append(f"{adapter_id}:prompt")
                 continue
 
             if mode == AdapterMode.HYBRID:
-                # Hybrid: always extract prompt, optionally add to remote
-                prompt = self._extract_prompt_instructions(adapter)
-                if prompt:
-                    prompt_injections.append(prompt)
-                # Check if has remote component
+                # Same for the hybrid fallback; the remote half below is a
+                # different mechanism and still this backend's to perform.
                 if adapter.get("remote_model_id") or adapter.get("remote_adapter_id"):
                     remote_adapters.append(adapter)
                     applied.append(f"{adapter_id}:hybrid")
@@ -1484,7 +1484,6 @@ class ApiAdapterBackend:
         return {
             "model": model,
             "extra_body": extra_body,
-            "prompt_injections": prompt_injections,
             "applied": applied,
             "dropped": dropped,
         }
@@ -1631,33 +1630,6 @@ class ApiAdapterBackend:
             )
 
         return result
-
-    def _inject_adapter_prompts(
-        self, messages: List[dict], prompts: List[str]
-    ) -> List[dict]:
-        """Inject adapter prompt instructions into message list."""
-        if not prompts:
-            return messages
-
-        prompt_text = "\n".join(f"- {p}" for p in prompts)
-        system_addition = f"\n\nAdapter guidance:\n{prompt_text}"
-
-        # Find and augment system message, or prepend new one
-        augmented = [dict(m) for m in messages]
-        for i, msg in enumerate(augmented):
-            if msg.get("role") == "system":
-                augmented[i] = {
-                    **msg,
-                    "content": msg.get("content", "") + system_addition,
-                }
-                return augmented
-
-        # No system message found, prepend one
-        augmented.insert(
-            0, {"role": "system", "content": f"Adapter guidance:\n{prompt_text}"}
-        )
-        return augmented
-
 
 # The local tool channel. A raw checkpoint has no second wire, so the channel
 # is a contract the backend enforces: tools are advertised in the prompt, the

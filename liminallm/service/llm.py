@@ -19,6 +19,11 @@ from liminallm.storage.models import Message
 logger = get_logger(__name__)
 
 
+def _mode_value(mode) -> str:
+    """An adapter mode as its comparable string, enum member or not."""
+    return str(getattr(mode, "value", mode) or "").strip().lower()
+
+
 class LLMService:
     """LLM executor that delegates to a pluggable model backend."""
 
@@ -48,6 +53,39 @@ class LLMService:
             fs_root=fs_root,
         )
 
+    def _prepare_backend_messages(
+        self, messages: List[dict], adapters: Optional[List[dict]]
+    ) -> tuple[List[dict], List[dict]]:
+        """Messages and adapters ready for any backend (SPEC §5.0.1).
+
+        The single materialization point. It canonicalizes the adapter set
+        (gate first, §5.0.1) and places `prompt_instructions` exactly once,
+        into a copy of the caller's list, choosing the representation from
+        (mode, backend) — weights on a local backend, prompt on an API one.
+
+        Every path into a backend goes through here, which is the whole
+        point. When only `generate`/`generate_stream` materialized, the API
+        backends materialized too "to be safe", so those two paths sent the
+        instructions twice while `generate_with_tools` and `stream_messages`
+        — which never passed through the service's message builder — sent
+        them once. Removing the backend copy alone would have taken the
+        latter pair to zero; giving the service one primitive that every
+        entry point uses is what makes one copy true everywhere.
+
+        Guidance goes after any leading system messages, so it sits with the
+        rest of the system content rather than ahead of the caller's own
+        framing.
+        """
+        normalized_adapters = self._normalize_adapters(adapters or [])
+        guidance = self._build_adapter_prompts(normalized_adapters)
+        prepared = list(messages or [])
+        if guidance:
+            index = 0
+            while index < len(prepared) and prepared[index].get("role") == "system":
+                index += 1
+            prepared[index:index] = guidance
+        return prepared, normalized_adapters
+
     def _prepare_generation(
         self,
         prompt: str,
@@ -60,13 +98,14 @@ class LLMService:
         Returns:
             Tuple of (messages, normalized_adapters) ready for the backend.
         """
-        normalized_adapters = self._normalize_adapters(adapters)
         messages = [{"role": "system", "content": "You are a concise assistant."}]
-        messages.extend(self._build_adapter_prompts(normalized_adapters))
         if history:
             for msg in history:
                 messages.append({"role": msg.role, "content": msg.content})
         messages.append({"role": "user", "content": self._format_user(prompt)})
+        messages, normalized_adapters = self._prepare_backend_messages(
+            messages, adapters
+        )
         messages = self._inject_context(messages, context_snippets)
         return messages, normalized_adapters
 
@@ -111,10 +150,13 @@ class LLMService:
         """
         if not self.supports_tools:
             raise RuntimeError("active backend does not support tool calling")
+        prepared, normalized_adapters = self._prepare_backend_messages(
+            messages, adapters
+        )
         return self.backend.generate_with_tools(
-            messages,
+            prepared,
             tools,
-            self._normalize_adapters(adapters or []),
+            normalized_adapters,
             user_id=user_id,
         )
 
@@ -130,8 +172,11 @@ class LLMService:
         Used by the attachment agent to stream its final answer after the
         tool-calling rounds have assembled the message history.
         """
+        prepared, normalized_adapters = self._prepare_backend_messages(
+            messages, adapters
+        )
         return self.backend.generate_stream(
-            messages, self._normalize_adapters(adapters or []), user_id=user_id
+            prepared, normalized_adapters, user_id=user_id
         )
 
     @property
@@ -308,7 +353,16 @@ class LLMService:
             # `backend` directly let `mode: hybrid, backend: prompt` receive
             # both the weights and the prompt after promotion, and
             # `mode: prompt, backend: local` receive neither.
-            mode = str(get_adapter_mode(adapter) or "").strip().lower()
+            # Compared as the value, not as `str()` of it. `get_adapter_mode`
+            # returns the raw string when the artifact states one and an
+            # `AdapterMode` member when it infers, and `str(AdapterMode.HYBRID)`
+            # is "AdapterMode.HYBRID" — which matches nothing, so every adapter
+            # that did not state a mode was silently skipped here. That is the
+            # documented default for legacy adapters, and it went unnoticed
+            # because the API backends were injecting the prompt themselves;
+            # with materialization now solely the service's (§5.0.1), the same
+            # bug would drop those adapters' instructions entirely.
+            mode = _mode_value(get_adapter_mode(adapter))
             if mode not in {AdapterMode.PROMPT, AdapterMode.HYBRID}:
                 continue
             if mode == AdapterMode.HYBRID and self._backend_applies_lora_weights:

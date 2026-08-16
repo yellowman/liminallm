@@ -212,7 +212,7 @@ class TestProcessAdaptersForProvider:
         assert len(result["applied"]) == 0
 
     def test_prompt_adapters_inject_instructions(self):
-        """PROMPT adapters should inject prompt instructions."""
+        """PROMPT adapters are reported as applied, not re-materialized."""
         backend = ApiAdapterBackend("gpt-4", provider="openai")
 
         adapters = [
@@ -224,8 +224,11 @@ class TestProcessAdaptersForProvider:
         ]
         result = backend._process_adapters_for_provider(adapters)
 
+        # Reported, not materialized: SPEC §5.0.1 gives prompt
+        # materialization to LLMService, so the backend names the adapter as
+        # applied and adds no second copy of its text.
         assert "a1:prompt" in result["applied"]
-        assert "Be concise and helpful" in result["prompt_injections"]
+        assert "prompt_injections" not in result
 
     def test_hybrid_adapters_extract_prompt(self):
         """HYBRID adapters should extract prompt and optionally add to remote."""
@@ -240,10 +243,10 @@ class TestProcessAdaptersForProvider:
         ]
         result = backend._process_adapters_for_provider(adapters)
 
-        # Prompt should be extracted
-        assert "Expert mode" in result["prompt_injections"]
-        # Without remote_model_id, should only apply as prompt
+        # Without remote_model_id only the prompt fallback applies, and its
+        # text is already in the messages (§5.0.1).
         assert "a1:prompt" in result["applied"]
+        assert "prompt_injections" not in result
 
     def test_hybrid_with_remote_model_id(self):
         """HYBRID adapter with remote_model_id should be added to remote list."""
@@ -259,8 +262,10 @@ class TestProcessAdaptersForProvider:
         ]
         result = backend._process_adapters_for_provider(adapters)
 
-        assert "Expert mode" in result["prompt_injections"]
+        # The remote half is this backend's to perform; the prompt half is
+        # not. Two mechanisms, one of them elsewhere (§5.0.1).
         assert "a1:hybrid" in result["applied"]
+        assert "prompt_injections" not in result
 
     def test_remote_adapters_added_to_list(self):
         """REMOTE adapters should be added to remote adapter list."""
@@ -593,83 +598,3 @@ class TestExtractPromptInstructions:
 
         assert result == "Valid"
 
-
-# ==============================================================================
-# _inject_adapter_prompts Tests
-# ==============================================================================
-
-
-class TestInjectAdapterPrompts:
-    """Test adapter prompt injection into messages."""
-
-    def test_injects_into_existing_system_message(self):
-        """Should append to existing system message."""
-        backend = ApiAdapterBackend("gpt-4", provider="openai")
-
-        messages = [
-            {"role": "system", "content": "You are helpful."},
-            {"role": "user", "content": "Hello"},
-        ]
-        prompts = ["Be concise"]
-
-        result = backend._inject_adapter_prompts(messages, prompts)
-
-        assert len(result) == 2
-        assert "You are helpful." in result[0]["content"]
-        assert "Adapter guidance" in result[0]["content"]
-        assert "Be concise" in result[0]["content"]
-
-    def test_prepends_system_message_if_missing(self):
-        """Should prepend system message if none exists."""
-        backend = ApiAdapterBackend("gpt-4", provider="openai")
-
-        messages = [{"role": "user", "content": "Hello"}]
-        prompts = ["Be helpful"]
-
-        result = backend._inject_adapter_prompts(messages, prompts)
-
-        assert len(result) == 2
-        assert result[0]["role"] == "system"
-        assert "Adapter guidance" in result[0]["content"]
-        assert "Be helpful" in result[0]["content"]
-
-    def test_multiple_prompts_combined(self):
-        """Should combine multiple prompt instructions."""
-        backend = ApiAdapterBackend("gpt-4", provider="openai")
-
-        messages = [{"role": "user", "content": "Hello"}]
-        prompts = ["Be concise", "Use examples", "Stay on topic"]
-
-        result = backend._inject_adapter_prompts(messages, prompts)
-
-        content = result[0]["content"]
-        assert "Be concise" in content
-        assert "Use examples" in content
-        assert "Stay on topic" in content
-
-    def test_no_injection_for_empty_prompts(self):
-        """Should not modify messages if no prompts."""
-        backend = ApiAdapterBackend("gpt-4", provider="openai")
-
-        messages = [{"role": "user", "content": "Hello"}]
-
-        result = backend._inject_adapter_prompts(messages, [])
-
-        assert result == messages
-
-    def test_does_not_modify_original(self):
-        """Should not modify original messages list."""
-        backend = ApiAdapterBackend("gpt-4", provider="openai")
-
-        messages = [
-            {"role": "system", "content": "Original"},
-            {"role": "user", "content": "Hello"},
-        ]
-        prompts = ["Added"]
-
-        result = backend._inject_adapter_prompts(messages, prompts)
-
-        # Original should be unchanged
-        assert messages[0]["content"] == "Original"
-        # Result should be modified
-        assert "Added" in result[0]["content"]

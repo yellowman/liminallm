@@ -178,7 +178,7 @@ class TestRemotePassthroughAndAccounting:
         )
         assert processed["applied"] == []
         assert processed["dropped"] == []
-        assert processed["prompt_injections"] == []
+        assert "prompt_injections" not in processed
 
     def test_a_closed_gate_is_not_sent_to_the_provider(self):
         remote = {"id": "r", "mode": "remote", "remote_adapter_id": "ra-1"}
@@ -241,17 +241,19 @@ class TestRemotePassthroughAndAccounting:
         assert model == "ft-b"
 
     def test_gemini_native_agrees(self):
+        """Accounting only. This used to assert the backend returned the
+        instruction text, which is the second-materializer contract §5.0.1
+        replaced — `_request_body` then prepended it on top of the copy
+        LLMService had already placed."""
         from liminallm.service.gemini_backend import GeminiBackend
 
         backend = GeminiBackend(base_model="gemini-2.0-flash", api_key="k")
-        closed, applied = backend._prompt_injections(
+        assert backend._applied_prompt_adapters(
             [{**PROMPT_ADAPTER, "weight": 0.0}]
-        )
-        assert closed == [] and applied == []
-        open_, applied = backend._prompt_injections(
+        ) == []
+        assert backend._applied_prompt_adapters(
             [{**PROMPT_ADAPTER, "weight": 0.2}]
-        )
-        assert open_ == ["prefer tabs"] and applied == ["skill:prompt"]
+        ) == ["skill:prompt"]
 
 
 class TestAccountingAndAuditSayDifferentThings:

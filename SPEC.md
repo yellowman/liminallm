@@ -758,6 +758,19 @@ not something one backend can decide alone, and a single materializer is what
 keeps an adapter's instructions from appearing twice. a backend that also
 injects is a second materializer by another name.
 
+**every entry point into a backend passes through that one primitive** —
+`generate`, `generate_stream`, and the caller-built-message paths
+`generate_with_tools` and `stream_messages` alike. when only the first two
+materialized, the API backends materialized as well "to be safe", so those
+two paths sent the text twice while the other two sent it once; removing the
+backend copy on its own would have taken the caller-built pair to zero. one
+primitive, used everywhere, is what makes "once" true rather than average.
+
+an adapter's mode may be **stated or inferred**, and the rules above apply to
+both. an artifact that states no `mode` is `hybrid` by default (§5.0.1), and
+a materializer that recognizes only a stated mode silently drops exactly the
+legacy adapters the default exists for.
+
 ### 5.0.2 provider capabilities (implementation detail)
 
 different API providers handle adapters in fundamentally different ways. the kernel maintains a capability registry to format requests correctly:
