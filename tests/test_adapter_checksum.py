@@ -40,8 +40,13 @@ class TestAdapterChecksumValidation:
         """Create valid adapter weights JSON."""
         return {"layer1": [1.0, 2.0, 3.0], "layer2": [4.0, 5.0, 6.0]}
 
-    def create_adapter_file(self, tmp_path, weights, subdir="test_adapter"):
-        """Create adapter params.json file and return its path and checksum."""
+    def create_adapter_file(self, tmp_path, weights, subdir="test-adapter"):
+        """Create adapter params.json file and return its path and checksum.
+
+        The directory is named for the adapter (SPEC §5.5): weights belong
+        to the adapter whose directory holds them, so a fixture that names
+        it something else describes weights this adapter may not serve.
+        """
         adapter_dir = tmp_path / subdir
         adapter_dir.mkdir(parents=True, exist_ok=True)
 

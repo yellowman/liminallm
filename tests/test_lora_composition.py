@@ -459,11 +459,13 @@ class TestSftSequenceConstruction:
 
         # And serving consumes exactly this file, through gate composition.
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
-        adapter_dir = tmp_path / "served"
+        # The directory carries the adapter's identity (§5.5), so it is named
+        # for the adapter rather than for its role in this test.
+        adapter_dir = tmp_path / "e2e"
         adapter_dir.mkdir()
         (adapter_dir / "params.json").write_text(params_path.read_text())
         blended = backend._blend_adapter_weights(
-            [{"id": "e2e", "base_model": BASE, "backend": "local", "fs_dir": "served", "weight": 1.0}],
+            [{"id": "e2e", "base_model": BASE, "backend": "local", "fs_dir": "e2e", "weight": 1.0}],
             user_id="u",
         )
         assert transformer.lora_by_layer(jnp, blended, config.num_layers) is not None

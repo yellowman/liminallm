@@ -353,13 +353,13 @@ class TestWeightedAdapterBlending:
 
         adapters = [
             {
-                "id": "adapter1_zero",  # Unique ID to avoid cache issues
+                "id": "adapter1",  # matches its directory (§5.5)
                 "base_model": "test-model",
                 "weight": 0.0,
                 "fs_dir": str(tmp_path / "adapters" / "adapter1"),
             },
             {
-                "id": "adapter2_full",  # Unique ID
+                "id": "adapter2",  # matches its directory (§5.5)
                 "base_model": "test-model",
                 "weight": 1.0,
                 "fs_dir": str(tmp_path / "adapters" / "adapter2"),

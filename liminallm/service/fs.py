@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import re
 import time
 from pathlib import Path
 from typing import Optional, Tuple
@@ -114,3 +115,61 @@ def safe_join(base: Path, relative: str) -> Path:
         return candidate
 
     raise PathTraversalError("path traversal detected")
+
+
+def adapter_dir_owner(path) -> str:
+    """The adapter id a weights path claims to belong to, read from layout.
+
+    One predicate for both ends of §5.5, because both ask the same question:
+    training, before it writes a version into a directory, and serving, once
+    it has resolved which `params.json` it would read. Handles every layout
+    the resolver produces — `.../A`, `.../A/vNNNN/params.json` and the
+    never-versioned `.../A/params.json`.
+    """
+    candidate = Path(str(path))
+    if candidate.name == "params.json":
+        candidate = candidate.parent
+    if re.fullmatch(r"v\d+", candidate.name):
+        candidate = candidate.parent
+    return candidate.name
+
+
+def adapter_root(base: Path, adapter_id: str, explicit=None) -> Path:
+    """The directory holding one adapter's versions, bound to its identity.
+
+    An explicit ``fs_dir``/``cephfs_dir`` says **where** an adapter's directory
+    lives — a per-user root, a different mount — never **whose** it is. Its
+    final component must therefore be the adapter's own id, which both
+    documented layouts already satisfy: ``adapters/{adapter_id}`` and
+    ``/users/{user_id}/adapters/{adapter_id}``.
+
+    Containment under ``base`` alone was not enough. It proved the path was
+    inside the shared root, which every adapter's directory is, so an artifact
+    whose schema named ``adapters/B`` had B's ``v0001/params.json`` served as
+    A's version 1 — the same substitution as ``A/latest → B/v0001``, one level
+    earlier, and reachable through ordinary artifact creation because the
+    adapter schema accepts additional properties.
+
+    Raises ``PathTraversalError`` for an escape or an identity mismatch.
+    """
+    identity = str(adapter_id or "").strip()
+    if not identity:
+        raise PathTraversalError("adapter path resolution requires an adapter id")
+    if explicit is None or explicit == "":
+        return safe_join(base, f"adapters/{identity}")
+
+    base_resolved = base.resolve()
+    candidate = Path(str(explicit))
+    resolved = (
+        candidate if candidate.is_absolute() else base_resolved / candidate
+    ).resolve()
+    if not (resolved == base_resolved or base_resolved in resolved.parents):
+        raise PathTraversalError("adapter path must reside within fs_root")
+    owner = adapter_dir_owner(resolved)
+    if owner != identity:
+        raise PathTraversalError(
+            f"adapter {identity!r} declares directory {str(explicit)!r}, which "
+            f"belongs to {owner!r}; an explicit root may relocate an adapter, "
+            "never rename one adapter's weights to another's"
+        )
+    return resolved

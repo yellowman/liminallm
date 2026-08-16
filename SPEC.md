@@ -749,6 +749,15 @@ service that calls it: the local backend reported a zero-gated adapter as the
 turn's `adapter_id`, and sized its tokenizer from it, while correctly
 excluding it from both the LoRA sum and the cache key.
 
+**prompt materialization happens once, in the service, before any backend
+runs.** `LLMService` places `prompt_instructions` into the messages according
+to the (mode, backend) rules above; backends receive prepared messages and
+materialize only what is theirs — LoRA weights locally, an adapter or model
+selection remotely. the choice of representation is a rule about the pair,
+not something one backend can decide alone, and a single materializer is what
+keeps an adapter's instructions from appearing twice. a backend that also
+injects is a second materializer by another name.
+
 ### 5.0.2 provider capabilities (implementation detail)
 
 different API providers handle adapters in fundamentally different ways. the kernel maintains a capability registry to format requests correctly:
@@ -1284,6 +1293,23 @@ cluster qualifies          pooled events ≥ threshold      eval gate passes
      never at `adapters/<id>/latest`: handing it the pointer made it look for
      `latest/vNNNN`, so a correctly promoted adapter became unservable merely
      because the convenience pointer existed beside its versions.
+   - **the version is pinned, and so is the adapter.** weights belong to the
+     adapter whose directory holds them, checked two ways where weights are
+     about to be read. **by layout**: the directory containing a
+     `params.json` is named for its owner, so `adapters/A/vNNNN/params.json`
+     is A's and nothing else's. an explicit `fs_dir`/`cephfs_dir` may say
+     *where* an adapter's directory lives — a per-user root, another mount —
+     never *whose* it is; validating only that it sits under `fs_root` proved
+     nothing, since every adapter's directory does, and an artifact naming
+     `adapters/B` had B's weights served as A's version 1. **by provenance**:
+     training records `adapter_id` and `version` inside each version's
+     `metadata.json`, and a recorded id or version that disagrees refuses —
+     that is what catches a directory renamed to A holding B's run, which
+     layout alone cannot see. provenance is verified when present rather than
+     required, so a hand-written version fails on disagreement rather than on
+     absence. the same identity binds the write side: a training job may not
+     place a new version in another adapter's tree, where that adapter's
+     promotion would authorize it.
    - **a versionless artifact cannot authorize a version.** an artifact with
      no `current_version` at all — the never-versioned legacy shape, which
      the adapter schema no longer permits to be created — may serve its own

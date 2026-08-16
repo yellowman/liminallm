@@ -14,7 +14,7 @@ from liminallm.config import AdapterMode, get_compatible_adapter_modes
 from liminallm.logging import get_logger
 from liminallm.service import local_format, transformer
 from liminallm.service.embeddings import deterministic_embedding
-from liminallm.service.fs import PathTraversalError, safe_join
+from liminallm.service.fs import adapter_root, safe_join
 from liminallm.service.tokenizer_utils import (
     DEFAULT_VOCAB_SIZE,
     vocab_size_from_tokenizer,
@@ -1273,20 +1273,11 @@ class TrainingService:
     ) -> Path:
         adapter_schema = adapter_schema or {}
         explicit = adapter_schema.get("cephfs_dir") or adapter_schema.get("fs_dir")
-        if explicit:
-            candidate = Path(explicit)
-            base_root = Path(self.fs_root).resolve()
-            resolved = (
-                candidate
-                if candidate.is_absolute()
-                else safe_join(base_root, str(candidate))
-            )
-            if base_root not in resolved.parents and resolved != base_root:
-                raise PathTraversalError(
-                    "adapter directory must reside under shared_fs_root"
-                )
-            return resolved
-        return safe_join(self.fs_root, f"adapters/{adapter_id}")
+        # The same identity binding serving uses (§5.5). Containment alone let
+        # an explicit root name *another* adapter's directory, and on this
+        # side that writes A's new version into B's tree — where serving would
+        # then find it under B's own id, with B's promotion authorizing it.
+        return adapter_root(Path(self.fs_root), adapter_id, explicit)
 
     def _job_dir(
         self,

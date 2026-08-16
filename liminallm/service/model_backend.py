@@ -19,7 +19,7 @@ from liminallm.config import (
 )
 from liminallm.logging import get_logger
 from liminallm.service import local_format, responses_compat, transformer
-from liminallm.service.fs import safe_join
+from liminallm.service.fs import adapter_dir_owner, safe_join
 from liminallm.service.prompt_utils import extract_prompt_instructions
 from liminallm.service.tokenizer_utils import (
     DEFAULT_VOCAB_SIZE,
@@ -1728,10 +1728,23 @@ def _is_prefix(shorter: Tuple[int, ...], longer: Tuple[int, ...]) -> bool:
 class LocalJaxLoRABackend:
     """Backend for local JAX generation with filesystem-backed LoRA adapters.
 
-    Supports SPEC §5 dual-mode operation:
-    - LOCAL adapters: Load weights from filesystem, apply LoRA math
-    - HYBRID adapters: Load local weights, with prompt fallback
-    - PROMPT adapters: Inject behavior via system prompt (no weights)
+    **This backend materializes weights, not prompts.** It accepts the modes
+    of SPEC §5 so the router may route them here, and it applies exactly one
+    of the two representations:
+
+    - LOCAL, and HYBRID with a promoted version: LoRA matrices from
+      ``fs_root``, composed per §5.2 and scaled by the router's gate.
+    - PROMPT, and HYBRID with nothing promoted: **no weights**, and no
+      instructions either — those are already in ``messages``.
+
+    ``prompt_instructions`` are placed by ``LLMService._build_adapter_prompts``
+    before any backend is called, because the choice of representation is a
+    §5.0.1 rule about the *pair* (mode, backend) rather than something a
+    backend can decide alone, and because one materializer is what keeps a
+    prompt from being injected twice. So a prompt-rung adapter passed
+    straight to this class changes nothing: the messages it would have
+    changed were the caller's to prepare. The docstring used to say this
+    class injects them, which described an intent no code here carries out.
 
     The backend keeps a tokenizer and (optional) Flax model resident, reads
     LoRA matrices from ``fs_root`` paths, and runs a lightweight JAX forward
@@ -2000,6 +2013,9 @@ class LocalJaxLoRABackend:
         # whole strings, so in strict mode it refused an adapter naming the
         # same checkpoint by a different path).
         self._assert_exact_base_model(adapter, adapter_id)
+        self._assert_version_belongs_to_adapter(
+            params_path, adapter_id, current_version
+        )
 
         mtime = params_path.stat().st_mtime
         # Keyed by (adapter_id, version) as SPEC §5.3 declares, not by id
@@ -2733,6 +2749,66 @@ class LocalJaxLoRABackend:
         except (TypeError, ValueError):
             return 0
 
+    @staticmethod
+    def _assert_version_belongs_to_adapter(
+        params_path: Path, adapter_id: str, current_version: Optional[int]
+    ) -> None:
+        """Check that these weights are this adapter's (SPEC §5.5), two ways.
+
+        **Layout.** The directory holding a `params.json` is named for the
+        adapter that owns it. Containment under `fs_root` proved only that a
+        path was inside the shared root — which every adapter's directory is —
+        so an artifact whose schema said `fs_dir: adapters/B` had B's
+        `v0001/params.json` served as A's version 1. That is the
+        `A/latest → B/v0001` substitution one level earlier, and reachable
+        through ordinary artifact creation, since the adapter schema accepts
+        additional properties.
+
+        **Provenance.** Training writes `adapter_id` and `version` into each
+        version's `metadata.json`, so the run itself says what it produced.
+        That catches what layout cannot: a directory renamed to A holding B's
+        run. Verified when present rather than required — a version written
+        by hand has nothing to check against, and refusing on a missing file
+        fails closed on absence rather than on disagreement.
+
+        Checked here, where a params path has resolved and weights are about
+        to be read, so an adapter that will contribute nothing stays a no-op.
+        """
+        owner = adapter_dir_owner(params_path)
+        if owner != str(adapter_id):
+            raise ValueError(
+                f"adapter {adapter_id!r} resolved to weights under {owner!r}; "
+                "an explicit root may relocate an adapter, never rename one "
+                "adapter's weights to another's"
+            )
+        metadata_path = params_path.parent / "metadata.json"
+        if not metadata_path.is_file():
+            return
+        try:
+            metadata = json.loads(metadata_path.read_text())
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return  # unreadable convenience metadata proves nothing either way
+        if not isinstance(metadata, dict):
+            return
+        recorded_id = metadata.get("adapter_id")
+        if recorded_id and str(recorded_id) != str(adapter_id):
+            raise ValueError(
+                f"adapter {adapter_id!r} resolved to weights whose metadata "
+                f"records adapter {recorded_id!r}; refusing to serve one "
+                "adapter's training run as another's"
+            )
+        recorded_version = metadata.get("version")
+        if (
+            current_version is not None
+            and recorded_version is not None
+            and str(recorded_version) != str(current_version)
+        ):
+            raise ValueError(
+                f"adapter {adapter_id!r} pins version {current_version} but "
+                f"these weights record version {recorded_version}; the "
+                "promotion authorized a different run"
+            )
+
     def _assert_exact_base_model(self, adapter: dict, adapter_id: str) -> None:
         """Refuse weights whose declared base is not the serving base.
 
@@ -2934,6 +3010,12 @@ class LocalJaxLoRABackend:
                 and visibility not in {"shared", "global"}
             ):
                 raise ValueError("adapter owner mismatch")
+            # Containment only, here. The identity half of §5.5 is checked on
+            # the *resolved* params path, beside the base-model rule, so an
+            # adapter that will contribute no weights — nothing promoted, a
+            # closed gate, a directory that does not exist — stays a no-op
+            # instead of raising. Refusing at path-computation time made a
+            # malformed-but-inert artifact fail every turn it was routed into.
             base = self.fs_root.resolve()
             candidate = (
                 Path(str(explicit)) if isinstance(explicit, (str, Path)) else Path("")
@@ -2941,7 +3023,6 @@ class LocalJaxLoRABackend:
             resolved = (
                 candidate if candidate.is_absolute() else base / candidate
             ).resolve()
-            # Path must be within fs_root: base must be a parent of resolved, or they must be equal
             if not (base in resolved.parents or resolved == base):
                 raise ValueError("adapter path must reside within fs_root")
             return str(resolved)

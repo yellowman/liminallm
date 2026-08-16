@@ -1368,6 +1368,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
             candidate = {"id": art.id, "name": art.name}
             if isinstance(art.schema, dict):
                 candidate.update(art.schema)
+            # Ownership travels with the adapter, because the path check that
+            # enforces it lives in the backend and was reading fields nothing
+            # put here — it compared an owner it never had against the
+            # requesting user, and passed. Set after the schema so a
+            # user-authored `owner_user_id` cannot overwrite the artifact's.
+            candidate["owner_user_id"] = art.owner_user_id
+            candidate["visibility"] = art.visibility
             cid = candidate.get("cluster_id")
             if cid and cid in cluster_lookup:
                 candidate.setdefault("centroid", cluster_lookup[cid].centroid)

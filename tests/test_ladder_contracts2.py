@@ -264,6 +264,115 @@ class TestVersionAuthorityIsAbsolute:
         resolved = backend._resolve_params_path(adapter_dir, current_version=1)
         assert resolved == adapter_dir / "v0001" / "params.json"
 
+    def test_an_explicit_root_cannot_name_another_adapters_directory(
+        self, tmp_path, checkpoint, config
+    ):
+        """§5.5 pins the version; it has to pin the adapter too.
+
+        `fs_dir` was validated only for containment under `fs_root` — which
+        every adapter's directory satisfies — so an artifact naming
+        `adapters/B` had B's `v0001/params.json` served as A's version 1.
+        Same substitution as `A/latest → B/v0001`, one level earlier, and
+        reachable through ordinary artifact creation because the adapter
+        schema accepts additional properties.
+        """
+        _write(tmp_path / "adapters" / "B" / "v0001", _valid_pair(config))
+        (tmp_path / "adapters" / "A").mkdir(parents=True)
+        backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
+        borrowed = {
+            "id": "A",
+            "mode": "local",
+            "fs_dir": "adapters/B",
+            "current_version": 1,
+            "base_model": str(checkpoint),
+            "weight": 1.0,
+        }
+        with pytest.raises(ValueError, match="never rename one adapter"):
+            backend._blend_adapter_weights([borrowed], user_id="u", config=config)
+
+        # Control: B serving its own directory is untouched.
+        assert backend._blend_adapter_weights(
+            [{**borrowed, "id": "B", "fs_dir": "adapters/B"}],
+            user_id="u",
+            config=config,
+        )
+
+    def test_a_renamed_directory_is_caught_by_the_runs_own_metadata(
+        self, tmp_path, checkpoint, config
+    ):
+        """Layout is a claim a rename can forge. Training records the
+        adapter id and version inside each version, so the run itself says
+        what it produced."""
+        version = tmp_path / "adapters" / "C" / "v0001"
+        _write(version, _valid_pair(config))
+        (version / "metadata.json").write_text(
+            json.dumps({"adapter_id": "B", "version": 1})
+        )
+        backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
+        adapter = {
+            "id": "C",
+            "mode": "local",
+            "current_version": 1,
+            "base_model": str(checkpoint),
+            "weight": 1.0,
+        }
+        with pytest.raises(ValueError, match="metadata records adapter 'B'"):
+            backend._blend_adapter_weights([adapter], user_id="u", config=config)
+
+        # A version number that disagrees is the same kind of lie.
+        (version / "metadata.json").write_text(
+            json.dumps({"adapter_id": "C", "version": 7})
+        )
+        with pytest.raises(ValueError, match="record version 7"):
+            backend._blend_adapter_weights([adapter], user_id="u", config=config)
+
+        # Agreeing metadata serves, and so does a version that has none.
+        (version / "metadata.json").write_text(
+            json.dumps({"adapter_id": "C", "version": 1})
+        )
+        assert backend._blend_adapter_weights([adapter], user_id="u", config=config)
+        (version / "metadata.json").unlink()
+        assert backend._blend_adapter_weights([adapter], user_id="u", config=config)
+
+    def test_a_borrowed_root_on_an_inert_adapter_is_still_a_no_op(
+        self, tmp_path, checkpoint, config
+    ):
+        """The identity rule guards weights that will be applied, like the
+        base rule beside it. An adapter with nothing promoted contributes
+        nothing whatever its `fs_dir` says, so it must not raise."""
+        _write(tmp_path / "adapters" / "B" / "v0001", _valid_pair(config))
+        backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
+        assert (
+            backend._blend_adapter_weights(
+                [
+                    {
+                        "id": "A",
+                        "mode": "local",
+                        "fs_dir": "adapters/B",
+                        "current_version": 0,
+                        "base_model": str(checkpoint),
+                    }
+                ],
+                user_id="u",
+                config=config,
+            )
+            == {}
+        )
+
+    def test_training_will_not_write_into_another_adapters_directory(self, tmp_path):
+        """The same rule on the write side: an explicit root that names B
+        would put A's new version in B's tree, where B's own promotion would
+        then authorize it."""
+        from liminallm.service.fs import PathTraversalError
+
+        service = TrainingService(store=None, fs_root=str(tmp_path))
+        with pytest.raises(PathTraversalError, match="never rename one adapter"):
+            service._adapter_dir("u", "A", {"fs_dir": "adapters/B"})
+        # Its own directory, relocated, is what the field is for.
+        assert service._adapter_dir("u", "A", {"fs_dir": "users/u/adapters/A"}) == (
+            tmp_path / "users" / "u" / "adapters" / "A"
+        )
+
     def test_a_versionless_artifact_cannot_resolve_to_a_version(
         self, tmp_path, checkpoint
     ):
