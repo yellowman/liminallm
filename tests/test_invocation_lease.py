@@ -587,3 +587,268 @@ class TestPublishingAUserFileIsADurableOperation:
             )
         assert published == ["result.csv"]
         assert (files_dir / "result.csv").is_file()
+
+
+# ---------------------------------------------------------------------------
+# Acceptance tests for the brokered capabilities. These are not assertions
+# about the thread design — they state what the spawned worker plus broker
+# must deliver, and they are red until it exists.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Open: web access is not yet a brokered capability. `_run_web_search` "
+        "and `_run_web_fetch` hand raw `self.settings` to agent_tools, which "
+        "no proxy sees, so a revoked worker still reaches the network with "
+        "the deployment's proxy, allowlist and credentials. Closing it means "
+        "the parent owning WEB_SEARCH/WEB_FETCH, not another in-thread check."
+    ),
+)
+class TestWebAccessIsACapability:
+    """`store`, `llm` and `rag` are proxied; `settings` never was.
+
+    `_run_web_search` and `_run_web_fetch` hand `self.settings` straight to
+    `agent_tools`, so a revoked worker can still reach the network with the
+    deployment's configured proxy, allowlist and provider credentials. That
+    is authority the invocation no longer holds, and no proxy sees it — the
+    capability has to be owned by the parent broker.
+    """
+
+    def test_a_revoked_invocation_sends_no_fetch(
+        self, runtime, caller, monkeypatch
+    ):
+        from liminallm.service import web
+        from liminallm.service.lease import current_invocation
+
+        engine = runtime.workflow
+        reached: list = []
+        monkeypatch.setattr(
+            web, "fetch_url", lambda url, **kw: reached.append(url) or (_ for _ in ()).throw(
+                web.WebFetchError("unreachable")
+            )
+        )
+
+        invocation = engine.broker.issue(
+            "web.fetch_v1", user_id=caller.id, tenant_id=caller.tenant_id
+        )
+        engine.broker.revoke(invocation)
+
+        with current_invocation(invocation):
+            try:
+                engine._run_web_fetch("https://example.invalid/page")
+            except LeaseRevoked:
+                pass
+
+        assert reached == [], (
+            f"a revoked invocation reached the network: {reached}"
+        )
+
+    def test_a_revoked_invocation_sends_no_search(
+        self, runtime, caller, monkeypatch
+    ):
+        from liminallm.service import web
+        from liminallm.service.lease import current_invocation
+
+        engine = runtime.workflow
+        reached: list = []
+        monkeypatch.setattr(
+            web, "search_web", lambda *a, **kw: reached.append(a) or []
+        )
+
+        invocation = engine.broker.issue(
+            "web.search_v1", user_id=caller.id, tenant_id=caller.tenant_id
+        )
+        engine.broker.revoke(invocation)
+
+        with current_invocation(invocation):
+            try:
+                engine._run_web_search("anything", 3)
+            except LeaseRevoked:
+                pass
+
+        assert reached == [], f"a revoked invocation searched the web: {reached}"
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "Open: publication is checked, the launch is not. A revoked worker "
+        "still spawns a confined child and burns its budget before the "
+        "publish refuses. Closing it means RUN_PYTHON being a broker-owned "
+        "capability whose child the parent registers and can kill."
+    ),
+)
+class TestRunPythonIsNotStartedForARevokedInvocation:
+    """Publication is checked; the launch is not.
+
+    A revoked worker can still spawn a confined sandbox child and burn its
+    CPU and memory budget, only to have the publish refused at the end. The
+    capability must refuse before the process starts.
+    """
+
+    def test_no_sandbox_child_is_spawned(self, runtime, caller, monkeypatch):
+        from liminallm.service import agent_tools, interpreter
+        from liminallm.service.lease import current_invocation
+
+        engine = runtime.workflow
+        spawned: list = []
+        monkeypatch.setattr(
+            interpreter,
+            "run_python_sandboxed",
+            lambda code, **kw: spawned.append(code) or {
+                "ok": True, "stdout": "", "stderr": "", "created_files": []
+            },
+        )
+
+        invocation = engine.broker.issue(
+            "code.python_v1", user_id=caller.id, tenant_id=caller.tenant_id
+        )
+        engine.broker.revoke(invocation)
+
+        with current_invocation(invocation):
+            try:
+                agent_tools.run_python(
+                    "print(1)", [],
+                    settings=engine.settings, user_id=caller.id, session={},
+                )
+            except LeaseRevoked:
+                pass
+
+        assert spawned == [], (
+            "a revoked invocation launched a sandbox child before its "
+            "publication was refused"
+        )
+
+
+class TestTheCommitGuardIsALinearizationPoint:
+    """A bare `check()` before `COMMIT` still has a window.
+
+        check says live
+                              revoke lands here
+        COMMIT
+
+    `commit_guard` and `revoke` contend on the same per-invocation lock, so
+    only two histories exist: the commit runs and revocation waits for it, or
+    revocation completes and the commit is refused. There is no third in
+    which the timeout path reports revocation done while a commit slips
+    through behind it.
+    """
+
+    def test_a_revocation_racing_the_guard_never_lands_mid_commit(
+        self, runtime, caller
+    ):
+        broker = runtime.workflow.broker
+        for _ in range(200):  # a window this small needs repetition to catch
+            invocation = broker.issue(
+                "t", user_id=caller.id, tenant_id=caller.tenant_id
+            )
+            committed: list = []
+            inside = threading.Event()
+
+            def commit():
+                try:
+                    with broker.commit_guard(invocation):
+                        inside.set()
+                        committed.append(True)
+                except LeaseRevoked:
+                    pass
+
+            worker = threading.Thread(target=commit, daemon=True)
+            revoker = threading.Thread(
+                target=lambda: broker.revoke(invocation), daemon=True
+            )
+            worker.start()
+            revoker.start()
+            worker.join(timeout=5)
+            revoker.join(timeout=5)
+
+            # Whichever won, the invariant holds: nothing is live afterwards,
+            # and a commit that happened happened before revocation returned.
+            assert not broker.is_live(invocation)
+            assert len(committed) <= 1
+
+    def test_a_commit_after_revocation_is_refused(self, runtime, caller):
+        broker = runtime.workflow.broker
+        invocation = broker.issue(
+            "t", user_id=caller.id, tenant_id=caller.tenant_id
+        )
+        broker.revoke(invocation)
+        with pytest.raises(LeaseRevoked):
+            with broker.commit_guard(invocation):
+                raise AssertionError("the guard admitted a revoked invocation")
+
+    def test_revocation_waits_for_a_commit_already_inside(self, runtime, caller):
+        """The other ordering, made deterministic: revocation cannot return
+        while a commit holds the guard."""
+        broker = runtime.workflow.broker
+        invocation = broker.issue(
+            "t", user_id=caller.id, tenant_id=caller.tenant_id
+        )
+        inside = threading.Event()
+        finished_commit = threading.Event()
+        revoke_returned = threading.Event()
+
+        def commit():
+            with broker.commit_guard(invocation):
+                inside.set()
+                time.sleep(0.5)
+                finished_commit.set()
+
+        def revoke():
+            inside.wait(timeout=5)
+            broker.revoke(invocation)
+            revoke_returned.set()
+
+        threads = [
+            threading.Thread(target=commit, daemon=True),
+            threading.Thread(target=revoke, daemon=True),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert finished_commit.is_set()
+        assert revoke_returned.is_set()
+        assert not broker.is_live(invocation)
+
+
+class TestTheBrokerTravelsWithTheInvocation:
+    def test_a_replaced_engine_does_not_answer_for_an_old_lease(
+        self, runtime, caller, monkeypatch, tmp_path
+    ):
+        """Hot reload replaces the engine while in-flight workers finish.
+
+        With a process-global broker, an old worker's durable operation asked
+        the *new* engine's broker about a lease it never issued, and got a
+        refusal that looks identical to a real revocation. The invocation
+        carries its own broker instead.
+        """
+        from liminallm.service import interpreter
+        from liminallm.service.lease import InvocationBroker, current_invocation
+
+        old = runtime.workflow.broker
+        invocation = old.issue(
+            "code.python_v1", user_id=caller.id, tenant_id=caller.tenant_id
+        )
+        # Stand in for the reload: a wholly new engine and broker appear.
+        runtime.workflow.broker = InvocationBroker()
+
+        files_dir = tmp_path / "files"
+        files_dir.mkdir()
+        workdir = tmp_path / "work"
+        workdir.mkdir()
+        (workdir / "out.csv").write_text("x\n")
+
+        with current_invocation(invocation):
+            published = interpreter.publish_artifacts(
+                str(workdir), str(files_dir),
+                [{"name": "out.csv", "size": 2}],
+                allowed_extensions={".csv"},
+            )
+        assert published == ["out.csv"], (
+            "the old invocation's still-live lease was judged by the new "
+            "engine's broker"
+        )

@@ -28,7 +28,7 @@ from __future__ import annotations
 import threading
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 __all__ = [
@@ -39,7 +39,6 @@ __all__ = [
     "active_invocation",
     "current_invocation",
     "require_live_lease",
-    "set_broker",
 ]
 
 _CURRENT = threading.local()
@@ -68,6 +67,12 @@ class ToolInvocation:
     # or attempt two duplicates an operation attempt one already submitted at
     # the boundary. Killing a worker does not recall what it sent.
     logical_execution_id: str = ""
+    # The broker that answers for this lease, carried by the invocation
+    # rather than looked up in a process global. Runtime hot reload replaces
+    # the engine while in-flight workers finish, so a global would have an
+    # old worker asking the *new* engine's broker about an invocation it
+    # never issued. Not compared or repr'd: it is a channel, not identity.
+    broker: Any = field(default=None, repr=False, compare=False)
 
     def operation_key(self, operation: str) -> str:
         """A key stable across retries of one logical node execution."""
@@ -85,6 +90,9 @@ class InvocationBroker:
     def __init__(self) -> None:
         self._live: set[str] = set()
         self._lock = threading.Lock()
+        # One guard per live invocation. `commit_guard` and `revoke` contend
+        # on it, which is what makes the two orderings the only two.
+        self._guards: dict[str, threading.Lock] = {}
 
     def issue(
         self,
@@ -103,15 +111,48 @@ class InvocationBroker:
             artifact_id=artifact_id,
             # A call with no node behind it is its own logical execution.
             logical_execution_id=logical_execution_id or uuid.uuid4().hex,
+            broker=self,
         )
         with self._lock:
             self._live.add(invocation.invocation_id)
+            self._guards[invocation.invocation_id] = threading.Lock()
         return invocation
 
-    def revoke(self, invocation: ToolInvocation) -> None:
-        """Idempotent: a lease revoked on timeout is revoked again on return."""
+    def _guard(self, invocation: ToolInvocation) -> threading.Lock:
         with self._lock:
-            self._live.discard(invocation.invocation_id)
+            guard = self._guards.get(invocation.invocation_id)
+            if guard is None:
+                # Already revoked and cleaned up. A fresh lock is correct:
+                # `check` inside the guard will refuse anyway.
+                guard = threading.Lock()
+                self._guards[invocation.invocation_id] = guard
+            return guard
+
+    def revoke(self, invocation: ToolInvocation) -> None:
+        """Idempotent: a lease revoked on timeout is revoked again on return.
+
+        Takes the invocation's commit guard first. A commit already inside
+        the guard completes before this returns, and one that has not yet
+        entered finds the lease dead when it does — so the timeout path never
+        reports revocation complete while an authorized commit is still in
+        flight.
+        """
+        with self._guard(invocation):
+            with self._lock:
+                self._live.discard(invocation.invocation_id)
+
+    @contextmanager
+    def commit_guard(self, invocation: ToolInvocation):
+        """Hold the linearization point across a durable commit.
+
+        A bare `check()` before `COMMIT` is not enough: revocation can land
+        between the two. Holding this guard leaves exactly two histories --
+        the commit wins and revocation waits for it, or revocation wins and
+        the commit is refused. Do no blocking work inside it.
+        """
+        with self._guard(invocation):
+            self.check(invocation)
+            yield
 
     def is_live(self, invocation: ToolInvocation) -> bool:
         with self._lock:
@@ -145,34 +186,28 @@ def active_invocation() -> Optional[ToolInvocation]:
     return getattr(_CURRENT, "invocation", None)
 
 
-# The broker that answers for leases in this process. Durable operations that
-# do not reach their target through a proxied dependency — publishing into the
-# user's file area is the one that exists today — ask it directly, and cannot
-# be handed a proxy to go through instead.
-_BROKER: Optional["InvocationBroker"] = None
-
-
-def set_broker(broker: "InvocationBroker") -> None:
-    global _BROKER
-    _BROKER = broker
-
-
 def require_live_lease() -> None:
     """Refuse a durable operation whose invocation has ended.
 
-    A thread with no lease is the API path and passes, exactly as the proxy
-    treats it. A leased thread with no registered broker is a wiring mistake
-    rather than an authorization one, so it fails closed and says which.
+    For work that does not reach its target through a proxied dependency —
+    web access, launching a sandbox child, publishing into the user's file
+    area. A thread with no lease is the API path and passes, exactly as the
+    proxy treats it.
+
+    The broker comes from the invocation, never from a process global: hot
+    reload replaces the engine while in-flight workers finish, and a global
+    would have an old worker asking a new engine's broker about a lease it
+    never issued.
     """
     invocation = active_invocation()
     if invocation is None:
         return
-    if _BROKER is None:  # pragma: no cover - defensive
+    if invocation.broker is None:  # pragma: no cover - defensive
         raise LeaseRevoked(
-            "a leased thread reached a durable operation but no broker is "
-            "registered to say whether the lease is live"
+            f"invocation {invocation.invocation_id} carries no broker, so "
+            "nothing can say whether its lease is live"
         )
-    _BROKER.check(invocation)
+    invocation.broker.check(invocation)
 
 
 class LeasedProxy:

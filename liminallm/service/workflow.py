@@ -44,7 +44,6 @@ from liminallm.service.lease import (
     LeaseRevoked,
     active_invocation,
     current_invocation,
-    set_broker,
 )
 from liminallm.service.llm import LLMService
 from liminallm.service.model_backend import DEFAULT_CONTEXT_WINDOW, active_adapters
@@ -144,7 +143,6 @@ class WorkflowEngine(WorkflowStreamingMixin):
         # it never had to remember. Threads with no lease (every API request)
         # pass straight through. See service/lease.py.
         self.broker = InvocationBroker()
-        set_broker(self.broker)
         self.store = LeasedProxy(store, self.broker)
         self.llm = LeasedProxy(llm, self.broker)
         self.router = router

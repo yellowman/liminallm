@@ -2602,6 +2602,18 @@ the following are treated as constants the kernel must honor; LLM edits happen o
     asks the broker itself.** publishing into the user's file area copies
     straight to disk, so the check lives at the copy, and it refuses loudly
     rather than returning an empty result a caller would report as success.
+  - **a durable commit needs a linearization point, not a check before it.**
+    `check(); COMMIT` leaves a window where revocation lands between the two,
+    so the timeout path can report revocation complete while an authorized
+    commit is still in flight. `commit_guard` and `revoke` contend on the
+    same per-invocation lock, leaving only two histories: the commit runs and
+    revocation waits for it, or revocation completes and the commit is
+    refused. no blocking work inside the guard.
+  - **the broker travels with the invocation, never in a process global.**
+    hot reload replaces the engine while in-flight workers finish, and a
+    global would have an old worker asking the new engine's broker about a
+    lease it never issued — a refusal indistinguishable from a real
+    revocation.
   - **two ids, because they answer different questions.** a lease is keyed by
     `invocation_id`, fresh per attempt, so a retry cannot inherit the previous
     attempt's authority. a durable idempotency key is keyed by
