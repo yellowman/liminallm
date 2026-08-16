@@ -29,12 +29,12 @@ after: backend lanes, model handling, replicas, and ops defaults.
 - scenarios:
   - **managed foundation only**: set `base_model` to the provider model; with no adapters routed this is pure hosted inference.
   - **provider-hosted adapters** (`mode: remote`): the provider holds the weights. the adapter records `remote_adapter_id` or `remote_model_id`, and the backend sends it — as an `adapter_id` parameter with its gate for a multi-lora provider, or as the model id where one fine-tune serves the request. locally trained weights on disk are **not** usable this way: an api backend cannot apply your `params.json`, and §5.0.1's matrix marks `local` incompatible with it.
-  - **prompt-only adapters**: for providers without lora, use `adapter_mode=prompt` to inject adapter prompts instead of weights. the injection happens once, in the service, before any backend runs — backends transport prepared messages and never add a second copy.
+  - **prompt-only adapters**: for providers without lora, route an adapter whose artifact records `mode: prompt` — or a hybrid one, which falls back to its prompt wherever its weights cannot apply. the instructions are materialized once, by `LLMService`, before any backend runs; backends transport prepared messages and never add a second copy.
 - switching providers is an admin-console change: set `model_backend` and the provider key; model services rebuild without a restart.
 
 ### hybrid deployments
 - keep `model_backend` on `local_gpu_lora` for on-prem traffic and point select routes or tenants at an api backend via adapter modes or routing policies stored in artifacts.
-- filesystem artifacts stay authoritative even with api backends; adapter payloads live under `/srv/liminallm/adapters`.
+- adapter metadata and routing policy stay authoritative across a backend change — that is what makes the switch a config edit. the weight *payloads* do not travel: local `params.json` under `shared_fs_root` serves the local backend only, and an api backend carries the same adapter as a provider-hosted adapter/model id (`mode: remote`) or as prompt fallback, never by reading those files.
 
 ## model handling at a glance
 - base models are frozen. local deployments place them under `/srv/liminallm/models` and the local jax backend keeps them resident; api backends treat `base_model` as a provider-owned model id and never upload local weights.
