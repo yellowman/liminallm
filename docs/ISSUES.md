@@ -7872,3 +7872,40 @@ The lost-update test drives `record_attachment` directly under a barrier
 rather than through the route. After the fix the read and the write are one
 transaction, so there is no longer a seam between them to pause at; what is
 left to test is the property under real contention.
+
+## Tranche 2E.2: one destination, one publisher
+
+The counterexample is not two requests for one archive. `bundle.zip` and
+`bundle.tar.gz` are different files, pass different arguments, and share only
+where they land: `archive_stem` maps both to `bundle/`. The route checked
+`dest_path.exists()` in the API process and started the sandbox much later,
+and inside the child `extract_archive` does `mkdir(parents=True,
+exist_ok=True)` — so both requests passed the check and both wrote into one
+tree. Measured, `bundle/` held `zip.txt` and `tar.txt` with both requests
+returning 200.
+
+The failure path is worse. `extract_archive` removes the destination when it
+refuses, so a corrupt archive's cleanup deletes whatever is there — including
+a tree the other request has already published. Measured with a valid
+`bundle.zip` racing a truncated `bundle.tar.gz`: the zip reported 200 and
+`bundle/` was gone.
+
+The check and the extraction are one act now, under `path_lock`, off the event
+loop, keyed on the **destination**. The key matters and has its own mutation:
+locking the archive path serialises nothing here, because the two archives are
+deliberately different files. A waiter that arrives after the winner finishes
+finds the completed tree and gets the ordinary 409, which is why the existing
+conflict response needed no new semantics — only to be asked at the right
+moment.
+
+Deliberately not in this tranche: staging plus atomic rename, locking the
+source archive, and locking downloads or deletion. A reader can still observe
+a partially written tree, but §21.3 fixes streamed extraction rather than
+publication atomicity, and the defect actually reachable here is competing
+publishers and competing cleanup on shared state. Source replacement and
+reader/deleter swaps belong to 2E.3.
+
+One test-ordering note worth keeping: the cleanup red only fires when the
+*failing* request is the one paused. Run the other way round and the
+destination does not exist yet when the failure tidies up, so the test passes
+while the defect stands.

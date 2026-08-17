@@ -4073,13 +4073,6 @@ async def extract_uploaded_archive(
         dest_path = safe_join(files_dir, dest_rel.as_posix())
     except PathTraversalError:
         raise http_error("validation_error", "invalid filename", status_code=400)
-    if dest_path.exists():
-        raise http_error(
-            "conflict",
-            f"'{dest_rel.as_posix()}' already exists; delete it first",
-            status_code=409,
-        )
-
     # Budgets scale with the user's plan: per-member = upload limit,
     # total = 10x upload limit. Ratio and entry caps stop crafted bombs.
     user = runtime.store.get_user(principal.user_id)
@@ -4092,10 +4085,42 @@ async def extract_uploaded_archive(
         "max_ratio": 100,
         "allowed_extensions": sorted(ALLOWED_UPLOAD_EXTENSIONS),
     }
+
+    def _extract_into_destination() -> dict:
+        """Claim the destination, then fill it, without letting go between.
+
+        The check and the extraction are one act. `bundle.zip` and
+        `bundle.tar.gz` are different requests for different archives whose
+        only shared state is where they land, so two of them could both pass
+        an exists-check taken in the API process and both write into one
+        tree — measured, `bundle/` ended up holding `zip.txt` and `tar.txt`
+        with both requests returning 200.
+
+        Worse on the failure path: `extract_archive` removes the destination
+        when it refuses, so a corrupt archive's cleanup deleted a tree the
+        other request had already published. Measured, `bundle/` was gone and
+        the successful request had reported 200.
+
+        Keyed on the destination rather than on the archive, because the
+        archive names are deliberately different and the destination is the
+        thing being competed for. A waiter that arrives afterwards finds the
+        finished tree and gets the ordinary 409.
+        """
+        with path_lock(runtime.settings.shared_fs_root, str(dest_path)):
+            if dest_path.exists():
+                raise http_error(
+                    "conflict",
+                    f"'{dest_rel.as_posix()}' already exists; delete it first",
+                    status_code=409,
+                )
+            return extract_archive_sandboxed(
+                str(archive_path), str(dest_path), limits
+            )
+
     try:
-        report = await asyncio.to_thread(
-            extract_archive_sandboxed, str(archive_path), str(dest_path), limits
-        )
+        report = await asyncio.to_thread(_extract_into_destination)
+    except PathLockTimeout as exc:
+        raise http_error("conflict", str(exc), status_code=409)
     except ArchiveExtractionError as exc:
         raise http_error("validation_error", str(exc), status_code=413)
     except SandboxError as exc:

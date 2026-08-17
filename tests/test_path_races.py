@@ -544,3 +544,148 @@ class TestAConversationDescribesTheFileThatSurvived:
             f"records were lost to concurrent writers: missing "
             f"{sorted(set(names) - recorded)}"
         )
+
+
+def _zip_bytes(name: str, body: bytes) -> bytes:
+    import io
+    import zipfile
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(name, body)
+    return buf.getvalue()
+
+
+def _targz_bytes(name: str, body: bytes) -> bytes:
+    import io
+    import tarfile
+
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as tf:
+        info = tarfile.TarInfo(name)
+        info.size = len(body)
+        tf.addfile(info, io.BytesIO(body))
+    return buf.getvalue()
+
+
+class TestOneDestinationHasOnePublisher:
+    """Two archives, one destination.
+
+    `bundle.zip` and `bundle.tar.gz` both extract to `bundle/`, so the
+    conflict is not two requests for one archive — it is two *different*
+    requests whose only shared state is where they land. The route checked
+    `dest_path.exists()` in the API process and started the sandbox much
+    later; inside, extraction does `mkdir(exist_ok=True)` and, on failure,
+    `rmtree` of that same directory. So both requests could pass the check,
+    both could write into one tree, and either could delete the other's.
+
+    Locking has to be keyed on the resolved destination for the same reason:
+    the archive names are deliberately different.
+    """
+
+    def _publish_archives(self, client, headers):
+        for name, data in (
+            ("bundle.zip", _zip_bytes("zip.txt", b"from the zip\n" * 40)),
+            ("bundle.tar.gz", _targz_bytes("tar.txt", b"from the tarball\n" * 40)),
+        ):
+            resp = client.post(
+                "/v1/files/upload",
+                headers={**headers, "Idempotency-Key": _unique("k")},
+                files={"file": (name, data, "application/zip")},
+            )
+            assert resp.status_code == 200, resp.text
+
+    def _race_extract(self, client, runtime, monkeypatch, headers, names):
+        """Both extractions, with the first paused inside the sandbox call."""
+        from liminallm.api import routes
+
+        reached = threading.Event()
+        may_continue = threading.Event()
+        armed = {"on": True}
+        real_extract = routes.extract_archive_sandboxed
+
+        def gated(*args, **kwargs):
+            # The window: the destination check has passed and the tree has
+            # not been written yet.
+            if armed["on"]:
+                armed["on"] = False
+                reached.set()
+                may_continue.wait(20)
+            return real_extract(*args, **kwargs)
+
+        monkeypatch.setattr(routes, "extract_archive_sandboxed", gated)
+        results: dict = {}
+
+        def run(index, name):
+            results[index] = client.post(
+                f"/v1/files/{name}/extract", headers=headers
+            )
+
+        threads = [
+            threading.Thread(target=run, args=(i, n), daemon=True)
+            for i, n in enumerate(names)
+        ]
+        threads[0].start()
+        assert reached.wait(30), "the first extraction never started"
+        for t in threads[1:]:
+            t.start()
+        time.sleep(1.0)
+        may_continue.set()
+        for t in threads:
+            t.join(90)
+        assert all(not t.is_alive() for t in threads), "an extraction hung"
+        return results
+
+    def test_only_one_archive_lands_in_the_shared_destination(
+        self, client, monkeypatch
+    ):
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        self._publish_archives(client, headers)
+
+        results = self._race_extract(
+            client, runtime, monkeypatch, headers, ["bundle.zip", "bundle.tar.gz"]
+        )
+        codes = sorted(r.status_code for r in results.values())
+        assert codes == [200, 409], [
+            (r.status_code, r.text[:200]) for r in results.values()
+        ]
+
+        tree = sorted(p.name for p in (_files_dir(runtime, user_id) / "bundle").iterdir())
+        assert tree in (["zip.txt"], ["tar.txt"]), (
+            f"two archives were published into one destination: {tree}"
+        )
+
+    def test_a_failing_extraction_never_deletes_a_published_tree(
+        self, client, monkeypatch
+    ):
+        """The failure path removes the destination directory. If the two
+        requests share it, the loser's cleanup takes the winner's files."""
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        good = _zip_bytes("zip.txt", b"from the zip\n" * 40)
+        # A tarball header with a truncated body: accepted as an upload,
+        # refused by the extractor, and its refusal removes the destination.
+        corrupt = _targz_bytes("tar.txt", b"x" * 40)[:60]
+        for name, data in (("bundle.zip", good), ("bundle.tar.gz", corrupt)):
+            resp = client.post(
+                "/v1/files/upload",
+                headers={**headers, "Idempotency-Key": _unique("k")},
+                files={"file": (name, data, "application/zip")},
+            )
+            assert resp.status_code == 200, resp.text
+
+        # The corrupt one goes first and pauses, so the good one publishes
+        # inside its window and the failure's cleanup lands afterwards. The
+        # other order proves nothing: the destination does not exist yet when
+        # the failure tidies up.
+        results = self._race_extract(
+            client, runtime, monkeypatch, headers, ["bundle.tar.gz", "bundle.zip"]
+        )
+        assert results[1].status_code == 200, results[1].text
+
+        dest = _files_dir(runtime, user_id) / "bundle"
+        assert dest.is_dir(), "the failing extraction deleted the published tree"
+        assert sorted(p.name for p in dest.iterdir()) == ["zip.txt"], (
+            "the published tree did not survive intact"
+        )
