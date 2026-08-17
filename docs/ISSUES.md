@@ -7573,3 +7573,92 @@ signalling one.
 The handshake shares the caller's deadline rather than getting one of its own,
 which is what `timeout` has always meant here: the single `poll(wall_timeout)`
 it replaced already covered start-up.
+
+## Tranche 2D.0 residuals: the two paths the group fix missed
+
+Both found by review after 2D.0 landed, and both are the same shape as the
+defect they follow: a rule applied on the exceptional path and not the
+ordinary one.
+
+### HIGH: a successful tool call could abandon a descendant
+
+The timeout and revocation paths learned about process groups. Normal
+completion did not. `WorkerHandle.terminate()` killed the leader and reaped
+it, and `_serve_invocation` dropped the registration one line later, so a
+helper the worker had started belonged to nobody:
+
+```
+worker setsid()s, spawns a helper into its group,
+answers with a valid result, exits
+parent reaps the leader, forgets it
+helper keeps running
+```
+
+SPEC §18 says "a worker's authority ends when its invocation ends, and so does
+the worker" and "what the invocation started, the invocation can kill". Neither
+sentence has a clause about how the worker finished. `terminate()` now carries
+the READY-proven group status and kills the group on every terminal path,
+before reaping — and deliberately does not consult `Process.is_alive()` first,
+because that joins an exited child and a reaped pid is a number the kernel may
+hand to anyone.
+
+Two things surfaced while building the red, both worth keeping:
+
+A confined worker cannot `exec` anything here at all. `confine` binds the
+*realpaths* of the runtime, which on a merged-`/usr` system are `/usr/lib` and
+`/usr/lib64`, so the new root has no `/lib64` — and the interpreter's ELF
+loader is `/lib64/ld-linux-x86-64.so.2`. `execve` finds the binary, the kernel
+fails on the loader, and Python reports `FileNotFoundError` for a path that
+`os.path.exists` says is there. So the test forks instead, which needs no
+loader and produces the same group member.
+
+Getting a body into the worker takes no production seam. The child rebuilds
+`_BODIES` when it imports `tool_worker`, so a parent-side registration does not
+survive the spawn — but `multiprocessing` pickles a function by reference, so
+putting the body in the plan makes the child import the test module while
+unpickling its arguments, and the module's import registers it.
+
+### MEDIUM: RLIMIT_CORE was still fail-open
+
+2D.1 made memory, CPU and file size mandatory and left core-dump suppression
+best-effort, reasoning that a core dump is not a bound on consumption. True,
+and beside the point: `run_in_sandbox` is shared, and §21.2 gives `run_python`
+"rlimits (memory/cpu/file-size/no core dumps)". §19.5's three were satisfied;
+§21.2's four were not.
+
+All four are required now. That is stricter than extraction needs and entirely
+compatible with it, which is the better trade than a mode switch whose only
+purpose would be to let one untrusted child dump core.
+
+## Tranche 2D.3: what may become a note
+
+`tests/test_note_publication.py`. The route already had the right shape —
+resolve beneath the authenticated user's own attachment root, extract, and
+only then create — so this tranche is proof rather than repair. Nothing was
+asserting the ordering, and the ordering is the whole defence.
+
+Fourteen tests: a stranger cannot promote another user's upload by any
+spelling of the name; a binary file, an image nothing can read, and a read
+that fails each leave the vault exactly as it was; provenance records the
+filename and the method, so a vision transcription is not mistaken for
+something the user wrote; the 64 KiB cap and its `truncated` flag agree at,
+above and across a multi-byte boundary; and RAG ingestion through the same
+extractor contributes zero chunks rather than indexing decoded binary.
+
+The slot-forging cases are the interesting ones. Pending vision slots are
+private-use characters in the extracted text and the parent substitutes into
+them, so any text that reached the parent carrying those characters could name
+a slot. All three sources are stripped — file text, reader output, and the
+model's own transcription — and the tests assert the *characters* are gone
+rather than that the slot is gone. Those differ exactly where it matters:
+`_PH_RE` erases a whole `<open>N<close>` group, so text that survived to that
+point would have content silently eaten instead of preserved.
+
+Two tests were wrong on the first pass and both passed for the wrong reason
+until measured. The unreadable-file case used `chmod(0o000)`; the suite runs as
+root here, which reads it happily, so the refusal never came — it injects an
+`OSError` now and says why. The traversal case used relative paths that were
+arithmetically wrong: from `<root>/users/<stranger>/files`, `../<victim>/...`
+lands on a path that exists for nobody, and the 404 it earned said nothing
+about traversal. Verified by removing `safe_join` from `attachment_path` and
+watching the corrected test go red.

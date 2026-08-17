@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import signal
 import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
@@ -543,13 +544,23 @@ class WorkerHandle:
     """The parent's grip on one worker process."""
 
     def __init__(
-        self, process: Any, conn: Any, attempt: Attempt, budget: FrameBudget
+        self,
+        process: Any,
+        conn: Any,
+        attempt: Attempt,
+        budget: FrameBudget,
+        *,
+        leads_group: bool = False,
     ) -> None:
         self._process = process
         self.conn = conn
         self.attempt = attempt
         #: How large a frame this worker may send, grown as the broker answers.
         self.budget = budget
+        #: Whether READY proved this worker leads a process group of its own.
+        #: Carried here because teardown needs it on *every* path, and only
+        #: `spawn` was in a position to learn it.
+        self.leads_group = leads_group
 
     @property
     def pid(self) -> Optional[int]:
@@ -559,7 +570,30 @@ class WorkerHandle:
         return bool(self._process.is_alive())
 
     def terminate(self) -> None:
-        """Kill this worker and reap it. Safe to call more than once."""
+        """End this worker and everything it started. Safe to call twice.
+
+        The group goes first and the reap second. Succeeding is not an
+        exception to that: a tool that starts a helper and then answers
+        normally leaves it running, and the invocation forgets the worker one
+        line later, so the helper becomes nobody's. SPEC §18 has no clause
+        about how the worker finished — "what the invocation started, the
+        invocation can kill".
+
+        `Process.is_alive()` is deliberately not consulted first. It joins an
+        exited child, and a reaped pid is a number the kernel may hand to
+        anyone — the group has to be signalled while that pid still names it.
+        """
+        pid = self._process.pid
+        if self.leads_group and pid and hasattr(os, "killpg"):
+            try:
+                # A group kill is only ever aimed at a group the target leads.
+                # READY already proved that; this re-checks it against the
+                # kernel, because the alternative to being wrong here is
+                # signalling the process group of the API server.
+                if os.getpgid(pid) == pid:
+                    os.killpg(pid, signal.SIGKILL)
+            except OSError:
+                pass  # already gone, or not ours to signal
         if self._process.is_alive():
             self._process.kill()
         self._process.join(_JOIN_TIMEOUT_SECONDS)
@@ -627,6 +661,9 @@ def spawn(
         invocation.resources.add_child(
             process.pid or 0, f"worker:{tool}", group=True, reap=reap
         )
+    # The registry learns this for revocation; the handle learns it for every
+    # other way the attempt can end, ordinary completion included.
+    handle.leads_group = leads_group
     logger.info(
         "tool_worker_spawned",
         invocation_id=invocation.invocation_id,

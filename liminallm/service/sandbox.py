@@ -578,11 +578,12 @@ def validate_path_access(
 def apply_resource_limits(config: SandboxConfig) -> dict[str, bool]:
     """Apply resource limits to the calling process, or raise.
 
-    SPEC §18 gives the tool worker a memory hard cap and CPU shares; §19.5
-    says the same of the parser child. Those three caps — memory, CPU, output
-    size — are what "resource-limited child" means, so a platform that refuses
-    one has not given us a limited child, and this raises rather than running
-    the body anyway.
+    All four are required, because this function is shared. §19.5 gives the
+    parser child memory, CPU and file size; §21.2 gives `run_python` those
+    *and* no core dumps, and `run_python` comes through here. The stricter
+    contract governs both: suppressing core dumps is stricter than extraction
+    needs and entirely compatible with it, where a mode switch would exist
+    only to let one untrusted child dump core.
 
     Every one of these used to be caught and recorded in a returned dict, and
     the only caller ignored the dict. A refused cap therefore read as success
@@ -590,17 +591,11 @@ def apply_resource_limits(config: SandboxConfig) -> dict[str, bool]:
     on it. Reporting a failure to a caller that does not check is the same as
     not detecting it.
 
-    Core-dump suppression stays best-effort. A core dump is a disk and
-    disclosure concern, not a bound on what the child can consume, so a
-    platform that refuses it has still given us the three caps that contain
-    the job.
-
     Returns:
-        Which limits are in force — every required one, plus whether the
-        core-dump suppression took.
+        The limits now in force.
 
     Raises:
-        SandboxError: a required limit was refused.
+        SandboxError: any of them was refused.
     """
     memory = config.max_memory_mb * 1024 * 1024
     file_size = config.max_file_size_mb * 1024 * 1024
@@ -608,6 +603,7 @@ def apply_resource_limits(config: SandboxConfig) -> dict[str, bool]:
         ("memory", resource.RLIMIT_AS, (memory, memory)),
         ("cpu", resource.RLIMIT_CPU, (config.max_cpu_seconds, config.max_cpu_seconds + 5)),
         ("file_size", resource.RLIMIT_FSIZE, (file_size, file_size)),
+        ("core", resource.RLIMIT_CORE, (0, 0)),
     )
     results: dict[str, bool] = {}
     for name, which, limit in required:
@@ -620,13 +616,6 @@ def apply_resource_limits(config: SandboxConfig) -> dict[str, bool]:
                 "run unbounded in a sandbox"
             ) from exc
         results[name] = True
-
-    try:
-        resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        results["core"] = True
-    except (ValueError, OSError) as exc:
-        logger.warning("sandbox_core_limit_failed", error=str(exc))
-        results["core"] = False
 
     return results
 

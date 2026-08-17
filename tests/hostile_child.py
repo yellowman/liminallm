@@ -85,6 +85,62 @@ def raises_an_unknown_type() -> None:
     raise MadeUpError("a type the caller did not allow for")
 
 
+#: The tool name `body_that_leaves_a_helper_behind` answers to.
+WORKER_BODY_TOOL = "test.leaves_a_helper_v1"
+
+
+def body_that_leaves_a_helper_behind(_broker, _tool, _plan) -> dict:
+    """A worker body that spawns into its group and then succeeds normally.
+
+    Not hostile, and that is the point: a tool that shells out and *then
+    answers* is the ordinary case, and it is the one the timeout and
+    revocation paths never see.
+
+    `fork`, not `exec`, and the reason is worth recording: measured, a
+    confined worker cannot exec anything at all here. `confine` binds the
+    realpaths of the runtime, which on a merged-`/usr` system are `/usr/lib`
+    and `/usr/lib64`, so the new root has no `/lib64` — and `python3`'s ELF
+    interpreter is `/lib64/ld-linux-x86-64.so.2`. `execve` finds the file and
+    the kernel then fails on the loader, which surfaces as `FileNotFoundError`
+    for a path that exists. `fork` needs none of that, and the child it makes
+    is in the worker's process group just the same.
+
+    The helper's pid comes back in the result rather than through a file: by
+    the time this runs the process is confined, so a path from the parent's
+    filesystem is not somewhere it can write.
+    """
+    import time
+
+    pid = os.fork()
+    if pid == 0:  # pragma: no cover - the helper, in its own process
+        try:
+            time.sleep(300)
+        finally:
+            os._exit(0)
+    return {
+        "content": "done, and something of mine is still running",
+        "helper_pid": pid,
+    }
+
+
+def register_worker_body() -> None:
+    """Put the body in the worker's table, in whichever process imports this.
+
+    The child builds `_BODIES` when it imports `tool_worker`, so a
+    registration made in the parent does not survive the spawn. What does
+    survive is an import: `multiprocessing` pickles a function by reference,
+    so putting `body_that_leaves_a_helper_behind` in the plan makes the child
+    import this module while unpickling its arguments — before `_worker_main`
+    runs — and this line is the side effect that matters.
+    """
+    from liminallm.service import tool_worker
+
+    tool_worker._BODIES[WORKER_BODY_TOOL] = body_that_leaves_a_helper_behind
+
+
+register_worker_body()
+
+
 def returns_plain_data() -> dict:
     """The ordinary case, so a refusal above is not just a broken pipe."""
     return {"ok": True, "items": ["a", "b"], "count": 2}

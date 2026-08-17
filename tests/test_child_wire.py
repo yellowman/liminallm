@@ -33,6 +33,14 @@ from tests.hostile_child import MARKER_ENV
 
 
 @pytest.fixture
+def engine(client):
+    """The real WorkflowEngine, for the tests that drive a whole tool call."""
+    from liminallm.service.runtime import get_runtime
+
+    return get_runtime().workflow
+
+
+@pytest.fixture
 def marker(tmp_path, monkeypatch):
     """A file the payload writes its pid into, if it ever executes."""
     path = tmp_path / f"pwned-{uuid.uuid4().hex[:8]}"
@@ -288,6 +296,48 @@ class TestTheSandboxTerminatesItsDescendants:
         )
 
 
+class TestASuccessfulToolCallLeavesNothingRunning:
+    """SPEC §18: "a worker's authority ends when its invocation ends, and so
+    does the worker"; "what the invocation started, the invocation can kill."
+
+    Neither sentence has an exception for succeeding. The timeout and
+    revocation paths learned about process groups; the ordinary path — a tool
+    that shells out, answers, and exits — did not, and the registration was
+    dropped a line later, so the helper was nobody's.
+    """
+
+    def test_a_helper_does_not_outlive_a_normal_completion(self, engine):
+        from liminallm.service.broker import InvocationContext
+        from liminallm.service.invocation import Invocation
+
+        invocation = Invocation("normal-completion", tool=hostile_child.WORKER_BODY_TOOL)
+        # The function reference is what makes the child import the test
+        # module, which is what registers the body it then dispatches to.
+        plan = {"inputs": {}, "body": hostile_child.body_that_leaves_a_helper_behind}
+        try:
+            result = engine._serve_invocation(
+                invocation,
+                hostile_child.WORKER_BODY_TOOL,
+                plan,
+                InvocationContext(user_id="u1"),
+                engine._worker_limits(None),
+            )
+            helper = result.get("helper_pid")
+            assert helper, f"the body never ran, so nothing is proved: {result}"
+            leader = invocation.attempts[-1].pid
+
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline and _alive(helper):
+                time.sleep(0.1)
+            assert not _alive(helper), (
+                f"helper {helper} outlived the tool call that started it"
+            )
+            assert not _alive(leader), f"worker {leader} was not reaped"
+            assert invocation.resources.live_children() == []
+        finally:
+            invocation.close()
+
+
 class TestRevocationReachesTheSameDescendants:
     """The wall clock is not the only thing that ends a job.
 
@@ -331,24 +381,39 @@ class TestRevocationReachesTheSameDescendants:
 
 
 class TestRequiredLimitsFailClosed:
-    """§19.5 states the parser runs under memory/CPU/file-size caps. A cap the
-    platform refused used to be recorded in a dict nobody read."""
+    """A cap the platform refused used to be recorded in a dict nobody read.
 
-    def test_a_refused_limit_stops_the_body(self, tmp_path, monkeypatch):
+    All four are required, because `run_in_sandbox` is shared. §19.5 names
+    memory, CPU and file size for the parser; §21.2 names those *and no core
+    dumps* for `run_python`, which comes through the same function. The
+    stricter contract governs — the alternative is a mode switch whose only
+    purpose is to let one untrusted child dump core.
+    """
+
+    @pytest.mark.parametrize(
+        "refused",
+        ["RLIMIT_AS", "RLIMIT_CPU", "RLIMIT_FSIZE", "RLIMIT_CORE"],
+    )
+    def test_a_refused_limit_stops_the_body(self, tmp_path, monkeypatch, refused):
         import resource
 
         from liminallm.service import sandbox as sandbox_module
 
+        target = getattr(resource, refused)
         calls: list = []
 
+        # Every call is intercepted, not just the refused one. This runs
+        # in-process, and letting the others through would put a 256MB address
+        # space and a ten-second CPU cap on the test runner itself.
         def refuse(which, value):
             calls.append(which)
-            raise OSError(1, "operation not permitted")
+            if which == target:
+                raise OSError(1, "operation not permitted")
 
         monkeypatch.setattr(resource, "setrlimit", refuse)
         with pytest.raises(sandbox_module.SandboxError):
             sandbox_module.apply_resource_limits(_sandbox_config(tmp_path))
-        assert calls, "setrlimit was never attempted"
+        assert target in calls, f"{refused} was never attempted"
 
 
 class TestTheExtractionChildQueuesOnlyWhatTheParentCanRead:
