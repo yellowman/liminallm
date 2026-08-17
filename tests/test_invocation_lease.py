@@ -1424,3 +1424,173 @@ class TestTheWholePathStillWorks:
                 assert not _alive(pid), f"worker {pid} outlived the timeout"
         finally:
             engine.tool_registry.pop("test.hang", None)
+
+
+# ---------------------------------------------------------------------------
+# reaping is confirmed, not bounded
+
+
+class TestReapingIsConfirmedNotAssumed:
+    """§18: "reaping is confirmed rather than bounded: a tree that will not
+    die fails the node instead of running alongside its successor."
+
+    `Invocation.terminate()` implements exactly that — kill, re-check, refuse
+    at the deadline — and the retry honours its answer. `_serve_invocation`
+    used to walk around it. The handle joined with a bounded wait and had no
+    postcondition, and the registration was dropped whether or not that join
+    reaped anything, so the machinery that refuses an unreaped retry had its
+    evidence deleted one line before it was consulted.
+    """
+
+    def _plan(self):
+        from tests import hostile_child
+
+        # The function reference is what makes the child import the test
+        # module, which is what registers the body it dispatches to.
+        return {"inputs": {}, "body": hostile_child.body_that_leaves_a_helper_behind}
+
+    def _serve(self, engine, invocation):
+        from tests import hostile_child
+
+        return engine._serve_invocation(
+            invocation,
+            hostile_child.WORKER_BODY_TOOL,
+            self._plan(),
+            InvocationContext(user_id="u1"),
+            engine._worker_limits(None),
+        )
+
+    def test_a_draining_tree_is_confirmed_once_it_has_drained(self, runtime):
+        """The ordinary case, so the fix cannot be "always refuse".
+
+        The handle does not wait for the group to empty — measured, a group
+        outlives its reaped leader by about a second, which is too much to
+        spend on every tool call. It reports, keeps the registration, and
+        `Invocation.terminate()` polls to its own deadline. What must not
+        happen is the answer never becoming True.
+        """
+        invocation = Invocation("reap-confirmed", tool="test.leaves_a_helper_v1")
+        try:
+            result = self._serve(runtime.workflow, invocation)
+            helper = result.get("helper_pid")
+            assert helper, result
+            assert invocation.terminate() is True, (
+                "a tree that did die was never confirmed dead"
+            )
+            assert invocation.resources.live_children() == []
+            assert not _alive(helper)
+        finally:
+            invocation.close()
+
+    def test_a_join_that_did_not_reap_is_not_a_teardown(self, runtime, tmp_path):
+        """The other half of the postcondition, on its own.
+
+        `join(timeout)` returns whether or not it reaped anything, so "we
+        called join" is not "the process is gone". Checked here with the group
+        question out of the way, because otherwise the group answer alone
+        carries the test and this half goes unasserted — which is exactly what
+        a mutation showed.
+        """
+        scratch = tmp_path / "scratch"
+        scratch.mkdir()
+        invocation = Invocation("join-no-reap", tool="web.fetch_v1")
+        handle = tool_worker.spawn(
+            invocation, "web.fetch_v1", {"inputs": {}},
+            limits={}, scratch=str(scratch),
+        )
+        real_join = handle._process.join
+        try:
+            handle.leads_group = False  # isolate the reaping question
+            handle._process.join = lambda *_a, **_k: None
+            assert handle.terminate() is False, (
+                "a worker that was never reaped was reported torn down"
+            )
+        finally:
+            handle._process.join = real_join
+            assert handle.terminate() is True
+            invocation.close()
+
+    def test_an_unconfirmed_teardown_keeps_the_evidence(self, runtime, monkeypatch):
+        """A group that outlives its leader is a tree that is not gone.
+
+        The leader can be joined while the group still holds members, so
+        "joined" is not the question — SPEC asks whether anything is left.
+        """
+        from liminallm.service import invocation as invocation_module
+
+        invocation = Invocation("reap-unconfirmed", tool="test.leaves_a_helper_v1")
+        undead = {"on": True}
+        monkeypatch.setattr(
+            invocation_module, "group_alive", lambda pgid: undead["on"]
+        )
+        try:
+            result = self._serve(runtime.workflow, invocation)
+            assert result.get("helper_pid"), result
+            assert invocation.resources.live_children(), (
+                "the worker's registration was dropped, so nothing is left to "
+                "refuse the retry with"
+            )
+            assert invocation.terminate(timeout=0.5) is False
+        finally:
+            undead["on"] = False
+            invocation.close()
+
+    @pytest.mark.asyncio
+    async def test_the_retry_refuses_while_the_worker_tree_is_unconfirmed(
+        self, runtime, caller, monkeypatch
+    ):
+        """End to end, with no injected extra child: the *worker's own* tree
+        is what stops the second attempt."""
+        from liminallm.service import invocation as invocation_module
+        from tests import hostile_child
+
+        engine = runtime.workflow
+        # A body that *fails* — a retry is what the refusal has to stop, and
+        # nothing retries a node that succeeded.
+        tool = hostile_child.FAILING_WORKER_BODY_TOOL
+        engine.tool_registry.setdefault(tool, {"name": tool})
+        undead = {"on": True}
+        monkeypatch.setattr(
+            invocation_module, "group_alive", lambda pgid: undead["on"]
+        )
+        attempts = 0
+        real_serve = engine._serve_invocation
+
+        def counted(invocation, worker_tool, plan, context, limits, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            plan = {**plan, **self._plan()}  # carries the import that registers
+            return real_serve(invocation, worker_tool, plan, context, limits, **kwargs)
+
+        monkeypatch.setattr(engine, "_serve_invocation", counted)
+        node = {
+            "id": "unreaped_node",
+            "type": "tool_call",
+            "tool": tool,
+            "max_retries": 2,
+            "backoff_ms": 1,
+            "timeout_ms": 5_000,
+        }
+        try:
+            result, _ = await engine._execute_node_with_retry(
+                node,
+                user_message="hello",
+                context_id=None,
+                conversation_id=None,
+                adapters=[],
+                history=[],
+                vars_scope={},
+                user_id=caller.id,
+                tenant_id=caller.tenant_id,
+                workflow_start_time=time.monotonic(),
+                workflow_timeout_ms=30_000,
+            )
+        finally:
+            undead["on"] = False
+            engine.tool_registry.pop(tool, None)
+            for invocation_id in list(engine.invocations.live()):
+                live = engine.invocations.get(invocation_id)
+                if live is not None:
+                    live.close()
+        assert attempts == 1, f"a second worker started anyway ({attempts})"
+        assert result.get("error") == "tool_worker_unreaped", result

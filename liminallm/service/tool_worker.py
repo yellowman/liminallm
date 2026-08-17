@@ -569,8 +569,8 @@ class WorkerHandle:
     def is_alive(self) -> bool:
         return bool(self._process.is_alive())
 
-    def terminate(self) -> None:
-        """End this worker and everything it started. Safe to call twice.
+    def terminate(self) -> bool:
+        """End this worker and everything it started; True once nothing is left.
 
         The group goes first and the reap second. Succeeding is not an
         exception to that: a tool that starts a helper and then answers
@@ -582,7 +582,16 @@ class WorkerHandle:
         `Process.is_alive()` is deliberately not consulted first. It joins an
         exited child, and a reaped pid is a number the kernel may hand to
         anyone — the group has to be signalled while that pid still names it.
+
+        **The return value is the point.** §18 says "reaping is confirmed
+        rather than bounded: a tree that will not die fails the node instead of
+        running alongside its successor", and a bounded `join` confirms
+        nothing. A caller that drops this worker's registration on a `False`
+        deletes the only evidence `Invocation.terminate()` has to refuse the
+        retry with.
         """
+        from liminallm.service.invocation import group_alive
+
         pid = self._process.pid
         if self.leads_group and pid and hasattr(os, "killpg"):
             try:
@@ -601,6 +610,22 @@ class WorkerHandle:
             self.conn.close()
         except OSError:
             pass
+        # `exitcode` rather than a pid probe: it is None until the child has
+        # actually been reaped, and it cannot be confused by a pid the kernel
+        # has since given to somebody else.
+        if self._process.exitcode is None:
+            return False
+        # The leader being reaped is not the group being empty. A killed
+        # member is still in the group until its parent reaps it, and once the
+        # leader is gone that parent is init — measured here, a group outlives
+        # its reaped leader by about a second.
+        #
+        # So this reports and does not wait. Waiting would put that second on
+        # every tool call, and the polling with a deadline already exists one
+        # level up: `Invocation.terminate()` is what SPEC charges with telling
+        # "draining" from "will not die", and it can only do that if this
+        # answer is honest and the registration is still there to re-check.
+        return not (self.leads_group and pid and group_alive(pid))
 
 
 def limits_from_config(config: Any) -> Dict[str, int]:

@@ -123,6 +123,16 @@ def body_that_leaves_a_helper_behind(_broker, _tool, _plan) -> dict:
     }
 
 
+#: Same, for a body that fails — a retry only happens after one does.
+FAILING_WORKER_BODY_TOOL = "test.fails_leaving_a_helper_v1"
+
+
+def body_that_fails_leaving_a_helper_behind(broker, tool, plan) -> dict:
+    """Leaves a descendant and then reports failure, so a retry follows."""
+    body_that_leaves_a_helper_behind(broker, tool, plan)
+    return {"status": "error", "content": "no", "error": "boom"}
+
+
 def register_worker_body() -> None:
     """Put the body in the worker's table, in whichever process imports this.
 
@@ -136,6 +146,9 @@ def register_worker_body() -> None:
     from liminallm.service import tool_worker
 
     tool_worker._BODIES[WORKER_BODY_TOOL] = body_that_leaves_a_helper_behind
+    tool_worker._BODIES[FAILING_WORKER_BODY_TOOL] = (
+        body_that_fails_leaving_a_helper_behind
+    )
 
 
 register_worker_body()

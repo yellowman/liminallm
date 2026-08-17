@@ -1,7 +1,9 @@
 import hashlib
 import hmac
+import os
 import re
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional, Tuple
 from urllib.parse import urlencode
@@ -289,3 +291,82 @@ def adapter_root(base: Path, adapter_id: str, explicit=None) -> Path:
             "never rename one adapter's weights to another's"
         )
     return resolved
+
+
+# ---------------------------------------------------------------------------
+# publication locks (SPEC §22: shared_fs_root is common across replicas)
+
+
+class PathLockTimeout(RuntimeError):
+    """Another publication of this path is in progress and did not finish."""
+
+
+#: Where lock files live. Under the shared root rather than beside the file
+#: they guard, so no user's directory listing grows an artefact, and one flat
+#: directory rather than a mirrored tree, so a lock never needs a path to be
+#: creatable before it can be taken.
+LOCK_DIRNAME = ".locks"
+
+_LOCK_POLL_SECONDS = 0.02
+DEFAULT_LOCK_TIMEOUT_SECONDS = 30.0
+
+
+def _lock_file(fs_root: Path, key: str) -> Path:
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    return Path(fs_root) / LOCK_DIRNAME / f"{digest}.lock"
+
+
+@contextmanager
+def path_lock(
+    fs_root: str | Path,
+    key: str,
+    *,
+    timeout: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+):
+    """Serialise everything that publishes one path, across replicas.
+
+    A publication is not one write. An upload puts bytes on disk, reads them
+    back to index them, and records a checksum — three artefacts that have to
+    describe the same generation, and three moments another request can land
+    between. Making each step atomic does not help: measured, two uploads of
+    one name left the second upload's bytes on disk, the second upload's
+    chunks in the index, and the *first* upload's checksum in the manifest,
+    with both requests returning 200.
+
+    `flock`, for two reasons that rule out the alternatives. It is held by an
+    open file description rather than by a process, so two threads in one API
+    process serialise on it exactly as two replicas do — measured both ways;
+    an in-process `threading.Lock` would be blind to the other replica, and
+    §22 puts `shared_fs_root` in common between them deliberately. And the
+    kernel drops it when the descriptor closes, so a replica that dies holding
+    one does not wedge the name forever, which is the failure mode of a lock
+    built out of `O_EXCL` and a stale file.
+
+    Blocking, so call it off the event loop. `key` is any stable string naming
+    what is being published — for a file, its path.
+
+    Raises `PathLockTimeout` rather than proceeding unserialised.
+    """
+    import fcntl
+
+    path = _lock_file(Path(fs_root), key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise PathLockTimeout(
+                        f"another publication of {key!r} is still in progress"
+                    )
+                time.sleep(_LOCK_POLL_SECONDS)
+        try:
+            yield
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)

@@ -303,10 +303,17 @@ class ResourceRegistry:
             return list(self._children.values())
 
     def live_children(self) -> List[int]:
-        """Pids that still exist. A reaped child is gone; a zombie is not."""
+        """Children whose tree still exists. A reaped child is gone.
+
+        For a child that leads its own group the pid is not the whole tree.
+        A process group outlives its leader for as long as any member is in
+        it, so a leader that has been reaped while its group still holds
+        somebody is not "gone" — and forgetting it there is what turns an
+        abandoned descendant into nobody's.
+        """
         alive: List[int] = []
         for child in self.children():
-            if _pid_alive(child.pid):
+            if _pid_alive(child.pid) or (child.group and group_alive(child.pid)):
                 alive.append(child.pid)
             else:
                 self.forget_child(child.pid)
@@ -348,6 +355,28 @@ def _pid_alive(pid: int) -> bool:
     except ProcessLookupError:
         return False
     except PermissionError:
+        return True
+    return True
+
+
+def group_alive(pgid: int) -> bool:
+    """Whether a process group still has members.
+
+    Only ever asked about a group whose id was proved equal to its leader's
+    pid, because that is the only group this service is entitled to reason
+    about. Uncertainty answers True: the cost of a false "still there" is a
+    refused retry, which SPEC already prescribes for a tree that will not die,
+    while the cost of a false "gone" is a descendant nobody owns.
+    """
+    if pgid <= 0 or not hasattr(os, "killpg"):
+        return False
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
         return True
     return True
 

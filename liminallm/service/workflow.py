@@ -2194,8 +2194,23 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 budget=handle.budget,
             )
         finally:
-            handle.terminate()
-            invocation.resources.forget_child(handle.pid or 0)
+            # Only a confirmed teardown releases the registration. §18 makes a
+            # tree that will not die fail the node rather than run beside its
+            # successor, and `Invocation.terminate()` is what enforces that —
+            # forgetting the worker regardless would delete the evidence one
+            # line before the retry consults it.
+            if handle.terminate():
+                invocation.resources.forget_child(handle.pid or 0)
+            else:
+                # Not an error on its own: a signalled group takes a moment to
+                # empty. What matters is that the registration stays, so the
+                # deadline that tells draining from undead belongs to
+                # `Invocation.terminate()` rather than to a bounded join here.
+                self.logger.debug(
+                    "tool_worker_teardown_unconfirmed",
+                    invocation_id=invocation.invocation_id,
+                    pid=handle.pid,
+                )
             invocation.end_attempt(handle.attempt)
 
     def _run_host_tool(

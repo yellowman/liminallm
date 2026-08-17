@@ -142,9 +142,11 @@ from liminallm.service.auth import AuthContext
 from liminallm.service.errors import BadRequestError, NotFoundError, ServiceError
 from liminallm.service.fs import (
     PathAuthorityError,
+    PathLockTimeout,
     PathTraversalError,
     authorize_path,
     generate_signed_url,
+    path_lock,
     safe_join,
     validate_signed_url,
 )
@@ -3564,25 +3566,31 @@ async def upload_file(
         dest_path.parent.mkdir(parents=True, exist_ok=True)
 
         manifest_path = dest_dir / ".checksums.json"
-        existing_checksums: dict[str, Any] = {}
-        if manifest_path.exists():
-            try:
-                existing_checksums = json.loads(manifest_path.read_text())
-            except Exception:
-                logger.warning("file_checksum_manifest_read_failed", path=str(manifest_path))
-        prior_entry = existing_checksums.get(safe_filename)
-        prior_checksum: Optional[str] = None
-        prior_contexts: set[str] = set()
-        if isinstance(prior_entry, dict):
-            prior_checksum = prior_entry.get("checksum")
-            try:
-                prior_contexts = set(
-                    str(c) for c in prior_entry.get("contexts", []) if c is not None
-                )
-            except Exception:
-                prior_contexts = set()
-        elif isinstance(prior_entry, str):
-            prior_checksum = prior_entry
+
+        def _read_manifest() -> tuple[dict, Optional[str], set[str]]:
+            """The manifest as of now. Only meaningful under the lock."""
+            existing: dict[str, Any] = {}
+            if manifest_path.exists():
+                try:
+                    existing = json.loads(manifest_path.read_text())
+                except Exception:
+                    logger.warning(
+                        "file_checksum_manifest_read_failed", path=str(manifest_path)
+                    )
+            entry = existing.get(safe_filename)
+            checksum_before: Optional[str] = None
+            contexts: set[str] = set()
+            if isinstance(entry, dict):
+                checksum_before = entry.get("checksum")
+                try:
+                    contexts = set(
+                        str(c) for c in entry.get("contexts", []) if c is not None
+                    )
+                except Exception:
+                    contexts = set()
+            elif isinstance(entry, str):
+                checksum_before = entry
+            return existing, checksum_before, contexts
         # Archives are binary; they are stored but never text-ingested.
         # POST /files/{name}/extract expands them (with ingestion) instead.
         # (Attaching an archive to a conversation is fine — it is handed to the
@@ -3631,98 +3639,115 @@ async def upload_file(
                 analyzable=attachment_caps["analyzable"],
             )
             return next((r for r in records if r.get("name") == safe_filename), None)
-        if dest_path.exists() and prior_checksum == checksum:
-            chunk_count = None
-            if context_id and context_id not in prior_contexts:
-                _get_owned_context(runtime, context_id, principal)
-                # The bytes are already on disk, so this branch makes exactly
-                # one durable mutation — and it is ledgered like the other
-                # ingestion, or "the ledger records the uploads" would be true
-                # of one upload path and not the other.
+        def _publish() -> Optional[int]:
+            """Put this upload on disk, in the index, and in the manifest.
+
+            One critical section, because the three are one generation. Each
+            step alone was already atomic and that was not enough: measured,
+            two uploads of one name left the second's bytes on disk, the
+            second's chunks in the index, and the *first's* checksum in the
+            manifest, with both requests returning 200. Between this upload's
+            write and its own read-back another can replace the file, and the
+            re-read is what indexes somebody else's bytes under this one's
+            provenance.
+
+            The manifest is read *here* rather than earlier for the same
+            reason: it is a read-modify-write, and a copy taken before the
+            lock describes a generation that may already be gone.
+
+            Synchronous, and run in one thread, so the lock is taken and
+            released off the event loop and never spans an await.
+            """
+            existing_checksums, prior_checksum, prior_contexts = _read_manifest()
+            deduped = dest_path.exists() and prior_checksum == checksum
+            chunks: Optional[int] = None
+
+            if not deduped:
+                # The IdempotencyGuard already claimed an in-progress slot on
+                # entry, so a concurrent duplicate request is rejected with 409
+                # while this write proceeds. The slot records that the request
+                # was entered; the guards here record which of its mutations
+                # actually landed — this upload writes bytes and then ingests
+                # them, and those are two facts, not one.
                 with idem.commit(
-                    "files.ingest",
-                    {"path": safe_filename, "context_id": context_id},
+                    "files.write", {"path": safe_filename, "checksum": checksum}
                 ) as operation:
-                    if operation.replayable:
-                        chunk_count = operation.result
-                    else:
-                        chunk_count = runtime.rag.ingest_file(
-                            context_id, str(dest_path), chunk_size=chunk_size
-                        )
-                        operation.result = chunk_count
-                prior_contexts.add(context_id)
+                    if not operation.replayable:
+                        dest_path.write_bytes(contents)
+
+            wants_ingest = bool(context_id) and (
+                not deduped or context_id not in prior_contexts
+            )
+            if wants_ingest:
                 try:
-                    existing_checksums[safe_filename] = {
-                        "checksum": checksum,
-                        "contexts": sorted(prior_contexts),
-                    }
-                    manifest_path.write_text(json.dumps(existing_checksums, indent=2))
+                    _get_owned_context(runtime, context_id, principal)
+                    # Ingestion is its own mutation: the bytes can be on disk
+                    # with the chunks not yet written, and a retry must be
+                    # able to tell.
+                    with idem.commit(
+                        "files.ingest",
+                        {"path": safe_filename, "context_id": context_id},
+                    ) as operation:
+                        if operation.replayable:
+                            chunks = operation.result
+                        else:
+                            chunks = runtime.rag.ingest_file(
+                                context_id, str(dest_path), chunk_size=chunk_size
+                            )
+                            operation.result = chunks
+                except Exception:
+                    # Clean up on any error (not just ConstraintViolation), but
+                    # only when this request is what put the bytes there: a
+                    # dedupe hit means the file was already somebody else's.
+                    if not deduped:
+                        dest_path.unlink(missing_ok=True)
+                    raise
+
+            # Persist checksum manifest for deduplication (SPEC §2.5).
+            #
+            # Under a second lock, and re-read rather than reusing the copy
+            # above, because this file is one JSON object for every name in
+            # the directory: an upload of *another* name takes a different
+            # file lock, runs alongside, and its read-modify-write is built
+            # from a snapshot taken before this one landed. Measured, that
+            # dropped the other upload's entry entirely — and a missing entry
+            # is a dedupe miss, so the next upload of that name re-ingests a
+            # file that never changed.
+            #
+            # Always file lock then manifest lock, never the reverse: one
+            # order for two locks is what stops two uploads from each holding
+            # what the other is waiting for.
+            if not deduped or wants_ingest:
+                contexts = set(prior_contexts) if deduped else set()
+                if context_id:
+                    contexts.add(context_id)
+                try:
+                    with path_lock(
+                        runtime.settings.shared_fs_root, str(manifest_path)
+                    ):
+                        current, _, _ = _read_manifest()
+                        current[safe_filename] = {
+                            "checksum": checksum,
+                            "contexts": sorted(contexts),
+                        }
+                        manifest_path.write_text(json.dumps(current, indent=2))
+                except PathLockTimeout:
+                    raise
                 except Exception:
                     logger.warning(
-                        "file_checksum_manifest_write_failed", path=str(manifest_path)
+                        "file_checksum_manifest_write_failed",
+                        path=str(manifest_path),
                     )
-            resp = FileUploadResponse(
-                fs_path=safe_filename,
-                context_id=context_id,
-                chunk_count=chunk_count,
-                attachment=_record(chunk_count),
-            )
-            envelope = Envelope(status="ok", data=resp, request_id=idem.request_id)
-            await idem.store_result(envelope)
-            return envelope
+            return chunks
 
-        # The IdempotencyGuard already claimed an in-progress slot on entry, so
-        # a concurrent duplicate request is rejected with 409 while this write
-        # proceeds. The slot records that the request was entered; the two
-        # guards below record which of its mutations actually landed — this
-        # upload writes bytes and then ingests them, and those are two facts,
-        # not one.
-        # Write the file (Issue 32.3: off the event loop to avoid blocking).
-        # The guard goes into the thread with the write rather than around the
-        # await: SPEC §18 wants the linearization point held for the mutation
-        # and nothing else, and a lock held across an await is held by the event
-        # loop, which is the one thread that must never wait on it.
-        def _write_bytes() -> None:
-            with idem.commit(
-                "files.write", {"path": safe_filename, "checksum": checksum}
-            ) as operation:
-                if not operation.replayable:
-                    dest_path.write_bytes(contents)
+        def _locked_publish() -> Optional[int]:
+            with path_lock(runtime.settings.shared_fs_root, str(dest_path)):
+                return _publish()
 
-        await asyncio.to_thread(_write_bytes)
-        chunk_count = None
-        if context_id:
-            try:
-                _get_owned_context(runtime, context_id, principal)
-                # Ingestion is its own mutation: the bytes can be on disk with
-                # the chunks not yet written, and a retry must be able to tell.
-                with idem.commit(
-                    "files.ingest",
-                    {"path": safe_filename, "context_id": context_id},
-                ) as operation:
-                    if operation.replayable:
-                        chunk_count = operation.result
-                    else:
-                        chunk_count = runtime.rag.ingest_file(
-                            context_id, str(dest_path), chunk_size=chunk_size
-                        )
-                        operation.result = chunk_count
-            except Exception:
-                # Clean up file on any error (not just ConstraintViolation)
-                dest_path.unlink(missing_ok=True)
-                raise
-
-        # Persist checksum manifest for deduplication (SPEC §2.5)
         try:
-            existing_checksums[safe_filename] = {
-                "checksum": checksum,
-                "contexts": [context_id] if context_id else [],
-            }
-            manifest_path.write_text(json.dumps(existing_checksums, indent=2))
-        except Exception:
-            logger.warning(
-                "file_checksum_manifest_write_failed", path=str(manifest_path)
-            )
+            chunk_count = await asyncio.to_thread(_locked_publish)
+        except PathLockTimeout as exc:
+            raise http_error("conflict", str(exc), status_code=409)
 
         # Update idempotency with final result
         resp = FileUploadResponse(

@@ -7662,3 +7662,107 @@ arithmetically wrong: from `<root>/users/<stranger>/files`, `../<victim>/...`
 lands on a path that exists for nobody, and the 404 it earned said nothing
 about traversal. Verified by removing `safe_join` from `attachment_path` and
 watching the corrected test go red.
+
+## The final process-tree residual: confirmed, not bounded
+
+§18 does not stop at "send SIGKILL": "reaping is confirmed rather than
+bounded: a tree that will not die fails the node instead of running alongside
+its successor." `Invocation.terminate()` implements exactly that — kill,
+re-check `live_children()`, refuse at the deadline — and the retry honours it.
+
+`_serve_invocation` walked around it. `WorkerHandle.terminate()` signalled,
+called `join(2)`, and returned nothing; the caller then dropped the pid from
+the registry unconditionally. If that bounded join had not reaped, the
+machinery built to refuse the retry had its evidence deleted one line before
+it was consulted.
+
+`terminate()` returns a verdict now, and only a `True` releases the
+registration. Two things make up the verdict:
+
+- `Process.exitcode is not None`, not a pid probe. It is None until the child
+  has actually been reaped and it cannot be confused by a pid the kernel has
+  since handed to somebody else.
+- For a READY-proven group, the group being empty. A killed member stays in
+  the group until its parent reaps it, and once the leader is gone that parent
+  is init — measured, a group outlives its reaped leader by about a second.
+  `ResourceRegistry.live_children()` asks the same question, so a leader whose
+  group still holds somebody is not forgotten.
+
+The handle reports and does not wait. Waiting would put that second on every
+tool call, and the deadline that tells "draining" from "will not die" already
+exists one level up; it just needs an honest answer and a registration still
+there to re-check.
+
+One mutation survived the first pass — deleting the `exitcode` check changed
+nothing, because the group answer alone carried every test. The half is now
+asserted on its own, with `leads_group` set aside so the group answer cannot
+stand in for it.
+
+## Tranche 2E.1: one filename, one generation
+
+`tests/test_path_races.py`. Every test forces its interleaving rather than
+hoping for it: a race that reproduces one run in fifty is a race that passes
+CI, so each gates a real request at the point the window opens.
+
+### The upload race
+
+Two uploads of one name, different bytes, different idempotency keys — two
+requests, correctly, not a duplicate. Each phase succeeded and the order was
+the damage:
+
+```
+A: write bytes A
+B: write bytes B
+A: ingest the path  -> reads B
+A: write manifest   -> records checksum A
+```
+
+Measured: the disk held B, the index held B, and the manifest swore the file
+was A, with both requests returning 200. The next upload of that name then
+compares against a checksum no file ever had.
+
+The fix is `fs.path_lock`, held across write → ingest → manifest, because the
+three are one generation and making each step atomic does not help. `flock`
+for two measured reasons: it is held by an open file description rather than
+by a process, so two threads in one API process serialise on it exactly as two
+replicas do — an in-process lock would be blind to the other replica, and §22
+puts `shared_fs_root` in common between them deliberately — and the kernel
+drops it when the descriptor closes, so a replica that dies holding one does
+not wedge the name, which is the failure mode of a lock built from `O_EXCL`
+and a stale file.
+
+### What mutation found next
+
+Moving the manifest read back outside the lock did **not** fail the same-name
+test. That is not the mutation being harmless; it is the same-name test being
+the wrong witness. The manifest is one JSON object for every name in the
+directory, so an upload of *another* name takes a different file lock, runs
+alongside, and does its own read-modify-write from a snapshot taken earlier.
+Measured with two names: the first upload's entry disappeared completely, and
+a missing entry is a dedupe miss, so the next upload of that name re-ingests a
+file that never changed.
+
+So the manifest update takes a second lock on the manifest itself and re-reads
+under it. Always file lock then manifest lock, never the reverse — one order
+for two locks is what stops two uploads each holding what the other waits for.
+
+### Recorded, not fixed: re-ingestion leaves the old generation
+
+After two uploads of one name the index holds *both*. Nothing removes a path's
+previous chunks before writing its new ones, so a search over the context can
+return, as the contents of `notes.md`, text that file has not held since the
+first upload.
+
+It is a strict xfail rather than a fix because it is not this tranche's defect.
+No interleaving reaches it — two sequential uploads are enough, measured — and
+the repair is a deletion semantic that does not exist yet: the store has
+`add_chunks` and no way to drop a path's chunks, and whatever answers this has
+to answer `DELETE /files/{name}` too, which leaves the same chunks behind for
+the same reason.
+
+### A process note
+
+Reverting one of these mutations with `git checkout` discarded the whole
+uncommitted fix in that file, not just the mutation. Mutation runs restore the
+file from text held in memory for exactly this reason; the ad-hoc one that
+skipped that step cost the work in `routes.py` and had to be reapplied.
