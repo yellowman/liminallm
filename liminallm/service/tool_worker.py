@@ -561,6 +561,11 @@ class WorkerHandle:
         #: Carried here because teardown needs it on *every* path, and only
         #: `spawn` was in a position to learn it.
         self.leads_group = leads_group
+        #: Set by `terminate()` once the leader is positively reaped, whether
+        #: or not its group has finished draining. The caller needs the two
+        #: apart: "not gone" says keep the registration, and this says keep it
+        #: as a group id rather than as a pid.
+        self.leader_reaped = False
 
     @property
     def pid(self) -> Optional[int]:
@@ -615,6 +620,10 @@ class WorkerHandle:
         # has since given to somebody else.
         if self._process.exitcode is None:
             return False
+        # Recorded because it changes what the pid *means*. A reaped leader's
+        # number is the kernel's to reissue, so a caller that keeps this
+        # registration has to keep it as a group and not as a process.
+        self.leader_reaped = True
         # The leader being reaped is not the group being empty. A killed
         # member is still in the group until its parent reaps it, and once the
         # leader is gone that parent is init — measured here, a group outlives

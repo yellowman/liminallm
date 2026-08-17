@@ -7766,3 +7766,54 @@ Reverting one of these mutations with `git checkout` discarded the whole
 uncommitted fix in that file, not just the mutation. Mutation runs restore the
 file from text held in memory for exactly this reason; the ad-hoc one that
 skipped that step cost the work in `routes.py` and had to be reapplied.
+
+## The last process-tree correction: a reaped pid is not a handle
+
+Retaining the registration while the group drains was right — the retry needs
+something to wait on. Retaining it *as a pid* was not. Once the leader has been
+positively reaped that number names nothing, and the kernel may give it to an
+unrelated process; §18 calls a registration left behind after a reap "a
+standing licence to signal whoever inherits it".
+
+The damage is not theoretical, and `_kill` is where it lands. Its group branch
+requires `os.getpgid(pid) == pid`, and a reissued pid belongs to somebody
+else's group, so the branch declines and the `else` sends a plain
+`os.kill(pid, SIGKILL)`. Measured, with the kernel made to answer as it would
+after a reissue — the pid exists and sits in another group — a single
+`Invocation.terminate(timeout=0.3)` aimed **sixteen** SIGKILLs at it.
+
+So a reaped leader's entry becomes group-observation only: `live_children()`
+asks `group_alive` and nothing else, and `kill_all()` skips it entirely. There
+is nothing left to signal — the SIGKILL that emptied the group has already
+been sent, and all that remains is to watch it drain and let
+`Invocation.terminate()`'s existing deadline decide.
+
+The first mutation pass left one survivor worth recording: restoring the pid
+probe in `live_children` failed nothing, because the safety test patches the
+group alive and both readings then say "alive". The harm of the probe is the
+opposite one — a *drained* group whose pid has been reissued reads as alive
+forever, so the tree is never confirmed gone and the node fails for as long as
+some stranger holds the number. That is now its own test, and the mutation is
+red.
+
+## 2E.1 closed: one generation, in the index too
+
+The tranche's own invariant named three records — disk, index, manifest — and
+the concurrent test only proved the surviving generation was *somewhere* in the
+index, not that the dead one was absent. The strict xfail immediately below it
+said why: ingestion appended, so two uploads of one name left both generations
+indexed.
+
+`replace_chunks_for_path` closes it narrowly. Within one context a path's
+chunks are made to *be* the new generation rather than to join the old one,
+deleting and inserting in a single transaction so a reader never sees the path
+with no chunks at all — an interrupted refresh that emptied a path would be a
+worse answer than a stale one. §2.5 dedupes by checksum *and path* and
+refreshes a changed path by ingesting it, which describes one generation;
+returning text from an older checksum as the current contents of that path did
+not.
+
+Inline text still appends: it has no path to be a generation of.
+
+The deletion half of that primitive is what `DELETE /files/{name}` will want
+when that route gets its own consistency pass. Deliberately not done here.

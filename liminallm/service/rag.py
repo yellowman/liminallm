@@ -755,7 +755,16 @@ class RAGService:
                 break
 
         if chunks:
-            self.store.add_chunks(context_id, chunks)  # type: ignore[attr-defined]
+            # A named path is replaced, not appended to: these chunks claim to
+            # *be* the contents of `source_path`, and after a re-upload the
+            # previous generation's chunks make that claim about bytes the file
+            # no longer holds. `inline` text has no path to be a generation of,
+            # so it is added.
+            replace = getattr(self.store, "replace_chunks_for_path", None)
+            if source_path and callable(replace):
+                replace(context_id, default_path, chunks)
+            else:
+                self.store.add_chunks(context_id, chunks)  # type: ignore[attr-defined]
             self._index_segments(chunks)
         return len(chunks)
 

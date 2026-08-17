@@ -1594,3 +1594,131 @@ class TestReapingIsConfirmedNotAssumed:
                     live.close()
         assert attempts == 1, f"a second worker started anyway ({attempts})"
         assert result.get("error") == "tool_worker_unreaped", result
+
+
+class TestAReapedLeaderStopsBeingAHandle:
+    """§18: "a reaped pid is released ... a registration left behind after a
+    child is reaped is a standing licence to signal whoever inherits it."
+
+    Retaining the registration while the group drains is right — the retry has
+    to wait for something. What is not right is retaining it as a *pid*. Once
+    the leader has been positively reaped that number names nothing, and the
+    kernel is free to give it to an unrelated process; `_pid_alive` would then
+    say the child is alive and `kill_all` would signal a stranger, including
+    by plain `os.kill` when the group check declines.
+
+    The group is a different identity and the one still worth observing. The
+    SIGKILL that emptied it has already been sent, so from here the registry
+    only has to watch it disappear.
+    """
+
+    def test_a_draining_group_is_watched_and_never_signalled(
+        self, runtime, monkeypatch
+    ):
+        from liminallm.service import invocation as invocation_module
+        from tests import hostile_child
+
+        engine = runtime.workflow
+        invocation = Invocation("stale-pid", tool="test.leaves_a_helper_v1")
+        undead = {"on": True}
+        monkeypatch.setattr(
+            invocation_module, "group_alive", lambda pgid: undead["on"]
+        )
+        signalled: list = []
+        real_kill, real_killpg = os.kill, os.killpg
+
+        def watched_kill(pid, sig):
+            if sig:
+                signalled.append(("kill", pid))
+            return real_kill(pid, sig)
+
+        def watched_killpg(pgid, sig):
+            if sig:
+                signalled.append(("killpg", pgid))
+            return real_killpg(pgid, sig)
+
+        try:
+            result = engine._serve_invocation(
+                invocation,
+                hostile_child.WORKER_BODY_TOOL,
+                {"inputs": {}, "body": hostile_child.body_that_leaves_a_helper_behind},
+                InvocationContext(user_id="u1"),
+                engine._worker_limits(None),
+            )
+            assert result.get("helper_pid"), result
+            leader = invocation.attempts[-1].pid
+            assert invocation.resources.live_children() == [leader], (
+                "the draining tree must stay registered for the retry to see"
+            )
+
+            # From here the leader pid is a number the kernel may reissue, so
+            # the kernel is made to answer as it would once it has: the pid
+            # exists, and it is in somebody else's process group. That is the
+            # state `_kill` mishandles — the group branch declines and the
+            # `else` sends SIGKILL to whoever now holds the number.
+            stranger_group = leader + 1
+
+            def reused_kill(pid, sig):
+                if pid == leader:
+                    if sig:
+                        signalled.append(("kill", pid))
+                    return None  # the stranger is alive and unharmed
+                return real_kill(pid, sig)
+
+            def reused_killpg(pgid, sig):
+                if pgid == leader and sig:
+                    signalled.append(("killpg", pgid))
+                    return None
+                return real_killpg(pgid, sig)
+
+            def reused_getpgid(pid):
+                return stranger_group if pid == leader else os.getpgid(pid)
+
+            monkeypatch.setattr(invocation_module.os, "kill", reused_kill)
+            monkeypatch.setattr(invocation_module.os, "killpg", reused_killpg)
+            monkeypatch.setattr(invocation_module.os, "getpgid", reused_getpgid)
+
+            assert invocation.terminate(timeout=0.3) is False, (
+                "the retry must still wait on the draining group"
+            )
+            assert signalled == [], (
+                f"the reaped leader {leader} was signalled after its pid was "
+                f"reissued: {signalled}"
+            )
+        finally:
+            undead["on"] = False
+            monkeypatch.undo()
+            invocation.close()
+
+    def test_a_drained_group_is_gone_even_if_the_pid_came_back(
+        self, runtime, monkeypatch
+    ):
+        """The same confusion, costing liveness instead of safety.
+
+        Once the group has drained the tree *is* gone, and the retry must be
+        allowed to start. Reading the reaped number as a pid says otherwise
+        the moment the kernel reissues it, and the answer never changes back —
+        so the node fails for as long as some unrelated process holds it.
+        """
+        from liminallm.service import invocation as invocation_module
+
+        invocation = Invocation("drained-but-reissued", tool="test.tool")
+        leader = 424242
+        invocation.resources.add_child(
+            leader, "worker:test", group=True, reap=lambda: None
+        )
+        invocation.resources.mark_leader_reaped(leader)
+        try:
+            # The group is empty; the number belongs to somebody else now.
+            monkeypatch.setattr(invocation_module, "group_alive", lambda pgid: False)
+            monkeypatch.setattr(
+                invocation_module, "_pid_alive", lambda pid: pid == leader
+            )
+            assert invocation.resources.live_children() == [], (
+                "a drained tree was held open by a pid that is no longer its own"
+            )
+            assert invocation.terminate(timeout=0.3) is True
+        finally:
+            monkeypatch.undo()
+            invocation.resources.forget_child(leader)
+            invocation.close()

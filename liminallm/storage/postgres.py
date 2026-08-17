@@ -3515,6 +3515,48 @@ class PostgresStore:
             raise ConstraintViolation("context not found", {"context_id": context_id})
         return inserted
 
+    def replace_chunks_for_path(
+        self, context_id: str, fs_path: str, chunks: Iterable[KnowledgeChunk]
+    ) -> List[int]:
+        """Make `chunks` the whole of what this context says about `fs_path`.
+
+        Ingestion used to append, so re-uploading a file left the previous
+        generation's chunks in place beside the new ones and a search could
+        return, as the contents of that path, text it had not held since an
+        earlier upload. SPEC §2.5 dedupes by checksum *and path* and refreshes
+        a changed path by ingesting it, which only describes one generation.
+
+        Delete and insert in one transaction, so a reader never sees the path
+        with no chunks at all — an interrupted refresh that emptied a path
+        would be a worse answer than a stale one.
+        """
+        deleted_generation: List[int] = []
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "DELETE FROM knowledge_chunk WHERE context_id = %s AND fs_path = %s",
+                    (context_id, fs_path),
+                )
+                for chunk in chunks:
+                    row = conn.execute(
+                        "INSERT INTO knowledge_chunk (context_id, fs_path, chunk_index, content, embedding, created_at, meta) VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                        (
+                            context_id,
+                            fs_path,
+                            chunk.chunk_index,
+                            chunk.content,
+                            chunk.embedding,
+                            chunk.created_at,
+                            json.dumps(chunk.meta) if chunk.meta else None,
+                        ),
+                    ).fetchone()
+                    if row:
+                        chunk.id = int(row["id"])
+                        deleted_generation.append(int(row["id"]))
+        except errors.ForeignKeyViolation:
+            raise ConstraintViolation("context not found", {"context_id": context_id})
+        return deleted_generation
+
     def add_chunk_vectors(
         self,
         chunk_id: int,

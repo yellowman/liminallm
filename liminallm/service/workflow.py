@@ -2206,10 +2206,18 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 # empty. What matters is that the registration stays, so the
                 # deadline that tells draining from undead belongs to
                 # `Invocation.terminate()` rather than to a bounded join here.
+                #
+                # It stays as a *group* once the leader is reaped, though. The
+                # pid is the kernel's to reissue from that moment, and a
+                # registration that keeps signalling it is §18's "standing
+                # licence to signal whoever inherits it".
+                if handle.leader_reaped:
+                    invocation.resources.mark_leader_reaped(handle.pid or 0)
                 self.logger.debug(
                     "tool_worker_teardown_unconfirmed",
                     invocation_id=invocation.invocation_id,
                     pid=handle.pid,
+                    leader_reaped=handle.leader_reaped,
                 )
             invocation.end_attempt(handle.attempt)
 

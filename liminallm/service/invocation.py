@@ -258,6 +258,12 @@ class _Child:
     #: Reaper for a child this process did not create with `os.fork` directly —
     #: a `multiprocessing.Process` is joined, not waitpid-ed.
     reap: Optional[Callable[[], None]] = None
+    #: Set once the leader has been positively reaped while its group is still
+    #: draining. From then on `pid` is not a handle: the kernel may reissue the
+    #: number, so it is read only as the group's id and never signalled.
+    #: §18 — "a registration left behind after a child is reaped is a standing
+    #: licence to signal whoever inherits it."
+    leader_reaped: bool = False
 
 
 class ResourceRegistry:
@@ -293,6 +299,20 @@ class ResourceRegistry:
         with self._lock:
             self._children.pop(pid, None)
 
+    def mark_leader_reaped(self, pid: int) -> None:
+        """This child's leader is gone; only its group is left to watch.
+
+        Not the same as forgetting it. The group still holds members, so a
+        retry must still wait — but the number that named the leader is now
+        the kernel's to reissue, so from here it is read as a group id and
+        nothing is ever signalled through it. The SIGKILL that emptied the
+        group has already been sent; what remains is to watch it drain.
+        """
+        with self._lock:
+            child = self._children.get(pid)
+            if child is not None:
+                child.leader_reaped = True
+
     def add_path(self, path: str) -> None:
         if path:
             with self._lock:
@@ -313,6 +333,15 @@ class ResourceRegistry:
         """
         alive: List[int] = []
         for child in self.children():
+            if child.leader_reaped:
+                # The number is a group id and nothing else now. Asking
+                # `_pid_alive` here would answer about whoever the kernel gave
+                # the pid to next, and answer "the child is alive".
+                if group_alive(child.pid):
+                    alive.append(child.pid)
+                else:
+                    self.forget_child(child.pid)
+                continue
             if _pid_alive(child.pid) or (child.group and group_alive(child.pid)):
                 alive.append(child.pid)
             else:
@@ -320,9 +349,18 @@ class ResourceRegistry:
         return alive
 
     def kill_all(self) -> List[int]:
-        """Signal every child, then reap it. Returns the pids signalled."""
+        """Signal every child, then reap it. Returns the pids signalled.
+
+        A child whose leader has been reaped is skipped, not re-signalled. Its
+        group already took a SIGKILL, and the only thing the pid could reach
+        now is whoever inherited the number — `_kill` falls back to a plain
+        `os.kill` whenever the target does not lead the expected group, which
+        is precisely what a reissued pid looks like.
+        """
         signalled: List[int] = []
         for child in self.children():
+            if child.leader_reaped:
+                continue
             if _kill(child.pid, group=child.group):
                 signalled.append(child.pid)
             if child.reap is not None:

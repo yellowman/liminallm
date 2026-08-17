@@ -154,9 +154,13 @@ class TestOneNameLeavesOneGeneration:
         # similarity search returns is a ranking question that would answer a
         # different one.
         marker = "alpha" if on_disk == alpha else "beta"
+        stale = "beta" if marker == "alpha" else "alpha"
         chunks = runtime.store.list_chunks(context_id, limit=200)
         texts = " ".join(c.content or "" for c in chunks)
         assert marker in texts, f"the surviving file was never indexed: {texts[:200]}"
+        assert stale not in texts, (
+            "the index still describes a generation the file no longer holds"
+        )
 
 
 class TestOneManifestHoldsEveryName:
@@ -239,25 +243,21 @@ class TestOneManifestHoldsEveryName:
 class TestReingestingAPathReplacesItsChunks:
     """Found while building the race above, and it is not a race.
 
-    After two uploads of one name the index holds *both* generations: nothing
-    removes a path's previous chunks before writing its new ones. So a search
-    over the context can return, as the current contents of `notes.md`, text
-    that `notes.md` has not contained since the first upload.
+    Ingestion appended, so after two uploads of one name the index held both
+    generations and a search could return, as the contents of `notes.md`, text
+    that file had not held since the first upload. No interleaving reaches it —
+    two sequential uploads are enough — which is why it sits here rather than
+    among the races.
 
-    Recorded rather than fixed, because it is a different defect from the one
-    2E.1 is about. No interleaving is needed to reach it — the sequential case
-    below is enough — and the fix is a deletion semantic that does not exist
-    yet: the store has `add_chunks` and no way to drop a path's chunks, and
-    whatever answers this has to answer file *deletion* too, which leaves the
-    same chunks behind for the same reason. That is a scope decision, not an
-    implementation detail of a lock.
+    `replace_chunks_for_path` is the narrow answer: within one context, a
+    path's chunks are made to *be* the new generation rather than to join the
+    old one, deleting and inserting in a single transaction so a reader never
+    sees the path with no chunks at all. §2.5 dedupes by checksum and path and
+    refreshes a changed path by ingesting it, which describes one generation.
+    Its deletion half is what `DELETE /files/{name}` will want when that route
+    gets its own consistency pass; that is not this tranche.
     """
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="re-ingesting a path adds chunks beside the old ones; needs a "
-        "deletion semantic that also covers DELETE /files/{name}",
-    )
     def test_the_index_holds_only_the_current_generation(self, client):
         runtime = get_runtime()
         user_id, headers = _account(client)
