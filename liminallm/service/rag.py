@@ -675,12 +675,12 @@ class RAGService:
         lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
         blob = " ".join(lines)
         if not blob:
-            return 0
+            return self._commit_generation(context_id, source_path, [])
 
         # Tokenize the text per SPEC §2.5 requirement for token-based chunking
         tokens = _simple_tokenize(blob)
         if not tokens:
-            return 0
+            return self._commit_generation(context_id, source_path, [])
 
         chosen_chunk_tokens = max(chunk_size or self.default_chunk_size, 64)
         # Use default overlap if not specified (SPEC §2.5: 50 token overlap)
@@ -754,17 +754,37 @@ class RAGService:
             if end >= len(tokens):
                 break
 
+        return self._commit_generation(context_id, source_path, chunks)
+
+    def _commit_generation(
+        self,
+        context_id: str,
+        source_path: Optional[str],
+        chunks: List[KnowledgeChunk],
+    ) -> int:
+        """Make `chunks` the whole of what this context says about a path.
+
+        A named path is replaced rather than appended to, **including by
+        nothing**. These chunks claim to *be* the contents of `source_path`,
+        so once new bytes are committed the previous generation's chunks make
+        that claim about a file that is gone; "this generation produced no
+        text" is an answer about the current bytes, not permission to keep the
+        last ones. Empty input and an extractor refusal both arrive here.
+
+        The cost is worth stating: a *re-scan* of unchanged bytes whose
+        extraction fails transiently — a sandbox timeout, say — drops that
+        path from retrieval until the next ingest. That is recoverable and it
+        is logged, where the alternative is an index that answers with text
+        the file has not held since an earlier generation, which is not.
+
+        `inline` text has no path to be a generation of, so it is added.
+        """
+        replace = getattr(self.store, "replace_chunks_for_path", None)
+        if source_path and callable(replace):
+            replace(context_id, source_path, chunks)
+        elif chunks:
+            self.store.add_chunks(context_id, chunks)  # type: ignore[attr-defined]
         if chunks:
-            # A named path is replaced, not appended to: these chunks claim to
-            # *be* the contents of `source_path`, and after a re-upload the
-            # previous generation's chunks make that claim about bytes the file
-            # no longer holds. `inline` text has no path to be a generation of,
-            # so it is added.
-            replace = getattr(self.store, "replace_chunks_for_path", None)
-            if source_path and callable(replace):
-                replace(context_id, default_path, chunks)
-            else:
-                self.store.add_chunks(context_id, chunks)  # type: ignore[attr-defined]
             self._index_segments(chunks)
         return len(chunks)
 
@@ -830,10 +850,13 @@ class RAGService:
         try:
             data = extract_text(Path(path))["text"]
         except ExtractError as exc:
+            # A refusal is still an answer about the current bytes, so it
+            # commits an empty generation rather than leaving the last
+            # readable one standing as this path's contents.
             logger.warning(
                 "ingest_file_skipped", path=str(path), reason=exc.reason
             )
-            return 0
+            return self._commit_generation(context_id, path, [])
         return self.ingest_text(
             context_id, data, chunk_size=chunk_size, source_path=path
         )

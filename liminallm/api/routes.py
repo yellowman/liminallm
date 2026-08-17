@@ -3738,14 +3738,21 @@ async def upload_file(
                         "file_checksum_manifest_write_failed",
                         path=str(manifest_path),
                     )
-            return chunks
+            # Inside the lock, because the record says how large this file is
+            # and therefore how the conversation may use it — §19.5 makes
+            # inline/searchable/analyzable part of that. Written after the
+            # lock was released, the loser's classification could land last,
+            # and `read_inline_contents` would then open the winner's bytes
+            # under the loser's rules. Measured: the conversation said 6000
+            # bytes while the disk held 24000.
+            return chunks, _record(chunks)
 
-        def _locked_publish() -> Optional[int]:
+        def _locked_publish() -> tuple[Optional[int], Optional[dict]]:
             with path_lock(runtime.settings.shared_fs_root, str(dest_path)):
                 return _publish()
 
         try:
-            chunk_count = await asyncio.to_thread(_locked_publish)
+            chunk_count, attachment = await asyncio.to_thread(_locked_publish)
         except PathLockTimeout as exc:
             raise http_error("conflict", str(exc), status_code=409)
 
@@ -3754,7 +3761,7 @@ async def upload_file(
             fs_path=safe_filename,
             context_id=context_id,
             chunk_count=chunk_count,
-            attachment=_record(chunk_count),
+            attachment=attachment,
         )
         envelope = Envelope(status="ok", data=resp, request_id=idem.request_id)
         await idem.store_result(envelope)

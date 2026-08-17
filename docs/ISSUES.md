@@ -7817,3 +7817,58 @@ Inline text still appends: it has no path to be a generation of.
 
 The deletion half of that primitive is what `DELETE /files/{name}` will want
 when that route gets its own consistency pass. Deliberately not done here.
+
+## 2E.1 residuals: zero is a generation, and the conversation is state too
+
+### Replacement by an empty generation
+
+`replace_chunks_for_path` only ran when a generation produced chunks. Both
+early returns in `ingest_text` and the extractor refusal in `ingest_file` came
+back with zero before reaching it, so:
+
+```
+notes.md A = readable text        -> chunks A
+notes.md B = unreadable bytes     -> disk B, manifest B, chunks A remain
+```
+
+Zero is a number, not an exemption. The new bytes are committed, so A's chunks
+describe a file that is gone, and "this generation produced no text" is an
+answer about the current bytes rather than permission to keep the last ones.
+Every named-path exit now goes through one `_commit_generation`.
+
+One cost is accepted and stated in the code: a *re-scan* of unchanged bytes
+whose extraction fails transiently — a sandbox timeout — drops that path from
+retrieval until the next ingest. That is recoverable and logged; an index
+answering with text the file has not held since an earlier generation is not.
+
+Mutation corrected the tests here. Reverting the `if not blob` branch failed
+nothing, because a whitespace-only *upload* never reaches it: measured,
+`extract_text` strips and refuses, so the route arrives by the refusal path
+and both route tests were exercising one branch. The empty-normalization
+branch is reachable through the ingestion API, and is tested there.
+
+### Attachment metadata outside the generation lock
+
+Two defects in the same few lines.
+
+The record was written after `_locked_publish` released. Classification comes
+from size — §19.5 makes inline/searchable/analyzable part of how a
+conversation uses a file, and a `.md` is `inline` under `INLINE_MAX_BYTES` and
+`searchable` above it — so the loser's record could land last. Measured: the
+conversation said 6000 bytes while the disk held 24000, and
+`read_inline_contents` would then open the winner's bytes under the loser's
+rules. `_record` now runs inside the critical section, so its order is the
+publication order.
+
+Separately, `record_attachment` read the attachment list, edited it in Python
+and wrote it back whole. Two writers that both read before either wrote each
+stored their own copy; measured with two filenames uploaded at once, one
+record disappeared entirely. `upsert_conversation_attachment` does the whole
+edit in one transaction behind `SELECT ... FOR UPDATE`. A file lock could not
+have fixed this — the state is in Postgres, and §22 has several replicas
+sharing exactly that.
+
+The lost-update test drives `record_attachment` directly under a barrier
+rather than through the route. After the fix the read and the write are one
+transaction, so there is no longer a seam between them to pause at; what is
+left to test is the property under real contention.

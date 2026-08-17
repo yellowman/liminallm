@@ -135,22 +135,30 @@ def record_attachment(
     capabilities: dict[str, Any],
     chunk_count: Optional[int] = None,
 ) -> list[dict[str, Any]]:
-    """Add (or replace) an attachment record on the conversation."""
+    """Add (or replace) an attachment record on the conversation.
+
+    The edit is handed to the store whole rather than done here, because the
+    list is one JSON value holding every attachment: reading it, changing one
+    entry and writing it back is a read-modify-write on shared state, and two
+    uploads that both read before either wrote lose one of the additions.
+    """
+    record = {
+        "name": name,
+        "size": size,
+        "inline": bool(capabilities.get("inline")),
+        "searchable": bool(capabilities.get("searchable")),
+        "analyzable": bool(capabilities.get("analyzable")),
+        "chunk_count": chunk_count,
+        "uploaded_at": datetime.now(timezone.utc).isoformat(),
+    }
+    upsert = getattr(store, "upsert_conversation_attachment", None)
+    if callable(upsert):
+        return upsert(conversation_id, user_id=user_id, record=record) or []
     conversation = store.get_conversation(conversation_id, user_id=user_id)
     if not conversation:
         return []
     existing = [a for a in list_attachments(conversation) if a.get("name") != name]
-    existing.append(
-        {
-            "name": name,
-            "size": size,
-            "inline": bool(capabilities.get("inline")),
-            "searchable": bool(capabilities.get("searchable")),
-            "analyzable": bool(capabilities.get("analyzable")),
-            "chunk_count": chunk_count,
-            "uploaded_at": datetime.now(timezone.utc).isoformat(),
-        }
-    )
+    existing.append(record)
     store.merge_conversation_meta(
         conversation_id, user_id=user_id, patch={"attachments": existing}
     )

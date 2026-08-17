@@ -258,6 +258,81 @@ class TestReingestingAPathReplacesItsChunks:
     gets its own consistency pass; that is not this tranche.
     """
 
+    def _upload(self, client, headers, context_id, name, body):
+        resp = client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={"file": (name, body, "text/markdown")},
+            data={"context_id": context_id},
+        )
+        assert resp.status_code == 200, resp.text
+        return resp
+
+    def test_an_empty_generation_replaces_the_last_one(self, client):
+        """The `ingest_text` branch, driven at the service rather than the route.
+
+        Measured: a whitespace-only upload does not reach it — `extract_text`
+        strips and refuses, so the route arrives by the refusal path below.
+        This branch is reachable through the ingestion API itself, and the two
+        have to agree, or "no text this time" means one thing when the
+        extractor says it and another when normalization does.
+        """
+        runtime = get_runtime()
+        _user_id, headers = _account(client)
+        context_id = _context(client, headers)
+        path = "/srv/does-not-need-to-exist/notes.md"
+
+        assert runtime.rag.ingest_text(
+            context_id, "the first generation body\n" * 20, source_path=path
+        ) > 0
+        assert "first generation" in " ".join(
+            c.content or "" for c in runtime.store.list_chunks(context_id, limit=200)
+        ), "the first generation was never indexed; the test proves nothing"
+
+        assert runtime.rag.ingest_text(context_id, "   \n\t\n  ", source_path=path) == 0
+        texts = " ".join(
+            c.content or "" for c in runtime.store.list_chunks(context_id, limit=200)
+        )
+        assert "first generation" not in texts, (
+            "an empty generation left the previous one standing as current"
+        )
+
+    def test_a_generation_the_extractor_refuses_still_replaces_the_last_one(
+        self, client
+    ):
+        """Same rule by the other route: `ingest_file` returns zero before it
+        ever reaches `ingest_text`, so the replacement has to happen there too.
+        """
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        context_id = _context(client, headers)
+        name = "notes.md"
+
+        self._upload(
+            client, headers, context_id, name,
+            b"# alpha\nthe first generation body\n" * 20,
+        )
+        assert "alpha" in " ".join(
+            c.content or "" for c in runtime.store.list_chunks(context_id, limit=200)
+        ), "the first generation was never indexed; the test proves nothing"
+
+        # Accepted by the upload endpoint (extension and MIME are fine) and
+        # refused by the shared extractor, which is what makes this the other
+        # zero-chunk path rather than a rejected upload.
+        self._upload(
+            client, headers, context_id, name,
+            b"\x00\x01\x02\x00\xff\xfe" * 400,
+        )
+
+        on_disk = (_files_dir(runtime, user_id) / name).read_bytes()
+        assert on_disk.startswith(b"\x00\x01"), "the binary generation is not on disk"
+        texts = " ".join(
+            c.content or "" for c in runtime.store.list_chunks(context_id, limit=200)
+        )
+        assert "alpha" not in texts, (
+            "an unreadable generation left the readable one indexed as current"
+        )
+
     def test_the_index_holds_only_the_current_generation(self, client):
         runtime = get_runtime()
         user_id, headers = _account(client)
@@ -282,4 +357,190 @@ class TestReingestingAPathReplacesItsChunks:
         texts = " ".join(c.content or "" for c in chunks)
         assert "alpha" not in texts, (
             "the index still describes a generation the file no longer has"
+        )
+
+
+class TestAConversationDescribesTheFileThatSurvived:
+    """Attachment metadata is model-visible state, and it was outside the lock.
+
+    §19.5 makes inline/searchable/analyzable part of how a conversation uses a
+    file, and the classification comes from the size. So the record is not
+    bookkeeping that can settle in any order: a 5KB `.md` is `inline` and the
+    same name at 20KB is `searchable`, and `read_inline_contents` opens the
+    file on disk using whichever classification the conversation ended up
+    holding.
+    """
+
+    def _conversation(self, client, headers) -> str:
+        resp = client.post(
+            "/v1/conversations", headers=headers, json={"title": _unique("conv")}
+        )
+        assert resp.status_code in (200, 201), resp.text
+        return resp.json()["data"]["id"]
+
+    def _attachments(self, runtime, conversation_id, user_id) -> list:
+        conv = runtime.store.get_conversation(conversation_id, user_id=user_id)
+        return list((conv.meta or {}).get("attachments") or [])
+
+    def _race(self, runtime, monkeypatch, jobs, *, gate: str):
+        """Run `jobs` with the first one paused at `gate`.
+
+        Two windows, so two gate points. `record` pauses before the record is
+        written at all, which is the gap between releasing the publication
+        lock and describing what was published. `merge` pauses *inside*
+        `record_attachment`, after it has read the attachment list and before
+        it writes the edited copy back — a different bug in the same line of
+        code, and one no file lock can reach because the state is in Postgres.
+
+        Neither is reachable by luck: the first request wins the sprint from
+        one to the next almost every time, which is what makes these races
+        that pass CI rather than races that do not exist.
+        """
+        from liminallm.api import routes
+
+        reached = threading.Event()
+        may_continue = threading.Event()
+        armed = {"on": True}
+
+        def pause():
+            if armed["on"]:
+                armed["on"] = False
+                reached.set()
+                may_continue.wait(20)
+
+        if gate == "record":
+            real_record = routes.record_attachment
+
+            def wrapper(*args, **kwargs):
+                pause()
+                return real_record(*args, **kwargs)
+
+            monkeypatch.setattr(routes, "record_attachment", wrapper)
+        else:
+            real_merge = runtime.store.merge_conversation_meta
+
+            def wrapper(*args, **kwargs):  # noqa: F811 - one name, two gates
+                pause()
+                return real_merge(*args, **kwargs)
+
+            monkeypatch.setattr(
+                runtime.store, "merge_conversation_meta", wrapper, raising=False
+            )
+
+        results: dict = {}
+        threads = [
+            threading.Thread(
+                target=lambda i=i, j=j: results.update({i: j()}), daemon=True
+            )
+            for i, j in enumerate(jobs)
+        ]
+        threads[0].start()
+        assert reached.wait(30), f"the first request never reached the {gate} gate"
+        for t in threads[1:]:
+            t.start()
+        time.sleep(1.0)
+        may_continue.set()
+        for t in threads:
+            t.join(60)
+        assert all(not t.is_alive() for t in threads), "a request hung"
+        return results
+
+    def test_the_recorded_size_is_the_size_of_the_file_on_disk(
+        self, client, monkeypatch
+    ):
+        """Small then large, concurrently. Whichever generation survives on
+        disk, the conversation must describe *that* one — a record written
+        after the lock was released can be the loser's."""
+        from liminallm.service.attachments import INLINE_MAX_BYTES
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        name = "notes.md"
+        small = b"s" * (INLINE_MAX_BYTES // 2)
+        large = b"l" * (INLINE_MAX_BYTES * 2)
+
+        def upload(body):
+            return lambda: client.post(
+                "/v1/files/upload",
+                headers={**headers, "Idempotency-Key": _unique("k")},
+                files={"file": (name, body, "text/markdown")},
+                data={"conversation_id": conversation_id},
+            )
+
+        # Small first: it pauses at its record, the large one then
+        # publishes fully, and the small one's record lands last.
+        results = self._race(
+            runtime, monkeypatch, [upload(small), upload(large)], gate="record"
+        )
+        for resp in results.values():
+            assert resp.status_code == 200, resp.text
+
+        on_disk = (_files_dir(runtime, user_id) / name).read_bytes()
+        records = [
+            a for a in self._attachments(runtime, conversation_id, user_id)
+            if a.get("name") == name
+        ]
+        assert len(records) == 1, records
+        record = records[0]
+        assert record["size"] == len(on_disk), (
+            f"the conversation says {record['size']} bytes; disk holds "
+            f"{len(on_disk)}"
+        )
+        assert record["inline"] is (len(on_disk) <= INLINE_MAX_BYTES), (
+            "the classification describes the generation that lost"
+        )
+
+    def test_concurrent_attachment_records_all_survive(self, client):
+        """The list is one JSON value holding every attachment.
+
+        Editing it means read, change one entry, write the whole thing back —
+        and two writers that both read before either wrote each store their
+        own copy, so one addition disappears. Driven straight at
+        `record_attachment` with a barrier rather than through the route,
+        because after the fix the read and the write are one transaction and
+        there is no longer a seam between them to pause at; what is left to
+        test is the property, under real contention.
+        """
+        from liminallm.service.attachments import record_attachment
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+
+        names = [f"file{i}.md" for i in range(8)]
+        start = threading.Barrier(len(names))
+        errors: list = []
+
+        def add(name: str):
+            try:
+                start.wait(30)
+                record_attachment(
+                    runtime.store,
+                    conversation_id=conversation_id,
+                    user_id=user_id,
+                    name=name,
+                    size=100,
+                    capabilities={"inline": True, "searchable": False,
+                                  "analyzable": False},
+                    chunk_count=None,
+                )
+            except Exception as exc:  # noqa: BLE001 - reported below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=add, args=(n,), daemon=True) for n in names]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(60)
+        assert not errors, errors
+        assert all(not t.is_alive() for t in threads), "a writer hung"
+
+        recorded = {
+            a.get("name")
+            for a in self._attachments(runtime, conversation_id, user_id)
+        }
+        assert recorded == set(names), (
+            f"records were lost to concurrent writers: missing "
+            f"{sorted(set(names) - recorded)}"
         )

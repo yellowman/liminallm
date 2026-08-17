@@ -2026,6 +2026,49 @@ class PostgresStore:
             return None
         return self.get_conversation(conversation_id)
 
+    def upsert_conversation_attachment(
+        self, conversation_id: str, *, user_id: str, record: dict
+    ) -> Optional[list]:
+        """Add or replace one attachment record, atomically. Owner-only.
+
+        The list is one JSON value holding every attachment, so editing it
+        outside a transaction is a read-modify-write on shared state: two
+        uploads that both read before either wrote each store their own copy,
+        and the later write erases the earlier addition. Measured with two
+        filenames uploaded at once, one record disappeared entirely.
+
+        `SELECT ... FOR UPDATE` takes the conversation row, so the second
+        writer reads what the first one committed rather than what it saw
+        before. A file lock could not have done this — the state is in
+        Postgres, and §22 has several replicas sharing exactly that.
+
+        Returns the resulting list, or None when the conversation is not this
+        user's.
+        """
+        now = datetime.now(timezone.utc)
+        name = record.get("name")
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT meta FROM conversation WHERE id = %s AND user_id = %s FOR UPDATE",
+                (conversation_id, user_id),
+            ).fetchone()
+            if not row:
+                return None
+            meta = dict(row["meta"] or {})
+            attachments = [
+                a
+                for a in (meta.get("attachments") or [])
+                if isinstance(a, dict) and a.get("name") != name
+            ]
+            attachments.append(record)
+            meta["attachments"] = attachments
+            conn.execute(
+                "UPDATE conversation SET meta = %s::jsonb, updated_at = %s "
+                "WHERE id = %s AND user_id = %s",
+                (json.dumps(meta), now, conversation_id, user_id),
+            )
+        return attachments
+
     def set_conversation_public(
         self, conversation_id: str, *, user_id: str, public: bool
     ) -> Optional[Conversation]:
@@ -3566,12 +3609,13 @@ class PostgresStore:
     ) -> int:
         """Persist a chunk's segment vectors, replacing any it already had.
 
-        The replace covers re-indexing one chunk — a backfill, a repair. It
-        does **not** make re-ingestion idempotent, and must not be read as
-        doing so: ``add_chunks`` always inserts fresh rows with new ids, and
-        nothing deletes a file's old chunks, so ingesting the same file twice
-        leaves two full generations of both chunks and segments. Fixing that
-        needs a delete-by-path on ingest, which does not exist yet.
+        The replace covers re-indexing one chunk — a backfill, a repair. It is
+        not what makes re-ingestion idempotent: ``add_chunks`` still inserts
+        fresh rows with new ids, so a caller that appends leaves two
+        generations of both chunks and segments. What a named path does
+        instead is ``replace_chunks_for_path``, which drops the path's previous
+        rows in the same transaction that writes its new ones; the segments go
+        with them, because a chunk's segments are keyed on the chunk id.
         """
         if not segments:
             return 0
