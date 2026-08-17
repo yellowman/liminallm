@@ -2187,7 +2187,12 @@ class WorkflowEngine(WorkflowStreamingMixin):
             scratch=self._worker_scratch(invocation),
         )
         try:
-            return broker.serve(handle.conn, invocation, is_alive=handle.is_alive)
+            return broker.serve(
+                handle.conn,
+                invocation,
+                is_alive=handle.is_alive,
+                budget=handle.budget,
+            )
         finally:
             handle.terminate()
             invocation.resources.forget_child(handle.pid or 0)

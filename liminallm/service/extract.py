@@ -109,6 +109,17 @@ OCR_MIN_CHARS = 24
 # Scanned PDFs: how many page images to read before stopping.
 MAX_SCANNED_PAGES = 10
 
+# What the child may answer with. Two terms, each a budget that already
+# exists: the text, which no reader inflates past MAX_DOC_XML_BYTES, and up to
+# MAX_SCANNED_PAGES images of at most MAX_IMAGE_BYTES, base64 costing four
+# bytes for every three. The image term dominates and is meant to — SPEC
+# §19.5 puts the vision pass in the parent, so those bytes crossing the pipe
+# is the architecture, not a leak. What this stops is the other thing: a
+# compromised parser answering with everything its 1GB rlimit allows.
+EXTRACT_RESULT_BYTES = (
+    MAX_DOC_XML_BYTES + MAX_SCANNED_PAGES * (MAX_IMAGE_BYTES * 4 // 3) + 1024 * 1024
+)
+
 _NO_READER_REMEDY = (
     "install tesseract (pip install 'liminallm[ocr]' plus the tesseract-ocr "
     "package) or configure a multimodal model backend"
@@ -233,7 +244,16 @@ def _image_bytes_to_text(
             return text, name
         if scraps is None:
             scraps = (text, name)
-    if pending is not None and len(pending) < MAX_SCANNED_PAGES:
+    # MAX_IMAGE_BYTES is the parent's data-URL ceiling, so an image over it has
+    # no vision pass waiting for it and parking it only buys a bigger frame.
+    # The two paths that read an image from a file already check it; a
+    # rasterized pdf page did not, and pdftoppm writes up to the child's whole
+    # RLIMIT_FSIZE.
+    if (
+        pending is not None
+        and len(pending) < MAX_SCANNED_PAGES
+        and len(image_bytes) <= MAX_IMAGE_BYTES
+    ):
         import base64
 
         # Scraps ride along so the parent can fall back to them if vision
@@ -612,6 +632,11 @@ def extract_text(
                 max_file_size_mb=EXTRACT_FILE_SIZE_MB,
             ),
             timeout=EXTRACT_WALL_SECONDS,
+            max_result_bytes=EXTRACT_RESULT_BYTES,
+            # `.reason` is what the caller shows the user, and rag ingest
+            # skips a file on it rather than failing the batch, so the
+            # distinction from a sandbox failure has to survive the wire.
+            error_types={"ExtractError": ExtractError},
         )
     except ExtractError:
         raise

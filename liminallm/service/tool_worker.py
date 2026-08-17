@@ -82,15 +82,26 @@ class BrokerClient:
 
     def call(self, capability: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Ask for a capability. Raises `BrokerRefused` when it is refused."""
+        from liminallm.service.wire import recv_frame, send_frame
+
         self._seq += 1
-        self._conn.send(
-            {"operation_seq": self._seq, "capability": capability, "payload": payload}
+        # Neither direction is capped here, for opposite reasons. Outbound,
+        # the broker's `FrameBudget` is the cap that counts and it grows as
+        # the broker answers; a second copy of it in this process would drift
+        # from the real one and refuse frames the broker would have taken.
+        # Inbound, the broker is the trusted end — a cap here would defend a
+        # disposable rlimited process against its own parent.
+        send_frame(
+            self._conn,
+            {"operation_seq": self._seq, "capability": capability, "payload": payload},
+            max_bytes=None,
         )
-        reply = self._conn.recv()
-        if not isinstance(reply, dict) or not reply.get("ok"):
-            code = (reply or {}).get("code", "failed")
-            raise BrokerRefused(code, str((reply or {}).get("error") or capability))
-        return reply.get("result") or {}
+        reply = recv_frame(self._conn, max_bytes=None)
+        if not reply.get("ok"):
+            code = reply.get("code", "failed")
+            raise BrokerRefused(str(code), str(reply.get("error") or capability))
+        result = reply.get("result")
+        return result if isinstance(result, dict) else {}
 
 
 class WorkerLimitsUnavailable(RuntimeError):
@@ -197,7 +208,14 @@ def _worker_main(
     use. Until the parent has seen a pgid equal to this pid, this process is
     still in the *parent's* group, and a `killpg` aimed at it would take down
     the API server. The parent kills by single pid until READY arrives.
+
+    Everything this process says is JSON (service/wire.py). SPEC §18 names it
+    the untrusted half of the boundary, and a pickle would have let it choose
+    which class the *broker* constructs while decoding — before the broker
+    could check anything about the message.
     """
+    from liminallm.service.wire import WireError, send_frame
+
     try:
         os.setsid()
     except (AttributeError, OSError):
@@ -206,8 +224,8 @@ def _worker_main(
         # single pid — the group shortcut is lost, nothing else is.
         pass
     try:
-        conn.send({"ready": True, "pid": os.getpid(), "pgid": os.getpgid(0)})
-    except (BrokenPipeError, OSError):
+        send_frame(conn, {"ready": True, "pid": os.getpid(), "pgid": os.getpgid(0)})
+    except (BrokenPipeError, OSError, WireError):
         return
 
     result: Optional[Dict[str, Any]] = None
@@ -252,7 +270,26 @@ def _worker_main(
                 "error": f"{type(exc).__name__}: {exc}",
             }
     try:
-        conn.send({"done": True, "result": result})
+        send_frame(conn, {"done": True, "result": result}, max_bytes=None)
+    except WireError as exc:
+        # Not representable as data — a body returned an object. Say so in a
+        # frame that is, rather than letting the broker read a silence it
+        # would report as a dead worker.
+        try:
+            send_frame(
+                conn,
+                {
+                    "done": True,
+                    "result": {
+                        "status": "error",
+                        "content": f"the tool produced a result it could not return: {exc}",
+                        "error": "result_unreturnable",
+                    },
+                },
+                max_bytes=None,
+            )
+        except (BrokenPipeError, OSError, WireError):
+            pass
     except (BrokenPipeError, OSError):
         pass
     finally:
@@ -467,13 +504,52 @@ BODY_NAMES = frozenset(_BODIES)
 # ---------------------------------------------------------------------------
 
 
+#: Headroom on top of what the parent has handed the worker, for one model
+#: turn and the structure around it. Everything a body returns is made of
+#: bytes the parent supplied — the plan, then each broker reply — so the
+#: parent's own outbound total is the natural budget, and this is what it does
+#: not account for: MAX_GENERATION_TOKENS of new text, plus keys and nesting.
+WORKER_FRAME_ALLOWANCE_BYTES = 1024 * 1024
+
+
+class FrameBudget:
+    """What the worker may say, measured in what it has been told.
+
+    A worker is a spawned process with a memory rlimit of its own, and without
+    a cap it can spend all of that inside the API process by answering with it.
+    A fixed cap would be a guess about conversation sizes; this is not a guess.
+    The agent loop returns the conversation it was given plus the broker's
+    replies, so the parent grants exactly its own outbound bytes and an
+    allowance for the model's new text.
+
+    Parent-side only. The worker holds no copy: two caps on one frame is two
+    numbers to keep in step, and the child's would drift below the real one as
+    the broker answered, refusing frames the broker would have taken.
+    """
+
+    def __init__(self, initial: int) -> None:
+        self._allowed = max(0, initial) + WORKER_FRAME_ALLOWANCE_BYTES
+
+    def credit(self, sent: int) -> None:
+        """Record bytes handed to the worker; it may hand them back."""
+        self._allowed += max(0, sent)
+
+    @property
+    def limit(self) -> int:
+        return self._allowed
+
+
 class WorkerHandle:
     """The parent's grip on one worker process."""
 
-    def __init__(self, process: Any, conn: Any, attempt: Attempt) -> None:
+    def __init__(
+        self, process: Any, conn: Any, attempt: Attempt, budget: FrameBudget
+    ) -> None:
         self._process = process
         self.conn = conn
         self.attempt = attempt
+        #: How large a frame this worker may send, grown as the broker answers.
+        self.budget = budget
 
     @property
     def pid(self) -> Optional[int]:
@@ -532,6 +608,7 @@ def spawn(
     # fresh interpreter holding none of the parent's handles is the boundary.
     ctx = multiprocessing.get_context("spawn")
     parent_conn, child_conn = ctx.Pipe(duplex=True)
+    budget = FrameBudget(_plan_bytes(plan))
     process = ctx.Process(
         target=_worker_main,
         args=(child_conn, tool, plan, limits or {}, scratch),
@@ -540,7 +617,7 @@ def spawn(
     process.start()
     child_conn.close()
     attempt.pid = process.pid
-    handle = WorkerHandle(process, parent_conn, attempt)
+    handle = WorkerHandle(process, parent_conn, attempt, budget)
     reap = lambda: process.join(_JOIN_TIMEOUT_SECONDS)  # noqa: E731
     invocation.resources.add_child(
         process.pid or 0, f"worker:{tool}", group=False, reap=reap
@@ -561,6 +638,14 @@ def spawn(
     return handle
 
 
+def _plan_bytes(plan: Dict[str, Any]) -> int:
+    """How much the parent is handing this worker, as encoded bytes."""
+    try:
+        return len(json.dumps(plan, default=str).encode("utf-8"))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _await_ready(conn: Any, process: Any) -> bool:
     """Whether the child has proved it leads a process group of its own.
 
@@ -569,14 +654,16 @@ def _await_ready(conn: Any, process: Any) -> bool:
     of those means the same thing here: keep killing by single pid, because a
     group kill would reach processes this worker does not own.
     """
+    from liminallm.service.wire import ERROR_FRAME_BYTES, WireError, recv_frame
+
     deadline = time.monotonic() + _READY_TIMEOUT_SECONDS
     while time.monotonic() < deadline:
         if conn.poll(_READY_POLL_SECONDS):
             try:
-                message = conn.recv()
-            except (EOFError, OSError):
+                message = recv_frame(conn, max_bytes=ERROR_FRAME_BYTES)
+            except (EOFError, OSError, WireError):
                 return False
-            if not isinstance(message, dict) or not message.get("ready"):
+            if not message.get("ready"):
                 return False
             pgid, pid = message.get("pgid"), message.get("pid")
             # The pgid must be the child's own pid. Anything else is a group it

@@ -961,6 +961,8 @@ class TestTheWorkerIsActuallyConfined:
     def test_a_worker_with_no_scratch_runs_nothing(self):
         """The conditional form of this check would be the defect stated as a
         default argument, so there is no conditional form."""
+        from liminallm.service.wire import recv_frame
+
         ctx = multiprocessing.get_context("spawn")
         parent_conn, child_conn = ctx.Pipe(duplex=True)
         proc = ctx.Process(
@@ -972,7 +974,7 @@ class TestTheWorkerIsActuallyConfined:
         child_conn.close()
         seen = []
         while parent_conn.poll(60):
-            seen.append(parent_conn.recv())
+            seen.append(recv_frame(parent_conn, max_bytes=None))
             if seen[-1].get("done"):
                 break
         proc.join(10)
@@ -998,21 +1000,29 @@ class TestTheWorkerIsActuallyConfined:
     def test_a_refused_rlimit_stops_the_body(self, monkeypatch, tmp_path):
         """And the body never reaches its first broker request.
 
-        Run in-process against a stand-in pipe: a spawned child cannot see a
+        Run in-process against a real pipe: a spawned child cannot see a
         monkeypatch, and the property under test is the ordering inside
         `_worker_main`, not the spawn. A wall-clock kill is not a substitute
         for an address-space cap — it stops a slow worker, not one that
         allocates 40GB in a second.
+
+        The send half is a real connection, so the frames asserted on are the
+        ones the real codec produced; only the receive half is replaced, and
+        only so that a body which reached the broker fails loudly instead of
+        blocking on a reply nobody is going to send.
         """
         import resource
 
-        sent: list = []
+        from liminallm.service.wire import recv_frame
 
-        class _Conn:
-            def send(self, message):
-                sent.append(message)
+        ctx = multiprocessing.get_context("spawn")
+        parent_conn, child_conn = ctx.Pipe(duplex=True)
 
-            def recv(self):  # pragma: no cover - reached only if the body runs
+        class _SendOnly:
+            def send_bytes(self, raw):
+                child_conn.send_bytes(raw)
+
+            def recv_bytes(self, maxlength=None):  # pragma: no cover - see above
                 raise AssertionError("the body asked the broker for a capability")
 
             def close(self):
@@ -1025,9 +1035,15 @@ class TestTheWorkerIsActuallyConfined:
             lambda which, value: (_ for _ in ()).throw(OSError(1, "refused")),
         )
         tool_worker._worker_main(
-            _Conn(), "web.fetch_v1", {"inputs": {"url": "http://x.invalid"}},
+            _SendOnly(), "web.fetch_v1", {"inputs": {"url": "http://x.invalid"}},
             {"memory_bytes": 1024}, str(tmp_path),
         )
+        child_conn.close()
+        sent = []
+        while parent_conn.poll(1):
+            sent.append(recv_frame(parent_conn, max_bytes=None))
+            if sent[-1].get("done"):
+                break
         done = [m for m in sent if m.get("done")]
         assert done, sent
         assert done[0]["result"]["error"] == "worker_unconfined", done

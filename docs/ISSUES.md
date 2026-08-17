@@ -7478,3 +7478,98 @@ one it names.
 The extraction child sharing the service UID is an acknowledged §19.5/§21.2
 limit, not a defect, so it is left alone. The `dest_path.exists()`-then-extract
 shape in the route is a check/use race and belongs to 2E.
+
+## Tranche 2D.0–2D.2: the IPC decoder was the hole
+
+Two boundaries in this codebase declare the child hostile. SPEC §18 makes the
+tool worker the untrusted half of the broker boundary; §19.5 puts parsers in a
+disposable child because "assume the parsers are compromisable". Both spoke
+`multiprocessing.Connection.send()` / `recv()`, and `recv()` unpickles.
+
+### BLOCKER: an untrusted child could make the parent unpickle arbitrary objects
+
+Unpickling runs `__reduce__`, so the dangerous operation happens **in the
+parent**, while it is decoding, before any check the parent might make. No
+exploit is needed — only the ability to return an object.
+
+Measured before changing anything, with a sandbox child returning an object
+whose `__reduce__` names a callback:
+
+```
+AssertionError: the payload executed in pid 4366 (this process is 4366)
+```
+
+The pid the payload ran in is the pid of the API process. Both channels failed
+it: the sandbox's result channel and the sandbox's *error* channel, which sent
+exceptions as objects precisely so callers could catch their own types.
+
+`service/wire.py` replaces both with JSON over `send_bytes`/`recv_bytes` — a
+grammar with no callable in it and no way to name a type. Errors cross as
+`{type, message}`. The type is a **name**, and the receiver decides what a name
+may become, from a vocabulary the receiver owns: a fixed set of builtins plus
+whatever the caller passes as `error_types`. Nothing is imported, resolved or
+constructed from the child's string. `ExtractError` and `ArchiveExtractionError`
+still reach their callers as themselves, because their callers translate them —
+`rag.ingest_file` skips a file on `.reason` rather than failing the batch.
+
+Frames are bounded, and every bound is derived rather than picked:
+
+- **extraction** — `MAX_DOC_XML_BYTES` for the text (no reader inflates past
+  it) plus `MAX_SCANNED_PAGES` images of at most `MAX_IMAGE_BYTES`, base64 at
+  four bytes for three. The image term dominates and is meant to: §19.5 puts
+  the vision pass in the parent, so those bytes crossing is the architecture.
+- **archive** — one bounded record per entry, times the entry cap.
+- **interpreter** — two streams of `MAX_OUTPUT_CHARS` plus `MAX_ARTIFACTS`.
+- **worker** — what the parent has itself handed over. Everything a body
+  returns is made of the plan plus the broker's replies, so the parent grants
+  its own outbound total (`FrameBudget`) and an allowance for the model's new
+  text. Not a guess about conversation sizes.
+
+Two of those bounds needed the code to hold to them before they were bounds.
+An archive skip record quoted the raw member name, which nothing capped; and a
+rasterized PDF page was queued for the parent's vision pass at up to the
+child's whole `RLIMIT_FSIZE`, though `MAX_IMAGE_BYTES` is the parent's own
+data-URL ceiling and an image above it has no vision pass waiting for it.
+
+Mutation testing found something worth writing down. Reverting the child's
+half of the sandbox codec left the tests green, because the parent's
+`recv_bytes` reads a pickle's *bytes* without running them — the property
+lives in the decoder, and the sender's cooperation is a courtesy that yields a
+clearer message. The same held for the size cap: either end alone refuses an
+oversized result. Both are deliberate, and the mutations now revert both ends
+so the reds mean what they claim. The broker channel is the case that proves
+it matters: its red comes from a worker writing raw bytes past the codec
+entirely, which only the parent's cap stops.
+
+### HIGH: the shared sandbox's rlimits failed open
+
+`apply_resource_limits` caught every `setrlimit` failure, logged it, and
+recorded the result in a dict — which its only caller ignored. A refused cap
+therefore read as success and untrusted code ran unbounded. Reporting a
+failure to a caller that does not check is the same as not detecting it.
+
+Memory, CPU and file size now raise `SandboxError`; those three are what
+"resource-limited child" means. Core-dump suppression stays best-effort, and
+the reason is stated in the code: a core dump is a disk and disclosure
+concern, not a bound on what the child can consume.
+
+### HIGH: the wall-clock kill reached one pid, not the job
+
+§19.5's parsers spawn grandchildren — `pdftoppm`, tesseract — which are not
+the API process's children and outlive the child that started them. The
+timeout killed `proc` and reaped it, and the grandchild ran on.
+
+The child now `setsid`s and announces itself before doing any work, and
+teardown kills the group first and reaps second — in that order, because a
+group stops naming anything once its leader has been reaped and its pid
+recycled. The handshake is what makes the group safe to signal at all:
+`Process.start()` returns before the child has run a line, so a `killpg` in
+that window reaches the group the child was *born* into, which is the server's.
+Same defect existed on the revocation path, where the sandbox child was
+registered with `group=False`; it is registered as a group leader now, and
+`ResourceRegistry._kill` re-checks that the target leads the group before
+signalling one.
+
+The handshake shares the caller's deadline rather than getting one of its own,
+which is what `timeout` has always meant here: the single `poll(wall_timeout)`
+it replaced already covered start-up.

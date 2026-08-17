@@ -49,6 +49,8 @@ from liminallm.service.invocation import (
     payload_hash,
 )
 from liminallm.service.sandbox import tool_network_guard
+from liminallm.service.tool_worker import FrameBudget
+from liminallm.service.wire import WireError, recv_frame, send_frame
 
 logger = get_logger(__name__)
 
@@ -141,7 +143,12 @@ class CapabilityBroker:
     # -- the loop ---------------------------------------------------------
 
     def serve(
-        self, conn: Any, invocation: Invocation, *, is_alive: Callable[[], bool]
+        self,
+        conn: Any,
+        invocation: Invocation,
+        *,
+        is_alive: Callable[[], bool],
+        budget: Optional[FrameBudget] = None,
     ) -> Dict[str, Any]:
         """Answer this worker until it finishes, dies, or is revoked.
 
@@ -155,7 +162,16 @@ class CapabilityBroker:
         ones through the engine, and binding here is what lets `LeasedProxy`
         check every call they make — reads included — without each handler
         having to remember.
+
+        **What arrives here is decoded as data, never as objects.** SPEC §18
+        designates the worker untrusted, and `Connection.recv()` unpickles: a
+        worker that had been talked into anything could hand back an object
+        whose *deserialization* ran its payload, in this process, inside this
+        loop, before the liveness check below. That is not a check that was
+        missing — the decoder was the hole. Frames are JSON, bounded by what
+        this loop has itself sent (`FrameBudget`).
         """
+        budget = budget or FrameBudget(0)
         with current_invocation(invocation):
             while True:
                 if invocation.revoked:
@@ -173,19 +189,43 @@ class CapabilityBroker:
                         }
                     continue
                 try:
-                    message = conn.recv()
-                except (EOFError, OSError):
+                    message = recv_frame(conn, max_bytes=budget.limit)
+                except (EOFError, OSError) as exc:
                     return {
                         "status": "error",
-                        "content": "tool worker closed the channel",
+                        "content": f"tool worker closed the channel: {exc}",
                         "error": "worker_died",
                     }
-                if not isinstance(message, dict):
-                    continue
+                except WireError as exc:
+                    # Oversized or not data. The pipe is unusable after an
+                    # over-length frame, and a worker that sent one has
+                    # nothing further to say that this process would believe.
+                    logger.warning(
+                        "worker_frame_rejected",
+                        invocation_id=invocation.invocation_id,
+                        error=str(exc),
+                    )
+                    return {
+                        "status": "error",
+                        "content": f"the tool worker sent something unreadable: {exc}",
+                        "error": "worker_protocol",
+                    }
                 if message.get("done"):
-                    return message.get("result") or {}
+                    result = message.get("result")
+                    return result if isinstance(result, dict) else {}
                 try:
-                    conn.send(self._answer(invocation, message))
+                    budget.credit(send_frame(conn, self._answer(invocation, message)))
+                except WireError as exc:
+                    logger.error(
+                        "capability_reply_unsendable",
+                        invocation_id=invocation.invocation_id,
+                        error=str(exc),
+                    )
+                    return {
+                        "status": "error",
+                        "content": "a capability produced a reply that could not be sent",
+                        "error": "broker_protocol",
+                    }
                 except (BrokenPipeError, OSError):
                     return {
                         "status": "error",

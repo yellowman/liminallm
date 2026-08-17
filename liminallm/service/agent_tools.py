@@ -244,7 +244,16 @@ def _register_child(
     """
 
     def register(pid: int, reap: Callable[[], None]) -> Callable[[], None]:
-        invocation.resources.add_child(pid, "sandbox:run_python", reap=reap)
+        # `group=True` because the sandbox child leads its own group: it
+        # `setsid`s before it runs anything, so one killpg reaches whatever
+        # the model's code went on to spawn. Killing the pid alone left those
+        # behind, which is the same defect on the revocation path that the
+        # wall-clock kill had on the timeout path. Registration happens before
+        # the child has reached its `setsid`, so the registry re-checks that
+        # the target leads the group before it signals one.
+        invocation.resources.add_child(
+            pid, "sandbox:run_python", group=True, reap=reap
+        )
         return lambda: invocation.resources.forget_child(pid)
 
     return register

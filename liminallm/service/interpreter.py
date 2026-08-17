@@ -50,6 +50,14 @@ MAX_WORKDIR_BYTES = 64 * 1024 * 1024
 MAX_ARTIFACTS = 10
 MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
 
+# What the child may answer with, derived from what it is allowed to produce:
+# two streams of MAX_OUTPUT_CHARS, plus MAX_ARTIFACTS names. JSON escapes at
+# worst six bytes per character, so 2 * 8_000 * 6 is ~94KB of output and ten
+# 255-char names are ~15KB. The rest is headroom for keys and structure.
+# Without a cap the code the model wrote decides how much the API process
+# allocates, which is the one thing the child process boundary exists to stop.
+_RESULT_BYTES = 128 * 1024
+
 # Modules that would give the code a network or a new process.
 _BLOCKED_MODULES = frozenset({
     "socket", "ssl", "subprocess", "multiprocessing", "asyncio", "ctypes",
@@ -286,6 +294,7 @@ def run_python_sandboxed(
             config=config,
             timeout=timeout,
             on_child=on_child,
+            max_result_bytes=_RESULT_BYTES,
         )
     except SandboxError as exc:
         return {
