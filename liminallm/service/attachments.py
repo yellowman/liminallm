@@ -21,6 +21,7 @@ or migration is needed.
 """
 from __future__ import annotations
 
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -125,6 +126,56 @@ def list_attachments(conversation: Any) -> list[dict[str, Any]]:
     return [a for a in items if isinstance(a, dict)] if isinstance(items, list) else []
 
 
+def resolve_attachment(
+    fs_root: str, user_id: str, record: dict[str, Any]
+) -> Optional[Path]:
+    """The path holding the bytes this record describes, or None.
+
+    An attachment record names a file, and the file is a moving target: it
+    lives at `/users/{u}/files/{name}`, which any later upload of that name
+    replaces. Every consumer resolved the name and read whatever was there,
+    so one conversation could be served the bytes another conversation
+    attached — and §19.5 scopes an attachment to the chat that received it.
+    Deleting the file and creating the name again later is the same thing
+    with a gap in the middle.
+
+    So the record carries the checksum of what was attached, and a path whose
+    contents no longer match it is not this attachment. Size is checked
+    first, which settles the ordinary case without reading anything.
+
+    What this gives is the safety half: an attachment never resolves to
+    bytes that are not the ones attached. Keeping the attached generation
+    *available* after the path moves needs somewhere to keep it, which is a
+    storage decision this does not make. Records written before checksums
+    were kept have nothing to compare, so they resolve as before.
+    """
+    path = attachment_path(fs_root, user_id, record.get("name") or "")
+    if not path or not path.is_file():
+        return None
+    expected = record.get("checksum")
+    if not expected:
+        return path
+    try:
+        if path.stat().st_size != record.get("size"):
+            return None
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+    return path if digest == expected else None
+
+
+def resolved_names(
+    records: list[dict[str, Any]], *, fs_root: str, user_id: str
+) -> list[str]:
+    """The names whose bytes are still the ones that were attached."""
+    return [
+        str(record.get("name"))
+        for record in records
+        if record.get("name")
+        and resolve_attachment(fs_root, user_id, record) is not None
+    ]
+
+
 def record_attachment(
     store,
     *,
@@ -134,6 +185,7 @@ def record_attachment(
     size: int,
     capabilities: dict[str, Any],
     chunk_count: Optional[int] = None,
+    checksum: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """Add (or replace) an attachment record on the conversation.
 
@@ -145,6 +197,9 @@ def record_attachment(
     record = {
         "name": name,
         "size": size,
+        # Which bytes these are, not just which name they had. The name is
+        # shared with every later upload of it; this is not.
+        "checksum": checksum,
         "inline": bool(capabilities.get("inline")),
         "searchable": bool(capabilities.get("searchable")),
         "analyzable": bool(capabilities.get("analyzable")),
@@ -174,8 +229,8 @@ def read_inline_contents(
     for att in attachments:
         if not att.get("inline") or remaining <= 0:
             continue
-        path = attachment_path(fs_root, user_id, att.get("name") or "")
-        if not path or not path.is_file():
+        path = resolve_attachment(fs_root, user_id, att)
+        if path is None:
             continue
         try:
             text = path.read_text(encoding="utf-8", errors="replace")
@@ -214,8 +269,16 @@ def describe_attachments(
         how = []
         if att.get("inline"):
             index = (numbering or {}).get(att.get("name"))
+            # No number means the file was not inlined, and the only reason
+            # it would not be is that it no longer holds the bytes that were
+            # attached. Saying "full text included below" then promises the
+            # model text that is not there, and a reader that cannot find
+            # what it was told to expect is worse off than one told plainly
+            # that the file is gone.
             how.append(
-                f"quoted below as [file {index}]" if index else "full text included below"
+                f"quoted below as [file {index}]"
+                if index
+                else "unavailable: replaced or removed since it was attached"
             )
         if att.get("searchable"):
             how.append("searchable via file_search")

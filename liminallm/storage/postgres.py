@@ -3600,6 +3600,36 @@ class PostgresStore:
             raise ConstraintViolation("context not found", {"context_id": context_id})
         return deleted_generation
 
+    def delete_chunks_under_path(self, owner_user_id: str, fs_path: str) -> int:
+        """Drop everything this user's contexts say about `fs_path` or its tree.
+
+        A chunk's ``fs_path`` claims to be the contents of that path, and the
+        claim is about the path's current bytes — nothing in the row records
+        which generation it came from. So when the path stops existing the
+        claim has to stop with it, or a deleted file stays retrievable through
+        any conversation grounded in a context that indexed it.
+
+        Scoped by owner rather than by context, because neither of the two
+        ways a path gets indexed leaves the route a list to work from: the
+        same file uploaded to a second context is ingested again, and an
+        extracted tree's members are recorded nowhere. Ownership covers both,
+        and covers nothing else.
+
+        The prefix match ends at a separator, so deleting ``bundle`` does not
+        take ``bundle2.md``. ``LIKE`` is avoided rather than escaped, since
+        ``_`` and ``%`` are wildcards a filename may legitimately contain.
+        Segment vectors go with their chunks by cascade.
+        """
+        prefix = fs_path.rstrip("/") + "/"
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM knowledge_chunk kc USING knowledge_context ctx "
+                "WHERE kc.context_id = ctx.id AND ctx.owner_user_id = %s "
+                "AND (kc.fs_path = %s OR left(kc.fs_path, %s) = %s)",
+                (owner_user_id, fs_path, len(prefix), prefix),
+            )
+            return cursor.rowcount or 0
+
     def add_chunk_vectors(
         self,
         chunk_id: int,

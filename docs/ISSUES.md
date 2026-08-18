@@ -8264,3 +8264,251 @@ headers and before the file is opened. It does not: the app wraps five
 so the inner response is already past that point when the outermost `send` is
 called — measured, the `FileResponse` revert survived that hook and was
 killed only once the window was held inside the route.
+
+## Tranche 2E.4: one path, one generation, all consumers
+
+A chunk whose `fs_path` is P claims to be the contents of P. Nothing in the
+row records which generation of P it came from, so the claim is about P now.
+`RAGService._commit_generation` already states that contract for its own
+writes; the rest of the system did not keep it.
+
+All six findings are addressed below. One of them — keeping a conversation's
+attachment *available* after its pathname moves — is closed only to the
+extent that it is safe to close without deciding where a generation is kept,
+and that remainder is recorded at the end.
+
+### HIGH: a deleted file stayed retrievable
+
+Deletion removed the bytes and the manifest entry. The chunks stayed, so a
+grounded conversation still answered with the contents of a file the user had
+deleted. The deletion did not happen; it became invisible in the file
+listing.
+
+`delete_chunks_under_path(owner_user_id, fs_path)` removes the path's rows
+and everything under it, across every context the caller owns. Scoped by
+owner rather than by context, because neither way a path gets indexed leaves
+the route a list to work from: the same file uploaded to a second context is
+ingested again, and an extracted tree's members are recorded nowhere. Segment
+vectors go with their chunks by cascade.
+
+The prefix match ends at a separator, so deleting `bundle` does not take
+`bundle2.md`. `LIKE` is avoided rather than escaped, because `_` and `%` are
+wildcards a filename may legitimately contain.
+
+Four mutations, four tests:
+
+| Reverted | Test that fails |
+| --- | --- |
+| no index cleanup | a deleted file is described by no context |
+| prefix without the separator | a sibling sharing the prefix is left alone |
+| owner predicate removed | the cleanup never reaches another owner's context |
+| pathname removed first | a failed index cleanup leaves everything in place |
+
+The owner predicate needed a test written against the store rather than the
+routes, and finding that out cost a wrong mutation first. The route-level
+version — two accounts, one filename, one of them deletes — passes either
+way, because every account's files live under its own directory and the two
+absolute paths already differ. The predicate decides nothing there. It
+decides when two contexts describe one absolute path, which is the shape a
+shared corpus would produce, so that is what the test builds.
+
+### The order inside the lock
+
+No transaction spans Postgres and the filesystem, so one half can be left
+behind. The halves are not equally bad. Removing the pathname first leaves
+"the file is gone, its contents are still retrievable, and the request
+failed" — the user is told the deletion did not happen while the thing they
+wanted deleted is still readable. Doing the durable work first leaves
+"nothing was deleted and the request failed", which the user can act on.
+
+So: namespace lock, index cleanup, manifest, and the unlink last.
+
+### HIGH: a context source could commit a stale generation
+
+`POST /contexts/{id}/sources` reads a path and commits what it read, and took
+part in none of the serialization the other writers of that pathname use.
+Measured, with the source request paused between reading and committing and a
+real upload of new bytes completing in the window:
+
+```
+disk      the upload's generation
+manifest  the upload's generation
+chunks    what the source had read
+```
+
+Both requests returned success, and no serial ordering produces it.
+
+Ingestion now runs in a thread — it was blocking the event loop anyway — and,
+for a path inside the caller's own files, under the same top-level namespace
+lock every other writer of those names takes. Only for the caller's own
+files: a shared corpus may have writers outside this application, and a lock
+no one else holds would only look like protection. That remains the recorded
+hardening question, unchanged.
+
+### HIGH: the checksum manifest failed open
+
+Upload caught every exception around its manifest write, logged a warning and
+returned 200. That reopens the false-dedupe history 2E.1 closed, from the
+other end: the manifest keeps naming the previous checksum and the previous
+context set, so re-uploading those previous bytes matches a record no file
+has — no write, no ingest, and a 200 over a file that still holds something
+else. Measured end to end, including the repair: the failed request is
+retried under the same idempotency key, which re-runs the publication and
+fixes the record.
+
+The same shape existed in the delete route's manifest edit, and both are
+gone.
+
+The read side needed a distinction rather than a removal. A read failure was
+swallowed and the manifest treated as empty, and the write that follows
+rebuilds the whole object from that empty copy — so one transient read error
+dropped every other name's entry. Corruption is different from a failure to
+find out: invalid JSON still reads as empty, because rebuilding is the
+recovery, and only `ValueError` counts as corrupt. `UnicodeDecodeError` is a
+`ValueError`, so binary rubbish counts too.
+
+### MEDIUM: an artifact was visible before it was complete
+
+`publish_artifacts` claimed the visible name with `O_CREAT|O_EXCL` and then
+filled it. The claim is atomic, which is what stops two producers taking one
+name and what stops an artifact replacing an upload — and it also makes the
+name appear before the bytes do. Measured, a reader found 65536 bytes of an
+artifact that was 300000; and a copy that failed partway left the truncated
+remains behind under a name the tool reported publishing nothing about.
+
+The artifact is now filled under a hidden `.{hex}.part` name and given a
+visible one with `os.link`, which refuses a name that exists. The no-clobber
+rule is unchanged and still needs no lock. Briefly the file has two links,
+until the staging name is removed; a context-source ingestion walking the
+directory in that instant skips it, because `_within_source` refuses a linked
+file. That is a skipped file in one scan, not a wrong answer.
+
+### One 2E.3 test had to change its assertion
+
+`test_a_delete_cannot_land_between_extraction_and_ingestion` asserted that
+the extraction's chunks were still in the index afterwards. That was only
+true because deletion left chunks behind. It now asserts the count the
+extraction committed, which is what the test was always about: `ingest_path`
+returns the count it managed rather than failing, so a tree removed mid-walk
+reports success over a partial count.
+
+The 2E.1 delete-inside-an-upload test reported the index state without
+asserting on it, for the same reason. It asserts on it now: all three records
+describe one outcome, or none of them do.
+
+### HIGH: a replaced path left an older generation in another context
+
+No race. Two ordinary uploads, one after the other:
+
+```
+upload report.md = A into C1     C1 = A
+upload report.md = B into C2     C2 = B, disk = B, manifest = B
+                                 C1 = A
+```
+
+Upload already stops *recording* the previous contexts — the manifest's
+context set starts empty when the checksum changes — and left their chunks
+in place. That is the record forgetting them while the index does not, and
+C1 goes on answering with text the file has not held since. The simplest
+form needs only one context: replacing the bytes while naming no context at
+all leaves the first one describing the first generation.
+
+Those contexts are emptied for that path now. Emptied rather than refreshed,
+for the reason `_commit_generation` already gives for its own writes: these
+chunks claim to be the contents of this path, so once new bytes exist the
+claim is false, and "this path has nothing to say" is an answer about the
+current bytes. Re-ingesting into contexts the request never named would
+spend an unbounded amount of work inside the publication lock and put
+content where it was not asked for. If that trade should go the other way,
+it is a policy choice and this is the line to change.
+
+A dedupe hit is not a replacement, and has its own test: uploading identical
+bytes again changes nothing, so nothing the other contexts say has stopped
+being true.
+
+A conversation's implicit context is skipped, and that has a test and a
+mutation of its own. §19.5 scopes an attachment to the chat that received
+it, so removing its chunks would be one chat changing another chat's state
+just as much as replacing them would. `is_auto_context` is the discriminator
+and it already existed.
+
+### HIGH: an attachment was identified by a mutable basename
+
+An attachment record named a file, and the file was a moving target.
+`/users/{u}/files/{name}` is what every consumer resolved, so:
+
+```
+chat A attaches notes.md = ALPHA
+chat B attaches notes.md = BRAVO      (the global path now holds BRAVO)
+
+chat A's inline reader  -> BRAVO
+chat A's run_python     -> BRAVO
+chat A's file_search    -> ALPHA
+```
+
+Measured, and the split is exactly that: `file_search` reads chunks, which
+are a copy taken at attach time and scoped to that conversation's own
+context, so it was already generation-bound. The other two resolve a name.
+Deleting the file and creating the name again later is the same defect with
+a gap in the middle — the old record silently rebinds to bytes that were
+never attached to anything.
+
+The record now carries the checksum of what was attached, and
+`resolve_attachment` refuses a path whose contents no longer match it. Both
+consumers already read the bytes — the inline reader reads the file, and the
+interpreter copies it — so verifying costs nothing they were not already
+paying. Size is compared first, which settles the ordinary case without
+reading anything. Records written before checksums were kept have nothing to
+compare and resolve as before.
+
+The prompt had to change with it. An inline attachment that is not inlined
+gets no number in the envelope, and the listing above it said "full text
+included below" regardless — telling the model to read text that is not
+there. It now says the file is unavailable.
+
+One consumer of `attachment_path` is deliberately left following the path.
+The note importer takes a filename from the request rather than an attachment
+record, and its own description says joining the permanent corpus is a
+deliberate act — the user names a file and gets that file's current text.
+That is a path-following consumer, and the rule for those is the one above:
+the current generation is the right answer.
+
+### What that closes, and what it does not
+
+Closed: an attachment never resolves to bytes that are not the ones
+attached. One chat's upload cannot put its bytes into another chat, and a
+recreated name cannot revive a deleted attachment.
+
+Not closed: the attached generation stops being *available* once the
+pathname moves. Keeping it needs somewhere to keep it, and that is a storage
+decision rather than an implementation detail:
+
+```
+persistent path         = mutable current generation
+conversation attachment = immutable generation capability
+```
+
+The checksum recorded here is the natural key for the second, so a
+content-addressed generation store would use it directly. What such a store
+costs is a second copy of every attached file — a hard link would be free
+but would leave `st_nlink > 1` on the user's own file, which is exactly what
+`_within_source` refuses, so context-source ingestion would then skip every
+attached file. That trade, and the lifecycle question of when a generation
+is reclaimed, are the open decisions.
+
+### Noticed while here, not fixed: extraction has the same shape
+
+`publish_artifacts` was the instance; the class is "a name is visible before
+its bytes are". `archive._write_member` opens each member at its final path
+and streams into it, inside a destination directory that already exists under
+its real name. So a listing taken during an extraction shows part of the tree,
+and a download of a member still being written returns a truncated file with a
+content-length taken from the descriptor at open time — the client gets a
+short file and no reason to doubt it.
+
+A listing seeing part of a tree is observational and fine; the truncated
+download is the same harm the staged upload and the linked artifact removed.
+The fix has the same shape too: extract into a hidden sibling and rename it
+onto the destination once the extraction has finished, inside the lock the
+route already holds. It is left for the reviewer to schedule rather than
+folded into this tranche.

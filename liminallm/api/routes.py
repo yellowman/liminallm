@@ -7,14 +7,14 @@ import json
 import math
 import mimetypes
 import os
-import stat
 import shutil
+import stat
 import time
 from contextlib import suppress
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
 from pathlib import Path as FilePath
 from typing import Any, Optional
+from urllib.parse import quote
 from uuid import uuid4
 
 from fastapi import (
@@ -33,7 +33,7 @@ from fastapi import (
     WebSocket,
     WebSocketDisconnect,
 )
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from liminallm.api import chat_turn, idempotency, mcp
 from liminallm.api.errors import http_error
@@ -3577,10 +3577,19 @@ async def upload_file(
             if manifest_path.exists():
                 try:
                     existing = json.loads(manifest_path.read_text())
-                except Exception:
+                except ValueError:
+                    # Corrupt content reads as empty, and the write below
+                    # rebuilds the file from this upload. An OSError is not
+                    # corruption: it says nothing about what the manifest
+                    # holds, and treating it as an empty manifest would make
+                    # the write replace every other name's entry with
+                    # nothing. `UnicodeDecodeError` is a `ValueError`, so
+                    # binary rubbish counts as corrupt too.
                     logger.warning(
                         "file_checksum_manifest_read_failed", path=str(manifest_path)
                     )
+                if not isinstance(existing, dict):
+                    existing = {}
             entry = existing.get(safe_filename)
             checksum_before: Optional[str] = None
             contexts: set[str] = set()
@@ -3632,6 +3641,9 @@ async def upload_file(
                 size=len(contents),
                 capabilities=attachment_caps,
                 chunk_count=chunks,
+                # Which bytes this chat was given. The name it was given
+                # them under belongs to every later upload of that name too.
+                checksum=checksum,
             )
             logger.info(
                 "conversation_attachment_added",
@@ -3696,6 +3708,36 @@ async def upload_file(
                         finally:
                             staged.unlink(missing_ok=True)
 
+                # The bytes changed, so every context that described the
+                # previous ones is now describing a file that is gone. Upload
+                # already stops *recording* them — the manifest's context set
+                # starts empty for a new checksum — and left their chunks in
+                # place, which is the record forgetting them while the index
+                # does not. Measured, with no race at all: two uploads of one
+                # name into two contexts left the first context answering
+                # with the first generation's text.
+                #
+                # Emptied rather than refreshed. `_commit_generation` states
+                # the reason for its own writes: these chunks claim to be the
+                # contents of this path, so once new bytes exist the claim is
+                # false, and "this path has nothing to say" is an answer about
+                # the current bytes. Re-ingesting into contexts the request
+                # never named would instead spend an unbounded amount of work
+                # inside this lock and put content where it was not asked for.
+                #
+                # A conversation's implicit context is skipped. §19.5 scopes
+                # an attachment to the chat that received it, so another
+                # chat's upload of the same filename must not reach into it —
+                # removing its chunks would be one chat changing another
+                # chat's state just as much as replacing them would. Those
+                # records are stale for a different reason, and the fix is
+                # generation identity rather than a sweep.
+                for stale in prior_contexts - {context_id}:
+                    context = runtime.store.get_context(stale)
+                    if context is None or is_auto_context(context):
+                        continue
+                    runtime.store.replace_chunks_for_path(stale, str(dest_path), [])
+
             wants_ingest = bool(context_id) and (
                 not deduped or context_id not in prior_contexts
             )
@@ -3742,23 +3784,25 @@ async def upload_file(
                 contexts = set(prior_contexts) if deduped else set()
                 if context_id:
                     contexts.add(context_id)
-                try:
-                    with path_lock(
-                        runtime.settings.shared_fs_root, str(manifest_path)
-                    ):
-                        current, _, _ = _read_manifest()
-                        current[safe_filename] = {
-                            "checksum": checksum,
-                            "contexts": sorted(contexts),
-                        }
-                        manifest_path.write_text(json.dumps(current, indent=2))
-                except PathLockTimeout:
-                    raise
-                except Exception:
-                    logger.warning(
-                        "file_checksum_manifest_write_failed",
-                        path=str(manifest_path),
-                    )
+                # Not best effort, and this is where that distinction earns
+                # its keep. The manifest is one of the three records that
+                # have to describe one generation, and it is the one the
+                # *next* upload reads. A swallowed failure here leaves it
+                # naming the previous checksum and the previous context set,
+                # so re-uploading those previous bytes matches a record no
+                # file has: no write, no ingest, and a 200 over a file that
+                # still holds something else. That is the false dedupe hit
+                # 2E.1 removed, arriving through the bookkeeping instead of
+                # through a race. A failed request is recoverable — the
+                # retry re-runs the whole publication and repairs the
+                # record — and a silent one is not.
+                with path_lock(runtime.settings.shared_fs_root, str(manifest_path)):
+                    current, _, _ = _read_manifest()
+                    current[safe_filename] = {
+                        "checksum": checksum,
+                        "contexts": sorted(contexts),
+                    }
+                    manifest_path.write_text(json.dumps(current, indent=2))
             # Inside the lock, because the record says how large this file is
             # and therefore how the conversation may use it — §19.5 makes
             # inline/searchable/analyzable part of that. Written after the
@@ -4101,29 +4145,45 @@ async def delete_file(
 
         Namespace lock first, manifest lock second — the same order upload
         uses, so the two can never each hold what the other waits for.
+
+        Inside the lock the order is bookkeeping first and the pathname last.
+        No transaction spans Postgres and the filesystem, so one of the two
+        halves can fail with the other already done, and the two ways of
+        failing are not equally bad. Unlinking first and cleaning up
+        afterwards leaves "the file is gone, its contents are still
+        retrievable, and the request failed" — the user is told the deletion
+        did not happen while the thing they wanted deleted is still readable
+        through any grounded conversation. Doing the durable work first
+        leaves "nothing was deleted and the request failed", which is a
+        state the user can act on by asking again.
         """
         with path_lock(runtime.settings.shared_fs_root, namespace):
             # Re-checked under the lock: existence answered before it is an
             # answer about a moment that has passed.
             if not file_path.exists() or file_path == files_dir.resolve():
                 raise http_error("not_found", "file not found", status_code=404)
+
+            # Every context this user owns, not one named context: the same
+            # file uploaded to a second context is ingested again, and an
+            # extracted tree's members are recorded nowhere the route could
+            # enumerate. For a directory this covers everything under it.
+            runtime.store.delete_chunks_under_path(principal.user_id, str(file_path))
+
+            with path_lock(runtime.settings.shared_fs_root, str(manifest_path)):
+                if manifest_path.exists():
+                    # Not best effort. The manifest is one of the three
+                    # records that have to describe one generation, and a
+                    # swallowed failure here leaves it naming a file that is
+                    # about to stop existing — the next upload of that name
+                    # then dedupes against a checksum no file has.
+                    manifest = json.loads(manifest_path.read_text())
+                    if manifest.pop(filename, None) is not None:
+                        manifest_path.write_text(json.dumps(manifest, indent=2))
+
             if file_path.is_dir():
                 shutil.rmtree(file_path)
             else:
                 file_path.unlink()
-
-            with path_lock(runtime.settings.shared_fs_root, str(manifest_path)):
-                if not manifest_path.exists():
-                    return
-                try:
-                    manifest = json.loads(manifest_path.read_text())
-                    if manifest.pop(filename, None) is not None:
-                        manifest_path.write_text(json.dumps(manifest, indent=2))
-                except Exception:
-                    logger.warning(
-                        "file_checksum_manifest_update_failed",
-                        path=str(manifest_path),
-                    )
 
     try:
         await asyncio.to_thread(_locked_delete)
@@ -4772,13 +4832,59 @@ async def add_context_source(
 
         # Trigger indexing via RAG service with validated path
         # Pass allowed_base for defense-in-depth path traversal protection
-        try:
-            runtime.rag.ingest_path(
-                context_id=context_id,
-                fs_path=str(validated_path),
-                recursive=body.recursive,
-                allowed_base=runtime.settings.shared_fs_root,
+        def _ingest() -> None:
+            """Read the path and commit what was read, without letting go.
+
+            Reading and committing are two moments. Upload, extraction and
+            deletion all treat a pathname as one critical section, and this
+            route took part in none of it — so its commit could land after a
+            newer generation had already replaced the bytes, the manifest
+            entry and the chunks. Measured: the disk and the manifest
+            described the upload while the index described what the source
+            had read, with both requests returning success. No serial
+            ordering produces that.
+
+            Only for a path inside the caller's own files. That is where the
+            lock means something, because every writer of those names takes
+            it. A shared corpus may have writers outside this application
+            entirely, and a lock no one else holds would only look like
+            protection.
+            """
+            files_dir = (
+                FilePath(runtime.settings.shared_fs_root)
+                / "users"
+                / principal.user_id
+                / "files"
             )
+            def ingest() -> None:
+                runtime.rag.ingest_path(
+                    context_id=context_id,
+                    fs_path=str(validated_path),
+                    recursive=body.recursive,
+                    allowed_base=runtime.settings.shared_fs_root,
+                )
+
+            try:
+                relative = FilePath(validated_path).relative_to(files_dir)
+            except ValueError:
+                ingest()
+                return
+            with path_lock(
+                runtime.settings.shared_fs_root,
+                namespace_key(files_dir, relative.as_posix()),
+            ):
+                ingest()
+
+        try:
+            # In a thread, both because the lock must not be taken on the
+            # event loop and because walking a tree was already blocking it.
+            await asyncio.to_thread(_ingest)
+        except PathLockTimeout as exc:
+            try:
+                runtime.store.delete_context_source(source.id)
+            except Exception:
+                pass  # Best effort cleanup
+            raise http_error("conflict", str(exc), status_code=409)
         except Exception as exc:
             # Clean up the source record since ingestion failed
             logger.warning(

@@ -24,7 +24,6 @@ import uuid
 from pathlib import Path
 
 import httpx
-import pytest
 
 from liminallm.service.runtime import get_runtime
 
@@ -1259,18 +1258,18 @@ class TestDeleteJoinsTheSameProtocol:
             c.content or "" for c in runtime.store.list_chunks(context_id, limit=200)
         )
         indexed = "the uploaded body" in chunks
-        # Either the upload won and everything describes it, or the delete won
-        # and nothing does. A file that is absent while the manifest still
-        # names it is neither.
-        assert (on_disk, bool(recorded)) in ((True, True), (False, False)), (
+        # All three records describe one outcome. Either the upload won and
+        # the bytes, the manifest entry and the chunks all exist, or the
+        # delete won and none of them do. A file that is absent while the
+        # manifest still names it is neither, and so is a deleted file whose
+        # contents are still retrievable.
+        assert (on_disk, bool(recorded), indexed) in (
+            (True, True, True),
+            (False, False, False),
+        ), (
             f"disk={on_disk} manifest={bool(recorded)} indexed={indexed}; "
             "no ordering of these two requests produces that"
         )
-        # `indexed` is reported and not asserted on. Deletion has never
-        # removed a path's chunks, in any ordering, so a deleted file leaving
-        # its chunks behind is not this race — it is the recorded consistency
-        # pass that `DELETE /files/{name}` still needs, and the deletion half
-        # of `replace_chunks_for_path` is what it will use.
 
     def test_deleting_inside_a_tree_conflicts_with_the_tree_being_published(
         self, client, monkeypatch
@@ -1286,8 +1285,7 @@ class TestDeleteJoinsTheSameProtocol:
 
         from liminallm.api import routes
 
-        runtime = get_runtime()
-        user_id, headers = _account(client)
+        _user_id, headers = _account(client)
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
             zf.writestr("subdir/one.txt", b"first member\n" * 20)
@@ -1584,17 +1582,17 @@ class TestExtractionOwnsItsDestinationUntilItIsIndexed:
             "the delete removed the destination while the extraction was "
             "still indexing it"
         )
-        # A delete that runs after a finished extraction is a correct
-        # ordering, so the tree is gone by now. What it must not have taken
-        # with it is the indexing the extraction reported doing.
-        indexed = " ".join(
-            c.content or "" for c in runtime.store.list_chunks(context_id, limit=500)
+        # The count the extraction committed, not what is in the index now:
+        # a delete that runs after a finished extraction is a correct
+        # ordering, and it removes that tree's chunks along with its files.
+        # What the delete must not be able to do is cut the indexing short —
+        # `ingest_path` catches per-file errors and returns the count it
+        # managed, so a tree removed mid-walk reports success over a partial
+        # count or none at all.
+        body = results["ex"].json()["data"]
+        assert body["chunk_count"] == 2, (
+            f"the extraction indexed {body['chunk_count']} of its 2 members: {body}"
         )
-        for marker in ("the first member says alpha", "the second member says beta"):
-            assert marker in indexed, (
-                f"the extraction reported success without indexing {marker!r}; "
-                f"body: {results['ex'].json()['data']}"
-            )
 
 
 async def _asgi_request(request, *, at_first_block=None):

@@ -2377,7 +2377,15 @@ class WorkflowEngine(WorkflowStreamingMixin):
         names: List[str] = []
         if state.get("workdir") is None:
             attachments = self._conversation_attachments(conversation_id, user_id)
-            names = [a.get("name") for a in attachments if a.get("name")]
+            # Only the ones that still hold the bytes this chat attached.
+            # The workdir is built from `/users/{u}/files/{name}`, so without
+            # this a later upload of that name would be staged instead —
+            # another conversation's file, read by code running for this one.
+            names = attachments_service.resolved_names(
+                attachments,
+                fs_root=self.settings.shared_fs_root,
+                user_id=user_id,
+            )
         return agent_tools.run_python(
             code,
             names,

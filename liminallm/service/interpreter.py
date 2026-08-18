@@ -36,7 +36,7 @@ import shutil
 import stat
 import sys
 import uuid
-from contextlib import redirect_stderr, redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout, suppress
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -211,42 +211,51 @@ def prepare_workdir(
     return str(workdir)
 
 
-def _create_unused(dest: Path, name: str) -> tuple[str, Optional[int]]:
-    """Create `name` under `dest`, or the first free variant of it.
+def _link_unused(dest: Path, name: str, complete: Path) -> Optional[str]:
+    """Give `complete` its first free name under `dest`.
 
-    `O_EXCL`, so publication never replaces a file that is already there.
-    Two producers write to the user's file area and only one keeps books:
-    `/files/upload` serialises a name, records its checksum and replaces that
-    path's indexed generation, while this writes into the same directory.
-    Overwriting left the manifest and the index describing the file that was
-    replaced, and the next upload of those same bytes then saw a dedupe hit
-    and returned success without restoring them.
+    `os.link` refuses a name that exists, so publication never replaces a
+    file that is already there. Two producers write to the user's file area
+    and only one keeps books: `/files/upload` serialises a name, records its
+    checksum and replaces that path's indexed generation, while this writes
+    into the same directory. Overwriting left the manifest and the index
+    describing the file that was replaced, and the next upload of those same
+    bytes then saw a dedupe hit and returned success without restoring them.
 
     SPEC does not say whether a model-produced artifact may overwrite an
     existing user filename, so this does not decide that it may. The artifact
     keeps a free name instead of being dropped, which is how
     `notes/from-file` already disambiguates a title.
 
-    `O_EXCL` also makes the claim atomic, so a concurrent producer cannot win
-    the same name; no lock is needed for that part.
+    Linking rather than creating-then-filling, because a name that exists is
+    a name that can be listed, downloaded and ingested. Claiming it first
+    published an empty file and then a growing one — measured, a reader found
+    65536 bytes of an artifact that was 300000 — and a copy that failed
+    partway left the truncated remains behind under a name the tool reported
+    publishing nothing about. `complete` is already whole here, so the name
+    appears with every byte behind it or does not appear at all.
 
-    Returns the name used and an open descriptor, or `(name, None)` when every
-    variant is taken or the directory refuses the write.
+    The link is still atomic, so a concurrent producer cannot win the same
+    name and no lock is needed for that part. Briefly the file has two
+    links, until the caller removes the staging name; a context-source
+    ingestion walking the directory in that instant skips it, because
+    `_within_source` refuses a linked file. That is a skipped file in one
+    scan, not a wrong answer.
+
+    Returns the name used, or None when every variant is taken or the
+    directory refuses the link.
     """
     stem, suffix = os.path.splitext(name)
     for attempt in range(1, MAX_NAME_ATTEMPTS + 1):
         candidate = name if attempt == 1 else f"{stem} ({attempt}){suffix}"
         try:
-            return candidate, os.open(
-                dest / candidate,
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                0o640,
-            )
+            os.link(complete, dest / candidate)
+            return candidate
         except FileExistsError:
             continue
         except OSError:
-            return name, None
-    return name, None
+            return None
+    return None
 
 
 def open_produced_file(workdir: str, name: str) -> Optional[int]:
@@ -372,25 +381,38 @@ def publish_artifacts(
         fd = open_produced_file(workdir, name)
         if fd is None:
             continue
+        staged = dest / f".{uuid.uuid4().hex}.part"
         try:
             if os.fstat(fd).st_size > MAX_ARTIFACT_BYTES:
                 continue
+            # Filled under a hidden name, then given a visible one. The
+            # staging name starts with a dot, so a listing skips it and an
+            # upload can never own it; if this process dies mid-copy it is
+            # what is left behind rather than a half-written artifact.
+            #
             # The destination refuses a link too: the user's file area is
             # where a planted one would be redeemed, and writing through it
             # would put these bytes wherever it points.
-            out_name, out_fd = _create_unused(dest, name)
-            if out_fd is None:
-                continue
+            out_fd = os.open(
+                staged,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o640,
+            )
             with open(fd, "rb", closefd=False) as src, open(
                 out_fd, "wb", closefd=False
             ) as out:
                 shutil.copyfileobj(src, out)
             os.close(out_fd)
+            out_name = _link_unused(dest, name, staged)
+            if out_name is None:
+                continue
             published.append(out_name)
         except OSError:
             continue
         finally:
             os.close(fd)
+            with suppress(OSError):
+                os.unlink(staged)
     return published
 
 
