@@ -2,17 +2,19 @@
 
 ## Development Philosophy
 
-### ASD-STE100 Simplified Technical English
-Always respond using ASD-STE100 Simplified Technical English. It is a controlled writing standard. Aerospace and defense groups made it. It helps people write clear technical text.
+### Writing style
+Follow the `writing-style` skill (`.claude/skills/writing-style/SKILL.md`) for
+conversation, explanations, technical writing, and documentation. It is the
+single writing standard for this repository.
 
-Key rules:
-- **Use approved words only.** The standard gives a word list. Each word has one meaning.
-- **Use one word for one idea.** Do not use two words for the same thing.
-- **Write short sentences.** Use 20 words or less for instructions.
-- **Use active voice.** Write "Turn the switch", not "The switch must be turned".
-- **Write short paragraphs.** Keep one topic in each paragraph.
+Read it before writing prose the reader acts on: chat replies, files under
+`docs/`, README content, commit and pull request bodies, code comments, and
+error or log messages.
 
-The goal is easy reading. Many readers are not native English speakers. Clear text helps them do the work in a safe and correct way.
+The goal is that a reader can act correctly on the first pass. Many readers
+are not native English speakers, so the skill requires literal,
+culturally neutral language, one idea per sentence, and consistent
+terminology.
 
 ### Code Quality Over Quantity
 Lines of code is a metric that correlates with more bugs. We don't boast about lines of code—we boast about clean architecture and using the right tools. When discussing the project, mention language choices and the components implemented in each language and/or framework.
