@@ -7989,3 +7989,69 @@ no writer under `files/` can plant one today. Stated as defence in depth
 rather than as a fix for something reachable — the write side deserves it
 because it is the same mistake, trusting a name to still mean the object it
 meant.
+
+## 2E.3 residuals: the name is the check, and there are two publishers
+
+### HIGH: the child chose the name, and nothing checked it
+
+`1f95271` stopped the parent from following a *link* the child created. It did
+not stop the child from naming a file directly. `open_produced_file` joined
+`workdir` and `name`, and `os.path.join(workdir, "/etc/passwd")` is
+`/etc/passwd`, because an absolute second argument discards the first.
+Publication rejects a name holding a separator, but `_durable_identity` runs
+first, so the parent had already opened and hashed the file by then.
+
+The whole sandbox result is the child's to choose. `execute_python` builds
+`created_files` from process-local Python state *after* running the code, so
+the code can change what that state reports. Measured through the real
+sandbox and the real wire, with `pathlib.PurePath.name` replaced by a
+property:
+
+```
+created_files: [{'name': '/etc/passwd', 'size': 1}]
+```
+
+The fix is a single-component check inside `open_produced_file`, so "a file
+the child produced" structurally means one entry in that directory.
+
+Mutation testing then corrected the shape of that fix twice:
+
+- Removing the absolute-path test changed nothing, because on POSIX every
+  absolute path contains a separator. Removed. Passing an absolute name to
+  `openat` ignores the directory descriptor as surely as `os.path.join`
+  ignores the directory, so no form of resolution substitutes for checking
+  the name. The descriptor is kept because it makes containment structural
+  rather than string-derived, and the comment no longer claims more than that.
+- Removing the `.`/`..` test changed nothing either, because neither holds a
+  separator, both reach the open, and the regular-file check refuses the
+  directory they name. Removed.
+
+`_durable_identity` also stops hashing at `MAX_ARTIFACT_BYTES`. A file too
+large to publish is not worth reading whole to decide it is the same one, and
+the child chooses how large it is.
+
+### MEDIUM: two publishers, one bookkeeper
+
+`/files/upload` serialises a name, records its checksum in the manifest, and
+replaces that path's indexed generation. `publish_artifacts` wrote into the
+same directory with `O_CREAT|O_TRUNC`, took no lock, and updated neither. So
+this sequential history was reachable:
+
+```
+upload report.txt = A into context C   -> disk A, chunks A, manifest SHA(A)
+run_python publishes report.txt = B    -> disk B, chunks A, manifest SHA(A)
+upload report.txt = A again            -> dedupe hit, success, disk still B
+```
+
+The third step is the damaging one: the upload contract says the submitted
+file is stored, and the user is told it was, while the disk holds the
+interpreter's file.
+
+SPEC does not say whether a model-produced artifact may overwrite an existing
+user filename, so this does not decide that it may. `O_EXCL` makes publication
+never replace a name that is already there, and the artifact keeps the first
+free variant — `report (2).txt` — which is how `notes/from-file` already
+disambiguates a title. Nothing is dropped and nothing is clobbered.
+
+`O_EXCL` also makes the claim atomic, so two concurrent producers cannot both
+take one name. No lock is needed for that part, which is why none was added.

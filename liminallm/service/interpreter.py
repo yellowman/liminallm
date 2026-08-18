@@ -50,6 +50,8 @@ MAX_WORKDIR_BYTES = 64 * 1024 * 1024
 # Files the code writes that get published back to the user's file area.
 MAX_ARTIFACTS = 10
 MAX_ARTIFACT_BYTES = 8 * 1024 * 1024
+# Variants tried when an artifact's name is already taken.
+MAX_NAME_ATTEMPTS = 20
 
 # What the child may answer with, derived from what it is allowed to produce:
 # two streams of MAX_OUTPUT_CHARS, plus MAX_ARTIFACTS names. JSON escapes at
@@ -209,6 +211,44 @@ def prepare_workdir(
     return str(workdir)
 
 
+def _create_unused(dest: Path, name: str) -> tuple[str, Optional[int]]:
+    """Create `name` under `dest`, or the first free variant of it.
+
+    `O_EXCL`, so publication never replaces a file that is already there.
+    Two producers write to the user's file area and only one keeps books:
+    `/files/upload` serialises a name, records its checksum and replaces that
+    path's indexed generation, while this writes into the same directory.
+    Overwriting left the manifest and the index describing the file that was
+    replaced, and the next upload of those same bytes then saw a dedupe hit
+    and returned success without restoring them.
+
+    SPEC does not say whether a model-produced artifact may overwrite an
+    existing user filename, so this does not decide that it may. The artifact
+    keeps a free name instead of being dropped, which is how
+    `notes/from-file` already disambiguates a title.
+
+    `O_EXCL` also makes the claim atomic, so a concurrent producer cannot win
+    the same name; no lock is needed for that part.
+
+    Returns the name used and an open descriptor, or `(name, None)` when every
+    variant is taken or the directory refuses the write.
+    """
+    stem, suffix = os.path.splitext(name)
+    for attempt in range(1, MAX_NAME_ATTEMPTS + 1):
+        candidate = name if attempt == 1 else f"{stem} ({attempt}){suffix}"
+        try:
+            return candidate, os.open(
+                dest / candidate,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o640,
+            )
+        except FileExistsError:
+            continue
+        except OSError:
+            return name, None
+    return name, None
+
+
 def open_produced_file(workdir: str, name: str) -> Optional[int]:
     """Open a file model-written code produced, following no link out of it.
 
@@ -233,19 +273,63 @@ def open_produced_file(workdir: str, name: str) -> Optional[int]:
     to leave the fifo there. Non-blocking, the open returns and `fstat`
     answers; on a regular file the flag does nothing.
 
-    Returns None for a link, a fifo, a directory, a device, or anything
-    unreadable.
+    The name is checked here rather than at the callers, because "a file the
+    child produced" has to *mean* one entry in that directory. The whole
+    sandbox result is the child's to choose: `execute_python` builds
+    `created_files` from process-local state after running the code, so the
+    code can change what that state reports. Measured, real sandboxed Python
+    returned `[{'name': '/etc/passwd', 'size': 1}]` — and
+    `os.path.join(workdir, "/etc/passwd")` is `/etc/passwd`, because an
+    absolute second argument discards the first. Publication rejects a name
+    holding a separator, but the identity hash runs first, so by then the
+    parent has already opened the file.
+
+    So the name must be a single component. That check is the whole defence,
+    and mutation testing is what established it: removing the separator test
+    reopens both counterexamples, while removing the absolute-path test
+    changes nothing, because on POSIX every absolute path contains a
+    separator. Passing an absolute name to `openat` would ignore the directory
+    descriptor as surely as `os.path.join` ignores the directory — no form of
+    resolution substitutes for checking the name.
+
+    The descriptor is still how the name is resolved, so containment is
+    structural rather than derived from string concatenation, but it is not
+    load-bearing on its own and is not claimed to be.
+
+    Returns None for an unusable name, a link, a fifo, a directory, a device,
+    or anything unreadable.
+
+    `.` and `..` need no test of their own: they hold no separator, so they
+    reach the open, and the regular-file check below refuses the directory
+    they name. Mutation testing established that too.
     """
+    if (
+        not name
+        or os.sep in name
+        or (os.altsep and os.altsep in name)
+        or "\0" in name
+    ):
+        return None
+    try:
+        dir_fd = os.open(
+            workdir,
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError:
+        return None
     try:
         fd = os.open(
-            os.path.join(workdir, name),
+            name,
             os.O_RDONLY
             | os.O_NOFOLLOW
             | os.O_NONBLOCK
             | getattr(os, "O_CLOEXEC", 0),
+            dir_fd=dir_fd,
         )
     except OSError:
         return None
+    finally:
+        os.close(dir_fd)
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
             os.close(fd)
@@ -294,17 +378,15 @@ def publish_artifacts(
             # The destination refuses a link too: the user's file area is
             # where a planted one would be redeemed, and writing through it
             # would put these bytes wherever it points.
-            out_fd = os.open(
-                dest / name,
-                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
-                0o640,
-            )
+            out_name, out_fd = _create_unused(dest, name)
+            if out_fd is None:
+                continue
             with open(fd, "rb", closefd=False) as src, open(
                 out_fd, "wb", closefd=False
             ) as out:
                 shutil.copyfileobj(src, out)
             os.close(out_fd)
-            published.append(name)
+            published.append(out_name)
         except OSError:
             continue
         finally:

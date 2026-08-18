@@ -797,6 +797,106 @@ class TestTheParentOpensOnlyWhatTheChildProduced:
             "the identity hash is a hash of a host file the child named"
         )
 
+    def test_a_fabricated_absolute_name_is_never_opened(self, client, tmp_path):
+        """The whole sandbox result is attacker-controlled, names included.
+
+        `os.path.join(workdir, "/etc/passwd")` is `/etc/passwd` — an absolute
+        second argument discards the first. Publication rejects names holding
+        a separator, but the identity hash runs before publication, so the
+        read has already happened by the time that check is reached.
+        """
+        import hashlib
+
+        from liminallm.service.agent_tools import _durable_identity
+        from liminallm.service.interpreter import open_produced_file
+
+        workdir, dest = tmp_path / "w", tmp_path / "d"
+        workdir.mkdir()
+        dest.mkdir()
+
+        assert open_produced_file(str(workdir), "/etc/passwd") is None
+        identity = _durable_identity(str(workdir), [{"name": "/etc/passwd"}])
+        host = hashlib.sha256(Path("/etc/passwd").read_bytes()).hexdigest()
+        assert identity[0]["sha256"] != host, (
+            "the parent hashed a host file the child merely named"
+        )
+        assert self._publish(workdir, dest, ["/etc/passwd"], {".txt"}) == []
+
+    def test_the_identity_hash_stops_at_the_publishable_size(self, tmp_path):
+        """A file too large to publish is not worth reading whole to decide
+        it is the same one, and the child chooses how large it is."""
+        import hashlib
+
+        from liminallm.service.agent_tools import _durable_identity
+        from liminallm.service.interpreter import MAX_ARTIFACT_BYTES
+
+        workdir = tmp_path / "w"
+        workdir.mkdir()
+        body = b"a" * (MAX_ARTIFACT_BYTES + 4096)
+        (workdir / "big.txt").write_bytes(body)
+
+        identity = _durable_identity(str(workdir), [{"name": "big.txt"}])
+        assert identity[0]["sha256"] == hashlib.sha256(
+            body[:MAX_ARTIFACT_BYTES]
+        ).hexdigest()
+        assert identity[0]["sha256"] != hashlib.sha256(body).hexdigest()
+
+    def test_a_traversal_name_is_never_opened(self, client, tmp_path):
+        """Same defect spelled relatively."""
+        import hashlib
+
+        from liminallm.service.agent_tools import _durable_identity
+        from liminallm.service.interpreter import open_produced_file
+
+        workdir = tmp_path / "w" / "inner"
+        workdir.mkdir(parents=True)
+        outside = tmp_path / "w" / "outside.txt"
+        outside.write_bytes(b"not the child's to name\n")
+        name = "../outside.txt"
+
+        assert open_produced_file(str(workdir), name) is None
+        identity = _durable_identity(str(workdir), [{"name": name}])
+        assert identity[0]["sha256"] != hashlib.sha256(
+            outside.read_bytes()
+        ).hexdigest(), "the parent hashed a file above the workdir"
+
+    def test_real_sandboxed_code_cannot_name_a_file_the_parent_opens(
+        self, client, tmp_path
+    ):
+        """The parent must distrust the child, not a helper's arguments.
+
+        `execute_python` builds `created_files` from process-local state
+        *after* running the code, so the code can change what that state
+        reports. Measured, this returned
+        `[{'name': '/etc/passwd', 'size': 1}]` through the real sandbox and
+        the real wire.
+        """
+        import hashlib
+
+        from liminallm.service.agent_tools import _durable_identity
+        from liminallm.service.interpreter import run_python_sandboxed
+
+        workdir = tmp_path / "wd"
+        workdir.mkdir()
+        result = run_python_sandboxed(
+            "open('out.txt','w').write('x')\n"
+            "import pathlib\n"
+            "pathlib.PurePath.name = property(lambda self: '/etc/passwd')\n",
+            workdir=str(workdir),
+            confine_root=str(tmp_path / "root"),
+            timeout=15,
+        )
+        created = result.get("created_files") or []
+        assert created and created[0]["name"] == "/etc/passwd", (
+            f"the child did not fabricate a name, so nothing is proved: {result}"
+        )
+
+        identity = _durable_identity(str(workdir), created)
+        host = hashlib.sha256(Path("/etc/passwd").read_bytes()).hexdigest()
+        assert identity[0]["sha256"] != host, (
+            "the parent hashed the host file the sandboxed code named"
+        )
+
     def test_a_fifo_named_as_an_artifact_is_refused_without_blocking(
         self, client, tmp_path
     ):
@@ -846,3 +946,64 @@ class TestTheParentOpensOnlyWhatTheChildProduced:
         assert elsewhere.read_bytes() == b"someone else's file\n", (
             "the publication wrote through a link at the destination"
         )
+
+
+class TestInterpreterPublicationDoesNotClobber:
+    """Two producers write to the user's file area, and only one keeps books.
+
+    `/files/upload` serialises a name, records its checksum in the manifest,
+    and replaces that path's indexed generation. `publish_artifacts` writes
+    into the same directory with `O_CREAT|O_TRUNC`, takes no lock, and updates
+    neither. So an interpreter artifact could replace an uploaded file while
+    the manifest and the index went on describing the file it replaced — and
+    the next upload of those same bytes then saw a dedupe hit and returned
+    success without restoring them.
+
+    SPEC does not say whether model-produced artifacts may overwrite an
+    existing user filename, so this does not decide that they may. It takes
+    the narrow contract: publication never replaces a name that is already
+    there. The artifact keeps a distinct name instead of being dropped, which
+    matches how `notes/from-file` already disambiguates a title.
+    """
+
+    def test_an_artifact_never_replaces_an_uploaded_file(self, client, tmp_path):
+        from liminallm.service.interpreter import publish_artifacts
+        from liminallm.service.invocation import Invocation, current_invocation
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        context_id = _context(client, headers)
+        name = "report.txt"
+        uploaded = b"the user's own uploaded report\n" * 20
+
+        resp = client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={"file": (name, uploaded, "text/plain")},
+            data={"context_id": context_id},
+        )
+        assert resp.status_code == 200, resp.text
+        files_dir = _files_dir(runtime, user_id)
+        before = _manifest(runtime, user_id).get(name, {}).get("checksum")
+        assert before == hashlib.sha256(uploaded).hexdigest()
+
+        workdir = tmp_path / "w"
+        workdir.mkdir()
+        (workdir / name).write_bytes(b"written by the model's code\n")
+        invocation = Invocation("clobber", tool="code.python_v1")
+        invocation.begin_attempt()
+        try:
+            with current_invocation(invocation):
+                published = publish_artifacts(
+                    str(workdir), str(files_dir), [{"name": name}], {".txt"}
+                )
+        finally:
+            invocation.close()
+
+        assert (files_dir / name).read_bytes() == uploaded, (
+            "an interpreter artifact replaced the file the user uploaded"
+        )
+        assert _manifest(runtime, user_id).get(name, {}).get("checksum") == before
+        # The artifact is kept, under a name that was free.
+        assert published and published != [name], published
+        assert (files_dir / published[0]).read_bytes() == b"written by the model's code\n"

@@ -284,8 +284,16 @@ def _durable_identity(workdir: str, created: List[dict]) -> List[dict]:
         else:
             try:
                 hasher = hashlib.sha256()
+                remaining = interpreter.MAX_ARTIFACT_BYTES
                 with open(fd, "rb", closefd=False) as handle:
-                    for block in iter(lambda: handle.read(1024 * 1024), b""):
+                    # Bounded by what publication would accept: a file
+                    # too large to publish is not worth reading whole
+                    # to decide it is the same one.
+                    while remaining > 0:
+                        block = handle.read(min(remaining, 1024 * 1024))
+                        if not block:
+                            break
+                        remaining -= len(block)
                         hasher.update(block)
                 digest = hasher.hexdigest()
             except OSError:
