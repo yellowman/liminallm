@@ -33,6 +33,7 @@ import builtins
 import io
 import os
 import shutil
+import stat
 import sys
 import uuid
 from contextlib import redirect_stderr, redirect_stdout
@@ -208,6 +209,53 @@ def prepare_workdir(
     return str(workdir)
 
 
+def open_produced_file(workdir: str, name: str) -> Optional[int]:
+    """Open a file model-written code produced, following no link out of it.
+
+    The child that chose this name runs confined (§21.2); this process does
+    not. A pathname is not a capability the child has to hold — it cannot open
+    `/etc/passwd`, because its root was pivoted away, but creating a link with
+    that target costs it nothing and does not need the target to exist on its
+    side. Measured before this existed: a link named `result.txt` had the
+    host's `/etc/passwd` copied into the caller's file area, and the same
+    trick reached another user's uploads under `shared_fs_root`. The child
+    could open neither; naming them was enough, because this process opened
+    them on its behalf.
+
+    `O_NOFOLLOW` is why this returns a descriptor rather than a validated
+    path. It makes deciding and reading one operation on one object, where an
+    `is_symlink()` check followed by an `open()` is two operations on a name.
+
+    `O_NONBLOCK` is why the open itself is safe to attempt. `O_NOFOLLOW`
+    refuses a link but says nothing about a fifo, and opening one for reading
+    waits for a writer — measured, `os.open` on a fifo never returned, which
+    would park this thread of the API process for as long as the child cared
+    to leave the fifo there. Non-blocking, the open returns and `fstat`
+    answers; on a regular file the flag does nothing.
+
+    Returns None for a link, a fifo, a directory, a device, or anything
+    unreadable.
+    """
+    try:
+        fd = os.open(
+            os.path.join(workdir, name),
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+            | os.O_NONBLOCK
+            | getattr(os, "O_CLOEXEC", 0),
+        )
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
 def publish_artifacts(
     workdir: str,
     dest_dir: str,
@@ -237,14 +285,30 @@ def publish_artifacts(
         if allowed_extensions is not None:
             if Path(name).suffix.lower() not in allowed_extensions:
                 continue
-        src = Path(workdir) / name
-        if not src.is_file() or src.stat().st_size > MAX_ARTIFACT_BYTES:
+        fd = open_produced_file(workdir, name)
+        if fd is None:
             continue
         try:
-            shutil.copy2(src, dest / name)
+            if os.fstat(fd).st_size > MAX_ARTIFACT_BYTES:
+                continue
+            # The destination refuses a link too: the user's file area is
+            # where a planted one would be redeemed, and writing through it
+            # would put these bytes wherever it points.
+            out_fd = os.open(
+                dest / name,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                0o640,
+            )
+            with open(fd, "rb", closefd=False) as src, open(
+                out_fd, "wb", closefd=False
+            ) as out:
+                shutil.copyfileobj(src, out)
+            os.close(out_fd)
             published.append(name)
         except OSError:
             continue
+        finally:
+            os.close(fd)
     return published
 
 

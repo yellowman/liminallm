@@ -689,3 +689,160 @@ class TestOneDestinationHasOnePublisher:
         assert sorted(p.name for p in dest.iterdir()) == ["zip.txt"], (
             "the published tree did not survive intact"
         )
+
+
+class TestTheParentOpensOnlyWhatTheChildProduced:
+    """§21.2 confines model-written code. The process that publishes its
+    output does not run under that confinement.
+
+    A pathname is not a capability the child has to hold. `run_python` pivots
+    the child's root away, so it cannot open `/etc/passwd` — but creating a
+    *link* with that target costs it nothing and needs no target to exist on
+    its side. The parent then resolves that link in its own namespace and
+    copies what it finds into the caller's file area. The authorized object
+    was a file the child produced; the object read was never that one.
+
+    This is the confused-deputy form of a check/use gap: the check ("is this a
+    regular file I may publish?") and the use ("read it") were two operations
+    against a name rather than one against an object.
+    """
+
+    def _publish(self, workdir, dest, names, allowed):
+        from liminallm.service.interpreter import publish_artifacts
+        from liminallm.service.invocation import Invocation, current_invocation
+
+        invocation = Invocation("publish", tool="code.python_v1")
+        invocation.begin_attempt()
+        try:
+            with current_invocation(invocation):
+                return publish_artifacts(
+                    str(workdir),
+                    str(dest),
+                    [{"name": n} for n in names],
+                    allowed_extensions=allowed,
+                )
+        finally:
+            invocation.close()
+
+    def test_a_link_to_a_host_file_publishes_nothing(self, client, tmp_path):
+        import os
+
+        workdir, dest = tmp_path / "w", tmp_path / "d"
+        workdir.mkdir()
+        dest.mkdir()
+        os.symlink("/etc/passwd", workdir / "result.txt")
+
+        published = self._publish(workdir, dest, ["result.txt"], {".txt"})
+        out = dest / "result.txt"
+        assert published == [], published
+        assert not out.exists(), (
+            f"a host file was published into the user's area: "
+            f"{out.read_bytes()[:60]!r}"
+        )
+
+    def test_a_link_to_another_users_file_publishes_nothing(self, client, tmp_path):
+        import os
+
+        runtime = get_runtime()
+        victim, victim_headers = _account(client)
+        secret = b"THE VICTIM'S PRIVATE PLAN\n"
+        resp = client.post(
+            "/v1/files/upload",
+            headers={**victim_headers, "Idempotency-Key": _unique("k")},
+            files={"file": ("private.md", secret, "text/markdown")},
+        )
+        assert resp.status_code == 200, resp.text
+        victim_file = _files_dir(runtime, victim) / "private.md"
+        assert victim_file.is_file()
+
+        workdir, dest = tmp_path / "w", tmp_path / "d"
+        workdir.mkdir()
+        dest.mkdir()
+        os.symlink(str(victim_file), workdir / "stolen.md")
+
+        published = self._publish(workdir, dest, ["stolen.md"], {".md"})
+        out = dest / "stolen.md"
+        assert published == [], published
+        assert not out.exists() or secret not in out.read_bytes(), (
+            "another user's file was published into this caller's area"
+        )
+
+    def test_a_file_the_code_actually_wrote_still_publishes(self, client, tmp_path):
+        """The refusals above must be about the link, not about publishing."""
+        workdir, dest = tmp_path / "w", tmp_path / "d"
+        workdir.mkdir()
+        dest.mkdir()
+        (workdir / "result.txt").write_bytes(b"computed by the model's code\n")
+
+        published = self._publish(workdir, dest, ["result.txt"], {".txt"})
+        assert published == ["result.txt"], published
+        assert (dest / "result.txt").read_bytes() == b"computed by the model's code\n"
+
+    def test_the_publication_identity_does_not_read_through_a_link(self, tmp_path):
+        """The identity hash opens the same child-named paths, so it is the
+        same defect one function earlier — and a hash of `/etc/passwd` is a
+        read of `/etc/passwd` whether or not anything is published."""
+        import hashlib
+        import os
+
+        from liminallm.service.agent_tools import _durable_identity
+
+        workdir = tmp_path / "w"
+        workdir.mkdir()
+        os.symlink("/etc/passwd", workdir / "result.txt")
+
+        identity = _durable_identity(str(workdir), [{"name": "result.txt"}])
+        host = hashlib.sha256(Path("/etc/passwd").read_bytes()).hexdigest()
+        assert identity[0]["sha256"] != host, (
+            "the identity hash is a hash of a host file the child named"
+        )
+
+    def test_a_fifo_named_as_an_artifact_is_refused_without_blocking(
+        self, client, tmp_path
+    ):
+        """`O_NOFOLLOW` refuses a link and says nothing about a fifo, and
+        opening one for reading waits for a writer. Measured, `os.open` on a
+        fifo never returned — which parks a thread of the API process for as
+        long as the child leaves it there. The test has its own clock because
+        the failure mode is a hang, not a wrong answer."""
+        import os
+        import threading
+
+        workdir, dest = tmp_path / "w", tmp_path / "d"
+        workdir.mkdir()
+        dest.mkdir()
+        os.mkfifo(workdir / "result.txt")
+
+        done = threading.Event()
+        outcome: dict = {}
+
+        def publish():
+            outcome["published"] = self._publish(
+                workdir, dest, ["result.txt"], {".txt"}
+            )
+            done.set()
+
+        threading.Thread(target=publish, daemon=True).start()
+        assert done.wait(20), "publication blocked on a fifo the child created"
+        assert outcome["published"] == [], outcome
+        assert not (dest / "result.txt").exists()
+
+    def test_the_destination_is_not_followed_either(self, client, tmp_path):
+        """Defence in depth, stated as such: no writer under `files/` can
+        plant a link today, which is why this plants one by hand. The write
+        side deserves the same treatment as the read side because it is the
+        same mistake — trusting a name to still mean the object it meant."""
+        import os
+
+        workdir, dest = tmp_path / "w", tmp_path / "d"
+        workdir.mkdir()
+        dest.mkdir()
+        (workdir / "result.txt").write_bytes(b"the model's output\n")
+        elsewhere = tmp_path / "elsewhere.txt"
+        elsewhere.write_bytes(b"someone else's file\n")
+        os.symlink(str(elsewhere), dest / "result.txt")
+
+        self._publish(workdir, dest, ["result.txt"], {".txt"})
+        assert elsewhere.read_bytes() == b"someone else's file\n", (
+            "the publication wrote through a link at the destination"
+        )

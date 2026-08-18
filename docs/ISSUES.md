@@ -7909,3 +7909,83 @@ One test-ordering note worth keeping: the cleanup red only fires when the
 *failing* request is the one paused. Run the other way round and the
 destination does not exist yet when the failure tidies up, so the test passes
 while the defect stands.
+
+## Recorded, not open: RAG refresh resilience
+
+The zero-chunk rule can temporarily drop an unchanged file from retrieval when
+its extraction fails transiently. Reviewed and kept, because the alternative
+history is worse: preserving the previous chunks blindly would serve
+generation A as the contents of generation B's path, and without a trustworthy
+generation identity at the RAG boundary the system cannot tell "same bytes,
+parser failed this time" from "different bytes, parser refused them".
+Recoverable loss of retrieval beats positively stale content under the current
+pathname.
+
+The eventual contract needs both a failure distinction *and* a persisted
+identity: successful extraction replaces the generation and records the source
+checksum; a semantic refusal commits an empty generation for the new checksum;
+a transient failure preserves the existing generation and marks it
+refresh-failed only when the current checksum matches the indexed one. An
+`ExtractTransientError` alone would not be enough, and context sources cannot
+borrow the upload manifest — they name other authorized filesystem sources, so
+the identity has to belong to the ingestion record. Future work, not an open
+defect and not an xfail.
+
+## Tranche 2E.3, first finding: the parent opened what the child named
+
+BLOCKER, found while asking the question 2E.3 opens with — whether readers
+need source locks or descriptor-bound reads. The answer arrived from a
+different direction than expected.
+
+`run_python` confines its child (§21.2): the root is pivoted, so
+`shared_fs_root`, other users' files and every host path are absent from its
+view. But `publish_artifacts` and `_durable_identity` run in the **parent**,
+which is not confined, and both opened `workdir / name` — a name the child
+chose — by path. `Path.is_file()` follows links and `shutil.copy2` copies
+through them.
+
+A pathname is not a capability the child has to hold. It cannot open
+`/etc/passwd`; it can create a link with that target, and the target does not
+need to exist on its side. Measured, twice:
+
+```
+symlink result.txt -> /etc/passwd
+  published: ['result.txt']
+  content:   b'root:x:0:0:root:/root:/bin/bash\ndaemon:...'
+
+symlink stolen.md -> <shared_fs_root>/users/<other>/files/private.md
+  published: ['stolen.md']
+  cross-user leak: True
+```
+
+Confinement was intact and irrelevant. The child named the file and the parent
+read it — a confused deputy, and the check/use shape 2E.3 is about: the check
+("is this a regular file I may publish?") and the use ("read it") were two
+operations against a name rather than one against an object.
+
+`open_produced_file` is the answer, and the descriptor is the point.
+`O_NOFOLLOW` makes deciding and reading one operation on one object, where an
+`is_symlink()` test followed by an `open()` is two operations on a name. The
+destination is opened the same way. Both readers use it.
+
+### The first version of that fix could hang the API process
+
+Mutation testing flagged an untested branch — "a non-regular file is
+published" survived — and following it up found a regression in the fix
+itself. `O_NOFOLLOW` refuses a link and says nothing about a fifo, and opening
+a fifo for reading waits for a writer. Measured: `os.open` on a fifo never
+returned. Model-written code could have named `result.txt` as a fifo and
+parked a thread of the API process for as long as it liked — a worse outcome
+than the `is_file()` it replaced, which merely skipped it.
+
+`O_NONBLOCK` makes the open return so `fstat` can answer; on a regular file
+the flag does nothing. The test has its own clock, because the failure mode is
+a hang rather than a wrong answer.
+
+### On the destination
+
+Writing is guarded the same way and the test plants the link by hand, because
+no writer under `files/` can plant one today. Stated as defence in depth
+rather than as a fix for something reachable — the write side deserves it
+because it is the same mistake, trusting a name to still mean the object it
+meant.

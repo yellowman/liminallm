@@ -18,6 +18,7 @@ page turns out to be hostile.
 from __future__ import annotations
 
 import hashlib
+import os
 import tempfile
 from pathlib import Path
 from typing import Any, Callable, List, Optional, Tuple
@@ -272,14 +273,25 @@ def _durable_identity(workdir: str, created: List[dict]) -> List[dict]:
     identity: List[dict] = []
     for item in sorted(created, key=lambda c: str(c.get("name") or "")):
         name = str(item.get("name") or "")
-        source = Path(workdir) / name
-        digest = ""
-        try:
-            digest = hashlib.sha256(source.read_bytes()).hexdigest()
-        except OSError:
+        # Opened the same way the publication opens it, and for the same
+        # reason: hashing a host file the child merely *named* is a read of
+        # that file whether or not anything is published afterwards.
+        fd = interpreter.open_produced_file(workdir, name)
+        if fd is None:
             # Unreadable here means unpublishable below, but the identity must
             # still differ from a readable file of the same name.
             digest = f"unreadable:{name}"
+        else:
+            try:
+                hasher = hashlib.sha256()
+                with open(fd, "rb", closefd=False) as handle:
+                    for block in iter(lambda: handle.read(1024 * 1024), b""):
+                        hasher.update(block)
+                digest = hasher.hexdigest()
+            except OSError:
+                digest = f"unreadable:{name}"
+            finally:
+                os.close(fd)
         identity.append({"name": name, "sha256": digest})
     return identity
 
