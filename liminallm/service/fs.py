@@ -316,6 +316,27 @@ def _lock_file(fs_root: Path, key: str) -> Path:
     return Path(fs_root) / LOCK_DIRNAME / f"{digest}.lock"
 
 
+def namespace_key(files_dir: str | Path, relative_name: str) -> str:
+    """The lock key for anything that publishes or removes `relative_name`.
+
+    The top-level entry, not the exact path. Publication and deletion do not
+    always name the same depth: extraction of `outer/dir/inner.zip` publishes
+    into `outer/dir/inner`, while a recursive delete targets `outer`. Locking
+    each side's own path gives two keys that never meet, and the delete walks
+    through a tree the extractor is still filling — later members recreate the
+    ancestry with `mkdir(parents=True, exist_ok=True)`, so both requests report
+    success over a partial tree. Measured before this rule existed.
+
+    So every mutation of a persistent name takes the lock on the name's first
+    component. For a root file that is the file itself, which is what upload
+    already used; for anything inside a tree it is the tree. Coarser than an
+    exact path, and the coarseness is the point: two operations on one tree
+    must be able to see each other.
+    """
+    parts = Path(relative_name).parts
+    return str(Path(files_dir) / (parts[0] if parts else relative_name))
+
+
 @contextmanager
 def path_lock(
     fs_root: str | Path,

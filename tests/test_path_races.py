@@ -15,6 +15,7 @@ process-local lock cannot be the answer either.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import threading
@@ -22,6 +23,7 @@ import time
 import uuid
 from pathlib import Path
 
+import httpx
 import pytest
 
 from liminallm.service.runtime import get_runtime
@@ -1347,6 +1349,95 @@ class TestDeleteJoinsTheSameProtocol:
             "destination lock, so it was not keyed on the same namespace"
         )
 
+    def test_deleting_an_ancestor_conflicts_with_a_nested_extraction(
+        self, client, monkeypatch
+    ):
+        """The trap in an exact-path delete lock.
+
+        A nested archive is reachable: extraction leaves nested archives
+        opaque, and the API lets the user extract one afterwards. So
+        `outer/dir/inner.zip` publishes into `outer/dir/inner` while a
+        recursive `DELETE outer` targets an ancestor. Locking the exact
+        destination on one side and the exact target on the other gives two
+        different keys, and the delete walks straight through — removing
+        files the child already wrote, while later members recreate the
+        ancestry with `mkdir(parents=True, exist_ok=True)`, so both requests
+        report success over a partial tree.
+
+        A `path_lock(str(file_path))` in the delete route closes the flat case
+        and leaves this one alive, which is why it has its own test.
+        """
+        import io
+        import zipfile
+
+        from liminallm.api import routes
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+
+        inner = io.BytesIO()
+        with zipfile.ZipFile(inner, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("one.txt", b"first member\n" * 20)
+            zf.writestr("two.txt", b"second member\n" * 20)
+        outer = io.BytesIO()
+        with zipfile.ZipFile(outer, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("dir/inner.zip", inner.getvalue())
+        resp = client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={"file": ("outer.zip", outer.getvalue(), "application/zip")},
+        )
+        assert resp.status_code == 200, resp.text
+        first = client.post("/v1/files/outer.zip/extract", headers=headers)
+        assert first.status_code == 200, first.text
+        nested = _files_dir(runtime, user_id) / "outer" / "dir" / "inner.zip"
+        assert nested.is_file(), "the nested archive was not published"
+
+        reached = threading.Event()
+        may_continue = threading.Event()
+        armed = {"on": True}
+        real_extract = routes.extract_archive_sandboxed
+
+        def gated(*args, **kwargs):
+            out = real_extract(*args, **kwargs)
+            if armed["on"]:
+                armed["on"] = False
+                reached.set()
+                may_continue.wait(20)
+            return out
+
+        monkeypatch.setattr(routes, "extract_archive_sandboxed", gated)
+        results: dict = {}
+        released = threading.Event()
+
+        def delete_and_record():
+            results["rm"] = client.delete("/v1/files/outer", headers=headers)
+            results["waited_for_release"] = released.is_set()
+
+        extractor = threading.Thread(
+            target=lambda: results.update(
+                ex=client.post(
+                    "/v1/files/outer/dir/inner.zip/extract", headers=headers
+                )
+            ),
+            daemon=True,
+        )
+        deleter = threading.Thread(target=delete_and_record, daemon=True)
+        extractor.start()
+        assert reached.wait(30), "the nested extraction never ran"
+        deleter.start()
+        time.sleep(1.0)
+        released.set()
+        may_continue.set()
+        extractor.join(60)
+        deleter.join(60)
+
+        assert results["ex"].status_code == 200, results["ex"].text
+        assert results["waited_for_release"], (
+            "the delete of an ancestor completed while the nested extraction "
+            "still owned its destination"
+        )
+
     def test_a_delete_does_not_erase_another_names_manifest_entry(self, client):
         """The manifest is one object for the whole directory, so deletion's
         read-modify-write can drop an entry it never touched."""
@@ -1407,3 +1498,440 @@ class TestDeleteJoinsTheSameProtocol:
         assert manifest[keep]["checksum"] == hashlib.sha256(on_disk).hexdigest(), (
             "the surviving manifest entry describes bytes that are not on disk"
         )
+
+
+class TestExtractionOwnsItsDestinationUntilItIsIndexed:
+    """Extracting into a context is one operation, not two.
+
+    The destination lock was released as soon as the sandbox returned, and
+    ingestion ran after it. `ingest_path` walks the tree it is given and
+    catches per-file errors, returning the count it managed rather than
+    failing, so a delete landing in that window removed the folder, the walk
+    found nothing, and the request still reported 200 with every extracted
+    file listed in its body.
+    """
+
+    def _bundle(self) -> bytes:
+        import io
+        import zipfile
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("one.txt", b"the first member says alpha\n" * 20)
+            zf.writestr("two.txt", b"the second member says beta\n" * 20)
+        return buf.getvalue()
+
+    def test_a_delete_cannot_land_between_extraction_and_ingestion(self, client):
+        runtime = get_runtime()
+        _user_id, headers = _account(client)
+        context_id = _context(client, headers)
+        resp = client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={"file": ("bundle.zip", self._bundle(), "application/zip")},
+        )
+        assert resp.status_code == 200, resp.text
+
+        reached = threading.Event()
+        may_continue = threading.Event()
+        released = threading.Event()
+        armed = {"on": True}
+        real_ingest = runtime.rag.ingest_path
+
+        def gated(*args, **kwargs):
+            # Entered, with nothing walked yet: the whole ingestion is still
+            # ahead, which is the widest form of the window.
+            if armed["on"]:
+                armed["on"] = False
+                reached.set()
+                may_continue.wait(20)
+            return real_ingest(*args, **kwargs)
+
+        results: dict = {}
+
+        def delete_and_record():
+            results["rm"] = client.delete("/v1/files/bundle", headers=headers)
+            # Recorded at the moment the delete returns: whether the
+            # extraction had finished indexing by then.
+            results["waited_for_release"] = released.is_set()
+
+        extractor = threading.Thread(
+            target=lambda: results.update(
+                ex=client.post(
+                    f"/v1/files/bundle.zip/extract?context_id={context_id}",
+                    headers=headers,
+                )
+            ),
+            daemon=True,
+        )
+        deleter = threading.Thread(target=delete_and_record, daemon=True)
+        runtime.rag.ingest_path = gated
+        try:
+            extractor.start()
+            assert reached.wait(30), "the extraction never reached ingestion"
+            deleter.start()
+            time.sleep(1.0)
+            released.set()
+            may_continue.set()
+            extractor.join(60)
+            deleter.join(60)
+        finally:
+            may_continue.set()
+            runtime.rag.ingest_path = real_ingest
+
+        assert results["ex"].status_code == 200, results["ex"].text
+        assert results["waited_for_release"], (
+            "the delete removed the destination while the extraction was "
+            "still indexing it"
+        )
+        # A delete that runs after a finished extraction is a correct
+        # ordering, so the tree is gone by now. What it must not have taken
+        # with it is the indexing the extraction reported doing.
+        indexed = " ".join(
+            c.content or "" for c in runtime.store.list_chunks(context_id, limit=500)
+        )
+        for marker in ("the first member says alpha", "the second member says beta"):
+            assert marker in indexed, (
+                f"the extraction reported success without indexing {marker!r}; "
+                f"body: {results['ex'].json()['data']}"
+            )
+
+
+async def _asgi_request(request, *, at_first_block=None):
+    """Run one request through the app, suspended between two body blocks.
+
+    starlette's `TestClient` runs the app to completion and only then hands
+    back a response, so nothing it returns is still being produced and no
+    interleaving can be placed inside one — measured, `iter_bytes()` yielded
+    the whole 512 KiB in a single block. Driving the ASGI app directly gives
+    back the real blocks, and `at_first_block` is awaited between two of
+    them, so a second real request runs while the body is half sent.
+
+    Only the body hook exists. A hook on `http.response.start` looks like it
+    would name the moment after the headers and before the file is opened,
+    but the app wraps five `BaseHTTPMiddleware` layers and each relays
+    messages through a memory stream, so the inner response is already past
+    that point by the time the outermost `send` is called. A window that
+    narrow has to be held inside the route, not observed from outside it.
+    """
+    url = request.url
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": request.method,
+        "scheme": "http",
+        "path": url.path,
+        "raw_path": url.raw_path.split(b"?")[0],
+        "query_string": url.query,
+        "root_path": "",
+        "headers": [
+            (k.lower().encode(), v.encode()) for k, v in request.headers.items()
+        ],
+        "client": ("127.0.0.1", 12345),
+        "server": ("testserver", 80),
+    }
+    body = request.read()
+    state = {"sent": False, "fired": False}
+    out = {"status": None, "headers": [], "body": b""}
+
+    async def receive():
+        if not state["sent"]:
+            state["sent"] = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        # Never `http.disconnect`: a StreamingResponse races the body against
+        # a disconnect watcher and cancels itself when one arrives, which
+        # silently produced an empty 200.
+        await asyncio.Event().wait()
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            out["status"] = message["status"]
+            out["headers"] = message["headers"]
+        elif message["type"] == "http.response.body":
+            chunk = message.get("body", b"")
+            out["body"] += chunk
+            if chunk and at_first_block is not None and not state["fired"]:
+                state["fired"] = True
+                await at_first_block()
+
+    from liminallm import app as app_module
+
+    await app_module.app(scope, receive, send)
+    return out
+
+
+class TestADownloadReadsOneGeneration:
+    """`FileResponse` takes a pathname and opens it later.
+
+    Between the route's existence check and the first byte read there is a
+    window, and two ordinary requests reach into it. An upload of the same
+    name rewrote the file in place, so a download already in progress read
+    the head of one generation and the tail of another — measured, 512 KiB
+    of bytes that were never a file. A delete in the same window left the
+    response headers already sent and then failed to open anything.
+
+    A signed URL names a path, not a generation, so it may resolve to either
+    one. It may not resolve to half of one, and it may not resolve to a
+    header with no body behind it.
+    """
+
+    NAME = "payload.txt"
+    BODY_A = b"A" * (512 * 1024)
+    BODY_B = b"B" * (512 * 1024)
+
+    def _upload_request(self, headers, body):
+        return httpx.Request(
+            "POST",
+            "http://testserver/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={"file": (self.NAME, body, "text/plain")},
+        )
+
+    def _upload(self, client, headers, body):
+        resp = client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={"file": (self.NAME, body, "text/plain")},
+        )
+        assert resp.status_code == 200, resp.text
+
+    def _download_request(self, client, headers):
+        """A minted signed URL, as an unsent request."""
+        from urllib.parse import parse_qs, urlparse
+
+        resp = client.get(f"/v1/files/{self.NAME}/url", headers=headers)
+        assert resp.status_code == 200, resp.text
+        query = urlparse(resp.json()["data"]["download_url"]).query
+        return httpx.Request(
+            "GET",
+            "http://testserver/v1/files/download",
+            headers=headers,
+            params={k: v[0] for k, v in parse_qs(query).items()},
+        )
+
+    def test_an_overwrite_during_a_download_never_tears_the_body(self, client):
+        user_id, headers = _account(client)
+        self._upload(client, headers, self.BODY_A)
+        download = self._download_request(client, headers)
+        overwrite = self._upload_request(headers, self.BODY_B)
+        landed: dict = {}
+
+        async def second_generation():
+            landed["upload"] = await _asgi_request(overwrite)
+
+        out = asyncio.run(
+            _asgi_request(download, at_first_block=second_generation)
+        )
+
+        assert landed["upload"]["status"] == 200, landed["upload"]["body"][:200]
+        assert out["status"] == 200, out["status"]
+        body = out["body"]
+        assert body in (self.BODY_A, self.BODY_B), (
+            f"the download returned {len(body)} of an expected "
+            f"{len(self.BODY_A)} bytes, made of {sorted(set(body))}: neither "
+            "generation, so the body was torn across both"
+        )
+        assert (_files_dir(get_runtime(), user_id) / self.NAME).read_bytes() == (
+            self.BODY_B
+        ), "the overwrite never landed, so nothing was raced"
+
+    def test_a_delete_during_a_download_still_delivers_the_file(
+        self, client, monkeypatch
+    ):
+        """The check and the open have to be one act.
+
+        `FileResponse` is given a pathname: it stats the file in the API
+        process, sends the headers, and opens the name later. Between the
+        route's existence check and that open, a delete leaves the response
+        already started with nothing behind it.
+
+        The window is held inside the route, where it is a single point
+        rather than something to aim at. The delete is a real request, run
+        from another thread on its own event loop — the download's loop is
+        blocked while it is paused, which is what a second worker or a second
+        replica looks like from here.
+        """
+        from liminallm.api import routes
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        self._upload(client, headers, self.BODY_A)
+        download = self._download_request(client, headers)
+
+        reached = threading.Event()
+        done = threading.Event()
+        armed = {"on": True}
+        real_guess = routes.mimetypes.guess_type
+        results: dict = {}
+
+        def gated(name, *args, **kwargs):
+            # The route has decided the file is there. Whatever it holds at
+            # this point is what it will read the body from.
+            if armed["on"] and str(name).endswith(self.NAME):
+                armed["on"] = False
+                reached.set()
+                done.wait(30)
+            return real_guess(name, *args, **kwargs)
+
+        def delete_when_open():
+            if not reached.wait(30):
+                return
+            results["rm"] = client.delete(f"/v1/files/{self.NAME}", headers=headers)
+            done.set()
+
+        monkeypatch.setattr(routes.mimetypes, "guess_type", gated)
+        deleter = threading.Thread(target=delete_when_open, daemon=True)
+        deleter.start()
+        try:
+            out = asyncio.run(_asgi_request(download))
+        finally:
+            done.set()
+            deleter.join(60)
+
+        assert not armed["on"], "the window never opened, so nothing was raced"
+        assert results["rm"].status_code == 200, results["rm"].text
+        assert not (_files_dir(runtime, user_id) / self.NAME).exists(), (
+            "the delete returned 200 without removing the file"
+        )
+        assert out["status"] == 200, out["status"]
+        assert out["body"] == self.BODY_A, (
+            f"the download sent a 200 and then {len(out['body'])} of "
+            f"{len(self.BODY_A)} bytes"
+        )
+
+
+class TestAListingToleratesADisappearance:
+    """`GET /files` is observational, and a name it saw may already be gone.
+
+    The route asked `is_file()` and then `stat()` — two questions about one
+    name — and caught only `PermissionError`. A delete between them raised
+    `FileNotFoundError` out of the route, so an unrelated user listing their
+    files got an internal failure because someone deleted a file.
+    """
+
+    def _upload(self, client, headers, name):
+        resp = client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={"file": (name, b"# body\ncontent\n" * 20, "text/markdown")},
+        )
+        assert resp.status_code == 200, resp.text
+
+    def _list_with_vanishing(self, client, monkeypatch, headers, doomed, when):
+        """List while `doomed` disappears, before or after it is measured."""
+        armed = {"on": True}
+        real_stat = Path.stat
+
+        def gated(path, *args, **kwargs):
+            if not (armed["on"] and path == doomed):
+                return real_stat(path, *args, **kwargs)
+            armed["on"] = False
+            if when == "before":
+                doomed.unlink()
+                return real_stat(path, *args, **kwargs)
+            out = real_stat(path, *args, **kwargs)
+            doomed.unlink()
+            return out
+
+        monkeypatch.setattr(Path, "stat", gated)
+        resp = client.get("/v1/files", headers=headers)
+        assert not armed["on"], "the listing never asked about the doomed name"
+        return resp
+
+    def test_a_delete_between_two_questions_about_one_name_is_not_an_error(
+        self, client, monkeypatch
+    ):
+        """The name answers the first question and is gone by the second.
+
+        This is the window the old code had. A route that asks once cannot be
+        caught by it, which is the point: it stays as the guard against
+        anything reintroducing a second question.
+        """
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        for name in ("keep.md", "doomed.md"):
+            self._upload(client, headers, name)
+
+        resp = self._list_with_vanishing(
+            client,
+            monkeypatch,
+            headers,
+            _files_dir(runtime, user_id) / "doomed.md",
+            when="after",
+        )
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text[:300]}"
+        names = {f["name"] for f in resp.json()["data"]["files"]}
+        assert "keep.md" in names, names
+        # Reported from the one measurement the route took, which is the
+        # whole point of taking one: the entry was there when it was asked
+        # about, and a listing describes the moment it looked.
+        assert "doomed.md" in names, names
+
+    def test_a_name_that_vanishes_before_it_is_measured_is_simply_omitted(
+        self, client, monkeypatch
+    ):
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        for name in ("keep.md", "doomed.md"):
+            self._upload(client, headers, name)
+
+        resp = self._list_with_vanishing(
+            client,
+            monkeypatch,
+            headers,
+            _files_dir(runtime, user_id) / "doomed.md",
+            when="before",
+        )
+        assert resp.status_code == 200, f"{resp.status_code}: {resp.text[:300]}"
+        data = resp.json()["data"]
+        names = {f["name"] for f in data["files"]}
+        assert "keep.md" in names, names
+        assert "doomed.md" not in names, (
+            "a name that no longer exists was reported with a size and dates "
+            "that came from somewhere"
+        )
+        assert data["total"] == len(data["files"]), (
+            "the count and the list disagree about how many files there are"
+        )
+
+
+class TestTheFileResponsesSayWhatTheSpecSays:
+    """§13.3 states two response bodies this route did not produce."""
+
+    def test_a_delete_reports_only_that_it_deleted(self, client):
+        _user_id, headers = _account(client)
+        resp = client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={"file": ("gone.md", b"# body\n" * 20, "text/markdown")},
+        )
+        assert resp.status_code == 200, resp.text
+
+        resp = client.delete("/v1/files/gone.md", headers=headers)
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["data"] == {"deleted": True}, resp.json()["data"]
+
+    def test_a_signed_url_says_when_it_expires(self, client):
+        import datetime as dt
+
+        _user_id, headers = _account(client)
+        resp = client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={"file": ("report.md", b"# body\n" * 20, "text/markdown")},
+        )
+        assert resp.status_code == 200, resp.text
+
+        before = dt.datetime.now(dt.timezone.utc)
+        resp = client.get("/v1/files/report.md/url", headers=headers)
+        assert resp.status_code == 200, resp.text
+        data = resp.json()["data"]
+        assert "expires_at" in data, sorted(data)
+        expires_at = dt.datetime.fromisoformat(data["expires_at"])
+        assert expires_at.tzinfo is not None, data["expires_at"]
+        # §18 fixes the window at ten minutes; the field has to describe the
+        # same window `expires_in` reports, not a second, different one.
+        window = (expires_at - before).total_seconds()
+        assert 590 <= window <= 610, f"{window}s from {data['expires_at']}"
+        assert data["expires_in"] == 600, data["expires_in"]

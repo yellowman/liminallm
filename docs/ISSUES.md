@@ -8140,3 +8140,127 @@ Deletion does not remove a path's chunks, in any ordering. That is the
 consistency pass `DELETE /files/{name}` still needs, and the deletion half of
 `replace_chunks_for_path` is what it will use. The race test reports the
 index state and does not assert on it, for that reason.
+
+## 2E.3, completed: the namespace, the descriptor and the listing
+
+Five findings, each with a red that fails without its fix and passes with it.
+Every fix below was mutation-tested: reverted in the working tree, the test
+re-run, and the failure recorded here.
+
+### The namespace key has two sides, and each side has its own test
+
+Review predicted that the ancestor case would survive a superficially correct
+`path_lock(file_path)` in the delete route. Measured, the prediction was
+right about the risk and wrong about which side holds it.
+
+`namespace_key(files_dir, name)` returns the top-level component, so every
+publisher and every deleter under one name take one key. Two mutations, two
+different tests:
+
+| Reverted to an exact path | Test that fails |
+| --- | --- |
+| delete's key (`str(file_path)`) | deleting `bundle/subdir` during the extraction that publishes `bundle/` |
+| extraction's key (`str(dest_path)`) | deleting `outer` during the extraction of `outer/dir/inner.zip` |
+
+The ancestor case survives the naive delete-side patch because the delete
+target *is* the top-level component there, so the two keys coincide by
+accident. What holds it is the extraction side: with `str(dest_path)` the
+nested extraction locks `outer/dir/inner` while the delete locks `outer`, and
+the delete walks straight through a tree the child is still writing —
+measured, the delete completed while the extraction still owned its
+destination.
+
+Nested archives are reachable: extraction leaves them opaque, and the API
+lets the user extract one afterwards.
+
+### HIGH: extraction released the destination before it indexed it
+
+`ingest_path` catches per-file errors and returns the count it managed rather
+than failing. With ingestion outside the lock, a delete removed the folder
+between the sandbox returning and the walk starting, and the request reported
+200 with every extracted file listed and nothing indexed.
+
+Ingestion moved inside the lock; `_extract_into_destination` returns
+`(report, chunks)`. "Extract with a context" is one operation.
+
+### HIGH: a download read a body that was never a file
+
+`FileResponse` takes a pathname and opens it later. Two ordinary requests
+reach into the gap.
+
+An upload of the same name rewrote the file in place. Measured, with the
+overwrite landing between two body blocks of a download of the same name:
+
+```
+download body: 524288 bytes, made of [65, 66]
+```
+
+Half `A`, half `B`: 512 KiB that no generation ever held. Publication is now
+staged beside the destination and renamed onto it, so a rename replaces the
+*name* — an open descriptor keeps the inode it has, and the next open gets
+the new one. A signed URL names a path, not a generation, so it may resolve
+to either one; it may not resolve to half of one.
+
+A delete in the same window is the second failure. `FileResponse` stats the
+path, sends the headers, and opens the name afterwards, so a delete between
+the route's check and that open leaves a started response with nothing behind
+it. Measured, with the window held inside the route and a real `DELETE`
+issued from another thread:
+
+```
+RuntimeError: File at path /srv/.../files/payload.txt does not exist.
+```
+
+The route now opens the file itself — `O_RDONLY | O_NOFOLLOW | O_NONBLOCK` —
+checks `S_ISREG` on the descriptor, and streams from it. The check and the
+open are one operation on one object, and a delete afterwards unlinks the
+name while the download finishes, which is what POSIX already promises. The
+RFC 5987 disposition encoding that 2B added is reproduced by hand, because
+the body no longer goes through `FileResponse`; `tests/test_signed_download.py`
+is what holds it, and it passes under both versions.
+
+### MEDIUM: a listing failed because someone else deleted a file
+
+`GET /files` asked `is_file()` and then `stat()` — two questions about one
+name — and caught only `PermissionError`. Measured, with the name removed
+between them:
+
+```
+FileNotFoundError: [Errno 2] No such file or directory: '.../files/doomed.md'
+```
+
+One `stat()` now, and a disappearance is skipped rather than raised. A
+listing is observational: it does not need a lock, it needs to accept that
+what it saw a moment ago may be gone.
+
+The regression guard is the harder half. A route that asks once cannot be
+caught by a gate placed between two questions, so the test unlinks the name
+after the *first* successful `stat` of it: the current code asks no second
+question and passes, and anything that reintroduces one fails. A second test
+covers the tolerated path directly — a name that vanishes before it is
+measured is omitted from the listing, and the count agrees with the list.
+
+### MEDIUM: two §13.3 response shapes
+
+`DELETE /files/{name}` returned the filename beside `deleted`; the filename
+is already the request path. `GET /files/{name}/url` returned only
+`expires_in`. §13.3 names `expires_at`, which is now returned beside
+`expires_in` rather than replacing it — removing a field clients may already
+read is a break the SPEC does not ask for. `delete_note` returns the same
+`{"deleted": true}` shape and was already correct.
+
+### A note on the test harness
+
+starlette's `TestClient` runs the app to completion before it hands back a
+response, so nothing it returns is still being produced. Measured,
+`iter_bytes()` on a streamed 512 KiB download yielded the whole body in one
+block, and the first version of the tear test passed against the unfixed
+code. The download races drive the ASGI app directly, which gives back the
+real 64 KiB blocks and suspends the response between two of them.
+
+A hook on `http.response.start` looks like it would name the moment after the
+headers and before the file is opened. It does not: the app wraps five
+`BaseHTTPMiddleware` layers, each relaying messages through a memory stream,
+so the inner response is already past that point when the outermost `send` is
+called — measured, the `FileResponse` revert survived that hook and was
+killed only once the window was held inside the route.

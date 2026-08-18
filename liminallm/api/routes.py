@@ -6,10 +6,13 @@ import hashlib
 import json
 import math
 import mimetypes
+import os
+import stat
 import shutil
 import time
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 from pathlib import Path as FilePath
 from typing import Any, Optional
 from uuid import uuid4
@@ -146,6 +149,7 @@ from liminallm.service.fs import (
     PathTraversalError,
     authorize_path,
     generate_signed_url,
+    namespace_key,
     path_lock,
     safe_join,
     validate_signed_url,
@@ -3673,7 +3677,24 @@ async def upload_file(
                     "files.write", {"path": safe_filename, "checksum": checksum}
                 ) as operation:
                     if not operation.replayable:
-                        dest_path.write_bytes(contents)
+                        # Staged beside the destination, then renamed onto it.
+                        # `write_bytes` truncates the file in place, so a
+                        # download that already opened it saw the old bytes
+                        # end mid-stream — measured, a reader got eight bytes
+                        # and then EOF, which is neither generation. A rename
+                        # replaces the *name*: an open descriptor keeps the
+                        # inode it has, and the next open gets the new one.
+                        # The signed URL naming a path rather than a
+                        # generation is the standing reading; it may resolve
+                        # to either, and never to a torn one.
+                        staged = dest_path.with_name(
+                            f".{dest_path.name}.{uuid4().hex[:8]}.part"
+                        )
+                        try:
+                            staged.write_bytes(contents)
+                            os.replace(staged, dest_path)
+                        finally:
+                            staged.unlink(missing_ok=True)
 
             wants_ingest = bool(context_id) and (
                 not deduped or context_id not in prior_contexts
@@ -3748,7 +3769,10 @@ async def upload_file(
             return chunks, _record(chunks)
 
         def _locked_publish() -> tuple[Optional[int], Optional[dict]]:
-            with path_lock(runtime.settings.shared_fs_root, str(dest_path)):
+            with path_lock(
+                runtime.settings.shared_fs_root,
+                namespace_key(dest_dir, safe_filename),
+            ):
                 return _publish()
 
         try:
@@ -3820,17 +3844,26 @@ async def list_files(
     all_files = []
     try:
         for f in files_dir.rglob("*"):
-            if not f.is_file():
+            # One stat, and a disappearance is not an error. A listing is
+            # observational: `is_file()` followed by `stat()` is two questions
+            # about a name, and a delete landing between them raised
+            # FileNotFoundError out of a route that only caught
+            # PermissionError. Nothing here needs a lock — it needs to accept
+            # that what it saw a moment ago may be gone.
+            try:
+                info = f.stat()
+            except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
+                continue
+            if not stat.S_ISREG(info.st_mode):
                 continue
             rel = f.relative_to(files_dir)
             if any(part.startswith(".") for part in rel.parts):
                 continue
-            stat = f.stat()
             all_files.append({
                 "name": rel.as_posix(),
-                "size": stat.st_size,
-                "created_at": datetime.fromtimestamp(stat.st_ctime, tz=timezone.utc).isoformat(),
-                "modified_at": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+                "size": info.st_size,
+                "created_at": datetime.fromtimestamp(info.st_ctime, tz=timezone.utc).isoformat(),
+                "modified_at": datetime.fromtimestamp(info.st_mtime, tz=timezone.utc).isoformat(),
             })
     except PermissionError:
         logger.warning("files_list_permission_denied", user_id=principal.user_id)
@@ -3901,6 +3934,12 @@ async def get_file_download_url(
         status="ok",
         data={
             "download_url": signed_url,
+            # §13.3 names `expires_at`. `expires_in` is kept beside it rather
+            # than replaced, because removing a field clients may already read
+            # is a break the SPEC does not ask for.
+            "expires_at": (
+                datetime.now(timezone.utc) + timedelta(seconds=600)
+            ).isoformat(),
             "expires_in": 600,
             "filename": filename,
         },
@@ -3946,7 +3985,27 @@ async def download_file(
     except PathTraversalError:
         raise http_error("validation_error", "invalid file path", status_code=400)
 
-    if not file_path.exists() or not file_path.is_file():
+    # Opened once, here, and streamed from that descriptor. `FileResponse`
+    # takes a pathname and opens it later, so the route's checks described a
+    # moment that had passed by the time anything was read: a delete landing
+    # in between turned a valid request into an internal failure rather than
+    # into either the file or a clean 404. Holding the object instead means a
+    # delete afterwards unlinks the name while this download finishes, which
+    # is what POSIX already promises.
+    #
+    # `O_NOFOLLOW` for the same reason it is used when publishing: the check
+    # and the open are then one operation on one object.
+    try:
+        fd = os.open(file_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError:
+        raise http_error("not_found", "file not found", status_code=404)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            os.close(fd)
+            raise http_error("not_found", "file not found", status_code=404)
+    except OSError:
+        os.close(fd)
         raise http_error("not_found", "file not found", status_code=404)
 
     # Determine content type
@@ -3955,20 +4014,36 @@ async def download_file(
         content_type = "application/octet-stream"
 
     # SPEC §18: content-disposition set to prevent inline execution.
-    # The header is built by FileResponse rather than interpolated here: a
-    # filename is attacker-influenced the moment model-written code chose it,
-    # and `filename="{path}"` let a name containing a quote close the string
-    # and add a second `filename=` parameter — a browser taking the last one
-    # saves the file under a name and extension the injected page picked.
-    # `interpreter.publish_artifacts` refuses only `/` and a leading dot, so
-    # such a name is reachable. Starlette percent-encodes anything that is not
-    # already safe and emits the RFC 5987 `filename*=` form instead.
-    return FileResponse(
-        path=str(file_path),
-        filename=path,
+    # The header is *encoded*, never interpolated: a filename is
+    # attacker-influenced the moment model-written code chose it, and
+    # `filename="{path}"` let a name containing a quote close the string and
+    # add a second `filename=` parameter — a browser taking the last one saves
+    # the file under a name and extension the injected page picked. This is
+    # the same RFC 5987 rule `FileResponse` applies, kept when the body moved
+    # to a descriptor; `tests/test_signed_download.py` is what holds it.
+    quoted = quote(path)
+    disposition = (
+        f"attachment; filename*=utf-8''{quoted}"
+        if quoted != path
+        else f'attachment; filename="{path}"'
+    )
+
+    def _stream():
+        try:
+            while True:
+                block = os.read(fd, 64 * 1024)
+                if not block:
+                    return
+                yield block
+        finally:
+            os.close(fd)
+
+    return StreamingResponse(
+        _stream(),
         media_type=content_type,
-        content_disposition_type="attachment",
         headers={
+            "content-disposition": disposition,
+            "content-length": str(info.st_size),
             "X-Content-Type-Options": "nosniff",
             "Cache-Control": "private, no-cache, no-store, must-revalidate",
         },
@@ -4005,7 +4080,7 @@ async def delete_file(
     # underneath it. Deleting `bundle/subdir` has to conflict with the
     # extraction that owns `bundle`, or a publisher finishes reporting success
     # over a tree something else removed part of.
-    namespace = files_dir / FilePath(filename).parts[0]
+    namespace = namespace_key(files_dir, filename)
     manifest_path = files_dir / ".checksums.json"
 
     def _locked_delete() -> None:
@@ -4027,7 +4102,7 @@ async def delete_file(
         Namespace lock first, manifest lock second — the same order upload
         uses, so the two can never each hold what the other waits for.
         """
-        with path_lock(runtime.settings.shared_fs_root, str(namespace)):
+        with path_lock(runtime.settings.shared_fs_root, namespace):
             # Re-checked under the lock: existence answered before it is an
             # answer about a moment that has passed.
             if not file_path.exists() or file_path == files_dir.resolve():
@@ -4056,7 +4131,9 @@ async def delete_file(
         raise http_error("conflict", str(exc), status_code=409)
 
     logger.info("file_deleted", user_id=principal.user_id, filename=filename)
-    return Envelope(status="ok", data={"deleted": filename})
+    # §13.3 states the body exactly: {"deleted": true}. The filename is
+    # already the request path, so returning it said nothing extra.
+    return Envelope(status="ok", data={"deleted": True})
 
 
 @router.post("/files/{filename:path}/extract", response_model=Envelope, tags=["files"])
@@ -4120,7 +4197,7 @@ async def extract_uploaded_archive(
         "allowed_extensions": sorted(ALLOWED_UPLOAD_EXTENSIONS),
     }
 
-    def _extract_into_destination() -> dict:
+    def _extract_into_destination() -> tuple[dict, Optional[int]]:
         """Claim the destination, then fill it, without letting go between.
 
         The check and the extraction are one act. `bundle.zip` and
@@ -4140,19 +4217,41 @@ async def extract_uploaded_archive(
         thing being competed for. A waiter that arrives afterwards finds the
         finished tree and gets the ordinary 409.
         """
-        with path_lock(runtime.settings.shared_fs_root, str(dest_path)):
+        with path_lock(
+            runtime.settings.shared_fs_root,
+            namespace_key(files_dir, dest_rel.as_posix()),
+        ):
             if dest_path.exists():
                 raise http_error(
                     "conflict",
                     f"'{dest_rel.as_posix()}' already exists; delete it first",
                     status_code=409,
                 )
-            return extract_archive_sandboxed(
+            report = extract_archive_sandboxed(
                 str(archive_path), str(dest_path), limits
             )
+            # Ingestion stays inside the lock. Releasing it here and indexing
+            # afterwards leaves the tree deletable mid-traversal, and
+            # `ingest_path` catches per-file errors and returns the partial
+            # count rather than failing — so the request reports success with
+            # the folder gone and only the files read before the delete
+            # indexed. "Extract with a context" is one operation; the
+            # destination has to stay this operation's until it is finished
+            # with it.
+            chunks = None
+            if context_id:
+                _get_owned_context(runtime, context_id, principal)
+                chunks = runtime.rag.ingest_path(
+                    context_id,
+                    str(dest_path),
+                    recursive=True,
+                    chunk_size=chunk_size,
+                    allowed_base=files_dir,
+                )
+            return report, chunks
 
     try:
-        report = await asyncio.to_thread(_extract_into_destination)
+        report, chunk_count = await asyncio.to_thread(_extract_into_destination)
     except PathLockTimeout as exc:
         raise http_error("conflict", str(exc), status_code=409)
     except ArchiveExtractionError as exc:
@@ -4166,17 +4265,6 @@ async def extract_uploaded_archive(
         )
         raise http_error(
             "validation_error", f"extraction failed: {exc}", status_code=422
-        )
-
-    chunk_count = None
-    if context_id:
-        _get_owned_context(runtime, context_id, principal)
-        chunk_count = runtime.rag.ingest_path(
-            context_id,
-            str(dest_path),
-            recursive=True,
-            chunk_size=chunk_size,
-            allowed_base=files_dir,
         )
 
     logger.info(
