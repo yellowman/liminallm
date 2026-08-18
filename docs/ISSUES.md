@@ -8055,3 +8055,88 @@ disambiguates a title. Nothing is dropped and nothing is clobbered.
 
 `O_EXCL` also makes the claim atomic, so two concurrent producers cannot both
 take one name. No lock is needed for that part, which is why none was added.
+
+## 2E.3, continued: authority stopped at the root, and delete stood outside
+
+### HIGH: an authorized source did not bound its descendants
+
+`add_context_source` authorizes the source correctly and then hands
+`ingest_path` the *shared root* as its allowed base, which discards the
+narrower authority it just established. `ingest_path` validated only the
+starting path, then globbed descendants and called `is_file()` on each —
+which follows a link.
+
+Measured, both through the real route:
+
+```
+corpus/secret.txt -> <shared_fs_root>/users/<other>/files/private.md
+  indexed into the caller's context
+
+corpus/escape.txt -> <a path outside shared_fs_root entirely>
+  indexed into the caller's context
+```
+
+§18 makes authority the caller's own area, or an artifact covering a
+particular path. Membership anywhere under `shared_fs_root` is not authority,
+so containment is re-established at the ingestion boundary against the source
+itself: the source is the authority for everything under it.
+
+`_within_source` applies three tests, and mutation testing is what
+established that each is needed. On the route-level cases all three overlap,
+so each has a case of its own now:
+
+- A link resolving *inside* the source is refused by the link test, which
+  containment accepts.
+- A file reached through a symlinked parent is refused by containment, which
+  the link test accepts — `glob` does not descend into a symlinked directory
+  today, and that is a property of the Python version rather than of this
+  code.
+- A **hardlink** is refused by neither of the others. It *is* the file it
+  points at, with nothing in the path to say so: measured, a hardlink to
+  another user's upload placed inside a source directory passed both. This
+  was found by asking what the surviving mutations were failing to
+  distinguish, and it is a real gap rather than a redundancy. `st_nlink` is
+  the only available signal, and refusing a linked file matches what the
+  archive extractor already does with hardlinked members.
+
+Exploitability qualifier, as recorded by review: no supported writer plants a
+link under `files/` today. The authority check is wrong regardless, and
+externally provisioned source trees are not bound by the API's write set.
+
+### MEDIUM: DELETE was outside both locking protocols
+
+Upload holds `path_lock(dest_path)` across disk, index and manifest.
+Extraction holds it across the whole destination. `DELETE` took no lock, and
+two failures followed. Both measured.
+
+A delete landing inside an upload's transaction left this state, with both
+requests returning 200:
+
+```
+disk=False  manifest=True  indexed=True
+```
+
+No ordering of those two requests produces it.
+
+And the manifest is one object for every name in the directory, so deletion's
+unlocked read-modify-write dropped an entry belonging to a concurrent upload
+of a *different* file — the false dedupe hit 2E.1 removed, reintroduced from
+the other side.
+
+`_locked_delete` runs synchronously in a thread: namespace lock, re-check,
+delete, then the manifest lock and its read-modify-write. Namespace before
+manifest, the same order upload uses.
+
+The lock key is the top-level namespace entry, not the target. Extraction
+publishes `bundle/` under a lock on `bundle`, so deleting `bundle/subdir`
+must conflict with it. That has its own test and its own mutation, and the
+test asserts the *contention* rather than the final tree — a delete that runs
+after a completed extraction is a correct ordering and legitimately removes
+what it was asked to.
+
+### Still recorded, not fixed
+
+Deletion does not remove a path's chunks, in any ordering. That is the
+consistency pass `DELETE /files/{name}` still needs, and the deletion half of
+`replace_chunks_for_path` is what it will use. The race test reports the
+index state and does not assert on it, for that reason.

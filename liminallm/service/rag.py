@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import os
 import re
+import stat
 import unicodedata
 from enum import Enum
 from pathlib import Path
@@ -61,6 +62,38 @@ def _detokenize(tokens: List[str]) -> str:
             result.append(" ")
         result.append(token)
     return "".join(result)
+
+
+def _within_source(candidate: Path, root: Path) -> bool:
+    """Whether `candidate` is a real file inside `root`, and not a link out.
+
+    Three tests, because each refuses something the others accept.
+
+    The link test answers what a directory listing can see. The
+    resolved-containment test catches a path reaching outside through a
+    component the listing did not name — `glob` does not descend into a
+    symlinked directory today, and that is a property of the Python version
+    rather than of this code, so the test does not rely on it.
+
+    The hardlink test is the one neither of the others can make. A hardlink
+    *is* the file it points at, with nothing in the path to say so: measured,
+    a hardlink to another user's upload placed inside a source directory
+    passed both other tests. `st_nlink` is the only signal available, and
+    refusing a linked file matches what the archive extractor already does
+    with hardlinked members. A legitimate file with a second link elsewhere is
+    skipped as a consequence, which is the safe direction here — the reader
+    cannot tell the two apart, and the content is somebody's either way.
+    """
+    try:
+        if candidate.is_symlink():
+            return False
+        resolved = candidate.resolve(strict=True)
+        info = resolved.stat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink > 1:
+            return False
+    except OSError:
+        return False
+    return root in resolved.parents or resolved == root
 
 
 class RAGService:
@@ -967,10 +1000,25 @@ class RAGService:
             logger.warning("ingest_path_not_found", path=str(path))
             return 0
 
-        # Directory - iterate through files with limits
+        # Directory - iterate through files with limits.
+        #
+        # The source itself is the authority for everything under it. The
+        # caller's `allowed_base` answers whether *this* path may be read, and
+        # `add_context_source` passes the shared root, which is far broader
+        # than the authority `authorize_path` just established. Descendants
+        # were never checked against anything: `glob` yields a link and
+        # `is_file()` follows it, so a link inside an authorized directory
+        # read whatever it pointed at — measured, another user's upload and a
+        # file outside `shared_fs_root` entirely, both indexed into the
+        # caller's context.
+        #
+        # §18 makes authority the caller's own area or an artifact covering a
+        # particular path. Being somewhere under the shared root is not
+        # authority, so containment is re-established here against the source.
+        source_root = path.resolve()
         pattern = "**/*" if recursive else "*"
         for file_path in path.glob(pattern):
-            if not file_path.is_file():
+            if not _within_source(file_path, source_root):
                 continue
             if extensions and file_path.suffix.lower() not in extensions:
                 continue

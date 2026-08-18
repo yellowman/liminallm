@@ -1007,3 +1007,403 @@ class TestInterpreterPublicationDoesNotClobber:
         # The artifact is kept, under a name that was free.
         assert published and published != [name], published
         assert (files_dir / published[0]).read_bytes() == b"written by the model's code\n"
+
+
+class TestAnAuthorizedSourceBoundsItsDescendants:
+    """§18: authority is the caller's own `/users/{user_id}` area, or an
+    artifact covering a particular path. Membership somewhere under
+    `shared_fs_root` is not authority.
+
+    `add_context_source` authorizes the source correctly and then hands
+    `ingest_path` the *shared root* as its allowed base, which throws that
+    narrower authority away. `ingest_path` validates only the starting path,
+    then globs descendants and calls `is_file()` on each — and `is_file()`
+    follows a link. So a link inside an authorized directory reads whatever it
+    points at, including another user's files and paths outside the shared
+    root entirely.
+
+    No supported writer can plant such a link under `files/` today: uploads
+    write bytes, the archive extractor skips links, and interpreter
+    publication refuses non-regular sources. The link here is planted
+    directly, because the authority check is wrong whether or not the API
+    currently offers a way to exploit it, and externally provisioned source
+    trees are not bound by the API's write set.
+    """
+
+    def test_a_link_inside_the_source_does_not_reach_the_index(self, client):
+        import os
+
+        runtime = get_runtime()
+        victim, victim_headers = _account(client)
+        secret = b"THE VICTIM'S PRIVATE CORPUS ENTRY\n"
+        resp = client.post(
+            "/v1/files/upload",
+            headers={**victim_headers, "Idempotency-Key": _unique("k")},
+            files={"file": ("private.md", secret, "text/markdown")},
+        )
+        assert resp.status_code == 200, resp.text
+        victim_file = _files_dir(runtime, victim) / "private.md"
+        assert victim_file.is_file()
+
+        user_id, headers = _account(client)
+        corpus = _files_dir(runtime, user_id) / "corpus"
+        corpus.mkdir(parents=True, exist_ok=True)
+        (corpus / "innocent.txt").write_bytes(b"material belonging to the caller\n" * 20)
+        os.symlink(str(victim_file), corpus / "secret.txt")
+
+        context_id = _context(client, headers)
+        added = client.post(
+            f"/v1/contexts/{context_id}/sources",
+            headers=headers,
+            json={"fs_path": str(corpus), "recursive": True},
+        )
+        assert added.status_code in (200, 201), added.text
+
+        texts = " ".join(
+            c.content or ""
+            for c in runtime.store.list_chunks(context_id, limit=500)
+        )
+        assert "belonging to the caller" in texts, (
+            "the source was never indexed, so nothing is proved"
+        )
+        assert "PRIVATE CORPUS ENTRY" not in texts, (
+            "a link inside the source indexed another user's file"
+        )
+
+    def test_a_link_pointing_outside_the_shared_root_is_refused_too(
+        self, client, tmp_path
+    ):
+        """The allowed base has already been satisfied by the directory, so
+        the target is not confined to `shared_fs_root` either."""
+        import os
+
+        runtime = get_runtime()
+        outside = tmp_path / "outside.txt"
+        outside.write_bytes(b"NOT UNDER THE SHARED ROOT AT ALL\n")
+
+        user_id, headers = _account(client)
+        corpus = _files_dir(runtime, user_id) / "corpus2"
+        corpus.mkdir(parents=True, exist_ok=True)
+        (corpus / "innocent.txt").write_bytes(b"material belonging to the caller\n" * 20)
+        os.symlink(str(outside), corpus / "escape.txt")
+
+        context_id = _context(client, headers)
+        added = client.post(
+            f"/v1/contexts/{context_id}/sources",
+            headers=headers,
+            json={"fs_path": str(corpus), "recursive": True},
+        )
+        assert added.status_code in (200, 201), added.text
+
+        texts = " ".join(
+            c.content or ""
+            for c in runtime.store.list_chunks(context_id, limit=500)
+        )
+        assert "belonging to the caller" in texts
+        assert "NOT UNDER THE SHARED ROOT" not in texts, (
+            "a link read a path outside the shared root entirely"
+        )
+
+    def test_a_hardlink_is_refused_though_no_path_reveals_it(self, client):
+        """A hardlink *is* the file it points at. Nothing in the path says so,
+        so neither the link test nor resolved containment can refuse it —
+        measured, both accepted one. The archive extractor already skips
+        hardlinked members for the same reason."""
+        import os
+
+        runtime = get_runtime()
+        victim, victim_headers = _account(client)
+        secret = b"THE VICTIM HARDLINKED ENTRY\n"
+        resp = client.post(
+            "/v1/files/upload",
+            headers={**victim_headers, "Idempotency-Key": _unique("k")},
+            files={"file": ("private.md", secret, "text/markdown")},
+        )
+        assert resp.status_code == 200, resp.text
+        victim_file = _files_dir(runtime, victim) / "private.md"
+
+        user_id, headers = _account(client)
+        corpus = _files_dir(runtime, user_id) / "corpus3"
+        corpus.mkdir(parents=True, exist_ok=True)
+        (corpus / "innocent.txt").write_bytes(b"material belonging to the caller\n" * 20)
+        os.link(str(victim_file), corpus / "hard.md")
+
+        context_id = _context(client, headers)
+        added = client.post(
+            f"/v1/contexts/{context_id}/sources",
+            headers=headers,
+            json={"fs_path": str(corpus), "recursive": True},
+        )
+        assert added.status_code in (200, 201), added.text
+        texts = " ".join(
+            c.content or ""
+            for c in runtime.store.list_chunks(context_id, limit=500)
+        )
+        assert "belonging to the caller" in texts
+        assert "VICTIM HARDLINKED ENTRY" not in texts, (
+            "a hardlink inside the source indexed another user's file"
+        )
+
+    def test_each_descendant_test_refuses_something_the_others_accept(
+        self, tmp_path
+    ):
+        """Kept separate because mutation showed the three overlap on the
+        route-level cases, and code no test distinguishes is code nobody is
+        checking."""
+        import os
+
+        from liminallm.service.rag import _within_source
+
+        root = tmp_path / "src"
+        root.mkdir()
+        (root / "real.txt").write_bytes(b"inside")
+        outside = tmp_path / "outside.txt"
+        outside.write_bytes(b"outside")
+
+        # Refused by the link test alone: it resolves inside the root, so
+        # containment accepts it, and it is not hardlinked.
+        os.symlink(str(root / "real.txt"), root / "inside-link.txt")
+        assert not _within_source(root / "inside-link.txt", root.resolve())
+
+        # Refused by containment alone: the final component is a real file and
+        # is not hardlinked, but its parent is a link out of the root.
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "file.txt").write_bytes(b"beyond")
+        os.symlink(str(elsewhere), root / "subdir")
+        assert not _within_source(root / "subdir" / "file.txt", root.resolve())
+
+        # Refused by the hardlink test alone: no link in the path, and it
+        # resolves inside the root.
+        os.link(str(outside), root / "hard.txt")
+        assert not _within_source(root / "hard.txt", root.resolve())
+
+        # And an ordinary file is still accepted.
+        assert _within_source(root / "real.txt", root.resolve())
+
+
+class TestDeleteJoinsTheSameProtocol:
+    """Upload and extraction each treat a name as one critical section.
+    Deletion took no lock at all.
+
+    Upload holds `path_lock(dest_path)` across disk, index, and manifest, and
+    its own comment says the manifest is meaningful only under that lock.
+    Extraction holds `path_lock(dest_path)` across the whole destination.
+    `DELETE` resolved a path, checked it, removed it, and then did an
+    unlocked read-modify-write of the shared manifest.
+    """
+
+    def _conversation_free_upload(self, client, headers, name, body, context_id):
+        return client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={"file": (name, body, "text/markdown")},
+            data={"context_id": context_id},
+        )
+
+    def test_a_delete_inside_an_upload_leaves_no_impossible_state(self, client):
+        """Neither serialization order produces "file absent, manifest and
+        index describe it, both requests succeeded"."""
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        context_id = _context(client, headers)
+        name = "report.md"
+        body = b"# report\nthe uploaded body\n" * 20
+
+        reached = threading.Event()
+        may_continue = threading.Event()
+        real_ingest = runtime.rag.ingest_file
+        armed = {"on": True}
+
+        def ingest(ctx, path, **kwargs):
+            out = real_ingest(ctx, path, **kwargs)
+            if armed["on"]:
+                armed["on"] = False
+                reached.set()
+                may_continue.wait(20)
+            return out
+
+        results: dict = {}
+        upload = threading.Thread(
+            target=lambda: results.update(
+                up=self._conversation_free_upload(
+                    client, headers, name, body, context_id
+                )
+            ),
+            daemon=True,
+        )
+        deleter = threading.Thread(
+            target=lambda: results.update(
+                rm=client.delete(f"/v1/files/{name}", headers=headers)
+            ),
+            daemon=True,
+        )
+        runtime.rag.ingest_file = ingest
+        try:
+            upload.start()
+            assert reached.wait(30), "the upload never reached ingestion"
+            deleter.start()
+            time.sleep(1.0)
+            may_continue.set()
+            upload.join(60)
+            deleter.join(60)
+        finally:
+            may_continue.set()
+            runtime.rag.ingest_file = real_ingest
+
+        on_disk = (_files_dir(runtime, user_id) / name).exists()
+        recorded = _manifest(runtime, user_id).get(name)
+        chunks = " ".join(
+            c.content or "" for c in runtime.store.list_chunks(context_id, limit=200)
+        )
+        indexed = "the uploaded body" in chunks
+        # Either the upload won and everything describes it, or the delete won
+        # and nothing does. A file that is absent while the manifest still
+        # names it is neither.
+        assert (on_disk, bool(recorded)) in ((True, True), (False, False)), (
+            f"disk={on_disk} manifest={bool(recorded)} indexed={indexed}; "
+            "no ordering of these two requests produces that"
+        )
+        # `indexed` is reported and not asserted on. Deletion has never
+        # removed a path's chunks, in any ordering, so a deleted file leaving
+        # its chunks behind is not this race — it is the recorded consistency
+        # pass that `DELETE /files/{name}` still needs, and the deletion half
+        # of `replace_chunks_for_path` is what it will use.
+
+    def test_deleting_inside_a_tree_conflicts_with_the_tree_being_published(
+        self, client, monkeypatch
+    ):
+        """The lock key is the namespace, not the target.
+
+        Extraction publishes `bundle/` under a lock on `bundle`. Deleting
+        `bundle/subdir` has to conflict with that, or the delete removes part
+        of a tree the extraction goes on to finish and report as whole.
+        """
+        import io
+        import zipfile
+
+        from liminallm.api import routes
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("subdir/one.txt", b"first member\n" * 20)
+            zf.writestr("subdir/two.txt", b"second member\n" * 20)
+        resp = client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={"file": ("bundle.zip", buf.getvalue(), "application/zip")},
+        )
+        assert resp.status_code == 200, resp.text
+
+        reached = threading.Event()
+        may_continue = threading.Event()
+        armed = {"on": True}
+        real_extract = routes.extract_archive_sandboxed
+
+        def gated(*args, **kwargs):
+            out = real_extract(*args, **kwargs)
+            if armed["on"]:
+                armed["on"] = False
+                reached.set()
+                may_continue.wait(20)
+            return out
+
+        monkeypatch.setattr(routes, "extract_archive_sandboxed", gated)
+        results: dict = {}
+        released = threading.Event()
+
+        def delete_and_record():
+            resp = client.delete("/v1/files/bundle/subdir", headers=headers)
+            # Recorded at the moment the delete returns: whether the
+            # extraction had let go of `bundle` by then.
+            results["rm"] = resp
+            results["waited_for_release"] = released.is_set()
+
+        extractor = threading.Thread(
+            target=lambda: results.update(
+                ex=client.post("/v1/files/bundle.zip/extract", headers=headers)
+            ),
+            daemon=True,
+        )
+        deleter = threading.Thread(target=delete_and_record, daemon=True)
+        extractor.start()
+        assert reached.wait(30), "the extraction never ran"
+        deleter.start()
+        time.sleep(1.0)
+        released.set()
+        may_continue.set()
+        extractor.join(60)
+        deleter.join(60)
+
+        assert results["ex"].status_code == 200, results["ex"].text
+        # The outcome asserted on is the contention, not the final tree: a
+        # delete that runs *after* a completed extraction is a correct
+        # ordering and removes what it was asked to. What must not happen is
+        # the delete finishing while the extraction still owns `bundle`.
+        assert results["waited_for_release"], (
+            "the delete completed while the extraction still held the "
+            "destination lock, so it was not keyed on the same namespace"
+        )
+
+    def test_a_delete_does_not_erase_another_names_manifest_entry(self, client):
+        """The manifest is one object for the whole directory, so deletion's
+        read-modify-write can drop an entry it never touched."""
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        context_id = _context(client, headers)
+        keep, drop = "keep.md", "drop.md"
+        for name in (keep, drop):
+            resp = self._conversation_free_upload(
+                client, headers, name, b"# first\nbody\n" * 20, context_id
+            )
+            assert resp.status_code == 200, resp.text
+
+        reached = threading.Event()
+        may_continue = threading.Event()
+        armed = {"on": True}
+        real_loads = json.loads
+
+        def gated_loads(*args, **kwargs):
+            out = real_loads(*args, **kwargs)
+            # After the delete has read the manifest and before it writes.
+            if armed["on"] and isinstance(out, dict) and keep in out:
+                armed["on"] = False
+                reached.set()
+                may_continue.wait(20)
+            return out
+
+        results: dict = {}
+        deleter = threading.Thread(
+            target=lambda: results.update(
+                rm=client.delete(f"/v1/files/{drop}", headers=headers)
+            ),
+            daemon=True,
+        )
+        import liminallm.api.routes as routes
+
+        monkey = routes.json.loads
+        routes.json.loads = gated_loads
+        try:
+            deleter.start()
+            if reached.wait(20):
+                second = self._conversation_free_upload(
+                    client, headers, keep, b"# second\nreplaced body\n" * 20, context_id
+                )
+                assert second.status_code == 200, second.text
+                may_continue.set()
+            deleter.join(60)
+        finally:
+            may_continue.set()
+            routes.json.loads = monkey
+
+        manifest = _manifest(runtime, user_id)
+        on_disk = (_files_dir(runtime, user_id) / keep).read_bytes()
+        assert keep in manifest, (
+            f"the delete of {drop} erased {keep}'s manifest entry: "
+            f"{sorted(manifest)}"
+        )
+        assert manifest[keep]["checksum"] == hashlib.sha256(on_disk).hexdigest(), (
+            "the surviving manifest entry describes bytes that are not on disk"
+        )

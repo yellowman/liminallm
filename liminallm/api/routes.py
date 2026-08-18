@@ -3995,31 +3995,65 @@ async def delete_file(
     except PathTraversalError:
         raise http_error("validation_error", "invalid filename", status_code=400)
 
-    # Hidden files are internal bookkeeping (upload strips leading dots, so a
-    # user can never own one); report them as absent rather than deletable.
-    # The files root itself is never deletable.
-    if (
-        _is_hidden_relpath(filename)
-        or not file_path.exists()
-        or file_path == files_dir.resolve()
-    ):
+    if _is_hidden_relpath(filename):
+        # Hidden files are internal bookkeeping (upload strips leading dots,
+        # so a user can never own one); report them as absent.
         raise http_error("not_found", "file not found", status_code=404)
 
-    # Delete file, or an extracted-archive folder recursively
-    if file_path.is_dir():
-        await asyncio.to_thread(shutil.rmtree, file_path)
-    else:
-        await asyncio.to_thread(file_path.unlink)
-
-    # Drop the file's entry from the checksum manifest so it doesn't go stale.
+    # The name a publisher claims, not the one being deleted. Upload locks
+    # `report.txt`; extraction locks `bundle` and then writes a whole tree
+    # underneath it. Deleting `bundle/subdir` has to conflict with the
+    # extraction that owns `bundle`, or a publisher finishes reporting success
+    # over a tree something else removed part of.
+    namespace = files_dir / FilePath(filename).parts[0]
     manifest_path = files_dir / ".checksums.json"
-    if manifest_path.exists():
-        try:
-            manifest = json.loads(manifest_path.read_text())
-            if manifest.pop(filename, None) is not None:
-                manifest_path.write_text(json.dumps(manifest, indent=2))
-        except Exception:
-            logger.warning("file_checksum_manifest_update_failed", path=str(manifest_path))
+
+    def _locked_delete() -> None:
+        """Remove the target and its manifest entry as one act.
+
+        Deletion used to take no lock while upload and extraction each treat a
+        name as one critical section. Two things followed, both measured.
+
+        A delete landing inside an upload's transaction left the file absent
+        while the manifest and the index still described it, with both
+        requests returning 200 — a state no ordering of those two requests
+        produces.
+
+        And the manifest is one object for every name in the directory, so an
+        unlocked read-modify-write here dropped an entry belonging to a
+        concurrent upload of a *different* file, which is the false dedupe hit
+        2E.1 removed, reintroduced from the other side.
+
+        Namespace lock first, manifest lock second — the same order upload
+        uses, so the two can never each hold what the other waits for.
+        """
+        with path_lock(runtime.settings.shared_fs_root, str(namespace)):
+            # Re-checked under the lock: existence answered before it is an
+            # answer about a moment that has passed.
+            if not file_path.exists() or file_path == files_dir.resolve():
+                raise http_error("not_found", "file not found", status_code=404)
+            if file_path.is_dir():
+                shutil.rmtree(file_path)
+            else:
+                file_path.unlink()
+
+            with path_lock(runtime.settings.shared_fs_root, str(manifest_path)):
+                if not manifest_path.exists():
+                    return
+                try:
+                    manifest = json.loads(manifest_path.read_text())
+                    if manifest.pop(filename, None) is not None:
+                        manifest_path.write_text(json.dumps(manifest, indent=2))
+                except Exception:
+                    logger.warning(
+                        "file_checksum_manifest_update_failed",
+                        path=str(manifest_path),
+                    )
+
+    try:
+        await asyncio.to_thread(_locked_delete)
+    except PathLockTimeout as exc:
+        raise http_error("conflict", str(exc), status_code=409)
 
     logger.info("file_deleted", user_id=principal.user_id, filename=filename)
     return Envelope(status="ok", data={"deleted": filename})
