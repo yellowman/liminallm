@@ -17,9 +17,11 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import os
 import time
 import uuid
 import zipfile
+import zlib
 from pathlib import Path
 
 import pytest
@@ -1150,6 +1152,77 @@ class TestTheIndexIsItsOwnReverseIndex:
         )
         assert str(target) not in _described_paths(runtime, context_id)
 
+    def test_a_source_rooted_above_the_file_still_serializes(self, client):
+        """The lock has to be taken where the mutation happens.
+
+        One lock for the whole source works while the source *is* the file.
+        A source rooted at `files/` locks `files/`, an upload of
+        `files/report.md` locks `report.md`, and the two never meet — so the
+        walk reads one generation while the upload publishes the next, and
+        the walk's commit lands last. Every step succeeds.
+        """
+        import threading
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        context_id = _context(client, headers)
+        first = b"# report\nTHE GENERATION THE WALK READ\n" * 12
+        second = b"# report\nTHE GENERATION THE UPLOAD WROTE\n" * 12
+        assert _upload(client, headers, "report.md", first).status_code == 200
+        files_dir = _files_dir(runtime, user_id)
+
+        reached = threading.Event()
+        may_continue = threading.Event()
+        released = threading.Event()
+        armed = {"on": True}
+        real_commit = runtime.rag._commit_generation
+
+        def gated(*args, **kwargs):
+            if armed["on"]:
+                armed["on"] = False
+                reached.set()
+                may_continue.wait(30)
+            return real_commit(*args, **kwargs)
+
+        results: dict = {}
+
+        def add_source():
+            results["src"] = self._add_source(client, headers, context_id, files_dir)
+
+        def upload_and_record():
+            results["up"] = _upload(client, headers, "report.md", second)
+            results["waited_for_release"] = released.is_set()
+
+        runtime.rag._commit_generation = gated
+        source_thread = threading.Thread(target=add_source, daemon=True)
+        upload_thread = threading.Thread(target=upload_and_record, daemon=True)
+        try:
+            source_thread.start()
+            assert reached.wait(30), "the walk never reached a commit"
+            upload_thread.start()
+            time.sleep(1.0)
+            released.set()
+            may_continue.set()
+            source_thread.join(90)
+            upload_thread.join(90)
+        finally:
+            may_continue.set()
+            runtime.rag._commit_generation = real_commit
+
+        assert results["up"].status_code == 200, results["up"].text
+        assert results["src"].status_code in (200, 201), results["src"].text
+        assert results["waited_for_release"], (
+            "the upload replaced the file while the walk still owned it"
+        )
+        assert (files_dir / "report.md").read_bytes() == second
+        indexed = _text(runtime, context_id)
+        assert "THE GENERATION THE UPLOAD WROTE" in indexed, (
+            "the walk committed over the newer generation's chunks"
+        )
+        assert "THE GENERATION THE WALK READ" not in indexed, (
+            "the index describes a generation the file no longer holds"
+        )
+
     def test_the_context_receiving_the_new_generation_keeps_it(self, client):
         """The one context that must not be swept is the one being written."""
         runtime = get_runtime()
@@ -1435,6 +1508,83 @@ class TestUnreferencedGenerationsAreReclaimed:
         resp = client.get(f"/v1/files/{checksum}/url", headers=headers)
         assert resp.status_code == 404, resp.status_code
 
+    def test_reusing_an_old_generation_survives_a_concurrent_sweep(self, client):
+        """The grace period protects a *new* object, not a reused old one.
+
+        `store_generation` returns an existing object without touching it, so
+        its age still says when it was first written. An object that has been
+        unreferenced long enough to be swept can be reused by a new
+        attachment, and the sweep then unlinks it during that attachment's
+        own operation: the record lands naming bytes that are already gone.
+        """
+        import threading
+
+        from liminallm.api import routes
+        from liminallm.service.attachments import (
+            generation_path,
+            resolve_attachment,
+            store_generation,
+            sweep_generations,
+        )
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        body = b"# reused\nBYTES ATTACHED ONCE AND THEN AGAIN\n"
+        checksum = hashlib.sha256(body).hexdigest()
+
+        # An old object nothing references: what the sweep is looking for.
+        blob = store_generation(
+            runtime.settings.shared_fs_root, user_id, body, checksum
+        )
+        assert blob is not None and blob.is_file()
+        self._age(blob, 10_000)
+
+        swept: dict = {}
+        armed = {"on": True}
+        real_store = routes.store_generation
+
+        def gated(*args, **kwargs):
+            out = real_store(*args, **kwargs)
+            if armed["on"]:
+                armed["on"] = False
+
+                def sweep():
+                    swept["removed"] = sweep_generations(
+                        runtime.store,
+                        runtime.settings.shared_fs_root,
+                        grace_seconds=60,
+                    )
+
+                sweeper = threading.Thread(target=sweep, daemon=True)
+                sweeper.start()
+                # Long enough for a sweep that takes no lock to finish.
+                time.sleep(1.0)
+                swept["thread"] = sweeper
+            return out
+
+        conversation_id = self._conversation(client, headers)
+        original = routes.store_generation
+        routes.store_generation = gated
+        try:
+            resp = self._attach(client, headers, conversation_id, "reused.md", body)
+        finally:
+            routes.store_generation = original
+        assert resp.status_code == 200, resp.text
+        assert not armed["on"], "the window never opened"
+        swept["thread"].join(60)
+
+        record = resp.json()["data"]["attachment"]
+        assert record and record["checksum"] == checksum, record
+        assert resolve_attachment(
+            runtime.settings.shared_fs_root, user_id, record
+        ) is not None, (
+            "the sweep removed the generation during the attachment that was "
+            "adopting it, so the record names bytes that are gone"
+        )
+        assert generation_path(
+            runtime.settings.shared_fs_root, user_id, checksum
+        ).is_file()
+
     def test_a_referenced_generation_survives_the_sweep(self, client):
         from liminallm.service.attachments import generation_path, sweep_generations
 
@@ -1593,3 +1743,539 @@ class TestTheListingAgreesWithTheEnvelope:
         assert "did not fit" in preamble, preamble
         # The capability that does not depend on the prompt is still offered.
         assert "run_python" in preamble
+
+
+def _pdf_bytes(line: str) -> bytes:
+    """A one-page PDF whose text only a PDF reader can recover.
+
+    The content stream is Flate-compressed on purpose. An uncompressed one
+    is mostly ASCII, so the marker survives a generic byte decode and a test
+    built on it passes whether or not the format was recognised — measured,
+    that is exactly what the first version of this did.
+    """
+    raw = f"BT /F1 24 Tf 72 700 Td ({line}) Tj ET".encode()
+    content = zlib.compress(raw)
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] "
+        b"/Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        b"<< /Length " + str(len(content)).encode() + b" /Filter /FlateDecode >>"
+        b"\nstream\n" + content + b"\nendstream",
+    ]
+    out = bytearray(b"%PDF-1.4\n")
+    offsets = []
+    for index, body in enumerate(objects, start=1):
+        offsets.append(len(out))
+        out += f"{index} 0 obj\n".encode() + body + b"\nendobj\n"
+    xref = len(out)
+    out += f"xref\n0 {len(objects) + 1}\n".encode() + b"0000000000 65535 f \n"
+    for offset in offsets:
+        out += f"{offset:010d} 00000 n \n".encode()
+    out += (
+        f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
+        f"startxref\n{xref}\n%%EOF\n"
+    ).encode()
+    return bytes(out)
+
+
+class TestAGenerationKeepsItsFormat:
+    """The object is named by its digest, and a digest has no extension.
+
+    `extract_text` routes by `path.suffix`, so moving a searchable
+    attachment into the content-addressed store took its format away with
+    its name: a `.docx` arrived as an extensionless object, fell through to
+    the generic byte decode, and was refused as binary. The upload reported
+    success with nothing indexed.
+
+    The extension does not go into the key — the key is the identity of the
+    bytes and nothing else. The format travels beside it, as what the
+    conversation calls the file.
+    """
+
+    def _conversation(self, client, headers) -> str:
+        resp = client.post(
+            "/v1/conversations", headers=headers, json={"title": _unique("chat")}
+        )
+        assert resp.status_code in (200, 201), resp.text
+        return resp.json()["data"]["id"]
+
+    def test_a_document_attachment_is_still_read(self, client):
+        from liminallm.service.attachments import (
+            classify_attachment,
+            find_conversation_context_id,
+        )
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        body = _pdf_bytes("THE PARAGRAPH INSIDE THE DOCUMENT")
+        assert classify_attachment("report.pdf", len(body))["searchable"], (
+            "the test needs a format the upload routes into the index"
+        )
+
+        resp = client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={"file": ("report.pdf", body, "application/pdf")},
+            data={"conversation_id": conversation_id},
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["data"]["chunk_count"], (
+            f"the document was stored and never read: {resp.json()['data']}"
+        )
+
+        auto_ctx = find_conversation_context_id(
+            runtime.store, user_id=user_id, conversation_id=conversation_id
+        )
+        assert auto_ctx, "no implicit context was created"
+        assert "THE PARAGRAPH INSIDE THE DOCUMENT" in _text(runtime, auto_ctx)
+
+    def test_the_extension_is_not_part_of_the_key(self, client):
+        """Two names, one set of bytes, one object.
+
+        The digest is the identity of the bytes. Putting a display name into
+        it would give the same bytes two objects and defeat the dedupe the
+        store gets for free.
+        """
+        from liminallm.service.attachments import generation_path
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        first = self._conversation(client, headers)
+        second = self._conversation(client, headers)
+        body = b"# shared\nTHE SAME BYTES UNDER TWO NAMES\n"
+        for conversation_id, name in ((first, "one.md"), (second, "two.md")):
+            resp = client.post(
+                "/v1/files/upload",
+                headers={**headers, "Idempotency-Key": _unique("k")},
+                files={"file": (name, body, "text/markdown")},
+                data={"conversation_id": conversation_id},
+            )
+            assert resp.status_code == 200, resp.text
+
+        blob = generation_path(
+            runtime.settings.shared_fs_root, user_id, hashlib.sha256(body).hexdigest()
+        )
+        assert blob is not None and blob.is_file()
+        assert blob.suffix == "", blob.name
+        stored = sorted(p.name for p in blob.parent.iterdir())
+        assert stored == [blob.name], (
+            f"the same bytes were stored more than once: {stored}"
+        )
+
+
+class TestAChatSearchesOnlyWhatItStillHolds:
+    """Replacing an attachment in one chat leaves two generations indexed.
+
+    `replace_chunks_for_path` replaces the rows for the path it is given, and
+    the path is now the generation. A second attachment under the same name
+    is a *different* generation, so its ingestion replaced nothing: the
+    conversation's record named the new bytes while its index held both.
+
+    The record is the authority for what the chat holds. What the index
+    happens to contain is not a capability.
+    """
+
+    def _conversation(self, client, headers) -> str:
+        resp = client.post(
+            "/v1/conversations", headers=headers, json={"title": _unique("chat")}
+        )
+        assert resp.status_code in (200, 201), resp.text
+        return resp.json()["data"]["id"]
+
+    def _attach(self, client, headers, conversation_id, name, body):
+        return client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={"file": (name, body, "text/markdown")},
+            data={"conversation_id": conversation_id},
+        )
+
+    def _search(self, runtime, conversation_id, user_id, query):
+        text, _snippets = runtime.workflow._run_file_search(
+            query,
+            8,
+            conversation_id=conversation_id,
+            context_id=None,
+            user_id=user_id,
+            tenant_id=None,
+        )
+        return text
+
+    def test_replacing_an_attachment_retires_the_one_it_replaced(self, client):
+        from liminallm.service.attachments import (
+            classify_attachment,
+            find_conversation_context_id,
+            list_attachments,
+        )
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        first = b"# manual\nTHE INSTRUCTIONS FROM THE FIRST EDITION\n" * 400
+        second = b"# manual\nTHE INSTRUCTIONS FROM THE SECOND EDITION\n" * 400
+        assert classify_attachment("manual.md", len(first))["searchable"], (
+            "the test needs an attachment large enough to be chunked"
+        )
+
+        assert self._attach(
+            client, headers, conversation_id, "manual.md", first
+        ).status_code == 200
+        assert self._attach(
+            client, headers, conversation_id, "manual.md", second
+        ).status_code == 200
+
+        conversation = runtime.store.get_conversation(conversation_id, user_id=user_id)
+        records = list_attachments(conversation)
+        assert [r["checksum"] for r in records] == [
+            hashlib.sha256(second).hexdigest()
+        ], records
+
+        found = self._search(runtime, conversation_id, user_id, "instructions edition")
+        editions = {
+            name for name in ("FIRST EDITION", "SECOND EDITION") if name in found
+        }
+        assert editions == {"SECOND EDITION"}, (
+            f"file_search returned {sorted(editions)}; the chat holds only the "
+            "second edition"
+        )
+
+        auto_ctx = find_conversation_context_id(
+            runtime.store, user_id=user_id, conversation_id=conversation_id
+        )
+        assert "THE INSTRUCTIONS FROM THE FIRST EDITION" not in _text(
+            runtime, auto_ctx
+        ), "the retired generation's chunks were left in the index"
+
+    def test_a_generation_reclaimed_by_the_sweep_is_not_retrievable(self, client):
+        """Chunks outlive the object they describe unless something says so.
+
+        The sweeper removes an unreferenced blob; it does not touch Postgres.
+        If retrieval were driven by what the index contains rather than by
+        what the conversation holds, `file_search` would go on answering from
+        a generation whose bytes are gone.
+        """
+        from liminallm.service.attachments import generation_path
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        body = b"# ledger\nTHE ENTRIES IN THE OLD LEDGER\n" * 400
+        assert self._attach(
+            client, headers, conversation_id, "ledger.md", body
+        ).status_code == 200
+        assert "OLD LEDGER" in self._search(
+            runtime, conversation_id, user_id, "entries ledger"
+        )
+
+        # Drop the record, leaving the chunks: the shape a sweep produces.
+        runtime.store.merge_conversation_meta(
+            conversation_id, user_id=user_id, patch={"attachments": []}
+        )
+        blob = generation_path(
+            runtime.settings.shared_fs_root, user_id, hashlib.sha256(body).hexdigest()
+        )
+        blob.unlink()
+
+        found = self._search(runtime, conversation_id, user_id, "entries ledger")
+        assert "OLD LEDGER" not in found, (
+            "file_search answered from a generation the conversation no "
+            f"longer holds and whose bytes are gone: {found[:120]!r}"
+        )
+
+
+class TestAConversationsIndexIsNotAUserManagedContext:
+    """`meta.auto` is load-bearing, so it has to be true.
+
+    The invalidation sweep skips auto contexts because they hold attachment
+    generations, which are immutable and scoped to one chat. That reasoning
+    only holds if nothing else can put a path-following source into one —
+    and `POST /contexts/{id}/sources` checked ownership and nothing else.
+    The id is not even hidden: a searchable attachment upload returns it.
+
+    So a client could add an ordinary mutable file to a conversation's index
+    and then replace that file, and the sweep would deliberately leave the
+    stale generation alone. Making the architectural statement true is
+    cheaper than making the sweep understand the exception.
+    """
+
+    def test_a_source_cannot_be_added_to_a_conversations_index(self, client):
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        resp = client.post(
+            "/v1/conversations", headers=headers, json={"title": _unique("chat")}
+        )
+        assert resp.status_code in (200, 201), resp.text
+        conversation_id = resp.json()["data"]["id"]
+
+        body = b"# manual\nTHE ATTACHED MANUAL TEXT\n" * 400
+        resp = client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={"file": ("manual.md", body, "text/markdown")},
+            data={"conversation_id": conversation_id},
+        )
+        assert resp.status_code == 200, resp.text
+        auto_ctx = resp.json()["data"]["context_id"]
+        assert auto_ctx, "the searchable attachment did not report its context"
+
+        assert _upload(client, headers, "ordinary.md", b"# ordinary\nBODY\n" * 12).status_code == 200
+        resp = client.post(
+            f"/v1/contexts/{auto_ctx}/sources",
+            headers=headers,
+            json={
+                "fs_path": str(_files_dir(runtime, user_id) / "ordinary.md"),
+                "recursive": False,
+            },
+        )
+        assert resp.status_code == 404, (
+            f"a conversation's index accepted a user-managed source: "
+            f"{resp.status_code} {resp.text[:200]}"
+        )
+        assert "BODY" not in _text(runtime, auto_ctx)
+
+    def test_an_ordinary_context_still_accepts_sources(self, client):
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        context_id = _context(client, headers)
+        assert _upload(
+            client, headers, "corpus.md", b"# corpus\nTHE CORPUS TEXT\n" * 12
+        ).status_code == 200
+
+        resp = client.post(
+            f"/v1/contexts/{context_id}/sources",
+            headers=headers,
+            json={
+                "fs_path": str(_files_dir(runtime, user_id) / "corpus.md"),
+                "recursive": False,
+            },
+        )
+        assert resp.status_code in (200, 201), resp.text
+        assert "THE CORPUS TEXT" in _text(runtime, context_id)
+
+
+def _bundle_zip(members: dict) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, body in members.items():
+            zf.writestr(name, body)
+    return buf.getvalue()
+
+
+class TestARefusedExtractionPublishesNothing:
+    """The upload ordering defect, in the archive route.
+
+    `extract_archive_sandboxed` runs and *then* the named context is
+    checked, so a request refused for naming a context that does not exist
+    has already published the whole tree. Worse than the upload case: a
+    retry without the bad parameter gets 409, because the destination the
+    refused request created is now in the way.
+    """
+
+    def _publish_archive(self, client, headers):
+        resp = _upload(
+            client,
+            headers,
+            "bundle.zip",
+            _bundle_zip({"a.txt": b"THE MEMBER TEXT\n" * 20}),
+            media="application/zip",
+        )
+        assert resp.status_code == 200, resp.text
+
+    def test_an_unknown_context_extracts_nothing(self, client):
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        self._publish_archive(client, headers)
+
+        resp = client.post(
+            f"/v1/files/bundle.zip/extract?context_id={uuid.uuid4()}",
+            headers=headers,
+        )
+        assert resp.status_code == 404, f"{resp.status_code}: {resp.text[:200]}"
+        assert not (_files_dir(runtime, user_id) / "bundle").exists(), (
+            "a request refused for naming an unknown context published the "
+            "whole tree first"
+        )
+
+        # And the destination is still free, so the corrected request works.
+        context_id = _context(client, headers)
+        resp = client.post(
+            f"/v1/files/bundle.zip/extract?context_id={context_id}", headers=headers
+        )
+        assert resp.status_code == 200, (
+            f"the refused request left its destination behind: {resp.text[:200]}"
+        )
+        assert "THE MEMBER TEXT" in _text(runtime, context_id)
+
+    def test_another_users_context_extracts_nothing(self, client):
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        _other, other_headers = _account(client)
+        theirs = _context(client, other_headers)
+        self._publish_archive(client, headers)
+
+        resp = client.post(
+            f"/v1/files/bundle.zip/extract?context_id={theirs}", headers=headers
+        )
+        assert resp.status_code == 403, f"{resp.status_code}: {resp.text[:200]}"
+        assert not (_files_dir(runtime, user_id) / "bundle").exists(), (
+            "a request refused for naming another account's context still "
+            "published the tree"
+        )
+
+
+class TestAnExtractedTreeIsInvisibleUntilItIsComplete:
+    """`_write_member` opens each member at its final path and streams into it.
+
+    The destination directory exists under its real name from the first
+    member onward, so a download of a member still being written returns a
+    truncated file with a content-length taken from the descriptor at open
+    time — the client gets a short file and no reason to doubt it. This is
+    the same harm the staged upload and the linked artifact removed, one
+    level up, and it takes the same answer: fill something nobody can see,
+    then make it visible in one step.
+
+    Whole-tree staging rather than one temporary file per member, because
+    the unit that has to appear at once is the tree: a listing that shows
+    half a bundle is describing something that never existed.
+    """
+
+    def _publish_archive(self, client, headers, size: int) -> bytes:
+        # Incompressible on purpose: a run of one byte compresses past the
+        # extractor's 100:1 ratio guard and is refused as a bomb.
+        member = os.urandom(size)
+        resp = _upload(
+            client,
+            headers,
+            "bundle.zip",
+            _bundle_zip({"big.txt": member}),
+            media="application/zip",
+        )
+        assert resp.status_code == 200, resp.text
+        return member
+
+    def test_no_member_is_reachable_while_the_tree_is_being_written(
+        self, client, monkeypatch
+    ):
+        """Observed from inside the extraction, which is the only moment a
+        member exists half-written.
+
+        The extractor is replaced by one that writes a partial member, waits,
+        and then finishes. What it writes into is whatever the route hands
+        it, so the substitution changes nothing about the property under
+        test: the route decides where members land before they are whole.
+        """
+        import threading
+
+        from liminallm.api import routes
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        member = self._publish_archive(client, headers, 400_000)
+
+        reached = threading.Event()
+        may_continue = threading.Event()
+        seen: dict = {}
+
+        def partial_then_whole(archive, destination, limits, *args, **kwargs):
+            dest = Path(destination)
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / "big.txt").write_bytes(member[:64_000])
+            reached.set()
+            may_continue.wait(30)
+            (dest / "big.txt").write_bytes(member)
+            return {
+                "extracted": ["big.txt"],
+                "skipped": [],
+                "total_bytes": len(member),
+            }
+
+        monkeypatch.setattr(
+            routes, "extract_archive_sandboxed", partial_then_whole
+        )
+        results: dict = {}
+
+        def extract():
+            results["ex"] = client.post(
+                "/v1/files/bundle.zip/extract", headers=headers
+            )
+
+        worker = threading.Thread(target=extract, daemon=True)
+        worker.start()
+        try:
+            assert reached.wait(30), "the extraction never started"
+            seen["listing"] = {
+                f["name"]
+                for f in client.get("/v1/files", headers=headers).json()["data"]["files"]
+            }
+            seen["url"] = client.get(
+                "/v1/files/bundle/big.txt/url", headers=headers
+            ).status_code
+            seen["on_disk"] = (_files_dir(runtime, user_id) / "bundle").exists()
+        finally:
+            may_continue.set()
+            worker.join(90)
+
+        assert results["ex"].status_code == 200, results["ex"].text
+        assert seen["url"] == 404, (
+            f"a member of an unfinished tree was signable: {seen['url']}"
+        )
+        assert not [n for n in seen["listing"] if n.startswith("bundle/")], (
+            f"an unfinished tree was listed: {sorted(seen['listing'])}"
+        )
+        assert not seen["on_disk"], (
+            "the destination existed under its real name while it was still "
+            "being filled"
+        )
+
+        # And it is whole once the request returns.
+        resp = client.get("/v1/files/bundle/big.txt/url", headers=headers)
+        assert resp.status_code == 200, resp.text
+        assert (
+            _files_dir(runtime, user_id) / "bundle" / "big.txt"
+        ).read_bytes() == member
+
+    def test_the_staging_area_is_not_inside_the_users_files(self, client):
+        """It cannot be staged as a hidden sibling of the destination.
+
+        `ingest_path` walks `**/*` and does not skip hidden components, so a
+        context source covering `files/` would discover a half-written member
+        under `files/.bundle-xxx.part/`. The staging root is outside every
+        user's path authority instead.
+        """
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        self._publish_archive(client, headers, 2_000)
+        resp = client.post("/v1/files/bundle.zip/extract", headers=headers)
+        assert resp.status_code == 200, resp.text
+
+        files_dir = _files_dir(runtime, user_id)
+        leftovers = [p.name for p in files_dir.iterdir() if p.name.startswith(".")]
+        assert leftovers == [".checksums.json"], (
+            f"extraction left staging state inside the user's files: {leftovers}"
+        )
+        assert sorted(p.name for p in (files_dir / "bundle").iterdir()) == ["big.txt"]
+
+    def test_stale_staging_is_reclaimed_but_a_live_one_is_left(self, tmp_path):
+        """A staging tree outlives its extraction only if the process died.
+
+        Nothing reads these directories, so age is the only signal there is —
+        and the only one needed, since a finished extraction removes its own.
+        """
+        from liminallm.app import _sweep_archive_staging
+
+        root = tmp_path / ".archive-staging" / "someone"
+        root.mkdir(parents=True)
+        stale, live = root / "old", root / "new"
+        for tree in (stale, live):
+            tree.mkdir()
+            (tree / "member.txt").write_bytes(b"partial")
+        stamp = stale.stat().st_mtime - 10_000
+        os.utime(stale, (stamp, stamp))
+
+        _sweep_archive_staging(tmp_path, max_age_hours=1)
+
+        assert not stale.exists(), "a staging tree from a dead process was kept"
+        assert live.exists(), "a staging tree still being filled was removed"

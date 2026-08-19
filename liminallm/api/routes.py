@@ -135,8 +135,11 @@ from liminallm.service.archive import (
     is_archive_filename,
 )
 from liminallm.service.attachments import (
+    authorized_generation_paths,
     classify_attachment,
     ensure_conversation_context,
+    find_conversation_context_id,
+    generation_lock,
     is_auto_context,
     list_attachments,
     record_attachment,
@@ -168,6 +171,11 @@ from liminallm.storage.errors import ConstraintViolation
 from liminallm.storage.models import Conversation, KnowledgeContext, Session
 
 logger = get_logger(__name__)
+
+#: Where archives are extracted before they are published. Outside every
+#: user's path authority on purpose: a hidden sibling of the destination
+#: would still be walked by a context source covering `files/`.
+ARCHIVE_STAGING_DIRNAME = ".archive-staging"
 
 # ALLOWED_UPLOAD_EXTENSIONS (SPEC §17) is imported above from
 # service.upload_policy so the tool sandbox can apply the same policy; it stays
@@ -3661,6 +3669,27 @@ async def upload_file(
                 # them under belongs to every later upload of that name too.
                 checksum=checksum,
             )
+            # Retire whatever this conversation no longer holds. Attaching a
+            # name a second time produces a *different* generation, so the new
+            # ingestion replaced nothing and the previous one stayed
+            # searchable — measured, the chat's own file_search answered from
+            # the edition its record no longer named, ranked above the one it
+            # did. The records are the authority; what the index contains is
+            # not a capability.
+            auto_context_id = find_conversation_context_id(
+                runtime.store,
+                user_id=principal.user_id,
+                conversation_id=conversation_id,
+            )
+            if auto_context_id:
+                runtime.store.prune_context_to_paths(
+                    auto_context_id,
+                    authorized_generation_paths(
+                        records,
+                        fs_root=runtime.settings.shared_fs_root,
+                        user_id=principal.user_id,
+                    ),
+                )
             logger.info(
                 "conversation_attachment_added",
                 user_id=principal.user_id,
@@ -3830,7 +3859,13 @@ async def upload_file(
                             chunks = operation.result
                         else:
                             chunks = runtime.rag.ingest_file(
-                                context_id, str(indexed_path), chunk_size=chunk_size
+                                context_id,
+                                str(indexed_path),
+                                chunk_size=chunk_size,
+                                # The generation is named by its digest, so
+                                # the extractor is told what the file is
+                                # called separately from where it is kept.
+                                format_name=safe_filename,
                             )
                             operation.result = chunks
                 except Exception:
@@ -3879,7 +3914,20 @@ async def upload_file(
                 runtime.settings.shared_fs_root,
                 namespace_key(dest_dir, safe_filename),
             ):
-                return _publish()
+                if not attachment_caps:
+                    return _publish()
+                # An attachment also holds its generation still, from before
+                # the object is created or reused until the record naming it
+                # is durable. `store_generation` adopts an existing object
+                # without touching its age, so an object old enough to be
+                # swept can be adopted — and the sweep then unlinked it
+                # during the very attachment that was adopting it. Namespace
+                # lock first, generation lock second; the sweep takes only
+                # the second, so the two orders cannot meet.
+                with generation_lock(
+                    runtime.settings.shared_fs_root, principal.user_id, checksum
+                ):
+                    return _publish()
 
         try:
             chunk_count, attachment = await asyncio.to_thread(_locked_publish)
@@ -4299,6 +4347,14 @@ async def extract_uploaded_archive(
             "not an archive (.zip, .tar, .tar.gz, .tgz, .gz)",
             status_code=400,
         )
+    # Before anything is published. The check used to sit after the
+    # extraction, so a request refused for naming a context that does not
+    # exist had already written the whole tree — and the corrected retry then
+    # got 409, because the destination the refused request created was in the
+    # way. Same ordering rule as the upload route: a parameter this will
+    # refuse is knowable before any mutation.
+    if context_id:
+        _get_owned_context(runtime, context_id, principal)
 
     # Destination folder sits next to the archive, named after its stem.
     dest_rel = FilePath(filename).parent / archive_stem(archive_path.name)
@@ -4349,9 +4405,39 @@ async def extract_uploaded_archive(
                     f"'{dest_rel.as_posix()}' already exists; delete it first",
                     status_code=409,
                 )
-            report = extract_archive_sandboxed(
-                str(archive_path), str(dest_path), limits
+            # Filled somewhere nobody can reach, then moved into place. The
+            # extractor creates each member at its final path and streams
+            # into it, so the destination existed under its real name from
+            # the first member onward: measured, a member of an unfinished
+            # tree was signable, and a download of it would have returned a
+            # short file with a content-length that agreed. The unit that
+            # has to appear at once is the tree — a listing showing half a
+            # bundle describes something that never existed.
+            #
+            # Staged outside the user's area rather than as a hidden sibling
+            # of the destination. `ingest_path` walks `**/*` and does not
+            # skip hidden components, so a context source covering `files/`
+            # would find the half-written members. Nothing here is under any
+            # user's path authority.
+            staging_root = (
+                FilePath(runtime.settings.shared_fs_root)
+                / ARCHIVE_STAGING_DIRNAME
+                / principal.user_id
             )
+            staging_root.mkdir(parents=True, exist_ok=True)
+            staging = staging_root / uuid4().hex
+            try:
+                report = extract_archive_sandboxed(
+                    str(archive_path), str(staging), limits
+                )
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                # One filesystem, so this is a rename and not a copy. The
+                # destination was checked absent under this lock and nothing
+                # else may claim it while the lock is held, so the rename has
+                # nothing to overwrite.
+                os.rename(staging, dest_path)
+            finally:
+                shutil.rmtree(staging, ignore_errors=True)
             # Ingestion stays inside the lock. Releasing it here and indexing
             # afterwards leaves the tree deletable mid-traversal, and
             # `ingest_path` catches per-file errors and returns the partial
@@ -4362,7 +4448,6 @@ async def extract_uploaded_archive(
             # with it.
             chunks = None
             if context_id:
-                _get_owned_context(runtime, context_id, principal)
                 chunks = runtime.rag.ingest_path(
                     context_id,
                     str(dest_path),
@@ -4883,7 +4968,19 @@ async def add_context_source(
             return idem.cached
 
         # Verify context ownership
-        _get_owned_context(runtime, context_id, principal)
+        context = _get_owned_context(runtime, context_id, principal)
+        if is_auto_context(context):
+            # A conversation's implicit index is not a context the user
+            # manages. Everything else relies on that being true: the
+            # stale-generation sweep skips these contexts because they hold
+            # attachment generations, which are immutable and scoped to one
+            # chat, and retrieval from them is filtered to what the
+            # conversation's records still name. A path-following source
+            # added here would be covered by neither. Reported as absent
+            # rather than refused, because these contexts are not part of
+            # the API's surface — the id only appears in an upload response
+            # so a client can tell the file was indexed.
+            raise http_error("not_found", "context not found", status_code=404)
 
         # Add the source with validated path
         source = runtime.store.add_context_source(
@@ -4895,7 +4992,7 @@ async def add_context_source(
         # Trigger indexing via RAG service with validated path
         # Pass allowed_base for defense-in-depth path traversal protection
         def _ingest() -> None:
-            """Read the path and commit what was read, without letting go.
+            """Read each file and commit what was read, without letting go.
 
             Reading and committing are two moments. Upload, extraction and
             deletion all treat a pathname as one critical section, and this
@@ -4905,6 +5002,13 @@ async def add_context_source(
             described the upload while the index described what the source
             had read, with both requests returning success. No serial
             ordering produces that.
+
+            The guard is per file, not one lock over the whole source. A
+            source rooted at `files/` takes a key nothing else takes, while
+            an upload of `files/report.md` takes that name's key, so a single
+            source-wide lock let the same interleaving straight through one
+            level up — measured again, with the source being the directory
+            rather than the file.
 
             Only for a path inside the caller's own files. That is where the
             lock means something, because every writer of those names takes
@@ -4918,24 +5022,24 @@ async def add_context_source(
                 / principal.user_id
                 / "files"
             )
-            def ingest() -> None:
-                runtime.rag.ingest_path(
-                    context_id=context_id,
-                    fs_path=str(validated_path),
-                    recursive=body.recursive,
-                    allowed_base=runtime.settings.shared_fs_root,
+
+            def guard(candidate: FilePath):
+                try:
+                    relative = candidate.relative_to(files_dir)
+                except ValueError:
+                    return contextlib.nullcontext()
+                return path_lock(
+                    runtime.settings.shared_fs_root,
+                    namespace_key(files_dir, relative.as_posix()),
                 )
 
-            try:
-                relative = FilePath(validated_path).relative_to(files_dir)
-            except ValueError:
-                ingest()
-                return
-            with path_lock(
-                runtime.settings.shared_fs_root,
-                namespace_key(files_dir, relative.as_posix()),
-            ):
-                ingest()
+            runtime.rag.ingest_path(
+                context_id=context_id,
+                fs_path=str(validated_path),
+                recursive=body.recursive,
+                allowed_base=runtime.settings.shared_fs_root,
+                file_guard=guard,
+            )
 
         try:
             # In a thread, both because the lock must not be taken on the

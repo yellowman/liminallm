@@ -3600,6 +3600,27 @@ class PostgresStore:
             raise ConstraintViolation("context not found", {"context_id": context_id})
         return deleted_generation
 
+    def prune_context_to_paths(self, context_id: str, keep_paths: Sequence[str]) -> int:
+        """Drop everything this context says about anything not in `keep_paths`.
+
+        For a conversation's implicit index, where the paths are attachment
+        generations and the conversation's records say which ones it holds.
+        Re-attaching a filename produces a different generation, so the new
+        ingestion replaces nothing and the retired one stays searchable
+        until this removes it.
+
+        A row with no path cannot be matched against a generation, so it goes
+        too: everything in one of these contexts is there to describe an
+        attachment.
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM knowledge_chunk WHERE context_id = %s "
+                "AND (fs_path IS NULL OR NOT (fs_path = ANY(%s)))",
+                (context_id, list(keep_paths)),
+            )
+            return cursor.rowcount or 0
+
     def referenced_attachment_checksums(self, owner_user_id: str) -> set[str]:
         """Every attachment generation this user's conversations still name.
 
@@ -3625,6 +3646,28 @@ class PostgresStore:
                 (owner_user_id,),
             ).fetchall()
         return {str(row["checksum"]) for row in rows}
+
+    def attachment_checksum_referenced(
+        self, owner_user_id: str, checksum: str
+    ) -> bool:
+        """Whether any of this user's conversations still names `checksum`.
+
+        The same question `referenced_attachment_checksums` answers for a
+        whole account, asked about one object so the sweep can re-ask it
+        while holding that object's lock.
+        """
+        if not _is_uuid(owner_user_id):
+            raise ValueError("owner_user_id is not a user identifier")
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM conversation c, LATERAL jsonb_array_elements("
+                "  CASE WHEN jsonb_typeof(c.meta -> 'attachments') = 'array' "
+                "       THEN c.meta -> 'attachments' ELSE '[]'::jsonb END"
+                ") AS att "
+                "WHERE c.user_id = %s AND att ->> 'checksum' = %s LIMIT 1",
+                (owner_user_id, checksum),
+            ).fetchone()
+        return row is not None
 
     def invalidate_path_in_other_contexts(
         self,

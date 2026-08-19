@@ -464,14 +464,18 @@ def _extract_doc(
     llm: Any,
     order: Optional[Tuple[str, ...]] = None,
     pending: Optional[List[Dict[str, str]]] = None,
+    suffix: Optional[str] = None,
 ) -> Tuple[str, Optional[str], bool]:
     """Text of a docx/odt: the XML pass plus its content-bearing images.
 
     Same rule as pdfs — a document is text, image, or both. The pasted
     screenshot in a Word file is often the actual content; it walks the same
     reader roster and lands beside the typed paragraphs.
+
+    `suffix` says which of the two container layouts to read, because the
+    path may be a content address with no extension at all.
     """
-    suffix = path.suffix.lower()
+    suffix = (suffix or path.suffix).lower()
     if suffix == ".docx":
         xml = _read_zipped_xml(path, "word/document.xml")
         text = _paragraphs_from_xml(xml, {f"{_DOCX_NS}p"})
@@ -519,13 +523,23 @@ def _parse(
     llm: Any,
     order: Optional[Tuple[str, ...]],
     pending: Optional[List[Dict[str, str]]],
+    format_name: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Route by format; returns {text, container, mech, had_text}."""
+    """Route by format; returns {text, container, mech, had_text}.
+
+    The format comes from `format_name` when the caller supplies one, and
+    from the path otherwise. The two are the same thing for a file the user
+    named, and not for an attachment generation: those are named by their
+    digest, which has no extension, so routing by the path alone sent every
+    PDF and Word document to the generic byte decode and had it refused as
+    binary. The extension does not belong in a content address, so the
+    format travels beside it instead.
+    """
     if path.stat().st_size > MAX_EXTRACT_BYTES:
         raise ExtractError("file is too large to extract")
-    suffix = path.suffix.lower()
+    suffix = (Path(format_name).suffix if format_name else path.suffix).lower()
     if suffix in DOC_EXTENSIONS:
-        text, mech, had_text = _extract_doc(path, llm, order, pending)
+        text, mech, had_text = _extract_doc(path, llm, order, pending, suffix)
         return {
             "text": text, "container": suffix.lstrip("."),
             "mech": mech, "had_text": had_text,
@@ -551,7 +565,10 @@ def _parse(
 
 
 def _sandboxed_parse(
-    path_str: str, order: Optional[Tuple[str, ...]], want_pending: bool
+    path_str: str,
+    order: Optional[Tuple[str, ...]],
+    want_pending: bool,
+    format_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Child-process entry: all parsing of untrusted bytes happens here.
 
@@ -582,7 +599,7 @@ def _sandboxed_parse(
                     "extract_plugin_import_failed", module=module, error=str(exc)
                 )
     pending: Optional[List[Dict[str, str]]] = [] if want_pending else None
-    result = _parse(Path(path_str), None, order, pending)
+    result = _parse(Path(path_str), None, order, pending, format_name)
     result["pending"] = pending or []
     return result
 
@@ -593,6 +610,7 @@ def extract_text(
     llm: Any = None,
     readers: Optional[Tuple[str, ...]] = None,
     sandbox: bool = True,
+    format_name: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Best-effort text from a file: {text, method} or ExtractError.
 
@@ -608,7 +626,7 @@ def extract_text(
     """
     order = tuple(readers) if readers else DEFAULT_READER_ORDER
     if not sandbox:
-        result = _parse(path, llm, order, pending=None)
+        result = _parse(path, llm, order, None, format_name)
         return {
             "text": result["text"],
             "method": _compose_method(
@@ -626,6 +644,7 @@ def extract_text(
             str(path),
             order,
             want_pending,
+            format_name,
             config=SandboxConfig(
                 max_memory_mb=EXTRACT_MEMORY_MB,
                 max_cpu_seconds=EXTRACT_CPU_SECONDS,

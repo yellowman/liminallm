@@ -21,7 +21,7 @@ import hashlib
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, List, Optional, Set, Tuple
 
 from liminallm.service import attachments as attachments_service
 from liminallm.service import compaction, interpreter, web
@@ -119,11 +119,19 @@ def run_file_search(
     rag: Any,
     user_id: Optional[str],
     tenant_id: Optional[str],
+    attachment_context_ids: Optional[Set[str]] = None,
+    authorized_paths: Optional[Set[str]] = None,
 ) -> Tuple[str, List[str]]:
     """Retrieve excerpts for a model-supplied query. Returns (text, snippets).
 
     Scoping is the caller's job: `context_ids` must already be the set this
     user is allowed to read.
+
+    A conversation's implicit context is scoped once more, by what the
+    conversation still holds. Its rows describe attachment generations, and
+    the conversation's records — not the rows — say which generations that
+    is. Pruning keeps the two in step; this keeps a row that outlives its
+    record from being a capability in the window before it does.
     """
     if not context_ids:
         return ("No searchable files are attached to this conversation.", [])
@@ -134,6 +142,14 @@ def run_file_search(
         user_id=user_id,
         tenant_id=tenant_id,
     )
+    if attachment_context_ids:
+        allowed = authorized_paths or set()
+        chunks = [
+            chunk
+            for chunk in chunks
+            if chunk.context_id not in attachment_context_ids
+            or chunk.fs_path in allowed
+        ]
     if not chunks:
         return (f"No excerpts matched '{query}'.", [])
     rendered, snippets = [], []

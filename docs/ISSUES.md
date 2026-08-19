@@ -8595,22 +8595,130 @@ changed is reached only when a file *is* stored and the shared inline budget
 filled up before it. Two different facts had been given one sentence. They
 have two now, and the budget case has the test it needed.
 
+## 2E.4, third pass: what did not move with the object identity
 
-### Recorded for 2E.5: extraction has the same shape
+Review of the content-addressed store accepted the boundary and found four
+places where something else stayed behind. Each is the same shape: an
+identity moved and a piece of state that depended on it did not.
 
-`publish_artifacts` was the instance; the class is "a name is visible before
-its bytes are". `archive._write_member` opens each member at its final path
-and streams into it, inside a destination directory that already exists under
-its real name. So a listing taken during an extraction shows part of the tree,
-and a download of a member still being written returns a truncated file with a
-content-length taken from the descriptor at open time — the client gets a
-short file and no reason to doubt it.
+### HIGH: the format moved out with the name
 
-A listing seeing part of a tree is observational and fine; the truncated
-download is the same harm the staged upload and the linked artifact removed.
-The fix has the same shape too, and review has scheduled it as the first
-2E.5 item: extract into a hidden sibling and rename the whole tree onto the
-destination once extraction has finished, inside the lock the route already
-holds. Whole-tree staging rather than one temporary file per member, so no
-member is visible until every member is, and the extractor's existing
-failure cleanup then points at a throwaway tree.
+`extract_text` routes by `path.suffix`, and a generation is named by its
+digest. So a searchable PDF reached the extractor as an extensionless
+object, fell through to the generic byte decode, and was refused as binary —
+the upload reported success with `chunk_count: 0`.
+
+The extension does not go into the key. The key is the identity of the bytes
+and nothing else; putting a display name in it would give the same bytes two
+objects and lose the dedupe the store gets for free. The format travels
+beside the object instead, as `format_name`, through `ingest_file` into
+`extract_text` and on into `_extract_doc`, which reads the suffix again for
+its own container choice.
+
+The red for this cost two attempts. The first built an uncompressed PDF,
+which is mostly ASCII, so the marker survived the generic decode and the
+test passed whether or not the format was recognised. The content stream is
+Flate-compressed now, which no byte decode recovers.
+
+### HIGH: re-attaching a name left the generation it replaced searchable
+
+`replace_chunks_for_path` replaces the rows for the path it is given, and a
+second attachment under the same name is a *different* generation — so its
+ingestion replaced nothing. The conversation's record named the new bytes
+while its index held both, and measured, `file_search` returned only the
+retired edition, ranked above the one the chat actually held.
+
+The records are the authority for what a conversation holds; what its index
+contains is not a capability. Two layers, and each has its own mutation:
+
+- **Pruning.** Recording an attachment drops everything in that
+  conversation's index that its records no longer name.
+- **Filtering.** Retrieval from an implicit context keeps only chunks whose
+  path is currently authorized. That covers the window before pruning runs,
+  and covers a generation whose object the sweep has already reclaimed —
+  the sweep removes blobs, not rows, so without it `file_search` answered
+  from bytes that no longer existed.
+
+An explicitly named knowledge context is not filtered this way: it follows
+paths on purpose, and its rows are its own answer.
+
+### HIGH: one lock for a whole source is the wrong shape
+
+The previous pass took `namespace_key` for the source pathname. That works
+while the source *is* the file. A source rooted at `files/` takes a key
+nothing else takes, while an upload of `files/report.md` takes that name's
+key — so the same interleaving reappeared one level up, entirely
+sequentially, and the walk's commit landed after the upload had published.
+
+`ingest_path` takes an optional `file_guard` held around each file's own
+read-and-commit, so the lock is taken where the mutation it races is. The
+context-source route maps every candidate under the caller's `files/` to its
+top-level namespace key. Extraction passes no guard: it already holds its
+destination, and would otherwise wait for itself.
+
+The mutation that restores the source-wide lock is kept, because that is the
+shape the previous pass shipped.
+
+### HIGH: the grace period protects a new object, not a reused old one
+
+`store_generation` returns an existing object without touching it, so its age
+says when it was first written. An object unreferenced long enough to be
+swept can be adopted by a new attachment, and the sweep then unlinked it
+during that attachment's own operation — the record landed naming bytes that
+were already gone.
+
+A checksum-scoped lock, `attachment-generation:<user>:<sha>`, held by the
+upload from before the object is created or reused until its record is
+durable. The sweep takes the same lock and re-asks whether that checksum is
+referenced *inside* it. Both halves have their own mutation: acting on the
+snapshot taken before the lock still deletes a reference created while
+waiting.
+
+Lock order is namespace then generation; the sweep takes only the second, so
+the two orders cannot meet.
+
+### MEDIUM: a conversation's index was writable as an ordinary context
+
+`meta.auto` is load-bearing — the invalidation sweep skips these contexts,
+and retrieval from them is filtered — and `POST /contexts/{id}/sources`
+checked ownership and nothing else. The id is not hidden either: a searchable
+attachment upload returns it. So a path-following source could be added to a
+context covered by neither rule.
+
+Reported as absent rather than refused, because these contexts are not part
+of the API's surface. `POST .../sources` is the only write among the three
+routes that take a context id, so there was no sibling to miss.
+
+## Tranche 2E.5: archive publication
+
+### HIGH: a refused extraction had already published the tree
+
+The archive route validated its `context_id` after the extraction, so a
+request refused for naming an unknown context published the whole tree
+first — and the corrected retry then got 409, because the destination the
+refused request created was in the way. The same ordering rule the upload
+route now follows: a parameter the route will refuse is knowable before any
+mutation.
+
+### HIGH: an extracted tree was visible before it was complete
+
+`_write_member` creates each member at its final path and streams into it,
+inside a destination directory that already exists under its real name.
+Measured, with an extractor paused after writing a partial member, that
+member was signable — and a download would have returned a short file with a
+content-length that agreed with it.
+
+Extraction now fills a staging tree and renames it into place under the lock
+the route already holds. Whole-tree staging rather than one temporary file
+per member, because the unit that has to appear at once is the tree: a
+listing showing half a bundle describes something that never existed.
+
+The staging root is `<shared_fs_root>/.archive-staging/<user>/<uuid>`, not a
+hidden sibling of the destination. `ingest_path` walks `**/*` and does not
+skip hidden components, so a context source covering `files/` would have
+found the half-written members. Nothing under the staging root is inside any
+user's path authority.
+
+A finished extraction removes its own staging tree, so anything left there
+outlived the process that made it. The periodic cleanup loop reclaims those
+by age, alongside the scratch and generation sweeps.

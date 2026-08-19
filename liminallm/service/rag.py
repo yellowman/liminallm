@@ -5,9 +5,18 @@ import os
 import re
 import stat
 import unicodedata
+from contextlib import nullcontext
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Sequence, Union
+from typing import (
+    Callable,
+    ContextManager,
+    Dict,
+    List,
+    Optional,
+    Sequence,
+    Union,
+)
 
 from liminallm.logging import get_logger
 from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
@@ -873,15 +882,27 @@ class RAGService:
                 return
 
     def ingest_file(
-        self, context_id: str, path: str, chunk_size: Optional[int] = None
+        self,
+        context_id: str,
+        path: str,
+        chunk_size: Optional[int] = None,
+        *,
+        format_name: Optional[str] = None,
     ) -> int:
+        """Index one file's text as the whole of what this context says about it.
+
+        `format_name` is what the file is called when that differs from where
+        it is kept. An attachment generation is named by its digest, which
+        carries no extension, so without the hint every PDF and Word document
+        reached the extractor as an unrecognised blob.
+        """
         # Route through the shared extractor: read_text() on a PDF "succeeds"
         # and fills the index with stripped-binary garbage that then wins
         # similarity searches. Better to skip a file than to poison retrieval.
         from liminallm.service.extract import ExtractError, extract_text
 
         try:
-            data = extract_text(Path(path))["text"]
+            data = extract_text(Path(path), format_name=format_name)["text"]
         except ExtractError as exc:
             # A refusal is still an answer about the current bytes, so it
             # commits an empty generation rather than leaving the last
@@ -909,6 +930,7 @@ class RAGService:
         allowed_base: Optional[Union[str, Path]] = None,
         max_files: Optional[int] = None,
         max_depth: Optional[int] = None,
+        file_guard: Optional[Callable[[Path], ContextManager]] = None,
     ) -> int:
         """Ingest content from a filesystem path (file or directory).
 
@@ -924,6 +946,15 @@ class RAGService:
                          Per SPEC §18, path traversal prevention is mandatory.
             max_files: Maximum number of files to process (default: 10000)
             max_depth: Maximum directory depth for recursive mode (default: 20)
+            file_guard: Held around each file's own read-and-commit. A lock on
+                       the source as a whole is the wrong shape: a source
+                       rooted at `files/` takes a key nothing else takes,
+                       while an upload of `files/report.md` takes that name's
+                       key, so the walk reads one generation and commits it
+                       after the upload has published the next. The guard is
+                       taken where the mutation it races is. Callers that
+                       already hold the destination pass none, so an
+                       extraction does not wait for itself.
 
         Returns:
             Total number of chunks created
@@ -987,7 +1018,10 @@ class RAGService:
             # Single file
             if not extensions or path.suffix.lower() in extensions:
                 try:
-                    total_chunks += self.ingest_file(context_id, str(path), chunk_size)
+                    with (file_guard(path) if file_guard else nullcontext()):
+                        total_chunks += self.ingest_file(
+                            context_id, str(path), chunk_size
+                        )
                 except Exception as exc:
                     logger.warning(
                         "ingest_path_file_failed",
@@ -1040,7 +1074,10 @@ class RAGService:
                 break
 
             try:
-                total_chunks += self.ingest_file(context_id, str(file_path), chunk_size)
+                with (file_guard(file_path) if file_guard else nullcontext()):
+                    total_chunks += self.ingest_file(
+                        context_id, str(file_path), chunk_size
+                    )
                 files_processed += 1
             except Exception as exc:
                 logger.warning(

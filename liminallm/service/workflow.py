@@ -2331,15 +2331,28 @@ class WorkflowEngine(WorkflowStreamingMixin):
         tenant_id: Optional[str],
     ) -> Tuple[str, List[str]]:
         """Resolve what this user may search, then hand off to the tool."""
-        ctx_ids = self._attachment_context_ids(conversation_id, user_id) or []
+        attachment_ctx_ids = self._attachment_context_ids(conversation_id, user_id) or []
+        ctx_ids = list(attachment_ctx_ids)
         if context_id:
             allowed = self._validate_context_scope(
                 [context_id], user_id=user_id, tenant_id=tenant_id
             )
             ctx_ids = list(dict.fromkeys(ctx_ids + (allowed or [])))
+        # What this conversation still holds, from its own records. An
+        # explicitly named knowledge context is not filtered this way: it
+        # follows paths on purpose, and its rows are its own answer.
+        records = self._conversation_attachments(conversation_id, user_id)
         return agent_tools.run_file_search(
             query, limit, ctx_ids, rag=self.rag,
             user_id=user_id, tenant_id=tenant_id,
+            attachment_context_ids=set(attachment_ctx_ids),
+            authorized_paths=set(
+                attachments_service.authorized_generation_paths(
+                    records,
+                    fs_root=self.settings.shared_fs_root,
+                    user_id=user_id,
+                )
+            ),
         )
 
     def _run_python_capability(

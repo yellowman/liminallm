@@ -5,6 +5,7 @@ import contextlib
 import os
 import posixpath
 import re
+import shutil
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -723,6 +724,36 @@ def _sweep_tmp_dirs(shared_root: Path, max_age_hours: int) -> None:
                 tmp_dir.rmdir()
 
 
+def _sweep_archive_staging(shared_root: Path, max_age_hours: int) -> None:
+    """Remove archive staging trees no extraction is still filling.
+
+    An extraction renames its staging tree into place and removes what is
+    left in a `finally`, so anything here outlived the process that made it.
+    Nothing reads these directories, so age is the only signal available and
+    the only one needed.
+    """
+    root = shared_root / ".archive-staging"
+    if not root.is_dir():
+        return
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=max(max_age_hours, 1))
+    ).timestamp()
+    removed = 0
+    for user_dir in root.iterdir():
+        if not user_dir.is_dir():
+            continue
+        for staging in user_dir.iterdir():
+            try:
+                if staging.stat().st_mtime > cutoff:
+                    continue
+            except OSError:
+                continue
+            shutil.rmtree(staging, ignore_errors=True)
+            removed += 1
+    if removed:
+        logger.info("archive_staging_swept", removed=removed)
+
+
 def _sweep_attachment_generations(shared_root: Path, max_age_hours: int) -> None:
     """Reclaim attached generations no conversation names any more.
 
@@ -765,6 +796,14 @@ async def _run_tmp_cleanup(
                 raise
             except Exception as exc:  # pragma: no cover - best-effort cleanup
                 logger.warning("attachment_generation_sweep_failed", error=str(exc))
+            try:
+                await asyncio.to_thread(
+                    _sweep_archive_staging, shared_root, max_age_hours
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover - best-effort cleanup
+                logger.warning("archive_staging_sweep_failed", error=str(exc))
             await asyncio.sleep(interval)
     except asyncio.CancelledError:
         logger.info("tmp_cleanup_task_cancelled")

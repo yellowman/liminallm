@@ -30,7 +30,12 @@ from typing import Any, Optional
 from uuid import uuid4
 
 from liminallm.service.archive import ARCHIVE_SUFFIXES
-from liminallm.service.fs import PathTraversalError, safe_join
+from liminallm.service.fs import (
+    PathLockTimeout,
+    PathTraversalError,
+    path_lock,
+    safe_join,
+)
 from liminallm.service.web import UNTRUSTED_CLOSE, UNTRUSTED_OPEN, neutralize_markers
 
 #: How much of a filename may reach the prompt. Long enough for real names,
@@ -118,6 +123,25 @@ def generation_path(fs_root: str, user_id: str, checksum: Any) -> Optional[Path]
     if len(text) != 64 or any(c not in "0123456789abcdef" for c in text):
         return None
     return generation_root(fs_root, user_id) / text[:2] / text
+
+
+def generation_lock(fs_root: str, user_id: str, checksum: Any):
+    """Hold a checksum still while it is being adopted or reclaimed.
+
+    `store_generation` returns an object that already exists without touching
+    it, so its age says when it was first written — and an object old enough
+    to be swept can be adopted by a new attachment. Measured, the sweep then
+    unlinked it during that attachment's own operation and the record landed
+    naming bytes that were already gone.
+
+    Scoped to one checksum, so it serialises an attachment against the sweep
+    of the same object and against nothing else. The upload holds it from
+    before the object is created or reused until its record is durable; the
+    sweep holds it while it re-asks whether the checksum is referenced. The
+    re-ask inside the lock is the point — a decision made from a snapshot
+    taken before the lock still deletes a reference created while waiting.
+    """
+    return path_lock(fs_root, f"attachment-generation:{user_id}:{checksum}")
 
 
 def store_generation(
@@ -227,6 +251,30 @@ def resolve_attachment(
 def _existing_generation(fs_root: str, user_id: str, checksum: Any) -> Optional[Path]:
     path = generation_path(fs_root, user_id, checksum)
     return path if path is not None and path.is_file() else None
+
+
+def authorized_generation_paths(
+    records: list[dict[str, Any]], *, fs_root: str, user_id: str
+) -> list[str]:
+    """The generation objects a conversation's records currently name.
+
+    The records are the authority for what a conversation holds, and what
+    its index happens to contain is not a capability. Re-attaching a name
+    produces a *different* generation, so the ingestion of the new one
+    replaces nothing — measured, the chat's own `file_search` went on
+    answering from the edition its record no longer named, and ranked it
+    above the one that did.
+
+    Derived from the records rather than from the store's contents, so a
+    generation whose object has been reclaimed is still not retrievable and
+    a chunk written outside a record is not authorized merely by existing.
+    """
+    paths = []
+    for record in records:
+        path = generation_path(fs_root, user_id, record.get("checksum"))
+        if path is not None:
+            paths.append(str(path))
+    return paths
 
 
 def resolved_sources(
@@ -484,8 +532,20 @@ def sweep_generations(store, fs_root: str, *, grace_seconds: int) -> int:
             try:
                 if blob.stat().st_mtime > cutoff:
                     continue
-                blob.unlink()
             except OSError:
+                continue
+            try:
+                with generation_lock(fs_root, user_dir.name, blob.name):
+                    # Asked again, inside the lock. The snapshot above was
+                    # taken before any attachment adopting this object could
+                    # be made to wait, so acting on it alone deletes a
+                    # reference created while this was queuing.
+                    if store.attachment_checksum_referenced(
+                        user_dir.name, blob.name
+                    ):
+                        continue
+                    blob.unlink()
+            except (OSError, PathLockTimeout):
                 continue
             removed += 1
     return removed
