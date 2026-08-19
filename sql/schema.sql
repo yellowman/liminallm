@@ -446,3 +446,51 @@ CREATE TABLE IF NOT EXISTS sweep_report (
 
 CREATE INDEX IF NOT EXISTS idx_sweep_report_user_created
   ON sweep_report (user_id, created_at DESC);
+
+
+-- ===== from 008_implicit_context_identity.sql =====
+-- One conversation, one implicit attachment context (SPEC §19.5 scopes an
+-- attachment to the chat that received it; §22 puts Postgres across
+-- replicas). Identity used to be "the first row a 500-row listing matched",
+-- and creation was an unconditional INSERT — so two first attachments racing
+-- produced two hidden contexts, and a later lookup found only one of them
+-- while the other kept chunks nothing could reach.
+--
+-- Duplicates that already exist are merged rather than dropped: the losers'
+-- chunks move to the oldest row, which is the one any earlier lookup would
+-- have returned. Deleting a loser outright would take chunks the winner does
+-- not have.
+DO $$
+DECLARE
+  winner RECORD;
+BEGIN
+  FOR winner IN
+    SELECT owner_user_id,
+           meta ->> 'conversation_id' AS conversation_id,
+           MIN(created_at::text || '|' || id::text) AS oldest
+    FROM knowledge_context
+    WHERE COALESCE((meta ->> 'auto')::boolean, false)
+      AND meta ->> 'conversation_id' IS NOT NULL
+    GROUP BY 1, 2
+    HAVING COUNT(*) > 1
+  LOOP
+    UPDATE knowledge_chunk
+    SET context_id = split_part(winner.oldest, '|', 2)::uuid
+    WHERE context_id IN (
+      SELECT id FROM knowledge_context
+      WHERE COALESCE((meta ->> 'auto')::boolean, false)
+        AND owner_user_id = winner.owner_user_id
+        AND meta ->> 'conversation_id' = winner.conversation_id
+        AND id <> split_part(winner.oldest, '|', 2)::uuid
+    );
+    DELETE FROM knowledge_context
+    WHERE COALESCE((meta ->> 'auto')::boolean, false)
+      AND owner_user_id = winner.owner_user_id
+      AND meta ->> 'conversation_id' = winner.conversation_id
+      AND id <> split_part(winner.oldest, '|', 2)::uuid;
+  END LOOP;
+END $$;
+
+CREATE UNIQUE INDEX IF NOT EXISTS knowledge_context_auto_conversation_idx
+  ON knowledge_context (owner_user_id, (meta ->> 'conversation_id'))
+  WHERE COALESCE((meta ->> 'auto')::boolean, false);

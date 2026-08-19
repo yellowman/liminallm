@@ -188,26 +188,31 @@ def ensure_conversation_context(store, *, user_id: str, conversation_id: str) ->
 
     Marked ``meta.auto`` and ``meta.conversation_id`` so the contexts UI can
     filter it out — users never manage these directly.
+
+    One per conversation, and the database is what makes that true. Looking
+    first and inserting after is not a guard: §22 shares Postgres across
+    replicas, and measured within one process, two first attachments both
+    looked, both found nothing, and both inserted — leaving one acknowledged
+    attachment in a context no later lookup returns.
     """
-    for ctx in store.list_contexts(owner_user_id=user_id, limit=500) or []:
-        meta = ctx.meta or {}
-        if meta.get("auto") and meta.get("conversation_id") == conversation_id:
-            return ctx
-    return store.upsert_context(
+    return store.get_or_create_conversation_attachment_context(
         user_id,
+        conversation_id,
         f"conversation:{conversation_id}",
         "Files attached to a conversation",
-        meta={"auto": True, "conversation_id": conversation_id},
     )
 
 
 def find_conversation_context_id(store, *, user_id: str, conversation_id: str) -> Optional[str]:
-    """The conversation's implicit context id, without creating one."""
-    for ctx in store.list_contexts(owner_user_id=user_id, limit=500) or []:
-        meta = ctx.meta or {}
-        if meta.get("auto") and meta.get("conversation_id") == conversation_id:
-            return ctx.id
-    return None
+    """The conversation's implicit context id, without creating one.
+
+    An identity lookup, not a search through a page of contexts. The listing
+    it used to walk stops at 500 rows, so an account with more recent
+    contexts than that lost an older conversation's index — and with it, the
+    ability to search attachments whose records and objects were both intact.
+    """
+    context = store.get_conversation_attachment_context(user_id, conversation_id)
+    return context.id if context is not None else None
 
 
 def is_auto_context(ctx: Any) -> bool:

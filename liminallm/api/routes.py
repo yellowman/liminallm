@@ -4838,16 +4838,20 @@ async def list_contexts(
     paging = _get_pagination_settings(runtime)
     effective_page_size = page_size or limit or paging["default_page_size"]
     resolved_page_size = min(max(effective_page_size, 1), paging["max_page_size"])
+    # Per-conversation attachment contexts are an implementation detail of
+    # the attach-to-conversation flow, so they are not part of what this
+    # listing pages over. Excluded in the query rather than from the result:
+    # the ordering and the limit happen in the store, so dropping them
+    # afterwards spent page slots on rows the caller never sees and reported
+    # no next page with ordinary contexts still unreached.
     contexts = runtime.store.list_contexts(
         owner_user_id=principal.user_id,
         page=page,
         page_size=resolved_page_size,
         cursor=cursor,
         include_sentinel=True,
+        include_auto=False,
     )
-    # Per-conversation attachment contexts are an implementation detail of the
-    # attach-to-conversation flow; they never appear in the contexts UI.
-    contexts = [c for c in contexts if not is_auto_context(c)]
     has_next = len(contexts) > resolved_page_size
     page_contexts = contexts[:resolved_page_size]
     next_cursor = None

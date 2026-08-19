@@ -2753,3 +2753,358 @@ class TestAuthorizationReachesCandidateSelection:
             "the top-k was spent on rows the conversation does not hold, so "
             f"the one it does hold never reached the prompt: {found[:160]!r}"
         )
+
+
+class TestOneConversationHasOneImplicitContext:
+    """The whole per-chat boundary rests on that being exactly true.
+
+    Identity was discovered by enumerating up to 500 of the user's contexts
+    and matching `meta.auto` and `meta.conversation_id`, and `upsert_context`
+    always inserts a fresh UUID with nothing in the schema forbidding a
+    second row for the same conversation. §22 puts Postgres across replicas,
+    so a lookup-then-insert in one process is not a guard at all.
+
+    Two ways it breaks, and neither needs anything exotic: two first
+    attachments racing, and an account with enough contexts that the older
+    one falls off the horizon.
+    """
+
+    def _conversation(self, client, headers) -> str:
+        resp = client.post(
+            "/v1/conversations", headers=headers, json={"title": _unique("chat")}
+        )
+        assert resp.status_code in (200, 201), resp.text
+        return resp.json()["data"]["id"]
+
+    def _attach(self, client, headers, conversation_id, name, body):
+        return client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={"file": (name, body, "text/markdown")},
+            data={"conversation_id": conversation_id},
+        )
+
+    def _auto_contexts(self, runtime, user_id, conversation_id) -> list:
+        return [
+            ctx
+            for ctx in runtime.store.list_contexts(owner_user_id=user_id, limit=500)
+            if (ctx.meta or {}).get("auto")
+            and (ctx.meta or {}).get("conversation_id") == conversation_id
+        ]
+
+    def test_two_concurrent_first_attachments_get_one_implicit_context(self, client):
+        import threading
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        first = b"# first\nTHE FIRST ATTACHED DOCUMENT\n" * 800
+        second = b"# second\nTHE SECOND ATTACHED DOCUMENT\n" * 800
+
+        # Both requests finish looking before either inserts.
+        looked = threading.Barrier(2, timeout=30)
+        real_create = runtime.store.upsert_context
+
+        def gated(*args, **kwargs):
+            try:
+                looked.wait()
+            except threading.BrokenBarrierError:
+                pass
+            return real_create(*args, **kwargs)
+
+        results: dict = {}
+
+        def attach(key, name, body):
+            results[key] = self._attach(client, headers, conversation_id, name, body)
+
+        runtime.store.upsert_context = gated
+        try:
+            threads = [
+                threading.Thread(target=attach, args=("a", "a.md", first), daemon=True),
+                threading.Thread(target=attach, args=("b", "b.md", second), daemon=True),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(120)
+        finally:
+            runtime.store.upsert_context = real_create
+
+        assert results["a"].status_code == 200, results["a"].text
+        assert results["b"].status_code == 200, results["b"].text
+        contexts = self._auto_contexts(runtime, user_id, conversation_id)
+        assert len(contexts) == 1, (
+            f"the conversation has {len(contexts)} implicit contexts; every "
+            "rule about them assumes one"
+        )
+
+        found, _snippets = runtime.workflow._run_file_search(
+            "attached document",
+            8,
+            conversation_id=conversation_id,
+            context_id=None,
+            user_id=user_id,
+            tenant_id=None,
+        )
+        for marker in ("THE FIRST ATTACHED DOCUMENT", "THE SECOND ATTACHED DOCUMENT"):
+            assert marker in found, (
+                f"{marker!r} was attached and acknowledged but cannot be "
+                "searched: it went into a context nothing looks in"
+            )
+
+    def test_the_database_refuses_a_second_one(self, client):
+        """The invariant is asserted where it cannot be bypassed.
+
+        Every rule about these contexts assumes one per conversation, and
+        application code is not the place to hold that: §22 shares Postgres
+        across replicas, so only the database can refuse the second row.
+        """
+        import psycopg
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        assert self._attach(
+            client, headers, conversation_id, "one.md",
+            b"# one\nTHE ATTACHED TEXT\n" * 800,
+        ).status_code == 200
+        contexts = self._auto_contexts(runtime, user_id, conversation_id)
+        assert len(contexts) == 1
+
+        with pytest.raises(psycopg.errors.UniqueViolation):
+            with runtime.store._connect() as conn:
+                conn.execute(
+                    "INSERT INTO knowledge_context "
+                    "(id, owner_user_id, name, description, meta) "
+                    "VALUES (gen_random_uuid(), %s, %s, %s, %s::jsonb)",
+                    (
+                        user_id,
+                        "a second index for one conversation",
+                        "",
+                        json.dumps(
+                            {"auto": True, "conversation_id": conversation_id}
+                        ),
+                    ),
+                )
+        assert len(self._auto_contexts(runtime, user_id, conversation_id)) == 1
+
+    def test_existing_duplicates_are_merged_rather_than_dropped(self, client):
+        """The migration has to cope with what earlier versions produced.
+
+        An account upgrading from before the unique index may already hold
+        two indexes for one conversation, and adding the index would simply
+        fail against them. The losers' chunks move to the oldest row — the
+        one any earlier lookup would have returned — because deleting a
+        loser outright takes chunks the winner does not have.
+        """
+        import os
+
+        from liminallm.storage.models import KnowledgeChunk
+        from tests.harness import apply_schema
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+
+        # The state an older version could leave behind.
+        with runtime.store._connect() as conn:
+            conn.execute(
+                "DROP INDEX IF EXISTS knowledge_context_auto_conversation_idx"
+            )
+        made = []
+        for label in ("winner", "loser"):
+            with runtime.store._connect() as conn:
+                row = conn.execute(
+                    "INSERT INTO knowledge_context "
+                    "(id, owner_user_id, name, description, meta) "
+                    "VALUES (gen_random_uuid(), %s, %s, %s, %s::jsonb) "
+                    "RETURNING id",
+                    (
+                        user_id,
+                        f"conversation:{conversation_id} ({label})",
+                        "",
+                        json.dumps(
+                            {"auto": True, "conversation_id": conversation_id}
+                        ),
+                    ),
+                ).fetchone()
+            made.append(str(row["id"]))
+        assert len(self._auto_contexts(runtime, user_id, conversation_id)) == 2
+        for context_id, marker in zip(made, ("FROM THE WINNER", "FROM THE LOSER")):
+            runtime.store.add_chunks(
+                context_id,
+                [
+                    KnowledgeChunk(
+                        context_id=context_id,
+                        fs_path=f"/generations/{marker.replace(' ', '-')}",
+                        content=marker,
+                        embedding=runtime.rag.embed(marker),
+                        chunk_index=0,
+                    )
+                ],
+            )
+
+        # In a finally: leaving the index dropped would silently disarm the
+        # invariant for every test that runs after this one.
+        try:
+            apply_schema(os.environ["DATABASE_URL"], embedding_dim=64)
+        finally:
+            with runtime.store._connect() as conn:
+                conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "knowledge_context_auto_conversation_idx ON knowledge_context "
+                    "(owner_user_id, (meta ->> 'conversation_id')) "
+                    "WHERE COALESCE((meta ->> 'auto')::boolean, false)"
+                )
+
+        survivors = self._auto_contexts(runtime, user_id, conversation_id)
+        assert len(survivors) == 1, (
+            f"the migration left {len(survivors)} indexes for one conversation"
+        )
+        kept = _text(runtime, survivors[0].id)
+        assert "FROM THE WINNER" in kept
+        assert "FROM THE LOSER" in kept, (
+            "the merge dropped a duplicate's chunks instead of moving them"
+        )
+
+    def test_an_implicit_context_is_found_without_a_row_horizon(self, client):
+        """Identity is not a question about the first page of a listing."""
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        assert self._attach(
+            client, headers, conversation_id, "held.md",
+            b"# held\nTHE TEXT THIS CHAT HOLDS\n" * 800,
+        ).status_code == 200
+        assert len(self._auto_contexts(runtime, user_id, conversation_id)) == 1
+
+        # More recent contexts than the lookup ever reads.
+        for index in range(520):
+            runtime.store.upsert_context(
+                user_id, f"filler-{index}", "pushes the older one off the page"
+            )
+
+        found, _snippets = runtime.workflow._run_file_search(
+            "text this chat holds",
+            8,
+            conversation_id=conversation_id,
+            context_id=None,
+            user_id=user_id,
+            tenant_id=None,
+        )
+        assert "THE TEXT THIS CHAT HOLDS" in found, (
+            "the conversation's own attachment became unreachable because its "
+            "index fell outside the lookup's page"
+        )
+
+
+class TestEveryBackendScopesBeforeItsCandidateCut:
+    """The pgvector lane filters in SQL. The local lane did not.
+
+    `search_chunks` reads `list_chunks(context_id, limit=candidate_limit * 5)`
+    and filters the result in Python. The bounded read has already happened,
+    and it is ordered by `chunk_index, id` — every generation starts at
+    chunk index 0, so older unauthorized rows fill the whole window and the
+    authorized generation is never loaded. The filter then removes all of
+    them and retrieval answers with nothing.
+    """
+
+    def test_the_local_lane_returns_the_authorized_generation(self, client):
+        from liminallm.storage.models import KnowledgeChunk
+
+        runtime = get_runtime()
+        _user_id, headers = _account(client)
+        context_id = _context(client, headers)
+        stale_path = "/generations/sha256/aa/" + "a" * 64
+        live_path = "/generations/sha256/bb/" + "b" * 64
+        text = "the quarterly revenue figures for the northern region"
+
+        # More unauthorized rows than the candidate window, inserted first so
+        # they hold the lower ids.
+        for index in range(40):
+            runtime.store.add_chunks(
+                context_id,
+                [
+                    KnowledgeChunk(
+                        context_id=context_id,
+                        fs_path=stale_path,
+                        content=f"{text} (retired copy {index})",
+                        embedding=runtime.rag.embed(text),
+                        chunk_index=0,
+                    )
+                ],
+            )
+        runtime.store.add_chunks(
+            context_id,
+            [
+                KnowledgeChunk(
+                    context_id=context_id,
+                    fs_path=live_path,
+                    content=f"{text} THE GENERATION THIS CHAT HOLDS",
+                    embedding=runtime.rag.embed(text),
+                    chunk_index=0,
+                )
+            ],
+        )
+
+        found = runtime.store.search_chunks(
+            context_id,
+            text,
+            runtime.rag.embed(text),
+            limit=4,
+            allowed_paths=[live_path],
+        )
+        contents = " ".join(chunk.content or "" for chunk in found)
+        assert "THE GENERATION THIS CHAT HOLDS" in contents, (
+            f"the authorized generation was never loaded: {len(found)} rows "
+            "came back after the unauthorized ones filled the candidate read"
+        )
+        assert "retired copy" not in contents, contents[:160]
+
+
+class TestHiddenContextsDoNotPaginate:
+    """`/contexts` hides implicit contexts after the page has been cut.
+
+    The store orders and limits, then the route drops the auto rows from
+    what came back. A page whose sentinel row was an auto context reports
+    `has_next` false with contexts still unreached, and enough recent ones
+    make a page empty while claiming there is nothing after it.
+    """
+
+    def test_a_hidden_context_does_not_consume_a_page(self, client):
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        first = _context(client, headers)
+        second = _context(client, headers)
+        resp = client.post(
+            "/v1/conversations", headers=headers, json={"title": _unique("chat")}
+        )
+        conversation_id = resp.json()["data"]["id"]
+        # Newest, so it lands at the head of the ordering.
+        resp = client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={
+                "file": ("held.md", b"# held\nTHE HELD TEXT\n" * 800, "text/markdown")
+            },
+            data={"conversation_id": conversation_id},
+        )
+        assert resp.status_code == 200, resp.text
+
+        seen: list = []
+        page = 1
+        for _ in range(6):
+            resp = client.get(
+                f"/v1/contexts?page={page}&page_size=1", headers=headers
+            )
+            assert resp.status_code == 200, resp.text
+            data = resp.json()["data"]
+            seen.extend(item["id"] for item in data["items"])
+            if not data.get("has_next"):
+                break
+            page += 1
+
+        assert set(seen) == {first, second}, (
+            f"following the pagination reached {len(set(seen))} of 2 contexts: "
+            f"{seen}"
+        )

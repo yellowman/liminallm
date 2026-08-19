@@ -8832,3 +8832,80 @@ argument. A store that cannot scope a context cannot serve a conversation's
 index, and passing the argument only when a store accepts it would authorize
 by omission — so the legacy-store double in `tests/test_rag.py` implements it
 too.
+
+## Tranche 2E.6: implicit context identity and scoped enumeration
+
+Everything 2E.4 built rests on one sentence: a conversation has exactly one
+private implicit index. Review found that sentence was not enforced anywhere,
+and that two enumerations which look like filters were really page cuts.
+
+### HIGH: the implicit index had no durable identity
+
+Identity was "the first row a 500-context listing matched", and creation was
+`upsert_context`, which always inserts a fresh UUID with nothing in the schema
+forbidding a second row for the same conversation. §22 shares Postgres across
+replicas, so lookup-then-insert was never a guard — and measured, it was not
+one inside a single process either.
+
+Two first attachments racing both looked, both found nothing, and both
+inserted. The conversation ended with two hidden indexes, one acknowledged
+attachment in each, and `find_conversation_context_id` returning one of them:
+a file the API had accepted was searchable from nowhere.
+
+The horizon needed no concurrency at all. An account that accumulates more
+than 500 contexts loses an older conversation's index off the end of the page,
+and its attachments stop being searchable while their records and immutable
+objects are both intact — and the next attachment to that conversation creates
+yet another index, because `ensure_conversation_context` cannot see the first
+either.
+
+The database decides now. A partial unique index over
+`(owner_user_id, meta->>'conversation_id')` where `meta.auto` is true, and
+`get_or_create_conversation_attachment_context` inserting with
+`ON CONFLICT DO NOTHING` and then reading the winner, so every racing caller
+comes back with the same row. Lookup is a direct predicate, not a page.
+
+Duplicates that already exist are merged before the index is added: the
+losers' chunks move to the oldest row — the one any earlier lookup would have
+returned — and only then are the losers removed. Deleting a loser outright
+would take chunks the winner does not have. The mutation that skips the
+repair makes the index creation fail against exactly the state an upgrade
+would find, which is what the test asserts.
+
+### MEDIUM: the local retrieval lane scoped after its candidate cut
+
+The pgvector lane carries the path scope into SQL. The local lane read
+`list_chunks(context_id, limit=candidate_limit * 5)` and filtered the result
+in Python — and the comment above it said the filter came first, which was the
+part that made it look finished. The bounded read had already happened, and
+`list_chunks` orders by `chunk_index, id`: every generation starts at index 0,
+so unauthorized rows inserted earlier hold the lower ids and fill the whole
+window. Measured, forty retired rows consumed a twenty-row read and the
+authorized generation was never loaded, so retrieval answered with nothing.
+
+The predicate is part of the query that produces the candidate set now.
+Raising the cap would not have fixed it: any finite pre-filter window has the
+same counterexample.
+
+That comment is the second time in this tranche a claim about ordering was
+written above code that did the opposite. A comment is not evidence.
+
+### MEDIUM: hidden contexts were paginated and then hidden
+
+`/contexts` fetched a page plus a sentinel, then dropped the implicit indexes
+from what came back. The ordering and the limit happen in the store, so a page
+whose sentinel row was an implicit context reported no next page with ordinary
+contexts still unreached — and enough recent ones make a page empty while
+claiming there is nothing after it.
+
+`list_contexts(include_auto=False)` puts it in the query domain, before
+ordering, cursor evaluation and `LIMIT`.
+
+### A note on the mutation harness
+
+One mutation run was killed by an outer command timeout before the harness
+restored the file it had edited, leaving a mutated working tree that later
+commands would have been measured against. It was caught by checking the tree
+rather than by trusting the harness, and repaired by reversing the edit in
+place — never by `git checkout`, which would have discarded the whole
+uncommitted tranche. Mutations are run one at a time now, with room to finish.

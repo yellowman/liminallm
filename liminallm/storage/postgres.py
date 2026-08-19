@@ -3389,6 +3389,81 @@ class PostgresStore:
         return {**SYSTEM_SETTINGS_DEFAULTS, **merged}
 
     # knowledge
+    def get_conversation_attachment_context(
+        self, owner_user_id: str, conversation_id: str
+    ) -> Optional[KnowledgeContext]:
+        """The conversation's implicit index, by identity rather than by page.
+
+        This used to be "the first row a 500-context listing matched", which
+        is not an identity lookup: an account with more recent contexts than
+        the page holds lost an older conversation's index entirely, and the
+        conversation's own attachments stopped being searchable while their
+        records and objects were still perfectly intact.
+        """
+        if not _is_uuid(owner_user_id):
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM knowledge_context "
+                "WHERE owner_user_id = %s "
+                "AND COALESCE((meta ->> 'auto')::boolean, false) "
+                "AND meta ->> 'conversation_id' = %s "
+                "ORDER BY created_at ASC, id ASC LIMIT 1",
+                (owner_user_id, str(conversation_id)),
+            ).fetchone()
+        return self._context_from_row(row) if row else None
+
+    def get_or_create_conversation_attachment_context(
+        self, owner_user_id: str, conversation_id: str, name: str, description: str
+    ) -> KnowledgeContext:
+        """That context, creating it once however many callers ask at once.
+
+        Lookup-then-insert in one process is not a guard when Postgres is
+        shared across replicas (§22), and it was not one within a process
+        either: two first attachments both looked, both found nothing, and
+        both inserted. Measured, the conversation ended up with two hidden
+        contexts and one of the two acknowledged attachments was searchable
+        from neither, because the later lookup returns one row.
+
+        The database decides. `ON CONFLICT DO NOTHING` against the partial
+        unique index means the loser inserts nothing and then reads the
+        winner, so every caller comes back with the same context.
+        """
+        existing = self.get_conversation_attachment_context(
+            owner_user_id, conversation_id
+        )
+        if existing is not None:
+            return existing
+        meta = {"auto": True, "conversation_id": str(conversation_id)}
+        ctx_id = str(uuid.uuid4())
+        try:
+            with self._connect() as conn:
+                conn.execute(
+                    "INSERT INTO knowledge_context "
+                    "(id, owner_user_id, name, description, meta) "
+                    "VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                    (
+                        ctx_id,
+                        owner_user_id,
+                        name,
+                        description,
+                        self._json_param(meta),
+                    ),
+                )
+        except errors.ForeignKeyViolation:
+            raise ConstraintViolation(
+                "context owner missing", {"owner_user_id": owner_user_id}
+            )
+        created = self.get_conversation_attachment_context(
+            owner_user_id, conversation_id
+        )
+        if created is None:
+            raise ConstraintViolation(
+                "conversation context could not be created",
+                {"conversation_id": conversation_id},
+            )
+        return created
+
     def upsert_context(
         self,
         owner_user_id: Optional[str],
@@ -3427,16 +3502,8 @@ class PostgresStore:
             meta=meta,
         )
 
-    def get_context(self, context_id: str) -> Optional[KnowledgeContext]:
-        if not _is_uuid(context_id):
-            return None
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM knowledge_context WHERE id = %s", (context_id,)
-            ).fetchone()
-        if not row:
-            return None
-
+    @staticmethod
+    def _context_from_row(row) -> KnowledgeContext:
         return KnowledgeContext(
             id=str(row["id"]),
             owner_user_id=str(row["owner_user_id"]),
@@ -3448,6 +3515,15 @@ class PostgresStore:
             meta=row.get("meta"),
         )
 
+    def get_context(self, context_id: str) -> Optional[KnowledgeContext]:
+        if not _is_uuid(context_id):
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM knowledge_context WHERE id = %s", (context_id,)
+            ).fetchone()
+        return self._context_from_row(row) if row else None
+
     def list_contexts(
         self,
         owner_user_id: Optional[str] = None,
@@ -3457,7 +3533,16 @@ class PostgresStore:
         cursor: Optional[str] = None,
         include_sentinel: bool = False,
         limit: Optional[int] = None,
+        include_auto: bool = True,
     ) -> List[KnowledgeContext]:
+        """This user's contexts, ordered newest first.
+
+        `include_auto` decides whether conversations' implicit indexes are
+        part of the domain. Dropping them from the *result* instead made
+        pagination lie: the ordering and the LIMIT had already happened, so a
+        page whose sentinel row was an implicit context reported no next page
+        with ordinary contexts still unreached.
+        """
         if not owner_user_id:
             return []
 
@@ -3476,9 +3561,15 @@ class PostgresStore:
             except Exception as exc:  # pragma: no cover - defensive
                 self.logger.warning("context_cursor_decode_failed", error=str(exc))
 
+        auto_filter = (
+            ""
+            if include_auto
+            else " AND COALESCE((meta ->> 'auto')::boolean, false) IS FALSE"
+        )
         with self._connect() as conn:
             query = (
                 "SELECT * FROM knowledge_context WHERE owner_user_id = %s"
+                + auto_filter
                 + cursor_filter
                 + " ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s"
             )
@@ -3926,6 +4017,7 @@ class PostgresStore:
         context_id: Optional[str] = None,
         *,
         owner_user_id: Optional[str] = None,
+        allowed_paths: Optional[Sequence[str]] = None,
         page: int = 1,
         page_size: int = 100,
         cursor: Optional[str] = None,
@@ -3956,6 +4048,11 @@ class PostgresStore:
                     params.append(owner_user_id)
                 query += " WHERE kc.context_id = %s"
                 params.append(context_id)
+                if allowed_paths is not None:
+                    # Part of what the bounded read selects from, not a
+                    # filter over what it returned.
+                    query += " AND kc.fs_path = ANY(%s)"
+                    params.append(list(allowed_paths))
                 if cursor_filter:
                     query += cursor_filter
                     params.extend(cursor_params)
@@ -4310,12 +4407,17 @@ class PostgresStore:
         candidate_limit = limit or 4
         # Issue 25.3: prevent unbounded candidate loading by limiting DB reads
         max_candidates = min(candidate_limit * 5, 500)
-        candidates = self.list_chunks(context_id, limit=max_candidates)
-        if allowed_paths is not None:
-            # Before the scoring, not after it: an unauthorized row that
-            # scores well otherwise consumes a slot and is then discarded.
-            permitted = set(allowed_paths)
-            candidates = [c for c in candidates if c.fs_path in permitted]
+        # The restriction goes into the query that produces the bounded set,
+        # not over what it returned. `list_chunks` orders by chunk index and
+        # id, and every generation starts at index 0, so unauthorized rows
+        # inserted earlier hold the lower ids and filled the whole window —
+        # measured, forty retired rows consumed a twenty-row read and the
+        # authorized generation was never loaded, so retrieval answered with
+        # nothing. Raising the cap does not fix that; any finite pre-filter
+        # window has the same counterexample.
+        candidates = self.list_chunks(
+            context_id, limit=max_candidates, allowed_paths=allowed_paths
+        )
         if not candidates:
             return []
         query_tokens = _tokenize_text(query)
