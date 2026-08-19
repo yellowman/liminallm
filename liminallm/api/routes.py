@@ -140,6 +140,7 @@ from liminallm.service.attachments import (
     is_auto_context,
     list_attachments,
     record_attachment,
+    store_generation,
 )
 from liminallm.service.auth import AuthContext
 from liminallm.service.errors import BadRequestError, NotFoundError, ServiceError
@@ -148,6 +149,7 @@ from liminallm.service.fs import (
     PathLockTimeout,
     PathTraversalError,
     authorize_path,
+    file_digest,
     generate_signed_url,
     namespace_key,
     path_lock,
@@ -3616,6 +3618,20 @@ async def upload_file(
                 status_code=400,
             )
 
+        # Before anything durable happens. `_publish` used to reach this
+        # check inside its ingestion step, which runs after the pathname has
+        # already been replaced — so a request refused for naming a context
+        # that does not exist had overwritten the file first, and the failure
+        # handler then unlinked it. Measured: the pathname was gone while the
+        # manifest and the chunks still described the generation it used to
+        # hold, and the user was told their request was refused.
+        #
+        # A parameter the route will refuse is knowable before any mutation,
+        # so it is refused there. The conversation branch below creates its
+        # own context, which needs no checking.
+        if context_id:
+            _get_owned_context(runtime, context_id, principal)
+
         # Attach-to-conversation: classify the file, and route searchable ones
         # into the conversation's implicit context so file_search can find them.
         attachment_caps: Optional[dict] = None
@@ -3675,8 +3691,40 @@ async def upload_file(
             released off the event loop and never spans an await.
             """
             existing_checksums, prior_checksum, prior_contexts = _read_manifest()
-            deduped = dest_path.exists() and prior_checksum == checksum
+            # The manifest nominates a dedupe hit; the disk confirms it. The
+            # record can outlive the bytes it describes — a publication that
+            # failed after writing them and was never retried leaves exactly
+            # that — and when the record alone decides, re-uploading the bytes
+            # it names skips the write and reports success over a file holding
+            # something else. That is the false dedupe hit 2E.1 removed,
+            # reached this time by abandoning a failed request rather than by
+            # racing. Hashing only happens when the record already claims a
+            # match, so an ordinary upload of new bytes pays nothing.
+            deduped = (
+                prior_checksum == checksum
+                and dest_path.exists()
+                and file_digest(dest_path) == checksum
+            )
             chunks: Optional[int] = None
+
+            # A conversation attachment keeps its own copy of these bytes.
+            # The chat was given *this* generation, and `/files/{name}` is a
+            # name every later upload of it also owns — so what the chat can
+            # read has to stop depending on that name. Stored before anything
+            # names it, and unreferenced copies are reclaimed by the sweep.
+            generation: Optional[FilePath] = None
+            if attachment_caps:
+                generation = store_generation(
+                    runtime.settings.shared_fs_root,
+                    principal.user_id,
+                    contents,
+                    checksum,
+                )
+            # What this upload's chunks will claim to be the contents of. For
+            # an attachment that is the immutable generation, so a later
+            # upload of the same filename cannot make the conversation's
+            # index describe something the chat was never given.
+            indexed_path = generation if generation is not None else dest_path
 
             if not deduped:
                 # The IdempotencyGuard already claimed an in-progress slot on
@@ -3717,6 +3765,13 @@ async def upload_file(
                 # name into two contexts left the first context answering
                 # with the first generation's text.
                 #
+                # Asked of the database, not of `prior_contexts`. The manifest
+                # records only the contexts an upload named, and a context can
+                # acquire a path through `POST /contexts/{id}/sources` without
+                # ever appearing there — so a sweep driven by the manifest
+                # walked straight past it. The chunks are what claim to be
+                # this path's contents, so they are the reverse index.
+                #
                 # Emptied rather than refreshed. `_commit_generation` states
                 # the reason for its own writes: these chunks claim to be the
                 # contents of this path, so once new bytes exist the claim is
@@ -3724,26 +3779,46 @@ async def upload_file(
                 # the current bytes. Re-ingesting into contexts the request
                 # never named would instead spend an unbounded amount of work
                 # inside this lock and put content where it was not asked for.
-                #
-                # A conversation's implicit context is skipped. §19.5 scopes
-                # an attachment to the chat that received it, so another
-                # chat's upload of the same filename must not reach into it —
-                # removing its chunks would be one chat changing another
-                # chat's state just as much as replacing them would. Those
-                # records are stale for a different reason, and the fix is
-                # generation identity rather than a sweep.
-                for stale in prior_contexts - {context_id}:
-                    context = runtime.store.get_context(stale)
-                    if context is None or is_auto_context(context):
-                        continue
-                    runtime.store.replace_chunks_for_path(stale, str(dest_path), [])
+                runtime.store.invalidate_path_in_other_contexts(
+                    principal.user_id,
+                    str(dest_path),
+                    keep_context_id=context_id,
+                )
+
+            def _persist(contexts: set) -> None:
+                """Record this generation's checksum and its context set.
+
+                Under a second lock, and re-read rather than reusing the copy
+                above, because this file is one JSON object for every name in
+                the directory: an upload of *another* name takes a different
+                file lock, runs alongside, and its read-modify-write is built
+                from a snapshot taken before this one landed. Measured, that
+                dropped the other upload's entry entirely — and a missing
+                entry is a dedupe miss, so the next upload of that name
+                re-ingests a file that never changed.
+
+                Always file lock then manifest lock, never the reverse: one
+                order for two locks is what stops two uploads from each
+                holding what the other is waiting for.
+
+                Not best effort. The manifest is one of the three records
+                that have to describe one generation, and a swallowed failure
+                leaves it naming the previous checksum — recoverable only
+                because the dedupe check now confirms against the disk.
+                """
+                with path_lock(runtime.settings.shared_fs_root, str(manifest_path)):
+                    current, _, _ = _read_manifest()
+                    current[safe_filename] = {
+                        "checksum": checksum,
+                        "contexts": sorted(contexts),
+                    }
+                    manifest_path.write_text(json.dumps(current, indent=2))
 
             wants_ingest = bool(context_id) and (
                 not deduped or context_id not in prior_contexts
             )
             if wants_ingest:
                 try:
-                    _get_owned_context(runtime, context_id, principal)
                     # Ingestion is its own mutation: the bytes can be on disk
                     # with the chunks not yet written, and a retry must be
                     # able to tell.
@@ -3755,54 +3830,41 @@ async def upload_file(
                             chunks = operation.result
                         else:
                             chunks = runtime.rag.ingest_file(
-                                context_id, str(dest_path), chunk_size=chunk_size
+                                context_id, str(indexed_path), chunk_size=chunk_size
                             )
                             operation.result = chunks
                 except Exception:
-                    # Clean up on any error (not just ConstraintViolation), but
-                    # only when this request is what put the bytes there: a
-                    # dedupe hit means the file was already somebody else's.
-                    if not deduped:
-                        dest_path.unlink(missing_ok=True)
+                    # The new bytes stay. Unlinking them does not restore what
+                    # they replaced — those bytes are already gone — so it only
+                    # removes the pathname while the manifest and the index go
+                    # on describing a generation no file has. What exists by
+                    # here is this generation, so it is what gets recorded,
+                    # with the context whose ingestion failed left out of the
+                    # set. A retry under the same key finds the bytes in place
+                    # and re-runs only the ingestion.
+                    logger.warning(
+                        "file_upload_ingest_failed",
+                        user_id=principal.user_id,
+                        filename=safe_filename,
+                        context_id=context_id,
+                    )
+                    # The target context is the one case the invalidation
+                    # above deliberately skips, because it was about to
+                    # receive this generation. It did not, so whatever it
+                    # still says about this path describes bytes that are
+                    # gone.
+                    runtime.store.replace_chunks_for_path(
+                        context_id, str(indexed_path), []
+                    )
+                    _persist(set(prior_contexts) if deduped else set())
                     raise
 
             # Persist checksum manifest for deduplication (SPEC §2.5).
-            #
-            # Under a second lock, and re-read rather than reusing the copy
-            # above, because this file is one JSON object for every name in
-            # the directory: an upload of *another* name takes a different
-            # file lock, runs alongside, and its read-modify-write is built
-            # from a snapshot taken before this one landed. Measured, that
-            # dropped the other upload's entry entirely — and a missing entry
-            # is a dedupe miss, so the next upload of that name re-ingests a
-            # file that never changed.
-            #
-            # Always file lock then manifest lock, never the reverse: one
-            # order for two locks is what stops two uploads from each holding
-            # what the other is waiting for.
             if not deduped or wants_ingest:
                 contexts = set(prior_contexts) if deduped else set()
                 if context_id:
                     contexts.add(context_id)
-                # Not best effort, and this is where that distinction earns
-                # its keep. The manifest is one of the three records that
-                # have to describe one generation, and it is the one the
-                # *next* upload reads. A swallowed failure here leaves it
-                # naming the previous checksum and the previous context set,
-                # so re-uploading those previous bytes matches a record no
-                # file has: no write, no ingest, and a 200 over a file that
-                # still holds something else. That is the false dedupe hit
-                # 2E.1 removed, arriving through the bookkeeping instead of
-                # through a race. A failed request is recoverable — the
-                # retry re-runs the whole publication and repairs the
-                # record — and a silent one is not.
-                with path_lock(runtime.settings.shared_fs_root, str(manifest_path)):
-                    current, _, _ = _read_manifest()
-                    current[safe_filename] = {
-                        "checksum": checksum,
-                        "contexts": sorted(contexts),
-                    }
-                    manifest_path.write_text(json.dumps(current, indent=2))
+                _persist(contexts)
             # Inside the lock, because the record says how large this file is
             # and therefore how the conversation may use it — §19.5 makes
             # inline/searchable/analyzable part of that. Written after the

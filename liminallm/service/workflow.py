@@ -2374,21 +2374,21 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 findings=len(taint.findings(state)),
             )
             return taint.refusal(state)
-        names: List[str] = []
+        sources: List[Tuple[str, str]] = []
         if state.get("workdir") is None:
             attachments = self._conversation_attachments(conversation_id, user_id)
-            # Only the ones that still hold the bytes this chat attached.
-            # The workdir is built from `/users/{u}/files/{name}`, so without
-            # this a later upload of that name would be staged instead —
-            # another conversation's file, read by code running for this one.
-            names = attachments_service.resolved_names(
+            # Name and bytes together. The workdir used to be built from
+            # `/users/{u}/files/{name}`, so a later upload of that name was
+            # staged instead — another conversation's file, read by code
+            # running for this one.
+            sources = attachments_service.resolved_sources(
                 attachments,
                 fs_root=self.settings.shared_fs_root,
                 user_id=user_id,
             )
         return agent_tools.run_python(
             code,
-            names,
+            sources,
             settings=self.settings,
             user_id=user_id,
             session=state,

@@ -316,6 +316,31 @@ def _lock_file(fs_root: Path, key: str) -> Path:
     return Path(fs_root) / LOCK_DIRNAME / f"{digest}.lock"
 
 
+DIGEST_BLOCK_BYTES = 1024 * 1024
+
+
+def file_digest(path: str | Path) -> Optional[str]:
+    """The SHA-256 of the bytes at `path`, or None if it cannot be read.
+
+    Streamed, because the same function answers for a 200 MB upload and a
+    12 KB attachment, and reading either one whole to hash it is a cost the
+    caller did not ask for.
+
+    None is "no answer", not "no match". Every caller compares the result
+    with an expected digest, and None fails that comparison — which is the
+    safe direction for all of them: an unreadable file is not a confirmed
+    dedupe hit and is not a verified attachment.
+    """
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(DIGEST_BLOCK_BYTES), b""):
+                digest.update(block)
+    except OSError:
+        return None
+    return digest.hexdigest()
+
+
 def namespace_key(files_dir: str | Path, relative_name: str) -> str:
     """The lock key for anything that publishes or removes `relative_name`.
 

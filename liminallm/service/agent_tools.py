@@ -146,7 +146,7 @@ def run_file_search(
 
 def run_python(
     code: str,
-    attachment_names: List[str],
+    attachment_sources: List[Tuple[str, str]],
     *,
     settings: Any,
     user_id: Optional[str],
@@ -185,9 +185,7 @@ def run_python(
             settings.interpreter_scratch_dir or tempfile.gettempdir()
         ) / "liminallm-interpreter"
         scratch.mkdir(parents=True, exist_ok=True)
-        workdir = interpreter.prepare_workdir(
-            str(scratch), str(files_dir), attachment_names
-        )
+        workdir = interpreter.prepare_workdir(str(scratch), attachment_sources)
         session["workdir"] = workdir
         if invocation is not None:
             invocation.resources.add_path(workdir)

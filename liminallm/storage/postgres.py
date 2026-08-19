@@ -3600,6 +3600,69 @@ class PostgresStore:
             raise ConstraintViolation("context not found", {"context_id": context_id})
         return deleted_generation
 
+    def referenced_attachment_checksums(self, owner_user_id: str) -> set[str]:
+        """Every attachment generation this user's conversations still name.
+
+        The marks for the generation store's sweep. They already exist —
+        each attachment record names its generation — so a reference count
+        would be a second record of the same fact, to be kept correct across
+        every way a conversation is created, edited and deleted.
+
+        Raises rather than returning an empty set when the query fails: the
+        caller deletes what is not in here, and "unknown" must not be
+        mistaken for "nothing".
+        """
+        if not _is_uuid(owner_user_id):
+            raise ValueError("owner_user_id is not a user identifier")
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT DISTINCT att ->> 'checksum' AS checksum "
+                "FROM conversation c, LATERAL jsonb_array_elements("
+                "  CASE WHEN jsonb_typeof(c.meta -> 'attachments') = 'array' "
+                "       THEN c.meta -> 'attachments' ELSE '[]'::jsonb END"
+                ") AS att "
+                "WHERE c.user_id = %s AND att ->> 'checksum' IS NOT NULL",
+                (owner_user_id,),
+            ).fetchall()
+        return {str(row["checksum"]) for row in rows}
+
+    def invalidate_path_in_other_contexts(
+        self,
+        owner_user_id: str,
+        fs_path: str,
+        *,
+        keep_context_id: Optional[str] = None,
+    ) -> int:
+        """Empty what this user's path-following contexts say about `fs_path`.
+
+        Asked of the database rather than of the upload manifest, because the
+        manifest records only the contexts an upload named. A context that
+        acquired the path through ``POST /contexts/{id}/sources`` is not in it
+        and never becomes so, so a sweep driven by the manifest walked past it
+        and left the previous generation's chunks answering for the new bytes.
+        The rows themselves are the reverse index: they are what claims to be
+        the contents of this path, so they are what the question is put to.
+
+        `keep_context_id` is the context about to receive the new generation.
+        Everything else the caller owns is emptied for this path.
+
+        Contexts marked ``meta.auto`` are conversations' implicit indexes and
+        are left alone. §19.5 scopes an attachment to the chat that received
+        it, so another chat's upload of the same filename must not reach into
+        one — removing its chunks would be one chat changing another chat's
+        state as much as replacing them would.
+        """
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM knowledge_chunk kc USING knowledge_context ctx "
+                "WHERE kc.context_id = ctx.id AND ctx.owner_user_id = %s "
+                "AND kc.fs_path = %s "
+                "AND (%s::uuid IS NULL OR ctx.id <> %s::uuid) "
+                "AND COALESCE((ctx.meta ->> 'auto')::boolean, false) IS FALSE",
+                (owner_user_id, fs_path, keep_context_id, keep_context_id),
+            )
+            return cursor.rowcount or 0
+
     def delete_chunks_under_path(self, owner_user_id: str, fs_path: str) -> int:
         """Drop everything this user's contexts say about `fs_path` or its tree.
 

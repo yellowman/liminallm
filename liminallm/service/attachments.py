@@ -21,10 +21,13 @@ or migration is needed.
 """
 from __future__ import annotations
 
-import hashlib
+import os
+import time
+from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from uuid import uuid4
 
 from liminallm.service.archive import ARCHIVE_SUFFIXES
 from liminallm.service.fs import PathTraversalError, safe_join
@@ -43,6 +46,9 @@ TEXT_EXTENSIONS = {
 DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".odt"}
 # Formats the model should reach for the interpreter to parse.
 DATA_EXTENSIONS = {".csv", ".tsv", ".json"} | set(ARCHIVE_SUFFIXES)
+
+#: Where a conversation's attached generations live, beside `files/`.
+GENERATION_DIRNAME = "attachment-generations"
 
 # A small text file is cheaper and more faithful to inject whole than to chunk;
 # past this size retrieval wins. ~12KB is roughly 3k tokens.
@@ -88,6 +94,71 @@ def attachment_path(fs_root: str, user_id: str, name: str) -> Optional[Path]:
         return None
 
 
+def generation_root(fs_root: str, user_id: str) -> Path:
+    """Where this user's attached generations are kept.
+
+    Beside `files/`, not inside it: nothing here is a name the user chose or
+    can reach through `/files`, and a listing must not show it.
+    """
+    return Path(fs_root) / "users" / user_id / GENERATION_DIRNAME / "sha256"
+
+
+def generation_path(fs_root: str, user_id: str, checksum: Any) -> Optional[Path]:
+    """The immutable object holding the bytes `checksum` names.
+
+    Fanned out one level by the first two characters, so a busy account does
+    not end up with a single directory holding every generation it ever
+    attached.
+
+    The checksum is validated rather than trusted. It arrives from a stored
+    record, and a record that has been corrupted or hand-edited would
+    otherwise choose a path.
+    """
+    text = str(checksum or "")
+    if len(text) != 64 or any(c not in "0123456789abcdef" for c in text):
+        return None
+    return generation_root(fs_root, user_id) / text[:2] / text
+
+
+def store_generation(
+    fs_root: str, user_id: str, contents: bytes, checksum: str
+) -> Optional[Path]:
+    """Keep `contents` as an immutable generation, and return where.
+
+    The bytes are already in memory — the upload buffered them to hash and
+    write them — so this is one more copy of something the request is holding
+    anyway. A hard link from `/users/{u}/files/{name}` would be free instead,
+    and is not used: it would leave that file with two links, which is
+    exactly what `rag._within_source` refuses, so a context source covering
+    the user's files would then skip every attached file.
+
+    Written under a hidden name and linked into place, for the reason
+    `interpreter.publish_artifacts` does the same: a reader must find the
+    whole object or no object. `os.link` refuses a name that exists, so two
+    requests attaching identical bytes cost one copy and neither overwrites
+    the other's.
+    """
+    path = generation_path(fs_root, user_id, checksum)
+    if path is None:
+        return None
+    if path.is_file():
+        return path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staged = path.parent / f".{uuid4().hex}.part"
+    try:
+        staged.write_bytes(contents)
+        try:
+            os.link(staged, path)
+        except FileExistsError:
+            # Another request stored the same bytes first. Same content, same
+            # name; there is nothing to reconcile.
+            pass
+    finally:
+        with suppress(OSError):
+            staged.unlink()
+    return path if path.is_file() else None
+
+
 def ensure_conversation_context(store, *, user_id: str, conversation_id: str) -> Any:
     """Get (or create) the implicit knowledge context for a conversation.
 
@@ -129,51 +200,52 @@ def list_attachments(conversation: Any) -> list[dict[str, Any]]:
 def resolve_attachment(
     fs_root: str, user_id: str, record: dict[str, Any]
 ) -> Optional[Path]:
-    """The path holding the bytes this record describes, or None.
+    """The immutable object this record names, or None.
 
-    An attachment record names a file, and the file is a moving target: it
-    lives at `/users/{u}/files/{name}`, which any later upload of that name
-    replaces. Every consumer resolved the name and read whatever was there,
-    so one conversation could be served the bytes another conversation
+    An attachment record used to name a file, and the file was a moving
+    target: `/users/{u}/files/{name}` is replaced by any later upload of that
+    name, so one conversation was served the bytes another conversation
     attached — and §19.5 scopes an attachment to the chat that received it.
-    Deleting the file and creating the name again later is the same thing
-    with a gap in the middle.
 
-    So the record carries the checksum of what was attached, and a path whose
-    contents no longer match it is not this attachment. Size is checked
-    first, which settles the ordinary case without reading anything.
+    Verifying the pathname's contents against a recorded checksum was not
+    enough, because verifying and reading are two moments. The check noticed
+    a replacement that had already happened and said nothing about one that
+    had not happened yet: measured, a replacement landing between the two
+    was served exactly as before.
 
-    What this gives is the safety half: an attachment never resolves to
-    bytes that are not the ones attached. Keeping the attached generation
-    *available* after the path moves needs somewhere to keep it, which is a
-    storage decision this does not make. Records written before checksums
-    were kept have nothing to compare, so they resolve as before.
+    A hash is only a name for bytes if the bytes cannot move, so the record's
+    checksum names an object in a write-once store instead. Reopening it by
+    name is safe because nothing can put different bytes behind that name.
+
+    Records written before the store existed carry no generation. Their
+    bytes cannot be reconstructed, and today's contents of the pathname are
+    not evidence of what was attached, so they resolve to nothing at all.
     """
-    path = attachment_path(fs_root, user_id, record.get("name") or "")
-    if not path or not path.is_file():
-        return None
-    expected = record.get("checksum")
-    if not expected:
-        return path
-    try:
-        if path.stat().st_size != record.get("size"):
-            return None
-        digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    except OSError:
-        return None
-    return path if digest == expected else None
+    return _existing_generation(fs_root, user_id, record.get("checksum"))
 
 
-def resolved_names(
+def _existing_generation(fs_root: str, user_id: str, checksum: Any) -> Optional[Path]:
+    path = generation_path(fs_root, user_id, checksum)
+    return path if path is not None and path.is_file() else None
+
+
+def resolved_sources(
     records: list[dict[str, Any]], *, fs_root: str, user_id: str
-) -> list[str]:
-    """The names whose bytes are still the ones that were attached."""
-    return [
-        str(record.get("name"))
-        for record in records
-        if record.get("name")
-        and resolve_attachment(fs_root, user_id, record) is not None
-    ]
+) -> list[tuple[str, str]]:
+    """Each usable attachment as (the name the chat knows, where its bytes are).
+
+    Both halves, because they are no longer the same thing: the name belongs
+    to the conversation and the bytes belong to the generation store. A
+    consumer that took only the name would have to resolve it again, which is
+    the second moment this exists to remove.
+    """
+    sources: list[tuple[str, str]] = []
+    for record in records:
+        name = record.get("name")
+        path = resolve_attachment(fs_root, user_id, record)
+        if name and path is not None:
+            sources.append((str(name), str(path)))
+    return sources
 
 
 def record_attachment(
@@ -256,38 +328,50 @@ def safe_name(name: Any) -> str:
 
 
 def describe_attachments(
-    attachments: list[dict[str, Any]], *, numbering: Optional[dict[str, int]] = None
+    attachments: list[dict[str, Any]],
+    *,
+    numbering: Optional[dict[str, int]] = None,
+    unavailable: Optional[set[str]] = None,
 ) -> str:
     """One line per attachment, telling the model how it can reach each one.
 
     `numbering` maps an inline file's name to the label it carries inside the
     data envelope, so the model can attribute quoted text to a file without the
     label having to contain the file's name.
+
+    `unavailable` names the attachments whose generation is gone — records
+    written before the generation store existed, and anything the sweep has
+    reclaimed. Listing a capability the tools will refuse tells the model to
+    read text that is not there and to open a file `run_python` will not
+    stage, so those get one honest line instead of three misleading ones.
     """
     lines = []
+    missing = unavailable or set()
     for att in attachments:
         how = []
-        if att.get("inline"):
-            index = (numbering or {}).get(att.get("name"))
-            # No number means the file was not inlined, and the only reason
-            # it would not be is that it no longer holds the bytes that were
-            # attached. Saying "full text included below" then promises the
-            # model text that is not there, and a reader that cannot find
-            # what it was told to expect is worse off than one told plainly
-            # that the file is gone.
-            how.append(
-                f"quoted below as [file {index}]"
-                if index
-                else "unavailable: replaced or removed since it was attached"
-            )
-        if att.get("searchable"):
-            how.append("searchable via file_search")
-        if att.get("analyzable"):
-            how.append("readable in run_python's working directory")
+        name = att.get("name")
+        if name in missing:
+            how.append("unavailable: no longer stored")
+        else:
+            if att.get("inline"):
+                index = (numbering or {}).get(name)
+                # Stored, and still not in the envelope: the inline budget
+                # filled up before this one. Saying "full text included
+                # below" tells the model to read text that is not there, and
+                # saying it is gone is not true either — the other
+                # capabilities on this line still work.
+                how.append(
+                    f"quoted below as [file {index}]"
+                    if index
+                    else "stored, but its text did not fit in this prompt"
+                )
+            if att.get("searchable"):
+                how.append("searchable via file_search")
+            if att.get("analyzable"):
+                how.append("readable in run_python's working directory")
         size = att.get("size") or 0
         lines.append(
-            f"- {safe_name(att.get('name'))} ({size} bytes) — "
-            f"{'; '.join(how) or 'stored'}"
+            f"- {safe_name(name)} ({size} bytes) — {'; '.join(how) or 'stored'}"
         )
     return "\n".join(lines)
 
@@ -315,6 +399,14 @@ def build_attachment_preamble(
     if not attachments:
         return ""
     inline = read_inline_contents(attachments, fs_root=fs_root, user_id=user_id)
+    # One `is_file()` per record, not a hash: the generation store is
+    # content-addressed and write-once, so whether the object is there is the
+    # whole question.
+    unavailable = {
+        att.get("name")
+        for att in attachments
+        if resolve_attachment(fs_root, user_id, att) is None
+    }
     # Files inside the envelope are labelled by number, and the listing above
     # says which number is which name. A label holding the name would be one
     # more structure a name could imitate — `rerank.py` numbers its passages
@@ -322,7 +414,9 @@ def build_attachment_preamble(
     numbering = {item["name"]: index for index, item in enumerate(inline, start=1)}
     parts = [
         "Files attached to this conversation:",
-        describe_attachments(attachments, numbering=numbering),
+        describe_attachments(
+            attachments, numbering=numbering, unavailable=unavailable
+        ),
     ]
     if inline:
         # One envelope around all of them: a per-file envelope would give a
@@ -343,9 +437,55 @@ def build_attachment_preamble(
             f"{UNTRUSTED_CLOSE}"
         )
     # Which capability applies to these files; how each tool works is already
-    # in its schema description — say it once, there.
-    if any(a.get("searchable") for a in attachments):
+    # in its schema description — say it once, there. Only for files that are
+    # actually there: offering a tool that will find nothing to work on
+    # invites the model to call it and report a failure as a result.
+    usable = [a for a in attachments if a.get("name") not in unavailable]
+    if any(a.get("searchable") for a in usable):
         parts.append("\nUse file_search to look inside the searchable files.")
-    if any(a.get("analyzable") for a in attachments):
+    if any(a.get("analyzable") for a in usable):
         parts.append("\nUse run_python to work on the files directly.")
     return "\n".join(parts)
+
+
+def sweep_generations(store, fs_root: str, *, grace_seconds: int) -> int:
+    """Remove generations no conversation names any more.
+
+    Mark and sweep rather than a reference count: the marks already exist —
+    every attachment record names its generation — and a count would be a
+    second record of the same fact, to be kept correct across every way a
+    conversation can be created, edited and deleted.
+
+    The grace period covers the window between storing a generation and
+    recording the attachment that names it. A blob younger than it is left
+    alone whether or not anything points at it yet.
+
+    Each account is swept from its own referenced set, and a failure to read
+    that set skips the account. An empty set legitimately means "no
+    attachments"; an unreadable one means "unknown", and deleting on unknown
+    would take every generation the account has.
+    """
+    root = Path(fs_root) / "users"
+    if not root.is_dir():
+        return 0
+    cutoff = time.time() - max(grace_seconds, 0)
+    removed = 0
+    for user_dir in root.iterdir():
+        base = user_dir / GENERATION_DIRNAME / "sha256"
+        if not base.is_dir():
+            continue
+        try:
+            referenced = store.referenced_attachment_checksums(user_dir.name)
+        except Exception:
+            continue
+        for blob in base.glob("*/*"):
+            if blob.name in referenced:
+                continue
+            try:
+                if blob.stat().st_mtime > cutoff:
+                    continue
+                blob.unlink()
+            except OSError:
+                continue
+            removed += 1
+    return removed

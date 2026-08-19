@@ -776,10 +776,9 @@ class TestAnAttachmentNeverResolvesToOtherBytes:
     thing with a gap in the middle: the old record silently rebinds to bytes
     that were never attached to anything.
 
-    What is closed here is the safety half: an attachment never resolves to
-    bytes that are not the ones attached. Keeping the attached generation
-    available after the path moves needs somewhere to keep it, which is the
-    open design question.
+    These are the plain sequential cases. The interleavings the same defect
+    also allowed, and the store that removes both, are in
+    `TestAnAttachmentIsAnImmutableGeneration` below.
     """
 
     def _conversation(self, client, headers) -> str:
@@ -856,8 +855,9 @@ class TestAnAttachmentNeverResolvesToOtherBytes:
         )
 
     def test_the_interpreter_stages_no_substituted_bytes(self, client):
-        """`run_python` rebuilds its workdir from the same global names."""
+        """`run_python` rebuilds its workdir from the conversation's records."""
         from liminallm.service import interpreter
+        from liminallm.service.attachments import list_attachments, resolved_sources
 
         runtime = get_runtime()
         user_id, headers = _account(client)
@@ -869,18 +869,14 @@ class TestAnAttachmentNeverResolvesToOtherBytes:
             client, headers, "data.md", b"# data\nROWS FROM SOMEWHERE ELSE\n"
         ).status_code == 200
 
-        from liminallm.service.attachments import list_attachments, resolved_names
-
         conversation = runtime.store.get_conversation(conversation_id, user_id=user_id)
-        records = list_attachments(conversation)
-        # The same list the tool builds, through the same helper.
-        names = resolved_names(
-            records, fs_root=runtime.settings.shared_fs_root, user_id=user_id
+        sources = resolved_sources(
+            list_attachments(conversation),
+            fs_root=runtime.settings.shared_fs_root,
+            user_id=user_id,
         )
         workdir = interpreter.prepare_workdir(
-            str(Path(runtime.settings.shared_fs_root) / "scratch"),
-            str(_files_dir(runtime, user_id)),
-            names,
+            str(Path(runtime.settings.shared_fs_root) / "scratch"), sources
         )
         staged = " ".join(
             p.read_text(errors="replace") for p in Path(workdir).iterdir() if p.is_file()
@@ -888,19 +884,442 @@ class TestAnAttachmentNeverResolvesToOtherBytes:
         assert "ROWS FROM SOMEWHERE ELSE" not in staged, (
             "the interpreter staged bytes that were never attached"
         )
+        assert "THE ATTACHED ROWS" in staged
 
     def test_the_prompt_does_not_promise_text_it_leaves_out(self, client):
         """The listing and the envelope have to agree.
 
-        An inline attachment that no longer resolves is simply not in the
+        An attachment whose generation is not there is simply not in the
         envelope. The listing above it said "full text included below"
         regardless, so the model was told to read text that was not there.
+        A record from before the generation store is the case that still
+        reaches this: its bytes cannot be reconstructed, so it resolves to
+        nothing.
         """
-        from liminallm.service.attachments import (
-            build_attachment_preamble,
-            list_attachments,
+        from liminallm.service.attachments import build_attachment_preamble
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        assert _upload(
+            client, headers, "legacy.md", b"# legacy\nTODAYS BYTES AT THAT NAME\n"
+        ).status_code == 200
+
+        legacy = {
+            "name": "legacy.md",
+            "size": 33,
+            "inline": True,
+            "searchable": False,
+            "analyzable": True,
+        }
+        preamble = build_attachment_preamble(
+            [legacy], fs_root=runtime.settings.shared_fs_root, user_id=user_id
+        )
+        assert "TODAYS BYTES AT THAT NAME" not in preamble
+        assert "full text included below" not in preamble, (
+            "the listing promised text the envelope does not contain"
+        )
+        assert "run_python" not in preamble, (
+            "the listing offered a capability the tool will refuse"
+        )
+        assert "unavailable" in preamble, preamble
+
+
+class TestARejectedRequestDoesNotMutateAnything:
+    """The order of validation and mutation.
+
+    `_publish` replaced the pathname and validated the named context
+    afterwards, inside the ingestion step. So a request rejected for naming a
+    context that does not exist had already overwritten the file, and the
+    failure handler then unlinked it: the pathname was gone, the manifest and
+    the chunks still described the generation it used to hold, and the user
+    was told their request was refused.
+
+    A parameter the route will refuse is knowable before anything durable
+    happens, so it is checked there.
+    """
+
+    def test_an_unknown_context_leaves_the_previous_generation_alone(self, client):
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        context_id = _context(client, headers)
+        first = b"# report\nTHE GENERATION ALREADY PUBLISHED\n" * 12
+        assert _upload(client, headers, "report.md", first, context_id).status_code == 200
+        target = _files_dir(runtime, user_id) / "report.md"
+
+        resp = _upload(
+            client,
+            headers,
+            "report.md",
+            b"# report\nTHE GENERATION THAT WAS REFUSED\n" * 12,
+            str(uuid.uuid4()),
+        )
+        assert resp.status_code == 404, resp.status_code
+
+        assert target.exists(), (
+            "a request refused for naming an unknown context deleted the "
+            "file it was replacing"
+        )
+        assert target.read_bytes() == first
+        assert _manifest(runtime, user_id)["report.md"]["checksum"] == (
+            hashlib.sha256(first).hexdigest()
+        )
+        assert "THE GENERATION ALREADY PUBLISHED" in _text(runtime, context_id)
+
+    def test_another_users_context_is_refused_before_the_write(self, client):
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        _other_id, other_headers = _account(client)
+        theirs = _context(client, other_headers)
+        first = b"# report\nMY OWN PUBLISHED GENERATION\n" * 12
+        assert _upload(client, headers, "report.md", first).status_code == 200
+        target = _files_dir(runtime, user_id) / "report.md"
+
+        resp = _upload(
+            client, headers, "report.md", b"# report\nREFUSED BYTES\n" * 12, theirs
+        )
+        assert resp.status_code == 403, resp.status_code
+        assert target.read_bytes() == first, (
+            "a request refused for naming another account's context still "
+            "replaced the file"
         )
 
+    def test_a_failed_ingestion_leaves_a_generation_that_can_be_retried(self, client):
+        """The other half: the context is real and the ingestion fails.
+
+        Unlinking the destination does not restore what it replaced — the
+        previous bytes are already gone — so it leaves the pathname absent
+        while the manifest and the chunks still describe them. The new bytes
+        are the only generation that exists by then, so they are what is
+        kept, recorded, and left for the retry to finish.
+        """
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        context_id = _context(client, headers)
+        first = b"# report\nTHE FIRST GENERATION\n" * 12
+        second = b"# report\nTHE SECOND GENERATION\n" * 12
+        assert _upload(client, headers, "report.md", first, context_id).status_code == 200
+        target = _files_dir(runtime, user_id) / "report.md"
+
+        armed = {"on": True}
+        real_ingest = runtime.rag.ingest_file
+
+        def failing(*args, **kwargs):
+            if armed["on"]:
+                armed["on"] = False
+                raise OSError("the index is unreachable")
+            return real_ingest(*args, **kwargs)
+
+        runtime.rag.ingest_file = failing
+        key = _unique("retry")
+        try:
+            with pytest.raises(OSError):
+                client.post(
+                    "/v1/files/upload",
+                    headers={**headers, "Idempotency-Key": key},
+                    files={"file": ("report.md", second, "text/markdown")},
+                    data={"context_id": context_id},
+                )
+            assert target.exists(), (
+                "the failed ingestion removed the pathname, leaving the "
+                "manifest and the index describing bytes no file has"
+            )
+            assert target.read_bytes() == second
+            assert _manifest(runtime, user_id)["report.md"]["checksum"] == (
+                hashlib.sha256(second).hexdigest()
+            ), "the surviving bytes are not the ones the manifest describes"
+            assert "THE FIRST GENERATION" not in _text(runtime, context_id), (
+                "the index still describes a generation the file no longer holds"
+            )
+
+            resp = client.post(
+                "/v1/files/upload",
+                headers={**headers, "Idempotency-Key": key},
+                files={"file": ("report.md", second, "text/markdown")},
+                data={"context_id": context_id},
+            )
+            assert resp.status_code == 200, resp.text
+            assert "THE SECOND GENERATION" in _text(runtime, context_id), (
+                "the retry did not finish the ingestion the first attempt failed"
+            )
+        finally:
+            runtime.rag.ingest_file = real_ingest
+
+
+class TestDedupeIsConfirmedByTheDiskNotTheRecord:
+    """A manifest entry nominates a dedupe hit; the file confirms it.
+
+    The manifest can outlive the bytes it describes — a publication that
+    failed after writing them leaves exactly that. When the record alone
+    decides, re-uploading the bytes it names skips the write and reports
+    success over a file holding something else entirely, which is the false
+    dedupe hit 2E.1 removed, arriving through a failed request instead of a
+    race. Whoever abandons a failed upload reaches it; no retry is involved.
+    """
+
+    def test_an_abandoned_failure_cannot_make_a_later_upload_lie(
+        self, client, monkeypatch
+    ):
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        context_id = _context(client, headers)
+        first = b"# report\nTHE FIRST GENERATION\n" * 12
+        second = b"# report\nTHE SECOND GENERATION\n" * 12
+        target = _files_dir(runtime, user_id) / "report.md"
+        manifest_path = _files_dir(runtime, user_id) / ".checksums.json"
+
+        assert _upload(client, headers, "report.md", first, context_id).status_code == 200
+
+        armed = {"on": True}
+        real_write = Path.write_text
+
+        def gated(path, *args, **kwargs):
+            if armed["on"] and path == manifest_path:
+                armed["on"] = False
+                raise OSError("no space left on device")
+            return real_write(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "write_text", gated)
+        with pytest.raises(OSError):
+            _upload(client, headers, "report.md", second, context_id)
+        monkeypatch.undo()
+
+        # The state a client that walks away leaves behind.
+        assert target.read_bytes() == second
+        assert _manifest(runtime, user_id)["report.md"]["checksum"] == (
+            hashlib.sha256(first).hexdigest()
+        ), "the manifest was expected to be describing the first generation"
+
+        # A fresh request for the first generation. The manifest nominates it
+        # as a dedupe hit; the file on disk is not it.
+        resp = _upload(client, headers, "report.md", first, context_id)
+        assert resp.status_code == 200, resp.text
+        assert target.read_bytes() == first, (
+            "the upload reported success without writing, because a record "
+            "nominated a dedupe hit that the disk did not confirm"
+        )
+        assert "THE FIRST GENERATION" in _text(runtime, context_id)
+        assert "THE SECOND GENERATION" not in _text(runtime, context_id)
+
+
+class TestTheIndexIsItsOwnReverseIndex:
+    """Which contexts describe a path is a question the database answers.
+
+    The invalidation swept `prior_contexts` out of `.checksums.json`, which
+    only ever records the contexts an *upload* named. A context that acquired
+    the path through `POST /contexts/{id}/sources` is not in it, and never
+    becomes so — the source route ingests and takes the namespace lock, and
+    writes nothing to the manifest. So the sweep walked past it, entirely
+    sequentially, with no failure anywhere.
+
+    The manifest's context set stays useful for deciding whether an upload
+    needs to re-ingest. It is not the reverse index, because it cannot see
+    every way a path gets indexed.
+    """
+
+    def _add_source(self, client, headers, context_id, path):
+        return client.post(
+            f"/v1/contexts/{context_id}/sources",
+            headers=headers,
+            json={"fs_path": str(path), "recursive": False},
+        )
+
+    def test_a_context_that_took_the_path_as_a_source_is_invalidated(self, client):
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        context_id = _context(client, headers)
+        first = b"# report\nTHE GENERATION THE SOURCE INDEXED\n" * 12
+        second = b"# report\nTHE GENERATION THAT REPLACED IT\n" * 12
+
+        # No context named on the upload, so the manifest records none.
+        assert _upload(client, headers, "report.md", first).status_code == 200
+        target = _files_dir(runtime, user_id) / "report.md"
+        assert self._add_source(
+            client, headers, context_id, target
+        ).status_code in (200, 201)
+        assert "THE GENERATION THE SOURCE INDEXED" in _text(runtime, context_id)
+        assert _manifest(runtime, user_id)["report.md"]["contexts"] == [], (
+            "the manifest was expected to know nothing about this context"
+        )
+
+        assert _upload(client, headers, "report.md", second).status_code == 200
+
+        assert target.read_bytes() == second
+        assert "THE GENERATION THE SOURCE INDEXED" not in _text(runtime, context_id), (
+            "a context that acquired the path as a source still describes the "
+            "generation the file no longer holds"
+        )
+        assert str(target) not in _described_paths(runtime, context_id)
+
+    def test_the_context_receiving_the_new_generation_keeps_it(self, client):
+        """The one context that must not be swept is the one being written."""
+        runtime = get_runtime()
+        _user_id, headers = _account(client)
+        first_ctx, second_ctx = _context(client, headers), _context(client, headers)
+        first = b"# report\nTHE EARLIER GENERATION\n" * 12
+        second = b"# report\nTHE INCOMING GENERATION\n" * 12
+
+        assert _upload(client, headers, "report.md", first, first_ctx).status_code == 200
+        assert _upload(client, headers, "report.md", second, second_ctx).status_code == 200
+
+        assert "THE INCOMING GENERATION" in _text(runtime, second_ctx), (
+            "the invalidation removed the generation the request was writing"
+        )
+        assert "THE EARLIER GENERATION" not in _text(runtime, first_ctx)
+
+    def test_a_lost_manifest_does_not_lose_the_invalidation(self, client):
+        """The manifest is an optimization for dedupe, not the record of
+        which contexts describe a path. Deleting it must not make a stale
+        generation survive."""
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        context_id = _context(client, headers)
+        first = b"# notes\nTHE GENERATION BEFORE THE MANIFEST WENT\n" * 12
+        second = b"# notes\nTHE GENERATION AFTER IT\n" * 12
+
+        assert _upload(client, headers, "notes.md", first, context_id).status_code == 200
+        (_files_dir(runtime, user_id) / ".checksums.json").unlink()
+
+        assert _upload(client, headers, "notes.md", second).status_code == 200
+
+        assert "THE GENERATION BEFORE THE MANIFEST WENT" not in _text(
+            runtime, context_id
+        ), "losing the manifest left a stale generation in the index"
+
+
+class TestAnAttachmentIsAnImmutableGeneration:
+    """Verifying a pathname and then reopening it is two moments again.
+
+    `resolve_attachment` hashed `/users/{u}/files/{name}` and returned the
+    *path*; the inline reader then reopened it to read the text, and
+    `resolved_names` threw the object away entirely and returned a basename
+    for `prepare_workdir` to reopen later. So a replacement landing between
+    the check and the use was served exactly as before — the check noticed a
+    replacement that had already happened, and nothing about one that had
+    not happened yet.
+
+    A hash is only a name for bytes if the bytes cannot move. Each attached
+    generation is now copied into a content-addressed store the moment it is
+    attached, and every consumer reads that object. The pathname a chat was
+    given the file under can then be replaced, deleted, or recreated without
+    the chat noticing.
+    """
+
+    def _conversation(self, client, headers) -> str:
+        resp = client.post(
+            "/v1/conversations", headers=headers, json={"title": _unique("chat")}
+        )
+        assert resp.status_code in (200, 201), resp.text
+        return resp.json()["data"]["id"]
+
+    def _attach(self, client, headers, conversation_id, name, body):
+        return client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={"file": (name, body, "text/markdown")},
+            data={"conversation_id": conversation_id},
+        )
+
+    def _records(self, runtime, conversation_id, user_id):
+        from liminallm.service.attachments import list_attachments
+
+        return list_attachments(
+            runtime.store.get_conversation(conversation_id, user_id=user_id)
+        )
+
+    def _inline(self, runtime, conversation_id, user_id):
+        from liminallm.service.attachments import read_inline_contents
+
+        return read_inline_contents(
+            self._records(runtime, conversation_id, user_id),
+            fs_root=runtime.settings.shared_fs_root,
+            user_id=user_id,
+        )
+
+    def test_a_replacement_between_the_check_and_the_read_is_not_served(
+        self, client, monkeypatch
+    ):
+        """The window `resolve_attachment` left open, closed at the source."""
+        from liminallm.service import attachments as attachments_service
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        attached = b"# notes\nTHE BYTES THIS CHAT ATTACHED\n"
+        assert self._attach(
+            client, headers, conversation_id, "notes.md", attached
+        ).status_code == 200
+
+        armed = {"on": True}
+        real_resolve = attachments_service.resolve_attachment
+
+        def gated(fs_root, uid, record):
+            resolved = real_resolve(fs_root, uid, record)
+            if armed["on"] and resolved is not None:
+                armed["on"] = False
+                # The window: the attachment has been resolved and nothing
+                # has read it yet.
+                assert _upload(
+                    client, headers, "notes.md", b"# notes\nBYTES FROM ELSEWHERE\n"
+                ).status_code == 200
+            return resolved
+
+        monkeypatch.setattr(attachments_service, "resolve_attachment", gated)
+        served = " ".join(
+            item["content"] for item in self._inline(runtime, conversation_id, user_id)
+        )
+        assert not armed["on"], "the window never opened, so nothing was raced"
+        assert "BYTES FROM ELSEWHERE" not in served, (
+            "the reader was served bytes that replaced the attachment after "
+            "the attachment had been verified"
+        )
+        assert "THE BYTES THIS CHAT ATTACHED" in served
+
+    def test_a_replacement_between_resolution_and_staging_is_not_copied(
+        self, client
+    ):
+        """The same window on the interpreter's side of the fence."""
+        from liminallm.service import attachments as attachments_service
+        from liminallm.service import interpreter
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        assert self._attach(
+            client, headers, conversation_id, "data.md", b"# data\nTHE ATTACHED ROWS\n"
+        ).status_code == 200
+
+        sources = attachments_service.resolved_sources(
+            self._records(runtime, conversation_id, user_id),
+            fs_root=runtime.settings.shared_fs_root,
+            user_id=user_id,
+        )
+        assert sources, "the attachment did not resolve at all"
+
+        # Between the resolution and the copy, exactly where the basename
+        # used to be re-read.
+        assert _upload(
+            client, headers, "data.md", b"# data\nROWS FROM SOMEWHERE ELSE\n"
+        ).status_code == 200
+
+        workdir = interpreter.prepare_workdir(
+            str(Path(runtime.settings.shared_fs_root) / "scratch"), sources
+        )
+        staged = " ".join(
+            p.read_text(errors="replace")
+            for p in Path(workdir).iterdir()
+            if p.is_file()
+        )
+        assert "ROWS FROM SOMEWHERE ELSE" not in staged, (
+            "the interpreter staged bytes that replaced the attachment after "
+            "it had been resolved"
+        )
+        assert "THE ATTACHED ROWS" in staged
+        assert [p.name for p in Path(workdir).iterdir()] == ["data.md"], (
+            "the workdir should hold the file under the name the chat knows"
+        )
+
+    def test_the_attachment_survives_the_pathname_being_replaced(self, client):
+        """The payoff: the chat keeps its file when the global name moves."""
         runtime = get_runtime()
         user_id, headers = _account(client)
         conversation_id = self._conversation(client, headers)
@@ -911,14 +1330,266 @@ class TestAnAttachmentNeverResolvesToOtherBytes:
             client, headers, "brief.md", b"# brief\nA LATER UNRELATED BRIEF\n"
         ).status_code == 200
 
-        conversation = runtime.store.get_conversation(conversation_id, user_id=user_id)
-        preamble = build_attachment_preamble(
-            list_attachments(conversation),
-            fs_root=runtime.settings.shared_fs_root,
-            user_id=user_id,
+        served = " ".join(
+            item["content"] for item in self._inline(runtime, conversation_id, user_id)
         )
-        assert "A LATER UNRELATED BRIEF" not in preamble
+        assert "THE ATTACHED BRIEF" in served, (
+            "the chat lost its attachment because the global pathname moved"
+        )
+        assert "A LATER UNRELATED BRIEF" not in served
+
+    def test_the_attachment_survives_the_pathname_being_deleted(self, client):
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        assert self._attach(
+            client, headers, conversation_id, "payroll.md", b"# payroll\nTHE FIGURES\n"
+        ).status_code == 200
+        assert client.delete("/v1/files/payroll.md", headers=headers).status_code == 200
+        assert _upload(
+            client, headers, "payroll.md", b"# payroll\nWRITTEN LATER\n"
+        ).status_code == 200
+
+        served = " ".join(
+            item["content"] for item in self._inline(runtime, conversation_id, user_id)
+        )
+        assert "WRITTEN LATER" not in served, "a recreated name rebound the attachment"
+        assert "THE FIGURES" in served, (
+            "deleting the global pathname took the chat's attachment with it"
+        )
+
+    def test_a_record_from_before_generations_fails_closed(self, client):
+        """An old record names a pathname and nothing else.
+
+        Its generation cannot be reconstructed, so today's bytes at that
+        pathname are not evidence of what was attached. Resolving them would
+        be the cross-chat substitution this removed, kept alive by the
+        upgrade.
+        """
+        from liminallm.service.attachments import resolve_attachment
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        assert _upload(client, headers, "legacy.md", b"# legacy\nTODAYS BYTES\n").status_code == 200
+
+        legacy = {"name": "legacy.md", "size": 22, "inline": True}
+        assert resolve_attachment(
+            runtime.settings.shared_fs_root, user_id, legacy
+        ) is None, (
+            "a record with no generation resolved against the live pathname"
+        )
+
+
+class TestUnreferencedGenerationsAreReclaimed:
+    """The store is write-once, so something has to take things out of it.
+
+    Mark and sweep, over the marks that already exist: every attachment
+    record names its generation. A reference count would be a second record
+    of the same fact, to be kept correct across every way a conversation is
+    created, edited and deleted.
+    """
+
+    def _attach(self, client, headers, conversation_id, name, body):
+        return client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={"file": (name, body, "text/markdown")},
+            data={"conversation_id": conversation_id},
+        )
+
+    def _conversation(self, client, headers) -> str:
+        resp = client.post(
+            "/v1/conversations", headers=headers, json={"title": _unique("chat")}
+        )
+        assert resp.status_code in (200, 201), resp.text
+        return resp.json()["data"]["id"]
+
+    def _age(self, path: Path, seconds: int) -> None:
+        import os
+
+        stamp = path.stat().st_mtime - seconds
+        os.utime(path, (stamp, stamp))
+
+    def test_the_generation_store_is_not_part_of_the_users_files(self, client):
+        """It sits beside `files/`, so nothing that walks `files/` sees it.
+
+        These objects are named by hash, are not files the user created, and
+        are not files the user can delete without deleting the conversation
+        that holds them. Listing them would offer all three.
+        """
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        body = b"# hidden\nTHE ATTACHED TEXT\n"
+        assert self._attach(
+            client, headers, conversation_id, "hidden.md", body
+        ).status_code == 200
+        checksum = hashlib.sha256(body).hexdigest()
+
+        resp = client.get("/v1/files", headers=headers)
+        assert resp.status_code == 200, resp.text
+        names = {f["name"] for f in resp.json()["data"]["files"]}
+        assert names == {"hidden.md"}, names
+
+        # And it cannot be reached through the download path either.
+        resp = client.get(f"/v1/files/{checksum}/url", headers=headers)
+        assert resp.status_code == 404, resp.status_code
+
+    def test_a_referenced_generation_survives_the_sweep(self, client):
+        from liminallm.service.attachments import generation_path, sweep_generations
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        body = b"# kept\nTHE ATTACHED TEXT\n"
+        assert self._attach(
+            client, headers, conversation_id, "kept.md", body
+        ).status_code == 200
+        blob = generation_path(
+            runtime.settings.shared_fs_root, user_id, hashlib.sha256(body).hexdigest()
+        )
+        assert blob is not None and blob.is_file()
+        self._age(blob, 10_000)
+
+        sweep_generations(
+            runtime.store, runtime.settings.shared_fs_root, grace_seconds=60
+        )
+        assert blob.is_file(), (
+            "a generation a conversation still names was reclaimed"
+        )
+
+    def test_a_generation_nothing_names_is_reclaimed(self, client):
+        from liminallm.service.attachments import (
+            generation_path,
+            store_generation,
+            sweep_generations,
+        )
+
+        runtime = get_runtime()
+        user_id, _headers = _account(client)
+        body = b"orphaned bytes nothing ever attached"
+        checksum = hashlib.sha256(body).hexdigest()
+        stored = store_generation(
+            runtime.settings.shared_fs_root, user_id, body, checksum
+        )
+        assert stored is not None and stored.is_file()
+        self._age(stored, 10_000)
+
+        removed = sweep_generations(
+            runtime.store, runtime.settings.shared_fs_root, grace_seconds=60
+        )
+        assert removed >= 1, removed
+        assert generation_path(
+            runtime.settings.shared_fs_root, user_id, checksum
+        ).exists() is False
+
+    def test_a_fresh_generation_is_inside_the_grace_period(self, client):
+        """The window between storing a generation and recording the
+        attachment that names it is exactly what the grace period covers."""
+        from liminallm.service.attachments import store_generation, sweep_generations
+
+        runtime = get_runtime()
+        user_id, _headers = _account(client)
+        body = b"just written, not yet recorded"
+        stored = store_generation(
+            runtime.settings.shared_fs_root,
+            user_id,
+            body,
+            hashlib.sha256(body).hexdigest(),
+        )
+        assert stored is not None
+
+        sweep_generations(
+            runtime.store, runtime.settings.shared_fs_root, grace_seconds=3600
+        )
+        assert stored.is_file(), (
+            "a generation written moments ago was reclaimed before anything "
+            "had a chance to name it"
+        )
+
+    def test_an_unreadable_reference_set_sweeps_nothing(self, client):
+        """An empty set means "no attachments"; an error means "unknown"."""
+        from liminallm.service.attachments import store_generation, sweep_generations
+
+        runtime = get_runtime()
+        user_id, _headers = _account(client)
+        body = b"kept because the marks could not be read"
+        stored = store_generation(
+            runtime.settings.shared_fs_root,
+            user_id,
+            body,
+            hashlib.sha256(body).hexdigest(),
+        )
+        assert stored is not None
+        self._age(stored, 10_000)
+
+        class _Unreadable:
+            def referenced_attachment_checksums(self, owner_user_id):
+                raise OSError("the database is unreachable")
+
+        removed = sweep_generations(
+            _Unreadable(), runtime.settings.shared_fs_root, grace_seconds=60
+        )
+        assert removed == 0, removed
+        assert stored.is_file(), (
+            "the sweep deleted generations after failing to read what "
+            "references them"
+        )
+
+
+class TestTheListingAgreesWithTheEnvelope:
+    """Every line of the listing has to be true of the prompt it introduces.
+
+    Two ways an inline attachment ends up outside the envelope, and they are
+    not the same fact. Its generation may be gone, or the shared inline
+    budget may have filled up before it. "Full text included below" was said
+    in both cases, and "no longer stored" would be wrong in the second.
+    """
+
+    def test_a_file_that_did_not_fit_is_not_announced_as_included(self, client):
+        from liminallm.service.attachments import (
+            INLINE_TOTAL_BUDGET,
+            build_attachment_preamble,
+            store_generation,
+        )
+
+        runtime = get_runtime()
+        user_id, _headers = _account(client)
+        records = []
+        # Enough small inline files to overrun the shared budget.
+        for index in range(6):
+            body = (f"file {index} " + "x" * 40).encode() * 200
+            checksum = hashlib.sha256(body).hexdigest()
+            assert store_generation(
+                runtime.settings.shared_fs_root, user_id, body, checksum
+            ) is not None
+            records.append(
+                {
+                    "name": f"part{index}.txt",
+                    "size": len(body),
+                    "checksum": checksum,
+                    "inline": True,
+                    "searchable": False,
+                    "analyzable": True,
+                }
+            )
+        assert sum(r["size"] for r in records) > INLINE_TOTAL_BUDGET
+
+        preamble = build_attachment_preamble(
+            records, fs_root=runtime.settings.shared_fs_root, user_id=user_id
+        )
+        quoted = preamble.count("quoted below as [file ")
+        assert 0 < quoted < len(records), (
+            f"{quoted} of {len(records)} files were quoted; the budget was "
+            "expected to stop some of them"
+        )
         assert "full text included below" not in preamble, (
             "the listing promised text the envelope does not contain"
         )
-        assert "unavailable" in preamble, preamble
+        assert "no longer stored" not in preamble, (
+            "a file that is stored was described as gone because its text "
+            "did not fit"
+        )
+        assert "did not fit" in preamble, preamble
+        # The capability that does not depend on the prompt is still offered.
+        assert "run_python" in preamble

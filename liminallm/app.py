@@ -723,6 +723,26 @@ def _sweep_tmp_dirs(shared_root: Path, max_age_hours: int) -> None:
                 tmp_dir.rmdir()
 
 
+def _sweep_attachment_generations(shared_root: Path, max_age_hours: int) -> None:
+    """Reclaim attached generations no conversation names any more.
+
+    On the same loop and the same age as the scratch sweep, because it is the
+    same question: how long is something nobody claims kept. The age doubles
+    as the grace period covering the window between storing a generation and
+    recording the attachment that names it.
+    """
+    from liminallm.service import attachments as attachments_service
+    from liminallm.service.runtime import get_runtime
+
+    removed = attachments_service.sweep_generations(
+        get_runtime().store,
+        str(shared_root),
+        grace_seconds=max(max_age_hours, 1) * 3600,
+    )
+    if removed:
+        logger.info("attachment_generations_swept", removed=removed)
+
+
 async def _run_tmp_cleanup(
     shared_root: Path, interval_seconds: int, max_age_hours: int
 ) -> None:
@@ -737,6 +757,14 @@ async def _run_tmp_cleanup(
                 raise
             except Exception as exc:  # pragma: no cover - best-effort cleanup
                 logger.warning("tmp_cleanup_failed", error=str(exc))
+            try:
+                await asyncio.to_thread(
+                    _sweep_attachment_generations, shared_root, max_age_hours
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover - best-effort cleanup
+                logger.warning("attachment_generation_sweep_failed", error=str(exc))
             await asyncio.sleep(interval)
     except asyncio.CancelledError:
         logger.info("tmp_cleanup_task_cancelled")

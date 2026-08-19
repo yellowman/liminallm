@@ -8272,10 +8272,10 @@ row records which generation of P it came from, so the claim is about P now.
 `RAGService._commit_generation` already states that contract for its own
 writes; the rest of the system did not keep it.
 
-All six findings are addressed below. One of them — keeping a conversation's
-attachment *available* after its pathname moves — is closed only to the
-extent that it is safe to close without deciding where a generation is kept,
-and that remainder is recorded at the end.
+This entry covers the tranche in two passes. The first pass fixed six
+findings; review then established that two of the properties it claimed were
+still open, and named four more. The second pass is recorded from
+"An attachment was identified by a mutable basename" onwards.
 
 ### HIGH: a deleted file stayed retrievable
 
@@ -8449,54 +8449,154 @@ chat A's file_search    -> ALPHA
 Measured, and the split is exactly that: `file_search` reads chunks, which
 are a copy taken at attach time and scoped to that conversation's own
 context, so it was already generation-bound. The other two resolve a name.
-Deleting the file and creating the name again later is the same defect with
-a gap in the middle — the old record silently rebinds to bytes that were
-never attached to anything.
 
-The record now carries the checksum of what was attached, and
-`resolve_attachment` refuses a path whose contents no longer match it. Both
-consumers already read the bytes — the inline reader reads the file, and the
-interpreter copies it — so verifying costs nothing they were not already
-paying. Size is compared first, which settles the ordinary case without
-reading anything. Records written before checksums were kept have nothing to
-compare and resolve as before.
-
-The prompt had to change with it. An inline attachment that is not inlined
-gets no number in the envelope, and the listing above it said "full text
-included below" regardless — telling the model to read text that is not
-there. It now says the file is unavailable.
-
-One consumer of `attachment_path` is deliberately left following the path.
-The note importer takes a filename from the request rather than an attachment
-record, and its own description says joining the permanent corpus is a
-deliberate act — the user names a file and gets that file's current text.
-That is a path-following consumer, and the rule for those is the one above:
-the current generation is the right answer.
-
-### What that closes, and what it does not
-
-Closed: an attachment never resolves to bytes that are not the ones
-attached. One chat's upload cannot put its bytes into another chat, and a
-recreated name cannot revive a deleted attachment.
-
-Not closed: the attached generation stops being *available* once the
-pathname moves. Keeping it needs somewhere to keep it, and that is a storage
-decision rather than an implementation detail:
+The first pass recorded the checksum of what was attached and refused a
+pathname whose contents no longer matched. Review established that this is
+the same check/use gap 2E.3 exists to remove, one level up: verifying and
+reading are two moments, and a replacement landing between them was served
+exactly as before. Measured through the real route, with the replacement
+placed after a successful verification:
 
 ```
-persistent path         = mutable current generation
-conversation attachment = immutable generation capability
+served to the chat: BYTES FROM ELSEWHERE
 ```
 
-The checksum recorded here is the natural key for the second, so a
-content-addressed generation store would use it directly. What such a store
-costs is a second copy of every attached file — a hard link would be free
-but would leave `st_nlink > 1` on the user's own file, which is exactly what
-`_within_source` refuses, so context-source ingestion would then skip every
-attached file. That trade, and the lifecycle question of when a generation
-is reclaimed, are the open decisions.
+A hash is only a name for bytes if the bytes cannot move.
 
-### Noticed while here, not fixed: extraction has the same shape
+### Attached generations are kept
+
+Each attached generation is copied into a per-user, content-addressed store
+the moment it is attached:
+
+```
+/users/{u}/attachment-generations/sha256/ab/<full-sha256>
+```
+
+The record's checksum is the key. Inline reading, `run_python` staging and
+the conversation's implicit index all consume that object, so the pathname a
+chat was given the file under can be replaced, deleted or recreated without
+the chat noticing. Reopening by name is safe here in a way it never was for
+`/files/{name}`: the name *is* the hash and the store is written once.
+
+Copied, not hard-linked from `/files/{name}`. A link would be free and would
+leave that file with two links, which is exactly what `rag._within_source`
+refuses — a context source covering the user's files would then skip every
+attached file.
+
+`resolved_sources` returns the display name and the object together, because
+they are no longer the same thing: the name belongs to the conversation and
+the bytes belong to the store. `prepare_workdir` takes those pairs instead of
+basenames, so nothing resolves a name a second time. It still holds the
+display name to a single component, since that name decides a path inside the
+workdir.
+
+Records written before the store existed carry no generation. Their bytes
+cannot be reconstructed, and today's contents of the pathname are not
+evidence of what was attached, so they resolve to nothing rather than to
+whatever is there now — otherwise an upgrade would carry the old
+substitution behaviour forward for every existing conversation.
+
+Reclamation is a mark-and-sweep on the same loop and the same age as the
+scratch sweep, because it answers the same question: how long is something
+nobody claims kept. The marks already exist — every attachment record names
+its generation — so a reference count would be a second record of the same
+fact, to be kept correct across every way a conversation is created, edited
+and deleted. The age doubles as the grace period covering the window between
+storing a generation and recording the attachment that names it. An account
+whose referenced set cannot be read is skipped: an empty set means "no
+attachments", an error means "unknown", and deleting on unknown would take
+everything.
+
+The prompt changed with it, in both halves. An attachment that does not
+resolve is described as unavailable rather than as "full text included
+below", and the trailing "use file_search" / "use run_python" hints are
+offered only for attachments something can actually serve.
+
+### HIGH: the invalidation could not see contexts that took a path as a source
+
+The first pass swept `prior_contexts` from `.checksums.json`, which records
+only the contexts an *upload* named. A context that acquires a path through
+`POST /contexts/{id}/sources` never appears there, so this entirely
+sequential history survived it:
+
+```
+upload report.md = A, no context      manifest contexts = []
+POST C1/sources -> report.md          C1 = A
+upload report.md = B, no context      nothing invalidated
+
+disk = B, manifest = B, C1 = A
+```
+
+The chunks are what claim to be a path's contents, so they are the reverse
+index. `invalidate_path_in_other_contexts` asks the database instead: every
+context the caller owns, except the one about to receive the new generation,
+and never a conversation's implicit index. The manifest's context set stays
+what it always was, an optimization for deciding whether an upload needs to
+re-ingest. Losing it now costs a dedupe miss and not a stale generation,
+which has its own test.
+
+### HIGH: a dedupe hit was decided by the record alone
+
+The first pass made a failed manifest write fail the request. It did not stop
+the state that write leaves behind from causing a later success. After the
+injected failure the disk holds B, the index holds B and the manifest still
+names A — and a client that abandons the request rather than retrying leaves
+it that way. A *fresh* upload of A then matches the manifest, skips the
+write, and reports success over a file still holding B.
+
+The manifest nominates a dedupe hit; the disk confirms it. The destination is
+stream-hashed under the namespace lock, and only when the record already
+claims a match — so an ordinary upload of new bytes pays nothing for it.
+
+### HIGH: a refused request had already replaced the file
+
+`_publish` validated the named context inside its ingestion step, which runs
+after `os.replace`. So a request refused for naming a context that does not
+exist had overwritten the file first, and the failure handler then unlinked
+it:
+
+```
+report.md absent, manifest still A, chunks still A, request rejected
+```
+
+An explicit `context_id` is now checked before any mutation.
+
+The failure path itself was the same mistake in a different form. Unlinking
+the destination does not restore what it replaced — those bytes are already
+gone — so it removed the pathname while the manifest and the index went on
+describing a generation no file had. The new bytes are the only generation
+that exists by then, so they are kept, recorded with the failed context left
+out of the set, and the target context's chunks for that path are emptied
+because it did not receive them. A retry under the same key finds the bytes
+in place and re-runs only the ingestion.
+
+### The mutations for the completion
+
+| Reverted | Test that fails |
+| --- | --- |
+| attachment resolves a verified pathname | replacement between the check and the read is not served |
+| a record with no generation resolves to the live path | a record from before generations fails closed |
+| no generation stored at all | the attachment survives the pathname being replaced |
+| the listing ignores availability | the prompt does not promise text it leaves out |
+| sweep with no grace period | a fresh generation is inside the grace period |
+| sweep treats a read error as an empty set | an unreadable reference set sweeps nothing |
+| sweep ignores what conversations name | a referenced generation survives the sweep |
+| invalidation driven by the manifest | a context that took the path as a source is invalidated |
+| invalidation reaching conversations | a conversation's attachment index is not invalidated |
+| dedupe trusts the record | an abandoned failure cannot make a later upload lie |
+| context validated late | an unknown context leaves the previous generation alone |
+| failed ingestion unlinks its generation | a failed ingestion leaves a generation that can be retried |
+| the listing announces text it left out | a file that did not fit is not announced as included |
+
+That last row is one a mutation had to find twice. The first version of the
+listing said "no longer stored" for any inline attachment missing from the
+envelope, and reverting the wording killed nothing — because the branch it
+changed is reached only when a file *is* stored and the shared inline budget
+filled up before it. Two different facts had been given one sentence. They
+have two now, and the budget case has the test it needed.
+
+
+### Recorded for 2E.5: extraction has the same shape
 
 `publish_artifacts` was the instance; the class is "a name is visible before
 its bytes are". `archive._write_member` opens each member at its final path
@@ -8508,7 +8608,9 @@ short file and no reason to doubt it.
 
 A listing seeing part of a tree is observational and fine; the truncated
 download is the same harm the staged upload and the linked artifact removed.
-The fix has the same shape too: extract into a hidden sibling and rename it
-onto the destination once the extraction has finished, inside the lock the
-route already holds. It is left for the reviewer to schedule rather than
-folded into this tranche.
+The fix has the same shape too, and review has scheduled it as the first
+2E.5 item: extract into a hidden sibling and rename the whole tree onto the
+destination once extraction has finished, inside the lock the route already
+holds. Whole-tree staging rather than one temporary file per member, so no
+member is visible until every member is, and the extractor's existing
+failure cleanup then points at a throwaway tree.

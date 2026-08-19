@@ -21,6 +21,7 @@ about what the model is handed.
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 
 import pytest
@@ -46,14 +47,27 @@ def user(runtime):
 
 
 def _attach(runtime, user, name: str, body: str) -> list[dict]:
-    """A real inline attachment: bytes on disk, record shaped like the store's."""
+    """A real inline attachment: bytes on disk, record shaped like the store's.
+
+    The generation is stored through the same function the upload route uses,
+    because that is what the record names. A record built by hand with a
+    plausible-looking checksum would resolve to nothing and the envelope
+    would be empty — which is a way of passing every test here for the wrong
+    reason.
+    """
+    encoded = body.encode("utf-8")
+    checksum = hashlib.sha256(encoded).hexdigest()
     files = attachments_service.user_files_dir(runtime.settings.shared_fs_root, user.id)
     files.mkdir(parents=True, exist_ok=True)
     (files / name).write_text(body, encoding="utf-8")
+    assert attachments_service.store_generation(
+        runtime.settings.shared_fs_root, user.id, encoded, checksum
+    ) is not None
     return [
         {
             "name": name,
-            "size": len(body.encode("utf-8")),
+            "size": len(encoded),
+            "checksum": checksum,
             "inline": True,
             "searchable": False,
             "analyzable": False,

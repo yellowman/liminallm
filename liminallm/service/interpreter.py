@@ -184,30 +184,37 @@ def execute_python(code: str, workdir: str, confine_root: str = "") -> dict[str,
     }
 
 
-def prepare_workdir(
-    session_root: str, attachment_dir: str, names: list[str]
-) -> str:
-    """Create a session directory holding copies of the named attachments."""
+def prepare_workdir(session_root: str, sources: list[tuple[str, str]]) -> str:
+    """Create a session directory holding copies of the attached files.
+
+    Each source pairs the name the conversation knows a file by with the
+    object holding its bytes. The two used to be one basename, resolved
+    against `/users/{u}/files` here — which meant the caller checked one
+    generation and this copied whatever that name held by the time it ran.
+    The bytes now come from the caller's already-resolved generation, and
+    only the display name comes from the record.
+
+    That display name still decides a path inside the workdir, so it is held
+    to one component: a record naming `../../etc/passwd` would otherwise
+    choose where the copy lands.
+    """
     workdir = Path(session_root) / f"session-{uuid.uuid4().hex[:12]}"
     workdir.mkdir(parents=True, exist_ok=True)
-    source = Path(attachment_dir)
     budget = MAX_WORKDIR_BYTES
-    for name in names:
-        src = source / name
-        # `names` comes from stored attachment records, but re-check anyway so
-        # a crafted record can never copy from outside the user's file area.
+    for name, origin in sources:
+        if not name or "/" in name or "\\" in name or name.startswith("."):
+            continue
+        src = Path(origin)
         try:
-            src = src.resolve()
-            src.relative_to(source.resolve())
-        except (ValueError, OSError):
+            if src.is_symlink() or not src.is_file():
+                continue
+            size = src.stat().st_size
+        except OSError:
             continue
-        if not src.is_file():
-            continue
-        size = src.stat().st_size
         if size > budget:
             continue
         budget -= size
-        shutil.copy2(src, workdir / src.name)
+        shutil.copy2(src, workdir / name)
     return str(workdir)
 
 
