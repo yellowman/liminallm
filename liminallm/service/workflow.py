@@ -2347,11 +2347,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             user_id=user_id, tenant_id=tenant_id,
             attachment_context_ids=set(attachment_ctx_ids),
             authorized_paths=set(
-                attachments_service.authorized_generation_paths(
-                    records,
-                    fs_root=self.settings.shared_fs_root,
-                    user_id=user_id,
-                )
+                attachments_service.authorized_generation_keys(records)
             ),
         )
 
@@ -2744,6 +2740,21 @@ class WorkflowEngine(WorkflowStreamingMixin):
         for ctx_id in ctx_ids:
             ctx = owned.get(ctx_id)
             if not ctx:
+                continue
+            if attachments_service.is_auto_context(ctx):
+                # A conversation's implicit index enters only through the
+                # conversation that owns it. Ownership is not the boundary
+                # here: §19.5 scopes an attachment to the chat that received
+                # it, and every other rule about these contexts keys on the
+                # conversation. Measured, a second chat named the first
+                # chat's index and read it, with the generation filtering
+                # never applied because that filtering keys on the current
+                # conversation's contexts.
+                self.logger.warning(
+                    "context_scope_auto_context_refused",
+                    context_id=ctx_id,
+                    user_id=user_id,
+                )
                 continue
             if tenant_id:
                 owner = self.store.get_user(ctx.owner_user_id)

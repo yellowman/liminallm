@@ -135,15 +135,24 @@ def run_file_search(
     """
     if not context_ids:
         return ("No searchable files are attached to this conversation.", [])
+    allowed = authorized_paths or set()
     chunks = rag.retrieve(
         context_ids,
         query,
         limit=max(1, min(MAX_FILE_SEARCH_RESULTS, limit or 4)),
         user_id=user_id,
         tenant_id=tenant_id,
+        # Carried into candidate selection, so the ranking never spends a
+        # slot on a generation this conversation no longer holds.
+        path_scope=(
+            {ctx_id: sorted(allowed) for ctx_id in attachment_context_ids}
+            if attachment_context_ids
+            else None
+        ),
     )
     if attachment_context_ids:
-        allowed = authorized_paths or set()
+        # Kept as well, not instead: a retriever that ignores the scope is a
+        # retriever that would otherwise disclose.
         chunks = [
             chunk
             for chunk in chunks

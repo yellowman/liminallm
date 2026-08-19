@@ -2027,7 +2027,14 @@ class PostgresStore:
         return self.get_conversation(conversation_id)
 
     def upsert_conversation_attachment(
-        self, conversation_id: str, *, user_id: str, record: dict
+        self,
+        conversation_id: str,
+        *,
+        user_id: str,
+        record: dict,
+        prune_context_id: Optional[str] = None,
+        paths_for: Optional[Any] = None,
+        generation_prefix: Optional[str] = None,
     ) -> Optional[list]:
         """Add or replace one attachment record, atomically. Owner-only.
 
@@ -2042,6 +2049,27 @@ class PostgresStore:
         before. A file lock could not have done this — the state is in
         Postgres, and §22 has several replicas sharing exactly that.
 
+        Retiring what this record displaces happens here too, in the same
+        transaction and under the same row lock. Attaching a name a second
+        time produces a *different* generation, so the new ingestion replaces
+        no rows and the previous one stays searchable — but pruning the index
+        to an absolute set afterwards is a read-modify-act on shared state.
+        Measured with two filenames uploaded at once, the first one's prune
+        ran from a snapshot that did not name the second and deleted its
+        chunks, with both uploads returning 200.
+
+        So only what *this* record displaces is retired. A generation whose
+        record has not been written yet is not unauthorized, it is
+        unfinished. `paths_for` maps records to the objects they name, which
+        keeps that layout in the service that owns it; the displaced object
+        survives if another record still names it, which is what makes two
+        names sharing identical bytes work.
+
+        `generation_prefix` additionally retires rows that can never become
+        authorized — anything in this context that is not an attachment
+        generation at all, which is what these contexts held before the
+        store existed.
+
         Returns the resulting list, or None when the conversation is not this
         user's.
         """
@@ -2055,11 +2083,11 @@ class PostgresStore:
             if not row:
                 return None
             meta = dict(row["meta"] or {})
-            attachments = [
-                a
-                for a in (meta.get("attachments") or [])
-                if isinstance(a, dict) and a.get("name") != name
+            current = [
+                a for a in (meta.get("attachments") or []) if isinstance(a, dict)
             ]
+            displaced = [a for a in current if a.get("name") == name]
+            attachments = [a for a in current if a.get("name") != name]
             attachments.append(record)
             meta["attachments"] = attachments
             conn.execute(
@@ -2067,6 +2095,26 @@ class PostgresStore:
                 "WHERE id = %s AND user_id = %s",
                 (json.dumps(meta), now, conversation_id, user_id),
             )
+            if prune_context_id and paths_for is not None:
+                keep = set(paths_for(attachments))
+                retired = sorted(set(paths_for(displaced)) - keep)
+                if retired:
+                    conn.execute(
+                        "DELETE FROM knowledge_chunk WHERE context_id = %s "
+                        "AND fs_path = ANY(%s)",
+                        (prune_context_id, retired),
+                    )
+                if generation_prefix:
+                    conn.execute(
+                        "DELETE FROM knowledge_chunk WHERE context_id = %s "
+                        "AND (fs_path IS NULL "
+                        "     OR left(fs_path, %s) <> %s)",
+                        (
+                            prune_context_id,
+                            len(generation_prefix),
+                            generation_prefix,
+                        ),
+                    )
         return attachments
 
     def set_conversation_public(
@@ -3784,6 +3832,7 @@ class PostgresStore:
         *,
         user_id: str,  # REQUIRED per SPEC §12.2 - user isolation is mandatory
         tenant_id: Optional[str] = None,
+        path_scope: Optional[dict[str, Sequence[str]]] = None,
     ) -> List[int]:
         """Chunks with a segment near this query vector, nearest first.
 
@@ -3801,7 +3850,11 @@ class PostgresStore:
             self.logger.error("late_candidate_ids_missing_user_id")
             return []
         where, params = self._chunk_scope(
-            context_ids, user_id=user_id, tenant_id=tenant_id, filters=filters
+            context_ids,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            filters=filters,
+            path_scope=path_scope,
         )
         with self._connect() as conn:
             sql = """
@@ -4078,8 +4131,22 @@ class PostgresStore:
         user_id: str,
         tenant_id: Optional[str],
         filters: Optional[dict[str, Any]],
+        path_scope: Optional[dict[str, Sequence[str]]] = None,
     ) -> tuple[str, list[Any]]:
-        """Access and metadata predicate shared by the chunk searches."""
+        """Access and metadata predicate shared by the chunk searches.
+
+        `path_scope` restricts named contexts to a set of paths and leaves
+        every other context alone. A conversation's implicit index is scoped
+        this way, to the generations its records still authorize.
+
+        It belongs here rather than after retrieval because it has to reach
+        candidate selection. Discarding unauthorized rows from the result
+        keeps them out of the prompt but not out of the ranking: measured,
+        eight unauthorized rows took every slot and `file_search` reported
+        that nothing matched, while the file the conversation actually held
+        sat just outside the cut. Over-fetching is not an answer either —
+        any fixed over-fetch is consumed by enough rows.
+        """
         where_clauses: list[str] = ["kc.context_id = ANY(%s)"]
         params: list[Any] = [list(context_ids)]
         # Always enforce user isolation - this is not optional
@@ -4094,6 +4161,17 @@ class PostgresStore:
         if filters and filters.get("embedding_model_id"):
             where_clauses.append("kc.meta->>'embedding_model_id' = %s")
             params.append(filters["embedding_model_id"])
+        if path_scope:
+            scoped = sorted(path_scope)
+            # Unscoped contexts are unrestricted; a scoped one contributes
+            # only its authorized paths. An empty set is a real answer: a
+            # conversation holding nothing retrieves nothing from its index.
+            branches = ["kc.context_id <> ALL(%s)"]
+            params.append(scoped)
+            for ctx_id in scoped:
+                branches.append("(kc.context_id = %s AND kc.fs_path = ANY(%s))")
+                params.extend([ctx_id, list(path_scope[ctx_id])])
+            where_clauses.append("(" + " OR ".join(branches) + ")")
         return " WHERE " + " AND ".join(where_clauses), params
 
     def search_chunks_pgvector(
@@ -4106,6 +4184,7 @@ class PostgresStore:
         *,
         user_id: str,  # REQUIRED per SPEC §12.2 - user isolation is mandatory
         tenant_id: Optional[str] = None,
+        path_scope: Optional[dict[str, Sequence[str]]] = None,
     ) -> List[KnowledgeChunk]:
         """Dense candidate generation over knowledge chunks.
 
@@ -4125,7 +4204,11 @@ class PostgresStore:
             self.logger.error("search_chunks_pgvector_missing_user_id")
             return []
         where, params = self._chunk_scope(
-            context_ids, user_id=user_id, tenant_id=tenant_id, filters=filters
+            context_ids,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            filters=filters,
+            path_scope=path_scope,
         )
         with self._connect() as conn:
             sql = self._CHUNK_SELECT + where
@@ -4144,6 +4227,7 @@ class PostgresStore:
         *,
         user_id: str,  # REQUIRED per SPEC §12.2 - user isolation is mandatory
         tenant_id: Optional[str] = None,
+        path_scope: Optional[dict[str, Sequence[str]]] = None,
     ) -> List[KnowledgeChunk]:
         """Lexical candidate generation over knowledge chunks.
 
@@ -4169,7 +4253,11 @@ class PostgresStore:
         if not terms:
             return []
         where, params = self._chunk_scope(
-            context_ids, user_id=user_id, tenant_id=tenant_id, filters=filters
+            context_ids,
+            user_id=user_id,
+            tenant_id=tenant_id,
+            filters=filters,
+            path_scope=path_scope,
         )
         # 'simple' rather than 'english': no stemming, so an identifier stays
         # itself, and no language is assumed of the user's own files.
@@ -4193,8 +4281,13 @@ class PostgresStore:
         limit: int = 4,
         *,
         semantic: bool = False,
+        allowed_paths: Optional[Sequence[str]] = None,
     ) -> List[KnowledgeChunk]:
         """Non-pgvector hybrid search; suitable for tests and tiny corpora only.
+
+        `allowed_paths` restricts this context to a set of paths, applied
+        before the candidate cut for the same reason the pgvector path
+        applies it in SQL.
 
         ``semantic`` is the caller's assertion that ``query_embedding`` came
         from a real encoder. It defaults to False because the kernel's default
@@ -4218,6 +4311,11 @@ class PostgresStore:
         # Issue 25.3: prevent unbounded candidate loading by limiting DB reads
         max_candidates = min(candidate_limit * 5, 500)
         candidates = self.list_chunks(context_id, limit=max_candidates)
+        if allowed_paths is not None:
+            # Before the scoring, not after it: an unauthorized row that
+            # scores well otherwise consumes a slot and is then discarded.
+            permitted = set(allowed_paths)
+            candidates = [c for c in candidates if c.fs_path in permitted]
         if not candidates:
             return []
         query_tokens = _tokenize_text(query)

@@ -1223,6 +1223,50 @@ class TestTheIndexIsItsOwnReverseIndex:
             "the index describes a generation the file no longer holds"
         )
 
+    def test_a_guard_that_cannot_be_taken_fails_the_request(self, client):
+        """Failing to serialize is not "this document had no readable text".
+
+        The per-file guard sat inside the walk's best-effort catch, which
+        exists so one unreadable PDF does not abandon a whole tree. A
+        `PathLockTimeout` entering the guard was swallowed the same way, so a
+        source that never got its lock returned 201 with zero chunks and left
+        its source record behind — while the route's own 409 handler, which
+        removes that record, could not be reached.
+        """
+        from liminallm.service.fs import PathLockTimeout
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        context_id = _context(client, headers)
+        assert _upload(
+            client, headers, "corpus.md", b"# corpus\nTHE CORPUS TEXT\n" * 12
+        ).status_code == 200
+
+        real_ingest_path = runtime.rag.ingest_path
+
+        def contended(*args, **kwargs):
+            def refuse(_candidate):
+                raise PathLockTimeout("another writer holds this name")
+
+            kwargs["file_guard"] = refuse
+            return real_ingest_path(*args, **kwargs)
+
+        runtime.rag.ingest_path = contended
+        try:
+            resp = self._add_source(
+                client, headers, context_id, _files_dir(runtime, user_id) / "corpus.md"
+            )
+        finally:
+            runtime.rag.ingest_path = real_ingest_path
+
+        assert resp.status_code == 409, f"{resp.status_code}: {resp.text[:200]}"
+        sources = client.get(f"/v1/contexts/{context_id}/sources", headers=headers)
+        assert sources.status_code == 200, sources.text
+        assert sources.json()["data"]["items"] == [], (
+            "the refused source left its record behind"
+        )
+        assert "THE CORPUS TEXT" not in _text(runtime, context_id)
+
     def test_the_context_receiving_the_new_generation_keeps_it(self, client):
         """The one context that must not be swept is the one being written."""
         runtime = get_runtime()
@@ -1745,7 +1789,7 @@ class TestTheListingAgreesWithTheEnvelope:
         assert "run_python" in preamble
 
 
-def _pdf_bytes(line: str) -> bytes:
+def _pdf_bytes(line: str, pad: int = 0) -> bytes:
     """A one-page PDF whose text only a PDF reader can recover.
 
     The content stream is Flate-compressed on purpose. An uncompressed one
@@ -1777,6 +1821,12 @@ def _pdf_bytes(line: str) -> bytes:
         f"trailer\n<< /Size {len(objects) + 1} /Root 1 0 R >>\n"
         f"startxref\n{xref}\n%%EOF\n"
     ).encode()
+    if pad:
+        # A trailing PDF comment. Readers ignore it; it is here to push the
+        # file past the size at which a text attachment is chunked rather
+        # than inlined, so the same bytes can be attached under two names
+        # that both reach the index.
+        out += b"%" + b"P" * pad + b"\n"
     return bytes(out)
 
 
@@ -2018,8 +2068,15 @@ class TestAConversationsIndexIsNotAUserManagedContext:
             data={"conversation_id": conversation_id},
         )
         assert resp.status_code == 200, resp.text
-        auto_ctx = resp.json()["data"]["context_id"]
-        assert auto_ctx, "the searchable attachment did not report its context"
+        assert resp.json()["data"]["context_id"] is None, (
+            "the upload advertised the conversation's implicit index"
+        )
+        from liminallm.service.attachments import find_conversation_context_id
+
+        auto_ctx = find_conversation_context_id(
+            runtime.store, user_id=user_id, conversation_id=conversation_id
+        )
+        assert auto_ctx, "the searchable attachment was not indexed"
 
         assert _upload(client, headers, "ordinary.md", b"# ordinary\nBODY\n" * 12).status_code == 200
         resp = client.post(
@@ -2279,3 +2336,420 @@ class TestAnExtractedTreeIsInvisibleUntilItIsComplete:
 
         assert not stale.exists(), "a staging tree from a dead process was kept"
         assert live.exists(), "a staging tree still being filled was removed"
+
+
+class TestAnAutoContextIsNotATransferableCapability:
+    """§19.5 scopes an attachment to the chat that received it.
+
+    `meta.auto` was made load-bearing on the write side: the sweep skips
+    these contexts, retrieval from them is filtered, and a source cannot be
+    added to one. The read side still accepted one as an ordinary knowledge
+    context when a caller named it — and the id is not secret, because a
+    searchable attachment upload returned it.
+
+    So a second chat could name the first chat's index and read it, with the
+    generation filtering never applied because that filtering keys on the
+    *current* conversation's contexts. The whole per-chat boundary this work
+    builds is defeated by carrying one identifier across.
+
+    An identifier is only an implementation detail if nothing accepts it.
+    """
+
+    def _conversation(self, client, headers) -> str:
+        resp = client.post(
+            "/v1/conversations", headers=headers, json={"title": _unique("chat")}
+        )
+        assert resp.status_code in (200, 201), resp.text
+        return resp.json()["data"]["id"]
+
+    def _attach_searchable(self, client, headers, conversation_id, name, body):
+        resp = client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={"file": (name, body, "text/markdown")},
+            data={"conversation_id": conversation_id},
+        )
+        assert resp.status_code == 200, resp.text
+        return resp.json()["data"]
+
+    def _auto_context(self, runtime, user_id, conversation_id) -> str:
+        from liminallm.service.attachments import find_conversation_context_id
+
+        found = find_conversation_context_id(
+            runtime.store, user_id=user_id, conversation_id=conversation_id
+        )
+        assert found, "the attachment was not indexed"
+        return found
+
+    def test_another_chat_cannot_name_this_chats_index(self, client):
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        first = self._conversation(client, headers)
+        second = self._conversation(client, headers)
+        self._attach_searchable(
+            client, headers, first, "secret.md", b"# secret\nCHAT A ONLY TEXT\n" * 800
+        )
+        auto_ctx = self._auto_context(runtime, user_id, first)
+        assert "CHAT A ONLY TEXT" in _text(runtime, auto_ctx)
+
+        found, _snippets = runtime.workflow._run_file_search(
+            "chat a only text",
+            8,
+            conversation_id=second,
+            context_id=auto_ctx,
+            user_id=user_id,
+            tenant_id=None,
+        )
+        assert "CHAT A ONLY TEXT" not in found, (
+            "one conversation read another conversation's attachment by "
+            f"naming its index: {found[:160]!r}"
+        )
+
+    def test_the_owning_chat_still_reads_its_own_index(self, client):
+        """The refusal must not cost the conversation its own attachments."""
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        self._attach_searchable(
+            client, headers, conversation_id, "own.md", b"# own\nTHIS CHATS TEXT\n" * 800
+        )
+        found, _snippets = runtime.workflow._run_file_search(
+            "this chats text",
+            8,
+            conversation_id=conversation_id,
+            context_id=None,
+            user_id=user_id,
+            tenant_id=None,
+        )
+        assert "THIS CHATS TEXT" in found, found[:160]
+
+    def test_the_direct_context_routes_report_it_absent(self, client):
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        self._attach_searchable(
+            client, headers, conversation_id, "notes.md", b"# notes\nINDEXED TEXT\n" * 800
+        )
+        auto_ctx = self._auto_context(runtime, user_id, conversation_id)
+
+        for path in (f"/v1/contexts/{auto_ctx}/chunks", f"/v1/contexts/{auto_ctx}/sources"):
+            resp = client.get(path, headers=headers)
+            assert resp.status_code == 404, f"{path}: {resp.status_code}"
+
+    def test_an_upload_cannot_name_a_conversations_index(self, client):
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        self._attach_searchable(
+            client, headers, conversation_id, "held.md", b"# held\nHELD TEXT\n" * 800
+        )
+        auto_ctx = self._auto_context(runtime, user_id, conversation_id)
+
+        resp = _upload(
+            client, headers, "outside.md", b"# outside\nWRITTEN FROM OUTSIDE\n" * 12,
+            auto_ctx,
+        )
+        assert resp.status_code == 404, f"{resp.status_code}: {resp.text[:200]}"
+        assert "WRITTEN FROM OUTSIDE" not in _text(runtime, auto_ctx)
+
+    def test_an_extraction_cannot_name_a_conversations_index(self, client):
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        self._attach_searchable(
+            client, headers, conversation_id, "kept.md", b"# kept\nKEPT TEXT\n" * 800
+        )
+        auto_ctx = self._auto_context(runtime, user_id, conversation_id)
+        assert _upload(
+            client, headers, "bundle.zip",
+            _bundle_zip({"a.txt": b"EXTRACTED MEMBER TEXT\n" * 20}),
+            media="application/zip",
+        ).status_code == 200
+
+        resp = client.post(
+            f"/v1/files/bundle.zip/extract?context_id={auto_ctx}", headers=headers
+        )
+        assert resp.status_code == 404, f"{resp.status_code}: {resp.text[:200]}"
+        assert "EXTRACTED MEMBER TEXT" not in _text(runtime, auto_ctx)
+        assert not (_files_dir(runtime, user_id) / "bundle").exists()
+
+
+class TestTwoAttachmentsDoNotRetireEachOther:
+    """Pruning to an absolute set is a read-modify-act on shared state.
+
+    Two filenames take different filesystem locks, so their uploads run
+    alongside each other. Each ingests, then records, then prunes the
+    conversation's index to what its own snapshot of the records named — and
+    the first one's snapshot does not name the second one. Measured, the
+    conversation ended with both records, both objects, and only one of them
+    indexed, with both uploads returning 200. No serialization of two
+    successful uploads produces that.
+
+    The transaction that displaces a record is also the one that retires what
+    it displaced, and it retires only that. A generation whose record has not
+    been written yet is not "unauthorized" — it is unfinished, and the
+    difference is the whole bug.
+    """
+
+    def _conversation(self, client, headers) -> str:
+        resp = client.post(
+            "/v1/conversations", headers=headers, json={"title": _unique("chat")}
+        )
+        assert resp.status_code in (200, 201), resp.text
+        return resp.json()["data"]["id"]
+
+    def _attach(self, client, headers, conversation_id, name, body):
+        return client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={"file": (name, body, "text/markdown")},
+            data={"conversation_id": conversation_id},
+        )
+
+    def test_a_concurrent_attachment_is_not_retired_by_the_other(self, client):
+        import threading
+
+        from liminallm.service.attachments import find_conversation_context_id
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        first = b"# alpha\nTHE ALPHA DOCUMENT TEXT\n" * 800
+        second = b"# bravo\nTHE BRAVO DOCUMENT TEXT\n" * 800
+
+        reached = threading.Event()
+        may_continue = threading.Event()
+        armed = {"on": True}
+        real_upsert = runtime.store.upsert_conversation_attachment
+
+        def gated(*args, **kwargs):
+            # Paused with this upload's chunks committed and its record not
+            # yet written. Before the record rather than after it, because
+            # that is the ordering that catches both shapes: retiring from a
+            # stale snapshot taken outside the transaction, and retiring to
+            # an absolute set inside it. Chunks whose record has not landed
+            # are unfinished, and neither may treat them as unauthorized.
+            if armed["on"]:
+                armed["on"] = False
+                reached.set()
+                may_continue.wait(30)
+            return real_upsert(*args, **kwargs)
+
+        results: dict = {}
+
+        def attach(key, name, body):
+            results[key] = self._attach(
+                client, headers, conversation_id, name, body
+            )
+
+        runtime.store.upsert_conversation_attachment = gated
+        alpha = threading.Thread(
+            target=attach, args=("alpha", "alpha.md", first), daemon=True
+        )
+        try:
+            alpha.start()
+            assert reached.wait(30), "the first attachment never got that far"
+            # The second finishes entirely inside the first one's window.
+            attach("bravo", "bravo.md", second)
+            may_continue.set()
+            alpha.join(60)
+        finally:
+            may_continue.set()
+            runtime.store.upsert_conversation_attachment = real_upsert
+
+        assert results["alpha"].status_code == 200, results["alpha"].text
+        assert results["bravo"].status_code == 200, results["bravo"].text
+        auto_ctx = find_conversation_context_id(
+            runtime.store, user_id=user_id, conversation_id=conversation_id
+        )
+        indexed = _text(runtime, auto_ctx)
+        missing = [
+            marker
+            for marker in ("THE ALPHA DOCUMENT TEXT", "THE BRAVO DOCUMENT TEXT")
+            if marker not in indexed
+        ]
+        assert not missing, (
+            f"one attachment retired the other's chunks: {missing} absent "
+            "although both uploads succeeded"
+        )
+
+
+class TestOneObjectCanHoldTwoInterpretations:
+    """Raw identity and parsed identity are not the same identity.
+
+    The store is keyed by digest, which is right: the bytes are the bytes.
+    But the index was keyed by the *object*, and `replace_chunks_for_path`
+    replaces by path — so attaching identical bytes under two names that
+    parse differently made the second interpretation replace the first. A
+    `.pdf` read as a document and the same bytes read as `.md` are two
+    readings of one object, and the `.md` reading is a refusal, so its empty
+    generation deleted the document's chunks.
+
+    Both attachment records stay valid, both name the same object, and only
+    one derived representation could exist.
+    """
+
+    def _conversation(self, client, headers) -> str:
+        resp = client.post(
+            "/v1/conversations", headers=headers, json={"title": _unique("chat")}
+        )
+        assert resp.status_code in (200, 201), resp.text
+        return resp.json()["data"]["id"]
+
+    def _attach(self, client, headers, conversation_id, name, body, media):
+        return client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={"file": (name, body, media)},
+            data={"conversation_id": conversation_id},
+        )
+
+    def test_the_same_bytes_under_two_names_keep_both_readings(self, client):
+        from liminallm.service.attachments import (
+            classify_attachment,
+            find_conversation_context_id,
+        )
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        # Long enough to survive retrieval's minimum chunk size: a
+        # five-word document is indexed and never returned, which would make
+        # the search assertion below prove nothing.
+        body = _pdf_bytes("THE PARAGRAPH INSIDE THE DOCUMENT " * 8, pad=14_000)
+        for name in ("report.pdf", "report.md"):
+            assert classify_attachment(name, len(body))["searchable"], (
+                f"{name} must reach the index for this to test anything"
+            )
+
+        resp = self._attach(
+            client, headers, conversation_id, "report.pdf", body, "application/pdf"
+        )
+        assert resp.status_code == 200, resp.text
+        assert resp.json()["data"]["chunk_count"], resp.json()["data"]
+        auto_ctx = find_conversation_context_id(
+            runtime.store, user_id=user_id, conversation_id=conversation_id
+        )
+        assert "THE PARAGRAPH INSIDE THE DOCUMENT" in _text(runtime, auto_ctx)
+
+        # The same object, attached again under a name that reads it another
+        # way. Nothing about the first reading has stopped being true.
+        resp = self._attach(
+            client, headers, conversation_id, "report.md", body, "text/markdown"
+        )
+        assert resp.status_code == 200, resp.text
+
+        assert "THE PARAGRAPH INSIDE THE DOCUMENT" in _text(runtime, auto_ctx), (
+            "reading the object a second way deleted the first reading"
+        )
+        found, _snippets = runtime.workflow._run_file_search(
+            "paragraph inside the document",
+            8,
+            conversation_id=conversation_id,
+            context_id=None,
+            user_id=user_id,
+            tenant_id=None,
+        )
+        assert "THE PARAGRAPH INSIDE THE DOCUMENT" in found, found[:160]
+
+    def test_one_copy_of_the_bytes_is_still_enough(self, client):
+        """Two interpretations, one object: the store is unchanged."""
+        from liminallm.service.attachments import generation_path
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        body = _pdf_bytes("THE PARAGRAPH INSIDE THE DOCUMENT " * 8, pad=14_000)
+        for name, media in (
+            ("report.pdf", "application/pdf"),
+            ("report.md", "text/markdown"),
+        ):
+            assert self._attach(
+                client, headers, conversation_id, name, body, media
+            ).status_code == 200
+
+        blob = generation_path(
+            runtime.settings.shared_fs_root, user_id, hashlib.sha256(body).hexdigest()
+        )
+        assert blob is not None and blob.is_file()
+        assert sorted(p.name for p in blob.parent.iterdir()) == [blob.name]
+
+
+class TestAuthorizationReachesCandidateSelection:
+    """Filtering after the top-k is safe but not complete.
+
+    Dropping unauthorized chunks from what retrieval returned keeps them out
+    of the prompt, which is the disclosure question and it is answered. It
+    does not keep them out of the *ranking*: if enough of them outrank the
+    current attachment, the top-k is spent on rows that are then discarded
+    and the conversation is told nothing matched — while the file it holds
+    sits just outside the cut.
+
+    The predicate has to reach candidate selection, before each channel's
+    own LIMIT. Over-fetching is not an answer, because arbitrarily many
+    unauthorized rows can consume any fixed over-fetch.
+    """
+
+    def _conversation(self, client, headers) -> str:
+        resp = client.post(
+            "/v1/conversations", headers=headers, json={"title": _unique("chat")}
+        )
+        assert resp.status_code in (200, 201), resp.text
+        return resp.json()["data"]["id"]
+
+    def test_the_authorized_generation_survives_a_crowded_index(self, client):
+        from liminallm.service.attachments import find_conversation_context_id
+        from liminallm.storage.models import KnowledgeChunk
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        # The phrase appears once in a long document, which is ordinary: a
+        # file is not usually mostly the sentence you are looking for.
+        held = (
+            b"# held\nfiller sentence about unrelated matters.\n" * 400
+            + b"THE TREATY CLAUSE THIS CHAT HOLDS AND CITES\n"
+        )
+        resp = client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={"file": ("held.md", held, "text/markdown")},
+            data={"conversation_id": conversation_id},
+        )
+        assert resp.status_code == 200, resp.text
+        auto_ctx = find_conversation_context_id(
+            runtime.store, user_id=user_id, conversation_id=conversation_id
+        )
+        assert auto_ctx
+
+        # Rows in the index that no record names: the shape the window
+        # between ingesting and recording produces, and the shape a sweep
+        # leaves when it takes an object but not its rows.
+        text = "THE TREATY CLAUSE THIS CHAT HOLDS AND CITES " * 12
+        runtime.store.add_chunks(
+            auto_ctx,
+            [
+                KnowledgeChunk(
+                    context_id=auto_ctx,
+                    fs_path=f"attachment-generation:{'0' * 63}{index}:.md",
+                    content=f"UNAUTHORIZED PASSAGE {index}. {text}",
+                    embedding=runtime.rag.embed(text),
+                    chunk_index=index,
+                )
+                for index in range(8)
+            ],
+        )
+
+        found, _snippets = runtime.workflow._run_file_search(
+            "treaty clause this chat holds and cites",
+            1,
+            conversation_id=conversation_id,
+            context_id=None,
+            user_id=user_id,
+            tenant_id=None,
+        )
+        assert "UNAUTHORIZED PASSAGE" not in found, found[:160]
+        assert "THE TREATY CLAUSE THIS CHAT HOLDS AND CITES" in found, (
+            "the top-k was spent on rows the conversation does not hold, so "
+            f"the one it does hold never reached the prompt: {found[:160]!r}"
+        )

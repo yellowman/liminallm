@@ -111,8 +111,21 @@ class LegacyOnlyStore:
         limit: int = 4,
         *,
         semantic: bool = False,
+        allowed_paths: list[str] | None = None,
     ) -> list[KnowledgeChunk]:
-        return list(self.chunks.get(context_id or "", []))[:limit]
+        """The local path's candidate generation.
+
+        `allowed_paths` is part of the interface rather than optional
+        politeness: a store that cannot scope a context to a set of paths
+        cannot serve a conversation's implicit index, and skipping the
+        argument when a store does not accept it would authorize by
+        omission. Applied before the cut, as the real store does.
+        """
+        found = list(self.chunks.get(context_id or "", []))
+        if allowed_paths is not None:
+            permitted = set(allowed_paths)
+            found = [c for c in found if c.fs_path in permitted]
+        return found[:limit]
 
 
 def test_local_hybrid_without_pgvector():

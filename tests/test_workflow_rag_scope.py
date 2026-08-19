@@ -8,13 +8,23 @@ class RecordingRAG:
     def __init__(self):
         self.calls = []
 
-    def retrieve(self, context_ids, query, limit=4, *, user_id=None, tenant_id=None):
+    def retrieve(
+        self,
+        context_ids,
+        query,
+        limit=4,
+        *,
+        user_id=None,
+        tenant_id=None,
+        path_scope=None,
+    ):
         self.calls.append(
             {
                 "context_ids": context_ids,
                 "query": query,
                 "user_id": user_id,
                 "tenant_id": tenant_id,
+                "path_scope": path_scope,
             }
         )
         return []

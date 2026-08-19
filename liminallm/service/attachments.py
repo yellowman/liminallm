@@ -253,10 +253,34 @@ def _existing_generation(fs_root: str, user_id: str, checksum: Any) -> Optional[
     return path if path is not None and path.is_file() else None
 
 
-def authorized_generation_paths(
-    records: list[dict[str, Any]], *, fs_root: str, user_id: str
-) -> list[str]:
-    """The generation objects a conversation's records currently name.
+#: What an indexed reading of an attachment is called. Not a filesystem
+#: path: the object is one thing and a reading of it is another, so nothing
+#: that invalidates paths should ever match one of these.
+GENERATION_KEY_PREFIX = "attachment-generation:"
+
+
+def generation_key(checksum: Any, name: Any) -> Optional[str]:
+    """The identity of one *reading* of an attached object.
+
+    The store is keyed by digest, which is right: the bytes are the bytes,
+    and two names holding identical bytes cost one copy. The index cannot
+    use that key, because `replace_chunks_for_path` replaces by path and a
+    reading is not the object. Measured, attaching the same bytes as
+    `report.pdf` and then as `report.md` made the second reading — a refusal,
+    since a PDF is not text — delete the document's chunks.
+
+    So the raw object keeps `sha256(bytes)` and each reading of it is
+    `sha256 + the format it was read as`. The sweeper still works from the
+    checksum alone, because the object is what it reclaims.
+    """
+    text = str(checksum or "")
+    if len(text) != 64 or any(c not in "0123456789abcdef" for c in text):
+        return None
+    return f"{GENERATION_KEY_PREFIX}{text}:{Path(str(name or '')).suffix.lower()}"
+
+
+def authorized_generation_keys(records: list[dict[str, Any]]) -> list[str]:
+    """The readings a conversation's records currently authorize.
 
     The records are the authority for what a conversation holds, and what
     its index happens to contain is not a capability. Re-attaching a name
@@ -269,12 +293,12 @@ def authorized_generation_paths(
     generation whose object has been reclaimed is still not retrievable and
     a chunk written outside a record is not authorized merely by existing.
     """
-    paths = []
+    keys = []
     for record in records:
-        path = generation_path(fs_root, user_id, record.get("checksum"))
-        if path is not None:
-            paths.append(str(path))
-    return paths
+        key = generation_key(record.get("checksum"), record.get("name"))
+        if key is not None:
+            keys.append(key)
+    return keys
 
 
 def resolved_sources(
@@ -306,6 +330,8 @@ def record_attachment(
     capabilities: dict[str, Any],
     chunk_count: Optional[int] = None,
     checksum: Optional[str] = None,
+    fs_root: Optional[str] = None,
+    prune_context_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """Add (or replace) an attachment record on the conversation.
 
@@ -328,7 +354,20 @@ def record_attachment(
     }
     upsert = getattr(store, "upsert_conversation_attachment", None)
     if callable(upsert):
-        return upsert(conversation_id, user_id=user_id, record=record) or []
+        # Retiring what this record displaces belongs in the same
+        # transaction that displaces it. Doing it afterwards, from the
+        # records this call returned, is a read-modify-act on state another
+        # upload is editing at the same time.
+        prune: dict[str, Any] = {}
+        if prune_context_id and fs_root:
+            prune = {
+                "prune_context_id": prune_context_id,
+                "paths_for": authorized_generation_keys,
+                "generation_prefix": GENERATION_KEY_PREFIX,
+            }
+        return upsert(
+            conversation_id, user_id=user_id, record=record, **prune
+        ) or []
     conversation = store.get_conversation(conversation_id, user_id=user_id)
     if not conversation:
         return []

@@ -135,10 +135,10 @@ from liminallm.service.archive import (
     is_archive_filename,
 )
 from liminallm.service.attachments import (
-    authorized_generation_paths,
     classify_attachment,
     ensure_conversation_context,
     find_conversation_context_id,
+    generation_key,
     generation_lock,
     is_auto_context,
     list_attachments,
@@ -265,8 +265,23 @@ def _stringify_adapters(adapters: Any) -> list[str]:
 def _get_owned_context(
     runtime, context_id: str, principal: AuthContext
 ) -> KnowledgeContext:
+    """A context this caller may name, or an error.
+
+    A conversation's implicit index is never one of them. `meta.auto` is
+    load-bearing — the stale-generation sweep skips these contexts, and
+    retrieval from them is filtered to what the conversation's records still
+    name — and both of those key on the conversation, not on the context. So
+    a caller that can *name* one gets an index nothing scopes: measured, a
+    second chat read the first chat's attachment by naming its id, which
+    §19.5 scopes to the chat that received it.
+
+    Reported as absent before ownership is even considered, so the answer is
+    the same for every caller and the id says nothing. Enforcement does not
+    depend on the id being hard to obtain; it depends on nothing accepting
+    it.
+    """
     ctx = runtime.store.get_context(context_id)
-    if not ctx:
+    if not ctx or is_auto_context(ctx):
         raise http_error("not_found", "context not found", status_code=404)
     if ctx.owner_user_id != principal.user_id:
         raise http_error(
@@ -3643,6 +3658,9 @@ async def upload_file(
         # Attach-to-conversation: classify the file, and route searchable ones
         # into the conversation's implicit context so file_search can find them.
         attachment_caps: Optional[dict] = None
+        #: True when `context_id` below is a conversation's implicit index
+        #: rather than something the caller named.
+        implicit_context = False
         if conversation_id and not context_id:
             _get_owned_conversation(runtime, conversation_id, principal)
             attachment_caps = classify_attachment(safe_filename, len(contents))
@@ -3652,6 +3670,7 @@ async def upload_file(
                     user_id=principal.user_id,
                     conversation_id=conversation_id,
                 ).id
+                implicit_context = True
 
         def _record(chunks: Optional[int]) -> Optional[dict]:
             """Persist the attachment record on the conversation."""
@@ -3668,28 +3687,15 @@ async def upload_file(
                 # Which bytes this chat was given. The name it was given
                 # them under belongs to every later upload of that name too.
                 checksum=checksum,
+                # Recording and retiring are one transaction under the
+                # conversation's row lock.
+                fs_root=runtime.settings.shared_fs_root,
+                prune_context_id=find_conversation_context_id(
+                    runtime.store,
+                    user_id=principal.user_id,
+                    conversation_id=conversation_id,
+                ),
             )
-            # Retire whatever this conversation no longer holds. Attaching a
-            # name a second time produces a *different* generation, so the new
-            # ingestion replaced nothing and the previous one stayed
-            # searchable — measured, the chat's own file_search answered from
-            # the edition its record no longer named, ranked above the one it
-            # did. The records are the authority; what the index contains is
-            # not a capability.
-            auto_context_id = find_conversation_context_id(
-                runtime.store,
-                user_id=principal.user_id,
-                conversation_id=conversation_id,
-            )
-            if auto_context_id:
-                runtime.store.prune_context_to_paths(
-                    auto_context_id,
-                    authorized_generation_paths(
-                        records,
-                        fs_root=runtime.settings.shared_fs_root,
-                        user_id=principal.user_id,
-                    ),
-                )
             logger.info(
                 "conversation_attachment_added",
                 user_id=principal.user_id,
@@ -3754,6 +3760,16 @@ async def upload_file(
             # upload of the same filename cannot make the conversation's
             # index describe something the chat was never given.
             indexed_path = generation if generation is not None else dest_path
+            # What this upload's chunks are called. For an attachment that is
+            # a *reading* of the object rather than the object itself: the
+            # same bytes attached under two names parse two ways, and keying
+            # the index by the object made the second reading replace the
+            # first.
+            indexed_identity = (
+                generation_key(checksum, safe_filename)
+                if generation is not None
+                else str(dest_path)
+            )
 
             if not deduped:
                 # The IdempotencyGuard already claimed an in-progress slot on
@@ -3862,6 +3878,7 @@ async def upload_file(
                                 context_id,
                                 str(indexed_path),
                                 chunk_size=chunk_size,
+                                source_identity=indexed_identity,
                                 # The generation is named by its digest, so
                                 # the extractor is told what the file is
                                 # called separately from where it is kept.
@@ -3889,7 +3906,7 @@ async def upload_file(
                     # still says about this path describes bytes that are
                     # gone.
                     runtime.store.replace_chunks_for_path(
-                        context_id, str(indexed_path), []
+                        context_id, indexed_identity, []
                     )
                     _persist(set(prior_contexts) if deduped else set())
                     raise
@@ -3937,7 +3954,11 @@ async def upload_file(
         # Update idempotency with final result
         resp = FileUploadResponse(
             fs_path=safe_filename,
-            context_id=context_id,
+            # Not the implicit one. Nothing accepts a conversation's index as
+            # a named context any more, so publishing its id buys a client
+            # nothing — `chunk_count` already says the file was indexed — and
+            # an identifier nobody needs is one more thing to keep refusing.
+            context_id=None if implicit_context else context_id,
             chunk_count=chunk_count,
             attachment=attachment,
         )
@@ -4968,19 +4989,9 @@ async def add_context_source(
             return idem.cached
 
         # Verify context ownership
-        context = _get_owned_context(runtime, context_id, principal)
-        if is_auto_context(context):
-            # A conversation's implicit index is not a context the user
-            # manages. Everything else relies on that being true: the
-            # stale-generation sweep skips these contexts because they hold
-            # attachment generations, which are immutable and scoped to one
-            # chat, and retrieval from them is filtered to what the
-            # conversation's records still name. A path-following source
-            # added here would be covered by neither. Reported as absent
-            # rather than refused, because these contexts are not part of
-            # the API's surface — the id only appears in an upload response
-            # so a client can tell the file was indexed.
-            raise http_error("not_found", "context not found", status_code=404)
+        # `_get_owned_context` refuses a conversation's implicit index, so
+        # a path-following source cannot be added to one.
+        _get_owned_context(runtime, context_id, principal)
 
         # Add the source with validated path
         source = runtime.store.add_context_source(

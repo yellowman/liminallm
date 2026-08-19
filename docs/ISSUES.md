@@ -8722,3 +8722,113 @@ user's path authority.
 A finished extraction removes its own staging tree, so anything left there
 outlived the process that made it. The periodic cleanup loop reclaims those
 by age, alongside the scratch and generation sweeps.
+
+## 2E.4, fourth pass: what an identifier is allowed to authorize
+
+Review of the content-addressed store's second pass found four more places
+where the object identity had moved and something depending on it had not,
+plus one weakness in where authorization is applied.
+
+### HIGH: an auto context was a transferable cross-chat capability
+
+`meta.auto` had been made load-bearing on the write side, and the read side
+still accepted one when a caller named it. `_validate_context_scope` checks
+ownership, and ownership is not the boundary here — §19.5 scopes an
+attachment to the chat that received it. Measured, a second conversation
+named the first conversation's index and read its attachment, with the
+generation filtering never applied because that filtering keys on the
+*current* conversation's contexts.
+
+The id was not hard to obtain either: a searchable attachment upload returned
+it.
+
+One rule, in one place. `_get_owned_context` reports an auto context as
+absent before it considers ownership, so the answer is the same for every
+caller and every route that takes a context id — upload, archive extraction,
+conversation creation, both context GETs, and the sources route, whose own
+check this replaces. `_validate_context_scope` skips them too, so an auto
+context enters the workflow only through `_attachment_context_ids` for the
+conversation that owns it.
+
+The upload response no longer carries the implicit context id. Enforcement
+does not depend on that — the point of the rule above is that nothing accepts
+the id — but an identifier nobody needs is one more thing to keep refusing.
+
+### HIGH: concurrent attachments retired each other
+
+Pruning the index to an absolute set is a read-modify-act on state another
+upload is editing. Two filenames take different filesystem locks, so:
+
+```
+A: ingest, record [A],      prune to {A}
+B: ingest, record [A, B],   prune to {A, B}
+```
+
+is only one interleaving. Measured with the first upload paused before its
+record landed, the conversation ended with both records, both objects, and
+one of them indexed, with both uploads returning 200.
+
+Moving the prune inside the row-locked transaction is necessary and not
+sufficient: chunks exist before the record that names them, so an absolute
+set computed under the lock still deletes a generation whose upload has not
+finished. That variant has its own mutation, and the first version of the red
+could not see it — the gate sat after the record rather than before it, which
+is the ordering that distinguishes them.
+
+So the transaction that displaces a record retires what it displaced, and
+only that. A generation whose record has not been written is not
+unauthorized, it is unfinished. The displaced object survives if another
+record still names it, which is what makes two names sharing identical bytes
+work. Rows that can never become authorized — anything in the context that is
+not a generation reading at all — are removed by prefix in the same
+transaction.
+
+### HIGH: one object cannot hold two readings
+
+Keeping the extension out of the store key was right: the bytes are the
+bytes, and two names holding identical bytes cost one copy. The index cannot
+use that key. `replace_chunks_for_path` replaces by path, so attaching the
+same bytes as `report.pdf` and then as `report.md` made the second reading —
+a refusal, since a PDF is not text — delete the document's chunks. Both
+records stayed valid, both named the same object, and one reading could
+exist.
+
+Raw identity stays `sha256(bytes)`; a reading is
+`attachment-generation:<sha>:<ext>`. The extractor still opens the raw
+object, `_commit_generation` keys the chunks by the reading, and the sweeper
+still works from the checksum, because the object is what it reclaims.
+
+The red needed the document's text to be long enough to survive retrieval's
+minimum chunk size — a five-word document is indexed and never returned,
+which would have made the search assertion prove nothing.
+
+### MEDIUM: a lock that could not be taken looked like an unreadable file
+
+The per-file guard sat inside the walk's best-effort catch, which exists so
+one unreadable document does not abandon a whole tree. A `PathLockTimeout`
+entering the guard was swallowed the same way, so a source that never got its
+lock returned 201 with zero chunks and kept its source record — while the
+route's own 409 handler, the one that removes that record, could not be
+reached. The guard is outside the catch now.
+
+### MEDIUM: authorization has to reach candidate selection
+
+Discarding unauthorized rows from what retrieval returned keeps them out of
+the prompt, which is the disclosure question and it was answered. It does not
+keep them out of the ranking. Measured with eight unauthorized rows matching
+a query better than the held file: `file_search` reported that nothing
+matched, while the file the conversation actually held sat just outside the
+cut.
+
+A per-context path scope now reaches `_chunk_scope`, which is the predicate
+every pgvector-path channel shares — lexical, dense and late — and the local
+path filters its own per-context pool before its cut. Unscoped contexts are
+unrestricted; an ordinary knowledge context follows paths on purpose. The
+post-retrieval filter stays as well, because a retriever that ignores the
+scope is a retriever that would otherwise disclose.
+
+`allowed_paths` is part of the store interface rather than an optional
+argument. A store that cannot scope a context cannot serve a conversation's
+index, and passing the argument only when a store accepts it would authorize
+by omission — so the legacy-store double in `tests/test_rag.py` implements it
+too.

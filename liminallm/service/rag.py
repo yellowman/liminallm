@@ -183,6 +183,7 @@ class RAGService:
         tenant_id: Optional[str] = None,
         max_tokens: Optional[int] = None,
         min_token_count: int = 10,
+        path_scope: Optional[dict] = None,
     ) -> List[KnowledgeChunk]:
         """Retrieve relevant chunks for a query.
 
@@ -195,6 +196,13 @@ class RAGService:
             max_tokens: Optional maximum total tokens across all returned chunks.
                        Uses token_count from chunk metadata if available.
             min_token_count: Minimum tokens per chunk (filters out very short chunks)
+            path_scope: Per-context restriction on which paths may be
+                       retrieved. A conversation's implicit index is scoped
+                       to the generations its records authorize; every other
+                       context is unrestricted. Applied during candidate
+                       selection, because a filter after the top-k keeps
+                       unauthorized rows out of the prompt without keeping
+                       them out of the ranking.
 
         Returns:
             List of relevant chunks, optionally limited by total token budget
@@ -209,7 +217,7 @@ class RAGService:
         # placed just outside the cut.
         results = self._retriever(
             context_ids, normalized_query, limit * 2 if max_tokens else limit,
-            user_id=user_id, tenant_id=tenant_id
+            user_id=user_id, tenant_id=tenant_id, path_scope=path_scope,
         )
 
         # Filter out very short chunks (likely noise). Before reranking, so no
@@ -354,6 +362,7 @@ class RAGService:
         *,
         user_id: Optional[str],
         tenant_id: Optional[str],
+        path_scope: Optional[dict] = None,
     ) -> List[KnowledgeChunk]:
         """Hybrid retrieval: two candidate pools, one rerank (SPEC §2.5)."""
         allowed_ids = self._allowed_context_ids(
@@ -382,6 +391,7 @@ class RAGService:
                     filters=None,
                     user_id=user_id,
                     tenant_id=tenant_id,
+                    path_scope=path_scope,
                 )
             )
         except Exception as exc:  # noqa: BLE001 - the other channels stand
@@ -407,6 +417,7 @@ class RAGService:
                     filters=vector_filters,
                     user_id=user_id,
                     tenant_id=tenant_id,
+                    path_scope=path_scope,
                 )
             )
             if self.late_interaction:
@@ -418,6 +429,7 @@ class RAGService:
                         filters=vector_filters,
                         user_id=user_id,
                         tenant_id=tenant_id,
+                        path_scope=path_scope,
                     )
                 except Exception as exc:  # noqa: BLE001 - the other channels stand
                     # This channel is an addition, so its failure must cost
@@ -479,6 +491,7 @@ class RAGService:
         filters: Dict[str, str],
         user_id: Optional[str],
         tenant_id: Optional[str],
+        path_scope: Optional[dict] = None,
     ) -> List[KnowledgeChunk]:
         """MaxSim ranking over chunks that keep their segments separately.
 
@@ -506,6 +519,7 @@ class RAGService:
                 filters=filters,
                 user_id=user_id,
                 tenant_id=tenant_id,
+                path_scope=path_scope,
             ):
                 if chunk_id not in seen:
                     seen.add(chunk_id)
@@ -641,6 +655,7 @@ class RAGService:
         *,
         user_id: Optional[str],
         tenant_id: Optional[str],
+        path_scope: Optional[dict] = None,
     ) -> List[KnowledgeChunk]:
         allowed_ids = self._allowed_context_ids(
             context_ids, user_id=user_id, tenant_id=tenant_id
@@ -665,13 +680,16 @@ class RAGService:
         # from another encoder is not a match, and scores nothing.
         per_context: List[List[KnowledgeChunk]] = []
         for ctx_id in allowed_ids:
-            per_context.append(list(self.store.search_chunks(
+            allowed_paths = (path_scope or {}).get(ctx_id)
+            found = list(self.store.search_chunks(
                 ctx_id,
                 query,
                 query_embedding,
                 per_context_limit,
                 semantic=self.semantic,
-            )))
+                allowed_paths=allowed_paths,
+            ))
+            per_context.append(found)
 
         # Rank across contexts, and interleave only to break ties.
         # Concatenating hands every slot to whichever context was listed
@@ -888,6 +906,7 @@ class RAGService:
         chunk_size: Optional[int] = None,
         *,
         format_name: Optional[str] = None,
+        source_identity: Optional[str] = None,
     ) -> int:
         """Index one file's text as the whole of what this context says about it.
 
@@ -895,7 +914,14 @@ class RAGService:
         it is kept. An attachment generation is named by its digest, which
         carries no extension, so without the hint every PDF and Word document
         reached the extractor as an unrecognised blob.
+
+        `source_identity` is what the resulting chunks claim to be the
+        contents of, when that differs from where the bytes were read. One
+        object can be read two ways — the same bytes attached as `.pdf` and
+        as `.md` — and keying the index by the object made the second reading
+        replace the first.
         """
+        identity = source_identity or path
         # Route through the shared extractor: read_text() on a PDF "succeeds"
         # and fills the index with stripped-binary garbage that then wins
         # similarity searches. Better to skip a file than to poison retrieval.
@@ -910,9 +936,9 @@ class RAGService:
             logger.warning(
                 "ingest_file_skipped", path=str(path), reason=exc.reason
             )
-            return self._commit_generation(context_id, path, [])
+            return self._commit_generation(context_id, identity, [])
         return self.ingest_text(
-            context_id, data, chunk_size=chunk_size, source_path=path
+            context_id, data, chunk_size=chunk_size, source_path=identity
         )
 
     # Issue 38.3: Default limits for recursive ingestion to prevent resource exhaustion
@@ -1017,17 +1043,23 @@ class RAGService:
         if path.is_file():
             # Single file
             if not extensions or path.suffix.lower() in extensions:
-                try:
-                    with (file_guard(path) if file_guard else nullcontext()):
+                # The guard is outside the catch. That catch exists so one
+                # unreadable document does not abandon a whole tree; failing
+                # to take the serialization primitive is not that, and
+                # swallowing it turned a source that never got its lock into
+                # a 201 with zero chunks, with the route's own 409 handler —
+                # the one that removes the source record — unreachable.
+                with (file_guard(path) if file_guard else nullcontext()):
+                    try:
                         total_chunks += self.ingest_file(
                             context_id, str(path), chunk_size
                         )
-                except Exception as exc:
-                    logger.warning(
-                        "ingest_path_file_failed",
-                        path=str(path),
-                        error=str(exc),
-                    )
+                    except Exception as exc:
+                        logger.warning(
+                            "ingest_path_file_failed",
+                            path=str(path),
+                            error=str(exc),
+                        )
             return total_chunks
 
         if not path.is_dir():
@@ -1073,18 +1105,21 @@ class RAGService:
                 )
                 break
 
-            try:
-                with (file_guard(file_path) if file_guard else nullcontext()):
+            # The guard is outside the catch below, for the reason given in
+            # the single-file branch: a lock that cannot be taken is an
+            # operation failure, not an unreadable document.
+            with (file_guard(file_path) if file_guard else nullcontext()):
+                try:
                     total_chunks += self.ingest_file(
                         context_id, str(file_path), chunk_size
                     )
-                files_processed += 1
-            except Exception as exc:
-                logger.warning(
-                    "ingest_path_file_failed",
-                    path=str(file_path),
-                    error=str(exc),
-                )
+                    files_processed += 1
+                except Exception as exc:
+                    logger.warning(
+                        "ingest_path_file_failed",
+                        path=str(file_path),
+                        error=str(exc),
+                    )
 
         logger.info(
             "ingest_path_completed",
