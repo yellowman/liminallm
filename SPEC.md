@@ -361,7 +361,7 @@ ON knowledge_chunk_vector (chunk_id, segment_index);
 - **dimension handling is dynamic, never pinned**: retrieval validates that query and chunk share a dimension rather than asserting 64. pinning it to `EMBEDDING_DIM` made every real-encoder query fail validation and silently score 0 — collapsing semantic search to bm25 while appearing to work. a chunk from a different encoder scores 0 rather than being garbage-compared.
 - **embedding dimensionality**: 64-d (`EMBEDDING_DIM`) is the *hash-fallback* size and remains mandatory for routing and clustering, where vectors from many contexts are compared in one space.
   **amended:** external providers persist their **native** dimensionality (e.g. 1536) for rag chunks, notes, and message recall. truncating a real 1536-d embedding to 64-d discards most of the signal the encoder exists to provide — obeying the original rule would defeat semantic retrieval. the invariant that actually matters is *never compare vectors from different encoders*: every consumer records the encoder id alongside the vector (`knowledge_chunk.meta.embedding_model_id`, `note.meta`, `message.meta.embedding_model`) and filters on it; a mismatch is treated as "not embedded", so the backfill re-embeds rather than comparing across spaces.
-  **verified and fixed:** `knowledge_chunk.embedding` was declared bare `VECTOR` and indexed `USING ivfflat`. reproduced against real pgvector: `ERROR: column does not have dimensions` — so with `ON_ERROR_STOP` (which `scripts/migrate.sh` uses) migrations aborted at 002, and without it the index silently never existed and every similarity search was a sequential scan. the column is now pinned to `EMBEDDING_VECTOR_DIM` (default 1536, use 64 for the hash fallback), passed to psql by `migrate.sh`. there is no upgrade path to get wrong: the numbered migrations are gone in favour of one idempotent `sql/schema.sql` (see §2), because this project has never been deployed and a migration history that reconciles states no database was ever in is fiction with a data-loss hazard attached. a wrong `EMBEDDING_VECTOR_DIM` can no longer corrupt anything quietly either — startup compares the column's dimension against the encoder's and refuses with both numbers and the fix. verified end to end on postgres 16 + pgvector at 1536 and 64.
+  **dimension is a schema parameter**: `knowledge_chunk.embedding` and `knowledge_chunk_vector.embedding` are declared at the configured `EMBEDDING_VECTOR_DIM` (default 1536; 64 for the built-in hash fallback), which `scripts/migrate.sh` supplies as `:embedding_dim` when it creates the schema. pgvector requires a fixed dimension — an ivfflat index cannot be built on a bare `VECTOR` column. the dimension is fixed for an existing database: changing the setting does not alter a column that already exists, so a change requires rebuilding the vector columns and re-embedding stored content. startup compares the column's width against the configured encoder's and refuses to start when they differ, naming both numbers and the fix.
 - **refresh cadence**:
   - watch filesystem path events; enqueue ingestion job on file change.
   - encoder change is handled by *invalidation*, not a sweep: a vector whose recorded encoder id differs from the current one reads as "not embedded", so the normal backfill re-embeds it lazily. no daily job exists — a scheduled re-embed is still open work, and until it lands, old vectors are re-embedded only when something reads them.
@@ -2246,19 +2246,22 @@ contexts without adopting the responses api. same credentials as
 
 - same endpoints as §10; PATCH application triggers validation + dry-run.
 
-### 13.6 migrations (basic shell tool)
+### 13.6 schema application (basic shell tool)
 
-- repository includes `scripts/migrate.sh`:
+- `scripts/migrate.sh` is the sole schema-application entry point. it applies the single desired-state `sql/schema.sql` in one transaction, with `ON_ERROR_STOP`, supplying `EMBEDDING_VECTOR_DIM` as `:embedding_dim`:
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-psql "$DATABASE_URL" -v embedding_dim="${EMBEDDING_VECTOR_DIM:-1536}" -f sql/schema.sql
-# add future numbered files in order
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 \
+  -v embedding_dim="${EMBEDDING_VECTOR_DIM:-1536}" \
+  --single-transaction -f sql/schema.sql
 ```
 
-- no special tooling; developers add ordered `sql/*.sql` files; CI runs script; idempotency via `CREATE TABLE IF NOT EXISTS` inside SQL.
-- optional seeding happens inside numbered SQL (idempotent upserts) to create default workflow, routing policy, and tool specs as artifacts; keep seeds versioned so reruns are safe.
+- no special tooling and no migration history. `sql/schema.sql` states the desired schema, and every statement in it — declarations and any embedded data-repair block alike — must be safe to execute repeatedly against every database state the project supports.
+- optional `sql/seed/*.sql` files are deterministic upserts, applied after the schema, and may be rerun.
+- CI runs the same command against a fresh database, then runs the suite against the database that command produced.
+- if a schema transformation cannot be expressed safely as a repeatable desired-state operation, introduce an ordered migration mechanism before shipping that transformation.
 
 ---
 
@@ -2794,9 +2797,9 @@ the following are treated as constants the kernel must honor; LLM edits happen o
   - backups: nightly Postgres logical backup retained 7d; weekly filesystem snapshot pointers retained 4 weeks; Redis not backed up (ephemeral) but seeded data survives via Postgres + filesystem artifacts.
   - health checks: `/healthz` per service does dependency checks (DB, Redis, filesystem mount) and reports build/version; readiness gates traffic in orchestrator/gateway.
 
-- **migrations & seeding**
-  - `scripts/migrate.sh` is the only required tool; it applies ordered `sql/*.sql` files and optional `sql/seed/*.sql` that upsert default artifacts (workflow, routing policy, base tool specs); rerunning is safe due to `IF NOT EXISTS` and deterministic upserts.
-  - CI runs migrations on a fresh DB to validate schema; production runs migrations during maintenance windows with `DATABASE_URL` from environment and fails fast on checksum mismatch.
+- **schema application & seeding**
+  - `scripts/migrate.sh` is the only required tool; it applies `sql/schema.sql` and optional `sql/seed/*.sql` that upsert default artifacts (workflow, routing policy, base tool specs); rerunning is safe because the schema is desired-state and the seeds are deterministic upserts.
+  - CI runs the same command against a fresh DB and then runs the suite against that database, so a schema step that produced nothing fails the build instead of being repaired by the harness. production runs it during maintenance windows with `DATABASE_URL` from environment, and fails fast on the first SQL error (`ON_ERROR_STOP`).
 
 - **configuration management (database-driven)**
   - **principle**: most operational settings MUST be database-managed and editable via admin/instance-admin UI (`/admin.html`, `GET/PUT /v1/admin/settings`); environment variables serve only as bootstrap defaults or for infrastructure/secrets that cannot safely reside in the database.

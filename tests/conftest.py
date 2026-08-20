@@ -69,7 +69,20 @@ if not os.environ.get("TEST_DATABASE_URL"):
     os.environ["DATABASE_URL"] = _PG.start()
 else:
     os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
-apply_schema(os.environ["DATABASE_URL"], embedding_dim=64)
+
+# TEST_SCHEMA_PREPARED says "something already applied the schema to this
+# database; do not touch it". CI sets it after running scripts/migrate.sh, so
+# the suite runs against the database the deploy command actually produced.
+#
+# Without it, applying the schema here unconditionally means the suite proves
+# nothing about migrate.sh: gut the script to `exit 0` and CI's schema step
+# still succeeds, conftest then builds the whole schema from scratch on the
+# empty database it left behind, and the suite goes green over a deploy
+# command that does nothing. A scratch cluster this file started has no such
+# ambiguity — nothing else could have prepared it — so it still applies the
+# schema itself.
+if not os.environ.get("TEST_SCHEMA_PREPARED"):
+    apply_schema(os.environ["DATABASE_URL"], embedding_dim=64)
 from fastapi.dependencies import utils as fastapi_dep_utils  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent

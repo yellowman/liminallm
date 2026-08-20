@@ -3319,3 +3319,58 @@ class TestALoadBearingIndexIsVerifiedAtStartup:
             with runtime.store._connect() as conn:
                 conn.execute("DROP INDEX IF EXISTS bogus_auto_context_index")
             apply_schema(url, embedding_dim=64)
+
+    @pytest.mark.parametrize(
+        "name, ddl, why",
+        [
+            (
+                "predicate_nulls_out_every_row",
+                "CREATE UNIQUE INDEX bogus_auto_context_index "
+                "ON knowledge_context (owner_user_id, (meta ->> 'conversation_id')) "
+                "WHERE COALESCE((meta ->> 'auto')::boolean, false) AND id IS NULL",
+                "id is the primary key and is never NULL, so this index covers "
+                "zero rows and enforces nothing at all",
+            ),
+            (
+                "second_key_carries_the_row_id",
+                "CREATE UNIQUE INDEX bogus_auto_context_index "
+                "ON knowledge_context "
+                "(owner_user_id, ((meta ->> 'conversation_id') || ':' || id::text)) "
+                "WHERE COALESCE((meta ->> 'auto')::boolean, false)",
+                "folding the row id into the second key makes every entry "
+                "distinct, so uniqueness is free and constrains nothing",
+            ),
+        ],
+    )
+    def test_an_index_that_enforces_nothing_does_not_satisfy_the_check(
+        self, client, name, ddl, why
+    ):
+        """Both keys and the whole predicate are checked, not sampled.
+
+        The constraint that has to hold is exactly one thing: for every auto
+        context, `(owner_user_id, conversation_id)` is unique. Each index here
+        is unique, has two keys, and starts with `owner_user_id`; each defeats
+        the constraint by changing one field the previous check only pattern
+        matched. Substring tests cannot tell them apart from the real one, so
+        the second key and the predicate are compared whole.
+        """
+        import os
+
+        import pytest as _pytest
+
+        from liminallm.storage.postgres import PostgresStore
+        from tests.harness import apply_schema
+
+        runtime = get_runtime()
+        url = os.environ["DATABASE_URL"]
+        with runtime.store._connect() as conn:
+            conn.execute("DROP INDEX IF EXISTS knowledge_context_auto_conversation_idx")
+            conn.execute(ddl)
+        try:
+            with _pytest.raises(RuntimeError) as caught:
+                PostgresStore(url, fs_root=str(runtime.settings.shared_fs_root))
+            assert "migrate" in str(caught.value).lower(), f"{name}: {why}"
+        finally:
+            with runtime.store._connect() as conn:
+                conn.execute("DROP INDEX IF EXISTS bogus_auto_context_index")
+            apply_schema(url, embedding_dim=64)

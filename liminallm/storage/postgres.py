@@ -450,15 +450,26 @@ class PostgresStore:
             # the database, so a load-bearing schema feature is checked where
             # the message can name the fix.
             #
-            # Checked by structure, not by name and not by the words its
-            # definition happens to contain. "Unique, partial, mentions
-            # conversation_id" is satisfied by an index keyed on `id`
-            # alongside the conversation — unique for free, because every row
-            # has a distinct id, and therefore constraining nothing that the
-            # primary key does not. `ON CONFLICT DO NOTHING` would still see
-            # no conflict. So the two key columns are named: owner first,
-            # the conversation expression second, and the predicate has to
-            # narrow it to the implicit contexts.
+            # The property that has to hold is one sentence: for every auto
+            # context, `(owner_user_id, conversation_id)` is unique. Nothing
+            # weaker is worth checking, because every weaker check has a
+            # counterexample that enforces nothing:
+            #
+            #   * keyed `(id, conversation_id)` — unique for free, every row
+            #     has a distinct id;
+            #   * keyed `(owner_user_id, conversation_id || ':' || id)` — the
+            #     same trick moved inside the second key;
+            #   * predicate `... AND id IS NULL` — a primary key is never
+            #     NULL, so the index covers no rows at all.
+            #
+            # Each is unique, two-keyed, owner-first, and mentions the right
+            # words. `ON CONFLICT DO NOTHING` would find no conflict under any
+            # of them. So both key expressions and the whole predicate are
+            # compared to the catalog's own normalized rendering of the index
+            # in sql/schema.sql — verified against PostgreSQL 16. A future
+            # release that renders them differently fails this check, which
+            # costs a false alarm that names the fix; the alternative is a
+            # substring test that a nonexistent constraint can satisfy.
             uniqueness = conn.execute(
                 """
                 SELECT 1 FROM pg_index i
@@ -466,10 +477,13 @@ class PostgresStore:
                   AND i.indisunique
                   AND i.indnkeyatts = 2
                   AND pg_get_indexdef(i.indexrelid, 1, true) = 'owner_user_id'
-                  AND pg_get_indexdef(i.indexrelid, 2, true) LIKE %s
-                  AND pg_get_expr(i.indpred, i.indrelid) LIKE %s
+                  AND pg_get_indexdef(i.indexrelid, 2, true) = %s
+                  AND pg_get_expr(i.indpred, i.indrelid) = %s
                 """,
-                ("%meta%conversation_id%", "%auto%"),
+                (
+                    "(meta ->> 'conversation_id'::text)",
+                    "COALESCE(((meta ->> 'auto'::text))::boolean, false)",
+                ),
             ).fetchone()
             if not uniqueness:
                 raise RuntimeError(

@@ -9,6 +9,7 @@ success, so these skip when Redis is absent rather than passing quietly.
 from __future__ import annotations
 
 import os
+import re
 
 import pytest
 
@@ -112,23 +113,36 @@ def test_docker_has_one_schema_authority():
     )
 
 
-def test_the_migrate_container_is_told_the_embedding_width():
-    """`migrate.sh` reads EMBEDDING_VECTOR_DIM and defaults to 1536.
+def _service_env(service: str) -> dict:
+    """A compose service's environment, from either of the two YAML forms."""
+    environment = _compose()["services"][service].get("environment") or {}
+    if isinstance(environment, dict):
+        return {str(k): str(v) for k, v in environment.items()}
+    pairs = (str(entry).split("=", 1) for entry in environment)
+    return {p[0]: (p[1] if len(p) > 1 else "") for p in pairs}
 
-    A migrate service that is handed only DATABASE_URL therefore pins the
-    vector column at 1536 whatever the operator configured, and the app —
-    which checks the column against the encoder at startup — refuses to boot
-    with no indication that the width came from a container that never saw
-    the setting.
+
+def test_the_migrate_container_is_told_the_same_embedding_width_as_the_app():
+    """One writes the column, the other checks it. They cannot disagree.
+
+    `migrate.sh` reads EMBEDDING_VECTOR_DIM and defaults to 1536, so a migrate
+    service handed only DATABASE_URL pins the vector column at 1536 whatever
+    the operator configured. Asserting the key is merely *present* is not
+    enough either: hard-coding the migrate service to "1536" passes that test
+    and rebuilds the same bug for anyone running at 64. The two services have
+    to resolve the setting the same way, so compare the values.
     """
-    environment = _compose()["services"]["migrate"].get("environment") or {}
-    keys = environment if isinstance(environment, dict) else [
-        str(entry).split("=", 1)[0] for entry in environment
-    ]
-    assert "EMBEDDING_VECTOR_DIM" in keys, (
+    migrate = _service_env("migrate").get("EMBEDDING_VECTOR_DIM")
+    app = _service_env("app").get("EMBEDDING_VECTOR_DIM")
+    assert migrate is not None, (
         "the migrate service does not receive EMBEDDING_VECTOR_DIM, so it "
         "builds the vector column at the 1536 default regardless of what the "
         "operator set, and the app then refuses to start."
+    )
+    assert migrate == app, (
+        f"migrate builds the vector column from {migrate!r} while the app "
+        f"checks it against {app!r}. Whatever the operator sets, these two "
+        "must resolve to one number or the app cannot boot."
     )
 
 
@@ -153,4 +167,96 @@ def test_ci_applies_the_schema_the_way_production_does():
     )
     assert any("migrate.sh" in str(s.get("run", "")) for s in steps), (
         "no CI step runs scripts/migrate.sh"
+    )
+
+
+def test_ci_does_not_let_pytest_repair_the_migrated_database():
+    """CI must run the tests against the database migrate.sh produced.
+
+    Running the deploy command proves the command executes; it does not prove
+    it built anything. `conftest` applying the schema unconditionally closes
+    that gap in the wrong direction — gut migrate.sh to `exit 0` and the
+    schema step still passes, conftest builds the schema on the empty database
+    it left, and the suite goes green.
+    """
+    import pathlib
+
+    import yaml
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    workflow = yaml.safe_load((root / ".github" / "workflows" / "tests.yml").read_text())
+    steps = workflow["jobs"]["test"]["steps"]
+
+    migrated = next(
+        (i for i, s in enumerate(steps) if "migrate.sh" in str(s.get("run", ""))), None
+    )
+    assert migrated is not None, "no CI step runs scripts/migrate.sh"
+    # `pytest` as a command, not `pip install pytest` in the setup step.
+    invokes_pytest = re.compile(r"^\s*pytest\b", re.MULTILINE)
+    testing = next(
+        (i for i, s in enumerate(steps) if invokes_pytest.search(str(s.get("run", "")))),
+        None,
+    )
+    assert testing is not None, "no CI step runs pytest"
+    assert migrated < testing, "CI runs pytest before it applies the schema"
+    assert (steps[testing].get("env") or {}).get("TEST_SCHEMA_PREPARED"), (
+        "the pytest step does not set TEST_SCHEMA_PREPARED, so conftest "
+        "reapplies sql/schema.sql over whatever migrate.sh did — or did not — "
+        "produce, and the suite cannot fail because of it."
+    )
+
+
+@pytest.mark.slow
+def test_a_prepared_database_that_is_empty_stops_the_suite():
+    """The other half: the flag has to actually suppress the repair.
+
+    Setting TEST_SCHEMA_PREPARED in CI is only worth anything if the harness
+    honours it. Against an empty database that claims to be prepared, the
+    suite must refuse — that refusal is exactly what a no-op migrate.sh would
+    produce in CI, and it is the signal the previous arrangement swallowed.
+    """
+    import subprocess
+    import sys
+
+    from tests.harness import ScratchPostgres
+
+    pg = ScratchPostgres()
+    if not pg.available:
+        pytest.skip("initdb not available; cannot build an unprepared database")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    url = pg.start()
+    try:
+        env = {
+            k: v for k, v in os.environ.items()
+            if k not in {"DATABASE_URL", "TEST_PG_PORT", "SHARED_FS_ROOT"}
+        }
+        env.update(
+            TEST_DATABASE_URL=url,
+            TEST_SCHEMA_PREPARED="true",
+            EMBEDDING_VECTOR_DIM="64",
+            ALLOW_REDIS_FALLBACK_DEV="true",
+        )
+        done = subprocess.run(
+            [sys.executable, "-m", "pytest", "-x", "-q", "-p", "no:cacheprovider",
+             "tests/test_harness_runs_the_real_thing.py"
+             "::test_redis_url_has_no_environment_variable"],
+            cwd=root, env=env, capture_output=True, text=True, timeout=600,
+        )
+    finally:
+        pg.stop()
+
+    assert done.returncode != 0, (
+        "the suite passed against an empty database it was told was already "
+        "prepared. TEST_SCHEMA_PREPARED is not suppressing the repair, so a "
+        "migrate.sh that built nothing would still go green in CI."
+    )
+    # Not "does the word migrate appear" — the tracebacks of this very file
+    # would satisfy that. The refusal has to be the store's schema check.
+    output = done.stdout + done.stderr
+    assert "Missing required Postgres tables" in output, (
+        "the suite failed, but not because the schema was absent, so this "
+        f"proves nothing about TEST_SCHEMA_PREPARED:\n{output[-3000:]}"
+    )
+    assert "scripts/migrate.sh" in output, (
+        f"the refusal does not name the command that fixes it:\n{output[-3000:]}"
     )

@@ -146,7 +146,7 @@ Only these are environment variables:
 | Variable | Required | Purpose |
 |---|---|---|
 | `DATABASE_URL` | yes | Postgres connection string |
-| `EMBEDDING_VECTOR_DIM` | no | Embedding width; must match the schema (default 1536) |
+| `EMBEDDING_VECTOR_DIM` | no | Embedding width, fixed when the schema is first created (default 1536) |
 | `<PROVIDER>_API_KEY` | no | `OPENAI_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`, … used when the matching admin setting is blank |
 | `INSTANCE_SETTINGS_JSON` | no | JSON object seeding managed settings on first boot only |
 
@@ -154,8 +154,15 @@ Everything else — model, provider, Redis URL, SMTP, OAuth, rate limits — is 
 in the admin console at `/` after signing in as an admin. `JWT_SECRET` is
 generated on first boot if unset.
 
-Changing `EMBEDDING_VECTOR_DIM` after the schema exists requires re-applying
-the schema and re-embedding.
+`EMBEDDING_VECTOR_DIM` sets the width of the vector columns, and that width is
+fixed when the schema is first created. Re-running `scripts/migrate.sh` does
+not change it: every statement in `sql/schema.sql` is `CREATE TABLE IF NOT
+EXISTS`, so an existing table is left as it is.
+
+To change the width on an existing database, you must drop and recreate the
+vector columns, then re-embed all stored content. The application compares the
+column width against the configured encoder at startup, and refuses to start
+when the two differ.
 
 ---
 

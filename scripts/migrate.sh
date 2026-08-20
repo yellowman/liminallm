@@ -6,9 +6,12 @@
 # first and without :embedding_dim; every statement here is IF NOT EXISTS, so
 # this run then changed nothing and still reported success.
 #
-# Not a migration runner: there is no migration history. The schema is a
-# single idempotent file, so this is safe to re-run against an existing
-# database — it creates what is missing and leaves the rest alone.
+# Not a migration runner: there is no migration history. sql/schema.sql states
+# the desired schema, and every statement in it is required to be safe to
+# execute repeatedly, so this is safe to re-run against an existing database.
+#
+# This is the only thing that applies the schema. CI runs this same script, and
+# then runs the test suite against the database it produced.
 set -euo pipefail
 
 : "${DATABASE_URL:?DATABASE_URL must be set}"

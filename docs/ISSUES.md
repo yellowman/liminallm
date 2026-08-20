@@ -9038,16 +9038,58 @@ CI runs the script.
 
 ### MEDIUM: the startup check accepted an index that constrains nothing
 
-The check added for the previous tranche matched the index by the words in
-`pg_get_indexdef` rather than by its structure. A unique partial index keyed on
-`(id, (meta ->> 'conversation_id'))` contains `conversation_id`, has an `auto`
-predicate, and is unique for free because every row has a distinct id. It
-satisfied the check while `ON CONFLICT DO NOTHING` still had nothing to collide
+The property that has to hold is one sentence: for every auto context,
+`(owner_user_id, conversation_id)` is unique. The check reached it in two
+steps, and the first step was still a substring test.
+
+It first matched the index by the words in `pg_get_indexdef`, which a unique
+partial index keyed on `(id, (meta ->> 'conversation_id'))` satisfies — that
+index contains `conversation_id`, has an `auto` predicate, and is unique for
+free because every row has a distinct id. Tightening it to require two key
+attributes with `owner_user_id` first killed that impostor and left two more:
+
+- second key `((meta ->> 'conversation_id') || ':' || id::text)` — the same
+  trick moved inside the second key, still unique for free;
+- predicate `COALESCE((meta ->> 'auto')::boolean, false) AND id IS NULL` — a
+  primary key is never NULL, so the index covers no rows at all.
+
+Both were installed against a real cluster and confirmed to pass the tightened
+check. Under any of the three, `ON CONFLICT DO NOTHING` has nothing to collide
 with, which is the exact state the check exists to refuse.
 
-The check now reads the catalog: unique, exactly two key attributes, first key
-`owner_user_id`, second the conversation expression, and a partial predicate
-over `auto`.
+Both key expressions and the whole predicate are now compared to the catalog's
+normalized rendering of the index in `sql/schema.sql`, read from PostgreSQL 16
+rather than guessed. Each half is independently load-bearing: reverting the
+predicate to a substring test kills one of the two reds, reverting the second
+key kills the other.
+
+### MEDIUM: CI ran the deploy command but did not test what it built
+
+Running `scripts/migrate.sh` proves the command executes. It does not prove the
+command built anything, because `tests/conftest.py` then applied
+`sql/schema.sql` unconditionally — including when `TEST_DATABASE_URL` pointed
+at the database CI had just migrated.
+
+So this mutation escaped: reduce `migrate.sh` to `echo; exit 0`. The "Apply
+schema" step succeeds, conftest builds the whole schema on the empty database
+left behind, and the suite goes green over a deploy command that does nothing.
+
+`TEST_SCHEMA_PREPARED` closes it. CI sets it on the pytest step; conftest skips
+`apply_schema()` when it is set. A scratch cluster the harness started itself
+has no such ambiguity, so local runs are unchanged.
+
+Verified by replaying the CI sequence against a scratch cluster. With the real
+script: schema step exits 0, test step exits 0. With the script reduced to
+`exit 0`: schema step still exits 0, and the test step now exits 1 with
+`Missing required Postgres tables: ... Run scripts/migrate.sh`.
+
+### LOW: the compose test asserted presence where it needed equality
+
+The first version of the embedding-width test asserted only that the `migrate`
+service has an `EMBEDDING_VECTOR_DIM` key. Hard-coding that service to `"1536"`
+passes it and rebuilds the original bug for anyone running at 64. The test
+compares the `migrate` and `app` values instead, so the two services cannot
+resolve the setting differently.
 
 ## Recorded, not fixed: SPEC carries project status and contradicts itself
 
@@ -9068,7 +9110,57 @@ is no upgrade path to get wrong" — becomes false silently, with nothing in the
 document marking the dependency. Eight lines in SPEC carry this kind of
 verification narrative; one of them carries the expiring fact.
 
-Two decisions are open for the owner: whether the build-note prose in §364
-moves into this file, where the rest of that history lives, and whether the
-"checksum mismatch" clause in §21 is struck so the document stops describing
-two designs.
+**Resolved.** Both decisions were taken, and a third followed from them.
+
+§364's build note is replaced by a specification of the same behaviour:
+`knowledge_chunk.embedding` and `knowledge_chunk_vector.embedding` are declared
+at the configured `EMBEDDING_VECTOR_DIM`, `scripts/migrate.sh` supplies it, the
+dimension is fixed for an existing database, and startup refuses a database
+whose width does not match the encoder. The history that sentence used to carry
+is preserved below rather than deleted.
+
+§21's "fails fast on checksum mismatch" is struck. No checksum exists, so the
+clause specified a mechanism that could not run. It now says what the command
+does do: fail on the first SQL error, under `ON_ERROR_STOP`.
+
+§13.6 needed the same treatment and had not been named. It still said
+developers "add ordered `sql/*.sql` files" and carried the comment `# add
+future numbered files in order`, which describes the design that was
+deliberately not built. Both §13.6 and §21 now state one invariant:
+`scripts/migrate.sh` is the sole schema-application entry point; it applies the
+desired-state `sql/schema.sql` in one transaction with `ON_ERROR_STOP`,
+supplying `EMBEDDING_VECTOR_DIM`; every statement in that file, including any
+data-repair block, must be safe to execute repeatedly against every supported
+database state; CI runs the same command against a fresh database. None of that
+depends on whether the project has been deployed.
+
+The guard that keeps the small design honest is stated rather than assumed: if
+a schema transformation cannot be expressed safely as a repeatable
+desired-state operation, an ordered migration mechanism is introduced before
+that transformation ships. The decision is revisitable on evidence instead of
+being sealed by a premise that expires.
+
+`sql/schema.sql`'s own header carried the same expiring premise and is rewritten
+the same way — the repeat-safety requirement is now stated as a rule for
+anything added to the file, not as an observation about what it happens to
+contain.
+
+### Preserved history: the bare `VECTOR` column
+
+`knowledge_chunk.embedding` was declared bare `VECTOR` and indexed `USING
+ivfflat`. Reproduced against real pgvector: `ERROR: column does not have
+dimensions`. With `ON_ERROR_STOP` the schema application aborted at the
+knowledge section; without it the index silently never existed, and every
+similarity search became a sequential scan. The column is pinned to
+`EMBEDDING_VECTOR_DIM` (default 1536, 64 for the hash fallback), passed to psql
+by `migrate.sh`. A wrong `EMBEDDING_VECTOR_DIM` can no longer corrupt anything
+quietly: startup compares the column's dimension against the encoder's and
+refuses with both numbers and the fix. Verified end to end on PostgreSQL 16
+with pgvector at 1536 and at 64.
+
+At the time this was fixed, numbered migrations were replaced by the single
+`sql/schema.sql`. The reasoning recorded then was that the project had never
+been deployed, so a migration history would reconcile states no database had
+ever been in. That reasoning was sound when written; the error was leaving it
+in SPEC as a standing premise rather than recording it here as a decision made
+on the evidence available.

@@ -1,14 +1,19 @@
 -- liminallm schema (SPEC §2).
 --
--- One file, applied once. There is no migration history: this project has
--- never been deployed, so numbered migrations only carried the fiction of an
--- upgrade path that never existed — and with it a real hazard, since the
--- pgvector dimension change had to guess what a "previous encoder" left
--- behind. A single schema has no previous state to reconcile.
+-- This file states the desired schema, not a step in a history. It is applied
+-- by scripts/migrate.sh, which is the only thing that applies it and which
+-- passes :embedding_dim from EMBEDDING_VECTOR_DIM.
 --
--- Apply with scripts/migrate.sh (which passes :embedding_dim from
--- EMBEDDING_VECTOR_DIM). Every statement is IF NOT EXISTS / idempotent, so
--- re-running is safe.
+-- Every statement here must be safe to execute repeatedly against every
+-- database state the project supports: declarations are IF NOT EXISTS, and a
+-- data-repair block must reach the same result whether it runs once or many
+-- times. That property is what makes re-running the schema safe, so it is a
+-- requirement on anything added to this file, not an observation about what
+-- the file currently happens to contain.
+--
+-- If a schema change ever cannot be written that way, add an ordered
+-- migration mechanism before shipping the change rather than weakening the
+-- rule here.
 
 -- pgvector needs a fixed dimension to build an ivfflat index; a bare VECTOR
 -- column fails with "column does not have dimensions". This must match the
