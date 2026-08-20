@@ -2930,6 +2930,7 @@ class TestOneConversationHasOneImplicitContext:
                 ).fetchone()
             made.append(str(row["id"]))
         assert len(self._auto_contexts(runtime, user_id, conversation_id)) == 2
+        shared_path = "/generations/attached-by-both"
         for context_id, marker in zip(made, ("FROM THE WINNER", "FROM THE LOSER")):
             runtime.store.add_chunks(
                 context_id,
@@ -2940,7 +2941,18 @@ class TestOneConversationHasOneImplicitContext:
                         content=marker,
                         embedding=runtime.rag.embed(marker),
                         chunk_index=0,
-                    )
+                    ),
+                    # The stronger case: both contexts indexed the *same*
+                    # generation. Two concurrent first attachments of one file
+                    # produced exactly this, because the second was a disk
+                    # dedupe hit into a context that was nonetheless new.
+                    KnowledgeChunk(
+                        context_id=context_id,
+                        fs_path=shared_path,
+                        content="THE GENERATION BOTH INDEXED",
+                        embedding=runtime.rag.embed("shared generation"),
+                        chunk_index=0,
+                    ),
                 ],
             )
 
@@ -2961,10 +2973,24 @@ class TestOneConversationHasOneImplicitContext:
         assert len(survivors) == 1, (
             f"the migration left {len(survivors)} indexes for one conversation"
         )
-        kept = _text(runtime, survivors[0].id)
-        assert "FROM THE WINNER" in kept
-        assert "FROM THE LOSER" in kept, (
+        kept = _chunks(runtime, survivors[0].id)
+        contents = " ".join(chunk.content or "" for chunk in kept)
+        assert "FROM THE WINNER" in contents
+        assert "FROM THE LOSER" in contents, (
             "the merge dropped a duplicate's chunks instead of moving them"
+        )
+        # Moving is not enough. `_commit_generation` builds on one fs_path
+        # being one complete current generation, and the merge bypasses
+        # `replace_chunks_for_path` — so a generation both contexts held
+        # arrives twice, and the copies spend candidate slots that belong to
+        # other attachments.
+        duplicated = [
+            chunk for chunk in kept
+            if chunk.fs_path == shared_path and chunk.chunk_index == 0
+        ]
+        assert len(duplicated) == 1, (
+            f"the merged context holds {len(duplicated)} copies of one "
+            "generation's chunk 0"
         )
 
     def test_an_implicit_context_is_found_without_a_row_horizon(self, client):
@@ -3108,3 +3134,153 @@ class TestHiddenContextsDoNotPaginate:
             f"following the pagination reached {len(set(seen))} of 2 contexts: "
             f"{seen}"
         )
+
+
+class TestAuthorizationIsNeverAPage:
+    """2E.6 stopped paging for implicit context identity. Ordinary contexts
+    still authorize through the same primitive.
+
+    `_validate_context_scope` builds its owned set from
+    `list_contexts(owner_user_id=...)`, which defaults to one 100-row page and
+    really does `LIMIT` it in SQL. So a context the API has already accepted
+    by direct id lookup — the request is running, the conversation records it
+    — silently drops out of retrieval once the account has a hundred newer
+    contexts. The turn succeeds and the model is simply given no grounding.
+
+    An authorization decision is a question about one identity. It should
+    never be answered by asking whether that identity is near the top of a
+    list.
+    """
+
+    def test_an_older_context_still_grounds_a_turn(self, client):
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        target = _context(client, headers)
+        resp = client.post(
+            "/v1/conversations", headers=headers, json={"title": _unique("chat")}
+        )
+        conversation_id = resp.json()["data"]["id"]
+        assert _upload(
+            client, headers, "corpus.md",
+            b"# corpus\nTHE MARKER IN THE OLDER CORPUS\n" * 12, target,
+        ).status_code == 200
+        assert "THE MARKER IN THE OLDER CORPUS" in _text(runtime, target)
+
+        # More recent contexts than the authorization listing reads.
+        for index in range(120):
+            runtime.store.upsert_context(
+                user_id, f"newer-{index}", "pushes the target off the page"
+            )
+
+        found, _snippets = runtime.workflow._run_file_search(
+            "marker older corpus",
+            8,
+            conversation_id=conversation_id,
+            context_id=target,
+            user_id=user_id,
+            tenant_id=None,
+        )
+        assert "THE MARKER IN THE OLDER CORPUS" in found, (
+            "a context the request already validated by id was dropped from "
+            "retrieval because it was not on the first page of a listing"
+        )
+
+    def test_another_users_context_is_still_refused(self, client):
+        """The identity lookup must not become a way past ownership."""
+        runtime = get_runtime()
+        mine_id, my_headers = _account(client)
+        _theirs, their_headers = _account(client)
+        theirs = _context(client, their_headers)
+        assert _upload(
+            client, their_headers, "private.md",
+            b"# private\nANOTHER ACCOUNTS CORPUS\n" * 12, theirs,
+        ).status_code == 200
+
+        resp = client.post(
+            "/v1/conversations", headers=my_headers, json={"title": _unique("chat")}
+        )
+        conversation_id = resp.json()["data"]["id"]
+
+        found, _snippets = runtime.workflow._run_file_search(
+            "another accounts corpus",
+            8,
+            conversation_id=conversation_id,
+            context_id=theirs,
+            user_id=mine_id,
+            tenant_id=None,
+        )
+        assert "ANOTHER ACCOUNTS CORPUS" not in found, found[:160]
+
+    def test_a_conversations_index_is_still_refused(self, client):
+        """And the 2E.6 rule survives the change of primitive."""
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        first = client.post(
+            "/v1/conversations", headers=headers, json={"title": _unique("chat")}
+        ).json()["data"]["id"]
+        second = client.post(
+            "/v1/conversations", headers=headers, json={"title": _unique("chat")}
+        ).json()["data"]["id"]
+        assert client.post(
+            "/v1/files/upload",
+            headers={**headers, "Idempotency-Key": _unique("k")},
+            files={
+                "file": (
+                    "held.md", b"# held\nTHE FIRST CHATS TEXT\n" * 800, "text/markdown"
+                )
+            },
+            data={"conversation_id": first},
+        ).status_code == 200
+        from liminallm.service.attachments import find_conversation_context_id
+
+        auto_ctx = find_conversation_context_id(
+            runtime.store, user_id=user_id, conversation_id=first
+        )
+        found, _snippets = runtime.workflow._run_file_search(
+            "the first chats text",
+            8,
+            conversation_id=second,
+            context_id=auto_ctx,
+            user_id=user_id,
+            tenant_id=None,
+        )
+        assert "THE FIRST CHATS TEXT" not in found, found[:160]
+
+
+class TestALoadBearingIndexIsVerifiedAtStartup:
+    """`ON CONFLICT DO NOTHING` needs a conflict to detect.
+
+    `get_or_create_conversation_attachment_context` is correct only while the
+    partial unique index exists. An install that deploys the code without
+    successfully applying the schema boots clean, and the insert then has no
+    constraint to collide with — the duplicate-context race is back, silently.
+
+    This codebase already settled the principle for `content_tsv`: code can
+    be newer than the database, so a load-bearing schema feature is checked
+    at startup and the operator is told which script to run.
+    """
+
+    def test_startup_refuses_a_database_without_the_uniqueness_rule(self, client):
+        import os
+
+        import pytest as _pytest
+
+        from liminallm.storage.postgres import PostgresStore
+        from tests.harness import apply_schema
+
+        runtime = get_runtime()
+        url = os.environ["DATABASE_URL"]
+        with runtime.store._connect() as conn:
+            conn.execute(
+                "DROP INDEX IF EXISTS knowledge_context_auto_conversation_idx"
+            )
+        try:
+            with _pytest.raises(RuntimeError) as caught:
+                PostgresStore(url, fs_root=str(runtime.settings.shared_fs_root))
+            message = str(caught.value)
+            assert "migrate" in message.lower(), message
+        finally:
+            apply_schema(url, embedding_dim=64)
+
+        # And the repaired database starts normally again.
+        PostgresStore(url, fs_root=str(runtime.settings.shared_fs_root))

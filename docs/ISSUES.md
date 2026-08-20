@@ -8909,3 +8909,75 @@ commands would have been measured against. It was caught by checking the tree
 rather than by trusting the harness, and repaired by reversing the edit in
 place — never by `git checkout`, which would have discarded the whole
 uncommitted tranche. Mutations are run one at a time now, with room to finish.
+
+## Tranche 2E.7: identity is never a page
+
+2E.6 stopped using a listing to find a conversation's implicit index. The same
+primitive was still answering two other questions it cannot answer.
+
+### MEDIUM: ordinary contexts were authorized by page
+
+`_validate_context_scope` built its owned set from `list_contexts`, which
+defaults to one 100-row page and really does `LIMIT` it in SQL. So a context
+the request had already validated by direct id lookup — accepted, recorded on
+the conversation, in use — dropped out of retrieval as soon as the account had
+a hundred newer contexts. The turn succeeded and the model was given no
+grounding at all, which is the worst shape a failure can take: nothing to see
+in any status code.
+
+`get_contexts_for_scope` asks about the ids in question, in one statement, and
+excludes implicit indexes there rather than in Python. An authorization
+decision is a question about particular identities; it should never be
+answered by asking whether they are near the top of a list.
+
+### MEDIUM: the duplicate repair could leave one generation twice
+
+The 2E.6 migration moved the losers' chunks to the winner and stopped there.
+Two concurrent first attachments of *one file* produce a stronger state than
+the test built: the second attachment is a disk dedupe hit, so both contexts
+index the same generation, and moving the rows leaves the winner holding two
+copies of every chunk of it. There is no uniqueness on
+`(context_id, fs_path, chunk_index)` to prevent that.
+
+That satisfies "one implicit context" while breaking the invariant
+`_commit_generation` is built on — one `fs_path` is one complete current
+generation — because the merge bypasses `replace_chunks_for_path`. The copies
+also spend candidate slots belonging to other attachments. The repair now
+collapses duplicates by `(fs_path, chunk_index)` after moving them, keeping
+the lowest id; segment vectors cascade with the rows removed.
+
+The earlier test passed because it gave the winner and the loser different
+paths. It builds the shared-generation case now.
+
+### MEDIUM: the index the code depends on was not verified at startup
+
+`get_or_create_conversation_attachment_context` is correct only while the
+partial unique index exists: `ON CONFLICT DO NOTHING` needs a constraint to
+collide with. An install that deployed the code without successfully applying
+the schema booted clean, and the duplicate-context race was silently back.
+
+This codebase already settled that principle for `content_tsv` — code can be
+newer than the database, so a load-bearing schema feature is checked at
+startup and the operator is told which script to run. The index is checked by
+shape rather than by name, so an index that merely carries the name does not
+satisfy it.
+
+## Recorded, not fixed: the migration mechanism does not match the SPEC
+
+Canonical SPEC describes ordered `sql/*.sql` files applied by
+`scripts/migrate.sh`, a checksum ledger, and a fail-fast on mismatch. The
+repository has one aggregate `sql/schema.sql`, and `migrate.sh` says plainly
+that it is not a migration runner and keeps no history.
+
+This mattered less while the file was purely declarative. It matters now:
+`008_implicit_context_identity` is an upgrade-time data transformation, and
+the aggregate file re-executes that historical repair on every future run.
+A single idempotent file also cannot distinguish "not yet applied", "already
+applied exactly", and "a historical migration changed after it was applied".
+
+Reviewed and scheduled as its own tranche rather than settled by rewriting the
+SPEC to match the code. The shape agreed: keep `schema.sql` for fresh installs
+and tests, add immutable ordered migration files plus a ledger recording
+filename, checksum and applied-at, and have `migrate.sh` apply what is
+unapplied in order and refuse a checksum mismatch for a filename already
+applied.

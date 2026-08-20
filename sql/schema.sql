@@ -488,6 +488,21 @@ BEGIN
       AND owner_user_id = winner.owner_user_id
       AND meta ->> 'conversation_id' = winner.conversation_id
       AND id <> split_part(winner.oldest, '|', 2)::uuid;
+
+    -- Moving the rows is not enough. Both contexts could hold the *same*
+    -- generation — two concurrent first attachments of one file, where the
+    -- second was a disk dedupe hit into a context that was nonetheless new —
+    -- and the merge bypasses replace_chunks_for_path, which is what normally
+    -- keeps one fs_path meaning one complete current generation. Duplicate
+    -- copies also spend candidate slots that belong to other attachments.
+    -- Segment vectors cascade with the chunk rows removed here.
+    DELETE FROM knowledge_chunk kc
+    USING knowledge_chunk keep
+    WHERE kc.context_id = split_part(winner.oldest, '|', 2)::uuid
+      AND keep.context_id = kc.context_id
+      AND keep.fs_path IS NOT DISTINCT FROM kc.fs_path
+      AND keep.chunk_index = kc.chunk_index
+      AND keep.id < kc.id;
   END LOOP;
 END $$;
 

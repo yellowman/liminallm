@@ -2736,24 +2736,25 @@ class WorkflowEngine(WorkflowStreamingMixin):
             return None
 
         allowed: List[str] = []
-        owned = {ctx.id: ctx for ctx in self.store.list_contexts(owner_user_id=user_id)}
+        # Asked about these ids, not about the first page of this user's
+        # contexts. `list_contexts` pages at 100 rows in SQL, so authorizing
+        # through it dropped a context the request had already validated by
+        # id once the account had a hundred newer ones — the turn succeeded
+        # with no grounding at all.
+        #
+        # The query also excludes conversations' implicit indexes, which enter
+        # only through the conversation that owns them: §19.5 scopes an
+        # attachment to the chat that received it, and measured, a second
+        # chat named the first chat's index and read it.
+        owned = {
+            ctx.id: ctx
+            for ctx in self.store.get_contexts_for_scope(user_id, list(ctx_ids))
+        }
         for ctx_id in ctx_ids:
             ctx = owned.get(ctx_id)
             if not ctx:
-                continue
-            if attachments_service.is_auto_context(ctx):
-                # A conversation's implicit index enters only through the
-                # conversation that owns it. Ownership is not the boundary
-                # here: §19.5 scopes an attachment to the chat that received
-                # it, and every other rule about these contexts keys on the
-                # conversation. Measured, a second chat named the first
-                # chat's index and read it, with the generation filtering
-                # never applied because that filtering keys on the current
-                # conversation's contexts.
                 self.logger.warning(
-                    "context_scope_auto_context_refused",
-                    context_id=ctx_id,
-                    user_id=user_id,
+                    "context_scope_refused", context_id=ctx_id, user_id=user_id
                 )
                 continue
             if tenant_id:

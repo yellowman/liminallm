@@ -441,6 +441,37 @@ class PostgresStore:
                     "the SPEC §2.5 schema."
                 )
 
+            # `get_or_create_conversation_attachment_context` is correct only
+            # while this index exists: its `ON CONFLICT DO NOTHING` needs a
+            # constraint to collide with, and without one two concurrent first
+            # attachments each insert an index for the same conversation —
+            # leaving an acknowledged attachment somewhere no lookup returns.
+            # Same reasoning as `content_tsv` above: code can be newer than
+            # the database, so a load-bearing schema feature is checked where
+            # the message can name the fix.
+            #
+            # Checked by shape rather than by name, so an index that happens
+            # to carry the name without the predicate does not satisfy it.
+            uniqueness = conn.execute(
+                """
+                SELECT 1 FROM pg_index i
+                JOIN pg_class c ON c.oid = i.indexrelid
+                WHERE i.indrelid = 'knowledge_context'::regclass
+                  AND i.indisunique
+                  AND pg_get_expr(i.indpred, i.indrelid) IS NOT NULL
+                  AND pg_get_indexdef(i.indexrelid) LIKE %s
+                  AND pg_get_expr(i.indpred, i.indrelid) LIKE %s
+                """,
+                ("%conversation_id%", "%auto%"),
+            ).fetchone()
+            if not uniqueness:
+                raise RuntimeError(
+                    "the unique index making one conversation have one implicit "
+                    "attachment context is missing, so concurrent attachments can "
+                    "create two and one of them becomes unreachable. Rerun "
+                    "scripts/migrate.sh to apply the SPEC §19.5 schema."
+                )
+
             vector_ext = conn.execute(
                 "SELECT extname FROM pg_extension WHERE extname = 'vector'"
             ).fetchone()
@@ -3412,6 +3443,33 @@ class PostgresStore:
                 (owner_user_id, str(conversation_id)),
             ).fetchone()
         return self._context_from_row(row) if row else None
+
+    def get_contexts_for_scope(
+        self, owner_user_id: str, context_ids: Sequence[str]
+    ) -> List[KnowledgeContext]:
+        """The named contexts this user owns, by identity rather than by page.
+
+        Authorization is a question about particular ids, and answering it
+        with `list_contexts` answered a different one: whether those ids are
+        near the top of a listing. That listing pages at 100 rows in SQL, so
+        a context the request had already validated by direct lookup dropped
+        out of retrieval once the account had a hundred newer ones — the turn
+        succeeded and the model was given no grounding.
+
+        Implicit conversation indexes are excluded here as everywhere else:
+        they are reachable only through the conversation that owns them.
+        """
+        wanted = [ctx_id for ctx_id in context_ids or [] if _is_uuid(ctx_id)]
+        if not wanted or not _is_uuid(owner_user_id):
+            return []
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM knowledge_context "
+                "WHERE owner_user_id = %s AND id = ANY(%s::uuid[]) "
+                "AND COALESCE((meta ->> 'auto')::boolean, false) IS FALSE",
+                (owner_user_id, wanted),
+            ).fetchall()
+        return [self._context_from_row(row) for row in rows]
 
     def get_or_create_conversation_attachment_context(
         self, owner_user_id: str, conversation_id: str, name: str, description: str
