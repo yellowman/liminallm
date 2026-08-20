@@ -74,6 +74,7 @@ from liminallm.api.schemas import (
     ConversationListResponse,
     ConversationMessagesResponse,
     ConversationShareRequest,
+    ConversationUpdateRequest,
     ConversationSummary,
     CreateConversationRequest,
     CreateConversationResponse,
@@ -267,7 +268,7 @@ def _get_owned_context(
 ) -> KnowledgeContext:
     """A context this caller may name, or an error.
 
-    A conversation's implicit index is never one of them. `meta.auto` is
+    A conversation's implicit index is never one of them. Being one is
     load-bearing — the stale-generation sweep skips these contexts, and
     retrieval from them is filtered to what the conversation's records still
     name — and both of those key on the conversation, not on the context. So
@@ -4659,6 +4660,86 @@ async def get_conversation(
             source=(conversation.meta or {}).get("source") or "chat",
         ),
     )
+
+
+@router.patch(
+    "/conversations/{conversation_id}", response_model=Envelope, tags=["conversations"]
+)
+async def update_conversation(
+    body: ConversationUpdateRequest,
+    conversation_id: str = Path(..., max_length=255, description="Conversation identifier"),
+    principal: AuthContext = Depends(get_user),
+):
+    """Rename or archive a conversation. Owner-only.
+
+    Only `title` and `status` are editable here; the request model forbids
+    anything else rather than ignoring it, so a caller sending `meta` or
+    `active_context_id` is told they were refused instead of being told their
+    edit succeeded when it silently did not.
+    """
+    runtime = get_runtime()
+    await rate_limit(runtime, "write", principal.user_id)
+    _get_owned_conversation(runtime, conversation_id, principal)
+    conversation = runtime.store.update_conversation(
+        conversation_id,
+        user_id=principal.user_id,
+        title=body.title,
+        status=body.status,
+    )
+    if not conversation:
+        raise NotFoundError(
+            "conversation not found", detail={"conversation_id": conversation_id}
+        )
+    return Envelope(
+        status="ok",
+        data=ConversationSummary(
+            id=conversation.id,
+            created_at=conversation.created_at,
+            updated_at=conversation.updated_at,
+            title=conversation.title,
+            status=conversation.status,
+            active_context_id=conversation.active_context_id,
+            public=bool((conversation.meta or {}).get("public")),
+            source=(conversation.meta or {}).get("source") or "chat",
+        ),
+    )
+
+
+@router.delete(
+    "/conversations/{conversation_id}", response_model=Envelope, tags=["conversations"]
+)
+async def delete_conversation(
+    conversation_id: str = Path(..., max_length=255, description="Conversation identifier"),
+    principal: AuthContext = Depends(get_user),
+):
+    """Delete a conversation and everything scoped to it. Owner-only.
+
+    That includes the chat's messages and its implicit attachment index, whose
+    chunks hold the text of files attached to this chat and nowhere else
+    (SPEC §19.5). The index is removed by the cascading foreign key on
+    `knowledge_context.conversation_id`, in the same transaction.
+
+    The stored file objects are not unlinked here. They are content-addressed
+    and another conversation may name the same checksum, so releasing them is
+    left to the sweep, which reclaims what no conversation references any
+    more.
+    """
+    runtime = get_runtime()
+    await rate_limit(runtime, "write", principal.user_id)
+    _get_owned_conversation(runtime, conversation_id, principal)
+    deleted = runtime.store.delete_conversation(
+        conversation_id, user_id=principal.user_id
+    )
+    if not deleted:
+        raise NotFoundError(
+            "conversation not found", detail={"conversation_id": conversation_id}
+        )
+    logger.info(
+        "conversation_deleted",
+        user_id=principal.user_id,
+        conversation_id=conversation_id,
+    )
+    return Envelope(status="ok", data={"deleted": True})
 
 
 @router.post(

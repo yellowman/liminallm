@@ -155,9 +155,10 @@ in the admin console at `/` after signing in as an admin. `JWT_SECRET` is
 generated on first boot if unset.
 
 `EMBEDDING_VECTOR_DIM` sets the width of the vector columns, and that width is
-fixed when the schema is first created. Re-running `scripts/migrate.sh` does
-not change it: every statement in `sql/schema.sql` is `CREATE TABLE IF NOT
-EXISTS`, so an existing table is left as it is.
+fixed when the schema is first created. The width comes from the
+`CREATE TABLE IF NOT EXISTS` declaration that creates each vector column, so
+re-running `scripts/migrate.sh` cannot change it: the table already exists, the
+declaration is skipped, and the column keeps the type it was created with.
 
 To change the width on an existing database, you must drop and recreate the
 vector columns, then re-embed all stored content. The application compares the

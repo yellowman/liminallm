@@ -37,6 +37,7 @@ from liminallm.service.fs import (
     safe_join,
 )
 from liminallm.service.web import UNTRUSTED_CLOSE, UNTRUSTED_OPEN, neutralize_markers
+from liminallm.storage.errors import ConversationGone
 
 #: How much of a filename may reach the prompt. Long enough for real names,
 #: short enough that one cannot push the instructions out of a small window.
@@ -186,8 +187,11 @@ def store_generation(
 def ensure_conversation_context(store, *, user_id: str, conversation_id: str) -> Any:
     """Get (or create) the implicit knowledge context for a conversation.
 
-    Marked ``meta.auto`` and ``meta.conversation_id`` so the contexts UI can
-    filter it out — users never manage these directly.
+    Tied to the conversation by ``knowledge_context.conversation_id``, a
+    foreign key that cascades on delete: the index is part of the chat's
+    lifetime, not a row that happens to mention it. ``meta.auto`` and
+    ``meta.conversation_id`` are written alongside it as description, which
+    is what the contexts UI filters on — users never manage these directly.
 
     One per conversation, and the database is what makes that true. Looking
     first and inserting after is not a guard: §22 shares Postgres across
@@ -216,7 +220,17 @@ def find_conversation_context_id(store, *, user_id: str, conversation_id: str) -
 
 
 def is_auto_context(ctx: Any) -> bool:
-    """True for implicit per-conversation contexts (hidden from the UI)."""
+    """True for a conversation's implicit attachment index.
+
+    The foreign key is the authority: it is what the database enforces, what
+    cascades when the conversation is deleted, and what every exclusion
+    filter in the store keys on. `meta.auto` is checked too because it is
+    what older rows carry and what the UI reads, and because this guard
+    refuses access — a row that looks implicit by either account must not be
+    nameable as an ordinary context.
+    """
+    if getattr(ctx, "conversation_id", None):
+        return True
     return bool((getattr(ctx, "meta", None) or {}).get("auto"))
 
 
@@ -370,12 +384,25 @@ def record_attachment(
                 "paths_for": authorized_generation_keys,
                 "generation_prefix": GENERATION_KEY_PREFIX,
             }
-        return upsert(
-            conversation_id, user_id=user_id, record=record, **prune
-        ) or []
+        records = upsert(conversation_id, user_id=user_id, record=record, **prune)
+        if records is None:
+            # The store took the conversation's row lock and found no
+            # conversation. This used to become `[]`, which is
+            # indistinguishable from "recorded, and the list happens to be
+            # empty" — so the upload answered 200 for a chat that had been
+            # deleted while it worked, after indexing that file's text under
+            # an index the deletion could no longer reach.
+            raise ConversationGone(
+                "conversation deleted during upload",
+                {"conversation_id": str(conversation_id)},
+            )
+        return records
     conversation = store.get_conversation(conversation_id, user_id=user_id)
     if not conversation:
-        return []
+        raise ConversationGone(
+            "conversation deleted during upload",
+            {"conversation_id": str(conversation_id)},
+        )
     existing = [a for a in list_attachments(conversation) if a.get("name") != name]
     existing.append(record)
     store.merge_conversation_meta(

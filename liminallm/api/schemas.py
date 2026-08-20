@@ -668,6 +668,23 @@ class ConversationSummary(BaseModel):
     source: str = "chat"
 
 
+class ConversationUpdateRequest(BaseModel):
+    """The fields a user may edit on their own conversation.
+
+    Deliberately two. `meta` carries the public-share flag and the attachment
+    records, and `active_context_id` names a knowledge context whose ownership
+    is checked where contexts are chosen — so accepting either here would let
+    a rename request publish a chat, rewrite its attachment list, or point it
+    at a context the caller does not own. Sharing has its own endpoint that
+    says what it does.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    title: Optional[str] = Field(default=None, max_length=500)
+    status: Optional[Literal["open", "archived"]] = None
+
+
 class ConversationShareRequest(BaseModel):
     public: bool
 

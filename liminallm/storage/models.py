@@ -183,6 +183,11 @@ class KnowledgeContext:
     updated_at: datetime = field(default_factory=_utcnow)
     fs_path: Optional[str] = None
     meta: Dict | None = None
+    #: Set for a conversation's implicit attachment index, and the authority
+    #: on what that context is. `meta.auto` describes the same thing for the
+    #: UI, but only this is a foreign key: it cascades on delete and it is
+    #: what every exclusion filter keys on.
+    conversation_id: Optional[str] = None
 
 
 @dataclass

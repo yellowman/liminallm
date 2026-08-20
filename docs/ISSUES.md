@@ -9164,3 +9164,125 @@ been deployed, so a migration history would reconcile states no database had
 ever been in. That reasoning was sound when written; the error was leaving it
 in SPEC as a standing premise rather than recording it here as a decision made
 on the evidence available.
+
+## Tranche 2G.1: conversation lifetime owns chat-only state
+
+SPEC §12.3 gives users CRUD over their own conversations. SPEC §19.5 scopes a
+conversation attachment to "that chat only". The two meet at deletion, and
+deletion did not exist.
+
+### LOW: two comments explained a true rule with a false reason
+
+`INSTALL.md` and `scripts/migrate.sh` both said every statement in
+`sql/schema.sql` is `CREATE TABLE IF NOT EXISTS`. It is not: the file also has
+5 `ALTER TABLE`, 29 `CREATE INDEX`, and 3 `DO $$` blocks. The conclusion drawn
+from it was right and the reason was wrong, which is the shape that survives
+review longest. Both now say the specific true thing — a vector column's width
+comes from the `CREATE TABLE IF NOT EXISTS` that creates it, so re-running
+finds the table present, skips the declaration, and leaves the type alone —
+and the general rule stays where it belongs, as the repeat-safety requirement
+in the schema header.
+
+### HIGH: users could not delete or update a conversation
+
+The API had create, read, list, messages, attachments and share. There was no
+`PATCH /v1/conversations/{id}` and no `DELETE /v1/conversations/{id}`, so the
+canonical CRUD rule was unimplemented for the object the product is built
+around.
+
+Both are owner-only. PATCH takes `title` and `status` and nothing else: the
+request model forbids unknown fields rather than dropping them, because `meta`
+carries the public-share flag and the attachment records, and
+`active_context_id` names a context whose ownership is checked where contexts
+are chosen. Ignoring those silently would answer 200 to a request that did not
+happen. `status` is an enumeration, so free text is refused at the boundary.
+
+### HIGH: the deletion primitive left the chat's RAG state behind
+
+`delete_conversation` removed the conversation row and its messages. The
+implicit attachment index is a `knowledge_context` in a different table, and
+its tie to the chat lived only in `meta.conversation_id` — a JSON string that
+could not be enforced, could not cascade, and could not be joined on. Exposing
+the existing method would have produced:
+
+```text
+delete_conversation(C)
+  conversation C   -> gone
+  messages         -> gone
+  auto context CA  -> still present
+  chunks           -> still present, holding the attached file's text
+```
+
+which is the opposite of what §19.5 promises.
+
+### HIGH: an upload could outlive the conversation it belonged to
+
+The upload validates the conversation, then does seconds of file, hashing and
+indexing work, then persists the attachment record under the conversation's
+row lock. `upsert_conversation_attachment` already returned `None` when the
+conversation had disappeared, and `record_attachment` turned that into `[]` —
+indistinguishable from "recorded, and the list is empty" — so the route built
+a successful response and answered 200. The chat was gone; its index and
+chunks were not.
+
+All three are one fix. `knowledge_context.conversation_id` is now a real
+column, `REFERENCES conversation(id) ON DELETE CASCADE`, unique where it is not
+NULL. That makes PostgreSQL the arbiter rather than a cleanup pass:
+
+- deleting a conversation removes its index by cascade, and the chunks with
+  the index, in the same transaction;
+- an insert for a conversation deleted a moment earlier cannot satisfy its
+  reference, so the race has two outcomes and neither leaves an orphan;
+- the identity is the key, so `get_conversation_attachment_context` returns at
+  most one row without an ORDER BY to pick a winner from.
+
+`meta.auto` and `meta.conversation_id` remain as description for the UI. Every
+exclusion filter in the store, and the capability guard that stops one chat
+naming another chat's index, key on the column instead — a row can carry the
+relationship without the JSON, and under the old guard such a row was treated
+as an ordinary context.
+
+Content-addressed objects are deliberately not unlinked by the delete. Another
+conversation may name the same checksum, so they are released by the sweep once
+no conversation references them, which is the mark-and-sweep rule already in
+place.
+
+### The startup verification got smaller, not larger
+
+Checking the old JSON-expression index took three rounds, because "unique, two
+keys, owner first, mentions the right words" is satisfied by indexes that
+enforce nothing. A single key on a foreign-key column admits none of those:
+there is no expression to substitute and no room for an extra key. Two facts
+are checked now — the unique index, and that the foreign key cascades — and
+the second is what makes deletion complete.
+
+### Mutations
+
+Six, each killed by a named test.
+
+| Mutation | Killed by |
+|---|---|
+| implicit context inserted with no `conversation_id` (the pre-fix world) | deletion, both sweep tests, the searchable race |
+| `record_attachment` swallows the `None` again | the inline-attachment race |
+| `is_auto_context` asks `meta.auto` only | the guard test |
+| startup check drops `indisunique` | the non-unique index test |
+| startup check accepts any delete action | the cascade test |
+| foreign key becomes `ON DELETE SET NULL` | refused at startup before any test runs |
+
+Two of these are worth recording for how they failed first.
+
+The searchable-race red and the inline-race red look like duplicates and are
+not: the foreign key catches the first before the attachment record is
+reached, and only the inline path — a small text file, injected into the
+prompt rather than indexed, so no context is ever created — reaches the
+`None`. Removing the `None` guard leaves the searchable test green.
+
+The guard test passed against its own mutation at first. It asserted 404 from
+`GET /v1/contexts/{id}`, a route that does not exist, so every caller gets 404
+and the assertion proved nothing. It now reads the two routes that do exist and
+do call the guard, plus the upload path that names a context.
+
+The attachment fixtures had the same shape of error one layer down: the first
+bodies were a few dozen bytes, and a text file at or under `INLINE_MAX_BYTES`
+is inlined rather than indexed. Three tests were exercising a path that builds
+no implicit context at all.

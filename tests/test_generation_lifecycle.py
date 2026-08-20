@@ -2875,8 +2875,8 @@ class TestOneConversationHasOneImplicitContext:
             with runtime.store._connect() as conn:
                 conn.execute(
                     "INSERT INTO knowledge_context "
-                    "(id, owner_user_id, name, description, meta) "
-                    "VALUES (gen_random_uuid(), %s, %s, %s, %s::jsonb)",
+                    "(id, owner_user_id, name, description, meta, conversation_id) "
+                    "VALUES (gen_random_uuid(), %s, %s, %s, %s::jsonb, %s)",
                     (
                         user_id,
                         "a second index for one conversation",
@@ -2884,9 +2884,78 @@ class TestOneConversationHasOneImplicitContext:
                         json.dumps(
                             {"auto": True, "conversation_id": conversation_id}
                         ),
+                    conversation_id,
                     ),
                 )
         assert len(self._auto_contexts(runtime, user_id, conversation_id)) == 1
+
+    def test_the_relationship_is_a_key_not_a_string(self, client):
+        """`meta` is description; `conversation_id` is what anything relies on.
+
+        The two used to be the same fact stored once, in JSON, where it could
+        not be enforced and could not cascade. A row claiming a conversation
+        only in `meta` is now just a row: it constrains nothing, and no
+        lookup returns it.
+        """
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        assert self._attach(
+            client, headers, conversation_id, "one.md",
+            b"# one\nTHE ATTACHED TEXT\n" * 800,
+        ).status_code == 200
+
+        # Claiming the conversation in JSON alone is accepted by the index —
+        # it is not the key — and changes nothing about which context the
+        # conversation resolves to.
+        real = runtime.store.get_conversation_attachment_context(
+            user_id, conversation_id
+        )
+        with runtime.store._connect() as conn:
+            conn.execute(
+                "INSERT INTO knowledge_context "
+                "(id, owner_user_id, name, description, meta) "
+                "VALUES (gen_random_uuid(), %s, %s, %s, %s::jsonb)",
+                (
+                    user_id,
+                    "a pretender",
+                    "",
+                    json.dumps({"auto": True, "conversation_id": conversation_id}),
+                ),
+            )
+        again = runtime.store.get_conversation_attachment_context(
+            user_id, conversation_id
+        )
+        assert again is not None and again.id == real.id, (
+            "a row that only says it belongs to the conversation displaced "
+            "the one that does"
+        )
+
+    def test_the_index_dies_with_the_conversation(self, client):
+        """Foreign key, not bookkeeping: the cascade is the deletion."""
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        assert self._attach(
+            client, headers, conversation_id, "one.md",
+            b"# one\nTHE ATTACHED TEXT\n" * 800,
+        ).status_code == 200
+        context = runtime.store.get_conversation_attachment_context(
+            user_id, conversation_id
+        )
+        assert context is not None
+
+        with runtime.store._connect() as conn:
+            conn.execute(
+                "DELETE FROM conversation WHERE id = %s", (conversation_id,)
+            )
+            remaining = conn.execute(
+                "SELECT COUNT(*) AS n FROM knowledge_context WHERE id = %s",
+                (context.id,),
+            ).fetchone()
+        assert int(remaining["n"]) == 0, (
+            "deleting the conversation row left its implicit index behind"
+        )
 
     def test_existing_duplicates_are_merged_rather_than_dropped(self, client):
         """The migration has to cope with what earlier versions produced.
@@ -3248,68 +3317,76 @@ class TestAuthorizationIsNeverAPage:
 
 
 class TestALoadBearingIndexIsVerifiedAtStartup:
-    """`ON CONFLICT DO NOTHING` needs a conflict to detect.
+    """Two schema facts the code cannot work without, checked where it starts.
 
     `get_or_create_conversation_attachment_context` is correct only while the
-    partial unique index exists. An install that deploys the code without
-    successfully applying the schema boots clean, and the insert then has no
-    constraint to collide with — the duplicate-context race is back, silently.
+    unique index exists: `ON CONFLICT DO NOTHING` needs a conflict to detect,
+    and without one two concurrent first attachments each insert an index for
+    the same conversation. Deleting a conversation is complete only while the
+    foreign key cascades: without it the chat's implicit index and the text of
+    its attachments outlive the chat.
 
-    This codebase already settled the principle for `content_tsv`: code can
-    be newer than the database, so a load-bearing schema feature is checked
-    at startup and the operator is told which script to run.
+    An install that deploys the code without successfully applying the schema
+    boots clean under both faults and fails silently afterwards. This codebase
+    already settled the principle for `content_tsv`: code can be newer than
+    the database, so a load-bearing schema feature is checked at startup and
+    the operator is told which script to run.
+
+    These checks got much smaller when the relationship stopped being a JSON
+    expression. Verifying a unique index over `meta ->> 'conversation_id'`
+    took three rounds, because "unique, two keys, owner first, mentions the
+    right words" is satisfied by indexes that enforce nothing — an extra key
+    of `id`, the row id folded into the second key, a predicate of
+    `id IS NULL`. A single key on a foreign-key column admits none of them:
+    there is no expression to substitute and no room for an extra key.
     """
 
+    def _restore(self, url):
+        from tests.harness import apply_schema
+
+        apply_schema(url, embedding_dim=64)
+
     def test_startup_refuses_a_database_without_the_uniqueness_rule(self, client):
+        """No unique index means the duplicate-context race is back."""
         import os
 
         import pytest as _pytest
 
         from liminallm.storage.postgres import PostgresStore
-        from tests.harness import apply_schema
 
         runtime = get_runtime()
         url = os.environ["DATABASE_URL"]
         with runtime.store._connect() as conn:
-            conn.execute(
-                "DROP INDEX IF EXISTS knowledge_context_auto_conversation_idx"
-            )
+            conn.execute("DROP INDEX IF EXISTS knowledge_context_conversation_idx")
         try:
             with _pytest.raises(RuntimeError) as caught:
                 PostgresStore(url, fs_root=str(runtime.settings.shared_fs_root))
-            message = str(caught.value)
-            assert "migrate" in message.lower(), message
+            assert "migrate" in str(caught.value).lower(), str(caught.value)
         finally:
-            apply_schema(url, embedding_dim=64)
+            self._restore(url)
 
-        # And the repaired database starts normally again.
         PostgresStore(url, fs_root=str(runtime.settings.shared_fs_root))
 
-    def test_an_index_that_constrains_nothing_does_not_satisfy_the_check(self, client):
-        """Unique, partial, and mentioning the right words is not enough.
+    def test_a_non_unique_index_does_not_satisfy_the_check(self, client):
+        """An index of the right name and column, without the constraint.
 
-        An index keyed on `id` alongside the conversation is unique for free
-        — every row has a distinct id — so it constrains nothing beyond the
-        primary key and `ON CONFLICT DO NOTHING` still sees no conflict. A
-        check that only looks for the words in the definition accepts it.
+        This is what a hand-repaired database looks like: something named the
+        column, so the schema appears to describe the relationship, but
+        nothing refuses the second row.
         """
         import os
 
         import pytest as _pytest
 
         from liminallm.storage.postgres import PostgresStore
-        from tests.harness import apply_schema
 
         runtime = get_runtime()
         url = os.environ["DATABASE_URL"]
         with runtime.store._connect() as conn:
+            conn.execute("DROP INDEX IF EXISTS knowledge_context_conversation_idx")
             conn.execute(
-                "DROP INDEX IF EXISTS knowledge_context_auto_conversation_idx"
-            )
-            conn.execute(
-                "CREATE UNIQUE INDEX bogus_auto_context_index "
-                "ON knowledge_context (id, ((meta ->> 'conversation_id'))) "
-                "WHERE COALESCE((meta ->> 'auto')::boolean, false)"
+                "CREATE INDEX knowledge_context_conversation_idx "
+                "ON knowledge_context (conversation_id)"
             )
         try:
             with _pytest.raises(RuntimeError) as caught:
@@ -3317,60 +3394,56 @@ class TestALoadBearingIndexIsVerifiedAtStartup:
             assert "migrate" in str(caught.value).lower(), str(caught.value)
         finally:
             with runtime.store._connect() as conn:
-                conn.execute("DROP INDEX IF EXISTS bogus_auto_context_index")
-            apply_schema(url, embedding_dim=64)
+                conn.execute(
+                    "DROP INDEX IF EXISTS knowledge_context_conversation_idx"
+                )
+            self._restore(url)
 
-    @pytest.mark.parametrize(
-        "name, ddl, why",
-        [
-            (
-                "predicate_nulls_out_every_row",
-                "CREATE UNIQUE INDEX bogus_auto_context_index "
-                "ON knowledge_context (owner_user_id, (meta ->> 'conversation_id')) "
-                "WHERE COALESCE((meta ->> 'auto')::boolean, false) AND id IS NULL",
-                "id is the primary key and is never NULL, so this index covers "
-                "zero rows and enforces nothing at all",
-            ),
-            (
-                "second_key_carries_the_row_id",
-                "CREATE UNIQUE INDEX bogus_auto_context_index "
-                "ON knowledge_context "
-                "(owner_user_id, ((meta ->> 'conversation_id') || ':' || id::text)) "
-                "WHERE COALESCE((meta ->> 'auto')::boolean, false)",
-                "folding the row id into the second key makes every entry "
-                "distinct, so uniqueness is free and constrains nothing",
-            ),
-        ],
-    )
-    def test_an_index_that_enforces_nothing_does_not_satisfy_the_check(
-        self, client, name, ddl, why
-    ):
-        """Both keys and the whole predicate are checked, not sampled.
+    def test_startup_refuses_a_foreign_key_that_does_not_cascade(self, client):
+        """A reference that does not cascade is not a lifetime.
 
-        The constraint that has to hold is exactly one thing: for every auto
-        context, `(owner_user_id, conversation_id)` is unique. Each index here
-        is unique, has two keys, and starts with `owner_user_id`; each defeats
-        the constraint by changing one field the previous check only pattern
-        matched. Substring tests cannot tell them apart from the real one, so
-        the second key and the predicate are compared whole.
+        `ON DELETE SET NULL` still refuses an insert for a conversation that
+        does not exist, so the upload race stays closed and the fault is
+        invisible from that side. What it stops doing is deleting: the index
+        survives its conversation with the chat's file text still in it, and
+        the NULL makes the row unreachable rather than absent.
         """
         import os
 
         import pytest as _pytest
 
         from liminallm.storage.postgres import PostgresStore
-        from tests.harness import apply_schema
 
         runtime = get_runtime()
         url = os.environ["DATABASE_URL"]
         with runtime.store._connect() as conn:
-            conn.execute("DROP INDEX IF EXISTS knowledge_context_auto_conversation_idx")
-            conn.execute(ddl)
+            conn.execute(
+                "ALTER TABLE knowledge_context "
+                "DROP CONSTRAINT knowledge_context_conversation_id_fkey"
+            )
+            conn.execute(
+                "ALTER TABLE knowledge_context "
+                "ADD CONSTRAINT knowledge_context_conversation_id_fkey "
+                "FOREIGN KEY (conversation_id) REFERENCES conversation(id) "
+                "ON DELETE SET NULL"
+            )
         try:
             with _pytest.raises(RuntimeError) as caught:
                 PostgresStore(url, fs_root=str(runtime.settings.shared_fs_root))
-            assert "migrate" in str(caught.value).lower(), f"{name}: {why}"
+            message = str(caught.value)
+            assert "cascade" in message.lower(), message
+            assert "migrate" in message.lower(), message
         finally:
             with runtime.store._connect() as conn:
-                conn.execute("DROP INDEX IF EXISTS bogus_auto_context_index")
-            apply_schema(url, embedding_dim=64)
+                conn.execute(
+                    "ALTER TABLE knowledge_context "
+                    "DROP CONSTRAINT knowledge_context_conversation_id_fkey"
+                )
+                conn.execute(
+                    "ALTER TABLE knowledge_context "
+                    "ADD CONSTRAINT knowledge_context_conversation_id_fkey "
+                    "FOREIGN KEY (conversation_id) REFERENCES conversation(id) "
+                    "ON DELETE CASCADE"
+                )
+
+        PostgresStore(url, fs_root=str(runtime.settings.shared_fs_root))

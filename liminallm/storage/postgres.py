@@ -60,7 +60,7 @@ from liminallm.storage.cursors import (
     decode_index_cursor,
     decode_time_id_cursor,
 )
-from liminallm.storage.errors import ConstraintViolation
+from liminallm.storage.errors import ConstraintViolation, ConversationGone
 from liminallm.storage.models import (
     AdapterRouterState,
     ApiKey,
@@ -450,46 +450,58 @@ class PostgresStore:
             # the database, so a load-bearing schema feature is checked where
             # the message can name the fix.
             #
-            # The property that has to hold is one sentence: for every auto
-            # context, `(owner_user_id, conversation_id)` is unique. Nothing
-            # weaker is worth checking, because every weaker check has a
-            # counterexample that enforces nothing:
+            # The property that has to hold is one sentence: a conversation
+            # has at most one implicit attachment context. It is now a unique
+            # index on a real column, so the check is a question about that
+            # column rather than about the shape of a JSON expression.
             #
-            #   * keyed `(id, conversation_id)` — unique for free, every row
-            #     has a distinct id;
-            #   * keyed `(owner_user_id, conversation_id || ':' || id)` — the
-            #     same trick moved inside the second key;
-            #   * predicate `... AND id IS NULL` — a primary key is never
-            #     NULL, so the index covers no rows at all.
-            #
-            # Each is unique, two-keyed, owner-first, and mentions the right
-            # words. `ON CONFLICT DO NOTHING` would find no conflict under any
-            # of them. So both key expressions and the whole predicate are
-            # compared to the catalog's own normalized rendering of the index
-            # in sql/schema.sql — verified against PostgreSQL 16. A future
-            # release that renders them differently fails this check, which
-            # costs a false alarm that names the fix; the alternative is a
-            # substring test that a nonexistent constraint can satisfy.
+            # This used to introspect an index over `meta ->> 'conversation_id'`
+            # with an `auto` predicate, and each successive tightening was
+            # answering a counterexample: keyed on `id` alongside the
+            # conversation, or with the row id folded into the second key, or
+            # with a predicate that matched no rows — each unique, each
+            # enforcing nothing. A single key on a foreign-key column admits
+            # none of those, because there is no expression to substitute and
+            # no room for an extra key.
             uniqueness = conn.execute(
                 """
                 SELECT 1 FROM pg_index i
                 WHERE i.indrelid = 'knowledge_context'::regclass
                   AND i.indisunique
-                  AND i.indnkeyatts = 2
-                  AND pg_get_indexdef(i.indexrelid, 1, true) = 'owner_user_id'
-                  AND pg_get_indexdef(i.indexrelid, 2, true) = %s
-                  AND pg_get_expr(i.indpred, i.indrelid) = %s
-                """,
-                (
-                    "(meta ->> 'conversation_id'::text)",
-                    "COALESCE(((meta ->> 'auto'::text))::boolean, false)",
-                ),
+                  AND i.indnkeyatts = 1
+                  AND pg_get_indexdef(i.indexrelid, 1, true) = 'conversation_id'
+                """
             ).fetchone()
             if not uniqueness:
                 raise RuntimeError(
                     "the unique index making one conversation have one implicit "
                     "attachment context is missing, so concurrent attachments can "
                     "create two and one of them becomes unreachable. Rerun "
+                    "scripts/migrate.sh to apply the SPEC §19.5 schema."
+                )
+
+            # The other half of the same invariant, and the one that makes
+            # deletion complete: without the cascading foreign key an implicit
+            # context outlives the conversation it belongs to, keeping the
+            # text of that chat's attachments indexed after the chat is gone.
+            lifetime = conn.execute(
+                """
+                SELECT 1 FROM pg_constraint c
+                JOIN pg_attribute a
+                  ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+                WHERE c.conrelid = 'knowledge_context'::regclass
+                  AND c.contype = 'f'
+                  AND c.confrelid = 'conversation'::regclass
+                  AND c.confdeltype = 'c'
+                  AND array_length(c.conkey, 1) = 1
+                  AND a.attname = 'conversation_id'
+                """
+            ).fetchone()
+            if not lifetime:
+                raise RuntimeError(
+                    "knowledge_context.conversation_id is not a foreign key that "
+                    "cascades on delete, so deleting a conversation leaves its "
+                    "attachment index and that chat's file text behind. Rerun "
                     "scripts/migrate.sh to apply the SPEC §19.5 schema."
                 )
 
@@ -2049,6 +2061,43 @@ class PostgresStore:
             ).fetchone()
         return self.get_conversation(conversation_id) if row else None
 
+    def update_conversation(
+        self,
+        conversation_id: str,
+        *,
+        user_id: str,
+        title: Optional[str] = None,
+        status: Optional[str] = None,
+    ) -> Optional[Conversation]:
+        """Edit the user-editable fields of a conversation; owner-only.
+
+        Only the fields the caller supplied are written, so a PATCH carrying
+        one of them does not blank the other. Nothing else is reachable from
+        here: `meta` and `active_context_id` have their own paths with their
+        own checks, and a general column setter would make this the way
+        around them.
+        """
+        assignments = []
+        params: list[Any] = []
+        if title is not None:
+            assignments.append("title = %s")
+            params.append(title)
+        if status is not None:
+            assignments.append("status = %s")
+            params.append(status)
+        if not assignments:
+            return self.get_conversation(conversation_id, user_id=user_id)
+
+        assignments.append("updated_at = %s")
+        params.extend([datetime.now(timezone.utc), conversation_id, user_id])
+        with self._connect() as conn:
+            row = conn.execute(
+                f"UPDATE conversation SET {', '.join(assignments)} "
+                "WHERE id = %s AND user_id = %s RETURNING id",
+                tuple(params),
+            ).fetchone()
+        return self.get_conversation(conversation_id) if row else None
+
     def update_message_meta(
         self, message_id: str, *, user_id: str, patch: dict
     ) -> Optional[Any]:
@@ -2201,7 +2250,23 @@ class PostgresStore:
     def delete_conversation(
         self, conversation_id: str, *, user_id: Optional[str] = None
     ) -> bool:
-        """Delete a conversation and its messages atomically."""
+        """Delete a conversation and everything scoped to it, atomically.
+
+        "Everything scoped to it" is wider than the conversation row. The
+        implicit attachment index is a `knowledge_context` in another table,
+        and it used to survive this call — leaving the text of files attached
+        to a deleted chat indexed and searchable, which is the opposite of
+        what SPEC §19.5 promises by scoping an attachment to that chat.
+
+        Nothing here deletes it. `knowledge_context.conversation_id` is a
+        foreign key with `ON DELETE CASCADE`, so the context goes with the
+        conversation and its chunks go with the context. That is deliberate:
+        a cascade also covers the rows this method never learns about, and it
+        cannot be raced by an upload that creates the index a moment after a
+        cleanup statement would have run.
+        """
+        if not _is_uuid(conversation_id):
+            return False
 
         with self._connect() as conn, conn.transaction():
             params: list[Any] = [conversation_id]
@@ -3451,16 +3516,17 @@ class PostgresStore:
         the page holds lost an older conversation's index entirely, and the
         conversation's own attachments stopped being searchable while their
         records and objects were still perfectly intact.
+
+        The relationship is a foreign key, so it is also the row's identity:
+        the unique index on `conversation_id` means this returns at most one
+        row without an ORDER BY to pick a winner from.
         """
-        if not _is_uuid(owner_user_id):
+        if not _is_uuid(owner_user_id) or not _is_uuid(conversation_id):
             return None
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM knowledge_context "
-                "WHERE owner_user_id = %s "
-                "AND COALESCE((meta ->> 'auto')::boolean, false) "
-                "AND meta ->> 'conversation_id' = %s "
-                "ORDER BY created_at ASC, id ASC LIMIT 1",
+                "WHERE owner_user_id = %s AND conversation_id = %s",
                 (owner_user_id, str(conversation_id)),
             ).fetchone()
         return self._context_from_row(row) if row else None
@@ -3487,7 +3553,7 @@ class PostgresStore:
             rows = conn.execute(
                 "SELECT * FROM knowledge_context "
                 "WHERE owner_user_id = %s AND id = ANY(%s::uuid[]) "
-                "AND COALESCE((meta ->> 'auto')::boolean, false) IS FALSE",
+                "AND conversation_id IS NULL",
                 (owner_user_id, wanted),
             ).fetchall()
         return [self._context_from_row(row) for row in rows]
@@ -3504,32 +3570,55 @@ class PostgresStore:
         contexts and one of the two acknowledged attachments was searchable
         from neither, because the later lookup returns one row.
 
-        The database decides. `ON CONFLICT DO NOTHING` against the partial
-        unique index means the loser inserts nothing and then reads the
-        winner, so every caller comes back with the same context.
+        The database decides. `ON CONFLICT DO NOTHING` against the unique
+        index means the loser inserts nothing and then reads the winner, so
+        every caller comes back with the same context.
+
+        The same insert is what makes the context's lifetime the
+        conversation's. `conversation_id` is a foreign key, so a conversation
+        deleted between this caller validating it and reaching here fails the
+        insert instead of leaving an index behind for a chat that is gone.
+        Postgres serializes that; nothing here has to detect it.
         """
+        if not _is_uuid(conversation_id):
+            raise ConstraintViolation(
+                "conversation not found", {"conversation_id": conversation_id}
+            )
         existing = self.get_conversation_attachment_context(
             owner_user_id, conversation_id
         )
         if existing is not None:
             return existing
+        # Kept as description for the UI and for anything reading contexts
+        # generically. The relationship it used to carry now lives in the
+        # column, which is the only copy anything depends on.
         meta = {"auto": True, "conversation_id": str(conversation_id)}
         ctx_id = str(uuid.uuid4())
         try:
             with self._connect() as conn:
                 conn.execute(
                     "INSERT INTO knowledge_context "
-                    "(id, owner_user_id, name, description, meta) "
-                    "VALUES (%s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
+                    "(id, owner_user_id, name, description, meta, conversation_id) "
+                    "VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING",
                     (
                         ctx_id,
                         owner_user_id,
                         name,
                         description,
                         self._json_param(meta),
+                        str(conversation_id),
                     ),
                 )
-        except errors.ForeignKeyViolation:
+        except errors.ForeignKeyViolation as exc:
+            # Two references, and they fail differently: the owner going away
+            # is an account teardown, the conversation going away is the race
+            # this key exists to lose safely. Naming the wrong one would send
+            # the caller looking in the wrong place.
+            if "conversation" in str(exc):
+                raise ConversationGone(
+                    "conversation deleted during upload",
+                    {"conversation_id": str(conversation_id)},
+                )
             raise ConstraintViolation(
                 "context owner missing", {"owner_user_id": owner_user_id}
             )
@@ -3592,6 +3681,9 @@ class PostgresStore:
             updated_at=row["updated_at"],
             fs_path=row.get("fs_path"),
             meta=row.get("meta"),
+            conversation_id=(
+                str(row["conversation_id"]) if row.get("conversation_id") else None
+            ),
         )
 
     def get_context(self, context_id: str) -> Optional[KnowledgeContext]:
@@ -3643,7 +3735,7 @@ class PostgresStore:
         auto_filter = (
             ""
             if include_auto
-            else " AND COALESCE((meta ->> 'auto')::boolean, false) IS FALSE"
+            else " AND conversation_id IS NULL"
         )
         with self._connect() as conn:
             query = (
@@ -3907,11 +3999,11 @@ class PostgresStore:
         `keep_context_id` is the context about to receive the new generation.
         Everything else the caller owns is emptied for this path.
 
-        Contexts marked ``meta.auto`` are conversations' implicit indexes and
-        are left alone. §19.5 scopes an attachment to the chat that received
-        it, so another chat's upload of the same filename must not reach into
-        one — removing its chunks would be one chat changing another chat's
-        state as much as replacing them would.
+        Contexts with a ``conversation_id`` are conversations' implicit
+        indexes and are left alone. §19.5 scopes an attachment to the chat
+        that received it, so another chat's upload of the same filename must
+        not reach into one — removing its chunks would be one chat changing
+        another chat's state as much as replacing them would.
         """
         with self._connect() as conn:
             cursor = conn.execute(
@@ -3919,7 +4011,7 @@ class PostgresStore:
                 "WHERE kc.context_id = ctx.id AND ctx.owner_user_id = %s "
                 "AND kc.fs_path = %s "
                 "AND (%s::uuid IS NULL OR ctx.id <> %s::uuid) "
-                "AND COALESCE((ctx.meta ->> 'auto')::boolean, false) IS FALSE",
+                "AND ctx.conversation_id IS NULL",
                 (owner_user_id, fs_path, keep_context_id, keep_context_id),
             )
             return cursor.rowcount or 0

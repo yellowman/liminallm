@@ -514,3 +514,55 @@ END $$;
 CREATE UNIQUE INDEX IF NOT EXISTS knowledge_context_auto_conversation_idx
   ON knowledge_context (owner_user_id, (meta ->> 'conversation_id'))
   WHERE COALESCE((meta ->> 'auto')::boolean, false);
+
+
+-- A conversation's implicit attachment index belongs to that conversation's
+-- lifetime, and that relationship is relational state rather than a string in
+-- JSON. `meta.conversation_id` could not be enforced, could not cascade, and
+-- could not serialize against a deletion: an upload that validated the chat,
+-- did its work, and inserted afterwards left an index behind for a chat that
+-- had been deleted in between, with the attached file's text still in it.
+--
+-- The foreign key makes PostgreSQL the arbiter of that race. Either the
+-- insert commits while the conversation exists and the later delete cascades
+-- it away, or the delete commits first and the insert cannot satisfy its
+-- reference. There is no third outcome and no cleanup pass to get right.
+ALTER TABLE knowledge_context
+  ADD COLUMN IF NOT EXISTS conversation_id UUID
+  REFERENCES conversation(id) ON DELETE CASCADE;
+
+-- Adopt the contexts that already carry the relationship in JSON. Guarded on
+-- the text being a UUID and on the conversation existing, so this is safe to
+-- run against any state, and it does nothing once every row is adopted.
+UPDATE knowledge_context kc
+SET conversation_id = (kc.meta ->> 'conversation_id')::uuid
+WHERE kc.conversation_id IS NULL
+  AND COALESCE((kc.meta ->> 'auto')::boolean, false)
+  AND kc.meta ->> 'conversation_id' ~*
+      '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+  AND EXISTS (
+    SELECT 1 FROM conversation c
+    WHERE c.id = (kc.meta ->> 'conversation_id')::uuid
+  );
+
+-- What the previous deletion path left behind. An implicit context whose
+-- conversation is gone is unreachable — every lookup goes through the
+-- conversation — while its chunks still hold the text of files attached to
+-- that chat and still spend candidate slots belonging to other attachments.
+-- Chunks and segment vectors cascade with the context rows.
+DELETE FROM knowledge_context kc
+WHERE kc.conversation_id IS NULL
+  AND COALESCE((kc.meta ->> 'auto')::boolean, false)
+  AND kc.meta ->> 'conversation_id' IS NOT NULL;
+
+-- One conversation, one implicit index. Keyed on the real identity, so no
+-- expression can be substituted for it and no extra key can make it unique
+-- for free. Ordinary contexts have a NULL conversation_id and are unaffected.
+DROP INDEX IF EXISTS knowledge_context_auto_conversation_idx;
+CREATE UNIQUE INDEX IF NOT EXISTS knowledge_context_conversation_idx
+  ON knowledge_context (conversation_id)
+  WHERE conversation_id IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS knowledge_context_owner_ordinary_idx
+  ON knowledge_context (owner_user_id)
+  WHERE conversation_id IS NULL;

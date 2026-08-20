@@ -2907,7 +2907,14 @@ three tiers, from transient to permanent:
 1. **conversation attachments** (automatic): uploads are classified
    inline / searchable / analyzable and rag'd into the conversation's implicit
    context. scope: that chat only. no consent needed — the user just handed
-   the file to this conversation.
+   the file to this conversation. that scope is a lifetime as well as a
+   boundary: the implicit context is tied to its conversation by
+   `knowledge_context.conversation_id`, a foreign key that cascades on delete,
+   so deleting the chat removes the index and its chunks in the same
+   transaction and an upload cannot create one for a conversation that is
+   already gone. the stored file objects are content-addressed and shared, so
+   they are released by the sweep once no conversation names the checksum,
+   not by the delete.
 2. **knowledge contexts** (deliberate): notebooklm-style corpora bound to
    chats by choice. scope: wherever the user binds them.
 3. **the vault** (deliberate, one click): `POST /v1/notes/from-file` extracts

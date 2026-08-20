@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # Apply the liminallm schema (sql/schema.sql).
 #
-# The only thing that applies the schema. Docker used to also mount sql/ into
-# the postgres image's /docker-entrypoint-initdb.d, which applied the file
-# first and without :embedding_dim; every statement here is IF NOT EXISTS, so
-# this run then changed nothing and still reported success.
+# The only thing that applies the schema. CI runs this same script, and then
+# runs the test suite against the database it produced.
 #
 # Not a migration runner: there is no migration history. sql/schema.sql states
-# the desired schema, and every statement in it is required to be safe to
+# the desired schema, and every operation in it is required to be safe to
 # execute repeatedly, so this is safe to re-run against an existing database.
 #
-# This is the only thing that applies the schema. CI runs this same script, and
-# then runs the test suite against the database it produced.
+# Repeat-safe is not the same as inert. A declaration that already exists is
+# skipped, which is why a second executor is dangerous: Docker used to also
+# mount sql/ into the postgres image's /docker-entrypoint-initdb.d, applying
+# the file first and without :embedding_dim. This run then found everything
+# present, changed nothing, and reported success over a schema built at the
+# wrong vector width.
 set -euo pipefail
 
 : "${DATABASE_URL:?DATABASE_URL must be set}"
