@@ -450,19 +450,26 @@ class PostgresStore:
             # the database, so a load-bearing schema feature is checked where
             # the message can name the fix.
             #
-            # Checked by shape rather than by name, so an index that happens
-            # to carry the name without the predicate does not satisfy it.
+            # Checked by structure, not by name and not by the words its
+            # definition happens to contain. "Unique, partial, mentions
+            # conversation_id" is satisfied by an index keyed on `id`
+            # alongside the conversation — unique for free, because every row
+            # has a distinct id, and therefore constraining nothing that the
+            # primary key does not. `ON CONFLICT DO NOTHING` would still see
+            # no conflict. So the two key columns are named: owner first,
+            # the conversation expression second, and the predicate has to
+            # narrow it to the implicit contexts.
             uniqueness = conn.execute(
                 """
                 SELECT 1 FROM pg_index i
-                JOIN pg_class c ON c.oid = i.indexrelid
                 WHERE i.indrelid = 'knowledge_context'::regclass
                   AND i.indisunique
-                  AND pg_get_expr(i.indpred, i.indrelid) IS NOT NULL
-                  AND pg_get_indexdef(i.indexrelid) LIKE %s
+                  AND i.indnkeyatts = 2
+                  AND pg_get_indexdef(i.indexrelid, 1, true) = 'owner_user_id'
+                  AND pg_get_indexdef(i.indexrelid, 2, true) LIKE %s
                   AND pg_get_expr(i.indpred, i.indrelid) LIKE %s
                 """,
-                ("%conversation_id%", "%auto%"),
+                ("%meta%conversation_id%", "%auto%"),
             ).fetchone()
             if not uniqueness:
                 raise RuntimeError(

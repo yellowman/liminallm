@@ -74,3 +74,83 @@ def test_redis_url_has_no_environment_variable():
         "redis_url gained an environment variable; point the harness at it "
         "rather than patching the field default."
     )
+
+
+# --- One schema authority, and it is the one production runs -----------------
+#
+# The same principle as the store and the cache above, one layer down. The
+# schema a deploy ends up with is only trustworthy if exactly one thing writes
+# it, with the parameter it needs. Two of these were live defects: Docker had a
+# second executor that ran first and won, and the migration container did not
+# receive the embedding width, so `EMBEDDING_VECTOR_DIM=64 docker compose up`
+# built a 1536-wide database that then refused to boot.
+
+
+def _compose() -> dict:
+    import pathlib
+
+    import yaml
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    return yaml.safe_load((root / "docker-compose.yaml").read_text())
+
+
+def test_docker_has_one_schema_authority():
+    """`scripts/migrate.sh` applies the schema. Nothing else may.
+
+    Mounting `sql/` into `/docker-entrypoint-initdb.d` makes Postgres apply
+    `schema.sql` itself on first boot — before the migrate service runs, and
+    without the `-v embedding_dim` that only `migrate.sh` passes. Every
+    `CREATE TABLE IF NOT EXISTS` in the real run is then a no-op, so the
+    entrypoint's defaults are what the database keeps.
+    """
+    volumes = _compose()["services"]["postgres"].get("volumes") or []
+    offenders = [v for v in volumes if "docker-entrypoint-initdb.d" in str(v)]
+    assert not offenders, (
+        f"postgres mounts {offenders}: a second thing applies the schema, and "
+        "it runs first. scripts/migrate.sh is the only schema authority."
+    )
+
+
+def test_the_migrate_container_is_told_the_embedding_width():
+    """`migrate.sh` reads EMBEDDING_VECTOR_DIM and defaults to 1536.
+
+    A migrate service that is handed only DATABASE_URL therefore pins the
+    vector column at 1536 whatever the operator configured, and the app —
+    which checks the column against the encoder at startup — refuses to boot
+    with no indication that the width came from a container that never saw
+    the setting.
+    """
+    environment = _compose()["services"]["migrate"].get("environment") or {}
+    keys = environment if isinstance(environment, dict) else [
+        str(entry).split("=", 1)[0] for entry in environment
+    ]
+    assert "EMBEDDING_VECTOR_DIM" in keys, (
+        "the migrate service does not receive EMBEDDING_VECTOR_DIM, so it "
+        "builds the vector column at the 1536 default regardless of what the "
+        "operator set, and the app then refuses to start."
+    )
+
+
+def test_ci_applies_the_schema_the_way_production_does():
+    """CI must run the command a deploy runs, not reimplement it.
+
+    Calling psql on sql/schema.sql directly means scripts/migrate.sh — the
+    command SPEC §13.6 names and Docker invokes — is never executed by CI, so
+    a break in it is found by an operator instead.
+    """
+    import pathlib
+
+    import yaml
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    workflow = yaml.safe_load((root / ".github" / "workflows" / "tests.yml").read_text())
+    steps = workflow["jobs"]["test"]["steps"]
+    schema_steps = [s for s in steps if "schema.sql" in str(s.get("run", ""))]
+    assert not schema_steps, (
+        "CI applies sql/schema.sql with its own psql invocation; it should "
+        "run scripts/migrate.sh so the deploy path is what gets exercised."
+    )
+    assert any("migrate.sh" in str(s.get("run", "")) for s in steps), (
+        "no CI step runs scripts/migrate.sh"
+    )

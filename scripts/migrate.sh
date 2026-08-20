@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Apply the liminallm schema (sql/schema.sql).
 #
+# The only thing that applies the schema. Docker used to also mount sql/ into
+# the postgres image's /docker-entrypoint-initdb.d, which applied the file
+# first and without :embedding_dim; every statement here is IF NOT EXISTS, so
+# this run then changed nothing and still reported success.
+#
 # Not a migration runner: there is no migration history. The schema is a
 # single idempotent file, so this is safe to re-run against an existing
 # database — it creates what is missing and leaves the rest alone.

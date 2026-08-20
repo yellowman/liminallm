@@ -3284,3 +3284,38 @@ class TestALoadBearingIndexIsVerifiedAtStartup:
 
         # And the repaired database starts normally again.
         PostgresStore(url, fs_root=str(runtime.settings.shared_fs_root))
+
+    def test_an_index_that_constrains_nothing_does_not_satisfy_the_check(self, client):
+        """Unique, partial, and mentioning the right words is not enough.
+
+        An index keyed on `id` alongside the conversation is unique for free
+        — every row has a distinct id — so it constrains nothing beyond the
+        primary key and `ON CONFLICT DO NOTHING` still sees no conflict. A
+        check that only looks for the words in the definition accepts it.
+        """
+        import os
+
+        import pytest as _pytest
+
+        from liminallm.storage.postgres import PostgresStore
+        from tests.harness import apply_schema
+
+        runtime = get_runtime()
+        url = os.environ["DATABASE_URL"]
+        with runtime.store._connect() as conn:
+            conn.execute(
+                "DROP INDEX IF EXISTS knowledge_context_auto_conversation_idx"
+            )
+            conn.execute(
+                "CREATE UNIQUE INDEX bogus_auto_context_index "
+                "ON knowledge_context (id, ((meta ->> 'conversation_id'))) "
+                "WHERE COALESCE((meta ->> 'auto')::boolean, false)"
+            )
+        try:
+            with _pytest.raises(RuntimeError) as caught:
+                PostgresStore(url, fs_root=str(runtime.settings.shared_fs_root))
+            assert "migrate" in str(caught.value).lower(), str(caught.value)
+        finally:
+            with runtime.store._connect() as conn:
+                conn.execute("DROP INDEX IF EXISTS bogus_auto_context_index")
+            apply_schema(url, embedding_dim=64)

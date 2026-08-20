@@ -8981,3 +8981,94 @@ and tests, add immutable ordered migration files plus a ledger recording
 filename, checksum and applied-at, and have `migrate.sh` apply what is
 unapplied in order and refuse a checksum mismatch for a filename already
 applied.
+
+## 2F.1: one thing builds the schema
+
+### Resolved premise: the migration ledger is not needed
+
+The tranche scheduled after `d0bb645` was to add immutable ordered migration
+files and a checksum ledger. The premise was that
+`008_implicit_context_identity` had made `schema.sql` non-declarative, so
+re-executing a historical data repair on every deploy was a hazard.
+
+Checked rather than assumed. The repair loop is bounded by
+`HAVING COUNT(*) > 1`, and the partial unique index applied alongside it makes
+that group unreachable. On any database that has applied the file once, the
+block is a single aggregate scan that does nothing. `scripts/migrate.sh` was
+run twice against a scratch cluster to confirm: both runs exit 0.
+
+With no installed base there is no history to reconcile. A ledger, a preflight,
+an advisory lock and a snapshot generator would be machinery guarding a state
+no database is in, and the runner would itself become schema-writing code that
+has never applied a migration to a real database. The single idempotent
+`schema.sql` stays.
+
+Three defects found while examining that path were real, and none of them
+depend on migration history. They are fixed.
+
+### HIGH: Docker had two things applying the schema, and the wrong one ran first
+
+The `postgres` service mounted `./sql` at `/docker-entrypoint-initdb.d`, so the
+image entrypoint applied `schema.sql` on first boot. That happens before the
+`migrate` service runs, and without the `-v embedding_dim` that only
+`scripts/migrate.sh` passes, so the vector column was built at the 1536
+default. Because every statement is `CREATE ... IF NOT EXISTS`, the real run
+afterwards was a no-op that changed nothing and reported success.
+
+The mount is removed. `scripts/migrate.sh` is the only schema authority.
+
+### HIGH: the migrate container was never told the embedding width
+
+The `migrate` service received `DATABASE_URL` alone, and `migrate.sh` reads
+`${EMBEDDING_VECTOR_DIM:-1536}`. So `EMBEDDING_VECTOR_DIM=64 docker compose up`
+built a 1536-wide vector column whatever the operator configured.
+
+Startup compares that column against the encoder and refuses, so the failure
+surfaced at the app with no indication that the width came from a container
+that never saw the setting. The service now takes the same
+`${EMBEDDING_VECTOR_DIM:-1536}` expression the app does, so the two cannot
+disagree.
+
+### MEDIUM: CI reimplemented the deploy command instead of running it
+
+The "Apply schema" step called `psql -f sql/schema.sql` directly. Nothing in CI
+executed `scripts/migrate.sh`, which is the command SPEC §13.6 names and the
+command Docker invokes, so a break in it would have been found by an operator.
+CI runs the script.
+
+### MEDIUM: the startup check accepted an index that constrains nothing
+
+The check added for the previous tranche matched the index by the words in
+`pg_get_indexdef` rather than by its structure. A unique partial index keyed on
+`(id, (meta ->> 'conversation_id'))` contains `conversation_id`, has an `auto`
+predicate, and is unique for free because every row has a distinct id. It
+satisfied the check while `ON CONFLICT DO NOTHING` still had nothing to collide
+with, which is the exact state the check exists to refuse.
+
+The check now reads the catalog: unique, exactly two key attributes, first key
+`owner_user_id`, second the conversation expression, and a partial predicate
+over `auto`.
+
+## Recorded, not fixed: SPEC carries project status and contradicts itself
+
+SPEC is not a usable authority on how the schema is applied, for two separate
+reasons.
+
+It contradicts itself. §13.6 specifies "no special tooling" and idempotency
+through `CREATE TABLE IF NOT EXISTS`. §21 asks, in one bullet, for both
+"rerunning is safe due to `IF NOT EXISTS` and deterministic upserts" and "fails
+fast on checksum mismatch". The first describes a design with no history; the
+second requires one.
+
+It also embeds project status as a permanent premise. §364 is a build note
+(`**verified and fixed:** ...`) rather than a specification, and it derives a
+design decision from the sentence "this project has never been deployed". That
+fact expires on the first deployment, and the conclusion drawn from it — "there
+is no upgrade path to get wrong" — becomes false silently, with nothing in the
+document marking the dependency. Eight lines in SPEC carry this kind of
+verification narrative; one of them carries the expiring fact.
+
+Two decisions are open for the owner: whether the build-note prose in §364
+moves into this file, where the rest of that history lives, and whether the
+"checksum mismatch" clause in §21 is struck so the document stops describing
+two designs.

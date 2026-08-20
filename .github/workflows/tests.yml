@@ -77,12 +77,13 @@ jobs:
       - name: Compile Python files
         run: python -m compileall liminallm
 
+      # Runs the deploy command itself rather than reimplementing it, so a
+      # break in scripts/migrate.sh is found here and not by an operator.
       - name: Apply schema
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/liminallm
-        run: |
-          PGPASSWORD=postgres psql -h localhost -U postgres -d liminallm \
-            -v ON_ERROR_STOP=1 -v embedding_dim=64 -f sql/schema.sql
+          EMBEDDING_VECTOR_DIM: "64"
+        run: bash scripts/migrate.sh
 
       - name: Run tests with coverage
         env:
