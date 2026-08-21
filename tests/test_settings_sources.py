@@ -29,6 +29,12 @@ EXPECTED_ENV_SETTINGS = {
     # The test harness tells the process it is a test before anything else
     # happens, and it must not be flippable from a web form.
     "test_mode",
+    # Where the data lives on this machine. Needed while the Postgres store
+    # is being constructed, so a stored value could not take effect: the store
+    # keeps the root it was built with while every service made afterwards
+    # uses the refreshed one — artifact payloads under one tree, file and
+    # adapter authority under another.
+    "shared_fs_root",
     # A property of the schema that was applied, not of the running app;
     # scripts/migrate.sh needs the same value.
     "embedding_vector_dim",

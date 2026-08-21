@@ -1,17 +1,19 @@
 import asyncio
 import inspect
 import os
+import shutil
 import sys
 import tempfile
 from pathlib import Path
 
-# NOTE: `shared_fs_root` is a database-managed field with no environment
-# variable (see config.managed_field), so exporting SHARED_FS_ROOT does
-# nothing — the same trap this file documents for `redis_url` below. The suite
-# therefore runs against the shipped default, and `tests/harness.py` reads the
-# setting rather than the environment so the store and the runtime cannot
-# disagree about where they write.
+# A throwaway root for everything this run writes: artifact payloads,
+# adapters, uploaded files, lock files. `shared_fs_root` is environment-only
+# (see config.env_field), so setting it here before any import genuinely takes
+# effect — for a while it did not, because the field was database-managed and
+# this line was inert, and the suite wrote into /srv/liminallm, which is where
+# a real install keeps its data.
 _test_tmp_dir = tempfile.mkdtemp(prefix="liminallm_test_")
+os.environ["SHARED_FS_ROOT"] = _test_tmp_dir
 os.environ.setdefault("TEST_MODE", "true")
 # Tests run against a real Postgres. See tests/harness.py: the in-memory
 # store used to double the storage layer, so every storage feature was written
@@ -205,6 +207,7 @@ def pytest_configure(config):
 
 def pytest_sessionfinish(session, exitstatus):
     close_test_store()
+    shutil.rmtree(_test_tmp_dir, ignore_errors=True)
     if _PG is not None:
         _PG.stop()
     if _REDIS is not None:

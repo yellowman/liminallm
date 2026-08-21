@@ -159,7 +159,6 @@ from liminallm.service.fs import (
     namespace_key,
     path_lock,
     safe_join,
-    server_owned_artifact_dirs,
     validate_signed_url,
 )
 from liminallm.service.runtime import MODEL_AFFECTING_SETTINGS, get_runtime
@@ -3168,13 +3167,14 @@ async def delete_artifact(
     the worker is writing weights and will try to promote a version onto this
     row, so the deletion has to lose that race rather than win it.
 
-    Order matters for the payloads. The database capability is revoked and
-    committed first, then the directories this server derives from the
-    artifact's id are removed, best effort. Filesystem-first would leave a
-    live artifact pointing at missing bytes if the delete then failed; this
-    way a failed cleanup leaves storage nothing can reach, which is
-    recoverable. A cleanup error must not turn a committed, irreversible
-    deletion into a reported failure the caller would retry.
+    The payloads are deliberately *not* removed here. A turn resolves an
+    adapter from Postgres and only then touches disk, so unlinking inside this
+    request lets a caller that legitimately acquired the artifact read a
+    filesystem where it no longer exists — a state no serial order of the two
+    produces. `service/artifacts.sweep_artifact_payloads` collects them once
+    they have been orphans for longer than any request may live, which also
+    keeps an `rmtree` of a large checkpoint tree off an API worker and makes
+    an I/O failure a retry rather than a permanent orphan.
     """
     runtime = get_runtime()
     await rate_limit(runtime, "write", principal.user_id)
@@ -3186,27 +3186,11 @@ async def delete_artifact(
     if artifact is None:
         raise http_error("not_found", "artifact not found", status_code=404)
 
-    removed = []
-    for directory in server_owned_artifact_dirs(
-        runtime.settings.shared_fs_root, artifact.id, artifact.type
-    ):
-        try:
-            if directory.is_dir():
-                shutil.rmtree(directory)
-                removed.append(str(directory))
-        except OSError as exc:  # pragma: no cover - filesystem failure
-            logger.warning(
-                "artifact_payload_cleanup_failed",
-                artifact_id=artifact_id,
-                path=str(directory),
-                error=str(exc),
-            )
     logger.info(
         "artifact_deleted",
         user_id=principal.user_id,
         artifact_id=artifact_id,
         artifact_type=artifact.type,
-        payloads_removed=removed,
     )
     return Envelope(status="ok", data={"deleted": True})
 
@@ -3251,10 +3235,14 @@ async def patch_artifact(
             detail={"kind": schema_kind, "type": current.type},
         )
 
-    artifact = runtime.store.update_artifact(
+    # The private-owner predicate travels into the statement that takes the
+    # lock. `_get_private_artifact` above answers the request; this is what
+    # makes the answer still true at the moment of the write.
+    artifact = runtime.store.update_private_artifact(
         artifact_id,
         schema=new_schema,
         description=new_description,
+        owner_user_id=principal.user_id,
         version_author=principal.user_id,
     )
     if not artifact:

@@ -2820,8 +2820,15 @@ the following are treated as constants the kernel must honor; LLM edits happen o
       `trust_forwarded_host`; JWT: `jwt_issuer`, `jwt_audience`
   - **environment-only settings** — everything that must be known *before* the
     database is readable, or that describes the machine rather than the install.
-    There are five, and adding a sixth needs one of those two reasons:
+    There are six, and adding a seventh needs one of those two reasons:
     - `DATABASE_URL` — where the rest of the configuration lives.
+    - `SHARED_FS_ROOT` — where the data lives. Needed while the postgres store
+      is being constructed, and it names a mount on this machine. A stored
+      value could not take effect anyway: the store is handed this root before
+      any managed setting is readable, so a row would move it for every
+      service built afterwards while the store kept writing where it started —
+      artifact payloads under one tree, file and adapter authority under
+      another.
     - `EMBEDDING_VECTOR_DIM` — the vector column's width, fixed at schema apply.
     - `TEST_MODE`, `BUILD_SHA` — what this process is, not how it is configured.
     - `EXTRACT_READER_PLUGINS` — code to import, so it cannot come from a row.

@@ -2656,28 +2656,7 @@ class PostgresStore:
             params.extend(cursor_params)
             params.extend([limit, offset])
             rows = conn.execute(query, tuple(params)).fetchall()
-        artifacts: List[Artifact] = []
-        for row in rows:
-            artifacts.append(
-                Artifact(
-                    id=str(row["id"]),
-                    type=row["type"],
-                    name=row["name"],
-                    description=row.get("description") or "",
-                    schema=row.get("schema") or {},
-                    owner_user_id=(
-                        str(row["owner_user_id"]) if row.get("owner_user_id") else None
-                    ),
-                    visibility=row.get("visibility", "private"),
-                    created_at=row.get("created_at", datetime.now(timezone.utc)),
-                    updated_at=row.get("updated_at", datetime.now(timezone.utc)),
-                    fs_path=row.get("fs_path"),
-                    base_model=row.get("base_model")
-                    or (row.get("schema") or {}).get("base_model"),
-                    meta=row.get("meta"),
-                )
-            )
-        return artifacts
+        return [self._artifact_from_row(row) for row in rows]
 
     def _artifact_from_row(self, row) -> Artifact:
         """One mapping from an `artifact` row, so every reader sees the same.
@@ -2873,6 +2852,40 @@ class PostgresStore:
             base_model=schema.get("base_model"),
         )
 
+    def update_private_artifact(
+        self,
+        artifact_id: str,
+        schema: dict,
+        description: Optional[str] = None,
+        *,
+        owner_user_id: str,
+        version_author: Optional[str] = None,
+        change_note: Optional[str] = None,
+    ) -> Optional[Artifact]:
+        """Edit an artifact this user owns and has not published.
+
+        The predicate goes into the statement that takes the lock, not into a
+        check the caller made earlier. `update_artifact` locks by id alone, so
+        validating "private and mine" in the route left a window: anything
+        publishing the artifact in between — config ops, an admin action, a
+        future share endpoint — lands after the check and before the write,
+        and the edit is applied to an artifact that is no longer the caller's
+        alone. Same shape as the delete, so it is enforced the same way.
+
+        `update_artifact` stays unrestricted for the callers that are not a
+        user editing their own thing: training promoting a version, and config
+        ops applying a reviewed patch.
+        """
+        return self.update_artifact(
+            artifact_id,
+            schema,
+            description,
+            version_author=version_author,
+            change_note=change_note,
+            owner_user_id=owner_user_id,
+            require_private=True,
+        )
+
     def update_artifact(
         self,
         artifact_id: str,
@@ -2881,6 +2894,8 @@ class PostgresStore:
         *,
         version_author: Optional[str] = None,
         change_note: Optional[str] = None,
+        owner_user_id: Optional[str] = None,
+        require_private: bool = False,
     ) -> Optional[Artifact]:
         schema_kind = schema.get("kind")
         if schema_kind == "workflow.chat":
@@ -2900,8 +2915,17 @@ class PostgresStore:
             # Issue 19.5: Use SELECT ... FOR UPDATE to prevent race condition
             # This locks the artifact row until the transaction completes,
             # preventing concurrent version inserts from calculating the same next_version
+            conditions = ["id = %s"]
+            params: list[Any] = [artifact_id]
+            if owner_user_id is not None:
+                conditions.append("owner_user_id = %s")
+                params.append(owner_user_id)
+            if require_private:
+                conditions.append("visibility = 'private'")
             row = conn.execute(
-                "SELECT * FROM artifact WHERE id = %s FOR UPDATE", (artifact_id,)
+                f"SELECT * FROM artifact WHERE {' AND '.join(conditions)} "
+                "FOR UPDATE",
+                tuple(params),
             ).fetchone()
             if not row:
                 return None

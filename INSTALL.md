@@ -146,6 +146,7 @@ Only these are environment variables:
 | Variable | Required | Purpose |
 |---|---|---|
 | `DATABASE_URL` | yes | Postgres connection string |
+| `SHARED_FS_ROOT` | no | Where the data lives on this machine (default `/srv/liminallm`) |
 | `EMBEDDING_VECTOR_DIM` | no | Embedding width, fixed when the schema is first created (default 1536) |
 | `<PROVIDER>_API_KEY` | no | `OPENAI_API_KEY`, `GEMINI_API_KEY`, `XAI_API_KEY`, … used when the matching admin setting is blank |
 | `INSTANCE_SETTINGS_JSON` | no | JSON object seeding managed settings on first boot only |

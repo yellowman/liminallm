@@ -121,22 +121,29 @@ class TestRetiringAPrivateArtifact:
             f"/v1/artifacts/{artifact_id}", headers=headers
         ).status_code == 404
 
-    def test_the_server_owned_payload_is_retired_after_the_commit(self, client):
+    def test_the_server_owned_payload_is_retired_by_the_sweep(self, client):
         """Versions live on disk as well as in rows.
 
-        The order is deliberate: revoke the capability, commit, then clean the
-        payload. Filesystem-first would leave a valid artifact pointing at
-        missing bytes if the delete then failed; this way a failed cleanup
-        leaves unreachable storage, which a sweep can take later.
+        The request revokes the capability and returns; the bytes go later.
+        Unlinking them inside the request would let a caller that had already
+        resolved the artifact read a filesystem where it no longer exists.
         """
+        from liminallm.service.artifacts import sweep_artifact_payloads
+
         _, headers = _account(client)
         artifact_id = _artifact(client, headers)
         payload = _payload_dir(artifact_id)
         assert payload.is_dir(), f"nothing was written under {payload}"
 
+        runtime = get_runtime()
         assert client.delete(
             f"/v1/artifacts/{artifact_id}", headers=headers
         ).status_code == 200
+        assert payload.is_dir(), "the request unlinked the payload itself"
+
+        sweep_artifact_payloads(
+            runtime.store, runtime.settings.shared_fs_root, grace_seconds=0
+        )
         assert not payload.exists(), (
             "the artifact's version payloads outlived the artifact"
         )
@@ -293,14 +300,20 @@ class TestRetiringAnAdapterAgainstTraining:
         ) == 0
 
     def test_only_this_adapters_tree_is_removed(self, client):
+        from liminallm.service.artifacts import sweep_artifact_payloads
+
         user_id, headers = _account(client)
         doomed = _adapter(client, headers, user_id)
         sibling = _adapter(client, headers, user_id)
-        root = Path(get_runtime().settings.shared_fs_root) / "adapters"
+        runtime = get_runtime()
+        root = Path(runtime.settings.shared_fs_root) / "adapters"
 
         assert client.delete(
             f"/v1/artifacts/{doomed}", headers=headers
         ).status_code == 200
+        sweep_artifact_payloads(
+            runtime.store, runtime.settings.shared_fs_root, grace_seconds=0
+        )
         assert not (root / doomed).exists()
         assert (root / sibling / "v0001" / "params.json").exists(), (
             "deleting one adapter took another adapter's weights"
@@ -334,6 +347,13 @@ class TestRetiringAnAdapterAgainstTraining:
         assert client.delete(
             f"/v1/artifacts/{placeholder}", headers=headers
         ).status_code == 200
+        from liminallm.service.artifacts import sweep_artifact_payloads
+
+        sweep_artifact_payloads(
+            get_runtime().store,
+            get_runtime().settings.shared_fs_root,
+            grace_seconds=0,
+        )
         assert (victim / "keep.json").exists(), (
             "deletion used schema.fs_dir as its target and destroyed a path "
             "the artifact merely named"
@@ -389,3 +409,172 @@ class TestPatchAgainstDelete:
                 "the PATCH reported success for an artifact that is gone: "
                 f"{patched.status_code} {patched.text[:300]}"
             )
+
+
+class TestDeletionDoesNotYankFilesFromUnderAReader:
+    """The writer was serialized. The reader was not.
+
+    A turn resolves a promoted adapter from Postgres and only then touches
+    disk: `params_path.stat()` comes after the capability has been acquired,
+    and the in-memory cache is consulted after that stat. DELETE committed the
+    row removal and immediately `rmtree`'d the adapter tree, so a turn that
+    had legitimately acquired the adapter could reach the filesystem after it
+    was gone.
+
+    That state has no serial explanation. If the turn ran first it held the
+    adapter and should be able to finish; if the delete ran first the turn
+    should never have acquired it. Reclamation therefore stops being part of
+    the request: DELETE revokes the capability and returns, and the payloads
+    are collected later by a sweep whose grace period outlives any in-flight
+    request.
+    """
+
+    def test_a_turn_that_already_acquired_the_adapter_can_still_read_it(
+        self, client
+    ):
+        user_id, headers = _account(client)
+        adapter_id = _adapter(client, headers, user_id)
+        root = Path(get_runtime().settings.shared_fs_root) / "adapters" / adapter_id
+        params = root / "v0001" / "params.json"
+        assert params.exists()
+
+        # The turn has resolved the adapter and is about to touch disk.
+        deleted = client.delete(f"/v1/artifacts/{adapter_id}", headers=headers)
+        assert deleted.status_code == 200, deleted.text
+
+        # It resumes. The bytes it already had a capability for are still here.
+        assert params.exists(), (
+            "the adapter's weights were removed inside the DELETE request, so "
+            "a turn holding the pre-delete capability reads a post-delete "
+            "filesystem"
+        )
+        assert params.read_bytes(), "the weights are empty"
+
+    def test_the_sweep_collects_the_payloads_once_they_are_orphans(self, client):
+        """Delayed, not skipped. The storage still goes."""
+        from liminallm.service.artifacts import sweep_artifact_payloads
+
+        user_id, headers = _account(client)
+        adapter_id = _adapter(client, headers, user_id)
+        workflow_id = _artifact(client, headers)
+        runtime = get_runtime()
+        root = Path(runtime.settings.shared_fs_root)
+
+        for artifact_id in (adapter_id, workflow_id):
+            assert client.delete(
+                f"/v1/artifacts/{artifact_id}", headers=headers
+            ).status_code == 200
+
+        removed = sweep_artifact_payloads(
+            runtime.store, runtime.settings.shared_fs_root, grace_seconds=0
+        )
+        assert removed >= 2, f"the sweep collected {removed} directories"
+        assert not (root / "adapters" / adapter_id).exists()
+        assert not (root / "artifacts" / workflow_id).exists()
+
+    def test_the_sweep_leaves_a_live_artifact_alone(self, client):
+        """Its rule is "no artifact row names this id", nothing looser."""
+        from liminallm.service.artifacts import sweep_artifact_payloads
+
+        user_id, headers = _account(client)
+        keeper = _adapter(client, headers, user_id)
+        runtime = get_runtime()
+        root = Path(runtime.settings.shared_fs_root)
+
+        sweep_artifact_payloads(
+            runtime.store, runtime.settings.shared_fs_root, grace_seconds=0
+        )
+        assert (root / "adapters" / keeper / "v0001" / "params.json").exists(), (
+            "the sweep removed the payloads of an artifact that still exists"
+        )
+
+    def test_the_grace_period_protects_a_recent_orphan(self, client):
+        """Long enough to outlive any request that already holds the id."""
+        from liminallm.service.artifacts import sweep_artifact_payloads
+
+        user_id, headers = _account(client)
+        adapter_id = _adapter(client, headers, user_id)
+        runtime = get_runtime()
+        root = Path(runtime.settings.shared_fs_root)
+        assert client.delete(
+            f"/v1/artifacts/{adapter_id}", headers=headers
+        ).status_code == 200
+
+        removed = sweep_artifact_payloads(
+            runtime.store, runtime.settings.shared_fs_root, grace_seconds=3600
+        )
+        assert removed == 0
+        assert (root / "adapters" / adapter_id).is_dir(), (
+            "an orphan younger than the grace period was collected, which is "
+            "exactly the window an in-flight request needs"
+        )
+
+
+class TestPatchCarriesItsOwnPredicate:
+    def test_publishing_between_the_check_and_the_write_stops_the_patch(
+        self, client
+    ):
+        """The authorization has to be in the statement that mutates.
+
+        PATCH validated `private` and then called a generic update that locked
+        and wrote by id alone. Anything that publishes the artifact in between
+        — config ops, an admin action, a future share endpoint — lands after
+        the check and before the write, and the edit goes through on an
+        artifact that is no longer the caller's alone.
+        """
+        user_id, headers = _account(client)
+        artifact_id = _artifact(client, headers, name="about-to-be-published")
+        published: dict = {}
+
+        store = get_runtime().store
+        real_get = store.get_private_artifact
+
+        def get_then_publish(*a, **kw):
+            artifact = real_get(*a, **kw)
+            if artifact is not None and not published:
+                with store._connect() as conn:
+                    conn.execute(
+                        "UPDATE artifact SET visibility = 'shared' WHERE id = %s",
+                        (artifact_id,),
+                    )
+                published["done"] = True
+            return artifact
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(store, "get_private_artifact", get_then_publish)
+        try:
+            resp = client.patch(
+                f"/v1/artifacts/{artifact_id}",
+                headers=headers,
+                json={"description": "edited after publication"},
+            )
+        finally:
+            monkeypatch.undo()
+
+        assert published.get("done"), "the publication under test did not happen"
+        assert resp.status_code >= 400, (
+            "the patch was applied to an artifact that had been published "
+            f"between the check and the write: {resp.status_code}"
+        )
+        assert store.get_artifact(artifact_id).description == (
+            "a private workflow"
+        ), "the description changed on a published artifact"
+
+
+def test_list_artifacts_uses_the_same_mapping_as_every_other_reader():
+    """One mapper, or the copies drift.
+
+    `list_contexts` hand-built its rows and silently dropped a column the
+    model had gained. The artifact listing was the last hand-written copy.
+    """
+    import inspect
+
+    from liminallm.storage.postgres import PostgresStore
+
+    source = inspect.getsource(PostgresStore.list_artifacts)
+    assert "_artifact_from_row" in source, (
+        "list_artifacts still builds Artifact(...) by hand"
+    )
+    assert "Artifact(" not in source, (
+        "list_artifacts still has a hand-written mapping beside the shared one"
+    )

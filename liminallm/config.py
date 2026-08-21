@@ -489,7 +489,14 @@ class Settings(BaseModel):
             "durability and caches fall back to in-process state."
         ),
     )
-    shared_fs_root: str = managed_field("/srv/liminallm")
+    # Environment-only, not database-managed. `Runtime` has to construct the
+    # Postgres store — and hand it this root — before it can read a single
+    # managed setting, so a stored value would move the root for every service
+    # built afterwards while the store went on writing where it started:
+    # artifact payloads under one tree, file and adapter authority under
+    # another. It is also the plainest case of what `env_field` is for, a fact
+    # about the machine rather than about the install.
+    shared_fs_root: str = env_field("/srv/liminallm", "SHARED_FS_ROOT")
     tmp_cleanup_interval_seconds: int = managed_field(
         86400,
         description="How often to sweep per-user tmp scratch directories (seconds)",
@@ -1347,7 +1354,7 @@ _SETTING_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("URLs & identity", ("app_base_url", "oauth_redirect_uri", "jwt_")),
     ("Operations", ("settings_watch_interval_seconds",)),
     ("Infrastructure", ("redis_url", "allow_redis_fallback_dev",
-                        "cluster_bus_backend", "shared_fs_root",
+                        "cluster_bus_backend",
                         "interpreter_scratch_dir")),
 )
 

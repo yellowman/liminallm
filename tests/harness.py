@@ -165,9 +165,8 @@ def get_test_store():
         # filesystem authority, adapters, archive staging and the interpreter
         # resolved paths under another.
         #
-        # Read from the settings rather than from SHARED_FS_ROOT: like
-        # `redis_url`, `shared_fs_root` is a database-managed field with no
-        # environment variable, so exporting that name changes nothing.
+        # From the settings, which read SHARED_FS_ROOT — the throwaway root
+        # conftest exports before any import.
         from liminallm.config import get_settings
 
         _STORE_ROOT = get_settings().shared_fs_root

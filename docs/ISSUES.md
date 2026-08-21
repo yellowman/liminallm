@@ -9535,3 +9535,85 @@ live on two documented routes.
 The artifact row mapping was written out by hand in four places, which is how
 `list_contexts` came to silently drop a column the model had gained. One
 `_artifact_from_row` now.
+
+## Tranche 2G.3: one filesystem root, and reclamation that outlives a request
+
+### HIGH: deletion was serialized against the writer but not the reader
+
+Adapter DELETE locked against training. Local inference is the other live user
+of the same files, and it was not covered: a turn resolves a promoted adapter
+from Postgres and only then touches disk — `params_path.stat()` comes after the
+capability has been acquired, and the in-memory cache is consulted after that
+stat. DELETE committed the row removal and immediately `rmtree`'d the tree, so
+a turn holding the pre-delete capability read a post-delete filesystem.
+
+No serial order produces that. If the turn ran first it should finish; if the
+delete ran first the turn should never have acquired the adapter.
+
+Reclamation is no longer part of the request. DELETE revokes the capability and
+returns; `service/artifacts.sweep_artifact_payloads` collects `artifacts/<id>`
+and `adapters/<id>` once they have been orphans for longer than any request may
+live. Three things improve at once: a request that already materialized the
+adapter can finish, an `rmtree` of a large checkpoint tree stops blocking an API
+worker, and an I/O failure becomes a retry next sweep rather than an orphan
+logged once and kept forever. `schema.fs_dir` is still never a target.
+
+### HIGH: the same split-root condition existed in production
+
+`shared_fs_root` was a database-managed setting. `Runtime` must construct the
+Postgres store — and hand it this root — before it can read any managed
+setting, so a stored value moved the root for every service built afterwards
+while the store went on writing where it started. A database holding
+`shared_fs_root=/mnt/liminal` boots with artifact payloads under
+`/srv/liminallm` and file, adapter and tool authority under `/mnt/liminal`.
+A live admin edit is worse: non-model settings are refreshed into the running
+runtime, and the admin route reports the saved settings as live.
+
+It is now `env_field("/srv/liminallm", "SHARED_FS_ROOT")`, removed from the
+admin Infrastructure group, and out of `SYSTEM_SETTINGS_DEFAULTS` — which is
+what `_seed_settings_from_env` filters against, so `INSTANCE_SETTINGS_JSON`
+cannot seed it either. SPEC's environment-only list goes from five to six with
+the reason recorded.
+
+The harness had the mirror of this problem. `SHARED_FS_ROOT` was inert, so
+`get_test_store()` read the shipped default and the suite wrote artifact
+payloads, adapters, files and lock files into `/srv/liminallm` — the production
+data root — with nothing removing it at session end. `conftest` exports a real
+temporary root before any import now, which is what that line always looked
+like it was doing, and removes it at session end.
+
+### MEDIUM: PATCH's private predicate was not in the mutating transaction
+
+DELETE enforced `id / owner_user_id / visibility = 'private'` inside its
+locking SELECT. PATCH validated the same thing in the route and then called a
+generic update that locked and wrote by id alone, so anything publishing the
+artifact in between landed after the check and before the write.
+`update_private_artifact` carries the predicate into the lock;
+`update_artifact` stays unrestricted for training promotion and config ops.
+
+### LOW: the last hand-written artifact mapping
+
+`list_artifacts` still built `Artifact(...)` by hand next to
+`_artifact_from_row`. One mapper now, which is the whole point of having one.
+
+### Mutations
+
+| Mutation | Killed by |
+|---|---|
+| DELETE unlinks the payloads again | the reader race and the grace-period red |
+| PATCH back to the unpredicated update | the publish-between-check-and-write red |
+| `shared_fs_root` back to `managed_field` | three root-identity reds |
+| sweep ignores the grace period | the grace-period red |
+| sweep stops asking whether the artifact exists | two sweep reds |
+| `list_artifacts` hand-builds again | the mapper red |
+
+Two notes on how the mutations went. The sweep originally asked
+`get_artifact` twice — once during the scan and once before removing — and
+*neither* copy was individually killable, because artifact ids are never reused
+so no test can construct the window the first one guards. That is a redundant
+check dressed as a careful one; there is one now, taken at the point of
+removal, and removing it kills two tests.
+
+The `managed_field` mutation also hangs one root-identity test rather than
+failing it cleanly. Recorded rather than chased: it is mutant-only behaviour,
+and the other three reds kill it in under a second.
