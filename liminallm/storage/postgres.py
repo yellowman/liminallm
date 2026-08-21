@@ -515,6 +515,45 @@ class PostgresStore:
                     "scripts/migrate.sh to apply the SPEC §19.5 schema."
                 )
 
+            # Retiring a context releases the chats bound to it, and that is
+            # a schema fact rather than something the delete does. Without
+            # this key, deleting a context leaves every conversation whose
+            # `active_context_id` names it pointing at a row that is gone.
+            #
+            # Checked by shape because the schema's own guard could not be:
+            # it looked for a constraint of the expected *name* in
+            # information_schema, which lists every constraint type, so
+            # anything wearing that name — a CHECK included — convinced it
+            # the foreign key existed.
+            #
+            # `confdeltype = 'n'` is SET NULL, and it is the specific
+            # behaviour that matters. A cascading key here is still a
+            # foreign key, and it would delete the user's conversations
+            # along with a corpus they had merely selected.
+            binding = conn.execute(
+                """
+                SELECT 1 FROM pg_constraint c
+                JOIN pg_attribute a
+                  ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+                JOIN pg_attribute ref
+                  ON ref.attrelid = c.confrelid AND ref.attnum = c.confkey[1]
+                WHERE c.conrelid = 'conversation'::regclass
+                  AND c.contype = 'f'
+                  AND c.confrelid = 'knowledge_context'::regclass
+                  AND c.confdeltype = 'n'
+                  AND array_length(c.conkey, 1) = 1
+                  AND a.attname = 'active_context_id'
+                  AND ref.attname = 'id'
+                """
+            ).fetchone()
+            if not binding:
+                raise RuntimeError(
+                    "conversation.active_context_id is not a foreign key that "
+                    "nulls on delete, so retiring a knowledge context leaves "
+                    "conversations bound to a row that no longer exists. Rerun "
+                    "scripts/migrate.sh to apply the SPEC §2 schema."
+                )
+
             vector_ext = conn.execute(
                 "SELECT extname FROM pg_extension WHERE extname = 'vector'"
             ).fetchone()
@@ -3759,21 +3798,97 @@ class PostgresStore:
             params.extend([fetch_limit, offset])
             rows = conn.execute(query, tuple(params)).fetchall()
 
-        contexts: List[KnowledgeContext] = []
-        for row in rows:
-            contexts.append(
-                KnowledgeContext(
-                    id=str(row["id"]),
-                    owner_user_id=str(row["owner_user_id"]),
-                    name=row["name"],
-                    description=row["description"],
-                    created_at=row.get("created_at", datetime.now(timezone.utc)),
-                    updated_at=row.get("updated_at", datetime.now(timezone.utc)),
-                    fs_path=row.get("fs_path"),
-                    meta=row.get("meta"),
-                )
-            )
-        return contexts
+        return [self._context_from_row(row) for row in rows]
+
+    def update_context(
+        self,
+        context_id: str,
+        *,
+        owner_user_id: str,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> Optional[KnowledgeContext]:
+        """Rename or redescribe an ordinary context. Owner-only.
+
+        The three conditions are in the statement, not in the caller. The
+        route helper checks them too, and that is not the same thing: a
+        helper guards the callers that use it, while the predicate here
+        guards the row. `conversation_id IS NULL` is what keeps a chat's
+        implicit index out — its lifetime belongs to the conversation
+        (SPEC §19.5), so it is not part of the collection this edits.
+
+        Only supplied fields are written, so a rename does not blank the
+        description.
+        """
+        if not _is_uuid(context_id) or not _is_uuid(owner_user_id):
+            return None
+        assignments = []
+        params: list[Any] = []
+        if name is not None:
+            assignments.append("name = %s")
+            params.append(name)
+        if description is not None:
+            assignments.append("description = %s")
+            params.append(description)
+        if not assignments:
+            return self.get_ordinary_context(context_id, owner_user_id=owner_user_id)
+
+        assignments.append("updated_at = %s")
+        params.extend([datetime.now(timezone.utc), context_id, owner_user_id])
+        with self._connect() as conn:
+            row = conn.execute(
+                f"UPDATE knowledge_context SET {', '.join(assignments)} "
+                "WHERE id = %s AND owner_user_id = %s AND conversation_id IS NULL "
+                "RETURNING id",
+                tuple(params),
+            ).fetchone()
+        if not row:
+            return None
+        return self.get_context(context_id)
+
+    def delete_context(self, context_id: str, *, owner_user_id: str) -> bool:
+        """Retire an ordinary context. Owner-only.
+
+        Nothing is cleaned up by hand. `context_source` and `knowledge_chunk`
+        reference this row with `ON DELETE CASCADE`, and segment vectors
+        cascade with the chunks, so one statement removes the context and
+        everything that describes its contents. `conversation.active_context_id`
+        references it with `ON DELETE SET NULL`, so chats bound to it are
+        released rather than deleted.
+
+        The files the context indexed are untouched. A context references
+        paths; it does not own them.
+        """
+        if not _is_uuid(context_id) or not _is_uuid(owner_user_id):
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "DELETE FROM knowledge_context "
+                "WHERE id = %s AND owner_user_id = %s AND conversation_id IS NULL "
+                "RETURNING id",
+                (context_id, owner_user_id),
+            ).fetchone()
+        return bool(row)
+
+    def get_ordinary_context(
+        self, context_id: str, *, owner_user_id: str
+    ) -> Optional[KnowledgeContext]:
+        """One context this user owns and manages directly, by identity.
+
+        Not a listing. The same identity-versus-page mistake cost an earlier
+        tranche a conversation's whole index: `list_contexts` pages in SQL,
+        so anything past the first page was unreachable by a caller that
+        already knew the id.
+        """
+        if not _is_uuid(context_id) or not _is_uuid(owner_user_id):
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM knowledge_context "
+                "WHERE id = %s AND owner_user_id = %s AND conversation_id IS NULL",
+                (context_id, owner_user_id),
+            ).fetchone()
+        return self._context_from_row(row) if row else None
 
     def add_context_source(
         self,

@@ -255,14 +255,45 @@ CREATE UNIQUE INDEX IF NOT EXISTS knowledge_chunk_vector_segment_idx
 ON knowledge_chunk_vector (chunk_id, segment_index);
 CREATE INDEX IF NOT EXISTS knowledge_chunk_context_chunk_idx ON knowledge_chunk (context_id, chunk_index);
 
--- Add FK constraint for conversation.active_context_id now that knowledge_context exists
+-- Add FK constraint for conversation.active_context_id now that
+-- knowledge_context exists.
+--
+-- Asked by shape, not by name. The guard used to look for a constraint called
+-- `conversation_active_context_id_fkey` in information_schema, which lists
+-- every constraint type — so anything of that name, a CHECK included,
+-- convinced it the work was done and the foreign key was never created. The
+-- column then held arbitrary UUIDs, and deleting a context left every
+-- conversation bound to it pointing at a row that no longer exists.
+--
+-- `ON DELETE SET NULL` specifically: a conversation's binding to a context is
+-- a preference, so retiring the context releases the chats. CASCADE here
+-- would delete the user's conversations along with a corpus they had merely
+-- selected.
 DO $$
 BEGIN
   IF NOT EXISTS (
-    SELECT 1 FROM information_schema.table_constraints
-    WHERE constraint_name = 'conversation_active_context_id_fkey'
-      AND table_name = 'conversation'
+    SELECT 1 FROM pg_constraint c
+    JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+    JOIN pg_attribute r ON r.attrelid = c.confrelid AND r.attnum = c.confkey[1]
+    WHERE c.conrelid = 'conversation'::regclass
+      AND c.contype = 'f'
+      AND c.confrelid = 'knowledge_context'::regclass
+      AND c.confdeltype = 'n'
+      AND array_length(c.conkey, 1) = 1
+      AND a.attname = 'active_context_id'
+      AND r.attname = 'id'
   ) THEN
+    -- Anything of that name is not the constraint we need; replace it.
+    ALTER TABLE conversation
+      DROP CONSTRAINT IF EXISTS conversation_active_context_id_fkey;
+    -- A database that ran without the key may hold bindings to contexts that
+    -- are gone, and those would make ADD CONSTRAINT fail. They are already
+    -- unusable: release them rather than refusing to install the rule.
+    UPDATE conversation SET active_context_id = NULL
+    WHERE active_context_id IS NOT NULL
+      AND NOT EXISTS (
+        SELECT 1 FROM knowledge_context k WHERE k.id = conversation.active_context_id
+      );
     ALTER TABLE conversation
       ADD CONSTRAINT conversation_active_context_id_fkey
       FOREIGN KEY (active_context_id) REFERENCES knowledge_context(id) ON DELETE SET NULL;

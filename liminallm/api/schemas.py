@@ -717,6 +717,23 @@ class KnowledgeContextRequest(BaseModel):
     chunk_size: Optional[int] = Field(default=None, ge=64, le=4000)
 
 
+class KnowledgeContextUpdateRequest(BaseModel):
+    """The fields a user may edit on a context they own.
+
+    Deliberately two. `meta` and `conversation_id` are how a row would claim
+    to be a conversation's implicit index, which has a different lifetime and
+    a different authorization rule; `fs_path` and `text` are ingestion, which
+    is a separate mutation with its own path authority. Unknown fields are
+    refused rather than dropped, so a caller is never told an edit succeeded
+    when part of it did not happen.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: Optional[str] = Field(default=None, min_length=1, max_length=255)
+    description: Optional[str] = Field(default=None, max_length=2000)
+
+
 class KnowledgeContextResponse(BaseModel):
     id: str
     name: str

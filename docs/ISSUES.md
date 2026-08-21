@@ -9326,3 +9326,90 @@ longer written. Running state still exists while the workflow does.
 Grepping for the shape found a fourth terminal site the first pass missed: a
 second `failed` branch persisting the whole `result` dictionary. All four
 retire now.
+
+## Tranche 2G.2 (contexts): owner-controlled retirement
+
+SPEC §12.3 gives users CRUD over their contexts. The API had create, list,
+chunks and source add/list — no direct read, no edit, no delete.
+
+### HIGH: the binding that makes deletion safe was installed by name
+
+`conversation.active_context_id` must be a foreign key with `ON DELETE SET
+NULL`, or retiring a context leaves every conversation bound to it pointing at
+a row that is gone. The schema created it conditionally, and the condition was
+a name lookup in `information_schema.table_constraints`, which lists every
+constraint type. Anything wearing the name `conversation_active_context_id_fkey`
+— a `CHECK` included — satisfied the guard, so the foreign key was never
+created and the column held arbitrary UUIDs.
+
+Both halves are fixed. The schema asks `pg_constraint` for the shape and
+replaces whatever holds the name if it is not that shape, releasing dangling
+bindings first so `ADD CONSTRAINT` cannot fail on data an earlier state left
+behind. Startup verifies the same shape, `confdeltype = 'n'` included:
+`ON DELETE CASCADE` is still a foreign key, and it would delete the user's
+conversations along with a corpus they had merely selected.
+
+### HIGH: GET, PATCH and DELETE, with the predicate in the mutation
+
+The three routes are owner-only. PATCH takes `name` and `description` and
+forbids the rest: `meta` and `conversation_id` are how a row would claim to be
+a conversation's implicit index, and `fs_path` and `text` are ingestion, which
+is a separate mutation with its own path authority.
+
+The ordinary-context predicate — `owner_user_id = ? AND conversation_id IS
+NULL` — is in the SQL of `update_context`, `delete_context` and
+`get_ordinary_context`, not only in `_get_owned_context`. A route helper
+guards the callers that use it; the predicate guards the row.
+
+Deletion is one statement. `context_source` and `knowledge_chunk` cascade from
+the context and segment vectors cascade with the chunks; conversations bound
+to it are released by the `SET NULL` key. The indexed files are untouched — a
+context references paths, it does not own them.
+
+### MEDIUM: a source could be reported as added to a deleted context
+
+`add_context_source` records the source, and the reading, chunking and
+embedding happen afterwards. A delete inside that window is refused by the
+database — chunks reference the context, and the source row went with it by
+cascade — but `ingest_path` treats a failed file as a warning and continues,
+which is right for one unreadable file in a tree and wrong for the context
+being gone. Measured: `ingest_path_file_failed: context not found`, clean
+durable state, and `201 Created` returned with a source record that no longer
+existed. The route now confirms the context survived and answers 409.
+
+Source *removal* is deliberately not added. Sources may overlap — a recursive
+source at `files/` and a second at `files/report.md` both entitle the context
+to that path — so deleting one source record cannot imply deleting the chunks
+under its path. Context deletion is well defined; individual source retirement
+is not yet.
+
+### Mutations
+
+| Mutation | Killed by |
+|---|---|
+| store drops `conversation_id IS NULL` | the direct store-invocation test only |
+| store drops `owner_user_id` | 14 tests |
+| startup binding check removed | both binding tests |
+| schema guard reverts to the name lookup | the schema-repair test |
+| sources route drops the post-ingest check | the ingestion race |
+
+Two mutations survived their first pass and are worth recording.
+
+The schema-guard mutation was invisible because the red dropped the CHECK
+constraint by hand before re-applying the schema, so the name-based guard
+found nothing and created the key anyway. The test that kills it re-applies
+the schema *with the CHECK still in place* — which is the actual state an
+operator would be in — and asserts the constraint is a foreign key with
+`confdeltype = 'n'` afterwards. Refusing to start is only useful if the
+command the error names then repairs it.
+
+Removing the implicit-context guard from `_get_owned_context` also changed
+nothing, because the store predicate refuses the same rows. That is defence in
+depth working: neither layer alone is load-bearing for the route test, and the
+store-level test covers the store directly. Recorded rather than papered over
+with a contrived test for a redundant guard.
+
+`list_contexts` hand-built `KnowledgeContext` from rows and predated
+`conversation_id`, so it silently dropped the field. It uses
+`_context_from_row` now — one mapping, so a column added to the model reaches
+every reader.

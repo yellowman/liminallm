@@ -86,6 +86,7 @@ from liminallm.api.schemas import (
     KnowledgeContextListResponse,
     KnowledgeContextRequest,
     KnowledgeContextResponse,
+    KnowledgeContextUpdateRequest,
     LoginRequest,
     MFADisableRequest,
     MFARequest,
@@ -5043,6 +5044,84 @@ async def list_chunks(
     )
 
 
+def _context_payload(ctx) -> KnowledgeContextResponse:
+    return KnowledgeContextResponse(
+        id=ctx.id,
+        name=ctx.name,
+        description=ctx.description,
+        created_at=ctx.created_at,
+        updated_at=ctx.updated_at,
+        owner_user_id=ctx.owner_user_id,
+        meta=ctx.meta,
+    )
+
+
+@router.get("/contexts/{context_id}", response_model=Envelope, tags=["knowledge"])
+async def get_context(
+    context_id: str = Path(..., max_length=255, description="Knowledge context ID"),
+    principal: AuthContext = Depends(get_user),
+):
+    """Read one context the caller owns.
+
+    An identity lookup, not the first page of a listing. `/contexts` pages in
+    SQL, so before this route existed a caller holding an id could not reach
+    the row behind it once the account had a page of newer contexts.
+    """
+    runtime = get_runtime()
+    await rate_limit(runtime, "read", principal.user_id)
+    _get_owned_context(runtime, context_id, principal)
+    ctx = runtime.store.get_ordinary_context(
+        context_id, owner_user_id=principal.user_id
+    )
+    if ctx is None:
+        raise http_error("not_found", "context not found", status_code=404)
+    return Envelope(status="ok", data=_context_payload(ctx))
+
+
+@router.patch("/contexts/{context_id}", response_model=Envelope, tags=["knowledge"])
+async def update_context(
+    body: KnowledgeContextUpdateRequest,
+    context_id: str = Path(..., max_length=255, description="Knowledge context ID"),
+    principal: AuthContext = Depends(get_user),
+):
+    """Rename or redescribe a context the caller owns."""
+    runtime = get_runtime()
+    await rate_limit(runtime, "write", principal.user_id)
+    _get_owned_context(runtime, context_id, principal)
+    ctx = runtime.store.update_context(
+        context_id,
+        owner_user_id=principal.user_id,
+        name=body.name,
+        description=body.description,
+    )
+    if ctx is None:
+        raise http_error("not_found", "context not found", status_code=404)
+    return Envelope(status="ok", data=_context_payload(ctx))
+
+
+@router.delete("/contexts/{context_id}", response_model=Envelope, tags=["knowledge"])
+async def delete_context(
+    context_id: str = Path(..., max_length=255, description="Knowledge context ID"),
+    principal: AuthContext = Depends(get_user),
+):
+    """Retire a context the caller owns.
+
+    Its source records, chunks and segment vectors go with it by cascade, and
+    conversations bound to it through `active_context_id` are released rather
+    than deleted. The files it indexed are untouched: a context references
+    paths, it does not own them.
+    """
+    runtime = get_runtime()
+    await rate_limit(runtime, "write", principal.user_id)
+    _get_owned_context(runtime, context_id, principal)
+    if not runtime.store.delete_context(context_id, owner_user_id=principal.user_id):
+        raise http_error("not_found", "context not found", status_code=404)
+    logger.info(
+        "context_deleted", user_id=principal.user_id, context_id=context_id
+    )
+    return Envelope(status="ok", data={"deleted": True})
+
+
 @router.post("/contexts/{context_id}/sources", response_model=Envelope, status_code=201, tags=["knowledge"])
 async def add_context_source(
     context_id: str = Path(..., max_length=255, description="Knowledge context ID"),
@@ -5181,6 +5260,27 @@ async def add_context_source(
                 "ingest_failed",
                 f"Failed to index source: {exc}",
                 status_code=500,
+            )
+
+        # Recording the source and reading it are two moments, and the owner
+        # may retire the context in between. The database already refuses the
+        # work — chunks reference the context, the source row went with it by
+        # cascade — but `ingest_path` treats a failed file as a warning and
+        # carries on, which is right for one unreadable file in a tree and
+        # wrong for the whole context being gone. Without this the request
+        # reported 201 and returned a source record that no longer existed.
+        if runtime.store.get_ordinary_context(
+            context_id, owner_user_id=principal.user_id
+        ) is None:
+            logger.info(
+                "context_source_abandoned",
+                context_id=context_id,
+                user_id=principal.user_id,
+            )
+            raise http_error(
+                "conflict",
+                "the context was deleted while its source was being indexed",
+                status_code=409,
             )
 
         envelope = Envelope(
