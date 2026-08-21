@@ -60,7 +60,11 @@ from liminallm.storage.cursors import (
     decode_index_cursor,
     decode_time_id_cursor,
 )
-from liminallm.storage.errors import ConstraintViolation, ConversationGone
+from liminallm.storage.errors import (
+    ConstraintViolation,
+    ConversationGone,
+    TrainingInProgress,
+)
 from liminallm.storage.models import (
     AdapterRouterState,
     ApiKey,
@@ -2675,15 +2679,12 @@ class PostgresStore:
             )
         return artifacts
 
-    def get_artifact(self, artifact_id: str) -> Optional[Artifact]:
-        if not _is_uuid(artifact_id):
-            return None
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM artifact WHERE id = %s", (artifact_id,)
-            ).fetchone()
-        if not row:
-            return None
+    def _artifact_from_row(self, row) -> Artifact:
+        """One mapping from an `artifact` row, so every reader sees the same.
+
+        Written out by hand in four places before this, which is how
+        `list_contexts` came to silently drop a column the model had gained.
+        """
         schema = row.get("schema")
         if isinstance(schema, str):
             try:
@@ -2708,6 +2709,15 @@ class PostgresStore:
             meta=row.get("meta"),
         )
 
+    def get_artifact(self, artifact_id: str) -> Optional[Artifact]:
+        if not _is_uuid(artifact_id):
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM artifact WHERE id = %s", (artifact_id,)
+            ).fetchone()
+        return self._artifact_from_row(row) if row else None
+
     def artifacts_for_paths(self, paths: Sequence[str]) -> List[Artifact]:
         """Artifacts whose `fs_path` is exactly one of `paths`.
 
@@ -2726,6 +2736,78 @@ class PostgresStore:
             ).fetchall()
         found = [self.get_artifact(str(row["id"])) for row in rows]
         return [artifact for artifact in found if artifact is not None]
+
+    def get_private_artifact(
+        self, artifact_id: str, *, owner_user_id: str
+    ) -> Optional[Artifact]:
+        """One artifact this user may mutate, or None.
+
+        SPEC §12.3 scopes user CRUD to *private* artifacts. Ownership alone is
+        not the rule: publishing an artifact as shared or global binds it into
+        other people's work and into ConfigOps review, so editing or retiring
+        one stops being a private decision.
+        """
+        if not _is_uuid(artifact_id) or not _is_uuid(owner_user_id):
+            return None
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM artifact "
+                "WHERE id = %s AND owner_user_id = %s AND visibility = 'private'",
+                (artifact_id, owner_user_id),
+            ).fetchone()
+        return self._artifact_from_row(row) if row else None
+
+    def delete_private_artifact(
+        self, artifact_id: str, *, owner_user_id: str
+    ) -> Optional[Artifact]:
+        """Retire a private artifact, or refuse while it is being trained.
+
+        Returns the deleted artifact so the caller can clean up the payloads
+        the server derived from its identity, or None if there was nothing
+        this user was allowed to delete.
+
+        Versions, config patches, router state and training jobs reference the
+        artifact with `ON DELETE CASCADE`, so the row carries them out.
+
+        The lock is the point. A worker claims a job with an atomic
+        `UPDATE ... WHERE status = 'queued'`, so taking the artifact and its
+        unfinished jobs `FOR UPDATE` gives the two operations one order: if
+        the worker claims first this sees `running` and refuses, and if this
+        commits first the claim finds no row to update. Without it, deleting
+        an adapter mid-training cascaded the job away while the worker went on
+        writing weights for an artifact that no longer existed.
+        """
+        if not _is_uuid(artifact_id) or not _is_uuid(owner_user_id):
+            return None
+        with self._connect() as conn, conn.transaction():
+            row = conn.execute(
+                "SELECT * FROM artifact "
+                "WHERE id = %s AND owner_user_id = %s AND visibility = 'private' "
+                "FOR UPDATE",
+                (artifact_id, owner_user_id),
+            ).fetchone()
+            if not row:
+                return None
+
+            unfinished = conn.execute(
+                "SELECT id, status FROM training_job "
+                "WHERE adapter_id = %s AND status IN ('queued', 'running') "
+                "FOR UPDATE",
+                (artifact_id,),
+            ).fetchall()
+            running = [j for j in unfinished if j["status"] == "running"]
+            if running:
+                raise TrainingInProgress(
+                    "the adapter is being trained and cannot be deleted",
+                    {
+                        "artifact_id": artifact_id,
+                        "job_ids": [str(j["id"]) for j in running],
+                    },
+                )
+
+            artifact = self._artifact_from_row(row)
+            conn.execute("DELETE FROM artifact WHERE id = %s", (artifact_id,))
+        return artifact
 
     def create_artifact(
         self,

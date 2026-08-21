@@ -96,7 +96,13 @@ async def store(
         {
             "status": status,
             "request_id": envelope.request_id,
-            "response": envelope.model_dump(),
+            # `mode="json"` because this record is JSON-encoded on the way to
+            # the cache. A plain model_dump leaves datetimes as datetimes, so
+            # every route whose response carries `created_at` answered 500 the
+            # moment a client sent the Idempotency-Key SPEC §18 invites — and
+            # the same request without the header succeeded, which is why it
+            # went unnoticed.
+            "response": envelope.model_dump(mode="json"),
         },
         ttl_seconds=IDEMPOTENCY_TTL_SECONDS,
     )

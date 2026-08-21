@@ -9458,3 +9458,80 @@ Three mutations, each killed by exactly one test. The session-cache test is an
 ordered pair — the first dirties the cache, the second requires it cleared —
 because a single test asserting an empty dictionary passes whenever it happens
 to run first.
+
+## Tranche 2G.2 (artifacts): private-artifact retirement
+
+### MEDIUM: PATCH used a read capability as its mutation rule
+
+`_get_owned_artifact` lets an admin through to another user's artifact and to
+ownerless system artifacts. That is right for viewing and wrong as the rule
+for `PATCH /v1/artifacts/{id}`, which used it — so an admin could edit a
+global system workflow directly through the ordinary user route, which is the
+change ConfigOps exists to review. Reproduced: the PATCH returned 200 and the
+description changed.
+
+`_get_private_artifact` is the mutation rule now, shared by PATCH and the new
+DELETE: `owner_user_id = caller AND visibility = 'private'`, enforced in the
+store's SQL. Visibility is part of it rather than ownership alone, because
+publishing an artifact binds it into other people's work.
+
+The owner of a *published* artifact gets 403 naming the reason, not 404 —
+they can already read it, so "not found" would only be confusing where the
+real answer is that publishing moved it out of their sole control. Everyone
+else gets 404.
+
+### HIGH: adapter deletion had to be serialized against training
+
+`training_job.adapter_id` cascades, so deleting an adapter mid-training would
+take the job record with it while the worker went on writing weights and then
+tried to promote a version onto a row that no longer existed.
+
+The delete takes the artifact and its unfinished jobs `FOR UPDATE` in one
+transaction. A worker claims with an atomic `UPDATE ... WHERE status =
+'queued'`, so the two operations get one order: claim first and the delete
+sees `running` and answers 409; delete first and the claim finds no row.
+
+### Payload cleanup is derived from the identity, never from the schema
+
+Order: revoke the database capability, commit, then remove the directories the
+server derives from the artifact's id. Filesystem-first would leave a live
+artifact pointing at missing bytes if the delete then failed; this way a
+failed cleanup leaves storage nothing can reach. Cleanup errors are logged,
+not raised — a committed, irreversible deletion must not be reported as a
+failure the caller would retry.
+
+`schema.fs_dir` is never a deletion target. `adapter_root` accepts an explicit
+directory whose final component matches the adapter id, which is enough
+authority to stop adapter A *serving* B's weights and is not authority to
+destroy: the schema is user-editable, so
+`<shared>/something-important/<own-artifact-id>` satisfies that rule while
+naming someone else's data. `server_owned_artifact_dirs` derives
+`artifacts/<id>` and, for adapters, `adapters/<id>` from the id alone.
+
+### Found on the way: an Idempotency-Key made these routes answer 500
+
+`POST /v1/artifacts` and `POST /v1/contexts` accept `Idempotency-Key` per
+SPEC §18. The guard cached `envelope.model_dump()`, which leaves `datetime`
+objects as objects, and the record is JSON-encoded on the way to the cache —
+so every route whose response carries `created_at` failed with
+`TypeError: Object of type datetime is not JSON serializable` the moment a
+client sent the header it is invited to send. The same request without the
+header succeeded, which is exactly why nothing noticed. `mode="json"` fixes
+it; the reds cover both routes and the replay path.
+
+This was found because the artifact test fixture sent the header. It had been
+live on two documented routes.
+
+### Mutations
+
+| Mutation | Killed by |
+|---|---|
+| remove the running-job guard | the running-training refusal |
+| delete `schema.fs_dir` as well | the malicious-path red |
+| PATCH back to `_get_owned_artifact` | both admin-bypass reds |
+| skip the payload cleanup | the payload and sibling-adapter reds |
+| idempotency record back to a plain `model_dump` | all three idempotency reds |
+
+The artifact row mapping was written out by hand in four places, which is how
+`list_contexts` came to silently drop a column the model had gained. One
+`_artifact_from_row` now.

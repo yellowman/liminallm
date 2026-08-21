@@ -252,6 +252,29 @@ def adapter_dir_owner(path) -> str:
     return candidate.name
 
 
+def server_owned_artifact_dirs(
+    fs_root, artifact_id: str, artifact_type: str
+) -> list[Path]:
+    """The directories this server derives from an artifact's identity alone.
+
+    Deliberately *not* `schema.fs_dir` or `cephfs_dir`. Those are accepted by
+    `adapter_root` when their final component matches the adapter's id, which
+    is enough authority to stop adapter A serving adapter B's weights — it is
+    not authority to destroy. The schema is user-editable, so a value like
+    `<shared>/something-important/<their-own-artifact-id>` satisfies that rule
+    while naming somebody else's data, and cleanup that trusted it would
+    delete a path the artifact merely mentions.
+
+    Derived from the id and joined safely, so a malformed identifier cannot
+    reach outside the shared root either.
+    """
+    base = Path(fs_root)
+    dirs = [safe_join(base, f"artifacts/{artifact_id}")]
+    if artifact_type == "adapter":
+        dirs.append(safe_join(base, f"adapters/{artifact_id}"))
+    return dirs
+
+
 def adapter_root(base: Path, adapter_id: str, explicit=None) -> Path:
     """The directory holding one adapter's versions, bound to its identity.
 

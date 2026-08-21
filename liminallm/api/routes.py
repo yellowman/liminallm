@@ -159,6 +159,7 @@ from liminallm.service.fs import (
     namespace_key,
     path_lock,
     safe_join,
+    server_owned_artifact_dirs,
     validate_signed_url,
 )
 from liminallm.service.runtime import MODEL_AFFECTING_SETTINGS, get_runtime
@@ -290,6 +291,44 @@ def _get_owned_context(
             "forbidden", "context is owned by another user", status_code=403
         )
     return ctx
+
+
+def _get_private_artifact(runtime, artifact_id: str, principal: AuthContext):
+    """An artifact this caller may *mutate*, or an error.
+
+    Not `_get_owned_artifact`. That one is a read capability: it lets an admin
+    through to another user's artifact and to ownerless system artifacts,
+    which is right for viewing and wrong as a mutation rule. Used for PATCH,
+    it made `/artifacts/{id}` a way to edit a global system workflow directly
+    — the change ConfigOps exists to review — as an accidental consequence of
+    being an admin on an ordinary user route.
+
+    SPEC §12.3 scopes user CRUD to *private* artifacts. Visibility is part of
+    the rule, not just ownership: publishing an artifact binds it into other
+    people's work, so retiring or editing it stops being a private decision.
+    Shared, global and system artifacts change through ConfigOps.
+
+    Reported as absent to anyone who could not already read it, so the id
+    says nothing about what exists. The owner of a *published* artifact is the
+    one exception: they can read it, so "not found" would only be confusing
+    where the real answer is that publishing moved it out of their sole
+    control.
+    """
+    artifact = runtime.store.get_private_artifact(
+        artifact_id, owner_user_id=principal.user_id
+    )
+    if artifact is not None:
+        return artifact
+
+    existing = runtime.store.get_artifact(artifact_id)
+    if existing is not None and existing.owner_user_id == principal.user_id:
+        raise http_error(
+            "forbidden",
+            f"this artifact is {existing.visibility}; published artifacts are "
+            "changed and retired through config ops, not here",
+            status_code=403,
+        )
+    raise http_error("not_found", "artifact not found", status_code=404)
 
 
 def _get_owned_artifact(runtime, artifact_id: str, principal: AuthContext):
@@ -3117,6 +3156,61 @@ async def create_artifact(
         return envelope
 
 
+@router.delete("/artifacts/{artifact_id}", response_model=Envelope, tags=["artifacts"])
+async def delete_artifact(
+    artifact_id: str = Path(..., max_length=255, description="Artifact identifier"),
+    principal: AuthContext = Depends(get_user),
+):
+    """Retire a private artifact the caller owns.
+
+    Its versions, config patches, router state and training jobs go with it by
+    cascade. An adapter being trained right now is refused with 409 instead:
+    the worker is writing weights and will try to promote a version onto this
+    row, so the deletion has to lose that race rather than win it.
+
+    Order matters for the payloads. The database capability is revoked and
+    committed first, then the directories this server derives from the
+    artifact's id are removed, best effort. Filesystem-first would leave a
+    live artifact pointing at missing bytes if the delete then failed; this
+    way a failed cleanup leaves storage nothing can reach, which is
+    recoverable. A cleanup error must not turn a committed, irreversible
+    deletion into a reported failure the caller would retry.
+    """
+    runtime = get_runtime()
+    await rate_limit(runtime, "write", principal.user_id)
+    _get_private_artifact(runtime, artifact_id, principal)
+
+    artifact = runtime.store.delete_private_artifact(
+        artifact_id, owner_user_id=principal.user_id
+    )
+    if artifact is None:
+        raise http_error("not_found", "artifact not found", status_code=404)
+
+    removed = []
+    for directory in server_owned_artifact_dirs(
+        runtime.settings.shared_fs_root, artifact.id, artifact.type
+    ):
+        try:
+            if directory.is_dir():
+                shutil.rmtree(directory)
+                removed.append(str(directory))
+        except OSError as exc:  # pragma: no cover - filesystem failure
+            logger.warning(
+                "artifact_payload_cleanup_failed",
+                artifact_id=artifact_id,
+                path=str(directory),
+                error=str(exc),
+            )
+    logger.info(
+        "artifact_deleted",
+        user_id=principal.user_id,
+        artifact_id=artifact_id,
+        artifact_type=artifact.type,
+        payloads_removed=removed,
+    )
+    return Envelope(status="ok", data={"deleted": True})
+
+
 @router.patch("/artifacts/{artifact_id}", response_model=Envelope, tags=["artifacts"])
 async def patch_artifact(
     artifact_id: str = Path(..., max_length=255, description="Artifact identifier"),
@@ -3131,7 +3225,7 @@ async def patch_artifact(
     """
     runtime = get_runtime()
     await rate_limit(runtime, "write", principal.user_id)
-    current = _get_owned_artifact(runtime, artifact_id, principal)
+    current = _get_private_artifact(runtime, artifact_id, principal)
 
     normalized = body.get_normalized_patch()
     new_schema = dict(current.schema) if isinstance(current.schema, dict) else {}

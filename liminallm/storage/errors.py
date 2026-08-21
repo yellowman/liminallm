@@ -24,4 +24,14 @@ class ConversationGone(ConstraintViolation):
     """
 
 
-__all__ = ["ConstraintViolation", "ConversationGone"]
+class TrainingInProgress(ConstraintViolation):
+    """An adapter cannot be retired while a worker is training it.
+
+    Training writes weights under the adapter's tree and then promotes a
+    version onto the artifact. `training_job.adapter_id` cascades, so deleting
+    the artifact would take the job record with it while the worker carried on
+    writing and then tried to promote onto a row that no longer exists.
+    """
+
+
+__all__ = ["ConstraintViolation", "ConversationGone", "TrainingInProgress"]
