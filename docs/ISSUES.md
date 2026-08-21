@@ -9413,3 +9413,48 @@ with a contrived test for a redundant guard.
 `conversation_id`, so it silently dropped the field. It uses
 `_context_from_row` now — one mapping, so a column added to the model reaches
 every reader.
+
+### Shared-store regressions: what a 2636-green run did not reveal
+
+Sharing one `PostgresStore` across the session bought 23% of the suite's wall
+clock and moved two facts about the environment that nothing was asserting.
+
+**HIGH: the store wrote under a different root than the runtime resolved.** A
+runtime-built store is handed `settings.shared_fs_root`, so the two agreed by
+construction. `get_test_store()` minted its own `liminallm_store_*` directory,
+and `Runtime` then adopted that store wholesale — leaving
+`store.fs_root != settings.shared_fs_root` for the whole run. Artifact payload
+locations derive from the first; filesystem authority, adapters, archive
+staging and the interpreter derive from the second. Almost nothing reads both,
+which is why it stayed invisible — and artifact retirement reads both.
+
+Investigating it turned up an older, quieter version of the same thing:
+`shared_fs_root` is a database-managed field with **no environment variable**,
+so `conftest`'s `os.environ.setdefault("SHARED_FS_ROOT", ...)` has never done
+anything and the suite has always run against the shipped default. That is
+exactly the trap the file already documents for `redis_url`. The harness reads
+the setting now, and the dead line is gone.
+
+**HIGH: the bootstrap artifacts stopped being re-seeded.**
+`_ensure_default_artifacts` runs in `PostgresStore.__init__` and seeds the
+default chat workflow and tool specs. While the store was rebuilt twice per
+test, the per-test TRUNCATE was undone by the next construction. With one
+store for the session, the first TRUNCATE removed the defaults and the
+remaining ~2600 tests ran in a boot state production never has — exercising
+fallbacks where the application runs on seeded rows.
+
+**MEDIUM: `PostgresStore.sessions` accumulated for the whole run.** An
+in-memory cache TRUNCATE cannot reach. Not the primary read path, so this is
+test isolation rather than a product bug, but a cache whose contents depend on
+test order does not belong in a session-wide object. The comment claiming the
+store has no per-test state was wrong, and is corrected.
+
+`reset_shared_store()` now runs after each TRUNCATE: it clears the session
+cache and re-seeds the defaults. Re-seeding a handful of rows is a fraction of
+what rebuilding a connection pool and rerunning the whole startup verifier
+twice per test cost, so the isolation is restored without giving back the time.
+
+Three mutations, each killed by exactly one test. The session-cache test is an
+ordered pair — the first dirties the cache, the second requires it cleared —
+because a single test asserting an empty dictionary passes whenever it happens
+to run first.

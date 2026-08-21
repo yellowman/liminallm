@@ -5,9 +5,13 @@ import sys
 import tempfile
 from pathlib import Path
 
-# Create temp directory for tests before any imports that might initialize runtime
+# NOTE: `shared_fs_root` is a database-managed field with no environment
+# variable (see config.managed_field), so exporting SHARED_FS_ROOT does
+# nothing — the same trap this file documents for `redis_url` below. The suite
+# therefore runs against the shipped default, and `tests/harness.py` reads the
+# setting rather than the environment so the store and the runtime cannot
+# disagree about where they write.
 _test_tmp_dir = tempfile.mkdtemp(prefix="liminallm_test_")
-os.environ.setdefault("SHARED_FS_ROOT", _test_tmp_dir)
 os.environ.setdefault("TEST_MODE", "true")
 # Tests run against a real Postgres. See tests/harness.py: the in-memory
 # store used to double the storage layer, so every storage feature was written
@@ -23,6 +27,7 @@ from tests.harness import (  # noqa: E402
     apply_schema,
     close_test_store,
     get_test_store,
+    reset_shared_store,
 )
 
 # Tests use the same async RedisCache production does, against a real
@@ -170,6 +175,10 @@ def _truncate_all() -> None:
 @pytest.fixture(autouse=True)
 def reset_runtime_state():
     _truncate_all()
+    # TRUNCATE takes the bootstrap artifacts with everything else, and it
+    # cannot reach the store's in-memory session cache. The store is built
+    # once for the session, so nothing else puts either back.
+    reset_shared_store(get_test_store())
     reset_runtime_for_tests()
     yield
     reset_runtime_for_tests()

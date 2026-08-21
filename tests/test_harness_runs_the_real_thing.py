@@ -260,3 +260,82 @@ def test_a_prepared_database_that_is_empty_stops_the_suite():
     assert "scripts/migrate.sh" in output, (
         f"the refusal does not name the command that fixes it:\n{output[-3000:]}"
     )
+
+
+# --- The shared store must be the store production would have built ---------
+#
+# One store now serves the whole session instead of being rebuilt twice per
+# test. That is worth 23% of the suite's wall clock, and it moved two facts
+# about the environment that no assertion was watching: which filesystem root
+# the store writes under, and whether the bootstrap artifacts a fresh boot
+# seeds are still there after the per-test TRUNCATE.
+
+
+def test_the_store_writes_where_the_runtime_thinks_it_does():
+    """`store.fs_root` and `settings.shared_fs_root` are one directory.
+
+    A runtime-built store is handed `settings.shared_fs_root`, so the two
+    agreed by construction. The shared store is built by the harness, and it
+    used to mint a second temporary directory of its own — leaving artifact
+    payloads written under one root while filesystem authority, adapters,
+    archive staging and the interpreter all resolved paths under another.
+
+    Nothing failed, because almost nothing reads both. Artifact retirement
+    reads both.
+    """
+    from pathlib import Path
+
+    runtime = get_runtime()
+    assert (
+        Path(runtime.store.fs_root).resolve()
+        == Path(runtime.settings.shared_fs_root).resolve()
+    ), (
+        f"store writes under {runtime.store.fs_root} while the runtime "
+        f"resolves paths under {runtime.settings.shared_fs_root}"
+    )
+
+
+def test_the_bootstrap_artifacts_survive_the_per_test_truncate():
+    """Every test starts from the state a fresh boot produces.
+
+    `_ensure_default_artifacts` runs in `PostgresStore.__init__` and seeds the
+    default chat workflow and tool specs. While the store was rebuilt per
+    test, the per-test TRUNCATE was undone by the next construction. With one
+    store for the session that construction happens once, so the first
+    TRUNCATE removed the defaults and the remaining tests ran without them —
+    exercising fallbacks where production runs on seeded rows.
+    """
+    artifacts = get_runtime().store.list_artifacts()
+    assert any(a.name == "default_chat_workflow" for a in artifacts), (
+        "the default chat workflow is missing, so this test — and every test "
+        "after the first — runs in a boot state production never has"
+    )
+    tools = {
+        a.schema.get("name")
+        for a in artifacts
+        if isinstance(a.schema, dict) and a.schema.get("kind") == "tool.spec"
+    }
+    assert tools, "the seeded tool specs are missing for the same reason"
+
+
+# The one piece of per-test state the shared store does carry.
+# `PostgresStore.sessions` is an in-memory dictionary that `_truncate_all`
+# cannot reach, so with a session-wide store it accumulated across the whole
+# run. Not the primary read path today, which is why this is isolation rather
+# than a product bug — but a cache whose contents depend on test order is a bad
+# thing to leave in place. These two run in file order: the first dirties the
+# cache, the second requires it to have been cleared between them.
+
+
+def test_a_session_cached_here_dirties_the_shared_store():
+    store = get_runtime().store
+    with store._session_lock:
+        store.sessions["leaked-from-the-previous-test"] = object()
+    assert store.sessions
+
+
+def test_the_stores_session_cache_does_not_leak_between_tests():
+    assert get_runtime().store.sessions == {}, (
+        "a session cached by the previous test is still here, so the cache "
+        "grows with test order across the whole run"
+    )

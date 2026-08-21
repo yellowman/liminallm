@@ -158,9 +158,43 @@ def get_test_store():
     if _STORE is None:
         from liminallm.storage.postgres import PostgresStore
 
-        _STORE_ROOT = tempfile.mkdtemp(prefix="liminallm_store_")
+        # The root the runtime resolves everything else against. A store built
+        # by `Runtime` is handed `settings.shared_fs_root`, so the two agree by
+        # construction; this one is built here, and minting a temporary
+        # directory of its own left artifact payloads under one root while
+        # filesystem authority, adapters, archive staging and the interpreter
+        # resolved paths under another.
+        #
+        # Read from the settings rather than from SHARED_FS_ROOT: like
+        # `redis_url`, `shared_fs_root` is a database-managed field with no
+        # environment variable, so exporting that name changes nothing.
+        from liminallm.config import get_settings
+
+        _STORE_ROOT = get_settings().shared_fs_root
         _STORE = PostgresStore(os.environ["DATABASE_URL"], fs_root=_STORE_ROOT)
     return _STORE
+
+
+def reset_shared_store(store) -> None:
+    """Put the session-wide store back into the state a fresh boot leaves.
+
+    `PostgresStore.__init__` seeds the default chat workflow and tool specs,
+    and it used to run twice per test, so the per-test TRUNCATE was undone by
+    the next construction. One store for the session means that construction
+    happens once — so the first TRUNCATE removed the defaults and every test
+    after it ran in a boot state production never has, exercising fallbacks
+    where the application runs on seeded rows.
+
+    Re-seeding a handful of rows is a fraction of what rebuilding the store
+    cost, so the isolation is restored without giving the time back.
+
+    `sessions` is cleared here for the same reason: it is an in-memory cache
+    that TRUNCATE cannot reach, and with a session-wide store it accumulated
+    for the length of the run.
+    """
+    with store._session_lock:
+        store.sessions.clear()
+    store._ensure_default_artifacts()
 
 
 def close_test_store() -> None:
@@ -168,8 +202,8 @@ def close_test_store() -> None:
     if _STORE is not None:
         _STORE.close_pool()
         _STORE = None
-    if _STORE_ROOT:
-        shutil.rmtree(_STORE_ROOT, ignore_errors=True)
+    # _STORE_ROOT is SHARED_FS_ROOT, which conftest owns and which holds
+    # everything the run wrote. It is not this function's to remove.
 
 
 def apply_schema(url: str, *, embedding_dim: int = 64) -> None:
