@@ -604,3 +604,28 @@ CREATE UNIQUE INDEX IF NOT EXISTS knowledge_context_conversation_idx
 CREATE INDEX IF NOT EXISTS knowledge_context_owner_ordinary_idx
   ON knowledge_context (owner_user_id)
   WHERE conversation_id IS NULL;
+
+
+-- Payloads waiting to be reclaimed, and when their capability was revoked.
+--
+-- Deleting an artifact and removing its bytes are two acts with different
+-- timing constraints: a turn resolves an adapter from Postgres and only then
+-- reads its weights, so unlinking inside the request lets a caller that
+-- legitimately acquired the artifact read a filesystem where it is gone.
+-- Reclamation is therefore delayed, and this is what it is delayed *from*.
+--
+-- The first attempt took the delay from the payload directory's mtime, which
+-- is the time of the last write rather than of the deletion — an adapter
+-- trained a week ago and deleted a moment ago was a week old by that measure
+-- and collected immediately. Written in the same transaction as the artifact
+-- delete, this row means exactly "the capability stopped existing at T": it
+-- survives a restart, every replica sees the same queue, and a failed cleanup
+-- is retried rather than becoming an orphan nothing looks at again.
+CREATE TABLE IF NOT EXISTS artifact_payload_retirement (
+  artifact_id   UUID PRIMARY KEY,
+  artifact_type TEXT NOT NULL,
+  retired_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS artifact_payload_retirement_due_idx
+  ON artifact_payload_retirement (retired_at);

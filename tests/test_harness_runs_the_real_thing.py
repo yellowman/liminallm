@@ -339,3 +339,40 @@ def test_the_stores_session_cache_does_not_leak_between_tests():
         "a session cached by the previous test is still here, so the cache "
         "grows with test order across the whole run"
     )
+
+
+def test_compose_does_not_seed_the_filesystem_root_through_settings():
+    """`shared_fs_root` is environment-only; Compose has to agree.
+
+    It is no longer a managed setting, so a `shared_fs_root` key in
+    INSTANCE_SETTINGS_JSON is filtered out as unknown — silently. The stack
+    kept working only because the environment default happened to equal the
+    mounted path.
+    """
+    import json as _json
+
+    app = _compose()["services"]["app"]
+    seed = (app.get("environment") or {}).get("INSTANCE_SETTINGS_JSON")
+    if seed:
+        assert "shared_fs_root" not in _json.loads(seed), (
+            "compose still seeds shared_fs_root as a managed setting, which "
+            "is now silently ignored"
+        )
+
+
+def test_compose_mounts_the_volume_where_the_app_will_look_for_it():
+    """One root, declared once, used by both the environment and the mount."""
+    app = _compose()["services"]["app"]
+    root = _service_env("app").get("SHARED_FS_ROOT")
+    assert root, (
+        "the app container is not told SHARED_FS_ROOT, so the documented way "
+        "to move the data root does nothing under Compose"
+    )
+    # Split on the first colon only: a target like `${VAR:-/default}` has
+    # colons of its own.
+    targets = [str(v).split(":", 1)[1] for v in (app.get("volumes") or [])
+               if ":" in str(v)]
+    assert root in targets, (
+        f"the app resolves its data root at {root} while the volume is "
+        f"mounted at {targets}"
+    )

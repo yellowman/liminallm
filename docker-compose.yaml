@@ -34,18 +34,26 @@ services:
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
       GROQ_API_KEY: ${GROQ_API_KEY:-}
       MISTRAL_API_KEY: ${MISTRAL_API_KEY:-}
+      # Where this container keeps its data. Environment-only, because the
+      # Postgres store is handed this root before any database-managed setting
+      # can be read — a stored value would move it for every service built
+      # afterwards while the store kept writing where it started. It is
+      # deliberately NOT in INSTANCE_SETTINGS_JSON below: the app filters that
+      # to managed settings, so a key there is dropped without a word.
+      SHARED_FS_ROOT: ${SHARED_FS_ROOT:-/srv/liminallm}
       # First-boot seed for the managed settings. redis_url matters here: its
       # default points at localhost, which inside this container is the
       # container itself rather than the redis service.
       INSTANCE_SETTINGS_JSON: >-
         {"redis_url": "redis://:${REDIS_PASSWORD:-changeme}@redis:6379/0",
-         "shared_fs_root": "/srv/liminallm",
          "model_backend": "${MODEL_BACKEND:-openai}",
          "model_path": "${MODEL_PATH:-gpt-4o-mini}",
          "app_base_url": "${APP_BASE_URL:-http://localhost:8000}",
          "embedding_model_id": "${EMBEDDING_MODEL_ID:-text-embedding-3-small}"}
     volumes:
-      - liminallm-data:/srv/liminallm
+      # Same expression as SHARED_FS_ROOT above, so the mount and the setting
+      # cannot name different directories.
+      - liminallm-data:${SHARED_FS_ROOT:-/srv/liminallm}
     depends_on:
       migrate:
         condition: service_completed_successfully

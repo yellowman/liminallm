@@ -578,3 +578,216 @@ def test_list_artifacts_uses_the_same_mapping_as_every_other_reader():
     assert "Artifact(" not in source, (
         "list_artifacts still has a hand-written mapping beside the shared one"
     )
+
+
+class TestTheGraceStartsAtRetirement:
+    """The clock has to measure the event it claims to measure.
+
+    The first sweep took its grace period from the payload directory's mtime,
+    which is the time of the last *write*, not of the deletion. An adapter
+    trained a week ago and deleted a millisecond ago is seven days old by that
+    measure, so it was collected immediately — putting back the exact race the
+    delayed sweep exists to remove. The earlier grace test did not catch it
+    because its fixture created the directory just before deleting it, so it
+    proved that a recently *written* payload survives.
+
+    Retirement is a durable record now, written in the same transaction as the
+    deletion, so "retired at T" means "the capability stopped existing at T".
+    """
+
+    def test_a_long_stable_adapter_deleted_a_moment_ago_is_not_collected(
+        self, client
+    ):
+        import os
+        import time
+
+        from liminallm.service.artifacts import sweep_artifact_payloads
+
+        user_id, headers = _account(client)
+        adapter_id = _adapter(client, headers, user_id)
+        runtime = get_runtime()
+        root = Path(runtime.settings.shared_fs_root)
+        tree = root / "adapters" / adapter_id
+        params = tree / "v0001" / "params.json"
+
+        # It has been in service, untouched, for a week.
+        week_ago = time.time() - 7 * 86400
+        for path in (params, tree / "v0001", tree):
+            os.utime(path, (week_ago, week_ago))
+
+        # A turn has already resolved it; then the owner deletes it.
+        assert runtime.store.get_artifact(adapter_id) is not None
+        assert client.delete(
+            f"/v1/artifacts/{adapter_id}", headers=headers
+        ).status_code == 200
+
+        removed = sweep_artifact_payloads(
+            runtime.store, runtime.settings.shared_fs_root, grace_seconds=3600
+        )
+        assert removed == 0, "a payload retired seconds ago was collected"
+        assert params.exists(), (
+            "the weights of an adapter deleted a moment ago were removed "
+            "because the directory itself was old"
+        )
+
+    def test_once_the_retirement_is_old_enough_the_payload_goes(self, client):
+        """Ageing the retirement, not the directory, is what releases it."""
+        from liminallm.service.artifacts import sweep_artifact_payloads
+
+        user_id, headers = _account(client)
+        adapter_id = _adapter(client, headers, user_id)
+        runtime = get_runtime()
+        tree = Path(runtime.settings.shared_fs_root) / "adapters" / adapter_id
+        assert client.delete(
+            f"/v1/artifacts/{adapter_id}", headers=headers
+        ).status_code == 200
+
+        with runtime.store._connect() as conn:
+            conn.execute(
+                "UPDATE artifact_payload_retirement "
+                "SET retired_at = now() - interval '2 hours' WHERE artifact_id = %s",
+                (adapter_id,),
+            )
+
+        assert sweep_artifact_payloads(
+            runtime.store, runtime.settings.shared_fs_root, grace_seconds=3600
+        ) >= 1
+        assert not tree.exists()
+
+    def test_the_retirement_record_is_written_with_the_deletion(self, client):
+        user_id, headers = _account(client)
+        adapter_id = _adapter(client, headers, user_id)
+        assert _count(
+            "SELECT COUNT(*) AS n FROM artifact_payload_retirement "
+            "WHERE artifact_id = %s",
+            (adapter_id,),
+        ) == 0
+        assert client.delete(
+            f"/v1/artifacts/{adapter_id}", headers=headers
+        ).status_code == 200
+        assert _count(
+            "SELECT COUNT(*) AS n FROM artifact_payload_retirement "
+            "WHERE artifact_id = %s",
+            (adapter_id,),
+        ) == 1
+
+    def test_a_refused_delete_records_no_retirement(self, client):
+        """The record and the deletion are one fact or neither."""
+        user_id, headers = _account(client)
+        adapter_id = _adapter(client, headers, user_id)
+        store = get_runtime().store
+        job = store.create_training_job(user_id=user_id, adapter_id=adapter_id)
+        assert store.claim_training_job(job.id) is not None
+
+        assert client.delete(
+            f"/v1/artifacts/{adapter_id}", headers=headers
+        ).status_code == 409
+        assert _count(
+            "SELECT COUNT(*) AS n FROM artifact_payload_retirement "
+            "WHERE artifact_id = %s",
+            (adapter_id,),
+        ) == 0
+
+    def test_the_record_is_cleared_once_the_payload_is_gone(self, client):
+        """Otherwise the queue grows forever and every sweep re-walks it."""
+        from liminallm.service.artifacts import sweep_artifact_payloads
+
+        user_id, headers = _account(client)
+        adapter_id = _adapter(client, headers, user_id)
+        runtime = get_runtime()
+        assert client.delete(
+            f"/v1/artifacts/{adapter_id}", headers=headers
+        ).status_code == 200
+
+        sweep_artifact_payloads(
+            runtime.store, runtime.settings.shared_fs_root, grace_seconds=0
+        )
+        assert _count(
+            "SELECT COUNT(*) AS n FROM artifact_payload_retirement "
+            "WHERE artifact_id = %s",
+            (adapter_id,),
+        ) == 0
+
+
+class TestTheSweepActuallyRunsInProduction:
+    @pytest.mark.asyncio
+    async def test_one_cleanup_pass_collects_a_due_retirement(self, client):
+        """A sweep nothing calls is a disk leak with good documentation.
+
+        The cleanup loop already retires tmp directories, attachment
+        generations and archive staging. Artifact payloads were added to
+        neither it nor anything else, so at the previous commit a deleted
+        artifact's bytes stayed on disk forever — safe from use-after-delete
+        only because nothing ever reclaimed them.
+        """
+        from liminallm.app import _run_cleanup_pass
+
+        user_id, headers = _account(client)
+        adapter_id = _adapter(client, headers, user_id)
+        runtime = get_runtime()
+        tree = Path(runtime.settings.shared_fs_root) / "adapters" / adapter_id
+        assert client.delete(
+            f"/v1/artifacts/{adapter_id}", headers=headers
+        ).status_code == 200
+        with runtime.store._connect() as conn:
+            conn.execute(
+                "UPDATE artifact_payload_retirement "
+                "SET retired_at = now() - interval '2 days' WHERE artifact_id = %s",
+                (adapter_id,),
+            )
+
+        await _run_cleanup_pass(
+            runtime, Path(runtime.settings.shared_fs_root), max_age_hours=24
+        )
+        assert not tree.exists(), (
+            "a due retirement survived a real cleanup pass, so nothing in "
+            "production ever reclaims artifact payloads"
+        )
+
+    def test_a_failed_cleanup_stays_in_the_queue(self, client):
+        """The retry is the point of putting this in the database.
+
+        Before, cleanup happened inside the request and an `OSError` was
+        logged once and forgotten — a permanent orphan. The record is only
+        cleared once the bytes are actually gone, so a full disk or a busy
+        mount means "next sweep" rather than "never".
+        """
+        import shutil as _shutil
+
+        from liminallm.service import artifacts as artifacts_module
+        from liminallm.service.artifacts import sweep_artifact_payloads
+
+        user_id, headers = _account(client)
+        adapter_id = _adapter(client, headers, user_id)
+        runtime = get_runtime()
+        tree = Path(runtime.settings.shared_fs_root) / "adapters" / adapter_id
+        assert client.delete(
+            f"/v1/artifacts/{adapter_id}", headers=headers
+        ).status_code == 200
+
+        def refuse(*a, **kw):
+            raise OSError("device or resource busy")
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(artifacts_module.shutil, "rmtree", refuse)
+        try:
+            removed = sweep_artifact_payloads(
+                runtime.store, runtime.settings.shared_fs_root, grace_seconds=0
+            )
+        finally:
+            monkeypatch.undo()
+
+        assert removed == 0
+        assert tree.is_dir(), "the tree went despite rmtree failing"
+        assert _count(
+            "SELECT COUNT(*) AS n FROM artifact_payload_retirement "
+            "WHERE artifact_id = %s",
+            (adapter_id,),
+        ) == 1, "the retirement was forgotten after a failed cleanup"
+
+        # The next sweep picks it up again.
+        assert _shutil is artifacts_module.shutil
+        assert sweep_artifact_payloads(
+            runtime.store, runtime.settings.shared_fs_root, grace_seconds=0
+        ) >= 1
+        assert not tree.exists()

@@ -2785,8 +2785,47 @@ class PostgresStore:
                 )
 
             artifact = self._artifact_from_row(row)
+            # One transaction, so "retired at T" means "the capability stopped
+            # existing at T" and nothing else. A refused delete writes no row,
+            # and a committed delete cannot leave its payloads unqueued.
+            conn.execute(
+                "INSERT INTO artifact_payload_retirement "
+                "(artifact_id, artifact_type) VALUES (%s, %s) "
+                "ON CONFLICT (artifact_id) DO NOTHING",
+                (artifact_id, artifact.type),
+            )
             conn.execute("DELETE FROM artifact WHERE id = %s", (artifact_id,))
         return artifact
+
+    def due_artifact_retirements(self, *, grace_seconds: int) -> list[tuple[str, str]]:
+        """Retired payloads whose grace period has elapsed.
+
+        Measured from the recorded retirement, not from anything on disk: the
+        question is how long ago the capability was revoked, and a payload's
+        own timestamps answer a different one.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT artifact_id, artifact_type FROM artifact_payload_retirement "
+                "WHERE retired_at <= now() - make_interval(secs => %s) "
+                "ORDER BY retired_at",
+                (max(grace_seconds, 0),),
+            ).fetchall()
+        return [(str(r["artifact_id"]), r["artifact_type"]) for r in rows]
+
+    def clear_artifact_retirement(self, artifact_id: str) -> None:
+        """Drop the queue entry once its payloads are gone.
+
+        Only after the bytes are, so a failed cleanup is retried next sweep
+        instead of being forgotten.
+        """
+        if not _is_uuid(artifact_id):
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM artifact_payload_retirement WHERE artifact_id = %s",
+                (artifact_id,),
+            )
 
     def create_artifact(
         self,

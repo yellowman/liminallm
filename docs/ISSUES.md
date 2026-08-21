@@ -9617,3 +9617,57 @@ removal, and removing it kills two tests.
 The `managed_field` mutation also hangs one root-identity test rather than
 failing it cleanly. Recorded rather than chased: it is mutant-only behaviour,
 and the other three reds kill it in under a second.
+
+### 2G.3 carry-over: the clock, the caller, and the deployment
+
+**HIGH: the grace period measured the wrong event.** The sweep took its cutoff
+from the payload directory's mtime — the time of the last *write*. An adapter
+trained a week ago and deleted a millisecond ago is a week old by that
+measure, so it was collected immediately and the reader race came straight
+back. The grace test did not catch it because its fixture created the
+directory just before deleting it: it proved that a recently *written* payload
+survives, which is a different sentence.
+
+Retirement is durable state now. `artifact_payload_retirement` is written in
+the same transaction as the artifact delete, so "retired at T" means "the
+capability stopped existing at T" — exact, restart-proof, identical across
+replicas, and involving no user-editable path. The sweep selects records past
+the grace period, removes only the directories derived from the id, and clears
+the record only once the bytes are gone, so a failed cleanup is retried rather
+than becoming an orphan logged once and kept.
+
+**MEDIUM/HIGH: nothing ran the sweep.** `sweep_artifact_payloads` was added and
+wired to nothing. The deployed behaviour was: delete an artifact, the database
+state goes, the payload stays — forever, across restarts. Safe from
+use-after-delete only because reclamation never happened, and an unbounded disk
+leak of adapter weights and version payloads.
+
+The cleanup loop's body is now `_run_cleanup_pass`, which a test executes once
+against a real due retirement. That is worth more than asserting a function
+name appears in `app.py`, and it caught a bug immediately: the loop called
+`get_runtime()`, which `app.py` imports inside `lifespan` rather than at module
+scope, so the loop would have raised `NameError` on its first iteration and no
+test would have noticed.
+
+**MEDIUM: Docker still implemented the old configuration model.** Compose
+seeded `shared_fs_root` through `INSTANCE_SETTINGS_JSON` — now filtered out as
+unknown, silently — and never passed `SHARED_FS_ROOT` to the app, so the newly
+documented way to move the data root did nothing under Compose. The stack kept
+working only because the environment default happened to equal the mounted
+path. Compose now passes `SHARED_FS_ROOT` and mounts the volume at the same
+expression, `.env.example` documents it, and the seed key is gone. A static
+test asserts both halves.
+
+### Mutations
+
+| Mutation | Killed by |
+|---|---|
+| grace taken from the filesystem again | the long-stable-adapter red and the grace red |
+| no retirement record written with the delete | three ledger reds |
+| artifact sweep removed from the cleanup pass | the one-real-pass red |
+| retirement cleared despite a failed cleanup | the retry red |
+| compose seeds `shared_fs_root` again | the compose seed red |
+
+The retry mutation survived its first pass: nothing tested that a failed
+`rmtree` leaves the record in place, which is the whole reason for putting the
+queue in the database. It has a red now.

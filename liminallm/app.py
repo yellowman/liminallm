@@ -774,36 +774,55 @@ def _sweep_attachment_generations(shared_root: Path, max_age_hours: int) -> None
         logger.info("attachment_generations_swept", removed=removed)
 
 
+async def _run_cleanup_pass(runtime, shared_root: Path, max_age_hours: int) -> None:
+    """One round of every periodic reclamation. Each failure is its own.
+
+    Extracted from the loop so a test can execute the real thing once. A sweep
+    that exists but is called by nothing is a disk leak with documentation:
+    artifact payload reclamation was added and wired to neither this loop nor
+    anything else, so a deleted artifact's bytes stayed on disk forever — safe
+    from use-after-delete only because nothing ever collected them.
+    """
+    from liminallm.service.artifacts import sweep_artifact_payloads
+
+    sweeps = (
+        ("tmp_cleanup_failed", _sweep_tmp_dirs, (shared_root, max_age_hours)),
+        (
+            "attachment_generation_sweep_failed",
+            _sweep_attachment_generations,
+            (shared_root, max_age_hours),
+        ),
+        (
+            "archive_staging_sweep_failed",
+            _sweep_archive_staging,
+            (shared_root, max_age_hours),
+        ),
+        (
+            "artifact_payload_sweep_failed",
+            sweep_artifact_payloads,
+            (runtime.store, str(shared_root)),
+        ),
+    )
+    for event, sweep, args in sweeps:
+        try:
+            await asyncio.to_thread(sweep, *args)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # pragma: no cover - best-effort cleanup
+            logger.warning(event, error=str(exc))
+
+
 async def _run_tmp_cleanup(
     shared_root: Path, interval_seconds: int, max_age_hours: int
 ) -> None:
     """Background loop to periodically clean tmp scratch directories."""
 
+    from liminallm.service.runtime import get_runtime
+
     interval = max(interval_seconds, 300)
     try:
         while True:
-            try:
-                await asyncio.to_thread(_sweep_tmp_dirs, shared_root, max_age_hours)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # pragma: no cover - best-effort cleanup
-                logger.warning("tmp_cleanup_failed", error=str(exc))
-            try:
-                await asyncio.to_thread(
-                    _sweep_attachment_generations, shared_root, max_age_hours
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # pragma: no cover - best-effort cleanup
-                logger.warning("attachment_generation_sweep_failed", error=str(exc))
-            try:
-                await asyncio.to_thread(
-                    _sweep_archive_staging, shared_root, max_age_hours
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # pragma: no cover - best-effort cleanup
-                logger.warning("archive_staging_sweep_failed", error=str(exc))
+            await _run_cleanup_pass(get_runtime(), shared_root, max_age_hours)
             await asyncio.sleep(interval)
     except asyncio.CancelledError:
         logger.info("tmp_cleanup_task_cancelled")

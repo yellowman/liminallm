@@ -25,9 +25,16 @@ free: an `rmtree` of a large checkpoint tree stops blocking an API worker, and
 an I/O failure becomes a retry next sweep rather than an orphan that is logged
 once and kept forever.
 
-Artifact ids are never reused, so the rule is simple: the directory is named
-like a server-owned payload, no artifact row has that id, and it has been that
-way for longer than the grace period.
+The delay is measured from a durable record written in the same transaction
+as the deletion, not from anything on disk. A payload's own timestamps answer
+a different question — an adapter trained a week ago and deleted a moment ago
+is a week old by that measure, and the first version of this sweep collected
+it immediately, putting the race straight back. "Retired at T" has to mean
+"the capability stopped existing at T".
+
+Artifact ids are never reused, so the rest is simple: take the retirements
+whose grace has elapsed, remove only the directories derived from the id, and
+clear the record once the bytes are gone.
 """
 
 from __future__ import annotations
@@ -35,9 +42,11 @@ from __future__ import annotations
 import shutil
 import time
 from pathlib import Path
-from typing import Iterable
 
-from liminallm.service.fs import PathTraversalError, safe_join
+from liminallm.service.fs import (
+    PathTraversalError,
+    server_owned_artifact_dirs,
+)
 from liminallm.logging import get_logger
 
 logger = get_logger(__name__)
@@ -52,62 +61,51 @@ PAYLOAD_DIRNAMES = ("artifacts", "adapters")
 DEFAULT_GRACE_SECONDS = 3600
 
 
-def _candidate_dirs(root: Path) -> Iterable[Path]:
-    for dirname in PAYLOAD_DIRNAMES:
-        parent = root / dirname
-        if not parent.is_dir():
-            continue
-        for child in parent.iterdir():
-            if child.is_dir():
-                yield child
-
-
 def sweep_artifact_payloads(
     store, fs_root: str, *, grace_seconds: int = DEFAULT_GRACE_SECONDS
 ) -> int:
-    """Remove payload directories no artifact claims. Returns how many went.
+    """Reclaim the payloads of retirements older than the grace period.
 
-    `grace_seconds` is measured from the directory's own mtime, which is what
-    a deletion leaves behind: the row goes, the directory stops changing.
+    Returns how many artifacts were reclaimed.
     """
-    root = Path(fs_root)
-    cutoff = time.time() - max(grace_seconds, 0)
     removed = 0
+    try:
+        due = store.due_artifact_retirements(grace_seconds=grace_seconds)
+    except Exception as exc:  # pragma: no cover - the queue is unreadable
+        logger.warning("artifact_retirement_queue_unreadable", error=str(exc))
+        return 0
 
-    for directory in _candidate_dirs(root):
-        artifact_id = directory.name
-        try:
-            # The name has to be one this server would have produced, so a
-            # directory that merely sits in the tree is not swept on the
-            # strength of its position.
-            if safe_join(root, f"{directory.parent.name}/{artifact_id}") != directory:
-                continue
-        except PathTraversalError:
+    for artifact_id, artifact_type in due:
+        # Ids are not reused, so this can only be true if the delete was rolled
+        # back after its record was read. Cheap, and it is the one question
+        # that must not be stale.
+        if store.get_artifact(artifact_id) is not None:
             continue
         try:
-            if directory.stat().st_mtime > cutoff:
-                continue
-        except OSError:
-            continue
-        try:
-            # The one authority check, taken immediately before removing
-            # rather than during the scan: the scan's answer is stale by the
-            # time the loop reaches this directory. A second, earlier copy of
-            # this question would only be an optimization, and no test can
-            # tell the two apart because artifact ids are never reused — so
-            # there is one.
-            if store.get_artifact(artifact_id) is not None:
-                continue
-            shutil.rmtree(directory)
-        except OSError as exc:
-            # Retried next sweep rather than lost. This is the failure mode
-            # that used to become an orphan nothing would look at again.
-            logger.warning(
-                "artifact_payload_sweep_failed",
-                path=str(directory),
-                error=str(exc),
+            directories = server_owned_artifact_dirs(
+                fs_root, artifact_id, artifact_type
             )
+        except PathTraversalError:  # pragma: no cover - malformed id
+            logger.warning("artifact_retirement_path_refused", artifact_id=artifact_id)
             continue
+
+        failed = False
+        for directory in directories:
+            try:
+                if directory.is_dir():
+                    shutil.rmtree(directory)
+                    logger.info("artifact_payload_reclaimed", path=str(directory))
+            except OSError as exc:
+                # Left in the queue, so the next sweep tries again. This is the
+                # failure that used to become an orphan logged once and kept.
+                logger.warning(
+                    "artifact_payload_sweep_failed",
+                    path=str(directory),
+                    error=str(exc),
+                )
+                failed = True
+        if failed:
+            continue
+        store.clear_artifact_retirement(artifact_id)
         removed += 1
-        logger.info("artifact_payload_reclaimed", path=str(directory))
     return removed

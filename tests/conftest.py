@@ -105,7 +105,9 @@ from liminallm.service.runtime import (  # noqa: E402
 # One store for the session. The runtime is rebuilt before and after every
 # test, and building one used to construct a connection pool and re-verify the
 # whole schema each time — measured at about a quarter of the suite's wall
-# clock. The store has no per-test state, so isolation loses nothing.
+# clock. What per-test state the store does carry — its in-memory session
+# cache, and the bootstrap artifacts TRUNCATE removes — is restored by
+# `reset_shared_store` below, which costs a fraction of rebuilding it.
 use_shared_store(get_test_store())
 
 # Avoid import-time failures for routes that rely on python-multipart in constrained test environments.
