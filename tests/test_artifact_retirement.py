@@ -791,3 +791,192 @@ class TestTheSweepActuallyRunsInProduction:
             runtime.store, runtime.settings.shared_fs_root, grace_seconds=0
         ) >= 1
         assert not tree.exists()
+
+
+class TestEveryDisappearanceEnrolls:
+    """The ledger only collects what something put in it.
+
+    Moving from an orphan-scanning sweep to a ledger-driven one traded
+    discovery for exactness, and the trade was unguarded: a deletion path that
+    does not write a retirement row leaves its payloads unreachable forever,
+    where the old sweep would eventually have found them. Enrolment therefore
+    belongs to the `artifact` table itself rather than to one caller.
+    """
+
+    def test_deleting_the_owner_enrols_their_artifacts(self, client):
+        """Admin account deletion removes artifacts by owner, in bulk.
+
+        `delete_user` runs `DELETE FROM artifact WHERE owner_user_id = ...`
+        with no retirement insert, so an adapter's weights survived the whole
+        account and no sweep would ever look at them again.
+        """
+        user_id, headers = _account(client)
+        _, admin_headers = _account(client, admin=True)
+        adapter_id = _adapter(client, headers, user_id)
+
+        resp = client.delete(f"/v1/admin/users/{user_id}", headers=admin_headers)
+        assert resp.status_code in (200, 204), resp.text
+        assert _count(
+            "SELECT COUNT(*) AS n FROM artifact WHERE id = %s", (adapter_id,)
+        ) == 0
+        assert _count(
+            "SELECT COUNT(*) AS n FROM artifact_payload_retirement "
+            "WHERE artifact_id = %s",
+            (adapter_id,),
+        ) == 1, (
+            "the account went and its adapter's weights were never enrolled "
+            "for reclamation"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_enrolled_payload_is_collected_by_a_real_pass(self, client):
+        from liminallm.app import _run_cleanup_pass
+
+        user_id, headers = _account(client)
+        _, admin_headers = _account(client, admin=True)
+        adapter_id = _adapter(client, headers, user_id)
+        runtime = get_runtime()
+        tree = Path(runtime.settings.shared_fs_root) / "adapters" / adapter_id
+
+        assert client.delete(
+            f"/v1/admin/users/{user_id}", headers=admin_headers
+        ).status_code in (200, 204)
+        with runtime.store._connect() as conn:
+            conn.execute(
+                "UPDATE artifact_payload_retirement "
+                "SET retired_at = now() - interval '2 days' WHERE artifact_id = %s",
+                (adapter_id,),
+            )
+        await _run_cleanup_pass(
+            runtime, Path(runtime.settings.shared_fs_root), max_age_hours=24
+        )
+        assert not tree.exists()
+
+    def test_deleting_an_account_refuses_while_a_worker_is_training(self, client):
+        """The same protection the artifact route has, by the same argument.
+
+        A worker writing weights will try to promote a version onto the
+        artifact. Removing the account takes the artifact and cascades the job
+        away underneath it.
+        """
+        user_id, headers = _account(client)
+        _, admin_headers = _account(client, admin=True)
+        adapter_id = _adapter(client, headers, user_id)
+        store = get_runtime().store
+        job = store.create_training_job(user_id=user_id, adapter_id=adapter_id)
+        assert store.claim_training_job(job.id) is not None
+
+        resp = client.delete(f"/v1/admin/users/{user_id}", headers=admin_headers)
+        assert resp.status_code == 409, (
+            "the account was deleted while a worker was training one of its "
+            f"adapters: {resp.status_code} {resp.text[:300]}"
+        )
+        assert _count(
+            "SELECT COUNT(*) AS n FROM artifact WHERE id = %s", (adapter_id,)
+        ) == 1
+
+    def test_an_unenrolled_orphan_is_enrolled_rather_than_removed(self, client):
+        """Self-healing, and conservative about when its clock starts.
+
+        `create_artifact` writes its payload before publishing the row, so a
+        failed publication leaves a directory no artifact ever named — nothing
+        to delete, so nothing to enrol. The old scanning sweep would have
+        found it; the ledger cannot. Discovery is back, but it records a
+        first-observed retirement instead of removing on sight, so the grace
+        period still protects anything that might legitimately be mid-read.
+        """
+        from liminallm.service.artifacts import sweep_artifact_payloads
+
+        runtime = get_runtime()
+        stray = uuid.uuid4()
+        tree = Path(runtime.settings.shared_fs_root) / "artifacts" / str(stray)
+        tree.mkdir(parents=True, exist_ok=True)
+        (tree / "v1.json").write_text("{}")
+
+        removed = sweep_artifact_payloads(
+            runtime.store, runtime.settings.shared_fs_root, grace_seconds=3600
+        )
+        assert removed == 0, "an orphan was removed on the sweep that found it"
+        assert tree.is_dir()
+        assert _count(
+            "SELECT COUNT(*) AS n FROM artifact_payload_retirement "
+            "WHERE artifact_id = %s",
+            (str(stray),),
+        ) == 1, "the orphan was neither enrolled nor removed, so it is immortal"
+
+        # Once its first-observed clock has run, the next sweep takes it.
+        with runtime.store._connect() as conn:
+            conn.execute(
+                "UPDATE artifact_payload_retirement "
+                "SET retired_at = now() - interval '2 hours' WHERE artifact_id = %s",
+                (str(stray),),
+            )
+        assert sweep_artifact_payloads(
+            runtime.store, runtime.settings.shared_fs_root, grace_seconds=3600
+        ) >= 1
+        assert not tree.exists()
+
+    def test_a_live_artifacts_payload_is_never_enrolled(self, client):
+        """Discovery must not enrol something that is simply in use."""
+        from liminallm.service.artifacts import sweep_artifact_payloads
+
+        user_id, headers = _account(client)
+        adapter_id = _adapter(client, headers, user_id)
+        runtime = get_runtime()
+
+        sweep_artifact_payloads(
+            runtime.store, runtime.settings.shared_fs_root, grace_seconds=0
+        )
+        assert _count(
+            "SELECT COUNT(*) AS n FROM artifact_payload_retirement "
+            "WHERE artifact_id = %s",
+            (adapter_id,),
+        ) == 0
+        assert (
+            Path(runtime.settings.shared_fs_root) / "adapters" / adapter_id
+        ).is_dir()
+
+
+def test_startup_refuses_a_database_without_the_retirement_ledger(client):
+    """It is load-bearing in DELETE and in the cleanup loop.
+
+    Without the table an older database boots clean, the first artifact DELETE
+    fails at request time, and the sweeper turns an unreadable queue into
+    "nothing to do" — which is the opposite of failing fast.
+    """
+    import os
+
+    from liminallm.storage.postgres import PostgresStore
+    from tests.harness import apply_schema
+
+    runtime = get_runtime()
+    url = os.environ["DATABASE_URL"]
+    with runtime.store._connect() as conn:
+        conn.execute("DROP TABLE IF EXISTS artifact_payload_retirement CASCADE")
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            PostgresStore(url, fs_root=str(runtime.settings.shared_fs_root))
+        assert "migrate" in str(caught.value).lower(), str(caught.value)
+    finally:
+        apply_schema(url, embedding_dim=64)
+
+    PostgresStore(url, fs_root=str(runtime.settings.shared_fs_root))
+
+
+def test_startup_refuses_a_database_without_the_enrolment_trigger(client):
+    """The table alone is not the rule; the trigger is what applies it."""
+    import os
+
+    from liminallm.storage.postgres import PostgresStore
+    from tests.harness import apply_schema
+
+    runtime = get_runtime()
+    url = os.environ["DATABASE_URL"]
+    with runtime.store._connect() as conn:
+        conn.execute("DROP TRIGGER IF EXISTS artifact_retire_payload ON artifact")
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            PostgresStore(url, fs_root=str(runtime.settings.shared_fs_root))
+        assert "migrate" in str(caught.value).lower(), str(caught.value)
+    finally:
+        apply_schema(url, embedding_dim=64)

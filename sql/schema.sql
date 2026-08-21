@@ -629,3 +629,31 @@ CREATE TABLE IF NOT EXISTS artifact_payload_retirement (
 
 CREATE INDEX IF NOT EXISTS artifact_payload_retirement_due_idx
   ON artifact_payload_retirement (retired_at);
+
+
+-- Enrolment belongs to the table, not to one caller.
+--
+-- `delete_private_artifact` wrote the retirement row itself, which was correct
+-- for the route it serves and silently wrong everywhere else: admin account
+-- deletion removes artifacts in bulk with `DELETE FROM artifact WHERE
+-- owner_user_id = ...`, so an adapter's weights outlived the whole account and
+-- the ledger-driven sweep had nothing to look at. The previous orphan-scanning
+-- sweep would eventually have found them; exchanging it for exactness made
+-- every unenrolled deletion permanent.
+--
+-- A trigger applies the rule to every path there is — the artifact route, user
+-- deletion, an FK cascade, a future maintenance statement — without any of
+-- them having to remember.
+CREATE OR REPLACE FUNCTION artifact_retire_payload_fn() RETURNS TRIGGER AS $$
+BEGIN
+  INSERT INTO artifact_payload_retirement (artifact_id, artifact_type)
+  VALUES (OLD.id, OLD.type)
+  ON CONFLICT (artifact_id) DO NOTHING;
+  RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS artifact_retire_payload ON artifact;
+CREATE TRIGGER artifact_retire_payload
+  AFTER DELETE ON artifact
+  FOR EACH ROW EXECUTE FUNCTION artifact_retire_payload_fn();

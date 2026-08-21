@@ -407,6 +407,11 @@ class PostgresStore:
             "training_job",
             "user_mfa_secret",
             "instance_config",
+            # Load-bearing in artifact DELETE and in the cleanup loop. Without
+            # it an older database boots clean, the first DELETE fails at
+            # request time, and the sweeper reads an unreadable queue as
+            # "nothing to do".
+            "artifact_payload_retirement",
         ]
 
         with self._connect() as conn:
@@ -556,6 +561,26 @@ class PostgresStore:
                     "nulls on delete, so retiring a knowledge context leaves "
                     "conversations bound to a row that no longer exists. Rerun "
                     "scripts/migrate.sh to apply the SPEC §2 schema."
+                )
+
+            # The table alone is not the rule. Enrolment is an AFTER DELETE
+            # trigger on `artifact`, and without it every deletion path
+            # silently stops queueing payloads while the queue table sits
+            # there looking correct — which is exactly the state the
+            # ledger-only sweep cannot recover from.
+            enrolment = conn.execute(
+                """
+                SELECT 1 FROM pg_trigger
+                WHERE tgrelid = 'artifact'::regclass
+                  AND tgname = 'artifact_retire_payload'
+                  AND NOT tgisinternal
+                """
+            ).fetchone()
+            if not enrolment:
+                raise RuntimeError(
+                    "the artifact_retire_payload trigger is missing, so deleting "
+                    "an artifact leaves its payloads with nothing to reclaim "
+                    "them. Rerun scripts/migrate.sh to apply the SPEC §2 schema."
                 )
 
             vector_ext = conn.execute(
@@ -1507,6 +1532,25 @@ class PostgresStore:
         if not row:
             return None
         return self._row_to_user(row)
+
+    def user_has_running_training(self, user_id: str) -> bool:
+        """Is a worker writing weights for one of this account's adapters?
+
+        Account deletion removes artifacts in bulk and cascades their training
+        jobs, which would take the record out from under a worker that is
+        still writing and will try to promote a version onto the artifact. The
+        artifact route refuses this; the account route has to refuse it for
+        the same reason.
+        """
+        if not _is_uuid(user_id):
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM training_job WHERE user_id = %s AND status = 'running' "
+                "LIMIT 1",
+                (user_id,),
+            ).fetchone()
+        return bool(row)
 
     def delete_user(self, user_id: str) -> bool:
         """Delete user and cascade to all related records.
@@ -2785,17 +2829,39 @@ class PostgresStore:
                 )
 
             artifact = self._artifact_from_row(row)
-            # One transaction, so "retired at T" means "the capability stopped
-            # existing at T" and nothing else. A refused delete writes no row,
-            # and a committed delete cannot leave its payloads unqueued.
-            conn.execute(
-                "INSERT INTO artifact_payload_retirement "
-                "(artifact_id, artifact_type) VALUES (%s, %s) "
-                "ON CONFLICT (artifact_id) DO NOTHING",
-                (artifact_id, artifact.type),
-            )
+            # The retirement row is written by an AFTER DELETE trigger on
+            # `artifact`, in this same transaction. Doing it here instead made
+            # enrolment a property of this one caller, and every other way an
+            # artifact can disappear — account deletion above all — left its
+            # payloads with nothing to collect them.
             conn.execute("DELETE FROM artifact WHERE id = %s", (artifact_id,))
         return artifact
+
+    def enrol_artifact_retirement(self, artifact_id: str, artifact_type: str) -> bool:
+        """Record a first-observed orphan, if nothing claims it.
+
+        Enrolment normally comes from the delete trigger, which knows exactly
+        when the capability went. This covers what no deletion produced: a
+        `create_artifact` that wrote its payload and then failed to publish
+        the row leaves a directory no artifact ever named, so there was
+        nothing to delete and nothing to enrol.
+
+        The clock starts now rather than at some unknowable earlier moment, so
+        the grace period still protects anything that might be mid-read.
+        """
+        if not _is_uuid(artifact_id):
+            return False
+        with self._connect() as conn, conn.transaction():
+            if conn.execute(
+                "SELECT 1 FROM artifact WHERE id = %s", (artifact_id,)
+            ).fetchone():
+                return False
+            row = conn.execute(
+                "INSERT INTO artifact_payload_retirement (artifact_id, artifact_type) "
+                "VALUES (%s, %s) ON CONFLICT (artifact_id) DO NOTHING RETURNING 1",
+                (artifact_id, artifact_type),
+            ).fetchone()
+        return bool(row)
 
     def due_artifact_retirements(self, *, grace_seconds: int) -> list[tuple[str, str]]:
         """Retired payloads whose grace period has elapsed.

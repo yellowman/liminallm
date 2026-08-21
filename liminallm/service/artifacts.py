@@ -35,13 +35,20 @@ it immediately, putting the race straight back. "Retired at T" has to mean
 Artifact ids are never reused, so the rest is simple: take the retirements
 whose grace has elapsed, remove only the directories derived from the id, and
 clear the record once the bytes are gone.
+
+The sweep also enrols what nothing enrolled for it. A ledger only collects
+what something puts in it, and `create_artifact` writes its payload before
+publishing the row — so a failed publication leaves a directory no artifact
+ever named, with no deletion to trigger enrolment. Those are recorded at
+first observation rather than removed on sight, which keeps discovery without
+bringing back a clock that means the wrong thing.
 """
 
 from __future__ import annotations
 
 import shutil
-import time
 from pathlib import Path
+from typing import Iterable
 
 from liminallm.service.fs import (
     PathTraversalError,
@@ -61,6 +68,43 @@ PAYLOAD_DIRNAMES = ("artifacts", "adapters")
 DEFAULT_GRACE_SECONDS = 3600
 
 
+def _candidate_dirs(root: Path) -> Iterable[tuple[str, str]]:
+    """Every directory shaped like a payload this server produced.
+
+    Yields `(artifact_id, artifact_type)`. The parent name is what tells the
+    two apart, and it is the server's own layout rather than anything the
+    artifact's schema claims.
+    """
+    for dirname in PAYLOAD_DIRNAMES:
+        parent = root / dirname
+        if not parent.is_dir():
+            continue
+        for child in parent.iterdir():
+            if child.is_dir():
+                yield child.name, ("adapter" if dirname == "adapters" else "artifact")
+
+
+def enrol_unknown_payloads(store, fs_root: str) -> int:
+    """Record payloads that no artifact claims and no retirement covers."""
+    enrolled = 0
+    for artifact_id, artifact_type in _candidate_dirs(Path(fs_root)):
+        try:
+            if store.enrol_artifact_retirement(artifact_id, artifact_type):
+                enrolled += 1
+                logger.info(
+                    "artifact_payload_orphan_enrolled",
+                    artifact_id=artifact_id,
+                    artifact_type=artifact_type,
+                )
+        except Exception as exc:  # pragma: no cover - malformed name, or a race
+            logger.warning(
+                "artifact_payload_enrolment_failed",
+                artifact_id=artifact_id,
+                error=str(exc),
+            )
+    return enrolled
+
+
 def sweep_artifact_payloads(
     store, fs_root: str, *, grace_seconds: int = DEFAULT_GRACE_SECONDS
 ) -> int:
@@ -69,6 +113,12 @@ def sweep_artifact_payloads(
     Returns how many artifacts were reclaimed.
     """
     removed = 0
+    # Discovery first, so an orphan nothing enrolled starts its clock on the
+    # sweep that finds it rather than never.
+    try:
+        enrol_unknown_payloads(store, fs_root)
+    except Exception as exc:  # pragma: no cover - filesystem unreadable
+        logger.warning("artifact_payload_enrolment_scan_failed", error=str(exc))
     try:
         due = store.due_artifact_retirements(grace_seconds=grace_seconds)
     except Exception as exc:  # pragma: no cover - the queue is unreadable

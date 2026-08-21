@@ -9671,3 +9671,56 @@ test asserts both halves.
 The retry mutation survived its first pass: nothing tested that a failed
 `rmtree` leaves the record in place, which is the whole reason for putting the
 queue in the database. It has a red now.
+
+### 2G.3 carry-over: not every disappearance wrote a ledger entry
+
+Moving from an orphan-scanning sweep to a ledger-driven one bought an exact
+retirement clock and quietly gave up discovery. The trade was unguarded.
+
+**HIGH: admin account deletion bypassed retirement entirely.**
+`delete_user` removes a user's artifacts with `DELETE FROM artifact WHERE
+owner_user_id = ...` and wrote no retirement row, so an adapter's weights
+outlived the whole account and the ledger-driven sweep had nothing to look at
+— permanently. The previous scanning sweep would eventually have found them.
+
+Enrolment belongs to the table now: an `AFTER DELETE ON artifact` trigger
+writes the retirement row, so every path gets the rule without remembering it
+— the artifact route, account deletion, an FK cascade, a future maintenance
+statement. The hand-written insert is gone from `delete_private_artifact`.
+
+The same endpoint also bypassed the running-training protection. It now
+refuses with 409 while any of the account's training jobs is running, for the
+same reason the artifact route does: the worker is writing weights and will
+try to promote a version onto an artifact the deletion would cascade away.
+
+**MEDIUM: the new load-bearing table was not verified at startup.** An older
+database booted clean, the first artifact DELETE failed at request time, and
+the sweeper turned an unreadable queue into "nothing to do". Both the table
+and the trigger are checked now — the table alone is not the rule, and a
+database can hold it while silently failing to populate it.
+
+**MEDIUM: a failed artifact creation made an orphan nothing could discover.**
+`create_artifact` writes its payload before publishing the row, so a failed
+publication leaves a directory no artifact ever named. There was no deletion,
+so no trigger fires, and the ledger-only sweep never looks at unknown
+directories.
+
+The sweep enrols them instead of removing them: a first-observed retirement at
+`now()`, so the grace period still protects anything that might legitimately be
+mid-read, and the following sweep reclaims it. That also makes the system
+self-healing if a future deletion path ever escapes the trigger.
+
+### Mutations
+
+| Mutation | Killed by |
+|---|---|
+| drop the enrolment trigger | refused at startup before any test runs |
+| trigger present but enrolling nothing | four reds, including the account-deletion one |
+| account deletion stops refusing during training | the running-training red |
+| sweep stops enrolling unknown orphans | the unenrolled-orphan red |
+| enrolment ignores whether the artifact is live | the live-payload red |
+
+The first mutation is the blunt kind — dropping the trigger trips the startup
+verifier, so the suite refuses to boot rather than failing one test. Mutating
+the trigger's *body* instead keeps startup happy and is the precise version;
+it is the one that proves the reds.
