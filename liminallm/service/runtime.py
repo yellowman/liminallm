@@ -82,6 +82,31 @@ def _mask_url_password(url: Optional[str]) -> Optional[str]:
         return "***url_parse_error***"
 
 
+#: A store for `Runtime` to adopt instead of building its own. Only the test
+#: harness sets it, and only in TEST_MODE.
+#:
+#: The suite rebuilds the runtime before and after every test for state
+#: isolation, and building one used to mean a new connection pool and a full
+#: re-run of the schema verification each time. Measured at 2636 tests: 38.5ms
+#: per `Runtime()`, twice per test, about a quarter of the suite's wall clock
+#: spent proving the same schema over and over against the same database.
+#:
+#: The store is the one thing in the runtime with no per-test state to
+#: isolate — it holds a pool and a fs_root — so sharing one across the session
+#: costs nothing that the reset was buying. Tests that need a store built from
+#: scratch, such as the startup-verification reds, construct `PostgresStore`
+#: directly and are unaffected.
+_shared_store = None
+
+
+def use_shared_store(store) -> None:
+    """Have `Runtime` adopt `store` rather than construct one. Test-mode only."""
+    global _shared_store
+    if not get_settings().test_mode:
+        raise RuntimeError("a shared store is only allowed in TEST_MODE")
+    _shared_store = store
+
+
 class Runtime:
     """Holds singleton service instances for the FastAPI app."""
 
@@ -93,7 +118,7 @@ class Runtime:
         )
 
         try:
-            self.store = PostgresStore(
+            self.store = _shared_store or PostgresStore(
                 self.settings.database_url, fs_root=self.settings.shared_fs_root
             )
             logger.info(
@@ -626,7 +651,10 @@ class Runtime:
             with contextlib.suppress(Exception):
                 await self.cache.close()
 
-        if getattr(self, "store", None):
+        # A runtime closes what it built. Under test the store is shared
+        # across the session, and the app's lifespan shutdown runs whenever a
+        # test exercises it — which closed the pool every later test needed.
+        if getattr(self, "store", None) and self.store is not _shared_store:
             with contextlib.suppress(Exception):
                 await self.store.close()
 
@@ -675,7 +703,13 @@ def reset_runtime_for_tests() -> Runtime:
         # Close the store's connection pool too. Replacing the runtime without
         # this leaks a pool per reset — invisible while the store was in-memory,
         # and it exhausts Postgres connections the moment it is not.
-        if runtime is not None and getattr(runtime, "store", None) is not None:
+        # Not the shared one: it outlives every reset by design, and closing
+        # its pool here would make the next test pay to rebuild it.
+        if (
+            runtime is not None
+            and getattr(runtime, "store", None) is not None
+            and runtime.store is not _shared_store
+        ):
             runtime.store.close_pool()
 
         reset_settings_cache()

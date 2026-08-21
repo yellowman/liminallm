@@ -18,6 +18,33 @@ import httpx
 from argon2 import PasswordHasher, Type
 from argon2.exceptions import InvalidHash, VerifyMismatchError
 
+
+def _password_hasher() -> PasswordHasher:
+    """Argon2id at production cost, or a deliberately cheap one under test.
+
+    The library defaults spend 64 MiB and about 65 ms per hash, and that cost
+    is the entire point: it is what makes a stolen hash expensive to attack.
+
+    The test suite creates thousands of accounts and buys nothing with it —
+    measured at 11.5% of the suite's wall clock. So TEST_MODE, and only
+    TEST_MODE, lowers the parameters. There is deliberately no setting of its
+    own: a knob that weakens password hashing is one an operator can turn by
+    accident, and `test_mode` is already the flag that refuses to be on in
+    production.
+
+    Existing hashes keep verifying either way. Argon2 encodes its parameters
+    in the hash string, so `verify` reads them from the stored value rather
+    than from whatever this returns.
+    """
+    from liminallm.config import get_settings
+
+    if get_settings().test_mode:
+        # The minimum the algorithm accepts: 8 KiB per lane, one pass.
+        return PasswordHasher(
+            type=Type.ID, time_cost=1, memory_cost=8, parallelism=1
+        )
+    return PasswordHasher(type=Type.ID)
+
 from liminallm.config import Settings
 from liminallm.logging import get_logger
 from liminallm.service.tenancy import user_belongs_to_site
@@ -106,7 +133,7 @@ class AuthService:
         self._email_verification_tokens: dict[str, tuple[str, datetime]] = {}
         # Issue 11.2: In-memory fallback for password reset tokens when Redis unavailable
         self._password_reset_tokens: dict[str, tuple[str, datetime]] = {}  # token -> (email, expires_at)
-        self._pwd_hasher = PasswordHasher(type=Type.ID)
+        self._pwd_hasher = _password_hasher()
         self.logger = logger
         self._last_cleanup = datetime.now(timezone.utc)
         # Allowance for small clock skew across nodes (Issue 76.1/76.2)

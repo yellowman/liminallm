@@ -90,7 +90,16 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
-from liminallm.service.runtime import reset_runtime_for_tests  # noqa: E402
+from liminallm.service.runtime import (  # noqa: E402
+    reset_runtime_for_tests,
+    use_shared_store,
+)
+
+# One store for the session. The runtime is rebuilt before and after every
+# test, and building one used to construct a connection pool and re-verify the
+# whole schema each time — measured at about a quarter of the suite's wall
+# clock. The store has no per-test state, so isolation loses nothing.
+use_shared_store(get_test_store())
 
 # Avoid import-time failures for routes that rely on python-multipart in constrained test environments.
 fastapi_dep_utils.ensure_multipart_is_installed = lambda: None
