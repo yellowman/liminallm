@@ -515,15 +515,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                     "context_snippets": context_snippets,
                     "vars": vars_scope,
                 }
-                await self._persist_workflow_state(
-                    state_key,
-                    {
-                        "status": "timeout",
-                        "failed_at": datetime.now(timezone.utc).isoformat(),
-                        "error": "workflow_timeout",
-                        "elapsed_ms": elapsed_ms,
-                    },
-                )
+                await self._retire_workflow_state(state_key)
                 return timeout_result
 
             node_id = pending.pop(0)
@@ -676,17 +668,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             "routing_trace": routing_trace,
             "vars": vars_scope,
         }
-        await self._persist_workflow_state(
-            state_key,
-            {
-                "status": "completed",
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-                "result": {
-                    "content": content,
-                    "adapters": [a.get("id") for a in adapters or []],
-                },
-            },
-        )
+        await self._retire_workflow_state(state_key)
         await self.cache_conversation_state(conversation_id, history)
         return result
 
@@ -714,16 +696,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         )
         if rollback_state:
             failure_entry["rollback"] = rollback_state
-        await self._persist_workflow_state(
-            state_key,
-            {
-                "status": "failed",
-                "failed_at": datetime.now(timezone.utc).isoformat(),
-                "error": str(exc),
-                "workflow_trace": workflow_trace,
-                "vars": vars_scope,
-            },
-        )
+        await self._retire_workflow_state(state_key)
         return {
             "status": "error",
             "content": "workflow execution failed",
@@ -754,15 +727,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         result.setdefault("routing_trace", routing_trace)
         result.setdefault("context_snippets", context_snippets)
         result.setdefault("vars", vars_scope)
-        await self._persist_workflow_state(
-            state_key,
-            {
-                "status": "failed",
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-                "result": result,
-                "error": result.get("error"),
-            },
-        )
+        await self._retire_workflow_state(state_key)
         return result
 
     async def _execute_node_with_retry(
@@ -1341,6 +1306,29 @@ class WorkflowEngine(WorkflowStreamingMixin):
         if not self.cache:
             return
         await self.cache.set_workflow_state(state_key, state)
+
+    async def _retire_workflow_state(self, state_key: str) -> None:
+        """Drop the state of a workflow that has finished.
+
+        A terminal state used to be written here — `completed`, `failed` or
+        `timeout`, carrying result content, the workflow trace, context
+        snippets and vars — and nothing ever read one back. That made it a
+        second copy of a conversation's content with its own TTL and its own
+        lifetime, which deleting the conversation would then have had to
+        enumerate and remove. Not keeping it is smaller than keeping it
+        correctly. Running state still exists while the workflow does.
+
+        Best effort: the workflow has already produced its answer, and a
+        cache that cannot be reached must not turn that into a failure.
+        """
+        if not self.cache:
+            return
+        try:
+            await self.cache.delete_workflow_state(state_key)
+        except Exception as exc:  # pragma: no cover - cache outage
+            self.logger.warning(
+                "workflow_state_retire_failed", state_key=state_key, error=str(exc)
+            )
 
     def _serialize_messages(self, history: List[Message]) -> List[dict]:
         serialized: List[dict] = []

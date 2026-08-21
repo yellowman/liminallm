@@ -370,6 +370,15 @@ return {1, tokens, 0}
             f"chat:summary:{conversation_id}", json.dumps(summary), ex=ttl_seconds
         )
 
+    async def delete_conversation_summary(self, conversation_id: str) -> None:
+        """Retire a deleted conversation's cached messages.
+
+        The TTL is an optimization, not a lifetime. Without this, deleting a
+        chat left its recent messages readable here for up to an hour after
+        every trace of it had gone from Postgres.
+        """
+        await self.client.delete(f"chat:summary:{conversation_id}")
+
     async def set_oauth_state(
         self, state: str, provider: str, expires_at: datetime, tenant_id: Optional[str]
     ) -> None:

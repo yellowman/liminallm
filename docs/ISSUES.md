@@ -9286,3 +9286,43 @@ The attachment fixtures had the same shape of error one layer down: the first
 bodies were a few dozen bytes, and a text file at or under `INLINE_MAX_BYTES`
 is inlined rather than indexed. Three tests were exercising a path that builds
 no implicit context at all.
+
+### 2G.1 carry-over: two residuals found reviewing 1d4eda3
+
+**MEDIUM: the unique index was verified without its predicate.** The check
+required unique, one key, `conversation_id` — and said nothing about the
+partial predicate the schema declared. `WHERE conversation_id IS NULL` passes
+all three and constrains none of the implicit contexts, because every one of
+them has a non-NULL `conversation_id`.
+
+The fix removes the predicate rather than verifying it. PostgreSQL treats
+NULLs as distinct in a unique index, so a plain `CREATE UNIQUE INDEX ON
+knowledge_context (conversation_id)` already permits any number of ordinary
+contexts while admitting one row per conversation. Startup then requires
+`indpred IS NULL`, which is not one more thing to check but one fewer thing to
+substitute.
+
+The foreign-key check was finished at the same time: it confirmed a cascading
+single-column reference into `conversation`, not that the reference is to
+`conversation.id`. That clause shipped without a test and its mutation
+survived — an FK pointing at `conversation(active_context_id)` satisfied every
+other clause. It has a red now.
+
+**MEDIUM: deleting a chat left its text in Redis.** `chat:summary:<id>` caches
+recent messages with an hour's TTL and had no delete. The relational lifetime
+was exact and covered exactly the tables, so the conversation's content stayed
+readable in the cache after every trace of it had gone from Postgres. The
+route now retires it after the database commits, best effort: the database is
+the record, and a cache outage must not turn a completed deletion into a
+failure the user retries against a chat that is already gone.
+
+The second family was `workflow:state:<tenant>:<conversation>:<workflow>`. The
+engine wrote `completed`, `failed` and `timeout` states holding result content,
+traces, context snippets and vars, and nothing read one back —
+`get_workflow_state` had no caller outside the cache module. Rather than build
+enumeration machinery so deletion could find them, terminal states are no
+longer written. Running state still exists while the workflow does.
+
+Grepping for the shape found a fourth terminal site the first pass missed: a
+second `failed` branch persisting the whole `result` dictionary. All four
+retire now.

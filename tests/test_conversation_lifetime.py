@@ -485,3 +485,93 @@ class TestTheGuardKeysOnTheKeyNotTheDescription:
         listed = client.get("/v1/contexts", headers=headers)
         assert listed.status_code == 200, listed.text
         assert context_id not in listed.text
+
+
+class TestDeletingAChatRetiresItsCachedState:
+    """Postgres is not the only place a conversation's text lives.
+
+    The relational lifetime is exact now, and it covers exactly the tables.
+    Redis holds the same content on its own schedule: recent messages are
+    cached under `chat:summary:<id>` with an hour's TTL so a follow-up turn
+    does not re-read them. Deleting the chat left that behind, so the text of
+    a deleted conversation stayed readable for up to an hour by anything
+    holding its id.
+    """
+
+    def _cache(self):
+        cache = get_runtime().cache
+        if cache is None:
+            pytest.skip("no Redis in this environment; nothing to retire")
+        return cache
+
+    def test_deleting_a_chat_drops_its_cached_history(self, client):
+        import asyncio
+
+        _, headers = _account(client)
+        conversation_id = _conversation(client, headers)
+        cache = self._cache()
+
+        secret = f"SECRET-{uuid.uuid4().hex[:10]}"
+        asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+            cache.set_conversation_summary(
+                conversation_id, {"recent_messages": [{"content": secret}]}
+            )
+        )
+
+        def _summary():
+            loop = asyncio.get_event_loop_policy().new_event_loop()
+            try:
+                return loop.run_until_complete(
+                    cache.get_conversation_summary(conversation_id)
+                )
+            finally:
+                loop.close()
+
+        cached = _summary()
+        assert cached and secret in json.dumps(cached), "nothing was cached to retire"
+
+        assert client.delete(
+            f"/v1/conversations/{conversation_id}", headers=headers
+        ).status_code == 200
+
+        assert _summary() is None, (
+            "the deleted conversation's messages are still in the cache, "
+            "readable for as long as the TTL lasts"
+        )
+
+    def test_a_finished_workflow_leaves_no_state_behind(self, client):
+        """Terminal workflow state is not retained at all.
+
+        The engine wrote `completed`, `failed` and `timeout` states carrying
+        result content, traces, context snippets and vars — and nothing ever
+        read them back. Retaining them meant a second copy of a chat's
+        content with its own lifetime, so deletion would have needed
+        machinery to enumerate and remove it. Not writing it is smaller and
+        leaves nothing to enumerate.
+        """
+        import asyncio
+
+        _, headers = _account(client)
+        conversation_id = _conversation(client, headers)
+        cache = self._cache()
+
+        resp = client.post(
+            "/v1/chat",
+            headers=headers,
+            json={
+                "conversation_id": conversation_id,
+                "message": {"content": "a question worth answering"},
+            },
+        )
+        assert resp.status_code == 200, resp.text
+
+        loop = asyncio.get_event_loop_policy().new_event_loop()
+        try:
+            keys = loop.run_until_complete(
+                cache.client.keys(f"workflow:state:*{conversation_id}*")
+            )
+        finally:
+            loop.close()
+        assert keys == [], (
+            f"the finished workflow left state behind: {keys}"
+        )

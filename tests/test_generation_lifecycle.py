@@ -3399,6 +3399,103 @@ class TestALoadBearingIndexIsVerifiedAtStartup:
                 )
             self._restore(url)
 
+    def test_a_predicate_that_excludes_every_implicit_context_is_refused(
+        self, client
+    ):
+        """Unique, one key, right column — and constraining nothing.
+
+        `WHERE conversation_id IS NULL` is the impostor a key check alone
+        cannot see. Every implicit context has a non-NULL conversation_id, so
+        the index covers none of them, and PostgreSQL permits arbitrarily many
+        NULLs in a unique index anyway. The schema therefore declares no
+        predicate at all — a plain unique index on a nullable column already
+        allows any number of ordinary contexts while admitting one row per
+        conversation — and startup requires that there be none.
+        """
+        import os
+
+        import pytest as _pytest
+
+        from liminallm.storage.postgres import PostgresStore
+
+        runtime = get_runtime()
+        url = os.environ["DATABASE_URL"]
+        with runtime.store._connect() as conn:
+            conn.execute("DROP INDEX IF EXISTS knowledge_context_conversation_idx")
+            conn.execute(
+                "CREATE UNIQUE INDEX knowledge_context_conversation_idx "
+                "ON knowledge_context (conversation_id) "
+                "WHERE conversation_id IS NULL"
+            )
+        try:
+            with _pytest.raises(RuntimeError) as caught:
+                PostgresStore(url, fs_root=str(runtime.settings.shared_fs_root))
+            assert "migrate" in str(caught.value).lower(), str(caught.value)
+        finally:
+            with runtime.store._connect() as conn:
+                conn.execute(
+                    "DROP INDEX IF EXISTS knowledge_context_conversation_idx"
+                )
+            self._restore(url)
+
+    def test_a_foreign_key_into_the_wrong_column_is_refused(self, client):
+        """Referencing the conversation table is not referencing its identity.
+
+        A cascading, single-column foreign key from `conversation_id` into
+        `conversation` satisfies every other clause here while pointing at
+        the wrong column — so the cascade fires on changes to something that
+        is not the conversation's identity, and the lifetime it appears to
+        establish is with a different value entirely.
+        """
+        import os
+
+        import pytest as _pytest
+
+        from liminallm.storage.postgres import PostgresStore
+
+        runtime = get_runtime()
+        url = os.environ["DATABASE_URL"]
+        with runtime.store._connect() as conn:
+            conn.execute(
+                "ALTER TABLE knowledge_context "
+                "DROP CONSTRAINT knowledge_context_conversation_id_fkey"
+            )
+            # An FK needs a unique column to reference; give it one that is
+            # not the conversation's identity.
+            conn.execute(
+                "ALTER TABLE conversation "
+                "ADD CONSTRAINT conversation_active_context_uniq "
+                "UNIQUE (active_context_id)"
+            )
+            conn.execute(
+                "ALTER TABLE knowledge_context "
+                "ADD CONSTRAINT knowledge_context_conversation_id_fkey "
+                "FOREIGN KEY (conversation_id) "
+                "REFERENCES conversation(active_context_id) ON DELETE CASCADE"
+            )
+        try:
+            with _pytest.raises(RuntimeError) as caught:
+                PostgresStore(url, fs_root=str(runtime.settings.shared_fs_root))
+            assert "migrate" in str(caught.value).lower(), str(caught.value)
+        finally:
+            with runtime.store._connect() as conn:
+                conn.execute(
+                    "ALTER TABLE knowledge_context "
+                    "DROP CONSTRAINT knowledge_context_conversation_id_fkey"
+                )
+                conn.execute(
+                    "ALTER TABLE conversation "
+                    "DROP CONSTRAINT conversation_active_context_uniq"
+                )
+                conn.execute(
+                    "ALTER TABLE knowledge_context "
+                    "ADD CONSTRAINT knowledge_context_conversation_id_fkey "
+                    "FOREIGN KEY (conversation_id) REFERENCES conversation(id) "
+                    "ON DELETE CASCADE"
+                )
+
+        PostgresStore(url, fs_root=str(runtime.settings.shared_fs_root))
+
     def test_startup_refuses_a_foreign_key_that_does_not_cascade(self, client):
         """A reference that does not cascade is not a lifetime.
 

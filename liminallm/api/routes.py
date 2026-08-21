@@ -4734,6 +4734,24 @@ async def delete_conversation(
         raise NotFoundError(
             "conversation not found", detail={"conversation_id": conversation_id}
         )
+
+    # After the database commits, and best effort. Redis caches this chat's
+    # recent messages under its own hour-long TTL, so without this the text of
+    # a deleted conversation stays readable there after every trace of it has
+    # gone from Postgres. It runs second because the database is the record:
+    # a cache that cannot be reached must not turn a completed deletion into a
+    # reported failure the user would retry against a chat that is already
+    # gone. What survives a failure here is an entry that expires on its own.
+    if runtime.cache is not None:
+        try:
+            await runtime.cache.delete_conversation_summary(conversation_id)
+        except Exception as exc:  # pragma: no cover - cache outage
+            logger.warning(
+                "conversation_cache_retire_failed",
+                conversation_id=conversation_id,
+                error=str(exc),
+            )
+
     logger.info(
         "conversation_deleted",
         user_id=principal.user_id,

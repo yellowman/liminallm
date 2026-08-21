@@ -557,11 +557,18 @@ WHERE kc.conversation_id IS NULL
 
 -- One conversation, one implicit index. Keyed on the real identity, so no
 -- expression can be substituted for it and no extra key can make it unique
--- for free. Ordinary contexts have a NULL conversation_id and are unaffected.
+-- for free.
+--
+-- Deliberately not a partial index. PostgreSQL treats NULLs as distinct in a
+-- unique index, so this already permits any number of ordinary contexts while
+-- admitting one row per conversation — and a predicate here would be one more
+-- thing that has to be verified and can be substituted. `WHERE conversation_id
+-- IS NULL` is unique, single-keyed, on the right column, and constrains none
+-- of the rows this exists to constrain.
 DROP INDEX IF EXISTS knowledge_context_auto_conversation_idx;
+DROP INDEX IF EXISTS knowledge_context_conversation_idx;
 CREATE UNIQUE INDEX IF NOT EXISTS knowledge_context_conversation_idx
-  ON knowledge_context (conversation_id)
-  WHERE conversation_id IS NOT NULL;
+  ON knowledge_context (conversation_id);
 
 CREATE INDEX IF NOT EXISTS knowledge_context_owner_ordinary_idx
   ON knowledge_context (owner_user_id)

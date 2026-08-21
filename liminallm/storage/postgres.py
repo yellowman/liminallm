@@ -458,17 +458,22 @@ class PostgresStore:
             # This used to introspect an index over `meta ->> 'conversation_id'`
             # with an `auto` predicate, and each successive tightening was
             # answering a counterexample: keyed on `id` alongside the
-            # conversation, or with the row id folded into the second key, or
-            # with a predicate that matched no rows — each unique, each
-            # enforcing nothing. A single key on a foreign-key column admits
-            # none of those, because there is no expression to substitute and
-            # no room for an extra key.
+            # conversation, the row id folded into the second key, a predicate
+            # of `id IS NULL` — each unique, each enforcing nothing.
+            #
+            # A single unqualified key on a foreign-key column admits none of
+            # them: no expression to substitute, no room for an extra key, and
+            # `indpred IS NULL` leaves no predicate to narrow it away. That
+            # last clause is not redundant. `WHERE conversation_id IS NULL`
+            # passes every other test here and covers none of the implicit
+            # contexts, because they all have a non-NULL conversation_id.
             uniqueness = conn.execute(
                 """
                 SELECT 1 FROM pg_index i
                 WHERE i.indrelid = 'knowledge_context'::regclass
                   AND i.indisunique
                   AND i.indnkeyatts = 1
+                  AND i.indpred IS NULL
                   AND pg_get_indexdef(i.indexrelid, 1, true) = 'conversation_id'
                 """
             ).fetchone()
@@ -489,12 +494,17 @@ class PostgresStore:
                 SELECT 1 FROM pg_constraint c
                 JOIN pg_attribute a
                   ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+                JOIN pg_attribute ref
+                  ON ref.attrelid = c.confrelid AND ref.attnum = c.confkey[1]
                 WHERE c.conrelid = 'knowledge_context'::regclass
                   AND c.contype = 'f'
                   AND c.confrelid = 'conversation'::regclass
                   AND c.confdeltype = 'c'
                   AND array_length(c.conkey, 1) = 1
                   AND a.attname = 'conversation_id'
+                  -- Referencing the conversation table is not enough; it has
+                  -- to reference the conversation's identity.
+                  AND ref.attname = 'id'
                 """
             ).fetchone()
             if not lifetime:
