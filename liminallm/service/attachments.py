@@ -584,55 +584,72 @@ def sweep_generations(store, fs_root: str, *, grace_seconds: int) -> int:
     attachments"; an unreadable one means "unknown", and deleting on unknown
     would take every generation the account has.
 
-    An account mid-erasure is skipped outright, because for it "empty" and
+    An account mid-erasure is not swept at all, because for it "empty" and
     "unknown" become the same thing. Its conversations are gone, so the mark
     set is legitimately empty and every generation it ever made looks
     unreferenced — judged by the blob's own mtime, which is as old as the day
     it was attached. Without this the deletion's grace period was undercut by
     the next cleanup pass, and a turn holding one of those blobs read a
     filesystem where it had gone.
+
+    That account's whole pass runs inside `hold_user_lifetime`, not after a
+    question asked once at the top. Asking and then acting is a check-then-act
+    across the deletion itself: the answer "not being erased" is only true
+    until it is not, and every step after it here — reading the referenced
+    set, judging an mtime, unlinking — is a step taken on a stale one. The
+    per-blob `generation_lock` does not help, because it serialises this sweep
+    against attachment adoption, not against the account's lifetime.
     """
     root = Path(fs_root) / "users"
     if not root.is_dir():
         return 0
-    try:
-        pending = store.pending_user_namespaces()
-    except Exception:
-        # Same rule as the referenced set below: unknown is not empty. If the
-        # queue cannot be read, no account can be shown to be safe to sweep.
-        return 0
     cutoff = time.time() - max(grace_seconds, 0)
     removed = 0
     for user_dir in root.iterdir():
-        if user_dir.name in pending:
-            continue
         base = user_dir / GENERATION_DIRNAME / "sha256"
         if not base.is_dir():
             continue
         try:
-            referenced = store.referenced_attachment_checksums(user_dir.name)
-        except Exception:
-            continue
-        for blob in base.glob("*/*"):
-            if blob.name in referenced:
-                continue
-            try:
-                if blob.stat().st_mtime > cutoff:
+            with store.hold_user_lifetime(user_dir.name) as collectable:
+                if not collectable:
                     continue
-            except OSError:
+                removed += _sweep_one_users_generations(
+                    store, fs_root, user_dir.name, base, cutoff
+                )
+        except Exception:
+            # Unknown is not empty, here as much as below: an account that
+            # cannot be shown to be safe to sweep is not swept.
+            continue
+    return removed
+
+
+def _sweep_one_users_generations(store, fs_root, user_id, base, cutoff) -> int:
+    """One account's generations, with its lifetime already held."""
+    try:
+        referenced = store.referenced_attachment_checksums(user_id)
+    except Exception:
+        # An empty set legitimately means "no attachments"; an unreadable one
+        # means "unknown", and deleting on unknown takes everything.
+        return 0
+    removed = 0
+    for blob in base.glob("*/*"):
+        if blob.name in referenced:
+            continue
+        try:
+            if blob.stat().st_mtime > cutoff:
                 continue
-            try:
-                with generation_lock(fs_root, user_dir.name, blob.name):
-                    # Asked again, inside the lock. The snapshot above was
-                    # taken before any attachment adopting this object could
-                    # be made to wait, so acting on it alone deletes a
-                    # reference created while this was queuing.
-                    if store.attachment_checksum_referenced(
-                        user_dir.name, blob.name
-                    ):
-                        continue
-                    blob.unlink()
-            except (OSError, PathLockTimeout):
-                continue
-            removed += 1
+        except OSError:
+            continue
+        try:
+            with generation_lock(fs_root, user_id, blob.name):
+                # Asked again, inside the lock. The snapshot above was taken
+                # before any attachment adopting this object could be made to
+                # wait, so acting on it alone deletes a reference created
+                # while this was queuing.
+                if store.attachment_checksum_referenced(user_id, blob.name):
+                    continue
+                blob.unlink()
+        except (OSError, PathLockTimeout):
+            continue
+        removed += 1
     return removed

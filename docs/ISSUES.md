@@ -9934,3 +9934,108 @@ and its own readers.
 | conversation summary purge removed | the cached-summary red |
 | purge failure allowed to escape | the Redis-outage red |
 | `deleted_email` restored | the audit-log red |
+
+### 2G.4 carry-overs: a snapshot is not a serialization point
+
+**HIGH: the subordinate-sweep exclusion was read, not held.** Every red in the
+first pass established the same order — delete, then sweep — which a set read
+at the top of the cleanup pass answers correctly. The other order was never
+forced:
+
+```
+GENERATION SWEEP                     ADMIN DELETE
+----------------                     ------------
+U is not being erased
+                                     delete U
+                                     retirement row, grace starts
+iterate users/U
+referenced checksums -> {}
+old blob mtime -> 7 days ago
+generation lock
+recheck reference -> false
+unlink blob
+```
+
+That is the state 2G.4 exists to prevent, reached through the mechanism 2G.4
+installed. A turn that resolved the generation before the deletion reads a
+filesystem where it is gone, inside the hour the retirement had just promised.
+The per-blob `generation_lock` does not help: it serialises this sweep against
+attachment adoption, not against the account's lifetime.
+
+The fix is the linearization that made artifact creation and discovery
+correct, applied to the account: a per-user advisory lifetime lock.
+`delete_user` takes it at the start of its transaction, and every collector
+takes it while it decides about that account and while it acts on the
+decision. Two histories remain. Either the sweep holds it first and runs to
+completion against pre-deletion state, where the account's own conversations
+still name the blob and it is kept; or the deletion holds it first, commits,
+and the sweep then sees the retirement and does nothing.
+
+The pass-wide `pending` set is gone rather than kept as a fast path. Its only
+remaining job would have been to skip taking a lock for accounts already being
+erased, and there are almost never any; leaving it in would have left two
+answers to one question, one of which is not authoritative.
+
+Scratch and archive staging are serialized rather than protected: their
+contents are not what the grace period is for, so what has to hold is that the
+deletion cannot land in the middle of one of those accounts while the
+namespace retirement is the other writer on the same tree.
+
+**MEDIUM: hot state was two key families out of ten.** Sessions and
+conversation summaries were purged. The rest of this account's Redis state was
+not, including the most content-bearing family in the cache: an idempotency
+record holds a completed API response, which for a chat turn is the
+assistant's message, and it lives for 24 hours under a key naming the erased
+account.
+
+`RedisCache.purge_user_state` now takes the whole `UserErasure` and removes
+every key the kernel can address: sessions, the session index, session
+activity and rotation, conversation summaries, MFA attempts and lockouts,
+idempotency records, router cache, concurrency slots, and the password-reset
+and email-verification tokens whose subject is this account. `SCAN`, never
+`KEYS`, for the families that carry no index.
+
+Two things are deliberately kept. `rate:*` is keyed by a salted digest, so it
+cannot be addressed and holds no content. `auth:access:denylist:*` and
+`auth:refresh:revoked:*` are revocations, and removing them would bring the
+erased account's outstanding tokens back to life.
+
+`UserErasure` carries the session ids now, read from Postgres inside the
+deleting transaction. Redis's `auth:user_sessions:<user>` set looks like it
+could name them, but it is an index with its own TTL rather than the authority
+on what exists: when it has expired and the session keys it should have named
+have not, deriving the list from it purges nothing and leaves exactly the
+sessions that outlived it.
+
+Each family is its own attempt. The first version ran all of them inside one
+`try`, so a failure revoking sessions meant no conversation summary was even
+attempted.
+
+### Mutations
+
+| Mutation | Killed by |
+|---|---|
+| the guard answers without holding | all three race reds |
+| the deletion stops taking the lifetime lock | all three race reds |
+| generation sweep acts outside the guard | the generation race red |
+| tmp sweep acts outside the guard | the path-sweep race red |
+| archive-staging sweep acts outside the guard | the path-sweep race red |
+| each sweep ignores the guard's answer | the grace reds |
+| sessions purged from Redis's own index | the expired-index red |
+| the idempotency scan is dropped | the completed-response red |
+| identity tokens are left behind | the reset-token red |
+| one failing family aborts the purge | the independence red |
+| the sessions or summaries family is dropped | its own red |
+
+Two reds had to be rewritten, and both were assertions that could not fail.
+
+The path-sweep red first asserted that a week-old scratch file survives a
+deletion landing mid-sweep. It does not, and should not: while the account is
+alive that file is legitimately collectable, so the assertion was asking a
+correct sweep to do nothing. It asserts the schedule instead — while the sweep
+holds the account, the deletion is still waiting.
+
+It then paused at the guard rather than at the removal, which proved only that
+the guard was entered. A body moved outside the `with` survived that version.
+It pauses at the per-account helper now, so the assertion is taken at the
+moment the files are removed.

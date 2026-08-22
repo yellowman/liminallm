@@ -686,18 +686,15 @@ async def metrics() -> Response:
     return Response(content="\n".join(lines) + "\n", media_type="text/plain")
 
 
-def _sweep_tmp_dirs(
-    shared_root: Path, max_age_hours: int, *, pending: set[str]
-) -> None:
+def _sweep_tmp_dirs(store, shared_root: Path, max_age_hours: int) -> None:
     """Remove stale files from per-user tmp scratch directories.
 
     SPEC §18 requires per-user scratch cleanup on a daily cadence. This helper
     runs in a thread to avoid blocking the event loop.
 
-    `pending` names the accounts whose erasure is still inside its grace
-    period. Their namespace belongs to that erasure until it completes, so
-    nothing here touches them; the parameter is required rather than
-    defaulted, because a default would make forgetting it silent.
+    Each account's files are removed while its lifetime is held, so an erasure
+    that starts mid-sweep waits rather than being overtaken. The account's own
+    retirement owns this namespace once it exists; see `hold_user_lifetime`.
     """
 
     cutoff_ts = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).timestamp()
@@ -706,37 +703,46 @@ def _sweep_tmp_dirs(
         return
 
     for user_dir in user_root.iterdir():
-        if user_dir.name in pending:
-            continue
         tmp_dir = user_dir / "tmp"
         if not tmp_dir.exists():
             continue
-        # Delete stale files and then prune empty directories depth-first
-        for path in sorted(tmp_dir.rglob("*"), key=lambda p: len(p.parts), reverse=True):
-            try:
-                stat = path.stat()
-            except FileNotFoundError:
-                continue
-            if path.is_file() and stat.st_mtime < cutoff_ts:
-                path.unlink(missing_ok=True)
-        # Remove empty directories after file cleanup
-        for path in sorted(tmp_dir.rglob("*"), key=lambda p: len(p.parts), reverse=True):
-            if path.is_dir():
-                try:
-                    next(path.iterdir())
-                except (OSError, StopIteration):
-                    with contextlib.suppress(OSError):
-                        path.rmdir()
         try:
-            next(tmp_dir.iterdir())
-        except (OSError, StopIteration):
-            with contextlib.suppress(OSError):
-                tmp_dir.rmdir()
+            with store.hold_user_lifetime(user_dir.name) as collectable:
+                if not collectable:
+                    continue
+                _sweep_one_tmp_dir(tmp_dir, cutoff_ts)
+        except Exception as exc:
+            logger.warning(
+                "tmp_cleanup_user_skipped", user=user_dir.name, error=str(exc)
+            )
 
 
-def _sweep_archive_staging(
-    shared_root: Path, max_age_hours: int, *, pending: set[str]
-) -> None:
+def _sweep_one_tmp_dir(tmp_dir: Path, cutoff_ts: float) -> None:
+    """One account's scratch directory, with its lifetime already held."""
+    # Delete stale files and then prune empty directories depth-first
+    for path in sorted(tmp_dir.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            continue
+        if path.is_file() and stat.st_mtime < cutoff_ts:
+            path.unlink(missing_ok=True)
+    # Remove empty directories after file cleanup
+    for path in sorted(tmp_dir.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+        if path.is_dir():
+            try:
+                next(path.iterdir())
+            except (OSError, StopIteration):
+                with contextlib.suppress(OSError):
+                    path.rmdir()
+    try:
+        next(tmp_dir.iterdir())
+    except (OSError, StopIteration):
+        with contextlib.suppress(OSError):
+            tmp_dir.rmdir()
+
+
+def _sweep_archive_staging(store, shared_root: Path, max_age_hours: int) -> None:
     """Remove archive staging trees no extraction is still filling.
 
     An extraction renames its staging tree into place and removes what is
@@ -744,8 +750,8 @@ def _sweep_archive_staging(
     Nothing reads these directories, so age is the only signal available and
     the only one needed.
 
-    `pending` names accounts mid-erasure; their whole staging tree is the
-    account retirement's to remove, not this sweep's.
+    Held per account, so an erasure that starts mid-sweep waits: once its
+    retirement exists, the whole staging tree is the retirement's to remove.
     """
     root = shared_root / ".archive-staging"
     if not root.is_dir():
@@ -755,18 +761,33 @@ def _sweep_archive_staging(
     ).timestamp()
     removed = 0
     for user_dir in root.iterdir():
-        if not user_dir.is_dir() or user_dir.name in pending:
+        if not user_dir.is_dir():
             continue
-        for staging in user_dir.iterdir():
-            try:
-                if staging.stat().st_mtime > cutoff:
+        try:
+            with store.hold_user_lifetime(user_dir.name) as collectable:
+                if not collectable:
                     continue
-            except OSError:
-                continue
-            shutil.rmtree(staging, ignore_errors=True)
-            removed += 1
+                removed += _sweep_one_staging_dir(user_dir, cutoff)
+        except Exception as exc:
+            logger.warning(
+                "archive_staging_user_skipped", user=user_dir.name, error=str(exc)
+            )
     if removed:
         logger.info("archive_staging_swept", removed=removed)
+
+
+def _sweep_one_staging_dir(user_dir: Path, cutoff: float) -> int:
+    """One account's staging trees, with its lifetime already held."""
+    removed = 0
+    for staging in user_dir.iterdir():
+        try:
+            if staging.stat().st_mtime > cutoff:
+                continue
+        except OSError:
+            continue
+        shutil.rmtree(staging, ignore_errors=True)
+        removed += 1
+    return removed
 
 
 def _sweep_attachment_generations(shared_root: Path, max_age_hours: int) -> None:
@@ -812,25 +833,16 @@ async def _run_cleanup_pass(runtime, shared_root: Path, max_age_hours: int) -> N
     except Exception as exc:  # pragma: no cover - best-effort cleanup
         logger.warning("user_namespace_sweep_failed", error=str(exc))
 
-    # Read once for the two sweeps that take only paths, and after the
-    # namespace sweep so it reflects what that just enrolled. An account still
-    # inside its erasure grace period owns its whole namespace until the
-    # retirement completes; nothing below may reach into it.
-    try:
-        pending = await asyncio.to_thread(runtime.store.pending_user_namespaces)
-    except asyncio.CancelledError:
-        raise
-    except Exception as exc:
-        # Unknown is not empty. Skipping this pass costs a day of scratch
-        # files; guessing "none pending" costs an account its grace period.
-        logger.warning("pending_user_namespaces_unreadable", error=str(exc))
-        return
-
+    # Each sweep below holds an account's lifetime while it decides about that
+    # account and while it acts on the decision. There is deliberately no
+    # pass-wide snapshot of which accounts are being erased: a set read here
+    # is already an answer to a question about a moment, and every sweep that
+    # consulted it would be acting on that moment rather than on this one.
     sweeps = (
         (
             "tmp_cleanup_failed",
             functools.partial(
-                _sweep_tmp_dirs, shared_root, max_age_hours, pending=pending
+                _sweep_tmp_dirs, runtime.store, shared_root, max_age_hours
             ),
         ),
         (
@@ -840,7 +852,7 @@ async def _run_cleanup_pass(runtime, shared_root: Path, max_age_hours: int) -> N
         (
             "archive_staging_sweep_failed",
             functools.partial(
-                _sweep_archive_staging, shared_root, max_age_hours, pending=pending
+                _sweep_archive_staging, runtime.store, shared_root, max_age_hours
             ),
         ),
         (

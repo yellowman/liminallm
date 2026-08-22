@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import threading
 import time
@@ -1652,13 +1653,23 @@ class PostgresStore:
         - The user record itself
         """
         with self._connect() as conn:
+            # First, and before any read: this is what the subordinate
+            # collectors wait on. Holding the account row is not enough for
+            # them — a sweep of `users/<id>` holds no row and would otherwise
+            # be free to decide "not being erased" and act on that decision
+            # after this transaction commits. See `hold_user_lifetime`.
+            self._lock_user_lifetime(conn, user_id)
+
             # Check if user exists first, and hold it: locking the account
-            # stops a new job being created for it while this runs.
+            # stops a new job being created for it while this runs. The tenant
+            # comes back with it because several cache keys are prefixed by it
+            # and the row is about to stop existing.
             exists = conn.execute(
-                "SELECT 1 FROM app_user WHERE id = %s FOR UPDATE", (user_id,)
+                "SELECT tenant_id FROM app_user WHERE id = %s FOR UPDATE", (user_id,)
             ).fetchone()
             if not exists:
                 return None
+            tenant_id = str(exists["tenant_id"]) if exists["tenant_id"] else None
 
             # Get user's artifacts for cascade (needed for config patches, versions, router state)
             # Locked, so another user cannot start training one of this
@@ -1700,6 +1711,18 @@ class PostgresStore:
                 "SELECT id FROM conversation WHERE user_id = %s", (user_id,)
             ).fetchall()
             conv_ids = [str(row["id"]) for row in conv_rows]
+
+            # Sessions are read here rather than derived afterwards from
+            # Redis's own `auth:user_sessions:<user>` set. That set is a
+            # convenience index with its own TTL, and it is not the authority
+            # on which sessions exist: it can expire, or be evicted, while an
+            # `auth:session:<id>` key it should have named is still readable.
+            # Purging from it alone leaves exactly those sessions behind —
+            # the ones whose index is already gone.
+            session_rows = conn.execute(
+                "SELECT id FROM auth_session WHERE user_id = %s", (user_id,)
+            ).fetchall()
+            session_ids = [str(row["id"]) for row in session_rows]
 
             # Delete in reverse dependency order
 
@@ -1782,7 +1805,12 @@ class PostgresStore:
 
             if result.rowcount <= 0:
                 return None
-            return UserErasure(user_id=user_id, conversation_ids=conv_ids)
+            return UserErasure(
+                user_id=user_id,
+                tenant_id=tenant_id,
+                conversation_ids=conv_ids,
+                session_ids=session_ids,
+            )
 
     # sessions
     def create_session(
@@ -3027,18 +3055,61 @@ class PostgresStore:
     # accumulate forever. Filtering on read makes the mistake self-healing
     # rather than permanent, and costs an index probe.
 
-    def pending_user_namespaces(self) -> set[str]:
-        """Accounts mid-erasure, whose namespace nothing else may touch.
+    _USER_LIFETIME_LOCK = 0x6C696675  # "lifu"
 
-        Read once per sweep and asked about each directory, rather than a
-        query per directory: this is the hot path of three collectors.
+    def _lock_user_lifetime(self, conn, user_id: str) -> None:
+        """Hold this account's lifetime for the rest of the transaction."""
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+            (self._USER_LIFETIME_LOCK, str(user_id)),
+        )
+
+    @contextlib.contextmanager
+    def hold_user_lifetime(self, user_id: str):
+        """Hold one account's lifetime, and say whether it may be collected in.
+
+        Yields True while nothing is erasing this account, and holds that
+        answer true for as long as the caller stays inside the block.
+
+        Asking without holding is not enough, and that is the whole point. A
+        collector that reads "not being erased" and then acts on it is a
+        check-then-act across the one event the answer is about:
+
+            SWEEP                          ADMIN DELETE
+            -----                          ------------
+            U is not being erased
+                                           delete U
+                                           retirement row, grace starts
+            conversations of U -> none
+            blob unreferenced, mtime old
+            unlink
+
+        which is exactly the state the retirement exists to prevent — a turn
+        that resolved that blob before the deletion reads a filesystem where
+        it is gone, inside the hour the grace period promised it.
+
+        `delete_user` takes the same lock at the start of its transaction, so
+        only two histories remain. Either the sweep holds it first and runs to
+        completion against pre-deletion state, where the account's own
+        conversations still name the blob and it is kept; or the deletion
+        holds it first, commits, and the sweep then sees the retirement and
+        does nothing. There is no third.
+
+        A name that is not a user id yields True: it cannot be an account, so
+        no account's lifetime governs it.
         """
-        with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT r.user_id FROM user_namespace_retirement r "
-                "WHERE NOT EXISTS (SELECT 1 FROM app_user u WHERE u.id = r.user_id)"
-            ).fetchall()
-        return {str(r["user_id"]) for r in rows}
+        if not _is_uuid(user_id):
+            yield True
+            return
+        with self._connect() as conn, conn.transaction():
+            self._lock_user_lifetime(conn, user_id)
+            row = conn.execute(
+                "SELECT 1 FROM user_namespace_retirement r "
+                "WHERE r.user_id = %s "
+                "  AND NOT EXISTS (SELECT 1 FROM app_user u WHERE u.id = r.user_id)",
+                (user_id,),
+            ).fetchone()
+            yield row is None
 
     def enrol_user_namespace_retirement(self, user_id: str) -> bool:
         """Record a namespace no account claims, at first observation.

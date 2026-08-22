@@ -365,6 +365,174 @@ class TestSubordinateSweepsDoNotUndercutTheGrace:
             "the sweep took a pending user's generations"
         )
 
+    def test_a_sweep_already_running_cannot_be_overtaken_by_the_deletion(
+        self, client
+    ):
+        """The order the skip-list could not describe.
+
+        Every other red here deletes first and sweeps second, which a snapshot
+        taken at the top of the pass answers correctly. This is the other
+        order: the sweep reaches the account, and the deletion lands while it
+        is working. A question asked once is stale from the moment after it is
+        asked, so the only thing that can hold here is a lock.
+
+        Both legal outcomes keep the blob, which is what makes the assertion
+        one sentence. If the sweep holds the account first it runs against
+        pre-deletion state, where the conversation still names the generation.
+        If the deletion holds it first, the sweep waits and then finds a
+        retirement. There is no interleaving in between.
+        """
+        import threading
+
+        from liminallm.service.attachments import sweep_generations
+
+        user_id, _, headers = _account(client)
+        _, _, admin_headers = _account(client, admin=True)
+        _populate(client, headers, user_id)
+        runtime = get_runtime()
+        generations = _namespace(user_id) / "attachment-generations" / "sha256"
+        before = set(generations.glob("*/*"))
+        assert before
+
+        reached = threading.Event()
+        release = threading.Event()
+        real = runtime.store.referenced_attachment_checksums
+
+        def pause_at(target_user_id):
+            if target_user_id == user_id:
+                reached.set()
+                assert release.wait(timeout=30), "the sweep was never released"
+            return real(target_user_id)
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(
+            runtime.store, "referenced_attachment_checksums", pause_at
+        )
+        deletion: dict = {}
+
+        def delete_the_account():
+            resp = client.delete(
+                f"/v1/admin/users/{user_id}", headers=admin_headers
+            )
+            deletion["status"] = resp.status_code
+
+        sweeper = threading.Thread(
+            target=sweep_generations,
+            args=(runtime.store, runtime.settings.shared_fs_root),
+            kwargs={"grace_seconds": 0},
+            daemon=True,
+        )
+        try:
+            sweeper.start()
+            assert reached.wait(timeout=30), "the sweep never reached the account"
+            deleter = threading.Thread(target=delete_the_account, daemon=True)
+            deleter.start()
+            # Long enough for an unserialized deletion to commit, which is the
+            # schedule under test. A serialized one is still blocked here.
+            deleter.join(timeout=2)
+            release.set()
+            sweeper.join(timeout=30)
+            deleter.join(timeout=30)
+        finally:
+            release.set()
+            monkeypatch.undo()
+
+        assert not sweeper.is_alive() and not deleter.is_alive()
+        assert deletion.get("status") in (200, 204), deletion
+        assert set(generations.glob("*/*")) == before, (
+            "an account deletion landed inside a running generation sweep, and "
+            "the sweep finished on its stale answer — reclaiming a generation "
+            "the erasure had just promised an hour of grace"
+        )
+
+    @pytest.mark.parametrize("sweep_name", ["tmp", "archive_staging"])
+    def test_a_path_sweep_holds_the_account_it_is_working_on(
+        self, client, sweep_name
+    ):
+        """These two are serialized, not protected.
+
+        Their contents are not what the grace period is for. A week-old
+        scratch file is legitimately collectable while the account is alive,
+        and an abandoned staging tree is collectable by definition, so
+        asserting they survive would be asserting that a correct sweep did
+        nothing. What has to hold is the ordering: the deletion cannot land in
+        the middle of one of these accounts, because the namespace retirement
+        removes the whole tree and a sweep pruning directories inside it is
+        the one other writer.
+
+        So the assertion is about the schedule directly, and it is taken at the
+        destructive step rather than at the guard: while this account's files
+        are being removed, the deletion is still waiting. Pausing at the guard
+        instead would only prove the guard was entered — measured, a body
+        moved outside the `with` survived that version of this test. A set
+        read once at the top of the pass makes neither true.
+
+        The seam is the per-account helper, which exists only because the work
+        had to be separable from the decision, so this red cannot run on a
+        tree that has no guard. Its mutations stand in for that.
+        """
+        import threading
+
+        from liminallm import app as app_module
+
+        user_id, _, headers = _account(client)
+        _, _, admin_headers = _account(client, admin=True)
+        _populate(client, headers, user_id)
+        runtime = get_runtime()
+        root = Path(runtime.settings.shared_fs_root)
+        sweep, helper = (
+            (app_module._sweep_tmp_dirs, "_sweep_one_tmp_dir")
+            if sweep_name == "tmp"
+            else (app_module._sweep_archive_staging, "_sweep_one_staging_dir")
+        )
+
+        reached = threading.Event()
+        release = threading.Event()
+        real = getattr(app_module, helper)
+
+        def pause_at_the_removal(target, *args, **kwargs):
+            if user_id in str(target):
+                reached.set()
+                assert release.wait(timeout=30), "the sweep was never released"
+            return real(target, *args, **kwargs)
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(app_module, helper, pause_at_the_removal)
+        deletion: dict = {}
+
+        def delete_the_account():
+            deletion["status"] = client.delete(
+                f"/v1/admin/users/{user_id}", headers=admin_headers
+            ).status_code
+
+        sweeper = threading.Thread(
+            target=sweep, args=(runtime.store, root, 24), daemon=True
+        )
+        deleter = threading.Thread(target=delete_the_account, daemon=True)
+        try:
+            sweeper.start()
+            assert reached.wait(timeout=30), "the sweep never reached the account"
+            deleter.start()
+            # Long enough for an unserialized deletion to commit. A serialized
+            # one is still blocked on the lock the sweep is holding.
+            deleter.join(timeout=3)
+            assert deleter.is_alive() and "status" not in deletion, (
+                "an account deletion committed while a sweep was working "
+                "inside that account's namespace"
+            )
+            release.set()
+            sweeper.join(timeout=30)
+            deleter.join(timeout=30)
+        finally:
+            release.set()
+            monkeypatch.undo()
+
+        assert not sweeper.is_alive() and not deleter.is_alive()
+        assert deletion.get("status") in (200, 204), (
+            f"the deletion never completed after the {sweep_name} sweep "
+            f"released the account: {deletion}"
+        )
+
 
 class TestRetirementIsDurableAndRetryable:
     def test_a_failed_removal_keeps_the_record(self, client):
@@ -584,6 +752,153 @@ class TestHotStateGoesWithTheAccount:
         )
 
     @pytest.mark.asyncio
+    async def test_the_session_index_is_not_the_authority_on_sessions(self, client):
+        """`auth:user_sessions` is a convenience index with its own TTL.
+
+        Deriving what to purge from it means purging nothing exactly when it
+        has expired and the session keys it should have named have not. The
+        ids are read from Postgres inside the deleting transaction instead,
+        which is why this can be forced: drop the index and the session must
+        still go.
+        """
+        runtime = get_runtime()
+        if runtime.cache is None:
+            pytest.skip("no Redis in this environment")
+
+        email = f"{_unique('era')}@example.com"
+        password = "TestPassword123!"
+        resp = client.post(
+            "/v1/auth/signup", json={"email": email, "password": password}
+        )
+        assert resp.status_code == 201, resp.text
+        user_id = resp.json()["data"]["user_id"]
+        _, _, admin_headers = _account(client, admin=True)
+
+        _, session, _ = await runtime.auth.login(email, password)
+        assert await runtime.cache.get_session_user(session.id) == (True, user_id)
+
+        # The index expires; the session key it named does not.
+        await runtime.cache.client.delete(f"auth:user_sessions:{user_id}")
+        assert await runtime.cache.get_session_user(session.id) == (True, user_id)
+
+        assert client.delete(
+            f"/v1/admin/users/{user_id}", headers=admin_headers
+        ).status_code in (200, 204)
+        present, cached_user = await runtime.cache.get_session_user(session.id)
+        assert not present and cached_user is None, (
+            "the purge found nothing to do because Redis's own session index "
+            "had expired, and left the erased account's session resolvable"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_completed_idempotency_record_goes_with_the_account(self, client):
+        """The most content-bearing thing in this cache, kept for a day.
+
+        A replayable record holds the completed API response. For a chat turn
+        that is the assistant's message, so an erasure that leaves it behind
+        leaves the account's content readable under a key naming the account.
+        """
+        runtime = get_runtime()
+        if runtime.cache is None:
+            pytest.skip("no Redis in this environment")
+
+        user_id, _, headers = _account(client)
+        _, _, admin_headers = _account(client, admin=True)
+        secret = f"SECRET-{uuid.uuid4().hex[:10]}"
+        await runtime.cache.set_idempotency_record(
+            "chat",
+            user_id,
+            _unique("key"),
+            {"status": "completed", "response": {"message": secret}},
+        )
+        matches = [
+            key
+            async for key in runtime.cache.client.scan_iter(
+                match=f"idemp:*{user_id}*", count=500
+            )
+        ]
+        assert matches, "the fixture stored no idempotency record"
+
+        assert client.delete(
+            f"/v1/admin/users/{user_id}", headers=admin_headers
+        ).status_code in (200, 204)
+        left = [
+            key
+            async for key in runtime.cache.client.scan_iter(
+                match=f"idemp:*{user_id}*", count=500
+            )
+        ]
+        assert left == [], (
+            f"the erased account's completed responses are still cached: {left}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_identity_token_does_not_outlive_its_account(self, client):
+        """A reset token names an account. The account is gone."""
+        runtime = get_runtime()
+        if runtime.cache is None:
+            pytest.skip("no Redis in this environment")
+
+        user_id, _, _ = _account(client)
+        _, _, admin_headers = _account(client, admin=True)
+        token = await runtime.auth.initiate_password_reset(
+            runtime.store.get_user(user_id)
+        )
+        assert await runtime.cache.client.get(f"reset:{token}") == user_id
+
+        assert client.delete(
+            f"/v1/admin/users/{user_id}", headers=admin_headers
+        ).status_code in (200, 204)
+        assert await runtime.cache.client.get(f"reset:{token}") is None, (
+            "a password reset token for an erased account is still stored"
+        )
+
+    @pytest.mark.asyncio
+    async def test_one_unreachable_family_does_not_cancel_the_others(self, client):
+        """Every category is its own attempt.
+
+        The first version ran all of them inside one `try`, so a failure
+        revoking sessions meant no conversation summary was even attempted —
+        one unreachable key pattern leaving an account's messages readable.
+        """
+        runtime = get_runtime()
+        if runtime.cache is None:
+            pytest.skip("no Redis in this environment")
+
+        user_id, _, headers = _account(client)
+        _, _, admin_headers = _account(client, admin=True)
+        conversation = client.post(
+            "/v1/conversations", headers=headers, json={"title": "chat"}
+        ).json()["data"]["id"]
+        await runtime.cache.set_conversation_summary(
+            conversation, {"recent_messages": [{"content": "still here"}]}
+        )
+
+        # The session family, which the purge attempts before the summaries.
+        # Failing a later one would prove nothing: the summaries would already
+        # be gone whether or not the categories are independent.
+        real_delete = type(runtime.cache.client).delete
+
+        async def refuse_sessions(self, *keys, **kw):
+            if any(str(k).startswith("auth:") for k in keys):
+                raise ConnectionError("this key family is unavailable")
+            return await real_delete(self, *keys, **kw)
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(type(runtime.cache.client), "delete", refuse_sessions)
+        try:
+            assert client.delete(
+                f"/v1/admin/users/{user_id}", headers=admin_headers
+            ).status_code in (200, 204)
+        finally:
+            monkeypatch.undo()
+
+        assert await runtime.cache.get_conversation_summary(conversation) is None, (
+            "one failing key family stopped the rest of the purge, so the "
+            "erased account's messages stayed readable"
+        )
+
+    @pytest.mark.asyncio
     async def test_a_redis_outage_does_not_roll_back_the_erasure(self, client):
         """Postgres is canonical. The purge is best-effort and comes after."""
         runtime = get_runtime()
@@ -598,7 +913,7 @@ class TestHotStateGoesWithTheAccount:
             raise ConnectionError("redis is down")
 
         monkeypatch = pytest.MonkeyPatch()
-        monkeypatch.setattr(runtime.cache, "revoke_user_sessions", unreachable)
+        monkeypatch.setattr(runtime.cache, "purge_user_state", unreachable)
         try:
             assert client.delete(
                 f"/v1/admin/users/{user_id}", headers=admin_headers

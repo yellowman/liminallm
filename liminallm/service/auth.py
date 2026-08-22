@@ -709,14 +709,23 @@ class AuthService:
             return False
         if self.cache:
             try:
-                await self.cache.revoke_user_sessions(user_id)
-                for conversation_id in erasure.conversation_ids:
-                    await self.cache.delete_conversation_summary(conversation_id)
+                purged = await self.cache.purge_user_state(erasure)
             except Exception as exc:
                 # Named, not swallowed: the rows are gone and the operator
                 # needs to know a copy may have outlived them.
                 self.logger.warning(
                     "user_hot_state_purge_failed", user_id=user_id, error=str(exc)
+                )
+            else:
+                failed = sorted(k for k, v in purged.items() if v < 0)
+                if failed:
+                    self.logger.warning(
+                        "user_hot_state_purge_partial",
+                        user_id=user_id,
+                        families=failed,
+                    )
+                self.logger.info(
+                    "user_hot_state_purged", user_id=user_id, **purged
                 )
         return True
 

@@ -503,6 +503,108 @@ return {1, tokens, 0}
                 pass
         return (False, None)
 
+    async def _delete_scanned(self, pattern: str, keeps) -> int:
+        """Remove every key matching `pattern` that `keeps` accepts.
+
+        `SCAN`, never `KEYS`: this walks the whole keyspace in bounded slices
+        instead of blocking the server for the length of it. Account deletion
+        is rare, so paying a scan for the key families that carry no index is
+        the right trade — the alternative is maintaining a per-user index for
+        each of them and getting the erasure wrong whenever one expires.
+
+        `keeps` re-checks each key, because a glob cannot express "this exact
+        field equals the user id" and a pattern alone would trust the position
+        of a colon in a route name somebody chooses.
+        """
+        removed = 0
+        async for key in self.client.scan_iter(match=pattern, count=500):
+            if not keeps(key):
+                continue
+            removed += int(await self.client.delete(key) or 0)
+        return removed
+
+    async def _delete_tokens_naming(self, prefix: str, user_id: str) -> int:
+        """Remove short-lived identity tokens whose subject is this account.
+
+        A password reset token and an email verification token each name one
+        account and outlive nothing else about it. They are bounded by their
+        own TTL rather than by anything the erasure controls, so leaving them
+        keeps a usable reference to an account that no longer exists.
+        """
+        removed = 0
+        async for key in self.client.scan_iter(match=f"{prefix}:*", count=500):
+            if await self.client.get(key) != user_id:
+                continue
+            removed += int(await self.client.delete(key) or 0)
+        return removed
+
+    async def purge_user_state(self, erasure) -> Dict[str, int]:
+        """Remove every Redis key this kernel can identify as one account's.
+
+        Called after the deleting transaction commits, and after it on
+        purpose: Postgres is canonical, so a cache that cannot be reached must
+        not be able to prevent an erasure. What it must not do is give up
+        early. Each family is its own attempt, because one unreachable key
+        pattern is not a reason to leave the rest of an erased account's
+        content readable — the first version of this ran every category inside
+        one `try`, so a failure revoking sessions meant no conversation
+        summary was even attempted.
+
+        Deliberately *not* purged: `rate:*` is keyed by a salted digest, so it
+        cannot be addressed and carries no content; `auth:access:denylist:*`
+        and `auth:refresh:revoked:*` are revocations, and removing them would
+        bring the erased account's outstanding tokens back to life.
+
+        Returns how many keys each family gave up, for the log.
+        """
+        user_id = erasure.user_id
+        sessions = list(erasure.session_ids)
+        conversations = list(erasure.conversation_ids)
+        exact = f":{user_id}:"
+
+        families = {
+            "sessions": [f"auth:session:{s}" for s in sessions]
+            + [f"auth:user_sessions:{user_id}"],
+            "session_activity": [f"session:activity:{s}" for s in sessions],
+            "session_rotation": [f"session:rotation:{s}" for s in sessions],
+            "conversation_summaries": [f"chat:summary:{c}" for c in conversations],
+            "mfa": [f"mfa:attempts:{user_id}", f"mfa:lockout:{user_id}"],
+        }
+        purged: Dict[str, int] = {}
+        for name, keys in families.items():
+            if not keys:
+                purged[name] = 0
+                continue
+            try:
+                purged[name] = int(await self.client.delete(*keys) or 0)
+            except Exception:
+                purged[name] = -1
+
+        scans = (
+            # The idempotency record holds a completed API response, which for
+            # a chat turn is the assistant's message. It is the most
+            # content-bearing thing in this cache and it lives for a day.
+            ("idempotency", f"idemp:*{exact}*", lambda k: exact in k),
+            ("router_cache", f"router:last:*{user_id}:*", lambda k: user_id in k),
+            (
+                "concurrency",
+                f"concurrency:*:{user_id}",
+                lambda k: k.endswith(f":{user_id}"),
+            ),
+        )
+        for name, pattern, keeps in scans:
+            try:
+                purged[name] = await self._delete_scanned(pattern, keeps)
+            except Exception:
+                purged[name] = -1
+
+        for name, prefix in (("reset_tokens", "reset"), ("verify_tokens", "verify")):
+            try:
+                purged[name] = await self._delete_tokens_naming(prefix, user_id)
+            except Exception:
+                purged[name] = -1
+        return purged
+
     async def close(self) -> None:
         """Close every per-loop client. Call on shutdown or runtime reset."""
         clients, self._clients, self._scripts = self._clients, {}, {}

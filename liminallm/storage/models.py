@@ -320,7 +320,16 @@ class UserErasure:
     no longer any way to ask which conversations it had. So the deletion says
     what it took, and the caller purges the copies on a best-effort basis —
     afterwards, so a Redis outage cannot roll back an erasure.
+
+    Every field is read from Postgres inside the deleting transaction, never
+    reconstructed afterwards from Redis. Redis holds a `auth:user_sessions`
+    set that looks like it could name the sessions, but it is an index with
+    its own TTL rather than the authority on what exists: when it has expired
+    and the session keys it should have named have not, deriving the list from
+    it purges nothing and leaves exactly the sessions that outlived it.
     """
 
     user_id: str
+    tenant_id: Optional[str] = None
     conversation_ids: List[str] = field(default_factory=list)
+    session_ids: List[str] = field(default_factory=list)
