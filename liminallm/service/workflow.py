@@ -888,7 +888,18 @@ class WorkflowEngine(WorkflowStreamingMixin):
 
             try:
                 start_ms = time.monotonic() * 1000
-                node_timeout_ms = node.get("timeout_ms", DEFAULT_NODE_TIMEOUT_MS)
+                # Three bounds, and the attempt gets the smallest. The node's
+                # own ask is the least authoritative of them: SPEC §18.3 caps
+                # it at MAX_NODE_TIMEOUT_SECONDS, and the workflow's remaining
+                # budget caps it again, because "timeout_ms caps total wall
+                # clock" is only true if no single attempt may outlive it. A
+                # node starting just inside the deadline used to run its own
+                # full timeout past it.
+                node_timeout_ms = min(
+                    node.get("timeout_ms", DEFAULT_NODE_TIMEOUT_MS),
+                    MAX_NODE_TIMEOUT_SECONDS * 1000,
+                    remaining_ms,
+                )
                 result, next_nodes = await asyncio.wait_for(
                     self._execute_node(
                         node,
@@ -959,10 +970,17 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 # Per SPEC §18: 1s, 4s, 16s progression (quadruple each retry)
                 current_backoff_ms = backoff_ms * (4 ** (attempt - 1))
 
-                # Don't sleep longer than remaining workflow timeout
-                sleep_ms = min(
-                    current_backoff_ms, remaining_ms - 100
-                )  # Leave 100ms buffer
+                # Measured now, not before the attempt. `remaining_ms` above
+                # was read on the way in, and the attempt has been running
+                # since — a node that consumed nearly the whole budget would
+                # otherwise still sleep a full backoff on top of it, and the
+                # workflow would return well after its deadline.
+                remaining_ms = workflow_timeout_ms - (
+                    (time.monotonic() - workflow_start_time) * 1000
+                )
+                # Leave a 100ms buffer so the caller sees the timeout rather
+                # than waking with nothing left to do.
+                sleep_ms = min(current_backoff_ms, remaining_ms - 100)
                 if sleep_ms > 0:
                     self.logger.info(
                         "workflow_node_backoff",

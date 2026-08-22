@@ -40,14 +40,17 @@ from tests.harness import (  # noqa: E402
     REDIS_LEASE_TTL,
     ScratchPostgres,
     ScratchRedis,
+    _base_in_use_error,
     apply_schema,
     claim_redis_database,
     close_test_store,
     create_worker_database,
     drop_worker_database,
     get_test_store,
+    redis_database_index,
     release_redis_database,
     renew_redis_database,
+    reserve_base_database,
     reset_shared_store,
 )
 
@@ -63,6 +66,10 @@ _PG = None
 _WORKER_DB: str | None = None
 _OWNED_REDIS_DB = False
 _REDIS_LEASE: tuple[str, int, str] | None = None
+#: The externally supplied database this run was pointed at, when there is
+#: one. Held so the per-test hook can keep its reservation alive; a serial run
+#: has no lease to renew but still needs the number kept out of circulation.
+_REDIS_BASE: str | None = None
 
 
 def _provision(worker: str) -> None:
@@ -78,7 +85,7 @@ def _provision(worker: str) -> None:
     Serial runs reach this the same way they always did, one process doing all
     of it, and nothing below behaves differently for them.
     """
-    global _REDIS, _PG, _WORKER_DB, _OWNED_REDIS_DB, _REDIS_LEASE
+    global _REDIS, _PG, _WORKER_DB, _OWNED_REDIS_DB, _REDIS_LEASE, _REDIS_BASE
 
     # Tests use the same async RedisCache production does, against a real
     # redis-server. A second, synchronous implementation used to exist for the
@@ -97,8 +104,23 @@ def _provision(worker: str) -> None:
             holder = f"{os.environ['LIMINALLM_TEST_RUN']}:{worker}"
             leased, index = claim_redis_database(redis_url, holder)
             _REDIS_LEASE = (redis_url, index, holder)
+            _REDIS_BASE = redis_url
             redis_url = leased
             _OWNED_REDIS_DB = True
+        else:
+            # Serial, against somebody's Redis. This run leases nothing, so
+            # nothing else was recording that the database it is about to use
+            # is spoken for — and an xdist run starting alongside it would
+            # lease that very number and flush it before every test. One
+            # terminal running `make test` and another running the parallel
+            # lane is an ordinary pair.
+            #
+            # Nothing is claimed here: the database is the caller's and this
+            # run does not empty it. The reservation only keeps it out of the
+            # candidate list.
+            if not reserve_base_database(redis_url):
+                raise _base_in_use_error(redis_database_index(redis_url))
+            _REDIS_BASE = redis_url
     else:
         _REDIS = ScratchRedis()
         if _REDIS.available:
@@ -251,6 +273,19 @@ def _flush_owned_redis() -> None:
     UUID and on TTLs expiring. That holds until one test asserts something
     about a key another test's name happened to collide with.
     """
+    if _REDIS_BASE is not None and _REDIS_LEASE is None:
+        # A serial run against somebody's Redis: no lease to renew, but the
+        # reservation that keeps its database out of other runs' candidate
+        # lists still has to outlive the suite. The measured serial lane is
+        # 881s against a 900s TTL, so this is not a margin to leave to one
+        # write at provisioning time.
+        if not reserve_base_database(_REDIS_BASE):
+            raise RuntimeError(
+                f"Redis database {redis_database_index(_REDIS_BASE)} is no "
+                "longer reserved for this run — another run has leased it and "
+                "is emptying it between its own tests. Re-run; if this "
+                "repeats, the two runs need different databases."
+            )
     if not _OWNED_REDIS_DB:
         return
     if _REDIS_LEASE is not None:

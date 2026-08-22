@@ -10684,3 +10684,95 @@ Checked while closing it: the code has no fourth copy — no artifact-kind
 schema declares a `max_retries` default; the engine's
 `DEFAULT_NODE_MAX_RETRIES = 2` in `workflow.py` is the only value, and the
 seed workflows in `storage/common.py` set none.
+
+### 2I.1 carry-over: the lease and the base, in both directions
+
+**HIGH: a database under a live lease could still become somebody's base.**
+`_CLAIM_IF_FREE` refused to lease a database already reserved as a base. The
+reverse transition was a bare `SET` that looked at nothing:
+
+```
+RUN A, base /1
+gw0 leases /2, writes state
+                        RUN B, TEST_REDIS_URL=.../2
+                        reserves /2 as its base and uses it
+next test: renews /2, FLUSHDB
+                        B's data is gone
+```
+
+The previous commit called this residual unavoidable without a reservation
+predating the run. That was wrong, and the reviewer was right to push: DB0
+already held the fact needed to decide. `_RESERVE_IF_UNLEASED` mirrors
+`_CLAIM_IF_FREE` — each transition tests the other's key in the same Lua step
+it writes its own, so of two runs reaching for one number in either order
+exactly one wins and the loser is told. `reserve_base_database` returns a
+boolean, and provisioning raises a message naming the database and the remedy.
+
+Renewal re-tests it on the same schedule, so a reservation that lapsed and was
+leased away is not silently re-taken.
+
+**HIGH (same finding, other half): a serial run reserved nothing at all.**
+Reservation happened only through a worker's claim, so `make test` against
+somebody's Redis left its database looking free and the parallel lane in the
+next terminal leased it. Serial external runs now reserve their base at
+provisioning and refresh it per test.
+
+The refresh is not decoration. The serial lane measures 881s against a
+900-second TTL, so a reservation written once and never refreshed lapses
+partway through a run on a machine only slightly slower than this one.
+`LIMINALLM_TEST_LEASE_TTL` shortens the TTL so a test can force that expiry in
+five seconds instead of waiting a quarter of an hour.
+
+**MEDIUM: the workflow deadline was not a wall-clock deadline.** §18.3 says
+`timeout_ms` caps total wall clock. Two independent leaks said otherwise:
+
+* the attempt was awaited with the node's own `timeout_ms`, neither capped at
+  the kernel's 60s nor reduced to the workflow's remaining budget, so a node
+  starting just inside the deadline ran its full timeout past it. Measured: a
+  workflow with a 1-second deadline returned after 10.1 seconds;
+* the backoff used a `remaining_ms` read *before* the attempt, so a node that
+  consumed almost the whole budget still slept a full backoff on top.
+
+`MAX_NODE_TIMEOUT_SECONDS` existed but capped the tool spec's
+`timeout_seconds`, not this outer node timeout — the constant was right and
+unused where it mattered. The attempt now gets `min(node ask, kernel cap,
+remaining budget)`, and `remaining_ms` is recomputed after the attempt.
+
+**LOW: the schema sketch still carried a default.** `"default": 2` in §6.1 was
+a second place the retry default could drift, however non-normative the
+surrounding prose says examples are. Removed, leaving the §18.3 pointer. No
+`"default"` key remains in any sketch in the document.
+
+**LOW: a stale test description.** `test_exponential_backoff_timing` said
+"1s, 2s, 4s" while asserting 1s, 4s, 16s. Fixed, and the file's eleven
+`SPEC §9`/`SPEC §18` citations moved to `§18.3` with it — the same stale-copy
+class the SPEC pass cleaned out, one directory over.
+
+### Mutations
+
+| Mutation | Killed by |
+|---|---|
+| reservation goes back to a bare SET that cannot see a lease | the reverse-transition red |
+| a run told to use a leased database carries on anyway | the legible-refusal red |
+| a serial run records nothing about the database it was given | the serial-reservation red |
+| the serial reservation is written once and never refreshed | the forced-expiry red |
+| the attempt is awarded the node's own timeout again | the wait_for-value and deadline reds |
+| the kernel's 60s cap is dropped, the workflow budget kept | the budget-to-spare red |
+| the workflow budget is dropped, the 60s cap kept | the deadline red |
+| backoff is measured before the attempt again | the budget-eater red |
+
+Two of these were written twice, because the first version of each proved
+nothing:
+
+* the serial-reservation mutation removed the provisioning call but left
+  `_REDIS_BASE` set, so the per-test hook still reserved and the code stayed
+  correct. The mutation was wrong, not the red — but rewriting it exposed that
+  nothing tested the refresh at all, which is where the TTL override and the
+  forced-expiry red came from;
+* the 60s-cap mutation survived because the red gave the workflow a 5-second
+  budget, and that bound is smaller than 60s, so the cap was never exercised.
+  "Independently capped" needs a case with budget to spare. A version with
+  `MAX_NODE_TIMEOUT_SECONDS` deleted entirely passed the first red.
+
+Both are the same lesson: a mutation that survives is a question about the
+red, and answering it honestly is what finds the untested guarantee.

@@ -111,7 +111,13 @@ REDIS_BASE_PREFIX = "liminallm:test:redis-db-base"
 #: Long enough that no single test outruns it — the slowest is about a minute
 #: — and renewed before every test, so a run that dies stops renewing and its
 #: databases come back on their own.
-REDIS_LEASE_TTL = 900
+#:
+#: It is the renewal that makes 900 safe, not the number: the serial lane
+#: measures 881s, which would otherwise be a 19-second margin on a machine no
+#: slower than this one. `LIMINALLM_TEST_LEASE_TTL` shortens it, which lets a
+#: test force the expiry the margin is about instead of waiting a quarter of
+#: an hour for one.
+REDIS_LEASE_TTL = int(os.environ.get("LIMINALLM_TEST_LEASE_TTL") or 900)
 
 #: Redis numbers its databases 0-15. Database 0 is left out even when it is
 #: not the ledger: it is the conventional default and the likeliest to hold
@@ -136,6 +142,27 @@ if redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2]) then
     return 1
 end
 return 0
+"""
+
+#: Mark a database as somebody's base, unless a worker already holds it.
+#:
+#: The mirror of `_CLAIM_IF_FREE`, and it has to exist for the same reason.
+#: Each transition tests the other's key in the same step it writes its own,
+#: so of two runs reaching for one number in either order exactly one wins:
+#:
+#:     lease first   -> the later run is refused this database as a base
+#:     reserve first -> the later worker is refused this database as a lease
+#:
+#: A bare `SET` here was a real hole, not a theoretical one. A run handed
+#: `TEST_REDIS_URL=redis://host/2` while another run's worker held a lease on
+#: database 2 used it anyway, and the holder went on flushing it before every
+#: test.
+_RESERVE_IF_UNLEASED = """
+if redis.call('EXISTS', KEYS[2]) == 1 then
+    return 0
+end
+redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[2])
+return 1
 """
 
 _RENEW_IF_OURS = """
@@ -234,7 +261,8 @@ def claim_redis_database(base_url: str, holder: str) -> tuple[str, int]:
     candidates = lease_candidates(base_url)
     ledger = _ledger(base_url)
     try:
-        reserve_base_database(base_url, ledger=ledger)
+        if not reserve_base_database(base_url, ledger=ledger):
+            raise _base_in_use_error(redis_database_index(base_url))
         for index in candidates:
             if ledger.eval(
                 _CLAIM_IF_FREE, 2,
@@ -252,13 +280,19 @@ def claim_redis_database(base_url: str, holder: str) -> tuple[str, int]:
     )
 
 
-def reserve_base_database(base_url: str, *, ledger=None) -> None:
+def reserve_base_database(base_url: str, *, ledger=None) -> bool:
     """Say, where every caller can see it, that this database is spoken for.
+
+    Answers False when a worker of another run already holds a lease on that
+    database. The two transitions are symmetric — see `_RESERVE_IF_UNLEASED` —
+    so whichever run gets there first keeps the database and the other is
+    told, rather than both proceeding and one flushing the other.
 
     Refreshed rather than claimed: workers of one run all reserve the same
     base, and none of them owns it alone. Nothing releases it — it expires,
     which leaves a database alone for a while longer rather than handing it
-    out early.
+    out early. Refreshing re-tests the lease key, so a reservation that lapsed
+    and was leased away is not silently re-taken.
 
     Failures are not swallowed here. Each caller already answers for one, and
     they answer differently: a claim that could not say which database it was
@@ -270,15 +304,26 @@ def reserve_base_database(base_url: str, *, ledger=None) -> None:
     """
     own = ledger is None
     ledger = ledger if ledger is not None else _ledger(base_url)
+    index = redis_database_index(base_url)
     try:
-        ledger.set(
-            f"{REDIS_BASE_PREFIX}:{redis_database_index(base_url)}",
-            "in use as a base",
-            ex=REDIS_LEASE_TTL,
+        return bool(
+            ledger.eval(
+                _RESERVE_IF_UNLEASED, 2,
+                f"{REDIS_BASE_PREFIX}:{index}", f"{REDIS_LEASE_PREFIX}:{index}",
+                "in use as a base", REDIS_LEASE_TTL,
+            )
         )
     finally:
         if own:
             ledger.close()
+
+
+def _base_in_use_error(index: int) -> RuntimeError:
+    return RuntimeError(
+        f"Redis database {index} is already leased to another test run, so "
+        "this run cannot use it as its base. Wait for that run to finish, or "
+        "point TEST_REDIS_URL at a different database."
+    )
 
 
 def renew_redis_database(base_url: str, index: int, holder: str) -> bool:
@@ -302,7 +347,11 @@ def renew_redis_database(base_url: str, index: int, holder: str) -> bool:
     except Exception:  # pragma: no cover - a Redis that went away mid-run
         return False
     try:
-        reserve_base_database(base_url, ledger=ledger)
+        # The base reservation is refreshed on the same schedule and answers
+        # the same way. If it lapsed and another run took that database as a
+        # lease, this run has stopped being isolated and must not carry on.
+        if not reserve_base_database(base_url, ledger=ledger):
+            return False
         return bool(
             ledger.eval(
                 _RENEW_IF_OURS, 1,

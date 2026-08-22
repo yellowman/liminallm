@@ -160,6 +160,26 @@ def test_probe_gives_its_lease_away():
         mine.close()
 
 
+_OUTLIVE = os.environ.get("LIMINALLM_HARNESS_OUTLIVE")
+
+
+@pytest.mark.skipif(not _OUTLIVE, reason="only runs inside the nested harness run")
+@pytest.mark.parametrize("step", [0, 1, 2, 3, 4])
+def test_probe_runs_longer_than_a_short_lease(step):
+    """Five tests spanning more than the shortened TTL.
+
+    Several rather than one long one, because the refresh happens in the
+    per-test reset: a single test that sleeps would never reach it, and would
+    prove the opposite of what this is for.
+
+    Five seconds against the caller's three-second TTL. The gap between two
+    refreshes is a third of the TTL, so a working refresh has margin; the run
+    as a whole outlasts it comfortably, so a reservation written once and
+    never refreshed is definitely gone by the end. Both margins measured.
+    """
+    time.sleep(1.0)
+
+
 class _External:
     """A Postgres and a Redis standing in for services supplied from outside.
 
@@ -239,6 +259,7 @@ class _External:
                 "TEST_SCHEMA_PREPARED",
                 "PYTEST_XDIST_WORKER",
                 "LIMINALLM_HARNESS_PROBE",
+                "LIMINALLM_HARNESS_OUTLIVE",
                 "LIMINALLM_HARNESS_HOLD",
                 "LIMINALLM_HARNESS_LOSE",
             }
@@ -471,6 +492,7 @@ HOLD_PROBE = (
     "::test_probe_holds_redis_state_while_another_run_flushes"
 )
 LOSE_PROBE = "tests/test_worker_isolation.py::test_probe_gives_its_lease_away"
+SLOW_PROBE = "tests/test_worker_isolation.py::test_probe_runs_longer_than_a_short_lease"
 
 
 @pytest.mark.slow  # stands up a Postgres and a Redis, then runs pytest in them
@@ -699,6 +721,153 @@ class TestAWorkerOwnsItsResources:
                 drop_worker_database(quirky, f"{base.rsplit('/', 1)[0]}/?dbname={name}")
         finally:
             pg.stop()
+
+    def test_a_database_under_a_live_lease_cannot_become_a_base(self):
+        """The transition the other way, which was not serialized.
+
+        `_CLAIM_IF_FREE` refuses to lease a database somebody has reserved as
+        their base. Reservation did not refuse the reverse: it was a bare
+        `SET`, so a run configured with a database another run had already
+        leased marked it as a base and used it, while the holder went on
+        renewing and flushing it before every test:
+
+            RUN A, base /1
+            gw0 leases /2, writes state
+                                    RUN B, TEST_REDIS_URL=.../2
+                                    reserves /2 as its base, uses it
+            next test: renews /2, FLUSHDB
+                                    B's data is gone
+
+        DB0 already held the fact needed to decide, so the residual the
+        previous commit called unavoidable was not. Both transitions test the
+        other key in the same Lua step, so exactly one of them wins and the
+        loser is told.
+        """
+        from tests.harness import (
+            ScratchRedis,
+            claim_redis_database,
+            reserve_base_database,
+        )
+
+        server = ScratchRedis()
+        if not server.available:
+            pytest.skip("needs redis-server")
+        host = server.start().rsplit("/", 1)[0]
+        try:
+            _, index = claim_redis_database(f"{host}/1", "run-a:gw0")
+
+            assert reserve_base_database(f"{host}/{index}") is False, (
+                f"database {index} carries a live lease and was still accepted "
+                "as another run's base"
+            )
+            # And a free one is still accepted, so the refusal is about the
+            # lease and not about refusing everything.
+            assert reserve_base_database(f"{host}/15") is True
+        finally:
+            server.stop()
+
+    def test_a_run_told_to_use_a_leased_database_says_so_and_stops(self):
+        """The refusal has to reach the caller, not just the return value."""
+        from tests.harness import (
+            ScratchRedis,
+            claim_redis_database,
+        )
+
+        server = ScratchRedis()
+        if not server.available:
+            pytest.skip("needs redis-server")
+        host = server.start().rsplit("/", 1)[0]
+        try:
+            _, index = claim_redis_database(f"{host}/1", "run-a:gw0")
+            with pytest.raises(RuntimeError, match="already leased"):
+                claim_redis_database(f"{host}/{index}", "run-b:gw0")
+        finally:
+            server.stop()
+
+    def test_a_serial_run_reserves_the_database_it_was_pointed_at(self, tmp_path):
+        """A serial run leases nothing, and used to record nothing either.
+
+        Reservation happened only through a worker's claim and renewal, so
+        `make test` against somebody's Redis left its database looking free.
+        The parallel lane in the next terminal leased that very number and
+        flushed it before every test. One serial run and one parallel run at
+        once is an ordinary pair, not an exotic schedule.
+        """
+        with _external_or_skip(redis_db=4) as ext:
+            done = ext.run_pytest(PROBE, probe_out=str(tmp_path / "probe.jsonl"))
+            assert done.returncode == 0, done.stdout[-3000:]
+
+            import redis
+
+            from tests.harness import (
+                REDIS_BASE_PREFIX,
+                claim_redis_database,
+                lease_candidates,
+            )
+
+            # The serial run has finished, but its reservation outlives it by
+            # the TTL — which is the point. Another run starting now must not
+            # be handed database 4.
+            ledger = redis.Redis.from_url(
+                ext.redis_url.rsplit("/", 1)[0] + "/0", decode_responses=True
+            )
+            try:
+                assert ledger.get(f"{REDIS_BASE_PREFIX}:4") is not None, (
+                    "a serial run left no record that it was using database 4"
+                )
+            finally:
+                ledger.close()
+
+            base = f"{ext.redis_url.rsplit('/', 1)[0]}/1"
+            taken = {
+                claim_redis_database(base, f"other:{n}")[1]
+                for n in range(len(lease_candidates(base)) - 1)
+            }
+            assert 4 not in taken, (
+                "another run leased the database a serial run was using: "
+                f"{sorted(taken)}"
+            )
+
+    def test_a_serial_run_keeps_its_reservation_alive_while_it_runs(self):
+        """Reserving once at provisioning is not enough for a long run.
+
+        The reservation carries the lease TTL, and the serial lane measures
+        881s against 900. Written once and never refreshed, a run on a machine
+        slightly slower than this one loses its reservation partway through
+        and the database it is still using goes back into circulation.
+
+        Forced rather than waited for: the run gets a 3-second TTL and
+        takes five, so the expiry the 19-second margin is about happens while
+        the suite is watching.
+        """
+        with _external_or_skip(redis_db=4) as ext:
+            done = ext.run_pytest(
+                SLOW_PROBE,
+                env_extra={
+                    "LIMINALLM_TEST_LEASE_TTL": "3",
+                    "LIMINALLM_HARNESS_OUTLIVE": "1",
+                },
+            )
+            assert done.returncode == 0, done.stdout[-3000:]
+            assert "5 passed" in done.stdout, (
+                "the probe did not actually run, so nothing outlived "
+                f"anything:\n{done.stdout[-2000:]}"
+            )
+
+            import redis
+
+            from tests.harness import REDIS_BASE_PREFIX
+
+            ledger = redis.Redis.from_url(
+                ext.redis_url.rsplit("/", 1)[0] + "/0", decode_responses=True
+            )
+            try:
+                assert ledger.get(f"{REDIS_BASE_PREFIX}:4") is not None, (
+                    "the reservation expired while the run was still using "
+                    "the database — it is written once and never refreshed"
+                )
+            finally:
+                ledger.close()
 
     def test_two_base_databases_on_one_server_do_not_lease_the_same_number(self):
         """One server, one ledger — whatever database each caller was given.

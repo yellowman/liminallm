@@ -1,7 +1,8 @@
-"""Tests for SPEC §9/§18 workflow retry backoff and timeout enforcement."""
+"""Retry backoff and timeout enforcement. The rule is SPEC §18.3."""
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Optional
 from unittest.mock import patch
@@ -13,6 +14,7 @@ from liminallm.service.workflow import (
     DEFAULT_NODE_MAX_RETRIES,
     DEFAULT_NODE_TIMEOUT_MS,
     DEFAULT_WORKFLOW_TIMEOUT_MS,
+    MAX_NODE_TIMEOUT_SECONDS,
     MAX_RETRIES_HARD_CAP,
     WorkflowEngine,
 )
@@ -102,10 +104,10 @@ def workflow_engine():
 
 
 class TestSpecConstants:
-    """Verify SPEC §9/§18 constants are correctly defined."""
+    """Verify SPEC §18.3 constants are correctly defined."""
 
     def test_default_node_timeout(self):
-        """Default node timeout should be 15s per SPEC §9."""
+        """Default node timeout should be 15s per SPEC §18.3."""
         assert DEFAULT_NODE_TIMEOUT_MS == 15000
 
     def test_default_max_retries(self):
@@ -132,7 +134,7 @@ class TestSpecConstants:
 
 
 class TestWorkflowTimeout:
-    """Test workflow-level timeout enforcement per SPEC §9."""
+    """Test workflow-level timeout enforcement per SPEC §18.3."""
 
     @pytest.mark.asyncio
     async def test_workflow_respects_timeout_ms_from_schema(self, workflow_engine):
@@ -247,7 +249,7 @@ class TestWorkflowTimeout:
 
 
 class TestRetryBackoff:
-    """Test node retry with exponential backoff per SPEC §9/§18."""
+    """Test node retry with exponential backoff per SPEC §18.3."""
 
     @pytest.mark.asyncio
     async def test_node_retries_on_error(self, workflow_engine):
@@ -389,7 +391,7 @@ class TestRetryBackoff:
 
     @pytest.mark.asyncio
     async def test_exponential_backoff_timing(self, workflow_engine):
-        """Backoff should grow exponentially: 1s, 2s, 4s per SPEC §18."""
+        """Backoff quadruples each retry: 1s, 4s, 16s per SPEC §18.3."""
         backoff_times = []
         call_count = 0
 
@@ -435,7 +437,7 @@ class TestRetryBackoff:
                 workflow_timeout_ms=60000,
             )
 
-            # Should have exponential backoff per SPEC §18: 1000, 4000, 16000 ms
+            # Per SPEC §18.3: 1000, 4000, 16000 ms
             assert len(backoff_times) == 3
             assert backoff_times[0] == 1000  # First backoff: 1s
             assert backoff_times[1] == 4000  # Second backoff: 4s (quadruple)
@@ -633,3 +635,245 @@ class TestRetryTimeoutIntegration:
 
             # Should use DEFAULT_NODE_MAX_RETRIES (2) = 3 total attempts
             assert call_count == DEFAULT_NODE_MAX_RETRIES + 1
+
+
+class TestTheWorkflowDeadlineIsRealWallClock:
+    """§18.3 promises the workflow's `timeout_ms` caps total wall clock.
+
+    It did not. Two independent leaks, both of which let a workflow return
+    materially after its own deadline:
+
+    * the attempt was awaited with the node's own `timeout_ms`, neither
+      capped at the kernel's 60s nor reduced to the time the workflow had
+      left, so a node starting just before the deadline ran well past it;
+    * the retry backoff was computed against a `remaining_ms` measured
+      *before* the attempt, so a node that consumed almost all of the
+      remaining budget still slept a full backoff on top.
+
+    `MAX_NODE_TIMEOUT_SECONDS` existed but capped the tool spec's
+    `timeout_seconds`, not this outer node timeout — the constant was right
+    and unused where it mattered.
+    """
+
+    @pytest.mark.asyncio
+    async def test_the_attempt_is_capped_by_the_time_the_workflow_has_left(
+        self, workflow_engine
+    ):
+        """What reaches `asyncio.wait_for` is the binding limit, not the node's ask."""
+        seen = []
+
+        real_wait_for = asyncio.wait_for
+
+        async def capturing_wait_for(aw, timeout=None):
+            seen.append(timeout)
+            return await real_wait_for(aw, timeout)
+
+        def ok_tool(*args, **kwargs):
+            return {"ok": True}
+
+        with (
+            patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers,
+            patch("asyncio.wait_for", capturing_wait_for),
+        ):
+            mock_handlers.return_value = {"test.tool": ok_tool}
+            workflow_engine.tool_registry["test.tool"] = {
+                "name": "test.tool",
+                "timeout_seconds": 30,
+            }
+
+            node = {
+                "id": "greedy",
+                "type": "tool_call",
+                "tool": "test.tool",
+                # Both larger than the kernel cap and larger than what the
+                # workflow has left.
+                "timeout_ms": 600_000,
+            }
+
+            await workflow_engine._execute_node_with_retry(
+                node,
+                user_message="test",
+                context_id=None,
+                conversation_id=None,
+                adapters=[],
+                history=[],
+                vars_scope={},
+                user_id=None,
+                tenant_id=None,
+                workflow_start_time=time.monotonic(),
+                workflow_timeout_ms=5_000,
+            )
+
+        assert seen, "the node was never awaited through wait_for"
+        applied = seen[0]
+        assert applied is not None
+        assert applied <= MAX_NODE_TIMEOUT_SECONDS, (
+            f"the node's own timeout_ms bypassed the {MAX_NODE_TIMEOUT_SECONDS}s "
+            f"kernel cap: {applied}s"
+        )
+        assert applied <= 5.0, (
+            "the attempt was allowed to run past the workflow's own deadline: "
+            f"{applied}s with 5s of budget left"
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_sixty_second_cap_holds_with_budget_to_spare(
+        self, workflow_engine
+    ):
+        """*Independently* capped, which the budget bound can hide.
+
+        With a small workflow budget the remaining-time bound is the smaller
+        of the two and the cap is never exercised — a version that dropped
+        `MAX_NODE_TIMEOUT_SECONDS` entirely passed a five-second-budget test.
+        So this one gives the workflow ten minutes and asks only about the
+        cap.
+        """
+        seen = []
+        real_wait_for = asyncio.wait_for
+
+        async def capturing_wait_for(aw, timeout=None):
+            seen.append(timeout)
+            return await real_wait_for(aw, timeout)
+
+        def ok_tool(*args, **kwargs):
+            return {"ok": True}
+
+        with (
+            patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers,
+            patch("asyncio.wait_for", capturing_wait_for),
+        ):
+            mock_handlers.return_value = {"test.tool": ok_tool}
+            workflow_engine.tool_registry["test.tool"] = {
+                "name": "test.tool",
+                "timeout_seconds": 30,
+            }
+
+            await workflow_engine._execute_node_with_retry(
+                {
+                    "id": "greedy",
+                    "type": "tool_call",
+                    "tool": "test.tool",
+                    "timeout_ms": 600_000,
+                },
+                user_message="test",
+                context_id=None,
+                conversation_id=None,
+                adapters=[],
+                history=[],
+                vars_scope={},
+                user_id=None,
+                tenant_id=None,
+                workflow_start_time=time.monotonic(),
+                workflow_timeout_ms=600_000,
+            )
+
+        assert seen and seen[0] is not None
+        assert seen[0] <= MAX_NODE_TIMEOUT_SECONDS, (
+            "a node asked for 600s inside a workflow with 600s of budget and "
+            f"got {seen[0]}s — the kernel cap is not applied independently"
+        )
+
+    @pytest.mark.asyncio
+    async def test_backoff_is_measured_after_the_attempt_not_before(
+        self, workflow_engine
+    ):
+        """A node that eats the budget must not then sleep a full backoff.
+
+        The workflow has 2s. The node burns 1.5s and fails. A backoff
+        computed against the budget as it was *before* the attempt still
+        believes 2s remain and sleeps a full second on top.
+        """
+        slept = []
+
+        async def mock_sleep(seconds):
+            slept.append(seconds * 1000)
+
+        def slow_failing_tool(*args, **kwargs):
+            time.sleep(1.5)
+            raise Exception("failure")
+
+        with (
+            patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers,
+            patch("asyncio.sleep", mock_sleep),
+        ):
+            mock_handlers.return_value = {"test.tool": slow_failing_tool}
+            workflow_engine.tool_registry["test.tool"] = {
+                "name": "test.tool",
+                "timeout_seconds": 30,
+            }
+
+            node = {
+                "id": "budget_eater",
+                "type": "tool_call",
+                "tool": "test.tool",
+                "max_retries": 1,
+                "backoff_ms": 1000,
+            }
+
+            await workflow_engine._execute_node_with_retry(
+                node,
+                user_message="test",
+                context_id=None,
+                conversation_id=None,
+                adapters=[],
+                history=[],
+                vars_scope={},
+                user_id=None,
+                tenant_id=None,
+                workflow_start_time=time.monotonic(),
+                workflow_timeout_ms=2_000,
+            )
+
+        # Either it declined to sleep at all, or it slept only what was
+        # genuinely left. What it must not do is sleep the full backoff.
+        assert all(ms <= 500 for ms in slept), (
+            "the backoff was computed against the budget as it stood before "
+            f"the attempt, so the workflow overran its deadline: slept {slept}ms "
+            "with ~0.5s of a 2s budget actually remaining"
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_workflow_does_not_return_materially_after_its_deadline(
+        self, workflow_engine
+    ):
+        """The contract as a caller experiences it, measured on the clock."""
+
+        def very_slow_tool(*args, **kwargs):
+            time.sleep(10)
+            return {"ok": True}
+
+        with patch.object(workflow_engine, "_builtin_tool_handlers") as mock_handlers:
+            mock_handlers.return_value = {"test.tool": very_slow_tool}
+            workflow_engine.tool_registry["test.tool"] = {
+                "name": "test.tool",
+                "timeout_seconds": 30,
+            }
+
+            node = {
+                "id": "overrunner",
+                "type": "tool_call",
+                "tool": "test.tool",
+                "timeout_ms": 600_000,
+                "max_retries": 0,
+            }
+
+            start = time.monotonic()
+            await workflow_engine._execute_node_with_retry(
+                node,
+                user_message="test",
+                context_id=None,
+                conversation_id=None,
+                adapters=[],
+                history=[],
+                vars_scope={},
+                user_id=None,
+                tenant_id=None,
+                workflow_start_time=start,
+                workflow_timeout_ms=1_000,
+            )
+            elapsed = time.monotonic() - start
+
+        assert elapsed < 5.0, (
+            f"a workflow with a 1s deadline returned after {elapsed:.1f}s — the "
+            "node's own timeout_ms governed, not the workflow's remaining budget"
+        )

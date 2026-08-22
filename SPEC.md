@@ -1197,7 +1197,7 @@ timeout numbers are §18.3's — the sketch describes the fields):
     "kind": {"const": "workflow.chat"},
     "entrypoint": {"type": "string"},
     "timeout_ms": {"type": "integer", "minimum": 1000},
-    "max_retries": {"type": "integer", "minimum": 0, "default": 2},
+    "max_retries": {"type": "integer", "minimum": 0},
     "nodes": {
       "type": "array",
       "items": {
