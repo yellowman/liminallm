@@ -583,13 +583,29 @@ def sweep_generations(store, fs_root: str, *, grace_seconds: int) -> int:
     that set skips the account. An empty set legitimately means "no
     attachments"; an unreadable one means "unknown", and deleting on unknown
     would take every generation the account has.
+
+    An account mid-erasure is skipped outright, because for it "empty" and
+    "unknown" become the same thing. Its conversations are gone, so the mark
+    set is legitimately empty and every generation it ever made looks
+    unreferenced — judged by the blob's own mtime, which is as old as the day
+    it was attached. Without this the deletion's grace period was undercut by
+    the next cleanup pass, and a turn holding one of those blobs read a
+    filesystem where it had gone.
     """
     root = Path(fs_root) / "users"
     if not root.is_dir():
         return 0
+    try:
+        pending = store.pending_user_namespaces()
+    except Exception:
+        # Same rule as the referenced set below: unknown is not empty. If the
+        # queue cannot be read, no account can be shown to be safe to sweep.
+        return 0
     cutoff = time.time() - max(grace_seconds, 0)
     removed = 0
     for user_dir in root.iterdir():
+        if user_dir.name in pending:
+            continue
         base = user_dir / GENERATION_DIRNAME / "sha256"
         if not base.is_dir():
             continue

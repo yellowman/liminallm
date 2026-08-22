@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import os
 import posixpath
 import re
@@ -685,11 +686,18 @@ async def metrics() -> Response:
     return Response(content="\n".join(lines) + "\n", media_type="text/plain")
 
 
-def _sweep_tmp_dirs(shared_root: Path, max_age_hours: int) -> None:
+def _sweep_tmp_dirs(
+    shared_root: Path, max_age_hours: int, *, pending: set[str]
+) -> None:
     """Remove stale files from per-user tmp scratch directories.
 
     SPEC §18 requires per-user scratch cleanup on a daily cadence. This helper
     runs in a thread to avoid blocking the event loop.
+
+    `pending` names the accounts whose erasure is still inside its grace
+    period. Their namespace belongs to that erasure until it completes, so
+    nothing here touches them; the parameter is required rather than
+    defaulted, because a default would make forgetting it silent.
     """
 
     cutoff_ts = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).timestamp()
@@ -698,6 +706,8 @@ def _sweep_tmp_dirs(shared_root: Path, max_age_hours: int) -> None:
         return
 
     for user_dir in user_root.iterdir():
+        if user_dir.name in pending:
+            continue
         tmp_dir = user_dir / "tmp"
         if not tmp_dir.exists():
             continue
@@ -724,13 +734,18 @@ def _sweep_tmp_dirs(shared_root: Path, max_age_hours: int) -> None:
                 tmp_dir.rmdir()
 
 
-def _sweep_archive_staging(shared_root: Path, max_age_hours: int) -> None:
+def _sweep_archive_staging(
+    shared_root: Path, max_age_hours: int, *, pending: set[str]
+) -> None:
     """Remove archive staging trees no extraction is still filling.
 
     An extraction renames its staging tree into place and removes what is
     left in a `finally`, so anything here outlived the process that made it.
     Nothing reads these directories, so age is the only signal available and
     the only one needed.
+
+    `pending` names accounts mid-erasure; their whole staging tree is the
+    account retirement's to remove, not this sweep's.
     """
     root = shared_root / ".archive-staging"
     if not root.is_dir():
@@ -740,7 +755,7 @@ def _sweep_archive_staging(shared_root: Path, max_age_hours: int) -> None:
     ).timestamp()
     removed = 0
     for user_dir in root.iterdir():
-        if not user_dir.is_dir():
+        if not user_dir.is_dir() or user_dir.name in pending:
             continue
         for staging in user_dir.iterdir():
             try:
@@ -784,28 +799,58 @@ async def _run_cleanup_pass(runtime, shared_root: Path, max_age_hours: int) -> N
     from use-after-delete only because nothing ever collected them.
     """
     from liminallm.service.artifacts import sweep_artifact_payloads
+    from liminallm.service.users import sweep_user_namespaces
+
+    # First, so a namespace this pass enrols is already excluded from the
+    # sweeps below rather than chewed on once more on the way out.
+    try:
+        await asyncio.to_thread(
+            sweep_user_namespaces, runtime.store, str(shared_root)
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # pragma: no cover - best-effort cleanup
+        logger.warning("user_namespace_sweep_failed", error=str(exc))
+
+    # Read once for the two sweeps that take only paths, and after the
+    # namespace sweep so it reflects what that just enrolled. An account still
+    # inside its erasure grace period owns its whole namespace until the
+    # retirement completes; nothing below may reach into it.
+    try:
+        pending = await asyncio.to_thread(runtime.store.pending_user_namespaces)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        # Unknown is not empty. Skipping this pass costs a day of scratch
+        # files; guessing "none pending" costs an account its grace period.
+        logger.warning("pending_user_namespaces_unreadable", error=str(exc))
+        return
 
     sweeps = (
-        ("tmp_cleanup_failed", _sweep_tmp_dirs, (shared_root, max_age_hours)),
+        (
+            "tmp_cleanup_failed",
+            functools.partial(
+                _sweep_tmp_dirs, shared_root, max_age_hours, pending=pending
+            ),
+        ),
         (
             "attachment_generation_sweep_failed",
-            _sweep_attachment_generations,
-            (shared_root, max_age_hours),
+            functools.partial(_sweep_attachment_generations, shared_root, max_age_hours),
         ),
         (
             "archive_staging_sweep_failed",
-            _sweep_archive_staging,
-            (shared_root, max_age_hours),
+            functools.partial(
+                _sweep_archive_staging, shared_root, max_age_hours, pending=pending
+            ),
         ),
         (
             "artifact_payload_sweep_failed",
-            sweep_artifact_payloads,
-            (runtime.store, str(shared_root)),
+            functools.partial(sweep_artifact_payloads, runtime.store, str(shared_root)),
         ),
     )
-    for event, sweep, args in sweeps:
+    for event, sweep in sweeps:
         try:
-            await asyncio.to_thread(sweep, *args)
+            await asyncio.to_thread(sweep)
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # pragma: no cover - best-effort cleanup

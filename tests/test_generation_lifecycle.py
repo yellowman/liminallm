@@ -2332,7 +2332,7 @@ class TestAnExtractedTreeIsInvisibleUntilItIsComplete:
         stamp = stale.stat().st_mtime - 10_000
         os.utime(stale, (stamp, stamp))
 
-        _sweep_archive_staging(tmp_path, max_age_hours=1)
+        _sweep_archive_staging(tmp_path, max_age_hours=1, pending=set())
 
         assert not stale.exists(), "a staging tree from a dead process was kept"
         assert live.exists(), "a staging tree still being filled was removed"

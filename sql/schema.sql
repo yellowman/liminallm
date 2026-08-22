@@ -673,3 +673,58 @@ DROP TRIGGER IF EXISTS artifact_retire_payload ON artifact;
 CREATE TRIGGER artifact_retire_payload
   AFTER DELETE ON artifact
   FOR EACH ROW EXECUTE FUNCTION artifact_retire_payload_fn();
+
+
+-- Accounts whose filesystem namespace is waiting to be reclaimed.
+--
+-- Deleting an account revokes every capability it had, and the rows go with
+-- the transaction. Its bytes do not: `/users/<id>` holds uploaded files and
+-- content-addressed attachment generations, and `.archive-staging/<id>` holds
+-- whole-tree extraction work. Removing those inside the request has the same
+-- shape of failure as an artifact payload — a turn that resolved a generation
+-- a moment earlier reads a filesystem where it is gone — so reclamation is
+-- delayed, and this row is what it is delayed from.
+--
+-- It also outranks the collectors that live inside that namespace. Three of
+-- them measure age from something on disk, and `sweep_generations` marks from
+-- what the account's conversations reference. Once the rows are gone that mark
+-- set is empty, so every generation the account ever made looks unreferenced
+-- and is judged by the blob's own mtime, which is weeks old: without this row
+-- to say "this user is mid-erasure, leave it alone", the deletion's own grace
+-- period is undercut by the next cleanup pass.
+CREATE TABLE IF NOT EXISTS user_namespace_retirement (
+  user_id    UUID PRIMARY KEY,
+  retired_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS user_namespace_retirement_due_idx
+  ON user_namespace_retirement (retired_at);
+
+
+-- Enrolment belongs to the table, for the reason it does above: the rule has
+-- to hold for every way an account can stop existing, not only for the admin
+-- route that exists today. There is deliberately no foreign key — the row is
+-- written by the delete of the row it names, so a reference would refuse it.
+CREATE OR REPLACE FUNCTION app_user_retire_namespace_fn() RETURNS TRIGGER AS $$
+BEGIN
+  INSERT INTO user_namespace_retirement (user_id)
+  VALUES (OLD.id)
+  ON CONFLICT (user_id) DO UPDATE SET retired_at = now();
+  RETURN OLD;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Retirements recorded for accounts that still exist, from a discovery scan
+-- that saw a namespace directory before its account row was committed. Left
+-- in place it is worse than the artifact case: while this row exists every
+-- subordinate sweep skips the user, so a live account's generations would
+-- never be collected again. The sweep filters live users out on every read as
+-- well; this makes the repair durable. Repeat-safe.
+DELETE FROM user_namespace_retirement r
+USING app_user u
+WHERE r.user_id = u.id;
+
+DROP TRIGGER IF EXISTS app_user_retire_namespace ON app_user;
+CREATE TRIGGER app_user_retire_namespace
+  AFTER DELETE ON app_user
+  FOR EACH ROW EXECUTE FUNCTION app_user_retire_namespace_fn();

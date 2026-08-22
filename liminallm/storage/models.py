@@ -307,3 +307,20 @@ class Note:
     created_at: datetime = field(default_factory=_utcnow)
     updated_at: datetime = field(default_factory=_utcnow)
     meta: Dict | None = None
+
+
+@dataclass(frozen=True)
+class UserErasure:
+    """What deleting an account removed, for the caller that has to follow it.
+
+    Postgres is canonical and its transaction takes everything with it, but
+    copies of the same rows live in Redis under keys derived from ids the
+    deletion is about to make unreachable. A cached conversation summary
+    outlives its chat by up to an hour, and after the account is gone there is
+    no longer any way to ask which conversations it had. So the deletion says
+    what it took, and the caller purges the copies on a best-effort basis —
+    afterwards, so a Redis outage cannot roll back an erasure.
+    """
+
+    user_id: str
+    conversation_ids: List[str] = field(default_factory=list)

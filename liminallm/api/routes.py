@@ -778,16 +778,20 @@ async def admin_delete_user(
     # account, its artifacts and their unfinished jobs. Asking here first
     # would be a check-then-act, which is the race this exists to remove; the
     # store raises TrainingInProgress and the handler turns that into 409.
-    target_email = target_user.email  # Capture before deletion
-    removed = runtime.auth.delete_user(user_id)
+    removed = await runtime.auth.delete_user(user_id)
     if not removed:
         raise NotFoundError("user not found", detail={"user_id": user_id})
     # Issue 51.3: Audit logging for user deletion (GDPR/SOC2 compliance)
+    #
+    # By id. The address is the identifier this request exists to remove, and
+    # writing it into the audit log copies it into a store with its own
+    # retention and its own readers — an erasure that ends by re-recording
+    # what it erased. The id correlates the entry with everything else about
+    # the account, which is what an audit trail is for.
     logger.info(
         "admin_user_deleted",
         admin_id=principal.user_id,
         deleted_user_id=user_id,
-        deleted_email=target_email,
         tenant_id=principal.tenant_id,
     )
     return Envelope(status="ok", data={"deleted": True, "user_id": user_id})
@@ -1037,7 +1041,7 @@ async def request_reset(body: PasswordResetRequest):
     # Check if user exists before generating token (don't reveal if user exists)
     user = runtime.store.get_user_by_email(body.email)
     if user:
-        token = await runtime.auth.initiate_password_reset(body.email)
+        token = await runtime.auth.initiate_password_reset(user)
         # Run blocking SMTP in thread to avoid blocking event loop
         await asyncio.to_thread(runtime.email.send_password_reset, body.email, token)
     # Always return success to prevent email enumeration

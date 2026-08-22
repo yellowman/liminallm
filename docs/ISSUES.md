@@ -9821,3 +9821,116 @@ with no such rows it removes nothing.
 | `tgenabled` back to `<> 'D'` | the replica-only red |
 | trigger back to `DO NOTHING` | the stale-retirement red |
 | schema repair removed | the repair red |
+
+## Tranche 2G.4: account erasure as one lifetime boundary
+
+### HIGH: a password reset token named an email address
+
+`initiate_password_reset` stored the address the reset was requested for, and
+`complete_password_reset` resolved it with `get_user_by_email`. An email
+address is a reassignable name, so the token followed the address rather than
+the account:
+
+1. A requests a password reset and keeps the token.
+2. A's account is deleted.
+3. B registers, and takes A's old address.
+4. A submits the token. It resolves to B, and A sets B's password.
+
+Nothing in that sequence looks unusual from either side. A holds a token their
+own account was legitimately issued, and B sees an ordinary reset they did not
+ask for. The 15-minute expiry does not close it: steps 2 and 3 are as fast as
+an admin deletion and a signup.
+
+The token records `user.id` now, in Redis and in the in-process fallback
+alike, and completion calls `get_user(user_id)`. Ids are never reused, so the
+token expires with the account instead of transferring with the address. This
+is the shape `request_email_verification` already had — it stored `user.id`
+from the beginning — which is why the fix is to make the two the same rather
+than to invent something for the reset path.
+
+### HIGH: deleting an account left its whole filesystem namespace
+
+The store's cascade took the rows. Everything the account owned on disk
+stayed: `/users/<id>`, holding uploaded files and content-addressed attachment
+generations, and `/.archive-staging/<id>`, holding whole-tree extraction work.
+
+The clock was the harder half. Three collectors already walked that namespace
+on their own schedules, and each measured age from something on disk:
+
+| sweep | what it removes | its clock |
+|---|---|---|
+| `_sweep_tmp_dirs` | `users/<u>/tmp/*` | file mtime |
+| `sweep_generations` | unreferenced generations | blob mtime |
+| `_sweep_archive_staging` | `.archive-staging/<u>/*` | tree mtime |
+
+`sweep_generations` marks from what the account's conversations reference.
+Once the rows are gone that mark set is empty, so every generation the account
+ever made looks unreferenced and is judged by the blob's own mtime — which is
+as old as the day it was attached. The deletion's grace period was therefore
+undercut by whichever cleanup pass ran next, and a turn that resolved one of
+those blobs a moment before the deletion read a filesystem where it had gone.
+
+So the account's retirement outranks every lifetime inside it. An `AFTER
+DELETE ON app_user` trigger writes `user_namespace_retirement`; while that row
+exists all three sweeps skip the user entirely; and when the grace period
+elapses both identity-derived trees go at once. There is deliberately no
+per-subdirectory logic — deleting the whole namespace makes it impossible to
+forget the next subdirectory somebody adds.
+
+Enrolment is the trigger's, not a caller's, for the reason artifact payload
+retirement already learned: the rule has to hold for every way an account can
+stop existing, not only for the admin route that exists today. Startup checks
+the trigger's shape, not its name, and both trigger checks are now one query
+over a table of expectations, because two hand-written copies of a nine-clause
+predicate is how the second one ends up missing the clause the first one
+earned.
+
+Discovery covers what no deletion produced — a namespace left behind before
+any of this existed. Those are enrolled at first observation and collected a
+grace period later, never removed on sight. A namespace whose account still
+exists is refused at enrolment and filtered out of every read, so a directory
+seen moments before its `app_user` row commits cannot poison the queue: left
+in place, such a record would stop all three sweeps from ever touching a live
+account again.
+
+### MEDIUM: hot state outlived the account
+
+Deleting one conversation retires its cached summary. Bulk erasure went
+straight to the store and skipped that, so an erased account's recent messages
+stayed readable under `chat:summary:<id>` for the rest of the TTL, and its
+sessions still resolved from `auth:session:<id>`.
+
+The conversation ids have to be captured before the rows disappear, because
+after the deletion there is no longer any way to ask which conversations the
+account had. `delete_user` returns them; `None` still means "no such account",
+which an empty list must not be confused with. The purge runs after the commit
+and its failures are logged rather than raised: Postgres is canonical, and a
+deletion that refuses to commit because a cache is down is an account that
+cannot be erased at all.
+
+### LOW: the erasure audit entry re-recorded the erased address
+
+`admin_delete_user` logged `deleted_email`. Correlation is what an audit trail
+is for and the user id serves it; writing the address back out copies the
+identifier the request exists to remove into a store with its own retention
+and its own readers.
+
+### Mutations
+
+| Mutation | Killed by |
+|---|---|
+| reset token stores the email again | the credential-transfer red |
+| trigger body enrols nothing | the retirement-record red |
+| `NAMESPACE_DIRNAMES` drops `.archive-staging` | the both-trees red |
+| record cleared after a failed `rmtree` | the retry red |
+| debris collected on sight | the first-observed red |
+| enrolment stops asking whether the account exists | the live-account red |
+| `sweep_generations` loses the exclusion | the week-old-generation red |
+| `_sweep_tmp_dirs` loses the exclusion | the scratch line of the grace red |
+| `_sweep_archive_staging` loses the exclusion | the staging line of the grace red |
+| startup drops `tgenabled IN ('O', 'A')` | the replica-only red |
+| startup drops the table from its list | the missing-table red |
+| session revocation removed | the cached-session red |
+| conversation summary purge removed | the cached-summary red |
+| purge failure allowed to escape | the Redis-outage red |
+| `deleted_email` restored | the audit-log red |

@@ -185,7 +185,7 @@ async def test_a_reset_token_rotates_the_password(auth, user):
     auth.save_password(user.id, "OldPassword123!")
     assert auth.verify_password(user.id, "OldPassword123!")
 
-    token = await auth.initiate_password_reset(user.email)
+    token = await auth.initiate_password_reset(user)
     assert await auth.complete_password_reset(token, "NewPassword456!")
 
     assert auth.verify_password(user.id, "NewPassword456!")
@@ -198,7 +198,7 @@ async def test_a_reset_revokes_every_existing_session(auth, user, store):
     auth.save_password(user.id, "OldPassword123!")
     session = store.create_session(user.id, tenant_id="public")
 
-    token = await auth.initiate_password_reset(user.email)
+    token = await auth.initiate_password_reset(user)
     assert await auth.complete_password_reset(token, "NewPassword456!")
 
     assert await auth.resolve_session(session.id) is None
@@ -207,7 +207,7 @@ async def test_a_reset_revokes_every_existing_session(auth, user, store):
 @pytest.mark.asyncio
 async def test_a_reset_token_works_once(auth, user):
     auth.save_password(user.id, "OldPassword123!")
-    token = await auth.initiate_password_reset(user.email)
+    token = await auth.initiate_password_reset(user)
     assert await auth.complete_password_reset(token, "NewPassword456!")
     assert not await auth.complete_password_reset(token, "ThirdPassword789!")
     assert not auth.verify_password(user.id, "ThirdPassword789!")
@@ -220,7 +220,7 @@ async def test_an_unknown_reset_token_is_refused(auth):
 
 @pytest.mark.asyncio
 async def test_a_reset_for_a_deleted_user_is_refused(auth, user, store):
-    token = await auth.initiate_password_reset(user.email)
+    token = await auth.initiate_password_reset(user)
     store.delete_user(user.id)
     assert not await auth.complete_password_reset(token, "NewPassword456!")
 

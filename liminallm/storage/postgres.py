@@ -82,6 +82,7 @@ from liminallm.storage.models import (
     Session,
     TrainingJob,
     User,
+    UserErasure,
     UserMFAConfig,
     UserSettings,
 )
@@ -412,6 +413,11 @@ class PostgresStore:
             # request time, and the sweeper reads an unreadable queue as
             # "nothing to do".
             "artifact_payload_retirement",
+            # Same, for account erasure. Its absence is worse than a leak: the
+            # subordinate sweeps ask this table which users are mid-erasure,
+            # and an unreadable answer is indistinguishable from "none", so a
+            # deleted account's generations become collectable at once.
+            "user_namespace_retirement",
         ]
 
         with self._connect() as conn:
@@ -563,11 +569,12 @@ class PostgresStore:
                     "scripts/migrate.sh to apply the SPEC §2 schema."
                 )
 
-            # The table alone is not the rule. Enrolment is an AFTER DELETE
-            # trigger on `artifact`, and without it every deletion path
-            # silently stops queueing payloads while the queue table sits
-            # there looking correct — which is exactly the state the
-            # ledger-only sweep cannot recover from.
+            # The table alone is not the rule. Enrolment into each retirement
+            # queue is an AFTER DELETE trigger, and without it every deletion
+            # path silently stops queueing while the queue table sits there
+            # looking correct — which is exactly the state a ledger-only sweep
+            # cannot recover from.
+            #
             # Shape, not name. `ALTER TABLE ... DISABLE TRIGGER` leaves the
             # row in pg_trigger, and a same-named trigger on INSERT or calling
             # a different function is equally present and equally useless.
@@ -579,25 +586,48 @@ class PostgresStore:
             # four states and only two of them fire for ordinary application
             # statements: 'O' (origin, the default) and 'A' (always). 'R' is
             # replica-only — not disabled, and equally useless here.
-            enrolment = conn.execute(
-                """
-                SELECT 1 FROM pg_trigger
-                WHERE tgrelid = 'artifact'::regclass
-                  AND tgname = 'artifact_retire_payload'
-                  AND NOT tgisinternal
-                  AND tgenabled IN ('O', 'A')
-                  AND (tgtype & 1) = 1
-                  AND (tgtype & 8) = 8
-                  AND (tgtype & 2) = 0
-                  AND tgfoid = 'artifact_retire_payload_fn'::regproc
-                """
-            ).fetchone()
-            if not enrolment:
-                raise RuntimeError(
-                    "the artifact_retire_payload trigger is missing, so deleting "
-                    "an artifact leaves its payloads with nothing to reclaim "
-                    "them. Rerun scripts/migrate.sh to apply the SPEC §2 schema."
-                )
+            #
+            # One query for both, because two hand-written copies of a
+            # nine-clause predicate is how the second one ends up missing the
+            # clause the first one earned.
+            for table, trigger, consequence in (
+                (
+                    "artifact",
+                    "artifact_retire_payload",
+                    "deleting an artifact leaves its payloads with nothing to "
+                    "reclaim them",
+                ),
+                (
+                    "app_user",
+                    "app_user_retire_namespace",
+                    "deleting an account leaves its files with nothing to "
+                    "reclaim them, and its generations exposed to a sweep that "
+                    "no longer sees anything referencing them",
+                ),
+            ):
+                enrolment = conn.execute(
+                    """
+                    SELECT 1 FROM pg_trigger
+                    WHERE tgrelid = %s::regclass
+                      AND tgname = %s
+                      AND NOT tgisinternal
+                      AND tgenabled IN ('O', 'A')
+                      AND (tgtype & 1) = 1
+                      AND (tgtype & 8) = 8
+                      AND (tgtype & 2) = 0
+                      AND tgfoid = (
+                        SELECT oid FROM pg_proc
+                        WHERE proname = %s || '_fn'
+                          AND pronamespace = 'public'::regnamespace
+                      )
+                    """,
+                    (table, trigger, trigger),
+                ).fetchone()
+                if not enrolment:
+                    raise RuntimeError(
+                        f"the {trigger} trigger is missing, so {consequence}. "
+                        "Rerun scripts/migrate.sh to apply the SPEC §2 schema."
+                    )
 
             vector_ext = conn.execute(
                 "SELECT extname FROM pg_extension WHERE extname = 'vector'"
@@ -1590,8 +1620,14 @@ class PostgresStore:
             ).fetchone()
         return bool(row)
 
-    def delete_user(self, user_id: str) -> bool:
+    def delete_user(self, user_id: str) -> Optional[UserErasure]:
         """Delete user and cascade to all related records.
+
+        Returns what the erasure took, or `None` if there was no such account.
+        The distinction matters and an empty list is not it: an account with no
+        conversations is still deleted, and the caller has to tell that from a
+        404. The ids come back because they stop being discoverable the moment
+        this commits, and the copies of those rows in Redis are keyed by them.
 
         Per SPEC §12, user deletion must clean up all associated data to prevent
         orphaned records and ensure complete data removal for privacy compliance.
@@ -1622,7 +1658,7 @@ class PostgresStore:
                 "SELECT 1 FROM app_user WHERE id = %s FOR UPDATE", (user_id,)
             ).fetchone()
             if not exists:
-                return False
+                return None
 
             # Get user's artifacts for cascade (needed for config patches, versions, router state)
             # Locked, so another user cannot start training one of this
@@ -1744,7 +1780,9 @@ class PostgresStore:
                 for sid in stale_ids:
                     self.sessions.pop(sid, None)
 
-            return result.rowcount > 0
+            if result.rowcount <= 0:
+                return None
+            return UserErasure(user_id=user_id, conversation_ids=conv_ids)
 
     # sessions
     def create_session(
@@ -2978,6 +3016,76 @@ class PostgresStore:
             conn.execute(
                 "DELETE FROM artifact_payload_retirement WHERE artifact_id = %s",
                 (artifact_id,),
+            )
+
+    # -- account namespace retirement ---------------------------------------
+    #
+    # `NOT EXISTS (SELECT 1 FROM app_user ...)` guards every read below. A
+    # discovery scan can enrol a namespace whose account row was still on its
+    # way, and that record is not merely stale: while it exists every
+    # subordinate sweep skips the user, so a live account's generations would
+    # accumulate forever. Filtering on read makes the mistake self-healing
+    # rather than permanent, and costs an index probe.
+
+    def pending_user_namespaces(self) -> set[str]:
+        """Accounts mid-erasure, whose namespace nothing else may touch.
+
+        Read once per sweep and asked about each directory, rather than a
+        query per directory: this is the hot path of three collectors.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT r.user_id FROM user_namespace_retirement r "
+                "WHERE NOT EXISTS (SELECT 1 FROM app_user u WHERE u.id = r.user_id)"
+            ).fetchall()
+        return {str(r["user_id"]) for r in rows}
+
+    def enrol_user_namespace_retirement(self, user_id: str) -> bool:
+        """Record a namespace no account claims, at first observation.
+
+        Enrolment normally comes from the delete trigger, which knows when the
+        account went. This covers what predates the trigger — a namespace left
+        by a deletion that happened before any of this existed — and it starts
+        the clock now rather than at an unknowable earlier moment, so nothing
+        is removed on the sweep that first sees it.
+        """
+        if not _is_uuid(user_id):
+            return False
+        with self._connect() as conn:
+            row = conn.execute(
+                "INSERT INTO user_namespace_retirement (user_id) "
+                "SELECT %s::uuid WHERE NOT EXISTS "
+                "(SELECT 1 FROM app_user u WHERE u.id = %s) "
+                "ON CONFLICT (user_id) DO NOTHING RETURNING 1",
+                (user_id, user_id),
+            ).fetchone()
+        return bool(row)
+
+    def due_user_namespace_retirements(self, *, grace_seconds: int) -> list[str]:
+        """Retired accounts whose grace period has elapsed."""
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT r.user_id FROM user_namespace_retirement r "
+                "WHERE r.retired_at <= now() - make_interval(secs => %s) "
+                "  AND NOT EXISTS (SELECT 1 FROM app_user u WHERE u.id = r.user_id) "
+                "ORDER BY r.retired_at",
+                (max(grace_seconds, 0),),
+            ).fetchall()
+        return [str(r["user_id"]) for r in rows]
+
+    def clear_user_namespace_retirement(self, user_id: str) -> None:
+        """Drop the queue entry once the namespace is gone.
+
+        Only after both trees are, so a failed removal is retried next sweep
+        instead of being forgotten — and so the subordinate sweeps keep
+        skipping the user until there is nothing left of them to skip.
+        """
+        if not _is_uuid(user_id):
+            return
+        with self._connect() as conn:
+            conn.execute(
+                "DELETE FROM user_namespace_retirement WHERE user_id = %s",
+                (user_id,),
             )
 
     def create_artifact(

@@ -132,7 +132,7 @@ class AuthService:
         self._oauth_states: dict[str, tuple[str, datetime, Optional[str]]] = {}
         self._email_verification_tokens: dict[str, tuple[str, datetime]] = {}
         # Issue 11.2: In-memory fallback for password reset tokens when Redis unavailable
-        self._password_reset_tokens: dict[str, tuple[str, datetime]] = {}  # token -> (email, expires_at)
+        self._password_reset_tokens: dict[str, tuple[str, datetime]] = {}  # token -> (user_id, expires_at)
         self._pwd_hasher = _password_hasher()
         self.logger = logger
         self._last_cleanup = datetime.now(timezone.utc)
@@ -690,8 +690,35 @@ class AuthService:
                 )
         return user
 
-    def delete_user(self, user_id: str) -> bool:
-        return bool(self.store.delete_user(user_id))
+    async def delete_user(self, user_id: str) -> bool:
+        """Erase the account, then the copies of it that live outside Postgres.
+
+        In that order, and never the reverse. Postgres is canonical: the
+        deletion must commit whether or not Redis can be reached, so the purge
+        is best-effort and runs afterwards. A cache that refuses to forget is
+        a stale read; a deletion that refuses to commit because a cache is
+        down is an account that cannot be erased at all.
+
+        Individual chat deletion already retires its cached summary. Bulk
+        erasure went straight to the store and skipped it, so an erased
+        account's recent messages stayed readable under `chat:summary:<id>`
+        for the rest of the TTL — an hour, by default.
+        """
+        erasure = self.store.delete_user(user_id)
+        if erasure is None:
+            return False
+        if self.cache:
+            try:
+                await self.cache.revoke_user_sessions(user_id)
+                for conversation_id in erasure.conversation_ids:
+                    await self.cache.delete_conversation_summary(conversation_id)
+            except Exception as exc:
+                # Named, not swallowed: the rows are gone and the operator
+                # needs to know a copy may have outlived them.
+                self.logger.warning(
+                    "user_hot_state_purge_failed", user_id=user_id, error=str(exc)
+                )
+        return True
 
     def _site_matches(self, user: User, site_tenant: Optional[str]) -> bool:
         """Does this account belong on the site the request arrived at?
@@ -1224,15 +1251,26 @@ class AuthService:
             self._mark_session_verified(session_id)
         return True
 
-    async def initiate_password_reset(self, email: str) -> str:
+    async def initiate_password_reset(self, user: User) -> str:
+        """Issue a token that names one account, the way verification does.
+
+        The token records `user.id`, not the address it was requested for. An
+        email address is a reassignable name: delete the account that asked
+        for a reset, register the same address, and a token that named the
+        address would resolve to the new account and change its password.
+        Nothing in the flow looks unusual — the attacker holds a token their
+        own account was legitimately issued. Ids are never reused, so binding
+        to one makes the token expire with the account rather than follow the
+        address to whoever holds it next.
+        """
         # Use raw bytes for proper entropy (not string representation)
-        token = hashlib.sha256(b"reset-" + email.encode() + os.urandom(32)).hexdigest()
+        token = hashlib.sha256(b"reset-" + user.id.encode() + os.urandom(32)).hexdigest()
         expires_at = self._now() + timedelta(minutes=15)
         # Persist a short-lived reset token with TTL in Redis if available
         if self.cache:
             await self.cache.client.set(
                 f"reset:{token}",
-                email,
+                user.id,
                 ex=int((expires_at - self._now()).total_seconds()),
             )
         else:
@@ -1240,17 +1278,14 @@ class AuthService:
             # _with_state_lock() already acquires _state_lock (a non-reentrant
             # Lock); acquiring it again here would deadlock.
             with self._with_state_lock():
-                self._password_reset_tokens[token] = (email, expires_at)
-        self.logger.info(
-            "password_reset_requested",
-            email_hash=hashlib.sha256(email.encode()).hexdigest(),
-        )
+                self._password_reset_tokens[token] = (user.id, expires_at)
+        self.logger.info("password_reset_requested", user_id=user.id)
         return token
 
     async def complete_password_reset(self, token: str, new_password: str) -> bool:
-        email = None
+        user_id = None
         if self.cache:
-            email = await self.cache.client.get(f"reset:{token}")
+            user_id = await self.cache.client.get(f"reset:{token}")
         else:
             # Issue 11.2: In-memory fallback for password reset tokens. Hold the
             # state lock once for the whole read-modify-write (nesting
@@ -1258,24 +1293,26 @@ class AuthService:
             with self._with_state_lock():
                 stored = self._password_reset_tokens.get(token)
                 if stored:
-                    stored_email, expires_at = stored
+                    stored_user_id, expires_at = stored
                     if expires_at <= self._now() - self._clock_skew_leeway:
                         # Remove expired token to prevent memory leak
                         self._password_reset_tokens.pop(token, None)
                     else:
-                        email = stored_email
+                        user_id = stored_user_id
                         self._password_reset_tokens.pop(token, None)
-        if not email:
+        if not user_id:
             self.logger.warning("password_reset_invalid_token", token_prefix=token[:8])
             return False
-        if isinstance(email, bytes):
-            email = email.decode()
-        user = self.store.get_user_by_email(email)
+        if isinstance(user_id, bytes):
+            user_id = user_id.decode()
+        # By id. `get_user_by_email` would resolve to whichever account owns
+        # the address now, which after an erasure need not be the one that
+        # asked for the reset.
+        user = self.store.get_user(user_id)
         if not user:
-            self.logger.warning(
-                "password_reset_user_missing",
-                email_hash=hashlib.sha256(email.encode()).hexdigest(),
-            )
+            self.logger.warning("password_reset_user_missing", user_id=user_id)
+            if self.cache:
+                await self.cache.client.delete(f"reset:{token}")
             return False
         pwd_hash, algo = self._hash_password(new_password)
         self.store.save_password(user.id, pwd_hash, algo)

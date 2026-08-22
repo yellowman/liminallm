@@ -253,7 +253,7 @@ def test_stale_files_go_and_fresh_files_stay(tmp_path):
     fresh = tmp / "new.bin"
     fresh.write_bytes(b"y")
 
-    _sweep_tmp_dirs(tmp_path, max_age_hours=24)
+    _sweep_tmp_dirs(tmp_path, max_age_hours=24, pending=set())
 
     assert not stale.exists()
     assert fresh.exists()
@@ -272,7 +272,7 @@ def test_emptied_directories_are_pruned_all_the_way_up(tmp_path):
     old = time.time() - 48 * 3600
     os.utime(f, (old, old))
 
-    _sweep_tmp_dirs(tmp_path, max_age_hours=24)
+    _sweep_tmp_dirs(tmp_path, max_age_hours=24, pending=set())
 
     assert not tmp.exists(), "an emptied tmp tree should vanish entirely"
     assert (tmp_path / "users" / "u1").exists(), "only tmp is swept, not the user"
@@ -281,14 +281,14 @@ def test_emptied_directories_are_pruned_all_the_way_up(tmp_path):
 def test_a_missing_users_root_is_a_no_op(tmp_path):
     from liminallm.app import _sweep_tmp_dirs
 
-    _sweep_tmp_dirs(tmp_path / "nowhere", max_age_hours=24)
+    _sweep_tmp_dirs(tmp_path / "nowhere", max_age_hours=24, pending=set())
 
 
 def test_a_user_without_a_tmp_dir_is_skipped(tmp_path):
     from liminallm.app import _sweep_tmp_dirs
 
     (tmp_path / "users" / "u1").mkdir(parents=True)
-    _sweep_tmp_dirs(tmp_path, max_age_hours=24)
+    _sweep_tmp_dirs(tmp_path, max_age_hours=24, pending=set())
     assert (tmp_path / "users" / "u1").exists()
 
 
