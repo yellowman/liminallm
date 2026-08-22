@@ -729,6 +729,24 @@ CREATE TRIGGER app_user_retire_namespace
   AFTER DELETE ON app_user
   FOR EACH ROW EXECUTE FUNCTION app_user_retire_namespace_fn();
 
+-- Python truthiness for a jsonb value, because that is what every deleted
+-- resolver used: `a or b`, never key presence. `->>` renders false, 0, [] and
+-- {} as the non-empty text "false", "0", "[]", "{}", so a text test calls them
+-- present when the old runtime called them absent. These fields lived behind
+-- additionalProperties: true, so nothing type-checked them and such rows can
+-- exist. Dropped again below; it is a repair tool, not part of the schema.
+CREATE OR REPLACE FUNCTION _jsonb_python_truthy(v jsonb) RETURNS boolean AS $$
+  SELECT CASE jsonb_typeof(v)
+    WHEN 'null'    THEN false
+    WHEN 'boolean' THEN v = 'true'::jsonb
+    WHEN 'number'  THEN (v #>> '{}')::numeric <> 0
+    WHEN 'string'  THEN (v #>> '{}') <> ''
+    WHEN 'array'   THEN jsonb_array_length(v) > 0
+    WHEN 'object'  THEN v <> '{}'::jsonb
+    ELSE v IS NOT NULL
+  END
+$$ LANGUAGE sql IMMUTABLE;
+
 -- Pass C data repair: every adapter carries an explicit mode; the legacy
 -- spellings collapse into their canonical fields. The CASE reproduces the
 -- deleted runtime inference exactly — backend/provider chains, prompt-alias
@@ -747,34 +765,34 @@ SET schema =
           - 'behavior_prompt' - 'system_prompt' - 'instructions'
           - 'prompt_template' - 'model_id' - 'adapter_id'
           - 'prompt_instructions'
-          - (CASE WHEN coalesce(schema->>'fs_dir','') = ''
+          - (CASE WHEN NOT _jsonb_python_truthy(schema->'fs_dir')
                   THEN 'fs_dir' ELSE '' END)
-          - (CASE WHEN coalesce(schema->>'remote_model_id','') = ''
+          - (CASE WHEN NOT _jsonb_python_truthy(schema->'remote_model_id')
                   THEN 'remote_model_id' ELSE '' END)
-          - (CASE WHEN coalesce(schema->>'remote_adapter_id','') = ''
+          - (CASE WHEN NOT _jsonb_python_truthy(schema->'remote_adapter_id')
                   THEN 'remote_adapter_id' ELSE '' END))
   || jsonb_build_object('mode', CASE
-       WHEN coalesce(schema->>'mode', '') <> '' THEN schema->>'mode'
+       WHEN _jsonb_python_truthy(schema->'mode') THEN schema->>'mode'
        WHEN lower(coalesce(schema->>'backend','')) IN ('prompt','prompt_distill')
          THEN 'prompt'
        WHEN lower(coalesce(schema->>'backend','')) IN ('local','local_lora')
             OR lower(coalesce(schema->>'provider','')) = 'local'
-         THEN CASE WHEN coalesce(schema->>'prompt_instructions','') <> ''
-                      OR coalesce(schema->>'behavior_prompt','') <> ''
+         THEN CASE WHEN _jsonb_python_truthy(schema->'prompt_instructions')
+                      OR _jsonb_python_truthy(schema->'behavior_prompt')
                THEN 'hybrid' ELSE 'local' END
        WHEN lower(coalesce(schema->>'backend','')) IN ('api','remote')
-            OR coalesce(schema->>'remote_model_id', '') <> ''
+            OR _jsonb_python_truthy(schema->'remote_model_id')
          THEN 'remote'
        ELSE 'hybrid' END)
-  || CASE WHEN coalesce(schema->>'cephfs_dir', '') <> ''
+  || CASE WHEN _jsonb_python_truthy(schema->'cephfs_dir')
        THEN jsonb_build_object('fs_dir', schema->>'cephfs_dir')
        ELSE '{}'::jsonb END
-  || CASE WHEN coalesce(schema->>'model_id', '') <> ''
-                 AND coalesce(schema->>'remote_model_id', '') = ''
+  || CASE WHEN _jsonb_python_truthy(schema->'model_id')
+                 AND NOT _jsonb_python_truthy(schema->'remote_model_id')
        THEN jsonb_build_object('remote_model_id', schema->>'model_id')
        ELSE '{}'::jsonb END
-  || CASE WHEN coalesce(schema->>'adapter_id', '') <> ''
-                 AND coalesce(schema->>'remote_adapter_id', '') = ''
+  || CASE WHEN _jsonb_python_truthy(schema->'adapter_id')
+                 AND NOT _jsonb_python_truthy(schema->'remote_adapter_id')
        THEN jsonb_build_object('remote_adapter_id', schema->>'adapter_id')
        ELSE '{}'::jsonb END
   || CASE
@@ -796,7 +814,7 @@ SET schema =
        ELSE '{}'::jsonb END
 WHERE type = 'adapter'
   AND schema->>'kind' = 'adapter.lora'
-  AND (coalesce(schema->>'mode', '') = ''
+  AND (NOT _jsonb_python_truthy(schema->'mode')
        OR schema ?| array['backend','provider','cephfs_dir','behavior_prompt',
                           'system_prompt','instructions','prompt_template',
                           'model_id','adapter_id']);
@@ -813,11 +831,34 @@ BEGIN
   FROM artifact
   WHERE type = 'adapter'
     AND schema->>'kind' = 'adapter.lora'
-    AND coalesce(schema->>'mode', '') NOT IN ('local','remote','prompt','hybrid');
+    AND (
+      -- The mode must be one of the four.
+      coalesce(schema->>'mode', '') NOT IN ('local','remote','prompt','hybrid')
+      -- No retired spelling may remain.
+      OR schema ?| array['backend','provider','cephfs_dir','behavior_prompt',
+                         'system_prompt','instructions','prompt_template',
+                         'model_id','adapter_id']
+      -- And every canonical field the validator types must be a string when
+      -- present. Checking the mode alone let other shapes through: a numeric
+      -- remote_model_id would have been "repaired" into a row this build
+      -- would refuse to create.
+      OR (schema ? 'prompt_instructions'
+          AND jsonb_typeof(schema->'prompt_instructions') <> 'string')
+      OR (schema ? 'fs_dir' AND jsonb_typeof(schema->'fs_dir') <> 'string')
+      OR (schema ? 'remote_model_id'
+          AND jsonb_typeof(schema->'remote_model_id') <> 'string')
+      OR (schema ? 'remote_adapter_id'
+          AND jsonb_typeof(schema->'remote_adapter_id') <> 'string')
+      OR (schema ? 'base_model' AND jsonb_typeof(schema->'base_model') <> 'string')
+    );
   IF bad_count > 0 THEN
     RAISE EXCEPTION
-      'migration incomplete: % adapter artifact(s) have a mode outside '
-      '(local, remote, prompt, hybrid). Repair or delete them, then re-run.',
+      'migration incomplete: % adapter artifact(s) are not canonical - mode '
+      'outside (local, remote, prompt, hybrid), a retired field, or a '
+      'non-string canonical field. Repair or delete them, then re-run.',
       bad_count;
   END IF;
 END $$;
+
+-- The repair tool is not part of the schema.
+DROP FUNCTION IF EXISTS _jsonb_python_truthy(jsonb);

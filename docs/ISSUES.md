@@ -11187,3 +11187,51 @@ mode read as hybrid, the repair keyed on presence, the migration downgraded to
 a NOTICE, and the fail-closed resolver. The fourth was written twice — the
 first version of the fail-closed mutation survived, because nothing tested
 that behaviour at all until the red above was written for it.
+
+### Pass C.2: the right door, and truthiness all the way down
+
+**HIGH: validation was chosen by the payload, not the row.** The boundary
+helper picked its validator from the incoming schema's `kind`, so a patch
+could choose which rules it would be judged by. An adapter row rewritten as
+`kind: tool.spec` with the two fields the tool schema requires passed the tool
+validator — and only `schema` is updated, so the row stayed `type='adapter'`.
+The door was there; the patch walked to a different one. `update_artifact` had
+the same shape, and validated before it had even read the row.
+
+Both are anchored to `artifact.type` now, which is immutable through every
+mutation path — an adapter row must remain a valid adapter. The kind-dispatch
+helper is deleted rather than given another rule, and `update_artifact`'s
+validation moved inside the transaction after the `FOR UPDATE`, which is where
+the row's type is known and still before `_persist_payload`.
+
+`create_artifact` was already correct: it validates against the requested
+`type_`.
+
+**MEDIUM: the SQL still diverged on JSON's other falsy values.** The previous
+round fixed `""` and `null` by testing `coalesce(schema->>'k','') <> ''`. But
+`->>` renders `false`, `0`, `[]` and `{}` as the non-empty text `"false"`,
+`"0"`, `"[]"`, `"{}"`, so a text test calls present what Python called absent.
+Not hypothetical: these fields lived behind `additionalProperties: true`, so
+nothing type-checked them.
+
+Ten more cases, all failing. `{"cephfs_dir": false, "fs_dir": "/good/a1"}`
+meant `/good/a1` and became the string `"false"`. The repair uses a
+`_jsonb_python_truthy` helper that reproduces Python's rule per JSON type,
+created for the repair and dropped after it — it is a tool, not schema. The
+oracle is 49 cases.
+
+**The postcondition now means what "canonical" means.** Checking `mode` alone
+let other shapes through: a numeric `remote_model_id` would have been
+"repaired" into a row this build would refuse to create. `schema.sql` also
+rejects any surviving retired spelling and any non-string canonical field, and
+the test asserts every repaired adapter passes `validate_artifact("adapter",
+...)` — the strongest available statement of the property.
+
+That assertion immediately found the fixtures were unrealistic: they omitted
+`base_model` and `current_version`, which the adapter schema required *before*
+Pass C as well, so they were rows no build could have created. Corrected, and
+checked against the old schema in git rather than assumed.
+
+Four mutations, each killed: either mutation surface picking its validator
+from the payload's kind, truthiness reverted to a text test, and the
+postcondition narrowed back to the mode alone.

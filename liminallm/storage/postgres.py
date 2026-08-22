@@ -3314,20 +3314,6 @@ class PostgresStore:
         owner_user_id: Optional[str] = None,
         require_private: bool = False,
     ) -> Optional[Artifact]:
-        schema_kind = schema.get("kind")
-        if schema_kind == "workflow.chat":
-            validator_type = "workflow"
-        elif schema_kind == "tool.spec":
-            validator_type = "tool"
-        elif schema_kind == "adapter.lora":
-            validator_type = "adapter"
-        else:
-            validator_type = "artifact"
-        try:
-            validate_artifact(validator_type, schema)  # type: ignore[arg-type]
-        except ArtifactValidationError as exc:
-            self.logger.warning("artifact_validation_failed", errors=exc.errors)
-            raise
         with self._connect() as conn, conn.transaction():
             # Issue 19.5: Use SELECT ... FOR UPDATE to prevent race condition
             # This locks the artifact row until the transaction completes,
@@ -3346,6 +3332,17 @@ class PostgresStore:
             ).fetchone()
             if not row:
                 return None
+            # Against the row's own type, which required reading the row
+            # first: choosing the validator from the incoming schema's `kind`
+            # let a payload pick which rules it would be judged by, and an
+            # adapter rewritten as `kind: tool.spec` passed the tool schema
+            # while the row stayed `type='adapter'`. Inside the transaction
+            # and before `_persist_payload`, so a refusal writes nothing.
+            try:
+                validate_artifact(row["type"], schema)  # type: ignore[arg-type]
+            except ArtifactValidationError as exc:
+                self.logger.warning("artifact_validation_failed", errors=exc.errors)
+                raise
             versions = conn.execute(
                 "SELECT COALESCE(MAX(version), 0) AS v FROM artifact_version WHERE artifact_id = %s",
                 (artifact_id,),
@@ -3806,25 +3803,6 @@ class PostgresStore:
             ).fetchone()
         return self._config_patch_from_row(row) if row else None
 
-    def _validate_artifact_schema(self, type_: str, schema: dict) -> None:
-        """Run the artifact validator the way the create/update paths do.
-
-        `validate_artifact` keys on the validator's own type name, which is
-        the artifact type except that a schema's `kind` picks a stricter one.
-        """
-        kind = schema.get("kind") if isinstance(schema, dict) else None
-        if kind == "adapter.lora":
-            validator_type = "adapter"
-        elif kind == "tool.spec":
-            validator_type = "tool"
-        elif isinstance(kind, str) and kind.startswith("workflow."):
-            validator_type = "workflow"
-        elif isinstance(kind, str) and kind.startswith("policy."):
-            validator_type = "policy"
-        else:
-            validator_type = type_ if type_ in ("adapter", "tool", "workflow", "policy") else "artifact"
-        validate_artifact(validator_type, schema)  # type: ignore[arg-type]
-
     def apply_config_patch(
         self,
         patch: ConfigPatchAudit,
@@ -3842,14 +3820,21 @@ class PostgresStore:
             if not artifact_row:
                 raise NotFoundError("artifact missing", detail={"artifact_id": patch.artifact_id})
 
-            # The door belongs here, on the mutation, not only on the API that
-            # usually reaches it. An approved patch is model-authored text,
-            # and without this one could remove `mode` or re-add `backend`
-            # and put back exactly the format Pass C deleted — persisted as a
-            # new historical version, and read at serving time as hybrid.
+            # The door belongs here, on the mutation, not only on the API
+            # that usually reaches it: an approved patch is model-authored
+            # text, and without this one could remove `mode` or re-add
+            # `backend` and put back exactly the format Pass C deleted.
+            #
+            # Judged against the row's own `type`, never against the incoming
+            # schema's `kind`. Choosing the validator from the payload lets
+            # the payload choose which rules it is judged by — an adapter
+            # rewritten as `kind: tool.spec` passed the tool schema while the
+            # row stayed `type='adapter'`. `type` is immutable through every
+            # mutation path, so an adapter row must remain a valid adapter.
+            #
             # Inside the transaction and before `_persist_payload`, so a
             # refusal leaves no row, no version and no payload behind.
-            self._validate_artifact_schema(artifact_row["type"], new_schema)
+            validate_artifact(artifact_row["type"], new_schema)  # type: ignore[arg-type]
 
             versions = conn.execute(
                 "SELECT COALESCE(MAX(version), 0) AS v FROM artifact_version WHERE artifact_id = %s",
