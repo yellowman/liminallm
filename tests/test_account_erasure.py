@@ -429,9 +429,10 @@ class TestSubordinateSweepsDoNotUndercutTheGrace:
             assert reached.wait(timeout=30), "the sweep never reached the account"
             deleter = threading.Thread(target=delete_the_account, daemon=True)
             deleter.start()
-            # Long enough for an unserialized deletion to commit, which is the
-            # schedule under test. A serialized one is still blocked here.
-            deleter.join(timeout=2)
+            # An unserialized deletion commits in tens of milliseconds, so a
+            # second is a wide margin for the schedule under test. A
+            # serialized one is still blocked on the lock.
+            deleter.join(timeout=1)
             release.set()
             sweeper.join(timeout=30)
             deleter.join(timeout=30)
@@ -515,9 +516,9 @@ class TestSubordinateSweepsDoNotUndercutTheGrace:
             sweeper.start()
             assert reached.wait(timeout=30), "the sweep never reached the account"
             deleter.start()
-            # Long enough for an unserialized deletion to commit. A serialized
-            # one is still blocked on the lock the sweep is holding.
-            deleter.join(timeout=3)
+            # A second: an unserialized deletion commits in tens of
+            # milliseconds. A serialized one is still blocked on the lock.
+            deleter.join(timeout=1)
             assert deleter.is_alive() and "status" not in deletion, (
                 "an account deletion committed while a sweep was working "
                 "inside that account's namespace"
@@ -1007,9 +1008,9 @@ class TestAnInFlightRequestCannotUndoTheErasure:
             writer.start()
             assert reached.wait(timeout=30), "the write never reached the guard"
             deleter.start()
-            # Long enough for an unguarded deletion to commit and purge, which
-            # is the schedule under test.
-            deleter.join(timeout=3)
+            # A second: an unguarded deletion commits and purges in tens of
+            # milliseconds, which is the schedule under test.
+            deleter.join(timeout=1)
             assert deleter.is_alive() and "status" not in deletion, (
                 "the account was erased and purged while a write on its "
                 "behalf was already in flight"

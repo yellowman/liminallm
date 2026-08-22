@@ -9,6 +9,13 @@ from liminallm.service.clustering import SemanticClusterer
 from liminallm.service.training import EVAL_MIN_RELATIVE_IMPROVEMENT, TrainingService
 from tests.harness import get_test_store
 
+# Every test in this module runs the real thing — training steps, a forward
+# pass, an eval gate — so it is measured in seconds rather than milliseconds.
+# `make test-fast` skips these; `make test` and the pre-commit gate do not,
+# because what they exercise is not covered anywhere else.
+pytestmark = pytest.mark.slow
+
+
 
 def _seed_user_with_events(store, email, cluster_id, n_events, corrected="use tabs"):
     user = store.create_user(email=f"{uuid.uuid4().hex[:8]}_{email}")

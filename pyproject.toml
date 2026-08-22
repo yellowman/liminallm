@@ -70,6 +70,13 @@ testpaths = ["tests"]
 filterwarnings = [
   "ignore::DeprecationWarning",
 ]
+markers = [
+  # A test that spends seconds rather than milliseconds because it runs the
+  # real thing: a training step, a forward pass, a process tree, a wall-clock
+  # timeout. `make test-fast` skips these. `make test` and the pre-commit gate
+  # do not, because nothing else covers what they cover.
+  "slow: runs real model or real wall-clock work",
+]
 
 [tool.coverage.run]
 source = ["liminallm"]

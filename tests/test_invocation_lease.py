@@ -109,6 +109,7 @@ class TestNoRetryBeforeThePriorTreeIsDead:
     so bounded reaping was the best a thread worker could do.
     """
 
+    @pytest.mark.slow  # waits on a real wall-clock timeout
     async def test_each_attempt_starts_with_its_predecessor_dead(
         self, runtime, caller, monkeypatch
     ):
@@ -410,6 +411,7 @@ class TestEverythingBrokerOwnedIsKilledAndReaped:
             invocation.resources.forget_child(1)
             invocation.close()
 
+    @pytest.mark.slow  # waits on a real wall-clock timeout
     async def test_a_tree_that_will_not_die_fails_the_node(
         self, runtime, caller, monkeypatch
     ):
@@ -1384,6 +1386,7 @@ class TestTheWholePathStillWorks:
         )
         assert "42" in result.get("content", ""), result
 
+    @pytest.mark.slow  # waits on a real wall-clock timeout
     async def test_a_timeout_leaves_no_worker_behind(
         self, runtime, caller, monkeypatch
     ):
@@ -1535,6 +1538,7 @@ class TestReapingIsConfirmedNotAssumed:
             undead["on"] = False
             invocation.close()
 
+    @pytest.mark.slow  # waits on a real wall-clock timeout
     @pytest.mark.asyncio
     async def test_the_retry_refuses_while_the_worker_tree_is_unconfirmed(
         self, runtime, caller, monkeypatch

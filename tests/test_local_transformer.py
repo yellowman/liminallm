@@ -25,6 +25,13 @@ import pytest
 
 from liminallm.service import transformer
 
+# Every test in this module runs the real thing — training steps, a forward
+# pass, an eval gate — so it is measured in seconds rather than milliseconds.
+# `make test-fast` skips these; `make test` and the pre-commit gate do not,
+# because what they exercise is not covered anywhere else.
+pytestmark = pytest.mark.slow
+
+
 jax = pytest.importorskip("jax")
 jnp = pytest.importorskip("jax.numpy")
 save_file = pytest.importorskip("safetensors.numpy").save_file

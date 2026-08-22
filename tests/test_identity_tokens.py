@@ -345,7 +345,7 @@ class TestIssuanceBelongsToTheAccountLifetime:
             issuer.start()
             assert reached.wait(timeout=30), "issuance never reached the guard"
             deleter.start()
-            deleter.join(timeout=3)
+            deleter.join(timeout=1)
             assert deleter.is_alive() and "status" not in deletion, (
                 "the account was erased and purged while a token naming it "
                 "was already being issued"

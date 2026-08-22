@@ -28,6 +28,13 @@ pytest.importorskip("safetensors")
 from liminallm.service.model_backend import LocalJaxLoRABackend  # noqa: E402
 from tests.test_local_transformer import _build_checkpoint  # noqa: E402
 
+# Every test in this module runs the real thing — training steps, a forward
+# pass, an eval gate — so it is measured in seconds rather than milliseconds.
+# `make test-fast` skips these; `make test` and the pre-commit gate do not,
+# because what they exercise is not covered anywhere else.
+pytestmark = pytest.mark.slow
+
+
 BASE = ""
 """The serving base identity these fixtures' adapters declare.
 

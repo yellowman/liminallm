@@ -24,6 +24,7 @@ import uuid
 from pathlib import Path
 
 import httpx
+import pytest
 
 from liminallm.service.runtime import get_runtime
 
@@ -1436,6 +1437,7 @@ class TestDeleteJoinsTheSameProtocol:
             "still owned its destination"
         )
 
+    @pytest.mark.slow  # waits on a real wall-clock timeout
     def test_a_delete_does_not_erase_another_names_manifest_entry(self, client):
         """The manifest is one object for the whole directory, so deletion's
         read-modify-write can drop an entry it never touched."""
