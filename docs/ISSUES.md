@@ -10890,6 +10890,22 @@ defect again.
 existed and nothing was looking at it. The extraction was checked against all
 three response shapes, including the one where `checks` has no `redis` key.
 
+That check first called `python3` unconditionally, while the script's own
+`check_dependencies` requires only `curl` and treats `jq` as optional. The
+predicted failure was that `set -euo pipefail` would kill the run at the
+assignment; measured, it does not — the call site is
+`test_redis_is_actually_configured || true`, and `set -e` is suppressed for a
+function whose status is tested. The real failure was worse in a quieter way:
+`status` came back empty and the check blamed the *deployment* for a parser
+missing on the *test host*.
+
+It reads the field through `jq` when the script already found it and `python3`
+otherwise, and returns a distinct code when neither exists, so "cannot parse"
+is reported as a skip rather than as an unhealthy Redis. `extract_json` could
+not be reused: its jq-less branch greps for a flat `"key": "value"` pair and
+this path is three deep. Both parsers were exercised against all four inputs —
+healthy, not_configured, no `redis` key, and malformed JSON — and agree.
+
 **First-boot semantics are not weakened for stale volumes.**
 `INSTANCE_SETTINGS_JSON` refuses to seed once an operator has saved any system
 setting, so an existing `postgres_test_data` volume holding `model_backend=stub`

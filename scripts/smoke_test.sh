@@ -65,6 +65,12 @@ check_dependencies() {
     else
         JQ_AVAILABLE=true
     fi
+    # One check reads a nested field, which needs a real JSON parser rather
+    # than a grep. Either tool will do; neither is fatal on its own, but say
+    # so here rather than let that check fail looking like a deployment fault.
+    if ! $JQ_AVAILABLE && ! command -v python3 &> /dev/null; then
+        echo "Warning: neither jq nor python3 found; the Redis health check will be skipped"
+    fi
 }
 
 # Wait for service to be ready
@@ -123,6 +129,24 @@ test_healthz() {
     fi
 }
 
+# `extract_json` above cannot read this: its jq-less branch greps for a flat
+# "key": "value" pair, and checks.redis.status is three deep. Returns 2 when
+# no parser is installed, so the caller can tell that from an unhealthy Redis.
+redis_status_from() {
+    local json="$1"
+    if $JQ_AVAILABLE; then
+        echo "$json" | jq -r '.checks.redis.status // "missing"' 2>/dev/null || echo "missing"
+    elif command -v python3 &> /dev/null; then
+        echo "$json" | python3 -c 'import json, sys
+try:
+    print(json.load(sys.stdin).get("checks", {}).get("redis", {}).get("status", "missing"))
+except Exception:
+    print("missing")' 2>/dev/null || echo "missing"
+    else
+        return 2
+    fi
+}
+
 test_redis_is_actually_configured() {
     run_test "Redis is configured, not silently absent"
 
@@ -138,8 +162,10 @@ test_redis_is_actually_configured() {
     }
 
     local status
-    status=$(echo "$response" \
-        | python3 -c 'import json,sys; print(json.load(sys.stdin).get("checks",{}).get("redis",{}).get("status","missing"))')
+    if ! status=$(redis_status_from "$response"); then
+        log_info "Skipped: needs jq or python3 to read a nested JSON field"
+        return 0
+    fi
 
     if [ "$status" = "healthy" ]; then
         log_pass "Redis reports healthy"
