@@ -27,6 +27,17 @@ end
 return {0, existing}
 """
 
+# Read a key and remove it in one step, for a Redis older than the 6.2 that
+# introduced GETDEL. `EVAL` is atomic, so the two calls inside it cannot be
+# interleaved with another client's.
+_GETDEL = """
+local value = redis.call('GET', KEYS[1])
+if value then
+    redis.call('DEL', KEYS[1])
+end
+return value
+"""
+
 
 class RedisCache:
     """Thin Redis wrapper for sessions and rate limits."""
@@ -388,14 +399,43 @@ return {1, tokens, 0}
         )
         await self.client.set(f"auth:oauth:{state}", json.dumps(payload), ex=ttl)
 
+    async def consume_identity_token(self, prefix: str, token: str) -> Optional[str]:
+        """Hand out a one-time token's subject, and only once.
+
+        The whole point is that the read and the removal are one step. Reading
+        first and deleting after the work is done leaves the token readable for
+        the length of that work, so two requests holding it both get a subject
+        and both proceed — and for a token that arrives by email, that window
+        is reachable by anyone who has read the message, and by an ordinary
+        double-click.
+
+        GETDEL where the server has it (Redis 6.2+), and an `EVAL` otherwise,
+        which is atomic for the same reason. One helper for every token of this
+        shape: OAuth state, password reset, email verification. The version
+        that mattered was written three times, and only one of the three was
+        written this way.
+
+        Returns the stored subject, or None if the token was not there — which
+        includes the case where somebody else has just taken it.
+        """
+        key = f"{prefix}:{token}"
+        try:
+            value = await self.client.getdel(key)
+        except AttributeError:
+            # Older redis-py has no getdel; the script is equivalent.
+            value = await self.client.eval(_GETDEL, 1, key)
+        if isinstance(value, bytes):
+            value = value.decode()
+        return value
+
     async def pop_oauth_state(
         self, state: str
     ) -> Optional[tuple[str, datetime, Optional[str]]]:
         """Atomically get and delete OAuth state to prevent replay attacks.
 
-        Uses Redis GETDEL command (Redis 6.2+) or Lua script fallback to ensure
-        atomicity. This prevents race conditions where two concurrent requests
-        could both consume the same OAuth state.
+        This prevents race conditions where two concurrent requests could both
+        consume the same OAuth state. See `consume_identity_token`, which is
+        where that guarantee lives for every token of this shape.
 
         Args:
             state: The OAuth state token to consume
@@ -403,21 +443,7 @@ return {1, tokens, 0}
         Returns:
             Tuple of (provider, expires_at, tenant_id) or None if not found
         """
-        key = f"auth:oauth:{state}"
-
-        # Try GETDEL first (Redis 6.2+) for atomic get-and-delete
-        try:
-            cached = await self.client.getdel(key)
-        except AttributeError:
-            # Fallback for older redis-py versions: use Lua script for atomicity
-            lua_script = """
-            local value = redis.call('GET', KEYS[1])
-            if value then
-                redis.call('DEL', KEYS[1])
-            end
-            return value
-            """
-            cached = await self.client.eval(lua_script, 1, key)
+        cached = await self.consume_identity_token("auth:oauth", state)
 
         if cached is None:
             return None

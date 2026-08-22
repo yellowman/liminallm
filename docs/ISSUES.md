@@ -10171,3 +10171,99 @@ principal has no account to erase and lost its idempotency for nothing. The
 red that was meant to separate the two guards had been asserting that
 over-correction, so it asserts the real distinction instead: an id with no
 account row and no retirement.
+
+## Tranche 2G: CLOSED
+
+The resource-lifetime and erasure series is complete. The model it leaves:
+
+- conversation deletion owns its implicit context and its cached summary;
+- context CRUD is owner-scoped and serialized;
+- private artifact deletion retires payloads durably, through every deletion
+  path rather than the one route that remembered;
+- artifact creation against discovery, and training against account deletion,
+  are serialized rather than checked;
+- account deletion owns `/users/<id>` and `.archive-staging/<id>` through a
+  durable retirement clock;
+- the collectors inside that namespace serialize against account deletion;
+- content-bearing hot state is purged, from ids captured in the deleting
+  transaction rather than from Redis's own indexes;
+- requests authorized before an erasure cannot put idempotency responses or
+  conversation summaries back afterwards, and neither can their claims;
+- namespace collection no longer inherits a per-blob 30-second wait.
+
+One residual is carried into 2H.1 rather than left open: reset and
+verification issuance wrote its token outside the account's lifetime, so a
+purge could be followed by a fresh token naming the erased account. Inert —
+completion re-resolves the immutable id and finds nothing — and it belongs
+with the token mechanics rather than with the filesystem model.
+
+## Tranche 2H.1: a one-time token is consumed, not observed
+
+**HIGH: the password reset token was readable for the length of the reset.**
+SPEC §12.1 calls it single-use, and the code enforced that by deleting it
+after the password had been written:
+
+```
+GET reset:T
+...
+save_password
+...
+DELETE reset:T
+```
+
+Between the read and the delete the token is still there, so two requests
+holding it both resolve a subject and both proceed, and the password ends up
+as whichever arrived last. For a token that arrives by email, that window is
+reachable by anyone who has read the message, and by an ordinary double-click.
+
+`pop_oauth_state` had already solved this for OAuth state, with GETDEL and a
+Lua fallback for a Redis older than 6.2. The guarantee lives in one place now
+— `consume_identity_token(prefix, token)` — and all three callers use it:
+OAuth state, password reset, email verification. Writing it a fourth time
+inline is how the third one ended up different from the first.
+
+Email verification had the same shape. Marking a mailbox verified twice is
+harmless, so that one is not a vulnerability; leaving it reading first is how
+the next reader concludes that reading first is the house pattern.
+
+One-time means one attempt, not one success. Nothing puts the token back when
+the reset fails, because restoring it is replayability under a friendlier
+name.
+
+The in-process fallback was already correct: its `pop()` under the state lock
+*is* the atomic consume. The work there was to leave it alone, and to have a
+red that says so.
+
+**LOW, carried from 2G.4: issuance wrote outside the account's lifetime.**
+`/auth/reset/request` resolves the account and then writes the token, so an
+erasure could commit and purge in the gap and the token would land afterwards.
+Both issuers run inside `hold_live_user` now and return None when the account
+has gone. The reset route sends no mail and answers exactly as it does for an
+address that never existed, so the distinction stays invisible from outside.
+
+### Mutations
+
+| Mutation | Killed by |
+|---|---|
+| the consume primitive reads first and deletes after | the eight-caller red |
+| the reset reads the token instead of consuming it | the forced-replay red |
+| the verification reads the token instead of consuming it | its forced-replay red |
+| a failed reset puts the token back | the one-attempt red |
+| the in-process fallback reads before it pops | the eight-completion red |
+| reset issuance writes outside the lifetime | the issuance-race reds |
+| verification issuance writes outside the lifetime | the after-erasure red |
+| the route mails a token it was not given | the declined-issuance red |
+
+Two reds were missing rather than wrong, and the battery found both.
+
+Reverting the primitive to `GET` then `DELETE` survived every flow-level red,
+because each of those pauses a caller *after* its consume returned — they test
+the order the service does things in, not whether the read and the removal are
+one step. A direct red does: eight callers, one key. Measured, GETDEL hands
+the subject to one of them and `GET`-then-`DELETE` hands it to all eight.
+
+Removing the route's `if token:` guard also survived, because the red deleted
+the account before the request and the route's own lookup failed first — the
+guarded line was never reached. The line is only reachable when the account
+was live at the lookup and gone at the write, so its red drives the route by
+that contract instead.

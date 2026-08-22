@@ -1260,7 +1260,7 @@ class AuthService:
             self._mark_session_verified(session_id)
         return True
 
-    async def initiate_password_reset(self, user: User) -> str:
+    async def initiate_password_reset(self, user: User) -> Optional[str]:
         """Issue a token that names one account, the way verification does.
 
         The token records `user.id`, not the address it was requested for. An
@@ -1271,30 +1271,54 @@ class AuthService:
         own account was legitimately issued. Ids are never reused, so binding
         to one makes the token expire with the account rather than follow the
         address to whoever holds it next.
+
+        Returns None when the account has gone between the caller resolving it
+        and this write. `/auth/reset/request` resolves the user and then calls
+        here, so an erasure can commit and purge in that gap and this would
+        put a fresh token naming the erased account back afterwards. The
+        caller sends no email and answers exactly as it does for an address
+        that never existed — which is what it already does, and why the
+        distinction is invisible from outside.
         """
         # Use raw bytes for proper entropy (not string representation)
         token = hashlib.sha256(b"reset-" + user.id.encode() + os.urandom(32)).hexdigest()
         expires_at = self._now() + timedelta(minutes=15)
-        # Persist a short-lived reset token with TTL in Redis if available
-        if self.cache:
-            await self.cache.client.set(
-                f"reset:{token}",
-                user.id,
-                ex=int((expires_at - self._now()).total_seconds()),
-            )
-        else:
-            # Issue 11.2: In-memory fallback for password reset tokens.
-            # _with_state_lock() already acquires _state_lock (a non-reentrant
-            # Lock); acquiring it again here would deadlock.
-            with self._with_state_lock():
-                self._password_reset_tokens[token] = (user.id, expires_at)
+        with self.store.hold_live_user(user.id) as live:
+            if not live:
+                self.logger.info("password_reset_skipped_erased", user_id=user.id)
+                return None
+            # Persist a short-lived reset token with TTL in Redis if available
+            if self.cache:
+                await self.cache.client.set(
+                    f"reset:{token}",
+                    user.id,
+                    ex=int((expires_at - self._now()).total_seconds()),
+                )
+            else:
+                # Issue 11.2: In-memory fallback for password reset tokens.
+                # _with_state_lock() already acquires _state_lock (a
+                # non-reentrant Lock); acquiring it again here would deadlock.
+                with self._with_state_lock():
+                    self._password_reset_tokens[token] = (user.id, expires_at)
         self.logger.info("password_reset_requested", user_id=user.id)
         return token
 
     async def complete_password_reset(self, token: str, new_password: str) -> bool:
+        """Consume the token, then act on what it named.
+
+        In that order. Reading the token and deleting it after the password
+        was written left it valid for the length of the reset, so two requests
+        holding it both resolved a subject and both wrote — the password
+        ending up as whichever arrived last. Consumed first, the second
+        request finds nothing.
+
+        One-time means one attempt, not one success: nothing below puts the
+        token back when the reset fails. Restoring it would be replayability
+        under a friendlier name.
+        """
         user_id = None
         if self.cache:
-            user_id = await self.cache.client.get(f"reset:{token}")
+            user_id = await self.cache.consume_identity_token("reset", token)
         else:
             # Issue 11.2: In-memory fallback for password reset tokens. Hold the
             # state lock once for the whole read-modify-write (nesting
@@ -1320,8 +1344,6 @@ class AuthService:
         user = self.store.get_user(user_id)
         if not user:
             self.logger.warning("password_reset_user_missing", user_id=user_id)
-            if self.cache:
-                await self.cache.client.delete(f"reset:{token}")
             return False
         pwd_hash, algo = self._hash_password(new_password)
         self.store.save_password(user.id, pwd_hash, algo)
@@ -1331,34 +1353,49 @@ class AuthService:
             self.logger.warning(
                 "revoke_sessions_failed", user_id=user.id, error=str(exc)
             )
-        if self.cache:
-            await self.cache.client.delete(f"reset:{token}")
         self.logger.info("password_reset_completed", user_id=user.id)
         return True
 
-    async def request_email_verification(self, user: User) -> str:
+    async def request_email_verification(self, user: User) -> Optional[str]:
+        """As above: the token is written under the account it names.
+
+        Returns None when the account has gone between the caller resolving it
+        and this write, so an erasure's purge is the last word on this
+        account's identity tokens.
+        """
         # Use raw bytes for proper entropy (not string representation)
         token = hashlib.sha256(
             b"verify-" + user.email.encode() + os.urandom(32)
         ).hexdigest()
         expires_at = self._now() + timedelta(hours=24)
-        if self.cache:
-            await self.cache.client.set(
-                f"verify:{token}",
-                user.id,
-                ex=int((expires_at - self._now()).total_seconds()),
-            )
-        else:
-            # Issue 28.4: Thread-safe state mutation
-            with self._state_lock:
-                self._email_verification_tokens[token] = (user.id, expires_at)
+        with self.store.hold_live_user(user.id) as live:
+            if not live:
+                self.logger.info("email_verification_skipped_erased", user_id=user.id)
+                return None
+            if self.cache:
+                await self.cache.client.set(
+                    f"verify:{token}",
+                    user.id,
+                    ex=int((expires_at - self._now()).total_seconds()),
+                )
+            else:
+                # Issue 28.4: Thread-safe state mutation
+                with self._state_lock:
+                    self._email_verification_tokens[token] = (user.id, expires_at)
         self.logger.info("email_verification_requested", user_id=user.id)
         return token
 
     async def complete_email_verification(self, token: str) -> bool:
+        """Consumed first, for the same reason the reset is.
+
+        Marking a mailbox verified twice is harmless, so this one is not a
+        vulnerability. It is the same one-time primitive, and leaving one of
+        its two users reading first is how the next reader concludes that
+        reading first is the house pattern.
+        """
         user_id = None
         if self.cache:
-            user_id = await self.cache.client.get(f"verify:{token}")
+            user_id = await self.cache.consume_identity_token("verify", token)
         else:
             # Issue 28.4: Thread-safe state access
             with self._state_lock:
@@ -1381,11 +1418,6 @@ class AuthService:
             self.logger.warning("email_verification_missing_user", user_id=user_id)
             return False
         self.store.mark_email_verified(user.id)
-        if self.cache:
-            await self.cache.client.delete(f"verify:{token}")
-        else:
-            with self._state_lock:
-                self._email_verification_tokens.pop(token, None)
         self.logger.info("email_verified", user_id=user.id)
         return True
 

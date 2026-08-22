@@ -1041,9 +1041,15 @@ async def request_reset(body: PasswordResetRequest):
     # Check if user exists before generating token (don't reveal if user exists)
     user = runtime.store.get_user_by_email(body.email)
     if user:
+        # No token when the account was erased between the lookup above and
+        # the write. Nothing is sent, and the answer below is the same one an
+        # address that never existed gets — which is the point of that answer.
         token = await runtime.auth.initiate_password_reset(user)
-        # Run blocking SMTP in thread to avoid blocking event loop
-        await asyncio.to_thread(runtime.email.send_password_reset, body.email, token)
+        if token:
+            # Run blocking SMTP in thread to avoid blocking event loop
+            await asyncio.to_thread(
+                runtime.email.send_password_reset, body.email, token
+            )
     # Always return success to prevent email enumeration
     return Envelope(status="ok", data={"status": "sent"})
 
@@ -1159,6 +1165,10 @@ async def request_email_verification(principal: AuthContext = Depends(get_user))
     if not user:
         raise http_error("not_found", "user not found", status_code=404)
     token = await runtime.auth.request_email_verification(user)
+    if not token:
+        # Erased between the lookup above and the write. The caller is holding
+        # a credential for an account that no longer exists.
+        raise http_error("not_found", "user not found", status_code=404)
     # Run blocking SMTP in thread to avoid blocking event loop
     await asyncio.to_thread(runtime.email.send_email_verification, user.email, token)
     return Envelope(status="ok", data={"status": "sent"})
