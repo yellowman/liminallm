@@ -450,8 +450,10 @@ def secret_field(default: Any = "", **kwargs):
     ordinary managed_field would be echoed back to every admin, into logs, and
     into anything that captures a response body.
 
-    Not for bootstrap secrets. JWT_SECRET and DATABASE_URL are needed before
-    the database can be read at all, so they stay env_field.
+    Not for bootstrap secrets. DATABASE_URL is needed before the database can
+    be read at all, so it stays env_field. jwt_secret is not a bootstrap
+    secret — it is generated on first boot and stored like any other secret
+    here; a JWT_SECRET environment variable reaches nothing.
     """
     extra = kwargs.pop("json_schema_extra", {}) or {}
     extra = {**extra, "admin": True, "secret": True}

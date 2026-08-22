@@ -7,7 +7,7 @@ import os
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional, Tuple, Union
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 from liminallm.config import (
     MODEL_AFFECTING_SETTINGS as _MODEL_AFFECTING,
@@ -49,34 +49,56 @@ logger = get_logger(__name__)
 MODEL_AFFECTING_SETTINGS: Tuple[str, ...] = tuple(sorted(_MODEL_AFFECTING))
 
 
-def _mask_url_password(url: Optional[str]) -> Optional[str]:
-    """Mask password in URL for safe logging (Issue 29.1).
+#: Query keys that carry a password. Both drivers read connection keywords
+#: from the query string — `?password=` for redis-py and libpq alike, plus
+#: libpq's `sslpassword` — so a mask that rewrites only the userinfo
+#: publishes the same secret through the other spelling.
+_PASSWORD_QUERY_KEYS = frozenset({"password", "sslpassword"})
 
-    Replaces password component with '***' to prevent sensitive data leakage in logs.
-    Example: redis://:mypassword@localhost:6379 -> redis://:***@localhost:6379
+
+def _mask_url_password(url: Optional[str]) -> Optional[str]:
+    """Mask passwords in a URL for safe logging (Issue 29.1).
+
+    Both places a URL can carry one: the userinfo
+    (redis://:secret@host -> redis://:***@host) and the query string
+    (postgresql://host/db?password=secret -> ...?password=***), which
+    redis-py and libpq honour just as they do the userinfo.
     """
     if not url:
         return url
     try:
         parsed = urlparse(url)
+        query_pairs = parse_qsl(parsed.query, keep_blank_values=True)
+        query_masked = any(
+            key.lower() in _PASSWORD_QUERY_KEYS and value for key, value in query_pairs
+        )
+        if not parsed.password and not query_masked:
+            return url
+        netloc = parsed.netloc
         if parsed.password:
-            # Reconstruct URL with masked password
             netloc = parsed.hostname or ""
             if parsed.port:
                 netloc = f"{netloc}:{parsed.port}"
             if parsed.username:
                 netloc = f"{parsed.username}:***@{netloc}"
-            elif parsed.password:
+            else:
                 netloc = f":***@{netloc}"
-            return urlunparse((
-                parsed.scheme,
-                netloc,
-                parsed.path,
-                parsed.params,
-                parsed.query,
-                parsed.fragment,
-            ))
-        return url
+        query = parsed.query
+        if query_masked:
+            query = urlencode(
+                [
+                    (key, "***" if key.lower() in _PASSWORD_QUERY_KEYS else value)
+                    for key, value in query_pairs
+                ]
+            )
+        return urlunparse((
+            parsed.scheme,
+            netloc,
+            parsed.path,
+            parsed.params,
+            query,
+            parsed.fragment,
+        ))
     except Exception:
         # If parsing fails, return masked placeholder
         return "***url_parse_error***"

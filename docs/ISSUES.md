@@ -10621,3 +10621,32 @@ Four earlier anchors had gone stale and were repaired rather than dropped:
 expiry move there with it; the candidate list grew a second exclusion; and the
 worker URL is built by a function rather than inline. All twenty-three
 mutations are killed.
+
+### Production sibling: the log mask read only one password spelling
+
+Found by grepping the class the harness tranche fixed — a URL carrying the
+same fact in two places while code reads one. `_mask_url_password`
+(`liminallm/service/runtime.py`) rewrote the userinfo and passed the query
+through, and both drivers read `?password=` from the query — measured, both:
+
+```
+redis://cache:6379/0?password=hunter2          ->  logged verbatim
+postgresql://db/prod?password=hunter2          ->  logged verbatim
+redis://:hunter2@cache:6379                    ->  redis://:***@cache:6379
+```
+
+The mask now covers both spellings — userinfo, and `password` /
+`sslpassword` (libpq's other one) in the query — and leaves innocent
+arguments alone. The red (`tests/test_url_redaction.py`) fails against the
+unfixed mask on exactly the query half; the mutation that stops reading the
+query is killed by it.
+
+Corrected in the same pass, because the same verification measured it: a
+`JWT_SECRET` environment variable reaches nothing — `Settings` reads env
+only through `env_field` and jwt_secret is a `secret_field` generated on
+first boot — while the `secret_field` docstring and `docs/CONFIGURATION.md`
+both claimed it was an env-read bootstrap secret. Both texts now state what
+the code does. The inert `JWT_SECRET` exports in `tests/conftest.py`,
+`tests/test_performance.py`, `docker-compose.test.yml` and
+`scripts/bootstrap_admin.py` are left in place and named here: dead weight,
+not defects, and removing them belongs to a pass of its own.
