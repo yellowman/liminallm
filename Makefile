@@ -61,9 +61,17 @@ test-fast:
 # and on a large workstation `auto` would also start that many Postgres
 # clusters. Override with `make test-fast-xdist XDIST_WORKERS=8`.
 XDIST_WORKERS ?= 4
+# `loadfile` keeps a file's tests on one worker. Measured on a 4-core box it is
+# the same wall clock as the default per-test scheduler — 126.5s against 127.5s
+# over three paired runs, which is noise — so it is chosen for what it makes
+# predictable rather than for speed: a module-scoped fixture is built once per
+# worker that sees the file, and tests written next to each other stay next to
+# each other. Override with XDIST_DIST=load.
+XDIST_DIST ?= loadfile
 test-fast-xdist:
 	@mkdir -p $(SHARED_FS_ROOT)
-	python -m pytest tests/ -q --tb=short -m 'not slow' -n $(XDIST_WORKERS)
+	python -m pytest tests/ -q --tb=short -m 'not slow' \
+		-n $(XDIST_WORKERS) --dist $(XDIST_DIST)
 
 # Run tests with PostgreSQL (requires docker-compose)
 # Credentials must match docker-compose.test.yml

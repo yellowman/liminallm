@@ -24,6 +24,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -81,6 +82,50 @@ def test_probe_records_what_this_worker_was_given():
         )
 
 
+#: Set by the outer test for the run that must survive another run's flush.
+#: Three paths: where to write the sentinel's name, when it is in place, and
+#: when it may check.
+_HOLD = os.environ.get("LIMINALLM_HARNESS_HOLD")
+
+
+@pytest.mark.skipif(not _HOLD, reason="only runs inside the nested harness run")
+def test_probe_holds_redis_state_while_another_run_flushes():
+    """Write into this run's Redis database, wait, and look again.
+
+    The waiting is the test. Another pytest invocation starts while this one
+    is paused and empties what it believes is its own database before every
+    test — so if the two runs were handed the same number, this comes back to
+    nothing.
+    """
+    import time as time_
+
+    from liminallm.config import get_settings
+    from liminallm.service.runtime import get_runtime
+
+    ready, release = Path(_HOLD + ".ready"), Path(_HOLD + ".release")
+    runtime = get_runtime()
+    assert runtime.cache is not None, "this probe needs a real Redis"
+
+    import redis as redis_
+
+    client = redis_.Redis.from_url(get_settings().redis_url, decode_responses=True)
+    try:
+        client.set("harness:held", "this run's own state")
+        Path(_HOLD).write_text(get_settings().redis_url)
+        ready.write_text("ready")
+        deadline = time_.monotonic() + 120
+        while not release.exists() and time_.monotonic() < deadline:
+            time_.sleep(0.05)
+        assert release.exists(), "the other run never finished"
+        assert client.get("harness:held") == "this run's own state", (
+            "another pytest invocation flushed this run's Redis database. Two "
+            "runs were handed the same number, and each one empties it before "
+            "every test believing it owns it."
+        )
+    finally:
+        client.close()
+
+
 class _External:
     """A Postgres and a Redis standing in for services supplied from outside.
 
@@ -125,7 +170,16 @@ class _External:
         self.pg.stop()
         self.redis.stop()
 
-    def run_pytest(self, *args, probe_out=None, prepared=True, env_extra=None):
+    def env(self, *, probe_out=None, hold_out=None, prepared=True, extra=None):
+        """The environment a nested run gets.
+
+        `LIMINALLM_TEST_RUN` is dropped so each invocation mints its own — two
+        runs sharing one would derive the same Postgres database name.
+        `PYTEST_XDIST_WORKER` is dropped because an inherited one is a claim
+        to belong to a run this process is not part of; conftest reads the
+        worker id from `config` rather than the environment, so this is belt
+        as well as braces.
+        """
         env = {
             k: v
             for k, v in os.environ.items()
@@ -137,6 +191,9 @@ class _External:
                 "SHARED_FS_ROOT",
                 "LIMINALLM_TEST_RUN",
                 "TEST_SCHEMA_PREPARED",
+                "PYTEST_XDIST_WORKER",
+                "LIMINALLM_HARNESS_PROBE",
+                "LIMINALLM_HARNESS_HOLD",
             }
         }
         env.update(
@@ -149,7 +206,13 @@ class _External:
             env["TEST_SCHEMA_PREPARED"] = "true"
         if probe_out:
             env["LIMINALLM_HARNESS_PROBE"] = probe_out
-        env.update(env_extra or {})
+        if hold_out:
+            env["LIMINALLM_HARNESS_HOLD"] = hold_out
+        env.update(extra or {})
+        return env
+
+    def run_pytest(self, *args, probe_out=None, prepared=True, env_extra=None):
+        env = self.env(probe_out=probe_out, prepared=prepared, extra=env_extra)
         return subprocess.run(
             [
                 sys.executable, "-m", "pytest", "-q", "--no-header",
@@ -193,7 +256,142 @@ def _external_or_skip():
     return ext
 
 
+class TestTheRedisLease:
+    """The claim itself, at the level where each rule is one question.
+
+    The end-to-end red above proves the property that matters and takes a
+    minute and a half to do it. These are the rules it rests on, asked
+    directly, so a broken one says which.
+    """
+
+    @pytest.fixture
+    def server(self):
+        from tests.harness import ScratchRedis
+
+        redis_server = ScratchRedis()
+        if not redis_server.available:
+            pytest.skip("needs redis-server")
+        url = redis_server.start()
+        try:
+            yield url
+        finally:
+            redis_server.stop()
+
+    def test_a_claim_is_exclusive_and_the_ledger_says_who_holds_it(self, server):
+        import redis
+
+        from tests.harness import REDIS_LEASE_PREFIX, claim_redis_database
+
+        first, first_index = claim_redis_database(server, "run-a:gw0")
+        second, second_index = claim_redis_database(server, "run-b:gw0")
+        assert first_index != second_index, "one database was claimed twice"
+        assert first.endswith(f"/{first_index}") and second.endswith(f"/{second_index}")
+        assert 0 not in (first_index, second_index), "database 0 holds the ledger"
+
+        client = redis.Redis.from_url(server, decode_responses=True)
+        try:
+            assert client.get(f"{REDIS_LEASE_PREFIX}:{first_index}") == "run-a:gw0"
+            assert client.ttl(f"{REDIS_LEASE_PREFIX}:{first_index}") > 0, (
+                "a claim with no expiry outlives the run that made it, and the "
+                "database never comes back"
+            )
+        finally:
+            client.close()
+
+    def test_a_release_frees_the_number_for_the_next_run(self, server):
+        from tests.harness import claim_redis_database, release_redis_database
+
+        _, index = claim_redis_database(server, "run-a:gw0")
+        release_redis_database(server, index, "run-a:gw0")
+        _, again = claim_redis_database(server, "run-b:gw0")
+        assert again == index, (
+            "a released database was not offered to the next run, so runs "
+            "would stop working after fifteen of them"
+        )
+
+    def test_a_release_cannot_take_somebody_else_s_claim(self, server):
+        """After a lease expires the number may already belong to somebody.
+
+        A teardown that deletes by number alone would then hand a live run's
+        database to a third one.
+        """
+        import redis
+
+        from tests.harness import REDIS_LEASE_PREFIX, release_redis_database
+
+        client = redis.Redis.from_url(server, decode_responses=True)
+        try:
+            client.set(f"{REDIS_LEASE_PREFIX}:1", "somebody-else:gw0")
+            release_redis_database(server, 1, "run-a:gw0")
+            assert client.get(f"{REDIS_LEASE_PREFIX}:1") == "somebody-else:gw0", (
+                "a run released a database it did not hold"
+            )
+        finally:
+            client.close()
+
+    def test_a_renewal_pushes_the_expiry_out_again(self, server):
+        """Renewed from the per-test reset, so a live run keeps its claim."""
+        import redis
+
+        from tests.harness import (
+            REDIS_LEASE_PREFIX,
+            claim_redis_database,
+            renew_redis_database,
+        )
+
+        _, index = claim_redis_database(server, "run-a:gw0")
+        client = redis.Redis.from_url(server, decode_responses=True)
+        try:
+            client.expire(f"{REDIS_LEASE_PREFIX}:{index}", 5)
+            assert client.ttl(f"{REDIS_LEASE_PREFIX}:{index}") <= 5
+            renew_redis_database(server, index, "run-a:gw0")
+            assert client.ttl(f"{REDIS_LEASE_PREFIX}:{index}") > 60, (
+                "a run that is still running let its claim run down"
+            )
+            renew_redis_database(server, index, "somebody-else:gw0")
+            client.expire(f"{REDIS_LEASE_PREFIX}:{index}", 5)
+            renew_redis_database(server, index, "somebody-else:gw0")
+            assert client.ttl(f"{REDIS_LEASE_PREFIX}:{index}") <= 5, (
+                "a run renewed a claim that was not its own"
+            )
+        finally:
+            client.close()
+
+    def test_running_out_of_databases_says_so(self, server):
+        from tests.harness import REDIS_LEASE_SLOTS, claim_redis_database
+
+        for n in REDIS_LEASE_SLOTS:
+            claim_redis_database(server, f"run-{n}:gw0")
+        with pytest.raises(RuntimeError) as caught:
+            claim_redis_database(server, "one-too-many:gw0")
+        assert "claimed by a test run" in str(caught.value)
+
+
+def test_a_fixed_scratch_port_is_refused_under_xdist(monkeypatch):
+    """Every worker would send its own cluster to the same port.
+
+    The second one fails inside `pg_ctl`, which is loud but says nothing about
+    why. This says why.
+    """
+    from tests.harness import _free_port
+
+    # Cleared first: this test may itself be running inside a worker, and the
+    # serial half has to be asked as a serial process would ask it.
+    monkeypatch.delenv("PYTEST_XDIST_WORKER", raising=False)
+    monkeypatch.setenv("TEST_PG_PORT", "5439")
+    assert _free_port("TEST_PG_PORT") == 5439, "a serial run may still pin a port"
+
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw1")
+    with pytest.raises(RuntimeError) as caught:
+        _free_port("TEST_PG_PORT")
+    assert "TEST_PG_PORT" in str(caught.value) and "worker" in str(caught.value)
+
+
 PROBE = "tests/test_worker_isolation.py::test_probe_records_what_this_worker_was_given"
+HOLD_PROBE = (
+    "tests/test_worker_isolation.py"
+    "::test_probe_holds_redis_state_while_another_run_flushes"
+)
 
 
 @pytest.mark.slow  # stands up a Postgres and a Redis, then runs pytest in them
@@ -340,6 +538,89 @@ class TestAWorkerOwnsItsResources:
             "source, so they cannot be re-run from a report and cannot be "
             "distributed across workers:\n" + "\n".join(drifted[:10])
         )
+
+    def test_two_invocations_at_once_do_not_share_a_redis_database(self, tmp_path):
+        """Ownership across runs, not only across the workers of one run.
+
+        The Postgres name carries a run id exactly so two invocations cannot
+        both take `gw0`. The Redis number could not carry one — there are
+        fifteen numbers, not an alphabet — and deriving it from the worker id
+        alone made every invocation pick the same one, while each flushed it
+        before every test believing it owned it. Two runs at once is one
+        terminal and one editor.
+
+        So run A pauses holding state, run B starts and flushes, and A looks
+        again. Nothing here inspects a URL: what has to hold is that A's state
+        is still there.
+        """
+        hold = tmp_path / "hold"
+        with _external_or_skip() as ext:
+            first = subprocess.Popen(
+                [
+                    sys.executable, "-m", "pytest", "-q", "--no-header",
+                    "-p", "no:cacheprovider", "-p", "no:randomly", "-n", "1",
+                    HOLD_PROBE,
+                ],
+                cwd=ROOT,
+                env=ext.env(hold_out=str(hold)),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            try:
+                ready = Path(str(hold) + ".ready")
+                deadline = time.monotonic() + 180
+                while not ready.exists() and time.monotonic() < deadline:
+                    if first.poll() is not None:
+                        raise AssertionError(
+                            "the holding run exited before it was ready:\n"
+                            + (first.stdout.read() if first.stdout else "")
+                        )
+                    time.sleep(0.05)
+                assert ready.exists(), "the holding run never signalled ready"
+
+                second = ext.run_pytest("-n", "1", PROBE,
+                                        probe_out=str(tmp_path / "probe.jsonl"))
+                assert second.returncode == 0, second.stdout[-3000:]
+            finally:
+                Path(str(hold) + ".release").write_text("go")
+                out = first.communicate(timeout=180)[0]
+            assert first.returncode == 0, (
+                "a second pytest invocation destroyed the first one's Redis "
+                "state:\n" + (out or "")
+            )
+            # And the numbers really were different, which is why it survived.
+            held = Path(hold).read_text().rsplit("/", 1)[-1]
+            other = json.loads(
+                (tmp_path / "probe.jsonl").read_text().splitlines()[0]
+            )["redis_url"].rsplit("/", 1)[-1]
+            assert held != other, f"both runs used Redis database {held}"
+
+    def test_a_released_database_can_be_claimed_again(self, tmp_path):
+        """A lease is a loan. Runs would otherwise stop after fifteen."""
+        import redis
+
+        from tests.harness import REDIS_LEASE_PREFIX
+
+        out = tmp_path / "probe.jsonl"
+        with _external_or_skip() as ext:
+            seen = []
+            for _ in range(3):
+                out.write_text("")
+                done = ext.run_pytest("-n", "1", PROBE, probe_out=str(out))
+                assert done.returncode == 0, done.stdout[-2000:]
+                seen.append(
+                    json.loads(out.read_text().splitlines()[0])["redis_url"]
+                )
+            assert len(set(seen)) == 1, (
+                f"consecutive runs did not reuse the released database: {seen}"
+            )
+            client = redis.Redis.from_url(ext.redis_url, decode_responses=True)
+            try:
+                leases = client.keys(f"{REDIS_LEASE_PREFIX}:*")
+            finally:
+                client.close()
+            assert leases == [], f"a finished run left its claim behind: {leases}"
 
     def test_cross_replica_proofs_still_hold_inside_a_worker(self):
         """Worker isolation must not weaken what these tests prove.

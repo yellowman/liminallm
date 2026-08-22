@@ -40,12 +40,14 @@ from tests.harness import (  # noqa: E402
     ScratchPostgres,
     ScratchRedis,
     apply_schema,
+    claim_redis_database,
     close_test_store,
     create_worker_database,
     drop_worker_database,
     get_test_store,
+    release_redis_database,
+    renew_redis_database,
     reset_shared_store,
-    worker_redis_url,
 )
 
 # Tests use the same async RedisCache production does, against a real
@@ -59,9 +61,10 @@ _REDIS = None
 _PG = None
 _WORKER_DB: str | None = None
 _OWNED_REDIS_DB = False
+_REDIS_LEASE: tuple[str, int, str] | None = None
 
 
-def _provision() -> None:
+def _provision(worker: str) -> None:
     """Start or derive every service this process will actually use.
 
     Called from `pytest_configure`, and not from module import, because of one
@@ -74,7 +77,7 @@ def _provision() -> None:
     Serial runs reach this the same way they always did, one process doing all
     of it, and nothing below behaves differently for them.
     """
-    global _REDIS, _PG, _WORKER_DB, _OWNED_REDIS_DB
+    global _REDIS, _PG, _WORKER_DB, _OWNED_REDIS_DB, _REDIS_LEASE
 
     # Tests use the same async RedisCache production does, against a real
     # redis-server. A second, synchronous implementation used to exist for the
@@ -85,11 +88,15 @@ def _provision() -> None:
     # production runs is the code the suite does not.
     redis_url = os.environ.get("TEST_REDIS_URL")
     if redis_url:
-        if _worker:
-            # A numbered database of this worker's own. The one we were given
-            # is left alone: it is what a serial run uses, and it may be
-            # somebody's.
-            redis_url = worker_redis_url(redis_url, _worker)
+        if worker:
+            # A numbered database nobody else is using. Claimed rather than
+            # derived from the worker id: that derivation is a function of
+            # `gw0`, so two pytest invocations at once would pick the same
+            # number and each would flush it believing it owned it.
+            holder = f"{os.environ['LIMINALLM_TEST_RUN']}:{worker}"
+            leased, index = claim_redis_database(redis_url, holder)
+            _REDIS_LEASE = (redis_url, index, holder)
+            redis_url = leased
             _OWNED_REDIS_DB = True
     else:
         _REDIS = ScratchRedis()
@@ -128,13 +135,13 @@ def _provision() -> None:
                 "postgresql-16 + postgresql-16-pgvector, or set TEST_DATABASE_URL."
             )
         os.environ["DATABASE_URL"] = _PG.start()
-    elif _worker:
+    elif worker:
         # Shared server. Each worker gets a database of its own, because the
         # per-test TRUNCATE below assumes exclusive ownership — four workers
         # truncating one database is not flakiness, it is every test deleting
         # every other test's rows.
         _WORKER_DB = create_worker_database(
-            base_url, _worker, os.environ["LIMINALLM_TEST_RUN"], prepared=prepared
+            base_url, worker, os.environ["LIMINALLM_TEST_RUN"], prepared=prepared
         )
         os.environ["DATABASE_URL"] = _WORKER_DB
     else:
@@ -245,6 +252,11 @@ def _flush_owned_redis() -> None:
     """
     if not _OWNED_REDIS_DB:
         return
+    if _REDIS_LEASE is not None:
+        # Renewed here rather than on a timer: this runs before every test, so
+        # a live run keeps its claim and a dead one stops renewing and gives
+        # its database back on its own.
+        renew_redis_database(*_REDIS_LEASE)
     from liminallm.config import get_settings
 
     url = get_settings().redis_url
@@ -318,11 +330,16 @@ def pytest_configure(config):
     # and holding a pool on the database its workers are about to clone would
     # stop them cloning it. `workerinput` is xdist's own answer to "am I a
     # worker"; `dist` is its answer to "is this run parallel at all".
+    #
+    # The worker id comes from `config`, not from the environment variable it
+    # was set in. A serial pytest launched from inside a worker — which the
+    # harness's own tests do — inherits `PYTEST_XDIST_WORKER` and would
+    # otherwise provision itself as a worker of a run it is not part of.
     is_worker = hasattr(config, "workerinput")
     is_controller = not is_worker and config.getoption("dist", "no") != "no"
     if is_controller:
         return
-    _provision()
+    _provision(config.workerinput["workerid"] if is_worker else "")
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -330,6 +347,8 @@ def pytest_sessionfinish(session, exitstatus):
     # After the pool is closed, so nothing is connected to it.
     if _WORKER_DB is not None:
         drop_worker_database(os.environ["TEST_DATABASE_URL"], _WORKER_DB)
+    if _REDIS_LEASE is not None:
+        release_redis_database(*_REDIS_LEASE)
     shutil.rmtree(_test_tmp_dir, ignore_errors=True)
     if _PG is not None:
         _PG.stop()

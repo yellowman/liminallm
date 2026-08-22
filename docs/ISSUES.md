@@ -10366,3 +10366,76 @@ their worker's Postgres and the actors in a path-race test share its
 filesystem root, so both still contend exactly as before — worker isolation
 keeps unrelated tests out, it does not stand between a test and itself. A red
 runs both under xdist to keep that true.
+
+### 2I.1 carry-over: ownership across invocations, not only across workers
+
+**MEDIUM: two pytest runs at once shared their Redis databases.** The Postgres
+name carries a run id exactly so two invocations cannot both take `gw0`. The
+Redis number did not: it was a function of the worker id, so every invocation
+mapped `gw0 → /1` — and each worker flushes its database before every test,
+believing it owns it.
+
+```
+RUN A                            RUN B
+-----                            -----
+gw0 -> /1, writes state
+                                 gw0 -> same /1
+                                 FLUSHDB before its next test
+reads its state
+-> gone
+```
+
+Two runs at once is one terminal and one editor, not an exotic schedule.
+
+The number cannot carry a run id the way the database name does — there are
+fifteen numbers, not an alphabet — so possession is recorded instead of
+encoded. A lease in database 0, claimed with `SET NX EX`, renewed from the
+per-test reset that already talks to Redis, and released with a
+compare-and-delete. A run that dies stops renewing and its database comes back
+on its own; a run that outlives its lease cannot take back a number that now
+belongs to somebody else. Database 0 is never a worker's, so the per-test
+`FLUSHDB` cannot reach the ledger.
+
+**LOW: a pinned scratch port under xdist sent every worker to one port.**
+`TEST_PG_PORT` and `TEST_REDIS_PORT` override the free-port search, which is
+the opposite of what parallel workers need. The second worker used to fail
+somewhere inside `pg_ctl` — loud, but silent about why. Refused now, where the
+reason can be stated.
+
+**Carried forward from 2I.2, because this pass touched the same lines:** the
+worker id now comes from `config.workerinput`, not from the environment
+variable it was set in. A serial pytest launched from inside a worker — which
+the harness's own tests do — inherits `PYTEST_XDIST_WORKER` and would
+otherwise provision itself as a worker of a run it is not part of.
+
+### Mutations
+
+| Mutation | Killed by |
+|---|---|
+| the Redis database is derived from the worker rather than claimed | the two-invocations red |
+| the claim is not exclusive | the exclusivity red |
+| the claim never expires | the exclusivity red |
+| a release takes the number whoever holds it | the not-ours red |
+| the run never releases what it claimed | the reuse red |
+| a renewal renews whoever's claim it finds | the renewal red |
+| a fixed scratch port is accepted under xdist | the pinned-port red |
+
+The two-invocations red starts a run that writes into its Redis database and
+pauses, lets a second run start and flush, then resumes the first and looks
+again. Nothing in it inspects a URL: what has to hold is that the first run's
+state is still there. It fails against the previous commit.
+
+### On `--dist loadfile`
+
+Adopted, but not for the reason it was suggested. Measured over three paired
+runs on four workers: `load` 121.9s, 129.0s, 128.5s; `loadfile` 125.6s,
+128.0s, 128.9s. That is parity, not a third — and the mechanism proposed for
+the difference is not present here: there are no `ast.parse` or source-tree
+scanning tests in `tests/` at all.
+
+What does hold is the second argument. Four files with module-scoped fixtures
+survive into the fast lane, and under the default scheduler their tests can be
+split across workers, so each worker builds that fixture again. `loadfile`
+makes that cost one-per-worker-that-sees-the-file, and keeps tests written
+next to each other running next to each other. It costs nothing measurable, so
+it is the default for the target, overridable with `XDIST_DIST=load`.

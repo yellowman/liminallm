@@ -73,36 +73,122 @@ def worker_database_name(base: str, worker: str, run: str) -> str:
     return base[: _MAX_IDENTIFIER - len(suffix)] + suffix
 
 
-def worker_redis_url(base_url: str, worker: str) -> str:
-    """A numbered Redis database of this worker's own.
+#: Where a claim on one numbered Redis database is recorded, in database 0.
+#: Database 0 is never a worker's, so nothing a worker does can remove these.
+REDIS_LEASE_PREFIX = "liminallm:test:redis-db-lease"
 
-    Cheaper than a server each, and cheaper than prefixing every key — which
-    would also mean the suite testing key derivation it invented rather than
-    the derivation production uses. The base database is left alone: it is
-    what a serial run uses, and it may be somebody's.
+#: Long enough that no single test outruns it — the slowest is about a minute
+#: — and renewed before every test, so a run that dies stops renewing and its
+#: databases come back on their own.
+REDIS_LEASE_TTL = 900
+
+#: Redis numbers its databases 0-15 and 0 is the ledger, so fifteen at once.
+REDIS_LEASE_SLOTS = range(1, 16)
+
+_RELEASE_IF_OURS = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('DEL', KEYS[1])
+end
+return 0
+"""
+
+
+def claim_redis_database(base_url: str, holder: str) -> tuple[str, int]:
+    """Take a numbered Redis database nobody else is using, and say so.
+
+    Deriving the number from the worker id alone looked sufficient and was
+    not: it is a function of `gw0`, so every simultaneous pytest invocation
+    picks the same one — and each of them flushes it before every test,
+    believing it owns it. Two runs at once is not exotic; it is one terminal
+    and one editor.
+
+    The database name cannot carry a run id the way the Postgres one does,
+    because there are fifteen numbers rather than an alphabet, so possession
+    is recorded instead of encoded. `SET NX` is the claim, and it is atomic,
+    so two runs reaching for the same number cannot both get it.
+
+    Returns the URL and the number, the latter so the holder can renew and
+    eventually release it.
     """
-    index = _worker_index(worker) + 1
-    if index > 15:
-        raise RuntimeError(
-            f"Redis has 16 numbered databases and {worker} would need "
-            f"number {index}. Run fewer workers, or give each one a server "
-            "with TEST_REDIS_URL unset."
-        )
+    import redis
+
     parts = urlsplit(base_url)
-    return urlunsplit(parts._replace(path=f"/{index}"))
+    ledger = redis.Redis.from_url(
+        urlunsplit(parts._replace(path="/0")), decode_responses=True
+    )
+    try:
+        for index in REDIS_LEASE_SLOTS:
+            if ledger.set(
+                f"{REDIS_LEASE_PREFIX}:{index}", holder, nx=True, ex=REDIS_LEASE_TTL
+            ):
+                return urlunsplit(parts._replace(path=f"/{index}")), index
+    finally:
+        ledger.close()
+    raise RuntimeError(
+        f"every one of Redis's {len(REDIS_LEASE_SLOTS)} usable databases is "
+        "claimed by a test run. Wait for one to finish, run fewer workers, or "
+        "unset TEST_REDIS_URL so each worker starts a server of its own."
+    )
 
 
-def _worker_index(worker: str) -> int:
-    """`gw3` is 3. Anything else is a name this code does not understand."""
-    digits = worker[2:] if worker.startswith("gw") else ""
-    if not digits.isdigit():
-        raise RuntimeError(f"cannot derive resources for xdist worker {worker!r}")
-    return int(digits)
+def renew_redis_database(base_url: str, index: int, holder: str) -> None:
+    """Push the lease out again, for as long as this run is still running.
+
+    Called from the per-test reset, which already talks to Redis, so a live
+    run renews continuously and a dead one does not renew at all.
+    """
+    import redis
+
+    parts = urlsplit(base_url)
+    ledger = redis.Redis.from_url(
+        urlunsplit(parts._replace(path="/0")), decode_responses=True
+    )
+    try:
+        if ledger.get(f"{REDIS_LEASE_PREFIX}:{index}") == holder:
+            ledger.expire(f"{REDIS_LEASE_PREFIX}:{index}", REDIS_LEASE_TTL)
+    except Exception:  # pragma: no cover - a Redis that went away mid-run
+        pass
+    finally:
+        ledger.close()
+
+
+def release_redis_database(base_url: str, index: int, holder: str) -> None:
+    """Give the database back, if it is still ours to give.
+
+    Compare-and-delete: after a lease has expired the number may already
+    belong to somebody else, and releasing it then would hand their database
+    to a third run.
+    """
+    import redis
+
+    parts = urlsplit(base_url)
+    ledger = redis.Redis.from_url(
+        urlunsplit(parts._replace(path="/0")), decode_responses=True
+    )
+    try:
+        ledger.eval(_RELEASE_IF_OURS, 1, f"{REDIS_LEASE_PREFIX}:{index}", holder)
+    except Exception:  # pragma: no cover - a Redis that went away at teardown
+        pass
+    finally:
+        ledger.close()
 
 
 def _free_port(env_override: str | None = None) -> int:
-    """A port the kernel just handed out is one no other run is holding."""
+    """A port the kernel just handed out is one no other run is holding.
+
+    A fixed override is the opposite of that, and under xdist it would send
+    every worker's scratch service to one port. The second worker then fails
+    somewhere inside `pg_ctl`, which is a loud failure but not a legible one —
+    so refuse here, where the reason can be stated.
+    """
     if env_override and os.environ.get(env_override):
+        if worker_id():
+            raise RuntimeError(
+                f"{env_override} pins every scratch service to one port, and "
+                f"this run has more than one worker. Unset {env_override}, or "
+                "point the workers at services of your own with "
+                "TEST_DATABASE_URL / TEST_REDIS_URL."
+            )
         return int(os.environ[env_override])
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
