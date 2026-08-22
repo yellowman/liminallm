@@ -11029,3 +11029,37 @@ too often on small fixtures for the end-to-end reds to see the difference.
 Pinned deterministically at the fusion seam with a pool whose arrival order
 disagrees with its BM25 order. Three mutations on the survivor, all killed:
 the hash-encoder gate, the dense channel in fusion, and BM25 ordering.
+
+### Deletion tranche gate: retired settings are dead everywhere
+
+The reviewer's condition before pass C, and the reason it matters now: adapter
+canonicalization is about to retire more names, and "removed from the declared
+model" has to mean dead, not "the main runtime happens to ignore it".
+
+`apply_managed_settings` filtered stored keys, so `runtime.settings` was safe —
+the measurement behind the rag_mode deletion was correct but incomplete. The
+store handed the raw blob to everyone else:
+
+* the first-boot seed counts stored keys as "an operator configured this
+  instance"; a database whose only history was an older build storing
+  `rag_mode` refused a fresh `INSTANCE_SETTINGS_JSON` seed — reproduced;
+* the admin settings API merged the raw blob over defaults, echoing the
+  deleted name forever;
+* `set_system_settings` merged the raw blob back on every write, so the stale
+  key was re-persisted indefinitely.
+
+`_get_stored_system_settings` now filters to keys the model declares, which
+fixes every reader and the seed in one place, and `set_system_settings` merges
+over the filtered set, so the next admin write physically prunes retired keys.
+Generic by construction: the next setting deletion is inert for free.
+
+Three reds, written first and each red on the exact symptom: absent from every
+reader, seed not blocked (the fixture is a blob holding only `jwt_secret` plus
+the retired key — exactly an old database that booted once), and the write
+prunes. Two mutations — each half of the filter reverted — both killed.
+
+The seed's own writer (`merge_instance_config`) still merges into the raw
+blob, deliberately: it writes only filtered keys, readers filter what it
+reads, and the next admin save prunes. Also fixed while here: two prose
+leftovers in `rag.py` still describing "both retrieval paths" and "two
+candidate pools".

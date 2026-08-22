@@ -164,6 +164,67 @@ class TestFirstBootSeed:
         assert set(stored) == {"jwt_secret"}
 
 
+class TestARetiredSettingIsActuallyDead:
+    """Deleting a field from the model must mean dead everywhere.
+
+    `apply_managed_settings` already ignored unknown stored keys, so the
+    runtime's settings were safe — but the store handed the raw blob to
+    everything else. A database written by an older build that once stored
+    `rag_mode` then (a) counted as "an operator configured this instance" and
+    refused a first-boot seed, and (b) echoed the deleted key from the admin
+    settings API forever, because every write merged the raw blob back.
+
+    The filter is generic — keys not in SYSTEM_SETTINGS_DEFAULTS — so the next
+    deletion tranche gets this behaviour for free rather than per-field.
+    """
+
+    RETIRED = "rag_mode"  # really retired, so the fixture is the real case
+
+    def _store_with_retired_key(self):
+        reset_runtime_for_tests()
+        runtime = get_runtime()
+        runtime.store.merge_instance_config(
+            "system_settings", {self.RETIRED: "memory"}
+        )
+        return runtime
+
+    def test_a_retired_persisted_setting_is_absent_from_every_reader(self):
+        runtime = self._store_with_retired_key()
+        assert self.RETIRED not in runtime.store.get_system_settings_overrides()
+        assert self.RETIRED not in runtime.store.get_system_settings_raw()
+        assert self.RETIRED not in runtime.store.get_system_settings()
+
+    def test_an_orphaned_retired_setting_does_not_block_the_seed(self, monkeypatch):
+        """jwt_secret is generated and excluded; a retired key must be too.
+
+        Together they are exactly the state of an old database whose only
+        history is "booted once, under a build that had rag_mode".
+        """
+        runtime = self._store_with_retired_key()
+        assert "jwt_secret" in runtime.store.get_instance_config("system_settings")
+
+        monkeypatch.setenv(
+            "INSTANCE_SETTINGS_JSON", json.dumps({"model_path": "seeded-model"})
+        )
+        reset_runtime_for_tests()
+        runtime = get_runtime()
+        assert runtime.settings.model_path == "seeded-model", (
+            "a setting this build retired still counted as an operator's "
+            "choice and refused the declarative seed"
+        )
+
+    def test_the_next_write_physically_prunes_retired_keys(self):
+        runtime = self._store_with_retired_key()
+        runtime.store.set_system_settings({"default_page_size": 120})
+
+        blob = runtime.store.get_instance_config("system_settings")
+        assert blob.get("default_page_size") == 120
+        assert self.RETIRED not in blob, (
+            "the write merged the raw blob back, so the retired key is "
+            "persisted forever instead of pruned on the next save"
+        )
+
+
 def test_no_stray_env_var_reads_outside_config(monkeypatch):
     """Settings should be the only thing reading configuration from os.environ.
 

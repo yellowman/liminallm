@@ -3990,13 +3990,23 @@ class PostgresStore:
 
         Defaults are never baked into storage, so a future change to a default
         propagates to keys the admin never overrode.
+
+        Filtered to the settings the model still declares, and generically so:
+        a key this build has retired is not an operator's choice — counting it
+        as one refused the first-boot seed on databases whose only history was
+        an older build, and echoed the deleted name from the admin API
+        forever. Any future setting deletion becomes inert here for free.
         """
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT config FROM instance_config WHERE name = %s",
                 ("system_settings",),
             ).fetchone()
-        return self._coerce_stored_settings(row)
+        return {
+            key: value
+            for key, value in self._coerce_stored_settings(row).items()
+            if key in SYSTEM_SETTINGS_DEFAULTS
+        }
 
     @staticmethod
     def _coerce_stored_settings(row: Any) -> dict:
@@ -4064,7 +4074,15 @@ class PostgresStore:
                 "SELECT config FROM instance_config WHERE name = %s FOR UPDATE",
                 ("system_settings",),
             ).fetchone()
-            merged = {**self._coerce_stored_settings(row), **settings}
+            # The merge starts from the filtered set, not the raw blob, so a
+            # write physically prunes keys the model no longer declares
+            # instead of carrying them forever.
+            stored = {
+                key: value
+                for key, value in self._coerce_stored_settings(row).items()
+                if key in SYSTEM_SETTINGS_DEFAULTS
+            }
+            merged = {**stored, **settings}
             conn.execute(
                 """
                 INSERT INTO instance_config (name, config, created_at, updated_at)

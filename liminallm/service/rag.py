@@ -216,8 +216,8 @@ class RAGService:
                 if self._get_chunk_token_count(chunk) >= min_token_count
             ]
 
-        # Both retrieval paths get the rerank stage, and both get it here
-        # rather than inside themselves, so the stage sees the whole shortlist.
+        # The rerank stage lives here rather than inside the retriever, so
+        # it sees the whole shortlist.
         if self.rerank is not None and results:
             results = list(self.rerank(normalized_query, results))
 
@@ -349,7 +349,8 @@ class RAGService:
         tenant_id: Optional[str],
         path_scope: Optional[dict] = None,
     ) -> List[KnowledgeChunk]:
-        """Hybrid retrieval: two candidate pools, one rerank (SPEC §2.5)."""
+        """Hybrid retrieval: lexical, dense, and MaxSim channels fused by
+        rank, then one rerank over the shortlist (SPEC §2.5)."""
         allowed_ids = self._allowed_context_ids(
             context_ids, user_id=user_id, tenant_id=tenant_id
         )
