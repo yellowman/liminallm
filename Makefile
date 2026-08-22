@@ -2,12 +2,13 @@
 #
 # Usage:
 #   make test      - Run unit tests (in-memory)
+#   make test-fast - Fast edit-loop tests; excludes @pytest.mark.slow
 #   make lint      - Run linters
 #   make qa        - Full QA gate (lint + test + security)
 #   make dev       - Start development server
 #   make docker    - Build and test with Docker
 
-.PHONY: help install test lint security qa dev docker clean docker-clean
+.PHONY: help install test test-fast lint security qa dev docker clean docker-clean
 
 # Default target
 help:
@@ -15,6 +16,7 @@ help:
 	@echo ""
 	@echo "  make install    Install dependencies"
 	@echo "  make test       Run unit tests (in-memory)"
+	@echo "  make test-fast  Fast edit-loop tests; excludes @pytest.mark.slow"
 	@echo "  make test-pg    Run tests with PostgreSQL (requires Docker)"
 	@echo "  make lint       Run linters (ruff)"
 	@echo "  make security   Run security scanner (bandit)"

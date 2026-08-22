@@ -27,9 +27,10 @@ end
 return {0, existing}
 """
 
-# Read a key and remove it in one step, for a Redis older than the 6.2 that
-# introduced GETDEL. `EVAL` is atomic, so the two calls inside it cannot be
-# interleaved with another client's.
+# Read a key and remove it in one step, for a redis-py client with no `getdel`
+# method. `EVAL` is atomic, so the two calls inside it cannot be interleaved
+# with another client's. Not a fallback for an old *server*: see
+# `consume_identity_token`.
 _GETDEL = """
 local value = redis.call('GET', KEYS[1])
 if value then
@@ -409,11 +410,18 @@ return {1, tokens, 0}
         is reachable by anyone who has read the message, and by an ordinary
         double-click.
 
-        GETDEL where the server has it (Redis 6.2+), and an `EVAL` otherwise,
-        which is atomic for the same reason. One helper for every token of this
-        shape: OAuth state, password reset, email verification. The version
-        that mattered was written three times, and only one of the three was
-        written this way.
+        `GETDEL`, with an `EVAL` for a redis-py old enough not to have the
+        method — `AttributeError` is a missing client method, not a server
+        that refuses the command. The server side needs Redis 6.2 or newer to
+        answer `GETDEL` at all, and `docker-compose.test.yml` pins Redis 7, so
+        there is nothing here that reaches an older one. Supporting a server
+        that predates `GETDEL` would mean catching the unknown-command
+        `ResponseError` specifically, and blanket-catching `ResponseError`
+        instead would turn an ACL denial into a silent `EVAL` attempt.
+
+        One helper for every token of this shape: OAuth state, password reset,
+        email verification. The version that mattered was written three times,
+        and only one of the three was written this way.
 
         Returns the stored subject, or None if the token was not there — which
         includes the case where somebody else has just taken it.
@@ -422,7 +430,7 @@ return {1, tokens, 0}
         try:
             value = await self.client.getdel(key)
         except AttributeError:
-            # Older redis-py has no getdel; the script is equivalent.
+            # A redis-py without the method, not a server without the command.
             value = await self.client.eval(_GETDEL, 1, key)
         if isinstance(value, bytes):
             value = value.decode()
