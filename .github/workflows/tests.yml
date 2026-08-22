@@ -95,8 +95,6 @@ jobs:
           TEST_SCHEMA_PREPARED: "true"
           EMBEDDING_VECTOR_DIM: "64"
           ALLOW_REDIS_FALLBACK_DEV: "true"
-          REDIS_URL: redis://localhost:6379/1
-          JWT_SECRET: test-secret-key-for-ci-only
         run: |
           pytest --cov=liminallm --cov-report=xml --cov-report=term-missing -v
 

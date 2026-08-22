@@ -32,8 +32,6 @@ help:
 
 # Environment variables for testing
 export TEST_MODE := true
-export USE_MEMORY_STORE := true
-export JWT_SECRET := Test-Secret-Key-4-Testing-Only-Do-Not-Use-In-Production!
 export SHARED_FS_ROOT := /tmp/liminallm-data
 
 # Install dependencies

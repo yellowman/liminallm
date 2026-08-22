@@ -332,12 +332,6 @@ pytest tests/test_post_smoke.py -v
 
 ## Troubleshooting
 
-### JWT_SECRET validation error
-
-```bash
-# Use a complex secret with mixed character classes
-```
-
 ### Rate limiting in tests
 
 Rate limits apply even in test mode. Wait 60 seconds between repeated file uploads, or restart the server to clear in-process rate limit state.

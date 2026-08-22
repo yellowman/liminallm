@@ -89,7 +89,13 @@ def _mask_url_password(url: Optional[str]) -> Optional[str]:
                 [
                     (key, "***" if key.lower() in _PASSWORD_QUERY_KEYS else value)
                     for key, value in query_pairs
-                ]
+                ],
+                # `*` is not special in a query string, and percent-encoding
+                # the replacement turned every masked value into `%2A%2A%2A`.
+                # The secret was gone either way; this is about the log line
+                # being readable, and about the function producing the `***`
+                # its own docstring promises.
+                safe="*",
             )
         return urlunparse((
             parsed.scheme,

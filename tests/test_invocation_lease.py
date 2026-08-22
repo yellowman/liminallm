@@ -931,9 +931,20 @@ class TestTheWorkerIsActuallyConfined:
     rather than reading the source and believing it.
     """
 
-    def _probe(self, tmp_path):
+    #: Planted in the parent before spawning, and asserted absent in the
+    #: child. Named secrets are a weaker check than they look: the scrubbing
+    #: assertion below is only meaningful for a variable the parent actually
+    #: had, and two of the three it used to name were not set by this suite at
+    #: all — `REDIS_URL` never was, and `JWT_SECRET` stopped being when the
+    #: dead exports went. A sentinel cannot go quietly vacuous that way.
+    _SENTINEL_ENV = "LIMINALLM_CONFINEMENT_SENTINEL"
+
+    def _probe(self, tmp_path, monkeypatch):
         scratch = tmp_path / "worker-scratch"
         scratch.mkdir()
+        # Set through monkeypatch so it is still in place when the
+        # assertions read it, and removed however the test ends.
+        monkeypatch.setenv(self._SENTINEL_ENV, "must not reach the worker")
         ctx = multiprocessing.get_context("spawn")
         parent_conn, child_conn = ctx.Pipe(duplex=True)
         proc = ctx.Process(
@@ -946,16 +957,21 @@ class TestTheWorkerIsActuallyConfined:
         proc.join(10)
         return findings
 
-    def test_the_host_filesystem_environment_and_network_are_gone(self, tmp_path):
+    def test_the_host_filesystem_environment_and_network_are_gone(
+        self, tmp_path, monkeypatch
+    ):
         from liminallm.service.confine import backend_name
 
         if backend_name() is None:
             pytest.skip("no confinement backend on this platform")
-        findings = self._probe(tmp_path)
+        findings = self._probe(tmp_path, monkeypatch)
         assert findings.get("confined") is True, findings
         assert findings["host_fs"] is False, "the worker could read /etc/passwd"
         assert findings["network"] is False, "the worker opened a socket"
-        for leaked in ("DATABASE_URL", "JWT_SECRET", "REDIS_URL"):
+        assert self._SENTINEL_ENV in os.environ, (
+            "the sentinel was never planted, so the check below proves nothing"
+        )
+        for leaked in (self._SENTINEL_ENV, "DATABASE_URL"):
             assert leaked not in findings["env"], (
                 f"{leaked} survived into the worker's environment"
             )

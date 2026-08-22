@@ -64,3 +64,27 @@ class TestTheQuerySpelling:
     def test_innocent_query_arguments_survive(self):
         url = "redis://cache:6379/0?socket_timeout=5"
         assert _mask_url_password(url) == url
+
+    def test_the_masked_value_is_literally_three_asterisks(self):
+        """Exact output, because "the secret is gone" was already true.
+
+        `urlencode` percent-encodes by default, so every masked query value
+        came out as `%2A%2A%2A` — safe, and unreadable in the log line this
+        function exists to produce. `*` is not special in a query string.
+        Asserted as an exact string rather than a substring, since a
+        substring check passes on the encoded form too.
+        """
+        assert (
+            _mask_url_password("postgresql://app@db:5432/prod?password=hunter2")
+            == "postgresql://app@db:5432/prod?password=***"
+        )
+        assert (
+            _mask_url_password("redis://cache:6379/0?password=hunter2")
+            == "redis://cache:6379/0?password=***"
+        )
+        assert (
+            _mask_url_password(
+                "postgresql://app@db/prod?sslmode=require&sslpassword=hunter2"
+            )
+            == "postgresql://app@db/prod?sslmode=require&sslpassword=***"
+        )

@@ -117,7 +117,32 @@ REDIS_BASE_PREFIX = "liminallm:test:redis-db-base"
 #: slower than this one. `LIMINALLM_TEST_LEASE_TTL` shortens it, which lets a
 #: test force the expiry the margin is about instead of waiting a quarter of
 #: an hour for one.
-REDIS_LEASE_TTL = int(os.environ.get("LIMINALLM_TEST_LEASE_TTL") or 900)
+def _lease_ttl() -> int:
+    """The lease TTL, from the override when there is one.
+
+    A value below one second is refused rather than clamped. `SET ... EX 0`
+    is an error in Redis and a negative TTL deletes on write, so the run
+    would fail somewhere inside the ledger with a message about the wrong
+    thing — while the mistake is right here, in a number somebody typed.
+    """
+    raw = os.environ.get("LIMINALLM_TEST_LEASE_TTL")
+    if not raw:
+        return 900
+    try:
+        seconds = int(raw)
+    except ValueError:
+        raise RuntimeError(
+            f"LIMINALLM_TEST_LEASE_TTL must be a whole number of seconds, not {raw!r}"
+        ) from None
+    if seconds < 1:
+        raise RuntimeError(
+            f"LIMINALLM_TEST_LEASE_TTL must be at least 1 second, not {seconds}. "
+            "A lease that expires on write is not a shorter lease, it is no lease."
+        )
+    return seconds
+
+
+REDIS_LEASE_TTL = _lease_ttl()
 
 #: Redis numbers its databases 0-15. Database 0 is left out even when it is
 #: not the ledger: it is the conventional default and the likeliest to hold

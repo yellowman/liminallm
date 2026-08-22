@@ -33,7 +33,6 @@ os.environ.setdefault("TEST_MODE", "true")
 # twice and verified once — and the untested half was the one production runs.
 os.environ.setdefault("EMBEDDING_VECTOR_DIM", "64")  # matches the hash encoder
 os.environ.setdefault("ALLOW_REDIS_FALLBACK_DEV", "true")
-os.environ.setdefault("JWT_SECRET", "Test-Secret-Key-4-Testing-Only-Do-Not-Use-In-Production!")
 import pytest  # noqa: E402
 
 from tests.harness import (  # noqa: E402

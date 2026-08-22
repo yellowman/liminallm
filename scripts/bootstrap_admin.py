@@ -127,12 +127,6 @@ def main():
         print("       (uppercase, lowercase, digits, special characters)")
         sys.exit(1)
 
-    # Set up minimal env for testing if not configured
-    if not os.environ.get("JWT_SECRET"):
-        # Generate a secure secret for bootstrap
-        import secrets
-        os.environ["JWT_SECRET"] = secrets.token_urlsafe(48)
-
     if not os.environ.get("SHARED_FS_ROOT"):
         os.environ["SHARED_FS_ROOT"] = "/tmp/liminallm-bootstrap"
 

@@ -967,7 +967,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             # If we have more retries, apply exponential backoff
             if attempt <= max_retries:
                 # Exponential backoff: backoff_ms * (4 ^ (attempt - 1))
-                # Per SPEC §18: 1s, 4s, 16s progression (quadruple each retry)
+                # Per SPEC §18.3: 1s, 4s, 16s progression (quadruple each retry)
                 current_backoff_ms = backoff_ms * (4 ** (attempt - 1))
 
                 # Measured now, not before the attempt. `remaining_ms` above

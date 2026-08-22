@@ -10776,3 +10776,63 @@ nothing:
 
 Both are the same lesson: a mutation that survives is a question about the
 red, and answering it honestly is what finds the untested guarantee.
+
+### Cleanup: a mask that escaped its own replacement, and five dead exports
+
+**The masked value was percent-encoded.** `urlencode` escapes by default, so
+every masked query value came out `password=%2A%2A%2A`. The secret was gone
+either way — this is a log line's legibility, and a function agreeing with its
+own docstring. `safe="*"` fixes it, and the red asserts the exact output
+rather than a substring, because a substring check passes on the encoded form
+too.
+
+**`JWT_SECRET` was exported in five places and read in none.** Measured: with
+the variable set to a sentinel and unset, `Settings().jwt_secret` is `''` both
+times. The six environment-only settings are `DATABASE_URL`, `SHARED_FS_ROOT`,
+`BUILD_SHA`, `TEST_MODE`, `EMBEDDING_VECTOR_DIM` and
+`EXTRACT_READER_PLUGINS`; `jwt_secret` is generated on first boot and stored
+like any other secret. Removed from the Makefile, the CI workflow, `conftest`,
+`test_performance`, and a `bootstrap_admin` block that generated a secret into
+an environment variable nothing consumes.
+
+Two troubleshooting entries went with them. `TESTING.md` and
+`docs/QA_RUNBOOK.md` both described a "JWT_SECRET must mix character classes"
+failure and offered an *empty* code block as the remedy — debris from the
+earlier correction. The validator fires on the stored setting, not on an
+environment variable, so the advice could not have worked.
+
+**A scrubbing assertion that was about to go vacuous.** `test_invocation_lease`
+asserted `DATABASE_URL`, `JWT_SECRET` and `REDIS_URL` do not survive into a
+confined worker. Only the first was ever set by this suite: `REDIS_URL` never
+was, and `JWT_SECRET` stopped being when the dead exports went — so two thirds
+of that check proved nothing, and removing the exports would have quietly made
+it three thirds of nothing.
+
+It plants a sentinel now and asserts the sentinel is still set before asking
+whether the worker saw it, so the check cannot pass by being about a variable
+nobody exported. That also matches what the implementation says about itself:
+`tool_worker` replaces the environment wholesale rather than filtering,
+"because a denylist of secret names is a guess about what the deployment
+exported" — and a test that names three secrets was making exactly that guess.
+
+Killing `os.environ.clear()` in `tool_worker` fails the test; it did not have
+to before.
+
+**`LIMINALLM_TEST_LEASE_TTL` rejects values below one second.** `SET ... EX 0`
+is an error and a negative TTL deletes on write, so the run would have failed
+somewhere inside the ledger with a message about the wrong thing.
+
+### Not fixed here: the QA compose environment has no Redis
+
+Found while checking whether `JWT_SECRET`'s neighbours were equally dead. They
+are — `USE_MEMORY_STORE`, `JWT_ISSUER` and `JWT_AUDIENCE` reach nothing — but
+`REDIS_URL` in `docker-compose.test.yml` is worse than dead. It is the only
+thing pointing that deployment at the `redis` service, and it reaches nothing,
+while `redis_url` defaults to `redis://localhost:6379/0`. Inside the app
+container there is no Redis on localhost, so that environment has been running
+on the in-process fallback: rate limits, idempotency, the session cache and
+the concurrency slots all on their fallback path.
+
+Deleting the line would tidy away the evidence without fixing the deployment,
+and seeding a managed setting at deploy time is a design question rather than a
+cleanup. Left as it is, and raised.
