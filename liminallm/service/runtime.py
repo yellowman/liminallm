@@ -274,7 +274,6 @@ class Runtime:
             "runtime_initialized",
             model_path=self.resolved_base_model,
             model_backend=str(self.backend_mode),
-            rag_mode=str(self.rag_mode),
             adapter_mode=str(self.default_adapter_mode),
             redis_enabled=self.cache is not None,
             email_configured=self.email.is_configured,
@@ -461,7 +460,6 @@ class Runtime:
         self.resolved_base_model = self.settings.model_path
         self.backend_mode = self.settings.model_backend
         self.default_adapter_mode = self.settings.default_adapter_mode
-        self.rag_mode = self.settings.rag_mode
         embedding_model_id = self.settings.embedding_model_id
         rag_chunk_size = self.settings.rag_chunk_size
         adapter_configs = {
@@ -511,7 +509,6 @@ class Runtime:
         self.rag = RAGService(
             self.store,
             default_chunk_size=rag_chunk_size,
-            rag_mode=self.rag_mode,
             embed=self.embeddings.embed,
             embed_many=self.embeddings.embed_many,
             embedding_model_id=embedding_model_id,
@@ -598,7 +595,6 @@ class Runtime:
         "resolved_base_model",
         "backend_mode",
         "default_adapter_mode",
-        "rag_mode",
         "router",
         "embeddings",
         "llm",
@@ -653,7 +649,6 @@ class Runtime:
             "runtime_model_services_reloaded",
             model_path=self.resolved_base_model,
             model_backend=str(self.backend_mode),
-            rag_mode=str(self.rag_mode),
         )
 
     async def close(self) -> None:

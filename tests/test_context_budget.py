@@ -1008,73 +1008,8 @@ def test_stale_vectors_are_re_embedded_not_reused():
     assert scores and scores[0] > 0
 
 
-def test_hybrid_search_ranks_on_the_vector_when_words_do_not_overlap(store):
-    """Semantic search must actually contribute, not collapse to BM25.
-
-    Against PostgresStore.search_chunks, which is the code that runs. These
-    used to drive a hybrid_search_chunks() in storage/common.py that nothing
-    called — the property was right, the implementation was not.
-    """
-    from liminallm.service.embeddings import EMBEDDING_DIM
-    from liminallm.storage.models import KnowledgeChunk
-
-    user = store.create_user(email=f"hs_{uuid.uuid4().hex[:8]}@example.com")
-    ctx = store.upsert_context(user.id, f"hs-{uuid.uuid4().hex[:6]}", "fixture")
-
-    wanted = [0.0] * EMBEDDING_DIM
-    wanted[7] = 1.0
-    other = [0.0] * EMBEDDING_DIM
-    other[EMBEDDING_DIM - 1] = 1.0
-    store.add_chunks(ctx.id, [
-        KnowledgeChunk(context_id=ctx.id, fs_path="/a", content="alpha text",
-                       embedding=wanted, chunk_index=0),
-        KnowledgeChunk(context_id=ctx.id, fs_path="/b", content="beta text",
-                       embedding=other, chunk_index=1),
-    ])
-
-    # The query shares no word with either chunk, so only the vector can decide.
-    # semantic=True is the caller asserting a real encoder; that assertion is
-    # what licenses cosine to enter the score at all (SPEC §2.5).
-    hits = store.search_chunks(ctx.id, "zzz", wanted, limit=2, semantic=True)
-    assert hits and hits[0].fs_path == "/a"
-
-
-def test_hash_embedding_cosine_never_enters_the_ranking(store):
-    """The other half of the rule: without a real encoder, bm25 ranks alone.
-
-    Same fixture, same vectors, only the caller's honesty about its encoder
-    changes. Blending noise at 0.55 is worse than keywords alone, so the
-    vector must not decide here — the scores must be flat.
-    """
-    from liminallm.service.embeddings import EMBEDDING_DIM
-    from liminallm.storage.models import KnowledgeChunk
-
-    user = store.create_user(email=f"hs_{uuid.uuid4().hex[:8]}@example.com")
-    ctx = store.upsert_context(user.id, f"hs-{uuid.uuid4().hex[:6]}", "fixture")
-
-    wanted = [0.0] * EMBEDDING_DIM
-    wanted[7] = 1.0
-    other = [0.0] * EMBEDDING_DIM
-    other[EMBEDDING_DIM - 1] = 1.0
-    store.add_chunks(ctx.id, [
-        KnowledgeChunk(context_id=ctx.id, fs_path="/a", content="alpha text",
-                       embedding=wanted, chunk_index=0),
-        KnowledgeChunk(context_id=ctx.id, fs_path="/b", content="beta text",
-                       embedding=other, chunk_index=1),
-    ])
-
-    # No shared word and no real encoder: nothing legitimately separates these
-    # two, and nothing legitimately selects either. A miss is the honest
-    # answer — the alternative is handing the model text picked by noise.
-    assert store.search_chunks(ctx.id, "zzz", wanted, limit=2) == []
-
-    # A shared word does separate them, and bm25 alone is enough to do it.
-    hits = store.search_chunks(ctx.id, "beta", wanted, limit=2)
-    assert hits and hits[0].fs_path == "/b"
-
-
 def test_the_schema_refuses_a_chunk_of_the_wrong_dimension(store):
-    """Why search_chunks needs no mismatch handling: it cannot happen.
+    """Why retrieval needs no width-mismatch handling: it cannot happen.
 
     knowledge_chunk.embedding is VECTOR(:embedding_dim) NOT NULL, so every
     stored vector has the same width and none is absent. That is a stronger

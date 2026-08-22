@@ -10980,3 +10980,52 @@ shapes, cached bounded by input (already true — both providers count cached
 inside the prompt — pinned so it stays true), and the derived total. Four
 mutations, each killed: never fold, fold unconditionally, reconcile with `>=`
 instead of `==`, and drop the derived total.
+
+## Deletion tranche B: one retrieval engine
+
+The owner authorized a deletion campaign — concepts, not syntax — with RAG
+first: *"we're not deleting the interesting system. We're deleting the
+obsolete second implementation of it."* The keeper architecture (lexical FTS +
+BM25 ordering, dense pgvector, segment MaxSim, rank fusion, reranker, the
+hash-encoder silence rule, access and path scoping) is untouched.
+
+Deleted, −498 lines net before this entry:
+
+* `_retrieve_local_hybrid` — the second engine: its own authorization pass,
+  per-context collection, python cosine, interleave, and fusion call.
+* `PostgresStore.search_chunks` — the in-Python candidate scorer that existed
+  only to feed it, with five imports that fed only that method.
+* `RagMode`, the `rag_mode` managed setting, its validator, its admin-console
+  group entry, its model-affecting entry, and the `RAG_MODE` env read —
+  measured first: `apply_managed_settings` filters stored keys against the
+  model's declared managed set, so an existing deployment with `rag_mode` in
+  `instance_config` boots unchanged and the stored key is inert. No migration.
+* The `"pg"` / `"vector"` spelling aliases, with `_uses_pgvector` and the
+  `_retriever` indirection.
+* `_fuse`'s `lexical_is_matched=False` branch, which only the dead engine
+  called.
+* Six tests of the dead engine, the fake store built for them, the dead-lane
+  candidate-window class in `test_generation_lifecycle` (its SQL-lane twin is
+  `test_pgvector_filters_fs_path`), and the `RAG_MODE` allowlist entry in the
+  env-var census test — which is *stronger* now: the variable may not appear
+  in `liminallm/` at all.
+
+`_retrieve_pgvector` is `_retrieve_hybrid` now. The old name described the
+substrate and invited misreading the method as dense-only retrieval; it runs
+the whole architecture.
+
+**A property retired with the engine, stated rather than hidden:** the dead
+engine's explicit interleave guaranteed every matching context a share of the
+answer on *exact ties*. The survivor's fusion does not — ported as a red, it
+fails: two contexts with identical content and one takes all four slots. Under
+this tranche's no-behavior-change rule the fusion was not altered. The
+substantive cross-context property — relevance decides, however early an
+irrelevant context was listed — was ported and holds.
+
+**Found by the tranche's own mutation rule:** removing BM25's reordering of
+the lexical pool (leaving ts_rank arrival order) survived every retrieval
+test. A pre-existing hole, not one the deletion made — the two scorers agree
+too often on small fixtures for the end-to-end reds to see the difference.
+Pinned deterministically at the fusion seam with a pool whose arrival order
+disagrees with its BM25 order. Three mutations on the survivor, all killed:
+the hash-encoder gate, the dense channel in fusion, and BM25 ordering.

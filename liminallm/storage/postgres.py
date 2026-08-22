@@ -25,9 +25,6 @@ from liminallm.service.artifact_validation import (
     validate_artifact,
 )
 from liminallm.service.bm25 import (
-    compute_bm25_scores as _compute_bm25_scores,
-)
-from liminallm.service.bm25 import (
     tokenize_text as _tokenize_text,
 )
 from liminallm.service.embeddings import (
@@ -35,18 +32,6 @@ from liminallm.service.embeddings import (
     validated_embedding,
 )
 from liminallm.service.errors import NotFoundError
-from liminallm.service.ranking import (
-    LEXICAL_WEIGHT as _LEXICAL_WEIGHT,
-)
-from liminallm.service.ranking import (
-    SEMANTIC_WEIGHT as _SEMANTIC_WEIGHT,
-)
-from liminallm.service.ranking import (
-    fuse_ranks as _fuse_ranks,
-)
-from liminallm.service.ranking import (
-    ranked_positive as _ranked_positive,
-)
 from liminallm.storage.common import (
     blend_centroid,
     clamp_success_score,
@@ -5203,89 +5188,6 @@ class PostgresStore:
             )
             rows = conn.execute(sql, (*params, terms, terms, limit)).fetchall()
         return [self._row_to_knowledge_chunk(row) for row in rows]
-
-    def search_chunks(
-        self,
-        context_id: Optional[str],
-        query: str,
-        query_embedding: Optional[List[float]],
-        limit: int = 4,
-        *,
-        semantic: bool = False,
-        allowed_paths: Optional[Sequence[str]] = None,
-    ) -> List[KnowledgeChunk]:
-        """Non-pgvector hybrid search; suitable for tests and tiny corpora only.
-
-        `allowed_paths` restricts this context to a set of paths, applied
-        before the candidate cut for the same reason the pgvector path
-        applies it in SQL.
-
-        ``semantic`` is the caller's assertion that ``query_embedding`` came
-        from a real encoder. It defaults to False because the kernel's default
-        encoder is the hash fallback, and cosine over those vectors is noise
-        that must never enter a score (SPEC §2.5).
-        """
-
-        def _cosine(a: List[float], b: List[float]) -> float:
-            # Belt and braces: knowledge_chunk.embedding is VECTOR(dim) NOT
-            # NULL, so widths cannot differ in practice. If one ever did,
-            # scoring the overlapping prefix would produce a number that looks
-            # like a similarity and is not — contribute nothing instead.
-            if not a or not b or len(a) != len(b):
-                return 0.0
-            dot = sum(x * y for x, y in zip(a, b))
-            norm_a = sum(x * x for x in a) ** 0.5 or 1.0
-            norm_b = sum(y * y for y in b) ** 0.5 or 1.0
-            return dot / (norm_a * norm_b)
-
-        candidate_limit = limit or 4
-        # Issue 25.3: prevent unbounded candidate loading by limiting DB reads
-        max_candidates = min(candidate_limit * 5, 500)
-        # The restriction goes into the query that produces the bounded set,
-        # not over what it returned. `list_chunks` orders by chunk index and
-        # id, and every generation starts at index 0, so unauthorized rows
-        # inserted earlier hold the lower ids and filled the whole window —
-        # measured, forty retired rows consumed a twenty-row read and the
-        # authorized generation was never loaded, so retrieval answered with
-        # nothing. Raising the cap does not fix that; any finite pre-filter
-        # window has the same counterexample.
-        candidates = self.list_chunks(
-            context_id, limit=max_candidates, allowed_paths=allowed_paths
-        )
-        if not candidates:
-            return []
-        query_tokens = _tokenize_text(query)
-        documents = [_tokenize_text(ch.content) for ch in candidates]
-        bm25_scores = _compute_bm25_scores(query_tokens, documents)
-        # Each channel ranks what it matched, and the two orders are fused by
-        # position rather than by score — the same rule the pgvector path uses
-        # (SPEC §2.5). Without a real encoder the semantic channel does not
-        # speak at all, because cosine over hash vectors is noise.
-        channels: list[tuple[float, list[int]]] = [
-            (_LEXICAL_WEIGHT, _ranked_positive(bm25_scores))
-        ]
-        if semantic and query_embedding:
-            channels.append(
-                (
-                    _SEMANTIC_WEIGHT,
-                    _ranked_positive(
-                        [_cosine(query_embedding, ch.embedding) for ch in candidates]
-                    ),
-                )
-            )
-        fused = _fuse_ranks(channels)
-
-        combined: dict[str, tuple[KnowledgeChunk, float]] = {}
-        for index, chunk in enumerate(candidates):
-            score = fused.get(index)
-            if score is None:
-                continue
-            key = " ".join(chunk.content.split()).lower() or str(chunk.id or "")
-            existing = combined.get(key)
-            if not existing or score > existing[1]:
-                combined[key] = (chunk, score)
-        ranked = sorted(combined.values(), key=lambda pair: pair[1], reverse=True)
-        return [pair[0] for pair in ranked[:limit]]
 
     def inspect_state(
         self,

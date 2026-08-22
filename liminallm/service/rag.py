@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import math
-import os
 import re
 import stat
 import unicodedata
 from contextlib import nullcontext
-from enum import Enum
 from pathlib import Path
 from typing import (
     Callable,
@@ -20,7 +18,7 @@ from typing import (
 
 from liminallm.logging import get_logger
 from liminallm.service.bm25 import compute_bm25_scores, tokenize_text
-from liminallm.service.embeddings import cosine_similarity, deterministic_embedding
+from liminallm.service.embeddings import deterministic_embedding
 from liminallm.service.fs import PathTraversalError, safe_join
 from liminallm.service.late import (
     QUERY_MIN_SEGMENT_WORDS,
@@ -33,7 +31,6 @@ from liminallm.service.ranking import (
     POOLED_WITH_LATE_WEIGHT,
     SEMANTIC_WEIGHT,
     fuse_ranks,
-    ranked_positive,
 )
 from liminallm.storage.models import KnowledgeChunk
 from liminallm.storage.postgres import PostgresStore
@@ -124,7 +121,6 @@ class RAGService:
         store: PostgresStore,
         default_chunk_size: int = 400,
         *,
-        rag_mode: str | Enum | None = None,
         embed: Callable[[str], List[float]] = deterministic_embedding,
         embed_many: Optional[Callable[[Sequence[str]], List[List[float]]]] = None,
         embedding_model_id: str = "text-embedding",
@@ -135,8 +131,6 @@ class RAGService:
     ) -> None:
         self.store = store
         self.default_chunk_size = max(default_chunk_size, 64)
-        mode_value = rag_mode.value if isinstance(rag_mode, Enum) else rag_mode
-        self.rag_mode = str(mode_value or os.getenv("RAG_MODE") or "pgvector").lower()
         self.embed = embed
         # One round trip per chunk instead of one per segment. Falls back to
         # the single encoder so a caller that supplies only ``embed`` still
@@ -166,12 +160,6 @@ class RAGService:
         # width mismatch. Nothing clears it, because nothing that would fix
         # those leaves this object standing.
         self._segment_index_broken = False
-
-        self._retriever = (
-            self._retrieve_pgvector
-            if self._uses_pgvector()
-            else self._retrieve_local_hybrid
-        )
 
     def retrieve(
         self,
@@ -215,7 +203,7 @@ class RAGService:
         # job, and the stages below decide precision. A reranker that only ever
         # saw ``limit`` chunks could reorder them but never rescue the one that
         # placed just outside the cut.
-        results = self._retriever(
+        results = self._retrieve_hybrid(
             context_ids, normalized_query, limit * 2 if max_tokens else limit,
             user_id=user_id, tenant_id=tenant_id, path_scope=path_scope,
         )
@@ -285,9 +273,6 @@ class RAGService:
         )
         return selected
 
-    def _uses_pgvector(self) -> bool:
-        return self.rag_mode in {"pgvector", "pg", "vector"}
-
     def _allowed_context_ids(
         self,
         context_ids: Sequence[str],
@@ -354,7 +339,7 @@ class RAGService:
 
         return allowed
 
-    def _retrieve_pgvector(
+    def _retrieve_hybrid(
         self,
         context_ids: Sequence[str],
         query: str,
@@ -563,8 +548,6 @@ class RAGService:
         lexical: Sequence[KnowledgeChunk],
         dense: Sequence[KnowledgeChunk],
         late: Sequence[KnowledgeChunk] = (),
-        *,
-        lexical_is_matched: bool = True,
     ) -> List[KnowledgeChunk]:
         """Fuse the channels by rank, per SPEC §2.5.
 
@@ -588,31 +571,20 @@ class RAGService:
 
         channels: List[tuple[float, List[object]]] = []
         if lexical:
-            # ``lexical_is_matched`` says whether membership of this pool is
-            # itself the match signal. It is for the pgvector path, where the
-            # store's own full-text query selected every member — so BM25 may
-            # order that pool but must not empty it. Dropping its zeros
-            # deleted answers the store had found: Postgres indexes "user_id"
-            # as 'user' + 'id' while this tokenizer keeps it whole, so a query
-            # of "user id" scored a matching chunk 0.0, and with the hash
-            # encoder — where lexical is the only live channel — retrieval
-            # returned nothing at all for a question the corpus answers. Any
-            # pre-filtered pool re-scored by a different scorer can be emptied
-            # that way; ordering is safe, discarding is not.
-            #
-            # The local path's pool is not pre-filtered — it is a top-N by
-            # another score, and a zero there really is a non-match — so it
-            # keeps the silence rule.
+            # Membership of this pool is itself the match signal: the store's
+            # own full-text query selected every member, so BM25 may order the
+            # pool but must not empty it. Dropping its zeros deleted answers
+            # the store had found — Postgres indexes "user_id" as 'user' +
+            # 'id' while this tokenizer keeps it whole, so a query of
+            # "user id" scored a matching chunk 0.0, and with the hash encoder
+            # retrieval returned nothing for a question the corpus answers.
             scores = compute_bm25_scores(
                 tokenize_text(query),
                 [tokenize_text(chunk.content) for chunk in lexical],
             )
-            if lexical_is_matched:
-                order = sorted(
-                    range(len(lexical)), key=lambda i: scores[i], reverse=True
-                )
-            else:
-                order = ranked_positive(scores)
+            order = sorted(
+                range(len(lexical)), key=lambda i: scores[i], reverse=True
+            )
             channels.append(
                 (LEXICAL_WEIGHT, [self._chunk_key(lexical[i]) for i in order])
             )
@@ -646,73 +618,6 @@ class RAGService:
         fused = fuse_ranks(channels)
         order = sorted(fused, key=lambda key: fused[key], reverse=True)
         return [chunks[key] for key in order]
-
-    def _retrieve_local_hybrid(
-        self,
-        context_ids: Sequence[str],
-        query: str,
-        limit: int,
-        *,
-        user_id: Optional[str],
-        tenant_id: Optional[str],
-        path_scope: Optional[dict] = None,
-    ) -> List[KnowledgeChunk]:
-        allowed_ids = self._allowed_context_ids(
-            context_ids, user_id=user_id, tenant_id=tenant_id
-        )
-        if not allowed_ids:
-            return []
-
-        # Only when it will be used: with the hash fallback the store ignores
-        # the vector entirely, and encoding it is a round trip bought for
-        # nothing — the same reason the pgvector path stopped asking.
-        query_embedding = self.embed(query) if self.semantic else None
-        # A shortlist per context, not a share of the final answer: the stages
-        # above still cut this to ``limit``, and a reranker needs more than the
-        # answer to improve on it.
-        per_context_limit = max(1, math.ceil(self._pool_size(limit) / len(allowed_ids)))
-        # No encoder gate here either. This path scores keywords as well as
-        # vectors, and dropping a chunk whose vector came from a previous
-        # encoder takes its *text* out of reach too — so flipping
-        # embedding_model_id answered nothing at all until the whole corpus
-        # was re-ingested, which the pgvector path was changed to stop doing.
-        # A stale vector still contributes nothing: cosine against a query
-        # from another encoder is not a match, and scores nothing.
-        per_context: List[List[KnowledgeChunk]] = []
-        for ctx_id in allowed_ids:
-            allowed_paths = (path_scope or {}).get(ctx_id)
-            found = list(self.store.search_chunks(
-                ctx_id,
-                query,
-                query_embedding,
-                per_context_limit,
-                semantic=self.semantic,
-                allowed_paths=allowed_paths,
-            ))
-            per_context.append(found)
-
-        # Rank across contexts, and interleave only to break ties.
-        # Concatenating hands every slot to whichever context was listed
-        # first. Interleaving alone fixes that but guarantees an irrelevant
-        # context half the answer. So the union is scored again — the same
-        # fusion the pgvector path uses, the only thing here that can compare
-        # a chunk in one context against a chunk in another — and it is built
-        # in interleaved order so that chunks the scoring cannot separate fall
-        # back to a fair share rather than to whoever was listed first.
-        union: List[KnowledgeChunk] = []
-        for rank in range(max((len(chunks) for chunks in per_context), default=0)):
-            for chunks in per_context:
-                if rank < len(chunks):
-                    union.append(chunks[rank])
-        if not union:
-            return []
-        dense: List[KnowledgeChunk] = []
-        if self.semantic:
-            scores = [
-                cosine_similarity(query_embedding, chunk.embedding) for chunk in union
-            ]
-            dense = [union[index] for index in ranked_positive(scores)]
-        return self._fuse(query, union, dense, lexical_is_matched=False)
 
     def ingest_text(
         self,

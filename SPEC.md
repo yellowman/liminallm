@@ -465,9 +465,9 @@ is for routing and clustering only and never ranks a retrieval.
 
 - Return chunk text + `fs_path` for citation; the orchestrator can ask
   the LLM to cite paths.
-- Optional dev fallback: in-process BM25 + cosine over a bounded window
-  (`rag_mode: local_hybrid`), fused by the same rule, for tests or tiny
-  corpora without pgvector.
+- There is one retrieval engine. Postgres FTS, pgvector, and the segment
+  store are the channels; there is no alternate in-process implementation
+  and no retrieval mode setting.
 - The hash-embedding fallback keeps chunks' vectors non-empty for
   routing/clustering; it never ranks a retrieval (see `is_semantic`).
 

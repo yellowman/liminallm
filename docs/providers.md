@@ -104,4 +104,3 @@ suggestion lists, recorded here because they date quickly:
 - voice: `voice_transcription_model` (whisper-1), `voice_synthesis_model`
   (tts-1, tts-1-hd), `voice_default_voice` (alloy, echo, fable, onyx, nova,
   shimmer).
-- `rag_mode`: pgvector, memory, local_hybrid.

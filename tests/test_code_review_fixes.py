@@ -108,7 +108,7 @@ class TestTokenBasedRAGChunking:
         from tests.harness import get_test_store
 
         store = get_test_store()
-        rag = RAGService(store, default_chunk_size=50, rag_mode="memory")
+        rag = RAGService(store, default_chunk_size=50)
 
         # Create a test context
         user = store.create_user("test@test.com", tenant_id="test")
@@ -139,7 +139,7 @@ class TestTokenBasedRAGChunking:
         from tests.harness import get_test_store
 
         store = get_test_store()
-        rag = RAGService(store, default_chunk_size=100, rag_mode="memory")
+        rag = RAGService(store, default_chunk_size=100)
 
         # Create context
         user = store.create_user("test@test.com")

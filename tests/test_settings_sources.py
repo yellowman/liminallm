@@ -187,8 +187,6 @@ def test_no_stray_env_var_reads_outside_config(monkeypatch):
     allowed = (
         # The one declarative-deploy seam, read once at boot.
         "INSTANCE_SETTINGS_JSON",
-        # A constructor default that every real caller passes explicitly.
-        "RAG_MODE",
         # Per-provider credentials, looked up by name so a Zhipu backend reads
         # ZHIPU_API_KEY rather than OPENAI_API_KEY. Secrets belong in env.
         "api_key_env",

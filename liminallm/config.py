@@ -78,14 +78,6 @@ class ModelBackend(str, Enum):
     STUB = "stub"
 
 
-class RagMode(str, Enum):
-    """RAG retrieval implementations supported by the kernel."""
-
-    PGVECTOR = "pgvector"
-    MEMORY = "memory"
-    LOCAL_HYBRID = "local_hybrid"
-
-
 class AdapterMode(str, Enum):
     """Adapter execution modes for dual local/API support.
 
@@ -836,10 +828,6 @@ class Settings(BaseModel):
             "otherwise a client can name its own tenant."
         ),
     )
-    rag_mode: RagMode = managed_field(
-        RagMode.PGVECTOR,
-        description="RAG mode: pgvector or memory",
-    )
     embedding_model_id: Literal[
         "text-embedding",
         "text-embedding-3-small",
@@ -891,7 +879,7 @@ class Settings(BaseModel):
     # - voice_transcription_model, voice_synthesis_model, voice_default_voice
     #
     # Model Settings:
-    # - model_path, model_backend, default_adapter_mode, rag_mode, embedding_model_id
+    # - model_path, model_backend, default_adapter_mode, embedding_model_id
     #
     # Tenant & JWT Settings:
     # - default_tenant_id, jwt_issuer, jwt_audience
@@ -1223,11 +1211,6 @@ class Settings(BaseModel):
             return None
         return ModelBackend(value)
 
-    @field_validator("rag_mode")
-    @classmethod
-    def _validate_rag_mode(cls, value: RagMode) -> RagMode:
-        return RagMode(value)
-
     @field_validator("default_adapter_mode")
     @classmethod
     def _validate_adapter_mode(cls, value: AdapterMode) -> AdapterMode:
@@ -1330,7 +1313,7 @@ _SETTING_GROUPS: tuple[tuple[str, tuple[str, ...]], ...] = (
                "default_adapter_mode",
                "adapter_openai_base_url", "adapter_openai_api_key",
                "adapter_server_model", "gemini_api_key")),
-    ("Retrieval", ("rag_mode", "rag_chunk_size", "embedding_model_id",
+    ("Retrieval", ("rag_chunk_size", "embedding_model_id",
                    "rag_rerank", "rag_rerank_candidates",
                    "rag_late_interaction", "rag_late_segments",
                    "history_budget_fraction", "history_recall_fraction")),
@@ -1377,7 +1360,6 @@ MODEL_AFFECTING_SETTINGS = frozenset({
     "model_backend",
     "model_path",
     "default_adapter_mode",
-    "rag_mode",
     "embedding_model_id",
     "rag_chunk_size",
     # rag_rerank and rag_rerank_candidates are deliberately absent: the

@@ -1,7 +1,8 @@
 import uuid
 
+from liminallm.service.embeddings import EMBEDDING_DIM
 from liminallm.service.rag import RAGService
-from liminallm.storage.models import KnowledgeChunk, KnowledgeContext, User
+from liminallm.storage.models import KnowledgeChunk
 from tests.harness import get_test_store
 
 
@@ -52,122 +53,6 @@ def test_pgvector_retrieve_requires_auth_scope():
     blocked = service.retrieve([ctx_b], "tenant b data", user_id=None, tenant_id=None)
 
     assert blocked == []
-
-
-class LegacyOnlyStore:
-    def __init__(self):
-        self.contexts = {}
-        self.users = {}
-        self.chunks = {}
-        self._chunk_id_seq = 1
-
-    def add_user(self, tenant_id: str) -> User:
-        user = User(
-            id=str(uuid.uuid4()),
-            email=f"user-{tenant_id}@example.com",
-            tenant_id=tenant_id,
-        )
-        self.users[user.id] = user
-        return user
-
-    def upsert_context(
-        self, owner_user_id: str, name: str, description: str
-    ) -> KnowledgeContext:
-        ctx = KnowledgeContext(
-            id=str(uuid.uuid4()),
-            owner_user_id=owner_user_id,
-            name=name,
-            description=description,
-        )
-        self.contexts[ctx.id] = ctx
-        return ctx
-
-    def get_context(self, context_id: str) -> KnowledgeContext | None:
-        return self.contexts.get(context_id)
-
-    def get_user(self, user_id: str) -> User | None:
-        return self.users.get(user_id)
-
-    def add_chunks(self, context_id: str, chunks: list[KnowledgeChunk]) -> list[int]:
-        # Returns ids and stamps chunk.id, as PostgresStore does — late
-        # interaction attaches segment vectors to the row that was just
-        # written, and a double that returns None makes any test of it pass
-        # by skipping the code entirely.
-        bucket = self.chunks.setdefault(context_id, [])
-        written: list[int] = []
-        for chunk in chunks:
-            if not chunk.id:
-                chunk.id = self._chunk_id_seq
-                self._chunk_id_seq += 1
-            bucket.append(chunk)
-            written.append(chunk.id)
-        return written
-
-    def search_chunks(
-        self,
-        context_id: str | None,
-        query: str,
-        query_embedding: list[float] | None,
-        limit: int = 4,
-        *,
-        semantic: bool = False,
-        allowed_paths: list[str] | None = None,
-    ) -> list[KnowledgeChunk]:
-        """The local path's candidate generation.
-
-        `allowed_paths` is part of the interface rather than optional
-        politeness: a store that cannot scope a context to a set of paths
-        cannot serve a conversation's implicit index, and skipping the
-        argument when a store does not accept it would authorize by
-        omission. Applied before the cut, as the real store does.
-        """
-        found = list(self.chunks.get(context_id or "", []))
-        if allowed_paths is not None:
-            permitted = set(allowed_paths)
-            found = [c for c in found if c.fs_path in permitted]
-        return found[:limit]
-
-
-def test_local_hybrid_without_pgvector():
-    store = LegacyOnlyStore()
-    owner = store.add_user("tenant_legacy")
-    ctx = store.upsert_context(owner.id, "legacy", "local hybrid")
-
-    rag = RAGService(
-        store, rag_mode="local_hybrid", embedding_model_id="legacy-embedding"
-    )
-    # Use longer content to ensure chunks have >= 10 tokens (min_token_count filter)
-    rag.ingest_text(ctx.id, "This is legacy search path content with enough tokens to pass the minimum token count filter")
-    existing_chunks = store.chunks.get(ctx.id, [])
-    store.add_chunks(
-        ctx.id,
-        [
-            KnowledgeChunk(
-                id=None,
-                context_id=ctx.id,
-                fs_path="inline",
-                content="This is other model content with enough tokens to pass the minimum token count filter",
-                embedding=[],
-                chunk_index=len(existing_chunks),
-                meta={"embedding_model_id": "other"},
-            )
-        ],
-    )
-
-    allowed = rag.retrieve(
-        [ctx.id], "legacy", user_id=owner.id, tenant_id="tenant_legacy"
-    )
-    assert allowed
-    assert all(
-        (chunk.meta or {}).get("embedding_model_id") == "legacy-embedding"
-        for chunk in allowed
-    )
-
-    blocked_user = store.add_user("other")
-    denied = rag.retrieve(
-        [ctx.id], "legacy", user_id=blocked_user.id, tenant_id="other"
-    )
-    assert denied == []
 
 
 def _hybrid_fixture(store, *, encoder="hybrid-encoder"):
@@ -334,77 +219,42 @@ def test_pgvector_filters_fs_path(tmp_path):
     assert results[0].fs_path == "keep_me"
 
 
-def test_local_hybrid_does_not_hand_the_whole_answer_to_one_context():
-    """Per-context lists are ranked within a context and not across them.
-
-    Concatenating them and letting the caller truncate gives every slot to
-    whichever context was listed first, however well the second matched.
-    """
-    store = LegacyOnlyStore()
-    owner = store.add_user("tenant_multi")
-    first = store.upsert_context(owner.id, "first", "ctx")
-    second = store.upsert_context(owner.id, "second", "ctx")
-
-    rag = RAGService(store, rag_mode="local_hybrid", embedding_model_id="multi")
-    for ctx in (first, second):
-        for index in range(6):
-            store.add_chunks(ctx.id, [
-                KnowledgeChunk(
-                    id=None, context_id=ctx.id, fs_path=f"/{ctx.name}-{index}",
-                    content=f"shared subject line number {index} with enough words to keep it",
-                    embedding=[], chunk_index=index,
-                    meta={"embedding_model_id": "multi"},
-                )
-            ])
-
-    hits = rag.retrieve(
-        [first.id, second.id], "shared subject", limit=4,
-        user_id=owner.id, tenant_id="tenant_multi", min_token_count=0,
-    )
-
-    assert {hit.context_id for hit in hits} == {first.id, second.id}
-
-
-def test_local_hybrid_ranks_across_contexts_by_relevance():
+def test_retrieval_ranks_across_contexts_by_relevance(store):
     """An irrelevant context must not get a fixed share of the answer.
 
-    Interleaving alone guaranteed it half the slots. The union is scored
-    again so relevance decides, and the interleave survives only as the
-    tie-break. This also exercises the semantic branch, which nothing else
-    reached — it carried an undefined name until ruff found it.
+    Ported from the deleted second engine: relevance decides across contexts,
+    so a context that matches neither the words nor the vector contributes
+    nothing however early it was listed.
     """
-    from liminallm.service.embeddings import EMBEDDING_DIM
-
-    store = LegacyOnlyStore()
-    owner = store.add_user("tenant_rank")
-    good = store.upsert_context(owner.id, "good", "ctx")
-    poor = store.upsert_context(owner.id, "poor", "ctx")
+    user = store.create_user(email=f"rk_{uuid.uuid4().hex[:8]}@example.com")
+    poor = store.upsert_context(user.id, f"rk-poor-{uuid.uuid4().hex[:6]}", "ctx")
+    good = store.upsert_context(user.id, f"rk-good-{uuid.uuid4().hex[:6]}", "ctx")
 
     near = [0.0] * EMBEDDING_DIM
     near[5] = 1.0
     far = [0.0] * EMBEDDING_DIM
     far[9] = 1.0
-
-    rag = RAGService(
-        store, rag_mode="local_hybrid", embedding_model_id="rank",
-        embed=lambda _text: near, semantic=True,
-    )
     for ctx, body, vec in (
         (good, "quokka census figures for rottnest island this year", near),
         (poor, "unrelated pottery glazing notes from the studio archive", far),
     ):
-        for index in range(6):
-            store.add_chunks(ctx.id, [
-                KnowledgeChunk(
-                    id=None, context_id=ctx.id, fs_path=f"/{ctx.name}-{index}",
-                    content=body, embedding=vec, chunk_index=index,
-                    meta={"embedding_model_id": "rank"},
-                )
-            ])
+        store.add_chunks(ctx.id, [
+            KnowledgeChunk(
+                context_id=ctx.id, fs_path=f"/{ctx.id}-{index}", chunk_index=index,
+                embedding=vec, content=body,
+                meta={"embedding_model_id": "rank"},
+            )
+            for index in range(6)
+        ])
 
+    rag = RAGService(
+        store, embedding_model_id="rank", embed=lambda _text: near, semantic=True,
+    )
+    # The irrelevant context listed first, which is exactly the case that
+    # used to hand it the answer.
     hits = rag.retrieve(
-        [good.id, poor.id], "quokka census", limit=4,
-        user_id=owner.id, tenant_id="tenant_rank", min_token_count=0,
+        [poor.id, good.id], "quokka census", limit=4,
+        user_id=user.id, min_token_count=0,
     )
 
     assert hits
@@ -438,3 +288,28 @@ def test_a_chunk_the_store_matched_is_never_dropped_by_the_rescore(store):
     )
 
     assert [hit.fs_path for hit in hits] == ["/auth.py"]
+
+
+def test_bm25_orders_the_lexical_pool_not_arrival_order(store):
+    """The SQL's ts_rank is a recall filter; BM25 decides the lexical order.
+
+    Pinned at the fusion seam with a pool whose arrival order disagrees with
+    its BM25 order, because a mutation that fused the pool as it arrived
+    passed every retrieval test — the two scorers agree too often on small
+    fixtures for an end-to-end red to catch the difference deterministically.
+    """
+    rag = RAGService(store)
+    off_topic = KnowledgeChunk(
+        id=1, context_id="ctx", fs_path="/off", chunk_index=0, embedding=[],
+        content="unrelated pottery glazing notes from the studio archive",
+    )
+    on_topic = KnowledgeChunk(
+        id=2, context_id="ctx", fs_path="/on", chunk_index=1, embedding=[],
+        content="quokka census figures and quokka census methods",
+    )
+
+    fused = rag._fuse("quokka census", [off_topic, on_topic], dense=[])
+
+    assert [chunk.fs_path for chunk in fused] == ["/on", "/off"], (
+        "the lexical pool kept its arrival order; BM25 never spoke"
+    )
