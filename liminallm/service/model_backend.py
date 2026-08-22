@@ -39,16 +39,21 @@ def get_adapter_mode(adapter: dict) -> str:
     arrives in two shapes (an artifact row with nested schema, or the
     flattened candidate the router builds), hence the two reads.
 
-    An absent adapter is weightless and promptless: prompt mode. An absent
-    mode cannot happen for validated artifacts; hybrid is the old default and
-    the safe answer for a hand-built dict in a test.
+    An absent adapter is weightless and promptless: prompt mode.
+
+    An absent mode fails closed — "" matches no compatibility matrix, so the
+    adapter is filtered out rather than served. Defaulting it to hybrid was
+    the deleted compatibility behaviour wearing a shorter spelling: it would
+    let anything that slipped past the validator be interpreted, which is the
+    hole the validator exists to close.
     """
     if not adapter:
         return AdapterMode.PROMPT
+    schema = adapter.get("schema")
     return (
         adapter.get("mode")
-        or adapter.get("schema", {}).get("mode")
-        or AdapterMode.HYBRID
+        or (schema.get("mode") if isinstance(schema, dict) else None)
+        or ""
     )
 
 

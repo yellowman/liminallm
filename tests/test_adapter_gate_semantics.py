@@ -346,7 +346,7 @@ class TestTheEffectiveStackHashesTheSame:
         zero-gated adapter cost a legitimate reuse on every turn where the
         router happened to close a gate."""
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
-        closed = {"id": "x", "current_version": 2, "weight": 0.0}
+        closed = {"id": "x", "mode": "local", "current_version": 2, "weight": 0.0}
 
         assert backend._adapter_signature([closed]) == backend._adapter_signature([])
         assert backend._adapter_signature([closed]) == "base"
@@ -373,15 +373,15 @@ class TestTheEffectiveStackHashesTheSame:
         ) == base
         # And the promoted ones still key apart by gate, as §5.3 requires.
         assert backend._adapter_signature(
-            [{"id": "a", "current_version": 2, "weight": 0.2}]
+            [{"id": "a", "mode": "local", "current_version": 2, "weight": 0.2}]
         ) != backend._adapter_signature(
-            [{"id": "a", "current_version": 2, "weight": 0.8}]
+            [{"id": "a", "mode": "local", "current_version": 2, "weight": 0.8}]
         )
 
     def test_a_closed_gate_does_not_perturb_an_open_one(self, tmp_path, checkpoint):
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
-        served = {"id": "y", "current_version": 1, "weight": 0.6}
-        closed = {"id": "x", "current_version": 2, "weight": 0.0}
+        served = {"id": "y", "mode": "local", "current_version": 1, "weight": 0.6}
+        closed = {"id": "x", "mode": "local", "current_version": 2, "weight": 0.0}
         assert backend._adapter_signature([served, closed]) == (
             backend._adapter_signature([served])
         )
@@ -462,9 +462,11 @@ class TestTheEffectiveStackHashesTheSame:
         backend.generate(
             [{"role": "user", "content": "hi"}],
             [
-                {"id": "X", "weight": 0.0, "vocab_size": 99, "current_version": 1},
+                {"id": "X", "mode": "local", "weight": 0.0,
+                 "vocab_size": 99, "current_version": 1},
                 {
                     "id": "Y",
+                    "mode": "local",
                     "weight": 1.0,
                     "current_version": 1,
                     "base_model": str(checkpoint),

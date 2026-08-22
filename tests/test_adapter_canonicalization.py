@@ -14,13 +14,17 @@ retired spelling, and the writers emit canonical fields only.
 from __future__ import annotations
 
 import json
+import subprocess
 import uuid
+from pathlib import Path
 
 import pytest
 
 from liminallm.service.model_backend import get_adapter_mode
 from liminallm.service.prompt_utils import extract_prompt_instructions
 from tests.harness import get_test_store
+
+ROOT = Path(__file__).resolve().parent.parent
 
 #: name -> (legacy schema, meaning under the old resolvers).
 #: "meaning" is what serving actually consumed: the mode, the effective
@@ -87,6 +91,39 @@ LEGACY = {
     "adapter_id_alias": (
         {"mode": "remote", "adapter_id": "lora-alias"},
         ("remote", None, None, None, "lora-alias")),
+    # Falsy canonical fields. Every old reader used `or`, never key presence,
+    # so an empty or null canonical value fell through to the legacy one. A
+    # repair keyed on `?` silently changes each of these.
+    "blank_mode_with_backend": (
+        {"mode": "", "backend": "prompt"}, ("prompt", None, None, None, None)),
+    "null_mode_with_backend": (
+        {"mode": None, "backend": "prompt"}, ("prompt", None, None, None, None)),
+    "blank_cephfs_with_fs_dir": (
+        {"cephfs_dir": "", "fs_dir": "/good/a1"},
+        ("hybrid", None, "/good/a1", None, None)),
+    "null_cephfs_with_fs_dir": (
+        {"cephfs_dir": None, "fs_dir": "/good/a1"},
+        ("hybrid", None, "/good/a1", None, None)),
+    "blank_remote_model_with_alias": (
+        {"mode": "remote", "remote_model_id": "", "model_id": "ft:working"},
+        ("remote", None, None, "ft:working", None)),
+    "null_remote_model_with_alias": (
+        {"mode": "remote", "remote_model_id": None, "model_id": "ft:working"},
+        ("remote", None, None, "ft:working", None)),
+    "blank_remote_adapter_with_alias": (
+        {"mode": "remote", "remote_adapter_id": "", "adapter_id": "lora-working"},
+        ("remote", None, None, None, "lora-working")),
+    "null_remote_adapter_with_alias": (
+        {"mode": "remote", "remote_adapter_id": None, "adapter_id": "lora-working"},
+        ("remote", None, None, None, "lora-working")),
+    # The same shape one level in: mode inference read remote_model_id
+    # truthily, so a blank one did NOT make an adapter remote.
+    "blank_remote_model_infers_nothing": (
+        {"remote_model_id": ""}, ("hybrid", None, None, None, None)),
+    "blank_prompt_keeps_backend_local": (
+        # And the local-vs-hybrid split was truthy on the prompt fields.
+        {"backend": "local", "prompt_instructions": ""},
+        ("local", None, None, None, None)),
 }
 
 RETIRED_KEYS = (
@@ -168,6 +205,45 @@ class TestTheRepairPreservesEveryLegacyMeaning:
         assert before == after
 
 
+class TestTheMigrationRefusesToLeaveCorruption:
+    """A garbage explicit mode survived the repair, because explicit mode was
+    historically authoritative — but the current validator would refuse to
+    create that row. Better for migrate.sh to name it than to boot with a
+    current adapter the current schema forbids.
+    """
+
+    def test_an_uncanonical_mode_is_reported_by_the_migration(self, client):
+        import psycopg
+
+        from tests.harness import apply_schema
+
+        store = get_test_store()
+        bad = str(uuid.uuid4())
+        with psycopg.connect(store.dsn, autocommit=True) as conn:
+            conn.execute(
+                "INSERT INTO artifact (id, type, name, schema) "
+                "VALUES (%s, 'adapter', 'corrupt', %s)",
+                (bad, json.dumps({"kind": "adapter.lora", "mode": "whatever"})),
+            )
+        try:
+            # Run psql directly rather than through apply_schema, which sends
+            # output to DEVNULL: the point is that an operator running
+            # migrate.sh is told *which* corruption stopped it.
+            done = subprocess.run(
+                ["psql", store.dsn, "-v", "ON_ERROR_STOP=1",
+                 "-v", "embedding_dim=64", "-f", "sql/schema.sql"],
+                cwd=ROOT, capture_output=True, text=True, timeout=180,
+            )
+            assert done.returncode != 0, "the migration completed over corruption"
+            assert "adapter" in done.stderr.lower(), done.stderr[-500:]
+            assert "local, remote, prompt, hybrid" in done.stderr, done.stderr[-500:]
+        finally:
+            with psycopg.connect(store.dsn, autocommit=True) as conn:
+                conn.execute("DELETE FROM artifact WHERE id = %s", (bad,))
+        # And with the corruption gone the migration completes again.
+        apply_schema(store.dsn, embedding_dim=64)
+
+
 class TestTheDoorIsShut:
     """Old shapes must not be creatable again tomorrow."""
 
@@ -237,3 +313,46 @@ class TestTheWritersEmitCanonicalFieldsOnly:
         assert schema.get("mode") in {"local", "remote", "prompt", "hybrid"}
         leftovers = [key for key in RETIRED_KEYS if key in schema]
         assert not leftovers, f"training still writes {leftovers}"
+
+
+class TestAModelessAdapterFailsClosed:
+    """An adapter that reaches the runtime without a mode is dropped.
+
+    Reading a missing mode as hybrid was the deleted compatibility behaviour
+    in a shorter spelling: it would interpret anything that slipped past the
+    validator, which is exactly what the validator exists to prevent. "" is
+    in no backend's compatibility matrix, so such an adapter is filtered out
+    rather than served.
+    """
+
+    def test_no_mode_resolves_to_nothing_rather_than_hybrid(self):
+        from liminallm.config import AdapterMode
+
+        assert get_adapter_mode({"id": "a", "prompt_instructions": "x"}) == ""
+        assert get_adapter_mode({"id": "a", "schema": {}}) == ""
+        assert get_adapter_mode({"id": "a"}) != AdapterMode.HYBRID
+
+    def test_it_is_filtered_out_by_every_backend(self):
+        from liminallm.service.model_backend import (
+            ApiAdapterBackend,
+            LocalJaxLoRABackend,
+            filter_adapters_by_mode,
+        )
+
+        modeless = {"id": "ghost", "prompt_instructions": "x"}
+        for backend in (ApiAdapterBackend, LocalJaxLoRABackend):
+            kept = filter_adapters_by_mode([modeless], backend.COMPATIBLE_MODES)
+            assert kept == [], (
+                f"{backend.__name__} accepted an adapter with no mode: {kept}"
+            )
+
+    def test_a_stated_mode_is_still_served(self):
+        from liminallm.service.model_backend import (
+            LocalJaxLoRABackend,
+            filter_adapters_by_mode,
+        )
+
+        stated = {"id": "real", "mode": "hybrid"}
+        assert filter_adapters_by_mode(
+            [stated], LocalJaxLoRABackend.COMPATIBLE_MODES
+        ) == [stated]

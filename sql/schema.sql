@@ -746,31 +746,35 @@ SET schema =
   (schema - 'backend' - 'provider' - 'cephfs_dir'
           - 'behavior_prompt' - 'system_prompt' - 'instructions'
           - 'prompt_template' - 'model_id' - 'adapter_id'
-          - 'prompt_instructions')
+          - 'prompt_instructions'
+          - (CASE WHEN coalesce(schema->>'fs_dir','') = ''
+                  THEN 'fs_dir' ELSE '' END)
+          - (CASE WHEN coalesce(schema->>'remote_model_id','') = ''
+                  THEN 'remote_model_id' ELSE '' END)
+          - (CASE WHEN coalesce(schema->>'remote_adapter_id','') = ''
+                  THEN 'remote_adapter_id' ELSE '' END))
   || jsonb_build_object('mode', CASE
-       WHEN schema ? 'mode' THEN schema->>'mode'
+       WHEN coalesce(schema->>'mode', '') <> '' THEN schema->>'mode'
        WHEN lower(coalesce(schema->>'backend','')) IN ('prompt','prompt_distill')
          THEN 'prompt'
        WHEN lower(coalesce(schema->>'backend','')) IN ('local','local_lora')
             OR lower(coalesce(schema->>'provider','')) = 'local'
-         THEN CASE WHEN (schema->'prompt_instructions' IS NOT NULL
-                         AND schema->'prompt_instructions' NOT IN
-                             ('""'::jsonb,'null'::jsonb,'false'::jsonb,'0'::jsonb,'[]'::jsonb,'{}'::jsonb))
-                    OR (schema->'behavior_prompt' IS NOT NULL
-                        AND schema->'behavior_prompt' NOT IN
-                            ('""'::jsonb,'null'::jsonb,'false'::jsonb,'0'::jsonb,'[]'::jsonb,'{}'::jsonb))
+         THEN CASE WHEN coalesce(schema->>'prompt_instructions','') <> ''
+                      OR coalesce(schema->>'behavior_prompt','') <> ''
                THEN 'hybrid' ELSE 'local' END
        WHEN lower(coalesce(schema->>'backend','')) IN ('api','remote')
-            OR schema ? 'remote_model_id'
+            OR coalesce(schema->>'remote_model_id', '') <> ''
          THEN 'remote'
        ELSE 'hybrid' END)
-  || CASE WHEN schema ? 'cephfs_dir'
+  || CASE WHEN coalesce(schema->>'cephfs_dir', '') <> ''
        THEN jsonb_build_object('fs_dir', schema->>'cephfs_dir')
        ELSE '{}'::jsonb END
-  || CASE WHEN schema ? 'model_id' AND NOT schema ? 'remote_model_id'
+  || CASE WHEN coalesce(schema->>'model_id', '') <> ''
+                 AND coalesce(schema->>'remote_model_id', '') = ''
        THEN jsonb_build_object('remote_model_id', schema->>'model_id')
        ELSE '{}'::jsonb END
-  || CASE WHEN schema ? 'adapter_id' AND NOT schema ? 'remote_adapter_id'
+  || CASE WHEN coalesce(schema->>'adapter_id', '') <> ''
+                 AND coalesce(schema->>'remote_adapter_id', '') = ''
        THEN jsonb_build_object('remote_adapter_id', schema->>'adapter_id')
        ELSE '{}'::jsonb END
   || CASE
@@ -792,7 +796,28 @@ SET schema =
        ELSE '{}'::jsonb END
 WHERE type = 'adapter'
   AND schema->>'kind' = 'adapter.lora'
-  AND (NOT schema ? 'mode'
+  AND (coalesce(schema->>'mode', '') = ''
        OR schema ?| array['backend','provider','cephfs_dir','behavior_prompt',
                           'system_prompt','instructions','prompt_template',
                           'model_id','adapter_id']);
+
+-- Post-repair assertion. A nonempty but invalid explicit mode survives the
+-- repair above, because an explicit mode was historically authoritative and
+-- the repair must not invent a meaning the old runtime never gave it. Such a
+-- row is nonetheless one the current validator would refuse to create, so the
+-- migration names it rather than letting the instance boot with it.
+DO $$
+DECLARE bad_count integer;
+BEGIN
+  SELECT count(*) INTO bad_count
+  FROM artifact
+  WHERE type = 'adapter'
+    AND schema->>'kind' = 'adapter.lora'
+    AND coalesce(schema->>'mode', '') NOT IN ('local','remote','prompt','hybrid');
+  IF bad_count > 0 THEN
+    RAISE EXCEPTION
+      'migration incomplete: % adapter artifact(s) have a mode outside '
+      '(local, remote, prompt, hybrid). Repair or delete them, then re-run.',
+      bad_count;
+  END IF;
+END $$;

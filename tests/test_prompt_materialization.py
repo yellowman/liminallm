@@ -117,14 +117,15 @@ class TestEveryServicePathMaterializesExactlyOnce:
         assert caller == CALLER_MESSAGES
 
 
-class TestAnInferredModeStillMaterializes:
-    """The mode may be stated or inferred, and both must reach the prompt.
+class TestAStatedModeMaterializes:
+    """Every prompt-carrying mode reaches the prompt, in either dict shape.
 
-    `get_adapter_mode` returns a raw string when the artifact states one and
-    an `AdapterMode` member when it infers. The service compared
-    `str(mode)` — which is "AdapterMode.HYBRID" for a member, matching
-    nothing — so every adapter that did not state a mode was skipped. HYBRID
-    is the documented default for legacy adapters, so that was most of them.
+    This was originally about *inferred* modes: `get_adapter_mode` returned a
+    raw string when the artifact stated one and an `AdapterMode` member when
+    it inferred, and the service compared `str(mode)` — "AdapterMode.HYBRID"
+    for a member, matching nothing — so every adapter that did not state a
+    mode was skipped. Inference is retired (Pass C), so the cases state their
+    modes; the enum-versus-string comparison it guards is still live.
 
     It went unnoticed because the API backends were injecting the prompt
     themselves; the same bug, with the backends no longer doing that, would
@@ -135,12 +136,11 @@ class TestAnInferredModeStillMaterializes:
     @pytest.mark.parametrize(
         "adapter",
         [
-            # Nothing states a mode: hybrid, the default for a hand-built
-            # dict. Stored artifacts always carry one (schema.sql repair +
-            # validator).
-            {"id": "legacy", "prompt_instructions": INSTRUCTION},
-            # Instructions nested in the schema shape.
-            {"id": "legacy", "schema": {"prompt_instructions": INSTRUCTION}},
+            # Hybrid carries the prompt as well as weights.
+            {"id": "legacy", "mode": "hybrid", "prompt_instructions": INSTRUCTION},
+            # Instructions and mode nested in the schema shape.
+            {"id": "legacy", "schema": {"mode": "hybrid",
+                                        "prompt_instructions": INSTRUCTION}},
             # A stated prompt mode, top-level instructions.
             {"id": "legacy", "mode": "prompt", "prompt_instructions": INSTRUCTION},
             # And nested instructions with a stated mode.

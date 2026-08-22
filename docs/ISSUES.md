@@ -11115,3 +11115,75 @@ same lock, stated mode.
 Net −1,346 lines. Three mutations, each killed: the repair removed from
 `schema.sql`, the validator allowing `backend` again, and (via the harness)
 any resolver change that alters a frozen meaning.
+
+### Pass C.1: the door was not on every write path
+
+Two findings from the review of `6c64a9a`, both inside the canonicalization
+contract rather than beside it.
+
+**HIGH: ConfigOps bypassed the validator.** `apply_config_patch` persisted
+whatever schema the service handed it — no validation between the approved,
+model-authored patch and the `UPDATE` plus the `artifact_version` insert. So
+an approved patch of `{"op":"remove","path":"/mode"}` or
+`{"op":"add","path":"/backend","value":"prompt"}` put back exactly the format
+Pass C deleted, as a new historical version. Reproduced through the product
+path: propose, approve, apply — all four variants succeeded before the fix.
+
+The validation is at the store's mutation boundary, inside the transaction and
+before `_persist_payload`, so a refusal leaves no row, no version and no
+payload. The reds assert all four consequences, because "it raised" is not the
+guarantee: the artifact, its version count and the patch's own status must all
+be unchanged.
+
+Deleted with it: ConfigOps' partial-success machinery. The store does artifact
+update, version insert and patch status in one transaction, so there is no
+partial state to report — and the recovery path referenced `updated` before
+assignment, so the "graceful" branch would have raised `UnboundLocalError`.
+
+**HIGH, same finding's tail: missing mode read as hybrid.** `get_adapter_mode`
+still ended `or AdapterMode.HYBRID`, so anything that slipped past a validator
+was interpreted rather than refused — the deleted compatibility behaviour in a
+shorter spelling. It returns `""` now, which is in no backend's compatibility
+matrix, so such an adapter is filtered out rather than served.
+
+That change broke fourteen tests across five files, all hand-built adapter
+dicts with no mode, and one test class whose subject was inference itself
+(`TestAnInferredModeStillMaterializes` → `TestAStatedModeMaterializes`). Every
+one of them was a fixture that had been relying on the default; none was a
+behaviour regression. Fixing them is the same work the schema.sql repair does
+for stored rows.
+
+**MEDIUM: the SQL oracle claimed more coverage than it had.** Every old Python
+reader used `or` — truthiness — while the repair keyed on `?`, key presence.
+Confirmed against the deleted code in git rather than from memory: `mode =
+adapter.get("mode") or ...; if mode:`, `cephfs_dir or fs_dir`,
+`remote_model_id or model_id`, `remote_adapter_id or adapter_id or id`. Ten
+falsy cases were added to the oracle and all ten failed:
+
+```
+{"mode": "", "backend": "prompt"}          meant prompt, became hybrid
+{"cephfs_dir": "", "fs_dir": "/good/a1"}   meant /good/a1, became ""
+{"remote_model_id": "", "model_id": "ft:working"}   lost ft:working
+```
+
+The repair reads `coalesce(schema->>'k','') <> ''` everywhere now, and strips
+a canonical key that is falsy so a blank cannot survive as a value. Two more
+of the same shape were found inside the fix itself, by grepping it: the mode
+CASE's own `schema ? 'remote_model_id'`, and the local-vs-hybrid prompt test.
+The oracle is 39 cases.
+
+**A post-repair assertion.** A nonempty but invalid explicit mode
+(`"mode": "whatever"`) survives the repair, because an explicit mode was
+historically authoritative and the repair must not invent a meaning the old
+runtime never gave it — but it is a row the current validator would refuse to
+create. `schema.sql` now raises, naming the count and the four legal values,
+so `migrate.sh` reports the corruption rather than booting over it. The red
+runs psql directly rather than through `apply_schema`, which sends output to
+DEVNULL: the point is that an operator is told *which* corruption stopped
+them.
+
+Five mutations, each killed: the store persisting without validating, missing
+mode read as hybrid, the repair keyed on presence, the migration downgraded to
+a NOTICE, and the fail-closed resolver. The fourth was written twice — the
+first version of the fail-closed mutation survived, because nothing tested
+that behaviour at all until the red above was written for it.

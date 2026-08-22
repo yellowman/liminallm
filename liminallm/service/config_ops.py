@@ -86,14 +86,10 @@ class ConfigOpsService:
     ) -> dict:
         """Apply an approved patch to its target artifact.
 
-        This operation is performed in two steps:
-        1. Update the artifact schema with the patch
-        2. Mark the patch as applied
-
-        Error Recovery:
-            If step 2 fails after step 1 succeeds, the artifact is still modified
-            but the patch status remains unchanged. In this case, we log the error
-            and return with a warning flag to indicate partial success.
+        The schema update, the historical version and the patch's status are
+        one transaction in the store, and the store validates the result
+        before writing any of them — so there is no partial state to report
+        and no invalid schema to persist. A failure here changed nothing.
         """
         patch = self.store.get_config_patch(patch_id)
         if not patch:
@@ -114,32 +110,13 @@ class ConfigOpsService:
         new_schema = self._apply_patch_to_schema(artifact.schema, patch.patch)
 
         # Step 2: Persist schema and mark the patch applied, in one transaction
-        applied_patch = None
-        status_update_failed = False
-        try:
-            updated, applied_patch = self.store.apply_config_patch(
-                patch,
-                new_schema,
-                artifact_description=artifact.description,
-                approver_user_id=approver_user_id,
-            )
-        except Exception as exc:
-            status_update_failed = True
-            logger.error(
-                "config_patch_status_update_failed",
-                patch_id=patch_id,
-                artifact_id=artifact.id,
-                error=str(exc),
-                message="Artifact was updated but patch status could not be marked as applied",
-            )
-            if not applied_patch:
-                applied_patch = self.store.get_config_patch(patch_id)
-
-        result = {"artifact": updated, "patch": applied_patch or patch}
-        if status_update_failed:
-            result["warning"] = "Patch applied but status update failed - patch may appear unapplied"
-
-        return result
+        updated, applied_patch = self.store.apply_config_patch(
+            patch,
+            new_schema,
+            artifact_description=artifact.description,
+            approver_user_id=approver_user_id,
+        )
+        return {"artifact": updated, "patch": applied_patch or patch}
 
     def _build_prompt(self, artifact: Artifact, goal: Optional[str]) -> str:
         insights = (

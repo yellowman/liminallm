@@ -155,7 +155,7 @@ class TestGateAwareKvCache:
         computed under one of them. An id+version key would let a 0.2 request
         continue a prefix built at 0.8."""
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
-        adapter = {"id": "ad", "current_version": 2}
+        adapter = {"id": "ad", "mode": "local", "current_version": 2}
 
         quiet = backend._adapter_signature([{**adapter, "weight": 0.2}])
         loud = backend._adapter_signature([{**adapter, "weight": 0.8}])

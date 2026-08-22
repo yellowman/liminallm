@@ -63,6 +63,7 @@ class TestAdapterChecksumValidation:
 
         adapter = {
             "id": "test-adapter",
+            "mode": "local",
             "base_model": BASE,
             # Promoted: §5.5 answers "no weights" from metadata before any
             # path is consulted, so an unversioned fixture never reaches the
@@ -97,6 +98,7 @@ class TestAdapterChecksumValidation:
 
         adapter = {
             "id": "test-adapter",
+            "mode": "local",
             "base_model": BASE,
             # Promoted: §5.5 answers "no weights" from metadata before any
             # path is consulted, so an unversioned fixture never reaches the
@@ -122,6 +124,7 @@ class TestAdapterChecksumValidation:
 
         adapter = {
             "id": "test-adapter",
+            "mode": "local",
             "base_model": BASE,
             # Promoted: §5.5 answers "no weights" from metadata before any
             # path is consulted, so an unversioned fixture never reaches the
@@ -155,6 +158,7 @@ class TestAdapterChecksumValidation:
 
         adapter = {
             "id": "test-adapter",
+            "mode": "local",
             "base_model": BASE,
             # Promoted: §5.5 answers "no weights" from metadata before any
             # path is consulted, so an unversioned fixture never reaches the
@@ -198,6 +202,7 @@ class TestAdapterChecksumValidation:
 
         adapter = {
             "id": "test-adapter",
+            "mode": "local",
             "base_model": BASE,
             # Promoted: §5.5 answers "no weights" from metadata before any
             # path is consulted, so an unversioned fixture never reaches the
@@ -230,6 +235,7 @@ class TestAdapterChecksumValidation:
 
         adapter = {
             "id": "test-adapter",
+            "mode": "local",
             "base_model": BASE,
             # Promoted: §5.5 answers "no weights" from metadata before any
             # path is consulted, so an unversioned fixture never reaches the
@@ -279,7 +285,8 @@ class TestAdapterChecksumValidation:
 
         adapter_dir, checksum = self.create_adapter_file(tmp_path, valid_weights)
         params_path = adapter_dir / "params.json"
-        adapter = {"id": "test-adapter", "base_model": BASE, "current_version": 1, "checksum": checksum}
+        adapter = {"id": "test-adapter", "mode": "local", "base_model": BASE,
+                   "current_version": 1, "checksum": checksum}
 
         with patch.object(mock_backend, "_adapter_path", return_value=str(adapter_dir)):
             with patch.object(
@@ -306,6 +313,7 @@ class TestAdapterChecksumValidation:
 
         adapter = {
             "id": "test-adapter",
+            "mode": "local",
             "base_model": BASE,
             # Promoted: §5.5 answers "no weights" from metadata before any
             # path is consulted, so an unversioned fixture never reaches the
