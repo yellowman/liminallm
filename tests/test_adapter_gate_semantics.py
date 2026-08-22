@@ -278,7 +278,6 @@ class TestAccountingAndAuditSayDifferentThings:
             {
                 "kind": "adapter.lora",
                 "mode": "prompt",
-                "backend": "prompt",
                 "base_model": "test-base",
                 "prompt_instructions": "be terse",
                 "current_version": 0,

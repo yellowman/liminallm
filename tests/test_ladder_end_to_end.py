@@ -228,7 +228,6 @@ class TestLadderEndToEnd:
 
         prompt_rung = {
             "id": "skill",
-            "backend": "prompt",
             "mode": "prompt",
             # Declared because a real artifact declares it (§5.1); the prompt
             # rung itself is exempt, carrying no weights to be fitted.
@@ -239,7 +238,7 @@ class TestLadderEndToEnd:
         assert backend._blend_adapter_weights([prompt_rung], user_id="u") == {}
 
         # Version 0 alone is also unservable, whatever the mode says.
-        unpromoted = {**prompt_rung, "mode": "local", "backend": "local"}
+        unpromoted = {**prompt_rung, "mode": "local"}
         assert backend._blend_adapter_weights([unpromoted], user_id="u") == {}
 
         # And once promoted, the same files load.

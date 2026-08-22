@@ -83,7 +83,7 @@ class TestRouterGatesReachTheModel:
                 "kind": "adapter.lora",
                 # hybrid so the runtime's configured backend accepts it; the
                 # mode filter is a separate concern from gate propagation.
-                "backend": "hybrid",
+                "mode": "hybrid",
                 "mode": "hybrid",
                 "base_model": "test-base",
                 "prompt_instructions": "be terse",
@@ -133,7 +133,7 @@ class TestRouterGatesReachTheModel:
         config = transformer.load_config(checkpoint)
         _write_adapter(tmp_path / "ad" / "v0001", config, value=0.05)
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
-        adapter = {"id": "ad", "base_model": BASE, "backend": "local", "fs_dir": "ad",
+        adapter = {"id": "ad", "base_model": BASE, "mode": "local", "fs_dir": "ad",
                    "current_version": 1}
 
         full = backend._blend_adapter_weights(
@@ -173,7 +173,7 @@ class TestGateAwareKvCache:
         backend = LocalJaxLoRABackend(
             str(checkpoint), str(tmp_path), max_new_tokens=2
         )
-        adapter = {"id": "ad", "base_model": BASE, "backend": "local", "fs_dir": "ad",
+        adapter = {"id": "ad", "base_model": BASE, "mode": "local", "fs_dir": "ad",
                    "current_version": 1}
         messages = [{"role": "user", "content": "hello there friend"}]
 
@@ -210,8 +210,8 @@ class TestCompositionRefusesRatherThanPartiallyApplies:
         with pytest.raises(ValueError, match="refusing the adapter stack"):
             backend._blend_adapter_weights(
                 [
-                    {"id": "ok", "base_model": BASE, "backend": "local", "fs_dir": "ok", "current_version": 1},
-                    {"id": "bad", "base_model": BASE, "backend": "local", "fs_dir": "bad", "current_version": 1},
+                    {"id": "ok", "base_model": BASE, "mode": "local", "fs_dir": "ok", "current_version": 1},
+                    {"id": "bad", "base_model": BASE, "mode": "local", "fs_dir": "bad", "current_version": 1},
                 ],
                 user_id="u",
             )
@@ -224,7 +224,7 @@ class TestCompositionRefusesRatherThanPartiallyApplies:
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
         with pytest.raises(ValueError, match="refusing the adapter stack"):
             backend._blend_adapter_weights(
-                [{"id": "half", "base_model": BASE, "backend": "local", "fs_dir": "half",
+                [{"id": "half", "base_model": BASE, "mode": "local", "fs_dir": "half",
                   "current_version": 1}], user_id="u"
             )
 
@@ -247,7 +247,7 @@ class TestPromotedVersionIsWhatServes:
         adapter = {
             "id": "skill",
             "base_model": BASE,
-            "backend": "local",
+            "mode": "local",
             "fs_dir": str(adapter_dir),
             "current_version": 1,
         }
@@ -262,7 +262,7 @@ class TestPromotedVersionIsWhatServes:
         _write_adapter(adapter_dir / "v0001", config, value=0.05)
         _write_adapter(adapter_dir / "v0002", config, value=0.9)
         backend = LocalJaxLoRABackend(str(checkpoint), str(tmp_path))
-        base = {"id": "skill", "base_model": BASE, "backend": "local", "fs_dir": str(adapter_dir)}
+        base = {"id": "skill", "base_model": BASE, "mode": "local", "fs_dir": str(adapter_dir)}
 
         first = backend._blend_adapter_weights(
             [{**base, "current_version": 1}], user_id="u"

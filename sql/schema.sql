@@ -728,3 +728,71 @@ DROP TRIGGER IF EXISTS app_user_retire_namespace ON app_user;
 CREATE TRIGGER app_user_retire_namespace
   AFTER DELETE ON app_user
   FOR EACH ROW EXECUTE FUNCTION app_user_retire_namespace_fn();
+
+-- Pass C data repair: every adapter carries an explicit mode; the legacy
+-- spellings collapse into their canonical fields. The CASE reproduces the
+-- deleted runtime inference exactly — backend/provider chains, prompt-alias
+-- precedence (the extractor's order: prompt_instructions, behavior_prompt,
+-- system_prompt, instructions, prompt_template; strings only, blank means
+-- absent, results stripped), truthiness of prompt fields for the
+-- local-vs-hybrid split, and cephfs_dir winning a directory conflict because
+-- the readers said `cephfs_dir or fs_dir`. tests/test_adapter_canonicalization.py
+-- holds the oracle frozen from the old resolvers before their deletion.
+-- Repairs artifact.schema only: artifact_version rows are history and stay
+-- what they were; a rollback re-enters through the validator.
+-- Repeat-safe: the WHERE matches only rows still carrying a legacy shape.
+UPDATE artifact
+SET schema =
+  (schema - 'backend' - 'provider' - 'cephfs_dir'
+          - 'behavior_prompt' - 'system_prompt' - 'instructions'
+          - 'prompt_template' - 'model_id' - 'adapter_id'
+          - 'prompt_instructions')
+  || jsonb_build_object('mode', CASE
+       WHEN schema ? 'mode' THEN schema->>'mode'
+       WHEN lower(coalesce(schema->>'backend','')) IN ('prompt','prompt_distill')
+         THEN 'prompt'
+       WHEN lower(coalesce(schema->>'backend','')) IN ('local','local_lora')
+            OR lower(coalesce(schema->>'provider','')) = 'local'
+         THEN CASE WHEN (schema->'prompt_instructions' IS NOT NULL
+                         AND schema->'prompt_instructions' NOT IN
+                             ('""'::jsonb,'null'::jsonb,'false'::jsonb,'0'::jsonb,'[]'::jsonb,'{}'::jsonb))
+                    OR (schema->'behavior_prompt' IS NOT NULL
+                        AND schema->'behavior_prompt' NOT IN
+                            ('""'::jsonb,'null'::jsonb,'false'::jsonb,'0'::jsonb,'[]'::jsonb,'{}'::jsonb))
+               THEN 'hybrid' ELSE 'local' END
+       WHEN lower(coalesce(schema->>'backend','')) IN ('api','remote')
+            OR schema ? 'remote_model_id'
+         THEN 'remote'
+       ELSE 'hybrid' END)
+  || CASE WHEN schema ? 'cephfs_dir'
+       THEN jsonb_build_object('fs_dir', schema->>'cephfs_dir')
+       ELSE '{}'::jsonb END
+  || CASE WHEN schema ? 'model_id' AND NOT schema ? 'remote_model_id'
+       THEN jsonb_build_object('remote_model_id', schema->>'model_id')
+       ELSE '{}'::jsonb END
+  || CASE WHEN schema ? 'adapter_id' AND NOT schema ? 'remote_adapter_id'
+       THEN jsonb_build_object('remote_adapter_id', schema->>'adapter_id')
+       ELSE '{}'::jsonb END
+  || CASE
+       WHEN jsonb_typeof(schema->'prompt_instructions') = 'string'
+            AND btrim(schema->>'prompt_instructions') <> ''
+         THEN jsonb_build_object('prompt_instructions', btrim(schema->>'prompt_instructions'))
+       WHEN jsonb_typeof(schema->'behavior_prompt') = 'string'
+            AND btrim(schema->>'behavior_prompt') <> ''
+         THEN jsonb_build_object('prompt_instructions', btrim(schema->>'behavior_prompt'))
+       WHEN jsonb_typeof(schema->'system_prompt') = 'string'
+            AND btrim(schema->>'system_prompt') <> ''
+         THEN jsonb_build_object('prompt_instructions', btrim(schema->>'system_prompt'))
+       WHEN jsonb_typeof(schema->'instructions') = 'string'
+            AND btrim(schema->>'instructions') <> ''
+         THEN jsonb_build_object('prompt_instructions', btrim(schema->>'instructions'))
+       WHEN jsonb_typeof(schema->'prompt_template') = 'string'
+            AND btrim(schema->>'prompt_template') <> ''
+         THEN jsonb_build_object('prompt_instructions', btrim(schema->>'prompt_template'))
+       ELSE '{}'::jsonb END
+WHERE type = 'adapter'
+  AND schema->>'kind' = 'adapter.lora'
+  AND (NOT schema ? 'mode'
+       OR schema ?| array['backend','provider','cephfs_dir','behavior_prompt',
+                          'system_prompt','instructions','prompt_template',
+                          'model_id','adapter_id']);

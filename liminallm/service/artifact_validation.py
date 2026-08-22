@@ -72,8 +72,16 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
         "type": "object",
         "properties": {
             "kind": {"const": "adapter.lora"},
-            "backend": {"type": "string"},
-            "provider": {"type": "string"},
+            # Pass C: mode is the one execution vocabulary. The old spellings
+            # were normalized by the schema.sql repair; refusing them here is
+            # what keeps them normalized — delete runtime compatibility
+            # without this and the old formats are simply created again
+            # tomorrow.
+            "mode": {"enum": ["local", "remote", "prompt", "hybrid"]},
+            "prompt_instructions": {"type": "string"},
+            "fs_dir": {"type": "string"},
+            "remote_model_id": {"type": "string"},
+            "remote_adapter_id": {"type": "string"},
             "scope": {"type": "string"},
             "user_id": {"type": ["string", "null"]},
             "base_model": {"type": "string"},
@@ -81,8 +89,18 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
             "layers": {"type": "array"},
             "matrices": {"type": "array"},
             "current_version": {"type": "integer", "minimum": 0},
+            # Retired spellings, rejected by name so the error says which.
+            "backend": False,
+            "provider": False,
+            "cephfs_dir": False,
+            "behavior_prompt": False,
+            "system_prompt": False,
+            "instructions": False,
+            "prompt_template": False,
+            "model_id": False,
+            "adapter_id": False,
         },
-        "required": ["kind", "base_model", "current_version"],
+        "required": ["kind", "mode", "base_model", "current_version"],
         "additionalProperties": True,
     },
     # SPEC §6.1 policy.routing / §8.1. The workflow engine already reads these

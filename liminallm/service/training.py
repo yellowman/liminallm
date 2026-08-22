@@ -281,10 +281,6 @@ class TrainingService:
             if runtime_base and not stored_base:
                 updated_schema["base_model"] = runtime_base
                 needs_update = True
-            # Migrate existing adapters to include mode if missing
-            if "mode" not in updated_schema:
-                updated_schema["mode"] = self._infer_adapter_mode(updated_schema)
-                needs_update = True
             if needs_update:
                 self.store.update_artifact(adapter.id, updated_schema)
                 adapter = self.store.get_artifact(adapter.id) or adapter
@@ -295,9 +291,7 @@ class TrainingService:
         _ = adapter_id_override  # Reserved for future use in adapter creation
         adapter_schema = {
             "kind": "adapter.lora",
-            "mode": resolved_mode,  # Explicit adapter mode
-            "backend": self._mode_to_backend(resolved_mode),
-            "provider": self._mode_to_provider(resolved_mode),
+            "mode": resolved_mode,
             "scope": "per-user",
             "user_id": user_id,
             "base_model": self.runtime_base_model or "jax-base",
@@ -317,47 +311,8 @@ class TrainingService:
         if resolved_mode in {AdapterMode.LOCAL, AdapterMode.HYBRID}:
             adapter_fs_dir = self._adapter_dir(user_id, adapter.id, adapter_schema)
             adapter_schema["fs_dir"] = str(adapter_fs_dir)
-            adapter_schema.setdefault("cephfs_dir", str(adapter_fs_dir))
         self.store.update_artifact(adapter.id, adapter_schema)
         return self.store.get_artifact(adapter.id) or adapter
-
-    def _infer_adapter_mode(self, schema: dict) -> str:
-        """Infer adapter mode from legacy schema fields."""
-        backend = (schema.get("backend") or "").lower()
-        provider = (schema.get("provider") or "").lower()
-
-        if backend in {"prompt", "prompt_distill"}:
-            return AdapterMode.PROMPT
-        if backend in {"local", "local_lora"} or provider == "local":
-            # If has prompt_instructions, it's hybrid
-            if schema.get("prompt_instructions") or schema.get("behavior_prompt"):
-                return AdapterMode.HYBRID
-            return AdapterMode.LOCAL
-        if backend in {"api", "remote"} or schema.get("remote_model_id"):
-            return AdapterMode.REMOTE
-        # Default to hybrid for backwards compatibility
-        return AdapterMode.HYBRID
-
-    def _mode_to_backend(self, mode: str) -> str:
-        """Map adapter mode to backend field value."""
-        if mode == AdapterMode.LOCAL:
-            return "local"
-        if mode == AdapterMode.REMOTE:
-            return "api"
-        if mode == AdapterMode.PROMPT:
-            return "prompt"
-        # HYBRID uses local backend with prompt fallback
-        return "hybrid"
-
-    def _mode_to_provider(self, mode: str) -> str:
-        """Map adapter mode to provider field value."""
-        if mode == AdapterMode.LOCAL:
-            return "local"
-        if mode == AdapterMode.REMOTE:
-            return self.backend_mode or "api"
-        if mode == AdapterMode.PROMPT:
-            return "prompt"
-        return "hybrid"
 
     def train_from_preferences(
         self,
@@ -533,8 +488,6 @@ class TrainingService:
             # with the prompt instructions kept as portable fallback.
             if updated_schema.get("mode") == AdapterMode.PROMPT:
                 updated_schema["mode"] = AdapterMode.HYBRID
-                updated_schema["backend"] = self._mode_to_backend(AdapterMode.HYBRID)
-                updated_schema["provider"] = self._mode_to_provider(AdapterMode.HYBRID)
                 updated_schema.setdefault("lifecycle", {})
                 if isinstance(updated_schema["lifecycle"], dict):
                     updated_schema["lifecycle"]["stage"] = "weights"
@@ -1272,7 +1225,7 @@ class TrainingService:
         self, user_id: str, adapter_id: str, adapter_schema: Optional[dict] = None
     ) -> Path:
         adapter_schema = adapter_schema or {}
-        explicit = adapter_schema.get("cephfs_dir") or adapter_schema.get("fs_dir")
+        explicit = adapter_schema.get("fs_dir")
         # The same identity binding serving uses (§5.5). Containment alone let
         # an explicit root name *another* adapter's directory, and on this
         # side that writes A's new version into B's tree — where serving would

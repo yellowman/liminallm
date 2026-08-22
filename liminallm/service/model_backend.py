@@ -31,62 +31,25 @@ logger = get_logger(__name__)
 
 
 def get_adapter_mode(adapter: dict) -> str:
-    """Extract adapter mode from schema, inferring from legacy fields if needed.
+    """The adapter's stated mode (SPEC §5.0.1): local, remote, prompt, hybrid.
 
-    Per SPEC §5.0.1, adapter modes determine how adapters are applied during inference:
+    Stated, not inferred. Every stored adapter carries an explicit mode — the
+    schema.sql repair normalized old artifacts and the validator refuses new
+    ones without it — so inference is not a runtime responsibility. The dict
+    arrives in two shapes (an artifact row with nested schema, or the
+    flattened candidate the router builds), hence the two reads.
 
-    - LOCAL: Adapter has trained LoRA weights stored locally (fs_dir).
-      Requires local JAX/transformer backend. Best for fine-tuned behavior.
-
-    - REMOTE: Adapter is hosted by external provider (Together, LoRAX, etc.).
-      Uses remote_model_id or remote_adapter_id. Supports provider scaling.
-
-    - PROMPT: Adapter contributes only prompt/system instructions.
-      No LoRA weights needed. Useful for behavior modification via prompting.
-
-    - HYBRID: Combines LOCAL weights with PROMPT fallback.
-      Uses LoRA when available, prompt instructions otherwise.
-      DEFAULT for backwards compatibility: existing adapters without explicit
-      mode may have both weights and prompts, so HYBRID ensures both are used.
-
-    Mode selection priority:
-    1. Explicit 'mode' field in adapter or schema
-    2. Inference from 'backend' or 'provider' fields
-    3. Default to HYBRID (safest for legacy adapters)
-
-    Args:
-        adapter: Adapter dict with mode, backend, provider fields
-
-    Returns:
-        AdapterMode string (local, remote, prompt, hybrid)
+    An absent adapter is weightless and promptless: prompt mode. An absent
+    mode cannot happen for validated artifacts; hybrid is the old default and
+    the safe answer for a hand-built dict in a test.
     """
     if not adapter:
         return AdapterMode.PROMPT
-
-    # Check explicit mode field first
-    mode = adapter.get("mode") or adapter.get("schema", {}).get("mode")
-    if mode:
-        return mode
-
-    # Infer from legacy backend/provider fields
-    backend = (adapter.get("backend") or "").lower()
-    provider = (adapter.get("provider") or "").lower()
-
-    if backend in {"prompt", "prompt_distill"}:
-        return AdapterMode.PROMPT
-    if backend in {"local", "local_lora"} or provider == "local":
-        if adapter.get("prompt_instructions") or adapter.get("behavior_prompt"):
-            return AdapterMode.HYBRID
-        return AdapterMode.LOCAL
-    if backend in {"api", "remote"} or adapter.get("remote_model_id"):
-        return AdapterMode.REMOTE
-    if backend == "hybrid":
-        return AdapterMode.HYBRID
-
-    # Default to HYBRID for backwards compatibility:
-    # Legacy adapters may have both LoRA weights and prompt instructions,
-    # so HYBRID ensures both mechanisms are available during inference.
-    return AdapterMode.HYBRID
+    return (
+        adapter.get("mode")
+        or adapter.get("schema", {}).get("mode")
+        or AdapterMode.HYBRID
+    )
 
 
 def filter_adapters_by_mode(adapters: List[dict], compatible_modes: set) -> List[dict]:
@@ -1558,7 +1521,7 @@ class ApiAdapterBackend:
                 else None
             )
             if selected:
-                model_id = selected.get("remote_model_id") or selected.get("model_id")
+                model_id = selected.get("remote_model_id")
                 if model_id:
                     applied.append(f"{selected.get('id', 'unknown')}:model_id")
                     # Drop other adapters
@@ -1583,11 +1546,7 @@ class ApiAdapterBackend:
             gate_weights: List[float] = []
 
             for adapter in selected:
-                aid = (
-                    adapter.get("remote_adapter_id")
-                    or adapter.get("adapter_id")
-                    or adapter.get("id")
-                )
+                aid = adapter.get("remote_adapter_id") or adapter.get("id")
                 if aid:
                     adapter_ids.append(aid)
                     applied.append(f"{adapter.get('id', 'unknown')}:adapter_param")
@@ -3006,7 +2965,7 @@ class LocalJaxLoRABackend:
     def _adapter_path(self, adapter: dict, *, requested_user_id: Optional[str]) -> str:
         if not adapter:
             return str(self.fs_root / "adapters")
-        explicit = adapter.get("cephfs_dir") or adapter.get("fs_dir")
+        explicit = adapter.get("fs_dir")
         if explicit:
             if not requested_user_id:
                 raise ValueError(

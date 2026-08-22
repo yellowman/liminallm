@@ -440,7 +440,6 @@ class TestTheWorkerCarriesTheGateDecision:
             {
                 "kind": "adapter.lora",
                 "mode": "local",
-                "backend": "local",
                 "base_model": "b",
                 "current_version": 0,
             },
@@ -469,44 +468,6 @@ class TestTheWorkerCarriesTheGateDecision:
         assert refreshed.status == "gate_rejected", refreshed.status
         assert credited == [], "a gate-rejected run was credited as a rollout"
         assert store.get_artifact(adapter.id).schema.get("current_version", 0) == 0
-
-
-class TestModeIsAuthoritative:
-    class _Local:
-        applies_lora_weights = True
-
-        def generate(self, messages, adapters, **kwargs):
-            return {"messages": messages}
-
-    def _prompts(self, adapter):
-        service = LLMService(base_model="m", backend=self._Local())
-        messages, _ = service._prepare_generation("hi", [adapter], [])
-        return "\n".join(m["content"] for m in messages if m["role"] == "system")
-
-    def test_mode_wins_over_a_disagreeing_backend_field(self):
-        """`mode: hybrid, backend: prompt` used to get the prompt AND the
-        weights once promoted, because injection read `backend`."""
-        adapter = {
-            "id": "s",
-            "base_model": BASE,
-            "mode": "hybrid",
-            "backend": "prompt",
-            "current_version": 2,
-            "prompt_instructions": "prefer tabs",
-        }
-        assert "prefer tabs" not in self._prompts(adapter)
-
-    def test_prompt_mode_with_a_local_backend_field_still_injects(self):
-        """And the mirror: `mode: prompt, backend: local` got neither weights
-        (prompt rung) nor prompt (not a prompt backend)."""
-        adapter = {
-            "id": "s",
-            "base_model": BASE,
-            "mode": "prompt",
-            "backend": "local",
-            "prompt_instructions": "be terse",
-        }
-        assert "be terse" in self._prompts(adapter)
 
 
 class TestOneBaseIdentityRuleForBothEnds:
@@ -931,16 +892,15 @@ class TestOnlyAPromotedVersionAuthorizesWeights:
         assert usage.get("adapter_id") == "P"
         assert sized == ["P"]
 
-    def test_an_inferred_prompt_rung_never_loads_weights(
+    def test_a_prompt_rung_never_loads_weights_even_when_they_exist(
         self, tmp_path, checkpoint, config
     ):
-        """§5.5's prompt-rung lock read the mode through `str()` of an enum,
-        so it recognized only a *stated* mode — a legacy `backend: prompt`
-        adapter loaded promoted weights."""
+        """§5.5's prompt-rung lock: a stated prompt mode is weightless even
+        with a promoted version and valid params on disk."""
         _write(tmp_path / "adapters" / "rung" / "v0001", _valid_pair(config))
         _, backend = self._service_and_backend(tmp_path, checkpoint)
         adapter = self._adapter(
-            checkpoint, "rung", backend="prompt", current_version=1
+            checkpoint, "rung", mode="prompt", current_version=1
         )
         assert backend._blend_adapter_weights(
             [adapter], user_id="u", config=config
@@ -1066,7 +1026,13 @@ class TestTrainingAndServingSerializeIdentically:
         service = TrainingService(store=store, fs_root=str(tmp_path))
         (example,) = list(service._build_examples([event]))
 
-        llm = LLMService(base_model="m", backend=TestModeIsAuthoritative._Local())
+        class _Local:
+            applies_lora_weights = True
+
+            def generate(self, messages, adapters, **kwargs):
+                return {"messages": messages}
+
+        llm = LLMService(base_model="m", backend=_Local())
         messages, _ = llm._prepare_generation(
             "how do I indent?", [], ["the style guide says tabs"]
         )

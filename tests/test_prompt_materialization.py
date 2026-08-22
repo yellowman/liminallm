@@ -135,14 +135,16 @@ class TestAnInferredModeStillMaterializes:
     @pytest.mark.parametrize(
         "adapter",
         [
-            # Nothing states a mode: inferred HYBRID.
+            # Nothing states a mode: hybrid, the default for a hand-built
+            # dict. Stored artifacts always carry one (schema.sql repair +
+            # validator).
             {"id": "legacy", "prompt_instructions": INSTRUCTION},
-            # Instructions nested in the schema, mode still inferred.
+            # Instructions nested in the schema shape.
             {"id": "legacy", "schema": {"prompt_instructions": INSTRUCTION}},
-            # A legacy `backend` field is an inference source, not a mode.
-            {"id": "legacy", "backend": "prompt", "prompt_instructions": INSTRUCTION},
-            # And an explicitly stated mode keeps working.
+            # A stated prompt mode, top-level instructions.
             {"id": "legacy", "mode": "prompt", "prompt_instructions": INSTRUCTION},
+            # And nested instructions with a stated mode.
+            {"id": "legacy", "mode": "prompt", "schema": {"prompt_instructions": INSTRUCTION}},
         ],
     )
     def test_the_instructions_are_placed(self, adapter):

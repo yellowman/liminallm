@@ -237,6 +237,7 @@ def _adapter(client, headers, user_id, *, fs_dir=None) -> str:
     store = get_runtime().store
     schema = {
         "kind": "adapter.lora",
+        "mode": "local",
         "base_model": "test-base",
         "current_version": 1,
         "rank": 4,

@@ -121,7 +121,7 @@ class TestMalformedAdaptersNeverPartiallyApply:
                 [{
                     "id": "mixed",
                     "base_model": BASE,
-                    "backend": "local",
+                    "mode": "local",
                     "mode": "local",
                     "fs_dir": "mixed",
                     "current_version": 1,
@@ -154,7 +154,7 @@ class TestHybridIsWeightsOrPromptNotBoth:
         adapter = {
             "id": "skill",
             "base_model": BASE,
-            "backend": "hybrid",
+            "mode": "hybrid",
             "mode": "hybrid",
             "current_version": 2,
             "prompt_instructions": "prefer tabs",
@@ -169,7 +169,7 @@ class TestHybridIsWeightsOrPromptNotBoth:
         adapter = {
             "id": "skill",
             "base_model": BASE,
-            "backend": "hybrid",
+            "mode": "hybrid",
             "mode": "hybrid",
             "current_version": 0,
             "prompt_instructions": "prefer tabs",
@@ -180,7 +180,7 @@ class TestHybridIsWeightsOrPromptNotBoth:
         adapter = {
             "id": "p",
             "base_model": BASE,
-            "backend": "prompt",
+            "mode": "prompt",
             "mode": "prompt",
             "prompt_instructions": "be terse",
         }
@@ -269,7 +269,7 @@ class TestVersionAuthorityOverPathShape:
         adapter = {
             "id": "direct",
             "base_model": BASE,
-            "backend": "local",
+            "mode": "local",
             "mode": "local",
             "fs_dir": str(params),
         }

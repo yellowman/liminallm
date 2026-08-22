@@ -257,7 +257,7 @@ def server_owned_artifact_dirs(
 ) -> list[Path]:
     """The directories this server derives from an artifact's identity alone.
 
-    Deliberately *not* `schema.fs_dir` or `cephfs_dir`. Those are accepted by
+    Deliberately *not* `schema.fs_dir`. That is accepted by
     `adapter_root` when their final component matches the adapter's id, which
     is enough authority to stop adapter A serving adapter B's weights — it is
     not authority to destroy. The schema is user-editable, so a value like
@@ -278,7 +278,7 @@ def server_owned_artifact_dirs(
 def adapter_root(base: Path, adapter_id: str, explicit=None) -> Path:
     """The directory holding one adapter's versions, bound to its identity.
 
-    An explicit ``fs_dir``/``cephfs_dir`` says **where** an adapter's directory
+    An explicit ``fs_dir`` says **where** an adapter's directory
     lives — a per-user root, a different mount — never **whose** it is. Its
     final component must therefore be the adapter's own id, which both
     documented layouts already satisfy: ``adapters/{adapter_id}`` and

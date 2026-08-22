@@ -11063,3 +11063,55 @@ blob, deliberately: it writes only filtered keys, readers filter what it
 reads, and the next admin save prunes. Also fixed while here: two prose
 leftovers in `rag.py` still describing "both retrieval paths" and "two
 candidate pools".
+
+## Deletion tranche C: one adapter vocabulary
+
+Scope per the reviewer's correction: canonicalize the *representation*, not
+the capability. `remote_model_id` and `remote_adapter_id` are the two current
+remote execution mechanisms — model-id selection and adapter-param selection —
+and stay. What goes is every historical way of spelling one fact.
+
+**The equivalence harness came first.** Before deleting a resolver, its
+answers were frozen: `get_adapter_mode`'s inference chain and
+`extract_prompt_instructions`' five-alias sweep were run over 29 legacy shapes
+in the same working tree, and the results became the oracle in
+`tests/test_adapter_canonicalization.py`. The repair must give each shape the
+same *meaning* — mode, effective prompt, weights directory, remote ids — not
+merely acquire a `mode` key. Old precedence is preserved exactly:
+`behavior_prompt` beats `system_prompt`, a top-level alias beats a nested
+canonical field, non-strings and blanks are skipped, and `cephfs_dir` wins a
+directory conflict because the readers said `cephfs_dir or fs_dir`.
+
+Deleted: `backend`, `provider`, `cephfs_dir`, the four prompt aliases,
+`model_id`/`adapter_id` as remote-id fallbacks, missing-mode inference,
+migrate-on-access, `_infer_adapter_mode`, `_mode_to_backend`,
+`_mode_to_provider`, and three compatibility test files
+(`test_adapter_dual_mode_fixes`, `test_adapter_mode_handling`,
+`test_training_adapter_modes` — 1,531 lines). `get_adapter_mode` is now a
+two-line read of a stated field.
+
+**The door is shut**, which is what makes the deletion durable rather than
+cosmetic: the validator requires `mode` from the four legal values and refuses
+all nine retired spellings *by name*, so the error says which. Without that,
+old-format artifacts could simply be created again tomorrow.
+
+**History is not rewritten.** The repair touches `artifact.schema` only.
+`artifact_version` rows are what they were; a rollback re-enters through the
+validator, which is where canonicalization belongs.
+
+**Found by the door, not by the census:** `clustering.promote_skill_adapters`
+was still writing `backend`/`provider` on every skill adapter it created. The
+grep for writers had missed it because it builds the schema dict inline. Eight
+slow-lane failures named it immediately — the fast lane could not, since those
+tests are slow-marked, which is the lane policy earning itself.
+
+Two tests were retired with the concept rather than ported:
+`TestModeIsAuthoritative`'s pair asserted that `mode` beats a *disagreeing*
+`backend` field. There is no `backend` field to disagree. A third,
+`test_an_inferred_prompt_rung_never_loads_weights`, became
+`test_a_prompt_rung_never_loads_weights_even_when_they_exist` — same fixture,
+same lock, stated mode.
+
+Net −1,346 lines. Three mutations, each killed: the repair removed from
+`schema.sql`, the validator allowing `backend` again, and (via the harness)
+any resolver change that alters a frozen meaning.

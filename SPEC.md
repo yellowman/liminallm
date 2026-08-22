@@ -626,12 +626,13 @@ each adapter artifact carries an explicit `mode`:
 | `prompt` | None | System prompt injection | Behavior without weights |
 | `hybrid` | Filesystem + prompt | Local weights where the backend applies them, prompt fallback everywhere else | Portable adapters |
 
-an artifact that states no `mode` is `hybrid` by default, and every rule
-below applies to stated and inferred modes alike — a materializer that
-recognizes only a stated mode silently drops exactly the legacy adapters
-the default exists for. `mode` — not the legacy `backend`/`provider`
-fields it is inferred from — is authoritative wherever behaviour depends
-on it.
+every adapter MUST carry an explicit, valid `mode`; the validator refuses
+an artifact without one, and refuses the retired spellings (`backend`,
+`provider`, `cephfs_dir`, the prompt aliases, `model_id`, `adapter_id`)
+by name. artifacts written by older builds were normalized by the
+repeat-safe repair in `schema.sql`; inference is not a runtime
+responsibility. `mode` is authoritative wherever behaviour depends on
+it, and `prompt_instructions` is the one prompt field.
 
 **mode compatibility**: the router filters adapters to those compatible
 with the active backend before policy evaluation (filtered adapters are
@@ -640,10 +641,7 @@ backend refuses an adapter whose mode its matrix marks incompatible
 rather than improvising a representation for it. the local backend serves
 `local` and `hybrid` as weights, carries `prompt` weightlessly, and
 refuses `remote`. `default_adapter_mode` (admin setting, default
-`hybrid`) sets the mode for newly created adapters; legacy artifacts
-without `mode` are migrated on first access (`backend=local` → `local`,
-or `hybrid` when prompt_instructions exist; `backend=api/remote` →
-`remote`).
+`hybrid`) sets the mode for newly created adapters.
 
 **adapter gate semantics (normative).**
 
