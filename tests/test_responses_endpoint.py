@@ -400,3 +400,85 @@ def test_the_streaming_usage_fallback_uses_the_shared_estimator():
     usage = events[-1]["data"]["usage"]
     assert usage["completion_tokens"] == estimate_token_count(cjk)
     assert usage["completion_tokens"] > len(cjk.split()) * 4
+
+
+class TestTheServedUsageObeysTheShapeItAdvertises:
+    """We serve the Responses shape, so our usage block must obey its equation.
+
+    In that shape `reasoning_tokens` is a *detail within* `output_tokens` and
+    `cached_tokens` a detail within `input_tokens`, so a client may compute
+    visible output as `output_tokens - reasoning_tokens` and expect
+    `input_tokens + output_tokens == total_tokens`.
+
+    Providers do not agree on that. Measured from our own Gemini fixture
+    (`test_gemini_native.py`): promptTokenCount 10 + candidatesTokenCount 5 is
+    15, while totalTokenCount is 22 — because thoughtsTokenCount 7 is
+    *additive* there, not a subset of candidates. Passed straight through, we
+    advertised 7 reasoning tokens inside 5 output tokens and a total that did
+    not add up.
+
+    Normalized from the provider's own total rather than from a per-backend
+    flag: if the parts only reconcile once reasoning is added, reasoning was
+    disjoint and is folded in.
+    """
+
+    def _served(self, usage):
+        from liminallm.api.routes import _responses_usage
+
+        return _responses_usage(usage)
+
+    def test_a_backend_that_counts_reasoning_separately_is_folded_in(self):
+        served = self._served(
+            {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 22,
+             "reasoning_tokens": 7, "cached_tokens": 3}
+        )
+        assert served["output_tokens"] == 12, (
+            "reasoning was counted separately by the backend and not folded "
+            f"into output_tokens: {served}"
+        )
+        assert served["input_tokens"] + served["output_tokens"] == served["total_tokens"]
+        assert served["output_tokens_details"]["reasoning_tokens"] == 7
+
+    def test_a_backend_that_already_includes_reasoning_is_left_alone(self):
+        served = self._served(
+            {"prompt_tokens": 10, "completion_tokens": 12, "total_tokens": 22,
+             "reasoning_tokens": 7, "cached_tokens": 3}
+        )
+        assert served["output_tokens"] == 12, (
+            f"reasoning was double-counted into output_tokens: {served}"
+        )
+        assert served["input_tokens"] + served["output_tokens"] == served["total_tokens"]
+
+    def test_reasoning_never_exceeds_the_output_it_is_part_of(self):
+        for usage in (
+            {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 22,
+             "reasoning_tokens": 7},
+            {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+            {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            {},
+        ):
+            served = self._served(usage)
+            assert (
+                served["output_tokens_details"]["reasoning_tokens"]
+                <= served["output_tokens"]
+            ), f"reasoning exceeds the output it is a part of: {usage} -> {served}"
+
+    def test_cached_never_exceeds_the_input_it_is_part_of(self):
+        # Both providers already agree here — cached is a subset of the prompt
+        # count in each — so this pins the half that is currently correct.
+        served = self._served(
+            {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15,
+             "cached_tokens": 3}
+        )
+        assert served["input_tokens_details"]["cached_tokens"] <= served["input_tokens"]
+
+    def test_a_total_the_backend_never_reported_is_still_consistent(self):
+        # The local tokenizer path reports parts without a sum.
+        served = self._served(
+            {"prompt_tokens": 10, "completion_tokens": 5, "reasoning_tokens": 2}
+        )
+        assert served["input_tokens"] + served["output_tokens"] == served["total_tokens"]
+        assert (
+            served["output_tokens_details"]["reasoning_tokens"]
+            <= served["output_tokens"]
+        )

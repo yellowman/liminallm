@@ -1658,16 +1658,34 @@ def _responses_usage(usage: dict) -> dict:
     """
     prompt = int(usage.get("prompt_tokens") or 0)
     completion = int(usage.get("completion_tokens") or 0)
+    reasoning = int(usage.get("reasoning_tokens") or 0)
+    total = int(usage.get("total_tokens") or 0)
+
+    # In this shape reasoning_tokens is a detail *within* output_tokens, so a
+    # client may compute visible output as output - reasoning and expect
+    # input + output == total. Backends disagree about that: OpenAI counts
+    # reasoning inside its output count, Gemini counts thoughts alongside
+    # candidates. Measured on our own fixture — prompt 10 + candidates 5 = 15
+    # against a reported total of 22, which only reconciles once the 7 thought
+    # tokens are added.
+    #
+    # Decided from the provider's own total rather than from a per-backend
+    # flag, because the total is the one number every backend reports and it
+    # is what makes the parts checkable at all: if they only add up once
+    # reasoning is included, reasoning was counted separately and belongs
+    # inside the output count we publish.
+    if reasoning and total and prompt + completion + reasoning == total:
+        completion += reasoning
+    if not total:
+        total = prompt + completion
     return {
         "input_tokens": prompt,
         "input_tokens_details": {
             "cached_tokens": int(usage.get("cached_tokens") or 0)
         },
         "output_tokens": completion,
-        "output_tokens_details": {
-            "reasoning_tokens": int(usage.get("reasoning_tokens") or 0)
-        },
-        "total_tokens": int(usage.get("total_tokens") or 0) or (prompt + completion),
+        "output_tokens_details": {"reasoning_tokens": reasoning},
+        "total_tokens": total,
     }
 
 

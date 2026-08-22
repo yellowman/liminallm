@@ -10950,3 +10950,33 @@ The slow set is 109 tests in 13 files, and `pytest tests/ -m slow
 (`test_local_transformer`, `test_lora_composition`, `test_adapter_ladder`,
 `test_lora_training`, `test_ladder_end_to_end`); the rest are the harness,
 sandbox boundary, voice and email, and a few reaping tests.
+
+## The served usage block: one shape, two provider equations
+
+We serve the Responses shape on `/v1/responses`, and in that shape
+`reasoning_tokens` is a detail *within* `output_tokens`: a client may compute
+visible output as `output - reasoning` and expect `input + output == total`.
+The backends feeding that block do not agree on the equation. OpenAI counts
+reasoning inside its output count. Gemini counts thoughts *alongside*
+candidates — measured on our own fixture, `promptTokenCount 10 +
+candidatesTokenCount 5 = 15` against `totalTokenCount 22`, which only
+reconciles once the 7 thought tokens are added.
+
+Passed straight through, a Gemini-backed turn served `reasoning_tokens: 7`
+inside `output_tokens: 5` and a total that did not add up — two states no
+client of this shape should ever see, and the kind that turns into a
+mis-billed dashboard rather than an error.
+
+`_responses_usage` reconciles from the provider's own total rather than a
+per-backend flag: if the parts only add up once reasoning is included,
+reasoning was counted separately and is folded into the published output
+count. The total is the one number every backend reports, and it is what
+makes the parts checkable at all. A backend that already includes reasoning
+reconciles without the fold and is left alone; a backend that reports no
+total (the local tokenizer path) gets `input + output`.
+
+Five reds: the fold, the leave-alone, reasoning bounded by output across four
+shapes, cached bounded by input (already true — both providers count cached
+inside the prompt — pinned so it stays true), and the derived total. Four
+mutations, each killed: never fold, fold unconditionally, reconcile with `>=`
+instead of `==`, and drop the derived total.
