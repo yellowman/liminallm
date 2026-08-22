@@ -10501,3 +10501,123 @@ commit, destroying the sentinel. The lost-lease red has the run hand its own
 claim to another holder and then start another test: the run must fail, and
 the other holder's state must survive. Standing in for an expiry, which has
 the same outcome and can be forced.
+
+### 2I.1 carry-over: a URL names a database twice
+
+**HIGH: `?db=N` reached past the base exclusion.** The previous commit read
+the base database off the URL path. redis-py does not: a `db=` query argument
+outranks the path, measured —
+
+```
+redis://127.0.0.1:6379/3?db=7   ->  redis-py connects to database 7
+```
+
+So `TEST_REDIS_URL=redis://host:6379/0?db=7` protected database 0, which
+nobody was using, and left 7 unprotected. Worse, the URL handed to a worker
+was built by replacing the path and keeping the query, so
+`redis://host:6379/1?db=7` still reached 7 — every worker connected to the
+caller's database whatever number it had been leased, and flushed it before
+every test. Reproduced against the previous commit: the sentinel in the
+caller's database is gone.
+
+`redis_database_index` asks redis-py which database a URL reaches rather than
+re-deriving the precedence, and `redis_url_for_database` drops any `db=` as
+well as replacing the path. Re-deriving it by hand is what produced the
+defect; asking the client that will do the connecting cannot disagree with
+itself.
+
+**MEDIUM: two base databases on one server kept two ledgers.** Moving the
+ledger into the caller's database — the previous commit's fix for the flush —
+fragmented the one thing a lease exists for. Two runs given different base
+databases on one server could not see each other's claims:
+
+```
+RUN A, base /1                 RUN B, base /2
+claim  [ledger in DB1]         claim  [ledger in DB2]
+```
+
+Measured against the previous commit: A leased `[2, 3]`, B leased `[1, 3]` —
+database 3 handed to both, and each run leased the other's base, which it then
+flushed before every test.
+
+The ledger is database 0 again, one per server, and never a candidate. The
+harness therefore writes into database 0 even when told to use another; those
+are short-lived keys under two known prefixes, compare-deleted at teardown and
+expiring on their own. The database the caller named is still never leased and
+never flushed, which was the defect the move was meant to fix.
+
+**A third case the reds found: a run cannot see somebody else's base.**
+Excluding our own base protects us from ourselves and from nothing else — run
+B, base `/2`, has no reason not to lease database 1, which is run A's. So a
+run now records the database it was given under `liminallm:test:redis-db-base`
+where every caller can see it, and a claim tests that in the same Lua step
+that takes the lease. One step, because a check followed by a claim is a
+window in which another run reserves the number just looked at.
+
+The reservation is refreshed rather than claimed, and nothing releases it:
+several workers of one run share a base, so it is not one holder's to give
+back. It expires, which errs towards leaving a database alone.
+
+**Residual, stated rather than fixed:** a run is protected from every run that
+starts after it, not from one that finished claiming before it started — at
+that moment nothing on the server knew the base was spoken for. Closing it
+needs a reservation that predates the server, which the harness cannot have.
+The test reserves both bases before either claims, which is the order
+provisioning actually uses.
+
+**HIGH: the same defect on Postgres, found by looking for it.** Only the Redis
+instance was reported. libpq also takes connection keywords from a URL's query
+string, and `dbname` there outranks the path — measured:
+
+```
+postgresql://host:5432/mydb?dbname=other   ->  libpq connects to other
+```
+
+`create_worker_database` read the base name off the path and built the
+worker's URL by replacing that path, keeping the query. So a caller who wrote
+`postgresql://host:5432/?dbname=liminallm` got:
+
+```
+postgresql://host:5432/liminallm_xd_ab12_gw0?dbname=liminallm
+```
+
+a URL that names the worker's database and reaches the caller's. Every worker
+ran against the caller's database and truncated it before every test.
+Reproduced before it was fixed: one per-test reset through that URL and the
+sentinel in the base is gone. `drop_worker_database`'s refusal to drop the
+base compared path to path, so it did not see this either.
+
+`postgres_database_name` asks psycopg which database a URL reaches, and
+`postgres_url_for_database` drops any `dbname` as well as replacing the path —
+the same pair as on the Redis side, and used by the maintenance URL, the
+clone, and the drop guard. Only `dbname` is normalized: `host` and `port` in a
+query redirect the maintenance connection and the worker's together, which is
+a caller naming a server, while `dbname` is what makes one URL say one
+database and reach another.
+
+### Mutations
+
+| Mutation | Killed by |
+|---|---|
+| the base database is read off the path, so `db=` wins unseen | the two-spellings red |
+| the worker's URL keeps the `db=` that outranks its path | the query-argument run |
+| the ledger goes back into whichever database the caller named | the cross-ledger red |
+| a run never says which database it was given | the cross-ledger red |
+| a claim ignores whether the number is somebody's base | the cross-ledger red |
+| the base Postgres database is read off the path, so `dbname=` wins | the `dbname` red |
+| the worker's Postgres URL keeps the `dbname=` that outranks its path | the `dbname` red |
+
+The Redis exclusion is asserted on the candidate list and not only through a
+run, because a run with one worker is handed the first free number and that is
+database 1 whichever way the exclusion was computed — measured. The end-to-end
+red catches the URL half and cannot see the other. Two reds, one per half.
+
+The `dbname` red truncates through the URL the worker was actually given and
+then reads the base, rather than comparing two strings, because what has to
+hold is that the caller's rows are still there.
+
+Four earlier anchors had gone stale and were repaired rather than dropped:
+`SET NX EX` is inside the Lua now, so the mutations that remove `NX` and the
+expiry move there with it; the candidate list grew a second exclusion; and the
+worker URL is built by a function rather than inline. All twenty-three
+mutations are killed.

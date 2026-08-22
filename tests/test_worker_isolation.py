@@ -167,12 +167,13 @@ class _External:
     answer rather than an absence of evidence.
     """
 
-    def __init__(self, redis_db: int = 0):
+    def __init__(self, redis_db: int = 0, db_in_query: bool = False):
         from tests.harness import ScratchPostgres, ScratchRedis
 
         self.pg = ScratchPostgres()
         self.redis = ScratchRedis()
         self.redis_db = redis_db
+        self.db_in_query = db_in_query
         self.url = None
         self.redis_url = None
 
@@ -190,7 +191,14 @@ class _External:
         # `TEST_REDIS_URL` is documented as "point at an existing service".
         # Nothing says that service's database must be 0, and using a numbered
         # one for tests is ordinary — so the fixture can name one.
-        self.redis_url = self.redis.start().rsplit("/", 1)[0] + f"/{self.redis_db}"
+        host = self.redis.start().rsplit("/", 1)[0]
+        # Both spellings redis-py accepts. The query form is the one where the
+        # path lies about which database the URL reaches.
+        self.redis_url = (
+            f"{host}/0?db={self.redis_db}"
+            if self.db_in_query
+            else f"{host}/{self.redis_db}"
+        )
         # What `scripts/migrate.sh` would have left behind, plus a fact that
         # only a clone can inherit.
         apply_schema(self.url, embedding_dim=64)
@@ -278,6 +286,20 @@ class _External:
             row = conn.execute("SELECT note FROM harness_sentinel").fetchone()
         return row and row[0]
 
+    def assert_control_keys_expire(self):
+        """A control key with no expiry would be litter, not bookkeeping."""
+        import redis
+
+        from tests.harness import REDIS_BASE_PREFIX, REDIS_LEASE_PREFIX
+
+        client = redis.Redis.from_url(self.redis_url, decode_responses=True)
+        try:
+            for prefix in (REDIS_LEASE_PREFIX, REDIS_BASE_PREFIX):
+                for key in client.keys(f"{prefix}:*"):
+                    assert client.ttl(key) > 0, f"{key} will never expire"
+        finally:
+            client.close()
+
     def base_redis(self):
         import redis
 
@@ -288,8 +310,25 @@ class _External:
             client.close()
 
 
-def _external_or_skip(redis_db: int = 0):
-    ext = _External(redis_db)
+def _data_keys(keys) -> list[str]:
+    """Everything except the harness's own control keys.
+
+    The lease ledger lives in database 0, which is also the caller's database
+    when they named that one, so its bookkeeping shows up in a listing there.
+    Those keys carry a TTL — `assert_control_keys_expire` checks it — so they
+    are not data the run left behind. They are also not the sentinel.
+    """
+    from tests.harness import REDIS_BASE_PREFIX, REDIS_LEASE_PREFIX
+
+    return sorted(
+        key
+        for key in keys
+        if not key.startswith((REDIS_LEASE_PREFIX, REDIS_BASE_PREFIX))
+    )
+
+
+def _external_or_skip(redis_db: int = 0, db_in_query: bool = False):
+    ext = _External(redis_db, db_in_query)
     if not ext.available:
         pytest.skip("needs initdb and redis-server to stand up external services")
     return ext
@@ -501,9 +540,10 @@ class TestAWorkerOwnsItsResources:
             assert sentinel == "the base survived", (
                 "a worker flushed the Redis database this run was handed"
             )
-            assert keys == ["harness:sentinel"], (
+            assert _data_keys(keys) == ["harness:sentinel"], (
                 f"a worker wrote into the base Redis database: {keys}"
             )
+            ext.assert_control_keys_expire()
 
     def test_the_database_the_caller_named_is_never_leased(self):
         """`TEST_REDIS_URL` may name any database, not only 0.
@@ -511,16 +551,31 @@ class TestAWorkerOwnsItsResources:
         Offering `1..15` regardless of which one the URL named meant a caller
         who pointed the harness at `redis://host/1` had that exact database
         leased to the first worker — and then flushed before every test,
-        because the lease said it was owned. The base is the ledger now, and
-        the ledger is never a candidate.
+        because the lease said it was owned.
+
+        Both spellings, because redis-py accepts two and they disagree: the
+        path, and a `db=` query argument that outranks it. Asserted here on
+        the list rather than only through a run, because a run with one worker
+        is handed the first free number and that is 1 whichever way the
+        exclusion was computed — the end-to-end red cannot see this half.
         """
         from tests.harness import lease_candidates, redis_database_index
 
-        for named in (0, 1, 7, 15):
-            url = f"redis://127.0.0.1:6379/{named}"
-            assert redis_database_index(url) == named
+        spellings = [
+            (0, "redis://127.0.0.1:6379/0"),
+            (1, "redis://127.0.0.1:6379/1"),
+            (7, "redis://127.0.0.1:6379/7"),
+            (15, "redis://127.0.0.1:6379/15"),
+            (7, "redis://127.0.0.1:6379/0?db=7"),
+            (7, "redis://127.0.0.1:6379/3?db=7"),
+            (15, "redis://127.0.0.1:6379?db=15"),
+        ]
+        for named, url in spellings:
+            assert redis_database_index(url) == named, (
+                f"{url} reaches a different database than {named}"
+            )
             assert named not in lease_candidates(url), (
-                f"the database the caller named ({named}) was offered to a worker"
+                f"the database {url} names ({named}) was offered to a worker"
             )
         assert redis_database_index("redis://127.0.0.1:6379") == 0
 
@@ -536,13 +591,155 @@ class TestAWorkerOwnsItsResources:
                 "the harness leased the database TEST_REDIS_URL named, and "
                 "then flushed it before every test"
             )
-            assert keys == ["harness:sentinel"], (
+            assert _data_keys(keys) == ["harness:sentinel"], (
                 f"a lease was left in the caller's database: {keys}"
             )
             worker_db = json.loads(
                 (tmp_path / "probe.jsonl").read_text().splitlines()[0]
             )["redis_url"].rsplit("/", 1)[-1]
             assert worker_db != "1", "the worker was given the caller's database"
+
+    def test_the_database_a_query_argument_names_is_never_leased(self, tmp_path):
+        """`db=` in the query wins over the path, and redis-py says so.
+
+        `redis://host:6379/0?db=7` connects to database seven. A base
+        exclusion that reads only the path protects database zero, leases
+        seven to the first worker, and flushes the caller's data before every
+        test — the same defect as the path case, through the other spelling
+        redis-py accepts.
+        """
+        with _external_or_skip(redis_db=7, db_in_query=True) as ext:
+            done = ext.run_pytest(
+                "-n", "1", PROBE, probe_out=str(tmp_path / "probe.jsonl")
+            )
+            assert done.returncode == 0, done.stdout[-3000:]
+            sentinel, keys = ext.base_redis()
+            assert sentinel == "the base survived", (
+                "the harness leased the database the URL's `db=` argument "
+                "named, and then flushed it before every test"
+            )
+            assert _data_keys(keys) == ["harness:sentinel"], (
+                f"a worker wrote into the caller's database: {keys}"
+            )
+            from tests.harness import redis_database_index
+
+            worker_url = json.loads(
+                (tmp_path / "probe.jsonl").read_text().splitlines()[0]
+            )["redis_url"]
+            assert redis_database_index(worker_url) != 7, (
+                f"the worker's URL still reaches database 7: {worker_url}"
+            )
+
+    def test_a_dbname_argument_does_not_point_every_worker_at_the_base(self):
+        """The same defect on the other service, found by looking for it.
+
+        libpq takes connection keywords from a URL's query string, and
+        `dbname` there outranks the path — measured, the same way redis-py's
+        `db=` was. So `postgresql://host:5432/?dbname=liminallm` names no
+        database in its path and connects to `liminallm`, and a worker URL
+        built by replacing the path keeps the argument that outranks it:
+
+            postgresql://host:5432/base_xd_ab12_gw0?dbname=liminallm
+
+        That URL says one database and reaches another. Every worker then ran
+        against the caller's database and truncated it before every test,
+        which is the destructive half of the Redis defect with none of the
+        Redis part. Reproduced before it was fixed.
+        """
+        import psycopg
+
+        from tests.harness import (
+            ScratchPostgres,
+            apply_schema,
+            create_worker_database,
+            drop_worker_database,
+            postgres_database_name,
+        )
+
+        pg = ScratchPostgres()
+        if not pg.available:
+            pytest.skip("needs initdb")
+        base = pg.start()
+        try:
+            name = postgres_database_name(base)
+            apply_schema(base, embedding_dim=64)
+            with psycopg.connect(base, autocommit=True) as conn:
+                conn.execute("CREATE TABLE harness_sentinel (note text)")
+                conn.execute("INSERT INTO harness_sentinel VALUES ('the base survived')")
+
+            # The same server and the same database, spelled the other way
+            # libpq accepts. Nothing in the documentation says a caller may
+            # not.
+            quirky = f"{base.rsplit('/', 1)[0]}/?dbname={name}"
+            assert postgres_database_name(quirky) == name
+
+            worker = create_worker_database(quirky, "gw0", "abc123", prepared=False)
+            try:
+                assert postgres_database_name(worker) != name, (
+                    f"the worker's URL still reaches the caller's database: {worker}"
+                )
+                # What the per-test reset does, through the URL the worker was
+                # actually given.
+                with psycopg.connect(worker, autocommit=True) as conn:
+                    conn.execute(
+                        "TRUNCATE app_user, conversation, message RESTART IDENTITY CASCADE"
+                    )
+                with psycopg.connect(base, autocommit=True) as conn:
+                    row = conn.execute("SELECT note FROM harness_sentinel").fetchone()
+                assert row and row[0] == "the base survived", (
+                    "a worker truncated the database the caller was using"
+                )
+            finally:
+                drop_worker_database(quirky, worker)
+
+            # And the guard that refuses to drop the base has to read the URL
+            # the same way, or it compares two paths and lets the base
+            # through.
+            with pytest.raises(RuntimeError, match="refusing to drop"):
+                drop_worker_database(quirky, f"{base.rsplit('/', 1)[0]}/?dbname={name}")
+        finally:
+            pg.stop()
+
+    def test_two_base_databases_on_one_server_do_not_lease_the_same_number(self):
+        """One server, one ledger — whatever database each caller was given.
+
+        A ledger kept in each caller's own database cannot see the other's
+        claims, so two runs configured with different base databases hand out
+        the same numbers and then flush each other. The exclusivity a lease
+        exists for is server-wide or it is nothing.
+        """
+        from tests.harness import (
+            ScratchRedis,
+            claim_redis_database,
+            reserve_base_database,
+        )
+
+        server = ScratchRedis()
+        if not server.available:
+            pytest.skip("needs redis-server")
+        host = server.start().rsplit("/", 1)[0]
+        try:
+            # Each run says which database it was given before it takes any.
+            # That is the order provisioning uses, and it is the whole
+            # guarantee: a run cannot protect its base from one that finished
+            # claiming before it ever started, because nothing on the server
+            # knew about it yet. It is protected from every run after.
+            reserve_base_database(f"{host}/1")
+            reserve_base_database(f"{host}/2")
+
+            first = {claim_redis_database(f"{host}/1", f"a{n}:gw0")[1] for n in (1, 2)}
+            second = {claim_redis_database(f"{host}/2", f"b{n}:gw0")[1] for n in (1, 2)}
+            assert len(first) == 2 and len(second) == 2
+            assert first.isdisjoint(second), (
+                "two runs with different base databases were handed the same "
+                f"numbers: {sorted(first)} and {sorted(second)}"
+            )
+            assert not {1, 2} & (first | second), (
+                "a run leased the database another run was configured with: "
+                f"{sorted(first)} and {sorted(second)}"
+            )
+        finally:
+            server.stop()
 
     def test_a_worker_that_lost_its_lease_stops_before_it_flushes(self, tmp_path):
         """Losing the claim is not something to carry on best-effort through.
@@ -569,9 +766,21 @@ class TestAWorkerOwnsItsResources:
             # Which database the probe was using, found the way anything
             # else would: the ledger still names its new holder, because the
             # run's own release compares before it deletes.
-            from tests.harness import REDIS_LEASE_PREFIX
+            from tests.harness import (
+                REDIS_LEASE_PREFIX,
+                REDIS_LEDGER_DB,
+                redis_url_for_database,
+            )
 
-            ledger = redis.Redis.from_url(ext.redis_url, decode_responses=True)
+            # Addressed the way the harness addresses it, not as "the URL the
+            # fixture was given". Those are the same database only while this
+            # fixture's base is 0, and a later edit to that argument would
+            # otherwise leave this reading an empty database and reporting a
+            # confusing failure.
+            ledger = redis.Redis.from_url(
+                redis_url_for_database(ext.redis_url, REDIS_LEDGER_DB),
+                decode_responses=True,
+            )
             try:
                 taken_over = [
                     key
