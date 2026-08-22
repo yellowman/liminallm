@@ -3,12 +3,13 @@
 # Usage:
 #   make test      - Run unit tests (in-memory)
 #   make test-fast - Fast edit-loop tests; excludes @pytest.mark.slow
+#   make test-fast-xdist - The same lane in parallel
 #   make lint      - Run linters
 #   make qa        - Full QA gate (lint + test + security)
 #   make dev       - Start development server
 #   make docker    - Build and test with Docker
 
-.PHONY: help install test test-fast lint security qa dev docker clean docker-clean
+.PHONY: help install test test-fast test-fast-xdist lint security qa dev docker clean docker-clean
 
 # Default target
 help:
@@ -17,6 +18,7 @@ help:
 	@echo "  make install    Install dependencies"
 	@echo "  make test       Run unit tests (in-memory)"
 	@echo "  make test-fast  Fast edit-loop tests; excludes @pytest.mark.slow"
+	@echo "  make test-fast-xdist  The same lane across $(XDIST_WORKERS) processes"
 	@echo "  make test-pg    Run tests with PostgreSQL (requires Docker)"
 	@echo "  make lint       Run linters (ruff)"
 	@echo "  make security   Run security scanner (bandit)"
@@ -50,6 +52,18 @@ test:
 test-fast:
 	@mkdir -p $(SHARED_FS_ROOT)
 	python -m pytest tests/ -q --tb=short -m 'not slow'
+
+# The same lane across several processes. Each worker gets a Postgres, a Redis
+# database and a filesystem root of its own — see tests/test_worker_isolation.py
+# — because the per-test TRUNCATE assumes it owns the database.
+#
+# A fixed default rather than `-n auto`: Redis has sixteen numbered databases,
+# and on a large workstation `auto` would also start that many Postgres
+# clusters. Override with `make test-fast-xdist XDIST_WORKERS=8`.
+XDIST_WORKERS ?= 4
+test-fast-xdist:
+	@mkdir -p $(SHARED_FS_ROOT)
+	python -m pytest tests/ -q --tb=short -m 'not slow' -n $(XDIST_WORKERS)
 
 # Run tests with PostgreSQL (requires docker-compose)
 # Credentials must match docker-compose.test.yml

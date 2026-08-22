@@ -10267,3 +10267,102 @@ the account before the request and the route's own lookup failed first — the
 guarded line was never reached. The line is only reachable when the account
 was live at the lookup and gone at the write, so its red drives the route by
 that contract instead.
+
+## Tranche 2I.1: an xdist worker owns its resources
+
+The suite wipes its database before every test. That is what makes tests
+independent of each other, and it is only true while one process owns the
+database — point four workers at one and `TRUNCATE every table` stops being
+isolation and becomes every test deleting every other test's rows. So
+parallelism is a provisioning problem before it is a scheduling one.
+
+Three facts were measured before anything was designed, because the whole
+shape depends on them:
+
+| question | answer |
+|---|---|
+| does the xdist controller import conftest? | yes |
+| does it import test modules? | **no** — only workers collect |
+| is `PYTEST_XDIST_WORKER` set before conftest is imported? | yes |
+| does `os.environ.setdefault` in the controller reach workers? | yes |
+
+The second is what settles the design. The controller runs no tests, so it
+needs no database, no Redis and no store — and provisioning at module import
+gave it all three, including a connection pool on the database its workers
+were about to clone, which `CREATE DATABASE ... TEMPLATE` refuses while any
+session holds it. Provisioning moved into `pytest_configure`, where
+`config.workerinput` and `config.getoption("dist")` answer "worker",
+"controller" or "serial" authoritatively rather than by parsing argv.
+
+Most isolation is then free: each worker is its own process, so the temp root,
+the scratch Postgres and the scratch Redis are already per-worker. What is not
+free is services supplied from outside, where every worker is handed the same
+one:
+
+- **Postgres.** A database per worker, `<base>_xd_<run>_<gwN>`, dropped at the
+  end. Databases rather than schemas: the schema, its triggers and much of the
+  store address `public` by name and cast with `::regclass`, so a per-worker
+  schema would be a different production model, tested.
+- **Redis.** A numbered database per worker, leaving the base one alone, and
+  flushed between tests now that it is exclusively owned. Isolation used to
+  rest on every key carrying a fresh UUID and on TTLs expiring.
+- **Filesystem.** Already per-process; the root is named for its worker so the
+  question "which root is this" has an answer from a directory listing.
+
+`TEST_SCHEMA_PREPARED` is the constraint that shapes provisioning. CI runs
+`scripts/migrate.sh` and then sets it, precisely so conftest cannot quietly
+repair a deploy command that does nothing. A worker therefore *clones* a
+prepared database rather than building its own — otherwise four workers would
+each rebuild from `schema.sql` and restore exactly the hole the flag closed.
+
+`make test`, `make qa` and CI are untouched. The parallel lane is
+`make test-fast-xdist`, four workers by default rather than `-n auto`: Redis
+has sixteen numbered databases, and on a large workstation `auto` would also
+start that many Postgres clusters.
+
+Measured: the fast lane 379s serial, 127s and 124s on two `-n 4` runs. The
+full serial lane is unchanged.
+
+### Found by turning it on: a test whose name was random
+
+A parametrization built two of its cases with `uuid.uuid4()` at collection
+time. Each worker collects independently, so four workers produced four
+different suites and xdist refused to run at all.
+
+The parallel lane fails loudly on this, so it is not a silent defect — but it
+is worth naming on its own, because it also means a test that cannot be re-run
+from a failure report: `pytest ...::test_x[309601fa-...]` is a command that
+works exactly once. Fixed ids now, and a red collects the suite twice and
+compares name for name.
+
+Two neighbouring parametrizations pass dicts containing fresh uuids and are
+fine — pytest ids non-primitives positionally, `payload0`, `payload1` — which
+was checked rather than assumed.
+
+### Mutations
+
+| Mutation | Killed by |
+|---|---|
+| workers share the database they were given | the derived-resources red |
+| the worker database is not derived at all | the base-database red |
+| workers share the Redis database they were given | the derived-resources red |
+| the worker flushes the base Redis database | the base-Redis red |
+| a prepared database is rebuilt instead of cloned | the clone red |
+| serial runs get a derived database too | the serial red |
+| the roots stop naming their owner | the derived-resources red |
+
+The isolation reds run pytest inside pytest against services stood up for the
+occasion, with sentinels in both. Asserting that the derivation functions
+return different strings would only prove the code meant well; what has to
+hold is that a real parallel run leaves the base database and the base Redis
+exactly as it found them, and that is a question with an answer.
+
+`--dist each` rather than the default scheduler for the probe, so both workers
+run it. Under `load` the two reports could land on one worker and the test
+would pass having compared a worker with itself.
+
+Nothing was serial-marked. The two replicas in an advisory-lock test share
+their worker's Postgres and the actors in a path-race test share its
+filesystem root, so both still contend exactly as before — worker isolation
+keeps unrelated tests out, it does not stand between a test and itself. A red
+runs both under xdist to keep that true.

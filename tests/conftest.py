@@ -12,8 +12,21 @@ from pathlib import Path
 # effect — for a while it did not, because the field was database-managed and
 # this line was inert, and the suite wrote into /srv/liminallm, which is where
 # a real install keeps its data.
-_test_tmp_dir = tempfile.mkdtemp(prefix="liminallm_test_")
+#
+# Named for the worker that owns it, because under xdist "which root is this"
+# is a question somebody will need answered from a directory listing, and
+# because a test can then assert that workers were actually given different
+# ones rather than that the code meant to.
+from tests.harness import run_id, worker_id  # noqa: E402
+
+_worker = worker_id()
+_test_tmp_dir = tempfile.mkdtemp(
+    prefix=f"liminallm_test_{_worker}_" if _worker else "liminallm_test_"
+)
 os.environ["SHARED_FS_ROOT"] = _test_tmp_dir
+# Stored in the controller's environment at import, which is before execnet
+# spawns any worker, so every worker in this invocation reads the same one.
+run_id()
 os.environ.setdefault("TEST_MODE", "true")
 # Tests run against a real Postgres. See tests/harness.py: the in-memory
 # store used to double the storage layer, so every storage feature was written
@@ -28,8 +41,11 @@ from tests.harness import (  # noqa: E402
     ScratchRedis,
     apply_schema,
     close_test_store,
+    create_worker_database,
+    drop_worker_database,
     get_test_store,
     reset_shared_store,
+    worker_redis_url,
 )
 
 # Tests use the same async RedisCache production does, against a real
@@ -40,56 +56,112 @@ from tests.harness import (  # noqa: E402
 # concurrency slots all take their fallback path, so the code production runs
 # is the code the suite does not.
 _REDIS = None
-_redis_url = os.environ.get("TEST_REDIS_URL")
-if not _redis_url:
-    _REDIS = ScratchRedis()
-    if _REDIS.available:
-        _redis_url = _REDIS.start()
-    else:
-        # No redis-server here. The suite still runs on the documented
-        # fallback, which is what a Redis outage does in production — but say
-        # so, because a green run then means less than it looks like.
-        _REDIS = None
-        print("redis-server not found: running on the in-process fallback")
-if _redis_url:
-    # redis_url is a database-managed setting with no environment variable of
-    # its own, so exporting REDIS_URL does nothing — which is what conftest
-    # used to do, and why the suite ran on the fallback while looking
-    # configured. Move the *default* instead of storing a value: seeding
-    # through INSTANCE_SETTINGS_JSON would spend the instance's one first boot,
-    # and writing a row would make every "has an operator configured anything"
-    # check answer yes.
-    from liminallm.config import SYSTEM_SETTINGS_DEFAULTS, Settings  # noqa: E402
-
-    Settings.model_fields["redis_url"].default = _redis_url
-    Settings.model_rebuild(force=True)
-    SYSTEM_SETTINGS_DEFAULTS["redis_url"] = _redis_url
-
 _PG = None
-if not os.environ.get("TEST_DATABASE_URL"):
-    _PG = ScratchPostgres()
-    if not _PG.available:
-        raise RuntimeError(
-            "The test suite needs Postgres (initdb not found). Install "
-            "postgresql-16 + postgresql-16-pgvector, or set TEST_DATABASE_URL."
-        )
-    os.environ["DATABASE_URL"] = _PG.start()
-else:
-    os.environ["DATABASE_URL"] = os.environ["TEST_DATABASE_URL"]
+_WORKER_DB: str | None = None
+_OWNED_REDIS_DB = False
 
-# TEST_SCHEMA_PREPARED says "something already applied the schema to this
-# database; do not touch it". CI sets it after running scripts/migrate.sh, so
-# the suite runs against the database the deploy command actually produced.
-#
-# Without it, applying the schema here unconditionally means the suite proves
-# nothing about migrate.sh: gut the script to `exit 0` and CI's schema step
-# still succeeds, conftest then builds the whole schema from scratch on the
-# empty database it left behind, and the suite goes green over a deploy
-# command that does nothing. A scratch cluster this file started has no such
-# ambiguity — nothing else could have prepared it — so it still applies the
-# schema itself.
-if not os.environ.get("TEST_SCHEMA_PREPARED"):
-    apply_schema(os.environ["DATABASE_URL"], embedding_dim=64)
+
+def _provision() -> None:
+    """Start or derive every service this process will actually use.
+
+    Called from `pytest_configure`, and not from module import, because of one
+    measured fact: under xdist the controller imports this file but never
+    imports a test module. Provisioning at import gave the controller a
+    Postgres cluster and a redis-server it had no use for — and worse, a
+    connection pool on the database the workers were about to clone, which
+    `CREATE DATABASE ... TEMPLATE` refuses while any session holds it.
+
+    Serial runs reach this the same way they always did, one process doing all
+    of it, and nothing below behaves differently for them.
+    """
+    global _REDIS, _PG, _WORKER_DB, _OWNED_REDIS_DB
+
+    # Tests use the same async RedisCache production does, against a real
+    # redis-server. A second, synchronous implementation used to exist for the
+    # suite alone; it drifted eight methods behind and broke the attachment
+    # agent the moment Redis was present. Running without Redis has the same
+    # shape of problem one layer down — rate limits, idempotency, the session
+    # cache and the concurrency slots all take their fallback path, so the code
+    # production runs is the code the suite does not.
+    redis_url = os.environ.get("TEST_REDIS_URL")
+    if redis_url:
+        if _worker:
+            # A numbered database of this worker's own. The one we were given
+            # is left alone: it is what a serial run uses, and it may be
+            # somebody's.
+            redis_url = worker_redis_url(redis_url, _worker)
+            _OWNED_REDIS_DB = True
+    else:
+        _REDIS = ScratchRedis()
+        if _REDIS.available:
+            redis_url = _REDIS.start()
+            _OWNED_REDIS_DB = True
+        else:
+            # No redis-server here. The suite still runs on the documented
+            # fallback, which is what a Redis outage does in production — but
+            # say so, because a green run then means less than it looks like.
+            _REDIS = None
+            print("redis-server not found: running on the in-process fallback")
+    if redis_url:
+        # redis_url is a database-managed setting with no environment variable
+        # of its own, so exporting REDIS_URL does nothing — which is what
+        # conftest used to do, and why the suite ran on the fallback while
+        # looking configured. Move the *default* instead of storing a value:
+        # seeding through INSTANCE_SETTINGS_JSON would spend the instance's one
+        # first boot, and writing a row would make every "has an operator
+        # configured anything" check answer yes.
+        from liminallm.config import SYSTEM_SETTINGS_DEFAULTS, Settings
+
+        Settings.model_fields["redis_url"].default = redis_url
+        Settings.model_rebuild(force=True)
+        SYSTEM_SETTINGS_DEFAULTS["redis_url"] = redis_url
+
+    base_url = os.environ.get("TEST_DATABASE_URL")
+    prepared = bool(os.environ.get("TEST_SCHEMA_PREPARED"))
+    if not base_url:
+        # A cluster of its own, so an xdist worker needs nothing derived: it
+        # already owns the whole server.
+        _PG = ScratchPostgres()
+        if not _PG.available:
+            raise RuntimeError(
+                "The test suite needs Postgres (initdb not found). Install "
+                "postgresql-16 + postgresql-16-pgvector, or set TEST_DATABASE_URL."
+            )
+        os.environ["DATABASE_URL"] = _PG.start()
+    elif _worker:
+        # Shared server. Each worker gets a database of its own, because the
+        # per-test TRUNCATE below assumes exclusive ownership — four workers
+        # truncating one database is not flakiness, it is every test deleting
+        # every other test's rows.
+        _WORKER_DB = create_worker_database(
+            base_url, _worker, os.environ["LIMINALLM_TEST_RUN"], prepared=prepared
+        )
+        os.environ["DATABASE_URL"] = _WORKER_DB
+    else:
+        os.environ["DATABASE_URL"] = base_url
+
+    # TEST_SCHEMA_PREPARED says "something already applied the schema to this
+    # database; do not touch it". CI sets it after running scripts/migrate.sh,
+    # so the suite runs against the database the deploy command actually
+    # produced.
+    #
+    # Without it, applying the schema here unconditionally means the suite
+    # proves nothing about migrate.sh: gut the script to `exit 0` and CI's
+    # schema step still succeeds, conftest then builds the whole schema from
+    # scratch on the empty database it left behind, and the suite goes green
+    # over a deploy command that does nothing. A scratch cluster this file
+    # started has no such ambiguity — nothing else could have prepared it — so
+    # it still applies the schema itself.
+    #
+    # A worker database is already in the right state either way:
+    # `create_worker_database` clones a prepared one and builds an unprepared
+    # one, which is the same distinction made one level up.
+    if not prepared and _WORKER_DB is None:
+        apply_schema(os.environ["DATABASE_URL"], embedding_dim=64)
+
+    use_shared_store(get_test_store())
+
+
 from fastapi.dependencies import utils as fastapi_dep_utils  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -102,13 +174,15 @@ from liminallm.service.runtime import (  # noqa: E402
     use_shared_store,
 )
 
-# One store for the session. The runtime is rebuilt before and after every
-# test, and building one used to construct a connection pool and re-verify the
-# whole schema each time — measured at about a quarter of the suite's wall
-# clock. What per-test state the store does carry — its in-memory session
-# cache, and the bootstrap artifacts TRUNCATE removes — is restored by
+# One store per process. The runtime is rebuilt before and after every test,
+# and building one used to construct a connection pool and re-verify the whole
+# schema each time — measured at about a quarter of the suite's wall clock.
+# What per-test state the store does carry — its in-memory session cache, and
+# the bootstrap artifacts TRUNCATE removes — is restored by
 # `reset_shared_store` below, which costs a fraction of rebuilding it.
-use_shared_store(get_test_store())
+#
+# Created in `_provision`, not here, so the xdist controller does not open a
+# pool on a database its workers are about to clone.
 
 # Avoid import-time failures for routes that rely on python-multipart in constrained test environments.
 fastapi_dep_utils.ensure_multipart_is_installed = lambda: None
@@ -157,11 +231,44 @@ def admin_headers(client):
     return _signup(client, "admin", admin=True)
 
 
+def _flush_owned_redis() -> None:
+    """Empty this process's Redis database between tests.
+
+    Only when we own it — a scratch server we started, or the numbered
+    database derived for this worker. An externally supplied base database in
+    a serial run is not ours to empty, and flushing it is the Redis-side
+    version of four workers truncating one Postgres.
+
+    Without this, isolation between tests rested on every key carrying a fresh
+    UUID and on TTLs expiring. That holds until one test asserts something
+    about a key another test's name happened to collide with.
+    """
+    if not _OWNED_REDIS_DB:
+        return
+    from liminallm.config import get_settings
+
+    url = get_settings().redis_url
+    if not url:
+        return
+    try:
+        from redis import Redis
+
+        client = Redis.from_url(url, decode_responses=True)
+        try:
+            client.flushdb()
+        finally:
+            client.close()
+    except Exception:  # pragma: no cover - a Redis that went away mid-run
+        pass
+
+
 def _truncate_all() -> None:
     """Wipe every table between tests.
 
-    One database serves the whole session; this is what makes tests independent
-    of each other without a cluster per test.
+    One database serves this process; this is what makes tests independent of
+    each other without a cluster per test. Under xdist that database belongs
+    to one worker — see `_provision` — because this statement assumes nothing
+    else is looking at it.
     """
     pg = get_test_store()
     with pg.pool.connection() as conn:
@@ -179,6 +286,7 @@ def _truncate_all() -> None:
 @pytest.fixture(autouse=True)
 def reset_runtime_state():
     _truncate_all()
+    _flush_owned_redis()
     # TRUNCATE takes the bootstrap artifacts with everything else, and it
     # cannot reach the store's in-memory session cache. The store is built
     # once for the session, so nothing else puts either back.
@@ -202,13 +310,26 @@ def pytest_pyfunc_call(pyfuncitem):
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "asyncio: mark test as async")
-    config.addinivalue_line(
-        "markers", "slow: spawns a subprocess or waits on a real timeout"
-    )
+    # `slow` is declared in pyproject.toml. Declaring it a second time here
+    # with different words is how two descriptions of one marker drift.
+
+    # The xdist controller imports this file and then never imports a test
+    # module — measured — so it has no use for a database, a Redis or a store,
+    # and holding a pool on the database its workers are about to clone would
+    # stop them cloning it. `workerinput` is xdist's own answer to "am I a
+    # worker"; `dist` is its answer to "is this run parallel at all".
+    is_worker = hasattr(config, "workerinput")
+    is_controller = not is_worker and config.getoption("dist", "no") != "no"
+    if is_controller:
+        return
+    _provision()
 
 
 def pytest_sessionfinish(session, exitstatus):
     close_test_store()
+    # After the pool is closed, so nothing is connected to it.
+    if _WORKER_DB is not None:
+        drop_worker_database(os.environ["TEST_DATABASE_URL"], _WORKER_DB)
     shutil.rmtree(_test_tmp_dir, ignore_errors=True)
     if _PG is not None:
         _PG.stop()

@@ -28,8 +28,76 @@ import subprocess
 import tempfile
 import time
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+from uuid import uuid4
 
 _PG_BIN_CANDIDATES = ("/usr/lib/postgresql/16/bin", "/usr/lib/postgresql/15/bin")
+
+#: Postgres truncates identifiers at 63 bytes, and a silently truncated name is
+#: two workers sharing a database.
+_MAX_IDENTIFIER = 63
+
+
+def worker_id() -> str:
+    """Which xdist worker this process is, or "" when there is no xdist.
+
+    Set by xdist in the worker's environment before conftest is imported —
+    measured, not assumed — so everything a worker must own can be derived at
+    module scope.
+    """
+    return os.environ.get("PYTEST_XDIST_WORKER", "")
+
+
+def run_id() -> str:
+    """One id per pytest invocation, shared by every worker in it.
+
+    The controller imports conftest first and `setdefault` stores the value in
+    its environment; execnet spawns workers from that environment, so they all
+    read the controller's. Measured the same way.
+
+    It exists so two pytest invocations running at once cannot both derive
+    `..._gw0` and share a database. Worker id alone is not unique across runs.
+    """
+    return os.environ.setdefault("LIMINALLM_TEST_RUN", uuid4().hex[:6])
+
+
+def worker_database_name(base: str, worker: str, run: str) -> str:
+    """The database this worker owns, derived from the one it was given.
+
+    Databases rather than schemas: the schema, its triggers and a good deal of
+    the store address `public` by name and cast with `::regclass`, so a
+    per-worker schema would be a different production model, tested. A
+    per-worker database is the same one, twice.
+    """
+    suffix = f"_xd_{run}_{worker}"
+    return base[: _MAX_IDENTIFIER - len(suffix)] + suffix
+
+
+def worker_redis_url(base_url: str, worker: str) -> str:
+    """A numbered Redis database of this worker's own.
+
+    Cheaper than a server each, and cheaper than prefixing every key — which
+    would also mean the suite testing key derivation it invented rather than
+    the derivation production uses. The base database is left alone: it is
+    what a serial run uses, and it may be somebody's.
+    """
+    index = _worker_index(worker) + 1
+    if index > 15:
+        raise RuntimeError(
+            f"Redis has 16 numbered databases and {worker} would need "
+            f"number {index}. Run fewer workers, or give each one a server "
+            "with TEST_REDIS_URL unset."
+        )
+    parts = urlsplit(base_url)
+    return urlunsplit(parts._replace(path=f"/{index}"))
+
+
+def _worker_index(worker: str) -> int:
+    """`gw3` is 3. Anything else is a name this code does not understand."""
+    digits = worker[2:] if worker.startswith("gw") else ""
+    if not digits.isdigit():
+        raise RuntimeError(f"cannot derive resources for xdist worker {worker!r}")
+    return int(digits)
 
 
 def _free_port(env_override: str | None = None) -> int:
@@ -213,3 +281,64 @@ def apply_schema(url: str, *, embedding_dim: int = 64) -> None:
          "-q", "-f", str(root / "sql" / "schema.sql")],
         check=True, stdout=subprocess.DEVNULL, timeout=180,
     )
+
+
+def _maintenance_url(base_url: str) -> str:
+    """A connection that is not to the database we are about to clone.
+
+    `CREATE DATABASE ... TEMPLATE t` refuses while any session is connected to
+    `t`, and a session connected to `t` in order to issue the statement counts.
+    So the statement is issued against `postgres`, which every server has.
+    """
+    parts = urlsplit(base_url)
+    return urlunsplit(parts._replace(path="/postgres"))
+
+
+def create_worker_database(base_url: str, worker: str, run: str, *, prepared: bool) -> str:
+    """Give one xdist worker a database of its own, and return its URL.
+
+    Two provisioning histories, and the difference between them is the whole
+    reason this is not one line:
+
+    * `TEST_SCHEMA_PREPARED` means something outside this suite already built
+      the schema — CI runs `scripts/migrate.sh` and then sets it, precisely so
+      that conftest cannot quietly repair a deploy command that does nothing.
+      A worker must therefore *clone* that database rather than build its own,
+      or the invariant is lost the moment the suite runs in parallel: gut
+      migrate.sh, and every worker would rebuild the schema from scratch and
+      go green over it.
+    * Without it, the database this suite was handed is one it prepared
+      itself, so an empty database plus `apply_schema` is the same thing.
+
+    The worker owns what it creates and drops it at the end. Nothing here ever
+    writes to the base database.
+    """
+    import psycopg
+
+    parts = urlsplit(base_url)
+    base_name = parts.path.lstrip("/")
+    name = worker_database_name(base_name, worker, run)
+    with psycopg.connect(_maintenance_url(base_url), autocommit=True) as conn:
+        conn.execute(f'DROP DATABASE IF EXISTS "{name}"')
+        if prepared:
+            conn.execute(f'CREATE DATABASE "{name}" TEMPLATE "{base_name}"')
+        else:
+            conn.execute(f'CREATE DATABASE "{name}"')
+    url = urlunsplit(parts._replace(path=f"/{name}"))
+    if not prepared:
+        apply_schema(url, embedding_dim=64)
+    return url
+
+
+def drop_worker_database(base_url: str, url: str) -> None:
+    """Remove what this worker created, and only that."""
+    import psycopg
+
+    name = urlsplit(url).path.lstrip("/")
+    if name == urlsplit(base_url).path.lstrip("/"):
+        raise RuntimeError("refusing to drop the database this run was given")
+    try:
+        with psycopg.connect(_maintenance_url(base_url), autocommit=True) as conn:
+            conn.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
+    except Exception:  # pragma: no cover - a server going away at teardown
+        pass
