@@ -669,7 +669,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             "vars": vars_scope,
         }
         await self._retire_workflow_state(state_key)
-        await self.cache_conversation_state(conversation_id, history)
+        await self.cache_conversation_state(conversation_id, history, user_id)
         return result
 
     async def _handle_node_failure(
@@ -1091,7 +1091,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
             keep_tokens=self.history_budget(),
             count=self._count_fn(),
         )
-        await self.cache_conversation_state(conversation_id, history)
+        await self.cache_conversation_state(conversation_id, history, user_id)
         return history
 
     # More messages than any window realistically holds verbatim; a bound so
@@ -1289,18 +1289,37 @@ class WorkflowEngine(WorkflowStreamingMixin):
         return normalized_context, normalized_history
 
     async def cache_conversation_state(
-        self, conversation_id: Optional[str], history: List[Message]
+        self,
+        conversation_id: Optional[str],
+        history: List[Message],
+        user_id: Optional[str],
     ) -> None:
+        """Cache the trimmed history, unless the account has been erased.
+
+        This writes the conversation's own messages into `chat:summary`, so a
+        turn that loaded them from Postgres and wrote them back after the
+        account was deleted restored the erased content for another hour. The
+        owner is held for the write; see `PostgresStore.hold_live_user`.
+
+        `user_id` has no default. It may be None — a caller without one is not
+        a principal's turn, and there is no account lifetime to hold — but it
+        has to be passed, because a default is how a call site loses the guard
+        without anyone noticing.
+        """
         if not conversation_id or not self.cache:
             return
         serialized = self._serialize_messages(history)  # already budget-trimmed
-        await self.cache.set_conversation_summary(
-            conversation_id,
-            {
-                "recent_messages": serialized,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
-            },
-        )
+        payload = {
+            "recent_messages": serialized,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if user_id is None:
+            await self.cache.set_conversation_summary(conversation_id, payload)
+            return
+        with self.store.hold_live_user(user_id) as live:
+            if not live:
+                return
+            await self.cache.set_conversation_summary(conversation_id, payload)
 
     async def _persist_workflow_state(self, state_key: str, state: dict) -> None:
         if not self.cache:

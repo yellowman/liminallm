@@ -206,7 +206,9 @@ async def finish(
             limit=runtime.settings.max_page_size,
             user_id=turn.user_id,
         )
-        await runtime.workflow.cache_conversation_state(turn.conversation_id, history)
+        await runtime.workflow.cache_conversation_state(
+            turn.conversation_id, history, turn.user_id
+        )
 
     return assistant_message
 

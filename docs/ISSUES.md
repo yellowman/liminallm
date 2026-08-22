@@ -10039,3 +10039,112 @@ It then paused at the guard rather than at the removal, which proved only that
 the guard was entered. A body moved outside the `with` survived that version.
 It pauses at the per-account helper now, so the assertion is taken at the
 moment the files are removed.
+
+### 2G.4 carry-over: the write side of the account lifetime
+
+**MEDIUM: the purge was complete at an instant, and an in-flight request put
+the content back.** Requests authorized before a deletion are deliberately
+allowed to finish, and they finish by writing:
+
+```
+CHAT                          ADMIN DELETE
+----                          ------------
+authorized as U
+turn finishes
+                              delete U
+                              purge every cached key of U
+                              200
+store the idempotency record
+  -> the completed response,
+     back for 24 hours
+```
+
+An idempotency record holds a completed API response, which for a chat turn is
+the assistant's message, so this is the account's own content restored under a
+key naming the account, minutes after the erasure returned 200. Workflow
+history caching is the second reproducer: it loads the messages from Postgres
+and later writes them into `chat:summary`, and the account can be erased and
+purged between those two steps.
+
+This is not an authentication hole. Access tokens are re-checked against
+Postgres, so a cache entry cannot make a deleted principal live again. It is a
+content-retention hole, which is what the erasure is about.
+
+`hold_live_user` is the write-side guard, on the same lock as the collectors'
+`hold_user_lifetime` and deliberately not the same question. That one asks
+"may a collector act inside this namespace?", which is true for a directory
+that is not an account at all; this one asks "is this principal still here?",
+which for the same input is false. Reusing the collector's answer would let a
+caller write on behalf of something that was never an account.
+
+A liveness check before the write does not close this. That is the same
+check-then-act the collectors had, one participant further along. Only a lock
+held across the decision and the write leaves two histories: the writer holds
+it first and the deletion waits, so the purge that follows removes what was
+just written; or the deletion holds it first and the writer then finds no
+account and writes nothing.
+
+`cache_conversation_state` takes `user_id` with no default. It may be None — a
+caller without one is not a principal's turn — but it has to be passed,
+because a default is how a call site loses the guard without anyone noticing.
+
+The idempotency slot is guarded as well as the result. Guarding only the
+result left an in-progress marker under a key naming the erased account, for a
+day, past a purge that had already run. When the account is gone the slot
+reports itself acquired and writes nothing, so the request still finishes and
+leaves no `idemp:` key behind at all.
+
+A name that is not a user id is *not* refused by this guard, and the reasoning
+is the opposite of the collector's. `app_user.id` is a UUID, so such a name can
+never have been an account, can never be erased, and can therefore never have
+anything to resurrect; refusing it would only break idempotency for a caller
+the erasure has no claim on. The two guards differ where it matters — an id
+with no account row and no retirement is debris to a collector and not a
+principal to a writer.
+
+Not guarded, and why: the remaining user-scoped cache writes are session
+activity and rotation timestamps, MFA counters, the router cache and
+concurrency slots. None carries conversation content, each is bounded by a
+short TTL, and each guarded write costs a synchronous Postgres round trip on a
+hot path. The two content-bearing writers are guarded.
+
+**Operational: the generation sweep's critical section was not bounded by its
+own work.** The account's lifetime is held for a user's whole generation pass,
+and inside it `generation_lock` waited up to 30 seconds per candidate blob —
+so a pathological account produced `scan + N × 30s`, and its own deletion
+inherited all of it.
+
+The sweep takes each blob's lock without waiting now. The upload has to wait,
+because it must publish that object; the sweep does not, because a blob it
+skips is collected on the next pass. The alternative — shrinking the critical
+section to each blob — would have nested the account lock inside the file lock
+and created a lock ordering that does not exist anywhere else in the system.
+
+### Mutations
+
+| Mutation | Killed by |
+|---|---|
+| the write guard prechecks liveness without holding | both in-flight reds |
+| the write guard answers the collector's question | the two-guards red |
+| the idempotency record is written outside the guard | the idempotency red |
+| the conversation summary is written outside the guard | the summary red |
+| the idempotency slot is claimed outside the guard | the already-gone red |
+| the sweep waits on a contended blob | the timing red, at 30.7s |
+
+The in-flight reds cannot run on the previous commit, because their seam is
+the guard. The first mutation is what stands in for that, and it is the
+previous behaviour exactly: liveness checked, nothing held.
+
+Two reds had to be rewritten, and the guard itself had to be corrected.
+
+The sweep-timing red first held the lock of a blob an attachment still
+referenced, so the sweep skipped it before ever reaching the lock and the
+blocking wait survived. It holds an unreferenced generation now, which is the
+only kind the sweep tries to take.
+
+The write guard first refused a name that is not a user id, which broke three
+idempotency tests that use a synthetic principal — correctly, because such a
+principal has no account to erase and lost its idempotency for nothing. The
+red that was meant to separate the two guards had been asserting that
+over-correction, so it asserts the real distinction instead: an id with no
+account row and no retirement.

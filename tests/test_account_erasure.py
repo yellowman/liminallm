@@ -21,6 +21,8 @@ identity-derived namespace goes at once.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import uuid
 from pathlib import Path
 
@@ -928,6 +930,301 @@ class TestHotStateGoesWithTheAccount:
             "SELECT COUNT(*) AS n FROM user_namespace_retirement WHERE user_id = %s",
             (user_id,),
         ) == 1
+
+
+class TestAnInFlightRequestCannotUndoTheErasure:
+    """The purge is complete at an instant. That is not the same as gone.
+
+    A request authorized before the deletion is allowed to finish, and it
+    finishes by writing. Every cached write those requests make lands after
+    the purge has already run, so the erased account's own content comes back
+    under a key naming the account, for as long as that key's TTL:
+
+        CHAT                          ADMIN DELETE
+        ----                          ------------
+        authorized as U
+        turn finishes
+                                      delete U
+                                      purge every cached key of U
+                                      200
+        store the idempotency record
+          -> the completed response,
+             back for 24 hours
+
+    A liveness check before the write does not close it — that is the same
+    check-then-act the collectors had, one participant further along. Only a
+    lock held across the decision and the write does.
+    """
+
+    async def _forced_schedule(
+        self, client, user_id, admin_headers, write, key_exists
+    ):
+        """Pause a cache write mid-flight, then erase the account under it.
+
+        Returns nothing; asserts both directions of the one property. While
+        the writer holds the account the deletion must still be waiting, and
+        once everything settles the key must not exist.
+        """
+        import threading
+
+        runtime = get_runtime()
+        reached = threading.Event()
+        release = threading.Event()
+        real = runtime.store.hold_live_user
+
+        @contextlib.contextmanager
+        def pause_inside(target_user_id):
+            with real(target_user_id) as live:
+                if target_user_id == user_id:
+                    reached.set()
+                    assert release.wait(timeout=30), "the writer was never released"
+                yield live
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(runtime.store, "hold_live_user", pause_inside)
+        deletion: dict = {}
+
+        def delete_the_account():
+            deletion["status"] = client.delete(
+                f"/v1/admin/users/{user_id}", headers=admin_headers
+            ).status_code
+
+        def run_the_write():
+            asyncio.run(write())
+
+        writer = threading.Thread(target=run_the_write, daemon=True)
+        deleter = threading.Thread(target=delete_the_account, daemon=True)
+        try:
+            writer.start()
+            assert reached.wait(timeout=30), "the write never reached the guard"
+            deleter.start()
+            # Long enough for an unguarded deletion to commit and purge, which
+            # is the schedule under test.
+            deleter.join(timeout=3)
+            assert deleter.is_alive() and "status" not in deletion, (
+                "the account was erased and purged while a write on its "
+                "behalf was already in flight"
+            )
+            release.set()
+            writer.join(timeout=30)
+            deleter.join(timeout=30)
+        finally:
+            release.set()
+            monkeypatch.undo()
+
+        assert not writer.is_alive() and not deleter.is_alive()
+        assert deletion.get("status") in (200, 204), deletion
+        assert not await key_exists(), (
+            "an in-flight request wrote the erased account's content back "
+            "into the cache after the purge had already run"
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_in_flight_idempotency_record_does_not_resurrect(self, client):
+        from liminallm.service.runtime import _set_cached_idempotency_record
+
+        runtime = get_runtime()
+        if runtime.cache is None:
+            pytest.skip("no Redis in this environment")
+        user_id, _, headers = _account(client)
+        _, _, admin_headers = _account(client, admin=True)
+        key = _unique("key")
+        secret = f"SECRET-{uuid.uuid4().hex[:10]}"
+
+        async def write():
+            await _set_cached_idempotency_record(
+                runtime,
+                "chat",
+                user_id,
+                key,
+                {"status": "completed", "response": {"message": secret}},
+            )
+
+        async def key_exists():
+            return [
+                k
+                async for k in runtime.cache.client.scan_iter(
+                    match=f"idemp:*{user_id}*", count=500
+                )
+            ]
+
+        await self._forced_schedule(
+            client, user_id, admin_headers, write, key_exists
+        )
+
+    @pytest.mark.asyncio
+    async def test_an_in_flight_conversation_summary_does_not_resurrect(self, client):
+        runtime = get_runtime()
+        if runtime.cache is None:
+            pytest.skip("no Redis in this environment")
+        user_id, _, headers = _account(client)
+        _, _, admin_headers = _account(client, admin=True)
+        conversation = client.post(
+            "/v1/conversations", headers=headers, json={"title": "chat"}
+        ).json()["data"]["id"]
+        history = runtime.store.list_messages(conversation, user_id=user_id)
+
+        async def write():
+            await runtime.workflow.cache_conversation_state(
+                conversation, history, user_id
+            )
+
+        async def key_exists():
+            return await runtime.cache.get_conversation_summary(conversation)
+
+        await self._forced_schedule(
+            client, user_id, admin_headers, write, key_exists
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_write_for_an_account_that_is_already_gone_does_nothing(
+        self, client
+    ):
+        """The other history: the deletion took the lock first."""
+        from liminallm.service.runtime import _set_cached_idempotency_record
+
+        runtime = get_runtime()
+        if runtime.cache is None:
+            pytest.skip("no Redis in this environment")
+        user_id, _, headers = _account(client)
+        _, _, admin_headers = _account(client, admin=True)
+        conversation = client.post(
+            "/v1/conversations", headers=headers, json={"title": "chat"}
+        ).json()["data"]["id"]
+        history = runtime.store.list_messages(conversation, user_id=user_id)
+
+        assert client.delete(
+            f"/v1/admin/users/{user_id}", headers=admin_headers
+        ).status_code in (200, 204)
+
+        # Exactly what the in-flight request would have done, a moment late.
+        await _set_cached_idempotency_record(
+            runtime,
+            "chat",
+            user_id,
+            _unique("key"),
+            {"status": "completed", "response": {"message": "too late"}},
+        )
+        await runtime.workflow.cache_conversation_state(
+            conversation, history, user_id
+        )
+
+        # And through the real guard, which claims a slot before it has a
+        # result to store. That claim is a key naming the account too, and the
+        # purge it would have to survive has already run.
+        from liminallm.api.idempotency import IdempotencyGuard
+        from liminallm.api.schemas import Envelope
+
+        async with IdempotencyGuard(
+            "chat", user_id, _unique("key"), require=True
+        ) as guard:
+            assert guard.cached is None
+            await guard.store_result(
+                Envelope(status="ok", data={"late": True}, request_id=guard.request_id)
+            )
+
+        left = [
+            k
+            async for k in runtime.cache.client.scan_iter(
+                match=f"idemp:*{user_id}*", count=500
+            )
+        ]
+        assert left == [], f"a write for an erased account created keys: {left}"
+        assert await runtime.cache.get_conversation_summary(conversation) is None
+
+    def test_a_sweep_does_not_make_a_deletion_wait_on_an_upload(self, client):
+        """The account's lifetime is held; the blob's lock is not waited on.
+
+        Holding the account across a blocking per-blob wait means a deletion
+        inherits that wait, once per contended blob. The sweep takes each
+        blob's lock without waiting instead, because a blob it skips is one
+        the next pass collects — the upload is the side that must publish.
+        """
+        import hashlib
+        import os
+        import threading
+        import time as time_
+
+        from liminallm.service.attachments import (
+            generation_lock,
+            store_generation,
+            sweep_generations,
+        )
+
+        user_id, _, headers = _account(client)
+        runtime = get_runtime()
+        root = runtime.settings.shared_fs_root
+
+        # Unreferenced and old, so the sweep actually reaches its lock. A blob
+        # an attachment still names is skipped before that, which is why the
+        # first version of this test passed with the blocking wait in place.
+        body = f"orphan {uuid.uuid4().hex}".encode()
+        checksum = hashlib.sha256(body).hexdigest()
+        blob = store_generation(root, user_id, body, checksum)
+        assert blob is not None and blob.is_file()
+        week_ago = time_.time() - 7 * 86400
+        os.utime(blob, (week_ago, week_ago))
+        assert checksum not in runtime.store.referenced_attachment_checksums(user_id)
+
+        held = threading.Event()
+        release = threading.Event()
+
+        def hold_the_blob():
+            with generation_lock(root, user_id, checksum):
+                held.set()
+                release.wait(timeout=30)
+
+        holder = threading.Thread(target=hold_the_blob, daemon=True)
+        holder.start()
+        try:
+            assert held.wait(timeout=10), "the fixture never took the blob lock"
+            started = time_.monotonic()
+            sweep_generations(runtime.store, root, grace_seconds=0)
+            elapsed = time_.monotonic() - started
+        finally:
+            release.set()
+            holder.join(timeout=30)
+
+        # The blocking wait is 30s per contended blob; anything near that means
+        # the sweep queued behind the upload while holding the account.
+        assert elapsed < 10, (
+            f"the sweep waited {elapsed:.1f}s on a contended generation lock "
+            "while holding the account's lifetime, which is a wait the "
+            "account's own deletion would have inherited"
+        )
+        assert blob.exists(), "the contended blob was taken anyway"
+
+    def test_the_two_guards_answer_different_questions(self, client):
+        """Debris to a collector is not a principal to a writer.
+
+        A user id with no account row and no retirement — the namespace of an
+        account erased long enough ago that its record was cleared — is
+        something a collector may act on and something no write may happen on
+        behalf of. Reusing the collector's boolean on the write side is how a
+        caller ends up writing for an account that is not there.
+        """
+        runtime = get_runtime()
+        gone = str(uuid.uuid4())
+        assert runtime.store.get_user(gone) is None
+        assert _count(
+            "SELECT COUNT(*) AS n FROM user_namespace_retirement WHERE user_id = %s",
+            (gone,),
+        ) == 0
+
+        with runtime.store.hold_user_lifetime(gone) as collectable:
+            assert collectable is True
+        with runtime.store.hold_live_user(gone) as live:
+            assert live is False, (
+                "the write guard treated an id with no account as a principal"
+            )
+
+        # And they agree on a live account, so the difference is about
+        # existence rather than about being generally stricter.
+        live_id, _, _ = _account(client)
+        with runtime.store.hold_user_lifetime(live_id) as collectable:
+            assert collectable is True
+        with runtime.store.hold_live_user(live_id) as live:
+            assert live is True
 
 
 def test_the_audit_log_does_not_keep_the_erased_email():

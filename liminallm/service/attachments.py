@@ -126,7 +126,7 @@ def generation_path(fs_root: str, user_id: str, checksum: Any) -> Optional[Path]
     return generation_root(fs_root, user_id) / text[:2] / text
 
 
-def generation_lock(fs_root: str, user_id: str, checksum: Any):
+def generation_lock(fs_root: str, user_id: str, checksum: Any, *, timeout=None):
     """Hold a checksum still while it is being adopted or reclaimed.
 
     `store_generation` returns an object that already exists without touching
@@ -141,8 +141,20 @@ def generation_lock(fs_root: str, user_id: str, checksum: Any):
     sweep holds it while it re-asks whether the checksum is referenced. The
     re-ask inside the lock is the point — a decision made from a snapshot
     taken before the lock still deletes a reference created while waiting.
+
+    `timeout=0` makes the attempt non-blocking, which is what the sweep uses.
+    The upload has to wait, because it must publish this object; the sweep
+    does not, because a blob it skips is collected on the next pass. That
+    difference is load-bearing rather than cosmetic: the sweep waits while
+    holding the account's lifetime lock, so a blocking wait per candidate is a
+    wait the account's own deletion inherits, multiplied by however many
+    contended blobs the account has.
     """
-    return path_lock(fs_root, f"attachment-generation:{user_id}:{checksum}")
+    return path_lock(
+        fs_root,
+        f"attachment-generation:{user_id}:{checksum}",
+        **({} if timeout is None else {"timeout": timeout}),
+    )
 
 
 def store_generation(
@@ -641,7 +653,10 @@ def _sweep_one_users_generations(store, fs_root, user_id, base, cutoff) -> int:
         except OSError:
             continue
         try:
-            with generation_lock(fs_root, user_id, blob.name):
+            # Non-blocking: this runs with the account's lifetime held, and a
+            # contended blob is one the next pass takes instead. Waiting here
+            # would make the account's own deletion queue behind an upload.
+            with generation_lock(fs_root, user_id, blob.name, timeout=0):
                 # Asked again, inside the lock. The snapshot above was taken
                 # before any attachment adopting this object could be made to
                 # wait, so acting on it alone deletes a reference created

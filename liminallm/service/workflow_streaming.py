@@ -370,7 +370,7 @@ class WorkflowStreamingMixin:
             },
         }
 
-        await self.cache_conversation_state(conversation_id, history)
+        await self.cache_conversation_state(conversation_id, history, user_id)
 
     async def _stream_llm_node(
         self,

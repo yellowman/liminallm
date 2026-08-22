@@ -3111,6 +3111,62 @@ class PostgresStore:
             ).fetchone()
             yield row is None
 
+    @contextlib.contextmanager
+    def hold_live_user(self, user_id: str):
+        """Hold one account's lifetime, and say whether it still exists.
+
+        The write-side counterpart of `hold_user_lifetime`, on the same lock
+        and deliberately not the same question. That one asks "may a collector
+        act inside this namespace?", which is true for a directory that is not
+        an account at all; this one asks "is this principal still here?", which
+        for the same input is false. A caller that reused the collector's
+        answer would write on behalf of an account that never existed.
+
+        What it closes is the other half of the erasure boundary. Requests
+        authorized before the deletion are allowed to finish, and they finish
+        by writing:
+
+            CHAT                          ADMIN DELETE
+            ----                          ------------
+            authorized as U
+            turn finishes
+                                          delete U
+                                          purge every cached key of U
+                                          200
+            store the idempotency record
+              -> the completed response,
+                 back for 24 hours
+
+        The purge is complete at the instant it runs, and that is not the same
+        as the account's content being gone. Only a lock held across the
+        decision and the write makes it so: either the writer holds it first
+        and the deletion waits, and the purge that follows removes what was
+        just written; or the deletion holds it first, and the writer then sees
+        no account and writes nothing.
+
+        This is not an authentication hole either way. Access tokens are
+        re-checked against Postgres, so a cache entry cannot make a deleted
+        principal live again. It is a content-retention hole, which is what
+        the erasure is about.
+
+        The two guards differ where it matters: an id with no `app_user` row
+        and no retirement is debris to a collector and not a principal to a
+        writer. They agree on a name that is not a user id at all, and for the
+        opposite reason to the collector's — `app_user.id` is a UUID, so such
+        a name can never have been an account, can never be erased, and can
+        therefore never have anything to resurrect. Refusing it would only
+        break idempotency for a caller the erasure has no claim on.
+        """
+        if not _is_uuid(user_id):
+            yield True
+            return
+        with self._connect() as conn, conn.transaction():
+            self._lock_user_lifetime(conn, user_id)
+            row = conn.execute(
+                "SELECT 1 FROM app_user WHERE id = %s", (user_id,)
+            ).fetchone()
+            yield row is not None
+
     def enrol_user_namespace_retirement(self, user_id: str) -> bool:
         """Record a namespace no account claims, at first observation.
 

@@ -764,17 +764,28 @@ async def _set_cached_idempotency_record(
     tenant_id: Optional[str] = None,
 ) -> None:
     expires_at = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
-    if runtime.cache:
-        # Issue 22.2: Pass tenant_id for multi-tenant isolation
-        await runtime.cache.set_idempotency_record(
-            route, user_id, key, record, ttl_seconds=ttl_seconds, tenant_id=tenant_id
-        )
-        return
-    async with runtime._local_idempotency_lock:
-        # Include tenant_id in in-memory key for multi-tenant isolation
-        cache_key = (tenant_id, route, user_id, key) if tenant_id else (route, user_id, key)
-        _cleanup_local_idempotency(runtime, datetime.now(timezone.utc))
-        runtime._local_idempotency[cache_key] = {**record, "expires_at": expires_at}
+    # Under the account's lifetime lock, because this record holds a completed
+    # API response and lives for a day. A request authorized before an erasure
+    # is allowed to finish, and finishing here after the erasure's purge put
+    # the account's own content back under a key naming the account. See
+    # `PostgresStore.hold_live_user`; the whole write is inside the guard, not
+    # after a question asked before it.
+    with runtime.store.hold_live_user(user_id) as live:
+        if not live:
+            return
+        if runtime.cache:
+            # Issue 22.2: Pass tenant_id for multi-tenant isolation
+            await runtime.cache.set_idempotency_record(
+                route, user_id, key, record, ttl_seconds=ttl_seconds, tenant_id=tenant_id
+            )
+            return
+        async with runtime._local_idempotency_lock:
+            # Include tenant_id in in-memory key for multi-tenant isolation
+            cache_key = (
+                (tenant_id, route, user_id, key) if tenant_id else (route, user_id, key)
+            )
+            _cleanup_local_idempotency(runtime, datetime.now(timezone.utc))
+            runtime._local_idempotency[cache_key] = {**record, "expires_at": expires_at}
 
 
 async def _acquire_idempotency_slot(
@@ -805,6 +816,14 @@ async def _acquire_idempotency_slot(
     """
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(seconds=ttl_seconds)
+
+    # Same guard as storing the result, so an erased account is left with no
+    # `idemp:` key at all rather than an in-progress marker the purge has
+    # already been past. Reporting the slot as acquired lets the request
+    # finish; storing its result is refused separately, by the same guard.
+    with runtime.store.hold_live_user(user_id) as live:
+        if not live:
+            return (True, None)
 
     if runtime.cache:
         # Issue 22.2: Pass tenant_id for multi-tenant isolation
