@@ -10439,3 +10439,65 @@ split across workers, so each worker builds that fixture again. `loadfile`
 makes that cost one-per-worker-that-sees-the-file, and keeps tests written
 next to each other running next to each other. It costs nothing measurable, so
 it is the default for the target, overridable with `XDIST_DIST=load`.
+
+### 2I.1 carry-over: the lease had two edges left
+
+**MEDIUM/HIGH: the database the caller named could itself be leased.**
+`claim_redis_database` always offered `1..15` and always put its ledger in
+database 0, without asking which database `TEST_REDIS_URL` named. So this was
+destructive:
+
+```
+TEST_REDIS_URL=redis://host:6379/1
+```
+
+The first worker claimed database 1 — the caller's — and then flushed it
+before every test, because the lease said it owned it. Every base-preservation
+red missed it, because the fixture's Redis was `/0`.
+
+The ledger lives in the database the URL names now, and that database is never
+a candidate. Two things follow: a worker's `FLUSHDB` cannot reach the ledger,
+and the only database this harness writes outside its own leases is the one it
+was pointed at.
+
+**MEDIUM: a worker that lost its lease flushed anyway.** Renewal read the
+holder and extended the claim if it matched, returned nothing, and swallowed
+its errors — and the caller flushed regardless:
+
+```
+RUN A                         RUN B
+-----                         -----
+holds /3
+its lease expires
+                              claims /3, writes state
+next test: renewal says
+  "not yours", silently
+FLUSHDB /3
+                              its state is gone
+```
+
+Release already compared before deleting, for exactly this reason; renewal
+needed the same. It is one Lua compare-and-expire now and it returns whether
+the claim still stands, and the per-test reset raises rather than flushing a
+database it no longer owns. A harness that has lost ownership must stop, not
+continue best-effort. An unreachable Redis answers False for the same reason:
+unknown is not owned.
+
+The 900-second TTL is left as it is. The implementation relies on every
+individual test being far shorter than that, and the slowest is about a
+minute. A heartbeat would be the next step if leases ever need to survive a
+debugger.
+
+### Mutations
+
+| Mutation | Killed by |
+|---|---|
+| the database the caller named is offered to a worker | the non-zero-base reds |
+| renewal reports success whether or not the lease is ours | the lost-lease red |
+| the run flushes without checking it still owns the database | the lost-lease red |
+
+The non-zero-base red runs against `redis://.../1` and fails on the previous
+commit, destroying the sentinel. The lost-lease red has the run hand its own
+claim to another holder and then start another test: the run must fail, and
+the other holder's state must survive. Standing in for an expiry, which has
+the same outcome and can be forced.

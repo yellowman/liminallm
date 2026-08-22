@@ -73,8 +73,11 @@ def worker_database_name(base: str, worker: str, run: str) -> str:
     return base[: _MAX_IDENTIFIER - len(suffix)] + suffix
 
 
-#: Where a claim on one numbered Redis database is recorded, in database 0.
-#: Database 0 is never a worker's, so nothing a worker does can remove these.
+#: Where a claim on one numbered Redis database is recorded. The ledger lives
+#: in whichever database `TEST_REDIS_URL` names, which is also the one no
+#: worker may lease — so the claims cannot be reached by a worker's `FLUSHDB`,
+#: and the only database this harness writes outside its own leases is the one
+#: the caller pointed it at.
 REDIS_LEASE_PREFIX = "liminallm:test:redis-db-lease"
 
 #: Long enough that no single test outruns it — the slowest is about a minute
@@ -82,7 +85,9 @@ REDIS_LEASE_PREFIX = "liminallm:test:redis-db-lease"
 #: databases come back on their own.
 REDIS_LEASE_TTL = 900
 
-#: Redis numbers its databases 0-15 and 0 is the ledger, so fifteen at once.
+#: Redis numbers its databases 0-15. Database 0 is left out even when it is
+#: not the ledger: it is the conventional default and the likeliest to hold
+#: somebody's data.
 REDIS_LEASE_SLOTS = range(1, 16)
 
 _RELEASE_IF_OURS = """
@@ -91,6 +96,38 @@ if redis.call('GET', KEYS[1]) == ARGV[1] then
 end
 return 0
 """
+
+_RENEW_IF_OURS = """
+if redis.call('GET', KEYS[1]) == ARGV[1] then
+    return redis.call('EXPIRE', KEYS[1], ARGV[2])
+end
+return 0
+"""
+
+
+def redis_database_index(url: str) -> int:
+    """The database number a Redis URL names. No path means 0."""
+    path = urlsplit(url).path.strip("/")
+    return int(path) if path.isdigit() else 0
+
+
+def _ledger(base_url: str):
+    """A client on the database the caller gave us, where claims are kept."""
+    import redis
+
+    return redis.Redis.from_url(base_url, decode_responses=True)
+
+
+def lease_candidates(base_url: str) -> list[int]:
+    """The numbers a worker may be given.
+
+    Never the one `TEST_REDIS_URL` itself names. That database is the caller's
+    — it holds the ledger, and a worker leasing it would flush it before every
+    test, which is the base-preservation rule inverted rather than bent.
+    Pointing the harness at `redis://host/1` is an ordinary thing to do.
+    """
+    base = redis_database_index(base_url)
+    return [index for index in REDIS_LEASE_SLOTS if index != base]
 
 
 def claim_redis_database(base_url: str, holder: str) -> tuple[str, int]:
@@ -110,14 +147,11 @@ def claim_redis_database(base_url: str, holder: str) -> tuple[str, int]:
     Returns the URL and the number, the latter so the holder can renew and
     eventually release it.
     """
-    import redis
-
     parts = urlsplit(base_url)
-    ledger = redis.Redis.from_url(
-        urlunsplit(parts._replace(path="/0")), decode_responses=True
-    )
+    candidates = lease_candidates(base_url)
+    ledger = _ledger(base_url)
     try:
-        for index in REDIS_LEASE_SLOTS:
+        for index in candidates:
             if ledger.set(
                 f"{REDIS_LEASE_PREFIX}:{index}", holder, nx=True, ex=REDIS_LEASE_TTL
             ):
@@ -125,29 +159,42 @@ def claim_redis_database(base_url: str, holder: str) -> tuple[str, int]:
     finally:
         ledger.close()
     raise RuntimeError(
-        f"every one of Redis's {len(REDIS_LEASE_SLOTS)} usable databases is "
-        "claimed by a test run. Wait for one to finish, run fewer workers, or "
-        "unset TEST_REDIS_URL so each worker starts a server of its own."
+        f"every one of the {len(candidates)} Redis databases this harness may "
+        "use is claimed by a test run. Wait for one to finish, run fewer "
+        "workers, or unset TEST_REDIS_URL so each worker starts a server of "
+        "its own."
     )
 
 
-def renew_redis_database(base_url: str, index: int, holder: str) -> None:
-    """Push the lease out again, for as long as this run is still running.
+def renew_redis_database(base_url: str, index: int, holder: str) -> bool:
+    """Push the lease out again, and say whether it is still ours.
 
     Called from the per-test reset, which already talks to Redis, so a live
     run renews continuously and a dead one does not renew at all.
-    """
-    import redis
 
-    parts = urlsplit(base_url)
-    ledger = redis.Redis.from_url(
-        urlunsplit(parts._replace(path="/0")), decode_responses=True
-    )
+    Compare-and-expire in one step, for the reason release compares before it
+    deletes: once a lease has expired the number may already belong to
+    somebody else, and a read followed by an `EXPIRE` would extend their
+    claim. The answer is returned rather than logged because the caller is
+    about to flush that database — a run that has lost its lease must stop,
+    not continue best-effort.
+
+    A Redis that cannot be reached answers False for the same reason: unknown
+    is not owned.
+    """
     try:
-        if ledger.get(f"{REDIS_LEASE_PREFIX}:{index}") == holder:
-            ledger.expire(f"{REDIS_LEASE_PREFIX}:{index}", REDIS_LEASE_TTL)
+        ledger = _ledger(base_url)
     except Exception:  # pragma: no cover - a Redis that went away mid-run
-        pass
+        return False
+    try:
+        return bool(
+            ledger.eval(
+                _RENEW_IF_OURS, 1,
+                f"{REDIS_LEASE_PREFIX}:{index}", holder, REDIS_LEASE_TTL,
+            )
+        )
+    except Exception:  # pragma: no cover - a Redis that went away mid-run
+        return False
     finally:
         ledger.close()
 
@@ -159,12 +206,7 @@ def release_redis_database(base_url: str, index: int, holder: str) -> None:
     belong to somebody else, and releasing it then would hand their database
     to a third run.
     """
-    import redis
-
-    parts = urlsplit(base_url)
-    ledger = redis.Redis.from_url(
-        urlunsplit(parts._replace(path="/0")), decode_responses=True
-    )
+    ledger = _ledger(base_url)
     try:
         ledger.eval(_RELEASE_IF_OURS, 1, f"{REDIS_LEASE_PREFIX}:{index}", holder)
     except Exception:  # pragma: no cover - a Redis that went away at teardown
@@ -310,8 +352,6 @@ def get_test_store():
     """
     global _STORE, _STORE_ROOT
     if _STORE is None:
-        from liminallm.storage.postgres import PostgresStore
-
         # The root the runtime resolves everything else against. A store built
         # by `Runtime` is handed `settings.shared_fs_root`, so the two agree by
         # construction; this one is built here, and minting a temporary
@@ -322,6 +362,7 @@ def get_test_store():
         # From the settings, which read SHARED_FS_ROOT — the throwaway root
         # conftest exports before any import.
         from liminallm.config import get_settings
+        from liminallm.storage.postgres import PostgresStore
 
         _STORE_ROOT = get_settings().shared_fs_root
         _STORE = PostgresStore(os.environ["DATABASE_URL"], fs_root=_STORE_ROOT)

@@ -126,6 +126,40 @@ def test_probe_holds_redis_state_while_another_run_flushes():
         client.close()
 
 
+#: Set for the run that must notice it no longer owns its database.
+_LOSE = os.environ.get("LIMINALLM_HARNESS_LOSE")
+
+
+@pytest.mark.skipif(not _LOSE, reason="only runs inside the nested harness run")
+def test_probe_gives_its_lease_away():
+    """Hand this run's claim to somebody else, then let it try another test.
+
+    Standing in for the schedule where a lease expires and another run takes
+    the number: the outcome is the same, and this one can be forced. The next
+    test's reset is what has to refuse — this one does nothing destructive
+    itself.
+    """
+    import redis as redis_
+
+    from liminallm.config import get_settings
+    from tests.harness import REDIS_LEASE_PREFIX, redis_database_index
+
+    url = get_settings().redis_url
+    index = redis_database_index(url)
+    assert index != 0, "this probe expects a leased database"
+
+    ledger = redis_.Redis.from_url(
+        url.rsplit("/", 1)[0] + "/0", decode_responses=True
+    )
+    mine = redis_.Redis.from_url(url, decode_responses=True)
+    try:
+        ledger.set(f"{REDIS_LEASE_PREFIX}:{index}", "another-run:gw0", ex=900)
+        mine.set("harness:taken-over", "the new holder's state")
+    finally:
+        ledger.close()
+        mine.close()
+
+
 class _External:
     """A Postgres and a Redis standing in for services supplied from outside.
 
@@ -133,11 +167,12 @@ class _External:
     answer rather than an absence of evidence.
     """
 
-    def __init__(self):
+    def __init__(self, redis_db: int = 0):
         from tests.harness import ScratchPostgres, ScratchRedis
 
         self.pg = ScratchPostgres()
         self.redis = ScratchRedis()
+        self.redis_db = redis_db
         self.url = None
         self.redis_url = None
 
@@ -152,7 +187,10 @@ class _External:
         from tests.harness import apply_schema
 
         self.url = self.pg.start()
-        self.redis_url = self.redis.start()
+        # `TEST_REDIS_URL` is documented as "point at an existing service".
+        # Nothing says that service's database must be 0, and using a numbered
+        # one for tests is ordinary — so the fixture can name one.
+        self.redis_url = self.redis.start().rsplit("/", 1)[0] + f"/{self.redis_db}"
         # What `scripts/migrate.sh` would have left behind, plus a fact that
         # only a clone can inherit.
         apply_schema(self.url, embedding_dim=64)
@@ -161,7 +199,7 @@ class _External:
             conn.execute("INSERT INTO harness_sentinel VALUES ('base survived')")
         client = redis.Redis.from_url(self.redis_url, decode_responses=True)
         try:
-            client.set("harness:sentinel", "base db0 survived")
+            client.set("harness:sentinel", "the base survived")
         finally:
             client.close()
         return self
@@ -194,6 +232,7 @@ class _External:
                 "PYTEST_XDIST_WORKER",
                 "LIMINALLM_HARNESS_PROBE",
                 "LIMINALLM_HARNESS_HOLD",
+                "LIMINALLM_HARNESS_LOSE",
             }
         }
         env.update(
@@ -239,7 +278,7 @@ class _External:
             row = conn.execute("SELECT note FROM harness_sentinel").fetchone()
         return row and row[0]
 
-    def redis_db0(self):
+    def base_redis(self):
         import redis
 
         client = redis.Redis.from_url(self.redis_url, decode_responses=True)
@@ -249,8 +288,8 @@ class _External:
             client.close()
 
 
-def _external_or_skip():
-    ext = _External()
+def _external_or_skip(redis_db: int = 0):
+    ext = _External(redis_db)
     if not ext.available:
         pytest.skip("needs initdb and redis-server to stand up external services")
     return ext
@@ -392,6 +431,7 @@ HOLD_PROBE = (
     "tests/test_worker_isolation.py"
     "::test_probe_holds_redis_state_while_another_run_flushes"
 )
+LOSE_PROBE = "tests/test_worker_isolation.py::test_probe_gives_its_lease_away"
 
 
 @pytest.mark.slow  # stands up a Postgres and a Redis, then runs pytest in them
@@ -457,12 +497,103 @@ class TestAWorkerOwnsItsResources:
                 probe_out=str(tmp_path / "probe.jsonl"),
             )
             assert done.returncode == 0, done.stdout[-3000:]
-            sentinel, keys = ext.redis_db0()
-            assert sentinel == "base db0 survived", (
+            sentinel, keys = ext.base_redis()
+            assert sentinel == "the base survived", (
                 "a worker flushed the Redis database this run was handed"
             )
             assert keys == ["harness:sentinel"], (
                 f"a worker wrote into the base Redis database: {keys}"
+            )
+
+    def test_the_database_the_caller_named_is_never_leased(self):
+        """`TEST_REDIS_URL` may name any database, not only 0.
+
+        Offering `1..15` regardless of which one the URL named meant a caller
+        who pointed the harness at `redis://host/1` had that exact database
+        leased to the first worker — and then flushed before every test,
+        because the lease said it was owned. The base is the ledger now, and
+        the ledger is never a candidate.
+        """
+        from tests.harness import lease_candidates, redis_database_index
+
+        for named in (0, 1, 7, 15):
+            url = f"redis://127.0.0.1:6379/{named}"
+            assert redis_database_index(url) == named
+            assert named not in lease_candidates(url), (
+                f"the database the caller named ({named}) was offered to a worker"
+            )
+        assert redis_database_index("redis://127.0.0.1:6379") == 0
+
+    def test_a_base_database_that_is_not_zero_survives_a_run(self, tmp_path):
+        """The same rule, through a real run rather than through a list."""
+        with _external_or_skip(redis_db=1) as ext:
+            done = ext.run_pytest(
+                "-n", "1", PROBE, probe_out=str(tmp_path / "probe.jsonl")
+            )
+            assert done.returncode == 0, done.stdout[-3000:]
+            sentinel, keys = ext.base_redis()
+            assert sentinel == "the base survived", (
+                "the harness leased the database TEST_REDIS_URL named, and "
+                "then flushed it before every test"
+            )
+            assert keys == ["harness:sentinel"], (
+                f"a lease was left in the caller's database: {keys}"
+            )
+            worker_db = json.loads(
+                (tmp_path / "probe.jsonl").read_text().splitlines()[0]
+            )["redis_url"].rsplit("/", 1)[-1]
+            assert worker_db != "1", "the worker was given the caller's database"
+
+    def test_a_worker_that_lost_its_lease_stops_before_it_flushes(self, tmp_path):
+        """Losing the claim is not something to carry on best-effort through.
+
+        Once a lease expires the number is very likely already somebody's, and
+        the next thing the per-test reset does is empty that database. So the
+        run stops instead. Forced by having the run overwrite its own claim
+        and then asking it to start another test.
+        """
+        import redis
+
+        with _external_or_skip() as ext:
+            done = ext.run_pytest(
+                "-n", "1",
+                LOSE_PROBE, PROBE,
+                probe_out=str(tmp_path / "probe.jsonl"),
+                env_extra={"LIMINALLM_HARNESS_LOSE": "1"},
+            )
+            assert done.returncode != 0, (
+                "a run whose lease had been taken carried on and flushed the "
+                "database anyway:\n" + done.stdout[-3000:]
+            )
+            assert "no longer holds Redis database" in done.stdout, done.stdout[-3000:]
+            # Which database the probe was using, found the way anything
+            # else would: the ledger still names its new holder, because the
+            # run's own release compares before it deletes.
+            from tests.harness import REDIS_LEASE_PREFIX
+
+            ledger = redis.Redis.from_url(ext.redis_url, decode_responses=True)
+            try:
+                taken_over = [
+                    key
+                    for key in ledger.keys(f"{REDIS_LEASE_PREFIX}:*")
+                    if ledger.get(key) == "another-run:gw0"
+                ]
+                assert len(taken_over) == 1, (
+                    f"expected the handed-over claim to still stand: {taken_over}"
+                )
+                index = taken_over[0].rsplit(":", 1)[-1]
+            finally:
+                ledger.close()
+
+            client = redis.Redis.from_url(
+                ext.redis_url.rsplit("/", 1)[0] + f"/{index}", decode_responses=True
+            )
+            try:
+                taken = client.get("harness:taken-over")
+            finally:
+                client.close()
+            assert taken == "the new holder's state", (
+                "the run emptied a database that had been claimed by another"
             )
 
     def test_a_prepared_database_is_cloned_rather_than_rebuilt(self, tmp_path):

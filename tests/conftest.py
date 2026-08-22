@@ -37,6 +37,7 @@ os.environ.setdefault("JWT_SECRET", "Test-Secret-Key-4-Testing-Only-Do-Not-Use-I
 import pytest  # noqa: E402
 
 from tests.harness import (  # noqa: E402
+    REDIS_LEASE_TTL,
     ScratchPostgres,
     ScratchRedis,
     apply_schema,
@@ -256,7 +257,18 @@ def _flush_owned_redis() -> None:
         # Renewed here rather than on a timer: this runs before every test, so
         # a live run keeps its claim and a dead one stops renewing and gives
         # its database back on its own.
-        renew_redis_database(*_REDIS_LEASE)
+        #
+        # And if the claim is gone, this stops. A lease that expired has very
+        # likely been taken by another run that is using that database right
+        # now, and the next statement in this function empties it. Losing
+        # ownership is not something to carry on best-effort through.
+        if not renew_redis_database(*_REDIS_LEASE):
+            raise RuntimeError(
+                f"this run no longer holds Redis database {_REDIS_LEASE[1]}. "
+                "Another run has most likely claimed it, and continuing would "
+                "empty a database in use. Re-run; if this repeats, a test is "
+                f"outrunning the {REDIS_LEASE_TTL}s lease."
+            )
     from liminallm.config import get_settings
 
     url = get_settings().redis_url
