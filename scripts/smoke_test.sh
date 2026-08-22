@@ -65,11 +65,13 @@ check_dependencies() {
     else
         JQ_AVAILABLE=true
     fi
-    # One check reads a nested field, which needs a real JSON parser rather
-    # than a grep. Either tool will do; neither is fatal on its own, but say
-    # so here rather than let that check fail looking like a deployment fault.
+    # The Redis health check reads a nested field, which needs a real JSON
+    # parser rather than a grep. Required, not optional: this suite exists to
+    # establish that Redis is actually healthy, and a run that cannot look is
+    # not a run that found nothing wrong.
     if ! $JQ_AVAILABLE && ! command -v python3 &> /dev/null; then
-        echo "Warning: neither jq nor python3 found; the Redis health check will be skipped"
+        echo "Error: jq or python3 is required to verify Redis health"
+        exit 1
     fi
 }
 
@@ -163,8 +165,12 @@ test_redis_is_actually_configured() {
 
     local status
     if ! status=$(redis_status_from "$response"); then
-        log_info "Skipped: needs jq or python3 to read a nested JSON field"
-        return 0
+        # check_dependencies exits before this is reachable. Kept because the
+        # failure it names is a harness fault, and counting it as a pass would
+        # let the suite exit 0 having never established the invariant it is
+        # here for — as it briefly did.
+        log_fail "cannot read checks.redis.status: no JSON parser on this host"
+        return 1
     fi
 
     if [ "$status" = "healthy" ]; then

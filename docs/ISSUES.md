@@ -10900,11 +10900,32 @@ function whose status is tested. The real failure was worse in a quieter way:
 missing on the *test host*.
 
 It reads the field through `jq` when the script already found it and `python3`
-otherwise, and returns a distinct code when neither exists, so "cannot parse"
-is reported as a skip rather than as an unhealthy Redis. `extract_json` could
-not be reused: its jq-less branch greps for a flat `"key": "value"` pair and
-this path is three deep. Both parsers were exercised against all four inputs —
-healthy, not_configured, no `redis` key, and malformed JSON — and agree.
+otherwise. `extract_json` could not be reused: its jq-less branch greps for a
+flat `"key": "value"` pair and this path is three deep. Both parsers were
+exercised against all four inputs — healthy, not_configured, no `redis` key,
+and malformed JSON — and agree.
+
+The first version of that fallback reported "no parser" as a *skip* returning
+0, which was wrong twice over. This suite exists to establish that Redis is
+healthy, and a run that could not look is not a run that found nothing wrong —
+it would have exited 0 without ever testing the invariant. It also called
+`run_test` (which increments `TESTS_RUN`) without ever reaching `log_pass` or
+`log_fail` (which increment the other two), so the summary's arithmetic no
+longer added up, and the exit code keys off `TESTS_FAILED`. Checked the rest of
+the file for the same shape: every other test function logs an outcome on every
+return path, so this one was unique.
+
+`check_dependencies` requires `jq` or `python3` now and exits 1 naming the
+reason, which makes the no-parser branch unreachable at runtime; it is kept,
+failing rather than skipping, because the fault it names is the harness's.
+Four outcomes, each distinct:
+
+| Condition | Reported as |
+|---|---|
+| Redis healthy | pass |
+| Redis unhealthy or not configured | deployment failure |
+| health response malformed or missing the field | deployment failure (`missing`) |
+| no JSON parser on the host | harness failure, before any test runs |
 
 **First-boot semantics are not weakened for stale volumes.**
 `INSTANCE_SETTINGS_JSON` refuses to seed once an operator has saved any system
