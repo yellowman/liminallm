@@ -568,12 +568,26 @@ class PostgresStore:
             # silently stops queueing payloads while the queue table sits
             # there looking correct — which is exactly the state the
             # ledger-only sweep cannot recover from.
+            # Shape, not name. `ALTER TABLE ... DISABLE TRIGGER` leaves the
+            # row in pg_trigger, and a same-named trigger on INSERT or calling
+            # a different function is equally present and equally useless.
+            # Startup's job here is to refuse an incompletely applied schema
+            # before requests arrive; the behavioural reds cover what the
+            # function body does.
+            #
+            # tgtype bit 0 is FOR EACH ROW and bit 3 is DELETE; tgenabled 'D'
+            # is disabled.
             enrolment = conn.execute(
                 """
                 SELECT 1 FROM pg_trigger
                 WHERE tgrelid = 'artifact'::regclass
                   AND tgname = 'artifact_retire_payload'
                   AND NOT tgisinternal
+                  AND tgenabled <> 'D'
+                  AND (tgtype & 1) = 1
+                  AND (tgtype & 8) = 8
+                  AND (tgtype & 2) = 0
+                  AND tgfoid = 'artifact_retire_payload_fn'::regproc
                 """
             ).fetchone()
             if not enrolment:
@@ -1533,6 +1547,28 @@ class PostgresStore:
             return None
         return self._row_to_user(row)
 
+    def _lock_unfinished_training(self, conn, user_id: str) -> list:
+        """Take this account's unfinished training jobs and hold them.
+
+        A separate step because the lock is the whole point and it is the
+        thing worth naming. Holding the queued rows is what makes a worker's
+        `UPDATE ... WHERE status = 'queued'` wait for this transaction and
+        then find nothing, rather than starting to write weights just after
+        the guard decided there was nothing running.
+
+        Both identities: a tenant adapter can be trained by one user and owned
+        by another, so asking only about `training_job.user_id` misses a job
+        by B against A's adapter.
+        """
+        return conn.execute(
+            "SELECT j.id, j.status FROM training_job j "
+            "LEFT JOIN artifact a ON a.id = j.adapter_id "
+            "WHERE (j.user_id = %s OR a.owner_user_id = %s) "
+            "AND j.status IN ('queued', 'running') "
+            "FOR UPDATE OF j",
+            (user_id, user_id),
+        ).fetchall()
+
     def user_has_running_training(self, user_id: str) -> bool:
         """Is a worker writing weights for one of this account's adapters?
 
@@ -1578,18 +1614,42 @@ class PostgresStore:
         - The user record itself
         """
         with self._connect() as conn:
-            # Check if user exists first
+            # Check if user exists first, and hold it: locking the account
+            # stops a new job being created for it while this runs.
             exists = conn.execute(
-                "SELECT 1 FROM app_user WHERE id = %s", (user_id,)
+                "SELECT 1 FROM app_user WHERE id = %s FOR UPDATE", (user_id,)
             ).fetchone()
             if not exists:
                 return False
 
             # Get user's artifacts for cascade (needed for config patches, versions, router state)
+            # Locked, so another user cannot start training one of this
+            # account's adapters while the deletion is in flight.
             artifact_rows = conn.execute(
-                "SELECT id FROM artifact WHERE owner_user_id = %s", (user_id,)
+                "SELECT id FROM artifact WHERE owner_user_id = %s FOR UPDATE",
+                (user_id,),
             ).fetchall()
             artifact_ids = [str(row["id"]) for row in artifact_rows]
+
+            # The guard belongs here rather than in the route. A check made
+            # before the transaction is a check-then-act: a worker's claim is
+            # an atomic `UPDATE ... WHERE status = 'queued'`, so a job could
+            # become running between the answer and the deletion, and the
+            # cascade would take its record out from under a worker that is
+            # writing weights and will try to promote a version.
+            #
+            # Both identities matter. A tenant adapter can be trained by one
+            # user and owned by another, so asking only about
+            # `training_job.user_id` misses a job by B against A's adapter.
+            # Locking the queued rows too is what makes queued -> running
+            # serialize with this transaction rather than race it.
+            unfinished = self._lock_unfinished_training(conn, user_id)
+            running = [str(j["id"]) for j in unfinished if j["status"] == "running"]
+            if running:
+                raise TrainingInProgress(
+                    "this account has training in progress",
+                    {"user_id": user_id, "job_ids": running},
+                )
 
             # Get user's contexts for cascade (needed for chunks, sources)
             context_rows = conn.execute(
@@ -2702,6 +2762,28 @@ class PostgresStore:
             rows = conn.execute(query, tuple(params)).fetchall()
         return [self._artifact_from_row(row) for row in rows]
 
+    #: Namespace for the per-artifact lifetime lock. Creation writes the
+    #: canonical payload directory before it publishes the row, and orphan
+    #: discovery reads exactly those directories — so without a shared lock a
+    #: scan in that window records a retirement for an artifact that is about
+    #: to exist. It looks harmless while the artifact is live, because the
+    #: sweep refuses to remove anything Postgres still knows about, but the
+    #: delete trigger's ON CONFLICT DO NOTHING then leaves that stale
+    #: timestamp in place: the real deletion inherits a grace period that has
+    #: already elapsed, and the payload goes immediately.
+    #:
+    #: An advisory lock rather than a file lock, because §22 puts several
+    #: replicas on one Postgres and only one of those is shared state they all
+    #: agree on.
+    _ARTIFACT_LIFETIME_LOCK = 0x6C696661  # "lifa"
+
+    def _lock_artifact_lifetime(self, conn, artifact_id: str) -> None:
+        """Hold this artifact's identity for the rest of the transaction."""
+        conn.execute(
+            "SELECT pg_advisory_xact_lock(%s, hashtext(%s))",
+            (self._ARTIFACT_LIFETIME_LOCK, str(artifact_id)),
+        )
+
     def _artifact_from_row(self, row) -> Artifact:
         """One mapping from an `artifact` row, so every reader sees the same.
 
@@ -2852,6 +2934,9 @@ class PostgresStore:
         if not _is_uuid(artifact_id):
             return False
         with self._connect() as conn, conn.transaction():
+            # Before looking, so a creation that has written its directory but
+            # not yet published its row finishes first and is then visible.
+            self._lock_artifact_lifetime(conn, artifact_id)
             if conn.execute(
                 "SELECT 1 FROM artifact WHERE id = %s", (artifact_id,)
             ).fetchone():
@@ -2912,9 +2997,14 @@ class PostgresStore:
             self.logger.warning("artifact_validation_failed", errors=exc.errors)
             raise
         artifact_id = str(uuid.uuid4())
-        fs_path = self._persist_payload(artifact_id, 1, schema)
         try:
             with self._connect() as conn, conn.transaction():
+                # Taken before the canonical directory exists, so orphan
+                # discovery cannot see a payload whose row is still on its way
+                # and record a retirement for an artifact that is about to be
+                # perfectly alive.
+                self._lock_artifact_lifetime(conn, artifact_id)
+                fs_path = self._persist_payload(artifact_id, 1, schema)
                 conn.execute(
                     "INSERT INTO artifact (id, owner_user_id, type, name, description, schema, fs_path, base_model, visibility) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)",
                     (

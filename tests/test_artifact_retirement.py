@@ -15,6 +15,7 @@ to be serialized against training rather than racing it.
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from pathlib import Path
 
@@ -979,4 +980,345 @@ def test_startup_refuses_a_database_without_the_enrolment_trigger(client):
             PostgresStore(url, fs_root=str(runtime.settings.shared_fs_root))
         assert "migrate" in str(caught.value).lower(), str(caught.value)
     finally:
+        apply_schema(url, embedding_dim=64)
+
+
+class TestAccountDeletionSerializesAgainstTraining:
+    """A precheck is not a guard.
+
+    The route asked whether any job was running and then deleted. A worker's
+    claim is an atomic `UPDATE ... WHERE status = 'queued'`, so a queued job
+    could become running in the window between the two — the same
+    writer-versus-retirement race already solved for individual artifacts, at
+    the account level.
+
+    The identity was wrong too. A tenant adapter can be trained by one user
+    and owned by another, so `training_job.user_id = A` misses a job by B
+    against A's adapter, and catches a job by A against B's surviving adapter
+    only by accident.
+    """
+
+    @pytest.mark.slow
+    def test_a_claim_cannot_slip_in_while_the_account_is_being_deleted(
+        self, client
+    ):
+        """Real threads, because the locks are what is under test.
+
+        The deletion holds the account, its artifacts and their unfinished
+        jobs `FOR UPDATE`, so a worker's `UPDATE ... WHERE status = 'queued'`
+        blocks until the transaction commits and then finds no row. The
+        outcome pair is the property: either the worker claimed first and the
+        deletion is refused, or the deletion committed and the claim fails.
+        Never both.
+        """
+        import threading
+
+        user_id, headers = _account(client)
+        _, admin_headers = _account(client, admin=True)
+        adapter_id = _adapter(client, headers, user_id)
+        store = get_runtime().store
+        job = store.create_training_job(user_id=user_id, adapter_id=adapter_id)
+
+        outcome: dict = {}
+
+        def delete_account():
+            resp = client.delete(f"/v1/admin/users/{user_id}", headers=admin_headers)
+            outcome["status"] = resp.status_code
+
+        worker = threading.Thread(target=delete_account, daemon=True)
+        worker.start()
+        claimed = store.claim_training_job(job.id)
+        worker.join(timeout=60)
+        assert "status" in outcome, "the deletion never finished"
+
+        account_gone = _count(
+            "SELECT COUNT(*) AS n FROM app_user WHERE id = %s", (user_id,)
+        ) == 0
+        if claimed is not None:
+            assert outcome["status"] == 409, (
+                "a worker claimed the job and the account was deleted anyway: "
+                f"{outcome['status']}"
+            )
+            assert not account_gone
+        else:
+            assert account_gone, (
+                "neither the claim nor the deletion succeeded: "
+                f"{outcome['status']}"
+            )
+
+    @pytest.mark.slow
+    def test_a_claim_after_the_guard_cannot_start_the_worker(self, client):
+        """The guard holds the queued rows, so a later claim finds nothing.
+
+        This is the ordering the lock exists for and the one an outcome-pair
+        assertion cannot force: the deletion has already decided that nothing
+        is running, and only then does a worker try to claim. Holding the
+        rows makes that claim wait for the transaction and then fail, so the
+        worker never starts. Without the hold it claims immediately and
+        begins writing weights for an account that is about to vanish.
+        """
+        import threading
+
+        user_id, headers = _account(client)
+        _, admin_headers = _account(client, admin=True)
+        adapter_id = _adapter(client, headers, user_id)
+        store = get_runtime().store
+        job = store.create_training_job(user_id=user_id, adapter_id=adapter_id)
+
+        claimed: dict = {}
+        real_lock = store._lock_unfinished_training
+
+        def lock_then_claim(conn, uid):
+            rows = real_lock(conn, uid)
+            if "thread" not in claimed:
+                def claim():
+                    claimed["job"] = store.claim_training_job(job.id)
+
+                claimed["thread"] = threading.Thread(target=claim, daemon=True)
+                claimed["thread"].start()
+                # Long enough for an unblocked claim to complete.
+                time.sleep(0.5)
+            return rows
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(store, "_lock_unfinished_training", lock_then_claim)
+        try:
+            resp = client.delete(f"/v1/admin/users/{user_id}", headers=admin_headers)
+        finally:
+            monkeypatch.undo()
+        claimed["thread"].join(timeout=60)
+
+        assert resp.status_code in (200, 204), resp.text
+        assert claimed.get("job") is None, (
+            "a worker claimed the job after the deletion had passed its guard, "
+            "so it is writing weights for an account that no longer exists"
+        )
+
+    @pytest.mark.slow
+    def test_the_deletion_waits_for_a_worker_holding_the_job_row(self, client):
+        """The lock, tested directly rather than through an outcome pair.
+
+        Asserting "either the worker won or the deletion won" cannot tell a
+        held lock from an absent one, because both orders are legal answers.
+        What only the lock produces is *waiting*: a worker claiming a job
+        holds that row for its transaction, so a deletion that locks the same
+        rows cannot pass its guard until the worker commits.
+
+        This holds the row the way `claim_training_job`'s UPDATE does, and
+        requires the deletion not to finish meanwhile. Without
+        `FOR UPDATE OF j` the deletion reads the row as still queued, passes
+        its guard, and removes the account out from under the worker.
+        """
+        import threading
+
+        user_id, headers = _account(client)
+        _, admin_headers = _account(client, admin=True)
+        adapter_id = _adapter(client, headers, user_id)
+        store = get_runtime().store
+        job = store.create_training_job(user_id=user_id, adapter_id=adapter_id)
+
+        outcome: dict = {}
+        holding = threading.Event()
+        release = threading.Event()
+
+        def hold_the_job_row():
+            with store._connect() as conn, conn.transaction():
+                conn.execute(
+                    "SELECT 1 FROM training_job WHERE id = %s FOR UPDATE", (job.id,)
+                )
+                holding.set()
+                release.wait(timeout=30)
+
+        holder = threading.Thread(target=hold_the_job_row, daemon=True)
+        holder.start()
+        assert holding.wait(timeout=30), "could not take the worker's row lock"
+
+        def delete_account():
+            resp = client.delete(f"/v1/admin/users/{user_id}", headers=admin_headers)
+            outcome["status"] = resp.status_code
+
+        deleter = threading.Thread(target=delete_account, daemon=True)
+        deleter.start()
+        deleter.join(timeout=3)
+
+        blocked = "status" not in outcome
+        release.set()
+        holder.join(timeout=30)
+        deleter.join(timeout=60)
+
+        assert blocked, (
+            "the account was deleted while a worker held its training job "
+            f"row: {outcome.get('status')}"
+        )
+        assert _count(
+            "SELECT COUNT(*) AS n FROM app_user WHERE id = %s", (user_id,)
+        ) == 0, "the deletion never completed after the worker released"
+
+    def test_a_job_by_another_user_against_this_owners_adapter_blocks(self, client):
+        """Tenant adapters are trained by contributors, not only by owners."""
+        owner_id, owner_headers = _account(client)
+        trainer_id, _ = _account(client)
+        _, admin_headers = _account(client, admin=True)
+        adapter_id = _adapter(client, owner_headers, owner_id)
+
+        store = get_runtime().store
+        job = store.create_training_job(user_id=trainer_id, adapter_id=adapter_id)
+        assert store.claim_training_job(job.id) is not None
+
+        resp = client.delete(f"/v1/admin/users/{owner_id}", headers=admin_headers)
+        assert resp.status_code == 409, (
+            "the adapter's owner was deleted while a different user's worker "
+            f"was training it: {resp.status_code}"
+        )
+        assert _count(
+            "SELECT COUNT(*) AS n FROM artifact WHERE id = %s", (adapter_id,)
+        ) == 1
+
+
+class TestCreationAndDiscoveryDoNotOverlap:
+    """Discovery must not enrol an artifact that is still being created.
+
+    `create_artifact` writes `artifacts/<id>/v1.json` before publishing the
+    row, so a scan in that window sees a directory Postgres does not know
+    about and records a retirement for a live artifact. It looks harmless —
+    the sweep's recheck refuses to remove anything that exists — but the
+    record persists, and the delete trigger's `ON CONFLICT DO NOTHING` leaves
+    that stale timestamp in place. Hours later the real deletion inherits a
+    retirement that is already past its grace period, and the payload is
+    collected immediately: the reader race, back through another door.
+    """
+
+    @pytest.mark.slow
+    def test_a_creation_in_flight_is_not_enrolled(self, client):
+        """The scan waits for the creation rather than racing it.
+
+        In a separate thread, because that is where a sweep actually runs.
+        Calling it inline from inside the creating transaction deadlocks —
+        the transaction holds this artifact's lifetime lock and cannot commit
+        until the call returns — which is the lock doing its job, but not a
+        schedule any deployment produces.
+        """
+        import threading
+
+        from liminallm.service.artifacts import enrol_unknown_payloads
+
+        user_id, headers = _account(client)
+        runtime = get_runtime()
+        store = runtime.store
+        scan_started = threading.Event()
+        scanned: dict = {}
+        real_persist = store._persist_payload
+
+        def scan():
+            scanned["enrolled"] = enrol_unknown_payloads(
+                store, runtime.settings.shared_fs_root
+            )
+
+        def persist_then_scan(artifact_id, version, schema):
+            path = real_persist(artifact_id, version, schema)
+            if not scan_started.is_set():
+                scan_started.set()
+                scanned["id"] = artifact_id
+                scanned["thread"] = threading.Thread(target=scan, daemon=True)
+                scanned["thread"].start()
+                # Long enough for a scan that ignored the lock to finish.
+                time.sleep(0.5)
+            return path
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(store, "_persist_payload", persist_then_scan)
+        try:
+            artifact_id = _artifact(client, headers)
+        finally:
+            monkeypatch.undo()
+        scanned["thread"].join(timeout=60)
+
+        assert scanned.get("id") == artifact_id, "the scan under test did not run"
+        assert _count(
+            "SELECT COUNT(*) AS n FROM artifact WHERE id = %s", (artifact_id,)
+        ) == 1, "the artifact was not published"
+        assert _count(
+            "SELECT COUNT(*) AS n FROM artifact_payload_retirement "
+            "WHERE artifact_id = %s",
+            (artifact_id,),
+        ) == 0, (
+            "a live artifact carries a retirement recorded while it was being "
+            "created; its eventual deletion would be due immediately"
+        )
+
+    def test_a_deletion_later_gets_a_fresh_clock(self, client):
+        """The consequence the previous test prevents, asserted directly."""
+        from liminallm.service.artifacts import sweep_artifact_payloads
+
+        user_id, headers = _account(client)
+        runtime = get_runtime()
+        adapter_id = _adapter(client, headers, user_id)
+        tree = Path(runtime.settings.shared_fs_root) / "adapters" / adapter_id
+
+        assert client.delete(
+            f"/v1/artifacts/{adapter_id}", headers=headers
+        ).status_code == 200
+        # A full grace period must still protect it, whatever happened during
+        # creation.
+        assert sweep_artifact_payloads(
+            runtime.store, runtime.settings.shared_fs_root, grace_seconds=3600
+        ) == 0
+        assert tree.is_dir()
+
+
+def test_startup_refuses_a_disabled_enrolment_trigger(client):
+    """Present is not the same as in force.
+
+    `ALTER TABLE artifact DISABLE TRIGGER` leaves the row in `pg_trigger`, so
+    a name check passes while nothing enrols. Startup's job is to refuse an
+    incompletely applied schema before requests arrive, so it checks the
+    shape: enabled, per row, after delete, and calling the right function.
+    """
+    import os
+
+    from liminallm.storage.postgres import PostgresStore
+    from tests.harness import apply_schema
+
+    runtime = get_runtime()
+    url = os.environ["DATABASE_URL"]
+    with runtime.store._connect() as conn:
+        conn.execute("ALTER TABLE artifact DISABLE TRIGGER artifact_retire_payload")
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            PostgresStore(url, fs_root=str(runtime.settings.shared_fs_root))
+        assert "migrate" in str(caught.value).lower(), str(caught.value)
+    finally:
+        with runtime.store._connect() as conn:
+            conn.execute(
+                "ALTER TABLE artifact ENABLE TRIGGER artifact_retire_payload"
+            )
+        apply_schema(url, embedding_dim=64)
+
+    PostgresStore(url, fs_root=str(runtime.settings.shared_fs_root))
+
+
+def test_startup_refuses_a_trigger_on_the_wrong_event(client):
+    """A same-named trigger on INSERT enrols nothing on delete."""
+    import os
+
+    from liminallm.storage.postgres import PostgresStore
+    from tests.harness import apply_schema
+
+    runtime = get_runtime()
+    url = os.environ["DATABASE_URL"]
+    with runtime.store._connect() as conn:
+        conn.execute("DROP TRIGGER IF EXISTS artifact_retire_payload ON artifact")
+        conn.execute(
+            "CREATE TRIGGER artifact_retire_payload AFTER INSERT ON artifact "
+            "FOR EACH ROW EXECUTE FUNCTION artifact_retire_payload_fn()"
+        )
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            PostgresStore(url, fs_root=str(runtime.settings.shared_fs_root))
+        assert "migrate" in str(caught.value).lower(), str(caught.value)
+    finally:
+        with runtime.store._connect() as conn:
+            conn.execute(
+                "DROP TRIGGER IF EXISTS artifact_retire_payload ON artifact"
+            )
         apply_schema(url, embedding_dim=64)

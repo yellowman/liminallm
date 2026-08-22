@@ -9724,3 +9724,71 @@ The first mutation is the blunt kind — dropping the trigger trips the startup
 verifier, so the suite refuses to boot rather than failing one test. Mutating
 the trigger's *body* instead keeps startup happy and is the precise version;
 it is the one that proves the reds.
+
+### 2G.3 completion: two races and a trigger that was checked by name
+
+**HIGH: account deletion's training guard was a check-before-act.** The route
+asked `user_has_running_training` and then deleted. A worker's claim is an
+atomic `UPDATE ... WHERE status = 'queued'`, so a job could become running in
+between — the writer-versus-retirement race already solved for individual
+artifacts, at the account level. The identity was wrong too: a tenant adapter
+can be trained by one user and owned by another, so `training_job.user_id = A`
+misses a job by B against A's adapter.
+
+The guard is inside `delete_user`'s transaction now. It locks the account (no
+new job for it), its artifacts (nobody else can start training one of its
+adapters), and the unfinished jobs themselves — which is what makes
+queued → running wait for the deletion and then find nothing. Both identities
+are asked. The route's precheck is gone; the store raises `TrainingInProgress`
+and the handler answers 409.
+
+**HIGH: orphan discovery raced a successful creation.** `create_artifact`
+writes `artifacts/<id>/v1.json` before publishing the row, so a scan in that
+window recorded a retirement for an artifact that was about to exist. Harmless
+while it lived — the sweep refuses to remove anything Postgres knows about —
+but the delete trigger's `ON CONFLICT DO NOTHING` left the stale timestamp in
+place, so the real deletion hours later inherited a grace period that had
+already elapsed and the payload went immediately. The reader race, back
+through another door. It could also record the wrong `artifact_type`.
+
+Both sides take a per-artifact `pg_advisory_xact_lock` — creation before it
+writes the canonical directory, enrolment before it looks. An advisory lock
+rather than a file lock because §22 puts several replicas on one Postgres.
+
+**MEDIUM: startup checked the trigger's name.** `ALTER TABLE ... DISABLE
+TRIGGER` leaves the row in `pg_trigger`, as does a same-named trigger on
+INSERT or one calling a different function. Startup verifies the shape now —
+enabled, `FOR EACH ROW`, `AFTER DELETE`, and the right `tgfoid`.
+
+### Mutations
+
+| Mutation | Killed by |
+|---|---|
+| drop `FOR UPDATE OF j` | the claim-after-the-guard red |
+| guard asks only the trainer identity | two account-deletion reds |
+| creation stops taking the lifetime lock | the creation-in-flight red |
+| disable the trigger | the disabled-trigger red |
+| trigger moved to INSERT | the wrong-event red |
+
+Two tests had to be rewritten before they proved anything.
+
+The creation-in-flight red first called the discovery scan *inline* from
+inside the creating transaction, which deadlocked: the transaction holds that
+artifact's lifetime lock and cannot commit until the call returns. That is the
+lock working, but it is not a schedule any deployment produces. The scan runs
+in a thread now.
+
+The account-deletion red first asserted the outcome pair — either the worker
+won and the deletion is refused, or the deletion won and the claim fails. That
+cannot distinguish a held lock from an absent one, because both orders are
+legal answers, and the mandatory mutation survived it. A second attempt held
+the job row the way a claiming worker does, and that survived too: the
+deletion blocks at its `DELETE FROM training_job` regardless, so the wait
+proved nothing about the guard.
+
+What the lock actually protects is one ordering — the guard decides nothing is
+running, and only *then* does a worker claim. Forcing it needed a seam between
+the lock and the deletion, so the locking read is now a named method,
+`_lock_unfinished_training`. The test claims from a thread at that moment: with
+the rows held the claim waits and finds nothing, and without them it succeeds
+and the account is deleted under a running worker.

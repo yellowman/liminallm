@@ -774,17 +774,10 @@ async def admin_delete_user(
         raise http_error(
             "forbidden", "cannot delete users in other tenant", status_code=403
         )
-    # Same refusal the artifact route makes, for the same reason. Deleting the
-    # account removes its artifacts in bulk and cascades their training jobs,
-    # which takes the record out from under a worker that is still writing
-    # weights and will try to promote a version onto the artifact.
-    if runtime.store.user_has_running_training(user_id):
-        raise http_error(
-            "conflict",
-            "this account has training in progress; retry once it finishes",
-            status_code=409,
-        )
-
+    # The refusal is inside `delete_user`'s transaction, where it can hold the
+    # account, its artifacts and their unfinished jobs. Asking here first
+    # would be a check-then-act, which is the race this exists to remove; the
+    # store raises TrainingInProgress and the handler turns that into 409.
     target_email = target_user.email  # Capture before deletion
     removed = runtime.auth.delete_user(user_id)
     if not removed:
