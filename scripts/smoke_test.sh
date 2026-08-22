@@ -123,6 +123,38 @@ test_healthz() {
     fi
 }
 
+test_redis_is_actually_configured() {
+    run_test "Redis is configured, not silently absent"
+
+    # `redis_url` is a managed setting with no environment variable of its
+    # own, so a bare REDIS_URL in the compose file configured nothing and left
+    # the default pointing at localhost — where, inside the app container,
+    # there is no Redis. /healthz already tells "healthy" from
+    # "not_configured", so the fallback cannot be exercised unnoticed.
+    local response
+    response=$(curl -sf "$BASE_URL/healthz" 2>&1) || {
+        log_fail "Health check request failed"
+        return 1
+    }
+
+    local status
+    status=$(echo "$response" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin).get("checks",{}).get("redis",{}).get("status","missing"))')
+
+    if [ "$status" = "healthy" ]; then
+        log_pass "Redis reports healthy"
+        return 0
+    fi
+    log_fail "checks.redis.status is \"$status\", expected \"healthy\". If this says
+       \"not_configured\", the deployment is running on the in-process
+       fallback: rate limits, idempotency, the session cache and the
+       concurrency slots are all on their fallback path. Seed redis_url
+       through INSTANCE_SETTINGS_JSON. Note that seeding only applies to a
+       first boot, so an existing data volume keeps whatever it already has:
+       docker compose -f docker-compose.test.yml down -v"
+    return 1
+}
+
 test_signup_user() {
     run_test "User signup"
 
@@ -408,6 +440,7 @@ main() {
 
     # Run tests (use || true to continue on test failures with set -e)
     test_healthz || true
+    test_redis_is_actually_configured || true
     test_unauthenticated_protected || true
     test_signup_user || true
     test_login_user || true

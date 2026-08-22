@@ -332,6 +332,32 @@ pytest tests/test_post_smoke.py -v
 
 ## Troubleshooting
 
+### `checks.redis.status` is `not_configured`
+
+The deployment is running on the in-process fallback, so rate limits,
+idempotency, the session cache and the concurrency slots are all on their
+fallback path.
+
+`redis_url` is a managed setting. It has no environment variable of its own,
+so a `REDIS_URL` entry in the compose file configures nothing — it is seeded
+through `INSTANCE_SETTINGS_JSON` instead, which
+`docker-compose.test.yml` now does for both `app` and `bootstrap`.
+
+Seeding applies on first boot only, and deliberately: once an operator has
+saved any system setting, the database is authoritative and a stale container
+environment must not silently revert it. So an existing `postgres_test_data`
+volume that already holds `model_backend=stub` will **not** pick up the new
+Redis setting from a changed compose file. Recreate the volume once:
+
+```bash
+docker compose -f docker-compose.test.yml down -v
+docker compose -f docker-compose.test.yml up -d
+```
+
+A QA environment should be reproducible from its compose declaration, which is
+why the fix is to recreate the volume rather than to weaken first-boot
+semantics.
+
 ### Rate limiting in tests
 
 Rate limits apply even in test mode. Wait 60 seconds between repeated file uploads, or restart the server to clear in-process rate limit state.

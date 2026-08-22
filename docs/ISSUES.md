@@ -10836,3 +10836,80 @@ the concurrency slots all on their fallback path.
 Deleting the line would tidy away the evidence without fixing the deployment,
 and seeding a managed setting at deploy time is a design question rather than a
 cleanup. Left as it is, and raised.
+
+**Correction, made while fixing it.** The paragraph above said that
+environment "has been running on the in-process fallback". That was wrong, and
+wrong in the optimistic direction. `allow_redis_fallback_dev` is also a
+managed setting, so compose's `ALLOW_REDIS_FALLBACK_DEV: "false"` reached
+nothing either — but its default is already `False`, and `TEST_MODE` *is* one
+of the six, set to `"false"`. So the app reaches `runtime.py`'s
+
+```python
+if not self.cache:
+    if not test_mode and not allow_redis_fallback_dev:
+        raise RuntimeError("Redis is required for sessions, ...")
+```
+
+with all three conditions met: the container does not degrade, it fails to
+boot. Every input to that decision was measured (each field's default and
+whether it reads the environment); the boot itself was not executed, because
+this environment has no Docker daemon.
+
+### The QA compose environment could not start, and said so nowhere
+
+Fixed rather than only raised. `redis_url` is a managed setting, so
+`REDIS_URL:` in `docker-compose.test.yml` configured nothing and left the
+default pointing at `localhost` — inside the app container, nowhere. Both
+services now seed it through `INSTANCE_SETTINGS_JSON`, which is the mechanism
+that already existed for exactly this: `Runtime._seed_settings_from_env` runs
+before the cache is built, and `bootstrap_admin` constructs a full `Runtime`,
+so the bootstrap container is normally the first process able to seed. The
+same declaration sits on `app` so either startup order is correct, rather than
+two definitions of one truth.
+
+Two more variables in the same blocks were dead in the same way, and one of
+them mattered:
+
+| Variable | Verdict |
+|---|---|
+| `REDIS_URL` | managed setting; seeded now |
+| `ENABLE_MFA` | managed setting, default `True` — QA has had MFA **on** while the file said "Disable MFA for easier testing". Seeded now |
+| `JWT_SECRET`, `JWT_ISSUER`, `JWT_AUDIENCE` | reach nothing; removed |
+| `ALLOW_REDIS_FALLBACK_DEV` | managed setting; its default is already `False`, so removing it changes nothing |
+| `REQUIRE_EMAIL_VERIFICATION` | names no setting at all — there is no email-verification setting. Removed |
+| `TEST_MODE`, `SHARED_FS_ROOT`, `DATABASE_URL` | genuinely environment-only; kept |
+| `ADMIN_EMAIL`, `ADMIN_PASSWORD` | read directly by `bootstrap_admin`; kept |
+
+Every seed key is checked against `SYSTEM_SETTINGS_DEFAULTS`, because
+`_seed_settings_from_env` drops unknown keys with a warning — a typo there
+would be a setting that silently stayed on its default, which is the whole
+defect again.
+
+`scripts/smoke_test.sh` now asserts `checks.redis.status == "healthy"`.
+`/healthz` already distinguished that from `"not_configured"`, so the evidence
+existed and nothing was looking at it. The extraction was checked against all
+three response shapes, including the one where `checks` has no `redis` key.
+
+**First-boot semantics are not weakened for stale volumes.**
+`INSTANCE_SETTINGS_JSON` refuses to seed once an operator has saved any system
+setting, so an existing `postgres_test_data` volume holding `model_backend=stub`
+will not acquire the new settings from a changed compose file. The runbook says
+to recreate the volume once. A QA environment should be reproducible from its
+compose declaration; inventing override semantics to salvage a stale volume
+would trade a real guarantee for a convenience.
+
+### Which tests to run
+
+Recorded in `CLAUDE.md` because it was being decided per-session and decided
+wrongly: the full serial suite was run *after* the fast lane as a routine pair,
+which re-executes about 2,600 tests the fast lane has already proved and costs
+a quarter of an hour for it. Fast lane by default; plus the affected slow
+file(s) when the change touches one; the full serial suite only for
+single-process or global behaviour, broad harness changes, or an occasional
+release gate.
+
+The slow set is 109 tests in 13 files, and `pytest tests/ -m slow
+--collect-only -q` names them. Two thirds are the model and training modules
+(`test_local_transformer`, `test_lora_composition`, `test_adapter_ladder`,
+`test_lora_training`, `test_ladder_end_to_end`); the rest are the harness,
+sandbox boundary, voice and email, and a few reaping tests.

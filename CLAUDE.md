@@ -28,6 +28,27 @@ Planning and careful use of resources is of the utmost importance. Use constrain
 ### Prompt Budget
 Model-facing prompt text is paid on every call — keep the wording tight. But this app exists to make weak local models perform well, and weak models drop a rule stated once: safety-critical rules (the untrusted-data/injection rule especially) are deliberately repeated across the system prompt, the tool descriptions, and the payload envelope. Tighten phrasing, never the repetition. No boilerplate; no copyright language.
 
+### Which tests to run
+
+Pick the smallest lane that covers what changed. The full serial suite
+re-executes about 2,600 tests the fast lane has already proved, so running it
+after the fast lane as a routine pair buys nothing and costs a quarter of an
+hour.
+
+* **Normal change:** `make test-fast-xdist`. This is the default and usually
+  the only run.
+* **The change touches a slow-marked subsystem:** the fast lane plus the
+  affected slow file(s). The fast lane is `-m 'not slow'`, so those tests do
+  not run in it. JAX/LoRA work means the relevant model and training modules,
+  not all 2,800 tests.
+* **Full serial suite (`make test`):** only when the thing under test is
+  inherently about single-process or global behaviour, when a broad harness
+  change could alter serial semantics, or as an occasional release gate. Not
+  every commit.
+
+`pytest tests/ -m slow --collect-only -q` lists the slow set and which files
+own it.
+
 ### Verification
 
 Three rules, each earned by a bug this project shipped and a review had to find.
