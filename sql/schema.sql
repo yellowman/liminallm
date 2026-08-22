@@ -646,12 +646,28 @@ CREATE INDEX IF NOT EXISTS artifact_payload_retirement_due_idx
 -- them having to remember.
 CREATE OR REPLACE FUNCTION artifact_retire_payload_fn() RETURNS TRIGGER AS $$
 BEGIN
+  -- A real deletion is authoritative about when the capability went, and it
+  -- overrides anything a first-observed scan recorded earlier. DO NOTHING left
+  -- a stale timestamp in place, so an artifact deleted today could inherit a
+  -- grace period that elapsed hours ago and lose its payload immediately.
   INSERT INTO artifact_payload_retirement (artifact_id, artifact_type)
   VALUES (OLD.id, OLD.type)
-  ON CONFLICT (artifact_id) DO NOTHING;
+  ON CONFLICT (artifact_id) DO UPDATE
+    SET artifact_type = EXCLUDED.artifact_type,
+        retired_at = now();
   RETURN OLD;
 END;
 $$ LANGUAGE plpgsql;
+
+-- Retirements recorded for artifacts that still exist. Before creation and
+-- discovery shared a lock, a scan could see a payload directory whose row was
+-- still on its way and enrol it; the artifact then published normally and kept
+-- a retirement it should never have had. Harmless while it lives, and a
+-- poisoned clock the moment it is really deleted. Repeat-safe: on a database
+-- with no such rows this deletes nothing.
+DELETE FROM artifact_payload_retirement r
+USING artifact a
+WHERE r.artifact_id = a.id;
 
 DROP TRIGGER IF EXISTS artifact_retire_payload ON artifact;
 CREATE TRIGGER artifact_retire_payload

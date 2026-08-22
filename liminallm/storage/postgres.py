@@ -575,15 +575,17 @@ class PostgresStore:
             # before requests arrive; the behavioural reds cover what the
             # function body does.
             #
-            # tgtype bit 0 is FOR EACH ROW and bit 3 is DELETE; tgenabled 'D'
-            # is disabled.
+            # tgtype bit 0 is FOR EACH ROW and bit 3 is DELETE. tgenabled has
+            # four states and only two of them fire for ordinary application
+            # statements: 'O' (origin, the default) and 'A' (always). 'R' is
+            # replica-only — not disabled, and equally useless here.
             enrolment = conn.execute(
                 """
                 SELECT 1 FROM pg_trigger
                 WHERE tgrelid = 'artifact'::regclass
                   AND tgname = 'artifact_retire_payload'
                   AND NOT tgisinternal
-                  AND tgenabled <> 'D'
+                  AND tgenabled IN ('O', 'A')
                   AND (tgtype & 1) = 1
                   AND (tgtype & 8) = 8
                   AND (tgtype & 2) = 0

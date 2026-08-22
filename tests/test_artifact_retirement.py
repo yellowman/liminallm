@@ -1322,3 +1322,101 @@ def test_startup_refuses_a_trigger_on_the_wrong_event(client):
                 "DROP TRIGGER IF EXISTS artifact_retire_payload ON artifact"
             )
         apply_schema(url, embedding_dim=64)
+
+
+def test_startup_refuses_a_replica_only_trigger(client):
+    """`ENABLE REPLICA` is neither disabled nor in force.
+
+    Postgres has four states, and only two of them fire for ordinary
+    application statements. A replica-only trigger sits in `pg_trigger`, is
+    not `'D'`, and does nothing when the app deletes an artifact — so
+    checking "not disabled" accepts a database where enrolment silently
+    stopped.
+    """
+    import os
+
+    from liminallm.storage.postgres import PostgresStore
+    from tests.harness import apply_schema
+
+    runtime = get_runtime()
+    url = os.environ["DATABASE_URL"]
+    with runtime.store._connect() as conn:
+        conn.execute(
+            "ALTER TABLE artifact ENABLE REPLICA TRIGGER artifact_retire_payload"
+        )
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            PostgresStore(url, fs_root=str(runtime.settings.shared_fs_root))
+        assert "migrate" in str(caught.value).lower(), str(caught.value)
+    finally:
+        with runtime.store._connect() as conn:
+            conn.execute(
+                "ALTER TABLE artifact ENABLE TRIGGER artifact_retire_payload"
+            )
+        apply_schema(url, embedding_dim=64)
+
+    PostgresStore(url, fs_root=str(runtime.settings.shared_fs_root))
+
+
+class TestARealDeletionOwnsTheClock:
+    """A first-observed record must never outrank an actual deletion.
+
+    Before the creation lock, a scan could record a retirement for an artifact
+    that was about to be published. Those records can already exist, and the
+    trigger's `ON CONFLICT DO NOTHING` means a genuine deletion inherits the
+    stale timestamp instead of replacing it — so the payload of a live
+    artifact deleted today can be due the moment it is deleted.
+    """
+
+    def test_deleting_refreshes_a_stale_retirement(self, client):
+        from liminallm.service.artifacts import sweep_artifact_payloads
+
+        user_id, headers = _account(client)
+        adapter_id = _adapter(client, headers, user_id)
+        runtime = get_runtime()
+        tree = Path(runtime.settings.shared_fs_root) / "adapters" / adapter_id
+
+        # The state an earlier scan could have left behind.
+        with runtime.store._connect() as conn:
+            conn.execute(
+                "INSERT INTO artifact_payload_retirement "
+                "(artifact_id, artifact_type, retired_at) "
+                "VALUES (%s, %s, now() - interval '2 hours')",
+                (adapter_id, "adapter"),
+            )
+
+        assert client.delete(
+            f"/v1/artifacts/{adapter_id}", headers=headers
+        ).status_code == 200
+        assert sweep_artifact_payloads(
+            runtime.store, runtime.settings.shared_fs_root, grace_seconds=3600
+        ) == 0, "the payload was due the instant it was deleted"
+        assert tree.is_dir(), (
+            "an adapter deleted seconds ago lost its weights because a stale "
+            "first-observed record set its clock"
+        )
+
+    def test_the_schema_clears_retirements_for_live_artifacts(self, client):
+        """Repair, because those records can already be in a database."""
+        import os
+
+        from tests.harness import apply_schema
+
+        user_id, headers = _account(client)
+        adapter_id = _adapter(client, headers, user_id)
+        runtime = get_runtime()
+        with runtime.store._connect() as conn:
+            conn.execute(
+                "INSERT INTO artifact_payload_retirement "
+                "(artifact_id, artifact_type, retired_at) "
+                "VALUES (%s, %s, now() - interval '2 hours')",
+                (adapter_id, "adapter"),
+            )
+
+        apply_schema(os.environ["DATABASE_URL"], embedding_dim=64)
+
+        assert _count(
+            "SELECT COUNT(*) AS n FROM artifact_payload_retirement "
+            "WHERE artifact_id = %s",
+            (adapter_id,),
+        ) == 0, "a retirement for an artifact that still exists survived repair"

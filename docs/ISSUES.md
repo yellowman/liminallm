@@ -9792,3 +9792,32 @@ the lock and the deletion, so the locking read is now a named method,
 `_lock_unfinished_training`. The test claims from a thread at that moment: with
 the rows held the claim waits and finds nothing, and without them it succeeds
 and the account is deleted under a running worker.
+
+### 2G.3 carry-overs: two states the checks did not distinguish
+
+**MEDIUM: `tgenabled <> 'D'` accepts a replica-only trigger.** PostgreSQL has
+four trigger states and only two fire for ordinary application statements:
+`'O'` (origin, the default) and `'A'` (always). `ENABLE REPLICA` leaves a
+trigger present, not disabled, and inert for everything the app does — so the
+check accepted a database where enrolment had silently stopped. It requires
+`tgenabled IN ('O', 'A')` now.
+
+**MEDIUM: a real deletion did not own the clock.** The advisory lock stops new
+create-versus-discovery poison, but records from before it can already exist:
+a retirement whose `retired_at` is hours old, attached to an artifact that is
+perfectly alive. The trigger's `ON CONFLICT DO NOTHING` meant a genuine
+deletion inherited that stale timestamp instead of replacing it, so the
+payload could be due the instant the artifact was deleted — the reader race
+again, from stored state rather than from a live race.
+
+Two changes, because the durable state and the rule both need fixing. The
+trigger is `ON CONFLICT DO UPDATE SET retired_at = now()`, so an actual
+deletion always outranks a first-observed guess. And the schema deletes
+retirements for artifacts that still exist, which is repeat-safe: on a database
+with no such rows it removes nothing.
+
+| Mutation | Killed by |
+|---|---|
+| `tgenabled` back to `<> 'D'` | the replica-only red |
+| trigger back to `DO NOTHING` | the stale-retirement red |
+| schema repair removed | the repair red |
