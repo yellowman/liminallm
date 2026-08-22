@@ -63,7 +63,7 @@ def _error_response(
 
 
 def register_exception_handlers(app: FastAPI) -> None:
-    """Install consistent exception handlers for domain and storage errors per SPEC §18."""
+    """Install consistent exception handlers for domain and storage errors per SPEC §13.0."""
 
     @app.exception_handler(ConstraintViolation)
     async def handle_constraint_violation(request: Request, exc: ConstraintViolation):

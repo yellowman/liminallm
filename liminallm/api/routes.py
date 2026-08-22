@@ -2221,7 +2221,7 @@ async def cancel_chat(
     body: ChatCancelRequest,
     principal: AuthContext = Depends(get_user),
 ):
-    """Cancel an in-progress chat request per SPEC §18.
+    """Cancel an in-progress chat request per SPEC §13.1.
 
     Cancellation signals the orchestrator to abort decode, free KV cache and
     adapter refs, and emit cancel_ack with partial tokens if any.
@@ -3288,7 +3288,7 @@ async def propose_patch(
     body: ConfigPatchRequest, principal: AuthContext = Depends(get_admin_user)
 ):
     runtime = get_runtime()
-    # Rate limit configops per SPEC §18: 30 req/hour
+    # Rate limit configops (database-managed setting, SPEC §18.6)
     await rate_limit(runtime, "configops", principal.user_id)
     proposer = "human_admin" if principal.role == "admin" else "user"
     audit = runtime.store.record_config_patch(
@@ -3306,7 +3306,7 @@ async def list_config_patches(
     status: Optional[str] = None, principal: AuthContext = Depends(get_admin_user)
 ):
     runtime = get_runtime()
-    # Rate limit configops per SPEC §18: 30 req/hour
+    # Rate limit configops (database-managed setting, SPEC §18.6)
     await rate_limit(runtime, "configops", principal.user_id)
     patches = runtime.store.list_config_patches(status)
     items = [
@@ -3323,7 +3323,7 @@ async def decide_config_patch(
     principal: AuthContext = Depends(get_admin_user),
 ):
     runtime = get_runtime()
-    # Rate limit configops per SPEC §18: 30 req/hour
+    # Rate limit configops (database-managed setting, SPEC §18.6)
     await rate_limit(runtime, "configops", principal.user_id)
     decision = runtime.config_ops.decide_patch(patch_id, body.decision, body.reason)
     resp = ConfigPatchAuditResponse.model_validate(decision)
@@ -3336,7 +3336,7 @@ async def apply_config_patch(
     principal: AuthContext = Depends(get_admin_user)
 ):
     runtime = get_runtime()
-    # Rate limit configops per SPEC §18: 30 req/hour
+    # Rate limit configops (database-managed setting, SPEC §18.6)
     await rate_limit(runtime, "configops", principal.user_id)
     result = runtime.config_ops.apply_patch(
         patch_id, approver_user_id=principal.user_id
@@ -3361,7 +3361,7 @@ async def auto_patch(
     body: AutoPatchRequest, principal: AuthContext = Depends(get_admin_user)
 ):
     runtime = get_runtime()
-    # Rate limit configops per SPEC §18: 30 req/hour
+    # Rate limit configops (database-managed setting, SPEC §18.6)
     await rate_limit(runtime, "configops", principal.user_id)
     audit = runtime.config_ops.auto_generate_patch(
         body.artifact_id, principal.user_id, goal=body.goal

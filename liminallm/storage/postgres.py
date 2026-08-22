@@ -248,7 +248,7 @@ class PostgresStore:
     def _cache_session(self, session: Session) -> Session:
         """Store session in the in-memory cache and return it.
 
-        Thread-safe per SPEC §18 inference/adapter cache discipline.
+        Thread-safe per SPEC §5.3 adapter cache discipline.
         """
         with self._session_lock:
             now = datetime.now(timezone.utc)
@@ -1873,7 +1873,7 @@ class PostgresStore:
                 )
             else:
                 conn.execute("DELETE FROM auth_session WHERE user_id = %s", (user_id,))
-        # Thread-safe iteration over session cache per SPEC §18
+        # Thread-safe iteration over the session cache
         with self._session_lock:
             stale_ids = [
                 sid

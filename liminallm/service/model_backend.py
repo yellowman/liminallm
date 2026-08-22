@@ -1344,7 +1344,7 @@ class ApiAdapterBackend:
         *,
         user_id: Optional[str] = None,
     ) -> Iterator[dict]:
-        """Stream tokens from the model per SPEC §18.
+        """Stream tokens from the model per SPEC §13.7.
 
         Yields events:
         - {"event": "token", "data": "token_text"}
@@ -1931,7 +1931,7 @@ class LocalJaxLoRABackend:
         if self._tokenizer:
             # truncation=False deliberately: the tokenizer would keep the
             # OLDEST tokens, discarding the newest turn before this method
-            # could choose. Training keeps the tail (SPEC §5.4.5); serving has
+            # could choose. Training keeps the tail (SPEC §5.4.3); serving has
             # to make the same choice or the adapter is fitted to one input
             # distribution and asked to serve another.
             encoded = self._tokenizer(text, truncation=False, return_tensors="np")
@@ -2638,7 +2638,7 @@ class LocalJaxLoRABackend:
         *,
         user_id: Optional[str] = None,
     ) -> Iterator[dict]:
-        """Stream tokens from local LoRA model per SPEC §18.
+        """Stream tokens from local LoRA model per SPEC §13.7.
 
         For local models, we simulate streaming by yielding tokens one at a time
         from the generated response.

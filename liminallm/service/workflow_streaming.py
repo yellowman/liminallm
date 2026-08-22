@@ -48,7 +48,7 @@ class WorkflowStreamingMixin:
         tenant_id: Optional[str] = None,
         cancel_event: Optional[asyncio.Event] = None,
     ) -> AsyncIterator[Dict[str, Any]]:
-        """Execute workflow with streaming token output per SPEC §18.
+        """Execute workflow with streaming token output per SPEC §13.7.
 
         Yields events:
         - {"event": "token", "data": "token_text"}

@@ -1196,7 +1196,7 @@ class AuthService:
         if not cfg:
             return False
 
-        # Check MFA lockout (5 failed attempts = 5 minute lockout per SPEC §18)
+        # Check MFA lockout (5 failed attempts = 5 minute lockout per SPEC §12.1)
         now = self._now()
 
         # Issue 19.3: Use atomic MFA lockout to prevent check-then-act race condition

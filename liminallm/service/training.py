@@ -1069,7 +1069,7 @@ class TrainingService:
         }
 
     def _build_examples(self, events: Iterable[PreferenceEvent]) -> Iterable[dict]:
-        # Issue 18.1: Dedupe by (conversation_id, message_id) per SPEC §18
+        # Issue 18.1: Dedupe by (conversation_id, message_id) per SPEC §5.4.3
         seen: set[tuple[str, str]] = set()
         for event in events:
             key = (event.conversation_id or "", event.message_id or "")

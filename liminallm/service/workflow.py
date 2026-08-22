@@ -78,14 +78,14 @@ from liminallm.storage.models import Message
 from liminallm.storage.postgres import PostgresStore
 from liminallm.storage.redis_cache import RedisCache
 
-# SPEC §9/§18: Default retry and timeout settings
+# SPEC §9.2: Default retry and timeout settings
 DEFAULT_NODE_TIMEOUT_MS = 15000  # 15 seconds per node
-MAX_NODE_TIMEOUT_SECONDS = 60  # SPEC §18: per-node timeout hard cap 60s
+MAX_NODE_TIMEOUT_SECONDS = 60  # SPEC §9.2: per-node timeout hard cap 60s
 DEFAULT_NODE_MAX_RETRIES = 2  # Up to 2 retries (3 total attempts), hard cap at 3
 DEFAULT_BACKOFF_MS = (
-    1000  # Initial backoff 1s, quadruples each retry (1s, 4s per SPEC §18)
+    1000  # Initial backoff 1s, quadruples each retry (1s, 4s per SPEC §9.2)
 )
-MAX_RETRIES_HARD_CAP = 3  # SPEC §18: hard cap at 3 retries
+MAX_RETRIES_HARD_CAP = 3  # SPEC §9.2: hard cap at 3 retries
 # How long the next attempt waits for the last one's parent-side serve loop to
 # return. The worker is already dead; this covers a capability that was mid-call
 # when the kill landed, and each of those carries a timeout of its own.
@@ -528,7 +528,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 self.logger.warning("workflow_loop_detected", node=node_id)
                 break
 
-            # SPEC §9/§18: Execute node with retry and exponential backoff
+            # SPEC §9.2: Execute node with retry and exponential backoff
             result, next_nodes = await self._execute_node_with_retry(
                 node,
                 user_message=user_message,
@@ -746,11 +746,11 @@ class WorkflowEngine(WorkflowStreamingMixin):
         workflow_timeout_ms: float,
         cancel_event: Optional[asyncio.Event] = None,
     ) -> Tuple[Dict[str, Any], List[str]]:
-        """Execute a node with SPEC §9/§18 exponential backoff retry logic.
+        """Execute a node with SPEC §9.2 exponential backoff retry logic.
 
         Retry settings are read from node metadata with defaults:
-        - max_retries: 2 (hard cap at 3 per SPEC §18)
-        - backoff_ms: 1000 (quadruples each retry: 1s, 4s per SPEC §18)
+        - max_retries: 2 (hard cap at 3 per SPEC §9.2)
+        - backoff_ms: 1000 (quadruples each retry: 1s, 4s per SPEC §9.2)
 
         One logical execution spans every attempt, so the ledger a killed
         attempt wrote is the ledger its replacement replays. And no attempt
@@ -1932,7 +1932,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 tool_name, user_id=user_id, tenant_id=tenant_id
             )
         tool_spec = descriptor.schema if descriptor else None
-        # Issue 6.9: Apply hardcap per SPEC §18 (default 15s, hard cap 60s)
+        # Issue 6.9: Apply hardcap per SPEC §9.2 (default 15s, hard cap 60s)
         raw_timeout = tool_spec.get("timeout_seconds", 15) if tool_spec else 15
         timeout = min(raw_timeout, MAX_NODE_TIMEOUT_SECONDS)
         validation_errors = self._validate_tool_payload(

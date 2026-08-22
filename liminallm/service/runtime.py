@@ -926,7 +926,7 @@ async def check_rate_limit(
             window_seconds=window_seconds,
             message="Invalid rate limit window_seconds; defaulting to 60 seconds",
         )
-        window_seconds = 60  # Default to 1 minute if invalid window per SPEC §18
+        window_seconds = 60  # Default to 1 minute if the configured window is invalid
     now = datetime.now(timezone.utc)
     if runtime.cache:
         result = await runtime.cache.check_rate_limit(

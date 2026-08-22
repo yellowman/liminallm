@@ -115,7 +115,7 @@ class ErrorBody(BaseModel):
 
     code: str = Field(
         ...,
-        description="Stable error code per SPEC §18",
+        description="Stable error code per SPEC §13.0",
     )
     message: str
     details: Optional[Any] = None  # object, array, or null
@@ -866,7 +866,7 @@ class AutoPatchRequest(BaseModel):
 
 
 class ChatCancelRequest(BaseModel):
-    """Request to cancel an in-progress chat request per SPEC §18."""
+    """Request to cancel an in-progress chat request per SPEC §13.1."""
     request_id: str = Field(..., max_length=128, description="The request_id of the chat request to cancel")
 
 

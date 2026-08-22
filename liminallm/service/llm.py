@@ -275,7 +275,7 @@ class LLMService:
         *,
         user_id: Optional[str] = None,
     ) -> Iterator[dict]:
-        """Stream tokens from the LLM per SPEC §18.
+        """Stream tokens from the LLM per SPEC §13.7.
 
         Yields events:
         - {"event": "token", "data": "token_text"}

@@ -27,7 +27,7 @@ logger = get_logger(__name__)
 
 _settings = Settings.from_env()
 
-# Version info per SPEC §18
+# Version info per SPEC §15.2
 __version__ = "0.1.0"
 __build__ = _settings.build_sha
 
