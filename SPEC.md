@@ -1185,7 +1185,8 @@ when absent, and code MUST NOT branch on them where `mode` answers.
 }
 ```
 
-**workflow.chat schema / contracts** (JSON Schema sketch):
+**workflow.chat schema / contracts** (JSON Schema sketch; retry and
+timeout numbers are §18.3's — the sketch describes the fields):
 
 ```json
 {
@@ -1196,7 +1197,7 @@ when absent, and code MUST NOT branch on them where `mode` answers.
     "kind": {"const": "workflow.chat"},
     "entrypoint": {"type": "string"},
     "timeout_ms": {"type": "integer", "minimum": 1000},
-    "max_retries": {"type": "integer", "minimum": 0, "default": 1},
+    "max_retries": {"type": "integer", "minimum": 0, "default": 2},
     "nodes": {
       "type": "array",
       "items": {
@@ -1233,10 +1234,11 @@ when absent, and code MUST NOT branch on them where `mode` answers.
 - `vars` is a `dict[str, Any]` scoped to a workflow execution; tool outputs merge into `vars` by key.
 - tool inputs are resolved by templating from `input` + `vars` (e.g., `${vars.intent}`); missing keys cause a node failure.
 - **error handling:** node failure retries up to `max_retries` with
-  exponential backoff capped at `timeout_ms`; exhausted retries emit an
-  `error` event and return a structured error; an optional `on_error`
-  fallback node may be named in node metadata.
-- **timeouts:** per-node default 15s unless overridden; workflow-level
+  exponential backoff — defaults and kernel hard caps per §18.3, the one
+  normative home for those numbers; exhausted retries emit an `error`
+  event and return a structured error; an optional `on_error` fallback
+  node may be named in node metadata.
+- **timeouts:** per-node `timeout_ms` per §18.3; workflow-level
   `timeout_ms` caps total wall clock; a timed-out node follows the retry
   rules.
 - **idempotency:** workflow runs are identified by
@@ -1482,11 +1484,10 @@ execution guardrails:
 - no shell execution unless the tool is `privileged:true` — which requires
   an admin-owned persisted artifact AND an admin caller (§18.3) — and is
   never called by default workflows.
-- per-node `max_retries` and `backoff_ms` defaults (2 retries, 1s initial
-  backoff quadrupling per retry: 1s, 4s) are overridable in workflow
-  nodes; retries are hard-capped at 3.
-- per-node `timeout_ms` (default 15000, hard cap 60000) after which the
-  node fails; workflow retries or aborts per policy.
+- per-node `max_retries`, `backoff_ms`, and `timeout_ms` are overridable
+  in workflow nodes; the defaults and the kernel hard caps are §18.3's,
+  stated once there. a node past its timeout fails; the workflow retries
+  or aborts per policy.
 - JSON Schema validation on tool inputs/outputs; outputs flagged
   `content_type: "html_untrusted"` must be sanitized by the client before
   render.
@@ -1741,7 +1742,9 @@ exist.
 - **pagination**: either `{ data: [...], next_cursor: "opaque" }` or
   `{ page, page_size, total }` — chosen per endpoint, stable once
   published. for simple bounded queries `limit` is accepted as an alias
-  for `page_size` (default 100, max 500).
+  for `page_size`, bounded by the `default_page_size` / `max_page_size`
+  settings (§18.6; code defaults 100 and 500) — the numbers are the
+  settings', not this section's.
 - **idempotency**: POST endpoints with side effects (`/v1/chat`,
   `/v1/tools/run`, `/v1/artifacts`) accept `Idempotency-Key`; the server
   replays the prior response within a 24h TTL and returns `409` while the
@@ -1917,7 +1920,7 @@ it).
 - `DELETE /v1/files/{filename}` — delete user file; returns `{ deleted: true }`.
 - `POST /v1/contexts` — create `knowledge_context`, attach file paths.
 - `GET /v1/contexts?limit=N` — list contexts + stats; supports `?owner=me|global`.
-- `GET /v1/contexts/{id}/chunks?limit=N` — list chunks; default limit 100, max 500.
+- `GET /v1/contexts/{id}/chunks?limit=N` — list chunks; `limit` bounds per §13.0.
 
 ### 13.4 artifacts
 
@@ -1925,7 +1928,7 @@ it).
 - `GET /v1/artifacts/{id}` — fetch current version + metadata.
 - `POST /v1/artifacts` — create; validates `schema.kind` using per-kind schema.
 - `PATCH /v1/artifacts/{id}` — update via JSON Patch; writes new `artifact_version`.
-- `GET /v1/artifacts/{id}/versions?limit=N` — list versions; default limit 100, max 500.
+- `GET /v1/artifacts/{id}/versions?limit=N` — list versions; `limit` bounds per §13.0.
 - `POST /v1/tools/run { tool_id, input }` — execute a tool outside a
   workflow (for testing), same retry/timeout caps as workflow nodes.
 
@@ -2155,6 +2158,15 @@ earned them live in `docs/decisions/` and `docs/ISSUES.md`.
   leading its own process group, under POSIX rlimits (memory, cpu, file
   size, no core dumps) backstopped by a wall-clock kill. The rlimits fail
   closed: a platform that refuses a limit does not run the body.
+- Node retry and timeout bounds have exactly one normative home, and it
+  is this bullet. A node defaults to **2 retries** after the initial
+  attempt (3 total attempts); backoff starts at **1 second** and
+  quadruples per retry (1s, then 4s), never sleeping past the workflow's
+  remaining `timeout_ms`. A workflow MAY override `max_retries` per node
+  up to the kernel hard cap of **3**. Per-node `timeout_ms` defaults to
+  **15s** and is independently capped by the kernel at **60s**. Schema
+  sketches and engine sections describe these fields and cite this rule;
+  they do not restate the numbers.
 - The worker holds nothing; the parent serves every effect. The child
   gets a plan — inputs, messages, offered schemas, budgets — and no store
   handle, model client, settings object, filesystem credential, or
@@ -2205,9 +2217,9 @@ earned them live in `docs/decisions/` and `docs/ISSUES.md`.
   lifetimes: namespace retirement is ledgered durably in the deleting
   transaction and swept under the same per-identity lock the writers
   hold (§18.2; docs/ISSUES.md tranche 2G).
-- Uploads enforce per-plan size caps; downloads use signed URLs (10m
-  expiry, attachment disposition); per-user scratch auto-cleans; no
-  cross-user hardlinks.
+- Uploads enforce per-plan size caps; downloads use signed URLs
+  (expiry per §13.3, attachment disposition); per-user scratch
+  auto-cleans; no cross-user hardlinks.
 - Staged worker inputs are read-only copies; originals are never handed
   to untrusted code (§18.3).
 

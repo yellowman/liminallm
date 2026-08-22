@@ -262,7 +262,7 @@ class CapabilityBroker:
             invocation.ledger.begin(operation_seq, capability, digest)
             self._notify(capability)
             started = time.monotonic()
-            # SPEC §9.2/§18: tool egress is allowlisted. The guard is
+            # SPEC §18.3/§21.1: tool egress is allowlisted. The guard is
             # thread-local and the serve loop has its own thread, so applying
             # it here covers every capability — which is the point, since the
             # capabilities are now the only things that open sockets at all.

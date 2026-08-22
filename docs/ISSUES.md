@@ -10650,3 +10650,37 @@ the code does. The inert `JWT_SECRET` exports in `tests/conftest.py`,
 `tests/test_performance.py`, `docker-compose.test.yml` and
 `scripts/bootstrap_admin.py` are left in place and named here: dead weight,
 not defects, and removing them belongs to a pass of its own.
+
+## SPEC canonicalization: the contradiction list
+
+The editorial pass (commit "The SPEC says what must remain true") resolved
+every case of the same document answering one question twice. Recorded here
+so the list survives the commit message, and because two entries were found
+after the pass by the rule the pass itself established — a default or limit
+has exactly one normative home.
+
+| Question | The answers that coexisted | Canonical (measured in code) |
+|---|---|---|
+| reset token TTL | 30m (§12.1) vs 15m (§18) | 15m — `auth.py` |
+| reset endpoints | `/auth/request_reset` (§12) vs `/auth/reset/...` (code) | `/auth/reset/request`, `/auth/reset/confirm` |
+| tenant transport | host-only (§12.2) vs `X-Tenant-ID` + frame `tenant_id` (§17.11) | host-derived only; the server reads neither field |
+| websocket tenant | "no tenant_id" (§18) vs §17.11's frame | host-derived only |
+| token storage | sessionStorage (§17.10) vs HttpOnly (§18) | HttpOnly refresh; the SPA's copy is a named deviation (roadmap) |
+| `notes_enabled` precedence | admin → env → code (§19.7) vs no env var (§18) | admin → code; managed settings have no env vars |
+| configops endpoints | §10's routes vs §18's `/v1/config/apply` | §10 — `/v1/config/apply` never existed |
+| node retry defaults | 1 retry/200ms (§9.2) vs 2 retries/1s quadrupling (§18) vs sketch `default: 1` (§6.1) | 2 retries, 1s quadrupling, caps 3 and 60s — `workflow.py`; stated once in §18.3, referenced from §6.1 and §9.2 |
+| sweep-report archive | "not yet built" (§19.6) vs `GET /v1/notes/sweeps` (code) | built; §19.6 describes it |
+| upload panel | Chat tab (§17.8) vs Files tab (§17.3, markup) | Files tab — `index.html` |
+| signed-URL expiry | 10m in §13.3 and again in §18 | §13.3 owns it |
+| pagination bounds | "default 100, max 500" in §13.0, §13.3, §13.4 | `default_page_size` / `max_page_size` settings own them; §13.0 names the settings, the endpoints cite §13.0 |
+
+The retry row is the instructive one: the third copy (the §6.1 schema
+sketch's `default: 1`) survived the first pass because it looked like an
+example, and an example carrying its own default is a second configuration
+source that happens to be indented. Schema sketches now describe fields and
+cite §18.3; the code's five retry-comment citations moved with the rule.
+
+Checked while closing it: the code has no fourth copy — no artifact-kind
+schema declares a `max_retries` default; the engine's
+`DEFAULT_NODE_MAX_RETRIES = 2` in `workflow.py` is the only value, and the
+seed workflows in `storage/common.py` set none.
