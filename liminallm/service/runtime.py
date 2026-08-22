@@ -817,51 +817,58 @@ async def _acquire_idempotency_slot(
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(seconds=ttl_seconds)
 
-    # Same guard as storing the result, so an erased account is left with no
-    # `idemp:` key at all rather than an in-progress marker the purge has
-    # already been past. Reporting the slot as acquired lets the request
-    # finish; storing its result is refused separately, by the same guard.
+    # Same guard as storing the result, and for the same reason: this claim is
+    # also a key naming the account, kept for a day. Reporting the slot as
+    # acquired lets a request whose account has just gone still finish; it
+    # simply records nothing, here or when its result comes back.
+    #
+    # The whole claim is inside the guard, not a question asked before it. An
+    # answer released before the write is a check-then-act across the
+    # deletion — the erasure commits and purges in the gap, and the claim
+    # lands afterwards under a key the purge has already been past.
     with runtime.store.hold_live_user(user_id) as live:
         if not live:
             return (True, None)
 
-    if runtime.cache:
-        # Issue 22.2: Pass tenant_id for multi-tenant isolation
-        return await runtime.cache.acquire_idempotency_slot(
-            route, user_id, key, record, ttl_seconds=ttl_seconds, tenant_id=tenant_id
-        )
-
-    # In-memory fallback with atomic check-and-set within lock
-    async with runtime._local_idempotency_lock:
-        # Include tenant_id in in-memory key for multi-tenant isolation
-        cache_key = (tenant_id, route, user_id, key) if tenant_id else (route, user_id, key)
-        expired, evicted = _cleanup_local_idempotency(runtime, now)
-        if expired or evicted:
-            logger.info(
-                "idempotency_local_cleanup",
-                expired=expired,
-                evicted=evicted,
-                remaining=len(runtime._local_idempotency),
+        if runtime.cache:
+            # Issue 22.2: Pass tenant_id for multi-tenant isolation
+            return await runtime.cache.acquire_idempotency_slot(
+                route, user_id, key, record, ttl_seconds=ttl_seconds, tenant_id=tenant_id
             )
-        existing = runtime._local_idempotency.get(cache_key)
 
-        if existing:
-            is_expired = existing.get("expires_at") and existing["expires_at"] < now
-            # Reclaim a prior failed attempt atomically (within this lock) so a
-            # retry proceeds without a separate racy overwrite.
-            is_failed = existing.get("status") == "failed"
-            if is_expired or is_failed:
-                runtime._local_idempotency.pop(cache_key, None)
-            else:
-                # Live in-progress/completed record: return it.
-                return (False, existing)
+        # In-memory fallback with atomic check-and-set within lock
+        async with runtime._local_idempotency_lock:
+            # Include tenant_id in in-memory key for multi-tenant isolation
+            cache_key = (
+                (tenant_id, route, user_id, key) if tenant_id else (route, user_id, key)
+            )
+            expired, evicted = _cleanup_local_idempotency(runtime, now)
+            if expired or evicted:
+                logger.info(
+                    "idempotency_local_cleanup",
+                    expired=expired,
+                    evicted=evicted,
+                    remaining=len(runtime._local_idempotency),
+                )
+            existing = runtime._local_idempotency.get(cache_key)
 
-        # No existing record or it was expired, claim the slot
-        runtime._local_idempotency[cache_key] = {
-            **record,
-            "expires_at": expires_at,
-        }
-        return (True, None)
+            if existing:
+                is_expired = existing.get("expires_at") and existing["expires_at"] < now
+                # Reclaim a prior failed attempt atomically (within this lock)
+                # so a retry proceeds without a separate racy overwrite.
+                is_failed = existing.get("status") == "failed"
+                if is_expired or is_failed:
+                    runtime._local_idempotency.pop(cache_key, None)
+                else:
+                    # Live in-progress/completed record: return it.
+                    return (False, existing)
+
+            # No existing record or it was expired, claim the slot
+            runtime._local_idempotency[cache_key] = {
+                **record,
+                "expires_at": expires_at,
+            }
+            return (True, None)
 
 
 async def check_rate_limit(

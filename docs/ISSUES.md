@@ -10094,6 +10094,28 @@ day, past a purge that had already run. When the account is gone the slot
 reports itself acquired and writes nothing, so the request still finishes and
 leaves no `idemp:` key behind at all.
 
+The first version of that slot guard asked and released before claiming:
+
+```python
+with runtime.store.hold_live_user(user_id) as live:
+    if not live:
+        return (True, None)
+
+if runtime.cache:
+    return await runtime.cache.acquire_idempotency_slot(...)
+```
+
+which is the write-after-purge shape again, for the claim instead of the
+result — the deletion commits and purges in the gap, and the claim lands
+afterwards. The whole acquisition is inside the guard now.
+
+The red that had covered the slot deleted the account *before* entering the
+guard, which proves the liveness predicate and says nothing about where the
+lock is held. Deletion-first reds cannot distinguish those two, and neither
+can a mutation that removes the guard: both die either way. The red pauses at
+`acquire_idempotency_slot` itself now — the statement that creates the key —
+and fails against the released-early version without needing a mutation at all.
+
 A name that is not a user id is *not* refused by this guard, and the reasoning
 is the opposite of the collector's. `app_user.id` is a UUID, so such a name can
 never have been an account, can never be erased, and can therefore never have
@@ -10128,7 +10150,8 @@ and created a lock ordering that does not exist anywhere else in the system.
 | the write guard answers the collector's question | the two-guards red |
 | the idempotency record is written outside the guard | the idempotency red |
 | the conversation summary is written outside the guard | the summary red |
-| the idempotency slot is claimed outside the guard | the already-gone red |
+| the idempotency slot guard is removed entirely | the already-gone red |
+| the slot guard answers, releases, then claims | the in-flight claim red |
 | the sweep waits on a contended blob | the timing red, at 30.7s |
 
 The in-flight reds cannot run on the previous commit, because their seam is

@@ -957,31 +957,40 @@ class TestAnInFlightRequestCannotUndoTheErasure:
     """
 
     async def _forced_schedule(
-        self, client, user_id, admin_headers, write, key_exists
+        self, client, user_id, admin_headers, write, key_exists,
+        reached=None, release=None,
     ):
         """Pause a cache write mid-flight, then erase the account under it.
 
         Returns nothing; asserts both directions of the one property. While
         the writer holds the account the deletion must still be waiting, and
         once everything settles the key must not exist.
+
+        With no `reached`/`release` the pause is installed just inside the
+        guard, which shows the guard is entered and held. A caller that passes
+        its own pair has put the pause at the statement that actually writes,
+        which is the stronger placement and the one that catches a guard
+        released too early — measured, a claim written after the `with` block
+        survived the weaker version of this.
         """
         import threading
 
         runtime = get_runtime()
-        reached = threading.Event()
-        release = threading.Event()
-        real = runtime.store.hold_live_user
-
-        @contextlib.contextmanager
-        def pause_inside(target_user_id):
-            with real(target_user_id) as live:
-                if target_user_id == user_id:
-                    reached.set()
-                    assert release.wait(timeout=30), "the writer was never released"
-                yield live
-
         monkeypatch = pytest.MonkeyPatch()
-        monkeypatch.setattr(runtime.store, "hold_live_user", pause_inside)
+        if reached is None or release is None:
+            reached = threading.Event()
+            release = threading.Event()
+            real = runtime.store.hold_live_user
+
+            @contextlib.contextmanager
+            def pause_inside(target_user_id):
+                with real(target_user_id) as live:
+                    if target_user_id == user_id:
+                        reached.set()
+                        assert release.wait(timeout=30), "the writer was not released"
+                    yield live
+
+            monkeypatch.setattr(runtime.store, "hold_live_user", pause_inside)
         deletion: dict = {}
 
         def delete_the_account():
@@ -1075,6 +1084,62 @@ class TestAnInFlightRequestCannotUndoTheErasure:
         await self._forced_schedule(
             client, user_id, admin_headers, write, key_exists
         )
+
+    @pytest.mark.asyncio
+    async def test_an_in_flight_idempotency_claim_does_not_resurrect(self, client):
+        """The claim is a key too, and it is written by a different call.
+
+        Deleting first and then entering the guard proves the liveness
+        predicate and nothing about where the lock is held. This pauses at the
+        cache acquisition itself — the statement that actually creates
+        `idemp:...:<user>:...` — so a guard that answered and released before
+        it lets the deletion through during the pause.
+        """
+        import threading
+
+        runtime = get_runtime()
+        if runtime.cache is None:
+            pytest.skip("no Redis in this environment")
+        user_id, _, headers = _account(client)
+        _, _, admin_headers = _account(client, admin=True)
+        key = _unique("key")
+
+        reached = threading.Event()
+        release = threading.Event()
+        real_acquire = runtime.cache.acquire_idempotency_slot
+
+        async def pause_at_the_claim(route, target_user_id, *args, **kwargs):
+            if target_user_id == user_id:
+                reached.set()
+                assert release.wait(timeout=30), "the claim was never released"
+            return await real_acquire(route, target_user_id, *args, **kwargs)
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(
+            runtime.cache, "acquire_idempotency_slot", pause_at_the_claim
+        )
+
+        async def write():
+            from liminallm.service.runtime import _acquire_idempotency_slot
+
+            await _acquire_idempotency_slot(
+                runtime, "chat", user_id, key, {"status": "in_progress"}
+            )
+
+        async def key_exists():
+            return [
+                k
+                async for k in runtime.cache.client.scan_iter(
+                    match=f"idemp:*{user_id}*", count=500
+                )
+            ]
+
+        try:
+            await self._forced_schedule(
+                client, user_id, admin_headers, write, key_exists, reached, release
+            )
+        finally:
+            monkeypatch.undo()
 
     @pytest.mark.asyncio
     async def test_a_write_for_an_account_that_is_already_gone_does_nothing(
