@@ -54,9 +54,30 @@ def is_tainted(session: Dict[str, Any]) -> bool:
     return bool(session.get("injection_findings"))
 
 
+def register_egress_tools(session: Dict[str, Any], names: Iterable[str]) -> None:
+    """Name this turn's discovered tools that can carry data off the box.
+
+    `WITHDRAWN_TOOLS` is a constant because the native tools are. Remote MCP
+    tools are not: which ones exist is discovered per turn, and whether one
+    has an egress channel is an operator's classification on its server's
+    artifact. So the static set is the floor and this is the rest of it.
+
+    Only the egress ones are registered. A `local_read` server stays callable
+    on a tainted turn for the same reason `file_search` does.
+    """
+    known = session.setdefault("egress_tools", [])
+    for name in names:
+        if name and name not in known:
+            known.append(name)
+
+
 def is_withdrawn(tool_name: str, session: Dict[str, Any]) -> bool:
     """Whether this tool is refused for the rest of the turn."""
-    return tool_name in WITHDRAWN_TOOLS and is_tainted(session)
+    if not is_tainted(session):
+        return False
+    return tool_name in WITHDRAWN_TOOLS or tool_name in (
+        session.get("egress_tools") or ()
+    )
 
 
 def refusal(session: Dict[str, Any]) -> str:

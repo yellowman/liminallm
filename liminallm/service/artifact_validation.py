@@ -56,6 +56,31 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
         },
         "required": ["kind", "nodes"],
     },
+    # A remote MCP server. Not a `tool`: a server is not callable, it
+    # discovers zero or more tools, and overloading `tool.spec` would make a
+    # configuration look like a capability before anything has been listed.
+    #
+    # `taint_class` is the operator's classification and the only one that
+    # counts. It is deliberately not inferrable from the server's own
+    # annotations: remote metadata is supplied by the party being classified.
+    # Absent or unrecognized means `egress` (see `mcp_client.server_taint_class`),
+    # so the enum here is what an operator may *attest*, not what is assumed.
+    "mcp_server": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "properties": {
+            "kind": {"const": "mcp.server"},
+            "name": {"type": "string", "minLength": 1},
+            # Streamable HTTP only in this tranche. stdio would turn "connect
+            # to a server" into "spawn the executable this row names", which
+            # is a different privilege boundary and belongs to its own review.
+            "url": {"type": "string", "pattern": "^https?://"},
+            "enabled": {"type": "boolean"},
+            "taint_class": {"enum": ["egress", "local_read"]},
+            "description": {"type": "string"},
+        },
+        "required": ["kind", "name", "url"],
+    },
     "tool": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",

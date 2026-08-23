@@ -17,6 +17,16 @@ dependencies = [
   "psycopg-pool>=3.2",
   "redis>=5.0",
   "openai>=1.30",
+  # The MCP wire, and the reason `liminallm/service/mcp_client.py` contains no
+  # protocol code. Version negotiation, Streamable HTTP and the message types
+  # are the SDK's; this repository owns authority, naming, network policy and
+  # the data boundary around it.
+  #
+  # Runtime, not dev: a remote tool server is a product capability, and an
+  # installation that discovers one needs the client at serving time. Capped
+  # below 3 because the client construction and the result shape this depends
+  # on are 2.x API, not a wire format the SDK would carry across a major.
+  "mcp>=2,<3",
   "structlog>=24.4",
   "jsonschema>=4.22"
 ]

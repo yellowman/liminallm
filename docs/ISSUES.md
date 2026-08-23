@@ -11989,3 +11989,146 @@ trusted to judge the server, rather than against our reading of
 Seven mutations, each killed: either MFA route requiring the JS session id,
 the challenge bound to the wrong session, verify issuing tokens for the body's
 session, and the SPA restoring a session id to either body.
+
+## Remote MCP servers: the SDK owns the wire, this kernel owns everything else
+
+A Liminal turn can now use tools that live on a remote MCP server. The
+constraint that shaped the whole tranche: no protocol code here.
+`mcp>=2,<3` is a runtime dependency and the wire arbiter — version
+negotiation, Streamable HTTP, the message types and the fallback handshake are
+all the SDK's. Measured, not assumed: `Client(url)` negotiated protocol
+`2026-07-28` against the SDK's own server with nothing in this repository
+naming a version.
+
+That leaves a short list of things the SDK cannot decide, and those are what
+`liminallm/service/mcp_client.py` is:
+
+* **Authority.** A server is a persisted `mcp.server` artifact, globally
+  visible and admin-owned. Ownership is read from the artifact row, never from
+  a field inside `schema` — a payload claiming `owner_user_id: <an admin>` is
+  a string somebody typed. Same rule `privileged: true` already lives under.
+* **Classification.** `egress` or `local_read`, from the artifact and nowhere
+  else. Not from the server's own annotations: `readOnlyHint` is metadata
+  supplied by the party being classified. Missing, unknown or malformed is
+  `egress`, because the safe default has to be the one that survives a typo.
+* **Network policy.** Discovery and dispatch both run inside the same
+  `tool_network_guard` the rest of the tool loop runs in. Measured before
+  relying on it: the guard patches `socket.socket.connect` globally, so it
+  catches the SDK's transport without the SDK knowing it exists — including
+  the host a 307 redirect leads to, which is the case a URL allowlist checked
+  at call time would miss.
+* **Naming.** Remote names are projected into `mcp__<server>__<tool>`, so a
+  server offering `web_fetch` gets `mcp__evil__web_fetch` and never the native
+  tool's name.
+* **The data boundary.** A result is third-party text: bounded, scanned,
+  wrapped, exactly like fetched web content. A server is not more trustworthy
+  for speaking JSON-RPC.
+
+### The defect that would have made the whole tranche a no-op
+
+`RemoteTool.spec()` emitted the flat Responses form —
+`{"type": "function", "name": ..., "parameters": ...}`. Every backend in this
+repository reads the nested chat-completions form instead:
+`StubBackend.generate_with_tools` selects on `tool["function"]["name"]`,
+`LocalJaxLoRABackend._tool_contract` advertises from the same key, and
+`responses_compat.to_tools` is what flattens it at the OpenAI boundary. All
+three skip a spec with no `function` silently.
+
+So the server would have been discovered, listed, name-projected, policy-
+guarded, and never offered to a model. Measured, not read: the spec was handed
+to the real `StubBackend`, which selected `file_search` from the native schema
+and nothing at all from this one. Every other test in the file passed with the
+defect in place, because they all called `mcp_client.call` directly.
+
+The three reds that now cover it hand the spec to the two real readers rather
+than asserting its shape — a shape assertion encodes the same belief that
+produced the module, so it would have agreed with the bug.
+
+### Two things the reds caught in the writing
+
+`neutralize_markers` before `scan_for_injection` was one call too many, and
+the wrong order besides: `wrap_untrusted` already neutralizes on the way out,
+so the early call only meant the scanner read text whose markers had already
+been mangled — a control marker could mask the pattern underneath it. Scanning
+raw and neutralizing at the envelope is both shorter and strictly stronger.
+
+The policy guard was on discovery but not on `call`. Those are two separate
+connections, and a tool discovered under one policy is dispatched under
+whatever policy the turn is running now, so guarding only the listing left the
+data-carrying half unguarded. It survived a mutation until
+`test_a_call_obeys_the_policy_too_not_only_discovery` existed.
+
+### The test server is the SDK's own server
+
+`tests/mcpfixture.py` runs `Server(...).streamable_http_app()` under uvicorn on
+a real port. A hand-written fake would put the wire back inside the test, which
+is the thing adopting the official client was meant to remove. It records
+`calls`, which several reds need: proving a withdrawn tool returned a refusal
+is weaker than proving the remote server never heard from us at all.
+
+### Recorded, not fixed: one equivalent mutation
+
+`servers_for_turn` asks for `visibility="global"`. Reverting that to the
+unscoped default survives every test, and the probe says why: unscoped listing
+widens to private and shared rows only for the identity it is given, and this
+call site gives it none. Measured — `unscoped=True/False/False` against
+`global-only=True/False/False` for global/shared/private rows, and
+`with-tenant=True/True/False` once a tenant is passed. So the two spellings
+return the same rows today and no test can separate them.
+
+The filter stays, because it is what keeps the call correct if it ever gains a
+tenant or an owner, and at that point one tenant's admin could otherwise put a
+tool server into every turn. But it is not what makes it correct now, and both
+docstrings said it was. Corrected to what was measured.
+`test_a_tenant_shared_server_is_not_the_installations` stays as an invariant
+witness with its docstring saying plainly that it cannot tell the two
+mechanisms apart.
+
+### Deliberately out of scope
+
+stdio, which turns "connect to a server" into "spawn the executable this row
+names" — a different privilege question that deserves its own review, and the
+reason the artifact schema's `url` is pinned to `^https?://` rather than left
+open. Also OAuth, resources, prompts and subscriptions. Discovery is per turn
+with no cache: a remote server's offering is neither persisted nor stable, so
+one listing per turn is the honest baseline and caching is a later
+optimisation rather than a correctness change.
+
+### Mutations
+
+Twenty-five run, 23 killed by `tests/test_mcp_client.py` alone. The spec in
+the flat dialect and the untrusted-data warning dropped from it; the prefix
+dropped, so a server can claim `web_fetch`; the separator collapsed to a
+single underscore, so `a__b`+`c` collides with `a`+`b__c`; the collision
+digest removed, so two remote names that normalize alike silently become one
+tool; the length cap raised; the URL guard removed; dispatch on the
+model-visible name rather than the remote one; the admin check removed; the
+enabled check removed; an unknown `taint_class` treated as an attestation
+rather than as `egress`; the server's own annotation read back in; the network
+guard removed from discovery; the same removed from `call`; the result cap
+removed; the scan skipped; the envelope skipped; findings not recorded; the
+taint check on an `egress` tool removed; one dead server failing the turn;
+registered egress tools ignored by `is_withdrawn`; and, against the artifact
+schema, the `url` pattern dropped — which lets `file:///etc/passwd` persist as
+a server — and the `taint_class` enum widened to any string, which turns an
+operator's `local-read` typo into a silent downgrade instead of a write error.
+
+Two survivors, both accounted for rather than chased:
+
+* `is_withdrawn` ignoring the taint check survives this file and is killed by
+  five tests elsewhere in the suite. The invariant it breaks — an untainted
+  turn withdraws nothing — belongs to `taint.py`'s own tests, which is where
+  it is. A per-file mutation run reporting it as a survivor is the same false
+  signal as the earlier `purged = 0` case: the harness's scope, not a gap.
+* `visibility="global"` reverted to the unscoped default is equivalent, as
+  above.
+
+Two survivors were real and are now killed. Raising `MAX_NAME_LENGTH` to 1000
+survived because the test asserted `len(n) <= mcp_client.MAX_NAME_LENGTH` —
+it read the module's own constant, so the mutation moved the goalposts and the
+test agreed. 64 is a provider's limit on a function name, not this module's
+preference, so the literal is now written out. And removing the URL guard
+survived because no row could reach it: `validate_artifact` requires `url` on
+create and on update. The witness writes the malformed row the only way it can
+exist, straight into the table, which is also the only way it *does* exist —
+a restore from an older dump, or an operator's UPDATE.
