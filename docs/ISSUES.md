@@ -11801,3 +11801,67 @@ One mutation in the first round measured nothing and is recorded so it is not
 repeated: replacing three dict entries with `pass` is a syntax error, so the
 run produced a collection ERROR rather than a FAILED, which the harness read
 as a survivor. Removing the keys cleanly killed it.
+
+### Closing the tranche: every event, one arbiter
+
+Validating only the shapes we had reason to doubt is backwards for a finite
+public protocol. Several independent required-field omissions in one surface
+is reason to check the whole surface. `ResponseStreamEvent` is the dialect's
+own discriminated union over every server event, so each payload goes to it
+whole — measured first to reject an unknown `type`, a missing required field,
+and an invalid nested item, so it is an arbiter rather than a formality.
+
+One successful stream carrying a tool and text, one failure stream, and every
+event validated: `response.created`, `.in_progress`, `.output_item.added`,
+`.output_item.done`, `.content_part.added`, `.content_part.done`,
+`.output_text.delta`, `.output_text.done`, `.completed`, `.failed`. The
+success test asserts the set of event names it saw, so it cannot pass by
+emitting two events and validating both.
+
+All ten already validated after the previous commit's fixes, which is the
+result worth recording: the earlier omissions were real and were the only
+ones.
+
+### The streamed item never learned what it searched for
+
+The conformance pass did surface one behavioural defect. A streamed tool item
+is built when the trace event opens it, and the trace event carries no
+arguments — so the item's query is the empty-when-unknown form. Nothing ever
+revisited it, so the *finished* response reported an empty query for a run
+whose trace named one.
+
+Measured on both item types before fixing: a `file_search_call` reported
+`queries: []` and a `web_search_call` an empty query, for a stream whose
+`message_done` carried `needle`. The blocking path was always correct; only
+streaming dropped it.
+
+The finished response is where a caller reads what the run did, so that is
+where the trace lands. The already-emitted `output_item.added`/`.done` keep
+the empty form — it was true when it was serialized — and the id is untouched,
+so a caller correlating the finished item with the one it saw open finds the
+same item. The witness is parametrized over both item types and asserts the
+id, the empty form at open, and the filled form at the end.
+
+Eight mutations, each killed: the enrichment never running, filling only one
+of the two item types, minting a new id, `content_part.added` losing its
+`annotations` or its `content_index`, `response.created` carrying no
+`response`, `response.in_progress` under an unknown event name, and
+`response.failed` carrying no `response`.
+
+### The arbiter has to be installable
+
+`openai>=1.30` is the declared floor, and `openai.types.responses` does not
+exist there — so a minimum-version environment could not collect these tests
+at all. The floor is not raised: the API backend deliberately supports SDKs
+and providers with no Responses endpoint and falls back to chat completions,
+and raising it would contradict that.
+
+`openai>=2.8.1` goes in the `dev` extra instead. Product runtime keeps the old
+SDK, the conformance suite gets the generated types, and `uv.lock` records
+which schema snapshot was qualified — it already resolved 2.8.1, and now
+carries the dev specifier too. Relocking also picked up `pytest-xdist`, which
+was declared in `dev` and had never been locked.
+
+Responses wire qualification is closed: every event the server emits validates
+under the locked SDK, the blocking response validates, errors keep their
+promised shape, and mutations prove each witness is live.

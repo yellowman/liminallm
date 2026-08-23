@@ -51,6 +51,17 @@ dev = [
   "pytest-xdist>=3.5",
   "ruff>=0.4",
   "bandit>=1.7",
+  # The arbiter for the served Responses wire (SPEC §16). Those tests hand
+  # each payload to the SDK's generated types, which live under
+  # `openai.types.responses` and do not exist in the base floor above — so a
+  # minimum-version environment could not even collect them.
+  #
+  # Deliberately not raised at runtime: the API backend supports SDKs and
+  # providers with no Responses endpoint and falls back to chat completions,
+  # and raising the base floor would contradict that. Product runtime keeps
+  # the old SDK; the conformance suite needs the generated types; the
+  # lockfile records which schema snapshot was qualified.
+  "openai>=2.8.1",
 ]
 
 [tool.setuptools]

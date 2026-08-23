@@ -1738,6 +1738,41 @@ def _responses_tool_items(tool_trace: list) -> list:
     return items
 
 
+def _responses_enrich_tool_items(items: list, tool_trace: list) -> None:
+    """Fill streamed tool items from the trace, once the trace exists.
+
+    A streamed item opens on a trace event that carries no arguments, so it
+    is emitted with the empty-when-unknown query — which is honest at that
+    moment and is what the dialect requires. By the time the turn finishes
+    the arguments are known, and the finished response is where a caller
+    reads what the run actually did, so it says so rather than staying empty
+    because of when the item happened to open. Measured before this existed:
+    a streamed `file_search_call` reported `queries: []` and a
+    `web_search_call` an empty query, for a run whose trace named one.
+
+    The already-emitted `output_item.done` keeps the empty form: it was
+    serialized when it was true. Ids are untouched, so a caller correlating
+    the finished item with the one it saw open finds the same item.
+
+    Matched by position among the dialect-native calls, which is the order
+    both lists are built in.
+    """
+    calls = [
+        call
+        for call in tool_trace or []
+        if isinstance(call, dict)
+        and _RESPONSES_TOOL_ITEM_TYPES.get(call.get("tool"))
+    ]
+    for item, call in zip(items, calls):
+        if _RESPONSES_TOOL_ITEM_TYPES.get(call.get("tool")) != item.get("type"):
+            continue
+        query = (call.get("arguments") or {}).get("query")
+        if item["type"] == "file_search_call":
+            item["queries"] = [str(query)] if query else []
+        else:
+            item["action"] = _web_search_action(query)
+
+
 def _responses_extension(orchestration: dict) -> dict:
     """The enrichment the dialect has no slot for, under one namespaced key.
 
@@ -2026,6 +2061,11 @@ async def _responses_stream(
             {"output_index": message_index, "item": item},
         )
         usage = turn.orchestration.get("usage") or {}
+        # The trace only exists now, so this is where the items it describes
+        # stop saying "unknown".
+        _responses_enrich_tool_items(
+            closed_items, turn.orchestration.get("tool_calls")
+        )
         yield ev(
             "response.completed",
             {

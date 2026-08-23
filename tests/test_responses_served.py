@@ -820,3 +820,165 @@ class TestTheWireIsTheDialectsOwnTypes:
 
         completed = events[-1]["data"]["response"]
         Response.model_validate(completed)
+
+
+class TestEveryStreamedEventValidatesAsItsDialectType:
+    """One stream, every event, one external arbiter.
+
+    The earlier reds validated the shapes we had reason to doubt. That is
+    backwards for a finite public protocol: several independent required-field
+    omissions in one surface is reason to check the whole surface, not the
+    parts we already suspected. `ResponseStreamEvent` is the dialect's own
+    discriminated union over every server event, so each payload is handed to
+    it whole — measured to reject an unknown `type`, a missing required field,
+    and an invalid nested item, so it is an arbiter rather than a formality.
+    """
+
+    def _validate(self, events):
+        import pydantic
+        from openai.types.responses import ResponseStreamEvent
+
+        adapter = pydantic.TypeAdapter(ResponseStreamEvent)
+        for event in events:
+            try:
+                adapter.validate_python(event["data"])
+            except pydantic.ValidationError as exc:
+                raise AssertionError(
+                    f"{event['event']} is not a valid Responses stream event: "
+                    f"{exc.errors()[:3]}"
+                ) from exc
+
+    def test_a_successful_stream_speaks_the_dialect_throughout(
+        self, client, auth_headers, monkeypatch
+    ):
+        from liminallm.service.runtime import get_runtime
+
+        async def run_streaming(*args, **kwargs):
+            yield {"event": "trace", "data": {"tool": "web_search", "status": "running"}}
+            yield {"event": "token", "data": "An"}
+            yield {"event": "token", "data": "swer."}
+            yield {
+                "event": "message_done",
+                "data": {
+                    "content": "Answer.",
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+                    "tool_calls": [
+                        {"tool": "web_search", "arguments": {"query": "needle"}}
+                    ],
+                },
+            }
+
+        monkeypatch.setattr(get_runtime().workflow, "run_streaming", run_streaming)
+        resp = client.post(
+            "/v1/responses",
+            headers=auth_headers,
+            json={"input": "hi", "stream": True},
+        )
+        events = _sse_events(resp.text)
+
+        # Named, so this cannot pass by emitting two events and validating
+        # both. Every kind the surface promises has to be here.
+        assert set(e["event"] for e in events) == {
+            "response.created",
+            "response.in_progress",
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.content_part.added",
+            "response.content_part.done",
+            "response.output_text.delta",
+            "response.output_text.done",
+            "response.completed",
+        }, sorted(set(e["event"] for e in events))
+        self._validate(events)
+
+    def test_a_failed_stream_speaks_it_too(
+        self, client, auth_headers, monkeypatch
+    ):
+        """The failure event is part of the wire, not an escape from it."""
+        from liminallm.service.runtime import get_runtime
+
+        async def run_streaming(*args, **kwargs):
+            yield {"event": "token", "data": "partial"}
+            yield {"event": "error", "data": {"message": "provider exploded"}}
+
+        monkeypatch.setattr(get_runtime().workflow, "run_streaming", run_streaming)
+        resp = client.post(
+            "/v1/responses",
+            headers=auth_headers,
+            json={"input": "hi", "stream": True},
+        )
+        events = _sse_events(resp.text)
+
+        assert "response.failed" in [e["event"] for e in events]
+        self._validate(events)
+
+    @pytest.mark.parametrize(
+        "tool, item_type, empty, filled",
+        [
+            (
+                "web_search",
+                "web_search_call",
+                {"action": {"type": "search", "query": ""}},
+                {"action": {"type": "search", "query": "needle"}},
+            ),
+            ("file_search", "file_search_call", {"queries": []}, {"queries": ["needle"]}),
+        ],
+        ids=["web_search", "file_search"],
+    )
+    def test_the_opened_item_and_the_finished_one_are_both_valid(
+        self, client, auth_headers, monkeypatch, tool, item_type, empty, filled
+    ):
+        """The item is opened before its arguments are known, then enriched.
+
+        An empty required query is honest while the information does not
+        exist. What must hold is that each intermediate object is itself
+        valid, and that the finished response carries the query the run
+        actually used — measured, both item types reported an empty one for a
+        run whose trace named it, because the item was built when the trace
+        event opened it and never revisited.
+        """
+        from openai.types.responses import Response
+
+        from liminallm.service.runtime import get_runtime
+
+        async def run_streaming(*args, **kwargs):
+            yield {"event": "trace", "data": {"tool": tool, "status": "running"}}
+            yield {"event": "token", "data": "Answer."}
+            yield {
+                "event": "message_done",
+                "data": {
+                    "content": "Answer.",
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+                    "tool_calls": [{"tool": tool, "arguments": {"query": "needle"}}],
+                },
+            }
+
+        monkeypatch.setattr(get_runtime().workflow, "run_streaming", run_streaming)
+        resp = client.post(
+            "/v1/responses",
+            headers=auth_headers,
+            json={"input": "hi", "stream": True},
+        )
+        events = _sse_events(resp.text)
+
+        opened = next(
+            e["data"]["item"]
+            for e in events
+            if e["event"] == "response.output_item.added"
+            and e["data"]["item"]["type"] == item_type
+        )
+        for key, value in empty.items():
+            assert opened[key] == value, opened
+        self._validate(events)
+
+        completed = events[-1]["data"]["response"]
+        Response.model_validate(completed)
+        final = next(o for o in completed["output"] if o["type"] == item_type)
+        assert final["id"] == opened["id"], (
+            "the finished item is a different item from the one that opened"
+        )
+        for key, value in filled.items():
+            assert final[key] == value, (
+                "the finished response does not say what the run searched "
+                f"for, although the trace recorded it: {final}"
+            )

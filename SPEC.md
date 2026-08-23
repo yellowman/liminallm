@@ -1877,6 +1877,11 @@ the caller changes nothing but the base URL.
   `file_search_call.queries`, and `web_search_call.action` — always
   `{"type": "search", ...}`, since the kernel's web tool only searches —
   with the query the trace recorded, or empty when it recorded none.
+  streaming opens an item before the run's arguments exist, so the
+  `output_item.added`/`.done` pair carries the empty form, which was true
+  when it was sent; the finished response carries the query, under the
+  same item id. what a caller reads as the outcome says what the run
+  actually did.
 - **the caller-tool fields say there were none.** `tools`, `tool_choice`
   and `parallel_tool_calls` are required by the dialect and all three
   describe the *caller-supplied* tool surface, which this endpoint
