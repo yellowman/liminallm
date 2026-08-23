@@ -82,9 +82,9 @@ def _within_source(candidate: Path, root: Path) -> bool:
     rather than of this code, so the test does not rely on it.
 
     The hardlink test is the one neither of the others can make. A hardlink
-    *is* the file it points at, with nothing in the path to say so: measured,
-    a hardlink to another user's upload placed inside a source directory
-    passed both other tests. `st_nlink` is the only signal available, and
+    *is* the file it points at, with nothing in the path to say so, so a
+    hardlink to another user's upload inside a source directory passes both
+    other tests. `st_nlink` is the only signal available, and
     refusing a linked file matches what the archive extractor already does
     with hardlinked members. A legitimate file with a second link elsewhere is
     skipped as a consequence, which is the safe direction here — the reader
@@ -636,7 +636,7 @@ class RAGService:
         - Creates chunks with specified token count
         - Applies overlap between consecutive chunks for context continuity
         """
-        # Issue 24.5: Normalize Unicode input so equivalent text shares canonical form
+        # Equivalent text must share a canonical form before chunking.
         text = unicodedata.normalize("NFC", text)
         lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
         blob = " ".join(lines)
@@ -737,11 +737,9 @@ class RAGService:
         text" is an answer about the current bytes, not permission to keep the
         last ones. Empty input and an extractor refusal both arrive here.
 
-        The cost is worth stating: a *re-scan* of unchanged bytes whose
-        extraction fails transiently — a sandbox timeout, say — drops that
-        path from retrieval until the next ingest. That is recoverable and it
-        is logged, where the alternative is an index that answers with text
-        the file has not held since an earlier generation, which is not.
+        The cost: a re-scan whose extraction fails transiently drops that
+        path from retrieval until the next ingest. Recoverable, and logged —
+        where an index answering with text the file no longer holds is not.
 
         `inline` text has no path to be a generation of, so it is added.
         """
@@ -786,16 +784,14 @@ class RAGService:
                 # table or a dimension mismatch escape would fail an ingest
                 # that in fact succeeded, and the retry would duplicate it.
                 #
-                # And stop. These failures are structural — a missing table, a
-                # width mismatch — so carrying on would pay the provider for
-                # `segments x remaining chunks` embeddings, throw every one
-                # away, and log the same warning several thousand times.
-                # Latched for the rest of this service's life, not just this
-                # file: ingest_path walks a tree one file at a time, so a
-                # per-call stop still paid `segments x chunks` embeddings and
-                # logged an identical warning for every one of ten thousand
-                # files. Changing the setting rebuilds the service, which is
-                # also how an operator clears it after fixing the schema.
+                # And stop, latched for this service's life rather than for
+                # this call: these failures are structural — a missing
+                # table, a width mismatch — and `ingest_path` walks a tree
+                # one file at a time, so a per-call stop still pays for
+                # `segments x chunks` embeddings and logs an identical
+                # warning once per file. Changing the setting rebuilds the
+                # service, which is how an operator clears it after fixing
+                # the schema.
                 self._segment_index_broken = True
                 logger.warning(
                     "rag_segment_index_failed",
@@ -847,7 +843,8 @@ class RAGService:
             context_id, data, chunk_size=chunk_size, source_path=identity
         )
 
-    # Issue 38.3: Default limits for recursive ingestion to prevent resource exhaustion
+    # Default limits for recursive ingestion, so a deep or wide tree cannot
+    # exhaust the process.
     MAX_INGEST_FILES = 10000  # Maximum files to process in one ingest operation
     MAX_INGEST_DEPTH = 20  # Maximum directory depth for recursive ingestion
 
@@ -894,7 +891,7 @@ class RAGService:
         Raises:
             PathTraversalError: If allowed_base is set and fs_path escapes it
         """
-        # SECURITY: Validate path against allowed base if specified (Issue 14.1)
+        # SECURITY: validate the path against the allowed base.
         if allowed_base is not None:
             base = Path(allowed_base)
             # For absolute paths, verify they're within allowed base
@@ -929,7 +926,7 @@ class RAGService:
                     raise
 
         path = Path(fs_path)
-        # Issue 38.3: Apply default limits to prevent resource exhaustion
+        # Apply the default limits.
         file_limit = max_files or self.MAX_INGEST_FILES
         depth_limit = max_depth or self.MAX_INGEST_DEPTH
         base_depth = len(path.resolve().parts)
@@ -980,9 +977,8 @@ class RAGService:
         # than the authority `authorize_path` just established. Descendants
         # were never checked against anything: `glob` yields a link and
         # `is_file()` follows it, so a link inside an authorized directory
-        # read whatever it pointed at — measured, another user's upload and a
-        # file outside `shared_fs_root` entirely, both indexed into the
-        # caller's context.
+        # reads whatever it points at — another user's upload, or a file
+        # outside `shared_fs_root` entirely.
         #
         # §18 makes authority the caller's own area or an artifact covering a
         # particular path. Being somewhere under the shared root is not
@@ -995,13 +991,13 @@ class RAGService:
             if extensions and file_path.suffix.lower() not in extensions:
                 continue
 
-            # Issue 38.3: Check depth limit for recursive ingestion
+            # Depth limit.
             if recursive:
                 file_depth = len(file_path.resolve().parts) - base_depth
                 if file_depth > depth_limit:
                     continue
 
-            # Issue 38.3: Check file count limit
+            # File count limit.
             if files_processed >= file_limit:
                 logger.warning(
                     "ingest_path_file_limit_reached",

@@ -202,7 +202,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
         entry: Dict[str, Any],
         max_entries: int = 500,
     ) -> None:
-        """Append to workflow_trace with bounded size (Issue 23.4)."""
+        """Append to workflow_trace, bounded so a long run cannot grow it without limit."""
 
         workflow_trace.append(entry)
         if len(workflow_trace) > max_entries:
@@ -892,9 +892,7 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 # own ask is the least authoritative of them: SPEC §18.3 caps
                 # it at MAX_NODE_TIMEOUT_SECONDS, and the workflow's remaining
                 # budget caps it again, because "timeout_ms caps total wall
-                # clock" is only true if no single attempt may outlive it. A
-                # node starting just inside the deadline used to run its own
-                # full timeout past it.
+                # clock" is only true if no single attempt may outlive it.
                 node_timeout_ms = min(
                     node.get("timeout_ms", DEFAULT_NODE_TIMEOUT_MS),
                     MAX_NODE_TIMEOUT_SECONDS * 1000,
@@ -1347,13 +1345,10 @@ class WorkflowEngine(WorkflowStreamingMixin):
     async def _retire_workflow_state(self, state_key: str) -> None:
         """Drop the state of a workflow that has finished.
 
-        A terminal state used to be written here — `completed`, `failed` or
-        `timeout`, carrying result content, the workflow trace, context
-        snippets and vars — and nothing ever read one back. That made it a
-        second copy of a conversation's content with its own TTL and its own
-        lifetime, which deleting the conversation would then have had to
-        enumerate and remove. Not keeping it is smaller than keeping it
-        correctly. Running state still exists while the workflow does.
+        No terminal state is written in its place. One would be a second copy
+        of a conversation's content, with its own TTL and lifetime for the
+        conversation's deletion to enumerate, and nothing reads it back.
+        Running state still exists while the workflow does.
 
         Best effort: the workflow has already produced its answer, and a
         cache that cannot be reached must not turn that into a failure.
@@ -1445,10 +1440,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
 
         Unscoped `list_artifacts` returns global and shared artifacts only, so
         nothing private lands here — and nothing private may be *added* here
-        either. Direct invocation used to `setdefault` its caller's spec into
-        this dict, which made one user's private tool definition resolvable
-        for every later request in the process. A private tool is resolved per
-        request instead, through `_resolve_tool`.
+        either: a caller's spec added here would make one user's private tool
+        definition resolvable for every later request in the process. A
+        private tool is resolved per request, through `_resolve_tool`.
         """
         registry: Dict[str, dict] = {}
         for artifact in self.store.list_artifacts(type_filter="tool"):
@@ -1715,11 +1709,10 @@ class WorkflowEngine(WorkflowStreamingMixin):
         )
         gates = routing.get("adapters", []) if isinstance(routing, dict) else []
         candidate_lookup = {c.get("id"): c for c in candidates if c.get("id")}
-        # The gate travels ON the adapter, not beside it. `gates` used to be
-        # returned for tracing only while the activated adapters were rebuilt
-        # from the candidate list, dropping every weight the router had just
-        # computed — so composition (SPEC §5.2) silently ran every adapter at
-        # 1.0 no matter what the policy decided.
+        # The gate travels ON the adapter, not beside it. Rebuilding the
+        # activated list from the candidates instead drops every weight the
+        # router just computed, and composition (SPEC §5.2) then runs every
+        # adapter at 1.0 whatever the policy decided.
         activated_adapters = []
         for gate in gates:
             adapter_id = gate.get("id") or ""
@@ -1964,12 +1957,11 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 "details": {"errors": validation_errors},
             }
         # SPEC §18: a privileged tool requires an admin-owned *artifact* and
-        # an admin caller. This used to ask only about the caller, so an
-        # ordinary user could author `privileged: true` — /v1/artifacts is
-        # open to any authenticated user and the tool schema permits extra
-        # properties — and an admin invoking it would be handed the privileged
-        # sandbox for someone else's definition. Ownership comes from the
-        # persisted row; a spec that names an owner is quoting itself.
+        # an admin caller. Asking only about the caller is not enough: any
+        # authenticated user can author `privileged: true` through
+        # /v1/artifacts, and an admin invoking it would be handed the
+        # privileged sandbox for someone else's definition. Ownership comes
+        # from the persisted row; a spec that names an owner quotes itself.
         if descriptor is not None and descriptor.privileged:
             user = self.store.get_user(user_id) if user_id else None
             role = user.role if user else None
@@ -2411,10 +2403,9 @@ class WorkflowEngine(WorkflowStreamingMixin):
         sources: List[Tuple[str, str]] = []
         if state.get("workdir") is None:
             attachments = self._conversation_attachments(conversation_id, user_id)
-            # Name and bytes together. The workdir used to be built from
-            # `/users/{u}/files/{name}`, so a later upload of that name was
-            # staged instead — another conversation's file, read by code
-            # running for this one.
+            # Name and bytes together: a workdir built from
+            # `/users/{u}/files/{name}` alone stages whichever upload holds
+            # that name now, which may be another conversation's file.
             sources = attachments_service.resolved_sources(
                 attachments,
                 fs_root=self.settings.shared_fs_root,
@@ -2769,8 +2760,8 @@ class WorkflowEngine(WorkflowStreamingMixin):
         #
         # The query also excludes conversations' implicit indexes, which enter
         # only through the conversation that owns them: §19.5 scopes an
-        # attachment to the chat that received it, and measured, a second
-        # chat named the first chat's index and read it.
+        # attachment to the chat that received it, so a second chat naming
+        # the first chat's index must not reach it.
         owned = {
             ctx.id: ctx
             for ctx in self.store.get_contexts_for_scope(user_id, list(ctx_ids))
@@ -3060,5 +3051,5 @@ class WorkflowEngine(WorkflowStreamingMixin):
 
     def __del__(self) -> None:
         """Fallback cleanup if shutdown() was not called explicitly."""
-        # Issue 23.1: Call shutdown method for proper cleanup
+        # Shut the executor down rather than dropping it.
         self.shutdown(wait=False)

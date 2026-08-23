@@ -128,7 +128,7 @@ class TrainingService:
         return self._base_checkpoint_state
 
     def _safe_int(self, value: object, default: int, *, context: str) -> int:
-        """Coerce values to int with fallback to avoid ValueError crashes (Issue 39.3)."""
+        """Coerce to int with a fallback; malformed data must not raise."""
 
         try:
             return int(value)
@@ -1010,11 +1010,10 @@ class TrainingService:
             }
         # No holdout means the ≥1% improvement of §5.4.6 cannot be shown, and
         # "promoted only when it improves" refuses what it cannot measure.
-        # This used to promote: harmless while trained weights were inert,
-        # but they now change the model, so an unevaluated version could
-        # regress it — which is exactly what §5.5's "nothing regresses"
-        # forbids. The adapter stays on the prompt rung until it has enough
-        # data to prove itself.
+        # Promoting anyway would let an unevaluated version regress the
+        # model, which is what §5.5's "nothing regresses" forbids. The
+        # adapter stays on the prompt rung until it has data to prove
+        # itself.
         return {
             "promoted": False,
             "reason": "no holdout (dataset below eval threshold); nothing to prove improvement",
@@ -1022,7 +1021,7 @@ class TrainingService:
         }
 
     def _build_examples(self, events: Iterable[PreferenceEvent]) -> Iterable[dict]:
-        # Issue 18.1: Dedupe by (conversation_id, message_id) per SPEC §5.4.3
+        # Dedupe by (conversation_id, message_id) per SPEC §5.4.3.
         seen: set[tuple[str, str]] = set()
         for event in events:
             key = (event.conversation_id or "", event.message_id or "")

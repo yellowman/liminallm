@@ -85,10 +85,7 @@ def _safe_weight(value: Any, default: float = 1.0, *, context: str = "") -> floa
     """Coerce adapter weights to float with defensive fallback.
 
     Router artifacts may carry user-authored weights that fail `float()`
-    coercion. Issue 39.3 requires gracefully handling these cases to avoid
-    request crashes. Shared by every backend (the JAX blending path used to
-    call a method that only existed on ApiAdapterBackend - dead code until
-    jax was actually installed).
+    coercion, which must not crash a request. Shared by every backend.
     """
     try:
         return float(value)
@@ -1449,11 +1446,8 @@ class ApiAdapterBackend:
                 # `applied` is a claim that the adapter affected inference
                 # (§5.0.1), so it is built from the mechanisms actually
                 # present, one entry each — never from the mode alone. A
-                # hybrid with neither instructions nor a remote id used to be
-                # reported as `:prompt` on the strength of being hybrid,
-                # while nothing was injected, no adapter was sent and the
-                # model was unchanged: a turn that named an adapter it did
-                # not use.
+                # hybrid carrying neither instructions nor a remote id
+                # changed nothing and must not appear here.
                 #
                 # The text itself is already in the messages — LLMService
                 # materializes it (§5.0.1) — so extracting it here only
@@ -1605,11 +1599,9 @@ class ApiAdapterBackend:
     def _select_best_adapter(self, adapters: List[dict], max_count: int) -> List[dict]:
         """Select best adapters up to max_count, ranked by the canonical gate.
 
-        Ranking used to re-derive the weight here with a bare `float()`, which
-        disagreed with `effective_gate` three ways: it ignored
-        `schema.weight`, it ranked an out-of-range 5.0 above a legitimate 1.0,
-        and it raised on a weight the canonical rule reads as 1.0 — turning a
-        malformed number into a failed request instead of a defaulted one.
+        Through `effective_gate`, never a bare `float()`: that reads
+        `schema.weight`, clamps out-of-range values rather than ranking them
+        first, and defaults a malformed weight to 1.0 instead of raising.
         """
         if not adapters:
             return []
@@ -1720,13 +1712,11 @@ class LocalJaxLoRABackend:
       instructions either — those are already in ``messages``.
 
     ``prompt_instructions`` are placed by ``LLMService._build_adapter_prompts``
-    before any backend is called, because the choice of representation is a
-    §5.0.1 rule about the *pair* (mode, backend) rather than something a
-    backend can decide alone, and because one materializer is what keeps a
-    prompt from being injected twice. So a prompt-rung adapter passed
-    straight to this class changes nothing: the messages it would have
-    changed were the caller's to prepare. The docstring used to say this
-    class injects them, which described an intent no code here carries out.
+    before any backend is called: the choice of representation is a §5.0.1
+    rule about the *pair* (mode, backend) rather than a backend's decision,
+    and one materializer is what keeps a prompt from being injected twice. A
+    prompt-rung adapter passed straight to this class therefore changes
+    nothing — the messages it would have changed were the caller's to prepare.
 
     The backend keeps a tokenizer and (optional) Flax model resident, reads
     LoRA matrices from ``fs_root`` paths, and runs a lightweight JAX forward
@@ -2024,22 +2014,16 @@ class LocalJaxLoRABackend:
         if not params_path:
             return {}
 
-        # SPEC §5.1: an adapter is fitted to the model that will serve it, and
+        # SPEC §5.1: an adapter is fitted to the model that serves it, and
         # training refuses to run when the bases disagree. Serving holds the
         # same line — B·A was optimized against one particular frozen W, and
         # passing the eval gate on that W says nothing about W'.
         #
-        # Placed here, after resolution and before the cache, so it guards
-        # exactly what it is about: weights that are about to be applied.
-        # Checking it earlier also refused adapters that would contribute no
-        # weights at all (nothing promoted yet, gate closed), which turns a
-        # no-op into an outage — renaming a checkpoint directory would have
-        # taken down every routed turn rather than just the weight-bearing
-        # ones. This is the only base check on the weight path; a
-        # family-similarity pass used to run beside it, which was both dead
-        # (an exact match is a family match) and contradictory (it compared
-        # whole strings, so in strict mode it refused an adapter naming the
-        # same checkpoint by a different path).
+        # After resolution and before the cache, so it guards exactly what it
+        # is about: weights that are about to be applied. Checking earlier
+        # also refuses adapters contributing no weights at all (nothing
+        # promoted, gate closed), which turns a no-op into an outage. This is
+        # the only base check on the weight path.
         self._assert_exact_base_model(adapter, adapter_id)
         self._assert_version_belongs_to_adapter(
             params_path, adapter_id, current_version
@@ -2078,7 +2062,6 @@ class LocalJaxLoRABackend:
                 path=str(params_path),
                 message="Adapter loaded without checksum verification - add schema.checksum for production use",
             )
-        # Issue 39.1: Add error handling for JSON deserialization
         try:
             weights_raw = json.loads(payload.decode())
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -2113,11 +2096,10 @@ class LocalJaxLoRABackend:
         `params.json`, not `latest`, not a directory scan, not the mere
         presence of a file.
 
-        This used to have a third lane for artifacts with no `current_version`
-        at all, which served a direct file and, before that, scanned `latest`
-        then `v*` then any subdirectory. Every hole this method closes had
-        reopened inside it: `latest` aimed elsewhere served another adapter's
-        weights, a bare `vNNNN` served exactly what a gate-rejected run leaves
+        There is no lane for an artifact with no `current_version`: serving a
+        directory scan reopens every hole this method closes — `latest` aimed
+        elsewhere serves another adapter's weights, a bare `vNNNN` serves what
+        a gate-rejected run leaves
         behind, and a versionless *hybrid* got weights from the file while the
         service, reading only metadata, injected its prompt fallback — the two
         voices §5.0.1 forbids. The lane existed for artifacts the adapter
@@ -2219,7 +2201,7 @@ class LocalJaxLoRABackend:
     def _ensure_model(self) -> None:
         """Resolve the base checkpoint into one of three states.
 
-        The distinction is the whole point, and collapsing it was a bug:
+        The distinction is the whole point:
 
         ``ABSENT``  no checkpoint on disk — a dev box or CI. The synthetic
                     stand-in is allowed, and logged, because it exercises the
@@ -2401,10 +2383,10 @@ class LocalJaxLoRABackend:
 
         if ids and (max(ids) >= config.vocab_size or min(ids) < 0):
             # The tokenizer and the checkpoint disagree — a configuration
-            # error, not a request error. This used to clamp the id into
-            # range, which is the same "fold it into a token the user never
-            # wrote" that training refuses; answering from an arbitrary
-            # embedding is worse than not answering. Refuse the real model
+            # error, not a request error. Clamping the id into range is the
+            # same "fold it into a token the user never wrote" that training
+            # refuses, and answering from an arbitrary embedding is worse
+            # than not answering. Refuse the real model
             # for the rest of this process and log it once: the documented
             # stand-in path is at least honest about what it is.
             if not self._vocab_mismatch_logged:
@@ -2519,9 +2501,8 @@ class LocalJaxLoRABackend:
         # this turn's accounting both come from the adapters that can
         # actually carry weights: past the gate, not the prompt rung, and
         # promoted. An open-gated `local` adapter with nothing promoted
-        # applies no mechanism at all, yet it was sizing the tokenizer's
-        # vocabulary and being named in `usage.adapter_id` — the local
-        # analogue of reporting `:prompt` for a hybrid with no prompt.
+        # applies no mechanism, so it must neither size the tokenizer's
+        # vocabulary nor be named in `usage.adapter_id`.
         weight_bearing = self._weight_bearing(adapters)
         self._apply_adapter_vocab_size(weight_bearing[0] if weight_bearing else {})
         # Before tokenizing, not after: the checkpoint's vocabulary governs
@@ -2743,14 +2724,13 @@ class LocalJaxLoRABackend:
         additional properties.
 
         **Provenance.** Training writes `adapter_id` and `version` into each
-        version's `metadata.json`, so the run itself says what it produced.
-        That catches what layout cannot: a directory renamed to A holding B's
-        run. Verified when present rather than required — a version written
-        by hand has nothing to check against, and refusing on a missing file
-        fails closed on absence rather than on disagreement.
+        version's `metadata.json`, which catches what layout cannot: a
+        directory renamed to A holding B's run. Verified when present rather
+        than required, so a hand-written version fails closed on
+        disagreement rather than on absence.
 
-        Checked here, where a params path has resolved and weights are about
-        to be read, so an adapter that will contribute nothing stays a no-op.
+        Checked where a params path has resolved and weights are about to be
+        read, so an adapter contributing nothing stays a no-op.
         """
         owner = adapter_dir_owner(params_path)
         if owner != str(adapter_id):
@@ -2867,8 +2847,8 @@ class LocalJaxLoRABackend:
             B* = [g_1α_1B_1 , g_2α_2B_2 , …]     (stacked columns)
             ⇒  B*A* = Σ_j g_j α_j B_j A_j        exactly, no cross terms.
 
-        The previous implementation gate-weighted A and B separately, summed
-        them, and divided by the total weight. That is wrong twice over. For
+        Gate-weighting A and B separately, summing, and dividing by the total
+        weight is wrong twice over. For
         one adapter it computed (gA)/g = A, so the router's gate cancelled
         itself and 0.2 behaved identically to 1.0. For two it formed B̄Ā,
         whose expansion contains B_1A_2 and B_2A_1 — products of one
@@ -2914,8 +2894,7 @@ class LocalJaxLoRABackend:
             # wrong column.
             self._validate_adapter_weights(adapter, weights, config)
             # Both orphans, not just one: the loop is A-driven, so a lone
-            # `.B` used to be invisible — "weights for a broken architecture
-            # fail visibly" with one silent case left in it.
+            # `.B` is invisible without this.
             for name in weights:
                 if name.endswith(".B") and f"{name[: -len('.B')]}.A" not in weights:
                     raise ValueError(
@@ -2992,8 +2971,8 @@ class LocalJaxLoRABackend:
             # the *resolved* params path, beside the base-model rule, so an
             # adapter that will contribute no weights — nothing promoted, a
             # closed gate, a directory that does not exist — stays a no-op
-            # instead of raising. Refusing at path-computation time made a
-            # malformed-but-inert artifact fail every turn it was routed into.
+            # instead of raising. Refusing at path-computation time makes a
+            # malformed-but-inert artifact fail every turn it is routed into.
             base = self.fs_root.resolve()
             candidate = (
                 Path(str(explicit)) if isinstance(explicit, (str, Path)) else Path("")
