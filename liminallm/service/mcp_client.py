@@ -219,7 +219,7 @@ def servers_for_turn(store) -> List[dict]:
     that could only pass either way.
     """
     resolved: List[dict] = []
-    for artifact in store.list_artifacts(type_filter="mcp_server", visibility="global"):
+    for artifact in store.list_artifacts(type_filter="mcp", visibility="global"):
         schema = artifact.schema if isinstance(artifact.schema, dict) else {}
         if not schema.get("enabled", True):
             continue

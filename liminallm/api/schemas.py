@@ -480,6 +480,14 @@ class ArtifactRequest(_SchemaPayload):
     type: str = Field(..., max_length=64)
     name: str = Field(..., max_length=256)
     description: Optional[str] = Field("", max_length=4096)
+    #: Who this artifact is for. `private` — the default, and what every
+    #: caller that omits the field keeps getting — is the owner's own. The
+    #: other two publish, and the route admits them only for an admin: a
+    #: globally visible `tool` or `mcp` artifact is a capability of every
+    #: turn in the installation, not a preference of the account that wrote
+    #: it. Constrained here rather than in the route so an unknown value is a
+    #: 422 naming the field, not a 500 from the store's enum.
+    visibility: Literal["private", "shared", "global"] = "private"
 
 
 class ArtifactPatchRequest(BaseModel):

@@ -12224,3 +12224,81 @@ copied into the worker's plan; a dead server raising out of the turn instead
 of answering; remote tools added to `PARALLEL_SAFE_TOOLS`; the streaming
 context built without the map; and the broker passing an empty map to the
 round.
+
+## The MCP server nobody could configure
+
+The client worked, the wiring worked, and every test passed. The feature was
+still unreachable: **no artifact created through the API could ever be one.**
+
+Two independent blockers, neither visible from where the earlier tests stood.
+
+### The type and the kind could never both be right
+
+`POST /v1/artifacts` requires `kind` to start with `f"{type}."`. The pair was
+type `mcp_server` with kind `mcp.server`, and `"mcp.server".startswith(
+"mcp_server.")` is false, so every create was a 400 — before authorization,
+before the schema, before anything.
+
+The earlier tests could not see it because they called
+`store.create_artifact(...)` directly, which is below the route and below that
+check. That is the sharper lesson than the typo: creating through the store
+proved the *schema* accepted the shape and said nothing about whether an
+operator could ever send it. A store-level witness for a thing operators
+configure is a witness for the wrong layer.
+
+The pair is now type `mcp`, kind `mcp.server`, which is the convention the
+rest of the table already follows — `workflow`/`workflow.linear`,
+`adapter`/`adapter.lora`.
+
+### Nothing created through the API was ever global
+
+`servers_for_turn` requires `visibility="global"`. `create_artifact` never
+passed a visibility and the store defaults to `private`, so even with the
+kind fixed, a published server was not reachable through any route. `PATCH`
+could not fix it either: it goes through `update_private_artifact`, which does
+not touch visibility.
+
+`ArtifactRequest` now carries `visibility`, defaulting to `private` so every
+existing caller keeps exactly what it had. `shared` and `global` require the
+admin role — read off the authenticated token, never from the body, the same
+rule `tenant_id` lives under. That gate is not MCP-specific and should not be:
+a globally visible `tool` artifact enters the process-wide registry every turn
+resolves against, so this field is the difference between "my configuration"
+and "everyone's capability" for more than one artifact type.
+
+### Retiring one was already answered, and it works
+
+`_get_private_artifact` says published artifacts "are changed and retired
+through config ops, not here", and refuses PATCH and DELETE for them. That is
+a coherent stance and this tranche did not widen it. What it did was check
+that the stated path actually works on this artifact type rather than being a
+sentence in a docstring: propose, approve, apply a patch setting
+`enabled: false`, then ask `servers_for_turn` — measured, not read.
+
+### The console, and a defect it exposed in every other section
+
+The admin page gets an MCP servers table and a publish form. Its browser
+witness asserts against `servers_for_turn` rather than against the table the
+page redraws: a page rendering a row it just typed is not evidence that
+anything was published, and a `visibility: private` post would look identical.
+
+Writing it surfaced a defect older than this tranche. The console loaded its
+tables only in the "page opened with a live session" branch, so an interactive
+sign-in left every table — patches, settings, users, adapters — empty until
+its own Refresh button was clicked. An operator cannot tell that from an
+installation with nothing in it. Both entry points now call one `loadConsole`,
+which also means they cannot drift into loading different things. The witness
+covers both branches by signing in and then reloading.
+
+### Mutations
+
+Twelve, each killed. `visibility` never passed to the store; the publish gate
+removed; the gate reading a field in the body instead of the token; the gate
+widened to cover `private` too, making artifact creation admin-only by
+accident; the default flipped to `global`; the field loosened from the literal
+to `str`, so an unknown value reaches the store's enum as a 500 instead of a
+422; the console publishing privately; the console sending the old type; the
+console ignoring the operator's chosen classification; signing in loading
+nothing; a reopened page loading nothing; and the publish button absent from
+the markup. The last six run in the browser lane, because none of them is
+observable without one.

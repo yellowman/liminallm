@@ -192,7 +192,7 @@ class TestAuthorityIsPersistedAndLocal:
         payload = fixture.as_artifact_schema()
         payload.update(schema)
         return store.create_artifact(
-            "mcp_server",
+            "mcp",
             payload["name"],
             payload,
             owner_user_id=user.id,
@@ -268,7 +268,7 @@ class TestAuthorityIsPersistedAndLocal:
                     (
                         str(uuid.uuid4()),
                         user.id,
-                        "mcp_server",
+                        "mcp",
                         "urlless",
                         '{"kind": "mcp.server", "name": "urlless"}',
                         "global",
@@ -337,7 +337,7 @@ class TestAuthorityIsPersistedAndLocal:
 
         with pytest.raises(ArtifactValidationError):
             store.create_artifact(
-                "mcp_server",
+                "mcp",
                 "local",
                 {"kind": "mcp.server", "name": "local", "url": "file:///etc/passwd"},
                 owner_user_id=user.id,
@@ -358,7 +358,7 @@ class TestAuthorityIsPersistedAndLocal:
 
         with pytest.raises(ArtifactValidationError):
             store.create_artifact(
-                "mcp_server",
+                "mcp",
                 "typo",
                 {
                     "kind": "mcp.server",

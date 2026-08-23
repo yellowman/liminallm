@@ -50,7 +50,7 @@ def _configure(store, fixture, *, taint_class: str = "egress"):
     store.update_user_role(user.id, role="admin")
     schema = fixture.as_artifact_schema(taint_class=taint_class)
     return store.create_artifact(
-        "mcp_server",
+        "mcp",
         schema["name"],
         schema,
         owner_user_id=user.id,

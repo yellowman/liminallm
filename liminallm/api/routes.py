@@ -3279,6 +3279,20 @@ async def create_artifact(
             )
         if not type_prefix:
             raise BadRequestError("type or kind is required")
+        # Publishing is a privilege, and the role comes off the authenticated
+        # token — never from the body, which is the same rule `tenant_id`
+        # lives under. A `shared` artifact is every account in the tenant's,
+        # and a `global` one is the installation's: a globally visible `tool`
+        # enters the registry every turn resolves against, and a globally
+        # visible `mcp` server becomes a capability of every turn. Private
+        # stays open to everybody, or this becomes an admin-only endpoint by
+        # accident.
+        if body.visibility != "private" and principal.role != "admin":
+            raise http_error(
+                "forbidden",
+                "publishing an artifact requires admin access",
+                status_code=403,
+            )
         artifact_schema = dict(body.schema)
         if schema_kind:
             artifact_schema["kind"] = schema_kind
@@ -3289,6 +3303,7 @@ async def create_artifact(
             schema=artifact_schema,
             owner_user_id=principal.user_id,
             version_author=principal.user_id,
+            visibility=body.visibility,
         )
         # New artifact starts at version 1
         resp = ArtifactResponse(

@@ -65,7 +65,7 @@ _ARTIFACT_SCHEMAS: dict[str, Dict[str, Any]] = {
     # annotations: remote metadata is supplied by the party being classified.
     # Absent or unrecognized means `egress` (see `mcp_client.server_taint_class`),
     # so the enum here is what an operator may *attest*, not what is assumed.
-    "mcp_server": {
+    "mcp": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "properties": {

@@ -2680,22 +2680,31 @@ are read (zip bombs), and every member path is sanitized component-wise and
 re-joined through `safe_join` (zip slip). member type is checked with
 `stat.S_IFMT` because many writers store permissions with no type bits.
 
-### 21.4 remote tool servers (MCP)
+### 21.4 remote tool servers (MCP client)
 
-a turn can use tools that live on a remote **MCP** server. the protocol is not
-implemented here: `mcp>=2,<3` is a runtime dependency and the wire arbiter, so
-nothing in this codebase names a protocol version or a transport frame.
-**streamable http only** — stdio is out of scope, because "connect to a
-server" would become "spawn the executable this row names", which is a
-different privilege question.
+the other direction from §13.7's `POST /v1/mcp`, which is this kernel *being*
+an MCP server. here a turn **uses** tools that live on somebody else's. the
+protocol is not implemented on this side: `mcp>=2,<3` is a runtime dependency
+and the wire arbiter, so nothing in the client path names a protocol version
+or a transport frame. **streamable http only** — stdio is out of scope,
+because "connect to a server" would become "spawn the executable this row
+names", which is a different privilege question.
 
 what the kernel owns is what the sdk cannot decide:
 
-- **authority is a persisted artifact.** a server is an `mcp.server` artifact
-  that is globally visible, enabled, and **admin-owned** — ownership read from
-  the artifact row, never from a field inside `schema`, the same rule
-  `privileged: true` lives under (§18). one unusable or unreachable row costs
-  its own server and never the turn.
+- **authority is a persisted artifact.** a server is an artifact of type `mcp`
+  and kind `mcp.server` that is globally visible, enabled, and **admin-owned**
+  — ownership read from the artifact row, never from a field inside `schema`,
+  the same rule `privileged: true` lives under (§18). one unusable or
+  unreachable row costs its own server and never the turn.
+- **publishing is the admin's act, and the only one that matters.**
+  `POST /v1/artifacts` takes a `visibility`, defaulting to `private`;
+  `shared` and `global` require the admin role, read off the authenticated
+  token and never from the body. a private `mcp` row is that account's
+  configuration and reaches no turn. changing or retiring a published server
+  goes through config ops (§12.3), not through artifact CRUD, which refuses
+  every published row. the admin console has a form for the publish half and
+  points at the patch flow for the rest.
 - **classification is the operator's, not the server's.** `taint_class` is
   `egress` or `local_read` and comes from the artifact. it is deliberately not
   inferred from the server's own annotations, which are metadata supplied by
