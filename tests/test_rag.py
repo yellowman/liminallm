@@ -1,5 +1,7 @@
 import uuid
 
+import pytest
+
 from liminallm.service.embeddings import EMBEDDING_DIM
 from liminallm.service.rag import RAGService
 from liminallm.storage.models import KnowledgeChunk
@@ -170,6 +172,36 @@ def test_lexical_search_enforces_user_isolation(store):
     theirs = store.search_chunks_lexical([ctx.id], "quokka", 4, user_id=intruder.id)
 
     assert mine and theirs == []
+
+
+@pytest.mark.parametrize("absent", ["", None], ids=["empty", "none"])
+def test_a_retrieval_channel_with_no_user_refuses_rather_than_widens(store, absent):
+    """Both chunk channels refuse an absent principal rather than widening.
+
+    `user_id` is keyword-only and annotated as required, so an absent one can
+    only arrive from a caller that bypassed the annotation — which is the case
+    the check exists for. The failure mode is not an error: `_chunk_scope`
+    builds a WHERE clause with no owner term, so the query runs and returns
+    every user's chunks in the named contexts.
+
+    Measured before this existed: removing the check from
+    `search_chunks_pgvector` left the whole fast lane green. The positive
+    control is in the same test because a refusal that returns nothing is
+    indistinguishable from a query that would have found nothing anyway.
+    `late_candidate_ids` carries the same check and is covered beside the
+    corpus that can exercise it, in `test_late_interaction.py`.
+    """
+    user, ctx, near = _hybrid_fixture(store)
+
+    assert store.search_chunks_lexical([ctx.id], "quokka", 4, user_id=user.id), (
+        "the fixture matches nothing, so refusing it would prove nothing"
+    )
+    assert store.search_chunks_pgvector([ctx.id], "quokka", near, 4, user_id=user.id)
+
+    assert store.search_chunks_lexical([ctx.id], "quokka", 4, user_id=absent) == []
+    assert store.search_chunks_pgvector(
+        [ctx.id], "quokka", near, 4, user_id=absent
+    ) == []
 
 
 def test_lexical_search_survives_a_query_of_pure_punctuation(store):

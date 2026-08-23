@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
+
 from liminallm.service.embeddings import EMBEDDING_DIM
 from liminallm.service.late import MIN_SEGMENT_WORDS, maxsim, segment_text
 from liminallm.service.rag import RAGService
@@ -284,6 +286,30 @@ def test_enabling_late_interaction_without_a_segment_count_still_indexes(store):
     rag = RAGService(store, embed=_subject_encoder, semantic=True, late_interaction=True)
 
     assert rag.late_segments >= 2
+
+
+@pytest.mark.parametrize("absent", ["", None], ids=["empty", "none"])
+def test_candidate_generation_with_no_user_refuses_rather_than_widens(store, absent):
+    """The same refusal the chunk channels make, on the channel that has its
+    own query.
+
+    `late_candidate_ids` scopes by owner like the others, and without that
+    check `_chunk_scope` builds a WHERE clause with no owner term — so the
+    query runs and offers every user's segments as candidates. Measured, no
+    test in the fast lane caught its removal. Its siblings are covered beside
+    the hybrid fixture in `test_rag.py`; this one needs a segmented corpus, so
+    it is covered here.
+
+    The positive control comes first: a refusal that returns nothing looks the
+    same as a query that would have matched nothing.
+    """
+    user, ctx = _near_miss_corpus(store)
+    query = _subject_encoder(_long("quokka"))
+
+    assert store.late_candidate_ids([ctx.id], query, 4, user_id=user.id), (
+        "the corpus offers no candidate, so refusing it would prove nothing"
+    )
+    assert store.late_candidate_ids([ctx.id], query, 4, user_id=absent) == []
 
 
 def test_every_query_part_gets_a_share_of_the_candidate_pool(store, monkeypatch):

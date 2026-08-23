@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -37,7 +36,14 @@ class TestZeroWeightAdapterHandling:
         assert result[1]["id"] == "disabled"
 
     def test_zero_weight_in_format_remote_adapters(self):
-        """weight=0.0 should be passed correctly to gate weights."""
+        """weight=0.0 reaches the gate, unconditionally.
+
+        This was `if extra_body and "adapter_weights" in extra_body:` around
+        the assertion, which passes exactly when the weight is missing —
+        measured, stopping the backend from sending `adapter_weights` at all
+        left this green. Together advertises `gate_weights`, so the key is
+        required rather than optional.
+        """
         from liminallm.service.model_backend import ApiAdapterBackend
 
         backend = ApiAdapterBackend("meta-llama", provider="together")
@@ -46,15 +52,13 @@ class TestZeroWeightAdapterHandling:
             {"id": "a1", "remote_adapter_id": "lora-1", "weight": 0.0},
         ]
 
-        model, extra_body, applied, dropped = backend._format_remote_adapters(adapters)
+        _model, extra_body, _applied, _dropped = backend._format_remote_adapters(
+            adapters
+        )
 
-        # Extra body should contain the gate weight
-        if extra_body and "adapter_weights" in extra_body:
-            weights = extra_body["adapter_weights"]
-            if isinstance(weights, list):
-                assert 0.0 in weights
-            else:
-                assert weights == 0.0
+        assert extra_body and "adapter_weights" in extra_body, extra_body
+        weights = extra_body["adapter_weights"]
+        assert (0.0 in weights) if isinstance(weights, list) else (weights == 0.0)
 
     def test_none_weight_defaults_to_one(self):
         """None weight should default to 1.0 (not 0.0)."""
@@ -128,10 +132,11 @@ class TestTokenBasedRAGChunking:
         chunks = store.list_chunks(ctx.id)
         assert len(chunks) > 1
 
-        # Check that overlap metadata exists
-        for i, chunk in enumerate(chunks):
-            if chunk.meta and i > 0:
-                assert "overlap_tokens" in chunk.meta
+        # Every chunk after the first records the overlap it carries. Not
+        # `if chunk.meta`: skipping when the metadata is absent passes
+        # exactly when it should fail.
+        for i, chunk in enumerate(chunks[1:], start=1):
+            assert chunk.meta and "overlap_tokens" in chunk.meta, (i, chunk.meta)
 
     def test_chunk_metadata_includes_token_info(self):
         """Chunks should have token count metadata."""
@@ -156,9 +161,9 @@ class TestTokenBasedRAGChunking:
         assert len(chunks) >= 1
 
         for chunk in chunks:
-            if chunk.meta:
-                assert "token_count" in chunk.meta
-                assert "embedding_model_id" in chunk.meta
+            assert chunk.meta, "a chunk with no metadata records neither"
+            assert "token_count" in chunk.meta
+            assert "embedding_model_id" in chunk.meta
 
 
 # ==============================================================================
@@ -199,57 +204,6 @@ class TestErrorBodyValidation:
 
         assert envelope.status == "error"
         assert envelope.error.code == "not_found"
-
-
-# ==============================================================================
-# Training Loss Recording Tests
-# ==============================================================================
-
-
-class TestTrainingLossRecording:
-    """Test that actual training loss is recorded, not heuristic."""
-
-    def test_extracts_loss_from_training_trace(self):
-        """Should extract actual loss from JAX training trace."""
-        # Mock the training trace returned by _run_jax_optax_training
-        training_trace = {
-            "status": "ok",
-            "steps": [
-                {"step": 0, "loss": 2.5},
-                {"step": 1, "loss": 1.8},
-                {"step": 2, "loss": 0.9},  # Final loss
-            ],
-            "final_params_path": "/tmp/params.json",
-        }
-
-        # The logic from training.py
-        loss = 1.0 / (1 + 10)  # Heuristic fallback
-        if training_trace.get("status") == "ok" and training_trace.get("steps"):
-            final_step = training_trace["steps"][-1]
-            if isinstance(final_step, dict) and "loss" in final_step:
-                actual_loss = final_step.get("loss")
-                if isinstance(actual_loss, (int, float)) and actual_loss >= 0:
-                    loss = float(actual_loss)
-
-        # Should use actual loss from trace, not heuristic
-        assert loss == 0.9
-
-    def test_falls_back_to_heuristic_if_no_trace(self):
-        """Should fall back to heuristic if training trace is empty."""
-        training_trace = {"status": "error", "steps": []}
-
-        dataset_entries = list(range(10))
-        loss = 1.0 / (1 + len(dataset_entries))  # Heuristic
-
-        if training_trace.get("status") == "ok" and training_trace.get("steps"):
-            final_step = training_trace["steps"][-1]
-            if isinstance(final_step, dict) and "loss" in final_step:
-                actual_loss = final_step.get("loss")
-                if isinstance(actual_loss, (int, float)) and actual_loss >= 0:
-                    loss = float(actual_loss)
-
-        # Should use heuristic since trace status is error
-        assert loss == pytest.approx(1.0 / 11)
 
 
 # ==============================================================================
@@ -331,73 +285,3 @@ class TestRefreshTokenRevocationSecurity:
 
         result = await auth._is_refresh_revoked("test-jti")
         assert result is False  # Token is not revoked
-
-
-# ==============================================================================
-# User ID Required in pgvector Search Tests
-# ==============================================================================
-
-
-class TestPgvectorUserIdRequired:
-    """Test that user_id is required for pgvector search (data isolation)."""
-
-    def test_empty_user_id_returns_empty(self):
-        """Empty user_id should return empty results for safety."""
-        # This tests the defense-in-depth check added to postgres.py
-        # The actual method now requires user_id as a non-optional parameter
-
-        # Mock the behavior we expect
-        def search_with_empty_user_id(user_id):
-            if not user_id:
-                return []  # Defense in depth
-            return ["results"]
-
-        assert search_with_empty_user_id("") == []
-        assert search_with_empty_user_id(None) == []
-        assert search_with_empty_user_id("valid-user") == ["results"]
-
-
-# ==============================================================================
-# Pagination Query Parameter Validation Tests
-# ==============================================================================
-
-
-class TestPaginationValidation:
-    """Test pagination parameter validation."""
-
-    def test_page_must_be_positive(self):
-        """page parameter must be >= 1."""
-        from pydantic import BaseModel, Field, ValidationError
-
-        class PaginationParams(BaseModel):
-            page: int = Field(1, ge=1, description="Page number")
-
-        # Valid page
-        params = PaginationParams(page=1)
-        assert params.page == 1
-
-        # Invalid page should raise
-        with pytest.raises(ValidationError):
-            PaginationParams(page=0)
-
-        with pytest.raises(ValidationError):
-            PaginationParams(page=-1)
-
-    def test_page_size_must_be_bounded(self):
-        """page_size parameter must be 1-200."""
-        from pydantic import BaseModel, Field, ValidationError
-
-        class PaginationParams(BaseModel):
-            page_size: int = Field(50, ge=1, le=200, description="Items per page")
-
-        # Valid page_size
-        params = PaginationParams(page_size=50)
-        assert params.page_size == 50
-
-        # Too small
-        with pytest.raises(ValidationError):
-            PaginationParams(page_size=0)
-
-        # Too large
-        with pytest.raises(ValidationError):
-            PaginationParams(page_size=201)

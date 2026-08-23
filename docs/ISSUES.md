@@ -11517,3 +11517,77 @@ setting is admin-managed with no `env` key, so `os.environ` cannot reach it —
 dead by construction, not by circumstance. Both sit beside `TEST_MODE`, which
 is a real `env_field` and short-circuits the same branch in `Runtime`, so
 removing them cannot change what either script does.
+
+## Pass E.3: tests that cannot fail
+
+`test_code_review_fixes.py` was the next candidate because its name records
+when a bug was found rather than what owns the invariant, and because it
+showed clusters — three zero-weight adapter tests, two chunking tests, three
+envelope tests. The expected finding was overlap. The actual finding was
+worse and easier to act on.
+
+Per-test coverage of `liminallm/` has a floor of about 3,757 lines, which is
+what importing the package and building the runtime executes before any test
+body runs. Five of the nineteen tests sat exactly on that floor: they execute
+no production line of their own.
+
+Reading says why, and running proves it:
+
+* `TestTrainingLossRecording` transcribes the loss-extraction loop from
+  `training.py` into the test body and asserts on its own copy. `training.py`
+  is never imported. Measured: take the first training step instead of the
+  last, or drop the assignment entirely, and both tests stay green.
+* `TestPgvectorUserIdRequired` defines `search_with_empty_user_id` locally —
+  "Mock the behavior we expect" — and asserts on that. Measured: remove the
+  real defence-in-depth check from `search_chunks_pgvector` and the test
+  passes.
+* `TestPaginationValidation` defines its own `PaginationParams(BaseModel)` and
+  asserts that pydantic's `ge` and `le` work. It also asserts a 1–200 bound
+  that exists nowhere in the product: the real clamp is
+  `min(max(page_size, 1), settings.max_page_size)`, with `Query(ge=1, le=1000)`
+  at the route. So the test was not merely inert, it described a contract the
+  product does not have.
+
+A test that cannot fail for any change to this codebase protects nothing, so
+these five are deleted. That is the campaign's rule at its least ambiguous:
+the set of mutations they kill is empty.
+
+### The isolation guard the deleted test was standing in front of
+
+`search_chunks_pgvector`, `search_chunks_lexical` and `late_candidate_ids`
+each refuse an absent `user_id`. Removing the check from any of them leaves
+`_chunk_scope` building a WHERE clause with no owner term, so the query runs
+and returns every user's chunks in the named contexts. Measured against the
+whole fast lane, not just this file: removing it left 2,606 tests green.
+
+Two reds replace the fake one, each beside the corpus that can exercise its
+channel — the chunk channels with the hybrid fixture in `test_rag.py`, late
+interaction with the segmented corpus in `test_late_interaction.py`. Both open
+with a positive control, because a refusal that returns nothing is
+indistinguishable from a query that would have matched nothing. All three
+guards are now killed.
+
+### Three assertions that passed by being skipped
+
+`test_zero_weight_in_format_remote_adapters` wrapped its whole assertion in
+`if extra_body and "adapter_weights" in extra_body:` — which is true exactly
+when the behaviour under test is present, so the test passed when the backend
+stopped sending gate weights altogether. Measured, and now unconditional: the
+Together capability table advertises `gate_weights`, so the key is required.
+Production was correct all along — `weight: 0.0` reaches
+`adapter_weights: 0.0`, and a missing weight becomes `1.0` — which is why this
+never surfaced as a failure.
+
+The two chunking tests had the same shape (`if chunk.meta:`) and, measured, do
+kill today because the metadata happens to be populated. The guard is what
+would stop them killing tomorrow, so it is gone from both.
+
+### Still unwitnessed
+
+`training.py`'s loss extraction has no test now that the transcription is
+gone, and it had none before. It sits inside the training-job method, so a
+real red means driving a job rather than a function; recorded rather than
+written here.
+
+The file is 403 lines and 19 tests before, 287 and 14 after. Four mutations
+newly killed, none lost.
