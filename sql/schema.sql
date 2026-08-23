@@ -123,7 +123,9 @@ CREATE INDEX IF NOT EXISTS idx_message_conversation_id ON message(conversation_i
 -- Artifact tables aligned to the SPEC kernel primitives
 CREATE TABLE IF NOT EXISTS artifact (
   id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  owner_user_id   UUID REFERENCES app_user(id) ON DELETE CASCADE,
+  -- SET NULL, not CASCADE: see the constraint block below for why, and for
+  -- the migration that corrects a database created before this line did.
+  owner_user_id   UUID REFERENCES app_user(id) ON DELETE SET NULL,
   type            TEXT NOT NULL,
   name            TEXT NOT NULL,
   description     TEXT,
@@ -156,6 +158,44 @@ ALTER TABLE artifact
   ADD COLUMN IF NOT EXISTS base_model TEXT;
 ALTER TABLE artifact_version
   ADD COLUMN IF NOT EXISTS base_model TEXT;
+
+-- Publishing detaches; it does not destroy.
+--
+-- This key was ON DELETE CASCADE, so removing an admin account removed every
+-- artifact that admin had published — a global MCP server, its versions and
+-- its config-patch history — with no review and no record. SPEC §12.3 says a
+-- published artifact has left its owner's sole control and changes through
+-- config ops, and a cascade is a change nobody proposed.
+--
+-- SET NULL rather than RESTRICT: refusing to delete the account would make
+-- one published row block a personnel action indefinitely, which is a worse
+-- answer than an artifact that survives without an owner. Owner-less already
+-- has a meaning here — `_get_owned_artifact` treats it as a system artifact
+-- only an admin may reach, and `mcp_client.servers_for_turn` skips it,
+-- because the admin attestation is what made it a capability. So a detached
+-- server goes inert and its history stays, which is the outcome that can be
+-- inspected and undone.
+--
+-- Private rows are still deleted, by `delete_user`, before the account goes.
+-- The key cannot tell visibilities apart, so a raw `DELETE FROM app_user`
+-- leaves a private artifact detached rather than removed. That direction is
+-- deliberate: recoverable beats unrecoverable when the key is guessing.
+DO $$
+BEGIN
+  IF EXISTS (
+    SELECT 1 FROM pg_constraint c
+    WHERE c.conrelid = 'artifact'::regclass
+      AND c.contype = 'f'
+      AND c.confrelid = 'app_user'::regclass
+      AND c.confdeltype = 'c'
+  ) THEN
+    ALTER TABLE artifact
+      DROP CONSTRAINT IF EXISTS artifact_owner_user_id_fkey;
+    ALTER TABLE artifact
+      ADD CONSTRAINT artifact_owner_user_id_fkey
+      FOREIGN KEY (owner_user_id) REFERENCES app_user(id) ON DELETE SET NULL;
+  END IF;
+END $$;
 
 CREATE INDEX IF NOT EXISTS idx_artifact_owner_user_id ON artifact(owner_user_id);
 CREATE INDEX IF NOT EXISTS idx_artifact_type ON artifact(type);

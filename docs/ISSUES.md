@@ -12420,3 +12420,98 @@ because a 400-level schema serializes past the size cap, so the size check
 rejected it either way — the witness is now deep and small. And the streaming
 loop test was deleted rather than kept: it killed nothing, and a test that
 cannot fail is the thing this project removes.
+
+## Published configuration outlived nothing: the account-deletion cascade
+
+`16b747c` made this normative in SPEC §12.3: an artifact that is `shared` or
+`global` has left its owner's sole control, and every subsequent change goes
+through config ops. The physical lifecycle said the opposite.
+
+`delete_user` removed every row with that `owner_user_id` whatever its
+visibility, and the foreign key was `ON DELETE CASCADE` independently. So a
+same-tenant admin deleting the admin who had published a global MCP server
+deleted the server, its versions and its config-patch history — no review, no
+record that it had ever existed.
+
+Not a security escape: it needs an admin and it fails closed. It is two rules
+the installation states about itself contradicting each other, and it made
+installation-wide configuration share a personnel account's lifetime.
+
+### The model, and why this one
+
+Publishing detaches; it does not destroy. A private artifact still dies with
+its account — the erasure guarantee is narrowed, not weakened. A published one
+keeps its row, its versions and its audit trail, and loses its owner.
+
+For an MCP server that means it goes **inert**, which is the honest outcome:
+the admin attestation is what made it a capability, and the admin is gone.
+`servers_for_turn` already skipped any artifact with no owner, so nothing new
+enforces this — it falls out of the rule that authority comes from a live
+admin-owned row. It stays inert until an admin publishes it again.
+
+`SET NULL` rather than `RESTRICT` on the key: refusing to delete the account
+would let one published row block a personnel action indefinitely, which is a
+worse answer than an artifact that survives unattributed. The key cannot tell
+visibilities apart, so a raw `DELETE FROM app_user` leaves a *private* row
+detached rather than removed. That direction is deliberate — recoverable beats
+unrecoverable when the constraint is guessing — and `delete_user`, the only
+supported path, still removes private rows itself.
+
+### Two mechanisms, and the one this repository controls
+
+The key does the detaching on every path, including ones no code here reads.
+But a database provisioned before the migration still carries the cascade, and
+on that database the key is the thing destroying published rows. So
+`delete_user` detaches them itself, first, and there is a witness that sets the
+constraint back to `CASCADE` and proves the delete path defends itself without
+it.
+
+That witness exists because the obvious mutation could not be run. Reverting
+the constraint in `sql/schema.sql` fails no test on an already-provisioned
+database: the migration is `IF confdeltype = 'c'`, so re-applying the file to a
+database that has already been corrected is a no-op, and the live constraint
+was measured at `n` throughout. Two tests on a scratch database cover the file
+itself — what a fresh install gets, and what an old one is migrated to. They
+are slow-marked, because each creates and drops a database and what they check
+is a migration rather than a request path.
+
+### SPEC §2.3 said something that was never quite true
+
+"`owner_user_id` null means global/shared" conflated two independent columns.
+Global MCP servers are deliberately global *and* admin-owned, because the
+ownership is the attestation. Null now has a precise meaning of its own — no
+account stands behind this row, either because the installation seeded it or
+because its owner was deleted — and that is exactly why an unattributed `tool`
+can never be privileged and an unattributed `mcp` server is offered to nobody.
+The kind list gains `mcp.server`, and the type list gains `mcp`.
+
+### The slow set did not need a lane of its own
+
+Asked while this was running, and answered by measuring rather than by
+reading the Makefile: xdist was wired into exactly one target,
+`test-fast-xdist`, and the slow-marked tests only ever ran inside the serial
+`make test`. Nothing about the per-worker isolation is marker-specific — each
+worker already gets its own Postgres, Redis database and filesystem root — so
+the slow set was running serially for no reason.
+
+Measured on a 4-core box: the 110 slow-marked tests take **5m37s** serially
+and **1m43s** at `-n 4`, same result. The whole non-browser suite, 2,814
+tests, takes **3m37s**. Parallelism is worth more here than in the fast lane
+because what makes a test slow is usually waiting.
+
+`make test-xdist` is that lane — the fast one with nothing deselected. It
+replaces "the full serial suite as an occasional release gate" in CLAUDE.md,
+whose advice was built on a quarter-hour cost that no longer exists.
+
+### Mutations
+
+Seven, six killed. Erasure taking published rows with the private ones;
+erasure deleting by owner rather than by the collected private ids; published
+rows never detached by the delete path; the migration block never running; an
+owner-less server still treated as a capability; and private artifacts
+surviving the account.
+
+One survivor, equivalent: putting `ON DELETE CASCADE` back in the `CREATE
+TABLE` line changes nothing, because the migration block below it repairs a
+fresh database on the same pass. The file is self-healing by design, so the
+two spellings are redundant on purpose.

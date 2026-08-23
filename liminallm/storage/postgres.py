@@ -1636,11 +1636,19 @@ class PostgresStore:
                 return None
             tenant_id = str(exists["tenant_id"]) if exists["tenant_id"] else None
 
-            # Get user's artifacts for cascade (needed for config patches, versions, router state)
+            # The account's *private* artifacts, which are the ones erasure is
+            # about. Published rows are deliberately excluded: SPEC §12.3 says
+            # an artifact that is `shared` or `global` has left its owner's
+            # sole control and changes only through config ops, and taking one
+            # away because a personnel account was removed is a change nobody
+            # reviewed. It also destroyed the version and patch history, which
+            # is the record of what the installation used to do.
+            #
             # Locked, so another user cannot start training one of this
             # account's adapters while the deletion is in flight.
             artifact_rows = conn.execute(
-                "SELECT id FROM artifact WHERE owner_user_id = %s FOR UPDATE",
+                "SELECT id FROM artifact WHERE owner_user_id = %s "
+                "AND visibility = 'private' FOR UPDATE",
                 (user_id,),
             ).fetchall()
             artifact_ids = [str(row["id"]) for row in artifact_rows]
@@ -1733,8 +1741,19 @@ class PostgresStore:
                     "DELETE FROM adapter_router_state WHERE artifact_id = ANY(%s)", (artifact_ids,)
                 )
 
-            # 9. Delete artifacts
-            conn.execute("DELETE FROM artifact WHERE owner_user_id = %s", (user_id,))
+            # 9. Delete the private artifacts, and detach the published ones.
+            # Stated here rather than left to the foreign key, which does the
+            # same thing: this is where the rule is visible to anyone reading
+            # what erasure takes. The key is the backstop for every other path
+            # — a maintenance statement, a restore — that never reads this.
+            if artifact_ids:
+                conn.execute(
+                    "DELETE FROM artifact WHERE id = ANY(%s)", (artifact_ids,)
+                )
+            conn.execute(
+                "UPDATE artifact SET owner_user_id = NULL WHERE owner_user_id = %s",
+                (user_id,),
+            )
 
             # 10. Delete preference events
             conn.execute("DELETE FROM preference_event WHERE user_id = %s", (user_id,))

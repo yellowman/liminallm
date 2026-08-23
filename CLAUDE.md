@@ -30,24 +30,30 @@ Model-facing prompt text is paid on every call — keep the wording tight. But t
 
 ### Which tests to run
 
-Pick the smallest lane that covers what changed. The full serial suite
-re-executes about 2,600 tests the fast lane has already proved, so running it
-after the fast lane as a routine pair buys nothing and costs a quarter of an
-hour.
+Pick the smallest lane that covers what changed.
 
-* **Normal change:** `make test-fast-xdist`. This is the default and usually
-  the only run.
-* **The change touches a slow-marked subsystem:** the fast lane plus the
-  affected slow file(s). The fast lane is `-m 'not slow'`, so those tests do
-  not run in it. JAX/LoRA work means the relevant model and training modules,
-  not all 2,800 tests.
+* **Normal change:** `make test-fast-xdist`. The default and usually the only
+  run — about two minutes.
+* **The change touches a slow-marked subsystem:** `make test-xdist`, which is
+  the same lane with nothing deselected. The slow set is not a separate lane
+  and needs no separate one: the per-worker Postgres, Redis database and
+  filesystem root that make the fast lane safe in parallel are not specific to
+  a marker.
 * **Full serial suite (`make test`):** only when the thing under test is
-  inherently about single-process or global behaviour, when a broad harness
-  change could alter serial semantics, or as an occasional release gate. Not
-  every commit.
+  inherently about single-process or global behaviour, or when a broad harness
+  change could alter serial semantics. Not as a release gate — `test-xdist`
+  covers the same tests — and not every commit.
+
+Parallelism buys more on the slow set than on the fast one, because what makes
+a test slow is usually waiting. Measured on a 4-core box: the 110 slow-marked
+tests alone take 5m37s serially and 1m43s at `-n 4`, and the whole non-browser
+suite — 2,814 tests — takes 3m37s. Running the fast lane and then the full one
+as a routine pair still buys nothing, but the full one is now cheap enough to
+be the gate whenever there is any doubt.
 
 `pytest tests/ -m slow --collect-only -q` lists the slow set and which files
-own it.
+own it. The browser lane stays out of both (`make test-browser`) because it
+needs a Chromium binary the dev extra does not install.
 
 ### Verification
 

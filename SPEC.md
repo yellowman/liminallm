@@ -228,10 +228,26 @@ trail.
 ### 2.3 artifacts (generic primitives)
 
 **artifact** — one generic table for everything configuration-like:
-- typed (`adapter`, `workflow`, `policy`, `tool`, `memory`, ...), named,
-  described, with a JSONB `schema` validated per kind.
-- `owner_user_id` null means global/shared; `visibility` is
-  `private` / `shared` / `global` (§12.2 access rules).
+- typed (`adapter`, `workflow`, `policy`, `tool`, `mcp`, `memory`, ...),
+  named, described, with a JSONB `schema` validated per kind.
+- **`visibility` decides who may reach it** — `private` / `shared` /
+  `global` (§12.2 access rules). ownership and visibility are independent:
+  a published artifact keeps its owner, and that owner is what several
+  authority checks read. an `mcp` server is `global` *and* admin-owned,
+  because the ownership is the attestation (§21.4), and `privileged: true`
+  on a `tool` means nothing without one.
+- **`owner_user_id` null means no account stands behind it**: a system
+  artifact seeded by the installation, or one whose owner has since been
+  deleted. it is not a synonym for global — it says the row is
+  unattributed, which is why an unattributed `tool` can never be
+  privileged and an unattributed `mcp` server is not offered to any turn.
+- **publishing detaches, it does not destroy.** deleting an account
+  removes its `private` artifacts and sets `owner_user_id` to null on the
+  rest, in the delete path and in the foreign key both. a `shared` or
+  `global` row has left its owner's sole control (§12.3), so removing a
+  personnel account must not silently retire installation configuration or
+  cascade away its version and patch history. the row survives, goes
+  unattributed, and is re-attested by an admin publishing it again.
 - payloads (workflow JSON, adapter weights) live on the shared filesystem
   under the artifact's directory; the database holds metadata and version
   pointers.
@@ -241,7 +257,8 @@ trail.
 `llm`) and why. Rollback is re-activating a prior version.
 
 Artifact kinds (in `schema.kind`): `adapter.lora`, `workflow.chat`,
-`policy.routing`, `tool.spec`, `memory.summary`, `context.knowledge`.
+`policy.routing`, `tool.spec`, `mcp.server`, `memory.summary`,
+`context.knowledge`.
 Every kind has a schema entry and is validated on create and patch — a
 kind without one cannot enter through `POST /v1/artifacts` at all.
 

@@ -1,7 +1,8 @@
 # LiminalLM Makefile
 #
 # Usage:
-#   make test      - Run unit tests (in-memory)
+#   make test      - Run unit tests (in-memory), serially
+#   make test-xdist - Every test but the browser lane, in parallel
 #   make test-fast - Fast edit-loop tests; excludes @pytest.mark.slow
 #   make test-fast-xdist - The same lane in parallel
 #   make lint      - Run linters
@@ -9,14 +10,15 @@
 #   make dev       - Start development server
 #   make docker    - Build and test with Docker
 
-.PHONY: help install test test-fast test-fast-xdist test-browser lint security qa dev docker clean docker-clean
+.PHONY: help install test test-xdist test-fast test-fast-xdist test-browser lint security qa dev docker clean docker-clean
 
 # Default target
 help:
 	@echo "LiminalLM Development Commands"
 	@echo ""
 	@echo "  make install    Install dependencies"
-	@echo "  make test       Run unit tests (in-memory)"
+	@echo "  make test       Run unit tests (in-memory), serially"
+	@echo "  make test-xdist Every test but the browser lane, across $(XDIST_WORKERS) processes"
 	@echo "  make test-fast  Fast edit-loop tests; excludes @pytest.mark.slow"
 	@echo "  make test-fast-xdist  The same lane across $(XDIST_WORKERS) processes"
 	@echo "  make test-browser     Real browser against a real server (needs Chromium)"
@@ -70,6 +72,21 @@ XDIST_DIST ?= loadfile
 test-fast-xdist:
 	@mkdir -p $(SHARED_FS_ROOT)
 	python -m pytest tests/ -q --tb=short -m 'not slow and not browser' \
+		-n $(XDIST_WORKERS) --dist $(XDIST_DIST)
+
+# The same lane with nothing deselected. The slow set is not a different lane
+# and does not need a different one: it is these tests plus the ones that run a
+# real model or wait on a real clock, and the per-worker Postgres, Redis
+# database and filesystem root that make the fast lane safe in parallel are not
+# specific to a marker.
+#
+# Parallelism buys more here than it does in the fast lane, because what makes
+# a test slow is usually waiting. Measured on a 4-core box: the 110 slow-marked
+# tests alone take 5m37s serially and 1m43s at -n 4, and this whole lane —
+# 2814 tests — takes 3m37s. That is the release gate, at edit-loop cost.
+test-xdist:
+	@mkdir -p $(SHARED_FS_ROOT)
+	python -m pytest tests/ -q --tb=short -m 'not browser' \
 		-n $(XDIST_WORKERS) --dist $(XDIST_DIST)
 
 # The browser lane. Excluded from every lane above because it needs a Chromium
