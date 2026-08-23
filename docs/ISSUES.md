@@ -11378,3 +11378,27 @@ a killer lost one, and eleven that had none now have one. Three still have no
 witness and are left open — the two identity-token issuance paths under
 `hold_live_user`, which want a fifth in-flight red, and the generation sweep's
 own age check, which no test in this cluster depends on.
+
+### Carry-over: nothing stopped the next dead compose variable
+
+"The QA compose environment could not start, and said so nowhere" was found
+by auditing `JWT_SECRET`'s neighbours by hand, and that audit is what
+confirmed `USE_MEMORY_STORE`, `JWT_ISSUER` and `JWT_AUDIENCE` were equally
+dead. A hand audit confirms a moment. Both compose files still declared a
+deployment nothing checked, so the same defect could be reintroduced by one
+line and would again look exactly like a working setting.
+
+`test_no_compose_variable_reaches_nothing` asserts every environment variable
+declared on a service this repository *builds* is read somewhere in
+`liminallm/` or `scripts/`. Services that name an `image:` are skipped: they
+run somebody else's entrypoint, and `POSTGRES_PASSWORD` is read by code this
+repository cannot see, so the `build:`/`image:` split is the rule rather than
+an allowlist that would need maintaining.
+
+Measured before landing, against planted variables rather than by reading:
+the check passes on both files as they stand, and fails on each of
+`REDIS_URL`, `JWT_ISSUER`, `JWT_AUDIENCE` and `USE_MEMORY_STORE` replanted one
+at a time — the four names the hand audit found — while `TEST_MODE` and
+`SHARED_FS_ROOT` still pass. All twenty-nine variables the two files declare
+on built services are read, so "remove the other known-dead compose variables
+once individually confirmed" is confirmed by the check rather than by a claim.

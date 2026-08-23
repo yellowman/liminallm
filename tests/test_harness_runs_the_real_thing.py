@@ -8,6 +8,7 @@ success, so these skip when Redis is absent rather than passing quietly.
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 
@@ -87,13 +88,18 @@ def test_redis_url_has_no_environment_variable():
 # built a 1536-wide database that then refused to boot.
 
 
-def _compose() -> dict:
+#: The production stack and the QA stack. Both declare the deployment, so a
+#: dead variable in either is a deployment that says it configured something.
+COMPOSE_FILES = ("docker-compose.yaml", "docker-compose.test.yml")
+
+
+def _compose(filename: str = COMPOSE_FILES[0]) -> dict:
     import pathlib
 
     import yaml
 
     root = pathlib.Path(__file__).resolve().parent.parent
-    return yaml.safe_load((root / "docker-compose.yaml").read_text())
+    return yaml.safe_load((root / filename).read_text())
 
 
 def test_docker_has_one_schema_authority():
@@ -375,4 +381,69 @@ def test_compose_mounts_the_volume_where_the_app_will_look_for_it():
     assert root in targets, (
         f"the app resolves its data root at {root} while the volume is "
         f"mounted at {targets}"
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _sources() -> tuple[str, ...]:
+    """Everything in this repository that could read an environment variable.
+
+    Read once: the caller asks about thirty names, and re-walking the package
+    for each one costs seconds in a lane whose wall clock is measured.
+    """
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parent.parent
+    texts = []
+    for path in (*root.glob("liminallm/**/*.py"), *root.glob("scripts/*")):
+        if not path.is_file():
+            continue
+        try:
+            texts.append(path.read_text(encoding="utf-8", errors="ignore"))
+        except OSError:
+            continue
+    return tuple(texts)
+
+
+def _anything_reads(name: str) -> bool:
+    """Does this repository read this environment variable anywhere?"""
+    needles = (f'"{name}"', f"'{name}'", f"${name}", "${%s}" % name)
+    return any(needle in text for text in _sources() for needle in needles)
+
+
+@pytest.mark.parametrize("filename", COMPOSE_FILES)
+def test_no_compose_variable_reaches_nothing(filename):
+    """A variable nothing reads is a configuration that only looks applied.
+
+    `REDIS_URL` sat in both files beside the settings that do work. But
+    `redis_url` is a managed setting with no environment variable of its own,
+    so the deployment ran on the in-process fallback — rate limits,
+    idempotency, the session cache and the concurrency slots all on their
+    fallback path — while its own compose file said otherwise. A dead name is
+    indistinguishable from a live one until something measures the behaviour
+    it claims to set, which is what this does.
+
+    Only services this repository builds are checked. A service that names an
+    `image:` runs somebody else's entrypoint, and `POSTGRES_PASSWORD` is read
+    by code this repository cannot see.
+    """
+    services = _compose(filename).get("services") or {}
+    dead = {}
+    for name, body in services.items():
+        if body.get("image"):
+            continue
+        environment = body.get("environment") or {}
+        declared = (
+            list(environment)
+            if isinstance(environment, dict)
+            else [str(entry).split("=", 1)[0] for entry in environment]
+        )
+        unread = sorted(key for key in declared if not _anything_reads(key))
+        if unread:
+            dead[name] = unread
+    assert not dead, (
+        f"{filename} declares variables nothing reads: {dead}. Either the "
+        "setting is managed and belongs in INSTANCE_SETTINGS_JSON, or the "
+        "name is stale and should go — leaving it makes the file claim a "
+        "configuration the deployment never receives."
     )
