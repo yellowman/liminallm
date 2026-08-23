@@ -468,7 +468,7 @@ class WorkflowStreamingMixin:
         message = inputs.get("message") or user_message or ""
         attachments = self._conversation_attachments(conversation_id, user_id)
 
-        messages, tools, _ = self._build_agent_context(
+        messages, tools, _, mcp_tools = self._build_agent_context(
             message, attachments, history, user_id, conversation_id
         )
         if not tools or not self.llm.supports_tools:
@@ -537,6 +537,10 @@ class WorkflowStreamingMixin:
                         adapters=list(adapters or []),
                         history=list(history or []),
                         user_message=user_message,
+                        # On the context, never in the plan above: the plan is
+                        # what the worker reads, and an entry there carries the
+                        # server's URL and its taint class.
+                        mcp_tools=mcp_tools,
                     ),
                     self._worker_limits(self.tool_registry.get("agent.files_v1")),
                     on_capability=traces.append,

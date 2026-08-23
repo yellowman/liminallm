@@ -49,6 +49,7 @@ def _fake_exec(record=None):
         invocation=None,
         operation_seq=0,
         step="",
+        mcp_tools=None,
     ):
         time.sleep(args.get("sleep", 0.15))
         if record is not None:

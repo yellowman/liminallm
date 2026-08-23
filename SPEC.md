@@ -2623,6 +2623,7 @@ be used, so an empty vault or a disabled feature costs zero prompt tokens.
 | `web_fetch` | web tools on | one page's visible text |
 | `note_search` | notes enabled **and** the user's vault is non-empty | vault excerpts |
 | `history_search` | turns have fallen outside the verbatim window (§20.3) | earlier turns, verbatim |
+| `mcp__<server>__<tool>` | an admin-owned, globally visible, enabled `mcp.server` artifact lists it (§21.4) | that tool's result, as untrusted data |
 
 ### 21.1 untrusted content and the injection rule
 
@@ -2678,6 +2679,47 @@ per-member size, total size, and compression-ratio caps are enforced as bytes
 are read (zip bombs), and every member path is sanitized component-wise and
 re-joined through `safe_join` (zip slip). member type is checked with
 `stat.S_IFMT` because many writers store permissions with no type bits.
+
+### 21.4 remote tool servers (MCP)
+
+a turn can use tools that live on a remote **MCP** server. the protocol is not
+implemented here: `mcp>=2,<3` is a runtime dependency and the wire arbiter, so
+nothing in this codebase names a protocol version or a transport frame.
+**streamable http only** — stdio is out of scope, because "connect to a
+server" would become "spawn the executable this row names", which is a
+different privilege question.
+
+what the kernel owns is what the sdk cannot decide:
+
+- **authority is a persisted artifact.** a server is an `mcp.server` artifact
+  that is globally visible, enabled, and **admin-owned** — ownership read from
+  the artifact row, never from a field inside `schema`, the same rule
+  `privileged: true` lives under (§18). one unusable or unreachable row costs
+  its own server and never the turn.
+- **classification is the operator's, not the server's.** `taint_class` is
+  `egress` or `local_read` and comes from the artifact. it is deliberately not
+  inferred from the server's own annotations, which are metadata supplied by
+  the party being classified. anything missing or unrecognized is `egress`.
+- **the network policy applies to every hop.** discovery and dispatch run
+  inside the same `tool_network_guard` as the rest of the tool loop, including
+  wherever a redirect leads.
+- **the namespace is the model's, and ours.** remote names are projected into
+  `mcp__<server>__<tool>`, so a remote server can never claim a native tool's
+  name or another server's, and two remote names that normalize alike stay
+  separately callable.
+- **a result is untrusted data** (§21.1): bounded, scanned, and wrapped in the
+  same envelope fetched web content gets, with the rule stated in the system
+  block whenever such a tool is offered.
+- **taint withdraws `egress` servers** (§21.1) alongside `web_fetch`;
+  `local_read` survives for the reason `file_search` does.
+- **the worker sends a name, not a server.** the discovered map lives on the
+  parent's `InvocationContext` and never crosses the pipe (§18): an entry
+  carries a url and a taint class, and a worker that could send either could
+  name a host of its own and call it `local_read`.
+
+discovery is per turn and not cached: a remote server's offering is neither
+persisted nor stable, so nothing correct may depend on a process-local copy of
+it. an installation with no `mcp.server` artifacts pays one indexed query.
 
 ---
 

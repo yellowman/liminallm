@@ -87,7 +87,7 @@ def _system_text(runtime, user, attachments, *, web_enabled: bool = False) -> st
     before = engine.settings.web_tools_enabled
     engine.settings.web_tools_enabled = web_enabled
     try:
-        messages, _tools, _preamble = engine._build_agent_context(
+        messages, _tools, _preamble, _mcp = engine._build_agent_context(
             "what do the files say?", attachments, [], user.id, None
         )
     finally:

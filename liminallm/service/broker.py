@@ -85,6 +85,13 @@ class InvocationContext:
     adapters: List[dict] = field(default_factory=list)
     history: List[Any] = field(default_factory=list)
     user_message: str = ""
+    #: Model-visible name -> the remote MCP tool it dispatches to, for the
+    #: tools discovered for this turn. Here rather than in the plan for the
+    #: reason above: the entry carries the server's URL and its taint class,
+    #: and a worker that could send either could name a host of its choosing
+    #: and call it `local_read`. The worker sends a name; the parent decides
+    #: what that name means.
+    mcp_tools: Dict[str, Any] = field(default_factory=dict)
 
 
 class CapabilityBroker:
@@ -498,7 +505,12 @@ class CapabilityBroker:
             for c in calls
         ]
         for _call, name, _args in parsed:
-            self._emit(name if name in self.ROUND_LABELS else None)
+            # A remote tool's label is dynamic, so it cannot be in the static
+            # set — but it is still matched rather than passed through: the
+            # name has to be one this turn actually discovered, which the
+            # worker did not choose either.
+            allowed = name in self.ROUND_LABELS or name in self._ctx.mcp_tools
+            self._emit(name if allowed else None)
             logger.info(
                 "attachment_tool_called",
                 tool=name,
@@ -519,6 +531,7 @@ class CapabilityBroker:
             fallback_query=str(payload.get("fallback_query") or ""),
             invocation=invocation,
             operation_seq=seq,
+            mcp_tools=self._ctx.mcp_tools,
         )
         after = list(invocation.session.get("artifacts") or [])
         return {

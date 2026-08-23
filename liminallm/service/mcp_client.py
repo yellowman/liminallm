@@ -26,9 +26,11 @@ OAuth, resources, prompts and subscriptions.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -63,6 +65,42 @@ MAX_NAME_LENGTH = 64
 #: cap is on the text this module contributes, before the envelope: a server
 #: that returns a novel must not be able to spend the turn's whole window.
 MAX_RESULT_CHARS = 8000
+
+
+def run_sync(coro):
+    """Run one coroutine from a synchronous caller, loop or no loop.
+
+    The two callers are both synchronous, but one of them is reached from an
+    `async def` — the streaming path — and `asyncio.run` raises there rather
+    than doing something quietly wrong. So a running loop gets its own thread
+    with its own loop instead.
+
+    Safe for the network guard specifically, and not by luck: the guard is
+    thread-local, and both `discover` and `call` take the policy as an
+    argument and apply it themselves on whatever thread they end up running
+    on. A helper that relied on inheriting an ambient guard would connect
+    unguarded here, because the socket allowlist permits when no policy is set
+    on the connecting thread.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    box: Dict[str, Any] = {}
+
+    def _run() -> None:
+        try:
+            box["value"] = asyncio.run(coro)
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller
+            box["error"] = exc
+
+    thread = threading.Thread(target=_run, name="mcp-sync")
+    thread.start()
+    thread.join()
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
 
 
 def server_taint_class(schema: Optional[dict]) -> str:

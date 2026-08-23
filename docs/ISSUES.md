@@ -12132,3 +12132,95 @@ survived because no row could reach it: `validate_artifact` requires `url` on
 create and on update. The witness writes the malformed row the only way it can
 exist, straight into the table, which is also the only way it *does* exist —
 a restore from an older dump, or an operator's UPDATE.
+
+## The MCP wiring: what a name means is the parent's decision
+
+The client existed and reached no model. This is the seam — discovery during
+prompt assembly, the spec in the offered tools, dispatch by name, and
+withdrawal through the ordinary taint path. SPEC §21.4 is its normative home.
+
+### Where the map lives, and why not in the plan
+
+The agent loop is split across a pipe: the parent assembles the prompt and
+owns every effect, and a worker process runs the model-chosen control flow.
+The worker sends the name it chose; the parent decides what that name means.
+
+So the discovered map — model name to `RemoteTool` — is a field on
+`InvocationContext`, which already says of itself "never crosses the pipe.
+Every field here is something the worker must not be able to choose." A
+`RemoteTool` carries a URL and a `taint_class`, and a worker that could send
+either could name a host of its own and call it `local_read`. That is the same
+defect class as reading `tenant_id` from a request parameter, and it gets the
+same answer.
+
+The reds check the property rather than the arrangement: the plan is
+serialized and searched for the server's URL, with an assertion first that the
+tool was offered at all, so a plan that happens to be empty cannot pass.
+
+### Two vacuous witnesses, both caught by mutation
+
+Both were written by hand, both passed, and both proved nothing:
+
+* `test_a_name_the_turn_did_not_discover_is_not_dispatched` passed an **empty**
+  map. A dispatch that matched on the `mcp__` prefix alone and fell back to
+  whatever server was configured would answer "unknown tool" for the same
+  reason the correct one does — there is nothing to fall back to. The map is
+  now non-empty, with an assertion that it is.
+* `test_the_turn_is_told_what_the_envelope_means` ran with web enabled, which
+  it is in this environment, so the untrusted-data instruction was in the
+  system block either way. Measured: the test passed with `or mcp_tools`
+  removed. Web is now turned off in that test, so the rule can only be there
+  because a remote tool is offered.
+
+### Two real gaps the same run found
+
+The batch path was covered and the other two hand-offs were not. Both are now
+witnessed, and neither is hypothetical — each mutation breaks the feature
+completely on one of the two paths a turn can take:
+
+* The **broker** hand-off (`_tools_round` reading `self._ctx.mcp_tools`). The
+  earlier reds called `_run_round_tools` directly, passing the map by hand,
+  which proves the broker nothing. The witness drives `_tools_round`.
+* The **streaming** path, which builds its own `InvocationContext` inline — the
+  chat window's path. Its test stops at `_serve_invocation` and inspects the
+  context that would have reached the broker: spawning a worker and streaming
+  an answer needs a live model, and neither is what the test is about.
+
+### One thing left alone deliberately
+
+A remote tool is not in `PARALLEL_SAFE_TOOLS`, so a round containing one runs
+strictly in order. That is not an omission: a remote result can taint the turn,
+and it has to be able to withdraw a later egress call in the same round, which
+only holds when the round runs one call at a time. Adding remote tools to the
+parallel set is one of the mutations, and the witness is a round of two calls
+where the first returns a hostile string and the second is refused.
+
+### One thing added on the way past
+
+Discovery is skipped when the backend cannot call tools. The planner discards
+the whole tool list in that case, and unlike the native schemas — which are
+constants — discovering costs a round trip per configured server before being
+thrown away. Its witness proves it on the server's own records rather than on
+the returned map, so it cannot pass by connecting and then answering empty.
+
+### A regression the lane caught and the grep did not
+
+Changing `_build_agent_context`'s return arity broke 15 tests in two files.
+Both were stale call sites, not defects — a three-value unpack and a stub
+missing the new keyword — but the way they were missed is worth recording: the
+grep that was supposed to find every caller was piped through `head -20`, and
+the second file's real call sat below the cut while its docstring mention sat
+above it. A truncated search is not a completeness check. Nothing about the
+grep looked wrong, which is the point.
+
+### Mutations
+
+Twelve, each killed. Discovery running on a backend that cannot call tools;
+discovered tools never appended to the offered list; the map never passed to
+the round; dispatch matching on the `mcp__` prefix rather than on the map;
+egress tools never registered for withdrawal; `local_read` registered along
+with them; the untrusted-data instruction restored to web-only; the servers
+copied into the worker's plan; a dead server raising out of the turn instead
+of answering; remote tools added to `PARALLEL_SAFE_TOOLS`; the streaming
+context built without the map; and the broker passing an empty map to the
+round.
