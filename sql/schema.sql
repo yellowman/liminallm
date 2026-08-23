@@ -827,13 +827,25 @@ WHERE type = 'adapter'
 DO $$
 DECLARE bad_count integer;
 BEGIN
+  -- Every row typed 'adapter', not only those still claiming
+  -- kind='adapter.lora'. Scoping this to the kind meant the one corruption
+  -- the pre-C.2 write-path bypass actually produced — an adapter row
+  -- rewritten as another kind, with `type` untouched — was the single shape
+  -- the migration could not see.
   SELECT count(*) INTO bad_count
   FROM artifact
   WHERE type = 'adapter'
-    AND schema->>'kind' = 'adapter.lora'
     AND (
+      -- It must still be an adapter.
+      coalesce(schema->>'kind', '') <> 'adapter.lora'
       -- The mode must be one of the four.
-      coalesce(schema->>'mode', '') NOT IN ('local','remote','prompt','hybrid')
+      OR coalesce(schema->>'mode', '') NOT IN ('local','remote','prompt','hybrid')
+      -- The fields the adapter schema requires must be present and typed.
+      -- Checking a field's type only when present let a patch that *removed*
+      -- one through.
+      OR jsonb_typeof(schema->'base_model') IS DISTINCT FROM 'string'
+      OR jsonb_typeof(schema->'current_version') IS DISTINCT FROM 'number'
+      OR (schema->>'current_version') !~ '^[0-9]+$'
       -- No retired spelling may remain.
       OR schema ?| array['backend','provider','cephfs_dir','behavior_prompt',
                          'system_prompt','instructions','prompt_template',
@@ -849,13 +861,14 @@ BEGIN
           AND jsonb_typeof(schema->'remote_model_id') <> 'string')
       OR (schema ? 'remote_adapter_id'
           AND jsonb_typeof(schema->'remote_adapter_id') <> 'string')
-      OR (schema ? 'base_model' AND jsonb_typeof(schema->'base_model') <> 'string')
     );
   IF bad_count > 0 THEN
     RAISE EXCEPTION
-      'migration incomplete: % adapter artifact(s) are not canonical - mode '
-      'outside (local, remote, prompt, hybrid), a retired field, or a '
-      'non-string canonical field. Repair or delete them, then re-run.',
+      'migration incomplete: % row(s) typed adapter are not canonical - a '
+      'kind other than adapter.lora, a mode outside (local, remote, prompt, '
+      'hybrid), a missing or mistyped base_model or current_version, a '
+      'retired field, or a non-string canonical field. No historical meaning '
+      'is recoverable for these; repair or delete them, then re-run.',
       bad_count;
   END IF;
 END $$;

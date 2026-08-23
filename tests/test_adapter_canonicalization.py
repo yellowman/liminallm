@@ -310,6 +310,59 @@ class TestTheMigrationRefusesToLeaveCorruption:
             with psycopg.connect(store.dsn, autocommit=True) as conn:
                 conn.execute("DELETE FROM artifact WHERE id = %s", (bad,))
 
+    @pytest.mark.parametrize(
+        "schema,why",
+        [
+            # Reachable before C.2: ConfigOps chose its validator from the
+            # payload's kind, so an adapter row could be rewritten as a tool
+            # while `artifact.type` stayed 'adapter'. Both the repair and its
+            # postcondition keyed on `schema.kind`, so such a row was
+            # invisible to the migration entirely.
+            ({"kind": "tool.spec", "name": "x", "handler": "x"},
+             "an adapter row wearing another kind"),
+            # And a patch could remove a required field.
+            ({"kind": "adapter.lora", "mode": "prompt", "current_version": 0},
+             "a missing base_model"),
+            ({"kind": "adapter.lora", "mode": "prompt", "base_model": "b"},
+             "a missing current_version"),
+            ({"kind": "adapter.lora", "mode": "prompt", "base_model": "b",
+              "current_version": -1},
+             "a negative current_version"),
+        ],
+    )
+    def test_corruption_the_old_bypass_could_persist_is_refused(
+        self, client, schema, why
+    ):
+        """The postcondition speaks for every row typed 'adapter'.
+
+        Scoping it to `schema.kind = 'adapter.lora'` meant the one corruption
+        the write-path bypass actually produced — a wrong kind — was the one
+        shape the migration could not see. No faithful historical meaning is
+        recoverable for these, so the migration refuses rather than inventing
+        one.
+        """
+        import psycopg
+
+        store = get_test_store()
+        bad = str(uuid.uuid4())
+        with psycopg.connect(store.dsn, autocommit=True) as conn:
+            conn.execute(
+                "INSERT INTO artifact (id, type, name, schema) "
+                "VALUES (%s, 'adapter', 'corrupt', %s)",
+                (bad, json.dumps(schema)),
+            )
+        try:
+            done = subprocess.run(
+                ["psql", store.dsn, "-v", "ON_ERROR_STOP=1",
+                 "-v", "embedding_dim=64", "-f", "sql/schema.sql"],
+                cwd=ROOT, capture_output=True, text=True, timeout=180,
+            )
+            assert done.returncode != 0, f"the migration completed over {why}"
+            assert "not canonical" in done.stderr, done.stderr[-400:]
+        finally:
+            with psycopg.connect(store.dsn, autocommit=True) as conn:
+                conn.execute("DELETE FROM artifact WHERE id = %s", (bad,))
+
     def test_an_uncanonical_mode_is_reported_by_the_migration(self, client):
         import psycopg
 

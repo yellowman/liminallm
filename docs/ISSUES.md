@@ -11235,3 +11235,27 @@ checked against the old schema in git rather than assumed.
 Four mutations, each killed: either mutation surface picking its validator
 from the payload's kind, truthiness reverted to a text test, and the
 postcondition narrowed back to the mode alone.
+
+### Pass C.3: the postcondition speaks for the row, not for its kind
+
+The repair and its postcondition both filtered on `schema->>'kind' =
+'adapter.lora'`. That made the one corruption the pre-C.2 write-path bypass
+actually produced — an adapter row rewritten as another kind, with
+`artifact.type` untouched, because only `schema` is updated — the single shape
+the migration could not see. The same bypass could remove a required field, and
+the postcondition only type-checked fields that were present.
+
+Four reds, each a state that was product-path reachable before C.2, and all
+four invisible to the migration: a `kind: tool.spec` adapter row, a missing
+`base_model`, a missing `current_version`, and a negative `current_version`.
+
+The postcondition now covers every row typed `adapter`, whatever its schema
+claims to be: the kind must still be `adapter.lora`, the mode one of four,
+`base_model` a string and `current_version` a non-negative integer, no retired
+spelling, and every optional canonical field a string. None of these are
+repaired — there is no faithful historical meaning to recover for a row whose
+kind was swapped or whose required field was deleted — so the migration names
+them and stops.
+
+Three mutations, each killed: the scope narrowed back to the kind, required
+fields checked only when present, and a negative version accepted.
