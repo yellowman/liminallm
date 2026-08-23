@@ -11279,3 +11279,102 @@ Pass C is closed.
 
 Two mutations, each killed: the five new types unchecked, and the integral
 test reverted to the regex.
+
+## Deletion tranche E: tests that prove what another test already proves
+
+Pass E removes tests subsumed by other tests, with mutation as the arbiter
+rather than reading. The rule for the whole pass: a test may go only when every
+mutation it kills is also killed by a test that survives, and the deletion is
+verified by re-running the entire mutation set against the reduced suite.
+
+### Pass E.1: the erasure cluster, and a mutation that measured nothing
+
+The cluster is `test_account_erasure.py` with `test_artifact_retirement.py`.
+The starting signal was a coarse mutation — make `delete_user` purge no hot
+state — that twenty-five tests appeared to kill. Twenty-five tests killing one
+mutation is the shape subsumption lives in, so it looked like the place to
+begin.
+
+It was not. `purged = await self.cache.purge_user_state(erasure)` became
+`purged = 0`, and the next statement is `purged.items()`. The mutation did not
+make the purge do nothing; it raised `AttributeError` inside `delete_user`, so
+every test that deletes an account failed. The twenty-five were not sharing an
+invariant, they were sharing a 500. A mutation that crashes the code under test
+measures which line runs, not which behaviour is covered.
+
+The replacement is thirty mutations that each leave the code running: one purge
+family at a time, one lifetime-guard call site at a time, one sweep unwired
+from the cleanup pass at a time. Every run reports tests passing rather than an
+error cascade, which is the cheap check that a mutation is behavioural.
+
+### Four dominated tests, each verified rather than argued
+
+* `test_deleting_an_account_revokes_its_cached_sessions` — the cached session
+  stops resolving after erasure. `test_the_session_index_is_not_the_authority_on_sessions`
+  is the same test with one extra step: it drops `auth:user_sessions:<uid>`
+  first. The stronger one is also the only test that kills a purge derived from
+  Redis's own index instead of from the deleting transaction.
+* `test_a_completed_idempotency_record_goes_with_the_account` — writes through
+  the store's own setter and asserts the key is gone. Both in-flight
+  idempotency tests close on that assertion, having written through the
+  production path under a forced schedule.
+* `test_deleting_an_account_retires_its_cached_conversations` — same shape,
+  covered twice: by the in-flight summary test and by the independence test.
+* `test_an_old_generation_survives_the_pass_that_follows_deletion` — a week-old
+  blob survives a real cleanup pass after deletion. `_populate` already
+  backdates everything a week, so `test_a_pending_retirement_is_not_collected_early`
+  runs the same pass over the same aged fixture and asserts that blob plus two
+  more collectors, and `test_the_generation_sweep_skips_a_pending_user` calls
+  the sweep directly.
+
+### Retained, because it kills something nothing else does
+
+`test_an_identity_token_does_not_outlive_its_account` looked subsumed by the
+family table below, which also asserts a `reset:` key naming the account is
+gone. It is not: the table writes its own fixture and so asserts its own shape,
+while this one issues a real token through `initiate_password_reset`. Measured
+— store `user.email` under `reset:<token>` instead of `user.id` and only this
+test and the ordinary-reset test fail. It holds the shape contract between the
+issuer and the purge, and the table cannot.
+
+### Eleven behaviours with no witness at all
+
+The analysis found far more missing coverage than redundancy, which is the
+honest result for this cluster and the reason this commit is five lines longer
+rather than shorter.
+
+Every assertion in `test_a_pending_retirement_is_not_collected_early` is that
+something still exists — which is also what a pass that ran no sweeps produces.
+Measured: unwire the scratch, generation or archive-staging sweep from
+`_run_cleanup_pass` and that test still passed, so the exclusion under test was
+never what kept those files. The artifact-payload sweep in the same tuple has a
+witness whose name says so, `TestTheSweepActuallyRunsInProduction`; the other
+three had only `_run_cleanup_pass`'s docstring. Its pair test now runs the same
+fixture and the same pass against a live account, one assertion per collector.
+
+Seven of `purge_user_state`'s families — the session index, session activity,
+session rotation, MFA, router cache, concurrency slots and verification tokens
+— could be disabled one at a time with the whole suite still passing. A family
+purged only by code nothing exercises stops being purged the next time its key
+shape changes, and says nothing when it does. One table-driven test now seeds a
+key per family and names the families that survive erasure.
+
+The purge has two loops, the families it addresses by name and the ones it
+scans for, and each keeps its own `try` so one unreachable family cannot cancel
+the rest. Only the first loop had a witness. The independence test is
+parametrized over both, refusing a family each loop attempts early and
+asserting on one it attempts later.
+
+That last one is worth recording for how it nearly passed vacuously: the first
+version of the `scanned` case refused `idemp:` keys for an account that had
+none, so no delete was attempted, nothing raised, and the test passed under the
+mutation it was written to kill. Seeding one key in each refused family is what
+makes the refusal happen.
+
+### Mutations
+
+Thirty, all behavioural, re-run against the reduced suite: no mutation that had
+a killer lost one, and eleven that had none now have one. Three still have no
+witness and are left open — the two identity-token issuance paths under
+`hold_live_user`, which want a fifth in-flight red, and the generation sweep's
+own age check, which no test in this cluster depends on.

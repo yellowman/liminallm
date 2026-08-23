@@ -288,6 +288,49 @@ class TestTheAccountOwnsItsWholeNamespace:
             (namespace / "attachment-generations" / "sha256").glob("*/*")
         ), "the generation sweep took the account's blobs mid-erasure"
 
+    @pytest.mark.asyncio
+    async def test_the_same_pass_collects_when_nothing_is_pending(self, client):
+        """The other half of the pair above, and the reason it means anything.
+
+        Every assertion there is that something still exists, which is also
+        what a pass that ran no sweeps produces. Measured: unwire any of the
+        three from `_run_cleanup_pass` and that test still passes — the
+        exclusion was never what kept those files. So the same fixture runs
+        the same pass against a live account, where all three collectors must
+        take their own kind of debris.
+        """
+        from liminallm.app import _run_cleanup_pass
+
+        user_id, _, headers = _account(client)
+        namespace, staging = _populate(client, headers, user_id)
+        runtime = get_runtime()
+        # A generation no attachment names. The one `_populate` leaves is
+        # referenced by a live conversation, so a correct sweep keeps it and
+        # it cannot stand in for the sweep having run.
+        orphan = (
+            namespace
+            / "attachment-generations"
+            / "sha256"
+            / "ab"
+            / f"ab{uuid.uuid4().hex}"
+        )
+        orphan.parent.mkdir(parents=True, exist_ok=True)
+        orphan.write_bytes(b"a generation nothing references")
+        _age(orphan.parent)
+
+        await _run_cleanup_pass(
+            runtime, Path(runtime.settings.shared_fs_root), max_age_hours=24
+        )
+        assert not (namespace / "tmp" / "scratch.txt").exists(), (
+            "the cleanup pass never ran the scratch sweep"
+        )
+        assert not (staging / "in-progress").exists(), (
+            "the cleanup pass never ran the archive-staging sweep"
+        )
+        assert not orphan.exists(), (
+            "the cleanup pass never ran the attachment-generation sweep"
+        )
+
 
 class TestSubordinateSweepsDoNotUndercutTheGrace:
     """The account's clock outranks every collector inside its namespace.
@@ -298,43 +341,6 @@ class TestSubordinateSweepsDoNotUndercutTheGrace:
     mtime, which is old. That is the right clock for its normal race and the
     wrong one for this event.
     """
-
-    @pytest.mark.asyncio
-    async def test_an_old_generation_survives_the_pass_that_follows_deletion(
-        self, client
-    ):
-        import os
-        import time
-
-        from liminallm.app import _run_cleanup_pass
-
-        user_id, _, headers = _account(client)
-        _, _, admin_headers = _account(client, admin=True)
-        _populate(client, headers, user_id)
-        runtime = get_runtime()
-
-        generations = (
-            _namespace(user_id) / "attachment-generations" / "sha256"
-        )
-        blobs = list(generations.glob("*/*")) if generations.is_dir() else []
-        assert blobs, "the account has no attachment generation to protect"
-        blob = blobs[0]
-        week_ago = time.time() - 7 * 86400
-        os.utime(blob, (week_ago, week_ago))
-
-        # A turn resolved that blob a moment ago; then the account is deleted.
-        assert client.delete(
-            f"/v1/admin/users/{user_id}", headers=admin_headers
-        ).status_code in (200, 204)
-        await _run_cleanup_pass(
-            runtime, Path(runtime.settings.shared_fs_root), max_age_hours=24
-        )
-
-        assert blob.exists(), (
-            "an attachment generation was reclaimed the moment its account's "
-            "rows disappeared, because the mark set emptied and the blob's own "
-            "age was already past the sweep's threshold"
-        )
 
     def test_the_generation_sweep_skips_a_pending_user(self, client):
         """Directly, so the exclusion is not only tested through the loop."""
@@ -700,35 +706,18 @@ class TestTheNamespaceRetirementIsVerifiedAtStartup:
 
 class TestHotStateGoesWithTheAccount:
     @pytest.mark.asyncio
-    async def test_deleting_an_account_retires_its_cached_conversations(
-        self, client
-    ):
-        """Individual chat DELETE retires this; bulk erasure bypassed it."""
-        runtime = get_runtime()
-        if runtime.cache is None:
-            pytest.skip("no Redis in this environment")
+    async def test_every_family_the_purge_names_is_actually_purged(self, client):
+        """One row per family in `purge_user_state`, because seven had none.
 
-        user_id, _, headers = _account(client)
-        _, _, admin_headers = _account(client, admin=True)
-        conversation = client.post(
-            "/v1/conversations", headers=headers, json={"title": "chat"}
-        ).json()["data"]["id"]
-        secret = f"SECRET-{uuid.uuid4().hex[:10]}"
-        await runtime.cache.set_conversation_summary(
-            conversation, {"recent_messages": [{"content": secret}]}
-        )
-        assert await runtime.cache.get_conversation_summary(conversation)
+        Measured before this existed: disable the session-index, session
+        activity, session rotation, MFA, router-cache, concurrency or
+        email-verification family and the whole suite still passed. A family
+        purged only by code nothing exercises stops being purged the next time
+        its key shape changes, and says nothing when it does.
 
-        assert client.delete(
-            f"/v1/admin/users/{user_id}", headers=admin_headers
-        ).status_code in (200, 204)
-        assert await runtime.cache.get_conversation_summary(conversation) is None, (
-            "the erased account's messages are still readable in the cache"
-        )
-
-    @pytest.mark.asyncio
-    async def test_deleting_an_account_revokes_its_cached_sessions(self, client):
-        """The row is gone; the cached answer to "whose session is this" is not."""
+        The table is the list the purge iterates, so a family added to
+        production without a witness leaves a row to write here.
+        """
         runtime = get_runtime()
         if runtime.cache is None:
             pytest.skip("no Redis in this environment")
@@ -740,18 +729,47 @@ class TestHotStateGoesWithTheAccount:
         )
         assert resp.status_code == 201, resp.text
         user_id = resp.json()["data"]["user_id"]
+        headers = {"Authorization": f"Bearer {resp.json()['data']['access_token']}"}
         _, _, admin_headers = _account(client, admin=True)
-
-        # The real login path, because that is what populates the cache.
+        # A real session and a real conversation: the per-session and
+        # per-conversation families are addressed from the deleting
+        # transaction's own rows, not from anything Redis holds.
         _, session, _ = await runtime.auth.login(email, password)
-        assert await runtime.cache.get_session_user(session.id) == (True, user_id)
+        conversation = client.post(
+            "/v1/conversations", headers=headers, json={"title": "chat"}
+        ).json()["data"]["id"]
+
+        keys = {
+            "sessions": f"auth:session:{session.id}",
+            "session_index": f"auth:user_sessions:{user_id}",
+            "session_activity": f"session:activity:{session.id}",
+            "session_rotation": f"session:rotation:{session.id}",
+            "conversation_summaries": f"chat:summary:{conversation}",
+            "mfa_attempts": f"mfa:attempts:{user_id}",
+            "mfa_lockout": f"mfa:lockout:{user_id}",
+            "idempotency": f"idemp:chat:{user_id}:{_unique('k')}",
+            "router_cache": f"router:last:model:{user_id}:0",
+            "concurrency": f"concurrency:workflow:{user_id}",
+        }
+        for key in keys.values():
+            await runtime.cache.client.set(key, "the account's own content")
+        # These two are found by value: the token itself is opaque, so the
+        # purge scans the prefix and keeps only the keys naming this account.
+        for family, prefix in (("reset_tokens", "reset"), ("verify_tokens", "verify")):
+            keys[family] = f"{prefix}:{uuid.uuid4().hex}"
+            await runtime.cache.client.set(keys[family], user_id)
+        for family, key in keys.items():
+            assert await runtime.cache.client.exists(key), f"unwritten: {family}"
 
         assert client.delete(
             f"/v1/admin/users/{user_id}", headers=admin_headers
         ).status_code in (200, 204)
-        present, cached_user = await runtime.cache.get_session_user(session.id)
-        assert not present and cached_user is None, (
-            "an erased account's session still resolves from the cache"
+        left = []
+        for family, key in keys.items():
+            if await runtime.cache.client.exists(key):
+                left.append(family)
+        assert not left, (
+            f"the erased account's own content is still cached: {sorted(left)}"
         )
 
     @pytest.mark.asyncio
@@ -763,6 +781,10 @@ class TestHotStateGoesWithTheAccount:
         ids are read from Postgres inside the deleting transaction instead,
         which is why this can be forced: drop the index and the session must
         still go.
+
+        The plain case — delete an account, its cached session stops
+        resolving — is this test with the index left in place, so it is this
+        one and not two.
         """
         runtime = get_runtime()
         if runtime.cache is None:
@@ -794,48 +816,6 @@ class TestHotStateGoesWithTheAccount:
         )
 
     @pytest.mark.asyncio
-    async def test_a_completed_idempotency_record_goes_with_the_account(self, client):
-        """The most content-bearing thing in this cache, kept for a day.
-
-        A replayable record holds the completed API response. For a chat turn
-        that is the assistant's message, so an erasure that leaves it behind
-        leaves the account's content readable under a key naming the account.
-        """
-        runtime = get_runtime()
-        if runtime.cache is None:
-            pytest.skip("no Redis in this environment")
-
-        user_id, _, headers = _account(client)
-        _, _, admin_headers = _account(client, admin=True)
-        secret = f"SECRET-{uuid.uuid4().hex[:10]}"
-        await runtime.cache.set_idempotency_record(
-            "chat",
-            user_id,
-            _unique("key"),
-            {"status": "completed", "response": {"message": secret}},
-        )
-        matches = [
-            key
-            async for key in runtime.cache.client.scan_iter(
-                match=f"idemp:*{user_id}*", count=500
-            )
-        ]
-        assert matches, "the fixture stored no idempotency record"
-
-        assert client.delete(
-            f"/v1/admin/users/{user_id}", headers=admin_headers
-        ).status_code in (200, 204)
-        left = [
-            key
-            async for key in runtime.cache.client.scan_iter(
-                match=f"idemp:*{user_id}*", count=500
-            )
-        ]
-        assert left == [], (
-            f"the erased account's completed responses are still cached: {left}"
-        )
-
-    @pytest.mark.asyncio
     async def test_an_identity_token_does_not_outlive_its_account(self, client):
         """A reset token names an account. The account is gone."""
         runtime = get_runtime()
@@ -857,12 +837,21 @@ class TestHotStateGoesWithTheAccount:
         )
 
     @pytest.mark.asyncio
-    async def test_one_unreachable_family_does_not_cancel_the_others(self, client):
+    @pytest.mark.parametrize("refused", ["auth:", "idemp:"], ids=["listed", "scanned"])
+    async def test_one_unreachable_family_does_not_cancel_the_others(
+        self, client, refused
+    ):
         """Every category is its own attempt.
 
         The first version ran all of them inside one `try`, so a failure
         revoking sessions meant no conversation summary was even attempted —
         one unreachable key pattern leaving an account's messages readable.
+
+        The purge has two loops — the families it can address by name and the
+        ones it has to scan for — and each keeps its own `try`. So each is
+        refused a family it attempts early, and the assertion is on a family it
+        attempts after that: refusing a later one would prove nothing, because
+        the earlier one is gone whether or not the categories are independent.
         """
         runtime = get_runtime()
         if runtime.cache is None:
@@ -876,19 +865,23 @@ class TestHotStateGoesWithTheAccount:
         await runtime.cache.set_conversation_summary(
             conversation, {"recent_messages": [{"content": "still here"}]}
         )
-
-        # The session family, which the purge attempts before the summaries.
-        # Failing a later one would prove nothing: the summaries would already
-        # be gone whether or not the categories are independent.
+        # One key in each refused family, or the purge finds nothing there to
+        # fail on and the refusal never happens.
+        await runtime.cache.set_idempotency_record(
+            "chat", user_id, _unique("key"), {"status": "completed"}
+        )
+        token = await runtime.auth.initiate_password_reset(
+            runtime.store.get_user(user_id)
+        )
         real_delete = type(runtime.cache.client).delete
 
-        async def refuse_sessions(self, *keys, **kw):
-            if any(str(k).startswith("auth:") for k in keys):
+        async def refuse_one_family(self, *keys, **kw):
+            if any(str(k).startswith(refused) for k in keys):
                 raise ConnectionError("this key family is unavailable")
             return await real_delete(self, *keys, **kw)
 
         monkeypatch = pytest.MonkeyPatch()
-        monkeypatch.setattr(type(runtime.cache.client), "delete", refuse_sessions)
+        monkeypatch.setattr(type(runtime.cache.client), "delete", refuse_one_family)
         try:
             assert client.delete(
                 f"/v1/admin/users/{user_id}", headers=admin_headers
@@ -896,9 +889,17 @@ class TestHotStateGoesWithTheAccount:
         finally:
             monkeypatch.undo()
 
-        assert await runtime.cache.get_conversation_summary(conversation) is None, (
+        # Sessions are the first family the purge lists; the idempotency scan
+        # is the first it scans for. The summary comes after the one, the reset
+        # token after the other.
+        later = (
+            runtime.cache.get_conversation_summary(conversation)
+            if refused == "auth:"
+            else runtime.cache.client.get(f"reset:{token}")
+        )
+        assert await later is None, (
             "one failing key family stopped the rest of the purge, so the "
-            "erased account's messages stayed readable"
+            "erased account's own content stayed readable"
         )
 
     @pytest.mark.asyncio
@@ -955,6 +956,10 @@ class TestAnInFlightRequestCannotUndoTheErasure:
     A liveness check before the write does not close it — that is the same
     check-then-act the collectors had, one participant further along. Only a
     lock held across the decision and the write does.
+
+    Each of these closes by asserting the key is gone, so each is also the
+    plain "the purge removed this family" witness, under the harder schedule
+    and through the production write path rather than the store's own setter.
     """
 
     async def _forced_schedule(
