@@ -160,7 +160,6 @@ class PostgresStore:
             raise
 
         try:
-            # Issue 48.2: Add connection pool timeout configuration
             # timeout: max seconds to wait for a connection from the pool
             # max_waiting: max requests that can wait for a connection
             # reconnect_timeout: seconds to wait before reconnecting failed connection
@@ -248,7 +247,7 @@ class PostgresStore:
                 )
                 return expires_at <= now
 
-            # First prune any expired sessions to avoid evicting valid ones (Issue 53.10)
+            # Prune expired sessions first, so the cap never evicts a valid one.
             expired_ids = [sid for sid, sess in self.sessions.items() if _is_expired(sess)]
             for sid in expired_ids:
                 self.sessions.pop(sid, None)
@@ -442,32 +441,17 @@ class PostgresStore:
                     "the SPEC §2.5 schema."
                 )
 
-            # `get_or_create_conversation_attachment_context` is correct only
-            # while this index exists: its `ON CONFLICT DO NOTHING` needs a
-            # constraint to collide with, and without one two concurrent first
-            # attachments each insert an index for the same conversation —
-            # leaving an acknowledged attachment somewhere no lookup returns.
-            # Same reasoning as `content_tsv` above: code can be newer than
-            # the database, so a load-bearing schema feature is checked where
-            # the message can name the fix.
+            # A conversation has at most one implicit attachment context.
+            # `get_or_create_conversation_attachment_context` relies on it:
+            # its `ON CONFLICT DO NOTHING` needs a constraint to collide with,
+            # and without one two concurrent first attachments each insert an
+            # index, leaving an acknowledged attachment no lookup returns.
             #
-            # The property that has to hold is one sentence: a conversation
-            # has at most one implicit attachment context. It is now a unique
-            # index on a real column, so the check is a question about that
-            # column rather than about the shape of a JSON expression.
-            #
-            # This used to introspect an index over `meta ->> 'conversation_id'`
-            # with an `auto` predicate, and each successive tightening was
-            # answering a counterexample: keyed on `id` alongside the
-            # conversation, the row id folded into the second key, a predicate
-            # of `id IS NULL` — each unique, each enforcing nothing.
-            #
-            # A single unqualified key on a foreign-key column admits none of
-            # them: no expression to substitute, no room for an extra key, and
-            # `indpred IS NULL` leaves no predicate to narrow it away. That
-            # last clause is not redundant. `WHERE conversation_id IS NULL`
-            # passes every other test here and covers none of the implicit
-            # contexts, because they all have a non-NULL conversation_id.
+            # Checked here because code can be newer than the database, and a
+            # single unqualified key on a foreign-key column is what makes the
+            # check exact. `indpred IS NULL` is not redundant: a partial index
+            # `WHERE conversation_id IS NULL` satisfies every other clause and
+            # covers no implicit context, since all of them have one.
             uniqueness = conn.execute(
                 """
                 SELECT 1 FROM pg_index i
@@ -517,20 +501,13 @@ class PostgresStore:
                 )
 
             # Retiring a context releases the chats bound to it, and that is
-            # a schema fact rather than something the delete does. Without
-            # this key, deleting a context leaves every conversation whose
-            # `active_context_id` names it pointing at a row that is gone.
+            # a schema fact rather than something the delete does.
             #
-            # Checked by shape because the schema's own guard could not be:
-            # it looked for a constraint of the expected *name* in
-            # information_schema, which lists every constraint type, so
-            # anything wearing that name — a CHECK included — convinced it
-            # the foreign key existed.
-            #
-            # `confdeltype = 'n'` is SET NULL, and it is the specific
-            # behaviour that matters. A cascading key here is still a
-            # foreign key, and it would delete the user's conversations
-            # along with a corpus they had merely selected.
+            # Checked by shape rather than by constraint name, which any
+            # constraint type can wear. `confdeltype = 'n'` is SET NULL and is
+            # the specific behaviour required: a cascading key here is still a
+            # foreign key, and would delete a user's conversations along with
+            # a corpus they had merely selected.
             binding = conn.execute(
                 """
                 SELECT 1 FROM pg_constraint c
@@ -555,27 +532,17 @@ class PostgresStore:
                     "scripts/migrate.sh to apply the SPEC §2 schema."
                 )
 
-            # The table alone is not the rule. Enrolment into each retirement
-            # queue is an AFTER DELETE trigger, and without it every deletion
-            # path silently stops queueing while the queue table sits there
-            # looking correct — which is exactly the state a ledger-only sweep
-            # cannot recover from.
+            # Enrolment into each retirement queue is an AFTER DELETE
+            # trigger. Without it every deletion path silently stops queueing
+            # while the queue table sits there looking correct, which a
+            # ledger-only sweep cannot recover from.
             #
-            # Shape, not name. `ALTER TABLE ... DISABLE TRIGGER` leaves the
-            # row in pg_trigger, and a same-named trigger on INSERT or calling
-            # a different function is equally present and equally useless.
-            # Startup's job here is to refuse an incompletely applied schema
-            # before requests arrive; the behavioural reds cover what the
-            # function body does.
-            #
-            # tgtype bit 0 is FOR EACH ROW and bit 3 is DELETE. tgenabled has
-            # four states and only two of them fire for ordinary application
-            # statements: 'O' (origin, the default) and 'A' (always). 'R' is
-            # replica-only — not disabled, and equally useless here.
-            #
-            # One query for both, because two hand-written copies of a
-            # nine-clause predicate is how the second one ends up missing the
-            # clause the first one earned.
+            # Checked by shape, not name: a disabled trigger stays in
+            # pg_trigger, and a same-named one on INSERT or calling another
+            # function is equally present and equally useless. tgtype bit 0 is
+            # FOR EACH ROW and bit 3 is DELETE; of tgenabled's four states
+            # only 'O' (origin) and 'A' (always) fire for application
+            # statements — 'R' is replica-only.
             for table, trigger, consequence in (
                 (
                     "artifact",
@@ -1140,7 +1107,7 @@ class PostgresStore:
         return self._row_to_training_job(row)
 
     def claim_training_job(self, job_id: str) -> TrainingJob | None:
-        """Atomically claim a training job for processing (Issue 26.2).
+        """Atomically claim a training job for processing.
 
         Only claims the job if its status is 'queued'. This prevents race
         conditions where multiple workers could claim the same job.
@@ -1615,27 +1582,8 @@ class PostgresStore:
         404. The ids come back because they stop being discoverable the moment
         this commits, and the copies of those rows in Redis are keyed by them.
 
-        Per SPEC §12, user deletion must clean up all associated data to prevent
-        orphaned records and ensure complete data removal for privacy compliance.
-
-        Deletes (in order to respect foreign key constraints):
-        - User MFA config
-        - User auth credentials
-        - User auth providers
-        - Sessions
-        - Messages (via conversation)
-        - Conversations
-        - Knowledge chunks (via context)
-        - Context sources (via context)
-        - Knowledge contexts
-        - Config patches (via artifact)
-        - Artifact versions (via artifact)
-        - Artifacts
-        - Preference events
-        - Training jobs
-        - Semantic clusters
-        - Adapter router state
-        - The user record itself
+        Deletes every record the account owns, in foreign-key order, so no
+        orphan survives it (SPEC §12).
         """
         with self._connect() as conn:
             # First, and before any read: this is what the subordinate
@@ -1869,7 +1817,7 @@ class PostgresStore:
                 self.sessions.pop(sid, None)
 
     def mark_session_verified(self, session_id: str) -> None:
-        # Issue 53.1: Cache update MUST only happen if DB update succeeds
+        # Only update the cache once the database write has succeeded.
         # to prevent MFA bypass via transient database failures
         try:
             with self._connect() as conn:
@@ -2349,37 +2297,23 @@ class PostgresStore:
     ) -> Optional[list]:
         """Add or replace one attachment record, atomically. Owner-only.
 
-        The list is one JSON value holding every attachment, so editing it
-        outside a transaction is a read-modify-write on shared state: two
-        uploads that both read before either wrote each store their own copy,
-        and the later write erases the earlier addition. Measured with two
-        filenames uploaded at once, one record disappeared entirely.
+        The attachment list is one JSON value, so `SELECT ... FOR UPDATE` on
+        the conversation row is what makes editing it safe: concurrent uploads
+        each read-modify-write the same value otherwise. A file lock cannot
+        serve here — the state is in Postgres and §22 runs several replicas.
 
-        `SELECT ... FOR UPDATE` takes the conversation row, so the second
-        writer reads what the first one committed rather than what it saw
-        before. A file lock could not have done this — the state is in
-        Postgres, and §22 has several replicas sharing exactly that.
-
-        Retiring what this record displaces happens here too, in the same
-        transaction and under the same row lock. Attaching a name a second
-        time produces a *different* generation, so the new ingestion replaces
-        no rows and the previous one stays searchable — but pruning the index
-        to an absolute set afterwards is a read-modify-act on shared state.
-        Measured with two filenames uploaded at once, the first one's prune
-        ran from a snapshot that did not name the second and deleted its
-        chunks, with both uploads returning 200.
-
-        So only what *this* record displaces is retired. A generation whose
-        record has not been written yet is not unauthorized, it is
-        unfinished. `paths_for` maps records to the objects they name, which
-        keeps that layout in the service that owns it; the displaced object
-        survives if another record still names it, which is what makes two
-        names sharing identical bytes work.
+        Retirement of what this record displaces happens in the same
+        transaction under the same lock, and only of what *this* record
+        displaces: a generation whose record has not been written yet is
+        unfinished, not unauthorized, so pruning the index to an absolute set
+        would delete a concurrent upload's chunks. `paths_for` maps records to
+        the objects they name, keeping that layout in the service that owns
+        it; a displaced object survives while another record still names it,
+        which is what lets two names share identical bytes.
 
         `generation_prefix` additionally retires rows that can never become
         authorized — anything in this context that is not an attachment
-        generation at all, which is what these contexts held before the
-        store existed.
+        generation at all.
 
         Returns the resulting list, or None when the conversation is not this
         user's.
@@ -2462,11 +2396,10 @@ class PostgresStore:
     ) -> bool:
         """Delete a conversation and everything scoped to it, atomically.
 
-        "Everything scoped to it" is wider than the conversation row. The
+        "Everything scoped to it" is wider than the conversation row: the
         implicit attachment index is a `knowledge_context` in another table,
-        and it used to survive this call — leaving the text of files attached
-        to a deleted chat indexed and searchable, which is the opposite of
-        what SPEC §19.5 promises by scoping an attachment to that chat.
+        and SPEC §19.5 scopes an attachment to its chat, so the text of a
+        deleted chat's files must stop being searchable with it.
 
         Nothing here deletes it. `knowledge_context.conversation_id` is a
         foreign key with `ON DELETE CASCADE`, so the context goes with the
@@ -2516,7 +2449,7 @@ class PostgresStore:
                         "SELECT 1 FROM conversation WHERE id = %s FOR UPDATE",
                         (conversation_id,),
                     )
-                    # Issue 37.6: Use MAX(seq) instead of COUNT(*) to handle gaps in sequence
+                    # MAX(seq), not COUNT(*): the sequence has gaps.
                     seq_row = conn.execute(
                         "SELECT COALESCE(MAX(seq), -1) + 1 AS next_seq FROM message WHERE conversation_id = %s",
                         (conversation_id,),
@@ -2838,11 +2771,7 @@ class PostgresStore:
         )
 
     def _artifact_from_row(self, row) -> Artifact:
-        """One mapping from an `artifact` row, so every reader sees the same.
-
-        Written out by hand in four places before this, which is how
-        `list_contexts` came to silently drop a column the model had gained.
-        """
+        """One mapping from an `artifact` row, so every reader sees the same."""
         schema = row.get("schema")
         if isinstance(schema, str):
             try:
@@ -2930,10 +2859,10 @@ class PostgresStore:
         The lock is the point. A worker claims a job with an atomic
         `UPDATE ... WHERE status = 'queued'`, so taking the artifact and its
         unfinished jobs `FOR UPDATE` gives the two operations one order: if
-        the worker claims first this sees `running` and refuses, and if this
-        commits first the claim finds no row to update. Without it, deleting
-        an adapter mid-training cascaded the job away while the worker went on
-        writing weights for an artifact that no longer existed.
+        the worker claims first this sees `running` and refuses; if this
+        commits first the claim finds no row to update. Otherwise a delete
+        mid-training cascades the job away while the worker writes weights
+        for an artifact that is gone.
         """
         if not _is_uuid(artifact_id) or not _is_uuid(owner_user_id):
             return None
@@ -3056,29 +2985,14 @@ class PostgresStore:
         Yields True while nothing is erasing this account, and holds that
         answer true for as long as the caller stays inside the block.
 
-        Asking without holding is not enough, and that is the whole point. A
-        collector that reads "not being erased" and then acts on it is a
-        check-then-act across the one event the answer is about:
-
-            SWEEP                          ADMIN DELETE
-            -----                          ------------
-            U is not being erased
-                                           delete U
-                                           retirement row, grace starts
-            conversations of U -> none
-            blob unreferenced, mtime old
-            unlink
-
-        which is exactly the state the retirement exists to prevent — a turn
-        that resolved that blob before the deletion reads a filesystem where
-        it is gone, inside the hour the grace period promised it.
-
-        `delete_user` takes the same lock at the start of its transaction, so
-        only two histories remain. Either the sweep holds it first and runs to
-        completion against pre-deletion state, where the account's own
-        conversations still name the blob and it is kept; or the deletion
-        holds it first, commits, and the sweep then sees the retirement and
-        does nothing. There is no third.
+        Holding is the point: asking and then acting is a check-then-act
+        across the one event the answer is about, and a sweep that straddles a
+        deletion unlinks a blob inside the grace period the retirement
+        promised. `delete_user` takes the same lock at the start of its
+        transaction, so only two histories remain — the sweep runs entirely
+        against pre-deletion state, where the account's conversations still
+        name the blob and it is kept, or the deletion commits first and the
+        sweep sees the retirement and does nothing.
 
         A name that is not a user id yields True: it cannot be an account, so
         no account's lifetime governs it.
@@ -3102,45 +3016,23 @@ class PostgresStore:
 
         The write-side counterpart of `hold_user_lifetime`, on the same lock
         and deliberately not the same question. That one asks "may a collector
-        act inside this namespace?", which is true for a directory that is not
-        an account at all; this one asks "is this principal still here?", which
-        for the same input is false. A caller that reused the collector's
-        answer would write on behalf of an account that never existed.
+        act inside this namespace?", true for a directory that is not an
+        account at all; this asks "is this principal still here?", false for
+        the same input. A caller that reused the collector's answer would
+        write on behalf of an account that never existed.
 
-        What it closes is the other half of the erasure boundary. Requests
-        authorized before the deletion are allowed to finish, and they finish
-        by writing:
+        Hold it across both the decision and the write. A purge is complete at
+        the instant it runs, which is not the same as the account's content
+        being gone: an in-flight request authorized before the deletion
+        finishes by writing, and an idempotency record holds a completed
+        response. Under the lock, either the writer goes first and the purge
+        that follows removes what it wrote, or the deletion goes first and the
+        writer sees no account and writes nothing.
 
-            CHAT                          ADMIN DELETE
-            ----                          ------------
-            authorized as U
-            turn finishes
-                                          delete U
-                                          purge every cached key of U
-                                          200
-            store the idempotency record
-              -> the completed response,
-                 back for 24 hours
-
-        The purge is complete at the instant it runs, and that is not the same
-        as the account's content being gone. Only a lock held across the
-        decision and the write makes it so: either the writer holds it first
-        and the deletion waits, and the purge that follows removes what was
-        just written; or the deletion holds it first, and the writer then sees
-        no account and writes nothing.
-
-        This is not an authentication hole either way. Access tokens are
-        re-checked against Postgres, so a cache entry cannot make a deleted
-        principal live again. It is a content-retention hole, which is what
-        the erasure is about.
-
-        The two guards differ where it matters: an id with no `app_user` row
-        and no retirement is debris to a collector and not a principal to a
-        writer. They agree on a name that is not a user id at all, and for the
-        opposite reason to the collector's — `app_user.id` is a UUID, so such
-        a name can never have been an account, can never be erased, and can
-        therefore never have anything to resurrect. Refusing it would only
-        break idempotency for a caller the erasure has no claim on.
+        A name that is not a UUID is accepted rather than refused: `app_user.id`
+        is a UUID, so such a name can never have been an account and has
+        nothing to resurrect. Refusing it would only break idempotency for a
+        caller the erasure has no claim on.
         """
         if not _is_uuid(user_id):
             yield True
@@ -3281,13 +3173,12 @@ class PostgresStore:
     ) -> Optional[Artifact]:
         """Edit an artifact this user owns and has not published.
 
-        The predicate goes into the statement that takes the lock, not into a
-        check the caller made earlier. `update_artifact` locks by id alone, so
-        validating "private and mine" in the route left a window: anything
-        publishing the artifact in between — config ops, an admin action, a
-        future share endpoint — lands after the check and before the write,
-        and the edit is applied to an artifact that is no longer the caller's
-        alone. Same shape as the delete, so it is enforced the same way.
+        The predicate goes into the statement that takes the lock, not into
+        a check the caller made earlier. `update_artifact` locks by id alone,
+        so validating "private and mine" in the route leaves a window:
+        anything publishing the artifact in between lands after the check and
+        before the write, and the edit reaches an artifact that is no longer
+        the caller's alone. Same shape as the delete, enforced the same way.
 
         `update_artifact` stays unrestricted for the callers that are not a
         user editing their own thing: training promoting a version, and config
@@ -3315,9 +3206,8 @@ class PostgresStore:
         require_private: bool = False,
     ) -> Optional[Artifact]:
         with self._connect() as conn, conn.transaction():
-            # Issue 19.5: Use SELECT ... FOR UPDATE to prevent race condition
-            # This locks the artifact row until the transaction completes,
-            # preventing concurrent version inserts from calculating the same next_version
+            # FOR UPDATE holds the artifact row for the transaction, so two
+            # concurrent inserts cannot compute the same next_version.
             conditions = ["id = %s"]
             params: list[Any] = [artifact_id]
             if owner_user_id is not None:
@@ -3516,12 +3406,10 @@ class PostgresStore:
     ) -> Optional[dict]:
         """The newest version of a workflow this caller may run, or None.
 
-        `user_id` is required rather than optional: `workflow_id` arrives in a
-        request body, and this method used to select on `artifact_id` alone,
-        so naming another user's private workflow ran it. A keyword with no
-        default means a caller cannot omit the question by accident — the two
-        callers that existed both had the identity to hand and neither passed
-        it.
+        `user_id` is required rather than optional: `workflow_id` arrives in
+        a request body, so without it, naming another user's private workflow
+        runs it. A keyword with no default means a caller cannot omit the
+        question by accident.
         """
         artifact = self.get_artifact(workflow_id)
         if artifact is None:
@@ -3946,7 +3834,7 @@ class PostgresStore:
         return None
 
     def _safe_float(self, value: Any, default: float = 1.0, *, context: str = "") -> float:
-        """Parse floats defensively to avoid crashes on malformed data (Issue 39.3)."""
+        """Parse floats defensively; malformed data must not raise."""
 
         try:
             return float(value)
@@ -4114,11 +4002,9 @@ class PostgresStore:
     ) -> Optional[KnowledgeContext]:
         """The conversation's implicit index, by identity rather than by page.
 
-        This used to be "the first row a 500-context listing matched", which
-        is not an identity lookup: an account with more recent contexts than
-        the page holds lost an older conversation's index entirely, and the
-        conversation's own attachments stopped being searchable while their
-        records and objects were still perfectly intact.
+        A paged scan is not an identity lookup: an account with more contexts
+        than the page holds loses an older conversation's index entirely,
+        while its records and objects stay intact.
 
         The relationship is a foreign key, so it is also the row's identity:
         the unique index on `conversation_id` means this returns at most one
@@ -4192,9 +4078,9 @@ class PostgresStore:
         )
         if existing is not None:
             return existing
-        # Kept as description for the UI and for anything reading contexts
-        # generically. The relationship it used to carry now lives in the
-        # column, which is the only copy anything depends on.
+        # Description for the UI and for anything reading contexts
+        # generically. The column carries the relationship; this is not a
+        # second copy anything depends on.
         meta = {"auto": True, "conversation_id": str(conversation_id)}
         ctx_id = str(uuid.uuid4())
         try:
@@ -4552,11 +4438,11 @@ class PostgresStore:
     ) -> List[int]:
         """Make `chunks` the whole of what this context says about `fs_path`.
 
-        Ingestion used to append, so re-uploading a file left the previous
-        generation's chunks in place beside the new ones and a search could
-        return, as the contents of that path, text it had not held since an
-        earlier upload. SPEC §2.5 dedupes by checksum *and path* and refreshes
-        a changed path by ingesting it, which only describes one generation.
+        Appending instead would leave the previous generation's chunks beside
+        the new ones, so a search could return, as the contents of that path,
+        text it has not held since an earlier upload. SPEC §2.5 dedupes by
+        checksum *and path* and refreshes a changed path by ingesting it,
+        which describes exactly one generation.
 
         Delete and insert in one transaction, so a reader never sees the path
         with no chunks at all — an interrupted refresh that emptied a path
@@ -5087,12 +4973,11 @@ class PostgresStore:
         this way, to the generations its records still authorize.
 
         It belongs here rather than after retrieval because it has to reach
-        candidate selection. Discarding unauthorized rows from the result
-        keeps them out of the prompt but not out of the ranking: measured,
-        eight unauthorized rows took every slot and `file_search` reported
-        that nothing matched, while the file the conversation actually held
-        sat just outside the cut. Over-fetching is not an answer either —
-        any fixed over-fetch is consumed by enough rows.
+        candidate selection: discarding unauthorized rows from the result
+        keeps them out of the prompt but not out of the ranking, so enough of
+        them take every slot and the authorized file falls outside the cut.
+        Over-fetching is not an answer — any fixed over-fetch is consumed by
+        enough rows.
         """
         where_clauses: list[str] = ["kc.context_id = ANY(%s)"]
         params: list[Any] = [list(context_ids)]
