@@ -521,19 +521,22 @@ class TrainingService:
                 job_id=job_id,
                 reason=gate["reason"],
             )
-        # Extract actual loss from JAX training instead of using heuristic
-        # Per SPEC §5.4: metrics = loss and preference alignment rate
-        loss = 1.0 / (1 + len(dataset_entries))  # Fallback heuristic
-        if training_trace.get("status") == "ok" and training_trace.get("steps"):
-            # Use actual final loss from training if available
-            final_step = training_trace["steps"][-1]
-            if isinstance(final_step, dict) and "loss" in final_step:
-                actual_loss = final_step.get("loss")
-                if isinstance(actual_loss, (int, float)) and actual_loss >= 0:
-                    loss = float(actual_loss)
+        # SPEC §5.4: metrics are loss and preference alignment rate. A run
+        # that did not train has no loss, and `1/(1+len(dataset))` is not one
+        # — it reported that the run went well because the dataset was large.
+        status = self.terminal_status(training_trace, gate)
+        loss = None
+        if status != "skipped":
+            loss = 1.0 / (1 + len(dataset_entries))  # Fallback heuristic
+            if training_trace.get("steps"):
+                final_step = training_trace["steps"][-1]
+                if isinstance(final_step, dict) and "loss" in final_step:
+                    actual_loss = final_step.get("loss")
+                    if isinstance(actual_loss, (int, float)) and actual_loss >= 0:
+                        loss = float(actual_loss)
         self.store.update_training_job(
             job_id,
-            status="succeeded",
+            status=status,
             loss=loss,
             new_version=next_version if gate["promoted"] else None,
             meta={
@@ -549,6 +552,7 @@ class TrainingService:
             "job_id": job_id,
             "adapter_id": adapter.id,
             "version_dir": str(version_dir),
+            "status": status,
             "loss": loss,
             "token_batches": token_batches,
             "jax_trace": training_trace,
@@ -971,6 +975,26 @@ class TrainingService:
                 train.append(entry)
         return train, holdout
 
+    @staticmethod
+    def terminal_status(trace: Optional[dict], gate: Optional[dict]) -> str:
+        """What a finished job should say happened. One rule, one place.
+
+        `skipped` did not train — no JAX, no base checkpoint, no tokenizer,
+        no LoRA matrices, no batches — so it has no loss to report and cannot
+        have been turned down by an eval it never reached. `gate_rejected`
+        trained and failed the holdout. `succeeded` trained and was promoted.
+
+        The three used to be decided twice. The service wrote `succeeded`
+        unconditionally and the worker overwrote it with
+        `succeeded if promoted else gate_rejected`, so a run that never
+        trained passed through a `succeeded` another replica could read, and
+        settled on a status that blames model quality for a missing
+        checkpoint.
+        """
+        if (trace or {}).get("status") != "ok":
+            return "skipped"
+        return "succeeded" if (gate or {}).get("promoted") else "gate_rejected"
+
     def _promotion_gate(self, trace: dict, *, holdout_count: int) -> dict:
         """Decide whether trained weights may be promoted (SPEC §5.4).
 
@@ -1369,6 +1393,12 @@ class TrainingService:
         microbatches before each optimizer update and checkpoints are written
         so the backend can reload trained weights.
         """
+        # Before anything else, because "no batches" is not a JAX question.
+        # The loop below is `for batch in batches`, so an empty list took zero
+        # optimizer steps and still returned `ok` with `steps: []` — a run the
+        # gate then judged on an eval it had never moved.
+        if not batches:
+            return {"status": "skipped", "reason": "no training batches"}
 
         try:
             import jax

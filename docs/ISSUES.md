@@ -11591,3 +11591,73 @@ written here.
 
 The file is 403 lines and 19 tests before, 287 and 14 after. Four mutations
 newly killed, none lost.
+
+## Training outcomes: a run that never trained said it succeeded
+
+Found by following E.3's remaining gap rather than by writing the test E.3
+asked for. The transcribed loss test was deleted because it could not fail;
+what it was standing in front of turned out to be a classification defect
+rather than a loss-extraction one.
+
+`_run_jax_optax_training` returns `status="skipped"` for a run that did not
+train: JAX absent, no base checkpoint, no loadable tokenizer, no LoRA matrices
+matching the model. `_promotion_gate` agrees — any non-`ok` trace is
+`promoted=False`, reason "training did not run". Then `train_from_preferences`
+wrote the job `succeeded` regardless, carrying `1.0 / (1 + len(dataset))` — a
+number that says the run went well because the dataset was large. The worker
+overwrote it afterwards with `succeeded if promoted else gate_rejected`, whose
+own comment defines `gate_rejected` as "a run that trained but failed the eval
+gate".
+
+So the sequence was:
+
+```
+no JAX / no checkpoint / no tokenizer
+    -> trace.status = skipped
+    -> service writes succeeded + a loss no training produced
+    -> worker overwrites to gate_rejected
+```
+
+Two defects in one path. A replica reading between the two writes sees
+`succeeded`. The state it settles on blames the eval gate for a missing
+checkpoint.
+
+### One owner for the terminal status
+
+`TrainingService.terminal_status(trace, gate)` is now the only place the rule
+exists: not `ok` is `skipped`; `ok` and promoted is `succeeded`; `ok` and not
+promoted is `gate_rejected`. The service calls it for its own write and the
+worker calls it for the final one, so there is one rule rather than two
+implementations that disagreed. A `skipped` run carries `loss=None`: it has no
+loss, and the dataset-size heuristic was not one. Exceptions remain the
+worker's retry and dead-letter path, and "no preference events" was already
+`skipped`.
+
+### Zero optimizer steps is not a successful run
+
+One layer lower, the same shape: the loop is `for batch in batches`, so an
+empty list ran nothing and returned `ok` with `steps: []`. The gate then
+judged it on an eval the run had never moved. The check is now the first thing
+the function does — before the JAX import, because "no batches" is not a JAX
+question, which also makes it reachable without a checkpoint.
+
+### Reds and mutations
+
+Four reds, none needing JAX: the expensive execution is replaced rather than
+exercised. A skipped trace must produce `skipped`, no loss, no new version and
+a preserved `jax_trace.reason`; the same trace through the worker must keep
+that status and earn no router credit; an `ok` trace the gate refuses must be
+`gate_rejected` carrying the loss the loop produced — which is also the
+witness E.3 left missing; and an empty batch list must be `skipped` before
+anything else.
+
+Six mutations, each killed: the service writing `succeeded` unconditionally,
+the heuristic loss reaching a skipped run, the worker re-deriving from
+`promoted` alone, `terminal_status` ignoring the trace, the no-batch check
+removed, and the gate-rejected path losing the training loss.
+
+SPEC §5.4 stated the defect — step 7 said "mark the job `succeeded` with its
+loss" unconditionally — and its `training_job` vocabulary was three statuses
+out of date, listing a `failed` the code does not write while omitting
+`gate_rejected`, `skipped` and `dead_letter`. Both corrected, along with the
+"what skipped covers" list.

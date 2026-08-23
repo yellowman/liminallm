@@ -270,6 +270,9 @@ class TrainingWorker:
                     # did NOT ship weights - record it as gate-rejected rather
                     # than "succeeded", and leave router state alone so an
                     # un-promoted adapter is not credited with a training pass.
+                    # A run that never trained is neither: see
+                    # `TrainingService.terminal_status`, which owns the rule
+                    # for both this and the service's own write.
                     gate = result.get("eval_gate") or {}
                     # Absent means unknown, and unknown is not approval: the
                     # summary used to drop eval_gate entirely, so this
@@ -297,7 +300,9 @@ class TrainingWorker:
                     )
                     self.store.update_training_job(
                         job_id,
-                        status="succeeded" if promoted else "gate_rejected",
+                        status=self.training.terminal_status(
+                            result.get("jax_trace"), gate
+                        ),
                         loss=result.get("loss"),
                         # TrainingService already set new_version on promotion;
                         # the result exposes the directory, not the number.

@@ -484,9 +484,13 @@ centroid of the events that trained it, usage count, success score,
 last-used and last-trained stamps.
 
 **training_job** — the unit of training work: names the adapter artifact
-and nominal owner, carries status (`queued`/`running`/`succeeded`/
-`failed`), dataset path, event ids, loss, the resulting version, and
-`meta.eval_gate` — the recorded gate decision (§5.4.6).
+and nominal owner, carries status, dataset path, event ids, loss, the
+resulting version, and `meta.eval_gate` — the recorded gate decision
+(§5.4.6). A terminal status says what happened: `succeeded` trained and
+was promoted, `gate_rejected` trained and failed the holdout, `skipped`
+did not train and so carries no loss, and `dead_letter` exhausted the
+worker's retries. `queued` and `running` are the two non-terminal ones,
+and are the only statuses the per-user throttle counts as active.
 
 The dataset pipeline is specified in §5.4.
 
@@ -982,7 +986,9 @@ loop for a `training_job`:
    - **what "skipped" covers**, each leaving the adapter on the prompt
      rung: JAX/optax missing; no base checkpoint to train against; an
      adapter carrying no LoRA matrices; matrices matching no projection in
-     the model; a checkpoint whose own tokenizer will not load; and token
+     the model; no training batches, since a loop over an empty list takes
+     zero optimizer steps and a run that changed nothing did not train; a
+     checkpoint whose own tokenizer will not load; and token
      ids outside the checkpoint's vocabulary. the last two are the same
      invariant as the first: "train against the model that will serve it"
      includes its tokenizer — gradients through the right weights teach
@@ -992,7 +998,14 @@ loop for a `training_job`:
      clipped, because clipping trains on a token nobody wrote.
 7. write new LoRA params to a new version directory; update
    `adapter_router_state` (EMA centroid, `last_trained_at`,
-   `success_score`); mark the job `succeeded` with its loss.
+   `success_score`) only on promotion; mark the job by what happened —
+   `succeeded` with its training loss when promoted, `gate_rejected` with
+   the same loss when the holdout refused it, `skipped` with no loss when
+   it did not train. one component decides that, and the worker records
+   the decision rather than deriving a second one: a run marked
+   `succeeded` and then corrected is a state another replica can read, and
+   a skipped run relabelled `gate_rejected` blames model quality for a
+   missing checkpoint. a loss derived from dataset size is not a loss.
 
 **scheduling & prioritization:**
 
