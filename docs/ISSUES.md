@@ -12640,6 +12640,44 @@ paragraph rather than a defect on the branch.
 The statement is now concatenated rather than triple-quoted, so the
 suppression has a line it can sit on.
 
+### test: the suite ran locally and could not even be collected in CI
+
+With lint finally passing, the matrix ran for the first time and every job
+that loads the suite died before a single test:
+
+    tests/conftest.py:20: from tests.harness import run_id, worker_id
+    E   ModuleNotFoundError: No module named 'tests'
+
+Not a 3.12 problem, though that is the job that reported it — reproduced on
+3.11 locally in one command. `python -m pytest` puts the working directory on
+`sys.path`; bare `pytest` does not, and CI runs bare `pytest`. Every local run
+this whole branch used the first form, and CI uses the second, so a conftest
+importing `tests.harness` — which this branch introduced with the worker
+isolation — was never once exercised the way CI would exercise it.
+
+`pythonpath = ["."]` in `[tool.pytest.ini_options]` makes both invocations the
+same invocation, which is the property that was missing rather than the path
+itself. Verified by running both lanes with bare `pytest`, as CI does: 2,816
+passed and 26 skipped on the non-browser lane, 11 passed on the browser lane.
+
+Note in passing: CI installs the project non-editably (`pip install .[dev]`),
+so `import liminallm` used to resolve to site-packages. With the repository
+root on the path it now resolves to the checked-out tree, which is the copy
+the run is supposed to be testing.
+
+### Three gates, three drifts, one shape
+
+Worth stating as a single lesson rather than three incidents. The lint gate
+ran different rules locally than in CI; the security gate had not been read in
+nine months; the test gate was invoked one way locally and another way in CI.
+In all three the local command and the blocking command were not the same
+command, and in all three the local one was the more permissive — so local
+green meant nothing and nobody could see that it meant nothing.
+
+The fix in each case was to delete the difference rather than to chase the
+symptom: drop the flags that diverged, read the findings, and make one
+invocation work both ways.
+
 ### The lanes still disagree in one place, deliberately
 
 `make security` runs `bandit -r liminallm/ -ll -q`; CI runs
