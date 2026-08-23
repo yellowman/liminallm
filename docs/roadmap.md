@@ -41,15 +41,11 @@ artifacts.
 
 **auth / frontend**
 
-- Move the SPA's refresh credential fully out of JS-visible storage. The
-  server already sets the refresh token as an HttpOnly cookie (the canonical
-  model, SPEC §12.1); the SPA still persists a body-delivered copy in
-  sessionStorage and replays it in the refresh body. Removing the JS-visible
-  copy is a frontend change plus a cookie-reading refresh path.
-- Remove the vestigial `tenant_id` fields the SPA still sends (WebSocket
-  init frame, refresh body). The server derives tenant from the host and
-  never reads them; the fields are dead weight that misleads readers of the
-  client code.
+Both entries here are done: the browser holds the access token and nothing
+else, refresh runs on the HttpOnly cookie alone, and the vestigial
+`tenant_id` and `session_id` fields are gone from the refresh body and the
+socket's init frame. See docs/ISSUES.md and `tests/test_browser_auth.py`,
+which is the browser lane's first witness.
 
 **artifacts / sharing**
 

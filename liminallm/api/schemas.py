@@ -260,7 +260,11 @@ class LoginRequest(BaseModel):
 
 
 class TokenRefreshRequest(BaseModel):
-    refresh_token: str = Field(..., max_length=2048)
+    #: Optional because a browser does not have one to send. §17.10 puts the
+    #: refresh token in an `HttpOnly` cookie precisely so the page cannot read
+    #: it, and a field the SPA must fill would undo that. API and mobile
+    #: clients, which have no cookie jar, still send it here.
+    refresh_token: Optional[str] = Field(default=None, max_length=2048)
 
 
 class OAuthStartRequest(BaseModel):
@@ -283,11 +287,14 @@ class OAuthStartResponse(BaseModel):
 
 
 class MFARequest(BaseModel):
-    session_id: str = Field(..., max_length=128)
+    #: Optional for the same reason as `TokenRefreshRequest.refresh_token`:
+    #: the browser's session id is an `HttpOnly` cookie it cannot read, and a
+    #: field the SPA must fill would require keeping a readable copy.
+    session_id: Optional[str] = Field(default=None, max_length=128)
 
 
 class MFAVerifyRequest(BaseModel):
-    session_id: str = Field(..., max_length=128)
+    session_id: Optional[str] = Field(default=None, max_length=128)
     code: str = Field(..., max_length=10)
 
 

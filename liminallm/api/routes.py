@@ -604,6 +604,31 @@ async def oauth_callback(
     )
 
 
+def _credential_from_body_or_cookie(
+    body_value: Optional[str], cookie_value: Optional[str], *, name: str
+) -> Optional[str]:
+    """One credential from two transports, or a refusal.
+
+    The browser sends it as an `HttpOnly` cookie it cannot read (§17.10); API
+    and mobile clients, which have no cookie jar, send it in the body. Both
+    remain supported, because narrowing the public API is not what moving the
+    browser's copy out of reach is for.
+
+    Disagreement is refused rather than resolved. Picking either one silently
+    lets a caller who can write one transport override the other, and there
+    is no reading of "here are two different credentials" that is safe to
+    guess at.
+    """
+    if body_value and cookie_value and body_value != cookie_value:
+        logger.warning("auth_credential_conflict", credential=name)
+        raise http_error(
+            "unauthorized",
+            f"conflicting {name}: the body and the cookie disagree",
+            status_code=401,
+        )
+    return body_value or cookie_value
+
+
 @router.post("/auth/refresh", response_model=Envelope, tags=["auth"])
 async def refresh_tokens(
     body: TokenRefreshRequest,
@@ -615,8 +640,15 @@ async def refresh_tokens(
     tenant_hint = tenancy.tenant_of(request.headers, runtime.settings)
     client_ip = request.client.host if request.client else "unknown"
     await rate_limit(runtime, "refresh", client_ip)
+    refresh_token = _credential_from_body_or_cookie(
+        body.refresh_token,
+        request.cookies.get("refresh_token"),
+        name="refresh token",
+    )
+    if not refresh_token:
+        raise http_error("unauthorized", "invalid refresh", status_code=401)
     user, session, tokens = await runtime.auth.refresh_tokens(
-        body.refresh_token, tenant_hint=tenant_hint
+        refresh_token, tenant_hint=tenant_hint
     )
     if not user or not session:
         logger.warning(
@@ -864,7 +896,13 @@ async def request_mfa(body: MFARequest, request: Request):
         runtime.settings.mfa_rate_limit_per_minute,
         60,
     )
-    if not session_cookie or session_cookie != body.session_id:
+    # The cookie is the browser's authority and the body is the API client's;
+    # a disagreement is refused rather than resolved. Neither means there is
+    # no session to act on.
+    session_id = _credential_from_body_or_cookie(
+        body.session_id, session_cookie, name="session id"
+    )
+    if not session_id:
         logger.warning(
             "mfa_request_missing_cookie",
             ip=client_ip,
@@ -872,17 +910,17 @@ async def request_mfa(body: MFARequest, request: Request):
         )
         raise http_error("unauthorized", "invalid session", status_code=401)
     auth_ctx = await runtime.auth.resolve_session(
-        body.session_id, allow_pending_mfa=True
+        session_id, allow_pending_mfa=True
     )
     if not auth_ctx:
         logger.warning("mfa_request_invalid_session", ip=client_ip)
         raise http_error("unauthorized", "invalid session", status_code=401)
     # Issue 50.1: Validate session IP matches requester IP for security
-    session = runtime.store.get_session(body.session_id)
+    session = runtime.store.get_session(session_id)
     if session and session.ip_addr and str(session.ip_addr) != client_ip:
         logger.warning(
             "mfa_request_ip_mismatch",
-            session_id=body.session_id,
+            session_id=session_id,
             session_ip=str(session.ip_addr),
             request_ip=client_ip,
         )
@@ -910,7 +948,13 @@ async def verify_mfa(body: MFAVerifyRequest, request: Request, response: Respons
         runtime.settings.mfa_rate_limit_per_minute,
         60,
     )
-    if not session_cookie or session_cookie != body.session_id:
+    # The cookie is the browser's authority and the body is the API client's;
+    # a disagreement is refused rather than resolved. Neither means there is
+    # no session to act on.
+    session_id = _credential_from_body_or_cookie(
+        body.session_id, session_cookie, name="session id"
+    )
+    if not session_id:
         logger.warning(
             "mfa_verify_missing_cookie",
             ip=client_ip,
@@ -918,17 +962,17 @@ async def verify_mfa(body: MFAVerifyRequest, request: Request, response: Respons
         )
         raise http_error("unauthorized", "invalid session", status_code=401)
     auth_ctx = await runtime.auth.resolve_session(
-        body.session_id, allow_pending_mfa=True
+        session_id, allow_pending_mfa=True
     )
     if not auth_ctx:
         logger.warning("mfa_verify_invalid_session", ip=client_ip)
         raise http_error("unauthorized", "invalid session", status_code=401)
     # Issue 50.2: Validate session IP matches requester IP for security
-    session = runtime.store.get_session(body.session_id)
+    session = runtime.store.get_session(session_id)
     if session and session.ip_addr and str(session.ip_addr) != client_ip:
         logger.warning(
             "mfa_verify_ip_mismatch",
-            session_id=body.session_id,
+            session_id=session_id,
             session_ip=str(session.ip_addr),
             request_ip=client_ip,
             user_id=auth_ctx.user_id,
@@ -945,12 +989,12 @@ async def verify_mfa(body: MFAVerifyRequest, request: Request, response: Respons
     # ordinary login check.
     was_enabled = bool(getattr(runtime.store.get_user_mfa_secret(auth_ctx.user_id), "enabled", False))
     ok = await runtime.auth.verify_mfa_challenge(
-        user_id=auth_ctx.user_id, code=body.code, session_id=body.session_id
+        user_id=auth_ctx.user_id, code=body.code, session_id=session_id
     )
     if not ok:
         logger.warning("mfa_verify_failed", user_id=auth_ctx.user_id, ip=client_ip)
         raise http_error("unauthorized", "invalid mfa", status_code=401)
-    user, session, tokens = runtime.auth.issue_tokens_for_session(body.session_id)
+    user, session, tokens = runtime.auth.issue_tokens_for_session(session_id)
     if not was_enabled and user and user.email:
         # Enrolment just completed. Telling the account holder that a second
         # factor now guards their login is how they find out if it was not

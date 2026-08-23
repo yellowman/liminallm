@@ -65,14 +65,18 @@ const updateDraftIndicator = () => {
 // =============================================================================
 
 // conversationId shares the auth session's lifetime so a reload reopens the
-// active thread; logout (resetAuth) clears it along with the tokens.
-const persistedKeys = ['accessToken', 'refreshToken', 'sessionId', 'tenantId', 'role', 'userId', 'conversationId'];
+// active thread; logout (resetAuth) clears it along with the token.
+//
+// The refresh token and the session id are deliberately absent (SPEC §17.10).
+// The server sets both as HttpOnly cookies the page cannot read, so a copy
+// here would be a durable credential any script on the page could take —
+// removing the protection the cookie exists to provide, and outliving the
+// short-lived access token it was meant to replace.
+const persistedKeys = ['accessToken', 'tenantId', 'role', 'userId', 'conversationId'];
 
 const createState = (storage) => {
   const backing = {
     accessToken: storage.read('accessToken'),
-    refreshToken: storage.read('refreshToken'),
-    sessionId: storage.read('sessionId'),
     tenantId: storage.read('tenantId'),
     role: storage.read('role'),
     userId: storage.read('userId'),
@@ -99,6 +103,9 @@ const createState = (storage) => {
         backing[k] = null;
         sync(k, null);
       });
+      // No longer written, but a session that predates the move to cookies
+      // still has them, and signing out is when they should go.
+      ['refreshToken', 'sessionId'].forEach((k) => storage.write(k, null));
       backing.lastAssistant = null;
       backing.conversationId = null;
     },
@@ -358,7 +365,9 @@ const updateAuthUI = () => {
   if (settingUserId) settingUserId.textContent = state.userId || '-';
   if (settingRole) settingRole.textContent = state.role || '-';
   if (settingTenant) settingTenant.textContent = state.tenantId || 'global';
-  if (settingSessionId) settingSessionId.textContent = state.sessionId ? state.sessionId.slice(0, 16) + '...' : '-';
+  // The session id lives in an HttpOnly cookie this page cannot read
+  // (SPEC §17.10), so there is nothing here to show.
+  if (settingSessionId) settingSessionId.textContent = 'held in a secure cookie';
 };
 
 // =============================================================================
@@ -1441,8 +1450,6 @@ const sendMessage = async (event) => {
         // The server rejects dual auth on the socket (fresh_session_required),
         // so send exactly one method — prefer the bearer token.
         access_token: state.accessToken || undefined,
-        session_id: state.accessToken ? undefined : state.sessionId,
-        tenant_id: state.tenantId,
         stream: true,
       }));
     });
@@ -2567,7 +2574,7 @@ const fetchMfaStatus = async () => {
 };
 
 const startMfaSetup = async () => {
-  if (!state.accessToken || !state.sessionId) {
+  if (!state.accessToken) {
     setMfaSetupStatus('Sign in first', true);
     return;
   }
@@ -2578,7 +2585,9 @@ const startMfaSetup = async () => {
       {
         method: 'POST',
         headers: headers(),
-        body: JSON.stringify({ session_id: state.sessionId }),
+        // No session_id: the server reads its own HttpOnly cookie, which is
+        // the only copy of it a browser has.
+        body: JSON.stringify({}),
       },
       'Failed to start MFA setup'
     );
@@ -2635,7 +2644,7 @@ const verifyMfaSetup = async (event) => {
     return;
   }
 
-  if (!state.sessionId) {
+  if (!state.accessToken) {
     setMfaSetupStatus('No session. Please sign in again.', true);
     return;
   }
@@ -2646,7 +2655,7 @@ const verifyMfaSetup = async (event) => {
       {
         method: 'POST',
         headers: headers(),
-        body: JSON.stringify({ session_id: state.sessionId, code }),
+        body: JSON.stringify({ code }),
       },
       'Invalid code. Try again.'
     );
@@ -3719,8 +3728,6 @@ const init = async () => {
   if (state.accessToken) {
     persistAuth({
       access_token: state.accessToken,
-      refresh_token: state.refreshToken,
-      session_id: state.sessionId,
       role: state.role,
       tenant_id: state.tenantId,
       user_id: state.userId,

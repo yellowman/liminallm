@@ -2118,11 +2118,23 @@ live in docs/ui.md; this section is the behavioral contract.
   token and sends `Authorization: Bearer`; `session_id` and
   `refresh_token` ride as HttpOnly cookies the client cannot read
   (§12.1). Client code MUST NOT persist refresh credentials in
-  JS-readable storage. *Known deviation:* the current SPA still keeps a
-  body-delivered refresh copy in sessionStorage; the migration is tracked
-  in docs/roadmap.md.
-- **on 401**: one refresh attempt, then re-authentication; MFA prompt when
-  `mfa_required` is returned.
+  JS-readable storage — the chat SPA and the admin console each hold the
+  access token and nothing else, and signing out clears the two older
+  keys as well.
+- **two transports, one credential**: `POST /v1/auth/refresh` and the MFA
+  routes take their credential from the request body *or* the cookie. the
+  browser sends only the cookie, because a required body field would force
+  it to keep the copy the cookie replaces; API and mobile clients, which
+  have no cookie jar, keep the body form. if both are present and disagree
+  the request is refused rather than resolved: choosing either lets a
+  caller who can write one transport speak as the account the other names.
+- **on 401**: one refresh attempt on the cookie alone, then
+  re-authentication; MFA prompt when `mfa_required` is returned. the
+  trigger is an authenticated session, not a refresh token JS can see —
+  there is no longer such a thing in a browser.
+- **the socket carries the access token and nothing else**: no
+  `session_id` fallback (the browser cannot read one) and no `tenant_id`
+  (the server derives the tenant from the hostname, §12.2).
 - **attachments**: uploads bind to the conversation automatically (§19.5
   tier 1); promotion to a context or the vault is a deliberate user
   action.

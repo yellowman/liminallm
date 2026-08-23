@@ -29,8 +29,6 @@ const writeSession = (key, value) => {
 
 const state = {
   accessToken: readSession('accessToken'),
-  refreshToken: readSession('refreshToken'),
-  sessionId: readSession('sessionId'),
   tenantId: readSession('tenantId'),
   role: readSession('role'),
 };
@@ -53,15 +51,16 @@ const showFeedback = (msg) => {
 
 const requireAdmin = () => state.role === 'admin';
 
+// The refresh token and the session id are deliberately not kept here
+// (SPEC §17.10). The server sets both as HttpOnly cookies the console cannot
+// read, so a copy in sessionStorage would be a durable credential any script
+// on the page could take, outliving the short-lived access token it was
+// meant to replace. The chat SPA holds the same line.
 const persistAuth = (payload) => {
   state.accessToken = payload.access_token;
-  state.refreshToken = payload.refresh_token;
-  state.sessionId = payload.session_id;
   state.role = payload.role;
   state.tenantId = payload.tenant_id;
   writeSession('accessToken', state.accessToken);
-  writeSession('refreshToken', state.refreshToken);
-  writeSession('sessionId', state.sessionId);
   writeSession('role', state.role);
   writeSession('tenantId', state.tenantId);
 };
@@ -830,7 +829,9 @@ const logout = async () => {
   };
 
   await tryRevoke();
-  ['accessToken', 'refreshToken', 'sessionId', 'role', 'tenantId'].forEach((k) =>
+  // The last two are no longer written; clearing them anyway removes what a
+  // session predating this change left behind.
+  ['accessToken', 'role', 'tenantId', 'refreshToken', 'sessionId'].forEach((k) =>
     sessionStorage.removeItem(sessionStorageKey(k))
   );
   window.location.href = '/';

@@ -9,7 +9,7 @@
 #   make dev       - Start development server
 #   make docker    - Build and test with Docker
 
-.PHONY: help install test test-fast test-fast-xdist lint security qa dev docker clean docker-clean
+.PHONY: help install test test-fast test-fast-xdist test-browser lint security qa dev docker clean docker-clean
 
 # Default target
 help:
@@ -19,6 +19,7 @@ help:
 	@echo "  make test       Run unit tests (in-memory)"
 	@echo "  make test-fast  Fast edit-loop tests; excludes @pytest.mark.slow"
 	@echo "  make test-fast-xdist  The same lane across $(XDIST_WORKERS) processes"
+	@echo "  make test-browser     Real browser against a real server (needs Chromium)"
 	@echo "  make test-pg    Run tests with PostgreSQL (requires Docker)"
 	@echo "  make lint       Run linters (ruff)"
 	@echo "  make security   Run security scanner (bandit)"
@@ -41,7 +42,7 @@ install:
 # Run unit tests with in-memory store
 test:
 	@mkdir -p $(SHARED_FS_ROOT)
-	python -m pytest tests/ -v --tb=short
+	python -m pytest tests/ -v --tb=short -m 'not browser'
 
 # Everything except the tests that run a real model or wait on a real clock.
 # A convenience for the edit loop, never the gate: `make test` above and the
@@ -49,7 +50,7 @@ test:
 # about 40% of the wall clock.
 test-fast:
 	@mkdir -p $(SHARED_FS_ROOT)
-	python -m pytest tests/ -q --tb=short -m 'not slow'
+	python -m pytest tests/ -q --tb=short -m 'not slow and not browser'
 
 # The same lane across several processes. Each worker gets a Postgres, a Redis
 # database and a filesystem root of its own — see tests/test_worker_isolation.py
@@ -68,8 +69,18 @@ XDIST_WORKERS ?= 4
 XDIST_DIST ?= loadfile
 test-fast-xdist:
 	@mkdir -p $(SHARED_FS_ROOT)
-	python -m pytest tests/ -q --tb=short -m 'not slow' \
+	python -m pytest tests/ -q --tb=short -m 'not slow and not browser' \
 		-n $(XDIST_WORKERS) --dist $(XDIST_DIST)
+
+# The browser lane. Excluded from every lane above because it needs a Chromium
+# binary, which `pip install playwright` does not provide — run
+# `playwright install chromium` once, or point LIMINALLM_CHROMIUM at a build.
+# It is not a second suite: it covers only what a browser can observe and a
+# TestClient cannot, which is what the page persists where scripts can read it
+# and what the browser actually puts on the wire.
+test-browser:
+	@mkdir -p $(SHARED_FS_ROOT)
+	python -m pytest tests/ -q --tb=short -m browser
 
 # Run tests with PostgreSQL (requires docker-compose)
 # Credentials must match docker-compose.test.yml

@@ -42,10 +42,11 @@ const renderAdminNotice = () => {
   renderAdminSettingsSection();
 };
 
+// Neither the refresh token nor the session id is kept: both are HttpOnly
+// cookies the page cannot read (SPEC §17.10), and a copy here would be a
+// durable credential in reach of any script on the page.
 const persistAuth = (payload) => {
   state.accessToken = payload.access_token;
-  state.refreshToken = payload.refresh_token;
-  state.sessionId = payload.session_id;
   state.role = payload.role;
   state.tenantId = payload.tenant_id;
   state.userId = payload.user_id;

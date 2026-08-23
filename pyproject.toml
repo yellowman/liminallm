@@ -62,6 +62,11 @@ dev = [
   # the old SDK; the conformance suite needs the generated types; the
   # lockfile records which schema snapshot was qualified.
   "openai>=2.8.1",
+  # The browser lane (`make test-browser`). The package alone is not enough:
+  # it needs a Chromium build, from `playwright install chromium` or from
+  # LIMINALLM_CHROMIUM pointing at one. That is why the lane is excluded from
+  # every default target rather than merely marked slow.
+  "playwright>=1.40",
 ]
 
 [tool.setuptools]
@@ -90,6 +95,10 @@ markers = [
   # timeout. `make test-fast` skips these. `make test` and the pre-commit gate
   # do not, because nothing else covers what they cover.
   "slow: runs real model or real wall-clock work",
+  # Drives a real browser against a real server. Not in any default lane:
+  # it needs a Chromium binary, which `uv pip install playwright` alone does
+  # not provide. `make test-browser` and its own CI job run it.
+  "browser: drives a real browser against a real server",
 ]
 
 [tool.coverage.run]

@@ -11865,3 +11865,98 @@ was declared in `dev` and had never been locked.
 Responses wire qualification is closed: every event the server emits validates
 under the locked SDK, the blocking response validates, errors keep their
 promised shape, and mutations prove each witness is live.
+
+## Browser auth: one JS-visible credential, and the lane that can see it
+
+SPEC §17.10 says the SPA holds the short-lived access token while `session_id`
+and `refresh_token` ride as `HttpOnly` cookies the page cannot read, and it
+carried a *Known deviation* admitting the SPA kept a readable refresh copy
+anyway. Both SPAs did: `liminal.refreshToken` and `liminal.sessionId` in
+`sessionStorage`, on the chat page and in the admin console.
+
+A copy in `sessionStorage` is a durable credential any script reaching the
+page can take, and it outlives the short-lived token it was supposed to
+replace — which is the entire reason the cookie exists. The cookie was being
+set the whole time; keeping the copy only removed the protection.
+
+### Two transports, one credential
+
+The refresh path could not simply drop the body field: `TokenRefreshRequest`
+required it, and API and mobile clients have no cookie jar. So the server now
+takes the credential from the body *or* the cookie, for refresh and for both
+MFA routes, and refuses when the two are present and disagree.
+
+The refusal is the security-relevant half. Choosing either silently lets a
+caller who can write one transport speak as the account the other names —
+and the first version of that red proved nothing, because a *nonsense* body
+token is refused whether or not the conflict is detected. Measured: the check
+could be removed and the test stayed green. The witness now signs in a second
+account and puts its **valid** refresh token in the body against the first
+account's cookie, which is the case that actually matters.
+
+The MFA routes already read the cookie and compared it to the body; the
+relationship is inverted rather than added. The resolved id flows through the
+IP check, the challenge and the token issue, so a body field is no longer the
+authority anywhere.
+
+`AuthResponse` is unchanged. Other clients consume `session_id`,
+`refresh_token` and `tenant_id`, and this tranche is about what the SPA treats
+as authority, not about shrinking a public response.
+
+### The SPA
+
+The chat page's `persistedKeys` lost both credentials, so nothing writes them;
+`resetAuth` still clears them, because a tab open across the change still has
+them. The admin console has its own `persistAuth` and lost the same two. The
+socket's init frame carries the access token alone — the `session_id` fallback
+is unreachable in a browser now, and `tenant_id` was always dead weight the
+server derives from the hostname. The refresh body is `{}`.
+
+The settings panel used to show a truncated session id. It says the id is held
+in a secure cookie instead, rather than displaying a permanent dash.
+
+### The browser lane
+
+This is the first Playwright witness, and it exists because these properties
+are observable nowhere else: `TestClient` has no script context, no `HttpOnly`
+enforcement and no same-origin cookie policy. The server runs in a thread so
+it shares this process's configured runtime, with no environment plumbing to
+keep in step.
+
+Five tests: login leaves only the access token, on chat and on the admin
+console; the cookies that matter are `HttpOnly` and invisible to
+`document.cookie` while the CSRF cookie is deliberately readable; signing out
+takes what an older session left behind; and the lifecycle — sign in, break
+the access token, make the app do real work, and require that it recovered on
+the cookie alone, sending no `refresh_token` and no `tenant_id`, exactly once,
+with the original operation completing afterwards.
+
+It is its own lane (`make test-browser`, `-m browser`) and its own CI job,
+excluded from every default target: it needs a Chromium binary that
+`pip install playwright` does not provide. `playwright>=1.40` joins the dev
+extra beside `openai>=2.8.1`, for the same reason — the qualification suite
+needs more than the product runtime does.
+
+### Mutations
+
+Eleven, each killed. Re-persisting the refresh token or the session id, on
+either page; the logout cleanup removed; refresh requiring the body token;
+refresh ignoring the body, which would break API clients; a missing credential
+no longer refused; the conflict check removed; MFA requiring the JS session
+id; suppressing the refresh attempt; sending `tenant_id` again; and
+refreshing twice.
+
+Three measured nothing on the first attempt and are recorded so they are not
+repeated. Adding a key back to `persistedKeys` does nothing when no code
+assigns the field, so that mutation had to move to `persistAuth`. The
+disagreement mutation needed a valid foreign credential, as above. And the
+first admin and logout mutations survived because the browser lane covered
+only the chat page — the admin console has its own copy of the rule, which is
+its own place to break it, so it got its own witness.
+
+### One CI variable removed on the way past
+
+The test job set `ALLOW_REDIS_FALLBACK_DEV: "true"`. That setting is
+admin-managed with no environment variable, so the line reached nothing;
+`TEST_MODE`, set beside it, is what actually permits the fallback. Same defect
+class as the compose variables, one file over.
