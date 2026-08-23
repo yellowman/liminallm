@@ -50,11 +50,11 @@ import shutil
 from pathlib import Path
 from typing import Iterable
 
+from liminallm.logging import get_logger
 from liminallm.service.fs import (
     PathTraversalError,
     server_owned_artifact_dirs,
 )
-from liminallm.logging import get_logger
 
 logger = get_logger(__name__)
 

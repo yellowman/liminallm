@@ -107,6 +107,12 @@ test-browser:
 # Run tests with PostgreSQL (requires docker-compose)
 # Credentials must match docker-compose.test.yml
 # Uses trap to ensure cleanup runs even if tests fail
+#
+# `-m 'not browser'` for the same reason every other lane has it, and it was
+# missed here when the marker was introduced: the dev extra installs Playwright
+# but not a Chromium binary, and a browser test with the library present and no
+# binary *errors* rather than skipping — measured. So this target collected the
+# browser lane and failed on it after an ordinary `make install`.
 test-pg:
 	@bash -c '\
 		trap "docker compose -f docker-compose.test.yml down" EXIT; \
@@ -115,13 +121,24 @@ test-pg:
 		USE_MEMORY_STORE=false \
 		DATABASE_URL="postgresql://liminallm:testpassword123@localhost:5433/liminallm_test" \
 		REDIS_URL="redis://localhost:6380/0" \
-		python -m pytest tests/ -v --tb=short \
+		python -m pytest tests/ -v --tb=short -m "not browser" \
 	'
 
 # Lint with ruff (auto-fix safe issues)
+#
+# No `--select` and no `--ignore` on the first line: `[tool.ruff.lint]` in
+# pyproject.toml already says `select = [E, F, W, I]` and `ignore = [E501]`,
+# and CI's explicit flags only restate it. This line used to pass
+# `--ignore E402`, which does not *add* to the configured ignore list — it
+# replaces it. So locally E402 was suppressed and E501 was not, while CI had
+# it the other way round, and five E402s and two unsorted import blocks sat on
+# this branch through every local run and failed the first time CI saw them.
+#
+# `--extend-ignore` on the second line for the same reason: tests may keep an
+# unused import or binding, and saying so must not silently drop E501 with it.
 lint:
-	ruff check liminallm/ --fix --ignore E402
-	ruff check tests/ --fix --ignore F401,F841
+	ruff check liminallm/ --fix
+	ruff check tests/ --extend-ignore F401,F841 --fix
 
 # Security scan with bandit
 security:

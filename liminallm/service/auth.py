@@ -18,6 +18,15 @@ import httpx
 from argon2 import PasswordHasher, Type
 from argon2.exceptions import InvalidHash, VerifyMismatchError
 
+from liminallm.config import Settings
+from liminallm.logging import get_logger
+from liminallm.service.tenancy import user_belongs_to_site
+from liminallm.storage.models import ApiKey, Session, User
+from liminallm.storage.redis_cache import RedisCache
+
+if TYPE_CHECKING:  # PostgresStore imports from service/, so keep this type-only.
+    from liminallm.storage.postgres import PostgresStore
+
 
 def _password_hasher() -> PasswordHasher:
     """Argon2id at production cost, or a deliberately cheap one under test.
@@ -44,15 +53,6 @@ def _password_hasher() -> PasswordHasher:
             type=Type.ID, time_cost=1, memory_cost=8, parallelism=1
         )
     return PasswordHasher(type=Type.ID)
-
-from liminallm.config import Settings
-from liminallm.logging import get_logger
-from liminallm.service.tenancy import user_belongs_to_site
-from liminallm.storage.models import ApiKey, Session, User
-from liminallm.storage.redis_cache import RedisCache
-
-if TYPE_CHECKING:  # PostgresStore imports from service/, so keep this type-only.
-    from liminallm.storage.postgres import PostgresStore
 
 # Bearer keys for the served Responses API. The prefix makes a key
 # recognizable in a paste or a log scrub, and — having no dots — impossible
