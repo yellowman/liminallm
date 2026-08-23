@@ -1700,6 +1700,22 @@ _RESPONSES_TOOL_ITEM_TYPES = {
 }
 
 
+def _web_search_action(query: Any) -> dict:
+    """What a `web_search_call` says it did. Required by the dialect.
+
+    The action distinguishes a search from opening a page or finding within
+    one, and the search variant requires the query — so an item that omitted
+    it said a web search happened without saying what for, and failed the
+    generated type outright. `run_web_search` is always a search, and the
+    trace carries the query, so nothing is invented here.
+
+    An unrecorded query is the empty string rather than an absent field, for
+    the reason §16 already gives for the usage detail objects: typed SDKs
+    require the field, so it is present and empty when unknown.
+    """
+    return {"type": "search", "query": str(query) if query else ""}
+
+
 def _responses_tool_items(tool_trace: list) -> list:
     items = []
     for call in tool_trace or []:
@@ -1713,9 +1729,11 @@ def _responses_tool_items(tool_trace: list) -> list:
             "id": f"{item_type[:2]}_{uuid4().hex}",
             "status": "completed",
         }
+        query = (call.get("arguments") or {}).get("query")
         if item_type == "file_search_call":
-            query = (call.get("arguments") or {}).get("query")
             item["queries"] = [str(query)] if query else []
+        else:
+            item["action"] = _web_search_action(query)
         items.append(item)
     return items
 
@@ -1761,6 +1779,15 @@ def _responses_payload(
         "store": True,
         "metadata": metadata,
         "usage": usage,
+        # Required by the dialect, and all three describe the caller-supplied
+        # tool surface — which this endpoint refuses by name, because it runs
+        # the kernel's own loop server-side. So: no caller tools were in
+        # effect, none were available to choose between, and none were
+        # emitted in parallel. What the server ran appears where §16 says it
+        # does, as dialect-native `output` items and the `liminallm` trace.
+        "tools": [],
+        "tool_choice": "none",
+        "parallel_tool_calls": False,
     }
     if extension is not None:
         payload["liminallm"] = extension
@@ -1898,6 +1925,11 @@ async def _responses_stream(
                             "output_index": message_index,
                             "content_index": 0,
                             "delta": data,
+                            # Required by the dialect on both text events, and
+                            # read by the SDK's own stream accumulator. There
+                            # are no token logprobs on this surface, so it is
+                            # present and empty rather than absent.
+                            "logprobs": [],
                         },
                     )
             elif kind == "trace":
@@ -1909,8 +1941,13 @@ async def _responses_stream(
                         "id": f"{item_type[:2]}_{uuid4().hex}",
                         "status": "in_progress",
                     }
+                    # The trace event that opens the item does not carry the
+                    # arguments, so both of these are the empty-when-unknown
+                    # form the dialect requires rather than an omission.
                     if item_type == "file_search_call":
                         tool_item["queries"] = []
+                    else:
+                        tool_item["action"] = _web_search_action(None)
                     yield ev(
                         "response.output_item.added",
                         {"output_index": next_output_index, "item": dict(tool_item)},
@@ -1971,6 +2008,7 @@ async def _responses_stream(
                 "output_index": message_index,
                 "content_index": 0,
                 "text": text,
+                "logprobs": [],
             },
         )
         yield ev(

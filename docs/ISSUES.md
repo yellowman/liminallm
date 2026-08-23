@@ -11721,3 +11721,83 @@ hold anything out — the branch the gate-rejected red actually exercises, now
 asserted by name so it cannot drift to the other one. The retry paragraph said
 "max 3 attempts, then failed with reason"; `failed` is not a status this code
 writes, and the correct one is `dead_letter`.
+
+## Responses wire qualification against the dialect's own generated types
+
+The served `/v1/responses` exists so an agent framework changes only its base
+URL (SPEC §16), and the SPEC says wire shapes are OpenAI's both ways. The
+tests asserting that transcribed what we believed those shapes were, which
+proves we were consistent with ourselves and nothing else. The arbiter here is
+the installed SDK's generated types — built from OpenAI's OpenAPI schema, and
+the thing a caller's client actually is.
+
+`model_validate` rather than the SDK's own response parser: that parser
+constructs models permissively and supplies defaults for absent fields, so
+"the Python client happens to deserialize it" is a weaker claim than the one
+§16 makes.
+
+Measured against `openai==2.8.1`, three shapes the server emitted today are
+rejected outright:
+
+```
+web_search_call      missing ['action']
+output_text.delta    missing ['logprobs']
+Response             missing ['parallel_tool_calls', 'tool_choice', 'tools']
+```
+
+### `web_search_call` said a search happened without saying what for
+
+`file_search_call` got its `queries`; `web_search_call` got `type`, `id` and
+`status` and nothing else. `action` is required and distinguishes a search
+from opening a page or finding within one, and `ActionSearch` requires the
+query as well — so the item was not merely thin, it failed the generated type.
+
+Nothing had to be invented: `run_web_search` is always a search and the
+workflow trace already carries the query. An unrecorded query is the empty
+string rather than an absent field, which is the rule §16 already gives for
+the usage detail objects.
+
+The streaming path builds its items separately, and opens them from a trace
+event that has no arguments yet, so there the query is empty at
+`response.output_item.added`. Both paths now validate.
+
+Why this survived: the served-Responses tests have a good dialect-native
+file-search witness including its query, and — measured — no `web_search`
+witness at all.
+
+### The text stream omitted a field the SDK's own accumulator reads
+
+`logprobs` is required on both `response.output_text.delta` and `.done`, and
+the SDK's streaming accumulator reads `event.logprobs` when handling both.
+There are no token logprobs on this surface, so the honest wire value is `[]`:
+present and empty, the same answer already given for `annotations` and the
+zero-valued usage details.
+
+### The three caller-tool fields
+
+`tools`, `tool_choice` and `parallel_tool_calls` are required, and all three
+describe the *caller-supplied* tool surface — which this endpoint refuses by
+name, because it runs the kernel's own loop server-side. So `[]`, `"none"` and
+`false`: no caller tools were in effect, none were available to choose
+between, and none were emitted in parallel. What the server ran is reported
+where §16 already says it is, as dialect-native `output` items and the
+`liminallm` trace. Anything else would be describing a surface this endpoint
+does not offer.
+
+### Reds and mutations
+
+Five reds, all at the wire rather than at a mapping helper, because the SPEC
+promises a served wire. Each asserts the value we intend and then hands the
+same payload to the generated type, so the external schema is the second
+opinion. Four ran red before the fix; the fifth is the streaming web-search
+item, which had no witness of any kind.
+
+Nine mutations, each killed: the blocking item losing its action, the action
+losing its query, the streamed item losing its action, each text event losing
+its logprobs, and each of the three top-level fields removed individually as
+well as together.
+
+One mutation in the first round measured nothing and is recorded so it is not
+repeated: replacing three dict entries with `pass` is a syntax error, so the
+run produced a collection ERROR rather than a FAILED, which the harness read
+as a survivor. Removing the keys cleanly killed it.

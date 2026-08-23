@@ -1873,7 +1873,25 @@ the caller changes nothing but the base URL.
   citations are NOT faked into `annotations` — an annotation needs a
   character anchor this surface cannot honestly provide, so it stays
   empty until the model actually cites, and provenance rides the
-  extension.
+  extension. each item carries what its dialect requires:
+  `file_search_call.queries`, and `web_search_call.action` — always
+  `{"type": "search", ...}`, since the kernel's web tool only searches —
+  with the query the trace recorded, or empty when it recorded none.
+- **the caller-tool fields say there were none.** `tools`, `tool_choice`
+  and `parallel_tool_calls` are required by the dialect and all three
+  describe the *caller-supplied* tool surface, which this endpoint
+  refuses by name. so they are `[]`, `"none"` and `false`: no caller
+  tools were in effect, none were available to choose between, and none
+  were emitted in parallel. what the server ran is reported as `output`
+  items and the `liminallm` trace, above.
+- **required fields are present and empty, never absent.** the same rule
+  as the usage detail objects, applied wherever the information does not
+  exist: `annotations`, and `logprobs` on
+  `response.output_text.delta`/`.done` — this surface has no token
+  logprobs, and the SDK's own stream accumulator reads the field. the
+  arbiter for all of this is the dialect's generated types, not our
+  reading of them: a test that transcribes the shape proves only that we
+  were consistent with ourselves.
 
 #### mcp server (`POST /v1/mcp`)
 

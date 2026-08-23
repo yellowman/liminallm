@@ -653,3 +653,170 @@ class TestResponsesWireShapeUnderFailure:
         # Generic message only: internals never reach the wire.
         assert "10.0.0.7" not in resp.text
         assert body["error"]["code"] == "server_error"
+
+
+class TestTheWireIsTheDialectsOwnTypes:
+    """The promise is a base-URL swap, so the arbiter is OpenAI's own model.
+
+    SPEC §16 exists so an agent framework can change only its base URL, and
+    says wire shapes are OpenAI's both ways. A test that transcribes what we
+    believe those shapes are proves we were consistent with ourselves, so
+    these validate against the installed SDK's generated types instead —
+    built from OpenAI's OpenAPI schema, and the thing a caller's client
+    actually is.
+
+    `model_validate` rather than the SDK's own response parser: that parser
+    constructs models permissively and fills in absent fields, so "the Python
+    client happens to deserialize it" is a weaker claim than the one the SPEC
+    makes.
+    """
+
+    def test_a_web_search_run_carries_the_action_it_performed(
+        self, client, auth_headers, monkeypatch
+    ):
+        """`action` is required, and says which of three operations this was.
+
+        `file_search_call` got its `queries` and `web_search_call` got
+        nothing, so the item said a web search happened without saying what
+        was searched for. `run_web_search` is a search, and the trace already
+        carries the query, so nothing has to be invented.
+        """
+        from openai.types.responses import ResponseFunctionWebSearch
+
+        from liminallm.service.runtime import get_runtime
+
+        async def run(*args, **kwargs):
+            return {
+                "content": "grounded answer",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "tool_calls": [
+                    {"tool": "web_search", "arguments": {"query": "needle"}},
+                ],
+            }
+
+        monkeypatch.setattr(get_runtime().workflow, "run", run)
+        body = _respond(client, auth_headers, {"input": "hi"}).json()
+
+        item = next(o for o in body["output"] if o["type"] == "web_search_call")
+        assert item["action"] == {"type": "search", "query": "needle"}
+        ResponseFunctionWebSearch.model_validate(item)
+
+    def test_a_web_search_with_no_query_still_names_its_action(
+        self, client, auth_headers, monkeypatch
+    ):
+        """The field is required, so an unrecorded query cannot omit it."""
+        from openai.types.responses import ResponseFunctionWebSearch
+
+        from liminallm.service.runtime import get_runtime
+
+        async def run(*args, **kwargs):
+            return {
+                "content": "answer",
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+                "tool_calls": [{"tool": "web_search"}],
+            }
+
+        monkeypatch.setattr(get_runtime().workflow, "run", run)
+        body = _respond(client, auth_headers, {"input": "hi"}).json()
+
+        item = next(o for o in body["output"] if o["type"] == "web_search_call")
+        assert item["action"]["type"] == "search"
+        ResponseFunctionWebSearch.model_validate(item)
+
+    def test_the_streamed_text_events_carry_the_logprobs_field(
+        self, client, auth_headers, monkeypatch
+    ):
+        """Required on both, and the SDK's own accumulator reads it.
+
+        There are no token logprobs on this surface, so the honest wire value
+        is the empty list — the same answer already given for `annotations`
+        and the zero-valued usage detail objects: the typed shape is present,
+        and empty because the information does not exist.
+        """
+        from openai.types.responses import ResponseTextDeltaEvent, ResponseTextDoneEvent
+
+        from liminallm.service.runtime import get_runtime
+
+        async def run_streaming(*args, **kwargs):
+            yield {"event": "token", "data": "Ans"}
+            yield {"event": "token", "data": "wer."}
+            yield {
+                "event": "message_done",
+                "data": {
+                    "content": "Answer.",
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+                },
+            }
+
+        monkeypatch.setattr(get_runtime().workflow, "run_streaming", run_streaming)
+        resp = client.post(
+            "/v1/responses",
+            headers=auth_headers,
+            json={"input": "hi", "stream": True},
+        )
+        events = _sse_events(resp.text)
+
+        deltas = [e for e in events if e["event"] == "response.output_text.delta"]
+        dones = [e for e in events if e["event"] == "response.output_text.done"]
+        assert deltas and dones, [e["event"] for e in events]
+        for event in deltas:
+            assert event["data"]["logprobs"] == []
+            ResponseTextDeltaEvent.model_validate(event["data"])
+        for event in dones:
+            assert event["data"]["logprobs"] == []
+            ResponseTextDoneEvent.model_validate(event["data"])
+
+    def test_the_completed_response_validates_as_one(self, client, auth_headers):
+        """The whole object, against the type a caller's client will use."""
+        from openai.types.responses import Response
+
+        body = _respond(client, auth_headers, {"input": "hi"}).json()
+
+        Response.model_validate(body)
+
+    def test_a_streamed_web_search_item_is_valid_when_it_opens(
+        self, client, auth_headers, monkeypatch
+    ):
+        """The streamed item is built by different code from the blocking one.
+
+        `response.output_item.added` carries the item before the arguments
+        are known, so it is the empty-query form; a typed reader validates it
+        at that moment all the same.
+        """
+        from openai.types.responses import Response, ResponseFunctionWebSearch
+
+        from liminallm.service.runtime import get_runtime
+
+        async def run_streaming(*args, **kwargs):
+            yield {"event": "trace", "data": {"tool": "web_search", "status": "running"}}
+            yield {"event": "token", "data": "Answer."}
+            yield {
+                "event": "message_done",
+                "data": {
+                    "content": "Answer.",
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 1},
+                    "tool_calls": [
+                        {"tool": "web_search", "arguments": {"query": "needle"}}
+                    ],
+                },
+            }
+
+        monkeypatch.setattr(get_runtime().workflow, "run_streaming", run_streaming)
+        resp = client.post(
+            "/v1/responses",
+            headers=auth_headers,
+            json={"input": "hi", "stream": True},
+        )
+        events = _sse_events(resp.text)
+
+        for name in ("response.output_item.added", "response.output_item.done"):
+            item = next(
+                e["data"]["item"]
+                for e in events
+                if e["event"] == name
+                and e["data"]["item"]["type"] == "web_search_call"
+            )
+            ResponseFunctionWebSearch.model_validate(item)
+
+        completed = events[-1]["data"]["response"]
+        Response.model_validate(completed)
