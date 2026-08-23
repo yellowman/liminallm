@@ -134,8 +134,10 @@ def main():
         print("Error: DATABASE_URL is required; bootstrap writes the admin to Postgres")
         sys.exit(1)
 
+    # TEST_MODE alone: `allow_redis_fallback_dev` is an admin setting with no
+    # environment variable, so setting one here reached nothing. Both feed the
+    # same branch, and this is the half that works.
     os.environ.setdefault("TEST_MODE", "true")
-    os.environ.setdefault("ALLOW_REDIS_FALLBACK_DEV", "true")
 
     try:
         result = asyncio.run(bootstrap_admin(args.email, args.password, args.dry_run))

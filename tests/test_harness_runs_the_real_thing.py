@@ -384,31 +384,79 @@ def test_compose_mounts_the_volume_where_the_app_will_look_for_it():
     )
 
 
-@functools.lru_cache(maxsize=1)
-def _sources() -> tuple[str, ...]:
-    """Everything in this repository that could read an environment variable.
+def _environ_read(node) -> set[str]:
+    """The environment variable this node reads, if it reads one."""
+    import ast
 
-    Read once: the caller asks about thirty names, and re-walking the package
-    for each one costs seconds in a lane whose wall clock is measured.
+    def is_environ(inner) -> bool:
+        return (isinstance(inner, ast.Attribute) and inner.attr == "environ") or (
+            isinstance(inner, ast.Name) and inner.id == "environ"
+        )
+
+    def literal(inner) -> set[str]:
+        return (
+            {inner.value}
+            if isinstance(inner, ast.Constant) and isinstance(inner.value, str)
+            else set()
+        )
+
+    if isinstance(node, ast.Subscript) and is_environ(node.value):
+        return literal(node.slice)
+    if isinstance(node, ast.Call) and node.args:
+        func = node.func
+        if isinstance(func, ast.Attribute) and (
+            (func.attr == "get" and is_environ(func.value))
+            or (func.attr == "getenv" and getattr(func.value, "id", "") == "os")
+        ):
+            return literal(node.args[0])
+    return set()
+
+
+@functools.lru_cache(maxsize=1)
+def _consumed_environment_variables() -> frozenset[str]:
+    """Every name this repository actually consumes, from what consumes it.
+
+    Not "the name occurs in source". A constant naming a variable nothing
+    reads any more would satisfy that, and a name that looks configured while
+    reaching nothing is the whole defect this guards against — measured, an
+    earlier version of this passed on a planted `DEPRECATED = "FUTURE_DEAD"`.
+
+    Three interfaces, because there are three:
+
+    * `env_field`, asked of the live `Settings` model rather than parsed, so
+      the six environment-only settings are whatever the model says they are;
+    * the provider credential table, likewise;
+    * `os.environ[...]`, `os.environ.get(...)` and `os.getenv(...)`, read by
+      AST so a mention is not mistaken for a read. `setdefault` is deliberately
+      not here: it writes.
+
+    Shell is deliberately excluded. Measured: no compose variable needs it,
+    and matching `$VAR` in `scripts/*.sh` admits every local a script sets for
+    itself — including `ALLOW_REDIS_FALLBACK_DEV`, one of the dead names this
+    exists to catch. A variable a shell script alone consumes would be a false
+    positive here; the failure message says so.
     """
+    import ast
     import pathlib
 
+    from liminallm.config import PROVIDER_ENDPOINTS, Settings
+
+    names = {
+        (field.json_schema_extra or {}).get("env")
+        for field in Settings.model_fields.values()
+    }
+    names |= {row.get("api_key_env") for row in PROVIDER_ENDPOINTS.values()}
+    names.discard(None)
+
     root = pathlib.Path(__file__).resolve().parent.parent
-    texts = []
-    for path in (*root.glob("liminallm/**/*.py"), *root.glob("scripts/*")):
-        if not path.is_file():
-            continue
+    for path in (*root.glob("liminallm/**/*.py"), *root.glob("scripts/*.py")):
         try:
-            texts.append(path.read_text(encoding="utf-8", errors="ignore"))
-        except OSError:
+            tree = ast.parse(path.read_text(encoding="utf-8", errors="ignore"))
+        except (OSError, SyntaxError):
             continue
-    return tuple(texts)
-
-
-def _anything_reads(name: str) -> bool:
-    """Does this repository read this environment variable anywhere?"""
-    needles = (f'"{name}"', f"'{name}'", f"${name}", "${%s}" % name)
-    return any(needle in text for text in _sources() for needle in needles)
+        for node in ast.walk(tree):
+            names |= _environ_read(node)
+    return frozenset(names)
 
 
 @pytest.mark.parametrize("filename", COMPOSE_FILES)
@@ -417,16 +465,16 @@ def test_no_compose_variable_reaches_nothing(filename):
 
     `REDIS_URL` sat in both files beside the settings that do work. But
     `redis_url` is a managed setting with no environment variable of its own,
-    so the deployment ran on the in-process fallback — rate limits,
-    idempotency, the session cache and the concurrency slots all on their
-    fallback path — while its own compose file said otherwise. A dead name is
-    indistinguishable from a live one until something measures the behaviour
-    it claims to set, which is what this does.
+    so the container did not degrade to the in-process path, it failed to
+    boot — and the file said otherwise either way. A dead name is
+    indistinguishable from a live one until something measures what consumes
+    it, which is what `_consumed_environment_variables` does.
 
     Only services this repository builds are checked. A service that names an
     `image:` runs somebody else's entrypoint, and `POSTGRES_PASSWORD` is read
     by code this repository cannot see.
     """
+    consumed = _consumed_environment_variables()
     services = _compose(filename).get("services") or {}
     dead = {}
     for name, body in services.items():
@@ -438,12 +486,15 @@ def test_no_compose_variable_reaches_nothing(filename):
             if isinstance(environment, dict)
             else [str(entry).split("=", 1)[0] for entry in environment]
         )
-        unread = sorted(key for key in declared if not _anything_reads(key))
+        unread = sorted(key for key in declared if key not in consumed)
         if unread:
             dead[name] = unread
     assert not dead, (
-        f"{filename} declares variables nothing reads: {dead}. Either the "
+        f"{filename} declares variables nothing consumes: {dead}. Either the "
         "setting is managed and belongs in INSTANCE_SETTINGS_JSON, or the "
         "name is stale and should go — leaving it makes the file claim a "
-        "configuration the deployment never receives."
+        "configuration the deployment never receives. If a shell script is "
+        "the only consumer, that is this check's known false positive: give "
+        "the name an `env_field` or read it in Python, rather than widening "
+        "this to match every local a script sets for itself."
     )

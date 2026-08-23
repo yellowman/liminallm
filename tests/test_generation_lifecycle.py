@@ -2724,6 +2724,74 @@ class TestOneObjectCanHoldTwoInterpretations:
         )
         assert "THE PARAGRAPH INSIDE THE DOCUMENT" in found, found[:160]
 
+    def test_replacing_one_name_keeps_the_reading_its_twin_still_names(self, client):
+        """A displaced object survives while another record still names it.
+
+        Two names holding identical bytes cost one copy and, when they parse
+        the same way, one reading: same digest and same suffix, so both
+        records authorize `attachment-generation:<X>:.md`. Replacing one of
+        them displaces a record naming that reading — and retiring it on that
+        basis alone would take the reading the *other* record still
+        authorizes.
+
+        `keep` is the difference. The transaction retires what this record
+        displaced, minus what the surviving records still name. Measured with
+        `keep = set()`: the survivor's chunks are deleted and the chat can no
+        longer search a file it still holds, while both uploads return 200.
+        """
+        from liminallm.service.attachments import (
+            classify_attachment,
+            find_conversation_context_id,
+            generation_key,
+        )
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        conversation_id = self._conversation(client, headers)
+        shared = ("# shared\nTHE TEXT THAT BOTH NAMES HOLD\n" * 400).encode()
+        later = ("# later\nTHE TEXT THAT REPLACED THE FIRST NAME\n" * 400).encode()
+        for name in ("first.md", "second.md"):
+            assert classify_attachment(name, len(shared))["searchable"], (
+                f"{name} must reach the index for this to test anything"
+            )
+
+        for name in ("first.md", "second.md"):
+            resp = self._attach(
+                client, headers, conversation_id, name, shared, "text/markdown"
+            )
+            assert resp.status_code == 200, resp.text
+        # One reading, authorized twice: that is what makes the displacement
+        # ambiguous, so assert it rather than assume the suffixes agree.
+        digest = hashlib.sha256(shared).hexdigest()
+        assert generation_key(digest, "first.md") == generation_key(
+            digest, "second.md"
+        )
+
+        auto_ctx = find_conversation_context_id(
+            runtime.store, user_id=user_id, conversation_id=conversation_id
+        )
+        assert "THE TEXT THAT BOTH NAMES HOLD" in _text(runtime, auto_ctx)
+
+        # Replace one of the two names. The other still names the old object.
+        resp = self._attach(
+            client, headers, conversation_id, "first.md", later, "text/markdown"
+        )
+        assert resp.status_code == 200, resp.text
+
+        assert "THE TEXT THAT BOTH NAMES HOLD" in _text(runtime, auto_ctx), (
+            "replacing one name retired the reading the other name still "
+            "authorizes, so a file the chat still holds left the index"
+        )
+        found, _snippets = runtime.workflow._run_file_search(
+            "the text that both names hold",
+            8,
+            conversation_id=conversation_id,
+            context_id=None,
+            user_id=user_id,
+            tenant_id=None,
+        )
+        assert "THE TEXT THAT BOTH NAMES HOLD" in found, found[:200]
+
     def test_one_copy_of_the_bytes_is_still_enough(self, client):
         """Two interpretations, one object: the store is unchanged."""
         from liminallm.service.attachments import generation_path

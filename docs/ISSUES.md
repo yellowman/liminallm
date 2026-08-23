@@ -11441,12 +11441,13 @@ Both mutations are now killed by every parametrization.
 
 ### Pass E.2: no deletions, and why the matrix says so
 
-The other five survivors are recorded rather than closed: `resolve_attachment`
+The other four survivors were recorded rather than closed: `resolve_attachment`
 returning a path for an object that is not a file, `keep = set()` in the
 displacement prune (two names sharing identical bytes), the
 `generation_prefix` sweep of rows that can never become authorized, and the
 record written after the prune rather than before it — a real reorder this
-time, which nothing forces a schedule against.
+time, which nothing forces a schedule against. `keep = set()` is closed
+below; the rest stand.
 
 Two mutations in the first round measured nothing and are recorded so the
 mistake is not repeated. `the_record_is_written_after_the_prune` deleted the
@@ -11464,3 +11465,55 @@ the check and the read, the pathname deleted, the pathname replaced. Telling
 them apart needs mutations that are schedule-sensitive at the reader, not one
 more mutation at the seam. Until those exist, deleting any of them would be
 deleting on a matrix already shown to be too coarse.
+
+### Pass E.2 carry-over: the shared object, and a guard that overclaimed
+
+Two follow-ups, both from measurement rather than reading.
+
+**`keep = set()` was a correctness defect, not an uncertain survivor.**
+`update_attachment_record` retires what this record displaced, minus what the
+surviving records still name. Two names holding identical bytes that parse the
+same way authorize one reading, so replacing one of them displaces a record
+naming a reading the *other* record still authorizes. With `keep` emptied, the
+survivor's chunks are deleted while both uploads return 200, and the chat can
+no longer search a file it still holds.
+
+One red: same bytes under `first.md` and `second.md`, asserted to produce the
+same generation key rather than assumed to, then `first.md` replaced and the
+shared reading required to survive — in the index and through
+`_run_file_search`, so the assertion is the user-visible consequence. It kills
+`keep = set()` and, correctly, kills neither of the two displacement mutations
+already witnessed elsewhere: it is a witness for `keep`, not a broad one.
+
+**The compose guard proved a weaker thing than its name.** Matching the
+variable's name as a quoted token anywhere in source establishes that the name
+occurs, not that anything consumes it. Measured against the counterexample:
+a planted `DEPRECATED_ENVIRONMENT_VARIABLE = "FUTURE_DEAD_VAR"` satisfied it
+while consuming nothing.
+
+It now builds the consumed set from the interfaces that consume: `env_field`
+asked of the live `Settings` model, the provider credential table, and
+`os.environ[...]` / `.get(...)` / `os.getenv(...)` by AST. `setdefault` is
+excluded because it writes.
+
+Shell is excluded too, and that is a strengthening rather than a gap. Matching
+`$VAR` in `scripts/*.sh` admits every local a script sets for itself —
+`GREEN`, `TESTS_RUN`, `BASE_URL` — and, measured, `ALLOW_REDIS_FALLBACK_DEV`,
+one of the four dead names this guard exists to catch. No compose variable
+needs the shell pass: all eighteen distinct names across the two files are
+consumed through the three interfaces above. A variable only a shell script
+consumed would be a false positive, and the failure message names that case
+rather than widening the rule to hide it.
+
+Verified against ten planted cases: green unmutated, red on `REDIS_URL`,
+`JWT_ISSUER`, `JWT_AUDIENCE`, `USE_MEMORY_STORE`, `ALLOW_REDIS_FALLBACK_DEV`
+and the counterexample, green on `TEST_MODE`, `OPENAI_API_KEY` and
+`BUILD_SHA`.
+
+**And the same defect one layer over.** Excluding shell surfaced two writes of
+`ALLOW_REDIS_FALLBACK_DEV` that reach nothing: `os.environ.setdefault` in
+`scripts/bootstrap_admin.py` and an `export` in `scripts/run_tests.sh`. The
+setting is admin-managed with no `env` key, so `os.environ` cannot reach it —
+dead by construction, not by circumstance. Both sit beside `TEST_MODE`, which
+is a real `env_field` and short-circuits the same branch in `Runtime`, so
+removing them cannot change what either script does.
