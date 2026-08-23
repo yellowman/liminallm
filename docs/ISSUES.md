@@ -11259,3 +11259,23 @@ them and stops.
 
 Three mutations, each killed: the scope narrowed back to the kind, required
 fields checked only when present, and a negative version accepted.
+
+### Pass C.4: the postcondition types every field the validator types
+
+The comment claimed the postcondition covered "every canonical field the
+validator types"; it stopped after four. The validator also types `scope`,
+`user_id`, `rank`, `layers` and `matrices`, and the pre-C.2 bypass could
+persist `{"rank": "banana"}` or `{"layers": 7}` just as easily as a numeric
+`remote_model_id`. Five checks, five reds.
+
+One parity defect in the previous round, found by measuring rather than
+reading: JSON Schema accepts `1.0` as an `integer`, and the `^[0-9]+$` regex
+on the rendered text did not. A postcondition stricter than the door it guards
+blocks an operator over a row this build would happily create. The test is
+numeric now — non-negative and equal to its own truncation — and a red asserts
+that `0`, `1` and `1.0` all pass the validator *and* migrate.
+
+Pass C is closed.
+
+Two mutations, each killed: the five new types unchecked, and the integral
+test reverted to the regex.

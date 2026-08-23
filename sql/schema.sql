@@ -845,13 +845,18 @@ BEGIN
       -- one through.
       OR jsonb_typeof(schema->'base_model') IS DISTINCT FROM 'string'
       OR jsonb_typeof(schema->'current_version') IS DISTINCT FROM 'number'
-      OR (schema->>'current_version') !~ '^[0-9]+$'
+      -- Integral and non-negative, tested numerically rather than by regex:
+      -- JSON Schema accepts 1.0 as an integer (measured), so a regex on the
+      -- rendered text is stricter than the door this guards.
+      OR (schema->>'current_version')::numeric < 0
+      OR (schema->>'current_version')::numeric
+         <> trunc((schema->>'current_version')::numeric)
       -- No retired spelling may remain.
       OR schema ?| array['backend','provider','cephfs_dir','behavior_prompt',
                          'system_prompt','instructions','prompt_template',
                          'model_id','adapter_id']
-      -- And every canonical field the validator types must be a string when
-      -- present. Checking the mode alone let other shapes through: a numeric
+      -- And every field today's validator types must match it when present.
+      -- Checking the mode alone let other shapes through: a numeric
       -- remote_model_id would have been "repaired" into a row this build
       -- would refuse to create.
       OR (schema ? 'prompt_instructions'
@@ -861,6 +866,15 @@ BEGIN
           AND jsonb_typeof(schema->'remote_model_id') <> 'string')
       OR (schema ? 'remote_adapter_id'
           AND jsonb_typeof(schema->'remote_adapter_id') <> 'string')
+      -- The rest of what today's validator types. Same class: before C.2 a
+      -- patch could persist {"rank": "banana"} or {"layers": 7}, which this
+      -- build would refuse to create.
+      OR (schema ? 'scope' AND jsonb_typeof(schema->'scope') <> 'string')
+      OR (schema ? 'user_id'
+          AND jsonb_typeof(schema->'user_id') NOT IN ('string', 'null'))
+      OR (schema ? 'rank' AND jsonb_typeof(schema->'rank') <> 'number')
+      OR (schema ? 'layers' AND jsonb_typeof(schema->'layers') <> 'array')
+      OR (schema ? 'matrices' AND jsonb_typeof(schema->'matrices') <> 'array')
     );
   IF bad_count > 0 THEN
     RAISE EXCEPTION

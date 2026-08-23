@@ -328,6 +328,22 @@ class TestTheMigrationRefusesToLeaveCorruption:
             ({"kind": "adapter.lora", "mode": "prompt", "base_model": "b",
               "current_version": -1},
              "a negative current_version"),
+            ({"kind": "adapter.lora", "mode": "prompt", "base_model": "b",
+              "current_version": 1.5},
+             "a fractional current_version"),
+            # The rest of what today's validator types, each equally
+            # persistable through the pre-C.2 bypass.
+            ({"kind": "adapter.lora", "mode": "prompt", "base_model": "b",
+              "current_version": 0, "rank": "banana"}, "a non-numeric rank"),
+            ({"kind": "adapter.lora", "mode": "prompt", "base_model": "b",
+              "current_version": 0, "layers": 7}, "a non-array layers"),
+            ({"kind": "adapter.lora", "mode": "prompt", "base_model": "b",
+              "current_version": 0, "matrices": "attn_q"},
+             "a non-array matrices"),
+            ({"kind": "adapter.lora", "mode": "prompt", "base_model": "b",
+              "current_version": 0, "scope": {}}, "a non-string scope"),
+            ({"kind": "adapter.lora", "mode": "prompt", "base_model": "b",
+              "current_version": 0, "user_id": []}, "a non-string user_id"),
         ],
     )
     def test_corruption_the_old_bypass_could_persist_is_refused(
@@ -362,6 +378,36 @@ class TestTheMigrationRefusesToLeaveCorruption:
         finally:
             with psycopg.connect(store.dsn, autocommit=True) as conn:
                 conn.execute("DELETE FROM artifact WHERE id = %s", (bad,))
+
+    @pytest.mark.parametrize(
+        "version", [0, 1, 1.0], ids=["zero", "int", "float-integral"]
+    )
+    def test_a_version_the_validator_accepts_still_migrates(self, client, version):
+        """JSON Schema counts 1.0 as an integer, so the migration must too —
+        a postcondition stricter than the door it guards blocks an operator
+        over a row this build would happily create."""
+        import psycopg
+
+        from tests.harness import apply_schema
+        from liminallm.service.artifact_validation import validate_artifact
+
+        schema = {"kind": "adapter.lora", "mode": "prompt", "base_model": "b",
+                  "current_version": version}
+        validate_artifact("adapter", schema)  # the door accepts it
+
+        store = get_test_store()
+        good = str(uuid.uuid4())
+        with psycopg.connect(store.dsn, autocommit=True) as conn:
+            conn.execute(
+                "INSERT INTO artifact (id, type, name, schema) "
+                "VALUES (%s, 'adapter', 'fine', %s)",
+                (good, json.dumps(schema)),
+            )
+        try:
+            apply_schema(store.dsn, embedding_dim=64)
+        finally:
+            with psycopg.connect(store.dsn, autocommit=True) as conn:
+                conn.execute("DELETE FROM artifact WHERE id = %s", (good,))
 
     def test_an_uncanonical_mode_is_reported_by_the_migration(self, client):
         import psycopg
