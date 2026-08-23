@@ -12563,3 +12563,91 @@ so a server whose publisher had been deleted read as **enabled** while
 on, and it was the opposite of the truth. Three states now, matching the
 resolver's three answers, with a browser witness that deletes a publisher and
 reads the table.
+
+## The gates were reporting on rules nobody was reading
+
+Opening PR #178 started Actions for the first time on this branch — correctly,
+since the workflow triggers only on `push` to `main`/`develop` and on
+`pull_request` targeting them, and a branch with no PR has neither event. What
+it started was not a clean run.
+
+### lint: seven errors, none on main, none visible locally
+
+`make lint` passed `--ignore E402`, and ruff's `--ignore` does not add to the
+configured ignore list — it **replaces** it. `[tool.ruff.lint]` in
+pyproject.toml already says `select = [E, F, W, I]` and `ignore = [E501]`, so
+the flag suppressed E402 locally and re-enabled E501, while CI's explicit
+`--select`/`--ignore` only restate the config. Five E402s and two unsorted
+import blocks therefore sat on this branch through every local `ruff check`
+and failed the moment CI saw them. Every other job is `needs: lint`, so the
+3.10/3.11/3.12 matrix and the browser job never ran at all.
+
+The flags are gone: `ruff check liminallm/ --fix` uses pyproject, which is
+what CI uses. The tests line keeps its relaxation through `--extend-ignore`,
+which adds rather than replaces.
+
+The errors are fixed at the cause. The E402s were not deliberate late imports
+— `_password_hasher` had been inserted above `auth.py`'s import block, so the
+block moved back above it.
+
+### security: red on main since 2025-11-30
+
+Roughly thirty consecutive failed runs, the last green being `911e7df`. The
+step is byte-identical between main and this branch, so nothing here caused
+it; the gate has simply not been read in nine months.
+
+Fifteen findings at `-ll --skip B101`, twelve of them on main. `git blame`
+against `origin/main` identified the three this branch added — all B608, all
+in `postgres.py`, all the same shape as seven that were already there.
+
+All fifteen were examined rather than suppressed on sight:
+
+* **Ten B608**, dynamic SQL. Every interpolated fragment is a source literal
+  (`"title = %s"`, `"visibility = 'private'"`) selected by an `is not None`
+  check; no caller value reaches the f-string and every value is bound. False
+  positives, suppressed per line with that reason.
+* **One B613, the only HIGH** — and the one worth fixing rather than
+  suppressing. `web.py` held raw bidi and zero-width characters inside
+  `_INVISIBLE_RE`, the class it uses to strip exactly those characters from
+  fetched pages. Data, not a Trojan Source attack — but a character class
+  nobody can read in an editor or a diff is not reviewable, and a file
+  containing raw bidi controls has the attack's shape whatever the intent. Now
+  written as `\u` escapes with a comment per range. Proven equivalent by
+  comparing old and new across all 1,114,112 codepoints: zero differences,
+  155 characters matched by both.
+* **One B314**, `ElementTree.fromstring` in the extractor, which already
+  carried a comment explaining that stdlib ElementTree resolves no external
+  entities and that the size guard bounds amplification — and which runs in
+  the disposable extraction child anyway.
+* **One B102**, `exec` in the code interpreter, which is that module's entire
+  purpose and already confined.
+* **Two B615**, `from_pretrained` without revision pinning. The only finding
+  that is not a false positive: it is a real supply-chain hardening
+  suggestion. Suppressed with a comment saying so, because pinning a revision
+  for an operator-chosen base model is a product decision rather than a defect
+  to fix in a lint pass.
+
+### One self-inflicted defect while fixing them
+
+The first pass appended `# nosec` to each reported line by line number. One of
+those lines opened a triple-quoted f-string, so the comment became part of the
+SQL — a broken `INSERT` that no test would have caught quickly, since bandit
+was satisfied and the statement still parsed. Found by asserting the real
+property instead of the proxy: walking every module's AST for a string literal
+containing `nosec` — none may exist. That query is the reason this is a
+paragraph rather than a defect on the branch.
+
+The statement is now concatenated rather than triple-quoted, so the
+suppression has a line it can sit on.
+
+### The lanes still disagree in one place, deliberately
+
+`make security` runs `bandit -r liminallm/ -ll -q`; CI runs
+`-ll --skip B101`. Left alone: CI is the more permissive of the two, so the
+local command cannot pass while CI fails, which is the safe direction for a
+mismatch to point.
+
+Not fixed, and pre-existing: `make lint` also fails on `tests/` — 22 errors on
+main, 25 here. Unsorted imports, `l` as a variable name, and six repeated dict
+keys whose values are identical, so nothing is dropped. CI does not lint
+`tests/`.

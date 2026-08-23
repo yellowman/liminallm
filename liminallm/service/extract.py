@@ -410,7 +410,7 @@ def _paragraphs_from_xml(xml: bytes, para_tags: set) -> str:
     # Stdlib ElementTree does not resolve external entities, and modern expat
     # bounds entity amplification; the size guard above bounds the rest.
     try:
-        root = ElementTree.fromstring(xml)
+        root = ElementTree.fromstring(xml)  # nosec B314 - stdlib ElementTree resolves no external entities; see above
     except ElementTree.ParseError as exc:
         raise ExtractError(f"could not parse document xml: {exc}")
     paragraphs = [

@@ -147,7 +147,7 @@ class TrainingService:
         try:  # pragma: no cover - optional dependency
             from transformers import AutoTokenizer
 
-            self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name)  # nosec B615 - pinning a revision for an operator-chosen base model is an open decision
             self._base_vocab_size = vocab_size_from_tokenizer(
                 self.tokenizer, fallback=self.default_vocab_size
             )

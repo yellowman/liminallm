@@ -78,9 +78,22 @@ _BREAK_TAGS = frozenset({
 
 # Invisible characters used to smuggle instructions past human review:
 # zero-width and bidi controls, word joiners, BOM, and the Unicode tag block.
+#
+# Written as escapes, never as the characters themselves. The literal form is
+# invisible in an editor and in a diff, so nobody can review what this class
+# actually contains — and a file holding raw bidi controls is the Trojan Source
+# shape regardless of intent, which is why bandit reports it as a HIGH. The set
+# is unchanged; `tests/test_web.py` covers what it strips.
 _INVISIBLE_RE = re.compile(
-    "[­​-‏‪-‮⁠-⁤⁦-⁯﻿]"
-    "|[\U000e0000-\U000e007f]"
+    "["
+    "\u00ad"                # soft hyphen
+    "\u200b-\u200f"         # zero-width space/non-joiner/joiner, LRM, RLM
+    "\u202a-\u202e"         # bidi embedding and override
+    "\u2060-\u2064"         # word joiner, invisible operators
+    "\u2066-\u206f"         # bidi isolates, deprecated formatting
+    "\ufeff"                # BOM / zero-width no-break space
+    "]"
+    "|[\U000e0000-\U000e007f]"  # Unicode tag block
 )
 
 # Heuristics for classic prompt-injection phrasings. Redacted, not trusted.

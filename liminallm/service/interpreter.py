@@ -165,7 +165,7 @@ def execute_python(code: str, workdir: str, confine_root: str = "") -> dict[str,
             # A dedicated namespace, but real builtins: the point is to run
             # ordinary Python (csv, json, zipfile), and the isolation that
             # matters is the process boundary, not a builtins denylist.
-            exec(compile(code, "<attachment-analysis>", "exec"), {"__builtins__": builtins, "__name__": "__main__"})
+            exec(compile(code, "<attachment-analysis>", "exec"), {"__builtins__": builtins, "__name__": "__main__"})  # nosec B102 - exec is this module's purpose, inside the sandboxed child
     except BaseException as exc:  # noqa: BLE001 - report to the model verbatim
         ok = False
         import traceback

@@ -1062,13 +1062,17 @@ class PostgresStore:
             "dataset_path, new_version, preference_event_ids, meta"
         )
         placeholders = "%s, %s, %s, %s, %s, 'queued', %s, NULL, %s, NULL, %s, %s"
+        # Bound to a name, and concatenated rather than triple-quoted, so the
+        # suppression has a line it can sit on: bandit reports the line a
+        # string opens on, and inside `"""` a comment becomes part of the SQL.
+        insert = (
+            f"INSERT INTO training_job ({columns}) "  # nosec B608 - fragments are source literals; values are always bound via %s
+            f"VALUES ({placeholders}) "
+            "RETURNING *"
+        )
         with self._connect() as conn:
             row = conn.execute(
-                f"""
-                INSERT INTO training_job ({columns})
-                VALUES ({placeholders})
-                RETURNING *
-                """,
+                insert,
                 (
                     job_id,
                     adapter_id,
@@ -2023,7 +2027,7 @@ class PostgresStore:
         try:
             with self._connect() as conn:
                 row = conn.execute(
-                    f"UPDATE note SET {', '.join(sets)} WHERE id = %s RETURNING *",
+                    f"UPDATE note SET {', '.join(sets)} WHERE id = %s RETURNING *",  # nosec B608 - fragments are source literals; values are always bound via %s
                     params,
                 ).fetchone()
         except errors.UniqueViolation:
@@ -2302,7 +2306,7 @@ class PostgresStore:
         params.extend([datetime.now(timezone.utc), conversation_id, user_id])
         with self._connect() as conn:
             row = conn.execute(
-                f"UPDATE conversation SET {', '.join(assignments)} "
+                f"UPDATE conversation SET {', '.join(assignments)} "  # nosec B608 - fragments are source literals; values are always bound via %s
                 "WHERE id = %s AND user_id = %s RETURNING id",
                 tuple(params),
             ).fetchone()
@@ -2471,7 +2475,7 @@ class PostgresStore:
                 params.append(user_id)
 
             deleted = conn.execute(
-                f"DELETE FROM conversation WHERE {where_clause} RETURNING id", tuple(params)
+                f"DELETE FROM conversation WHERE {where_clause} RETURNING id", tuple(params)  # nosec B608 - fragments are source literals; values are always bound via %s
             ).fetchone()
             if not deleted:
                 return False
@@ -2791,7 +2795,7 @@ class PostgresStore:
 
             where = " WHERE " + " AND ".join(clauses) if clauses else ""
             query = (
-                "SELECT * FROM artifact"
+                "SELECT * FROM artifact"  # nosec B608 - fragments are source literals; values are always bound via %s
                 + where
                 + " ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s"
             )
@@ -3268,7 +3272,7 @@ class PostgresStore:
             if require_private:
                 conditions.append("visibility = 'private'")
             row = conn.execute(
-                f"SELECT * FROM artifact WHERE {' AND '.join(conditions)} "
+                f"SELECT * FROM artifact WHERE {' AND '.join(conditions)} "  # nosec B608 - fragments are source literals; values are always bound via %s
                 "FOR UPDATE",
                 tuple(params),
             ).fetchone()
@@ -3386,7 +3390,7 @@ class PostgresStore:
             # Use a single query with GROUP BY for efficiency
             placeholders = ", ".join(["%s"] * len(artifact_ids))
             rows = conn.execute(
-                f"SELECT artifact_id, MAX(version) as max_version FROM artifact_version "
+                f"SELECT artifact_id, MAX(version) as max_version FROM artifact_version "  # nosec B608 - fragments are source literals; values are always bound via %s
                 f"WHERE artifact_id IN ({placeholders}) GROUP BY artifact_id",
                 tuple(artifact_ids),
             ).fetchall()
@@ -4280,7 +4284,7 @@ class PostgresStore:
         )
         with self._connect() as conn:
             query = (
-                "SELECT * FROM knowledge_context WHERE owner_user_id = %s"
+                "SELECT * FROM knowledge_context WHERE owner_user_id = %s"  # nosec B608 - fragments are source literals; values are always bound via %s
                 + auto_filter
                 + cursor_filter
                 + " ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s"
@@ -4329,7 +4333,7 @@ class PostgresStore:
         params.extend([datetime.now(timezone.utc), context_id, owner_user_id])
         with self._connect() as conn:
             row = conn.execute(
-                f"UPDATE knowledge_context SET {', '.join(assignments)} "
+                f"UPDATE knowledge_context SET {', '.join(assignments)} "  # nosec B608 - fragments are source literals; values are always bound via %s
                 "WHERE id = %s AND owner_user_id = %s AND conversation_id IS NULL "
                 "RETURNING id",
                 tuple(params),
@@ -4861,7 +4865,7 @@ class PostgresStore:
                         self.logger.warning("chunk_cursor_decode_failed", error=str(exc))
 
                 query = (
-                    "SELECT kc.* FROM knowledge_chunk kc JOIN knowledge_context ctx "
+                    "SELECT kc.* FROM knowledge_chunk kc JOIN knowledge_context ctx "  # nosec B608 - fragments are source literals; values are always bound via %s
                     "ON ctx.id = kc.context_id WHERE ctx.owner_user_id = %s"
                     + cursor_filter
                     + " ORDER BY kc.created_at DESC, kc.id DESC LIMIT %s OFFSET %s"
