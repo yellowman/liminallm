@@ -12302,3 +12302,121 @@ console ignoring the operator's chosen classification; signing in loading
 nothing; a reopened page loading nothing; and the publish button absent from
 the markup. The last six run in the browser lane, because none of them is
 observable without one.
+
+## The MCP revise pass: four findings, and two the pass found itself
+
+Review of the three MCP commits returned two HIGH, one MEDIUM and one LOW.
+All four are closed here. Two more turned up while closing them, and one of
+those was the worst defect in the tranche.
+
+### HIGH: an MCP-only chat never reached the MCP agent
+
+Both selectors chose the tool agent on `attachments or web_enabled`, and knew
+nothing about MCP. So the exact configuration an operator has after publishing
+one server — tool-capable backend, web off, nothing attached — took the
+plain-chat workflow and never discovered anything.
+
+This is the same shape as the finding the previous commit fixed, one layer up
+again. The test called the stopping-condition witness said "No attachments, no
+web" and then invoked `_build_agent_context` directly, which proves the tools
+are assembled correctly *after* something chose the agent path. It could not
+see that nothing ever chose it. The new reds drive `run` and `run_streaming`
+and assert on the fixture server's own `listed` counter.
+
+One selector now, shared by both paths, and it reads persisted state only:
+`servers_for_turn` is a store read. Probing here would let an unreachable
+third party decide, per request and after a timeout, whether a turn can use
+its own attachments. That is a red of its own — the selector must return True
+without the fixture recording a listing.
+
+### HIGH: discovery metadata reached the model before anything scanned it
+
+A result was capped, scanned and wrapped. A tool's `description` and
+`inputSchema` went straight into the model's tool contract — earlier than any
+call, therefore earlier than any scan. A server that never answered a single
+call could put "ignore previous instructions" in front of the model with the
+turn untainted and every native egress tool still callable. `inputSchema` was
+the wider hole: property titles and descriptions carry arbitrary text and the
+document was unbounded, so a server also had a pre-call context-exhaustion
+channel.
+
+Metadata is now vetted at discovery: bounded in size, depth and count, scanned
+for injection patterns and envelope markers. A tool whose metadata fails is
+**dropped, not rewritten** — neutralizing a schema would change enum values
+and property names, offering the model a contract the server does not
+implement. Rejection logs and does not taint: nothing hostile reached the
+model, and tainting would let any server disarm a turn by advertising a tool
+nobody called.
+
+Depth is answered iteratively, before `json.dumps` runs. A recursive walk over
+attacker-supplied JSON is a `RecursionError` whose timing the sender picks.
+
+### The defect that pass found: every tool had an empty parameter list
+
+Writing the schema reds surfaced it. `mcp==2.0.0` puts the wire's `inputSchema`
+on a model field named `input_schema`, and this module read the wire spelling
+off the Python object. `getattr` returned `None` — no error, no warning — so
+**every remote tool had been offered to the model with no parameters at all.**
+
+Nothing in the suite could see it: every test handed arguments to `call`
+directly instead of letting a model choose them from the schema. The fixture
+server ignores its arguments, so the calls succeeded and the tools looked
+fine. It is pinned now against `types.Tool.model_fields`, the same way the
+protocol test is pinned against the SDK's own signature.
+
+### MEDIUM: the stall is real, and not where it was reported
+
+`run_sync` joins a thread, so on the loop thread it blocks every other request
+the worker is serving for as long as the slowest server takes. The report
+named the streaming path. Measurement disagreed: with both offloads reverted,
+the streaming path's worst loop gap across a 1.0s listing was **0.021s** and
+the blocking path's was **1.10s**. The streaming call already reaches a worker
+thread by some route; `_invoke_tool` awaited nothing around `_plan_invocation`
+and is the call site that stalled.
+
+So there is one red, for the path that reproduces, and `_plan_invocation` is
+offloaded — measured first that it already ran unbound, so a worker thread
+changes nothing about leasing. The streaming offload stays as the right
+discipline for a synchronous network call in an `async def`, and is recorded
+in the code as having no witness rather than described as a fix.
+
+The instrument had to be corrected too. Counting heartbeat ticks over a whole
+turn measures nothing: a turn does plenty of other awaiting, so the count
+reaches any threshold from the parts that were never blocked, and the first
+version of these tests passed against the defect for exactly that reason. The
+longest gap between ticks is local to the stall and cannot be paid for
+elsewhere.
+
+### LOW: the refusal described a source that is no longer the only one
+
+`taint.refusal` said "content fetched from the web" and "web access", when an
+MCP result can now be what armed the taint and dynamic MCP egress is withdrawn
+alongside the static set. Both the module docstring and the message are
+source-neutral now.
+
+### SPEC
+
+§12.3 said users CRUD private artifacts and admins view system artifacts and
+approve patches. It did not carry the general publishing authority the route
+now implements. Documented as the generic rule, with the two properties that
+make it coherent: publishing is a one-way door — a published artifact leaves
+artifact CRUD entirely and every later change goes through config ops — and
+the create side is direct because a proposal needs an artifact to name, so
+requiring review to create one has no first step. §21.4 gains the metadata
+rule and the event-loop rule.
+
+### Mutations
+
+Thirteen, each killed. The selector ignoring MCP; the selector sending every
+turn to the agent; the streaming selector keeping its own copy of the old
+condition; the selector probing the wire instead of the store; the blocking
+path planning on the event loop; metadata never vetted; only the description
+scanned; the schema unbounded; depth unchecked; markers passing through
+metadata; the tool count unbounded; the schema read by its wire name; and a
+clean tool dropped along with the hostile ones.
+
+Two of those took a corrected witness first. `depth_is_unchecked` survived
+because a 400-level schema serializes past the size cap, so the size check
+rejected it either way — the witness is now deep and small. And the streaming
+loop test was deleted rather than kept: it killed nothing, and a test that
+cannot fail is the thing this project removes.

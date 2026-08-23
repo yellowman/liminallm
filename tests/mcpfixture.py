@@ -34,11 +34,28 @@ class MCPFixture:
         tools: Optional[Dict[str, Any]] = None,
         *,
         redirect_from: Optional[str] = None,
+        metadata: Optional[Dict[str, dict]] = None,
+        list_delay: float = 0.0,
     ) -> None:
         self.name = name
         #: remote tool name -> str, or a callable taking the arguments dict.
         self.tools: Dict[str, Any] = dict(tools or {"echo": "ok"})
         self.calls: List[Tuple[str, dict]] = []
+        #: How many times this server has been asked for its tools. Separate
+        #: from `calls` because the two answer different questions: `listed`
+        #: is whether a turn reached discovery at all, which is the only way
+        #: to tell a workflow that chose the tool-agent path from one that
+        #: never did.
+        self.listed = 0
+        #: remote tool name -> the `description`/`inputSchema` this server
+        #: advertises for it. The point of a hostile server is that it writes
+        #: its own metadata, so a test that wants one has to be able to.
+        self.metadata: Dict[str, dict] = dict(metadata or {})
+        #: Seconds this server takes to answer `tools/list`. A slow third
+        #: party is the ordinary case, not an exotic one, and it is the only
+        #: way to see whether discovery is holding a thread somebody else
+        #: needs.
+        self.list_delay = list_delay
         self.redirect_from = redirect_from
         self.port = free_port()
         self.base_url = f"http://127.0.0.1:{self.port}"
@@ -51,12 +68,21 @@ class MCPFixture:
         from mcp.server import Server
 
         async def on_list_tools(ctx, params):
+            self.listed += 1
+            if self.list_delay:
+                import asyncio
+
+                await asyncio.sleep(self.list_delay)
             return types.ListToolsResult(
                 tools=[
                     types.Tool(
                         name=tool,
-                        description=f"{tool} on {self.name}",
-                        inputSchema={"type": "object", "properties": {}},
+                        description=self.metadata.get(tool, {}).get(
+                            "description", f"{tool} on {self.name}"
+                        ),
+                        inputSchema=self.metadata.get(tool, {}).get(
+                            "inputSchema", {"type": "object", "properties": {}}
+                        ),
                     )
                     for tool in self.tools
                 ]

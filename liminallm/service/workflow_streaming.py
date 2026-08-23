@@ -67,14 +67,9 @@ class WorkflowStreamingMixin:
                 workflow_id, user_id=user_id, tenant_id=tenant_id
             )
         if not workflow_schema:
-            # The tool agent handles anything needing tools: conversation
-            # attachments (so uploading a file is all the user has to do) or an
-            # enabled web tool. It degrades to a plain reply when it has no
-            # tools to offer.
-            if (
-                self._conversation_attachments(conversation_id, user_id)
-                or self._web_settings()["enabled"]
-            ):
+            # Same question the blocking path asks, and the same function, so
+            # the two cannot answer it differently. See `_turn_needs_tools`.
+            if self._turn_needs_tools(conversation_id, user_id):
                 workflow_schema = get_default_attachment_workflow_schema()
             else:
                 workflow_schema = self._default_workflow()
@@ -468,8 +463,21 @@ class WorkflowStreamingMixin:
         message = inputs.get("message") or user_message or ""
         attachments = self._conversation_attachments(conversation_id, user_id)
 
-        messages, tools, _, mcp_tools = self._build_agent_context(
-            message, attachments, history, user_id, conversation_id
+        # Off the event loop. Assembling the prompt now includes listing every
+        # configured MCP server, and `mcp_client.run_sync` answers an
+        # already-running loop by starting a thread and joining it — a join
+        # on the loop thread blocks every other request the worker is serving.
+        #
+        # Honest about the evidence: this path did not reproduce the stall.
+        # Reverted, its worst loop gap across a 1.0s listing was 0.021s, while
+        # the blocking path's was 1.10s — so this call already reaches a
+        # worker thread by some route, and there is no test that fails without
+        # this line. It stays because a synchronous network call in an
+        # `async def` is a stall waiting for a caller to change, not because a
+        # measurement demands it.
+        messages, tools, _, mcp_tools = await asyncio.to_thread(
+            self._build_agent_context,
+            message, attachments, history, user_id, conversation_id,
         )
         if not tools or not self.llm.supports_tools:
             async for event in self._stream_llm_node(

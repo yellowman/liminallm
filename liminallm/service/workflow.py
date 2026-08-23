@@ -447,14 +447,11 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 workflow_id, user_id=user_id, tenant_id=tenant_id
             )
         if not workflow_schema:
-            # The tool agent handles anything needing tools: conversation
-            # attachments (so uploading a file is all the user has to do) or an
-            # enabled web tool. It degrades to a plain reply when it has no
-            # tools to offer.
-            if (
-                self._conversation_attachments(conversation_id, user_id)
-                or self._web_settings()["enabled"]
-            ):
+            # The tool agent handles anything needing tools. It degrades to a
+            # plain reply when it has no tools to offer, so the cost of a false
+            # positive is a worker process; the cost of a false negative is a
+            # capability the operator configured and the turn never sees.
+            if self._turn_needs_tools(conversation_id, user_id):
                 workflow_schema = get_default_attachment_workflow_schema()
             else:
                 workflow_schema = self._default_workflow()
@@ -1631,6 +1628,35 @@ class WorkflowEngine(WorkflowStreamingMixin):
             descriptor=descriptor,
         )
 
+    def _turn_needs_tools(
+        self, conversation_id: Optional[str], user_id: Optional[str]
+    ) -> bool:
+        """Whether this turn should take the tool-agent path.
+
+        One function because both entry points ask the same question, and the
+        two copies of it had already drifted from what the agent can actually
+        offer: they asked about attachments and web, and a published MCP
+        server made neither true. The exact configuration an operator gets
+        after publishing one — tool-capable backend, web off, nothing attached
+        — took the plain-chat workflow, so the server was never listed and its
+        tools never existed as far as the turn was concerned.
+
+        Persisted state only, deliberately. `servers_for_turn` is a store
+        read; discovery is not. Probing here would let an unreachable third
+        party decide, after a timeout and once per request, whether this turn
+        can use its own attachments. Discovery stays inside the agent context,
+        where one server being down already costs only its own tools.
+        """
+        if self._conversation_attachments(conversation_id, user_id):
+            return True
+        if self._web_settings()["enabled"]:
+            return True
+        try:
+            return bool(mcp_client.servers_for_turn(self.store))
+        except Exception as exc:  # noqa: BLE001 - a lookup is not a turn
+            self.logger.warning("mcp_server_lookup_failed", error=str(exc))
+            return False
+
     def _default_workflow(self) -> dict:
         plain_chat_node = {
             "id": "plain_chat",
@@ -2012,7 +2038,13 @@ class WorkflowEngine(WorkflowStreamingMixin):
                 user_id=user_id,
                 tenant_id=tenant_id,
             )
-        worker_tool, plan, context, preamble = self._plan_invocation(
+        # Off the event loop, for the reason the streaming path is: planning an
+        # agent turn lists every configured MCP server, and that listing is a
+        # blocking join on whichever thread it runs on. Measured before moving
+        # it — this already ran unbound, so a worker thread changes nothing
+        # about leasing.
+        worker_tool, plan, context, preamble = await asyncio.to_thread(
+            self._plan_invocation,
             tool_name,
             inputs,
             adapters=adapters,

@@ -1731,8 +1731,28 @@ execution guardrails:
   - user:
     - can CRUD their conversations, files, contexts, private artifacts.
     - can see some global artifacts (default routing, workflows).
+    - creates artifacts `private`, which is the default and the only
+      visibility a user may ask for.
   - admin:
     - can view system artifacts, approve config patches.
+    - **may publish an artifact directly**: `POST /v1/artifacts` accepts a
+      `visibility` of `shared` or `global` from an admin, for any artifact
+      type. the role is read from the authenticated token, never from the
+      body, like every other authority decision (§12.2).
+
+- publishing is a one-way door, not a general write capability. once an
+  artifact is `shared` or `global` it leaves its owner's sole control:
+  artifact CRUD refuses to edit or retire it, and every subsequent change
+  goes through config ops (§14). so an admin may *create* the installation's
+  capabilities and may not quietly *amend* them, which is the property the
+  review flow exists for.
+
+- the reason the create side is direct and generic rather than reviewed:
+  a proposal needs an artifact to name, so requiring review to create one
+  has no first step. the reason it is admin-only: a `global` artifact is a
+  capability of every turn in the installation — a `tool` spec enters the
+  registry every turn resolves against, and an `mcp` server contributes its
+  tools to every turn (§21.4).
 
 ---
 
@@ -2719,6 +2739,20 @@ what the kernel owns is what the sdk cannot decide:
 - **a result is untrusted data** (§21.1): bounded, scanned, and wrapped in the
   same envelope fetched web content gets, with the rule stated in the system
   block whenever such a tool is offered.
+- **metadata is untrusted data too, and earlier.** a tool's `description` and
+  `inputSchema` are written by the remote server and reach the model in the
+  tool contract, before any call and therefore before any result has been
+  scanned. so they are vetted at discovery: bounded in size, depth and count,
+  scanned for injection patterns and envelope markers, and a tool whose
+  metadata fails is **dropped, not rewritten** — neutralizing a schema would
+  change enum values and property names, offering the model a contract the
+  server does not implement. a rejection is logged and does not taint the
+  turn: nothing hostile reached the model, and tainting would let any server
+  disarm a turn's own capabilities by advertising a tool nobody called.
+- **discovery does not hold the event loop.** listing is a blocking call on
+  whichever thread runs it, so both chat paths assemble the agent's prompt in
+  a worker thread. a slow third party costs its own turn and not every other
+  request the worker is serving.
 - **taint withdraws `egress` servers** (§21.1) alongside `web_fetch`;
   `local_read` survives for the reason `file_search` does.
 - **the worker sends a name, not a server.** the discovered map lives on the
