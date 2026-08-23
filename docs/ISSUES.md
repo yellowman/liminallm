@@ -11402,3 +11402,65 @@ at a time — the four names the hand audit found — while `TEST_MODE` and
 `SHARED_FS_ROOT` still pass. All twenty-nine variables the two files declare
 on built services are read, so "remove the other known-dead compose variables
 once individually confirmed" is confirmed by the check rather than by a claim.
+
+### Pass E.2 finding: the guard that keeps a record inside the store
+
+Pass E.2 ran the same ledger method over `test_generation_lifecycle.py` and
+`test_path_races.py`: nineteen mutations across four invariant clusters, each
+one synchronization, ordering or structure rather than a return value. It
+produced no deletions and six surviving mutations. One of the six is a
+security boundary.
+
+`generation_path` builds `<store>/<first two>/<checksum>` and its consumers
+reopen whatever comes back — the inline reader calls `read_text`, the
+interpreter stages the file into a workdir. An attachment record is a stored
+jsonb value, so its `checksum` field chooses that path. The docstring says the
+checksum is "validated rather than trusted"; nothing checked that it was.
+
+Measured by running the mutated resolver rather than by reading it. With the
+validation replaced by a bare emptiness check:
+
+```
+../../../../../../etc/passwd      -> /etc/passwd
+../ x8 + root/.ssh/id_rsa         -> /root/.ssh/id_rsa
+/etc/shadow                       -> /etc/shadow
+..                                -> /srv/liminallm/users/<uid>
+```
+
+`generation_key` carries the same rule for the index, where the consequence is
+authorization rather than traversal: a reading of an object nothing can name
+is not a reading anybody may be authorized for. Both were unwitnessed, and
+both are one rule, so one red covers them — six spellings, asserted at the two
+functions and again end to end through the inline reader, which must be handed
+nothing rather than something it will read. Uppercase is in the table because
+the store writes lowercase digests: an uppercase spelling is a name for a path
+that does not exist, and accepting it would make `resolve_attachment` answer
+differently from `store_generation`.
+
+Both mutations are now killed by every parametrization.
+
+### Pass E.2: no deletions, and why the matrix says so
+
+The other five survivors are recorded rather than closed: `resolve_attachment`
+returning a path for an object that is not a file, `keep = set()` in the
+displacement prune (two names sharing identical bytes), the
+`generation_prefix` sweep of rows that can never become authorized, and the
+record written after the prune rather than before it — a real reorder this
+time, which nothing forces a schedule against.
+
+Two mutations in the first round measured nothing and are recorded so the
+mistake is not repeated. `the_record_is_written_after_the_prune` deleted the
+`UPDATE` instead of moving it, so sixteen tests died to "attachments never
+persist". And one structural mutation — make `resolve_attachment` hand back
+the pathname again — was killed by nine tests at once, which reads as
+redundancy and is not: the store has three consumers, and one mutation on the
+shared resolver cannot tell them apart. Split per consumer, the nine separate
+into the workdir stager, the inline reader and the availability check.
+
+Seven tests still die together to the inline-reader mutation, and they are not
+interchangeable: each forces a different schedule against that one consumer —
+another chat's upload, a name recreated after a delete, a replacement between
+the check and the read, the pathname deleted, the pathname replaced. Telling
+them apart needs mutations that are schedule-sensitive at the reader, not one
+more mutation at the seam. Until those exist, deleting any of them would be
+deleting on a matrix already shown to be too coarse.

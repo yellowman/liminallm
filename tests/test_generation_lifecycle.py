@@ -813,6 +813,76 @@ class TestAnAttachmentNeverResolvesToOtherBytes:
             user_id=user_id,
         )
 
+    @pytest.mark.parametrize(
+        "checksum",
+        [
+            "../../../../../../etc/passwd",
+            "../" * 8 + "root/.ssh/id_rsa",
+            "/etc/shadow",
+            "..",
+            "a" * 62 + "/..",
+            "A" * 64,
+        ],
+        ids=["traversal", "deep-traversal", "absolute", "bare-dotdot",
+             "trailing-dotdot", "wrong-case"],
+    )
+    def test_a_record_cannot_name_an_object_outside_the_store(
+        self, client, checksum
+    ):
+        """The record chooses the path, so the record is not trusted.
+
+        `generation_path` builds `<store>/<first two>/<checksum>` and the
+        consumers reopen whatever comes back — the inline reader reads it, the
+        interpreter stages it. A record is a stored jsonb value, so a
+        corrupted or hand-edited `checksum` chooses that path. Measured with
+        the validation removed: `../../../../../../etc/passwd` resolves to
+        `/etc/passwd`, and eight `../` reach `/root/.ssh/id_rsa`.
+
+        `generation_key` is the same rule for the index: a reading of an
+        object nothing can name is not a reading anybody may be authorized
+        for.
+
+        Uppercase is refused too. The store writes lowercase digests, so an
+        uppercase spelling is not a second name for the same object — it is a
+        name for a path that does not exist, and accepting it would make
+        `resolve_attachment` answer differently from `store_generation`.
+        """
+        from liminallm.service.attachments import (
+            generation_key,
+            generation_path,
+            generation_root,
+            read_inline_contents,
+        )
+
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        fs_root = runtime.settings.shared_fs_root
+
+        assert generation_path(fs_root, user_id, checksum) is None, (
+            "a stored record chose a path outside the generation store"
+        )
+        assert generation_key(checksum, "notes.md") is None, (
+            "a stored record named a reading the store cannot hold"
+        )
+
+        # End to end: the consumer that reopens the object must be given
+        # nothing, rather than something it will happily read.
+        poisoned = {
+            "name": "notes.md",
+            "checksum": checksum,
+            "size": 12,
+            "inline": True,
+            "searchable": False,
+            "analyzable": True,
+        }
+        served = read_inline_contents(
+            [poisoned], fs_root=fs_root, user_id=user_id
+        )
+        assert served == [], (
+            f"the inline reader served content for {checksum!r}: {served}"
+        )
+        assert generation_root(fs_root, user_id).name == "sha256"
+
     def test_another_chats_upload_is_not_served_to_this_one(self, client):
         runtime = get_runtime()
         user_id, headers = _account(client)
