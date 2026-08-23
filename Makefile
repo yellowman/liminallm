@@ -83,7 +83,12 @@ test-fast-xdist:
 # Parallelism buys more here than it does in the fast lane, because what makes
 # a test slow is usually waiting. Measured on a 4-core box: the 110 slow-marked
 # tests alone take 5m37s serially and 1m43s at -n 4, and this whole lane —
-# 2814 tests — takes 3m37s. That is the release gate, at edit-loop cost.
+# 2814 tests — takes 3m37s.
+#
+# This is the local gate, and what `make qa` runs. It is not the only signal:
+# GitHub CI runs the same selection serially, once per supported Python
+# version, which is a different question — whether the suite passes on an
+# interpreter this machine does not have.
 test-xdist:
 	@mkdir -p $(SHARED_FS_ROOT)
 	python -m pytest tests/ -q --tb=short -m 'not browser' \
@@ -123,14 +128,16 @@ security:
 	bandit -r liminallm/ -ll -q
 
 # Full QA gate - runs all checks
-qa: lint security test
+# The parallel lane, not the serial one: `test-xdist` runs the same tests and
+# the gate should not cost four times the wall clock to say the same thing.
+qa: lint security test-xdist
 	@echo ""
 	@echo "========================================="
 	@echo " QA Gate PASSED"
 	@echo "========================================="
 
 # Fast QA - unit tests only (no Docker)
-qa-unit: lint test
+qa-unit: lint test-xdist
 	@echo ""
 	@echo "========================================="
 	@echo " Unit QA Gate PASSED"

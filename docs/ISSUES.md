@@ -12515,3 +12515,51 @@ One survivor, equivalent: putting `ON DELETE CASCADE` back in the `CREATE
 TABLE` line changes nothing, because the migration block below it repairs a
 fresh database on the same pass. The file is self-healing by design, so the
 two spellings are redundant on purpose.
+
+### Carry-over: `SET NULL` was the other wrong guess
+
+The correction above replaced a key that destroyed published configuration
+with one that preserved it — and broke the erasure guarantee in the direction
+nobody was watching. `ON DELETE SET NULL` applies to every artifact, so a raw
+`DELETE FROM app_user` left a **private** artifact alive and unattributed,
+with its payload still under the shared filesystem root. §2.1 says an
+account's private artifacts go with it, and §2.3 claimed the key detached only
+"the rest" — which the key cannot do, because it cannot see visibility.
+
+Both guesses destroy something, so the key stops guessing. It is
+`ON DELETE RESTRICT` now, and the objection that a published row could block a
+personnel action does not survive contact with the code: `delete_user` deletes
+the private rows, detaches the published ones and only then removes the
+account, so by that statement nothing references it. Measured before changing
+anything — `delete_user` completes unchanged against a `RESTRICT` key.
+
+What the restriction costs is a deletion that skipped all of that, and
+refusing it is the point. An operation that cannot say which artifacts should
+die and which should be detached should stop rather than pick.
+
+The migration condition widened with it, from `confdeltype = 'c'` to
+`confdeltype <> 'r'`: two databases now exist in the wild, one that never ran
+the first correction and one that carries `SET NULL`, and the repair has to
+reach both. The scratch-database test is parametrized over both starting
+states, and a mutation narrowing the condition back to the cascade is killed
+by the `SET NULL` case.
+
+`grep -rn "DELETE FROM app_user"` returns exactly one production call site —
+inside `delete_user` — so nothing else was relying on the key to clean up.
+
+### Two carry-overs from the same review
+
+`make qa` and `make qa-unit` depended on the serial `test` target, so the lane
+described as the gate was not the one the gate ran. Both point at
+`test-xdist` now. CI was left alone deliberately: it runs the same selection
+serially on each supported Python version, which answers a different question —
+whether the suite passes on an interpreter this machine does not have — and I
+cannot verify a CI change from here. The wording in CLAUDE.md and the Makefile
+says "local gate" rather than "the release gate" for that reason.
+
+The admin console computed an MCP server's state from `schema.enabled` alone,
+so a server whose publisher had been deleted read as **enabled** while
+`servers_for_turn` offered it to nobody. That is the reading an operator acts
+on, and it was the opposite of the truth. Three states now, matching the
+resolver's three answers, with a browser witness that deletes a publisher and
+reads the table.

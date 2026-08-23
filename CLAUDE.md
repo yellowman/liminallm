@@ -49,7 +49,10 @@ a test slow is usually waiting. Measured on a 4-core box: the 110 slow-marked
 tests alone take 5m37s serially and 1m43s at `-n 4`, and the whole non-browser
 suite — 2,814 tests — takes 3m37s. Running the fast lane and then the full one
 as a routine pair still buys nothing, but the full one is now cheap enough to
-be the gate whenever there is any doubt.
+be the local gate whenever there is any doubt, and it is what `make qa` runs.
+CI is a separate signal and runs the same selection serially on each supported
+Python version — a green lane here does not answer whether the suite passes on
+an interpreter this machine does not have.
 
 `pytest tests/ -m slow --collect-only -q` lists the slow set and which files
 own it. The browser lane stays out of both (`make test-browser`) because it

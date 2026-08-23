@@ -169,6 +169,10 @@ exist — read the schema.
   keys, and private artifacts; relational deletion cascades all of it, and
   the filesystem namespace retires through the durable ledger the same
   transaction enrols (docs/ISSUES.md, tranche 2G.4).
+- artifacts are the one exception, because deletion means two things there
+  and only the application knows which: `delete_user` removes the account's
+  `private` artifacts and detaches the rest, in that order, before removing
+  the account. the foreign key does not cascade and does not guess (§2.3).
 
 **user_auth_credential** — one row per user; password hash + algorithm;
 null hash means external OAuth only.
@@ -241,13 +245,22 @@ trail.
   deleted. it is not a synonym for global — it says the row is
   unattributed, which is why an unattributed `tool` can never be
   privileged and an unattributed `mcp` server is not offered to any turn.
-- **publishing detaches, it does not destroy.** deleting an account
-  removes its `private` artifacts and sets `owner_user_id` to null on the
-  rest, in the delete path and in the foreign key both. a `shared` or
-  `global` row has left its owner's sole control (§12.3), so removing a
-  personnel account must not silently retire installation configuration or
-  cascade away its version and patch history. the row survives, goes
-  unattributed, and is re-attested by an admin publishing it again.
+- **publishing detaches, it does not destroy.** deleting an account removes
+  its `private` artifacts and sets `owner_user_id` to null on the rest. a
+  `shared` or `global` row has left its owner's sole control (§12.3), so
+  removing a personnel account must not silently retire installation
+  configuration or cascade away its version and patch history. the row
+  survives, goes unattributed, and is re-attested by an admin publishing it
+  again.
+- **the rule lives in `delete_user`, and the foreign key refuses rather
+  than infers.** a key cannot see visibility, and both answers it could
+  give on its own destroy something: `CASCADE` removes published
+  configuration, `SET NULL` leaves a private artifact and its payload
+  behind an account that was erased. so `artifact.owner_user_id` is
+  `ON DELETE RESTRICT`. `delete_user` deletes, detaches and only then
+  removes the account, by which point nothing references it — so the
+  restriction never blocks the supported path, and a deletion that skipped
+  the lifecycle stops instead of picking.
 - payloads (workflow JSON, adapter weights) live on the shared filesystem
   under the artifact's directory; the database holds metadata and version
   pointers.

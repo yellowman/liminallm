@@ -195,3 +195,61 @@ class TestTheConsoleCannotBeAWayAround:
         assert page.is_hidden("#admin-console"), (
             "a non-admin was shown the publishing form"
         )
+
+
+class TestTheTableSaysWhatTheResolverWouldSay:
+    def test_a_server_whose_publisher_is_gone_reads_as_inert(self, page, server):
+        """The console must not report a capability the turn does not have.
+
+        `servers_for_turn` skips any artifact with no owner, because the admin
+        attestation is what made it a capability. The table computed its state
+        from `schema.enabled` alone, so a server whose publisher was deleted
+        read as "enabled" while being offered to nobody — the one reading an
+        operator would act on, and the opposite of the truth.
+        """
+        import httpx
+
+        from liminallm.service import mcp_client
+        from liminallm.service.runtime import get_runtime
+
+        publisher_email, password = _admin(server)
+        viewer_email, _ = _admin(server)
+        login = httpx.post(
+            f"{server.base_url}/v1/auth/login",
+            json={"email": publisher_email, "password": password},
+            timeout=30,
+        )
+        assert login.status_code == 200, login.text
+        publisher_id = login.json()["data"]["user_id"]
+        token = login.json()["data"]["access_token"]
+
+        name = f"orph{uuid.uuid4().hex[:6]}"
+        with MCPFixture(name) as fixture:
+            created = httpx.post(
+                f"{server.base_url}/v1/artifacts",
+                json={
+                    "type": "mcp",
+                    "name": name,
+                    "visibility": "global",
+                    "schema": fixture.as_artifact_schema(),
+                },
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=30,
+            )
+            assert created.status_code == 201, created.text
+            store = get_runtime().store
+            assert any(
+                s["url"] == fixture.url for s in mcp_client.servers_for_turn(store)
+            ), "it was never a capability, so losing it proves nothing"
+
+            store.delete_user(publisher_id)
+            assert not any(
+                s["url"] == fixture.url for s in mcp_client.servers_for_turn(store)
+            ), "the resolver still offers it, so the table is not wrong yet"
+
+            _sign_in(page, server, viewer_email, password)
+
+            page.wait_for_selector(f"#mcp-table-wrapper td:text-is('{name}')",
+                                   timeout=15000)
+            row = page.inner_text("#mcp-table-wrapper")
+            assert "inert" in row, row

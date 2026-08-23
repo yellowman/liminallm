@@ -123,9 +123,10 @@ CREATE INDEX IF NOT EXISTS idx_message_conversation_id ON message(conversation_i
 -- Artifact tables aligned to the SPEC kernel primitives
 CREATE TABLE IF NOT EXISTS artifact (
   id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-  -- SET NULL, not CASCADE: see the constraint block below for why, and for
-  -- the migration that corrects a database created before this line did.
-  owner_user_id   UUID REFERENCES app_user(id) ON DELETE SET NULL,
+  -- RESTRICT, not CASCADE and not SET NULL: see the constraint block below
+  -- for why, and for the migration that corrects a database created before
+  -- this line did.
+  owner_user_id   UUID REFERENCES app_user(id) ON DELETE RESTRICT,
   type            TEXT NOT NULL,
   name            TEXT NOT NULL,
   description     TEXT,
@@ -159,27 +160,36 @@ ALTER TABLE artifact
 ALTER TABLE artifact_version
   ADD COLUMN IF NOT EXISTS base_model TEXT;
 
--- Publishing detaches; it does not destroy.
+-- The key does not guess what an artifact's lifetime should be.
 --
--- This key was ON DELETE CASCADE, so removing an admin account removed every
--- artifact that admin had published — a global MCP server, its versions and
--- its config-patch history — with no review and no record. SPEC §12.3 says a
--- published artifact has left its owner's sole control and changes through
--- config ops, and a cascade is a change nobody proposed.
+-- Deleting an account means two different things depending on visibility, and
+-- a foreign key cannot see visibility. Both guesses are wrong in a way that
+-- destroys something:
 --
--- SET NULL rather than RESTRICT: refusing to delete the account would make
--- one published row block a personnel action indefinitely, which is a worse
--- answer than an artifact that survives without an owner. Owner-less already
--- has a meaning here — `_get_owned_artifact` treats it as a system artifact
--- only an admin may reach, and `mcp_client.servers_for_turn` skips it,
--- because the admin attestation is what made it a capability. So a detached
--- server goes inert and its history stays, which is the outcome that can be
--- inspected and undone.
+--   CASCADE  — what this was — removes every artifact the account published.
+--              A global MCP server, its versions and its config-patch history
+--              vanish because a person left, which SPEC §12.3 says is a change
+--              only config ops may make.
+--   SET NULL — the first correction, and wrong in the other direction: a
+--              *private* artifact survives the deletion of the account that
+--              owned it, unattributed, with its payload still on disk. §2.1
+--              says an account's private artifacts go with it.
 --
--- Private rows are still deleted, by `delete_user`, before the account goes.
--- The key cannot tell visibilities apart, so a raw `DELETE FROM app_user`
--- leaves a private artifact detached rather than removed. That direction is
--- deliberate: recoverable beats unrecoverable when the key is guessing.
+-- So the key refuses instead. `delete_user` is the path that knows the rule:
+-- inside one transaction it deletes the private rows, detaches the published
+-- ones, and only then removes the account — by which point nothing references
+-- it and RESTRICT has nothing to refuse. Measured: `delete_user` completes
+-- unchanged against this constraint.
+--
+-- What RESTRICT costs is a raw `DELETE FROM app_user` that skipped all of
+-- that, and refusing it is the point. An operation that cannot state which
+-- artifacts should die and which should be detached is an operation that
+-- should stop, not one that should pick.
+--
+-- Owner-less remains a real state, reached by detaching rather than by
+-- deletion: `_get_owned_artifact` treats it as a system artifact only an
+-- admin may reach, and `mcp_client.servers_for_turn` skips it, because the
+-- admin attestation is what made it a capability.
 DO $$
 BEGIN
   IF EXISTS (
@@ -187,13 +197,17 @@ BEGIN
     WHERE c.conrelid = 'artifact'::regclass
       AND c.contype = 'f'
       AND c.confrelid = 'app_user'::regclass
-      AND c.confdeltype = 'c'
+      AND c.confdeltype <> 'r'
   ) THEN
     ALTER TABLE artifact
       DROP CONSTRAINT IF EXISTS artifact_owner_user_id_fkey;
+    -- A database that ran with CASCADE may hold no offending rows at all, and
+    -- one that ran with SET NULL may hold detached private artifacts. Neither
+    -- blocks ADD CONSTRAINT: the key constrains deletion of the parent, not
+    -- the state of the child, so this installs over any history.
     ALTER TABLE artifact
       ADD CONSTRAINT artifact_owner_user_id_fkey
-      FOREIGN KEY (owner_user_id) REFERENCES app_user(id) ON DELETE SET NULL;
+      FOREIGN KEY (owner_user_id) REFERENCES app_user(id) ON DELETE RESTRICT;
   END IF;
 END $$;
 

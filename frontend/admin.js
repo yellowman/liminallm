@@ -459,9 +459,21 @@ const renderMcpServers = (servers) => {
   const rows = servers
     .map((s) => {
       const schema = s.schema || {};
-      // `enabled` defaults to true when absent, the same way the resolver
-      // reads it — a blank cell here would say "off" for a server that is on.
-      const enabled = schema.enabled === false ? 'disabled' : 'enabled';
+      // Three states, because the resolver has three answers. `enabled`
+      // defaults to true when absent, the same way the resolver reads it — a
+      // blank cell would say "off" for a server that is on. And a row with no
+      // owner is offered to nobody however `enabled` reads: the admin
+      // attestation is what made it a capability, so a server whose publisher
+      // was deleted is inert until an admin publishes it again. Showing that
+      // as "enabled" tells an operator the opposite of what is true.
+      let enabled;
+      if (!s.owner_user_id) {
+        enabled = 'inert — publisher removed';
+      } else if (schema.enabled === false) {
+        enabled = 'disabled';
+      } else {
+        enabled = 'enabled';
+      }
       // Unrecognized is egress there, so it must read as egress here too.
       const taint = schema.taint_class === 'local_read' ? 'local_read' : 'egress';
       return `

@@ -1742,10 +1742,11 @@ class PostgresStore:
                 )
 
             # 9. Delete the private artifacts, and detach the published ones.
-            # Stated here rather than left to the foreign key, which does the
-            # same thing: this is where the rule is visible to anyone reading
-            # what erasure takes. The key is the backstop for every other path
-            # — a maintenance statement, a restore — that never reads this.
+            # This is the only place that knows the difference. The foreign
+            # key is `ON DELETE RESTRICT` precisely because it cannot see
+            # visibility, so both of these have to happen here — and after
+            # them nothing references the account, which is why a restrictive
+            # key never blocks step 17.
             if artifact_ids:
                 conn.execute(
                     "DELETE FROM artifact WHERE id = ANY(%s)", (artifact_ids,)

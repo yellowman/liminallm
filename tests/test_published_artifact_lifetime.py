@@ -154,29 +154,67 @@ class TestDeletingThePublisherLeavesTheConfiguration:
                 "SELECT count(*) AS n FROM artifact WHERE id = %s", (artifact_id,)
             ) == 0, "a private artifact outlived the account that owned it"
 
-    def test_the_foreign_key_detaches_rather_than_cascading(self, client):
+    def test_the_foreign_key_refuses_rather_than_guessing(self, client):
         """The database's own answer, not the delete path's.
 
         `delete_user` is one caller. The constraint decides what happens on
         every other path there will ever be — a maintenance statement, a
-        future admin flow, a restore — and it said CASCADE, which would take
-        published rows out from under any code that had been careful.
+        future admin flow, a restore — and it cannot see visibility, so every
+        answer it could give on its own destroys something. CASCADE removes
+        published configuration; SET NULL leaves a private artifact, and its
+        payload, behind an account that was deleted.
+
+        So it refuses, and the operation that skipped the lifecycle stops.
         """
+        import psycopg
+
         publisher_id, publisher = _account(client, "fk", admin=True)
         with MCPFixture(f"fk{uuid.uuid4().hex[:6]}") as fixture:
             artifact_id = _publish(client, publisher, fixture)
 
             # Straight at the table, so no application code is in the way.
-            with get_runtime().store._connect() as conn:
-                conn.execute("DELETE FROM app_user WHERE id = %s", (publisher_id,))
+            with pytest.raises(psycopg.errors.ForeignKeyViolation):
+                with get_runtime().store._connect() as conn:
+                    conn.execute(
+                        "DELETE FROM app_user WHERE id = %s", (publisher_id,)
+                    )
+
+            assert _count(
+                "SELECT count(*) AS n FROM artifact WHERE id = %s", (artifact_id,)
+            ) == 1, "the refusal did not leave the artifact alone"
+            assert _count(
+                "SELECT count(*) AS n FROM app_user WHERE id = %s", (publisher_id,)
+            ) == 1, "the account went anyway"
+
+    def test_a_private_artifact_is_never_left_behind_by_the_key(self, client):
+        """The failure the first correction introduced.
+
+        `SET NULL` was wrong in the direction nobody was watching: a private
+        artifact whose owner is deleted survives, unattributed, with its
+        payload still under the shared filesystem root. §2.1 says an account's
+        private artifacts go with it, so a key that keeps them is a key that
+        breaks the erasure guarantee to protect published configuration.
+        """
+        import psycopg
+
+        owner_id, owner = _account(client, "keep", admin=True)
+        with MCPFixture(f"keep{uuid.uuid4().hex[:6]}") as fixture:
+            artifact_id = _publish(client, owner, fixture, visibility="private")
+
+            with pytest.raises(psycopg.errors.ForeignKeyViolation):
+                with get_runtime().store._connect() as conn:
+                    conn.execute("DELETE FROM app_user WHERE id = %s", (owner_id,))
 
             with get_runtime().store._connect() as conn:
                 row = conn.execute(
                     "SELECT owner_user_id FROM artifact WHERE id = %s", (artifact_id,)
                 ).fetchone()
 
-            assert row is not None, "the constraint still cascades"
-            assert row["owner_user_id"] is None, row
+            assert row is not None
+            assert str(row["owner_user_id"]) == owner_id, (
+                "a private artifact was detached from an account that is being "
+                "deleted, which outlives the erasure it belongs to"
+            )
 
 
 class TestTheDeletePathDefendsItselfWithoutTheKey:
@@ -206,9 +244,10 @@ class TestTheDeletePathDefendsItselfWithoutTheKey:
             ).fetchone()
         return row["confdeltype"] if row else ""
 
-    def test_the_installed_key_detaches(self):
-        """`n` is SET NULL. `c` is the cascade this replaced."""
-        assert self._constraint_delete_rule() == "n"
+    def test_the_installed_key_refuses(self):
+        """`r` is RESTRICT. `c` was the cascade; `n` the SET NULL that
+        replaced it and guessed wrong for private rows."""
+        assert self._constraint_delete_rule() == "r"
 
     def test_erasure_detaches_on_a_database_that_never_migrated(self, client):
         """The key put back the way it was, then a real deletion over it."""
@@ -246,7 +285,7 @@ class TestTheDeletePathDefendsItselfWithoutTheKey:
                         "ALTER TABLE artifact "
                         "ADD CONSTRAINT artifact_owner_user_id_fkey "
                         "FOREIGN KEY (owner_user_id) REFERENCES app_user(id) "
-                        "ON DELETE SET NULL"
+                        "ON DELETE RESTRICT"
                     )
 
 
@@ -311,15 +350,21 @@ class TestAFreshDatabaseGetsTheRightKey:
         try:
             self._apply(dsn)
 
-            assert self._delete_rule(dsn) == "n", (
-                "a fresh install gets a key that destroys published artifacts "
-                "when their publisher's account is removed"
+            assert self._delete_rule(dsn) == "r", (
+                "a fresh install gets a key that decides an artifact's "
+                "lifetime on its own, and it cannot see visibility"
             )
         finally:
             self._drop(admin, name)
 
-    def test_an_old_installation_is_migrated(self):
-        """The other half: a database that already has the cascade."""
+    @pytest.mark.parametrize("was", ["CASCADE", "SET NULL"], ids=["cascade", "set_null"])
+    def test_an_old_installation_is_migrated(self, was):
+        """Both earlier answers, because two databases exist in the wild.
+
+        One never ran the first correction and still cascades. One ran it and
+        carries `SET NULL`. The migration has to reach both, which is why its
+        condition is `confdeltype <> 'r'` rather than a test for the cascade.
+        """
         import psycopg
 
         name, dsn, admin = self._scratch()
@@ -332,13 +377,15 @@ class TestAFreshDatabaseGetsTheRightKey:
                 )
                 conn.execute(
                     "ALTER TABLE artifact ADD CONSTRAINT artifact_owner_user_id_fkey "
-                    "FOREIGN KEY (owner_user_id) REFERENCES app_user(id) "
-                    "ON DELETE CASCADE"
+                    f"FOREIGN KEY (owner_user_id) REFERENCES app_user(id) "
+                    f"ON DELETE {was}"
                 )
-            assert self._delete_rule(dsn) == "c", "the setup did not take"
+            assert self._delete_rule(dsn) == {"CASCADE": "c", "SET NULL": "n"}[was], (
+                "the setup did not take"
+            )
 
             self._apply(dsn)
 
-            assert self._delete_rule(dsn) == "n", "the migration did not run"
+            assert self._delete_rule(dsn) == "r", "the migration did not run"
         finally:
             self._drop(admin, name)
