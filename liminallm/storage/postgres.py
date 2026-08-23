@@ -138,6 +138,24 @@ def _tsquery_terms(query: str, *, max_terms: int = _MAX_TSQUERY_TERMS) -> str:
     return " | ".join(terms)
 
 
+class _Unset:
+    """"Not mentioned", for patch arguments whose `None` means SQL NULL.
+
+    A patch method that defaults its arguments to `None` cannot express
+    "clear this column": `None` is already spoken for by "leave it alone".
+    Where a caller has to be able to say a field has no value, it takes this
+    instead as its default.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging only
+        return "<unset>"
+
+
+_UNSET = _Unset()
+
+
 class PostgresStore:
     """Thin Postgres-backed store to persist kernel primitives."""
 
@@ -1070,11 +1088,21 @@ class PostgresStore:
         job_id: str,
         *,
         status: str | None = None,
-        loss: float | None = None,
-        new_version: int | None = None,
+        loss: float | None | _Unset = _UNSET,
+        new_version: int | None | _Unset = _UNSET,
         dataset_path: str | None = None,
         meta: dict | None = None,
     ) -> TrainingJob | None:
+        """Patch one training job. Omitted fields keep their value.
+
+        `loss` and `new_version` distinguish "not mentioned" from "there is
+        none", because a terminal write has to be able to say the second.
+        `None` used to mean the first for both, so a skipped attempt could
+        say it never trained while keeping the loss and version an earlier
+        attempt on the same job had recorded — and the worker retries the
+        same claimed `job_id`, so that pairing is reachable rather than
+        theoretical.
+        """
         existing = self.get_training_job(job_id)
         if not existing:
             return None
@@ -1094,8 +1122,12 @@ class PostgresStore:
                 """,
                 (
                     status if status is not None else existing.status,
-                    loss if loss is not None else existing.loss,
-                    new_version if new_version is not None else existing.new_version,
+                    existing.loss if loss is _UNSET else loss,
+                    (
+                        existing.new_version
+                        if new_version is _UNSET
+                        else new_version
+                    ),
                     dataset_path if dataset_path is not None else existing.dataset_path,
                     self._json_param(meta if meta is not None else existing.meta),
                     new_updated_at,

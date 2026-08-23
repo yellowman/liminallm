@@ -304,9 +304,11 @@ class TrainingWorker:
                             result.get("jax_trace"), gate
                         ),
                         loss=result.get("loss"),
-                        # TrainingService already set new_version on promotion;
-                        # the result exposes the directory, not the number.
-                        new_version=None,
+                        # `new_version` is deliberately not passed: the service
+                        # already set it on promotion and cleared it otherwise,
+                        # and the result exposes the directory rather than the
+                        # number. Passing `None` here would now mean NULL and
+                        # erase the version the promotion just recorded.
                         meta=existing_meta,
                     )
                     logger.info(
@@ -329,10 +331,16 @@ class TrainingWorker:
                         await self.clusterer.cluster_after_training(user_id)
                     return
                 else:
-                    # No events to train on
+                    # No events to train on. The same rule as any other
+                    # skipped run: this attempt produced no loss and promoted
+                    # nothing, so an earlier attempt's numbers on this job go
+                    # with it rather than surviving under a status that says
+                    # nothing ran.
                     self.store.update_training_job(
                         job_id,
                         status="skipped",
+                        loss=None,
+                        new_version=None,
                         meta={"reason": "no_preference_events"},
                     )
                     logger.info("training_job_skipped", job_id=job_id, reason="no_events")
@@ -362,7 +370,11 @@ class TrainingWorker:
                     )
                     await asyncio.sleep(backoff)
 
-        # All retries exhausted
+        # All retries exhausted. `loss` and `new_version` are deliberately
+        # left as they are rather than cleared: unlike a skipped run, this
+        # says the worker gave up, not that nothing happened. If an attempt
+        # promoted a version before the failure, the artifact really does
+        # carry it, and erasing the record would hide that.
         self.store.update_training_job(
             job_id,
             status="dead_letter",

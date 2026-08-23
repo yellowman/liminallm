@@ -487,10 +487,17 @@ last-used and last-trained stamps.
 and nominal owner, carries status, dataset path, event ids, loss, the
 resulting version, and `meta.eval_gate` — the recorded gate decision
 (§5.4.6). A terminal status says what happened: `succeeded` trained and
-was promoted, `gate_rejected` trained and failed the holdout, `skipped`
-did not train and so carries no loss, and `dead_letter` exhausted the
-worker's retries. `queued` and `running` are the two non-terminal ones,
-and are the only statuses the per-user throttle counts as active.
+was promoted; `gate_rejected` trained but the promotion gate did not
+approve it, whether because the holdout showed no improvement or because
+there was no holdout to measure (§5.4.6); `skipped` did not train, and so
+carries no loss and no version; and `dead_letter` exhausted the worker's
+retries. `queued` and `running` are the two non-terminal ones, and are the
+only statuses the per-user throttle counts as active.
+
+`loss` and `new_version` are cleared by a status that denies them rather
+than left to an earlier attempt: the worker retries the same claimed job,
+so a skipped attempt that only overwrote the status would read as a run
+that never trained and yet produced a version.
 
 The dataset pipeline is specified in §5.4.
 
@@ -1015,7 +1022,11 @@ loop for a `training_job`:
   recent positive-feedback density and no recent training; priority
   admin > paying > free with fairness.
 - retry policy: exponential backoff on transient failures (I/O, OOM), max
-  3 attempts, then failed with reason.
+  3 attempts, then `dead_letter` with the reason. that status says the
+  worker gave up rather than that nothing ran, so unlike a skipped run it
+  keeps whatever loss and version an attempt had already recorded — if one
+  promoted before the failure, the artifact carries that version and the
+  job should not deny it.
 
 ### 5.5 adapter ladder (prompt → weights lifecycle)
 

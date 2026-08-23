@@ -11661,3 +11661,63 @@ loss" unconditionally — and its `training_job` vocabulary was three statuses
 out of date, listing a `failed` the code does not write while omitting
 `gate_rejected`, `skipped` and `dead_letter`. Both corrected, along with the
 "what skipped covers" list.
+
+### Carry-over: `None` meant two incompatible things at the storage boundary
+
+The classification fix wrote `loss=None` and `new_version=None` for a skipped
+run, meaning "this run has neither". `PostgresStore.update_training_job` read
+the same `None` as "leave the column alone":
+
+```python
+loss if loss is not None else existing.loss
+new_version if new_version is not None else existing.new_version
+```
+
+So saying a run never trained did not remove the numbers of one that had. The
+two reds from the previous commit could not see it: both start from a fresh
+job whose columns are already NULL, so they prove the status is assigned and
+nothing about the other fields being cleared.
+
+The route is not synthetic. The worker retries the same claimed `job_id`, and
+the service writes its terminal result before the worker re-reads and
+finalizes the job — so a transient failure in that later database work leaves
+a second attempt running against a job that already carries the first
+attempt's `loss` and `new_version`. A skipped second attempt then reads as a
+run that never trained and yet produced version 7 at loss 0.42.
+
+`_UNSET` separates the two meanings: omitted preserves, explicit `None` writes
+SQL NULL. Only `loss` and `new_version` need it — they are the fields a
+terminal status can deny.
+
+One companion change, and it is the reason this is not a one-line fix. The
+worker passed `new_version=None` *intending* to preserve what the service
+recorded on promotion; its comment said so. Under correct nullable semantics
+that argument had to be omitted instead, or every promotion would be erased at
+finalization. Nothing in the suite caught that: passing `None` there left the
+whole fast lane green, so the promoted branch had no witness at all.
+
+Two reds, one per direction. A job seeded with `loss=0.42, new_version=7` then
+driven with a skipped trace must end with both NULL; a promoted run through
+the worker must keep the version the service recorded. Five mutations, each
+killed: the storage reverting to "None preserves" for either field, the
+service omitting the fields on a skipped run, the worker passing
+`new_version=None` again, and the loss no longer coming from the trace.
+
+The sibling call site got the same rule: "no preference events" is a skipped
+run too, so it now clears both fields rather than leaving an earlier attempt's
+numbers under a status that says nothing ran. `dead_letter` deliberately does
+not — it says the worker gave up, not that nothing happened, and if an attempt
+promoted a version before the failure the artifact really carries it.
+
+The dataset-size fallback is gone with it. The loop appends a step per batch
+and a run with no batches is skipped before it starts, so a trained run always
+has a loss in its trace; what is left is a step whose loss is not a
+non-negative number, which a diverged run produces and which is not a loss
+either. `None` is the honest answer there.
+
+SPEC: `gate_rejected` now reads "trained, but the promotion gate did not
+approve it", covering both a measured regression and a dataset too small to
+hold anything out — the branch the gate-rejected red actually exercises, now
+asserted by name so it cannot drift to the other one. The retry paragraph said
+"max 3 attempts, then failed with reason"; `failed` is not a status this code
+writes, and the correct one is `dead_letter`.

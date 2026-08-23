@@ -521,19 +521,22 @@ class TrainingService:
                 job_id=job_id,
                 reason=gate["reason"],
             )
-        # SPEC §5.4: metrics are loss and preference alignment rate. A run
-        # that did not train has no loss, and `1/(1+len(dataset))` is not one
-        # — it reported that the run went well because the dataset was large.
+        # SPEC §5.4: metrics are loss and preference alignment rate. The loss
+        # is the one the loop produced or there is none — there is no
+        # fallback, because `1/(1+len(dataset))` reported that a run went well
+        # because its dataset was large. A trained run always has one: the
+        # loop appends a step per batch, and a run with no batches is skipped
+        # before it starts. What is left is a step whose loss is not a
+        # non-negative number, which a diverged run produces and which is not
+        # a loss either.
         status = self.terminal_status(training_trace, gate)
         loss = None
-        if status != "skipped":
-            loss = 1.0 / (1 + len(dataset_entries))  # Fallback heuristic
-            if training_trace.get("steps"):
-                final_step = training_trace["steps"][-1]
-                if isinstance(final_step, dict) and "loss" in final_step:
-                    actual_loss = final_step.get("loss")
-                    if isinstance(actual_loss, (int, float)) and actual_loss >= 0:
-                        loss = float(actual_loss)
+        if status != "skipped" and training_trace.get("steps"):
+            final_step = training_trace["steps"][-1]
+            if isinstance(final_step, dict):
+                actual_loss = final_step.get("loss")
+                if isinstance(actual_loss, (int, float)) and actual_loss >= 0:
+                    loss = float(actual_loss)
         self.store.update_training_job(
             job_id,
             status=status,

@@ -181,6 +181,12 @@ class TestAJobSaysWhatActuallyHappened:
             "the recorded loss is not the one the training loop produced"
         )
         assert job.new_version is None
+        # Named, so this keeps testing the branch it was written for: the gate
+        # also refuses a run it cannot evaluate, and `gate_rejected` covers
+        # both that and a measured regression.
+        assert "no holdout" in job.meta["eval_gate"]["reason"], (
+            job.meta["eval_gate"]
+        )
 
     def test_no_train_batches_is_a_skipped_run_not_an_empty_success(self, tmp_path):
         """Zero optimizer updates is not a training run that went well.
@@ -200,3 +206,81 @@ class TestAJobSaysWhatActuallyHappened:
 
         assert trace["status"] == "skipped", trace
         assert "batch" in trace["reason"], trace
+
+    def test_a_skipped_run_clears_the_previous_attempt_terminal_fields(
+        self, tmp_path
+    ):
+        """`None` has to mean NULL here, not "leave what is already there".
+
+        The worker retries the same claimed `job_id` after an exception, and
+        the service writes the terminal result before the worker re-reads and
+        finalizes it. So a transient failure in that later database work
+        leaves a second attempt running against a job that already carries a
+        previous attempt's `loss` and `new_version`. If the second attempt is
+        skipped, saying so is not enough: the earlier numbers have to go, or
+        the job reads as a run that never trained and yet produced version 7
+        at loss 0.42.
+        """
+        store = get_test_store()
+        training = TrainingService(store, fs_root=str(tmp_path))
+        user, adapter = self._job_with_one_positive_event(store, training, "_stale")
+        job = store.create_training_job(user.id, adapter.id)
+        store.update_training_job(job.id, loss=0.42, new_version=7)
+        assert store.get_training_job(job.id).loss == pytest.approx(0.42)
+
+        self._trace(training, {"status": "skipped", "reason": "no base checkpoint"})
+        training.train_from_preferences(user.id, adapter.id, job_id=job.id)
+
+        refreshed = store.get_training_job(job.id)
+        assert refreshed.status == "skipped"
+        assert refreshed.loss is None, (
+            f"a run that never trained kept an earlier attempt's loss "
+            f"({refreshed.loss})"
+        )
+        assert refreshed.new_version is None, (
+            f"a run that never trained kept an earlier attempt's version "
+            f"({refreshed.new_version})"
+        )
+
+    def test_a_promoted_run_keeps_the_version_the_service_recorded(self, tmp_path):
+        """The worker finalizes the job; it must not undo the promotion.
+
+        `TrainingService` writes `new_version` when the gate promotes, and the
+        result it returns names the directory rather than the number. The
+        worker therefore leaves that column alone — which under
+        "None preserves" it did by passing `None`, and under "None is NULL" it
+        does by not passing it at all. Measured: passing `None` here erased a
+        promoted version and nothing in the suite noticed.
+        """
+        import asyncio
+
+        from liminallm.service.training_worker import TrainingWorker
+
+        store = get_test_store()
+        training = TrainingService(store, fs_root=str(tmp_path))
+        user, conversation = _create_user_and_conversation(store, "_promoted")
+        adapter = self._adapter(store, user.id)
+        job = store.create_training_job(user.id, adapter.id)
+        # What the service records on promotion, before the worker finalizes.
+        store.update_training_job(job.id, new_version=3, loss=0.5)
+        credited = []
+        training.record_training_outcome = lambda **kw: credited.append(kw)
+        training.train_from_preferences = lambda *a, **k: {
+            "job_id": job.id,
+            "adapter_id": adapter.id,
+            "version_dir": str(tmp_path / "v0003"),
+            "status": "succeeded",
+            "loss": 0.5,
+            "jax_trace": {"status": "ok", "steps": [{"loss": 0.5}]},
+            "eval_gate": {"promoted": True, "reason": "improved"},
+        }
+
+        asyncio.run(TrainingWorker(store, training)._process_job(job))
+
+        refreshed = store.get_training_job(job.id)
+        assert refreshed.status == "succeeded", refreshed.status
+        assert refreshed.new_version == 3, (
+            "the worker erased the version the promotion recorded: "
+            f"{refreshed.new_version}"
+        )
+        assert credited, "a promoted run was not credited to the router"
