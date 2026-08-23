@@ -11960,3 +11960,32 @@ The test job set `ALLOW_REDIS_FALLBACK_DEV: "true"`. That setting is
 admin-managed with no environment variable, so the line reached nothing;
 `TEST_MODE`, set beside it, is what actually permits the fallback. Same defect
 class as the compose variables, one file over.
+
+### Carry-over: the browser MFA witness, and two vacuous waits
+
+Added against the reviewer's steer — "mostly ceremony around code generation
+unless an actual UI defect appears" — because measurement partly disagreed. No
+UI defect appeared, so that half was right. But three mutations die only here:
+the SPA putting a `session_id` back in the `mfa/request` body, the same in the
+`mfa/verify` body, and `verify` issuing tokens for `body.session_id` rather
+than the resolved one. The first two are frontend and have no API-level
+witness at all; the third is a response field the API tests never read.
+
+Building it produced two vacuous waits worth recording, both of which made the
+test pass while the thing it checks was broken:
+
+* `page.wait_for_function` polls a **synchronous** predicate, and an `async`
+  arrow hands it a Promise — always truthy, so the wait returned on the first
+  poll. Measured: that version passed with the entire verify path mutated
+  away. `page.evaluate` awaits the promise and the assertion is separate.
+* `page.wait_for_selector("#x.hidden")` defaults to `state="visible"`, so it
+  waits for a hidden element to become visible and times out forever. The
+  plain selector with `state="hidden"` is the one that means "closed".
+
+The TOTP generator is checked against RFC 6238's published vector before it is
+trusted to judge the server, rather than against our reading of
+`service/auth.py`.
+
+Seven mutations, each killed: either MFA route requiring the JS session id,
+the challenge bound to the wrong session, verify issuing tokens for the body's
+session, and the SPA restoring a session id to either body.
