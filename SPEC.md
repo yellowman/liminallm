@@ -2749,6 +2749,12 @@ the initial top-k, and must never be the only way the context is reachable —
 a context the user selected does not depend on the model deciding to go
 looking for it.
 
+routing adds capability; it does not rearrange priority. selected grounding
+is budgeted as **context**, so §20.3 prunes it from the low-priority end
+before any conversation turn is evicted, exactly as on the plain path. the
+`context_snippets` a turn reports are the chunks that survived that pruning
+and were actually in the prompt — never the larger retrieved set.
+
 | tool | offered when | returns |
 |---|---|---|
 | `file_search` | conversation has searchable attachments, **or** the turn names a knowledge context the caller owns | excerpts + file names |

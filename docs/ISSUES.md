@@ -13848,3 +13848,56 @@ broke instead of reporting that the model was never called.
 The same live probe, against the shipped configuration and a real model, went
 from three misses to three hits. The control — the same question with no
 context selected — misses in both, which is what makes the hits mean anything.
+
+### Two seams the first pass left, both found by review
+
+**The streaming half was implemented and not witnessed.** The red was six
+cases against `WorkflowEngine.run`. The green also changed
+`_stream_agent_files_node`, which calls `_explicit_context_grounding` itself,
+passes its own arguments into `_build_agent_context`, and seeds its own worker
+plan. Sharing the assembly function does not make any of that shared, so "both
+paths are fixed" rested on reading the code and one live browser run. That is
+the same altitude mistake as the defect itself: a seam above the shared
+function, invisible from below.
+
+One `run_streaming` case now covers it, and two mutations confirm the
+separation — removing the streaming retrieval, or the two arguments it passes
+down, kills that case alone and leaves every batch case green.
+
+**Grounding was exempt from the prompt budget.** `_apply_prompt_budget` drops
+context from its low-priority end *before* it drops any conversation history,
+and then refuses the turn if the prompt still does not fit. Appending the
+retrieved chunks straight onto `system_content` and passing `[]` as the
+context put them inside an indivisible system block, so the pruner reached
+past them:
+
+```text
+llm.generic:  drop lowest-priority context  -> then, if needed, history
+agent (as first written):  grounding cannot be dropped
+                           -> evict history instead
+                           -> reject the turn once the block alone overflows
+```
+
+Tool routing may add capabilities. It does not promote retrieved knowledge
+above the ordinary budget rules. Grounding is now passed as context and
+appended only after budgeting, so it is pruned before history like everything
+else — and `_build_agent_context` returns the surviving subset rather than the
+retrieved one.
+
+That return value is the point of the signature change. `context_snippets` is
+a claim about what the model was shown, so reporting the pre-pruning
+retrieval would name chunks that never reached it — the same class of untruth
+as reporting a context that was never injected, one stage later. The
+four-tuple was worth keeping while it cost only sixteen unpackings; it was not
+worth keeping at the price of recomputing the surviving set or parsing it back
+out of the system prompt.
+
+Two more mutations for that half: folding grounding into the system block
+before budgeting kills both budget cases, and reporting the retrieval instead
+of the survivors kills the reporting case alone.
+
+Seven mutations now, all applied and all killed. Two earlier attempts did not
+apply at all — a stale anchor, and a cooked string that turned a literal
+backslash-n into a newline — and a mutation that does not apply measures
+nothing, so the driver now reports an unmatched anchor as loudly as a
+survivor rather than printing a reassuring "skipped".

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from types import SimpleNamespace
 
 import pytest
 
@@ -248,6 +249,145 @@ class TestASelectedContextSurvivesToolRouting:
         assert "file_search" in model.first_tool_names, model.first_tool_names
 
 
+class TestTheStreamingPathIsGroundedToo:
+    """A second propagation seam, above the function the two paths share.
+
+    `_stream_agent_files_node` calls `_explicit_context_grounding` itself,
+    passes its own arguments into `_build_agent_context`, and seeds its own
+    worker plan. Sharing the assembly function does not make any of that
+    shared, so the batch witnesses above say nothing about it — which is the
+    altitude mistake this file exists to stop making twice.
+    """
+
+    def test_a_streamed_turn_carries_the_selected_context(
+        self, engine, model, store, monkeypatch
+    ):
+        user_id, ctx_id = grounded_context(store)
+        web_on(monkeypatch, engine)
+
+        # The final answer streams from the parent rather than the worker, so
+        # it needs an encoder of its own; the tool rounds still go through the
+        # recording model, which is what the grounding assertion reads.
+        monkeypatch.setattr(
+            engine.llm,
+            "stream_messages",
+            lambda messages, adapters=None, user_id=None: iter(
+                [{"event": "token", "data": "ok"},
+                 {"event": "message_done", "data": {"content": "ok", "usage": {}}}]
+            ),
+            raising=False,
+        )
+
+        async def collect():
+            return [
+                event
+                async for event in engine.run_streaming(
+                    None, None, QUESTION, ctx_id, user_id
+                )
+            ]
+
+        events = asyncio.run(collect())
+        done = [e for e in events if e.get("event") == "message_done"]
+        assert done, [e.get("event") for e in events]
+
+        assert FACT in model.first_prompt, (
+            "the streamed turn's first model call was not grounded: "
+            f"{model.first_prompt[:400]}"
+        )
+        reported = done[-1]["data"].get("context_snippets") or []
+        assert any(FACT in s for s in reported), (
+            f"message_done reported no snippet carrying the fact: {reported}"
+        )
+
+
+class TestGroundingObeysThePromptBudget:
+    """Capability may be added. Priority may not be rearranged.
+
+    `_apply_prompt_budget` drops context from its low-priority end before it
+    drops any conversation history. Grounding appended straight onto
+    `system_content` is not context as far as that function is concerned — it
+    is part of an indivisible system block, so the pruner reaches past it and
+    evicts turns instead, and once the block alone overflows the turn is
+    refused rather than trimmed.
+    """
+
+    def test_grounding_is_pruned_before_conversation_history(
+        self, engine, model, store, monkeypatch
+    ):
+        user_id, ctx_id = grounded_context(store)
+        web_on(monkeypatch, engine)
+
+        # Small budget, short history, grounding too large to keep whole.
+        engine._budget_cache = None
+        monkeypatch.setattr(
+            engine.llm, "context_window", lambda: 2048, raising=False
+        )
+        monkeypatch.setattr(engine, "prompt_budget", lambda: 700)
+        history = [
+            SimpleNamespace(role="user", content="the earlier question"),
+            SimpleNamespace(role="assistant", content="the earlier answer"),
+        ]
+        chunks = [f"chunk {i} " + ("filler " * 120) for i in range(5)]
+
+        messages, _tools, _preamble, _mcp, kept = engine._build_agent_context(
+            QUESTION, [], history, user_id, None,
+            explicit_context_ids=[ctx_id], grounding=chunks,
+        )
+
+        assert kept != chunks, (
+            "nothing was pruned, so this case did not exercise the budget"
+        )
+        assert len(kept) < len(chunks)
+        # Pruned from the low-priority end, keeping the best-ranked chunks.
+        assert kept == chunks[: len(kept)], kept
+
+        prompt = "\n".join(str(m.get("content") or "") for m in messages)
+        assert all(chunk in prompt for chunk in kept), (
+            "a chunk was reported as kept but is not in the prompt"
+        )
+        assert all(chunk not in prompt for chunk in chunks[len(kept):]), (
+            "a pruned chunk reached the prompt anyway"
+        )
+        # History is lower priority than nothing here: context goes first.
+        surviving = [m for m in messages if m.get("role") in {"user", "assistant"}]
+        assert len(surviving) == len(history) + 1, (
+            "history was evicted while grounding was still being kept: "
+            f"{[m['role'] for m in surviving]}"
+        )
+
+    def test_the_turn_reports_only_grounding_that_reached_the_model(
+        self, engine, model, store, monkeypatch
+    ):
+        """`context_snippets` is a claim about the prompt, not about retrieval.
+
+        Reporting the retrieved set would name chunks the model never saw,
+        which is the same class of lie as reporting a context that was never
+        injected — just one stage later.
+        """
+        user_id, ctx_id = grounded_context(store)
+        web_on(monkeypatch, engine)
+        engine._budget_cache = None
+        monkeypatch.setattr(engine, "prompt_budget", lambda: 700)
+        chunks = [f"chunk {i} " + ("filler " * 120) for i in range(5)]
+
+        monkeypatch.setattr(
+            engine,
+            "_explicit_context_grounding",
+            lambda *a, **k: ([ctx_id], list(chunks)),
+        )
+        result = asyncio.run(engine.run(None, None, QUESTION, ctx_id, user_id))
+
+        reported = result.get("context_snippets") or []
+        assert reported, "the turn reported no grounding at all"
+        assert len(reported) < len(chunks), (
+            f"the turn reported the whole retrieval, unpruned: {len(reported)}"
+        )
+        prompt = model.first_prompt
+        assert all(snippet in prompt for snippet in reported), (
+            "a reported snippet never reached the model"
+        )
+
+
 class TestCapabilityIsNotTradedForGrounding:
     """The wrong fix, refused by name.
 
@@ -264,7 +404,7 @@ class TestCapabilityIsNotTradedForGrounding:
         _user_id, _ctx_id = grounded_context(store)
         web_on(monkeypatch, engine)
 
-        _messages, tools, _preamble, _mcp = engine._build_agent_context(
+        _messages, tools, _preamble, _mcp, _grounded = engine._build_agent_context(
             QUESTION, [], [], None, None
         )
 

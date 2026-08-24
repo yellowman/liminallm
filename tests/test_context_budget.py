@@ -155,7 +155,7 @@ def test_agent_context_budgets_history(monkeypatch):
     history = [
         SimpleNamespace(role="user", content="word " * 800) for _ in range(20)
     ]
-    messages, _tools, _preamble, _mcp = engine._build_agent_context(
+    messages, _tools, _preamble, _mcp, _grounded = engine._build_agent_context(
         "question", [], history, "user-1", None
     )
     # system + budgeted history + the user turn, not all 20 turns.
@@ -658,7 +658,7 @@ def test_history_search_is_scoped_to_the_owner():
 def test_history_tool_offered_only_once_turns_fall_outside_the_window():
     engine = _engine()
     short = [SimpleNamespace(role="user", content="hi", seq=i) for i in range(3)]
-    _msgs_out, tools, _, _ = engine._build_agent_context("q", [], short, "u", None)
+    _msgs_out, tools, _, _, _grounded = engine._build_agent_context("q", [], short, "u", None)
     assert not any(
         t["function"]["name"] == "history_search" for t in tools
     )
@@ -669,7 +669,7 @@ def test_history_tool_offered_only_once_turns_fall_outside_the_window():
         for i in range(compaction.RECENT_MESSAGES + 5)
     ]
     with _mock.patch.object(engine, "history_budget", return_value=100):
-        _msgs_out, tools, _, _ = engine._build_agent_context("q", [], long, "u", None)
+        _msgs_out, tools, _, _, _grounded = engine._build_agent_context("q", [], long, "u", None)
     assert any(t["function"]["name"] == "history_search" for t in tools)
 
 

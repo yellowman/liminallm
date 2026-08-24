@@ -484,7 +484,7 @@ class WorkflowStreamingMixin:
         # this line. It stays because a synchronous network call in an
         # `async def` is a stall waiting for a caller to change, not because a
         # measurement demands it.
-        messages, tools, _, mcp_tools = await asyncio.to_thread(
+        messages, tools, _, mcp_tools, grounded = await asyncio.to_thread(
             partial(
                 self._build_agent_context,
                 explicit_context_ids=explicit_ids,
@@ -549,10 +549,11 @@ class WorkflowStreamingMixin:
                         "max_rounds": self.MAX_AGENT_ROUNDS,
                         "deadline_seconds": self.AGENT_DEADLINE_SECONDS,
                         "stream_final": True,
-                        # Already in `messages`; carried so the worker returns
-                        # them among its own and the streamed turn reports the
-                        # grounding it used, not only what a tool fetched.
-                        "context_snippets": list(grounding),
+                        # What survived budgeting, so it is exactly what is
+                        # in `messages`. Carried so the worker returns it among
+                        # its own and the streamed turn reports the grounding
+                        # it used, not only what a tool fetched.
+                        "context_snippets": list(grounded),
                     },
                     InvocationContext(
                         user_id=user_id,
