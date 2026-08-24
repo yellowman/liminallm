@@ -13124,3 +13124,123 @@ whether the diagnosis gets printed.
 The same instinct, one layer up, is why the replacement is a test rather than a
 step. `LIMINALLM_REQUIRE_CONFINEMENT` fails the lane loudly when confinement is
 missing, instead of leaving a green run whose evidence was silently skipped.
+
+## The other twenty failures were four things, and one of them was nothing
+
+With the confinement cause identified, the remaining CI failures were worth
+attributing rather than assuming. Breaking confinement locally — pointing the
+availability probe at a knob reading 1, which is the runner's setting —
+reproduces the CI run file by file:
+
+    test_attachments          10 failed   (CI: 9)
+    test_invocation_lease      7 failed   (CI: 7)
+    test_workflow_retry_timeout 7 failed  (CI: 7)
+    test_child_wire            1 failed   (CI: 1)
+    test_injection_taint       1 failed   (CI: 1)
+    test_path_races            1 failed   (CI: 1)
+    test_tool_authority        1 failed   (CI: 1)
+    test_web                   1 failed   (CI: 1)
+    test_workflow_rag_scope    1 failed   (CI: 1)
+    test_generation_lifecycle  0 failed   (CI: 1)   <- not this
+
+**Forty-six of the fifty-one failures are one cause.** Everything above except
+the last line, plus the seventeen confinement tests themselves, comes from the
+same `/proc/self/setgroups` refusal, and is fixed by the commit before this
+one. The remaining five are three separate things.
+
+### There was never a retry bug
+
+The seven `test_workflow_retry_timeout` failures all read `assert 0 == 3` — no
+retries at all, apparently. The log says otherwise:
+
+    tool_worker_spawned      pid 14308, attempt 0
+    workflow_node_backoff    attempt 1, backoff_ms 10
+    invocation_revoked       reason retry, attempt 0
+    tool_worker_spawned      pid 14309, attempt 1
+    workflow_node_backoff    attempt 2, backoff_ms 40
+    invocation_revoked       reason retry, attempt 1
+    tool_worker_spawned      pid 14310, attempt 2
+    workflow_node_retries_exhausted  attempts 3
+
+Three attempts, exponential backoff, retries exhausted. The retry machinery
+did exactly what SPEC §18.3 asks. What did not happen was the test's
+`call_count` reaching 3, because the counter lives in a closure in the parent
+and `_run_builtin_body` never got to run there: every attempt failed with
+
+    'error': 'worker_unconfined'
+    "the tool worker could not establish the boundary it runs under, so it ran
+     nothing: [Errno 13] Permission denied: '/proc/self/setgroups'"
+
+So the assertion was reporting a true fact — the tool body ran zero times —
+about a cause three layers below the test's subject. Reproduced by breaking
+confinement locally: the same four assertions fail, `assert 0 == 3`,
+`assert 0 == (3 + 1)`, `assert 0 == 1`, `assert 'error' == 'ok'`, in the same
+order CI reported them. Nothing in the retry path needed changing, and
+"fixing" it would have meant editing correct code to satisfy a symptom.
+
+### ripgrep, one level out from a Python package
+
+`tests/test_settings_sources.py` shelled out to `rg` for two source sweeps.
+It is a binary no lane installs, so both tests raised `FileNotFoundError: 'rg'`
+on the runner and passed on every developer machine that happened to have it.
+The same shape as the undeclared `httpx`, `numpy` and `Pillow` before it —
+this time not a Python package at all, which is why no dependency guard could
+have caught it.
+
+Replaced with a `pathlib` walk and `re`, not with `grep`: `grep` would only
+move the problem, since its regex dialect is not the one these patterns are
+written in and it is still an external process. The `path:lineno:line` output
+shape is ripgrep's and is kept deliberately, because the first test's allowlist
+matches against the whole formatted line.
+
+Verified by comparison rather than by re-running: the walk's output is
+byte-identical to ripgrep's on both patterns. One pattern legitimately matches
+nothing, which is exactly the shape that goes vacuous unnoticed, so both were
+mutation-tested — planting `os.getenv("SNEAKY_SETTING")` and
+`getattr(settings, "made_up_field", 42)` in a service module makes each test
+fail naming the planted line.
+
+### A scratch cluster that reached outside its scratch directory
+
+Two tests start a `ScratchPostgres` of their own, and both died on the runner
+with a bare `CalledProcessError` naming a `pg_ctl` command and no cause.
+
+The cause was one line, in the log file `pg_ctl` was handed with `-l` and
+nobody read:
+
+    FATAL: could not create lock file
+           "/var/run/postgresql/.s.PGSQL.45999.lock": Permission denied
+
+Debian and Ubuntu compile `unix_socket_directories` as `/var/run/postgresql`,
+owned by `postgres`. The harness runs as root locally and `su`s to that user,
+so it never noticed; a CI runner running the suite as an ordinary user cannot
+write there. The socket now goes in the data directory, which is the one place
+this cluster's own user is guaranteed to own — a scratch cluster should not be
+reaching outside its scratch directory anyway, and `createdb` and the tests
+connect over TCP regardless.
+
+The second half matters more than the first. `_run` sent both streams to
+`DEVNULL`, and `pg_ctl` only ever prints "could not start server. Examine the
+log output" — so the reason existed the whole time, in a file, and the harness
+threw it away. It now raises with the command, the exit status, both streams
+and the tail of the server log. **That is the third instrumentation gap in two
+days with the same shape: the failure was legible and something discarded the
+legible part.** Measured, as `nobody`: with the socket fix reverted the cluster
+still fails, and the new message states the permission error outright.
+
+### One failure left, and it is not reproduced
+
+`test_generation_lifecycle.py::test_a_source_rooted_above_the_file_still_serializes`
+is a real race — two threads, a gated `_commit_generation`, and an assertion
+that the walk did not commit over the newer generation. It does not reproduce
+here under any configuration tried: normally, with confinement broken, or
+pinned to one and to two CPUs, three runs each.
+
+Deliberately not "fixed". Its synchronisation includes a `time.sleep(1.0)`,
+which is the obvious thing to harden, but it is not the proximate cause —
+CI failed the *later* assertion, so the gate it guards did hold. Editing a race
+test's synchronisation without being able to reproduce its failure is how a
+test starts passing vacuously, which is the defect this file spends most of its
+length on. The next run has 46 fewer failures and workers that actually start,
+which changes its timing substantially; if it fails again, that is a second
+data point worth acting on.

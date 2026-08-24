@@ -8,6 +8,8 @@ restart, and identical across replicas.
 
 import json
 import os
+import pathlib
+import re
 
 import pytest
 
@@ -17,6 +19,36 @@ from liminallm.config import (
     apply_managed_settings,
 )
 from liminallm.service.runtime import get_runtime, reset_runtime_for_tests
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
+
+
+def _matching_lines(pattern: str, *, skip: frozenset[str] = frozenset()) -> list[str]:
+    """Every line under `liminallm/` matching `pattern`, as `path:lineno:line`.
+
+    Both callers below used to shell out to `ripgrep`. It is a binary no lane
+    installs, so on the GitHub runner they raised `FileNotFoundError: 'rg'`
+    and passed on every developer machine that happened to have it — the
+    undeclared-dependency shape again, one level out from a Python package.
+
+    Python rather than `grep`, which would only move the problem: its regex
+    dialect is not the one these patterns are written in, and it is still an
+    external process. `re` and `pathlib` are here by definition, because the
+    test is already running in Python.
+
+    The `path:lineno:line` shape is ripgrep's and is kept deliberately: the
+    allowlist below matches against the whole formatted line, so the path is
+    part of what it tests.
+    """
+    found: list[str] = []
+    for path in sorted((REPO / "liminallm").rglob("*.py")):
+        if "__pycache__" in path.parts or path.name in skip:
+            continue
+        relative = path.relative_to(REPO)
+        for number, line in enumerate(path.read_text().splitlines(), start=1):
+            if re.search(pattern, line):
+                found.append(f"{relative}:{number}:{line}")
+    return found
 
 # Env vars are a standing invitation to configure per-container. Each name here
 # is a deliberate exception; adding one should be a decision, not a reflex.
@@ -230,20 +262,13 @@ def test_no_stray_env_var_reads_outside_config(monkeypatch):
 
     A direct getenv elsewhere is a setting that escaped the classification.
     """
-    import subprocess
-
     # A *read* is the escaped setting. The sandbox child clears and rewrites
     # its own environment on the way into confinement — that is the opposite
     # move, and matching it here would push a security control into an
     # allowlist of exceptions.
-    out = subprocess.run(
-        [
-            "rg", "-n", r"os\.getenv\(|os\.environ\.get\(|os\.environ\[",
-            "--glob", "!**/config.py",
-            "--glob", "!**/logging.py",
-            "liminallm/",
-        ],
-        capture_output=True, text=True,
+    hits = _matching_lines(
+        r"os\.getenv\(|os\.environ\.get\(|os\.environ\[",
+        skip=frozenset({"config.py", "logging.py"}),
     )
     allowed = (
         # The one declarative-deploy seam, read once at boot.
@@ -261,10 +286,7 @@ def test_no_stray_env_var_reads_outside_config(monkeypatch):
         # have remote code execution, so it stays env-only. See config.py.
         "EXTRACT_READER_PLUGINS",
     )
-    offenders = [
-        line for line in out.stdout.splitlines()
-        if not any(x in line for x in allowed)
-    ]
+    offenders = [line for line in hits if not any(x in line for x in allowed)]
     assert offenders == [], "\n".join(offenders)
 
 
@@ -278,15 +300,10 @@ def test_no_setting_default_is_restated_outside_config():
     True, and history_budget_fraction was clamped in code to bounds the field
     did not state.
     """
-    import subprocess
-
-    out = subprocess.run(
-        # getattr with a third argument — the fallback is the problem, not the
-        # dynamic lookup.
-        ["rg", "-n", r"getattr\((self\.|runtime\.)?settings, [^)]+,", "liminallm/"],
-        capture_output=True, text=True,
-    )
-    assert out.stdout.strip() == "", out.stdout
+    # getattr with a third argument — the fallback is the problem, not the
+    # dynamic lookup.
+    hits = _matching_lines(r"getattr\((self\.|runtime\.)?settings, [^)]+,")
+    assert hits == [], "\n".join(hits)
 
 
 def test_bounds_are_declared_not_clamped():

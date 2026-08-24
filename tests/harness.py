@@ -459,9 +459,19 @@ class ScratchPostgres:
             shutil.chown(self.datadir, "postgres", "postgres")
             os.chmod(self.datadir, 0o700)
         self._run(f"{self._bin}/initdb -D {self.datadir} -U postgres --auth=trust")
+        # The unix socket goes in the data directory, which is the one place
+        # this cluster's own user is guaranteed to own. Debian and Ubuntu
+        # compile the default as /var/run/postgresql, owned by `postgres`,
+        # which is writable when we are root and `su` to that user and is not
+        # writable by anybody else — so on a CI runner that runs the suite as
+        # an ordinary user the postmaster died with "could not create lock
+        # file /var/run/postgresql/.s.PGSQL.<port>.lock: Permission denied".
+        # A scratch cluster should not reach outside its scratch directory in
+        # the first place; `createdb` and the tests connect over TCP anyway.
         self._run(
             f"{self._bin}/pg_ctl -D {self.datadir} "
-            f"-o '-p {self.port} -c listen_addresses=127.0.0.1 -c fsync=off' "
+            f"-o '-p {self.port} -c listen_addresses=127.0.0.1 -c fsync=off "
+            f"-c unix_socket_directories={self.datadir}' "
             f"-l {self.datadir}/log -w start"
         )
         self._run(f"{self._bin}/createdb -h 127.0.0.1 -p {self.port} -U postgres liminallm_test")
@@ -476,10 +486,32 @@ class ScratchPostgres:
     def _run(self, command: str, *, check: bool = True) -> None:
         if os.geteuid() == 0:
             command = f"su postgres -s /bin/sh -c \"{command}\""
-        subprocess.run(
-            command, shell=True, check=check,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=120,
+        done = subprocess.run(
+            command, shell=True, capture_output=True, text=True, timeout=120,
         )
+        if check and done.returncode != 0:
+            raise RuntimeError(self._why_it_failed(command, done))
+
+    def _why_it_failed(self, command: str, done: subprocess.CompletedProcess) -> str:
+        """`pg_ctl` says "Examine the log output". This examines it.
+
+        Both streams used to go to DEVNULL, so a cluster that would not start
+        surfaced as a bare `CalledProcessError` naming a command and no cause
+        — and `pg_ctl` itself only prints "could not start server", because
+        the reason is in the server log it was handed with `-l`. That cost a
+        full CI round trip to discover a one-line permissions problem that the
+        log had stated plainly the whole time.
+        """
+        parts = [f"{command}\nexit status {done.returncode}"]
+        for label, text in (("stdout", done.stdout), ("stderr", done.stderr)):
+            if text and text.strip():
+                parts.append(f"{label}:\n  " + "\n  ".join(text.strip().splitlines()))
+        log = Path(self.datadir or "", "log")
+        if log.exists():
+            tail = log.read_text(errors="replace").strip().splitlines()[-8:]
+            if tail:
+                parts.append("server log:\n  " + "\n  ".join(tail))
+        return "\n".join(parts)
 
 
 class ScratchRedis:
