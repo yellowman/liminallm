@@ -385,6 +385,54 @@ def namespace_key(files_dir: str | Path, relative_name: str) -> str:
     return str(Path(files_dir) / (parts[0] if parts else relative_name))
 
 
+def publication_key(fs_root: str | Path, fs_path: str | Path) -> str:
+    """`namespace_key` for an absolute path, found rather than assumed.
+
+    A worker holds an absolute path and the shared root; a route holds the
+    user's files directory and a relative name. Both have to arrive at the
+    same key or they take different locks and never see each other — which is
+    not hypothetical: a queue that keyed on the file's own parent let a
+    recursive delete of a tree run straight through a job indexing a file
+    inside it, and the job then failed on a file removed underneath it.
+
+    The files directory is read off `fs_root` at a fixed depth, never
+    searched for. A tree may contain any names a user can unpack, `users/`
+    and `files/` included, so looking upward for the nearest thing *shaped*
+    like the layout finds the archive's copy: a job on
+    `bundle/users/fake/files/inner.md` would key on that inner directory
+    while a delete of `bundle` keys on the tree, and the two never meet.
+    Shape is not identity — position under the root is.
+
+    No `resolve()`. The lock is on the persistent name, which is what every
+    other side of this locks; resolving would key two names for one file and
+    follow a symlink out of the namespace it belongs to.
+
+    A path outside any user's files directory — an adapter, a shared object —
+    has no tree to belong to, and keying it on itself is both stable and
+    correct for something nothing else contends on.
+    """
+    logical_root = Path(fs_root)
+    target = Path(fs_path)
+    # Recognise through a symlink, name from the logical root. `safe_join`
+    # resolves the paths it hands back, so a stored `fs_path` can be spelled
+    # with the physical root while a route builds its key from the configured
+    # one — the same file under two names, and so two locks. Matching against
+    # both spellings closes that. Resolving the *target* to choose the key
+    # would reopen it from the other side: the lock is on the persistent name,
+    # and a symlinked entry inside the tree would key outside its namespace.
+    for base in (logical_root, logical_root.resolve()):
+        try:
+            rel = target.relative_to(base)
+        except ValueError:
+            continue
+        # users / <id> / files / <name...>, and there has to be a name.
+        if len(rel.parts) >= 4 and rel.parts[0] == "users" and rel.parts[2] == "files":
+            files_dir = logical_root / "users" / rel.parts[1] / "files"
+            return namespace_key(files_dir, Path(*rel.parts[3:]).as_posix())
+        break
+    return str(target)
+
+
 @contextmanager
 def path_lock(
     fs_root: str | Path,

@@ -405,6 +405,14 @@ class PostgresStore:
             "context_source",
             "knowledge_chunk",
             "knowledge_chunk_vector",
+            # Where "this context owes this path a re-read" is recorded. Every
+            # replacement writes to it and every worker poll reads it, so an
+            # older database without it boots clean and then fails at request
+            # time on the first replacement — with the queue that would have
+            # repaired the index unreadable. It was required by the tranche
+            # that introduced it and lost that status in a merge, which is
+            # what this entry and its test exist to prevent recurring.
+            "ingest_job",
             "preference_event",
             "semantic_cluster",
             "adapter_router_state",
@@ -4845,14 +4853,19 @@ class PostgresStore:
         """
         try:
             with self._connect() as conn:
-                conn.execute(
+                cursor = conn.execute(
                     "UPDATE ingest_job SET status = 'queued', detail = %s, "
                     "attempts = GREATEST(attempts - 1, 0), "
                     "next_attempt_at = now(), updated_at = now() "
-                    "WHERE id = %s",
+                    # A transition, not an overwrite. Knowing a row's id is
+                    # not authority to revive it: a claim marks a job running
+                    # before it takes the publication lock, and a deletion
+                    # holding that lock supersedes it in that window. Handing
+                    # the job back must not write `queued` over that.
+                    "WHERE id = %s AND status = 'running'",
                     (detail, job_id),
                 )
-            return True
+            return (cursor.rowcount or 0) > 0
         except errors.UniqueViolation:
             return False
 
@@ -4881,13 +4894,18 @@ class PostgresStore:
         """
         try:
             with self._connect() as conn:
-                conn.execute(
+                cursor = conn.execute(
                     "UPDATE ingest_job SET status = 'queued', detail = %s, "
                     "next_attempt_at = now() + %s::interval, updated_at = now() "
-                    "WHERE id = %s",
+                    # Only a job still running may be put back, for the same
+                    # reason `yield_ingest_job` says so: a deletion is allowed
+                    # to close a claimed job under the publication lock, and
+                    # neither of these may resurrect a terminal row merely
+                    # because it knows the id.
+                    "WHERE id = %s AND status = 'running'",
                     (detail, f"{max(0, int(delay_seconds))} seconds", job_id),
                 )
-            return True
+            return (cursor.rowcount or 0) > 0
         except errors.UniqueViolation:
             return False
 
@@ -4942,6 +4960,67 @@ class PostgresStore:
                 "AND (%s::uuid IS NULL OR ctx.id <> %s::uuid) "
                 "AND ctx.conversation_id IS NULL",
                 (owner_user_id, fs_path, keep_context_id, keep_context_id),
+            )
+            return cursor.rowcount or 0
+
+    def delete_context_sources_under_path(
+        self, owner_user_id: str, fs_path: str
+    ) -> int:
+        """Drop the source rows that name `fs_path` or something inside it.
+
+        A `context_source` row is a claim about a name. Deleting the thing it
+        names makes the claim false, so the row goes — and for a tree, so do
+        the rows naming anything within it.
+
+        **Ancestors stay**, and this is the whole difficulty. A row on
+        ``files/`` says the context covers that directory, which is still true
+        after one file in it is deleted, and will be true again if the name
+        reappears. Removing every source that *covers* the path would take
+        that row too, and one deleted child would silently un-index every
+        other file in the directory. So the test is containment, not coverage:
+        the row's own path must be the target or lie beneath it.
+
+        The prefix match ends at a separator, so deleting ``bundle`` does not
+        take ``bundle2``. ``LIKE`` is avoided rather than escaped, since ``_``
+        and ``%`` are wildcards a filename may legitimately contain.
+        """
+        prefix = fs_path.rstrip("/") + "/"
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM context_source cs USING knowledge_context ctx "
+                "WHERE cs.context_id = ctx.id AND ctx.owner_user_id = %s "
+                "AND (cs.fs_path = %s OR left(cs.fs_path, %s) = %s)",
+                (owner_user_id, fs_path, len(prefix), prefix),
+            )
+            return cursor.rowcount or 0
+
+    def cancel_ingest_jobs_under_path(
+        self, owner_user_id: str, fs_path: str
+    ) -> int:
+        """Close any re-index still owed for a path that is being deleted.
+
+        A job carries the checksum of the bytes that prompted it and declines
+        when the file has moved on, so a queued one cannot in fact refill a
+        deleted path — it re-reads, finds nothing, and supersedes itself. This
+        is not relying on that. The queue is where "this context owes this
+        path a re-read" is recorded, and once the path is gone the record is
+        simply false; leaving it to be discovered later means a worker claims
+        it, reads a missing file and writes a failure, for work nobody wants.
+
+        Called under the publication lock, so nothing is mid-ingest on this
+        path: a job that was running has finished and released the lock before
+        the deletion could take it.
+        """
+        prefix = fs_path.rstrip("/") + "/"
+        with self._connect() as conn:
+            cursor = conn.execute(
+                "UPDATE ingest_job job SET status = 'superseded', "
+                "detail = 'the path was deleted', updated_at = now() "
+                "FROM knowledge_context ctx "
+                "WHERE job.context_id = ctx.id AND ctx.owner_user_id = %s "
+                "AND job.status IN ('queued', 'running') "
+                "AND (job.fs_path = %s OR left(job.fs_path, %s) = %s)",
+                (owner_user_id, fs_path, len(prefix), prefix),
             )
             return cursor.rowcount or 0
 

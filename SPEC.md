@@ -351,6 +351,47 @@ generated `content_tsv` column (GIN-indexed) for the lexical channel, and
   two the path is *absent* from those contexts: recoverable, and unlike a
   stale answer, honest. Emptying without recording the re-read is not a
   correction; it loses the file from every context that covers it.
+- **deleting a path leaves nothing that describes it.** After
+  `DELETE /v1/files/{path}` succeeds, no retrievable state may describe the
+  deleted bytes: its chunks go, throughout the owner's contexts and through a
+  whole subtree; any `ingest_job` still owed for it is closed, because a
+  re-read of a path that no longer exists is owed for nothing; and the
+  `context_source` rows naming that path *or anything inside it* go with it.
+  rows naming an **ancestor** stay — `files/` still covers that directory when
+  one file in it is deleted, and covers the name again if it reappears. the
+  test is containment, never coverage: "delete every source that covers this
+  path" would take the directory's row because one child went, and silently
+  un-index every file beside it.
+  deletion takes the publication lock, on the key `namespace_key` gives — the
+  name's first component, so a recursive delete of a tree and a mutation of a
+  file inside it meet. every side derives that key the same way, through
+  `publication_key` for an absolute path: keying on a file's own parent takes
+  a lock nothing else holds, and a delete then ran straight through a job
+  indexing a file inside the tree.
+  the key is read off `fs_root` at a fixed depth, never searched for by
+  shape, and always **spelled with the configured root**. `safe_join`
+  resolves the paths it returns, so a stored `fs_path` can carry the physical
+  spelling of a symlinked `SHARED_FS_ROOT` while a route builds its key from
+  the configured one — one file, two names, two locks. the root is therefore
+  matched against both its logical and resolved spellings to *recognise* a
+  path, and the key is built from the logical one. resolving the **target**
+  to choose the key is the opposite error: the lock is on the persistent
+  name, and a symlinked entry inside a tree would key outside its namespace.
+  the fixed depth is what keeps this honest: a tree may contain any names a user can unpack, `users/` and
+  `files/` included, so the nearest thing *shaped* like the layout is the
+  archive's copy rather than the real root — and a job keyed there while a
+  delete keys on the tree reopens the race.
+  putting a claimed job back is a `running -> queued` **transition**, never
+  an overwrite. a claim marks a job running before it takes the lock, and a
+  deletion holding that lock is entitled to supersede it in that window;
+  neither standing aside nor failing may then revive a terminal row merely
+  because it knows the id.
+  the subtree match is separator-bounded on both records, so deleting
+  `bundle` takes `bundle/inner.md`'s own source row and its queued job and
+  does not take `bundle2`. `ingest_job` is a **required table**: an older
+  database without it would otherwise boot clean and fail at request time on
+  the first replacement, with the queue that would have repaired the index
+  unreadable.
 - **the queue takes the same publication lock the upload takes**, on the
   same key, and re-reads the generation inside it. A worker that cannot get
   it stands aside without spending an attempt: whoever holds it is

@@ -13599,3 +13599,157 @@ rather than that anything was scheduled to run it. One simulated a racing
 replacement by deleting the very rows that would have proved the defect. The
 same lesson as the entry above, one level up again: a test that passes tells
 you nothing until you have seen it fail for the reason you intend.
+
+## Deleting a file: chunks were the easy half
+
+The invariant: **after `DELETE /v1/files/{path}` returns success, no
+retrievable state may describe the deleted bytes.**
+
+Chunks were already handled — `delete_chunks_under_path` runs under the
+publication lock and covers a whole subtree. What was left is everything that
+would put them back or go on claiming them.
+
+**Source rows are claims about names, and the test is containment, not
+coverage.** A `context_source` naming the deleted path, or anything inside it,
+is a claim about something that has stopped existing, so it goes. A row naming
+an *ancestor* is not: `files/` still covers that directory after one file in it
+is deleted, and covers the name again if it reappears.
+
+The obvious wrong fix is "delete every source that covers this path", and it is
+worth naming because it looks correct and is destructive: one deleted child
+would take the directory's row with it and silently un-index every other file
+beside it. That mistake has its own witness, and the mutation confirms the
+witness catches it and nothing else does.
+
+**A re-read owed for a path that is gone is owed for nothing.** A queued job
+could not in fact refill a deleted path — it re-reads the file, finds nothing
+and supersedes itself — so cancelling is not what makes deletion correct. It is
+that the queue records "this context owes this path a re-read", and once the
+path is gone that record is false; leaving it to be discovered later means a
+worker claims it, reads a missing file and writes a failure, for work nobody
+wants.
+
+**The lock key was wrong, and this is the finding that mattered.** The queue
+merged in the previous tranche keyed its publication lock on the file's own
+parent directory. `namespace_key` deliberately keys a name's *first component*
+so that a recursive delete of `bundle` and a mutation of `bundle/inner.md` meet
+— that is the whole reason it exists. Keying on the parent produced a lock
+nothing else takes.
+
+Measured, before the fix: a delete of `bundle` returned 200 while a job was
+mid-ingest on `bundle/inner.md`, and the job then failed on `FileNotFoundError`
+with the file removed underneath it. Whether the deleted file stayed
+retrievable came down to which of two unsynchronised writes landed second.
+
+The root-file case hid it, because at the top level `namespace_key(files_dir,
+"report.md")` and `namespace_key(files_dir/"", "report.md")` agree. Only the
+nested case separates them — a reminder that a serialization witness proves
+nothing about depths it does not exercise. `publication_key` now derives the
+key from an absolute path by locating the files directory rather than assuming
+a depth, and both sides go through it.
+
+**On the previous entry's carried-over claim.** It said deletion left chunks in
+every context. That was true when it was written and had already been fixed by
+the delete-lock work on this branch before this tranche started. The chunk half
+is verified here rather than re-fixed; what is new is the three above.
+
+### Two follow-ups the first pass left open
+
+**The recursive cleanup was correct but unwitnessed.** The nested test proves
+the lock key and that descendant *chunks* go. It says nothing about descendant
+source rows or descendant jobs: its source names the tree itself, and its job
+runs to completion before the deletion proceeds. So narrowing either
+predicate from separator-bounded subtree match to exact match would have left
+`bundle/inner.md`'s own source row and its queued job behind while all five
+cases still passed. One tree with three records at three depths — an ancestor
+directory source, an exact-file source inside the tree, and a queued job for
+that file — closes it, and the two narrowings now die by that test alone.
+
+**`ingest_job` had stopped being a required table.** `_verify_required_schema`
+refuses to start against a database missing a table the application needs, and
+names `scripts/migrate.sh`. The queue table was on that list in the tranche
+that introduced it and was not on it after that tranche was merged into
+another branch — a conflict-resolution casualty, silent because nothing
+depended on the list itself.
+
+The consequence is the shape the list exists to prevent: an older database
+boots clean, and the first replacement fails at request time with the queue
+that would have repaired the index unreadable. Restored, with a witness that
+builds a database, drops the table, and requires the refusal to name both the
+table and the fix.
+
+Worth stating as a rule rather than an incident: **a merge can silently
+un-require something.** Nothing about resolving a conflict in a list of table
+names looks like removing a startup guarantee, and no other test referenced
+the entry. The guard is cheap; noticing its absence was not.
+
+### Two more the review found in the queue's state machine
+
+**The lock key was found by shape, and a shape is not an identity.**
+`publication_key` walked upward for the first directory shaped like
+`users/*/files`. An extracted tree may contain exactly those names, so
+`bundle/users/fake/files/inner.md` matched the archive's copy first: a worker
+locked a namespace *inside* the tree while a delete of the tree locked the
+tree, and the race this tranche exists to close was open again — reachable by
+unpacking an archive that mirrors the layout. Measured, the delete returned
+200 mid-ingest and the job then failed on `FileNotFoundError`.
+
+The root is now read off `fs_root` at a fixed depth rather than searched for.
+No `resolve()`: the lock is on the persistent name, which is what every other
+side locks, and resolving would key two names for one file and follow a
+symlink out of the namespace it belongs to.
+
+**Putting a job back was an overwrite rather than a transition.** A claim
+marks a job `running` before it goes for the publication lock, and a deletion
+holding that lock is entitled to supersede it in that window. The worker then
+timed out and wrote `queued` over `superseded`, undoing a cancellation it
+never had the authority to touch.
+
+This does not by itself restore deleted chunks — the revived job finds the
+file missing and supersedes itself. It makes the deletion's cancellation
+guarantee false, and if the same name with the same bytes reappears before
+that job runs, it ingests into a context whose exact source row the deletion
+already removed: derived state recreating itself with no authority behind it.
+Both `yield_ingest_job` and `requeue_ingest_job` now carry
+`AND status = 'running'` and report whether the transition happened.
+
+The failure path needed its own witness, and the schedule for it is not
+contrived: deletion does its bookkeeping first and unlinks last, deliberately,
+so there is a real window where a job is superseded and the file is still on
+disk. A worker holding a claim gets past its generation check and into the
+ingest, and what it does when that ingest fails is the thing under test.
+
+**One test was changed rather than kept.** It reached "a job with a backoff"
+by requeueing a row that had never been claimed. That is no longer a state the
+system can produce, so it now claims the job first — the setup was arranging a
+shape rather than reproducing a history, and the predicate made the difference
+visible.
+
+### And a third: the root's own spelling
+
+Anchoring to `fs_root` fixed the lookalike-tree problem and introduced a
+narrower one. `safe_join` resolves the paths it hands back, so when
+`SHARED_FS_ROOT` is a symlink — an ordinary deployment shape — a stored
+`fs_path` carries the physical spelling while a route builds its key from the
+configured one. `relative_to` then fails, the queue falls back to keying on
+the path itself, and the two sides take different locks again.
+
+The correction is smaller than it looks and the distinction is worth stating
+exactly, because the two directions are opposite errors:
+
+* resolve the **root** to *recognise* a target — required, or the physical
+  spelling is unrecognisable;
+* resolve the **target** to *choose* the key — wrong, and the reason the
+  original code avoided `resolve()` at all: the lock is on the persistent
+  name, and a symlinked entry inside a tree would key outside its namespace;
+* build the returned key from the **logical** root — or recognition succeeds
+  and the answer still disagrees with the route's.
+
+One witness covers both identity rules at once: a symlinked root, and inside
+it a tree containing `users/fake/files/`. The key has to come out as the
+logical root's `bundle` — not the archive's copy, and not the physical
+spelling. Mutating away either half kills it.
+
+Three findings in this function now, each from the same family: it answers
+"which lock does this path take", and every wrong answer is some form of
+letting the *spelling* of a path decide instead of its *position*.

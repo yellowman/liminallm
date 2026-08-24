@@ -36,7 +36,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from liminallm.logging import get_logger
-from liminallm.service.fs import PathLockTimeout, namespace_key, path_lock
+from liminallm.service.fs import PathLockTimeout, path_lock, publication_key
 
 logger = get_logger(__name__)
 
@@ -124,7 +124,10 @@ def run_job(
     try:
         with path_lock(
             fs_root,
-            namespace_key(path.parent, path.name),
+            # The key an upload or a delete of this path would take, which for
+            # anything inside a tree is the tree. Keying on the file's own
+            # parent takes a lock nothing else holds.
+            publication_key(fs_root, path),
             timeout=LOCK_WAIT_SECONDS,
         ):
             return _reindex_under_lock(
