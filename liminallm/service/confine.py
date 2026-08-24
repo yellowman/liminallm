@@ -86,6 +86,31 @@ def _mount(libc, source, target, fstype, flags, data=None) -> None:
         raise OSError(errno, f"mount({source!r} -> {target!r}): {os.strerror(errno)}")
 
 
+def _write_proc(path: str, value: str, *, operation: str) -> None:
+    """One of the writes that establish the namespace's identity mapping.
+
+    Labelled the way `unshare` and `mount` are, and for the same reason. A
+    bare `PermissionError: [Errno 13] ... '/proc/self/setgroups'` names the
+    file but not the operation, and the operation is what tells an operator
+    which kernel policy refused them — the difference between "this host has
+    user namespaces switched off" and "this host allowed the namespace and
+    then refused the mapping inside it".
+
+    That distinction is not hypothetical. On a GitHub-hosted runner the
+    `unshare` above *succeeds* and this is the line that fails, which is a
+    much narrower fact than "the sandbox is unavailable" and points at a
+    different knob.
+    """
+    try:
+        Path(path).write_text(value)
+    except OSError as exc:
+        errno = exc.errno or 0
+        raise OSError(
+            errno,
+            f"{operation} ({path} <- {value!r}): {os.strerror(errno)}",
+        ) from exc
+
+
 def _linux_available() -> bool:
     """Whether this kernel can give a process its own user + mount namespace.
 
@@ -137,9 +162,9 @@ def _linux_confine(workdir: str, runtime: Sequence[str], root: Optional[str] = N
         raise OSError(errno, f"unshare: {os.strerror(errno)}")
     # Map this uid to root *inside the namespace only*, which is what allows
     # the mounts below. setgroups must be denied first or gid_map is refused.
-    Path("/proc/self/setgroups").write_text("deny")
-    Path("/proc/self/uid_map").write_text(f"0 {uid} 1")
-    Path("/proc/self/gid_map").write_text(f"0 {gid} 1")
+    _write_proc("/proc/self/setgroups", "deny", operation="deny setgroups")
+    _write_proc("/proc/self/uid_map", f"0 {uid} 1", operation="map uid inside namespace")
+    _write_proc("/proc/self/gid_map", f"0 {gid} 1", operation="map gid inside namespace")
     # Detach propagation so nothing here is visible to the host mount table.
     _mount(libc, None, "/", None, _MS_REC | _MS_PRIVATE)
 
