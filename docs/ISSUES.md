@@ -13317,3 +13317,52 @@ it is not, and by how much. Forcing that assertion also caught the check being
 applied to the wrong function — this file holds two tests with an identical
 block, and the first edit landed on the sibling, which is its own small lesson
 about verifying that a mutation went where it was aimed.
+
+### The between-tests wipe assumed nothing else was looking
+
+The browser lane failed once on `5eadf33` with
+
+    ERROR tests/test_browser_auth.py::...::test_login_leaves_only_the_access_token
+          psycopg.errors.DeadlockDetected: deadlock detected
+
+at fixture setup, failing a test that had not started. That commit touched only
+`ScratchPostgres` — which this lane never constructs, since it sets
+`TEST_DATABASE_URL` — and a settings test the lane deselects, so it was not the
+cause. First sighting, on a lane CI has only just become able to run.
+
+`_truncate_all`'s own docstring named the assumption it was breaking: *"this
+statement assumes nothing else is looking at it."* True in every lane but this
+one. The browser lane runs a real uvicorn server in a thread against the same
+database with a pool of its own, so a request still in flight holds ACCESS
+SHARE on some tables while the wipe wants ACCESS EXCLUSIVE on all of them. Two
+sessions taking locks across many tables in different orders deadlock, and
+Postgres kills one.
+
+Reproduced rather than reasoned about: a reader holding one table and reaching
+for a second, against a TRUNCATE holding the second and reaching for the first,
+deadlocks every time. Worth noting that the probe's *reader* lost while CI's
+*fixture* lost — either side can be chosen, so the fixture has to survive being
+it.
+
+**And the first fix did not work, which the measurement caught before it was
+committed.** A plain retry against six continuously looping readers changed
+nothing: 51 of 60 truncates failed with and without it, identical numbers,
+because a retry lands in the same steady state and the attempts stop being
+independent. Identical numbers are what prompted checking whether the `except`
+branch was even reached — it was, and `DeadlockDetected` was the right class.
+The retry simply does not help there.
+
+It helps decisively against the contention this lane actually produces. With a
+single in-flight reader overlapping the wipe: **40 of 40 failed without the
+retry, 0 of 40 with it.** So the fix is kept, with both numbers written down,
+because the boundary is the useful part — if this lane ever holds a database
+busy while wiping it, the right answer is to quiesce the server rather than
+raise the attempt count, and exhausting the attempts is how it will say so.
+
+Two lessons, and the second is the one that nearly got away. A retry is not
+automatically a fix for a deadlock; whether it helps depends entirely on
+whether the contention is transient, and that is measurable in about a minute.
+And an instrument that reports the same number for both arms of an experiment
+is reporting that it measured nothing — which is the same shape as the
+tick-count heartbeat and the vacuous witnesses that this file already tracks,
+arriving this time in the verification of a fix rather than in the fix itself.

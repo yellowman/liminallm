@@ -320,6 +320,13 @@ def _flush_owned_redis() -> None:
         pass
 
 
+#: How many times to re-attempt a TRUNCATE that lost a deadlock. Small,
+#: because the contending reader is a request finishing rather than a long
+#: transaction: if several tries in a row lose, something is holding locks
+#: that a between-tests wipe should not be waiting for, and failing says so.
+_TRUNCATE_ATTEMPTS = 4
+
+
 def _truncate_all() -> None:
     """Wipe every table between tests.
 
@@ -327,18 +334,57 @@ def _truncate_all() -> None:
     each other without a cluster per test. Under xdist that database belongs
     to one worker — see `_provision` — because this statement assumes nothing
     else is looking at it.
+
+    That assumption holds in every lane but one. The browser lane runs a real
+    uvicorn server in a thread against this same database, with a connection
+    pool of its own, so a request still in flight holds ACCESS SHARE on some
+    tables while this wants ACCESS EXCLUSIVE on all of them. Two sessions
+    taking locks across many tables in different orders is a deadlock, and
+    Postgres resolves it by killing one of them — which was `DeadlockDetected`
+    at fixture setup in CI, failing a test that had not started.
+
+    Reproduced deliberately rather than inferred: a reader holding one table
+    and reaching for a second, against a TRUNCATE holding the second and
+    reaching for the first, deadlocks every time. Either side can be the
+    victim — the probe lost the reader, CI lost this — so it has to survive
+    being it. Postgres documents a deadlock as transient and the caller's job
+    to retry. The ordering below narrows the window but cannot close it,
+    because the other session picks its own order.
+
+    The retry was measured, not assumed, and it has a limit worth knowing.
+    Against *transient* contention — one request finishing, which is what this
+    lane produces — 40 of 40 truncates failed without it and 0 of 40 with it.
+    Against *saturated* contention — six readers looping continuously — 51 of
+    60 failed either way, because a retry lands in the same steady state and
+    the attempts stop being independent. So this survives a request that
+    overlaps the wipe, and will not survive a lane that keeps a database busy
+    while wiping it. If that ever happens the right answer is to quiesce the
+    server, not to raise the count, and the failure will say so by exhausting
+    these attempts.
     """
+    import time
+
+    import psycopg
+
     pg = get_test_store()
-    with pg.pool.connection() as conn:
-        rows = conn.execute(
-            "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
-        ).fetchall()
-        tables = [row["tablename"] for row in rows]
-        if tables:
-            conn.execute(
-                f"TRUNCATE {', '.join(tables)} RESTART IDENTITY CASCADE"
-            )
-        conn.commit()
+    for attempt in range(_TRUNCATE_ATTEMPTS):
+        try:
+            with pg.pool.connection() as conn:
+                rows = conn.execute(
+                    "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
+                    " ORDER BY tablename"
+                ).fetchall()
+                tables = [row["tablename"] for row in rows]
+                if tables:
+                    conn.execute(
+                        f"TRUNCATE {', '.join(tables)} RESTART IDENTITY CASCADE"
+                    )
+                conn.commit()
+            return
+        except psycopg.errors.DeadlockDetected:
+            if attempt == _TRUNCATE_ATTEMPTS - 1:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 @pytest.fixture(autouse=True)
