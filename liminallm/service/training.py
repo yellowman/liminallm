@@ -684,7 +684,25 @@ class TrainingService:
             logger.warning(
                 "list_semantic_clusters_failed", user_id=user_id, error=str(exc)
             )
-        adapter_candidates = [a for a in self.store.list_artifacts(type_filter="adapter")]  # type: ignore[arg-type]
+        # Scoped like every other read in this summary, and like
+        # `_select_adapters`, which answers the same question at turn time.
+        # An unscoped artifact listing is a question about public visibility:
+        # the caller is what adds their own private rows, and their tenant is
+        # what adds the ones shared with them. Without both, this panel
+        # collapsed to `visibility='global'` and never showed a user the
+        # per-user adapter their own feedback had just created.
+        #
+        # `user_id` is optional on this method and nothing in the product
+        # omits it. When it is omitted the store's answer stays what it was —
+        # the public set — rather than becoming an error or everything.
+        subject = self.store.get_user(user_id) if user_id else None
+        adapter_candidates = list(
+            self.store.list_artifacts(  # type: ignore[arg-type]
+                type_filter="adapter",
+                owner_user_id=user_id,
+                tenant_id=subject.tenant_id if subject else None,
+            )
+        )
         adapters = [
             {
                 "id": a.id,

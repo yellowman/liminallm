@@ -13901,3 +13901,108 @@ apply at all — a stale anchor, and a cooked string that turned a literal
 backslash-n into a newline — and a mutation that does not apply measures
 nothing, so the driver now reports an unmatched anchor as loudly as a
 survivor rather than printing a reassuring "skipped".
+
+## Insights described adapters that belonged to nobody in particular
+
+Found while qualifying the learning loop against a running instance. Feedback
+was recorded, a per-user adapter was created, a training job was opened — and
+`GET /v1/preferences/insights` reported `adapters: []`. The adapter existed:
+the same run had just asserted one row in `artifact`.
+
+`/v1/preferences/insights` is a user-scoped surface. The route always calls
+`summarize_preferences(principal.user_id)`, and inside it the events and the
+clusters are both read for that user. The adapter list alone was read with an
+unscoped `list_artifacts(type_filter="adapter")`.
+
+### Not a leak, which is why nothing caught it
+
+The store treats an unscoped artifact listing as a question about *public*
+visibility, deliberately: caller identity is what adds that caller's private
+rows, and tenant identity is what adds the ones their tenant shares. With
+neither, the visibility clause collapses to `visibility = 'global'`.
+
+So the panel never showed one user another user's adapter. It showed nobody
+their own. Measured directly:
+
+```
+list_artifacts(type_filter='adapter')                 -> []
+list_artifacts(type_filter='adapter', owner_user_id=…) -> ['persona_adapter']
+```
+
+A fail-safe direction is the reason this survived: it produced an empty list
+rather than an error or a disclosure, and an empty list looks like an account
+with no adapters yet.
+
+### The same hazard, already known one function away
+
+`ensure_user_adapter` carries this comment, from an earlier fix:
+
+> Pass `owner_user_id` so the user's own private adapters are returned;
+> without it `list_artifacts` only yields global artifacts and this method
+> would never find an existing adapter (creating a duplicate each call).
+
+The shape was understood and repaired at that call site. `summarize_preferences`
+is the sibling that was not searched for at the time — the "grep the class when
+you fix the instance" case, arriving from the other end some months later.
+
+### Two arguments, not one
+
+Adding `owner_user_id` alone turns the reported symptom green and leaves the
+call one argument short of `_select_adapters`, which answers the same question
+when a turn actually picks an adapter and passes both. A user whose tenant
+shares an adapter with them would still not see it in the panel that claims to
+describe their adapters.
+
+The invariant is therefore about agreement, not about one missing row:
+**preference insights describe the adapters visible to the same user whose
+preferences they summarize.**
+
+Five adapters around one subject pin it — their own private row, a neighbour's
+private row, a row their tenant shares, a row another tenant shares, and a
+global one. The two negatives matter as much as the positives: "the list is
+non-empty" would pass against a listing that returned every adapter on the
+instance, which is the one outcome worse than showing none.
+
+`summarize_preferences(None)` keeps the meaning it already had. The signature
+allows it, nothing in the product passes it, and with no identity to scope by
+the store's answer is the public set — so that is pinned rather than changed.
+
+### Mutations
+
+Two, each killed by exactly one witness: dropping `owner_user_id` kills the
+subject's-own-adapter case and nothing else; dropping `tenant_id` kills the
+tenant-shared case and nothing else. That separation is the point — it is what
+distinguishes this fix from the one-argument version of it.
+
+### On how it was found
+
+Nothing in the unit suite covered `summarize_preferences` at all. The defect
+needed a real account, real feedback, and someone asking the panel what it
+showed. The tranche before this one came from the same kind of pass; both were
+invisible to reading, and both were obvious within a minute of running.
+
+### Two siblings found by the same grep, recorded rather than fixed
+
+Searching for the shape rather than stopping at the reported line turns up two
+more unscoped adapter listings. Neither is this defect, and neither is fixed
+here, because both raise a question this tranche does not answer: what scope
+does a caller with no user even have?
+
+`clustering.promote_clusters` lists adapters to build the set of clusters that
+already have one, so it does not create a second. That listing is unscoped, so
+it sees only global adapters — meaning a cluster whose adapter is private or
+tenant-shared reads as unbound, and the sweep can bind it again. It runs as an
+instance-level sweep with no principal, so the fix is a decision about what a
+cross-tenant sweep is entitled to see, not an argument to add.
+
+`/metrics` reports `liminallm_adapters_total` from the same unscoped listing,
+so the gauge counts global adapters only and reads zero on an instance whose
+adapters are all per-user personas. That is a monitoring inaccuracy rather
+than a correctness or disclosure problem, and the same scope question decides
+it.
+
+The common root is worth stating plainly, because it is what made all three
+easy to write and hard to see: **an artifact listing with no identity is a
+question about the public set.** It is a reasonable default and it fails
+quietly, so every caller that means "what can this principal see" has to say
+so, and a caller that means something else has to decide what.

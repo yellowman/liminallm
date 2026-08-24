@@ -603,6 +603,14 @@ that never trained and yet produced a version.
 
 The dataset pipeline is specified in §5.4.
 
+**preference insights** (`GET /v1/preferences/insights`) summarize one
+user, and every part of that summary is read for the same user: their
+events, their clusters, and **the adapters visible to them** — their own
+private rows, the ones their tenant shares, and the global ones, exactly
+the set adapter selection sees at turn time. An adapter listing given no
+identity is a question about the public set only, so a summary that omits
+the subject describes nobody's adapters rather than everybody's.
+
 ### 2.7 config ops (LLM as architect)
 
 **config_patch** — a proposed change to one artifact: JSON Patch ops, the
