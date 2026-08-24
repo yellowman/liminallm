@@ -4210,6 +4210,25 @@ async def upload_file(
                     runtime.store.replace_chunks_for_path(
                         context_id, indexed_identity, []
                     )
+                    # And record the re-read, for the same reason every other
+                    # covering context gets one. This context was skipped in
+                    # the enqueue above because it was about to be ingested
+                    # here; it was not, and the source row written before the
+                    # attempt still says it covers this path. A context that
+                    # covers a path and says nothing about it is the silent
+                    # coverage loss this queue exists to prevent, so leaving
+                    # it out would reintroduce that defect through the one
+                    # path that skips the queue.
+                    #
+                    # The worker's poll is what refills it: this request is
+                    # about to abort, so nothing it scheduled will run.
+                    # Attachments are excluded exactly as above — no source
+                    # row was written for one, so nothing claims coverage.
+                    if generation is None:
+                        with contextlib.suppress(Exception):
+                            runtime.store.enqueue_ingest_job(
+                                context_id, str(dest_path), checksum
+                            )
                     _persist(set(prior_contexts) if deduped else set())
                     raise
 

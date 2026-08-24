@@ -35,6 +35,7 @@ observation, not participation: the actions are the API's.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 import uuid
@@ -1067,3 +1068,57 @@ class TestOneLockForBothSides:
 
         # And once the worker is done, the same upload goes through.
         assert _upload(client, headers, "report.md", FIRST).status_code == 200
+
+
+class TestAFailedIngestStillOwesTheReRead:
+    """The one path that skips the queue must not skip it silently.
+
+    A named context is left out of the enqueue loop because it is about to be
+    ingested in the request. When that ingest fails, the request has written a
+    `context_source` row saying the context covers the path and has emptied
+    what it said about it — a context covering a file it describes not at all,
+    which is the coverage loss this whole queue exists to prevent, arriving
+    through the one branch that does not use it.
+    """
+
+    def test_a_context_whose_ingest_failed_is_queued_for_a_re_read(
+        self, client, monkeypatch
+    ):
+        runtime = get_runtime()
+        user_id, headers = _account(client)
+        context_id = _context(client, headers)
+
+        assert _upload(client, headers, "report.md", FIRST,
+                       context_id=context_id).status_code == 200
+        files_dir = _files_dir(runtime, user_id)
+        path = str(files_dir / "report.md")
+        assert "THE FIRST GENERATION" in _text_for(runtime, context_id, "report.md")
+
+        def unreachable(*args, **kwargs):
+            raise RuntimeError("embedding backend unreachable")
+
+        monkeypatch.setattr(runtime.rag, "ingest_file", unreachable)
+        with contextlib.suppress(Exception):
+            _upload(client, headers, "report.md", SECOND, context_id=context_id)
+
+        # The claim survived the failure, as it should: the context was given
+        # this file and still holds it as a source.
+        assert any(str(s.fs_path) == path for s in
+                   runtime.store.list_context_sources(context_id)), (
+            "the source row is gone, so this test is not about what it says"
+        )
+        assert not _chunks_for(runtime, context_id, "report.md"), (
+            "the failed generation was left in place"
+        )
+        assert runtime.store.count_pending_ingest_jobs(path) >= 1, (
+            "the context covers this path and says nothing about it, and "
+            "nothing is queued to fix that — the file is lost from a context "
+            "that claims to hold it"
+        )
+
+        # And the queue does fix it, once the backend is reachable again.
+        monkeypatch.undo()
+        assert ingest_queue.drain_until_idle(
+            runtime.store, runtime.rag, fs_root=_root(runtime)
+        ) >= 1
+        assert "THE SECOND GENERATION" in _text_for(runtime, context_id, "report.md")
