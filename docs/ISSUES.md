@@ -13490,3 +13490,48 @@ mean: the confinement work made CI able to run these tests for the first time,
 and the first thing it found was a data-correctness bug that had been invisible
 because the only machine that ever ran the test ordered a directory listing
 favourably.
+
+### Correction: the index forgets the file, it does not lie about it
+
+The section above says the index keeps the previous generation and would answer
+out of bytes that are gone. **That is wrong, and the error was in reading the
+test's assertion message rather than the index.**
+
+The failing assertion is only `"THE GENERATION THE UPLOAD WROTE" in indexed`,
+which fails both when the index holds stale text and when it holds nothing at
+all. Its message names the first case. The second assertion would have
+distinguished them and never runs, because the first one fails first.
+
+Measured instead of read:
+
+    WALK_TEXT_PRESENT=False  UPLOAD_TEXT_PRESENT=False  INDEX_LEN=112
+
+and dumping the rows outright:
+
+    [KnowledgeChunk(fs_path='.../files/.checksums.json',
+                    content='{"report.md":{"checksum":"c915c5b6...","contexts":[]}}')]
+
+One row, for `.checksums.json`, and **no row for `report.md` at all**. The
+walk's stale commit did land, and the upload's invalidation then removed it —
+which is the safe outcome and the opposite of what was claimed.
+
+So the real defect, stated correctly:
+
+* On replacing a file, every context covering it has its chunks for that path
+  invalidated. Correct, and it is why there are no stale answers.
+* The new generation is **not** indexed, because `wants_ingest` is
+  `bool(context_id) and ...` and an ordinary upload names no context.
+* `contexts = set(prior_contexts) if deduped else set()` then resets the
+  manifest's association, so nothing records that the context ever covered the
+  file — visible in the row above as `"contexts":[]`.
+
+The net effect is **silent coverage loss**: a context stops covering a file it
+covered, a search that used to find it finds nothing, and no error is raised
+and no record kept. Less severe than answering from bytes that are gone, and
+still not something to leave unnamed.
+
+Worth keeping as its own lesson, because it is the same shape as everything
+else in this file arriving one level up. An assertion message is a claim
+written at the same time as the assertion, by the same person, about what a
+failure would mean — so it is not evidence about what the failure *is*. The
+index had to be read.
