@@ -12832,3 +12832,35 @@ environment is never the narrowest environment.** Every one of these passed
 locally, on an interpreter with the extras installed, and failed on the lane
 that had least. Where a check is about what is installed, the only meaningful
 place to run it is somewhere with less installed than here.
+
+### A third instance, in the guard's own allowlist
+
+Reported by Cursor Bugbot against `1030758`, and correct.
+
+The `tests/` check asks whether a module-scope import is in base plus dev,
+which is what the browser lane installs. It read the requirement strings with a
+regex that takes the distribution name and stops, so **an environment marker
+was invisible to it**. `tomli>=2.0; python_version < '3.11'` is in the dev
+extra, so the set named `installed_everywhere` contained `tomli` — a package
+installed on 3.10 and on nothing else. The browser lane runs 3.11. A
+module-scope `import tomli` in `tests/` would have passed the guard and aborted
+that lane's collection anyway, which is the one failure the guard exists to
+prevent.
+
+Measured before fixing: `'tomli' in guaranteed` was `True`, and
+`find_spec("tomli")` on the 3.11 interpreter this suite runs on returned
+`None`. The set was named for a property it did not have.
+
+Any marker now disqualifies a name, including one that would hold everywhere.
+The parse cannot evaluate markers and should not pretend to, and the two ways
+of being wrong are not symmetric: too strict costs one unnecessary
+`importorskip`, too lax costs an aborted lane.
+
+Witnessed behaviourally rather than by inspecting the set. A module-scope
+`import tomli` dropped into `tests/` is flagged with the fix in place; with the
+marker exclusion reverted, the same file passes. That is the reported hole,
+reproduced and closed.
+
+Three findings in this file now, all the same sentence with a different
+subject: **what is declared, what is imported, and what is installed are three
+different sets, and every defect here came from treating two of them as one.**

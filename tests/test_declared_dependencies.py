@@ -28,6 +28,7 @@ else through `pytest.importorskip`.
 from __future__ import annotations
 
 import ast
+import importlib.util
 import pathlib
 import re
 import sys
@@ -61,14 +62,25 @@ _IMPORT_NAME = {
 _DIST = re.compile(r"^\s*([A-Za-z0-9][A-Za-z0-9._-]*)")
 
 
-def _declared() -> tuple[set[str], dict[str, set[str]]]:
-    """(base dependencies, {extra name: its dependencies}), as import names.
+def _declared() -> tuple[set[str], dict[str, set[str]], set[str]]:
+    """(base, {extra: its dependencies}, marker-gated), as import names.
 
     Parsed with a regex rather than `packaging.requirements`, which is itself
     a transitively-supplied import — pytest happens to depend on it. A test
     about undeclared dependencies should not rest on one.
+
+    The third set is every name whose requirement carries an environment
+    marker, and it exists because declaring something is not the same as
+    installing it. `tomli>=2.0; python_version < '3.11'` is declared in the
+    dev extra and absent from every 3.11 environment, so a list of what is
+    installed that reads markers as if they were not there names a package
+    that is not present. Any marker at all disqualifies a name here, even one
+    that happens to hold everywhere: the cost of being wrong that way is a
+    guard that asks for one `importorskip` too many, and the cost of the
+    other way is the collection abort this whole file is about.
     """
     data = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    conditional: set[str] = set()
 
     def names(reqs) -> set[str]:
         out = set()
@@ -76,7 +88,11 @@ def _declared() -> tuple[set[str], dict[str, set[str]]]:
             match = _DIST.match(raw)
             assert match, raw
             dist = match.group(1)
-            out.add(_IMPORT_NAME.get(dist.lower(), dist.lower().replace("-", "_")))
+            name = _IMPORT_NAME.get(dist.lower(), dist.lower().replace("-", "_"))
+            out.add(name)
+            # A marker follows a semicolon: `tomli>=2.0; python_version<"3.11"`.
+            if ";" in raw:
+                conditional.add(name)
         return out
 
     base = names(data["project"]["dependencies"])
@@ -84,7 +100,7 @@ def _declared() -> tuple[set[str], dict[str, set[str]]]:
         extra: names(reqs)
         for extra, reqs in (data["project"].get("optional-dependencies") or {}).items()
     }
-    return base, extras
+    return base, extras, conditional
 
 
 #: Package directories that are this repository's own, so an import of one is
@@ -115,7 +131,7 @@ def _module_scope_imports(package: str) -> dict[str, set[str]]:
 
 
 def test_every_module_scope_import_is_declared():
-    base, _extras = _declared()
+    base, _extras, _conditional = _declared()
     imports = _module_scope_imports("liminallm")
 
     undeclared = {
@@ -136,7 +152,9 @@ def test_a_test_module_imports_only_what_every_lane_installs():
     itself when the package is absent: it fails *collection*, and a collection
     error aborts the whole run before any marker deselects anything. So a
     module-scope import in `tests/` has to be satisfied by every lane, and the
-    narrowest is the browser lane — base plus the dev extra, nothing else.
+    narrowest is the browser lane — base plus the dev extra, less anything a
+    marker gates, because a declaration is not an installation. See
+    `test_a_marker_gated_dependency_is_not_treated_as_installed`.
 
     The `train` extra is the trap, because one lane hides it: the test job's
     install line names `jax`, which brings `numpy` with it, so both look
@@ -146,8 +164,8 @@ def test_a_test_module_imports_only_what_every_lane_installs():
     `pytest.importorskip`, which is an import this walk does not see and a
     skip rather than an error when the package is missing.
     """
-    base, extras = _declared()
-    installed_everywhere = base | extras["dev"]
+    base, extras, conditional = _declared()
+    installed_everywhere = (base | extras["dev"]) - conditional
     imports = _module_scope_imports("tests")
 
     unavailable = {
@@ -162,6 +180,34 @@ def test_a_test_module_imports_only_what_every_lane_installs():
         "pytest.importorskip:\n"
         + "\n".join(f"  {name}: {', '.join(files)}" for name, files in unavailable.items())
     )
+
+
+def test_a_marker_gated_dependency_is_not_treated_as_installed():
+    """Declaring a package and installing it are different claims.
+
+    The check above allows a module-scope import in `tests/` if the name is in
+    base or dev. Read without markers, that list said `tomli` — declared in
+    the dev extra as `tomli>=2.0; python_version < '3.11'`, and therefore
+    installed on 3.10 and on nothing else. The browser lane runs 3.11, where
+    it is absent. So a module-scope `import tomli` would have passed the
+    guard and still aborted that lane's collection, which is the exact
+    failure the guard was written to catch.
+
+    Any marker disqualifies a name, not just this one — the parse cannot
+    evaluate markers and should not pretend to.
+    """
+    base, extras, conditional = _declared()
+
+    assert "tomli" in extras["dev"], sorted(extras["dev"])
+    assert "tomli" in conditional, sorted(conditional)
+    assert "tomli" not in (base | extras["dev"]) - conditional
+
+    # Only the direction the marker guarantees. On 3.10 the dev extra promises
+    # `tomli`, so its absence would mean the extra was not installed. On 3.11
+    # nothing is claimed: the marker stops pip from installing it, but another
+    # package is free to bring it, and this test is not about that.
+    if sys.version_info < (3, 11):
+        assert importlib.util.find_spec("tomli") is not None
 
 
 @pytest.mark.parametrize(
