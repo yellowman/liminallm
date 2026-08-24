@@ -164,6 +164,10 @@ def test_the_worker_only_schedules():
         "_maybe_run_periodic_clustering",
         "_maybe_recommend_adapter_pruning",
         "_maybe_reembed_stale_vectors",
+        # every poll, no leader: the claim is atomic, so replicas take
+        # different jobs. The work lives in service/ingest_queue.py; what is
+        # here is the call, which is the shape this test asks for.
+        "_drain_ingest_queue",
         # queue consumption and the job state machine
         "_process_queued_jobs",
         "_get_queued_jobs",

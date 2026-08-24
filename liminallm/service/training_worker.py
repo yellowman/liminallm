@@ -17,6 +17,7 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, List, Optional
 
 from liminallm.logging import get_logger
+from liminallm.service import ingest_queue
 from liminallm.service import notes as notes_service
 from liminallm.service.replication import AdvisoryLock
 
@@ -65,6 +66,8 @@ class TrainingWorker:
         adapter_prune_interval: int = DEFAULT_ADAPTER_PRUNE_INTERVAL_SECONDS,
         reembed_interval: int = DEFAULT_REEMBED_INTERVAL_SECONDS,
         embeddings=None,
+        rag=None,
+        fs_root: Optional[str] = None,
         leader_lock: Optional["AdvisoryLock"] = None,
     ) -> None:
         self.store = store
@@ -81,6 +84,11 @@ class TrainingWorker:
         self.reembed_interval = reembed_interval
         # Needed to re-embed after an encoder change; None disables the sweep.
         self.embeddings = embeddings
+        # Needed to re-index files whose bytes were replaced, and to take the
+        # same publication lock the upload does; either being None disables
+        # the drain, leaving only the replacing request's own pass.
+        self.rag = rag
+        self.fs_root = fs_root
         # Periodic clustering and prune proposals are cluster-wide work, not
         # per-replica work: without this lock every replica repeats them.
         # Queued jobs need no lock — claim_training_job() is an atomic
@@ -120,6 +128,7 @@ class TrainingWorker:
         while self._running:
             try:
                 await self._process_queued_jobs()
+                await self._drain_ingest_queue()
                 await self._maybe_run_periodic_clustering()
                 await self._maybe_recommend_adapter_pruning()
                 await self._maybe_reembed_stale_vectors()
@@ -144,6 +153,30 @@ class TrainingWorker:
                     continue
 
             await asyncio.sleep(self.poll_interval)
+
+    async def _drain_ingest_queue(self) -> None:
+        """Re-index files whose bytes were replaced.
+
+        The replacing request empties the stale chunks itself and starts a
+        drain of its own, so this is not the usual path — it is what makes the
+        queue durable rather than best-effort. A process that dies between
+        recording the work and doing it would otherwise leave those files
+        absent from their contexts permanently, which is the failure this
+        design exists to avoid.
+
+        Every poll, not on an interval: work here means a user is waiting for
+        a file to become searchable again. No leader lock either — the claim
+        is an atomic UPDATE ... SKIP LOCKED, so replicas take different jobs,
+        and the publication lock keeps two of them off one path.
+        """
+        if self.rag is None or not self.fs_root:
+            return
+        await asyncio.to_thread(
+            ingest_queue.drain_until_idle,
+            self.store,
+            self.rag,
+            fs_root=self.fs_root,
+        )
 
     async def _maybe_run_periodic_clustering(self) -> None:
         if not self.clusterer or self.cluster_interval <= 0:

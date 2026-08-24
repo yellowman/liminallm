@@ -255,6 +255,10 @@ class Runtime:
             # Lets the worker re-embed vectors left behind by a previous
             # encoder; a hash encoder makes the sweep a no-op.
             embeddings=self.embeddings,
+            # Lets the worker re-index files whose bytes were replaced, which
+            # is what makes that queue durable rather than best-effort.
+            rag=self.rag,
+            fs_root=self.settings.shared_fs_root,
         )
         self._local_idempotency: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         self._local_idempotency_lock = asyncio.Lock()
@@ -640,8 +644,13 @@ class Runtime:
             # Mark this version applied so the watcher doesn't reload again.
             self._applied_settings_version = version
             if getattr(self, "training_worker", None):
+                # Every rebuilt service the worker holds, or it keeps running
+                # the old stack: a re-embed sweep on the previous encoder, or
+                # a re-index writing vectors nothing else compares against.
                 self.training_worker.training = self.training
                 self.training_worker.clusterer = self.clusterer
+                self.training_worker.embeddings = self.embeddings
+                self.training_worker.rag = self.rag
             if old_workflow is not None and old_workflow is not self.workflow:
                 with contextlib.suppress(Exception):
                     old_workflow.shutdown(wait=False)

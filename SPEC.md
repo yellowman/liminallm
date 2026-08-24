@@ -336,6 +336,37 @@ generated `content_tsv` column (GIN-indexed) for the lexical channel, and
   whose recorded encoder id differs from the current one reads as "not
   embedded" and is re-embedded by the normal backfill when read. A
   scheduled re-embed is open work (docs/roadmap.md).
+- **replacing a file changes its generation, not its coverage.** A context
+  covers a path by holding a `context_source` row — which is the single
+  authority for that, never `knowledge_chunk` (the materialisation of it,
+  which a stray row would otherwise promote into a relationship nobody
+  created) and never the upload manifest (which records only the contexts
+  an upload named, so a directory source never appears in it).
+  On replacement the upload MUST do the bounded half under the publication
+  lock it already holds: empty every covering context's chunks for that
+  path, because a chunk claiming to be the file's contents is false the
+  moment new bytes exist. It MUST NOT do the unbounded half there —
+  re-reading and re-embedding for a set of contexts the request never chose
+  — so it records an `ingest_job` per covering context instead. Between the
+  two the path is *absent* from those contexts: recoverable, and unlike a
+  stale answer, honest. Emptying without recording the re-read is not a
+  correction; it loses the file from every context that covers it.
+- **the queue takes the same publication lock the upload takes**, on the
+  same key, and re-reads the generation inside it. A worker that cannot get
+  it stands aside without spending an attempt: whoever holds it is
+  publishing that name and will queue what its own bytes need. Two locks
+  that merely resemble each other would serialise nothing, so that is what
+  the witness checks — a worker holding the lock, an ordinary upload of the
+  same path, and a 409.
+  Each job carries the checksum of the bytes that prompted it and declines
+  if the file has moved on; repeated replacements collapse onto one pending
+  slot holding the newest; retries are scheduled rather than immediate,
+  because a worker drains until the queue is empty and an unscheduled retry
+  is re-claimed within a second of the first failure; and a claimed job
+  carries a lease, so a process killed mid-job returns its work instead of
+  stranding it — the claim must not become the thing that forgets the file.
+  Conversations' implicit indexes are outside all of this, on both sides:
+  §19.5 scopes an attachment to the chat that received it.
 
 #### retrieval strategy
 
